@@ -202,7 +202,7 @@ allows concurrent readers while serialising a transition. We copy a snapshot out
 returning it, so a slow HTTP client never holds the lock.
 
 Readiness also travels to the leader in its own reporting message. Why another message?
-It gets its own lease, so a fresh state report can't keep a dead subsystem looking alive.
+It carries its own expiry, so a fresh state report can't keep a dead subsystem looking alive.
 The leader treats a missing or expired readiness report as unready. No optimistic guessing.
 
 There is one more trap here: “supervise” doesn't automatically mean “restart”. A gossip
@@ -216,6 +216,23 @@ maximum retry count, a delay, a recovery window and a shutdown deadline. The fac
 a child cancellation token for each attempt. Rust's ownership rules help us state the real
 question: can this closure build a completely new owner without borrowing the dead one? If
 the answer isn't obviously yes, we don't restart it.
+
+Spawning a task doesn't mean it has bound its socket or loaded its state, yet the first supervisor marked every owner `Ready` the moment it spawned it. Now each owner receives a signal and fires it itself, once its resources are in hand:
+
+```rust
+pub struct ReadySignal(tokio::sync::oneshot::Sender<()>);
+
+impl ReadySignal {
+    /// Publish resource readiness. A retired owner's acknowledgement is ignored.
+    pub fn ready(self) {
+        let _ = self.0.send(());
+    }
+}
+```
+
+`ReadySignal` is a *tuple struct*: a struct whose single field has no name and is reached as `self.0`. It wraps the sending half of a `oneshot` channel. `ready` takes `self` by value rather than `&self`, so calling it consumes the signal and the compiler won't let an owner report ready twice. A restarted owner gets a brand-new channel, so a slow signal from the attempt that just died can't mark its replacement ready. `let _ =` deliberately discards the send result: if the supervisor has already moved on, nobody is listening, and that's fine.
+
+Wiring this up produced a proper async deadlock, without any thread holding a lock forever. The supervisor drives the owner's future itself, in a `tokio::select!` alongside the ready signal. When the signal won, the supervisor ran that branch's body, which awaited a write to the readiness tracker. Meanwhile the owner was itself queued for the same tracker, first in line, and a future only makes progress while someone polls it. The supervisor *was* that someone, and it was busy awaiting inside a branch body, which doesn't keep polling the other branches. Nobody moved. The fix makes publishing readiness another future inside the `select!`, so the owner keeps getting polled while the supervisor waits. It's worth remembering: in `select!`, code in a branch body runs alone.
 
 The scheduler consumes the same evidence under an independent receive-time lease. A fresh
 metrics report can't keep stale readiness alive, and a leader change starts with no inherited
@@ -456,9 +473,11 @@ would enable it. `cargo tree --target all -i rkyv` found no active path, and Rel
 no rkyv archives. The advertised fix starts at the incompatible rkyv 0.8 API while
 `rust_decimal` 1.x deliberately pins its optional integration to 0.7. We recorded a temporary,
 expiring exception instead of pretending that changing an unused lockfile version was a fix.
+The exception has a condition attached: `make audit` asks Cargo for the active `rkyv`
+graph first, and fails if any feature or target activates it, or if Cargo can't answer.
 
 The repository audit denies every new vulnerability and maintenance warning. Its short
-exception list expires on 18 August 2026, and the Make target fails after that date until we
+exception list expires on 18 November 2026, and the Make target fails after that date until we
 review it. CI runs the audit on changes and releases; a weekly job catches a new advisory
 even when nobody changes the source. An exception without an owner and an alarm is just a
 quieter way to forget a problem.
@@ -701,6 +720,27 @@ Cleanup gets an independent outcome (`Confirmed`, `NotRequired`, `Failed` or
 Keeping cleanup outside `TestOutcome` records both facts instead of letting
 one overwrite the other.
 
+How does a case body say "unknown" rather than "failed"? The first version used a convention: an error message starting with `__unknown__:` was downgraded. That meant a workload printing `__unknown__:connection refused` could turn its own failure into missing evidence, which is a lot of power to hand a string. Case bodies now return a typed error:
+
+```rust
+pub enum CaseError {
+    /// An observed assertion or operation failed.
+    #[error("{0}")]
+    Failed(String),
+    /// Available evidence cannot establish a verdict.
+    #[error("{0}")]
+    Unknown(String),
+}
+
+impl From<String> for CaseError {
+    fn from(reason: String) -> Self {
+        Self::Failed(reason)
+    }
+}
+```
+
+`impl From<String> for CaseError` teaches Rust how to turn a `String` into a `CaseError`, and the `?` operator uses exactly that conversion when it propagates an error. So a case can keep writing `something().map_err(|e| e.to_string())?` and every such error becomes `Failed`, whatever it says. The only way to get `Unknown` is to construct it on purpose, through a small `unknown(reason)` helper. The runner never reads the message to decide.
+
 The serde attributes matter for the same reason:
 
 ```rust
@@ -780,8 +820,8 @@ failing halfway through setup.
 
 Production runs acquire server-owned leases for their apps and namespaces.
 The server checks exact ownership before cleanup; a familiar name is not proof
-of ownership. Names still use `rbtest-{run}-{seq}` for recognition. The legacy
-lease-free path used by focused tests also checks that prefix:
+of ownership. Names still use `rbtest-{run}-{seq}` for recognition. The
+lease-free path that focused unit tests use also checks that prefix:
 
 ```rust
 pub fn is_test_namespace(namespace: &str) -> bool {
@@ -871,11 +911,10 @@ Note "after every case" — pass, fail *or* timeout. It's tempting to only clean
 up after a pass, but that's exactly backwards: the case that failed halfway is
 the one that left a workload running. Teardown is the runner's job precisely so
 a case body can `return Err(...)` the moment something's wrong without a pile of
-cleanup code first. Teardown reverses exact fault receipts, releases the
+cleanup code first. Teardown reverses exactly the faults it injected, releases the
 server-owned lease and checks runtime absence. Timeout or unreachable peers
 mean unknown cleanup; they do not prove the resources are gone. The server's
-expiry reaper can still finish later. Jobs, images, tokens and mounts need the
-additional ownership work tracked as C34. We record timeout, API failure and a
+expiry reaper can still finish later. We record timeout, API failure and a
 workload which remains present as cleanup evidence. Discarding the result with `let _ =` would make
 the happy path shorter and the report less true.
 
@@ -1222,7 +1261,7 @@ pub enum FaultType {
 Where did the source cgroup id go? An earlier version carried a
 `source_cgroup_id` on the wire and refused any non-zero value. Nothing had
 shipped, so we deleted the field instead: a client can't name a cgroup at all.
-That's about authority. The kernel compares the key against
+That's a question of trust. The kernel compares the key against
 `bpf_get_current_cgroup_id()`, and only Bun can reliably tie that number to the
 instances it supervises. Trusting an arbitrary integer from a caller would let
 the caller fault some other cgroup or create a convincing no-op with a made-up
@@ -1396,8 +1435,11 @@ manifest under a tag. Reliaburger's own registry answers this protocol (that's
 how `buildah push` works against it), so the harness just plays the client side
 over `reqwest`. The first version ran two of the three cases: push-and-pull-back
 by digest, and "does it show up in `relish images`". The synthetic image contains
-one marker file and no executable, so it couldn't prove deployment. That third
-case remained unknown until the runnable fixture described below.
+one marker file and no executable, so it couldn't prove deployment. The third
+case now copies the digest-pinned BusyBox image, verified blob by blob, into
+Pickle under the lease's namespace, deploys it by digest and checks that its
+HTTP server answers from inside the container. A successful upload alone can't
+pass it.
 
 That completes the catalogue: thirteen groups, thirty-nine cases. Not all of
 them run everywhere — the process-runtime cases skip on runc and the container
@@ -1478,15 +1520,19 @@ idempotent. The enum owns apps and the matching namespace quota declaration:
 ```rust
 pub enum LeasedResource {
     App { app_id: AppId },
+    Job { job_id: AppId },
     Namespace { name: String },
+    ApiToken { name: String, fingerprint: [u8; 32] },
 }
 ```
 
-Apps sort before namespaces, so cleanup removes every app before its quota
-record. That's deliberately honest. Jobs, faults, tokens, images, mounts and
-node state need different cleanup operations. Pretending a namespace owns them
-would produce green reports and leaked state, which is quite an achievement for
-a test system.
+A derived ordering follows declaration order, so apps and jobs sort before
+namespaces and cleanup removes every workload before its quota record.
+`[u8; 32]` is a fixed-size array of 32 bytes, stored inline: a SHA-256
+fingerprint of the exact token, because a name alone could point at a
+replacement credential. Each kind of resource needs its own cleanup
+operation. Pretending a namespace owned them all would produce green reports
+and leaked state, which is quite an achievement for a test system.
 
 Expiry moves a lease to `Cleaning`. Standalone cleanup waits for the agent to confirm the app
 stopped. Cluster cleanup removes each owned app from replicated desired state and lets the
@@ -1521,9 +1567,43 @@ literally named `--`. A test which merely logged that error had been green.
 The new test fails on create, start, state or exec, and the adapter now emits
 the command shape Apple's CLI actually accepts.
 
-That closes the app/namespace and portable-workload part of the milestone.
-Jobs, faults, tokens, registry images, mounts and node state still need explicit
-ownership before the chaos catalogue can rely on them.
+### Every owner, not just the latest one
+
+The lease above answered "who deletes the app?". It took a surprising amount of work to answer "and how do we know it's gone?"
+
+Move a test app from worker A to worker B while A is disconnected. Deleting the app from Raft removes the *desired* state; it tells us nothing about the process still running on A. If we also dropped the lease at that point, we'd have lost our only reminder to go back and check. So the lease remembers every node that has ever been assigned its apps, and every node that accepted an upload into one of its registry repositories:
+
+```rust
+pub struct TestLease {
+    // ...
+    /// Resources atomically associated with this lease.
+    pub resources: BTreeSet<LeasedResource>,
+    /// All possible runtime owners, removed only by confirmed retirement.
+    pub placements: BTreeSet<LeasedPlacement>,
+    /// Repositories and every node that may hold uploads or metadata for them.
+    pub repositories: BTreeMap<String, BTreeSet<u64>>,
+    /// Confirmed workload retirement, required before repository deletion.
+    pub workloads_retired: bool,
+}
+```
+
+`LeasedPlacement` is a small struct of an `AppId` and a `NodeId` that derives `Ord`, so a `BTreeSet` can hold each pair once, in a deterministic order. The scheduler adds a pair in the same Raft entry that publishes the placement, and rescheduling adds a new owner rather than replacing the old one. `BTreeMap<String, BTreeSet<u64>>` nests one collection in another: each repository name maps to the set of node numbers that might hold its bytes.
+
+Cleanup then waits for each of those owners to say, in so many words, that it's done. A worker acknowledges retirement only after it has observed the runtime exit, removed the instance's identity directory and adoption record, unmounted and deleted any test volume, and saved its own checkpoint. The acknowledgement carries the lease's ID, so a late reply can't release a replacement lease's resources. Registry uploads wait behind the `workloads_retired` flag: there's no point deleting an image that a still-running container might need. The HTTP API tells the caller where it stands. `202 Accepted` means cleanup is under way; `204 No Content` means every recorded owner has confirmed. Relish polls on 202, retries a 503 from a follower that has briefly lost its leader, and puts one 30-second deadline around the whole lot, so a retry never quietly earns a fresh 30 seconds.
+
+What if a worker will never come back? Waiting forever keeps the record honest but leaves the operator stuck. `relish decommission-node worker-a --workloads-stopped --reason "powered off"` is the escape hatch, and it's deliberately a *different* kind of evidence. Only an unscoped Admin can submit it. Raft records who said it, why and when, releases that node's outstanding placements, and permanently retires the node identity, so an old disk can't come back with an old certificate and resume work the cluster has already forgotten. Bun observing a process exit and an operator promising they've pulled the plug are both valid reasons to finish cleanup. They're not the same reason, and the audit record says which one it was.
+
+Tokens, jobs and faults needed their own owners too. A test token is minted inside the lease, scoped to its namespace, never Admin, and it expires no later than the lease does. Jobs in 0.1 run on the node that received them, so their leases live on that node (`scope = "node_jobs"`) and a local reaper retires both running jobs and cron registrations that haven't fired yet. Chaos faults get a receipt *before* the request goes out, because the server may accept a fault whose response never reaches us; an unresolved receipt makes cleanup `Unknown` rather than `NotRequired`.
+
+One last trap. The reaper used to wait on each lease's operation lock in turn, so a single lease still being deployed stopped every other expired lease from being cleaned. It now asks without queueing:
+
+```rust
+let operation_guard = operation_lock
+    .try_lock_owned()
+    .map_err(|_| LeaseError::Busy)?;
+```
+
+`try_lock_owned` returns immediately, with either a guard or an error, where `lock_owned().await` would wait its turn. The "owned" part means the guard holds its own `Arc` reference to the mutex rather than borrowing it, so it can be stored in a struct or moved to another task. A busy lease becomes `LeaseError::Busy` (HTTP 409 to an explicit caller), the reaper moves on to the next one, and it comes back on its next tick.
 
 ## Who may break production
 
@@ -1691,20 +1771,15 @@ joined its cgroup, muddying process ownership and wasting memory in a programme
 which only needs to park.
 
 Linux gives us one more safety net: `prctl(PR_SET_PDEATHSIG, SIGKILL)` asks the
-kernel to kill the helper when the thread which created it exits. That thread
-can be a Tokio worker; Linux doesn't wait for the whole Bun process to die.
-The [Linux interface documentation](https://man7.org/linux/man-pages/man2/PR_SET_PDEATHSIG.2const.html)
-also explains that an earlier death doesn't produce a retroactive signal.
-`prctl` is a C system call, so Rust requires an `unsafe` block. The block's
-safety comment explains the invariant: the call changes process metadata and
-doesn't dereference Rust memory. `getppid()` detects process reparenting, but
-cannot prove a creator thread still exists inside a live parent process.
-Bun therefore records the kernel thread ID immediately before spawning, with
-no `.await` between those operations. An await could resume the Rust task on a
-different Tokio worker, making the recorded ID describe the wrong creator.
-After installing the signal, the helper requires `/proc/PID/task/TID` to exist
-inside that same parent process. Missing or unreadable evidence stops startup
-before the helper joins a pressure cgroup.
+kernel to kill the helper when the thread which created it exits. Note *thread*,
+not process: that thread can be a Tokio worker, and Linux doesn't wait for the
+whole of Bun to die. `prctl` is a C system call, so Rust requires an `unsafe`
+block, whose safety comment explains the invariant: the call changes process
+metadata and doesn't dereference Rust memory. Bun records the kernel thread ID
+immediately before spawning, with no `.await` in between (an await could resume
+the task on a different worker thread), and the helper refuses to start unless
+that thread still exists inside its parent. A fresh Bun sweeps any `fault-*`
+cgroups left by a hard crash.
 
 The storage helpers use the same trick through `Command::pre_exec`, a closure
 that runs in the child after `fork` and before `exec`. In a multi-threaded
@@ -1717,17 +1792,6 @@ error path: `std::io::Error::other("…")` boxes a string. It now returns
 and the parent turns that code back into a readable message after `spawn`
 returns. The `// SAFETY:` comment now says so, because the comment is the part
 a reviewer actually checks.
-
-The privileged acceptance fixture launches the real Bun helper from a Python
-thread, waits for readiness and then lets that thread finish while its process
-stays alive. The helper must exit through SIGKILL. A second case kills the
-whole parent. A third delays exec until the creator thread has already exited,
-while the parent process stays alive. Before the identity check this helper
-stays alive indefinitely; afterwards it refuses before applying pressure.
-All cases require an empty kernel cgroup membership list, followed by
-successful startup reclamation of the old directory. Early helper death never
-releases the capacity reservation by itself: cleanup must still inspect the
-owned cgroups.
 
 None of this is enabled by merely running as root. The server policy needs the
 independent `saturate_capacity` operation plus non-zero CPU or memory ceilings;
@@ -1794,8 +1858,8 @@ example `relish test --chaos --filter dead_worker_node_has_workloads_rescheduled
 This needs node kill and `alter_node_state`, but neither node pressure nor
 `saturate_capacity`. Selecting the pressure case still requires its capability
 and grant. Unknown names and empty comma-separated selections are errors.
-The report names the cases that actually ran; a subset is not full qualification. ProcessGrill stays separate for the
-same reason: fixed host ports can't restore three replicas onto two surviving
+The report names the cases that actually ran; a subset is not a full run.
+ProcessGrill stays separate for the same reason: fixed host ports can't restore three replicas onto two surviving
 nodes. The catalogue uses the digest-pinned BusyBox OCI workload which runs
 under both runc and Apple Container, although the full pressure scenario still
 needs rootful Linux cgroup v2.
@@ -2392,1132 +2456,25 @@ Finally, a milestone checkbox needs a scope. The cluster upgrade coordinator
 already checks gossip rejoin; the replacement process's local boot-marker check
 still has a separate gap. Calling all upgrade verification either finished or
 missing hides useful information. We now keep completed milestones and explicit
-residual tasks side by side in [progress](../progress.md), with completion tests
-in the [new plan](../plans/archive/2026-09-17-codebase-completion-plan.md).
+residual tasks side by side in [progress](../progress.md).
 
 Portable tests and controlled servers let us force awkward orderings quickly.
 They don't establish that three independent Linux nodes survive the complete
-catalogue. The [acceptance runbook](../plans/2026-07-06-plan-chaos.md) still needs
-its real-node execution record, including profiles, prerequisites, unknown results
-and proof that owned workloads and faults were removed. The laptop smoke run is
-valuable evidence for setup. It doesn't close that wider gate.
+catalogue. That still needs a real-node execution record, including profiles,
+prerequisites, unknown results and proof that owned workloads and faults were
+removed. The laptop smoke run is valuable evidence for setup. It doesn't close
+that wider gate.
 
-### Readiness belongs to the resource owner
+### Absent is not zero
 
-Spawning a future doesn't mean its listener has bound or its initial state has
-loaded. A wrapper used to mark every owner ready before polling that future.
-We now pass each owner a `ReadySignal`. It consumes that signal only after it has
-acquired its resources. Until then the subsystem remains `Starting`.
+The audit's findings kept rhyming, so here they are in one place. Each is a case of an *absent* observation being read as a *particular* one.
 
-The signal contains a one-shot sender. Consuming it transfers the acknowledgement
-to the supervisor, which still watches the running task. A task that exits or
-panics loses readiness. A reconstructible owner gets a new channel on every
-attempt, so a delayed signal from the previous attempt cannot mark its successor
-ready. This is an ownership boundary, not a sleep long enough to hope startup
-has finished.
+- **A missing measurement.** A baseline with network throughput compared against a run without it used to print PASS, because only the common metrics were compared. A metric missing from today's run now fails the comparison.
+- **A missing exit code.** The job probe accepted `None` as success alongside `Some(0)`. `None` means the API had no exit status to report, which proves nothing. It now requires `exit_code == Some(0)`.
+- **A missing voter list.** When the council endpoint failed, `relish wtf` fell back on gossip role flags and could compute "zero of zero members, quorum lost". Unavailable membership is now unknown, and no quorum arithmetic runs on it.
+- **A string that happens to match.** A `403` whose body mentioned "no eligible nodes" passed the capacity benchmark. The scheduler's refusal is now a typed `ScheduleError` with a JSON `code`, and the benchmark matches the `NoEligibleNodes` variant for the exact app it submitted. Trace had the same bug in another form: it searched nslookup's output for the VIP as text, so a resolver address containing those digits passed. It now parses `IpAddr` values and compares them.
+- **A guessed address.** The harness built node URLs by pairing each gossip IP with the entry node's API port, and found Pickle by assuming port 5050. On a laptop with three nodes on three ports, that contacted the same process three times and called it a healthy cluster. Membership now carries each node's advertised `api_address`, and capabilities publish a `ServiceEndpoints` struct whose fields are `Option<String>`: `None` means "no listener declared", never "try the default". Bun also binds its API socket before it starts clustering, so asking for port zero advertises the port the kernel actually chose rather than a zero.
 
-Bun's listeners acknowledge their already-bound sockets from inside their owner
-futures. The agent waits until initial capability collection completes, and the
-security refresh worker loads its state before signalling. Regression tests hold
-an owner before readiness, fail a real bind, retain a stale attempt's signal and
-panic during startup. Each checks the externally visible readiness snapshot.
+Several failures were in the harness rather than the product, and they're worth a sentence each. A fixture that released a port and then started Bun on it lost the port to another test, and its readiness probe cheerfully connected to *that* listener; fixtures now wait for Bun's own announcement of the address it bound. The cluster-upgrade job failed because the debug `bun` binary outgrew Pickle's 512 MiB upload limit; the harness now strips debug symbols from its copy. A nextest "leaked handle" warning turned out to be a runner bug on macOS, fixed upstream, so we pinned the fixed release and made leaks fail the gate instead of raising the timeout. And a few async tasks were doing blocking filesystem work, sweeping directories and hashing a stored Bun binary on a Tokio worker thread; that work now runs through `spawn_blocking`, and the one inventory read with no deadline got the same five-second bound as the others.
 
-### One busy lease must not stop the reaper
-
-Suppose a deployment still owns lease A when leases A and B expire. Cleanup
-must wait for A's deployment to finish, but B has no reason to wait. Previously
-the reaper awaited A's operation mutex and never reached B.
-
-Cleanup now calls `try_lock_owned()`. This returns immediately with either an
-owned guard or an error; unlike `lock_owned().await`, it never joins a waiting
-queue. We translate contention into `LeaseError::Busy` (HTTP 409 for an explicit
-cleanup request). The reaper leaves A's record intact, visits B, then retries A
-on its next tick. The operation guard still prevents cleanup from overtaking
-a deployment. A regression holds A's guard while the real reaper removes B,
-then checks that A remains active and can be cleaned once the guard is dropped.
-
-### Record intent before sending a fault
-
-The server may accept a fault even if the caller never receives its response.
-Previously the guard added its receipt after the HTTP request, with another
-`.await` to acquire the receipt mutex. Cancellation at either point could leave
-an active fault while cleanup reported `NotRequired`.
-
-We now add a pending receipt before sending the request. The receipt keeps the
-exact owning client and node, then gains the server's fault ID after the response.
-An `Arc<()>` gives each operation a distinct allocation without inventing an ID
-for the server: `Arc::ptr_eq` compares allocation identity, even though both
-values contain only `()`. An unresolved receipt makes cleanup `Unknown`. It
-cannot safely infer that a timeout meant refusal, or clear unrelated faults to
-make the result green.
-
-Cleanup also snapshots receipts instead of taking them out of the shared ledger.
-It removes each receipt only after confirmed reversal. Cancellation during a
-clear therefore leaves a retryable receipt. Local HTTP fixtures exercise both
-lost injection responses and interrupted cleanup; only the exact recorded IDs
-are ever cleared. This is in-process ownership, not a durable replacement for
-server-side fault expiry after the runner itself dies.
-
-### A lease acknowledgement includes the directory entry
-
-Writing and syncing a file does not make its subsequent rename durable. The
-lease store now uses the same private atomic writer as identity files: a unique
-0600 temporary file, file sync, rename, then parent-directory sync. A pre-existing
-`leases.json.tmp` is irrelevant. The regression plants that name as a symlink
-and verifies that another writer's file remains untouched.
-
-We move an `OwnedMutexGuard` into `spawn_blocking` along with the proposed lease
-map. The blocking transaction keeps the lock until it has persisted and published
-the new map and operation locks. Aborting the async caller cannot release that
-ownership halfway through a write. A controlled pause in the test demonstrates
-that a second writer waits and then preserves both leases after restart.
-
-A persistence failure might occur after rename, so the last acknowledged memory
-view might differ from disk. We retain that view for inspection but refuse further
-mutations until the store is reopened. Returning an error and then overwriting
-possibly newer ownership would defeat the safety mechanism. Physical crash and
-filesystem sync-failure qualification remain part of the recovery acceptance gate.
-
-### Expiry outranks a rotation label
-
-A certificate whose encoded expiry has passed is critical, even if its last
-rotation observation still says `valid`. Diagnosis now checks that timestamp
-first. A healthy automatically rotating 90-second leaf is fine, but the OK text
-says it is currently valid with healthy rotation; it no longer promises fourteen
-days of remaining validity. Near-expiry leaves without positive healthy rotation
-evidence produce a warning. Consumers that cannot hot-rotate remain separately
-unknown. Tests cover the exact expiry boundary with both automatic-rotation
-settings and the short-lived healthy case.
-
-### Unknown membership has no quorum denominator
-
-When the council endpoint fails, gossip can still report role flags. Those flags
-may describe an older Raft configuration. Using them as the configured voter set
-could turn an empty observation into “zero of zero members, quorum lost”, or
-report a false healthy majority. Council collection now records unavailable or
-empty membership as unknown and retains the source failure. Diagnosis also refuses
-quorum arithmetic for explicitly degraded or empty membership. A public HTTP
-collector regression covers missing membership, stale role flags and an empty
-council response; the existing observed failed-majority case remains critical.
-
-### Filesystem identity is not its capacity
-
-Two filesystems can both report 50 bytes used out of 100. That does not make them
-one filesystem. Diagnostics now attach a node-local device identity from Unix
-filesystem metadata, without exposing host paths. The collector groups storage
-domains only when that identity matches. Older reporters or unsupported systems
-omit it; those observations remain separate rather than being guessed together.
-
-If readings for one device change during collection, we retain the busiest
-complete reading and combine the domain names. A public HTTP collector regression
-covers identical-size distinct devices, missing identities and two changing
-readings of one device. A real filesystem test also confirms that sibling storage
-paths report the same device identity. The optional wire field is backward-readable
-by the new client; older strict diagnostic clients may report unknown until updated.
-
-### Match observations as identities, not substrings
-
-A counter-reset error for `api-10` must not hide the disappearance of `api-1`.
-The CPU observation window now tracks the exact instances seen in its second
-sample, independently of human-readable errors. Reset and missing-instance
-messages can therefore coexist without one suppressing the other.
-
-Trace had the same category of mistake: it searched every output line (including
-its own target description) for the expected VIP text. A resolver address or a
-hostname containing that text could pass. We now parse addresses from nslookup's
-answer section and compare `IpAddr` values. This rejects longer textual matches
-and recognises equivalent IPv6 spellings. The agent regression supplies successful
-probe output with misleading resolver/name text and verifies that DNS still fails;
-the existing correct-answer trace remains successful.
-
-### Watch mode keeps watching when collection fails
-
-An unavailable entry node is an observation worth displaying. Watch mode now
-renders that collection as unknown and retries after its normal 30-second
-interval. A pinned Ctrl-C future is polled both during collection and between
-reports, so an interruption can stop an in-flight collection too. `tokio::pin!`
-keeps that future at a stable address while multiple `select!` calls borrow it.
-
-Ctrl-C returns the last diagnostic outcome. Missing evidence cannot downgrade
-previously observed critical problems to clean; before any successful report,
-the outcome is unknown/warning. A real Relish subprocess test makes the first
-health request fail, waits for recovery on the next collection, then sends SIGINT
-and checks warning exit code 2. The test owns and reaps its child on failure too.
-
-### A missing measurement is a regression
-
-A baseline might contain network throughput while today's run contains only
-latency. Comparing their common metrics alone can print PASS without ever
-measuring throughput. `BenchComparison::failed` now includes missing baseline
-metrics as well as measured regressions. The command uses that same verdict for
-its exit outcome and human summary, and names missing and newly added metrics
-on separate lines. JSON and YAML retain their existing missing-metric lists.
-
-Hosted comparisons remain informational, but still display missing observations.
-The regression test replaces a baseline metric with a new one: it must fail and
-name both. Adding a new metric while retaining the baseline measurements stays
-clean. We don't invent a numeric value for absent evidence.
-
-### Give each invocation its own namespace
-
-Two test commands launched in the same second used to share a run ID. A
-1,024-invocation concurrent regression produced exactly one distinct ID. The
-command now draws 128 random bits and formats all 32 hexadecimal digits, leaving
-room for the `rbtest-` prefix and case suffix within a DNS label. It no longer
-depends on clock resolution, PID reuse or a process-local counter.
-
-Randomness makes accidental collisions negligible; it isn't ownership proof.
-The server still refuses a namespace with an active lease, including explicitly
-chosen fixed namespaces. Cleanup remains tied to the granted lease. Tests check
-concurrent IDs, DNS-label validity and the existing collision refusal.
-
-### A passing test can still leave a process behind
-
-Nextest can observe a test process exit successfully while a child still holds
-its output pipe open. That is a passing-but-leaky result, not proof of cleanup.
-Our `slow` status filter printed the aggregate leak count without the responsible
-case's name. Both default and CI profiles now use `status-level = "leak"`, so
-future occurrences retain that identity in the run log.
-
-The no-default suite reproduced one leak during this audit. Three reruns with
-detailed reporting did not reproduce it, so H08 remains open: we still need the
-case identity, an ownership fix and a focused regression. We haven't increased
-the leak timeout to make the warning disappear.
-
-
-### Case outcomes are data, not an error-message convention
-
-Suppose a failed workload prints `__unknown__:connection refused`. The runner
-used to interpret that prefix as a request to downgrade a failure to missing
-evidence. A workload's text had acquired authority over the test verdict.
-
-Case bodies now return `Result<(), CaseError>`. The enum distinguishes
-`Failed(String)` from `Unknown(String)`, and `unknown(...)` constructs the
-second variant explicitly. Ordinary string errors convert only to `Failed`.
-The catalogue macro boxes either kind of future and converts its error at the
-boundary; it never examines the message. The regression keeps the old prefix
-in a failure string and verifies that the report still counts a failure.
-
-The library entry point also validates its own input before creating tasks,
-leases or requests. Zero or excessive timeouts, invalid parallelism and unsafe
-namespace prefixes return `RunError`. A CLI check cannot protect a library from
-its other callers. Deadline construction uses checked clock arithmetic, so even
-`Duration::MAX` returns an error rather than panicking; a child deadline remains
-bounded by its parent.
-
-
-### Readiness reporting must not suspend its owner
-
-A subsystem sends its ready signal, then queues a capability update behind a
-reader of the readiness tracker. Its supervisor receives the signal and queues
-its own write. Tokio's read-write lock admits writers in order, so the owner is
-first in line. Who polls it now? In the original loop, nobody. The supervisor
-had entered a selected branch and was awaiting its own write there.
-
-This can deadlock without a thread holding a mutex forever. An async future
-only progresses when its caller polls it. `tokio::select!` polls the competing
-futures until a branch becomes ready, then runs that branch's body. An `await`
-in that body does not keep polling the other branches.
-
-The repair keeps readiness publication as a separate future inside the select.
-While that future waits for the tracker, the owner remains polled and can finish
-its earlier write. We retain the owner in the same supervision task, preserving
-cancellation and panic handling. Each restart still owns its own acknowledgement
-channel and publication future, so an old attempt cannot mark a new one ready.
-
-The regression deliberately holds a tracker reader while both writes queue.
-Releasing it must let the owner publish. We exercise both supervision loops;
-both stalled before the repair. The existing tests still cover startup panics,
-missing acknowledgements, bounded restarts and stale signals. This establishes
-a reproducible deadlock fix; the full upgrade runs remain separate evidence.
-
-
-### A leak reported by the runner
-
-The portable suite passed while nextest reported one leaked output handle. Once
-we retained the per-test report, it named a metrics backfill test. That case
-writes and queries Parquet files; it does not launch child processes.
-
-The local runner was nextest 0.9.140. Upstream's 0.9.145 release describes a
-matching macOS race: one concurrently launched test could inherit another
-test's capture pipe before its close-on-exec flag was set. The completed test
-then appeared to leak a handle held by its sibling. This explains why the
-reported case need not be the process that kept the pipe open.
-
-We require the repaired runner and pin it in CI. The leak deadline stays at
-100 ms, and a future report now fails the gate. We verify both feature
-configurations with the new runner; increasing a timeout would not repair
-ownership. The runtime's child-process cleanup tests remain necessary too.
-
-See the [nextest 0.9.145 release notes](https://github.com/nextest-rs/nextest/releases/tag/cargo-nextest-0.9.145)
-for the capture-pipe fix.
-
-### A safety refusal can arrive during an election
-
-The three-node chaos acceptance test kills one voter, then tries to kill a
-second. It originally demanded an error containing "quorum". CI caught another
-valid outcome: the surviving node temporarily lacked a live mapping for its
-Raft leader and refused with HTTP 503 before it could evaluate quorum.
-
-The test now accepts those two explicit missing-leader-evidence refusals as well
-as the quorum refusal. It still rejects unrelated failures and verifies that
-neither the second target nor the routing node acquired a fault. Then it reverses
-the first fault and observes recovery. The invariant is refusal without an
-effect, including while leadership evidence is incomplete.
-
-
-### Disabled authentication does not grant every chaos operation
-
-In the explicit disabled-auth development mode, a workload fault is attributed
-to `local-bootstrap` with the local administrator role. Server policy must still
-allow workload fault injection and any required acknowledgement must be present.
-When authentication is enabled, the caller's role and namespace scope apply.
-Node-level faults always require an authenticated principal, including in
-disabled-auth mode. They also pass the separate node-state or capacity policy
-and cluster safety checks. A successful workload-fault test therefore says
-nothing about permission to kill, drain or pressure a node. C06 still tracks
-the cluster-wide reservation needed to make concurrent node faults safe.
-
-## Keep debug symbols out of upgrade fixtures
-
-The cluster-upgrade CI job failed before its first upgrade. Pickle returned HTTP
-413 when the harness uploaded Bun. The registry's 512 MiB request limit was doing
-its job; the debug executable had grown past the fixture's upload budget.
-
-The harness now copies Cargo's executable into its temporary directory and runs
-`strip -S` on that copy. This removes debug information before we make versioned
-copies, hash them or sign them. Cargo's original stays available for backtraces.
-An explicit size assertion catches an oversized fixture before starting four
-nodes, and upload failures include the server's response body. The same real
-executable still has to boot, pass compatibility preflight, replace its running
-predecessor and survive rollback. Removing symbols doesn't relax those checks.
-
-This is acceptance-test preparation, not release qualification. We still need to
-exercise the exact signed release artefacts under V03.
-
-
-### Testing two faults that race each other
-
-The node-chaos acceptance test sends two kill requests through different API
-nodes in a live three-voter cluster. Exactly one may succeed. It clears that
-fault and waits for both gossip recovery and confirmed reservation release,
-then fails the current leader. The successor must inherit the outstanding slot,
-refuse another kill, and release capacity only after the old leader's fault
-expires and its target-side fence is acknowledged.
-
-This test found a recovery bug that the individual fault tests missed. The
-bootstrap node reopened its transports after expiry but had no configured seed
-addresses and had forgotten every peer. We added bounded gossip rediscovery and
-a separate regression for that case. The reservation remained held throughout
-the failure, which was the safe outcome, but the experiment still hadn't recovered.
-A refusal is not a substitute for testing the recovery path.
-
-
-### Finding the service we actually started
-
-Suppose the API is at `https://[::1]:19117` and Pickle is at
-`https://[::1]:15051`. Splitting the API string at its first colon doesn't find a
-host. It finds `https`. Even after removing the scheme, it finds `[`. Assuming
-port 5050 then produces an invalid URL and tests a listener we never started.
-
-Bun now publishes a `ServiceEndpoints` value with its capabilities. Each field is
-an `Option<String>`: `Some(origin)` names a bound listener; `None` says no endpoint
-was declared. A capability boolean alone doesn't tell a client how to reach the
-service. We bind Pickle before constructing that report, so a configured port of
-zero becomes the actual port assigned by the kernel. Ingress uses its bound HTTP
-and HTTPS addresses too.
-
-A wildcard bind such as `0.0.0.0` means all local interfaces. The probe substitutes
-the API host for that wildcard, while retaining the declared service's scheme and
-port. A node-local loopback address on a remote API is refused. It isn't the
-caller's loopback. Origins with credentials, paths, queries or unsupported schemes
-are refused rather than repaired by string manipulation.
-
-Managed VMs need another translation. Their listeners live in a guest network,
-while the laptop connects through explicit forwards. The saved context therefore
-replaces the report's endpoints with the forwards the setup operation owns. An
-absent forward stays absent. Setup adds one authenticated HTTPS Pickle forward on
-localhost port 15050, alongside HTTP ingress on 18080; both are configurable and
-checked for collisions. Older state has no registry forward, so lifecycle commands
-can still manage it without claiming that an uncreated forward exists.
-
-TLS adds one more name. The socket might be localhost port 18443, but the route
-and certificate belong to `workload.example`. We resolve the declared socket,
-then keep the workload name in the request URL and override DNS resolution for
-that name in a separate HTTP client. That preserves both the HTTP Host header and
-TLS SNI (the server name sent during the handshake). The client trusts the cluster
-CA alongside ordinary roots and performs normal hostname verification. It never
-inherits the API bearer or the control-plane hostname exception. Pickle's client
-is separate: it authenticates control-plane operations and refuses remote HTTP
-before sending credentials.
-
-The regression first reproduces the malformed IPv6 URL. A real Bun process then
-binds all three service ports to zero and proves the published listeners answer.
-A separate TLS server, reached through a TCP forward, records the workload SNI
-and headers so a successful response cannot hide a leaked administrator token.
-A negative handshake checks that API-specific hostname leniency hasn't escaped
-into workload requests. Managed-context tests verify that unforwarded guest
-endpoints never sneak back in.
-
-
-A partition test must also wait for the authority that admits the fault. Gossip
-can report three live nodes before Raft has elected a leader or finished adding
-the third voter. The legacy partition acceptance now waits for every node to see
-a known leader and a stable, non-joint three-voter membership as well as live
-gossip. The server continues to refuse an earlier request. Waiting only for the
-network view made the test race bootstrap on hosted runners.
-
-### A test token belongs to the server lease
-
-Suppose Relish creates a token, sends its probe and then loses power. A cleanup
-call at the end of the function never runs. The token must still disappear.
-
-Token issuance now commits the credential and its lease ownership in one Raft
-entry. Only the lease's exact authenticated owner may request it, with an
-unscoped Admin credential and permission to provision test resources. The
-token's name begins with the lease namespace, its namespace scope contains
-exactly that namespace, and its role cannot be Admin. Its expiry is capped at
-the lease's current expiry. Renewing the lease doesn't extend a token already
-issued; a longer test must mint another credential.
-
-`LeasedResource::ApiToken { name, fingerprint }` is another variant of the
-resource enum. Matching on the enum makes Rust ask us to handle this new kind
-in both cleanup paths. The cluster reaper first commits the Cleaning state,
-then revokes the exact fingerprint. A changed credential with the same name
-is an error, never permission to delete the replacement. The ownership record
-remains until absence is confirmed. A new leader resumes the same work.
-Standalone nodes refuse token cleanup because they have no token council.
-
-Names beginning with `rbtest-` are reserved for leased token issuance. Existing
-names cannot be overwritten or reclaimed by another lease, even after an
-operator revokes the original token before cleanup finishes. This also means
-a lost issuance response cannot be retried into a second live credential.
-The caller may obtain a new name under the same lease.
-
-The catalogue now uses the accepted lowercase `deployer` role and preserves
-the original connection's CA and managed forwards when switching credentials.
-It probes a read-only log endpoint outside its namespace. If scope enforcement
-breaks, the probe fails without creating a workload that it cannot own. A role
-refusal, authentication propagation delay, transport failure or arbitrary 403
-isn't evidence that the scope check worked.
-
-API tests exercise anonymous and wrong-owner refusal, bounded expiry and
-client-free reclamation. Raft tests cover invalid authority and scope, existing
-names, snapshot recovery and replacement fencing. Live acceptance runs the
-actual Relish catalogue against HTTPS Bun, and kills a three-node cluster's
-leader before the token expires to check successor cleanup. These new persisted
-variants require protocol 5, state 4 and lease schema 2: create fresh development
-clusters instead of reading them with an older binary.
-
-### An unsupported manifest cannot shed its lease
-
-A manifest with both an app and a job was refused by the runner. A manifest
-with only a job took the ordinary, unleased apply path. The same fallback
-accepted permission-only and build-only manifests. Removing the supported
-resource from a request must not remove its ownership requirement.
-
-The `match` now handles every `Some(lease_id)` path explicitly: supported
-resources use leased apply, while unsupported or empty manifests fail before
-HTTP. Only `None`, used by focused runner fixtures, selects ordinary apply.
-At the API boundary, the reserved test-namespace check covers jobs as well as
-apps and namespace declarations. The runner regression observes three outgoing
-mutations before the repair and zero afterwards; the API regression changes
-from accepting an unleased test job to returning a conflict. Durable job
-ownership remains required before job catalogue cases can run under a lease.
-
-### An advisory exception is a condition we must keep checking
-
-Our release review removed the unused PEM wrapper rather than extending its
-exception. Four explicit exceptions remain: three maintenance notices and one
-vulnerable archive crate that Cargo does not currently build. The
-[dated review](../qualification/2026-09-18-dependency-exceptions.md) records the
-paths, migration options and the unchanged November review deadline.
-
-The archive exception has an extra condition. Before auditing the lockfile,
-`make audit` asks Cargo for the active rkyv dependency graph across all root
-features and targets. An active path refuses the build. A failed inspection
-also refuses it; an unavailable observation cannot prove absence. Only an
-empty, successfully inspected graph allows that exception to remain in force.
-
-A command-level test supplies a controlled Cargo executable and date. It
-checks the inactive, active and failed-inspection outcomes without downloading
-an advisory database or waiting for the review deadline. The real audit then
-fetches the current database and checks the actual lockfile. These are
-separate pieces of evidence: one proves the gate's behaviour, the other checks
-what we intend to ship today.
-
-
-### Let the server reserve its own port
-
-The portable Linux run caught a bootstrap test losing its chosen port between
-closing a temporary listener and starting Bun. Another process bound that port
-first. A longer startup timeout could not repair the race.
-
-Bun now reports the API listener's actual bound address, including the kernel's
-choice when you request port zero. The bootstrap and service-endpoint tests
-start Bun on `127.0.0.1:0`, read that address from its output and probe that exact
-listener. No test releases a guessed API port for Bun to reclaim. The bootstrap
-regression first failed because the old startup line printed the requested
-port zero; it now requires a non-zero address and a successful health response.
-
-
-### Secret tests need a workload observation
-
-The secret catalogue used to return Unknown immediately because it could not
-obtain the cluster encryption recipient. It now fetches the public recipient
-over the authenticated API, encrypts fixture values and applies an app inside
-its server-owned test lease. It never reads a cluster private key.
-
-After placement, the probe finds the node that actually runs the app and uses
-that node's scoped exec API to read the container environment. The entry API
-node need not own the workload. Two independently randomised ciphertexts must
-recover the expected bytes, while an adjacent plaintext variable stays intact.
-The config-file case uses the same node selection to read its mounted file.
-
-The rootful acceptance test starts the real Bun and Relish binaries with a
-generated cluster CA, closes the unauthenticated bootstrap window and runs all
-three secrets/config cases against runc. Both the case verdict and server-owned
-cleanup must succeed. Missing capability, Unknown, timeout and cleanup failure
-all fail this qualification.
-
-
-### Reserve the API port before advertising it
-
-A listener on `127.0.0.1:0` asks the kernel to choose a free port. Printing that
-chosen address fixed standalone discovery, but the clustered first-run test
-found another dependency: cluster startup had already copied zero into its
-internal API endpoints. The API accepted an app while the scheduler reported
-no eligible node.
-
-Bun now binds a `TcpSocket` before starting the cluster and uses its actual
-local port everywhere it advertises the API. Binding reserves the address;
-listening is a separate operation. We delay that second step until replicated
-credentials are ready and the existing bootstrap checks pass. This keeps a
-joining node closed to connections while it waits for authentication.
-
-The black-box first-run test asks for port zero, reads the selected endpoint,
-creates the first administrator and deploys a process workload. It requires
-an observed running instance. Merely accepting the manifest wouldn't prove
-that the scheduler can use the advertised endpoint.
-
-
-### Observe workload identity without trusting its own bundle
-
-The identity catalogue used to return Unknown because it couldn't observe a
-workload certificate. A running container already exposes its public bundle at
-`/run/reliaburger/identity/bundle.pem`. We can inspect that through the same
-namespace-scoped exec path used by the secret/config cases. The helper selects
-the node that actually owns the running instance and keeps the case deadline.
-
-The new probe deploys a leased BusyBox workload and waits for identity issuance.
-It reads the public bundle, never the private key or bearer token. Rustls checks
-the leaf's signature chain, validity and client-auth usage against the CA
-configured by the caller. `CertificateDer` represents an encoded certificate;
-it doesn't make those bytes trusted. Only the configured anchors do that.
-The probe also requires exactly the SPIFFE URI for the expected cluster,
-namespace and app. This proves certificate delivery and validation, not a
-workload-to-workload TLS handshake or private-key possession.
-
-There is a useful negative test here. A Node CA can authenticate the Bun API,
-but it cannot validate a leaf signed by the separate Workload CA. The privileged
-fixture runs the identity case with that restricted trust anchor and requires
-a chain-verification failure plus confirmed resource cleanup. Trusting whatever
-root appears inside the container's bundle would make this test incorrectly
-pass. With no explicit CA configured, the case remains Unknown.
-
-### Give jobs an owner on the node that runs them
-
-Consider a catalogue case that starts a batch job, then loses its connection.
-The job may still be running. A cron registration can be even less visible:
-there may be no instance yet, but the next minute can start one. Cleaning up
-only the client's list of running instances misses both situations.
-
-Jobs in 0.1 run on the receiving node. Their test leases now do too. A request
-with `scope = "node_jobs"` reserves a server-generated namespace and records the
-job names before handing the manifest to the agent. Cluster nodes persist these
-records in `node-test-leases.json` and run a local reaper alongside the leader's
-application-lease reaper. A client disconnect doesn't drop the deployment guard:
-the server keeps draining the agent's event channel until deployment finishes.
-Only then may cleanup retire the job and its schedule.
-
-`LeaseScope` is an enum with two variants, `Applications` and `NodeJobs`.
-Matching on it makes the admission rule explicit: a job lease accepts job-only
-manifests, while an application lease cannot acquire jobs. The resource enum
-also distinguishes `Job { job_id }` from `App { app_id }`. Both contain an
-`AppId`, our existing namespace/name identity, but the enum variant preserves
-which kind of workload the record owns. Rust's exhaustive `match` requires us
-to consider the new kind in cleanup as well as validation.
-
-Routing needs a boundary too. Job lease IDs start with `node-jobs-`, followed by
-128 random bits encoded as lowercase hexadecimal. Their namespaces use the
-same complete suffix after `rbtest-node-`. Application leases cannot reserve
-that prefix, and callers cannot select or reuse a job lease's namespace.
-Creation requires an unscoped user credential and the ordinary test-operation
-grant. Renew, release and apply require the exact owner; an unscoped
-administrator may inspect or reclaim a lease. Raft refuses node-job records.
-Even an invalid or unknown ID with that prefix stays local: sending it to
-another node returns a missing lease, rather than forwarding to a leader.
-
-Cleanup removes ownership only after the agent confirms retirement. The test
-reopens the durable store, drops the first retirement reply and starts the
-reaper. The record must remain in `Cleaning` with its job still attached until
-a later reply confirms success. A separate running-agent test covers a batch
-job and a cron registration before its first firing. These exercise different
-failure modes; parsing a valid ownership record alone proves neither.
-
-The persisted lease schema is now 3, with protocol and durable-state generation
-6. This branch still requires fresh development clusters. Keeping old nodes
-from joining prevents a node without job-scope admission from accepting a new
-node's reserved namespace as an ordinary application lease.
-
-The actual-process fixture adds a stronger check. It starts a leased sleep job,
-records its PID and start time, kills Bun and verifies that the job survives.
-After expiry, a replacement Bun must adopt and retire that same process before
-removing the lease and instance record. The real TLS/Relish catalogue separately
-requires all three job cases to run and report confirmed cleanup. Its first run
-correctly skipped them because the fixture lacked an executable allowlist; the
-fixture now declares its exact binaries. A skipped case isn't a passing case.
-This tests process-crash recovery after the adoption record exists. It doesn't
-establish recovery from power loss or the earlier runtime-creation window.
-
-### A stopped job doesn't imply a successful job
-
-The completion probe used to accept both `Some(0)` and `None` as a successful
-exit. Those values mean different things: `Some(0)` contains an observed zero
-exit status; `None` means the API has no exit status to report. A stopped process
-with missing evidence cannot prove that its command succeeded.
-
-The catalogue now requires `exit_code == Some(0)`. Its HTTP regression serves a
-stopped job without an exit code and reproduces the old false pass. The same
-fixture rejects exit 7 and accepts exit 0. We run the actual job case as well,
-so changing the assertion cannot hide a runtime that never supplies the evidence.
-
-### Let the log collector catch up
-
-Job exit and log ingestion happen on different tasks. A successful exit can
-reach the status API before the collector publishes the job's stdout. Reading
-logs once at that instant used to fail an otherwise healthy catalogue case.
-
-The log probe now polls every 100 ms under the case's original `Deadline`.
-The same deadline wraps the HTTP read as well as the delay, so a stalled request
-or output that never arrives cannot turn this into an unlimited wait. An API
-error remains an error. The success condition is still the expected output.
-
-The regression serves an empty indexed result and an empty local fallback on
-the first read, then publishes the expected line. That reproduces the race
-without depending on task scheduling. A second case never publishes the line
-and must fail at the deadline. Neither test treats empty output as success.
-
-
-### Follow the caller before calling code unfinished
-
-The release audit listed unused public helpers. A symbol search was the start,
-not the conclusion. The old autoscaler loop and proxy wrapper had no callers;
-we removed them. A memory-allocation sizing helper also had no callers or tests,
-and didn't describe the cgroup-limit path Bun actually uses, so it went too.
-
-Other helpers have narrower jobs. `image_available_locally` is a tested,
-read-only verified-blob query; it doesn't pull an image or prove a runtime can
-launch it. `renew_test_lease` now has an actual node-job recovery caller. The
-catalogue runner requests enough lease lifetime for its bounded case and cleanup
-rather than maintaining a hidden renewal task. Its wait helpers share the case's
-absolute deadline. Expiry and per-node count queries in the fault registry are
-library observations, not scheduling or cluster admission.
-
-We record those callers and tests in the completion plan. The age unsealing
-primitive still doesn't constitute a CA recovery workflow, and changing an
-identity model's grace period cannot extend a signed certificate. Those operator
-features remain explicitly planned. Passing a helper's unit test must never
-silently promote the feature around it to supported.
-
-A later hosted minimum-Rust run passed 3,658 tests and failed the cross-node
-log partial-result fixture: its supposedly healthy peer contributed no rows.
-That fixture put a cold DataFusion query behind the same two-second deadline
-used to observe an unreachable peer. It mixed storage setup cost with transport
-failure, and its test server even converted storage errors into empty results.
-
-The partial-failure case now serves three fixed log entries over real HTTP.
-Its two-second deadline and exact failed-peer assertions stay unchanged. The
-other four cross-node cases still query real log stores, and those fixture
-handlers now surface storage errors instead of returning empty arrays. We also
-print node failures when the row count is wrong. A future CI failure should
-say which assumption failed, not send us guessing from a zero.
-
-### Make the public examples executable
-
-`cargo test --doc` used to pass without running any examples. It now executes
-small examples on `Config::parse` and `validate_endpoint`. The first parses and
-validates a workload, then checks that a misspelt key is refused. The second
-accepts remote HTTPS and local development HTTP, but checks the typed refusal
-for remote plaintext. Neither example contacts a cluster.
-
-Rustdoc compiles ordinary fenced Rust blocks in `///` comments as tests. We use
-`expect` in these examples to make a failed assumption fail the test visibly;
-application code can propagate the same `Result` with `?`. The configuration
-uses a raw string, `r#"..."#`, so TOML quotes need no escaping. Its image is an
-`Option<String>` because some workload forms have no image. `as_deref()` borrows
-that optional owned string as `Option<&str>` for the assertion; it doesn't move
-the image out of the configuration. `Some(...)` is the present-value variant.
-The endpoint example uses `matches!` to check an enum variant rather than error
-message wording. These examples teach the public contract and fail when it
-drifts.
-
-### Give the current revision the runners
-
-Several successive fixes left older PR builds competing with the current
-revision. Source CI and native builds now cancel their superseded PR runs.
-Each workflow has its own fixed concurrency prefix and uses the pull-request
-number as its group. Main and tag runs use their unique run ID instead, so a
-later source push cannot interrupt release validation or publication.
-
-The prefixes also matter when the release workflow calls source CI. GitHub
-associates a reusable workflow's context with its caller; using the same group
-for both can make a release cancel or wait on itself. The
-[workflow concurrency reference](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#concurrency)
-and [reusable workflow reference](https://docs.github.com/en/actions/reference/workflows-and-actions/reusing-workflow-configurations)
-spell out those rules. Cancelling an obsolete run is queue management, not a
-passing test result. We still require the complete gate set for the final
-candidate revision.
-
-### Capacity is an observation, not a failed string match
-
-An HTTP 403 containing the words "no eligible nodes" used to pass the capacity
-benchmark with a value of zero. The error was a permissions failure, yet its
-text looked like the end of a successful experiment. There was a second gap:
-cluster apply acknowledges desired-state writes before any worker starts the
-container. Counting those acknowledgements measures how many configurations
-we submitted, not how many workloads ran.
-
-Capacity applies now ask the actual leader scheduling loop for admission.
-A bounded `mpsc` channel carries requests; each request owns a `oneshot` sender
-for exactly one reply. Dropping that sender before replying is an unavailable
-observation. It cannot become a scheduling refusal. Queueing and response share
-a five-second deadline. The normal scheduling pass supplies current placement
-reservations and namespace quota usage, and incomplete or unready membership
-prevents a saturation claim. The check does not commit a placement. Other
-work can change capacity before deployment, which is why runtime observation
-is still required.
-
-The refusal schema contains `ScheduleError`, tagged with a stable JSON `code`.
-`#[serde(tag = "code", rename_all = "snake_case")]` tells Serde to encode the
-enum's variant name as that field. Its other fields carry structured context,
-including the app's namespace and name. `deny_unknown_fields` rejects an
-unexpected shape. Rust's `match` then selects the specific
-`NoEligibleNodes { app_id }` variant, and a guard requires that ID to equal the
-app we just submitted. Human-readable error wording can change independently.
-Authentication failures, unknown codes and missing IDs stay errors.
-
-The API requires a live lease and authorised capacity operation, forwards the
-request to the leader, and rechecks leadership and lease activity after the
-scheduler reply. The benchmark counts an app only after the complete cluster
-status endpoint observes its one running instance. Before returning a result,
-it rechecks all counted apps. A malformed status body, a disappeared workload,
-an exhausted deadline or the hard safety limit fails the measurement. Cleanup
-still has its own required outcome.
-
-The HTTP regressions cover both original errors and the distinction between
-pending, running and missing workloads. A real three-node test sends the
-request through a follower: an oversized app must return the typed refusal
-without entering desired state; a small app must actually run. That fixture
-also supplies the reconciler's internal service identity, just as authenticated
-production nodes do.
-
-
-### One address per node
-
-Run three nodes on your laptop, each with a different API port. A test that
-combines every gossip IP with the entry node's API port contacts the same
-process three times. Its supposed cluster inventory can look perfectly healthy.
-
-The membership response now carries each node's resolved `api_address` from
-the peer directory. `Option<SocketAddr>` means the address can be absent; it
-never means “guess 9117”. The shared client constructor returns a `Result`,
-so a caller must handle missing or unusable evidence. Formatting `SocketAddr`
-also supplies the brackets IPv6 URLs require. Retargeting the existing client
-preserves its bearer identity and configured trust roots.
-
-Testkit, diagnostics and trace collection use this constructor. An absent
-address fails inventory collection instead of silently dropping that peer.
-Standalone inventory still uses the explicit entry connection. Upgrade plans
-use the same advertised addresses, with explicit per-node overrides retained,
-and validate the target list before uploading the binary. Unit HTTP fixtures
-cover different ports, IPv6, absent addresses, invalid addresses and unresolved
-members. The authenticated three-node placement fixture checks the actual
-advertised ports and contacts each endpoint with the original credentials.
-
-### Accepted cleanup still needs evidence
-
-A DELETE can return HTTP 202 while a worker is unavailable. That's a promise to
-keep trying. It isn't evidence that the worker has stopped. Relish now polls the
-lease endpoint until the ownership record disappears, with a single 30-second
-limit covering the request and every poll. The test runner's shorter remaining
-teardown deadline can cancel that wait. Either timeout reports unknown cleanup.
-It still checks runtime absence independently after the server confirms release.
-
-The regression serves 202 and an empty runtime inventory while keeping the lease
-present. Previously that passed. Now it stays unknown; a second case removes the
-lease after two polls and confirms cleanup. This distinguishes accepting work
-from finishing it without making an unavailable worker block the CLI forever.
-
-### Retirement includes its durable files
-
-Suppose the process has stopped but Bun cannot unlink its adoption record. A
-warning followed by successful lease cleanup loses the live owner that could
-retry the unlink. Identity directories have the same problem: clearing an
-in-memory path doesn't remove its key material or unmount its backing storage.
-
-Normal Stop and Retire now wait for identity-directory cleanup, then adoption
-record removal, before forgetting ownership. Both removals sync their parent
-directories, including retries after an uncertain sync. Filesystem errors retain
-the tracked instance and its port so the next attempt can finish. The blocking
-filesystem work runs through `spawn_blocking`; Bun awaits its result before
-clearing the instance's identity fields. Ordinary application data volumes are
-outside this cleanup.
-
-The command-channel regression replaces an adoption record with a directory,
-then separately replaces the identity directory with a file. Each fault must
-refuse retirement and retain the owner. Removing the fault lets the next command
-finish. Rolling deployment cleanup has separate call paths and still needs its
-own error-propagation audit.
-
-### Integration agents own their filesystem paths
-
-A ProcessGrill fixture still prepares workload identity directories. Leaving its
-volume root at the production default makes tests depend on the host's existing
-permissions and lets otherwise independent fixtures share paths. Stricter Stop
-first exposed this in three Linux unit tests. The integration harnesses now give
-each agent a temporary volume root, kept alive until that agent exits; cluster
-fixtures use their existing private node directory. This keeps a test's cleanup
-inside the files that test owns.
-
-The affected agent, batch, build, ingress and discovery suites pass on macOS and
-Linux, as do all ten live Linux placement cases. Two build tests require Buildah
-to be absent; on the tool-equipped VM we execute those binaries in child
-processes with an empty PATH. Both negative scenarios still run and pass.
-
-### Every worker that might still own the workload
-
-Move a test application from worker A to worker B while A is disconnected.
-Deleting the application from Raft removes desired state. It tells us nothing
-about the process still running on A. If we also delete its lease, we've lost
-our reminder to go back and check.
-
-The lease now keeps every `(application, node)` pair ever assigned to it.
-Scheduling records that pair in the same Raft entry that publishes placement.
-A `BTreeSet<LeasedPlacement>` stores each distinct pair once, in deterministic
-order. `LeasedPlacement` is a struct containing our application and node identity
-types. Its `Ord` derive supplies the ordering a tree set needs; `Eq` makes the
-meaning of equality explicit. Rescheduling adds an owner rather than replacing
-history. A hard limit refuses further scheduling before history can grow
-without bound.
-
-Beginning cleanup fences new work. The current leader deletes desired state
-but retains those owners, then includes exact lease retirement instructions in
-each worker's placement response. A worker runs Retire even if its own journal
-is empty. Only observed runtime exit, artifact cleanup and a saved local
-checkpoint permit its acknowledgement. Lost responses and disk errors leave
-the owner recorded for retry. An acknowledgement includes the immutable lease
-ID, so an old request cannot release a replacement lease's resources.
-
-Reads need care too. An isolated former leader can still serve an empty local
-snapshot. We require a quorum-confirmed read before publishing placements or
-answering lease inspection. Followers forward inspection with the caller's
-credentials and a one-hop marker; a loop or unavailable quorum returns an
-error. HTTP 202 means cleanup is pending. HTTP 204 means every recorded owner
-has confirmed retirement or been explicitly decommissioned, and the remaining
-resource records are gone.
-
-The tests move a workload between owners, restore a Raft snapshot, replay
-acknowledgements and reject late scheduling. A worker test drops a response,
-returns a runtime error and breaks checkpoint persistence before allowing a
-successful acknowledgement. A real three-node fixture pauses the owner,
-changes leader, then resumes it with an empty journal. Cleanup must remain
-pending through the outage and finish only after that worker retires its real
-process. Operator-attested decommissioning is a separate path: it records
-who retired an identity after stopping or fencing that machine's workloads.
-
-### When a worker will never come back
-
-Worker A has been powered off for maintenance, but its lease still awaits a
-retirement acknowledgement. Waiting forever keeps the ownership record honest,
-but gives the operator no way to finish. We need a second kind of evidence:
-an explicit statement that the operator has stopped or fenced those workloads.
-
-`relish decommission-node worker-a --workloads-stopped --reason "powered off"`
-records that decision. An unscoped administrator must submit it; an ordinary
-node's shared service credential cannot. Raft stores the authenticated operator,
-reason, timestamp and the number of placement obligations released per lease.
-It clears those obligations and removes desired placements and service endpoints
-in the same state transition. Repeated requests return the original record.
-They don't manufacture a second decision or change its author.
-
-The record also retires the node identity permanently. Otherwise, an old disk
-could come back with an old certificate and resume work that the cluster has
-already forgotten. The existing live certificate revocation handle now checks
-node identities as well as serials, so obtaining another serial for the same
-identity cannot undo retirement. Enrolment, renewal, membership admission and
-scheduling all consult the durable fence. Existing API connections check their
-TLS peer identity again for each request. A returning machine needs fresh state,
-fresh credentials and a new node name.
-
-That per-request check originally cloned the whole replicated state (apps,
-catalogue, withdrawal ledger, leases) just to look up one name, on every request
-that arrived over mutual TLS. Now the state machine lends it out instead:
-`read_desired` takes a closure, runs it on a borrowed reference while holding the
-read lock, and returns only what the closure produces. The lookup costs a map
-probe. The same check also used to let an unreadable certificate identity
-through, because `is_ok_and` treats a parse error as "not retired". It now
-refuses: an identity we can't read might be one we've retired.
-
-Membership changes need their own fence. The retirement request carries the
-membership log position the leader observed; Raft refuses it if that position
-has changed or a joint membership change or another node's fault is in progress.
-An outstanding fault on the retired node is resolved by the same operator
-attestation, with its sequence recorded in the retirement audit; the allocation
-counter remains intact, so late activation cannot reuse it. Raft also
-refuses a decision that would leave fewer than the current quorum outside the
-retired set. The council reconciler removes retired voters together, then removes
-retired learners. This avoids accidentally promoting a retired peer from gossip
-or getting stuck while two retired voters wait for one another's removal.
-
-None of this stops a disconnected computer. The operator must do that first.
-The durable record says *operator-attested retirement*, which is different from
-Bun observing runtime exit. The tests preserve that distinction: authenticating
-with an admin token alone is insufficient without the explicit attestation,
-while runtime acknowledgements still require the system identity.
-
-### Run the cleanup owner in the fixture
-
-A placement test asked the real API to delete its lease, waited for HTTP 204,
-and timed out. The workers had acknowledged retirement. What was missing?
-Bun starts a cluster lease reaper on every node, but this fixture did not. The
-leader's reaper advances the persisted cleanup state after acknowledgements
-arrive. Wiring only the API and reconciler left nobody to finish that work.
-
-The fixture now starts the production reaper and gives its task to the existing
-shutdown guard. This matters for asynchronous acceptance tests: reproducing the
-request handler alone does not reproduce the full lifecycle. The regression
-keeps its bounded wait for durable lease absence; increasing that timeout would
-never create the missing owner.
-
-The broader run caught another asynchronous boundary. Gossip reported all nodes
-alive after reversing a fault, but the API’s separate membership table had not
-caught up. A second injection therefore met a valid safety refusal. The fixture
-now waits for the views the API actually consumes, matching voter membership
-and leader identity across peers and confirming quorum before submitting a new
-fault. Waiting for raw gossip alone was not enough. We keep the refusal intact
-and never retry an uncertain destructive request just to make a test pass.
-
-### Storage belongs in the cleanup acknowledgement
-
-A worker can stop its container and still leave a mounted test volume behind.
-Its retirement acknowledgement must cover both. The standalone lease reaper now
-asks the agent to retire test resources explicitly. A cluster worker uses the
-same command only for a committed cleaning lease; ordinary placement withdrawal
-keeps the data. It acknowledges the former placement after runtime retirement,
-storage retirement and the applied-placement checkpoint have all succeeded.
-
-The first regression creates identical application names in a test namespace
-and an ordinary namespace. Stop preserves the test's marker. Lease cleanup
-removes only the test directory. A second regression makes the runtime ignore
-termination and checks that both the marker and lease remain. After repairing
-the runtime, retrying the same cleanup removes them.
-
-The volume tests reopen checkpoints, interrupt provisioning before the first
-filesystem mutation, reject corrupt or duplicate claims, and preserve external
-files behind unsafe symlinks. Linux qualification creates real loop-backed ext4
-and Btrfs volumes. A process holds its working directory inside the loop mount to
-make unmount fail; retirement must remain pending. An unexpected nested mount
-also refuses. Another test kills the provisioning owner process, reopens its
-completed journal and retires the surviving mount. These tests exercise the
-storage boundary; they don't substitute for Bun's separate pre-adoption-record
-crash qualification.
-
-The three-node placement fixture adds managed storage to a leased application,
-scales it down, then injects an unexpected snapshot directory on one owner.
-The lease expires without a client cleanup request.
-Former placements must retain their data until lease cleanup. Unblocked owners
-can finish, but the lease must stay until the last worker's storage error is
-repaired. A neighbouring ordinary application directory remains intact.
-
-### Observing the child before killing its parent
-
-A job can be Running before its first shell command has executed. Spawning it
-and scheduling it are separate events. Our crash fixture used to read a counter
-file immediately after Running appeared. Hosted macOS caught that assumption:
-the retry had started, but the file still counted only its predecessor.
-
-The fixture now gates the retry before its first write, observes Running,
-releases that gate and waits for the workload's counter before killing Bun.
-This deliberately exercises the scheduling gap while keeping the crash at the
-intended point. The deadline is bounded; an extra or missing execution still
-fails. It does not relax recovery or treat an unknown launch as absent.
-
-### Waiting for registry writers after workloads
-
-A leased test image can outlive its app if we forget which node accepted the
-upload. Each application lease now has a repository-to-writer inventory beside
-its placement history. The reaper first removes desired resources and waits
-for the former runtime owners. It then commits a workload-retired barrier.
-Registry cleanup acknowledgements before that barrier refuse, and the lease
-cannot disappear while any writer remains. Decommissioning clears only the
-externally fenced identity's receipts and preserves the count in its audit.
-
-The standalone store persists the same inventory and barrier. Its reaper marks
-workloads retired only after the agent confirms their cleanup. The storage
-worker must subsequently retire uploads and local metadata before acknowledging
-its receipt. Chapter 5 describes the catalogue side. These state transitions
-are prerequisites; the progress ledger separately tracks connecting every
-upload and replication caller and proving physical cleanup.
-
-### Registry cleanup needs storage evidence
-
-An HTTP response disappearing does not mean its upload disappeared. The registry
-lease tests pause registration after creating a temporary file, cancel the caller
-and require cleanup to wait for the task still holding ownership. The test then
-releases registration and checks both the empty upload directory and the confirmed
-receipt. Another test replaces the temporary file with a directory, proving a
-failed deletion retains the lease. Repairing that obstruction exposes the next
-barrier: failed catalogue persistence must also retain the receipt until retry.
-
-These are controlled interleavings around real filesystem operations, not proof
-of complete physical-crash recovery. The live multi-node and process-death gates
-remain separate. We also keep ordinary content in the registry while deleting a
-leased repository with identical blobs, and check that GC still refuses to remove
-the shared bytes. The runnable catalogue below exercises leased upload and actual deployment.
-Complete multi-node registry crash qualification remains a separate gate.
-
-### Run what we pushed
-
-The registry catalogue used to report two passes and one unknown. Worse, its
-synthetic repositories had fixed names outside the lease namespace, so confirmed
-app cleanup said nothing about those images. The live runc regression preserves
-that original failure before replacing the fixture.
-
-Each case now uses its server-issued namespace as the repository prefix and
-attaches the exact lease header to every upload operation and manifest commit.
-The list assertion matches both repository and complete digest. Partial uploads
-and committed metadata therefore join the same storage receipt inventory used
-by normal test cleanup.
-
-For deployment we fetch the already-pinned BusyBox index through the shared
-verified upstream reader. The client selects Linux and the target node's reported
-architecture, then stages the verified child manifest, configuration and layers
-in Pickle. It verifies each blob's digest and length before upload, caps total
-fixture content at 64 MiB and refuses mutable upstream tags. Source registry
-access and authenticated cluster uploads use separate clients.
-
-The test deploys `repository@sha256:...` using the returned full child digest. Its
-command starts BusyBox's foreground HTTP server with known response content.
-After cluster-wide readiness, the harness finds the actual owner, executes a
-request inside that container and checks the response. A successful upload alone
-cannot pass this test. The physical acceptance also requires all three cleanup
-results to be confirmed and the final public image catalogue to be empty.
-
-The staging helper accepts `&dyn UpstreamRegistry`, a borrowed trait object. The
-borrow lets callers retain their registry client, while `dyn` dispatches through
-the implementation chosen at runtime. The same path uses a real upstream reader
-in production and controlled fixtures in tests. Refused or interrupted staging
-leaves its registered lease ownership available for the server's reaper.
-
-
-### A listening port can belong to the wrong process
-
-A first-run fixture reserved an API address, closed the reservation and launched
-Bun. Another test took that port in the gap. The readiness probe connected to
-that other listener and announced success while its own Bun was failing a
-reporting-port bind. The retry existed, but the false readiness result bypassed
-it.
-
-The fixture now requires the launched child's own API-listener announcement,
-parses its `SocketAddr`, checks that it matches the requested address (unless the
-OS chose an ephemeral port), and only then probes TCP. An occupied-port test
-fails before the change: the first attempt incorrectly succeeds. After the fix,
-Bun's bind failure triggers a fresh reservation and the second attempt proves
-readiness. This keeps port-allocation races separate from product startup errors;
-an unrelated error still fails the test.
-
-### Unknown is not stopped
-
-Hosted macOS CI caught a cancelled-start fixture unwrapping a transient owner
-socket error. The fixture was waiting for the independent owner to reach
-Running, but treated one broken connection as a final verdict. Under load, the
-owner's bounded request deadline can expire while the client is descheduled.
-
-The bounded readiness and retirement loops now accept only the state they are
-waiting for. A connection error keeps waiting; it never counts as Running or
-Stopped. If the deadline expires, the test still fails. This preserves the
-contract that matters: positive evidence establishes readiness and absence,
-and uncertain observations establish neither.
-
-### Cleanup through a leader election
-
-The live capacity test rejected an oversized application correctly, then ran its
-smaller fixture. Teardown failed anyway. A follower returned HTTP 503 because its
-lease leader was temporarily unavailable, and Relish abandoned cleanup at once.
-
-Lease release now retries HTTP 503 during both the initial DELETE and the later
-confirmation polls, within the original 30-second deadline. DELETE is idempotent:
-repeating it addresses the same durable lease, rather than creating another
-cleanup operation. HTTP 202 means accepted, so the client continues polling.
-Only HTTP 204 from DELETE, or HTTP 404 after acceptance, confirms completion.
-Authentication and conflict errors still return immediately.
-
-The deadline wraps the entire asynchronous operation. Moving it inside the retry
-loop would give every attempt another 30 seconds and could wait forever. Our
-HTTP fixture reproduces temporary failure before and after acceptance, checks
-permanent refusals, and advances Tokio's test clock to prove the overall limit.
-The original three-node case still runs against real nodes.
-
-### Retry only a confirmed admission refusal
-
-The concurrent node-fault acceptance test can observe a healthy council and still
-reach the fault API after its membership view changes. Hosted CI returned the
-explicit refusal that the leader could not be mapped to live membership. That
-check runs before reserving or applying a fault. The fixture now refreshes the
-views and retries only that exact 503 within a bounded deadline. Lost responses,
-other errors and unknown outcomes still fail the test; blindly retrying those
-could inject a second fault. Production safety checks are unchanged. The repaired
-live scenario passes on macOS (27.087s) and Linux (26.890s).
-
-
-### Keeping the runtime threads free
-
-Tokio runs async tasks on a handful of worker threads. A task that blocks one,
-by reading a large file or walking a directory with `std::fs`, stalls every
-other task scheduled there. Three places still did that. Startup swept stale
-workload identity directories with `std::fs::read_dir` on the agent's task;
-it now decides which names to keep while it can see the agent's state, then
-hands the directory walk and deletions to `spawn_blocking`. Rollback read the
-stored Bun binary twice, once to verify its signature and once to check its
-compatibility, hashing hundreds of megabytes on an async thread; it now reads
-it once in a blocking worker and passes the bytes on. And discovery recovery
-waited on the runtime inventory with no deadline at all, so a wedged runtime
-could hold startup forever. It gets the same five-second bound as the other
-inventory reads, and a test with an inventory that never answers checks it
-gives up.
-
-### Closing an evidence gap
-
-An application exits. Bun starts its replacement, then dies before saving the
-replacement's adoption record. A clean restart test doesn't cover that interval.
-Neither does killing Bun during the application's first deployment.
-
-The C34 audit found that our physical interruption matrix covered initial
-creation and explicit retries, but left this automatic-restart boundary implicit.
-We added a test-only Linux interposer that pauses the adoption record's `fsync`
-(the step that asks the filesystem to persist its bytes), before the atomic
-rename publishes it. Policy checkpoint writes continue normally. The test proves
-that the predecessor's adoption record is gone and a different execution
-generation is alive, then kills the actual Bun process.
-
-Recovery must retire that unrecorded execution before reporting readiness. It
-must preserve the original kernel owner, publish no stale application and permit
-an explicit fresh deployment. The final stop must clear both service and address
-obligations. The existing implementation passes; the new regression makes that
-claim reviewable and runs in the privileged OCI CI matrix.
-
-We keep implementation closure separate from release acceptance. C34 proves
-these ownership and cleanup contracts for supported modes. The independent-host
-catalogue, sustained recovery run, exact signed candidate and cold installations
-still need their own evidence under V01–V04.
+One gap we closed by adding a test rather than fixing code. An app exits, Bun starts its replacement, then dies before saving the replacement's adoption record. Our physical interruption tests covered first deployments and explicit retries, but not this automatic restart. A test-only Linux interposer now pauses the adoption record's `fsync` at exactly that point and kills the real Bun process. Recovery must retire the unrecorded process before reporting ready. The existing code passed. Now it's a claim someone can check.
