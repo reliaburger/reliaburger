@@ -1800,6 +1800,21 @@ fn build_dns_query(name: &str) -> Vec<u8> {
     packet
 }
 
+/// Unmount and remove every instance identity tmpfs under a volumes directory.
+///
+/// Only retirement removes an instance's identity mount; shutdown keeps it
+/// for the next Bun to adopt, and a refused retirement keeps it with the rest
+/// of the owner's state. Tests that kill such runtimes behind the agent's back
+/// call this, or the mounts outlive their temporary root.
+fn retire_identity_mounts(volumes: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(volumes.join(".identity")) else {
+        return;
+    };
+    for entry in entries {
+        reliaburger::sesame::identity::cleanup_identity_dir(&entry.unwrap().path()).unwrap();
+    }
+}
+
 // BPF_MAP_FREEZE makes userspace deletion fail while preserving readable
 // evidence. Each test owns a fresh, unpinned map destroyed with its loader.
 fn freeze_egress_map(ebpf: &OnionEbpf, name: &str) {
@@ -1968,6 +1983,7 @@ async fn agent_retirement_keeps_its_record_when_kernel_egress_cleanup_fails() {
     let retained_instances = status.await.unwrap();
     shutdown.cancel();
     task.await.unwrap();
+    retire_identity_mounts(&root.path().join("volumes"));
     ebpf.lock().await.detach().unwrap();
     assert!(result.is_err(), "retirement accepted failed kernel cleanup");
     assert!(
@@ -4297,6 +4313,7 @@ async fn check_backend_retirement(
             std::fs::remove_dir(path).unwrap();
         }
     }
+    retire_identity_mounts(&root.path().join("volumes"));
     let response = exercise.unwrap();
     if durable {
         return;
@@ -4690,6 +4707,7 @@ async fn check_stopped_address_retention(lose_enforcement: bool, durable_discove
             std::fs::remove_dir(path).unwrap();
         }
     }
+    retire_identity_mounts(&root.path().join("volumes"));
     let (original_ip, successor_ip, old_route) = exercise.unwrap();
     assert!(
         old_route.is_none(),
@@ -4794,6 +4812,7 @@ async fn refused_health_publication_prevents_restart_and_preserves_ownership() {
     shutdown.cancel();
     task.await.unwrap();
     runtime.kill(&id).await.unwrap();
+    retire_identity_mounts(&root.path().join("volumes"));
     ebpf.lock().await.detach().unwrap();
     server.abort();
     let _ = server.await;
