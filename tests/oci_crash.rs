@@ -905,6 +905,10 @@ async fn normal_clustered_bun_recovers_enrolled_consumer_before_adoption() {
         .unwrap();
     wait_file(&root.join("shared/main")).await;
     wait_cluster_publication(&node.client).await;
+    // Publication precedes the deploy's terminal event. A crash before the
+    // reconciler records the placement as applied leaves it pending, and
+    // recovery then rightly redeploys instead of adopting the original.
+    wait_placement_applied(&root).await;
     let original = node.client.status().await.unwrap().remove(0);
     node.crash().await;
     let journal =
@@ -965,6 +969,32 @@ async fn normal_clustered_bun_recovers_enrolled_consumer_before_adoption() {
     );
     drop(journal);
     retire_kernel(&root);
+}
+
+#[cfg(feature = "ebpf")]
+async fn wait_placement_applied(root: &Path) {
+    let checkpoint = root.join("data/applied-placements.json");
+    tokio::time::timeout(Duration::from_secs(45), async {
+        loop {
+            if std::fs::read(&checkpoint)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .is_some_and(|value| {
+                    value["entries"].as_array().is_some_and(|entries| {
+                        entries.iter().any(|entry| {
+                            entry["name"] == "cluster-owned"
+                                && entry["assignment"]["state"] == "applied"
+                        })
+                    })
+                })
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the reconciler never recorded the placement as applied");
 }
 
 #[cfg(feature = "ebpf")]

@@ -6148,6 +6148,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             self.finish_retire_bookkeeping(old_id).await?;
         }
         self.withdraw_service_ebpf(&service_id).await?;
+        // Re-registration can be refused: a stop that withdrew the council's
+        // allocation mid-rollout leaves nothing to register against. The
+        // retained replacements then retire by proving withdrawal against
+        // this local reservation, so a refusal must put it back.
+        let reserved = self.service_map.clone();
         let _ = self.service_map.unregister(&service_id);
 
         for new_id in new_ids {
@@ -6193,33 +6198,18 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let key = (app_name.to_string(), namespace.to_string());
         self.supervisor.app_instances.insert(key, new_ids.to_vec());
 
-        if let Some(port) = spec.port {
-            let firewall = spec.firewall.as_ref().and_then(|f| {
-                if f.allow_from.is_empty() {
-                    None
-                } else {
-                    Some(f.allow_from.clone())
-                }
-            });
-            self.register_local_service(&service_id, port, firewall)?;
-
-            for new_id in new_ids {
-                if let Some(host_port) = new_ports.get(new_id).copied().flatten() {
-                    let backend = self.local_backend(
-                        new_id,
-                        &service_id,
-                        new_ips.get(new_id).copied().flatten(),
-                        host_port,
-                        true,
-                    );
-                    self.service_map
-                        .add_backend(&service_id, backend)
-                        .map_err(|error| BunError::BackendPublication {
-                            service: service_id.clone(),
-                            reason: error.to_string(),
-                        })?;
-                }
-            }
+        if let Some(port) = spec.port
+            && let Err(error) = self.register_replacement_service(
+                &service_id,
+                port,
+                spec,
+                new_ids,
+                new_ports,
+                new_ips,
+            )
+        {
+            self.service_map = reserved;
+            return Err(error);
         }
 
         self.finish_instance_networking(app_name, namespace).await?;
@@ -6247,6 +6237,44 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             spec: Some(Box::new(spec.clone())),
         };
         self.deploy_history.write().await.push(entry);
+        Ok(())
+    }
+
+    /// Register a rolled-out app's service and its replacement backends. The
+    /// caller restores the previous reservation if this refuses.
+    fn register_replacement_service(
+        &mut self,
+        service_id: &crate::onion::service_id::ServiceId,
+        port: u16,
+        spec: &AppSpec,
+        new_ids: &[InstanceId],
+        new_ports: &std::collections::HashMap<InstanceId, Option<u16>>,
+        new_ips: &std::collections::HashMap<InstanceId, Option<std::net::Ipv4Addr>>,
+    ) -> Result<(), BunError> {
+        let firewall = spec
+            .firewall
+            .as_ref()
+            .filter(|firewall| !firewall.allow_from.is_empty())
+            .map(|firewall| firewall.allow_from.clone());
+        self.register_local_service(service_id, port, firewall)?;
+        for new_id in new_ids {
+            let Some(host_port) = new_ports.get(new_id).copied().flatten() else {
+                continue;
+            };
+            let backend = self.local_backend(
+                new_id,
+                service_id,
+                new_ips.get(new_id).copied().flatten(),
+                host_port,
+                true,
+            );
+            self.service_map
+                .add_backend(service_id, backend)
+                .map_err(|error| BunError::BackendPublication {
+                    service: service_id.clone(),
+                    reason: error.to_string(),
+                })?;
+        }
         Ok(())
     }
 
@@ -20693,6 +20721,74 @@ host = "remote.local"
             result.await.unwrap().is_err(),
             "invented an uncommitted cluster allocation"
         );
+    }
+
+    /// A `relish stop` can land mid-rollout: the council withdraws the app's
+    /// allocation, the next consumer poll drops it from the committed
+    /// catalogue, and only then does the rollout try to finalise. The failed
+    /// finalisation must leave the local reservation in place, because the
+    /// retained replacement's retirement proves withdrawal against it. Losing
+    /// it made every retry fail with "original service withdrawal is unproven".
+    #[tokio::test]
+    async fn failed_rollout_finalisation_keeps_the_reservation_retirement_needs() {
+        let (mut agent, _root, _catalog) = clustered_allocation_fixture().await;
+        let service = crate::onion::service_id::ServiceId::new("default", "remote");
+        let (reply, result) = oneshot::channel();
+        agent
+            .handle_deploy_op(DeployOp::RegisterServiceApp {
+                app_name: "remote".into(),
+                namespace: "default".into(),
+                port: 8080,
+                firewall: None,
+                reply,
+            })
+            .await;
+        result.await.unwrap().unwrap();
+        // The rollout published its replacement before retiring the old one.
+        let replacement = InstanceId("default__remote-g1-0".into());
+        let backend = agent.local_backend(&replacement, &service, None, 30002, true);
+        agent.service_map.add_backend(&service, backend).unwrap();
+        agent
+            .persist_discovery_publication(&service, &agent.service_map.clone())
+            .await
+            .unwrap();
+        let reserved = agent.service_map.resolve(&service).unwrap().clone();
+        agent
+            .synchronise_consumer(2, Default::default(), vec![], vec![])
+            .await
+            .unwrap();
+
+        let spec = Config::parse("[app.remote]\nimage = 'test:v1'\nport = 8080\n")
+            .unwrap()
+            .app
+            .remove("remote")
+            .unwrap();
+        let finalised = agent
+            .finalise_rolling_deploy(
+                "remote",
+                "default",
+                &spec,
+                &[],
+                std::slice::from_ref(&replacement),
+                &[(replacement.clone(), Some(30002))].into_iter().collect(),
+                &[(replacement.clone(), None)].into_iter().collect(),
+                Default::default(),
+                Instant::now(),
+            )
+            .await;
+        assert!(
+            finalised.is_err(),
+            "finalised against a withdrawn allocation"
+        );
+
+        let retained = agent.service_map.resolve(&service).cloned();
+        assert_eq!(retained.as_ref().map(|entry| entry.vip), Some(reserved.vip));
+        // Stop withdraws the replacement's backend, then retirement proves it.
+        agent
+            .service_map
+            .remove_backend(&service, &replacement.0)
+            .unwrap();
+        agent.retire_discovery_service(&service).await.unwrap();
     }
 
     #[tokio::test]
