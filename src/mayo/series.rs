@@ -170,9 +170,91 @@ pub fn align(series: Vec<(String, Vec<Point>)>) -> ChartData {
     ChartData { timestamps, series }
 }
 
+/// How a chart turns one app's rows into lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChartKind {
+    /// Values as they are (CPU, memory, queue depth).
+    Gauge,
+    /// A counter's per-second rate.
+    Rate,
+    /// A histogram's mean observation, from its `_sum` and `_count`.
+    Mean,
+}
+
+/// One line per instance for a gauge or a counter's rate.
+///
+/// A [`ChartKind::Mean`] chart needs two metrics; see [`mean_chart`]. Given
+/// one here, it draws the values unchanged.
+pub fn instance_chart(kind: ChartKind, rows: &[MetricsQueryRow]) -> ChartData {
+    align(
+        per_instance(rows)
+            .into_iter()
+            .map(|instance| {
+                let points = match kind {
+                    ChartKind::Rate => rates(&instance.points),
+                    ChartKind::Gauge | ChartKind::Mean => instance.points,
+                };
+                (instance.instance, points)
+            })
+            .collect(),
+    )
+}
+
+/// One line per instance of a histogram's mean observation:
+/// `rate(_sum) / rate(_count)` over each scrape interval.
+pub fn mean_chart(sum_rows: &[MetricsQueryRow], count_rows: &[MetricsQueryRow]) -> ChartData {
+    let sums: BTreeMap<String, Vec<Point>> = per_instance(sum_rows)
+        .into_iter()
+        .map(|instance| (instance.instance, rates(&instance.points)))
+        .collect();
+    align(
+        per_instance(count_rows)
+            .into_iter()
+            .map(|count| {
+                let means = sums
+                    .get(&count.instance)
+                    .map(|sum_rates| ratio(sum_rates, &rates(&count.points)))
+                    .unwrap_or_default();
+                (count.instance, means)
+            })
+            .collect(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_rate_chart_draws_one_rate_line_per_instance() {
+        let rows = vec![
+            row(10, "req_total", r#"{"instance":"a"}"#, 0.0),
+            row(20, "req_total", r#"{"instance":"a"}"#, 100.0),
+            row(12, "req_total", r#"{"instance":"b"}"#, 0.0),
+            row(22, "req_total", r#"{"instance":"b"}"#, 20.0),
+        ];
+        let chart = instance_chart(ChartKind::Rate, &rows);
+        assert_eq!(chart.timestamps, vec![20, 22]);
+        assert_eq!(chart.series[0].label, "a");
+        assert_eq!(chart.series[0].values, vec![Some(10.0), None]);
+        assert_eq!(chart.series[1].values, vec![None, Some(2.0)]);
+    }
+
+    #[test]
+    fn a_mean_chart_divides_sum_rate_by_count_rate() {
+        let sum = vec![
+            row(10, "lat_sum", r#"{"instance":"a"}"#, 0.0),
+            row(20, "lat_sum", r#"{"instance":"a"}"#, 2.0),
+        ];
+        let count = vec![
+            row(10, "lat_count", r#"{"instance":"a"}"#, 0.0),
+            row(20, "lat_count", r#"{"instance":"a"}"#, 40.0),
+        ];
+        let chart = mean_chart(&sum, &count);
+        assert_eq!(chart.timestamps, vec![20]);
+        assert_eq!(chart.series[0].values, vec![Some(0.05)]);
+    }
 
     fn row(timestamp: u64, name: &str, labels: &str, value: f64) -> MetricsQueryRow {
         MetricsQueryRow {

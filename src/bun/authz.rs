@@ -173,6 +173,7 @@ pub const ROUTE_MATRIX: &[Route] = &[
     route(Get, "/v1/metrics/rollup/owned", AnyToken),
     route(Get, "/v1/metrics/cluster", AnyToken),
     route(Get, "/v1/metrics/app/{app}/{namespace}", AnyToken),
+    route(Get, "/v1/metrics/app/{app}/{namespace}/chart", AnyToken),
     route(Get, "/v1/alerts", AnyToken),
     route(Get, "/v1/logs/sql", AnyToken),
     route(Post, "/v1/logs/export", Admin),

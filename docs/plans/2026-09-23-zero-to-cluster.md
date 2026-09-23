@@ -222,14 +222,14 @@ beat needs product work first:
   and reports how many connects succeeded; the latency figure measures the
   connect itself; the output names the backend the VIP chose and trims the raw
   resolver noise.
-- [ ] **Z6.5 Metrics without a Prometheus install.** The app spec gains
+- [x] **Z6.5 Metrics without a Prometheus install.** The app spec gains
   `metrics = { port, path }`, filled by the importer from `prometheus.io/scrape`,
   `port` and `path`. Each Bun scrapes its own local instances of such apps
   every few seconds, labels samples with app, namespace, instance and node, and
   handles histograms properly. `relish metrics <app>` lists what was scraped,
   and `--name` shows one metric per instance with a sparkline and rate for
   counters.
-- [ ] **Z6.6 Charts that draw.** Fix the dashboard's empty app charts, draw one
+- [x] **Z6.6 Charts that draw.** Fix the dashboard's empty app charts, draw one
   series per instance, show counters as rates, and add a requests-per-second
   and latency chart for apps with scraped metrics.
 - [ ] **Z6.7 Traffic and the new tour.** The demo manifest gains a tiny load

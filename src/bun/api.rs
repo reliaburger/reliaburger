@@ -447,6 +447,10 @@ pub fn router_with_upgrade(
             "/v1/metrics/app/{app}/{namespace}",
             get(metrics_app_handler),
         )
+        .route(
+            "/v1/metrics/app/{app}/{namespace}/chart",
+            get(metrics_app_chart_handler),
+        )
         .route("/v1/alerts", get(alerts_handler))
         .route("/v1/logs/sql", get(logs_sql_handler))
         .route("/v1/logs/export", post(logs_export_handler))
@@ -7037,6 +7041,24 @@ async fn dashboard_handler(State(state): State<ApiState>) -> Response {
     }
 }
 
+/// Names of the metrics an app's instances reported in the last five
+/// minutes, for choosing its page's charts. Empty if the query fails or
+/// takes more than three seconds: the page renders without those charts
+/// rather than waiting on a slow node.
+async fn scraped_metric_names(state: &ApiState, app: &str, namespace: &str) -> Vec<String> {
+    let start = crate::mayo::types::Sample::now(0.0)
+        .timestamp
+        .saturating_sub(300);
+    let query = app_metric_rows(state, app, namespace, None, start, i64::MAX as u64, Some(1));
+    let Ok(Ok(result)) = tokio::time::timeout(std::time::Duration::from_secs(3), query).await
+    else {
+        return Vec::new();
+    };
+    let names: std::collections::BTreeSet<String> =
+        result.data.into_iter().map(|row| row.metric_name).collect();
+    names.into_iter().collect()
+}
+
 /// `GET /ui/app/{app}/{namespace}` — app detail page.
 async fn app_detail_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
@@ -7107,22 +7129,11 @@ async fn app_detail_handler(
         vec![]
     };
 
-    let charts = vec![
-        ChartConfig {
-            endpoint: format!("/v1/metrics/app/{app}/{namespace}?name=process_cpu_percent"),
-            title: "CPU Usage".to_string(),
-            y_label: "%".to_string(),
-            refresh_secs: 10,
-            range_secs: 3600,
-        },
-        ChartConfig {
-            endpoint: format!("/v1/metrics/app/{app}/{namespace}?name=process_memory_bytes"),
-            title: "Memory Usage".to_string(),
-            y_label: "bytes".to_string(),
-            refresh_secs: 10,
-            range_secs: 3600,
-        },
-    ];
+    let charts = crate::brioche::app_detail::app_charts(
+        &app,
+        &namespace,
+        &scraped_metric_names(&state, &app, &namespace).await,
+    );
 
     let data = AppDetailData {
         app_name: app,
@@ -7622,38 +7633,28 @@ async fn metrics_cluster_handler(
     }
 }
 
-/// `GET /v1/metrics/app/{app}/{namespace}?name=X&start=S&end=E` — single-app query.
+/// One app's metric rows, wherever its instances run.
 ///
 /// When the placement map is visible (council + membership), fans out to the
 /// nodes running the app, hitting each one's app-filtered `/v1/metrics` leaf
 /// and merge-sorting the per-instance rows. Falls back to the local metrics
 /// store otherwise (single-node, or no placement info) — which is the same as
-/// fanning out to just this node.
-async fn metrics_app_handler(
-    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
-    State(state): State<ApiState>,
-    Path((app, namespace)): Path<(String, String)>,
-    Query(params): Query<MetricsQueryParams>,
-) -> Response {
-    if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
-        return resp;
-    }
-    let start = params.start.unwrap_or_else(|| {
-        crate::mayo::types::Sample::now(0.0)
-            .timestamp
-            .saturating_sub(APP_METRICS_DEFAULT_WINDOW_SECS)
-    });
-    // Clamped below u64::MAX: DataFusion 45's interval analysis
-    // overflows (debug-build panic) computing the cardinality of a
-    // full-domain unsigned range like `timestamp <= u64::MAX`.
-    let end = params.end.unwrap_or(i64::MAX as u64).min(i64::MAX as u64);
-
+/// fanning out to just this node. `Err` carries a store failure message.
+async fn app_metric_rows(
+    state: &ApiState,
+    app: &str,
+    namespace: &str,
+    name: Option<&str>,
+    start: u64,
+    end: u64,
+    per_series: Option<u32>,
+) -> Result<MetricsQueryResult, String> {
     // Cross-node fan-out: each node keeps only its own instances' samples, so
     // reading just this node's store misses instances scheduled elsewhere.
     if let (Some(council), Some(membership)) = (&state.council, &state.membership) {
         use crate::meat::types::AppId;
         let desired = council.desired_state().await;
-        let app_id = AppId::new(&app, &namespace);
+        let app_id = AppId::new(app, namespace);
         let node_ids: Vec<crate::meat::NodeId> = desired
             .scheduling
             .get(&app_id)
@@ -7671,73 +7672,180 @@ async fn metrics_app_handler(
 
             if !urls.is_empty() {
                 let query = MetricsQuery {
-                    metric_name: params.name.clone(),
+                    metric_name: name.map(str::to_string),
                     start,
                     end,
                     // The leaf filters on the `app` label, stored as `namespace/app`.
                     app: Some(format!("{namespace}/{app}")),
-                    per_series: params.per_series,
+                    per_series,
                 };
                 let timeout = std::time::Duration::from_secs(10);
-                let result = crate::mayo::query_fanout::fan_out_app_query(
+                return Ok(crate::mayo::query_fanout::fan_out_app_query(
                     &query,
                     &urls,
                     state.cluster_http.client(),
                     timeout,
                     state.service_token.as_deref(),
                 )
-                .await;
-                return Json(result).into_response();
+                .await);
             }
         }
     }
 
     let Some(mayo) = &state.mayo else {
-        return Json(MetricsQueryResult {
+        return Ok(MetricsQueryResult {
             data: vec![],
             warnings: vec![],
-        })
-        .into_response();
+        });
     };
-
-    let store = mayo.read().await;
 
     // Filter by app label in the local store. Both the app/namespace path
     // segments and the caller-supplied `name` reach the SQL literal, which
     // `query_app` escapes (OBS1): without that a crafted `?name=x' OR '1'='1`
     // or an app name carrying a quote would break out of the literal and drop
     // the tenant/time predicate, leaking other apps' metrics.
-    match store
-        .query_app(
-            &format!("{namespace}/{app}"),
-            params.name.as_deref(),
-            start,
-            end,
-            params.per_series,
-        )
+    let rows = mayo
+        .read()
         .await
-    {
-        Ok(rows) => {
-            let data: Vec<MetricsQueryRow> = rows
-                .into_iter()
-                .map(|(ts, name, labels, val)| MetricsQueryRow {
-                    timestamp: ts,
-                    metric_name: name,
-                    labels,
-                    value: val,
-                })
-                .collect();
-            Json(MetricsQueryResult {
-                data,
-                warnings: vec![],
+        .query_app(&format!("{namespace}/{app}"), name, start, end, per_series)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(MetricsQueryResult {
+        data: rows
+            .into_iter()
+            .map(|(timestamp, metric_name, labels, value)| MetricsQueryRow {
+                timestamp,
+                metric_name,
+                labels,
+                value,
             })
-            .into_response()
+            .collect(),
+        warnings: vec![],
+    })
+}
+
+/// The query window a per-app request names: `start` defaults to fifteen
+/// minutes ago, `end` to now.
+fn app_query_window(start: Option<u64>, end: Option<u64>) -> (u64, u64) {
+    let start = start.unwrap_or_else(|| {
+        crate::mayo::types::Sample::now(0.0)
+            .timestamp
+            .saturating_sub(APP_METRICS_DEFAULT_WINDOW_SECS)
+    });
+    // Clamped below u64::MAX: DataFusion 45's interval analysis
+    // overflows (debug-build panic) computing the cardinality of a
+    // full-domain unsigned range like `timestamp <= u64::MAX`.
+    let end = end.unwrap_or(i64::MAX as u64).min(i64::MAX as u64);
+    (start, end)
+}
+
+fn metrics_error_response(error: String) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({ "error": error })),
+    )
+        .into_response()
+}
+
+/// `GET /v1/metrics/app/{app}/{namespace}?name=X&start=S&end=E&per_series=N`
+/// — one app's raw metric rows, across every node running it.
+async fn metrics_app_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+    Path((app, namespace)): Path<(String, String)>,
+    Query(params): Query<MetricsQueryParams>,
+) -> Response {
+    if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
+        return resp;
+    }
+    let (start, end) = app_query_window(params.start, params.end);
+    match app_metric_rows(
+        &state,
+        &app,
+        &namespace,
+        params.name.as_deref(),
+        start,
+        end,
+        params.per_series,
+    )
+    .await
+    {
+        Ok(result) => Json(result).into_response(),
+        Err(error) => metrics_error_response(error),
+    }
+}
+
+#[derive(Deserialize)]
+struct AppChartParams {
+    /// Metric to draw; a histogram's base name for `kind=mean`.
+    name: String,
+    /// How rows become lines.
+    kind: crate::mayo::series::ChartKind,
+    start: Option<u64>,
+    end: Option<u64>,
+}
+
+/// What the dashboard's chart script draws: series lined up on one time
+/// axis, plus any fan-out warnings.
+#[derive(Debug, Serialize, Deserialize)]
+struct AppChartResponse {
+    #[serde(flatten)]
+    chart: crate::mayo::series::ChartData,
+    warnings: Vec<crate::mayo::rollup::QueryWarning>,
+}
+
+/// `GET /v1/metrics/app/{app}/{namespace}/chart?name=X&kind=gauge|rate|mean`
+/// — one metric as one line per instance, ready to draw.
+///
+/// `gauge` draws values, `rate` draws a counter's per-second rate, and
+/// `mean` draws `rate(X_sum) / rate(X_count)`, a histogram's mean.
+async fn metrics_app_chart_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+    Path((app, namespace)): Path<(String, String)>,
+    Query(params): Query<AppChartParams>,
+) -> Response {
+    use crate::mayo::series::{self, ChartKind};
+
+    if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
+        return resp;
+    }
+    let (start, end) = app_query_window(params.start, params.end);
+    let fetch = |name: String| {
+        let state = &state;
+        let app = &app;
+        let namespace = &namespace;
+        async move { app_metric_rows(state, app, namespace, Some(&name), start, end, None).await }
+    };
+    let response = match params.kind {
+        ChartKind::Gauge | ChartKind::Rate => {
+            fetch(params.name.clone())
+                .await
+                .map(|result| AppChartResponse {
+                    chart: series::instance_chart(params.kind, &result.data),
+                    warnings: result.warnings,
+                })
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
-            .into_response(),
+        ChartKind::Mean => {
+            match tokio::try_join!(
+                fetch(format!("{}_sum", params.name)),
+                fetch(format!("{}_count", params.name))
+            ) {
+                Ok((sum, count)) => {
+                    let mut warnings = sum.warnings;
+                    warnings.extend(count.warnings);
+                    Ok(AppChartResponse {
+                        chart: series::mean_chart(&sum.data, &count.data),
+                        warnings,
+                    })
+                }
+                Err(error) => Err(error),
+            }
+        }
+    };
+    match response {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => metrics_error_response(error),
     }
 }
 
@@ -9019,16 +9127,17 @@ mod tests {
         samples: &[(&str, &str, f64)],
     ) -> (Router, CancellationToken, tempfile::TempDir) {
         let now = crate::mayo::types::Sample::now(0.0).timestamp;
-        let timed: Vec<(&str, &str, u64, f64)> = samples
+        let timed: Vec<(&str, &str, &str, u64, f64)> = samples
             .iter()
-            .map(|(name, app, value)| (*name, *app, now, *value))
+            .map(|(name, app, value)| (*name, *app, "instance-0", now, *value))
             .collect();
         test_setup_with_timed_metrics(&timed).await
     }
 
-    /// Like [`test_setup_with_metrics`], with an explicit timestamp per sample.
+    /// Like [`test_setup_with_metrics`], with an explicit instance label
+    /// and timestamp per sample: `(name, app label, instance, time, value)`.
     async fn test_setup_with_timed_metrics(
-        samples: &[(&str, &str, u64, f64)],
+        samples: &[(&str, &str, &str, u64, f64)],
     ) -> (Router, CancellationToken, tempfile::TempDir) {
         use crate::mayo::types::{MetricKey, Sample};
 
@@ -9043,9 +9152,10 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let mut store = MayoStore::new(dir.path().to_path_buf());
-        for (name, app_filter, timestamp, value) in samples {
+        for (name, app_filter, instance, timestamp, value) in samples {
             let mut labels = std::collections::BTreeMap::new();
             labels.insert("app".to_string(), app_filter.to_string());
+            labels.insert("instance".to_string(), instance.to_string());
             let key = MetricKey::with_labels(*name, labels);
             store.insert(&key, Sample::at(*timestamp, *value));
         }
@@ -14261,8 +14371,8 @@ schedule = "* * * * *"
     async fn app_metrics_default_to_the_recent_window() {
         let now = crate::mayo::types::Sample::now(0.0).timestamp;
         let (app, shutdown, _dir) = test_setup_with_timed_metrics(&[
-            ("requests_total", "default/web", now - 3600, 1.0),
-            ("requests_total", "default/web", now - 30, 2.0),
+            ("requests_total", "default/web", "web-0", now - 3600, 1.0),
+            ("requests_total", "default/web", "web-0", now - 30, 2.0),
         ])
         .await;
         let (status, body) = get(app.clone(), "/v1/metrics/app/web/default").await;
@@ -14286,10 +14396,10 @@ schedule = "* * * * *"
     async fn app_metrics_per_series_returns_only_the_latest_samples() {
         let now = crate::mayo::types::Sample::now(0.0).timestamp;
         let (app, shutdown, _dir) = test_setup_with_timed_metrics(&[
-            ("requests_total", "default/web", now - 30, 1.0),
-            ("requests_total", "default/web", now - 20, 2.0),
-            ("requests_total", "default/web", now - 10, 3.0),
-            ("up", "default/web", now - 10, 1.0),
+            ("requests_total", "default/web", "web-0", now - 30, 1.0),
+            ("requests_total", "default/web", "web-0", now - 20, 2.0),
+            ("requests_total", "default/web", "web-0", now - 10, 3.0),
+            ("up", "default/web", "web-0", now - 10, 1.0),
         ])
         .await;
         let (status, body) = get(app, "/v1/metrics/app/web/default?per_series=1").await;
@@ -14305,6 +14415,123 @@ schedule = "* * * * *"
             latest,
             vec![("requests_total".to_string(), 3.0), ("up".to_string(), 1.0)]
         );
+        shutdown.cancel();
+    }
+
+    /// The dashboard's chart script reads `{timestamps, series: [{label,
+    /// values}]}` with one series per instance and `values` aligned to
+    /// `timestamps` (brioche.js `toChart`). Counters arrive as rates.
+    #[tokio::test]
+    async fn the_chart_endpoint_answers_one_rate_line_per_instance() {
+        let now = crate::mayo::types::Sample::now(0.0).timestamp;
+        let (app, shutdown, _dir) = test_setup_with_timed_metrics(&[
+            (
+                "http_requests_total",
+                "default/web",
+                "web-0",
+                now - 20,
+                100.0,
+            ),
+            (
+                "http_requests_total",
+                "default/web",
+                "web-0",
+                now - 10,
+                150.0,
+            ),
+            (
+                "http_requests_total",
+                "default/web",
+                "web-1",
+                now - 18,
+                10.0,
+            ),
+            ("http_requests_total", "default/web", "web-1", now - 8, 30.0),
+            (
+                "http_requests_total",
+                "default/other",
+                "other-0",
+                now - 8,
+                999.0,
+            ),
+        ])
+        .await;
+        let (status, body) = get(
+            app,
+            "/v1/metrics/app/web/default/chart?name=http_requests_total&kind=rate",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let chart: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            chart["timestamps"],
+            serde_json::json!([now - 10, now - 8]),
+            "{chart}"
+        );
+        assert_eq!(
+            chart["series"],
+            serde_json::json!([
+                {"label": "web-0", "values": [5.0, null]},
+                {"label": "web-1", "values": [null, 2.0]},
+            ]),
+            "{chart}"
+        );
+        assert_eq!(chart["warnings"], serde_json::json!([]));
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn the_chart_endpoint_draws_a_histogram_as_mean_latency() {
+        let now = crate::mayo::types::Sample::now(0.0).timestamp;
+        let (app, shutdown, _dir) = test_setup_with_timed_metrics(&[
+            ("latency_seconds_sum", "default/web", "web-0", now - 20, 1.0),
+            ("latency_seconds_sum", "default/web", "web-0", now - 10, 3.0),
+            (
+                "latency_seconds_count",
+                "default/web",
+                "web-0",
+                now - 20,
+                10.0,
+            ),
+            (
+                "latency_seconds_count",
+                "default/web",
+                "web-0",
+                now - 10,
+                50.0,
+            ),
+        ])
+        .await;
+        let (status, body) = get(
+            app,
+            "/v1/metrics/app/web/default/chart?name=latency_seconds&kind=mean",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let chart: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(chart["timestamps"], serde_json::json!([now - 10]));
+        assert_eq!(chart["series"][0]["values"], serde_json::json!([0.05]));
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn the_app_page_charts_what_the_app_exposes() {
+        let (app, shutdown, _dir) = test_setup_with_metrics(&[
+            ("http_requests_total", "default/web", 1.0),
+            ("http_request_duration_seconds_sum", "default/web", 1.0),
+            ("http_request_duration_seconds_count", "default/web", 1.0),
+        ])
+        .await;
+        let (status, body) = get(app, "/ui/app/web/default").await;
+        assert_eq!(status, StatusCode::OK);
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        for endpoint in [
+            "chart?name=process_cpu_percent&amp;kind=gauge",
+            "chart?name=http_requests_total&amp;kind=rate",
+            "chart?name=http_request_duration_seconds&amp;kind=mean",
+        ] {
+            assert!(html.contains(endpoint), "{endpoint} missing from {html}");
+        }
         shutdown.cancel();
     }
 
