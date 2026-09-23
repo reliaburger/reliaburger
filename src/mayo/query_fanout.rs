@@ -162,6 +162,7 @@ async fn fan_out_to_urls<T: serde::de::DeserializeOwned + Send + 'static>(
         let endpoint = format!("{base}{path}");
         let metric_name = query.metric_name.clone();
         let app = query.app.clone();
+        let per_series = query.per_series;
         let start = query.start;
         let end = query.end;
         let client = client.clone();
@@ -175,6 +176,9 @@ async fn fan_out_to_urls<T: serde::de::DeserializeOwned + Send + 'static>(
             }
             if let Some(app) = app {
                 params.push(("app", app));
+            }
+            if let Some(per_series) = per_series {
+                params.push(("per_series", per_series.to_string()));
             }
             let request = crate::sesame::auth::bearer_get(&client, &endpoint, token.as_deref())
                 .query(&params);
@@ -339,6 +343,7 @@ mod tests {
             start: 0,
             end: 2000,
             app: None,
+            per_series: None,
         };
         let result = fan_out_cluster_query(
             &query,
@@ -408,6 +413,7 @@ mod tests {
                 start: 0,
                 end: 2000,
                 app: None,
+                per_series: None,
             };
             let result = fan_out_cluster_query(
                 &query,

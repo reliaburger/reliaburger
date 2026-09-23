@@ -6763,7 +6763,15 @@ struct MetricsQueryParams {
     /// node answers with only that app's local data; absent for node-wide
     /// dashboard queries.
     app: Option<String>,
+    /// Keep only the newest N samples of each series (per-app queries).
+    per_series: Option<u32>,
 }
+
+/// Window the per-app endpoint reads when the caller gives no `start`.
+///
+/// Callers want "what's happening now"; reading from the epoch made every
+/// unbounded query scan (and cap) the whole retention period.
+const APP_METRICS_DEFAULT_WINDOW_SECS: u64 = 15 * 60;
 
 /// `GET /v1/metrics?name=X&start=S&end=E` — query time-series data.
 ///
@@ -6794,25 +6802,11 @@ async fn metrics_query_handler(
     // cross-node fan-out: answer with only that app's local samples. Every
     // caller-supplied string reaches the SQL literal, so escape each (OBS1).
     if let Some(app) = &params.app {
-        let app_filter = crate::mayo::store::escape_sql_literal(app);
-        let sql = if name == "*" {
-            format!(
-                "SELECT timestamp, metric_name, labels, value FROM metrics \
-                 WHERE labels LIKE '%\"{app_filter}\"%' \
-                 AND timestamp >= {start} AND timestamp <= {end} \
-                 ORDER BY timestamp LIMIT 10000"
-            )
-        } else {
-            let name = crate::mayo::store::escape_sql_literal(name);
-            format!(
-                "SELECT timestamp, metric_name, labels, value FROM metrics \
-                 WHERE metric_name = '{name}' \
-                 AND labels LIKE '%\"{app_filter}\"%' \
-                 AND timestamp >= {start} AND timestamp <= {end} \
-                 ORDER BY timestamp LIMIT 10000"
-            )
-        };
-        return match store.query_sql(&sql).await {
+        let name = (name != "*").then_some(name);
+        return match store
+            .query_app(app, name, start, end, params.per_series)
+            .await
+        {
             Ok(results) => {
                 let data: Vec<serde_json::Value> = results
                     .iter()
@@ -7586,6 +7580,7 @@ async fn metrics_cluster_handler(
             start,
             end,
             app: None,
+            per_series: None,
         };
         let timeout = std::time::Duration::from_secs(10);
         let result = crate::mayo::query_fanout::fan_out_cluster_query(
@@ -7643,7 +7638,11 @@ async fn metrics_app_handler(
     if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
         return resp;
     }
-    let start = params.start.unwrap_or(0);
+    let start = params.start.unwrap_or_else(|| {
+        crate::mayo::types::Sample::now(0.0)
+            .timestamp
+            .saturating_sub(APP_METRICS_DEFAULT_WINDOW_SECS)
+    });
     // Clamped below u64::MAX: DataFusion 45's interval analysis
     // overflows (debug-build panic) computing the cardinality of a
     // full-domain unsigned range like `timestamp <= u64::MAX`.
@@ -7677,6 +7676,7 @@ async fn metrics_app_handler(
                     end,
                     // The leaf filters on the `app` label, stored as `namespace/app`.
                     app: Some(format!("{namespace}/{app}")),
+                    per_series: params.per_series,
                 };
                 let timeout = std::time::Duration::from_secs(10);
                 let result = crate::mayo::query_fanout::fan_out_app_query(
@@ -7703,31 +7703,20 @@ async fn metrics_app_handler(
     let store = mayo.read().await;
 
     // Filter by app label in the local store. Both the app/namespace path
-    // segments and the caller-supplied `name` reach the SQL literal, so escape
-    // every one (OBS1): without this a crafted `?name=x' OR '1'='1` or an app
-    // name carrying a quote would break out of the literal and drop the
-    // tenant/time predicate, leaking other apps' metrics.
-    let app_filter = crate::mayo::store::escape_sql_literal(&format!("{namespace}/{app}"));
-    let sql = match &params.name {
-        Some(name) => {
-            let name = crate::mayo::store::escape_sql_literal(name);
-            format!(
-                "SELECT timestamp, metric_name, labels, value FROM metrics \
-                 WHERE metric_name = '{name}' \
-                 AND labels LIKE '%\"{app_filter}\"%' \
-                 AND timestamp >= {start} AND timestamp <= {end} \
-                 ORDER BY timestamp LIMIT 10000"
-            )
-        }
-        None => format!(
-            "SELECT timestamp, metric_name, labels, value FROM metrics \
-             WHERE labels LIKE '%\"{app_filter}\"%' \
-             AND timestamp >= {start} AND timestamp <= {end} \
-             ORDER BY timestamp LIMIT 10000"
-        ),
-    };
-
-    match store.query_sql(&sql).await {
+    // segments and the caller-supplied `name` reach the SQL literal, which
+    // `query_app` escapes (OBS1): without that a crafted `?name=x' OR '1'='1`
+    // or an app name carrying a quote would break out of the literal and drop
+    // the tenant/time predicate, leaking other apps' metrics.
+    match store
+        .query_app(
+            &format!("{namespace}/{app}"),
+            params.name.as_deref(),
+            start,
+            end,
+            params.per_series,
+        )
+        .await
+    {
         Ok(rows) => {
             let data: Vec<MetricsQueryRow> = rows
                 .into_iter()
@@ -9029,6 +9018,18 @@ mod tests {
     async fn test_setup_with_metrics(
         samples: &[(&str, &str, f64)],
     ) -> (Router, CancellationToken, tempfile::TempDir) {
+        let now = crate::mayo::types::Sample::now(0.0).timestamp;
+        let timed: Vec<(&str, &str, u64, f64)> = samples
+            .iter()
+            .map(|(name, app, value)| (*name, *app, now, *value))
+            .collect();
+        test_setup_with_timed_metrics(&timed).await
+    }
+
+    /// Like [`test_setup_with_metrics`], with an explicit timestamp per sample.
+    async fn test_setup_with_timed_metrics(
+        samples: &[(&str, &str, u64, f64)],
+    ) -> (Router, CancellationToken, tempfile::TempDir) {
         use crate::mayo::types::{MetricKey, Sample};
 
         let (cmd_tx, cmd_rx) = mpsc::channel(32);
@@ -9042,11 +9043,11 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let mut store = MayoStore::new(dir.path().to_path_buf());
-        for (name, app_filter, value) in samples {
+        for (name, app_filter, timestamp, value) in samples {
             let mut labels = std::collections::BTreeMap::new();
             labels.insert("app".to_string(), app_filter.to_string());
             let key = MetricKey::with_labels(*name, labels);
-            store.insert(&key, Sample::at(1000, *value));
+            store.insert(&key, Sample::at(*timestamp, *value));
         }
         store.flush().await.unwrap();
         let mayo = Some(Arc::new(RwLock::new(store)));
@@ -14252,6 +14253,59 @@ schedule = "* * * * *"
 
         shutdown.cancel();
         shutdown2.cancel();
+    }
+
+    /// With no `start`, the per-app endpoint reads the last fifteen minutes
+    /// rather than the whole retention period.
+    #[tokio::test]
+    async fn app_metrics_default_to_the_recent_window() {
+        let now = crate::mayo::types::Sample::now(0.0).timestamp;
+        let (app, shutdown, _dir) = test_setup_with_timed_metrics(&[
+            ("requests_total", "default/web", now - 3600, 1.0),
+            ("requests_total", "default/web", now - 30, 2.0),
+        ])
+        .await;
+        let (status, body) = get(app.clone(), "/v1/metrics/app/web/default").await;
+        assert_eq!(status, StatusCode::OK);
+        let parsed: MetricsQueryResult = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed.data.len(), 1, "{:?}", parsed.data);
+        assert_eq!(parsed.data[0].value, 2.0);
+
+        // An explicit start still reaches back.
+        let (_, body) = get(
+            app,
+            &format!("/v1/metrics/app/web/default?start={}", now - 7200),
+        )
+        .await;
+        let parsed: MetricsQueryResult = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed.data.len(), 2);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn app_metrics_per_series_returns_only_the_latest_samples() {
+        let now = crate::mayo::types::Sample::now(0.0).timestamp;
+        let (app, shutdown, _dir) = test_setup_with_timed_metrics(&[
+            ("requests_total", "default/web", now - 30, 1.0),
+            ("requests_total", "default/web", now - 20, 2.0),
+            ("requests_total", "default/web", now - 10, 3.0),
+            ("up", "default/web", now - 10, 1.0),
+        ])
+        .await;
+        let (status, body) = get(app, "/v1/metrics/app/web/default?per_series=1").await;
+        assert_eq!(status, StatusCode::OK);
+        let parsed: MetricsQueryResult = serde_json::from_slice(&body).unwrap();
+        let mut latest: Vec<(String, f64)> = parsed
+            .data
+            .iter()
+            .map(|row| (row.metric_name.clone(), row.value))
+            .collect();
+        latest.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            latest,
+            vec![("requests_total".to_string(), 3.0), ("up".to_string(), 1.0)]
+        );
+        shutdown.cancel();
     }
 
     #[tokio::test]
