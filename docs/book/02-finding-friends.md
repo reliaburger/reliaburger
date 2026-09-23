@@ -187,6 +187,8 @@ Three rules:
 
 Rule 2 is important. If two updates arrive with the same incarnation — say, one marking a node Suspect and one marking it Alive — the Suspect update wins. This biases the protocol towards detecting failures rather than missing them. A false positive (marking a healthy node as suspect) is recoverable: the node just bumps its incarnation. A false negative (thinking a dead node is alive) isn't.
 
+Incarnation and state are the whole conflict rule. Membership updates used to carry a `lamport` field too, which the code incremented locally but never merged from a received message or consulted when resolving a conflict. A counter that nobody compares isn't a Lamport clock, it's a misleading name, so we deleted it.
+
 ### The membership table
 
 Each node maintains a local copy of every known member's state:
@@ -547,6 +549,12 @@ Entry::Occupied(mut entry) => {
 This means there's a minimum rejoin delay of `cleanup_timeout` (60 seconds). In practice that's fine. You're not going to reboot a server and have it back in under a minute. And if you do, the 60-second cooldown actually helps: it prevents flapping where a misconfigured node repeatedly joins and leaves, generating a storm of membership updates.
 
 If you absolutely need faster rejoins (testing, development), reduce `cleanup_timeout`. The only constraint is that it must be long enough for the Left update to propagate to all nodes — at least a few seconds for any reasonable cluster size.
+
+### Finding the way home without a seed list
+
+Reaping has a nasty corner. The first node in a cluster starts with no seeds; the others find it, and gossip teaches it their addresses. Now cut that first node off from everyone for longer than the cleanup timeout. It marks every peer dead and reaps them. When the network comes back, it has an empty membership table and an empty seed list, and nobody is probing it either. We found this while testing node-fault expiry: the fault lifted cleanly, but the node had forgotten its way home.
+
+So Mustard remembers up to sixteen peers it has talked to directly, separately from live membership, and each cycle probes one of them if it's missing or not alive. A graceful `Left` removes the contact. On the far side, the peer may still hold the returning node as `Dead` long after the piggyback queue stopped repeating that claim, so a direct ping or ack now carries any non-alive claim about its recipient. The recipient refutes it with a higher incarnation, the normal way; we never flip `Dead` back to `Alive` just because a datagram arrived.
 
 ### Testing convergence
 
@@ -1375,7 +1383,7 @@ pub enum ReportHealthStatus {
 }
 ```
 
-The wire type has an `event_log` for future event reporting, but the agent currently sends it empty (F06). Protocol generation 3 refuses reports containing more than 100 events rather than truncating them. `max_events_per_report` must remain 100; other values fail configuration validation. The transport also checks the complete encoded size against its 1 MiB limit before allocating a payload.
+The wire type has an `event_log` for event reporting, but the agent doesn't fill it yet, so it travels empty. The receiver refuses a report with more than 100 events rather than truncating it, and `max_events_per_report` only accepts 100 until something produces events. The sender also checks the complete encoded size against a 1 MiB limit before it allocates a buffer (Chapter 11 has the details).
 
 ### The transport trait
 
@@ -1505,7 +1513,7 @@ On the receiving side, every node folds extensions into a `NodeDirectory` — a 
 
 ### Keeping the extension out of the message body
 
-Gossip messages are bincode, and bincode is positional — no field names, no tags, just bytes in struct order. Old and new binaries never share a wire format: the first byte is the protocol generation, and a mismatch is refused before anything else is read. The directory is still worth keeping apart from the membership payload, though. It's optional per datagram, and a bad one should cost us directory data, never membership.
+Gossip messages are bincode, and bincode is positional — no field names, no tags, just bytes in struct order. Old and new binaries never share a wire format: the first byte is the protocol generation, and a mismatch is refused before anything else is read. Raft and reporting check their generations the same way, before decoding, because a development snapshot can deserialise cleanly and still mean something different. Until 0.1.0 a format change simply means starting a fresh cluster; Chapter 14 covers the compatibility policy that replaces that. The directory is still worth keeping apart from the membership payload, though. It's optional per datagram, and a bad one should cost us directory data, never membership.
 
 So we don't put the extension in the message at all:
 
@@ -1680,7 +1688,7 @@ Required labels are hard constraints. If an app says `required = ["gpu=a100"]`, 
 | Spread | 60 | Penalise nodes already running this app |
 | Stability | 5 | Prefer longer-running nodes |
 
-These are points, not percentages. Spread contributes either zero or 60 points, so it outweighs bin-packing when the other dimensions are equal. Once candidates are equal on spread, bin-packing favours density. Image locality only helps when the cache contains image evidence; propagation of remote cached-image evidence remains F01 in the completion plan.
+These are points, not percentages. Spread contributes either zero or 60 points, so it outweighs bin-packing when the other dimensions are equal. Once candidates are equal on spread, bin-packing favours density. Image locality is wired into scoring, but nodes don't report their cached images to the leader yet, so in a live cluster it currently scores zero everywhere.
 
 **Phase 3: Select.** Pick the highest-scoring node. Ties are broken by `NodeId` (alphabetical), which gives us deterministic results. The same inputs always produce the same placement. This matters for debugging and for the property-based tests.
 
@@ -1698,7 +1706,7 @@ Namespaces provide resource isolation. Each namespace can have limits on CPU, me
 namespace "staging" would exceed CPU quota: 1800+500 > 2000m
 ```
 
-The leader builds a quota ledger from desired-state namespaces once per scheduling pass and accounts for each admitted app cumulatively. It also applies the active upgrade cordon before selecting nodes.
+The leader tallies each namespace's usage once per scheduling pass and adds every app it admits as it goes, so two apps admitted in the same pass can't each squeeze under a limit they exceed together. It also skips nodes cordoned by an in-progress upgrade before selecting.
 
 The `check_quota` function is straightforward: for each limit that's set, check if current usage plus the requested resources exceeds it. No limit means unlimited.
 
@@ -2326,52 +2334,3 @@ three Linux nodes and passed sample HTTP in 241.75 seconds. We record the
 [conditions and exclusions](../qualification/2026-09-17-laptop.md): it used local
 development binaries, so downloading and verifying a signed release remains a
 separate acceptance gate. One passing measurement is evidence, not a guarantee.
-
-
-### The first supported compatibility boundary
-
-A development snapshot might deserialize successfully and still represent a different contract. Before 0.1.0 we therefore require fresh clusters. Startup stamps a fresh data directory with its state generation and refuses an existing unmarked directory.
-
-A Raft request now carries protocol and state generations as well as its recovery epoch. All three checks run before dispatch to Raft. Responses carry the format contract too, so a new caller cannot mistake a development server's reply for an accepted negotiation. Gossip checks both generations before learning membership; reporting checks both generations before decoding its payload. Chapter 14 explains how the same contract gates binary replacement and rollback. Different product versions are supported only when they explicitly advertise equal formats.
-
-### Finding the cluster again without a seed list
-
-The first node starts without seeds. Other nodes find it, gossip supplies their
-addresses, and everything works until the first node loses contact with all of
-them. Once it has marked every peer dead and reaped the records, reopening its
-network isn't enough. Its seed list is still empty. Nobody is probing it either.
-
-Mustard now retains at most sixteen previously contacted peers separately from
-live membership. Each cycle considers one retained contact, rotating through the
-queue, and probes it if it is absent or no longer alive. While isolated, it also
-probes configured seeds. Keeping one live neighbour must not suppress recovery of
-the others: a three-node experiment exposed exactly that partial recovery gap.
-Those addresses are discovery candidates, not evidence that a node is alive. Direct messages refresh the bounded
-queue; relayed acknowledgements cannot put a relay's socket under another node's
-identity. An explicit `Left` state removes the contact before membership reaping,
-so a graceful departure doesn't become a permanent fallback seed.
-
-There's a second trap. The returning node may still be marked dead at its peer,
-but the ordinary piggyback queue may have exhausted every retransmission of that
-claim. A direct ping or reply now includes the current non-alive claim about its
-recipient, within the existing eight-update limit. That recipient can refute the
-claim with a higher incarnation. We don't silently turn an old `Dead` into
-`Alive` just because another datagram arrived.
-
-The regression starts a seedless bootstrap node, removes every peer from its
-membership table, and exhausts the other node's piggyback queue. Both sides must
-rediscover each other as alive. A separate test checks the contact bound and
-retirement of explicit departures. Another regression keeps a live neighbour
-while reaping a different peer, then requires a rediscovery probe. This was found
-while testing node-fault expiry:
-the transport gates reopened correctly, but discovery had forgotten its way home.
-
-
-### Remove the imaginary clock
-
-Membership updates used to carry a field named `lamport`. Earlier code incremented
-it locally but never merged a received timestamp or used it to resolve an update.
-That wasn't a Lamport clock. The actual conflict rules use incarnation and node
-state, so for 0.1.0 the field is gone. Removing a positional bincode field changes
-the message layout, which is exactly what the protocol generation is for: the
-change bumps it, and peers of the old generation are refused before decoding.
