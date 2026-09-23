@@ -343,6 +343,16 @@ fn format_number(value: f64) -> String {
     }
 }
 
+/// A per-second rate: two decimals while small, so 7/s and 7.5/s line up,
+/// then the same short form as other numbers.
+fn format_rate(rate: f64) -> String {
+    if rate.abs() < 100.0 {
+        format!("{rate:.2}")
+    } else {
+        format_number(rate)
+    }
+}
+
 /// A duration in seconds as µs, ms or s.
 fn format_seconds(seconds: f64) -> String {
     if seconds >= 1.0 {
@@ -370,7 +380,7 @@ fn format_summary_value(summary: &MetricSummary) -> String {
     };
     match summary.kind {
         MetricType::Gauge => format_number(value),
-        MetricType::Counter => format!("{}/s", format_number(value)),
+        MetricType::Counter => format!("{}/s", format_rate(value)),
         MetricType::Histogram => format!("mean {}", format_observation(&summary.name, value)),
     }
 }
@@ -433,7 +443,7 @@ pub fn render_detail(
         (Some(value), MetricType::Histogram) => format_observation(name, value),
         (Some(value), _) => format_number(value),
     };
-    let rate = |value: Option<f64>| value.map_or_else(|| "-".to_string(), format_number);
+    let rate = |value: Option<f64>| value.map_or_else(|| "-".to_string(), format_rate);
     let instance_width = instances
         .iter()
         .map(|i| i.instance.len())

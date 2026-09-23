@@ -4,6 +4,6 @@ expression: "render_detail(\"default\", \"web\", \"http_requests_total\", \"15m\
 ---
 default/web http_requests_total (counter, last 15m)
 INSTANCE        NODE    SERIES     LATEST    RATE/S  TREND
-default__web-0  node-a       1        250         9  ▁▃▅▆█
-default__web-1  node-b       1        100         2  ▁▁▁▁▁
-total                        2        350        11
+default__web-0  node-a       1        250      9.00  ▁▃▅▆█
+default__web-1  node-b       1        100      2.00  ▁▁▁▁▁
+total                        2        350     11.00
