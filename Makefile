@@ -4,6 +4,8 @@ CARGO = cargo
 NEXTEST_PROFILE ?= default
 NEXTEST = $(CARGO) nextest run --profile $(NEXTEST_PROFILE) --no-tests=fail
 COVERAGE_MIN_LINES ?= 78.65
+# Extra nextest filter for test-linux, e.g. to skip suites a job already ran.
+LINUX_EXCLUDE ?=
 
 # --- Rust targets ---
 
@@ -27,7 +29,7 @@ test-slow: ## Run required wall-clock acceptance tests
 
 test-linux: ## Run provisioned Linux runtime, network, eBPF, Btrfs and Buildah tests
 	$(CARGO) build --features ebpf --bin bun
-	RELIABURGER_RUNC_TESTS=1 RELIABURGER_NETNS_TESTS=1 RELIABURGER_EBPF_TESTS=1 RELIABURGER_BTRFS_TESTS=1 RELIABURGER_BUILDAH_TESTS=1 RELIABURGER_CGROUP_TESTS=1 RELIABURGER_NODE_PRESSURE_TESTS=1 RELIABURGER_BUN_BINARY="$(CURDIR)/target/debug/bun" $(NEXTEST) --features ebpf --run-ignored=only -E '(binary(ebpf) | binary(build) | binary(node_pressure) | binary(test_storage) | binary(owned_network) | binary(owned_runc) | test(/(runc_|netns|btrfs_|cgroup_|identity_dir_is_tmpfs)/)) & not binary(oci_crash) & !test(/^actual_(host_reboot|bun_kernel_discovery_host_reboot)/)'
+	RELIABURGER_RUNC_TESTS=1 RELIABURGER_NETNS_TESTS=1 RELIABURGER_EBPF_TESTS=1 RELIABURGER_BTRFS_TESTS=1 RELIABURGER_BUILDAH_TESTS=1 RELIABURGER_CGROUP_TESTS=1 RELIABURGER_NODE_PRESSURE_TESTS=1 RELIABURGER_BUN_BINARY="$(CURDIR)/target/debug/bun" $(NEXTEST) --features ebpf --run-ignored=only -E '(binary(ebpf) | binary(build) | binary(node_pressure) | binary(test_storage) | binary(owned_network) | binary(owned_runc) | test(/(runc_|netns|btrfs_|cgroup_|identity_dir_is_tmpfs)/)) & not binary(oci_crash) & !test(/^actual_(host_reboot|bun_kernel_discovery_host_reboot)/) $(LINUX_EXCLUDE)'
 
 test-rootless-runc: ## Prove rootless runc networking and port adoption as a non-root user
 	RELIABURGER_ROOTLESS_RUNC_TESTS=1 $(NEXTEST) --features ebpf --run-ignored=only -E 'binary(owned_rootless) | test(rootless_published_port_survives_bun_replacement) | test(normal_rootless_bun)'

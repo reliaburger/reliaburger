@@ -155,7 +155,7 @@ jobs:
   linux:
     name: privileged Linux
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.98.0
@@ -190,7 +190,11 @@ jobs:
           path: /var/tmp/reliaburger-oci-interruptions.*/
           if-no-files-found: ignore
       - name: Run only provisioned Linux tests
-        run: sudo -E env PATH="$PATH" NEXTEST_PROFILE=ci make test-linux
+        # The qualification step above already ran owned_runc and owned_network
+        # in a private namespace.
+        run: >-
+          sudo -E env PATH="$PATH" NEXTEST_PROFILE=ci make test-linux
+          LINUX_EXCLUDE='& not binary(owned_runc) & not binary(owned_network)'
 
   cluster:
     name: multi-node cluster
