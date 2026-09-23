@@ -3,9 +3,10 @@
 use super::{
     artifacts,
     download::Downloader,
+    lima::Lima,
     provision,
     security::{self, Bootstrap},
-    state::{ClusterSpec, NodePhase, Operation},
+    state::{ClusterSpec, NodePhase, NodeState, Operation},
 };
 use crate::{
     bun::agent::CouncilStatus,
@@ -175,11 +176,12 @@ async fn provision_cluster(
         .count();
     let to_create = statuses.iter().filter(|status| status.is_none()).count();
     super::preflight::resources(to_start, to_create, root).await?;
+    // Lima checks for its shared SSH key before taking a lock, so concurrent
+    // first starts can overwrite each other's key. Create it ourselves first.
+    lima.ensure_user_key().await?;
     let mut boots = FuturesUnordered::new();
     let nodes = operation.state.nodes.clone();
-    for (index, node) in nodes.iter().enumerate() {
-        let lima = lima.clone();
-        let node = node.clone();
+    for (index, node) in nodes.into_iter().enumerate() {
         let config_path = operation.directory.join(format!("{}.yaml", node.name));
         let yaml = provision::vm_config(
             image.to_str().context("non-UTF-8 image cache path")?,
@@ -189,46 +191,23 @@ async fn provision_cluster(
             (index == 0).then_some(spec.registry_port),
         )?;
         tokio::fs::write(&config_path, yaml).await?;
-        let status = statuses[index].clone();
-        let api_port = spec.api_port + index as u16;
-        let ingress_port = (index == 0).then_some(spec.ingress_port);
-        let registry_port = (index == 0).then_some(spec.registry_port);
-        let boot = async move {
-            if status.as_deref() != Some("Running") {
-                let mut ports = vec![api_port];
-                ports.extend(ingress_port);
-                ports.extend(registry_port);
-                super::preflight::ports(&ports).await?;
-            }
-            match status.as_deref() {
-                None if node.phase != NodePhase::Planned => bail!(
-                    "owned VM {} disappeared; refusing to create a replacement cluster implicitly",
-                    node.name
-                ),
-                None => {
-                    lima.command(&[
-                        "start",
-                        "--tty=false",
-                        &format!("--name={}", node.name),
-                        config_path.to_str().context("invalid VM config path")?,
-                    ])
-                    .await?;
-                }
-                Some("Running") => {}
-                Some("Stopped") => {
-                    lima.command(&["start", "--tty=false", &node.name]).await?;
-                }
-                Some(status) => bail!("VM {} is in unexpected state {status}", node.name),
-            }
-            lima.wait_for_guest(&node.name).await?;
-            Ok::<_, anyhow::Error>((index, lima.address(&node.name).await?))
-        };
-        // Lima creates its shared SSH key on first boot. Initialise once before
-        // starting peers, otherwise concurrent ssh-keygen calls can overwrite it.
+        let mut ports = vec![spec.api_port + index as u16];
         if index == 0 {
-            record_boot(operation, boot.await?).await?;
-        } else {
-            boots.push(boot);
+            ports.extend([spec.ingress_port, spec.registry_port]);
+        }
+        boots.push(boot_vm(
+            lima.clone(),
+            node,
+            index,
+            statuses[index].clone(),
+            config_path,
+            ports,
+        ));
+        // The first start also launches Lima's shared network daemon, which
+        // Lima does not guard against a concurrent second launch. Peers start
+        // as soon as it runs, while the first VM is still booting.
+        if index == 0 && to_start > 1 {
+            wait_for_shared_network(&lima, &mut boots, operation).await?;
         }
     }
     while let Some(result) = boots.next().await {
@@ -443,6 +422,62 @@ async fn provision_cluster(
     let path = root.join("context.json");
     tokio::task::spawn_blocking(move || context.save(&path)).await??;
     Ok(())
+}
+
+/// Create, restart or adopt one owned VM and return its shared address.
+async fn boot_vm(
+    lima: Lima,
+    node: NodeState,
+    index: usize,
+    status: Option<String>,
+    config_path: PathBuf,
+    ports: Vec<u16>,
+) -> Result<(usize, std::net::Ipv4Addr)> {
+    if status.as_deref() != Some("Running") {
+        super::preflight::ports(&ports).await?;
+    }
+    match status.as_deref() {
+        None if node.phase != NodePhase::Planned => bail!(
+            "owned VM {} disappeared; refusing to create a replacement cluster implicitly",
+            node.name
+        ),
+        None => {
+            lima.command(&[
+                "start",
+                "--tty=false",
+                &format!("--name={}", node.name),
+                config_path.to_str().context("invalid VM config path")?,
+            ])
+            .await?;
+        }
+        Some("Running") => {}
+        Some("Stopped") => {
+            lima.command(&["start", "--tty=false", &node.name]).await?;
+        }
+        Some(status) => bail!("VM {} is in unexpected state {status}", node.name),
+    }
+    lima.wait_for_guest(&node.name).await?;
+    Ok((index, lima.address(&node.name).await?))
+}
+
+/// Wait until Lima's shared network runs, or the first boot finishes.
+async fn wait_for_shared_network<F>(
+    lima: &Lima,
+    boots: &mut FuturesUnordered<F>,
+    operation: &mut Operation,
+) -> Result<()>
+where
+    F: std::future::Future<Output = Result<(usize, std::net::Ipv4Addr)>>,
+{
+    let network = async {
+        while !lima.shared_network_running().await {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    };
+    tokio::select! {
+        Some(result) = boots.next() => record_boot(operation, result?).await,
+        () = network => Ok(()),
+    }
 }
 
 async fn record_boot(

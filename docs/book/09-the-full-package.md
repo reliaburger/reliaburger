@@ -848,13 +848,28 @@ that you supply exactly one source; both routes use the same pinned-CA join.
 ### Put the steps together
 
 `setup --quickstart` wraps the whole operation in one five-minute deadline.
-Each completed external step gets a durable checkpoint. The first VM boots
-alone: Lima creates its shared SSH identity during this step, and concurrent
-first boots race that initialisation. The remaining VM boots run through
-`FuturesUnordered`, a collection of futures polled concurrently that yields
-results as they finish. A future is Rust's suspended asynchronous computation;
-putting several in this stream lets one VM boot while another waits for package
-installation. We persist each result before moving on. Dropping a timed-out
+Each completed external step gets a durable checkpoint. Our first version
+booted VM 1 alone, because concurrent first boots corrupted Lima's shared SSH
+key, and only then started the others. That cost a whole boot, 40 seconds or
+more. Reading Lima 2.1.0's source showed why: `limactl start` checks whether
+`_config/user` exists, and only afterwards takes a lock and runs `ssh-keygen`.
+It never checks again under the lock, so two first starts both generate a key
+and the second overwrites the first. Lima's `user-v2` network daemon has the
+same check-then-lock shape.
+
+So we remove the race instead of serialising around it. Before any VM starts,
+`Lima::ensure_user_key` runs the same `ssh-keygen -t ed25519 -N "" -C lima`
+into a private staging directory and renames the public half into place first,
+because Lima treats the private file as proof that both exist. Then the first
+`limactl start` launches the network daemon, and the others start as soon as
+its PID is alive and its socket exists, a second or two later rather than a
+whole boot later. All boots run through `FuturesUnordered`, a collection of
+futures polled concurrently that yields results as they finish. A future is
+Rust's suspended asynchronous computation; putting several in this stream lets
+one VM boot while another waits for package installation. `tokio::select!`
+waits for whichever comes first, the network daemon or the first boot itself
+(which also covers resuming a cluster whose first VM is already running). We
+persist each result before moving on. Dropping a timed-out
 Lima command kills its direct child; VMs already created remain recorded for
 resume or explicit cleanup.
 

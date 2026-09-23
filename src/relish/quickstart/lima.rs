@@ -55,6 +55,83 @@ impl Lima {
         String::from_utf8(output.stdout).context("Lima returned invalid UTF-8")
     }
 
+    /// Create Lima's shared SSH key before any VM starts.
+    ///
+    /// Lima 2.1.0 generates `$LIMA_HOME/_config/user` on first start, but it
+    /// checks for the key before taking its lock and never checks again, so
+    /// VMs created concurrently can overwrite each other's key. We generate
+    /// the same ed25519 key it would, publishing the public half first because
+    /// Lima treats the private file as proof that both exist.
+    pub async fn ensure_user_key(&self) -> Result<()> {
+        let home = self
+            .home
+            .as_ref()
+            .context("managed Lima has no private home")?;
+        let config = home.join("_config");
+        let private = config.join("user");
+        if tokio::fs::try_exists(&private).await? {
+            return Ok(());
+        }
+        let staging = {
+            let config = config.clone();
+            tokio::task::spawn_blocking(move || -> Result<tempfile::TempDir> {
+                let mut builder = std::fs::DirBuilder::new();
+                builder.recursive(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::DirBuilderExt;
+                    builder.mode(0o700);
+                }
+                builder.create(&config)?;
+                Ok(tempfile::Builder::new()
+                    .prefix(".user-key-")
+                    .tempdir_in(&config)?)
+            })
+            .await??
+        };
+        let key = staging.path().join("user");
+        let status = tokio::time::timeout(
+            Duration::from_secs(30),
+            tokio::process::Command::new("ssh-keygen")
+                .args(["-t", "ed25519", "-q", "-N", "", "-C", "lima", "-f"])
+                .arg(&key)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .status(),
+        )
+        .await
+        .context("ssh-keygen exceeded its deadline")?
+        .context("failed to run ssh-keygen; Lima needs OpenSSH on the host")?;
+        if !status.success() {
+            bail!("ssh-keygen failed ({status})");
+        }
+        tokio::fs::rename(key.with_extension("pub"), config.join("user.pub")).await?;
+        tokio::fs::rename(&key, &private).await?;
+        Ok(())
+    }
+
+    /// True once Lima's shared `user-v2` network daemon is running.
+    ///
+    /// The first `limactl start` launches it, again without re-checking under
+    /// its lock, so peers wait for it rather than racing to start a second one.
+    pub async fn shared_network_running(&self) -> bool {
+        let Some(home) = &self.home else {
+            return false;
+        };
+        let network = home.join("_networks/user-v2");
+        let Ok(pid) = tokio::fs::read_to_string(network.join("usernet_user-v2.pid")).await else {
+            return false;
+        };
+        let Ok(pid) = pid.trim().parse::<i32>() else {
+            return false;
+        };
+        process_alive(pid)
+            && tokio::fs::try_exists(network.join("user-v2_fd.sock"))
+                .await
+                .unwrap_or(false)
+    }
+
     /// Read the status of exactly one owned VM; absence is not a command failure.
     pub async fn status(&self, name: &str) -> Result<Option<String>> {
         let output = self.command(&["list", "--json"]).await?;
@@ -158,6 +235,20 @@ impl Lima {
     }
 }
 
+fn process_alive(pid: i32) -> bool {
+    #[cfg(unix)]
+    {
+        use nix::{errno::Errno, sys::signal::kill, unistd::Pid};
+        // Signal 0 only checks existence; EPERM still means the process exists.
+        pid > 0 && matches!(kill(Pid::from_raw(pid), None), Ok(()) | Err(Errno::EPERM))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
 fn shared_address(route: &str) -> Result<Ipv4Addr> {
     let routes: Vec<serde_json::Value> = serde_json::from_str(route)?;
     if routes.len() != 1 {
@@ -192,6 +283,56 @@ mod tests {
         ] {
             assert!(shared_address(route).is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn shared_key_is_created_once_in_the_format_lima_expects() {
+        let home = tempfile::tempdir().unwrap();
+        let lima =
+            Lima::new("/bin/sh".into(), Duration::from_secs(2)).with_home(home.path().to_owned());
+        lima.ensure_user_key().await.unwrap();
+        let config = home.path().join("_config");
+        let public = std::fs::read_to_string(config.join("user.pub")).unwrap();
+        assert!(public.starts_with("ssh-ed25519 "), "{public}");
+        assert!(public.trim_end().ends_with(" lima"), "{public}");
+        let private = std::fs::read(config.join("user")).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&config.join("user")), 0o600);
+        assert_eq!(mode(&config), 0o700);
+        // Only the key pair is left behind, never a staging directory.
+        assert_eq!(std::fs::read_dir(&config).unwrap().count(), 2);
+        lima.ensure_user_key().await.unwrap();
+        assert_eq!(std::fs::read(config.join("user")).unwrap(), private);
+    }
+
+    #[tokio::test]
+    async fn shared_network_needs_a_live_daemon_and_its_socket() {
+        let home = tempfile::tempdir().unwrap();
+        let lima =
+            Lima::new("/bin/sh".into(), Duration::from_secs(2)).with_home(home.path().to_owned());
+        assert!(!lima.shared_network_running().await);
+        let network = home.path().join("_networks/user-v2");
+        std::fs::create_dir_all(&network).unwrap();
+        std::fs::write(network.join("user-v2_fd.sock"), b"").unwrap();
+        // A stale PID file from a stopped cluster must not count as running.
+        let mut exited = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exit 0")
+            .spawn()
+            .unwrap();
+        let stale = exited.id();
+        exited.wait().unwrap();
+        std::fs::write(network.join("usernet_user-v2.pid"), stale.to_string()).unwrap();
+        assert!(!lima.shared_network_running().await);
+        std::fs::write(
+            network.join("usernet_user-v2.pid"),
+            std::process::id().to_string(),
+        )
+        .unwrap();
+        assert!(lima.shared_network_running().await);
+        std::fs::remove_file(network.join("user-v2_fd.sock")).unwrap();
+        assert!(!lima.shared_network_running().await);
     }
 
     #[tokio::test]
