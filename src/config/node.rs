@@ -751,15 +751,24 @@ pub struct MetricsSection {
     pub collection_interval_secs: u64,
     /// Days to retain metric data before pruning.
     pub retention_days: u32,
-    /// How often to scrape Prometheus /metrics endpoints (seconds).
+    /// How often to scrape the static `scrape_targets` (seconds).
     pub scrape_interval_secs: u64,
-    /// Prometheus `/metrics` endpoints to scrape on `scrape_interval_secs`.
+    /// Fixed Prometheus `/metrics` endpoints to scrape on
+    /// `scrape_interval_secs`, for anything that isn't an app on this
+    /// cluster. Apps opt in with `metrics = {...}` on the app spec instead.
     ///
-    /// Empty (the default) disables scraping entirely — there is no per-app
-    /// scrape opt-in on the app spec, so operators declare targets here. Each
-    /// target's `job` becomes the `app` label on its samples, so per-app
-    /// dashboards and `/v1/metrics/app/...` queries can filter on it.
+    /// Empty (the default) spawns no loop for them. Each target's `job`
+    /// becomes the `app` label on its samples, so per-app dashboards and
+    /// `/v1/metrics/app/...` queries can filter on it.
     pub scrape_targets: Vec<ScrapeTarget>,
+    /// How often this node scrapes its own instances of apps that declare
+    /// `metrics` (seconds).
+    ///
+    /// Ten seconds matches `collection_interval_secs`, so an app's own
+    /// metrics and its CPU and memory share a resolution: fifteen minutes is
+    /// ninety points, enough for a sparkline and a steady per-second rate,
+    /// for one small HTTP request per instance per tick.
+    pub app_scrape_interval_secs: u64,
     /// Enable built-in alert evaluation.
     pub alerts_enabled: bool,
     /// Object store URL for metric persistence. Empty = local filesystem.
@@ -783,6 +792,7 @@ impl Default for MetricsSection {
             retention_days: 7,
             scrape_interval_secs: 30,
             scrape_targets: Vec::new(),
+            app_scrape_interval_secs: 10,
             alerts_enabled: true,
             object_store_url: String::new(),
             rollup_interval_secs: 60,
@@ -1181,6 +1191,7 @@ mod tests {
         assert_eq!(nc.metrics.collection_interval_secs, 10);
         assert_eq!(nc.metrics.retention_days, 7);
         assert_eq!(nc.metrics.scrape_interval_secs, 30);
+        assert_eq!(nc.metrics.app_scrape_interval_secs, 10);
         assert!(nc.metrics.alerts_enabled);
         assert!(nc.metrics.object_store_url.is_empty());
     }

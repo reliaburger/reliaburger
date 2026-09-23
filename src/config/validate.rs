@@ -577,6 +577,10 @@ impl NodeConfig {
                 "metrics.rollup_interval_secs",
                 self.metrics.rollup_interval_secs,
             ),
+            (
+                "metrics.app_scrape_interval_secs",
+                self.metrics.app_scrape_interval_secs,
+            ),
             ("logs.export_interval_secs", self.logs.export_interval_secs),
         ] {
             if value == 0 {

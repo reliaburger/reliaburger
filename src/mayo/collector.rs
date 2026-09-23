@@ -16,6 +16,22 @@ pub struct CollectedMetric {
     pub value: f64,
 }
 
+/// One running workload instance whose process the collector samples.
+///
+/// Borrows its strings from the agent's status list for the length of
+/// one collection tick; the `'a` lifetime says it can't outlive them.
+#[derive(Debug, Clone, Copy)]
+pub struct InstanceProcess<'a> {
+    /// Host PID, when the runtime reports one.
+    pub pid: Option<u32>,
+    /// Namespace the app lives in.
+    pub namespace: &'a str,
+    /// App name.
+    pub app: &'a str,
+    /// Instance id, e.g. `default__web-0`.
+    pub instance: &'a str,
+}
+
 /// Collects system and per-process metrics via sysinfo.
 pub struct SystemCollector {
     system: System,
@@ -114,20 +130,28 @@ impl SystemCollector {
 
     /// Collect per-app process metrics for a batch of running instances.
     ///
-    /// Each instance is `(pid, namespace, app)`; instances without a PID are
-    /// skipped. Metrics are labelled `namespace/app` under the `app` key, the
-    /// shape the per-app query endpoint and autoscaler filter on. Extracted from
-    /// the collection loop in the `bun` binary so the labelling logic is
-    /// testable rather than buried in un-reachable glue (OBS3).
+    /// Instances without a PID are skipped. Metrics are labelled
+    /// `namespace/app` under the `app` key, the shape the per-app query
+    /// endpoint and autoscaler filter on, plus `namespace`, `instance` and
+    /// `node`, the same labels scraped app metrics carry, so a chart can
+    /// draw one line per instance. Extracted from the collection loop in the
+    /// `bun` binary so the labelling logic is testable rather than buried in
+    /// un-reachable glue (OBS3).
     pub fn collect_instance_metrics(
         &self,
-        instances: &[(Option<u32>, &str, &str)],
+        instances: &[InstanceProcess<'_>],
+        node: &str,
     ) -> Vec<CollectedMetric> {
         let mut metrics = Vec::new();
-        for (pid, namespace, app) in instances {
-            if let Some(pid) = pid {
-                let app_label = format!("{namespace}/{app}");
-                metrics.extend(self.collect_process_metrics(*pid, &app_label));
+        for instance in instances {
+            let Some(pid) = instance.pid else { continue };
+            let app_label = format!("{}/{}", instance.namespace, instance.app);
+            for mut metric in self.collect_process_metrics(pid, &app_label) {
+                let labels = &mut metric.key.labels;
+                labels.insert("namespace".to_string(), instance.namespace.to_string());
+                labels.insert("instance".to_string(), instance.instance.to_string());
+                labels.insert("node".to_string(), node.to_string());
+                metrics.push(metric);
             }
         }
         metrics
@@ -315,11 +339,14 @@ mod tests {
         // OBS3: the collection loop labels per-app metrics `namespace/app`.
         let collector = SystemCollector::new();
         let pid = std::process::id();
-        let instances = [(Some(pid), "prod", "web")];
-        let metrics = collector.collect_instance_metrics(&instances);
+        let instances = [process(Some(pid), "web")];
+        let metrics = collector.collect_instance_metrics(&instances, "node-a");
         assert_eq!(metrics.len(), 2, "cpu + memory for the one live instance");
         for m in &metrics {
             assert_eq!(m.key.labels.get("app").unwrap(), "prod/web");
+            assert_eq!(m.key.labels.get("namespace").unwrap(), "prod");
+            assert_eq!(m.key.labels.get("instance").unwrap(), "web-0");
+            assert_eq!(m.key.labels.get("node").unwrap(), "node-a");
         }
     }
 
@@ -328,11 +355,11 @@ mod tests {
         let collector = SystemCollector::new();
         let pid = std::process::id();
         let instances = [
-            (None, "prod", "no-pid"),             // skipped
-            (Some(pid), "prod", "live"),          // collected
-            (Some(999_999_999), "prod", "ghost"), // no such process → empty
+            process(None, "no-pid"),             // skipped
+            process(Some(pid), "live"),          // collected
+            process(Some(999_999_999), "ghost"), // no such process → empty
         ];
-        let metrics = collector.collect_instance_metrics(&instances);
+        let metrics = collector.collect_instance_metrics(&instances, "node-a");
         // Only the live instance contributes (2 metrics).
         assert_eq!(metrics.len(), 2);
         assert!(
@@ -345,7 +372,16 @@ mod tests {
     #[test]
     fn instance_metrics_empty_input_is_empty() {
         let collector = SystemCollector::new();
-        assert!(collector.collect_instance_metrics(&[]).is_empty());
+        assert!(collector.collect_instance_metrics(&[], "node-a").is_empty());
+    }
+
+    fn process(pid: Option<u32>, app: &str) -> InstanceProcess<'_> {
+        InstanceProcess {
+            pid,
+            namespace: "prod",
+            app,
+            instance: "web-0",
+        }
     }
 
     #[test]

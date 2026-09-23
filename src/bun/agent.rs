@@ -356,6 +356,11 @@ pub enum AgentCommand {
     DesiredApps {
         response: oneshot::Sender<Vec<crate::bun::diagnostics::DesiredAppEvidence>>,
     },
+    /// Get the metrics endpoint of every live local instance whose app
+    /// declares `metrics`, for the node's scrape loop.
+    ScrapeTargets {
+        response: oneshot::Sender<Vec<crate::mayo::scrape::AppScrapeTarget>>,
+    },
     /// Get the currently deployed resources in plan format ("app.{name}",
     /// "job.{name}") with their images, for `relish --dry-run` diffing.
     CurrentResources {
@@ -4016,6 +4021,35 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             AgentCommand::Status { response } => {
                 let statuses = self.get_status().await;
                 let _ = response.send(statuses);
+            }
+            AgentCommand::ScrapeTargets { response } => {
+                let targets = self
+                    .supervisor
+                    .list_instances()
+                    .iter()
+                    .filter(|instance| {
+                        !instance.is_job
+                            && matches!(
+                                instance.state,
+                                ContainerState::HealthWait
+                                    | ContainerState::Running
+                                    | ContainerState::Unhealthy
+                            )
+                    })
+                    .filter_map(|instance| {
+                        let spec = self
+                            .deployed_specs
+                            .get(&(instance.app_name.clone(), instance.namespace.clone()))?;
+                        crate::mayo::scrape::AppScrapeTarget::for_instance(
+                            &instance.id.0,
+                            &instance.app_name,
+                            &instance.namespace,
+                            instance.container_ip,
+                            spec,
+                        )
+                    })
+                    .collect();
+                let _ = response.send(targets);
             }
             AgentCommand::DesiredApps { response } => {
                 let mut apps = self
@@ -16141,6 +16175,44 @@ host = "remote.local"
                 .iter()
                 .all(|backend| backend.host_port == 8080),
             "a container IP must use its declared port, not the allocated host port"
+        );
+    }
+
+    #[tokio::test]
+    async fn scrape_targets_name_each_running_instance_of_apps_with_metrics() {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        grill.set_container_ip(std::net::Ipv4Addr::new(10, 0, 2, 5));
+        let config = Config::parse(
+            r#"
+            [app.web]
+            image = "myapp:v1"
+            port = 8080
+            metrics = { port = 9797 }
+
+            [app.quiet]
+            image = "myapp:v1"
+            port = 8081
+            "#,
+        )
+        .unwrap();
+        let (ev_tx, mut ev_rx) = mpsc::channel(64);
+        agent.deploy(config, &ev_tx).await;
+        drop(ev_tx);
+        while ev_rx.recv().await.is_some() {}
+
+        let (response, receiver) = oneshot::channel();
+        agent
+            .handle_command(AgentCommand::ScrapeTargets { response })
+            .await;
+        let targets = receiver.await.unwrap();
+        assert_eq!(
+            targets,
+            vec![crate::mayo::scrape::AppScrapeTarget {
+                app: "web".to_string(),
+                namespace: "default".to_string(),
+                instance: "default__web-0".to_string(),
+                url: "http://10.0.2.5:9797/metrics".to_string(),
+            }]
         );
     }
 

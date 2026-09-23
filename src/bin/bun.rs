@@ -1716,6 +1716,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     let collection_interval = config.metrics.collection_interval_secs.max(1);
     let collection_shutdown = shutdown.clone();
     let collection_cmd_tx = cmd_tx.clone();
+    let collection_node = node_name.clone();
     feeder_handles.push(tokio::spawn(async move {
         let mut collector = SystemCollector::new();
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(collection_interval));
@@ -1740,11 +1741,19 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                         .is_ok()
                         && let Ok(statuses) = status_rx.await
                     {
-                        let instances: Vec<(Option<u32>, &str, &str)> = statuses
-                            .iter()
-                            .map(|s| (s.pid, s.namespace.as_str(), s.app_name.as_str()))
-                            .collect();
-                        samples.extend(collector.collect_instance_metrics(&instances));
+                        let instances: Vec<reliaburger::mayo::collector::InstanceProcess<'_>> =
+                            statuses
+                                .iter()
+                                .map(|s| reliaburger::mayo::collector::InstanceProcess {
+                                    pid: s.pid,
+                                    namespace: &s.namespace,
+                                    app: &s.app_name,
+                                    instance: &s.id,
+                                })
+                                .collect();
+                        samples.extend(
+                            collector.collect_instance_metrics(&instances, &collection_node),
+                        );
                     }
 
                     // Ingress metrics (E): fold the wrapper's process-global
@@ -1797,6 +1806,59 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             }
         }
     }));
+
+    // Scrape this node's own instances of apps that declare `metrics` (Z6.5).
+    // The loop asks the agent for targets over the command channel and does
+    // the HTTP work itself, so a slow or hung app never stalls the agent.
+    // Each request is bounded by half the interval (at most 5 s), so a sweep
+    // finishes before the next one is due.
+    {
+        let scrape_mayo = Arc::clone(&mayo_store);
+        let interval =
+            std::time::Duration::from_secs(config.metrics.app_scrape_interval_secs.max(1));
+        let timeout = (interval / 2).clamp(
+            std::time::Duration::from_millis(500),
+            std::time::Duration::from_secs(5),
+        );
+        let scrape_shutdown = shutdown.clone();
+        let scrape_cmd_tx = cmd_tx.clone();
+        let scrape_node = node_name.clone();
+        feeder_handles.push(tokio::spawn(async move {
+            let client = reqwest::Client::builder()
+                .timeout(timeout)
+                .build()
+                .unwrap_or_default();
+            let mut tick = tokio::time::interval(interval);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = scrape_shutdown.cancelled() => break,
+                    _ = tick.tick() => {
+                        let (response, targets) = tokio::sync::oneshot::channel();
+                        if scrape_cmd_tx
+                            .send(reliaburger::bun::agent::AgentCommand::ScrapeTargets { response })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        let Ok(targets) = targets.await else { continue };
+                        if targets.is_empty() {
+                            continue;
+                        }
+                        reliaburger::mayo::scrape::scrape_app_targets(
+                            &scrape_mayo,
+                            &client,
+                            &targets,
+                            &scrape_node,
+                            timeout,
+                        )
+                        .await;
+                    }
+                }
+            }
+        }));
+    }
 
     // Spawn Prometheus scrape task (E). Only when targets are configured —
     // an empty list means scraping is disabled and no loop is spawned.
