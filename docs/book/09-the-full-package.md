@@ -157,6 +157,8 @@ The evaluation logic above — `compute_desired`, the hysteresis, the cooldown �
 
 Wiring it revealed a small design mismatch worth explaining. `run_autoscale_loop` took a *synchronous* `app_provider` closure — `Fn() -> Vec<(AppId, ...)>` — to list the apps to consider. But the apps live in the Raft desired state, which you read with an `async` call, and the metrics live in the rollup store, also async. A sync closure can't `await`. Rather than contort a shared cache to feed the sync closure, the leader task drives the same *pure* functions directly: `AutoscaleConfig::from_spec`, `evaluate`, and the `AutoscaleTracker`. The tested logic is reused; only the plumbing around it is new. When a library's shape doesn't fit the wiring, reach for its tested internals rather than bending the wiring to the shape.
 
+We later deleted `run_autoscale_loop` outright. Nothing called it, and it started the cooldown before knowing whether the Raft write had succeeded (the first bug below). `cluster::orchestrate::spawn_autoscaler` is now the only loop.
+
 The loop lives where every leader-only loop in Reliaburger lives — spawned once, checking leadership each tick, no start/stop dance. Each cycle: read the desired apps, keep only those with an `[autoscale]` section, query the rollup store for each app's recent metric, run `evaluate`, and on a decision commit an `AutoscaleOverride` to Raft.
 
 That last word is the whole trick. The autoscaler doesn't deploy anything or talk to nodes. It writes one number to Raft — the desired replica count — and stops. The scheduler from Chapter 2 already watches desired state; it now reads the *effective* replica count (the override if one exists, else the spec's) and re-places accordingly, and the per-node reconcilers converge. Scaling is just another edit to desired state, flowing through the exact machinery a manual `relish apply` uses. No parallel path, no special case. The integration test drives it end to end: deploy a one-replica app, feed a sustained 95% CPU metric into the rollup stores, and watch the cluster grow the app to its `max` of three — purely because a number changed in Raft.
@@ -871,6 +873,8 @@ the digest stays fixed, and the normal OCI client still resolves the host
 architecture and checks downloaded content. This remains a network dependency,
 so the signed cold-install gate must exercise it too.
 
+The context also records the other loopback forwards, HTTP ingress on 18080 and the authenticated registry on 15050, so tools don't have to guess guest ports. And the guest's systemd unit mounts bpffs at `/sys/fs/bpf` in an `ExecStartPre` step if the base image didn't, so Bun never starts without the filesystem that holds its eBPF pins.
+
 ### Status from any node
 
 A one-replica app can run on the third VM while your CLI connects to the first.
@@ -925,174 +929,33 @@ Cargo features select optional crate behaviour at compile time; here both debug
 and release builds carry their assets. A development binary should exercise the
 same standalone packaging contract as the release.
 
+### Scripts read exit codes, not sentences
 
-### A status command must fail when the cluster is unhealthy
+A script that runs `relish local status` can't read our intentions. It sees an exit code. The first version printed "Missing" or "API not ready" and still exited 0. Now every owned VM gets a condition:
 
-A script that runs `relish local status` cannot read our intentions. It sees an
-exit code. The first implementation printed “Missing” or “API not ready” and
-still returned success. We now collect a `NodeStatus` for every owned VM, with a
-`NodeCondition` enum distinguishing ready, missing, stopped, API failure and
-unknown evidence. Only a complete ready set returns exit 0; all other outcomes
-return exit 1 after showing the observations.
+```rust
+pub enum NodeCondition {
+    Ready,
+    Missing,
+    NotRunning { vm_state: String },
+    ApiNotReady { reason: String },
+    Unknown { reason: String },
+}
+```
 
-The real CLI regression supplies a private saved operation and a tiny Lima
-fixture that answers only read-only list requests. It checks missing and stopped
-VMs, then holds a TCP listener open without answering TLS to model an
-unresponsive API. All three must fail without changing any VM. Existing
-readiness tests separately prove that liveness without ready critical subsystems
-cannot pass.
+Unlike a C enum, a Rust variant can carry its own fields, so "not running" arrives with the state Lima reported. The command prints every node and exits 1 unless all are `Ready`. `Unknown` counts as unhealthy: if we couldn't look, we can't claim it's fine. The older `relish dev` commands likewise validate their saved state file (cluster name, node list, VM ownership) before touching Lima, because parsing JSON proves we have Rust values, not that they describe *our* cluster.
 
+Numbers are the other trap. `relish fault --duration 5m` must fit the request's seconds field:
 
-### Validate a saved development cluster before touching Lima
+```rust
+let seconds = mins.checked_mul(60).ok_or_else(|| RelishError::ApiError {
+    status: 0,
+    body: format!("duration {s} exceeds the supported seconds range"),
+})?;
+```
 
-Suppose a truncated state file says a cluster has no nodes. Indexing its first
-node panics. Worse, a saved node name that belongs to another cluster could send
-`dev destroy` to the wrong VM. Parsing JSON only establishes that we have Rust
-values; it does not prove that those values describe our cluster.
+Rust integer overflow panics in debug builds and silently wraps in release builds. `checked_mul` returns `Some(product)` when the result fits and `None` when it doesn't, and `ok_or_else` turns `None` into our error. Delays convert to nanoseconds with `u64::try_from(duration.as_nanos())` for the same reason: `as_nanos()` returns a `u128`, and an `as u64` cast would quietly drop the high bits and inject a different delay.
 
-The older `relish dev` commands now check the requested cluster name, complete
-node list, ownership names, runtime, resources and IP addresses before any VM
-operation. Start, stop and destroy confirm that every owned VM exists before
-mutating one. Errors preserve the state file so the operator can diagnose it.
-This development backend discovers IPv4 addresses; it refuses incomplete saved
-addresses instead of substituting loopback.
+### Ship the bytes you tested
 
-Paths need the same care. Rust's `Path` can contain bytes that are not UTF-8,
-while a Lima command string needs text. `Path::to_str` therefore returns an
-`Option<&str>`: `Some` contains valid text and `None` means conversion is not
-possible. We turn `None` into an actionable error before creating or recreating
-VMs. Shell commands quote valid paths and test filters as single arguments, so
-spaces, apostrophes and dollar signs keep their literal meaning.
-
-The CLI regressions use a private home directory and fake Lima executable.
-They prove that malformed ownership, missing addresses and unsupported runtimes
-never invoke Lima, that a missing owned VM permits only a listing, and that an
-invalid checkout is refused before `--recreate`. A shell fixture passes a path
-containing quotes and command substitution plus a semicolon-bearing test filter;
-only the intended argument reaches Cargo. No real VM is involved.
-
-
-The managed context also records service forwards. HTTP ingress defaults to
-localhost port 18080 and the authenticated HTTPS registry to 15050. The latter is
-selected with `relish setup --quickstart --registry-port PORT`. Setup checks that
-it doesn't overlap an API or ingress port, and Lima exposes it only on loopback.
-The context lets the test catalogue use the host address rather than guessing a
-guest port from the API URL. Chapter 15 follows that distinction through IPv6,
-TLS server names and credential-free workload probes.
-
-
-For 0.1.0, we delete that obsolete loop. It had no callers or tests, and it
-advanced the tracker before learning whether a decision had reached Raft. The
-wired `cluster::orchestrate::spawn_autoscaler` remains the sole long-lived loop;
-its pure decision functions and existing tests stay in `meat::autoscaler`.
-Leaving an unused alternative around would give the next reader two conflicting
-answers to the same lifecycle question.
-
-
-### Keep duration units inside their destination type
-
-A fault duration written in minutes must fit in the seconds field we send.
-A delay must fit in a narrower nanosecond field. Those are separate limits.
-`u64::MAX` seconds is representable as a Rust `Duration`, but multiplying it by
-one billion doesn't fit in a `u64` nanosecond counter.
-
-`checked_mul` returns `Some(product)` when multiplication fits and `None` when
-it doesn't. We turn `None` into a CLI error before submitting the request.
-`u64::try_from(duration.as_nanos())` checks the separate conversion from Rust's
-`u128` nanosecond total. An `as u64` cast would truncate the high bits and submit
-a different delay. Tests exercise the largest accepted value and its immediate
-successor for minutes, hours and milliseconds converted to nanoseconds. The
-original code panics on the multiplication in a debug build and silently
-truncates the delay; both failures reproduce before the repair.
-
-
-### Similar duration strings can mean different things
-
-`relish fault --duration 60` means sixty seconds. `relish logs --since 60`
-means epoch second sixty. The log filter also accepts `1d`; the fault/test
-parser does not. Combining these parsers would change the CLI contract.
-
-We evaluated humantime 2.3.0 against a twelve-input corpus. It rejects a bare
-`60` and accepts compound, fractional and extra-unit forms that our commands
-currently reject. Keeping today's syntax would still require our own admission
-wrapper and the same checked conversion to nanoseconds. For 0.1.0 we retain the
-small duration parsers. Their compatibility table, numeric boundary tests and
-arbitrary-text property test make that decision executable. Hickory replaces
-the DNS codec because complete wire decoding removes a second parser's worth
-of boundary and compression handling; the duration evaluation doesn't show
-the same benefit.
-
-### Build once, qualify those bytes, publish those bytes
-
-Suppose our laptop test passes with one binary, then pushing a release tag
-builds it again. The source is unchanged. The compiler, linker or build input
-might not be. We've tested one executable and published another.
-
-The candidate workflow now builds and signs on a manually selected main commit,
-after source CI passes. It records every asset's size and SHA-256 in
-`candidate.json`, together with the source commit and workflow run/attempt.
-The qualification report keeps that record's digest. A later promotion downloads
-the saved candidate and checks it against the report before creating a draft.
-It also compares GitHub's uploaded asset digests before making the draft public.
-No compiler or signing key participates in promotion.
-
-Promotion does hold a token that can write releases, though, so the code it
-runs matters as much as the bytes it publishes. Our first version checked out
-the tag and ran that tree's `candidate.py`. Anyone who could push a tag could
-therefore hand the write token a script of their own, skipping main's branch
-protection entirely. Now the workflow only runs from `main` and checks out
-`main`'s scripts. It treats the tag as data: `git show
-"refs/tags/$RELEASE_TAG:Cargo.toml"` reads the version and
-`git rev-parse "refs/tags/$RELEASE_TAG^{commit}"` names the candidate commit.
-Nothing from the tag's tree ever executes. `test_promote_workflow.py` pins
-both rules, and also checks that no `${{ inputs.* }}` expression is pasted
-into a shell script, where a crafted input would become code.
-
-The Python helper is deliberately separate from Rust's runtime upgrade verifier.
-It coordinates release files and GitHub provenance; the agent still verifies
-Ed25519 signatures before executing a replacement. A SHA-256 copied from an
-untrusted download is not an approval. Here the independently retained digest
-binds promotion to the bytes the operator qualified.
-
-Tests change each asset, remove it, add unexpected files and substitute a source
-commit, version, repository or run. They also reject failed/PR build provenance,
-symlinks, incomplete matrices, changed guest images and mismatched uploaded
-assets. A passing round trip preserves every original byte. This gives us a
-repeatable publication gate, not evidence that the first public installation
-has already passed; that still needs the real candidate and empty caches.
-
-### Test the final installer before its final URL exists
-
-Our candidate contains metadata pointing at `v0.1.0` on GitHub. Those URLs won't
-exist until publication. Rewriting metadata for a test server would change the
-file set we just promised to preserve.
-
-Instead, the installer accepts `RELIABURGER_RELEASE_BASE_URL`, an explicit HTTPS
-directory of unchanged candidate files. It downloads the same checksum-pinned
-CLI and passes that directory to `setup --quickstart --release-mirror`. The
-managed downloader translates only this version's Reliaburger asset URLs. Lima
-still comes from its pinned upstream URL. Every transferred binary and guest
-image keeps the existing checksum or signature verification.
-
-The optional mirror is a transport choice for one setup command, not a new
-cluster identity or a weaker development mode. Repeat it when resuming. We
-validate the directory before creating setup state, reject credentials/query
-strings/fragments, and refuse combining it with development binaries. Tests
-run both shell entry points with a captured download transport, then exercise
-metadata and binary downloads through a real local HTTP fixture. The fixture's
-HTTP exception exists only in test builds; distributed CLIs require HTTPS.
-
-The candidate record can also be verified locally before staging, without
-creating a release tag. None of these tests claims that the first signed
-candidate has completed the cold-host matrix. They make that test possible.
-
-### Establish the kernel filesystem before starting Bun
-
-Durable kernel recovery needs bpffs mounted at `/sys/fs/bpf`. A managed guest
-cannot assume the base image mounted it. Its systemd service now runs a short
-pre-start command: retain an existing mount, otherwise mount bpffs, and let any
-failure prevent Bun from starting. The loader still verifies ownership and refuses
-invalid pins. A physical regression starts in a private mount namespace, removes
-the inherited mount, runs the actual generated preflight twice and checks the
-filesystem type after each run. This covers first boot and repeat startup without
-unmounting the host's policy inventory.
+If a laptop test passes with one binary and the release tag then builds it again, we've tested one executable and published another. So the candidate workflow builds and signs once, from a commit on `main`, and records every asset's SHA-256 in `candidate.json`. Promotion checks the saved candidate against the digest kept at qualification time and publishes those exact bytes, with no compiler or signing key involved. It does hold a token that can write releases, so it runs only from `main` with `main`'s scripts and treats the tag strictly as data. Our first version ran the tagged tree's `candidate.py`, which let anyone who could push a tag hand that token a script of their own.
