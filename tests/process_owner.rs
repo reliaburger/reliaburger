@@ -2,37 +2,101 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
+
+use reliaburger::grill::process_owner;
+
+/// A fresh 32-hex-digit generation, unique per test process and owner.
+fn generation() -> String {
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    format!(
+        "{:016x}{:016x}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// An owner record in the current format, running `command`.
+fn owner_record(
+    nonce: &str,
+    command: serde_json::Value,
+    phase: serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "schema": 3,
+        "boot_id": process_owner::current_boot_id().unwrap().unwrap(),
+        "nonce": nonce,
+        "command": command,
+        "environment": {},
+        "phase": phase,
+        "launch": {
+            "instance_id": "default__owner-0",
+            "spec": {
+                "root": {"path": "/", "readonly": false},
+                "process": {
+                    "args": command,
+                    "env": [],
+                    "cwd": "/",
+                    "user": {"uid": 0, "gid": 0},
+                },
+                "mounts": [],
+                "linux": {"namespaces": []},
+            },
+        },
+    })
+}
 
 struct Owner {
     directory: tempfile::TempDir,
+    nonce: String,
+    socket: PathBuf,
     child: Child,
 }
 
 impl Owner {
     fn start(script: &str) -> Self {
         let directory = tempfile::tempdir_in("/tmp").unwrap();
-        let spec = serde_json::json!({
-            "schema": 1,
-            "nonce": "test-owner-generation",
-            "command": ["/bin/sh", "-c", script],
-            "environment": {},
-            "phase": { "state": "prepared" },
-        });
+        let nonce = generation();
+        let spec = owner_record(
+            &nonce,
+            serde_json::json!(["/bin/sh", "-c", script]),
+            serde_json::json!({ "state": "prepared" }),
+        );
         std::fs::write(
             directory.path().join("owner.json"),
             serde_json::to_vec(&spec).unwrap(),
         )
         .unwrap();
+        let socket = process_owner::socket_path(&serde_json::from_value(spec).unwrap());
         let child = Command::new(env!("CARGO_BIN_EXE_bun"))
             .args(["__process-owner", "--directory"])
             .arg(directory.path())
+            .arg("--generation")
+            .arg(&nonce)
             .stdout(Stdio::null())
             .stderr(std::fs::File::create(directory.path().join("owner.log")).unwrap())
             .spawn()
             .unwrap();
-        Self { directory, child }
+        Self {
+            directory,
+            nonce,
+            socket,
+            child,
+        }
+    }
+
+    /// Run a second owner helper against this owner's directory.
+    fn launch_duplicate(&self) -> std::process::Output {
+        Command::new(env!("CARGO_BIN_EXE_bun"))
+            .args(["__process-owner", "--directory"])
+            .arg(self.directory.path())
+            .arg("--generation")
+            .arg(&self.nonce)
+            .output()
+            .unwrap()
     }
 
     fn wait_phase(&mut self, expected: &str) -> serde_json::Value {
@@ -74,7 +138,7 @@ impl Owner {
     }
 
     fn request(&self, nonce: &str, action: &str) -> serde_json::Value {
-        let mut socket = UnixStream::connect(self.directory.path().join("control.sock")).unwrap();
+        let mut socket = UnixStream::connect(&self.socket).unwrap();
         socket
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
@@ -95,11 +159,11 @@ impl Drop for Owner {
         if self.child.try_wait().ok().flatten().is_some() {
             return;
         }
-        if let Ok(mut socket) = UnixStream::connect(self.directory.path().join("control.sock")) {
+        if let Ok(mut socket) = UnixStream::connect(&self.socket) {
             let _ = writeln!(
                 socket,
                 "{}",
-                serde_json::json!({"nonce": "test-owner-generation", "action": "kill"})
+                serde_json::json!({"nonce": self.nonce, "action": "kill"})
             );
         }
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -161,13 +225,10 @@ fn wrong_generation_cannot_signal_a_live_owner() {
         "owner generation mismatch"
     );
     assert_eq!(
-        owner.request("test-owner-generation", "status")["phase"]["state"],
+        owner.request(&owner.nonce, "status")["phase"]["state"],
         "running"
     );
-    assert_eq!(
-        owner.request("test-owner-generation", "kill")["accepted"],
-        true
-    );
+    assert_eq!(owner.request(&owner.nonce, "kill")["accepted"], true);
     let record = owner.wait_phase("retired");
     assert!(record["phase"]["exit_code"].is_null());
 }
@@ -176,11 +237,11 @@ fn wrong_generation_cannot_signal_a_live_owner() {
 fn execution_gate_refuses_eof_before_activation() {
     let directory = tempfile::tempdir_in("/tmp").unwrap();
     let marker = directory.path().join("ran");
-    let spec = serde_json::json!({
-        "schema": 1, "nonce": "test-owner-generation",
-        "command": ["/bin/sh", "-c", format!("touch '{}'", marker.display())],
-        "environment": {}, "phase": {"state": "prepared"},
-    });
+    let spec = owner_record(
+        &generation(),
+        serde_json::json!(["/bin/sh", "-c", format!("touch '{}'", marker.display())]),
+        serde_json::json!({"state": "prepared"}),
+    );
     std::fs::write(
         directory.path().join("owner.json"),
         serde_json::to_vec(&spec).unwrap(),
@@ -201,18 +262,14 @@ fn execution_gate_refuses_eof_before_activation() {
 fn duplicate_owner_cannot_launch_or_replace_a_live_generation() {
     let mut owner = Owner::start("sleep 30");
     let running = owner.wait_phase("running");
-    let output = Command::new(env!("CARGO_BIN_EXE_bun"))
-        .args(["__process-owner", "--directory"])
-        .arg(owner.directory.path())
-        .output()
-        .unwrap();
+    let output = owner.launch_duplicate();
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("busy"));
     assert_eq!(
-        owner.request("test-owner-generation", "status")["phase"],
+        owner.request(&owner.nonce, "status")["phase"],
         running["phase"]
     );
-    owner.request("test-owner-generation", "kill");
+    owner.request(&owner.nonce, "kill");
     owner.wait_phase("retired");
 }
 
@@ -221,11 +278,7 @@ fn retired_generation_cannot_execute_again() {
     let mut owner = Owner::start("exit 0");
     owner.wait_phase("retired");
     assert!(owner.child.wait().unwrap().success());
-    let output = Command::new(env!("CARGO_BIN_EXE_bun"))
-        .args(["__process-owner", "--directory"])
-        .arg(owner.directory.path())
-        .output()
-        .unwrap();
+    let output = owner.launch_duplicate();
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("already started"));
     owner.wait_phase("retired");
@@ -235,12 +288,12 @@ fn retired_generation_cannot_execute_again() {
 fn malformed_and_abandoned_clients_do_not_end_the_owner() {
     let mut owner = Owner::start("sleep 30");
     owner.wait_phase("running");
-    let path = owner.directory.path().join("control.sock");
+    let path = owner.socket.clone();
     // This connection never sends a newline. Its timeout must let the next
     // client through without preventing exit observation or future cleanup.
     let stalled = UnixStream::connect(&path).unwrap();
     let mut oversized = serde_json::to_vec(&serde_json::json!({
-        "nonce": "test-owner-generation", "action": "kill"
+        "nonce": owner.nonce, "action": "kill"
     }))
     .unwrap();
     oversized.extend(vec![b' '; 64 * 1024]);
@@ -270,10 +323,10 @@ fn malformed_and_abandoned_clients_do_not_end_the_owner() {
     }
     drop(stalled);
     assert_eq!(
-        owner.request("test-owner-generation", "status")["phase"]["state"],
+        owner.request(&owner.nonce, "status")["phase"]["state"],
         "running"
     );
-    owner.request("test-owner-generation", "kill");
+    owner.request(&owner.nonce, "kill");
     owner.wait_phase("retired");
 }
 
@@ -287,11 +340,11 @@ fn execution_gate_requires_its_exact_durable_identity() {
         let marker = directory.path().join("ran");
         std::fs::write(
             directory.path().join("owner.json"),
-            serde_json::to_vec(&serde_json::json!({
-                "schema": 1, "nonce": "test-owner-generation",
-                "command": ["/bin/sh", "-c", format!("touch '{}'", marker.display())],
-                "environment": {}, "phase": phase,
-            }))
+            serde_json::to_vec(&owner_record(
+                &generation(),
+                serde_json::json!(["/bin/sh", "-c", format!("touch '{}'", marker.display())]),
+                phase,
+            ))
             .unwrap(),
         )
         .unwrap();
@@ -317,7 +370,7 @@ fn failed_terminal_persistence_does_not_publish_retirement() {
     let path = owner.directory.path().join("owner.json");
     std::fs::rename(&path, owner.directory.path().join("last-confirmed.json")).unwrap();
     std::fs::create_dir(&path).unwrap();
-    owner.request("test-owner-generation", "kill");
+    owner.request(&owner.nonce, "kill");
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         if let Some(status) = owner.child.try_wait().unwrap() {

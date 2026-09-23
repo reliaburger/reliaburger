@@ -65,9 +65,9 @@ enum Command {
         directory: PathBuf,
         /// Exact generation selected before launching the helper.
         #[arg(long)]
-        generation: Option<String>,
+        generation: String,
         /// Reparent the durable owner before acknowledging the launcher.
-        #[arg(long, requires = "generation")]
+        #[arg(long)]
         detach: bool,
     },
     /// Internal workload activation gate; never executes before durable ownership.
@@ -616,19 +616,13 @@ fn main() -> anyhow::Result<()> {
             detach,
         }) => {
             if *detach {
-                let generation = generation
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("detached owner requires a generation"))?;
                 return reliaburger::grill::process_owner::launch_detached_owner(
                     directory, generation,
                 )
                 .map_err(Into::into);
             }
-            return reliaburger::grill::process_owner::run_owner_generation(
-                directory,
-                generation.as_deref(),
-            )
-            .map_err(Into::into);
+            return reliaburger::grill::process_owner::run_owner_generation(directory, generation)
+                .map_err(Into::into);
         }
         Some(Command::ProcessExecutionGate { directory }) => {
             return reliaburger::grill::process_owner::run_execution_gate(directory)

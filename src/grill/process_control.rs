@@ -52,10 +52,7 @@ impl ProcessControl {
         validate_directory(&self.root)?;
         validate_directory(&directory)?;
         let record = process_owner::load(&directory)?;
-        let launch = record
-            .launch
-            .as_ref()
-            .ok_or_else(|| io::Error::other("missing process launch intent"))?;
+        let launch = &record.launch;
         if launch.instance_id != *id
             || record.command != command(&launch.spec)
             || record.environment != environment(&launch.spec)
@@ -105,9 +102,7 @@ impl ProcessControl {
                         }
                         let instance_id = InstanceId(name);
                         let record = this.load(&instance_id)?;
-                        let launch = record
-                            .launch
-                            .ok_or_else(|| io::Error::other("missing process launch intent"))?;
+                        let launch = record.launch;
                         launches.push(super::RuntimeLaunch {
                             generation: super::RuntimeGeneration::process(&record.nonce),
                             instance_id,
@@ -147,15 +142,16 @@ impl ProcessControl {
                 .map_err(|_| io::Error::other("cannot generate process capability"))?;
             let record = OwnerRecord {
                 schema: 3,
-                boot_id: process_owner::current_boot_id()?,
+                boot_id: process_owner::current_boot_id()?
+                    .ok_or_else(|| io::Error::other("kernel boot identity unavailable"))?,
                 nonce: hex::encode(nonce),
                 command: command(&spec),
                 environment: environment(&spec),
                 phase: OwnerPhase::Prepared,
-                launch: Some(ProcessLaunch {
+                launch: ProcessLaunch {
                     instance_id: id.clone(),
                     spec,
-                }),
+                },
             };
             match std::fs::symlink_metadata(&directory) {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -196,7 +192,7 @@ impl ProcessControl {
                             "previous process generation has not retired",
                         ));
                     }
-                    remove_control_socket(&directory, &previous)?;
+                    remove_control_socket(&previous)?;
                     process_owner::persist(&directory, &record)
                 }
             }
@@ -301,7 +297,7 @@ impl ProcessControl {
                 if !matches!(record.phase, OwnerPhase::Running { .. }) {
                     return Ok(record);
                 }
-                let result = request(&this.directory(&id)?, &record, "status");
+                let result = request(&record, "status");
                 // The owner may commit completion and remove its socket between
                 // reading the record and connecting. Re-read that positive proof.
                 let current = this.finish_retirement(&id)?;
@@ -362,7 +358,7 @@ impl ProcessControl {
                     // subsequent reload sees Cancelled, never user code.
                     record.phase = OwnerPhase::Cancelled;
                     process_owner::persist(&directory, &record)?;
-                    remove_control_socket(&directory, &record)?;
+                    remove_control_socket(&record)?;
                     return Ok(());
                 }
             }
@@ -374,11 +370,7 @@ impl ProcessControl {
             }
             let mut attempt = 1;
             loop {
-                let result = request(
-                    &directory,
-                    &record,
-                    if force { "kill" } else { "terminate" },
-                );
+                let result = request(&record, if force { "kill" } else { "terminate" });
                 let current = this.finish_retirement(&id)?;
                 if current.nonce != record.nonce {
                     return Err(io::Error::other(
@@ -485,7 +477,7 @@ impl ProcessControl {
         if !matches!(record.phase, OwnerPhase::Running { .. }) {
             return Err(io::Error::other("instance is not running"));
         }
-        let path = process_owner::socket_path(&self.directory(id)?, &record);
+        let path = process_owner::socket_path(&record);
         let request = format!(
             "{}\n",
             serde_json::json!({"nonce": record.nonce, "action": "exec", "command": command})
@@ -623,8 +615,8 @@ fn wait_for_owner_lock(directory: &Path) -> io::Result<File> {
     }
 }
 
-fn remove_control_socket(directory: &Path, record: &OwnerRecord) -> io::Result<()> {
-    let socket = process_owner::socket_path(directory, record);
+fn remove_control_socket(record: &OwnerRecord) -> io::Result<()> {
+    let socket = process_owner::socket_path(record);
     let parent = socket
         .parent()
         .ok_or_else(|| io::Error::other("invalid socket path"))?;
@@ -657,8 +649,8 @@ fn dropped_connection(error: &io::Error) -> bool {
     )
 }
 
-fn request(directory: &Path, record: &OwnerRecord, action: &str) -> io::Result<serde_json::Value> {
-    let path = process_owner::socket_path(directory, record);
+fn request(record: &OwnerRecord, action: &str) -> io::Result<serde_json::Value> {
+    let path = process_owner::socket_path(record);
     process_owner::validate_socket_directory(
         path.parent()
             .ok_or_else(|| io::Error::other("invalid socket path"))?,
@@ -748,7 +740,7 @@ mod tests {
             process_owner::persist(&directory, &record).unwrap();
             // Holding the owner lock is what makes an owner live.
             let lock = process_owner::lock_owner(&directory).unwrap();
-            let socket = process_owner::socket_path(&directory, &record);
+            let socket = process_owner::socket_path(&record);
             let socket_directory = socket.parent().unwrap().to_path_buf();
             std::fs::DirBuilder::new()
                 .mode(0o700)

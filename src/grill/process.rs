@@ -586,11 +586,7 @@ impl super::Grill for ProcessGrill {
                 .status(instance)
                 .await
                 .map_err(|error| owner_error(instance, error))?;
-            if owner
-                .launch
-                .as_ref()
-                .is_none_or(|launch| launch.spec != record.oci_spec)
-            {
+            if owner.launch.spec != record.oci_spec {
                 return Err(owner_error(
                     instance,
                     "process launch conflicts with adoption record",
