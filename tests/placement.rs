@@ -1347,6 +1347,7 @@ async fn wtf_and_trace_reach_every_node_through_the_entry_node() {
             destination: "web".to_string(),
             destination_namespace: "default".to_string(),
             port: None,
+            count: None,
         },
         &entry.client,
     )

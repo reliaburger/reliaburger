@@ -2405,9 +2405,9 @@ drops an in-flight probe immediately, returns the semaphore permit and reports
 Unknown if the caller is still listening. A separate held-`exec()` test proves
 that path; graceful shutdown doesn't wait for a diagnostic timeout.
 
-## Four steps, three kinds of evidence
+## Five steps, three kinds of evidence
 
-An internal trace reports four layers:
+An internal trace reports five layers:
 
 1. A real `nslookup` from the source workload for
    `<destination>.<namespace>.internal`. The answer must contain the VIP from
@@ -2417,7 +2417,10 @@ An internal trace reports four layers:
 3. The live firewall decision. Bun resolves the source PID to its cgroup, reads
    `cgroup_namespace_map` and `firewall_map`, then applies the same rule as the
    eBPF connect hook.
-4. A real TCP connect from the source workload to the service VIP and port.
+4. The active faults on this path (see "A trace that knows about faults"
+   below).
+5. A real TCP connect from the source workload to the service VIP and port,
+   repeated with `--count`.
 
 Portable builds don't have attached kernel maps. They can still observe DNS,
 userspace service state and TCP, but they can't claim to have inspected eBPF.
@@ -2434,17 +2437,23 @@ pub enum TraceVerdict {
     Pass,
     Fail { reason: String },
     Unknown { reason: String },
+    Degraded { reason: String },
 }
 ```
 
 Evidence answers "how do we know?" A verdict answers "what did we learn?" A
 healthy userspace service map without an attached backend map is inferred but
 can pass that layer. A firewall map we can't read is unavailable and therefore
-unknown. A live map with no allow entry is an observed failure. Overall, Fail
-wins, then Unknown, then Pass. Missing evidence can't quietly turn green.
+unknown. A live map with no allow entry is an observed failure. `Degraded`
+means the path works, worse than it should: a delay or partial drop sits on it,
+or only some connects succeeded. Overall, Fail wins, then Degraded, then
+Unknown, then Pass. Degraded outranks Unknown because it's a positive
+observation (usually of a fault somebody injected on purpose), which is more
+useful to report than a gap in the evidence. Missing evidence still can't
+quietly turn green.
 
 Relish preserves that contract in human, JSON and YAML output. Pass exits 0,
-Fail exits 1 and Unknown exits 2, matching `wtf`. The JSON schema is versioned
+Fail exits 1, and Unknown and Degraded exit 2, matching `wtf`'s warnings. The JSON schema is versioned
 and rejects unknown top-level fields so automation doesn't silently interpret
 a changed response as the old one.
 
@@ -2457,6 +2466,59 @@ observed, but the current kernel map stores resolved addresses rather than the
 requested hostname relationship. Trace calls that firewall evidence Unknown.
 Honest again. Slightly annoying again. You can probably see the pattern by
 now.
+
+## A trace that knows about faults
+
+Chapter 8's network faults made the tour's best moment possible: inject a
+300 ms delay between the frontend and redis, then *trace* the path and watch
+the tool point at it. The first attempt was a let-down. The trace passed, its
+latency figure timed the whole `runc exec` rather than the connect, and
+nothing in the output hinted that an experiment was running.
+
+Three changes fixed it. First, a new step lists the faults that act on this
+source's calls to this destination. Bun already knows them: it filters its own
+registry with the same `applies_to_caller` rule the fault installer uses, so
+the trace and the kernel can't disagree about scope. Where it can, the step
+adds live evidence (the `fault_connect_map` entry the connect hook would find
+for this source's cgroup, and the netem delay on the source's interface), and
+labels the listing `inferred` when it can't. A partition, an NXDOMAIN or a
+100% drop fails the step; a delay or a partial drop degrades it.
+
+Second, the TCP step measures the connect *inside* the container. The probe
+script reads the clock either side of each `nc -z`, so exec overhead isn't in
+the figure. Reading the clock turned out to be the tricky part. `date +%s%N`
+gives nanoseconds with GNU date, but podinfo's Alpine BusyBox prints whole
+seconds, which a naive parser reads as "0 ms". So the script also reads
+`/proc/uptime` (good to 10 ms), and the parser only trusts a `date` value that
+is plausibly nanoseconds since 1970:
+
+```rust
+const PLAUSIBLE_EPOCH_NS: u128 = 1_000_000_000_000_000_000;
+let nanos = |text: Option<&str>| {
+    text.and_then(|text| text.parse::<u128>().ok())
+        .filter(|value| *value >= PLAUSIBLE_EPOCH_NS)
+};
+```
+
+`u128` is a 128-bit unsigned integer, native in Rust, so nanoseconds since
+1970 and their differences fit without a second thought. `Option::filter`
+keeps the value only if the closure says yes, turning an implausible reading
+into `None` without an `if`. When the coarse clock was used, the output says
+"10 ms clock" rather than pretending to precision it doesn't have.
+
+Third, `--count N` repeats the connect (up to ten times) and reports "7/10
+connects succeeded" with the minimum and median connect time. One connect
+through a 30% drop tells you nothing; ten tell you the path is flaky.
+
+On the podinfo demo the whole story reads the way the tour wants it to. Under
+`relish fault partition redis --from frontend` the trace fails with `fault 1
+(partition from frontend) blocks this path`, the live map entry shows the
+partition for the frontend's cgroup, and 0/5 connects succeed. Under `delay
+redis 300ms --from frontend` it's `DEGRADED`, the netem qdisc is listed, and
+5/5 connects succeed at a median of 300 ms. Clear the fault, and it's a clean
+pass again. The same step also names the backend the VIP picks, and the DNS
+step shrank from nslookup's full output to one line: the name, its answer and
+the resolver.
 
 The remaining acceptance work needs a real three-node environment and the
 rootful runc and Apple Container profiles. The implementation sandbox used for

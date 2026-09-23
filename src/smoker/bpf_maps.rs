@@ -45,6 +45,24 @@ mod inner {
         Ok(())
     }
 
+    /// Read one connect fault entry, if the kernel map holds it.
+    pub fn read_connect_fault(
+        bpf: &mut aya::Ebpf,
+        key: &BpfConnectFaultKey,
+    ) -> Result<Option<BpfConnectFaultValue>, BpfMapError> {
+        let map: HashMap<_, BpfConnectFaultKey, BpfConnectFaultValue> =
+            HashMap::try_from(bpf.map_mut("fault_connect_map").ok_or_else(|| {
+                BpfMapError::MapNotFound {
+                    map_name: "fault_connect_map".into(),
+                }
+            })?)?;
+        match map.get(key, 0) {
+            Ok(value) => Ok(Some(value)),
+            Err(aya::maps::MapError::KeyNotFound) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// Delete a connect fault entry.
     pub fn delete_connect_fault(
         bpf: &mut aya::Ebpf,

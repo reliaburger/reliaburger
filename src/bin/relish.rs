@@ -535,6 +535,10 @@ enum Command {
         /// Destination port. Internal services derive it when omitted.
         #[arg(long)]
         port: Option<u16>,
+        /// Repeat the TCP connect this many times (1-10) and report how many
+        /// succeeded and how long they took.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=10))]
+        count: u32,
     },
 }
 
@@ -1752,6 +1756,7 @@ async fn main() -> ExitCode {
             to,
             to_namespace,
             port,
+            count,
         } => {
             return finish_outcome(
                 reliaburger::relish::trace_cmd::run(reliaburger::relish::trace_cmd::TraceArgs {
@@ -1760,6 +1765,7 @@ async fn main() -> ExitCode {
                     destination: to,
                     destination_namespace: to_namespace,
                     port,
+                    count,
                     output: cli.output,
                 })
                 .await,
@@ -2113,11 +2119,33 @@ mod tests {
                 to,
                 to_namespace,
                 port: Some(5432),
+                count: 1,
             } if source == "api"
                 && namespace == "frontend"
                 && to == "db"
                 && to_namespace == "storage"
         ));
+    }
+
+    #[test]
+    fn trace_count_repeats_the_connect_up_to_ten_times() {
+        let parsed = parse(&[
+            "relish", "trace", "frontend", "--to", "redis", "--count", "10",
+        ])
+        .unwrap();
+        assert!(matches!(parsed.command, Command::Trace { count: 10, .. }));
+        assert!(
+            parse(&[
+                "relish", "trace", "frontend", "--to", "redis", "--count", "0"
+            ])
+            .is_err()
+        );
+        assert!(
+            parse(&[
+                "relish", "trace", "frontend", "--to", "redis", "--count", "11"
+            ])
+            .is_err()
+        );
     }
 
     #[test]

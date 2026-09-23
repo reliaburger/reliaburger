@@ -24,6 +24,8 @@ pub struct TraceArgs {
     pub destination_namespace: String,
     /// Destination port, derived for internal services when absent.
     pub port: Option<u16>,
+    /// TCP connects to make (1-10).
+    pub count: u32,
     /// Human, JSON or YAML output.
     pub output: OutputFormat,
 }
@@ -44,6 +46,7 @@ pub async fn run_with_client(
         destination: args.destination,
         destination_namespace: args.destination_namespace,
         port: args.port,
+        count: Some(args.count),
     };
     let result = trace(&request, entry).await?;
     println!("{}", render_result(&result, args.output)?);
@@ -54,7 +57,7 @@ pub async fn run_with_client(
 /// entry node's relay.
 pub async fn trace(request: &TraceRequest, entry: &BunClient) -> Result<TraceResult, RelishError> {
     let source = find_source_client(entry, &request.source, &request.source_namespace).await?;
-    tokio::time::timeout(Duration::from_secs(25), source.trace(request))
+    tokio::time::timeout(Duration::from_secs(50), source.trace(request))
         .await
         .map_err(|_| RelishError::RequestTimeout)?
 }
@@ -116,7 +119,7 @@ fn outcome(verdict: &TraceVerdict) -> CommandOutcome {
     match verdict {
         TraceVerdict::Pass => CommandOutcome::Clean,
         TraceVerdict::Fail { .. } => CommandOutcome::Problems,
-        TraceVerdict::Unknown { .. } => CommandOutcome::Warnings,
+        TraceVerdict::Unknown { .. } | TraceVerdict::Degraded { .. } => CommandOutcome::Warnings,
     }
 }
 
@@ -148,15 +151,39 @@ fn render_human(result: &TraceResult) -> String {
             let _ = writeln!(output, "     {detail}");
         }
         match &step.verdict {
-            TraceVerdict::Fail { reason } | TraceVerdict::Unknown { reason } => {
+            TraceVerdict::Fail { reason }
+            | TraceVerdict::Unknown { reason }
+            | TraceVerdict::Degraded { reason } => {
                 let _ = writeln!(output, "     reason: {reason}");
             }
             TraceVerdict::Pass => {}
         }
     }
     let _ = write!(output, "Overall: {}", verdict_name(&result.overall_result));
-    if let Some(latency_ms) = result.latency_ms {
-        let _ = write!(output, " ({latency_ms:.2} ms TCP probe)");
+    match (&result.connects, result.latency_ms) {
+        (Some(connects), Some(latency_ms)) => {
+            let _ = write!(
+                output,
+                " ({}/{} connects, median connect {latency_ms:.1} ms)",
+                connects.succeeded, connects.attempted
+            );
+        }
+        (Some(connects), None) => {
+            let _ = write!(
+                output,
+                " ({}/{} connects)",
+                connects.succeeded, connects.attempted
+            );
+        }
+        (None, Some(latency_ms)) => {
+            let _ = write!(output, " (median connect {latency_ms:.1} ms)");
+        }
+        (None, None) => {}
+    }
+    if let TraceVerdict::Fail { reason } | TraceVerdict::Degraded { reason } =
+        &result.overall_result
+    {
+        let _ = write!(output, "\n  because {reason}");
     }
     output
 }
@@ -166,6 +193,7 @@ fn verdict_name(verdict: &TraceVerdict) -> &'static str {
         TraceVerdict::Pass => "PASS",
         TraceVerdict::Fail { .. } => "FAIL",
         TraceVerdict::Unknown { .. } => "UNKNOWN",
+        TraceVerdict::Degraded { .. } => "DEGRADED",
     }
 }
 
@@ -198,6 +226,7 @@ mod tests {
             }],
             overall_result: verdict,
             latency_ms: None,
+            connects: None,
         }
     }
 
@@ -215,6 +244,94 @@ mod tests {
         assert_eq!(outcome(&result.overall_result), CommandOutcome::Warnings);
         let json = render_result(&result, OutputFormat::Json).unwrap();
         assert!(json.contains("\"verdict\": \"unknown\""));
+    }
+
+    #[test]
+    fn a_degraded_path_maps_to_exit_two() {
+        let result = result(TraceVerdict::Degraded {
+            reason: "fault 3 (delay 300ms from frontend) is active on this path".to_string(),
+        });
+        assert_eq!(outcome(&result.overall_result), CommandOutcome::Warnings);
+    }
+
+    /// The tour's `relish trace frontend --to redis --count 10` under a
+    /// delay: the fault is named, with its live evidence, and the connect
+    /// figures come from inside the container.
+    #[test]
+    fn a_trace_through_a_delay_shows_the_fault_and_the_connect_times() {
+        use crate::onion::trace::{ConnectSummary, TraceStep};
+        let step = |number: u32, name: &str, details: &[&str], verdict: TraceVerdict| TraceStep {
+            step_number: number,
+            name: name.to_string(),
+            evidence: TraceEvidence::Observed,
+            details: details.iter().map(|detail| detail.to_string()).collect(),
+            verdict,
+        };
+        let degraded = TraceVerdict::Degraded {
+            reason: "fault 3 (delay 300ms from frontend) is active on this path".to_string(),
+        };
+        let result = TraceResult {
+            schema_version: TRACE_SCHEMA_VERSION,
+            source: "default/frontend".to_string(),
+            destination: "default/redis".to_string(),
+            destination_port: 6379,
+            source_node: "node-1".to_string(),
+            steps: vec![
+                step(
+                    1,
+                    "DNS query",
+                    &["redis.default.internal -> 127.128.202.174 (resolver 10.202.142.1)"],
+                    TraceVerdict::Pass,
+                ),
+                step(
+                    2,
+                    "Service and eBPF state",
+                    &[
+                        "userspace service map: VIP 127.128.202.174, 1 of 1 backends healthy",
+                        "  backend default__redis-0 at 10.202.142.7:6379 (healthy)",
+                        "the VIP sends every connect to default__redis-0 at 10.202.142.7:6379",
+                        "live backend_map: 1 entries, 1 healthy",
+                        "  kernel backend 10.202.142.7:6379 (healthy)",
+                    ],
+                    TraceVerdict::Pass,
+                ),
+                step(
+                    3,
+                    "Firewall state",
+                    &[
+                        "live maps: source cgroup 4242, source namespace Some(7), destination namespace 7, action None",
+                    ],
+                    TraceVerdict::Pass,
+                ),
+                step(
+                    4,
+                    "Active faults",
+                    &[
+                        "fault 3: delay 300ms from frontend (571s left)",
+                        "live netem on the source's eth0: delay 300ms",
+                    ],
+                    degraded.clone(),
+                ),
+                step(
+                    5,
+                    "TCP probe",
+                    &[
+                        "10/10 connects to 127.128.202.174:6379 succeeded (connect time min 300.9 ms, median 301.6 ms)",
+                    ],
+                    TraceVerdict::Pass,
+                ),
+            ],
+            overall_result: degraded,
+            latency_ms: Some(301.6),
+            connects: Some(ConnectSummary {
+                attempted: 10,
+                succeeded: 10,
+                min_ms: Some(300.9),
+                median_ms: Some(301.6),
+                clock_resolution_ms: None,
+            }),
+        };
+        insta::assert_snapshot!(render_human(&result));
     }
 
     #[test]

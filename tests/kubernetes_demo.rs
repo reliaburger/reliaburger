@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use bun_process::{BunProcess, BunStart, reserve_address, wait_for_bind};
+use reliaburger::onion::trace::TraceVerdict;
 use reliaburger::relish::client::BunClient;
 
 const APPS: [&str; 3] = ["frontend", "backend", "redis"];
@@ -83,6 +84,40 @@ impl Demo {
 
     fn client(&self) -> BunClient {
         BunClient::new(&format!("http://{}", self.api))
+    }
+
+    /// `relish trace frontend --to redis --count 5`, printed for the record.
+    async fn trace_frontend_to_redis(&self) -> reliaburger::onion::trace::TraceResult {
+        let result = reliaburger::relish::trace_cmd::trace(
+            &reliaburger::onion::trace::TraceRequest {
+                source: "frontend".to_string(),
+                source_namespace: "default".to_string(),
+                destination: "redis".to_string(),
+                destination_namespace: "default".to_string(),
+                port: None,
+                count: Some(5),
+            },
+            &self.client(),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("trace failed: {error}\n{}", self.log()));
+        eprintln!(
+            "trace: {}\n{}",
+            serde_json::to_string(&result.overall_result).unwrap(),
+            result
+                .steps
+                .iter()
+                .flat_map(|step| {
+                    std::iter::once(format!(
+                        "  {}. {} {:?}",
+                        step.step_number, step.name, step.verdict
+                    ))
+                    .chain(step.details.iter().map(|detail| format!("     {detail}")))
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        result
     }
 
     /// The frontends' recent log lines about the cache, for the record.
@@ -327,6 +362,15 @@ allowed_operations = ["inject_workload_faults"]
         acknowledged: true,
     };
 
+    // Z6.4: with nothing injected, the trace passes end to end.
+    let clean = demo.trace_frontend_to_redis().await;
+    assert_eq!(
+        clean.overall_result,
+        TraceVerdict::Pass,
+        "{}",
+        serde_json::to_string_pretty(&clean).unwrap()
+    );
+
     // Z6.1 + Z6.2: a partition from the frontend cuts the connections its
     // redis pool already holds, so the very next cache call fails instead of
     // riding an old connection.
@@ -352,6 +396,12 @@ allowed_operations = ["inject_workload_faults"]
     eprintln!(
         "frontend logs under partition:\n{}",
         demo.frontend_cache_logs().await
+    );
+    let partitioned = demo.trace_frontend_to_redis().await;
+    assert!(
+        matches!(&partitioned.overall_result, TraceVerdict::Fail { reason } if reason.contains("partition from frontend")),
+        "{}",
+        serde_json::to_string_pretty(&partitioned).unwrap()
     );
     assert!(
         outcomes.iter().all(Result::is_err),
@@ -385,6 +435,19 @@ allowed_operations = ["inject_workload_faults"]
         .unwrap_or_else(|error| panic!("delay refused: {error}\n{}", demo.log()));
     let during = demo.median_cache_read().await;
     eprintln!("cache read median: {before:?} before the delay, {during:?} during it");
+    let delayed = demo.trace_frontend_to_redis().await;
+    assert!(
+        matches!(&delayed.overall_result, TraceVerdict::Degraded { reason } if reason.contains("delay 300ms from frontend")),
+        "{}",
+        serde_json::to_string_pretty(&delayed).unwrap()
+    );
+    let median = delayed
+        .latency_ms
+        .expect("connects timed inside the container");
+    assert!(
+        median >= 290.0,
+        "median connect {median} ms under a 300ms delay"
+    );
     assert!(
         during >= before + Duration::from_millis(500),
         "a 300ms delay only moved the cache read from {before:?} to {during:?}"
@@ -445,6 +508,13 @@ allowed_operations = ["inject_workload_faults"]
     }
     let after = demo.median_cache_read().await;
     eprintln!("cache read median after clearing the delay: {after:?}");
+    let healed = demo.trace_frontend_to_redis().await;
+    assert_eq!(healed.overall_result, TraceVerdict::Pass);
+    assert!(
+        healed.latency_ms.is_some_and(|median| median < 100.0),
+        "{:?}",
+        healed.latency_ms
+    );
     assert!(
         after < before + Duration::from_millis(200),
         "the delay outlived its clear: {before:?} before, {after:?} after"

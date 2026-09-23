@@ -895,6 +895,19 @@ async fn trace_handler(
         )
             .into_response();
     }
+    if request
+        .count
+        .is_some_and(|count| count == 0 || count > crate::onion::trace::MAX_TRACE_CONNECTS)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!(
+                "trace count must be between 1 and {}",
+                crate::onion::trace::MAX_TRACE_CONNECTS
+            )})),
+        )
+            .into_response();
+    }
     if !valid_trace_label(&request.source) || !valid_trace_label(&request.source_namespace) {
         return (
             StatusCode::BAD_REQUEST,
@@ -1008,7 +1021,8 @@ async fn trace_handler(
     {
         return (StatusCode::SERVICE_UNAVAILABLE, "agent unavailable").into_response();
     }
-    match tokio::time::timeout(std::time::Duration::from_secs(20), receiver).await {
+    // DNS (8s) plus up to ten connects at three seconds each.
+    match tokio::time::timeout(std::time::Duration::from_secs(45), receiver).await {
         Ok(Ok(Ok(result))) => Json(result).into_response(),
         Ok(Ok(Err(crate::bun::BunError::AppNotFound { .. }))) => (
             StatusCode::NOT_FOUND,
@@ -1024,7 +1038,7 @@ async fn trace_handler(
         Ok(Err(_)) => (StatusCode::SERVICE_UNAVAILABLE, "agent dropped response").into_response(),
         Err(_) => (
             StatusCode::GATEWAY_TIMEOUT,
-            "trace timed out after 20 seconds",
+            "trace timed out after 45 seconds",
         )
             .into_response(),
     }

@@ -217,7 +217,7 @@ beat needs product work first:
   destination's backend addresses and port, removed on expiry or clear, and
   applied to new source instances while active. It works on existing
   connections too.
-- [ ] **Z6.4 Trace shows the fault.** A new "Active faults" step names any
+- [x] **Z6.4 Trace shows the fault.** A new "Active faults" step names any
   fault on the path (id, kind, remaining time). `--count N` repeats the probe
   and reports how many connects succeeded; the latency figure measures the
   connect itself; the output names the backend the VIP chose and trims the raw

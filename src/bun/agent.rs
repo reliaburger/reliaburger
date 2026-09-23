@@ -1561,6 +1561,10 @@ struct PreparedTrace<G> {
     destination_port: u16,
     dns_name: String,
     expected_vip: Option<String>,
+    /// Active faults that act on this source's calls to the destination.
+    faults: Vec<crate::onion::trace::PathFault>,
+    /// TCP connects to make.
+    count: u32,
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
     onion_ebpf: Option<std::sync::Arc<tokio::sync::Mutex<crate::onion::ebpf::loader::OnionEbpf>>>,
 }
@@ -9457,6 +9461,20 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             request.destination.clone()
         };
         let expected_vip = service.as_ref().map(|entry| entry.vip.to_string());
+        let count = request.count.unwrap_or(1);
+        if count == 0 || count > crate::onion::trace::MAX_TRACE_CONNECTS {
+            return Err(BunError::SecurityError {
+                reason: format!(
+                    "trace count must be between 1 and {}",
+                    crate::onion::trace::MAX_TRACE_CONNECTS
+                ),
+            });
+        }
+        let faults = if internal_destination {
+            self.path_faults(&request)
+        } else {
+            Vec::new()
+        };
         let permit = self
             .trace_slots
             .clone()
@@ -9475,9 +9493,53 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             destination_port,
             dns_name,
             expected_vip,
+            faults,
+            count,
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
             onion_ebpf: self.onion_ebpf.clone(),
         })
+    }
+
+    /// The active network faults on this node that act on calls from the
+    /// trace's source to its destination: faults on the destination (in its
+    /// namespace) that either name this source or apply to every caller.
+    fn path_faults(
+        &self,
+        request: &crate::onion::trace::TraceRequest,
+    ) -> Vec<crate::onion::trace::PathFault> {
+        use crate::onion::trace::{PathFault, PathFaultKind};
+        use crate::smoker::types::FaultType;
+
+        let mut faults: Vec<PathFault> = self
+            .fault_registry
+            .iter()
+            .filter(|rule| rule.fault_type.acts_on_callers())
+            .filter(|rule| {
+                rule.target_service == request.destination
+                    && rule.matches_namespace(&request.destination_namespace)
+            })
+            .filter(|rule| {
+                crate::smoker::network::applies_to_caller(
+                    rule,
+                    &request.source,
+                    &request.source_namespace,
+                )
+            })
+            .map(|rule| PathFault {
+                id: rule.id.0,
+                kind: match rule.fault_type {
+                    FaultType::Partition { .. } => PathFaultKind::Partition,
+                    FaultType::Drop { probability } => PathFaultKind::Drop { probability },
+                    FaultType::Delay { .. } => PathFaultKind::Delay,
+                    FaultType::DnsNxdomain => PathFaultKind::DnsNxdomain,
+                    _ => PathFaultKind::Other,
+                },
+                description: rule.fault_type.to_string(),
+                remaining_secs: rule.remaining().as_secs(),
+            })
+            .collect();
+        faults.sort_by_key(|fault| fault.id);
+        faults
     }
 }
 
@@ -9493,15 +9555,10 @@ impl<G: Grill + Clone + 'static> PreparedTrace<G> {
                 &self.source_instance,
                 trace_dns_command(&self.dns_name),
                 "__RB_TRACE_DNS_STATUS__",
+                std::time::Duration::from_secs(8),
             )
             .await;
-        let dns_step = trace_probe_step(
-            1,
-            "DNS query",
-            &self.dns_name,
-            dns_probe,
-            self.expected_vip.as_deref(),
-        );
+        let dns_step = trace_dns_step(&self.dns_name, dns_probe, self.expected_vip.as_deref());
 
         let service_step = self
             .trace_service_state(self.service.as_ref(), self.internal_destination)
@@ -9513,30 +9570,39 @@ impl<G: Grill + Clone + 'static> PreparedTrace<G> {
                 self.internal_destination,
             )
             .await;
+        let faults_step = crate::onion::trace::path_faults_step(
+            4,
+            &self.faults,
+            self.trace_fault_evidence().await,
+        );
 
         let connect_host = self
             .expected_vip
             .as_deref()
             .unwrap_or(self.request.destination.as_str());
-        let started = std::time::Instant::now();
+        // One connect keeps the old three-second patience; a series waits
+        // two seconds per connect so the whole trace stays inside the API's
+        // deadline even when every connect hangs.
+        let wait_secs = if self.count > 1 { 2 } else { 3 };
         let tcp_probe = self
             .run_workload_trace_probe(
                 &self.source_instance,
-                trace_tcp_command(connect_host, self.destination_port),
+                trace_tcp_command(connect_host, self.destination_port, self.count, wait_secs),
                 "__RB_TRACE_TCP_STATUS__",
+                std::time::Duration::from_secs(u64::from(self.count * (wait_secs + 1)) + 5),
             )
             .await;
-        let tcp_succeeded = tcp_probe.as_ref().is_ok_and(|probe| probe.status == 0);
-        let tcp_step = trace_probe_step(
-            4,
-            "TCP probe",
+        let tcp_step = crate::onion::trace::tcp_probe_step(
+            5,
             &format!("{connect_host}:{}", self.destination_port),
-            tcp_probe,
-            None,
+            tcp_probe.clone(),
         );
-        let latency_ms = tcp_succeeded.then(|| started.elapsed().as_secs_f64() * 1000.0);
+        let connects = tcp_probe
+            .ok()
+            .and_then(|probe| crate::onion::trace::summarise_connects(&probe.attempts));
+        let latency_ms = connects.as_ref().and_then(|summary| summary.median_ms);
 
-        let steps = vec![dns_step, service_step, firewall_step, tcp_step];
+        let steps = vec![dns_step, service_step, firewall_step, faults_step, tcp_step];
         let overall_result = crate::onion::trace::overall_verdict(&steps);
         Ok(TraceResult {
             schema_version: crate::onion::trace::TRACE_SCHEMA_VERSION,
@@ -9554,7 +9620,72 @@ impl<G: Grill + Clone + 'static> PreparedTrace<G> {
             steps,
             overall_result,
             latency_ms,
+            connects,
         })
+    }
+
+    /// Live evidence for the faults on this path: the `fault_connect_map`
+    /// entries the connect hook would find for this source (its own cgroup
+    /// first, then every caller), and the netem delays on its interface.
+    async fn trace_fault_evidence(&self) -> Vec<String> {
+        if self.faults.is_empty() {
+            return Vec::new();
+        }
+        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+        let mut evidence = Vec::new();
+        #[cfg(all(feature = "ebpf", target_os = "linux"))]
+        if let (Some(handle), Some(service)) = (&self.onion_ebpf, &self.service) {
+            let cgroup = self
+                .grill
+                .workload_cgroup(&self.source_instance)
+                .await
+                .ok()
+                .flatten();
+            let virtual_ip = service.vip.to_network_byte_order();
+            let port = service.port.to_be();
+            let mut ebpf = handle.lock().await;
+            for (label, source_cgroup_id) in
+                [("this source's cgroup", cgroup), ("every caller", Some(0))]
+            {
+                let Some(source_cgroup_id) = source_cgroup_id else {
+                    continue;
+                };
+                let key = crate::smoker::bpf_types::partition_fault_key(
+                    virtual_ip,
+                    port,
+                    source_cgroup_id,
+                );
+                match crate::smoker::bpf_maps::read_connect_fault(&mut ebpf.bpf, &key) {
+                    Ok(Some(value)) => evidence.push(format!(
+                        "live fault_connect_map entry for {label}: {}",
+                        describe_connect_fault(&value)
+                    )),
+                    Ok(None) => {}
+                    Err(error) => {
+                        evidence.push(format!("fault_connect_map could not be read: {error}"))
+                    }
+                }
+            }
+        }
+        #[cfg(target_os = "linux")]
+        if self
+            .faults
+            .iter()
+            .any(|fault| fault.kind == crate::onion::trace::PathFaultKind::Delay)
+            && let Ok(shown) = crate::smoker::network::run_in_instance_netns(
+                &self.source_instance.0,
+                "tc",
+                &crate::smoker::network::delay_show_args(),
+            )
+            .await
+        {
+            evidence.extend(
+                crate::smoker::network::installed_delays(&shown)
+                    .into_iter()
+                    .map(|delay| format!("live netem on the source's eth0: {delay}")),
+            );
+        }
+        evidence
     }
 
     async fn run_workload_trace_probe(
@@ -9562,19 +9693,23 @@ impl<G: Grill + Clone + 'static> PreparedTrace<G> {
         source_instance: &InstanceId,
         command: Vec<String>,
         marker: &str,
+        timeout: std::time::Duration,
     ) -> Result<crate::onion::trace::ProbeOutput, String> {
         let future = self.grill.exec(source_instance, &command);
         let result = tokio::select! {
             _ = self.shutdown.cancelled() => {
                 return Err("workload probe cancelled because the agent is shutting down".to_string());
             }
-            result = tokio::time::timeout(std::time::Duration::from_secs(8), future) => result,
+            result = tokio::time::timeout(timeout, future) => result,
         };
         match result {
             Ok(Ok(output)) => crate::onion::trace::parse_probe_output(&output, marker)
                 .ok_or_else(|| "source image lacks a usable POSIX shell or probe tool".to_string()),
             Ok(Err(error)) => Err(format!("workload probe could not start: {error}")),
-            Err(_) => Err("workload probe timed out after 8 seconds".to_string()),
+            Err(_) => Err(format!(
+                "workload probe timed out after {} seconds",
+                timeout.as_secs()
+            )),
         }
     }
 
@@ -9618,6 +9753,7 @@ impl<G: Grill + Clone + 'static> PreparedTrace<G> {
             healthy,
             service.backends.len()
         )];
+        details.extend(describe_backends(service));
         if healthy == 0 {
             return TraceStep {
                 step_number: 2,
@@ -9645,6 +9781,20 @@ impl<G: Grill + Clone + 'static> PreparedTrace<G> {
                     details.push(format!(
                         "live backend_map: {} entries, {kernel_healthy} healthy",
                         value.count
+                    ));
+                    details.extend(value.backends.iter().take(value.count.min(5) as usize).map(
+                        |backend| {
+                            format!(
+                                "  kernel backend {}:{} ({})",
+                                std::net::Ipv4Addr::from(u32::from_be(backend.host_ip)),
+                                u16::from_be(backend.host_port),
+                                if backend.healthy == 1 {
+                                    "healthy"
+                                } else {
+                                    "unhealthy"
+                                }
+                            )
+                        },
                     ));
                     let verdict = if value.count == 0 || kernel_healthy == 0 {
                         TraceVerdict::Fail {
@@ -12189,10 +12339,28 @@ printf '%s\n' "$output"
 printf '__RB_TRACE_DNS_STATUS__=%s\n' "$status"
 "#;
 
+// Each connect is timed inside the container, so the figure excludes the
+// cost of exec'ing the probe. `date +%s%N` gives nanoseconds where the image's
+// `date` supports `%N`; BusyBox often doesn't, so `/proc/uptime` (10 ms) is
+// read too, and the parser uses whichever is plausible. nc's own chatter (the
+// OpenBSD "Connection ... succeeded!" line) is dropped on success.
 const TCP_TRACE_SCRIPT: &str = r#"
-output=$(nc -z -w 3 "$1" "$2" 2>&1)
-status=$?
-printf '%s\n' "$output"
+count=$3
+i=0
+status=1
+while [ "$i" -lt "$count" ]; do
+  up_start=
+  up_end=
+  read -r up_start _ < /proc/uptime 2>/dev/null
+  start=$(date +%s%N 2>/dev/null)
+  output=$(nc -z -w "$4" "$1" "$2" 2>&1)
+  status=$?
+  end=$(date +%s%N 2>/dev/null)
+  read -r up_end _ < /proc/uptime 2>/dev/null
+  [ "$status" -ne 0 ] && [ -n "$output" ] && printf '%s\n' "$output"
+  printf '__RB_TRACE_TCP_ATTEMPT__=%s %s %s %s %s\n' "$status" "$start" "$end" "$up_start" "$up_end"
+  i=$((i + 1))
+done
 printf '__RB_TRACE_TCP_STATUS__=%s\n' "$status"
 "#;
 
@@ -12206,7 +12374,7 @@ fn trace_dns_command(name: &str) -> Vec<String> {
     ]
 }
 
-fn trace_tcp_command(host: &str, port: u16) -> Vec<String> {
+fn trace_tcp_command(host: &str, port: u16, count: u32, wait_secs: u32) -> Vec<String> {
     vec![
         "sh".to_string(),
         "-c".to_string(),
@@ -12214,17 +12382,70 @@ fn trace_tcp_command(host: &str, port: u16) -> Vec<String> {
         "reliaburger-trace".to_string(),
         host.to_string(),
         port.to_string(),
+        count.to_string(),
+        wait_secs.to_string(),
     ]
 }
 
-fn trace_probe_step(
-    step_number: u32,
+/// Name a service's backends, and which one the VIP picks, for the trace.
+fn describe_backends(service: &crate::onion::types::ServiceEntry) -> Vec<String> {
+    let mut details: Vec<String> = service
+        .backends
+        .iter()
+        .take(5)
+        .map(|backend| {
+            format!(
+                "  backend {} at {}:{} ({})",
+                backend.instance_id,
+                backend.node_ip,
+                backend.host_port,
+                if backend.healthy {
+                    "healthy"
+                } else {
+                    "unhealthy"
+                }
+            )
+        })
+        .collect();
+    let healthy: Vec<_> = service
+        .backends
+        .iter()
+        .filter(|backend| backend.healthy)
+        .collect();
+    match healthy.as_slice() {
+        [] => {}
+        [only] => details.push(format!(
+            "the VIP sends every connect to {} at {}:{}",
+            only.instance_id, only.node_ip, only.host_port
+        )),
+        several => details.push(format!(
+            "the VIP spreads connects round-robin over {} healthy backends",
+            several.len()
+        )),
+    }
+    details
+}
+
+/// Describe a live `fault_connect_map` value.
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+fn describe_connect_fault(value: &crate::smoker::bpf_types::BpfConnectFaultValue) -> String {
+    let action = match value.action {
+        crate::smoker::bpf_types::FAULT_ACTION_PARTITION => "partition".to_string(),
+        crate::smoker::bpf_types::FAULT_ACTION_DROP => format!("drop {}%", value.probability),
+        other => format!("action {other}"),
+    };
+    let now = crate::smoker::types::monotonic_now_ns();
+    let left = value.expires_ns.saturating_sub(now) / 1_000_000_000;
+    format!("{action}, expires in {left}s")
+}
+
+fn trace_dns_step(
     name: &str,
-    target: &str,
     probe: Result<crate::onion::trace::ProbeOutput, String>,
     expected_value: Option<&str>,
 ) -> crate::onion::trace::TraceStep {
     use crate::onion::trace::{TraceEvidence, TraceStep, TraceVerdict};
+    let step_name = "DNS query".to_string();
     match probe {
         Ok(probe) => {
             let expected_answer = expected_value.is_none_or(|expected| {
@@ -12232,8 +12453,7 @@ fn trace_probe_step(
                     .parse::<std::net::IpAddr>()
                     .is_ok_and(|address| probe.dns_answers().contains(&address))
             });
-            let mut details = vec![format!("fixed workload probe target: {target}")];
-            details.extend(probe.lines);
+            let details = crate::onion::trace::dns_details(name, &probe);
             let verdict = if probe.status == 0 {
                 if let Some(expected) = expected_value
                     && !expected_answer
@@ -12248,26 +12468,27 @@ fn trace_probe_step(
                 }
             } else if probe.status == 126 || probe.status == 127 {
                 TraceVerdict::Unknown {
-                    reason: format!("source image does not provide the fixed {name} probe tool"),
+                    reason: "source image does not provide the fixed DNS query probe tool"
+                        .to_string(),
                 }
             } else {
                 TraceVerdict::Fail {
-                    reason: format!("{name} exited with status {}", probe.status),
+                    reason: format!("DNS query exited with status {}", probe.status),
                 }
             };
             TraceStep {
-                step_number,
-                name: name.to_string(),
+                step_number: 1,
+                name: step_name,
                 evidence: TraceEvidence::Observed,
                 details,
                 verdict,
             }
         }
         Err(reason) => TraceStep {
-            step_number,
-            name: name.to_string(),
+            step_number: 1,
+            name: step_name,
             evidence: TraceEvidence::Unavailable,
-            details: vec![format!("fixed workload probe target: {target}")],
+            details: vec![format!("query {name}")],
             verdict: TraceVerdict::Unknown { reason },
         },
     }
@@ -12329,23 +12550,23 @@ mod tests {
     fn trace_targets_are_positional_arguments_not_shell_source() {
         let hostile = "api; touch /tmp/never";
         let dns = trace_dns_command(hostile);
-        let tcp = trace_tcp_command(hostile, 443);
+        let tcp = trace_tcp_command(hostile, 443, 3, 2);
         assert!(!dns[2].contains(hostile));
         assert_eq!(dns[4], hostile);
         assert!(!tcp[2].contains(hostile));
         assert_eq!(tcp[4], hostile);
         assert_eq!(tcp[5], "443");
+        assert_eq!(tcp[6], "3");
     }
 
     #[test]
     fn missing_workload_probe_tool_is_unknown_not_a_network_failure() {
-        let step = trace_probe_step(
-            1,
-            "DNS query",
+        let step = trace_dns_step(
             "api.internal",
             Ok(crate::onion::trace::ProbeOutput {
                 status: 127,
                 lines: vec!["nslookup: not found".to_string()],
+                attempts: Vec::new(),
             }),
             None,
         );
@@ -12377,7 +12598,8 @@ mod tests {
             format!(
                 "Name: destination.default.internal\nAddress: {vip}\n__RB_TRACE_DNS_STATUS__=0\n"
             ),
-            "__RB_TRACE_TCP_STATUS__=0\n".to_string(),
+            "__RB_TRACE_TCP_ATTEMPT__=0 1727000000000000000 1727000000002500000\n__RB_TRACE_TCP_STATUS__=0\n"
+                .to_string(),
         ]);
         grill.block_execs();
         let (response, receiver) = oneshot::channel();
@@ -12388,6 +12610,7 @@ mod tests {
                 destination: "destination".to_string(),
                 destination_namespace: "default".to_string(),
                 port: None,
+                count: None,
             },
             internal_destination: true,
             source_node: "node-a".to_string(),
@@ -12412,7 +12635,7 @@ mod tests {
 
         let result = receiver.await.unwrap().unwrap();
 
-        assert_eq!(result.steps.len(), 4);
+        assert_eq!(result.steps.len(), 5);
         assert_eq!(
             result.steps[0].verdict,
             crate::onion::trace::TraceVerdict::Pass
@@ -12422,7 +12645,7 @@ mod tests {
             crate::onion::trace::TraceEvidence::Inferred
         );
         assert_eq!(
-            result.steps[3].verdict,
+            result.steps[4].verdict,
             crate::onion::trace::TraceVerdict::Pass
         );
         assert!(matches!(
@@ -12433,10 +12656,81 @@ mod tests {
             result.overall_result,
             crate::onion::trace::TraceVerdict::Unknown { .. }
         ));
-        assert!(result.latency_ms.is_some());
+        assert_eq!(result.latency_ms, Some(2.5));
 
         shutdown.cancel();
         handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_trace_lists_only_the_faults_that_act_on_its_own_path() {
+        use crate::smoker::types::{FaultRequest, FaultType};
+        let (mut agent, _tx, _shutdown) = test_agent();
+        let mut inject = |fault_type: FaultType, service: &str, namespace: &str| {
+            agent
+                .fault_registry
+                .insert(&FaultRequest {
+                    fault_type,
+                    target_service: service.to_string(),
+                    namespace: Some(namespace.to_string()),
+                    target_instance: None,
+                    target_node: None,
+                    duration: std::time::Duration::from_secs(60),
+                    injected_by: "test".to_string(),
+                    reason: None,
+                    include_leader: false,
+                    override_safety: false,
+                    acknowledged: true,
+                })
+                .id
+                .0
+        };
+        let partition = inject(
+            FaultType::Partition {
+                source_app: Some("frontend".to_string()),
+            },
+            "redis",
+            "default",
+        );
+        let delay = inject(
+            FaultType::Delay {
+                delay_ns: 300_000_000,
+                jitter_ns: 0,
+                source_app: None,
+            },
+            "redis",
+            "default",
+        );
+        inject(
+            FaultType::Partition {
+                source_app: Some("backend".to_string()),
+            },
+            "redis",
+            "default",
+        );
+        inject(FaultType::Drop { probability: 50 }, "redis", "team-b");
+        inject(FaultType::DnsNxdomain, "backend", "default");
+        inject(FaultType::Pause, "redis", "default");
+
+        let faults = agent.path_faults(&crate::onion::trace::TraceRequest {
+            source: "frontend".to_string(),
+            source_namespace: "default".to_string(),
+            destination: "redis".to_string(),
+            destination_namespace: "default".to_string(),
+            port: None,
+            count: None,
+        });
+        let listed: Vec<(u64, &str)> = faults
+            .iter()
+            .map(|fault| (fault.id, fault.description.as_str()))
+            .collect();
+        assert_eq!(
+            listed,
+            vec![
+                (partition, "partition from frontend"),
+                (delay, "delay 300ms"),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -12479,6 +12773,7 @@ mod tests {
                     destination: "destination".into(),
                     destination_namespace: "default".into(),
                     port: None,
+                    count: None,
                 },
                 internal_destination: true,
                 source_node: "node-a".into(),
@@ -12525,6 +12820,7 @@ mod tests {
             destination: "destination".to_string(),
             destination_namespace: "default".to_string(),
             port: None,
+            count: None,
         };
         let mut active_receivers = Vec::new();
         for _ in 0..MAX_CONCURRENT_TRACES {
@@ -12593,6 +12889,7 @@ mod tests {
                 destination: "destination".to_string(),
                 destination_namespace: "default".to_string(),
                 port: None,
+                count: None,
             },
             internal_destination: true,
             source_node: "node-a".to_string(),
