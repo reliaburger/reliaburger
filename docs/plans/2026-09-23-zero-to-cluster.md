@@ -133,18 +133,27 @@ tutorial, because a tutorial over a broken path is a lie.
   pinned Ubuntu image with runc, uidmap, btrfs-progs, nftables and iproute2
   already installed, compressed (`qcow2` + zstd), and the podinfo and busybox
   images pre-pulled. No `apt-get` on first boot. See D4.
-- [ ] **Z3.2 Boot every VM at once.** Generate Lima's SSH key in our `LIMA_HOME`
-  before the first boot, then start all VMs in parallel.
-- [ ] **Z3.3 Configure nodes in parallel, in one copy each.** One tarball per VM
+- [x] **Z3.2 Boot every VM at once.** Generate Lima's SSH key in our `LIMA_HOME`
+  before the first boot, then start all VMs in parallel. Done: peers start as
+  soon as Lima's network daemon runs (about 0.5 s after VM 1), and a 60 s
+  console watchdog restarts a VM that Virtualization.framework never boots.
+- [x] **Z3.3 Configure nodes in parallel, in one copy each.** One tarball per VM
   instead of ~5 `limactl` calls per file, and nodes 2 and 3 enrol concurrently
   once node 1 is ready.
-- [ ] **Z3.4 Progress you can trust.** A live line per step with elapsed time,
+- [x] **Z3.4 Progress you can trust.** A live line per step with elapsed time,
   download bytes and speed, and a summary of where the time went. Downloads
-  resume after interruption instead of failing at 180 s.
-- [ ] **Z3.5 Measure it.** A `--timings` report, recorded for cold and warm runs
+  resume after interruption instead of failing at 180 s. Done; the five-minute
+  deadline now covers building the cluster only, and downloads fail after 30 s
+  without data (30-minute backstop), because their speed is the network's.
+- [x] **Z3.5 Measure it.** A `--timings` report, recorded for cold and warm runs
   on Apple silicon (and Intel and Linux when available), feeding release gate
   V04. Target: under three minutes cold on 100 Mbit/s, leaving two for the
-  tutorial.
+  tutorial. Apple silicon done; Intel and Linux still to run. Measured on an M2 Max with development binaries
+  ([results](../qualification/2026-09-23-quickstart-timings.md)): cold
+  263 s → 194 s (147 s → 102 s excluding downloads), warm 160–177 s → about
+  105 s. The runs also found and fixed a memory preflight that refused busy
+  Macs, a 90 s logind stall in provisioning, and VMs that never boot. Z3.1
+  would take roughly another 40–50 s: first-boot apt costs 30–40 s per VM.
 
 ### Phase 4: install in one line
 

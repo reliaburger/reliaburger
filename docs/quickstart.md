@@ -93,7 +93,10 @@ Setup shows a line per step as it goes: each download with its size and
 speed, each VM boot, and each node's install, enrolment and start. It ends with
 a short summary of where the time went. Add `--timings` to also print every
 step's duration. Each run, successful or not, saves the same data as JSON in
-`~/.reliaburger/clusters/laptop/timings.json`.
+`~/.reliaburger/clusters/laptop/timings.json`. On an M2 Max, a three-node
+cluster took about 3¼ minutes with an empty cache (1½ of them downloading)
+and under two minutes with cached downloads; the
+[measurements](qualification/2026-09-23-quickstart-timings.md) have the detail.
 
 Setup saves ownership and credentials before creating VMs. Building the
 cluster, from the first VM boot to the demo app, has a five-minute deadline.
