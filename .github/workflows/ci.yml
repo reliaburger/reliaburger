@@ -17,6 +17,10 @@ concurrency:
 permissions:
   contents: read
 
+# Caches: GitHub keeps 10 GB per repository. Jobs that build the same profile
+# share one key, and only pushes to main save, even when tests fail. PRs,
+# stacked or not, restore main's cache instead of evicting each other's.
+
 env:
   CARGO_TERM_COLOR: always
   NEXTEST_PROFILE: ci
@@ -42,7 +46,9 @@ jobs:
           tool: cargo-nextest@0.9.145
       - uses: Swatinem/rust-cache@v2
         with:
-          key: minimum-rust-1.97.0
+          shared-key: minimum-rust
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
       - name: Prepare portable build host
         run: |
           sudo apt-get update -qq
@@ -68,7 +74,9 @@ jobs:
           tool: cargo-nextest@0.9.145
       - uses: Swatinem/rust-cache@v2
         with:
-          key: portable
+          shared-key: portable
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
       - name: Prepare portable build host
         run: |
           sudo apt-get update -qq
@@ -108,7 +116,9 @@ jobs:
           tool: cargo-nextest@0.9.145
       - uses: Swatinem/rust-cache@v2
         with:
-          key: slow
+          shared-key: linux-debug
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
       - run: make test-slow
 
   linux:
@@ -123,7 +133,9 @@ jobs:
           tool: cargo-nextest@0.9.145
       - uses: Swatinem/rust-cache@v2
         with:
-          key: linux-privileged
+          shared-key: linux-privileged
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
       - name: Install runtime and kernel test dependencies
         run: |
           sudo apt-get update -qq
@@ -161,7 +173,9 @@ jobs:
           tool: cargo-nextest@0.9.145
       - uses: Swatinem/rust-cache@v2
         with:
-          key: cluster
+          shared-key: linux-debug
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
       - run: make test-cluster
 
   upgrade-node:
@@ -176,7 +190,9 @@ jobs:
           tool: cargo-nextest@0.9.145
       - uses: Swatinem/rust-cache@v2
         with:
-          key: upgrade-node
+          shared-key: linux-debug
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
       - run: make test-upgrade-node
 
   upgrade-cluster:
@@ -191,7 +207,9 @@ jobs:
           tool: cargo-nextest@0.9.145
       - uses: Swatinem/rust-cache@v2
         with:
-          key: upgrade-cluster
+          shared-key: linux-debug
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
       - run: make test-upgrade-cluster
 
   macos:
@@ -207,7 +225,9 @@ jobs:
           tool: cargo-nextest@0.9.145
       - uses: Swatinem/rust-cache@v2
         with:
-          key: macos-portable
+          shared-key: macos
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
       - name: Lint every target and feature
         run: make lint
       - run: make test
@@ -227,7 +247,9 @@ jobs:
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: Swatinem/rust-cache@v2
         with:
-          key: coverage
+          shared-key: coverage
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
       - name: Remove provisioned container builder
         run: sudo apt-get remove -y -qq buildah
       - run: make coverage
@@ -246,7 +268,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.98.0
       - uses: Swatinem/rust-cache@v2
         with:
-          key: benchmark-fast
+          shared-key: bench
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
       - run: make bench
       - uses: actions/upload-artifact@v4
         with:
@@ -263,7 +287,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.98.0
       - uses: Swatinem/rust-cache@v2
         with:
-          key: benchmark-large
+          shared-key: bench
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
       - run: make bench-large
       - uses: actions/upload-artifact@v4
         with:
@@ -280,5 +306,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.98.0
       - uses: Swatinem/rust-cache@v2
         with:
-          key: scale-10k
+          shared-key: scale-10k
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
       - run: make bench-10k
