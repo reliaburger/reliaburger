@@ -295,6 +295,14 @@ impl CouncilNode {
         self.state_machine.desired_state().await.security_state
     }
 
+    /// Whether an operator has permanently retired this node identity.
+    /// Cheap enough to call on every request: it borrows, never clones.
+    pub async fn is_node_retired(&self, node_id: &str) -> bool {
+        self.state_machine
+            .read_desired(|state| state.security_state.crl.retired_nodes.contains_key(node_id))
+            .await
+    }
+
     /// Read the security state only if this node can prove the read is current.
     ///
     /// `ensure_linearizable` confirms with a quorum that this node is still

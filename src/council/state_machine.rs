@@ -1968,6 +1968,11 @@ impl CouncilStateMachine {
         self.inner.read().await.state.clone()
     }
 
+    /// Read part of the desired state under the lock, without cloning all of it.
+    pub async fn read_desired<T>(&self, read: impl FnOnce(&DesiredState) -> T) -> T {
+        read(&self.inner.read().await.state)
+    }
+
     /// Log id the loaded snapshot covers up to, `None` when no snapshot is
     /// loaded. Only meaningful straight after `with_store`, before Raft
     /// applies new entries; `council::validate_purge_boundary` reads it at

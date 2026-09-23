@@ -3032,12 +3032,21 @@ async fn refuse_retired_tls_peer(
             .extensions()
             .get::<crate::sesame::renewal::TlsPeerCertificate>(),
     ) {
-        let security = council.security_state().await;
-        let retired = crate::sesame::cert::subject_uri_sans(&peer.0).is_ok_and(|uris| {
-            uris.iter()
-                .filter_map(|uri| crate::sesame::ca::node_id_from_spiffe_uri(uri))
-                .any(|node| security.crl.retired_nodes.contains_key(node))
-        });
+        // An identity we can't read might belong to a retired node, so refuse it.
+        let Ok(uris) = crate::sesame::cert::subject_uri_sans(&peer.0) else {
+            return (
+                StatusCode::FORBIDDEN,
+                "peer certificate identity is unreadable",
+            )
+                .into_response();
+        };
+        let mut retired = false;
+        for node in uris
+            .iter()
+            .filter_map(|uri| crate::sesame::ca::node_id_from_spiffe_uri(uri))
+        {
+            retired |= council.is_node_retired(node).await;
+        }
         if retired {
             return (
                 StatusCode::FORBIDDEN,
@@ -10207,6 +10216,32 @@ schedule = "* * * * *"
         assert_eq!(
             instructions[1]["services"]["default__web"]["retire_vip"],
             true
+        );
+        shutdown.cancel();
+        council.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unparseable_peer_identity_is_refused_before_any_route() {
+        let council = seeded_council("unparseable-peer").await;
+        let (app, shutdown) = setup_with_auth_leases_events_and_council(
+            vec![],
+            Some("internal".into()),
+            crate::bun::readiness::ReadinessTracker::new(),
+            lease_static_capabilities(),
+            None,
+            None,
+            Some(council.clone()),
+        )
+        .await;
+        // The handshake verifier normally rejects this first; if anything
+        // slips past it, the retirement check must not wave it through.
+        let app = app.layer(axum::Extension(crate::sesame::renewal::TlsPeerCertificate(
+            Vec::from(b"not a certificate".as_slice()).into(),
+        )));
+        assert_eq!(
+            get_status(app, "/v1/health", None).await,
+            StatusCode::FORBIDDEN
         );
         shutdown.cancel();
         council.shutdown().await.unwrap();

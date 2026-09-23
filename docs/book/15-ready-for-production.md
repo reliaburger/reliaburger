@@ -3251,6 +3251,15 @@ scheduling all consult the durable fence. Existing API connections check their
 TLS peer identity again for each request. A returning machine needs fresh state,
 fresh credentials and a new node name.
 
+That per-request check originally cloned the whole replicated state (apps,
+catalogue, withdrawal ledger, leases) just to look up one name, on every request
+that arrived over mutual TLS. Now the state machine lends it out instead:
+`read_desired` takes a closure, runs it on a borrowed reference while holding the
+read lock, and returns only what the closure produces. The lookup costs a map
+probe. The same check also used to let an unreadable certificate identity
+through, because `is_ok_and` treats a parse error as "not retired". It now
+refuses: an identity we can't read might be one we've retired.
+
 Membership changes need their own fence. The retirement request carries the
 membership log position the leader observed; Raft refuses it if that position
 has changed or a joint membership change or another node's fault is in progress.

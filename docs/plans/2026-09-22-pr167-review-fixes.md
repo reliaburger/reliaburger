@@ -396,7 +396,9 @@ Discovery and API:
       `src/bun/discovery_ownership.rs:67-81`: `launch_inventory` returning
       `Ok(None)` records empty `executions`; `*previous = owner` overwrites the
       historical backend list the drain relies on. *Investigate first.*
-- [ ] **T2.13 Every mTLS request clones the whole cluster state.**
+- [x] **T2.13 Every mTLS request clones the whole cluster state.** Done. A
+      borrowing `read_desired` accessor backs `CouncilNode::is_node_retired`,
+      and an unreadable peer identity is now refused instead of passed.
       `refuse_retired_tls_peer` calls `council.security_state()`, which clones
       all of `DesiredState`. Add a borrowing accessor for the security part.
       Also make it fail closed when SAN parsing fails.
