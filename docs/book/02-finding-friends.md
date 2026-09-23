@@ -2264,9 +2264,7 @@ match self.generation {
 }
 ```
 
-One more thing had to work: upgrading a running cluster *across* this change. An older bun that's already running `api-0` writes an adoption record so a restarted bun can re-adopt the still-live process instead of killing and restarting it (Chapter 14 covers adoption in full). Those old records carry the legacy `api-0` string. If the new bun couldn't read them, every workload would be orphaned on upgrade — the exact failure adoption exists to prevent.
-
-So identity parsing has two doors. `parse` reads the new canonical form. `parse_legacy` reads the old namespace-less form, taking the namespace as a separate argument — which adoption always has, because the record stores `namespace`, `app_name` and `replica_index` as their own fields. The runtime keeps talking to the container by the id it was started under (the legacy one), while the supervisor keys the adopted instance under the fresh canonical id. Old workloads survive the upgrade; new ones are namespace-safe. A round-trip test pins both forms so a careless edit can't quietly break either.
+What about records written with the old, namespace-less ids? A restarted bun re-adopts still-live processes from their adoption records (Chapter 14 covers adoption in full), so this could have been a migration problem. It isn't, because nothing has shipped: no node in the wild carries an `api-0` record. `parse` reads only the canonical form, and adoption refuses any record whose id doesn't match the one rebuilt from its own `namespace`, `app_name` and `replica_index` fields. A round-trip test pins the canonical form so a careless edit can't quietly break it.
 
 ## What we built
 

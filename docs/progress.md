@@ -1174,12 +1174,10 @@ whole theme lands.
       reporting ordinal, record replica-index, upgrade inventory). Round-trip + hyphenated-app
       unit tests; DEP1 collision regression (two same-name apps in different namespaces
       coexist in the supervisor).
-    - [x] Adoption compat: a pre-theme record (bare `web-0`) re-adopts under the canonical
-      key rebuilt from the record's structured `namespace`/`app_name`/`replica_index` fields,
-      while the runtime, identity dir and log stem stay keyed on the legacy runtime id the
-      container ran as — so an in-place upgrade across the change never orphans a workload.
-      The upgrade marker gained a `full_id` (serde-default) so a marker written pre-theme
-      still loads; fixture test pins it.
+    - [x] Adoption checks each record's id against the canonical id rebuilt from its
+      structured `namespace`/`app_name`/`replica_index` fields and refuses a mismatch; the
+      upgrade marker records each instance's canonical `full_id`. (Pre-release, namespace-less
+      records and markers are not read; T4.9 deleted the compatibility path.)
     - [x] Cluster stop proposes `AppDelete` through Raft (`stop_handler` → `cluster_stop`,
       leader-forwarded like `apply`), so desired state clears and no reconciler resurrects the
       app; a leader with no local replica still clears cluster state (no spurious 404). The

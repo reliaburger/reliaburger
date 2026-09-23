@@ -132,9 +132,8 @@ impl InstanceIdentity {
     }
 
     /// The app-scoped suffix (`{app}-{ordinal}` or `{app}-g{gen}-{ordinal}`),
-    /// without the namespace prefix. This is the *legacy* string form, kept
-    /// only for parsing pre-theme records and container names.
-    pub fn app_suffix(&self) -> String {
+    /// without the namespace prefix.
+    fn app_suffix(&self) -> String {
         match self.generation {
             Some(generation) => format!("{}-g{generation}-{}", self.app, self.ordinal),
             None => format!("{}-{}", self.app, self.ordinal),
@@ -152,27 +151,23 @@ impl InstanceIdentity {
 
     /// Parse a canonical instance id back into its structured identity.
     ///
-    /// Returns `None` for a string that isn't in canonical form (for
-    /// example a legacy `{app}-{ordinal}` id that predates this theme) —
-    /// use [`InstanceIdentity::parse_legacy`] for those.
+    /// Returns `None` for a string that isn't in canonical form, such as a
+    /// bare `{app}-{ordinal}` with no namespace prefix.
+    ///
+    /// The suffix is ambiguous when an app name's last hyphenated segment
+    /// looks like `g{digits}` (e.g. an app literally named `worker-g5`).
+    /// Adoption instead checks the canonical ID against the record's separate
+    /// `namespace`/`app_name` fields, so this heuristic only matters for a
+    /// bare id parse.
     pub fn parse(id: &str) -> Option<Self> {
         let (namespace, suffix) = id.split_once(NAMESPACE_SEPARATOR)?;
-        let mut ident = Self::parse_legacy(suffix, namespace)?;
-        ident.namespace = namespace.to_string();
-        Some(ident)
+        Self::parse_suffix(suffix, namespace)
     }
 
-    /// Parse a legacy, namespace-less suffix (`{app}-{ordinal}` or
-    /// `{app}-g{generation}-{ordinal}`) with the namespace supplied
-    /// separately — the shape an old instance record or container name
-    /// carries. The app name may itself contain hyphens.
-    ///
-    /// The legacy format is inherently ambiguous when an app name's last
-    /// hyphenated segment looks like `g{digits}` (e.g. an app literally
-    /// named `worker-g5`). Adoption instead checks the canonical ID against
-    /// the record's separate `namespace`/`app_name` fields and refuses legacy
-    /// aliases, so this heuristic only matters for a bare container-name parse.
-    pub fn parse_legacy(suffix: &str, namespace: &str) -> Option<Self> {
+    /// Parse the app-scoped suffix (`{app}-{ordinal}` or
+    /// `{app}-g{generation}-{ordinal}`) of a canonical id. The app name may
+    /// itself contain hyphens.
+    fn parse_suffix(suffix: &str, namespace: &str) -> Option<Self> {
         let (head, ordinal_part) = suffix.rsplit_once('-')?;
         let ordinal: u32 = ordinal_part.parse().ok()?;
 
@@ -917,28 +912,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_rejects_legacy_bare_id() {
-        // A pre-theme id with no namespace prefix isn't canonical.
+    fn parse_rejects_bare_id_without_namespace() {
         assert!(InstanceIdentity::parse("api-0").is_none());
-    }
-
-    #[test]
-    fn parse_legacy_recovers_steady_state() {
-        let ident = InstanceIdentity::parse_legacy("api-0", "default").expect("parses");
-        assert_eq!(ident, InstanceIdentity::new("default", "api", 0));
-    }
-
-    #[test]
-    fn parse_legacy_recovers_canary() {
-        let ident = InstanceIdentity::parse_legacy("api-g1234-0", "prod").expect("parses");
-        assert_eq!(ident, InstanceIdentity::canary("prod", "api", 1234, 0));
-    }
-
-    #[test]
-    fn parse_legacy_recovers_hyphenated_app() {
-        let ident = InstanceIdentity::parse_legacy("my-web-app-7", "default").expect("parses");
-        assert_eq!(ident.app, "my-web-app");
-        assert_eq!(ident.ordinal, 7);
-        assert_eq!(ident.generation, None);
     }
 }

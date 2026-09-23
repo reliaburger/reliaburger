@@ -2419,13 +2419,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         marker: &crate::upgrade::marker::UpgradeMarker,
     ) -> Result<(), String> {
         for item in &marker.pre_upgrade_instances {
-            // Prefer the exact canonical id; fall back to the legacy
-            // `{app}-{ordinal}` form for a marker written before this theme.
-            let id = if item.full_id.is_empty() {
-                InstanceId(format!("{}-{}", item.app_name, item.instance_id))
-            } else {
-                InstanceId(item.full_id.clone())
-            };
+            let id = InstanceId(item.full_id.clone());
             match self.supervisor.get_instance(&id) {
                 Some(instance) if instance.state == ContainerState::Running => {}
                 Some(instance) => {
