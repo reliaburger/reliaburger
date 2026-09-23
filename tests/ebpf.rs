@@ -399,18 +399,19 @@ async fn agent_deploy_populates_backend_map() {
         shutdown.clone(),
         volumes.path(),
     );
+    let name = root_app_name("web", volumes.path());
     agent.set_onion_ebpf(Arc::clone(&ebpf)).await;
     let agent_task = tokio::spawn(async move { agent.run().await });
     let _tasks = TestTasks::new(shutdown.clone(), vec![agent_task]);
 
-    let config = Config::parse(
+    let config = Config::parse(&format!(
         r#"
-        [app.web]
+        [app.{name}]
         image = "proc-grill:image-ignored"
         command = ["sleep", "600"]
         port = 8080
-    "#,
-    )
+    "#
+    ))
     .unwrap();
     let (ev_tx, mut ev_rx) = mpsc::channel(64);
     cmd_tx
@@ -423,7 +424,7 @@ async fn agent_deploy_populates_backend_map() {
     while ev_rx.recv().await.is_some() {}
 
     // Let the instance reach Running and register its backend.
-    let vip = VirtualIP::from_service_id(&ServiceId::new("default", "web"));
+    let vip = VirtualIP::from_service_id(&ServiceId::new("default", name.as_str()));
     let bpf = BpfServiceMap::new();
     let populated = {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -482,6 +483,7 @@ async fn agent_drop_fault_refuses_vip_with_eperm() {
         shutdown.clone(),
         volumes.path(),
     );
+    let name = root_app_name("faulty", volumes.path());
     agent.set_onion_ebpf(Arc::clone(&ebpf)).await;
     let agent_task = tokio::spawn(async move { agent.run().await });
     let _tasks = TestTasks::new(shutdown.clone(), vec![agent_task]);
@@ -489,7 +491,7 @@ async fn agent_drop_fault_refuses_vip_with_eperm() {
     let service_port: u16 = 8090;
     let config = Config::parse(&format!(
         r#"
-        [app.faulty]
+        [app.{name}]
         image = "proc-grill:image-ignored"
         command = ["sleep", "600"]
         port = {service_port}
@@ -506,7 +508,7 @@ async fn agent_drop_fault_refuses_vip_with_eperm() {
         .unwrap();
     while ev_rx.recv().await.is_some() {}
 
-    let vip = VirtualIP::from_service_id(&ServiceId::new("default", "faulty"));
+    let vip = VirtualIP::from_service_id(&ServiceId::new("default", name.as_str()));
     let bpf = BpfServiceMap::new();
     // Wait for the backend to register so the VIP resolves to a real entry.
     for _ in 0..25 {
@@ -540,7 +542,7 @@ async fn agent_drop_fault_refuses_vip_with_eperm() {
             reservation: None,
             request: FaultRequest {
                 fault_type: FaultType::Drop { probability: 100 },
-                target_service: "faulty".into(),
+                target_service: name.clone(),
                 namespace: Some("default".into()),
                 target_instance: None,
                 target_node: None,
@@ -1470,19 +1472,21 @@ async fn egress_programmed_before_start_via_cgroup_path() {
         shutdown.clone(),
         volumes.path(),
     );
+    let name = root_app_name("prestart", volumes.path());
+    let _cgroups = AppCgroups::new("default", &name);
     agent.set_onion_ebpf(Arc::clone(&ebpf)).await;
     let agent_task = tokio::spawn(async move { agent.run().await });
 
-    let config = Config::parse(
+    let config = Config::parse(&format!(
         r#"
-        [app.prestart]
+        [app.{name}]
         image = "mock:image"
         command = ["sleep", "600"]
 
-        [app.prestart.egress]
+        [app.{name}.egress]
         allow = ["203.0.113.9:443"]
-    "#,
-    )
+    "#
+    ))
     .unwrap();
     let (ev_tx, mut ev_rx) = mpsc::channel(64);
     cmd_tx
@@ -1501,9 +1505,9 @@ async fn egress_programmed_before_start_via_cgroup_path() {
 
     // The agent created the cgroup directory and programmed enforcement
     // against its inode before ever calling start.
-    let cgroup_dir = std::path::Path::new("/sys/fs/cgroup/reliaburger/default/prestart/0");
+    let cgroup_dir = reliaburger::grill::cgroup::cgroup_path("default", &name, 0);
     let cgroup_id =
-        egress::cgroup_id_of_path(cgroup_dir).expect("agent should have created the cgroup dir");
+        egress::cgroup_id_of_path(&cgroup_dir).expect("agent should have created the cgroup dir");
     {
         let mut e = ebpf.lock().await;
         assert!(
@@ -1553,9 +1557,12 @@ async fn pre_start_programming_scrubs_recycled_cgroup_allows() {
 
     let ebpf = Arc::new(Mutex::new(load_ebpf()));
 
-    let cgroup_dir = std::path::Path::new("/sys/fs/cgroup/reliaburger/default/recycled/0");
-    std::fs::create_dir_all(cgroup_dir).unwrap();
-    let cgroup_id = egress::cgroup_id_of_path(cgroup_dir).unwrap();
+    let volumes = TestVolumes::new();
+    let name = root_app_name("recycled", volumes.path());
+    let _cgroups = AppCgroups::new("default", &name);
+    let cgroup_dir = reliaburger::grill::cgroup::cgroup_path("default", &name, 0);
+    std::fs::create_dir_all(&cgroup_dir).unwrap();
+    let cgroup_id = egress::cgroup_id_of_path(&cgroup_dir).unwrap();
     let stale_key = exact_v4_key(cgroup_id, Ipv4Addr::new(198, 51, 100, 77), 8443);
     {
         let mut e = ebpf.lock().await;
@@ -1574,7 +1581,6 @@ async fn pre_start_programming_scrubs_recycled_cgroup_allows() {
     grill.set_honours_cgroup_path(true);
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
     let shutdown = CancellationToken::new();
-    let volumes = TestVolumes::new();
     let mut agent = test_agent(
         grill,
         PortAllocator::new(42400, 42500),
@@ -1585,16 +1591,16 @@ async fn pre_start_programming_scrubs_recycled_cgroup_allows() {
     agent.set_onion_ebpf(Arc::clone(&ebpf)).await;
     tokio::spawn(async move { agent.run().await });
 
-    let config = Config::parse(
+    let config = Config::parse(&format!(
         r#"
-        [app.recycled]
+        [app.{name}]
         image = "mock:image"
         command = ["sleep", "600"]
 
-        [app.recycled.egress]
+        [app.{name}.egress]
         allow = ["203.0.113.9:443"]
-    "#,
-    )
+    "#
+    ))
     .unwrap();
     let (events, mut event_rx) = mpsc::channel(64);
     cmd_tx
@@ -1648,21 +1654,23 @@ async fn live_egress_hook_loss_stops_protected_workload() {
         shutdown.clone(),
         volumes.path(),
     );
+    let name = root_app_name("guarded", volumes.path());
+    let _cgroups = AppCgroups::new("default", &name);
     agent.set_onion_ebpf(Arc::clone(&ebpf)).await;
     let readiness = reliaburger::bun::readiness::ReadinessTracker::new();
     agent.set_readiness_tracker(readiness.clone());
     let owner = tokio::spawn(async move { agent.run().await });
 
-    let config = Config::parse(
+    let config = Config::parse(&format!(
         r#"
-        [app.guarded]
+        [app.{name}]
         image = "mock:image"
         command = ["sleep", "600"]
 
-        [app.guarded.egress]
+        [app.{name}.egress]
         allow = ["203.0.113.9:443"]
-    "#,
-    )
+    "#
+    ))
     .unwrap();
     let (events, mut event_rx) = mpsc::channel(64);
     cmd_tx
@@ -1732,6 +1740,8 @@ async fn pre_start_programming_error_fails_deploy_with_no_running_process() {
         shutdown.clone(),
         volumes.path(),
     );
+    let name = root_app_name("badcidr", volumes.path());
+    let _cgroups = AppCgroups::new("default", &name);
     agent.set_onion_ebpf(Arc::clone(&ebpf)).await;
     tokio::spawn(async move { agent.run().await });
 
@@ -1740,14 +1750,14 @@ async fn pre_start_programming_error_fails_deploy_with_no_running_process() {
     let allow: Vec<String> = (1..=9).map(|p| format!("\"10.0.0.0/8:{p}\"")).collect();
     let config = Config::parse(&format!(
         r#"
-        [app.badcidr]
+        [app.{name}]
         image = "mock:image"
         command = ["sleep", "600"]
 
-        [app.badcidr.egress]
-        allow = [{}]
+        [app.{name}.egress]
+        allow = [{allow}]
     "#,
-        allow.join(", ")
+        allow = allow.join(", ")
     ))
     .unwrap();
     let (ev_tx, mut ev_rx) = mpsc::channel(64);
@@ -1810,6 +1820,74 @@ fn build_dns_query(name: &str) -> Vec<u8> {
     packet.extend_from_slice(&[0x00, 0x01]);
 
     packet
+}
+
+/// An app name unique to this test root.
+///
+/// Instance cgroups live at a host-wide path built from the namespace, app
+/// and ordinal (`/sys/fs/cgroup/reliaburger/<namespace>/<app>/<ordinal>`). A
+/// fixed name shares that path with every earlier run, so a run killed before
+/// its cleanup leaves a cgroup (and possibly a workload) for the next run to
+/// trip over. Deriving the name from the test's temporary root keeps every
+/// run's cgroups, instance ids and records to itself.
+fn root_app_name(prefix: &str, root: &std::path::Path) -> String {
+    let suffix = root
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .trim_start_matches('.')
+        .to_ascii_lowercase();
+    format!("{prefix}-{suffix}")
+}
+
+/// Remove the (empty) instance cgroups the agent created for an app.
+///
+/// Cgroup directories outlive the test's temporary root, so a unique name per
+/// run would otherwise leave one set of empty directories behind every run.
+/// Best effort: a cgroup that still holds a process refuses removal and stays
+/// for the leak to be seen.
+fn remove_app_cgroups(namespace: &str, name: &str) {
+    fn remove_tree(path: &std::path::Path) {
+        if let Ok(entries) = std::fs::read_dir(path) {
+            for entry in entries.flatten() {
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    remove_tree(&entry.path());
+                }
+            }
+        }
+        match std::fs::remove_dir(path) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                eprintln!("test cgroup cleanup of {} failed: {error}", path.display());
+            }
+            _ => {}
+        }
+    }
+    let leaf = reliaburger::grill::cgroup::cgroup_path(namespace, name, 0);
+    if let Some(app) = leaf.parent() {
+        remove_tree(app);
+    }
+}
+
+/// Removes an app's instance cgroups when dropped, even if the test panics.
+struct AppCgroups {
+    namespace: &'static str,
+    name: String,
+}
+
+impl AppCgroups {
+    fn new(namespace: &'static str, name: &str) -> Self {
+        Self {
+            namespace,
+            name: name.to_string(),
+        }
+    }
+}
+
+impl Drop for AppCgroups {
+    fn drop(&mut self) {
+        remove_app_cgroups(self.namespace, &self.name);
+    }
 }
 
 /// Unmount and remove every instance identity tmpfs under a volumes directory.
@@ -1980,6 +2058,8 @@ async fn agent_retirement_keeps_its_record_when_kernel_egress_cleanup_fails() {
     let grill = MockGrill::new();
     grill.set_honours_cgroup_path(true);
     grill.set_pid(std::process::id());
+    let name = root_app_name("egress-retirement", root.path());
+    let _cgroups = AppCgroups::new("default", &name);
     let (commands, receiver) = mpsc::channel(64);
     let shutdown = CancellationToken::new();
     let mut agent = test_agent(
@@ -1992,15 +2072,15 @@ async fn agent_retirement_keeps_its_record_when_kernel_egress_cleanup_fails() {
     agent.set_records_dir(records.clone());
     agent.set_onion_ebpf(Arc::clone(&ebpf)).await;
     let task = tokio::spawn(async move { agent.run().await });
-    let config = Config::parse(
+    let config = Config::parse(&format!(
         r#"
-        [app.egress-retirement]
+        [app.{name}]
         image = "mock:image"
         command = ["sleep", "600"]
-        [app.egress-retirement.egress]
+        [app.{name}.egress]
         allow = ["203.0.113.9:443"]
-    "#,
-    )
+    "#
+    ))
     .unwrap();
     let (events, mut results) = mpsc::channel(64);
     commands
@@ -2010,7 +2090,7 @@ async fn agent_retirement_keeps_its_record_when_kernel_egress_cleanup_fails() {
     while let Some(event) = results.recv().await {
         assert!(!matches!(event, ApplyEvent::Error { .. }), "{event:?}");
     }
-    let record = reliaburger::grill::records::record_path(&records, "default__egress-retirement-0");
+    let record = reliaburger::grill::records::record_path(&records, &format!("default__{name}-0"));
     assert!(
         record.exists(),
         "deployment did not persist its adoption record"
@@ -2019,7 +2099,7 @@ async fn agent_retirement_keeps_its_record_when_kernel_egress_cleanup_fails() {
     let (response, result) = oneshot::channel();
     commands
         .send(AgentCommand::Retire {
-            app_name: "egress-retirement".into(),
+            app_name: name.clone(),
             namespace: "default".into(),
             response,
         })
@@ -2033,7 +2113,7 @@ async fn agent_retirement_keeps_its_record_when_kernel_egress_cleanup_fails() {
     let (response, retry) = oneshot::channel();
     commands
         .send(AgentCommand::Retire {
-            app_name: "egress-retirement".into(),
+            app_name: name.clone(),
             namespace: "default".into(),
             response,
         })
@@ -2557,9 +2637,12 @@ async fn agent_adoption_restores_durable_egress_ownership_before_live_checks() {
     agent.set_records_dir(records.clone());
     agent.set_onion_ebpf(Arc::clone(&ebpf)).await;
     let task = tokio::spawn(async move { agent.run().await });
-    let config = Config::parse(
-        "[app.egress-adoption]\nimage = 'mock:image'\ncommand = ['sleep', '600']\n[app.egress-adoption.egress]\nallow = ['203.0.113.9:443']\n",
-    ).unwrap();
+    let name = root_app_name("egress-adoption", root.path());
+    let _cgroups = AppCgroups::new("default", &name);
+    let config = Config::parse(&format!(
+        "[app.{name}]\nimage = 'mock:image'\ncommand = ['sleep', '600']\n[app.{name}.egress]\nallow = ['203.0.113.9:443']\n",
+    ))
+    .unwrap();
     let (events, mut results) = mpsc::channel(64);
     commands
         .send(AgentCommand::Deploy { config, events })
@@ -2571,7 +2654,7 @@ async fn agent_adoption_restores_durable_egress_ownership_before_live_checks() {
     let checkpoint_present = records.join("egress-owners.checkpoint").exists();
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
-    let id = InstanceId("default__egress-adoption-0".into());
+    let id = InstanceId(format!("default__{name}-0"));
     grill.set_adopt_result(&id, true);
     let shutdown = CancellationToken::new();
     let (commands, receiver) = mpsc::channel(64);
@@ -2601,7 +2684,7 @@ async fn agent_adoption_restores_durable_egress_ownership_before_live_checks() {
     let (response, retired) = oneshot::channel();
     commands
         .send(AgentCommand::Retire {
-            app_name: "egress-adoption".into(),
+            app_name: name.clone(),
             namespace: "default".into(),
             response,
         })
@@ -2623,6 +2706,8 @@ async fn agent_adoption_restores_durable_egress_ownership_before_live_checks() {
 
 struct EgressRecoveryFixture {
     root: tempfile::TempDir,
+    /// The deployed app, named after `root` so its cgroup is this run's own.
+    name: String,
     ebpf: std::sync::Arc<tokio::sync::Mutex<OnionEbpf>>,
     grill: reliaburger::grill::mock::MockGrill,
     commands: tokio::sync::mpsc::Sender<reliaburger::bun::agent::AgentCommand>,
@@ -2630,26 +2715,28 @@ struct EgressRecoveryFixture {
 }
 
 impl EgressRecoveryFixture {
-    async fn deploy(name: &str) -> Self {
-        Self::prepare(name, false).await
+    /// Deploy an app named `prefix` plus this fixture's root; see `name`.
+    async fn deploy(prefix: &str) -> Self {
+        Self::prepare(prefix, false).await
     }
 
-    async fn prepare(name: &str, failed_checkpoint: bool) -> Self {
-        Self::prepare_with_service(name, failed_checkpoint, false).await
+    async fn prepare(prefix: &str, failed_checkpoint: bool) -> Self {
+        Self::prepare_with_service(prefix, failed_checkpoint, false).await
     }
 
-    async fn prepare_with_service(name: &str, failed_checkpoint: bool, service: bool) -> Self {
-        Self::prepare_with_policy(name, failed_checkpoint, service, true).await
+    async fn prepare_with_service(prefix: &str, failed_checkpoint: bool, service: bool) -> Self {
+        Self::prepare_with_policy(prefix, failed_checkpoint, service, true).await
     }
 
     async fn prepare_with_policy(
-        name: &str,
+        prefix: &str,
         failed_checkpoint: bool,
         service: bool,
         allowlist: bool,
     ) -> Self {
         use reliaburger::bun::agent::{AgentCommand, ApplyEvent};
         let root = tempfile::tempdir().unwrap();
+        let name = root_app_name(prefix, root.path());
         std::fs::create_dir(root.path().join("records")).unwrap();
         if failed_checkpoint {
             std::fs::create_dir(root.path().join("records/egress-owners.checkpoint")).unwrap();
@@ -2663,6 +2750,7 @@ impl EgressRecoveryFixture {
         let (commands, _) = tokio::sync::mpsc::channel(64);
         let mut fixture = Self {
             root,
+            name: name.clone(),
             ebpf,
             grill,
             commands,
@@ -2747,6 +2835,7 @@ impl Drop for EgressRecoveryFixture {
         if let Some(task) = &self.task {
             task.abort();
         }
+        remove_app_cgroups("default", &self.name);
         if let Ok(entries) = std::fs::read_dir(self.root.path().join("volumes/.identity")) {
             for entry in entries.flatten() {
                 if let Err(error) =
@@ -2764,23 +2853,25 @@ impl Drop for EgressRecoveryFixture {
 async fn confirmed_egress_retirement_survives_interrupted_adoption_record_cleanup() {
     assert!(ebpf_tests_enabled());
     let mut fixture = EgressRecoveryFixture::deploy("egress-tombstone").await;
+    let name = fixture.name.clone();
+    let name = name.as_str();
     let identity = reliaburger::sesame::identity::instance_identity_dir(
         &fixture.root.path().join("volumes"),
-        "default__egress-tombstone-0",
+        &format!("default__{name}-0"),
     );
     std::fs::create_dir_all(identity.parent().unwrap()).unwrap();
     reliaburger::sesame::identity::cleanup_identity_dir(&identity).unwrap();
     std::fs::write(&identity, b"block identity cleanup").unwrap();
-    assert!(fixture.retire("egress-tombstone").await.is_err());
+    assert!(fixture.retire(name).await.is_err());
     let records = fixture.root.path().join("records");
     let document: serde_json::Value =
         serde_json::from_slice(&std::fs::read(records.join("egress-owners.checkpoint")).unwrap())
             .unwrap();
     let tombstone = document["owners"].as_array().unwrap().iter().any(|entry| {
-        entry["instance_id"] == "default__egress-tombstone-0"
+        entry["instance_id"] == format!("default__{name}-0")
             && entry["binding"]["phase"] == "Retired"
     });
-    let record = reliaburger::grill::records::record_path(&records, "default__egress-tombstone-0");
+    let record = reliaburger::grill::records::record_path(&records, &format!("default__{name}-0"));
     assert!(record.exists());
     fixture.crash().await;
     std::fs::remove_file(identity).unwrap();
@@ -2799,14 +2890,15 @@ async fn confirmed_egress_retirement_survives_interrupted_adoption_record_cleanu
 async fn missing_policy_owner_refuses_even_a_stopped_recorded_runtime() {
     assert!(ebpf_tests_enabled());
     let mut fixture = EgressRecoveryFixture::deploy("egress-missing-owner").await;
+    let name = fixture.name.clone();
+    let name = name.as_str();
     fixture.crash().await;
     let records = fixture.root.path().join("records");
     std::fs::remove_file(records.join("egress-owners.checkpoint")).unwrap();
     let (mut restored, _, _) = fixture.agent().await;
     let result = restored.adopt_recorded_instances().await;
     let retained =
-        reliaburger::grill::records::record_path(&records, "default__egress-missing-owner-0")
-            .exists();
+        reliaburger::grill::records::record_path(&records, &format!("default__{name}-0")).exists();
     fixture.ebpf.lock().await.detach().unwrap();
     assert!(
         result.is_err(),
@@ -2823,12 +2915,14 @@ async fn missing_policy_owner_refuses_even_a_stopped_recorded_runtime() {
 async fn failed_policy_checkpoint_prevents_kernel_programming_and_workload_start() {
     assert!(ebpf_tests_enabled());
     let mut fixture = EgressRecoveryFixture::prepare("egress-checkpoint-failure", true).await;
+    let name = fixture.name.clone();
+    let name = name.as_str();
     let never_started = !fixture
         .grill
         .calls()
         .iter()
         .any(|(operation, _)| operation == "start");
-    let path = reliaburger::grill::cgroup::cgroup_path("default", "egress-checkpoint-failure", 0);
+    let path = reliaburger::grill::cgroup::cgroup_path("default", name, 0);
     let id = reliaburger::sesame::egress::cgroup_id_of_path(&path).unwrap();
     let enforced =
         reliaburger::sesame::egress::egress_enforced(&mut fixture.ebpf.lock().await.bpf, id)
@@ -2850,6 +2944,8 @@ async fn failed_policy_checkpoint_prevents_kernel_programming_and_workload_start
 async fn agent_recovery_keeps_policy_ownership_when_kernel_retirement_is_refused() {
     assert!(ebpf_tests_enabled());
     let mut fixture = EgressRecoveryFixture::deploy("egress-recovery-cleanup").await;
+    let name = fixture.name.clone();
+    let name = name.as_str();
     fixture.crash().await;
     freeze_egress_map(&*fixture.ebpf.lock().await, "egress_map");
     let records = fixture.root.path().join("records");
@@ -2857,8 +2953,7 @@ async fn agent_recovery_keeps_policy_ownership_when_kernel_retirement_is_refused
     assert!(restored.adopt_recorded_instances().await.is_err());
     assert!(restored.adopt_recorded_instances().await.is_err());
     let retained_record =
-        reliaburger::grill::records::record_path(&records, "default__egress-recovery-cleanup-0")
-            .exists();
+        reliaburger::grill::records::record_path(&records, &format!("default__{name}-0")).exists();
     let document: serde_json::Value =
         serde_json::from_slice(&std::fs::read(records.join("egress-owners.checkpoint")).unwrap())
             .unwrap();
@@ -2880,10 +2975,12 @@ async fn adoption_fences_missing_enforcement_before_publishing_the_workload() {
     use reliaburger::sesame::egress;
     assert!(ebpf_tests_enabled());
     let mut fixture = EgressRecoveryFixture::deploy("egress-missing-flag").await;
+    let name = fixture.name.clone();
+    let name = name.as_str();
     fixture.crash().await;
-    let id = reliaburger::grill::InstanceId("default__egress-missing-flag-0".into());
+    let id = reliaburger::grill::InstanceId(format!("default__{name}-0"));
     fixture.grill.set_adopt_result(&id, true);
-    let path = reliaburger::grill::cgroup::cgroup_path("default", "egress-missing-flag", 0);
+    let path = reliaburger::grill::cgroup::cgroup_path("default", name, 0);
     let cgroup = egress::cgroup_id_of_path(&path).unwrap();
     egress::clear_egress_enforced(&mut fixture.ebpf.lock().await.bpf, cgroup).unwrap();
     let (mut restored, _, _) = fixture.agent().await;
@@ -2911,7 +3008,9 @@ async fn agent_namespace_binding_uses_the_workload_cgroup_instead_of_its_launche
     assert!(ebpf_tests_enabled());
     let mut fixture =
         EgressRecoveryFixture::prepare_with_service("source-cgroup", false, true).await;
-    let path = reliaburger::grill::cgroup::cgroup_path("default", "source-cgroup", 0);
+    let name = fixture.name.clone();
+    let name = name.as_str();
+    let path = reliaburger::grill::cgroup::cgroup_path("default", name, 0);
     let workload = egress::cgroup_id_of_path(&path).unwrap();
     let launcher = egress::cgroup_id_of_pid(std::process::id()).unwrap();
     let (workload_namespace, launcher_namespace) = {
@@ -2925,7 +3024,7 @@ async fn agent_namespace_binding_uses_the_workload_cgroup_instead_of_its_launche
                 .source_namespace_id,
         )
     };
-    fixture.retire("source-cgroup").await.unwrap();
+    fixture.retire(name).await.unwrap();
     fixture.crash().await;
     fixture.ebpf.lock().await.detach().unwrap();
     std::fs::remove_dir(path).unwrap();
@@ -3159,7 +3258,9 @@ async fn agent_namespace_binding_includes_outbound_only_workloads() {
     assert!(ebpf_tests_enabled());
     let mut fixture =
         EgressRecoveryFixture::prepare_with_service("outbound-source", false, false).await;
-    let path = reliaburger::grill::cgroup::cgroup_path("default", "outbound-source", 0);
+    let name = fixture.name.clone();
+    let name = name.as_str();
+    let path = reliaburger::grill::cgroup::cgroup_path("default", name, 0);
     let workload = egress::cgroup_id_of_path(&path).unwrap();
     let launcher = egress::cgroup_id_of_pid(std::process::id()).unwrap();
     let (workload_namespace, launcher_namespace) = {
@@ -3173,7 +3274,7 @@ async fn agent_namespace_binding_includes_outbound_only_workloads() {
                 .source_namespace_id,
         )
     };
-    fixture.retire("outbound-source").await.unwrap();
+    fixture.retire(name).await.unwrap();
     fixture.crash().await;
     fixture.ebpf.lock().await.detach().unwrap();
     std::fs::remove_dir(path).unwrap();
@@ -3189,8 +3290,10 @@ async fn agent_namespace_binding_includes_outbound_only_workloads() {
 #[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
 async fn agent_retirement_preserves_ownership_when_backend_removal_is_refused() {
     assert!(ebpf_tests_enabled());
-    let name = "backend-retirement";
-    let mut fixture = EgressRecoveryFixture::prepare_with_service(name, false, true).await;
+    let mut fixture =
+        EgressRecoveryFixture::prepare_with_service("backend-retirement", false, true).await;
+    let name = fixture.name.clone();
+    let name = name.as_str();
     let service = ServiceId::new("default", name);
     let vip = VirtualIP::from_service_id(&service);
     let record = reliaburger::grill::records::record_path(
@@ -3228,8 +3331,10 @@ async fn agent_retirement_preserves_ownership_when_backend_removal_is_refused() 
 #[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
 async fn agent_retirement_confirms_backend_absence_before_forgetting_ownership() {
     assert!(ebpf_tests_enabled());
-    let name = "backend-confirmed";
-    let mut fixture = EgressRecoveryFixture::prepare_with_service(name, false, true).await;
+    let mut fixture =
+        EgressRecoveryFixture::prepare_with_service("backend-confirmed", false, true).await;
+    let name = fixture.name.clone();
+    let name = name.as_str();
     let vip = VirtualIP::from_service_id(&ServiceId::new("default", name));
     let record = reliaburger::grill::records::record_path(
         &fixture.root.path().join("records"),
@@ -3255,18 +3360,12 @@ async fn assert_source_policy_precedes_start(job: bool) {
     use std::sync::Arc;
     use tokio::sync::{Mutex, mpsc, oneshot};
     assert!(ebpf_tests_enabled());
-    let name = if job {
-        "source-before-job"
-    } else {
-        "source-before-app"
-    };
-    let target_name = if job {
-        "source-target-job"
-    } else {
-        "source-target-app"
-    };
     let kind = if job { "job" } else { "app" };
     let root = tempfile::tempdir().unwrap();
+    let name = root_app_name(&format!("source-before-{kind}"), root.path());
+    let target_name = root_app_name(&format!("source-target-{kind}"), root.path());
+    let _cgroups = AppCgroups::new("default", &name);
+    let _target_cgroups = AppCgroups::new("backend", &target_name);
     let records = root.path().join("records");
     let ebpf = Arc::new(Mutex::new(
         OnionEbpf::load_embedded(CGROUP_PATH.as_ref()).unwrap(),
@@ -3317,7 +3416,7 @@ async fn assert_source_policy_precedes_start(job: bool) {
     tokio::time::timeout(Duration::from_secs(10), grill.wait_for_starts(1))
         .await
         .unwrap();
-    let path = reliaburger::grill::cgroup::cgroup_path("default", name, 0);
+    let path = reliaburger::grill::cgroup::cgroup_path("default", &name, 0);
     let cgroup = egress::cgroup_id_of_path(&path);
     let namespace = if let Some(cgroup) = cgroup {
         firewall::read_firewall_state(&mut ebpf.lock().await.bpf, cgroup, 0)
@@ -3330,7 +3429,9 @@ async fn assert_source_policy_precedes_start(job: bool) {
         firewall::read_firewall_state(
             &mut ebpf.lock().await.bpf,
             cgroup,
-            u32::from(VirtualIP::from_service_id(&ServiceId::new("backend", target_name)).0),
+            u32::from(
+                VirtualIP::from_service_id(&ServiceId::new("backend", target_name.as_str())).0,
+            ),
         )
         .unwrap()
         .action
@@ -3353,7 +3454,7 @@ async fn assert_source_policy_precedes_start(job: bool) {
     let (response, result) = oneshot::channel();
     commands
         .send(AgentCommand::Retire {
-            app_name: name.into(),
+            app_name: name.clone(),
             namespace: "default".into(),
             response,
         })
@@ -3363,7 +3464,7 @@ async fn assert_source_policy_precedes_start(job: bool) {
     let (response, result) = oneshot::channel();
     commands
         .send(AgentCommand::Retire {
-            app_name: target_name.into(),
+            app_name: target_name.clone(),
             namespace: "backend".into(),
             response,
         })
@@ -3375,7 +3476,7 @@ async fn assert_source_policy_precedes_start(job: bool) {
     if path.exists() {
         std::fs::remove_dir(path).unwrap();
     }
-    let target_path = reliaburger::grill::cgroup::cgroup_path("backend", target_name, 0);
+    let target_path = reliaburger::grill::cgroup::cgroup_path("backend", &target_name, 0);
     if target_path.exists() {
         std::fs::remove_dir(target_path).unwrap();
     }
@@ -3425,8 +3526,9 @@ async fn source_policy_precedes_job_start() {
 #[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
 async fn namespace_retirement_keeps_original_ownership_through_recovery() {
     assert!(ebpf_tests_enabled());
-    let name = "namespace-retirement";
-    let mut fixture = EgressRecoveryFixture::deploy(name).await;
+    let mut fixture = EgressRecoveryFixture::deploy("namespace-retirement").await;
+    let name = fixture.name.clone();
+    let name = name.as_str();
     freeze_egress_map(&*fixture.ebpf.lock().await, "cgroup_namespace_map");
     let first = fixture.retire(name).await;
     let second = fixture.retire(name).await;
@@ -3458,8 +3560,9 @@ async fn namespace_retirement_keeps_original_ownership_through_recovery() {
 async fn namespace_adoption_refuses_missing_original_enforcement() {
     use reliaburger::sesame::{egress, firewall};
     assert!(ebpf_tests_enabled());
-    let name = "namespace-adoption";
-    let mut fixture = EgressRecoveryFixture::deploy(name).await;
+    let mut fixture = EgressRecoveryFixture::deploy("namespace-adoption").await;
+    let name = fixture.name.clone();
+    let name = name.as_str();
     fixture.crash().await;
     let id = reliaburger::grill::InstanceId(format!("default__{name}-0"));
     fixture.grill.set_adopt_result(&id, true);
@@ -3485,8 +3588,11 @@ async fn namespace_adoption_refuses_missing_original_enforcement() {
 async fn source_namespace_loss_fences_a_live_workload() {
     use reliaburger::sesame::{egress, firewall};
     assert!(ebpf_tests_enabled());
-    let name = "namespace-live-loss";
-    let mut fixture = EgressRecoveryFixture::prepare_with_policy(name, false, false, false).await;
+    let mut fixture =
+        EgressRecoveryFixture::prepare_with_policy("namespace-live-loss", false, false, false)
+            .await;
+    let name = fixture.name.clone();
+    let name = name.as_str();
     let id = reliaburger::grill::InstanceId(format!("default__{name}-0"));
     let path = reliaburger::grill::cgroup::cgroup_path("default", name, 0);
     let cgroup = egress::cgroup_id_of_path(&path).unwrap();
@@ -3520,8 +3626,9 @@ async fn source_namespace_loss_fences_a_live_workload() {
 async fn source_namespace_recovery_refuses_an_owner_with_erased_identity() {
     use reliaburger::sesame::{egress, firewall};
     assert!(ebpf_tests_enabled());
-    let name = "namespace-erased-owner";
-    let mut fixture = EgressRecoveryFixture::deploy(name).await;
+    let mut fixture = EgressRecoveryFixture::deploy("namespace-erased-owner").await;
+    let name = fixture.name.clone();
+    let name = name.as_str();
     fixture.crash().await;
     let id = reliaburger::grill::InstanceId(format!("default__{name}-0"));
     fixture.grill.set_adopt_result(&id, true);
@@ -3552,8 +3659,11 @@ async fn source_namespace_recovery_refuses_an_owner_with_erased_identity() {
 async fn source_only_checkpoint_failure_prevents_execution() {
     use reliaburger::sesame::{egress, firewall};
     assert!(ebpf_tests_enabled());
-    let name = "source-checkpoint-failure";
-    let mut fixture = EgressRecoveryFixture::prepare_with_policy(name, true, false, false).await;
+    let mut fixture =
+        EgressRecoveryFixture::prepare_with_policy("source-checkpoint-failure", true, false, false)
+            .await;
+    let name = fixture.name.clone();
+    let name = name.as_str();
     let started = fixture
         .grill
         .calls()
@@ -3576,8 +3686,11 @@ async fn source_only_adoption_preserves_namespace_without_an_egress_allowlist() 
     use reliaburger::bun::agent::AgentCommand;
     use reliaburger::sesame::{egress, firewall};
     assert!(ebpf_tests_enabled());
-    let name = "source-only-adoption";
-    let mut fixture = EgressRecoveryFixture::prepare_with_policy(name, false, false, false).await;
+    let mut fixture =
+        EgressRecoveryFixture::prepare_with_policy("source-only-adoption", false, false, false)
+            .await;
+    let name = fixture.name.clone();
+    let name = name.as_str();
     fixture.crash().await;
     let id = reliaburger::grill::InstanceId(format!("default__{name}-0"));
     fixture.grill.set_adopt_result(&id, true);
@@ -3816,19 +3929,21 @@ async fn init_exit_preserves_policy_before_the_next_container_starts() {
     agent.set_records_dir(root.path().join("records"));
     agent.set_onion_ebpf(Arc::clone(&ebpf)).await;
     let task = tokio::spawn(async move { agent.run().await });
-    let config = reliaburger::config::Config::parse(
+    let name = root_app_name("init-policy-boundary", root.path());
+    let _cgroups = AppCgroups::new("default", &name);
+    let config = reliaburger::config::Config::parse(&format!(
         r#"
-        [app.init-policy-boundary]
+        [app.{name}]
         image = "/empty-fixture"
         command = ["/bin/busybox", "sleep", "60"]
-        [app.init-policy-boundary.egress]
+        [app.{name}.egress]
         allow = ["203.0.113.9:443"]
-        [[app.init-policy-boundary.init]]
+        [[app.{name}.init]]
         command = ["/bin/busybox", "true"]
-        [[app.init-policy-boundary.init]]
+        [[app.{name}.init]]
         command = ["/bin/busybox", "true"]
-    "#,
-    )
+    "#
+    ))
     .unwrap();
     let (events, mut results) = mpsc::channel(64);
     commands
@@ -3845,7 +3960,7 @@ async fn init_exit_preserves_policy_before_the_next_container_starts() {
     let (response, result) = oneshot::channel();
     commands
         .send(AgentCommand::Retire {
-            app_name: "init-policy-boundary".into(),
+            app_name: name.clone(),
             namespace: "default".into(),
             response,
         })
@@ -3858,7 +3973,7 @@ async fn init_exit_preserves_policy_before_the_next_container_starts() {
         runtime.kill(&launch.instance_id).await.unwrap();
     }
     ebpf.lock().await.detach().unwrap();
-    let cgroup = reliaburger::grill::cgroup::cgroup_path("default", "init-policy-boundary", 0);
+    let cgroup = reliaburger::grill::cgroup::cgroup_path("default", &name, 0);
     if cgroup.exists() {
         std::fs::remove_dir(cgroup).unwrap();
     }
@@ -3921,17 +4036,19 @@ async fn uncertain_initialiser_preserves_parent_policy_until_confirmed_retiremen
     agent.set_records_dir(root.path().join("records"));
     agent.set_onion_ebpf(Arc::clone(&ebpf)).await;
     let task = tokio::spawn(async move { agent.run().await });
-    let config = reliaburger::config::Config::parse(
+    let name = root_app_name("init-retirement-boundary", root.path());
+    let _cgroups = AppCgroups::new("default", &name);
+    let config = reliaburger::config::Config::parse(&format!(
         r#"
-        [app.init-retirement-boundary]
+        [app.{name}]
         image = "/empty-fixture"
         command = ["/bin/busybox", "sleep", "60"]
-        [app.init-retirement-boundary.egress]
+        [app.{name}.egress]
         allow = ["203.0.113.9:443"]
-        [[app.init-retirement-boundary.init]]
+        [[app.{name}.init]]
         command = ["/bin/busybox", "sleep", "60"]
-    "#,
-    )
+    "#
+    ))
     .unwrap();
     let (events, mut results) = mpsc::channel(64);
     commands
@@ -3948,7 +4065,7 @@ async fn uncertain_initialiser_preserves_parent_policy_until_confirmed_retiremen
     let (response, result) = oneshot::channel();
     commands
         .send(AgentCommand::Retire {
-            app_name: "init-retirement-boundary".into(),
+            app_name: name.clone(),
             namespace: "default".into(),
             response,
         })
@@ -3957,7 +4074,7 @@ async fn uncertain_initialiser_preserves_parent_policy_until_confirmed_retiremen
     let first = result.await.unwrap();
     let initialiser = reliaburger::grill::InstanceId(observed[0].0.clone());
     let first_state = runtime.state(&initialiser).await.unwrap();
-    let path = reliaburger::grill::cgroup::cgroup_path("default", "init-retirement-boundary", 0);
+    let path = reliaburger::grill::cgroup::cgroup_path("default", &name, 0);
     let cgroup = reliaburger::sesame::egress::cgroup_id_of_path(&path).unwrap();
     let namespace =
         reliaburger::sesame::firewall::read_firewall_state(&mut ebpf.lock().await.bpf, cgroup, 0)
@@ -3987,7 +4104,7 @@ async fn uncertain_initialiser_preserves_parent_policy_until_confirmed_retiremen
         runtime.kill(&launch.instance_id).await.unwrap();
     }
     ebpf.lock().await.detach().unwrap();
-    let cgroup = reliaburger::grill::cgroup::cgroup_path("default", "init-retirement-boundary", 0);
+    let cgroup = reliaburger::grill::cgroup::cgroup_path("default", &name, 0);
     if cgroup.exists() {
         std::fs::remove_dir(cgroup).unwrap();
     }
@@ -4215,10 +4332,17 @@ async fn check_backend_retirement(
     }
     let mut services = agent.service_map_watch();
     let mut task = Some(tokio::spawn(async move { agent.run().await }));
+    let predecessor = root_app_name("address-predecessor", root.path());
+    let successor = root_app_name("address-successor", root.path());
+    let _cgroups = [
+        AppCgroups::new("default", &predecessor),
+        AppCgroups::new("default", &successor),
+    ];
     let exercise = async {
         let mut original_address = None;
-        for name in ["address-predecessor", "address-successor"] {
-            let port = if name == "address-predecessor" { "port = 8080" } else { "" };
+        for name in [predecessor.as_str(), successor.as_str()] {
+            let is_predecessor = name == predecessor;
+            let port = if is_predecessor { "port = 8080" } else { "" };
             let config = reliaburger::config::Config::parse(&format!(
                 "[app.{name}]\nimage = '/empty-fixture'\ncommand = ['/bin/busybox', 'httpd', '-f', '-p', '8080', '-h', '/']\n{port}\n"
             ))?;
@@ -4230,13 +4354,13 @@ async fn check_backend_retirement(
             let id = InstanceId(format!("default__{name}-0"));
             let ip = runtime.container_ip(&id).await.ok_or_else(|| anyhow::anyhow!("runtime omitted container address"))?;
             if durable {
-                if name == "address-predecessor" { original_address = Some(ip); }
+                if is_predecessor { original_address = Some(ip); }
                 else { anyhow::ensure!(original_address == Some(ip), "confirmed release did not make the original address reusable"); }
             }
             let ready = read_runtime_fixture_page(SocketAddr::new(ip.into(), 8080))
                 .await.map_err(|error| anyhow::anyhow!("direct {id} ({ip}): {error}"))?;
             anyhow::ensure!(ready.contains(&id.0), "fixture did not serve its own identity");
-            if name == "address-predecessor" {
+            if is_predecessor {
                 let vip = VirtualIP::from_service_id(&ServiceId::new("default", name));
                 let ready = read_runtime_fixture_page(SocketAddr::new(vip.0.into(), 8080))
                     .await.map_err(|error| anyhow::anyhow!("original VIP before retirement: {error}"))?;
@@ -4350,7 +4474,7 @@ async fn check_backend_retirement(
                 }
             }
         }
-        let vip = VirtualIP::from_service_id(&ServiceId::new("default", "address-predecessor"));
+        let vip = VirtualIP::from_service_id(&ServiceId::new("default", predecessor.as_str()));
         let response = read_runtime_fixture_page(SocketAddr::new(vip.0.into(), 8080)).await;
         if durable {
             anyhow::ensure!(response.is_err(), "retired VIP reached a reused address");
@@ -4387,16 +4511,16 @@ async fn check_backend_retirement(
         return;
     }
     assert!(
-        !response.contains("default__address-successor-0"),
+        !response.contains(&format!("default__{successor}-0")),
         "old VIP served an unrelated replacement: {response}"
     );
     let expected = if freeze {
-        "default__address-predecessor-0"
+        format!("default__{predecessor}-0")
     } else {
-        "default__address-predecessor-g1-0"
+        format!("default__{predecessor}-g1-0")
     };
     assert!(
-        response.contains(expected),
+        response.contains(&expected),
         "VIP lost its intended endpoint {expected}: {response}"
     );
 }
@@ -4429,7 +4553,11 @@ async fn refused_backend_publication_cannot_report_a_completed_deployment() {
     agent.set_records_dir(root.path().join("records"));
     agent.set_onion_ebpf(Arc::clone(&ebpf)).await;
     let task = tokio::spawn(async move { agent.run().await });
-    let config = reliaburger::config::Config::parse("[app.publication-refusal]\nimage = 'proc-grill:image-ignored'\ncommand = ['sleep', '60']\nport = 8080\n").unwrap();
+    let name = root_app_name("publication-refusal", root.path());
+    let config = reliaburger::config::Config::parse(&format!(
+        "[app.{name}]\nimage = 'proc-grill:image-ignored'\ncommand = ['sleep', '60']\nport = 8080\n"
+    ))
+    .unwrap();
     let (events, mut results) = mpsc::channel(64);
     commands
         .send(AgentCommand::Deploy { config, events })
@@ -4449,15 +4577,15 @@ async fn refused_backend_publication_cannot_report_a_completed_deployment() {
     .await;
     let record = reliaburger::grill::records::record_path(
         &root.path().join("records"),
-        "default__publication-refusal-0",
+        &format!("default__{name}-0"),
     )
     .exists();
-    let vip = VirtualIP::from_service_id(&ServiceId::new("default", "publication-refusal"));
+    let vip = VirtualIP::from_service_id(&ServiceId::new("default", name.as_str()));
     let backend = BpfServiceMap::new()
         .read_backends(&mut *ebpf.lock().await, vip, 8080)
         .unwrap();
     let runtime_state = runtime
-        .state(&InstanceId("default__publication-refusal-0".into()))
+        .state(&InstanceId(format!("default__{name}-0")))
         .await;
     shutdown.cancel();
     task.await.unwrap();
@@ -4482,12 +4610,14 @@ async fn check_destination_grant_retirement(frozen: bool) {
     use reliaburger::onion::types::{FirewallKey, FirewallValue};
     use reliaburger::sesame::firewall;
     assert!(ebpf_tests_enabled());
-    let name = if frozen {
+    let prefix = if frozen {
         "grant-refused"
     } else {
         "grant-confirmed"
     };
-    let mut fixture = EgressRecoveryFixture::prepare_with_service(name, false, true).await;
+    let mut fixture = EgressRecoveryFixture::prepare_with_service(prefix, false, true).await;
+    let name = fixture.name.clone();
+    let name = name.as_str();
     let vip = VirtualIP::from_service_id(&ServiceId::new("default", name));
     let source = 0xDEAD_BEEF_CAFE_6401;
     let original = FirewallKey {
@@ -4661,17 +4791,23 @@ async fn check_stopped_address_retention(lose_enforcement: bool, durable_discove
             .unwrap();
     }
     let mut task = Some(tokio::spawn(async move { agent.run().await }));
-    let old = InstanceId("default__natural-predecessor-0".into());
-    let new = InstanceId("default__natural-successor-0".into());
-    let vip = VirtualIP::from_service_id(&ServiceId::new("default", "natural-predecessor"));
+    let predecessor = root_app_name("natural-predecessor", root.path());
+    let successor_name = root_app_name("natural-successor", root.path());
+    let _cgroups = [
+        AppCgroups::new("default", &predecessor),
+        AppCgroups::new("default", &successor_name),
+    ];
+    let old = InstanceId(format!("default__{predecessor}-0"));
+    let new = InstanceId(format!("default__{successor_name}-0"));
+    let vip = VirtualIP::from_service_id(&ServiceId::new("default", predecessor.as_str()));
     let exercise = async {
-        let mut config = reliaburger::config::Config::parse("[app.natural-predecessor]\nimage = '/empty-fixture'\nport = 8080\n")?;
-        config.app.get_mut("natural-predecessor").unwrap().command = vec![
+        let mut config = reliaburger::config::Config::parse(&format!("[app.{predecessor}]\nimage = '/empty-fixture'\nport = 8080\n"))?;
+        config.app.get_mut(&predecessor).unwrap().command = vec![
             "/bin/busybox".into(), "sh".into(), "-c".into(),
             "/bin/busybox httpd -f -p 8080 -h / & server=$!; while [ ! -f /exit-now ]; do /bin/busybox sleep 0.01; done; kill \"$server\"; wait \"$server\"; exit 0".into(),
         ];
         if lose_enforcement {
-            config.app.get_mut("natural-predecessor").unwrap().egress = Some(
+            config.app.get_mut(&predecessor).unwrap().egress = Some(
                 toml::from_str("allow = ['203.0.113.9:443']")?,
             );
         }
@@ -4725,7 +4861,7 @@ async fn check_stopped_address_retention(lose_enforcement: bool, durable_discove
                 "security fencing released an unconfirmed network reference");
             let (reply, result) = tokio::sync::oneshot::channel();
             commands.send(AgentCommand::Stop {
-                app_name: "natural-predecessor".into(), namespace: "default".into(), response: reply,
+                app_name: predecessor.clone(), namespace: "default".into(), response: reply,
             }).await?;
             anyhow::ensure!(result.await?.is_err(), "failed withdrawal was acknowledged as cleanup");
             anyhow::ensure!(reliaburger::grill::records::load_records(&root.path().join("records"))?
@@ -4738,8 +4874,8 @@ async fn check_stopped_address_retention(lose_enforcement: bool, durable_discove
             anyhow::ensure!(runtime.exit_code(&old).await == Some(0), "original did not exit naturally");
         }
         let successor: reliaburger::config::app::AppSpec = toml::from_str("image = '/empty-fixture'\ncommand = ['/bin/busybox', 'httpd', '-f', '-p', '8080', '-h', '/']\n")?;
-        let cgroup = reliaburger::grill::cgroup::instance_cgroup_path("default", "natural-successor", &new)?;
-        let spec = reliaburger::grill::oci::generate_oci_spec("natural-successor", "default", &successor, &new.0, None, &cgroup.to_string_lossy(), None, None);
+        let cgroup = reliaburger::grill::cgroup::instance_cgroup_path("default", &successor_name, &new)?;
+        let spec = reliaburger::grill::oci::generate_oci_spec(&successor_name, "default", &successor, &new.0, None, &cgroup.to_string_lossy(), None, None);
         grill.create(&new, &spec).await?;
         grill.start(&new).await?;
         let successor_ip = runtime.container_ip(&new).await.ok_or_else(|| anyhow::anyhow!("successor address absent"))?;
@@ -4841,10 +4977,11 @@ async fn refused_health_publication_prevents_restart_and_preserves_ownership() {
     agent.set_records_dir(root.path().join("records"));
     agent.set_onion_ebpf(Arc::clone(&ebpf)).await;
     let task = tokio::spawn(async move { agent.run().await });
-    let id = InstanceId("default__health-refusal-0".into());
+    let name = root_app_name("health-refusal", root.path());
+    let id = InstanceId(format!("default__{name}-0"));
     let exercise = tokio::time::timeout(Duration::from_secs(12), async {
         let config = reliaburger::config::Config::parse(&format!(
-            "[app.health-refusal]\nimage = 'proc-grill:image-ignored'\ncommand = ['sleep', '60']\nport = 8080\n[app.health-refusal.health]\npath = '/'\nport = {health_port}\ninterval = 1\ntimeout = 1\nthreshold_unhealthy = 1\nthreshold_healthy = 1\n"
+            "[app.{name}]\nimage = 'proc-grill:image-ignored'\ncommand = ['sleep', '60']\nport = 8080\n[app.{name}.health]\npath = '/'\nport = {health_port}\ninterval = 1\ntimeout = 1\nthreshold_unhealthy = 1\nthreshold_healthy = 1\n"
         ))?;
         let (events, mut results) = mpsc::channel(64);
         commands.send(AgentCommand::Deploy { config, events }).await?;
