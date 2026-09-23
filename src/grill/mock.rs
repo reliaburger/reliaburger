@@ -54,6 +54,7 @@ pub struct MockGrill {
     ignore_stop: Arc<Mutex<bool>>,
     ignore_kill: Arc<AtomicBool>,
     fail_kill: Arc<AtomicBool>,
+    fail_stop: Arc<AtomicBool>,
     fail_create: Arc<AtomicBool>,
     fail_start: Arc<AtomicBool>,
     fail_state: Arc<AtomicBool>,
@@ -94,6 +95,7 @@ impl Default for MockGrill {
             ignore_stop: Arc::default(),
             ignore_kill: Arc::default(),
             fail_kill: Arc::default(),
+            fail_stop: Arc::default(),
             fail_create: Arc::default(),
             fail_start: Arc::default(),
             fail_state: Arc::default(),
@@ -116,6 +118,11 @@ impl MockGrill {
     /// Make force-kill requests fail without changing runtime state.
     pub fn set_fail_kill(&self, value: bool) {
         self.fail_kill.store(value, Ordering::SeqCst);
+    }
+
+    /// Make graceful stop requests fail without changing runtime state.
+    pub fn set_fail_stop(&self, value: bool) {
+        self.fail_stop.store(value, Ordering::SeqCst);
     }
 
     /// Fail creation after recording the attempted runtime mutation.
@@ -476,6 +483,12 @@ impl super::Grill for MockGrill {
             .lock()
             .unwrap()
             .push(("stop".to_string(), instance.clone()));
+        if self.fail_stop.load(Ordering::SeqCst) {
+            return Err(GrillError::StopFailed {
+                instance: instance.clone(),
+                reason: "injected stop failure".into(),
+            });
+        }
         // A process that ignores SIGTERM stays as-is; the exit-aware stop path
         // must escalate to kill(). Otherwise reflect the stop in state (unless
         // a test pinned a specific state) so callers that poll for exit observe

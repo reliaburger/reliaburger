@@ -7999,7 +7999,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             };
             if let Err(e) = restart_egress {
                 eprintln!("bun: restart of {} refused: {e}", id.0);
-                let _ = self.supervisor.grill().stop(&id).await;
+                if let Err(error) = self.supervisor.grill().stop(&id).await {
+                    // The replacement is created but not stopped. Keep the
+                    // cleanup owed instead of abandoning it as Failed.
+                    self.record_failed_restart(
+                        &id,
+                        &format!("refused restart could not stop its created container: {error}"),
+                    )
+                    .await;
+                    continue;
+                }
                 if let Some(instance) = self.supervisor.get_instance_mut(&id)
                     && let Ok(state) = instance.state.transition_to(ContainerState::Failed)
                 {
@@ -13373,6 +13382,39 @@ mod tests {
             ContainerState::Running
         );
         agent.stop_app("retry", "default").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn refused_restart_keeps_cleanup_owed_when_stop_fails() {
+        let (mut agent, _, _, grill) = test_agent_with_grill();
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        let id = agent.supervisor.list_instances()[0].id.clone();
+        // Without its original cgroup path, egress preparation refuses the
+        // restart after the replacement container has been created.
+        grill.set_honours_cgroup_path(true);
+        agent
+            .supervisor
+            .get_instance_mut(&id)
+            .unwrap()
+            .oci_spec
+            .as_mut()
+            .unwrap()
+            .linux
+            .cgroups_path = None;
+        grill.set_state(&id, ContainerState::Stopped);
+        agent.check_apps().await;
+        grill.set_fail_stop(true);
+        agent.drive_pending_restarts().await;
+        let instance = agent.supervisor.get_instance(&id).unwrap();
+        assert_ne!(
+            instance.state,
+            ContainerState::Failed,
+            "a refused restart abandoned its created container"
+        );
+        assert!(
+            instance.retry_pending,
+            "cleanup of the created container is no longer owed"
+        );
     }
 
     #[tokio::test]

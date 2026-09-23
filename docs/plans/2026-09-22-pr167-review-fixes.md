@@ -355,7 +355,10 @@ Execution (grill):
 - [ ] **T2.6 Adoption compares start times exactly.**
       `src/grill/runc/owned.rs:786`. Use the ±2 s slack the rest of the code
       uses (NTP steps move `/proc/stat` btime).
-- [ ] **T2.7 A failed stop is silently ignored on restart egress refusal.**
+- [x] **T2.7 A failed stop is silently ignored on restart egress refusal.**
+      Done. A failed stop of the created replacement now takes the existing
+      `record_failed_restart` path (Stopping, retry pending) instead of
+      marking the instance Failed with its container abandoned.
       `src/bun/agent.rs:~7942` `let _ = …stop(&id).await`, then `Failed` with
       no retry, leaking the container and its network reference. Keep the
       instance owned and retry the stop.
