@@ -3288,7 +3288,11 @@ Adoption checks both the original specification and the saved log identity. The
 log path contains the immutable launcher command and runtime generation; matching
 specifications alone could accept metadata left by an earlier identical launch.
 The live launcher PID and start time must also agree, but cleanup never signals a
-PID taken from that adoption record.
+PID taken from that adoption record. "Agree" allows two seconds either way, as
+every other adoption check does. Linux reports a process's start time relative
+to boot, and turns it into a timestamp using the boot time, which moves when NTP
+steps the clock. An exact comparison refused a perfectly healthy container after
+a one-second clock correction.
 
 A completed log reader uncovered another lifetime problem. Its output channel
 could stall while it held the exclusive claim, blocking a replacement container.

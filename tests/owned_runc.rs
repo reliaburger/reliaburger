@@ -219,7 +219,9 @@ async fn runc_owned_adoption_validates_generation_and_restores_live_network() {
         image: "/empty-fixture".into(),
         runtime: RuntimeKind::Runc,
         pid,
-        pid_started_at: reliaburger::grill::records::process_start_time(pid).unwrap(),
+        // One second off, as an NTP step between launch and recovery would
+        // leave it: the same process, recorded against a moved clock.
+        pid_started_at: reliaburger::grill::records::process_start_time(pid).unwrap() + 1,
         runc_container_id: Some(id.0.clone()),
         log_stem: first.log_stem(&id).await,
         host_port: None,

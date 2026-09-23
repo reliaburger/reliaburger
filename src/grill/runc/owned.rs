@@ -782,9 +782,10 @@ impl RuncGrill {
                 runtime.owned_cleanup(&id, &context).await?;
                 return Ok(false);
             };
+            // Same ±2 s tolerance as every other adoption: /proc start times
+            // are derived from boot time, which moves with NTP steps.
             if adoption.pid != launcher_pid
-                || crate::grill::records::process_start_time(launcher_pid)
-                    != Some(adoption.pid_started_at)
+                || !crate::grill::records::process_matches(launcher_pid, adoption.pid_started_at)
             {
                 return Err(io::Error::other(
                     "adoption process identity conflicts with runtime owner",

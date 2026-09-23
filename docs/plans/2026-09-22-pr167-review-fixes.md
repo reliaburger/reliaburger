@@ -352,7 +352,9 @@ Execution (grill):
       Done. macOS reads `kern.bootsessionuuid`, both systems store lowercase
       UUIDs, and schema-3 records require one everywhere. The `setsid` gap is
       documented in chapter 8, not fixed.
-- [ ] **T2.6 Adoption compares start times exactly.**
+- [x] **T2.6 Adoption compares start times exactly.** Done: owned adoption
+      uses `records::process_matches` (±2 s), proven on Linux with a record
+      one second off.
       `src/grill/runc/owned.rs:786`. Use the ±2 s slack the rest of the code
       uses (NTP steps move `/proc/stat` btime).
 - [x] **T2.7 A failed stop is silently ignored on restart egress refusal.**
