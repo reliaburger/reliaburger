@@ -236,6 +236,9 @@ async fn unconfirmed_stop_retains_runtime_ownership(configure: fn(&MockGrill)) {
         shutdown.clone(),
     );
     agent.set_records_dir(records.path().to_path_buf());
+    // The runtime ignores SIGTERM for the whole test, so the ten-second
+    // production grace only delays the unconfirmed-kill path under test.
+    agent.set_stop_grace(Duration::from_millis(200));
     let task = tokio::spawn(async move { agent.run().await });
     let (events, mut results) = mpsc::channel(32);
     tx.send(AgentCommand::Deploy {

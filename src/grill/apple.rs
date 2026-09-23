@@ -35,6 +35,8 @@ struct AppleEntry {
 pub struct AppleContainerGrill {
     entries: Arc<Mutex<HashMap<InstanceId, AppleEntry>>>,
     container_program: std::path::PathBuf,
+    /// Deadline for one `container inspect`, after which the CLI is reaped.
+    inspection_timeout: std::time::Duration,
 }
 
 impl AppleContainerGrill {
@@ -43,6 +45,7 @@ impl AppleContainerGrill {
         Self {
             entries: Arc::new(Mutex::new(HashMap::new())),
             container_program: "container".into(),
+            inspection_timeout: std::time::Duration::from_secs(10),
         }
     }
 
@@ -129,7 +132,7 @@ impl AppleContainerGrill {
             reason,
         };
         let output = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
+            self.inspection_timeout,
             self.container_command(&["inspect", &instance.0], instance),
         )
         .await
@@ -640,6 +643,9 @@ mod tests {
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
         let mut grill = AppleContainerGrill::new();
         grill.container_program = program;
+        // The fixture never answers, so two seconds proves the same bound as
+        // the production ten while leaving the shell time to record its pid.
+        grill.inspection_timeout = std::time::Duration::from_secs(2);
         let started = tokio::time::Instant::now();
         let error = grill
             .state(&InstanceId("stalled-inspection".into()))

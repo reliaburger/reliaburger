@@ -530,6 +530,9 @@ impl WorkerFixture {
             "internal-token",
         )
         .unwrap();
+        // Several tests drive two or three failures in a row. None asserts the
+        // spacing, so the production five-second pause only adds wall time.
+        let worker = worker.with_retry_delay(Duration::from_millis(200));
         let council = self.council.clone();
         let stop = self.shutdown.clone();
         let address = self.address;

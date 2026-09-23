@@ -1050,6 +1050,7 @@ async fn poll_consumer(
     shutdown: &CancellationToken,
     cluster_http: &crate::cluster::ClusterHttp,
     receipt_cursor: &mut usize,
+    io_timeout: Duration,
 ) -> Option<(String, NodeAssignments)> {
     let client = cluster_http.client();
     let leader_url = {
@@ -1078,7 +1079,7 @@ async fn poll_consumer(
     };
     let polled = tokio::select! {
         _ = shutdown.cancelled() => return None,
-        result = tokio::time::timeout(RECONCILE_IO_TIMEOUT, poll) => result,
+        result = tokio::time::timeout(io_timeout, poll) => result,
     };
     let assignments = match polled {
         Ok(Ok(assignments)) => assignments,
@@ -1105,7 +1106,7 @@ async fn poll_consumer(
     };
     let synchronised = tokio::select! {
         _ = shutdown.cancelled() => return None,
-        result = tokio::time::timeout(RECONCILE_IO_TIMEOUT, sync_catalogue) => result,
+        result = tokio::time::timeout(io_timeout, sync_catalogue) => result,
     };
     let update = match synchronised {
         Ok(Ok(update)) => update,
@@ -1176,6 +1177,36 @@ pub fn spawn_placement_reconciler(
     // for ephemeral embedded tests and cannot provide restart recovery.
     state_dir: Option<std::path::PathBuf>,
 ) -> tokio::task::JoinHandle<()> {
+    spawn_placement_reconciler_with_io_timeout(
+        node_name,
+        metrics_rx,
+        directory_rx,
+        raft_to_api_offset,
+        service_token,
+        cmd_tx,
+        shutdown,
+        cluster_http,
+        state_dir,
+        RECONCILE_IO_TIMEOUT,
+    )
+}
+
+/// [`spawn_placement_reconciler`] with an explicit deadline for each leader
+/// request and agent reply, so tests of a stalled peer need not wait out
+/// the production [`RECONCILE_IO_TIMEOUT`].
+#[allow(clippy::too_many_arguments)]
+fn spawn_placement_reconciler_with_io_timeout(
+    node_name: String,
+    metrics_rx: watch::Receiver<openraft::RaftMetrics<u64, CouncilNodeInfo>>,
+    directory_rx: watch::Receiver<crate::mustard::directory::NodeDirectory>,
+    raft_to_api_offset: i32,
+    service_token: Option<String>,
+    cmd_tx: mpsc::Sender<AgentCommand>,
+    shutdown: CancellationToken,
+    cluster_http: crate::cluster::ClusterHttp,
+    state_dir: Option<std::path::PathBuf>,
+    io_timeout: Duration,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let client = cluster_http.client().clone();
         let mut tick = tokio::time::interval(RECONCILE_INTERVAL);
@@ -1243,6 +1274,7 @@ pub fn spawn_placement_reconciler(
                 &shutdown,
                 &cluster_http,
                 &mut receipt_cursor,
+                io_timeout,
             )
             .await
             else {
@@ -1282,7 +1314,7 @@ pub fn spawn_placement_reconciler(
                 });
                 let queued = tokio::select! {
                     _ = shutdown.cancelled() => return,
-                    result = tokio::time::timeout(RECONCILE_IO_TIMEOUT, deploy) => result,
+                    result = tokio::time::timeout(io_timeout, deploy) => result,
                 };
                 if !matches!(queued, Ok(Ok(()))) {
                     continue;
@@ -1291,17 +1323,18 @@ pub fn spawn_placement_reconciler(
                 tokio::pin!(terminal);
                 let succeeded = loop {
                     tokio::select! {
-                            _ = shutdown.cancelled() => return,
-                            result = &mut terminal => break result,
-                            _ = tick.tick() => {
-                                // The producer can need our own withdrawal receipt before
-                                // it can emit the terminal deployment event.
-                                let _ = poll_consumer(
-                        &node_name, &metrics_rx, &directory_rx, raft_to_api_offset,
-                        &service_token, &cmd_tx, &shutdown, &cluster_http, &mut receipt_cursor,
-                    ).await;
-                            }
+                        _ = shutdown.cancelled() => return,
+                        result = &mut terminal => break result,
+                        _ = tick.tick() => {
+                            // The producer can need our own withdrawal receipt before
+                            // it can emit the terminal deployment event.
+                            let _ = poll_consumer(
+                                &node_name, &metrics_rx, &directory_rx, raft_to_api_offset,
+                                &service_token, &cmd_tx, &shutdown, &cluster_http,
+                                &mut receipt_cursor, io_timeout,
+                            ).await;
                         }
+                    }
                 };
                 if succeeded {
                     let mut next = applied.clone();
@@ -1357,7 +1390,7 @@ pub fn spawn_placement_reconciler(
                 };
                 let retired = tokio::select! {
                     _ = shutdown.cancelled() => return,
-                    result = tokio::time::timeout(RECONCILE_IO_TIMEOUT, retire) => result,
+                    result = tokio::time::timeout(io_timeout, retire) => result,
                 };
                 match retired {
                     Ok(Ok(Ok(()))) => {
@@ -1379,7 +1412,7 @@ pub fn spawn_placement_reconciler(
                             }
                             let acknowledged = tokio::select! {
                                 _ = shutdown.cancelled() => return,
-                                result = tokio::time::timeout(RECONCILE_IO_TIMEOUT, request.send()) => result,
+                                result = tokio::time::timeout(io_timeout, request.send()) => result,
                             };
                             if !matches!(acknowledged, Ok(Ok(ref response)) if response.status() == reqwest::StatusCode::NO_CONTENT)
                             {
@@ -1527,7 +1560,11 @@ mod tests {
             }),
             ..Default::default()
         });
-        spawn_placement_reconciler(
+        // Every stall these tests inject is permanent, so a shorter deadline
+        // proves the same bound without waiting out the production ten
+        // seconds. Two seconds still leaves a loaded runner's local round
+        // trips well inside it; a spurious expiry only retries next tick.
+        spawn_placement_reconciler_with_io_timeout(
             "worker".into(),
             metrics_rx,
             directory_rx,
@@ -1537,6 +1574,7 @@ mod tests {
             CancellationToken::new(),
             crate::cluster::ClusterHttp::plaintext(),
             Some(directory.to_path_buf()),
+            Duration::from_secs(2),
         )
     }
 

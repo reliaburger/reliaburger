@@ -1735,6 +1735,11 @@ pub struct BunAgent<G: Grill> {
     /// Per-step deadline for the runtime to confirm a stop or force-kill
     /// (`[runtime] stop_confirmation_timeout_secs`).
     stop_confirmation_timeout: std::time::Duration,
+    /// How long an ordinary stop waits after SIGTERM before SIGKILL.
+    /// `STOP_GRACE_SECS` unless a test shortens it with `set_stop_grace`.
+    stop_grace: std::time::Duration,
+    /// The same wait for node shutdown: `SHUTDOWN_GRACE_SECS` by default.
+    shutdown_grace: std::time::Duration,
 }
 
 impl<G: Grill + Clone + 'static> BunAgent<G> {
@@ -1854,6 +1859,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             deploy_ops_rx,
             health_inflight: std::collections::HashSet::new(),
             drains: new_shared_drains(),
+            stop_grace: std::time::Duration::from_secs(STOP_GRACE_SECS),
+            shutdown_grace: std::time::Duration::from_secs(SHUTDOWN_GRACE_SECS),
         }
     }
 
@@ -1969,6 +1976,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             deploy_ops_rx,
             health_inflight: std::collections::HashSet::new(),
             drains: new_shared_drains(),
+            stop_grace: std::time::Duration::from_secs(STOP_GRACE_SECS),
+            shutdown_grace: std::time::Duration::from_secs(SHUTDOWN_GRACE_SECS),
         }
     }
 
@@ -2413,6 +2422,20 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Call before deploying anything; also enables `adopt_recorded_instances`.
     pub fn set_records_dir(&mut self, dir: PathBuf) {
         self.records_dir = Some(dir);
+    }
+
+    /// Override how long an ordinary stop waits after SIGTERM before it
+    /// escalates to SIGKILL. Production keeps `STOP_GRACE_SECS`; tests
+    /// whose runtime ignores SIGTERM on purpose use a short grace instead
+    /// of waiting the full ten seconds.
+    pub fn set_stop_grace(&mut self, grace: std::time::Duration) {
+        self.stop_grace = grace;
+    }
+
+    /// Override how long node shutdown waits after SIGTERM before SIGKILL.
+    /// Production keeps `SHUTDOWN_GRACE_SECS`, as with `set_stop_grace`.
+    pub fn set_shutdown_grace(&mut self, grace: std::time::Duration) {
+        self.shutdown_grace = grace;
     }
 
     /// Attach the self-upgrade manager (enables the upgrade commands).
@@ -7699,10 +7722,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .collect();
         for (id, state) in retrying {
             if state == ContainerState::Stopping {
-                match self
-                    .poll_instance_withdrawal(&id, std::time::Duration::from_secs(STOP_GRACE_SECS))
-                    .await
-                {
+                match self.poll_instance_withdrawal(&id, self.stop_grace).await {
                     Ok(true) => {}
                     Ok(false) => continue,
                     Err(error) => {
@@ -7794,10 +7814,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .collect();
 
         for (id, oci_spec, app_name, namespace, host_port) in pending_restarts {
-            match self
-                .poll_instance_withdrawal(&id, std::time::Duration::from_secs(STOP_GRACE_SECS))
-                .await
-            {
+            match self.poll_instance_withdrawal(&id, self.stop_grace).await {
                 Ok(true) => {}
                 Ok(false) => continue,
                 Err(error) => {
@@ -8169,10 +8186,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         // diverge — a "stopped" app whose process was still serving traffic.
         let mut first_error = None;
         for id in &instances {
-            if let Err(error) = self
-                .stop_and_wait_for_exit(id, std::time::Duration::from_secs(STOP_GRACE_SECS))
-                .await
-            {
+            if let Err(error) = self.stop_and_wait_for_exit(id, self.stop_grace).await {
                 first_error.get_or_insert(error);
             }
         }
@@ -9646,7 +9660,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         for id in &ids {
             let _ = self.supervisor.grill().stop(id).await;
         }
-        let deadline = Instant::now() + std::time::Duration::from_secs(SHUTDOWN_GRACE_SECS);
+        let deadline = Instant::now() + self.shutdown_grace;
         loop {
             let mut all_stopped = true;
             for id in &ids {
@@ -13777,6 +13791,9 @@ mod tests {
         let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
         let volumes = tempfile::tempdir().unwrap();
         agent.set_volumes_dir(volumes.path().to_path_buf());
+        // The runtime ignores SIGTERM on purpose; a short grace reaches the
+        // unconfirmed kill without waiting out the production ten seconds.
+        agent.set_stop_grace(std::time::Duration::from_millis(200));
         let task = tokio::spawn(async move { agent.run().await });
         let config = Config::parse("[app.web]\nimage = 'test:v1'\nnamespace = 'rbtest-cleanup'\n[app.web.deploy]\ndrain_timeout = '0s'\n[[app.web.volumes]]\npath = '/data'\n").unwrap();
         expect_complete(&send_deploy(&tx, config).await);
@@ -14536,6 +14553,8 @@ mod tests {
         let grill_handle = grill.clone();
         let port_allocator = PortAllocator::new(30000, 31000);
         let mut agent = BunAgent::new(grill, port_allocator, rx, shutdown);
+        // Escalation is under test, not the length of the production grace.
+        agent.set_shutdown_grace(std::time::Duration::from_millis(200));
 
         let (ev_tx, mut ev_rx) = mpsc::channel(64);
         agent.deploy(basic_config(), &ev_tx).await;
@@ -19150,6 +19169,9 @@ host = "remote.local"
         let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
         let volumes = tempfile::tempdir().unwrap();
         agent.set_volumes_dir(volumes.path().to_path_buf());
+        // Escalation, not the length of the grace, is under test here;
+        // `stop_reports_stopped_after_exit_without_kill` keeps the default.
+        agent.set_stop_grace(std::time::Duration::from_millis(200));
 
         let (ev_tx, mut ev_rx) = mpsc::channel(64);
         agent.deploy(basic_config(), &ev_tx).await;

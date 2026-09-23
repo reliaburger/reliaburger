@@ -269,12 +269,26 @@ pub struct RegistryProposal {
 pub struct RegistryForwarder {
     http: ClusterHttp,
     directory: watch::Receiver<NodeDirectory>,
+    /// Whole-exchange deadline for one proposal or query.
+    timeout: Duration,
 }
 
 impl RegistryForwarder {
     /// Use the cluster's credentialled, non-redirecting client and live directory.
     pub fn new(http: ClusterHttp, directory: watch::Receiver<NodeDirectory>) -> Self {
-        Self { http, directory }
+        Self {
+            http,
+            directory,
+            timeout: PROPOSAL_TIMEOUT,
+        }
+    }
+
+    /// Replace the production [`PROPOSAL_TIMEOUT`] so a test of a stalled
+    /// leader need not wait it out.
+    #[cfg(test)]
+    fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 
     /// Commit locally when possible, otherwise send directly to the leader.
@@ -284,7 +298,7 @@ impl RegistryForwarder {
         council: Option<&Arc<CouncilNode>>,
         mutation: RegistryMutation,
     ) -> Result<CouncilResponse, PickleError> {
-        tokio::time::timeout(PROPOSAL_TIMEOUT, self.write_inner(council, mutation))
+        tokio::time::timeout(self.timeout, self.write_inner(council, mutation))
             .await
             .map_err(|_| {
                 unavailable("registry proposal timed out; retry to establish acceptance")
@@ -327,7 +341,7 @@ impl RegistryForwarder {
             query,
         };
         tokio::time::timeout(
-            PROPOSAL_TIMEOUT,
+            self.timeout,
             self.send_request(council, REGISTRY_QUERY_PATH, &request),
         )
         .await
@@ -593,10 +607,14 @@ mod tests {
             .unwrap();
         });
         let (_tx, rx) = watch::channel(directory(address));
+        // The stalled body never completes, so a two-second deadline proves
+        // the same bound as the production ten; the chunked limit case
+        // finishes long before either.
         let forwarder = RegistryForwarder::new(
             crate::cluster::ClusterHttp::plaintext().with_bearer(Some("internal".into())),
             rx,
-        );
+        )
+        .with_timeout(Duration::from_secs(2));
         assert!(
             forwarder
                 .write(None, report())
