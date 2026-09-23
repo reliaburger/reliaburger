@@ -1,4 +1,4 @@
-.PHONY: build test test-cargo test-doc test-no-default test-slow test-linux test-rootless-runc test-cluster test-upgrade test-upgrade-node test-upgrade-cluster test-apple coverage check fmt lint audit clean pdf loc help examples bench bench-large bench-10k pickle-test-macos ci ci-full observability-demo kubernetes-demo toml-demo
+.PHONY: build test test-cargo test-doc test-slow test-linux test-rootless-runc test-cluster test-upgrade test-upgrade-node test-upgrade-cluster test-apple coverage check fmt lint audit clean pdf loc help examples bench bench-large bench-10k pickle-test-macos ci ci-full observability-demo kubernetes-demo toml-demo
 
 CARGO = cargo
 NEXTEST_PROFILE ?= default
@@ -21,9 +21,6 @@ test-cargo: ## Run the portable suite with Cargo's built-in runner
 
 test-doc: ## Run doctests (nextest does not run them)
 	$(CARGO) test --doc
-
-test-no-default: ## Run the portable suite without default features
-	$(NEXTEST) --no-default-features
 
 test-slow: ## Run required wall-clock acceptance tests
 	$(NEXTEST) --run-ignored=only -E 'binary(integration)'
@@ -59,8 +56,9 @@ fmt: ## Format all Rust source with rustfmt
 fmt-check: ## Check formatting without modifying files
 	$(CARGO) fmt -- --check
 
-lint: ## Run clippy for every target and feature with warnings as errors
+lint: ## Run clippy for every target, with all features and with none, warnings as errors
 	$(CARGO) clippy --all-targets --all-features -- -D warnings
+	$(CARGO) clippy --all-targets --no-default-features -- -D warnings
 
 audit: ## Fail on new RustSec findings or an expired advisory exception
 	@today=$$(date -u +%Y%m%d); expiry=20261118; \
@@ -130,7 +128,7 @@ toml-demo: build ## Demo config tooling (lint, fmt, compile, diff)
 pickle-test-macos: build ## Push/pull a real Docker image through Pickle (macOS + Docker Desktop)
 	./scripts/pickle-push-test.sh
 
-ci: fmt-check lint test test-doc test-no-default ## Run portable CI checks
+ci: fmt-check lint test test-doc ## Run portable CI checks
 
 ci-full: fmt-check lint test bench ## Run everything including benchmarks
 

@@ -335,7 +335,6 @@ cargo test
 
 ```sh
 make test                  # portable nextest suite
-make test-no-default       # portable suite without default features
 make test-doc              # doctests (nextest does not run them)
 make test-slow             # genuine wall-clock acceptance tests
 sudo make test-linux       # runc, netns, eBPF, Btrfs, Buildah and root-only tests

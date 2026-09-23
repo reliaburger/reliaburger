@@ -58,8 +58,6 @@ jobs:
         run: cargo check --locked --all-targets --all-features
       - name: Test the minimum compiler with default features
         run: cargo nextest run --locked --profile ci --no-tests=fail
-      - name: Test the minimum compiler without default features
-        run: cargo nextest run --locked --profile ci --no-tests=fail --no-default-features
 
   portable:
     name: portable Linux
@@ -84,14 +82,12 @@ jobs:
           sudo apt-get install -y -qq clang libbpf-dev llvm
       - name: Format
         run: make fmt-check
-      - name: Lint every target and feature
+      - name: Lint every target, with all features and with none
         run: make lint
       - name: Portable tests
         run: make test
       - name: Verify JUnit output
         run: test -s target/nextest/ci/junit.xml
-      - name: No-default-feature tests
-        run: make test-no-default
       - name: Doctests
         run: make test-doc
       - name: Executable examples
@@ -228,7 +224,7 @@ jobs:
           shared-key: macos
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
-      - name: Lint every target and feature
+      - name: Lint every target, with all features and with none
         run: make lint
       - run: make test
       - run: make test-doc

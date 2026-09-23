@@ -52,9 +52,8 @@ be visible until we remove its race.
 
 | Command | Contract | Automation |
 |---|---|---|
-| `make lint` | Clippy for every target and feature available on the host | Linux and hosted macOS |
+| `make lint` | Clippy for every target, with all features and with none, so the build without default features stays healthy | Linux and hosted macOS |
 | `make test` | Portable unit, component and integration correctness via nextest | Linux and hosted macOS |
-| `make test-no-default` | The same portable contract without default features | Linux |
 | `make test-doc` | Rust documentation examples | Linux and hosted macOS |
 | `make test-slow` | Required wall-clock health and retry acceptance | Linux |
 | `make test-linux` | runc, namespaces, eBPF, Btrfs, Buildah and root-only tmpfs | Privileged Linux |

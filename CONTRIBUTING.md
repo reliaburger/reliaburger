@@ -36,9 +36,8 @@ Use the narrowest relevant test while developing, then run the portable checks b
 ```sh
 make test                 # portable nextest suite
 make test-doc             # `Rust` documentation tests
-make test-no-default      # portable suite without default features
 make fmt-check            # formatting check
-make lint                 # Clippy with warnings as errors
+make lint                 # Clippy, all features and none, warnings as errors
 ```
 
 `make ci` runs the standard portable CI checks together. Use the specialised targets for ignored acceptance suites when your environment supports them: `make test-linux`, `make test-cluster`, `make test-upgrade`, and `make test-apple`.
