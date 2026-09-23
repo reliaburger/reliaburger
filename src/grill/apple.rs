@@ -1006,7 +1006,7 @@ mod tests {
         starter.start(&id).await.expect("start");
 
         let record = crate::grill::records::InstanceRecord {
-            schema: 1,
+            schema: 2,
             instance_id: id.0.clone(),
             namespace: "default".to_string(),
             app_name: "apple-adopt".to_string(),

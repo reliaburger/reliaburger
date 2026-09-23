@@ -1298,7 +1298,7 @@ mod tests {
         }
 
         let record = crate::grill::records::InstanceRecord {
-            schema: 1,
+            schema: 2,
             instance_id: id.0.clone(),
             namespace: "payments".to_string(),
             app_name: "rootfs-adoption".to_string(),

@@ -866,7 +866,7 @@ mod tests {
 
     fn record_for(instance: &InstanceId, pid: u32, started_at: u64) -> InstanceRecord {
         InstanceRecord {
-            schema: 1,
+            schema: 2,
             instance_id: instance.0.clone(),
             namespace: "default".to_string(),
             app_name: "test".to_string(),

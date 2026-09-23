@@ -49,7 +49,7 @@ pub struct RootlessNetworkRecord {
 /// Everything needed to adopt one running workload instance.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InstanceRecord {
-    /// Record format version. Currently 2; older records remain readable.
+    /// Record format version. Currently 2.
     pub schema: u32,
     /// Instance id string, e.g. `web-0`.
     pub instance_id: String,
@@ -173,8 +173,7 @@ pub fn load_records(records_dir: &Path) -> std::io::Result<Vec<InstanceRecord>> 
                     std::io::Error::new(std::io::ErrorKind::InvalidData, error),
                 )
             })?;
-        if !matches!(record.schema, 1 | 2)
-            || path.file_stem() != Some(std::ffi::OsStr::new(&record.instance_id))
+        if record.schema != 2 || path.file_stem() != Some(std::ffi::OsStr::new(&record.instance_id))
         {
             return Err(contextual(
                 &path,
@@ -309,7 +308,7 @@ mod tests {
 
     fn record(pid: u32, started_at: u64) -> InstanceRecord {
         InstanceRecord {
-            schema: 1,
+            schema: 2,
             instance_id: "web-0".to_string(),
             namespace: "default".to_string(),
             app_name: "web".to_string(),

@@ -18323,7 +18323,7 @@ host = "remote.local"
         };
         let app_spec: AppSpec = toml::from_str(spec_toml).unwrap();
         crate::grill::records::InstanceRecord {
-            schema: 1,
+            schema: 2,
             instance_id: instance.to_string(),
             namespace: "default".to_string(),
             app_name: app.to_string(),
