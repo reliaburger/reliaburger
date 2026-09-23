@@ -539,6 +539,62 @@ item only when both predicates are true. The matching fallback uses
 now runs the all-target, all-feature Clippy command. That's a compile-time check of the
 boundary, not a hopeful comment saying the code is portable.
 
+## A pipeline you're willing to wait for
+
+By the time the review tiers landed, a green push took half an hour and about 212
+runner-minutes, and more than half of those minutes went to runs that a newer push had
+already cancelled. Nobody waits half an hour for feedback. They push again, which cancels the
+run, which makes the wait longer. So we measured where the time went before touching anything.
+
+Two-thirds of it was compiling. The portable suite, about 4,150 tests that take five minutes to
+run, ran seven times per push: default and no-default features in three jobs, plus macOS. The
+only default feature is `kubernetes`, and nothing in the code depends on it being *off*, so the
+four no-default runs repeated the same 4,110 tests to prove the crate builds without one
+dependency. A second `clippy --no-default-features` proves that in seconds. The coverage job
+compiled and ran the suite again under instrumentation, beside the uninstrumented run it
+duplicated. The 10,000-member scale test had its own 21-minute release build, because
+everyone assumed it was slow. Timed in a debug build, it took 1.3 seconds.
+
+The rest of the fix follows one idea: build once, then fan out.
+
+- **One instrumented run.** Portable Linux runs the suite once under `cargo llvm-cov`, and that
+  single run is the test gate, the coverage floor and the JUnit report.
+- **One build for the acceptance suites.** A `build-tests` job compiles every test binary and
+  packs them with `cargo nextest archive`. The cluster, upgrade and wall-clock jobs download
+  the archive instead of each spending nine minutes compiling all 75 binaries to run a dozen
+  tests. It works because GitHub checks the repository out at the same path in every job, so
+  the paths that `env!("CARGO_BIN_EXE_bun")` baked into the test binaries still point at real
+  files after extraction.
+- **One cache per build, saved from `main`.** Thirteen per-job caches overflowed GitHub's
+  10 GB limit, so every pull request evicted the last and most jobs started cold. Jobs that
+  build the same profile now share a key, and only `main` writes it.
+
+The last piece is choosing what a run needs. A small script diffs a pull request against its
+base and sets three outputs, and every expensive job asks one of them:
+
+```yaml
+  cluster:
+    needs: [changes, build-tests]
+    if: needs.changes.outputs.heavy == 'true'
+```
+
+`needs` makes a job wait for others and gives it their outputs; `if` skips it when the
+expression is false, and a skipped job counts as passing. A pull request that touches only
+book chapters sets `code` to false and runs no Rust at all, unless it touches chapter 2 or 4,
+the READMEs or the manual. Those count as code, because `documentation_first_run` checks
+their snippets and the manual is compiled into `relish`. A pull request stacked on another
+branch skips the acceptance suites unless someone labels it `full-ci`; it gets them when it
+targets `main`. Benchmarks run on `main`, nightly, and on changes to the gossip protocol,
+since nothing gates on their numbers yet.
+
+Speed is only half of it. A flaky suite teaches everyone to press "re-run" without reading,
+and then a real race looks exactly like noise. Our retries stay at zero, so a failure that
+passes on a re-run goes into a register in `docs/progress.md` with its cause the same day. Of
+the seven we chased down, three were product races, not test problems: a node back from a
+fault spread stale suspicions about healthy peers, a rollout interrupted by a crash dropped the
+reservation its own retirement needed, and a two-second kill deadline was too short for a busy
+host. We fixed those in the product. Pressing re-run would have hidden all three.
+
 ## Dependencies are code too
 
 The lockfile is part of the programme. A perfectly tested call into a vulnerable archive
