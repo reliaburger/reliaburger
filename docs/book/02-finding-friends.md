@@ -2162,7 +2162,7 @@ You don't know if your cluster recovers from failure until you actually break so
 
 **Cargo tests** run in-memory clusters with simulated partitions. They're fast, deterministic, and run in CI. The `InMemoryNetwork::partition()` and `InMemoryRaftRouter::partition()` methods silently drop messages between specified nodes, simulating a network split without any real networking.
 
-**`relish chaos`** operates on real running clusters. It talks to actual Bun agents, tells them to inject partitions via the `/v1/chaos/partition` API, and then watches the cluster heal in real time. Every fault injection is time-bound with automatic cleanup — if the CLI crashes, the agent auto-heals when the TTL expires.
+**`relish test --chaos`** operates on real running clusters. It talks to actual Bun agents, asks one of them to cut itself off from its council peers through the fault API, and then watches the cluster heal in real time. Every fault injection is time-bound with automatic cleanup, so if the CLI crashes, the agent heals itself when the TTL expires. (The first version of this was a separate `relish chaos` command. Chapter 8 explains why it went.)
 
 ### The council partition test
 
@@ -2188,25 +2188,9 @@ Partition a worker from all council members:
 
 This tests the key invariant: running workloads survive control plane disruption.
 
-### `relish chaos` in action
+### Running it
 
-```
-$ relish chaos council-partition
-
-CHAOS  Council Partition
-───────────────────────────────────────────────────────
-
-  [0.00s]  DISCOVER  querying cluster topology...
-  [0.12s]  DISCOVER  found 5 nodes: node-1 (leader, council), ...
-  [0.15s]  INJECT    partitioning node-3 from 2 peer(s), duration: 30s
-  [3.20s]  POLL      leader: node-1, term: 1, members: 3
-  [10.0s]  HEAL      removing partition...
-  [12.1s]  VERIFY    cluster has 5 nodes, leader: node-1
-
-  PASSED  council partition scenario in 12.1s
-```
-
-Every injection has a TTL. If you forget to heal, the agent does it for you. `relish chaos status` shows active partitions and their remaining time. `relish chaos heal` cleans up immediately.
+`relish test --chaos --yes` runs the guarded scenario catalogue, including a minority partition. Every injection has a TTL. If you forget to heal, the agent does it for you, and `relish fault list` shows what's still active.
 
 This is a foundation. Phase 8 adds Smoker, which uses eBPF for fine-grained fault injection: network delays, packet drops, DNS failures, CPU stress. But the principle is the same: inject, observe, heal, verify. Make failure routine so recovery is trustworthy.
 

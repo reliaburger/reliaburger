@@ -122,7 +122,7 @@ One-command dev cluster using Lima VMs. The Reliaburger equivalent of `minikube 
 4. **GitHub release pipeline.** Cross-compile bun and relish for `linux-aarch64` and `linux-x86_64`. Attach to GitHub releases alongside PDFs.
 5. **Docs.** Whitepaper section, README, book getting-started guide.
 
-**Milestone:** `relish dev create --nodes 3` produces a working 3-node cluster. `relish chaos council-partition` runs against it successfully.
+**Milestone:** `relish dev create --nodes 3` produces a working 3-node cluster. `relish test --chaos` partitions a council member and the cluster recovers.
 
 ---
 

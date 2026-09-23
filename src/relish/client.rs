@@ -10,9 +10,7 @@ use futures_util::StreamExt;
 use rustls::pki_types::{CertificateDer, pem::PemObject};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-use crate::bun::agent::{
-    ApplyEvent, ApplyResult, ChaosState, CouncilStatus, InstanceStatus, NodeStatus,
-};
+use crate::bun::agent::{ApplyEvent, ApplyResult, CouncilStatus, InstanceStatus, NodeStatus};
 use crate::config::Config;
 
 use super::RelishError;
@@ -1639,29 +1637,6 @@ impl BunClient {
             body: format!("failed to parse response: {e}"),
         })?;
         Ok(json["message"].as_str().unwrap_or("ok").to_string())
-    }
-
-    /// Query chaos status.
-    pub async fn chaos_status(&self) -> Result<ChaosState, RelishError> {
-        let url = format!("{}/v1/chaos/status", self.base_url);
-        let response = self
-            .http()?
-            .get(&url)
-            .send()
-            .await
-            .map_err(classify_error)?;
-
-        let status = response.status().as_u16();
-        if !response.status().is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(RelishError::ApiError { status, body });
-        }
-
-        let state: ChaosState = response.json().await.map_err(|e| RelishError::ApiError {
-            status: 0,
-            body: format!("failed to parse response: {e}"),
-        })?;
-        Ok(state)
     }
 
     /// Inject a fault (Smoker API).

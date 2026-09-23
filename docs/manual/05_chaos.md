@@ -82,11 +82,13 @@ relish fault scenario examples/phase-8/chaos-scenario.toml --acknowledge
 
 ## Cluster-level scenarios
 
+Partitions that cut a node off from the council, leader failure and node
+death run as guarded scenarios in the test catalogue. Each one records the exact
+fault it injected and reverses only that:
+
 ```sh
-relish chaos council-partition --acknowledge # isolate the council
-relish chaos worker-isolation --acknowledge  # cut off a worker
-relish chaos status
-relish chaos heal
+relish test --chaos --yes    # the whole catalogue
+relish test --chaos --yes --filter minority_partition_degrades_and_heals
 ```
 
 Start small: one fault, one app, a hypothesis about what should happen. If

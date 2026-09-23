@@ -707,29 +707,6 @@ async fn nodes_with_client(output: OutputFormat, client: &BunClient) -> Result<(
     Ok(())
 }
 
-/// Run a chaos testing scenario or action.
-pub async fn chaos(action: &str, acknowledged: bool) -> Result<(), RelishError> {
-    let client = BunClient::default_local();
-    match action {
-        "council-partition" => super::chaos::council_partition(&client, acknowledged).await,
-        "worker-isolation" => super::chaos::worker_isolation(&client, acknowledged).await,
-        "status" => super::chaos::status(&client).await,
-        "heal" => super::chaos::heal(&client).await,
-        other => {
-            eprintln!("unknown chaos action: {other}");
-            eprintln!();
-            eprintln!("available actions:");
-            eprintln!("  use relish test --chaos for guarded recovery scenarios");
-            eprintln!("  status              show active fault injections");
-            eprintln!("  mutations and blanket heal are retired");
-            Err(RelishError::ApiError {
-                status: 0,
-                body: format!("unknown chaos action: {other}"),
-            })
-        }
-    }
-}
-
 /// Join an existing cluster: fetch a certificate from a member and persist it.
 ///
 /// Contacts `addr` (an existing member's API address) with the join token,

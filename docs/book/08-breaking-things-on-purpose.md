@@ -1089,13 +1089,11 @@ sent the fault through the entry client. Its cleanup then used blanket heal,
 which could reverse someone else's fault. Retrying that command more carefully
 would not establish ownership.
 
-For 0.1.0, `chaos council-partition`, `chaos worker-isolation` and `chaos heal`
-refuse before sending any request, even with acknowledgement. Use
-`relish test --chaos` for the guarded catalogue described in chapter 15. It
-routes to the selected node and keeps exact fault receipts through cancellation
-and cleanup. Existing faults can be inspected with `relish fault list` and
-reversed by their owned ID; `chaos status` remains read-only. An unreachable-node
-regression proves that the refusal does not depend on a server response.
+So we deleted the `relish chaos` command outright. There's nothing to migrate
+from: nobody has run a released Reliaburger yet. Use `relish test --chaos` for
+the guarded catalogue described in chapter 15. It routes to the selected node
+and keeps exact fault receipts through cancellation and cleanup. Existing faults
+can be inspected with `relish fault list` and reversed by their owned ID.
 
 ### Two requests, one quorum budget
 

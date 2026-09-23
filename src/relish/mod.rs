@@ -4,7 +4,6 @@ pub mod bench_cmd;
 /// Separates CLI logic from the binary so it can be tested as a library.
 /// The binary (`src/bin/relish.rs`) handles argument parsing and exit codes;
 /// this module handles everything else.
-pub mod chaos;
 pub mod client;
 pub mod commands;
 pub mod compile;
@@ -82,13 +81,6 @@ impl CommandOutcome {
 /// Errors from Relish CLI operations.
 #[derive(Debug, thiserror::Error)]
 pub enum RelishError {
-    /// A legacy command was removed because its ownership contract was unsafe.
-    #[error("{command} is retired; use {replacement}")]
-    RetiredCommand {
-        command: String,
-        replacement: String,
-    },
-
     /// Configuration parse or validation failure.
     #[error("{0}")]
     Config(#[from] ConfigError),

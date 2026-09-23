@@ -207,14 +207,6 @@ enum Command {
     },
     /// Show ingress routing table.
     Routes,
-    /// Show legacy chaos status (mutations retired; use test --chaos).
-    Chaos {
-        /// Action: status. Old mutation actions return a migration error.
-        action: String,
-        /// Confirm that a partition action is intentional.
-        #[arg(long)]
-        acknowledge: bool,
-    },
     /// Inject faults for chaos testing (Smoker).
     Fault {
         #[command(subcommand)]
@@ -1205,10 +1197,6 @@ async fn main() -> ExitCode {
         }
         Command::Resolve { ref name } => commands::resolve(name).await,
         Command::Routes => commands::routes().await,
-        Command::Chaos {
-            ref action,
-            acknowledge,
-        } => commands::chaos(action, acknowledge).await,
         Command::Snapshot { ref action } => match action {
             SnapshotAction::Create {
                 app,
