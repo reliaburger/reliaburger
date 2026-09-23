@@ -12283,6 +12283,11 @@ schedule = "* * * * *"
             9117,
             None,
         );
+        // The per-member deadline is a Tokio timer, so paused time reaches
+        // it as soon as the request is idle on the silent socket instead of
+        // waiting five real seconds. The 7 s guard still fires later, so a
+        // missing deadline fails rather than passes.
+        tokio::time::pause();
         let response = tokio::time::timeout(
             std::time::Duration::from_secs(7),
             app.oneshot(

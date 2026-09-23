@@ -1293,13 +1293,18 @@ async fn registry_control_routes_bound_oversized_and_stalled_request_bodies() {
         let stalled = Body::from_stream(futures_util::stream::pending::<
             Result<axum::body::Bytes, std::io::Error>,
         >());
+        // The route's 10 s deadline and this 12 s guard are both Tokio
+        // timers, so paused time fires them in deadline order without
+        // waiting them out. The body never arrives, so nothing the council
+        // does while the clock jumps can satisfy the request early.
+        tokio::time::pause();
         let response = tokio::time::timeout(
             Duration::from_secs(12),
             app.clone().oneshot(request(stalled)),
         )
-        .await
-        .unwrap()
-        .unwrap();
+        .await;
+        tokio::time::resume();
+        let response = response.unwrap().unwrap();
         assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
     }
     council.shutdown().await.unwrap();

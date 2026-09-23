@@ -1099,10 +1099,18 @@ mod tests {
         let fixture = fixture();
         let directive = directive_for(&fixture, b"#!/bin/sh\nexec sleep 30\n", "stalled");
         let started = std::time::Instant::now();
-        assert!(matches!(
-            fixture.manager.prepare(&directive, vec![]).await,
-            Err(UpgradeError::IncompatibleBinary(_))
-        ));
+        // The query deadline is a Tokio timer. With the clock paused it
+        // expires as soon as the runtime idles on the silent candidate, so
+        // the test proves the bound without spending ten real seconds.
+        tokio::time::pause();
+        let prepared = fixture.manager.prepare(&directive, vec![]).await;
+        tokio::time::resume();
+        // Only the deadline yields `Elapsed`; a spawn or exit failure would
+        // be a different incompatibility and must not pass as a timeout.
+        assert!(
+            matches!(&prepared, Err(UpgradeError::IncompatibleBinary(message)) if message.contains("Elapsed")),
+            "{prepared:?}"
+        );
         assert!(started.elapsed() < std::time::Duration::from_secs(15));
         assert!(!fixture.manager.upgrade_in_flight());
         assert!(!fixture.manager.store().binary_path(&v("0.2.0")).exists());
