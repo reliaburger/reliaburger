@@ -37,11 +37,9 @@ use super::{GrillError, InstanceId};
 struct ProcessEntry {
     spec: OciSpec,
     child: Option<tokio::process::Child>,
-    /// Pid of an adopted process (started by a previous bun). Mutually
-    /// exclusive with `child`: adopted processes have no handle, only a pid.
-    adopted_pid: Option<u32>,
-    /// Start time of the adopted pid, to detect pid reuse (M23).
-    adopted_pid_started_at: Option<u64>,
+    /// A process started by a previous bun. Mutually exclusive with
+    /// `child`: adopted processes have no handle, only a pid.
+    adopted: Option<AdoptedProcess>,
     state: ContainerState,
     stdout_buf: Arc<Mutex<Vec<u8>>>,
     stderr_buf: Arc<Mutex<Vec<u8>>>,
@@ -51,6 +49,14 @@ struct ProcessEntry {
     /// In-memory workloads have no adoption path, so dropping their last
     /// owner must not leave the process tree behind.
     cleanup_on_drop: bool,
+}
+
+/// The recorded identity of an adopted process.
+#[derive(Debug, Clone, Copy)]
+struct AdoptedProcess {
+    pid: u32,
+    /// Start time of the pid, to detect pid reuse (M23).
+    started_at: u64,
 }
 
 impl Drop for ProcessEntry {
@@ -68,13 +74,11 @@ impl Drop for ProcessEntry {
             let pid = nix::unistd::Pid::from_raw(pid as i32);
             let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
             let _ = child.start_kill();
-        } else if let Some(pid) = self.adopted_pid
-            && self
-                .adopted_pid_started_at
-                .is_some_and(|started| records::process_matches(pid, started))
+        } else if let Some(adopted) = self.adopted
+            && records::process_matches(adopted.pid, adopted.started_at)
         {
             let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(pid as i32),
+                nix::unistd::Pid::from_raw(adopted.pid as i32),
                 nix::sys::signal::Signal::SIGKILL,
             );
         }
@@ -88,14 +92,11 @@ fn signal_adopted_process(
     entry: &ProcessEntry,
     signal: nix::sys::signal::Signal,
 ) -> std::io::Result<bool> {
-    let Some(pid) = entry.adopted_pid else {
+    let Some(adopted) = entry.adopted else {
         return Ok(false);
     };
-    let nix_pid = nix::unistd::Pid::from_raw(pid as i32);
-    let owned = entry
-        .adopted_pid_started_at
-        .is_some_and(|started| records::process_matches(pid, started));
-    if !owned {
+    let nix_pid = nix::unistd::Pid::from_raw(adopted.pid as i32);
+    if !records::process_matches(adopted.pid, adopted.started_at) {
         if nix::sys::signal::kill(nix_pid, None) == Err(nix::errno::Errno::ESRCH) {
             return Ok(false);
         }
@@ -275,8 +276,7 @@ impl super::Grill for ProcessGrill {
             ProcessEntry {
                 spec: spec.clone(),
                 child: None,
-                adopted_pid: None,
-                adopted_pid_started_at: None,
+                adopted: None,
                 state: ContainerState::Pending,
                 stdout_buf: Arc::new(Mutex::new(Vec::new())),
                 stderr_buf: Arc::new(Mutex::new(Vec::new())),
@@ -305,7 +305,7 @@ impl super::Grill for ProcessGrill {
                 instance: instance.clone(),
             })?;
 
-        if entry.child.is_some() || entry.adopted_pid.is_some() {
+        if entry.child.is_some() || entry.adopted.is_some() {
             return Err(GrillError::StartFailed {
                 instance: instance.clone(),
                 reason: "already started".to_string(),
@@ -450,7 +450,7 @@ impl super::Grill for ProcessGrill {
         if let Some(pid) = entry.child.as_ref().and_then(|child| child.id()) {
             signal_child_group(pid, nix::sys::signal::Signal::SIGTERM).map_err(error)?;
             entry.state = ContainerState::Stopping;
-        } else if entry.adopted_pid.is_some() {
+        } else if entry.adopted.is_some() {
             entry.state = if signal_adopted_process(entry, nix::sys::signal::Signal::SIGTERM)
                 .map_err(error)?
             {
@@ -503,7 +503,7 @@ impl super::Grill for ProcessGrill {
                 .map_err(error)?;
             entry.exit_code = status.code();
             entry.state = ContainerState::Stopped;
-        } else if entry.adopted_pid.is_some() {
+        } else if entry.adopted.is_some() {
             entry.state = if signal_adopted_process(entry, nix::sys::signal::Signal::SIGKILL)
                 .map_err(error)?
             {
@@ -543,12 +543,12 @@ impl super::Grill for ProcessGrill {
                 instance: instance.clone(),
                 reason: error.to_string(),
             })?;
-        } else if let Some(pid) = entry.adopted_pid {
+        } else if let Some(adopted) = entry.adopted {
             // Adopted process: no handle, poll (and reap) by pid. This
             // doubles as the zombie reaper — the supervisor polls state
             // regularly, so exited adoptees get waitpid'd here.
             if entry.state != ContainerState::Stopped {
-                let (running, exit_code) = poll_adopted_process(pid, entry.adopted_pid_started_at)
+                let (running, exit_code) = poll_adopted_process(adopted.pid, adopted.started_at)
                     .map_err(|error| GrillError::StateUnavailable {
                         instance: instance.clone(),
                         reason: error.to_string(),
@@ -606,7 +606,7 @@ impl super::Grill for ProcessGrill {
             };
         }
         let (running, _) =
-            poll_adopted_process(record.pid, Some(record.pid_started_at)).map_err(|error| {
+            poll_adopted_process(record.pid, record.pid_started_at).map_err(|error| {
                 GrillError::StateUnavailable {
                     instance: instance.clone(),
                     reason: error.to_string(),
@@ -621,8 +621,10 @@ impl super::Grill for ProcessGrill {
             ProcessEntry {
                 spec: record.oci_spec.clone(),
                 child: None,
-                adopted_pid: Some(record.pid),
-                adopted_pid_started_at: Some(record.pid_started_at),
+                adopted: Some(AdoptedProcess {
+                    pid: record.pid,
+                    started_at: record.pid_started_at,
+                }),
                 state: ContainerState::Running,
                 stdout_buf: Arc::new(Mutex::new(Vec::new())),
                 stderr_buf: Arc::new(Mutex::new(Vec::new())),
@@ -647,7 +649,7 @@ impl super::Grill for ProcessGrill {
             .child
             .as_ref()
             .and_then(|c| c.id())
-            .or(entry.adopted_pid)
+            .or(entry.adopted.map(|adopted| adopted.pid))
     }
 
     async fn log_stem(&self, instance: &InstanceId) -> Option<PathBuf> {
@@ -1235,7 +1237,10 @@ mod tests {
             .await
             .get_mut(&id)
             .unwrap()
-            .adopted_pid_started_at = Some(started_at + 3600);
+            .adopted
+            .as_mut()
+            .unwrap()
+            .started_at = started_at + 3600;
         let refused = match operation {
             "stop" => grill.stop(&id).await.is_err(),
             "kill" => grill.kill(&id).await.is_err(),

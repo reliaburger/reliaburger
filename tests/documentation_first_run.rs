@@ -1400,10 +1400,8 @@ async fn node_job_lease_reaps_a_surviving_process_after_bun_is_killed() {
             .await
             .unwrap();
         let lease_state = leases.get(&lease.lease_id).await.map(|lease| lease.state);
-        let process = reliaburger::grill::records::poll_adopted_process(
-            record.pid,
-            Some(record.pid_started_at),
-        );
+        let process =
+            reliaburger::grill::records::poll_adopted_process(record.pid, record.pid_started_at);
         let log = std::fs::read_to_string(root.path().join("job-restarted.log")).unwrap();
         let recovery_lines = log
             .lines()
