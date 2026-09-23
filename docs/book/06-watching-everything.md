@@ -561,10 +561,10 @@ is a compensating control, not a fix.
 Our first attempt copied Parquet 54 into the repository and patched its decoder.
 It worked, and it was honest (the patch was recorded line by line), but it meant
 maintaining 90,000 lines of someone else's code. So we looked again. Parquet 59
-no longer uses the Thrift crate at all: it ships its own metadata decoder, with
-its own bounds on list sizes. DataFusion 55 depends on Parquet 59. Upgrading
-DataFusion from 45 to 55 removes Thrift from our dependency graph, and the
-unmaintained `paste` macro crate with it.
+no longer uses the Thrift crate at all: it ships its own metadata decoder.
+DataFusion 55 depends on Parquet 59. Upgrading DataFusion from 45 to 55 removes
+Thrift from our dependency graph, and the unmaintained `paste` macro crate with
+it.
 
 Ten major versions sounds like a migration project. It wasn't, and the reason
 is worth knowing. Our code never names the `parquet` crate in `Cargo.toml`; it
@@ -595,7 +595,7 @@ We read the deprecated implementations before renaming: both simply forward to
 their replacements, so the files we write are unchanged.
 
 The regression tests stay, because they check the parser we actually ship
-rather than a version number. Each one writes a real one-row Parquet file,
+rather than a version number. That turned out to matter more than we expected. Each one writes a real one-row Parquet file,
 edits a metadata field, fixes up the footer length and asks the public reader
 to open it. An impossible list count must be refused before allocation. A
 truncated `double` must return an error, not panic. An unknown field must be
@@ -613,8 +613,43 @@ let _ = accepts(&bytes);
 
 `let _ =` evaluates the expression and deliberately throws the result away.
 Here it says "accept or refuse, we don't mind". A panic would still fail the
-test. The metric, rollup and log restart and query suites complete the picture:
-a dependency scan and a parser regression are different evidence, and we want
+test.
+
+### A test that passed for the wrong reason
+
+We ran the upgrade on a Mac, every safety test passed, and we deleted the
+vendored copy. Then Linux CI aborted the whole test process: "memory allocation
+of 206158430112 bytes failed". The impossible-count test declares a list of two
+billion schema elements, and Parquet 59 calls `Vec::with_capacity` with that
+count before checking there are enough bytes to back it. On macOS, asking for
+206 GB of address space succeeds as long as you never touch it, and the
+decoder then fails on the next byte with an ordinary error. Linux refuses the
+reservation, and Rust's default response to a failed allocation is to abort
+the process, not to return an error. The same crafted or corrupted archive
+that returned `Err` on a laptop would take down a production node.
+
+Upstream had already fixed it in Parquet 60 by bounding every list count by
+the bytes that remain. DataFusion 55 still requires Parquet 59, though, and
+the fix wasn't backported. Rather than vendoring 90,000 lines again, we forked
+the upstream repository, applied that one commit to the 59.3.0 tag, and told
+Cargo to use the fork:
+
+```toml
+[patch.crates-io]
+parquet = { git = "https://github.com/reliaburger/arrow-rs", rev = "34ac1864f214da1648b05fbd1a2b6de4f2b4a952" }
+```
+
+`[patch.crates-io]` replaces a crates.io package everywhere in the build, not
+just in our own dependencies, so DataFusion picks up the fixed decoder too. We
+patch all fifteen arrow-rs crates to the same revision. Patching only
+`parquet` would have made Cargo build a second copy of the Arrow crates it
+depends on, and Rust treats a type from one copy as unrelated to the "same"
+type from the other. The block goes away as soon as DataFusion moves to a
+Parquet release that contains the fix. The tests, and running them on the
+platform we ship to, are what tell us when that is.
+
+The metric, rollup and log restart and query suites complete the picture: a
+dependency scan and a parser regression are different evidence, and we want
 both.
 
 ### A log query owns its response bodies

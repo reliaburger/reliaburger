@@ -289,6 +289,15 @@ this tier now blocks the 0.1.0 candidate rather than the merge.
       *Fix:* filter by scope the way `desired_apps_handler` does.
       *Test:* a namespace-scoped token only sees its own namespace's instances.
 
+- [x] **T1.10 Parquet 59 aborts on an impossible list count (regression from
+      T2.19, merged with PR #167).** Done. The T2.19 spike ran on macOS, which
+      grants a 206 GB untouched reservation; Linux CI aborted the process in
+      `impossible_schema_count_is_rejected_before_allocation`. Upstream fixed
+      it in Parquet 60 (apache/arrow-rs#10979) but DataFusion 55 needs 59 and
+      the fix wasn't backported. `[patch.crates-io]` pins all fifteen arrow-rs
+      crates to `reliaburger/arrow-rs@34ac186` (59.3.0 + that one commit).
+      Remove it when DataFusion depends on a Parquet release with #10979; the
+      safety tests must pass on Linux.
 ## Tier 2: fix before release
 
 Smaller, mostly one commit each.

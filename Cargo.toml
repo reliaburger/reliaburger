@@ -135,3 +135,28 @@ harness = false
 [[bench]]
 name = "gossip_large"
 harness = false
+
+# Parquet 59.3 can reserve memory for a Thrift list count far larger than
+# the metadata that follows, aborting the process on a crafted or corrupted
+# archive. Upstream fixed it in Parquet 60 (apache/arrow-rs#10979), but
+# DataFusion 55 still requires Parquet 59. This fork is the 59.3.0 tag plus
+# that one upstream commit. Every arrow-rs crate comes from the same revision
+# so Cargo builds a single copy of the Arrow types. Remove the whole block
+# once DataFusion depends on a Parquet release that contains #10979; the
+# tests/parquet_safety.rs regressions must still pass on Linux.
+[patch.crates-io]
+arrow = { git = "https://github.com/reliaburger/arrow-rs", rev = "34ac1864f214da1648b05fbd1a2b6de4f2b4a952" }
+arrow-arith = { git = "https://github.com/reliaburger/arrow-rs", rev = "34ac1864f214da1648b05fbd1a2b6de4f2b4a952" }
+arrow-array = { git = "https://github.com/reliaburger/arrow-rs", rev = "34ac1864f214da1648b05fbd1a2b6de4f2b4a952" }
+arrow-buffer = { git = "https://github.com/reliaburger/arrow-rs", rev = "34ac1864f214da1648b05fbd1a2b6de4f2b4a952" }
+arrow-cast = { git = "https://github.com/reliaburger/arrow-rs", rev = "34ac1864f214da1648b05fbd1a2b6de4f2b4a952" }
+arrow-csv = { git = "https://github.com/reliaburger/arrow-rs", rev = "34ac1864f214da1648b05fbd1a2b6de4f2b4a952" }
+arrow-data = { git = "https://github.com/reliaburger/arrow-rs", rev = "34ac1864f214da1648b05fbd1a2b6de4f2b4a952" }
+arrow-ipc = { git = "https://github.com/reliaburger/arrow-rs", rev = "34ac1864f214da1648b05fbd1a2b6de4f2b4a952" }
+arrow-json = { git = "https://github.com/reliaburger/arrow-rs", rev = "34ac1864f214da1648b05fbd1a2b6de4f2b4a952" }
+arrow-ord = { git = "https://github.com/reliaburger/arrow-rs", rev = "34ac1864f214da1648b05fbd1a2b6de4f2b4a952" }
+arrow-row = { git = "https://github.com/reliaburger/arrow-rs", rev = "34ac1864f214da1648b05fbd1a2b6de4f2b4a952" }
+arrow-schema = { git = "https://github.com/reliaburger/arrow-rs", rev = "34ac1864f214da1648b05fbd1a2b6de4f2b4a952" }
+arrow-select = { git = "https://github.com/reliaburger/arrow-rs", rev = "34ac1864f214da1648b05fbd1a2b6de4f2b4a952" }
+arrow-string = { git = "https://github.com/reliaburger/arrow-rs", rev = "34ac1864f214da1648b05fbd1a2b6de4f2b4a952" }
+parquet = { git = "https://github.com/reliaburger/arrow-rs", rev = "34ac1864f214da1648b05fbd1a2b6de4f2b4a952" }
