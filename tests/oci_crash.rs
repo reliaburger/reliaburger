@@ -2,7 +2,7 @@
 #![cfg(target_os = "linux")]
 
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use reliaburger::config::Config;
@@ -117,6 +117,134 @@ impl Node {
         self.child.kill().await.unwrap();
         self.child.wait().await.unwrap();
     }
+}
+
+/// Tears down everything a test started under its root when it goes out of
+/// scope, including while a failed assertion unwinds.
+///
+/// Bun dies with its `Child`, but the owners it launched lead process groups
+/// of their own and the containers they supervise outlive both. Leaked, they
+/// hold host-wide cgroups and addresses that break every later run, and their
+/// pinned eBPF programs make every connect() on the host fail. Drop can't
+/// wait or report, so the teardown is synchronous and best-effort: nothing in
+/// it may panic, since a second panic during unwinding aborts the test binary
+/// and hides the first.
+struct RootCleanup(PathBuf);
+
+impl Drop for RootCleanup {
+    fn drop(&mut self) {
+        kill_root_processes(&self.0);
+        for node in node_roots(&self.0) {
+            delete_runc_containers(&node.join("data/instances/runc/state"));
+            #[cfg(feature = "ebpf")]
+            retire_leaked_kernel(&node);
+        }
+    }
+}
+
+/// SIGKILL every process whose command line names a path under the root:
+/// Bun, its detached owners and the Runc commands they were running.
+fn kill_root_processes(root: &Path) {
+    use nix::sys::signal::{Signal, kill, killpg};
+    use nix::unistd::{Pid, getpgid, getpgrp};
+    use std::os::unix::ffi::OsStrExt;
+    // The trailing separator stops one root matching another it prefixes.
+    let mut needle = root.as_os_str().as_bytes().to_vec();
+    needle.push(b'/');
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        let Ok(command) = std::fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        if !command.windows(needle.len()).any(|part| part == needle) {
+            continue;
+        }
+        let pid = Pid::from_raw(pid);
+        // An owner leads its own group, so killing the group takes the Runc
+        // child it is waiting on too. Bun shares the test's group, and
+        // signalling that group would kill the test binary itself.
+        match getpgid(Some(pid)) {
+            Ok(group) if group != getpgrp() => {
+                let _ = killpg(group, Signal::SIGKILL);
+            }
+            _ => {
+                let _ = kill(pid, Signal::SIGKILL);
+            }
+        }
+    }
+}
+
+/// The root itself and any per-node subdirectory with its own data directory.
+fn node_roots(root: &Path) -> Vec<PathBuf> {
+    let mut nodes = vec![root.to_path_buf()];
+    if let Ok(entries) = std::fs::read_dir(root) {
+        nodes.extend(
+            entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.join("data").is_dir()),
+        );
+    }
+    nodes
+}
+
+/// Kill and delete every container Runc records in one state root.
+fn delete_runc_containers(state: &Path) {
+    if !state.is_dir() {
+        return;
+    }
+    let Ok(listed) = std::process::Command::new("runc")
+        .arg("--root")
+        .arg(state)
+        .args(["list", "--quiet"])
+        .output()
+    else {
+        return;
+    };
+    for id in String::from_utf8_lossy(&listed.stdout).lines() {
+        let _ = std::process::Command::new("runc")
+            .arg("--root")
+            .arg(state)
+            .args(["delete", "--force", id])
+            .output();
+    }
+}
+
+/// Unpin and detach the eBPF programs a node left behind, unless the test
+/// already retired them.
+#[cfg(feature = "ebpf")]
+fn retire_leaked_kernel(node: &Path) {
+    let policy = node.join("data/kernel-policy");
+    let Ok(bytes) = std::fs::read(policy.join("owner.json")) else {
+        return;
+    };
+    let Ok(owner) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return;
+    };
+    let (Some(cgroup), Some(pins)) = (
+        owner["cgroup_path"].as_str(),
+        owner["pin_directory"].as_str(),
+    ) else {
+        return;
+    };
+    if !Path::new(pins).exists() {
+        return;
+    }
+    let _ = reliaburger::onion::ebpf::loader::OnionEbpf::retire_owned_state(
+        Path::new(cgroup),
+        &policy,
+        Path::new(pins),
+    );
+    let _ = std::fs::remove_dir(pins);
 }
 
 fn runtime(root: &Path) -> RuncGrill {
@@ -270,6 +398,7 @@ async fn actual_bun_sigkill_and_cancelled_caller_preserve_oci_init_and_retry_own
         "retry",
     ] {
         let root = tempfile::tempdir().unwrap().keep();
+        let _cleanup = RootCleanup(root.clone());
         println!("qualifying {phase}: {}", root.as_path().display());
         let name = format!(
             "oci-crash-{}",
@@ -460,6 +589,7 @@ fn retire_kernel(root: &Path) {
 #[ignore = "requires isolated Linux root, bpffs, real runc/ip/nft and static BusyBox"]
 async fn normal_standalone_bun_recovers_durable_kernel_and_discovery() {
     let root = tempfile::tempdir().unwrap().keep();
+    let _cleanup = RootCleanup(root.clone());
     durable_fixture(&root);
     let mut node = Node::start(&root).await;
     let activated =
@@ -526,6 +656,7 @@ async fn normal_standalone_bun_recovers_durable_kernel_and_discovery() {
 #[ignore = "requires isolated Linux root, cgroup v2, bpffs, real runc/ip/nft and static BusyBox"]
 async fn service_cgroup_kill_of_bun_and_owners_retires_the_launch_and_redeploys() {
     let root = tempfile::tempdir().unwrap().keep();
+    let _cleanup = RootCleanup(root.clone());
     durable_fixture(&root);
     let name = format!(
         "cgkill-{}",
@@ -581,6 +712,7 @@ async fn service_cgroup_kill_of_bun_and_owners_retires_the_launch_and_redeploys(
 #[ignore = "requires isolated Linux root, bpffs, real runc/ip/nft and static BusyBox"]
 async fn automatic_restart_bun_death_before_adoption_retires_the_unrecorded_successor() {
     let root = tempfile::tempdir().unwrap().keep();
+    let _cleanup = RootCleanup(root.clone());
     println!("qualifying automatic restart: {}", root.display());
     durable_fixture(&root);
     let name = "restart-crash";
@@ -786,6 +918,7 @@ async fn upgrade_and_rollback(root: &Path, node: &Node, key: &[u8]) {
 #[ignore = "requires isolated Linux root, bpffs, real runc/ip/nft and static BusyBox"]
 async fn normal_owned_bun_upgrade_and_rollback_preserve_runtime_and_kernel() {
     let root = tempfile::tempdir().unwrap().keep();
+    let _cleanup = RootCleanup(root.clone());
     durable_fixture(&root);
     let key = upgrade_fixture(&root);
     let mut node = Node::start(&root).await;
@@ -814,6 +947,7 @@ async fn normal_owned_bun_upgrade_and_rollback_preserve_runtime_and_kernel() {
 async fn normal_rootless_bun_recovers_owned_forward_and_discovery() {
     assert!(!nix::unistd::geteuid().is_root());
     let root = tempfile::tempdir().unwrap().keep();
+    let _cleanup = RootCleanup(root.clone());
     durable_fixture(&root);
     let config = std::fs::read_to_string(root.join("node.toml")).unwrap();
     std::fs::write(
@@ -884,6 +1018,7 @@ async fn normal_clustered_bun_recovers_enrolled_consumer_before_adoption() {
     use reliaburger::config::node::NodeConfig;
     use sha2::{Digest, Sha256};
     let root = tempfile::tempdir().unwrap().keep();
+    let _cleanup = RootCleanup(root.clone());
     durable_fixture(&root);
     reliaburger::relish::commands::init(&root, "activation", "activation-node").unwrap();
     let base = NodeConfig::from_file(&root.join("node.toml")).unwrap();
@@ -1130,6 +1265,7 @@ async fn enrolled_upgrade_fixture(
 #[ignore = "requires isolated Linux root, bpffs, real runc/ip/nft and static BusyBox"]
 async fn three_enrolled_oci_nodes_preserve_ownership_through_upgrade_and_rollback() {
     let root = tempfile::tempdir().unwrap().keep();
+    let _cleanup = RootCleanup(root.clone());
     let roots: Vec<_> = (0..3)
         .map(|i| {
             let path = root.join(format!("node{i}"));
