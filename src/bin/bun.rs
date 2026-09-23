@@ -1789,6 +1789,16 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                         });
                     }
 
+                    // The leader's withdrawal ledger (zero on followers).
+                    for (name, value) in
+                        reliaburger::cluster::orchestrate::withdrawal_ledger_gauge().samples()
+                    {
+                        samples.push(reliaburger::mayo::collector::CollectedMetric {
+                            key: reliaburger::mayo::types::MetricKey::simple(name),
+                            value,
+                        });
+                    }
+
                     {
                         let mut store = collection_mayo.write().await;
                         for m in &samples {

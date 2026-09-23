@@ -1935,7 +1935,11 @@ The same trap exists with TLS, just more slowly. A node that dies without being
 decommissioned keeps owing every later withdrawal. The leader measures the
 ledger each tick. At 75% full it degrades a non-critical readiness subsystem,
 `discovery:withdrawal-backlog`, and logs which nodes owe receipts and whether
-gossip still sees them. It also stops proposing publications the ledger would
+gossip still sees them. It also publishes the reading as two metrics,
+`discovery_withdrawal_ledger_occupancy_ratio` and
+`discovery_withdrawal_pending_generations`, so an alert can fire long before
+the warning does. The leader keeps them in a pair of atomics that Bun's metric
+collection loop reads; followers report zero. It also stops proposing publications the ledger would
 refuse, so a full ledger doesn't fill the Raft log with refusals. We chose a
 warning over automatic expiry on purpose: a partitioned node that's still alive
 could be serving old routes, and handing its addresses to someone else is worse

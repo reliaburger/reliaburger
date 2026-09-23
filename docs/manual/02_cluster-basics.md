@@ -62,6 +62,10 @@ scheduler: endpoint withdrawal ledger is 78% full; catalogue updates stop at 100
 Receipts owed by: node-03 (800 generations, not alive), ...
 ```
 
+The leader also exports the reading as the metrics
+`discovery_withdrawal_ledger_occupancy_ratio` (0 to 1) and
+`discovery_withdrawal_pending_generations`, if you'd rather alert on a trend.
+
 At 100% the cluster stops publishing catalogue changes: new instances and
 scale-ups don't become reachable. If a node is permanently gone, stop or isolate
 whatever it was running, then retire it:

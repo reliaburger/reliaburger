@@ -460,7 +460,10 @@ Registry and storage:
       on `Refused`, `RegistryPublicationStale` or a forwarded 409; other errors keep it.
       `refused_publication_rolls_back_the_local_tag_but_uncertain_keeps_it` covers all three.
 
-- [ ] **T2.20 Export withdrawal-ledger occupancy as a Mayo metric.** T1.2
+- [x] **T2.20 Export withdrawal-ledger occupancy as a Mayo metric.** Done:
+      the leader loop records a process-wide gauge that the collection loop
+      exports as `discovery_withdrawal_ledger_occupancy_ratio` and
+      `discovery_withdrawal_pending_generations`; followers report zero. T1.2
       shipped the readiness signal and log. Mayo only records host metrics
       today (`src/mayo/collector.rs`), so a gauge needs a small path for
       Bun-internal metrics first.

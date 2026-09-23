@@ -34,6 +34,63 @@ use crate::reporting::aggregator::AggregatedState;
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
 const RECONCILE_IO_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The leader's latest reading of the endpoint withdrawal ledger, exported as
+/// Mayo metrics by Bun's collection loop. Followers report zero: only the
+/// leader judges the replicated ledger.
+#[derive(Debug, Default)]
+pub struct WithdrawalLedgerGauge {
+    occupancy_permille: std::sync::atomic::AtomicU64,
+    pending_generations: std::sync::atomic::AtomicU64,
+}
+
+impl WithdrawalLedgerGauge {
+    const fn new() -> Self {
+        Self {
+            occupancy_permille: std::sync::atomic::AtomicU64::new(0),
+            pending_generations: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Record the leader's view of the ledger.
+    pub fn record(&self, withdrawals: &crate::onion::withdrawal::EndpointWithdrawals) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let permille = (withdrawals.occupancy() * 1000.0).round() as u64;
+        self.occupancy_permille.store(permille, Relaxed);
+        self.pending_generations
+            .store(withdrawals.pending.len() as u64, Relaxed);
+    }
+
+    /// Forget the reading once this node stops leading.
+    pub fn clear(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.occupancy_permille.store(0, Relaxed);
+        self.pending_generations.store(0, Relaxed);
+    }
+
+    /// Samples for Mayo: occupancy as a 0–1 ratio of the tightest bound, and
+    /// the number of retained generations.
+    pub fn samples(&self) -> [(&'static str, f64); 2] {
+        use std::sync::atomic::Ordering::Relaxed;
+        [
+            (
+                "discovery_withdrawal_ledger_occupancy_ratio",
+                self.occupancy_permille.load(Relaxed) as f64 / 1000.0,
+            ),
+            (
+                "discovery_withdrawal_pending_generations",
+                self.pending_generations.load(Relaxed) as f64,
+            ),
+        ]
+    }
+}
+
+static WITHDRAWAL_LEDGER: WithdrawalLedgerGauge = WithdrawalLedgerGauge::new();
+
+/// The process-wide gauge the leader loop updates.
+pub fn withdrawal_ledger_gauge() -> &'static WithdrawalLedgerGauge {
+    &WITHDRAWAL_LEDGER
+}
+
 /// Ledger occupancy at which the leader starts warning. Publication itself
 /// only stops at 100%, so this leaves room to decommission a lost node.
 const WITHDRAWAL_BACKLOG_WARNING: f64 = 0.75;
@@ -183,6 +240,7 @@ pub fn spawn_leader_scheduler(
             was_leader = is_leader;
             if !is_leader {
                 // Only the leader judges the replicated ledger.
+                withdrawal_ledger_gauge().clear();
                 if backlog_warning.take().is_some()
                     && let Some(readiness) = &readiness
                 {
@@ -207,6 +265,7 @@ pub fn spawn_leader_scheduler(
                 .filter(|member| member.state == NodeState::Alive)
                 .map(|member| member.node_id.0.as_str())
                 .collect();
+            withdrawal_ledger_gauge().record(&desired.endpoint_withdrawals);
             let warning = withdrawal_backlog_warning(&desired.endpoint_withdrawals, &alive_names);
             if warning != backlog_warning {
                 if let Some(readiness) = &readiness {
@@ -1415,6 +1474,21 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn withdrawal_ledger_gauge_exports_the_leader_reading() {
+        let gauge = WithdrawalLedgerGauge::default();
+        gauge.record(&withdrawals_owed_by(&["lost"], 512));
+        assert_eq!(
+            gauge.samples(),
+            [
+                ("discovery_withdrawal_ledger_occupancy_ratio", 0.5),
+                ("discovery_withdrawal_pending_generations", 512.0),
+            ]
+        );
+        gauge.clear();
+        assert_eq!(gauge.samples()[0].1, 0.0);
     }
 
     #[test]
