@@ -423,7 +423,7 @@ impl UpgradeManager {
         let binary = self.store.binary_path(&target);
         let envelope_path = self.store.envelope_path(&target);
         let release_keys = self.release_keys.clone();
-        let external_key = self.external_key.clone();
+        let external_key = self.external_key;
         let bytes = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, UpgradeError> {
             let bytes = std::fs::read(&binary)?;
             if let Ok(envelope) = SignatureEnvelope::load(&envelope_path)
