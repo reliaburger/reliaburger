@@ -235,16 +235,23 @@ both log views at short and tall sizes and check the newest and oldest entries.
 
 ### Keep the node attached to every replica
 
-The terminal used to fetch the connected node's instances. An application whose
-only replica ran elsewhere disappeared from the list. The provider now requests
-cluster status and carries `ClusterInstanceStatus` through the message and state
-types. That wrapper keeps node identity beside the existing instance fields;
-renderers borrow the nested instance and the detail table displays its node.
-Applications still group by both name and namespace.
+The terminal used to list only the connected node's instances, so an app whose
+only replica ran elsewhere simply vanished. It now asks for cluster status and
+keeps each instance's node beside it:
 
-An HTTP fixture returns a remote-only replica only for the cluster request, and
-a second fixture returns an incomplete-cluster error. The UI preserves its last
-successful data on that error and displays the failure. Screen snapshots cover
-the node column and the explicit connected-node scope of logs and deployment
-history. Those views don't acquire cluster-wide coverage merely because the
-application list does.
+```rust
+pub struct ClusterInstanceStatus {
+    /// Node name, or `local` for a standalone agent.
+    pub node: String,
+    /// Node-local workload evidence.
+    #[serde(flatten)]
+    pub instance: InstanceStatus,
+}
+```
+
+`#[serde(flatten)]` keeps the JSON flat (the instance's fields sit next to
+`node`) while the Rust type stays nested, so renderers can borrow
+`&status.instance` and reuse their existing code. If the cluster answer is
+incomplete, the UI keeps its last good data and shows the error rather than a
+shorter list. Logs and deployment history still say plainly that they cover the
+connected node only; one cluster-wide view doesn't make the others cluster-wide.
