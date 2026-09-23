@@ -378,7 +378,7 @@ async fn ebpf_connect_non_vip_passes_through() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
 async fn agent_deploy_populates_backend_map() {
-    use reliaburger::bun::agent::{AgentCommand, BunAgent};
+    use reliaburger::bun::agent::AgentCommand;
     use reliaburger::config::Config;
     use reliaburger::grill::port::PortAllocator;
     use reliaburger::grill::process::ProcessGrill;
@@ -391,11 +391,13 @@ async fn agent_deploy_populates_backend_map() {
 
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
     let shutdown = CancellationToken::new();
-    let mut agent = BunAgent::new(
+    let volumes = TestVolumes::new();
+    let mut agent = test_agent(
         ProcessGrill::new(),
         PortAllocator::new(41100, 41400),
         cmd_rx,
         shutdown.clone(),
+        volumes.path(),
     );
     agent.set_onion_ebpf(Arc::clone(&ebpf)).await;
     let agent_task = tokio::spawn(async move { agent.run().await });
@@ -458,7 +460,7 @@ async fn agent_deploy_populates_backend_map() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
 async fn agent_drop_fault_refuses_vip_with_eperm() {
-    use reliaburger::bun::agent::{AgentCommand, BunAgent};
+    use reliaburger::bun::agent::AgentCommand;
     use reliaburger::config::Config;
     use reliaburger::grill::port::PortAllocator;
     use reliaburger::grill::process::ProcessGrill;
@@ -472,11 +474,13 @@ async fn agent_drop_fault_refuses_vip_with_eperm() {
 
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
     let shutdown = CancellationToken::new();
-    let mut agent = BunAgent::new(
+    let volumes = TestVolumes::new();
+    let mut agent = test_agent(
         ProcessGrill::new(),
         PortAllocator::new(41500, 41800),
         cmd_rx,
         shutdown.clone(),
+        volumes.path(),
     );
     agent.set_onion_ebpf(Arc::clone(&ebpf)).await;
     let agent_task = tokio::spawn(async move { agent.run().await });
@@ -1443,7 +1447,7 @@ async fn sweep_scrubs_orphaned_cgroup_state() {
 #[tokio::test]
 #[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
 async fn egress_programmed_before_start_via_cgroup_path() {
-    use reliaburger::bun::agent::{AgentCommand, BunAgent};
+    use reliaburger::bun::agent::AgentCommand;
     use reliaburger::config::Config;
     use reliaburger::grill::mock::MockGrill;
     use reliaburger::grill::port::PortAllocator;
@@ -1458,11 +1462,13 @@ async fn egress_programmed_before_start_via_cgroup_path() {
     grill.set_honours_cgroup_path(true);
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
     let shutdown = CancellationToken::new();
-    let mut agent = BunAgent::new(
+    let volumes = TestVolumes::new();
+    let mut agent = test_agent(
         grill.clone(),
         PortAllocator::new(42100, 42400),
         cmd_rx,
         shutdown.clone(),
+        volumes.path(),
     );
     agent.set_onion_ebpf(Arc::clone(&ebpf)).await;
     let agent_task = tokio::spawn(async move { agent.run().await });
@@ -1536,7 +1542,7 @@ async fn egress_programmed_before_start_via_cgroup_path() {
 #[tokio::test]
 #[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
 async fn pre_start_programming_scrubs_recycled_cgroup_allows() {
-    use reliaburger::bun::agent::{AgentCommand, BunAgent};
+    use reliaburger::bun::agent::AgentCommand;
     use reliaburger::config::Config;
     use reliaburger::grill::mock::MockGrill;
     use reliaburger::grill::port::PortAllocator;
@@ -1568,11 +1574,13 @@ async fn pre_start_programming_scrubs_recycled_cgroup_allows() {
     grill.set_honours_cgroup_path(true);
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
     let shutdown = CancellationToken::new();
-    let mut agent = BunAgent::new(
+    let volumes = TestVolumes::new();
+    let mut agent = test_agent(
         grill,
         PortAllocator::new(42400, 42500),
         cmd_rx,
         shutdown.clone(),
+        volumes.path(),
     );
     agent.set_onion_ebpf(Arc::clone(&ebpf)).await;
     tokio::spawn(async move { agent.run().await });
@@ -1619,7 +1627,7 @@ async fn pre_start_programming_scrubs_recycled_cgroup_allows() {
 #[tokio::test]
 #[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
 async fn live_egress_hook_loss_stops_protected_workload() {
-    use reliaburger::bun::agent::{AgentCommand, BunAgent};
+    use reliaburger::bun::agent::AgentCommand;
     use reliaburger::config::Config;
     use reliaburger::grill::mock::MockGrill;
     use reliaburger::grill::port::PortAllocator;
@@ -1632,11 +1640,13 @@ async fn live_egress_hook_loss_stops_protected_workload() {
     grill.set_honours_cgroup_path(true);
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
     let shutdown = CancellationToken::new();
-    let mut agent = BunAgent::new(
+    let volumes = TestVolumes::new();
+    let mut agent = test_agent(
         grill.clone(),
         PortAllocator::new(42800, 43100),
         cmd_rx,
         shutdown.clone(),
+        volumes.path(),
     );
     agent.set_onion_ebpf(Arc::clone(&ebpf)).await;
     let readiness = reliaburger::bun::readiness::ReadinessTracker::new();
@@ -1700,7 +1710,7 @@ async fn live_egress_hook_loss_stops_protected_workload() {
 #[tokio::test]
 #[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
 async fn pre_start_programming_error_fails_deploy_with_no_running_process() {
-    use reliaburger::bun::agent::{AgentCommand, BunAgent};
+    use reliaburger::bun::agent::AgentCommand;
     use reliaburger::config::Config;
     use reliaburger::grill::mock::MockGrill;
     use reliaburger::grill::port::PortAllocator;
@@ -1714,11 +1724,13 @@ async fn pre_start_programming_error_fails_deploy_with_no_running_process() {
     grill.set_honours_cgroup_path(true);
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
     let shutdown = CancellationToken::new();
-    let mut agent = BunAgent::new(
+    let volumes = TestVolumes::new();
+    let mut agent = test_agent(
         grill.clone(),
         PortAllocator::new(42500, 42800),
         cmd_rx,
         shutdown.clone(),
+        volumes.path(),
     );
     agent.set_onion_ebpf(Arc::clone(&ebpf)).await;
     tokio::spawn(async move { agent.run().await });
@@ -1815,6 +1827,63 @@ fn retire_identity_mounts(volumes: &std::path::Path) {
     }
 }
 
+/// A Bun agent whose volumes live under `volumes`.
+///
+/// `BunAgent::new` defaults to the host's `/var/lib/reliaburger/volumes`, and
+/// every deploy mounts an identity tmpfs there. Tests build agents only
+/// through this helper, so none of them can forget to confine it.
+fn test_agent<G: reliaburger::grill::Grill + Clone + 'static>(
+    grill: G,
+    ports: reliaburger::grill::port::PortAllocator,
+    commands: tokio::sync::mpsc::Receiver<reliaburger::bun::agent::AgentCommand>,
+    shutdown: CancellationToken,
+    volumes: &std::path::Path,
+) -> reliaburger::bun::agent::BunAgent<G> {
+    let mut agent = reliaburger::bun::agent::BunAgent::new(grill, ports, commands, shutdown);
+    agent.set_volumes_dir(volumes.to_path_buf());
+    agent
+}
+
+/// A temporary volumes directory for a test that has no root of its own.
+///
+/// Dropping it unmounts the identity tmpfs mounts the agent left behind
+/// (shutdown keeps them for adoption) before the directory is removed, even
+/// when the test panics.
+struct TestVolumes(tempfile::TempDir);
+
+impl TestVolumes {
+    fn new() -> Self {
+        Self(tempfile::tempdir().unwrap())
+    }
+
+    fn path(&self) -> &std::path::Path {
+        self.0.path()
+    }
+}
+
+impl Drop for TestVolumes {
+    fn drop(&mut self) {
+        let Ok(entries) = std::fs::read_dir(self.path().join(".identity")) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if let Err(error) = reliaburger::sesame::identity::cleanup_identity_dir(&entry.path()) {
+                eprintln!("test identity cleanup failed: {error}");
+            }
+        }
+    }
+}
+
+#[test]
+fn every_agent_is_built_with_a_test_volumes_directory() {
+    let source = include_str!("ebpf.rs");
+    let direct = source.matches(concat!("BunAgent::", "new(")).count();
+    assert_eq!(
+        direct, 1,
+        "construct agents through test_agent, which confines their volumes"
+    );
+}
+
 // BPF_MAP_FREEZE makes userspace deletion fail while preserving readable
 // evidence. Each test owns a fresh, unpinned map destroyed with its loader.
 fn freeze_egress_map(ebpf: &OnionEbpf, name: &str) {
@@ -1897,7 +1966,7 @@ fn egress_cleanup_refuses_a_frozen_enforcement_flag() {
 #[tokio::test]
 #[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
 async fn agent_retirement_keeps_its_record_when_kernel_egress_cleanup_fails() {
-    use reliaburger::bun::agent::{AgentCommand, ApplyEvent, BunAgent};
+    use reliaburger::bun::agent::{AgentCommand, ApplyEvent};
     use reliaburger::config::Config;
     use reliaburger::grill::mock::MockGrill;
     use reliaburger::grill::port::PortAllocator;
@@ -1913,14 +1982,14 @@ async fn agent_retirement_keeps_its_record_when_kernel_egress_cleanup_fails() {
     grill.set_pid(std::process::id());
     let (commands, receiver) = mpsc::channel(64);
     let shutdown = CancellationToken::new();
-    let mut agent = BunAgent::new(
+    let mut agent = test_agent(
         grill,
         PortAllocator::new(43400, 43500),
         receiver,
         shutdown.clone(),
+        &root.path().join("volumes"),
     );
     agent.set_records_dir(records.clone());
-    agent.set_volumes_dir(root.path().join("volumes"));
     agent.set_onion_ebpf(Arc::clone(&ebpf)).await;
     let task = tokio::spawn(async move { agent.run().await });
     let config = Config::parse(
@@ -2462,7 +2531,7 @@ fn persistent_policy_refuses_wrong_map_layout_and_foreign_map_identity() {
 #[tokio::test]
 #[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
 async fn agent_adoption_restores_durable_egress_ownership_before_live_checks() {
-    use reliaburger::bun::agent::{AgentCommand, ApplyEvent, BunAgent};
+    use reliaburger::bun::agent::{AgentCommand, ApplyEvent};
     use reliaburger::config::Config;
     use reliaburger::grill::{InstanceId, mock::MockGrill, port::PortAllocator};
     use std::sync::Arc;
@@ -2478,14 +2547,14 @@ async fn agent_adoption_restores_durable_egress_ownership_before_live_checks() {
     grill.set_honours_cgroup_path(true);
     grill.set_pid(std::process::id());
     let (commands, receiver) = mpsc::channel(64);
-    let mut agent = BunAgent::new(
+    let mut agent = test_agent(
         grill.clone(),
         PortAllocator::new(43400, 43500),
         receiver,
         CancellationToken::new(),
+        &root.path().join("volumes"),
     );
     agent.set_records_dir(records.clone());
-    agent.set_volumes_dir(root.path().join("volumes"));
     agent.set_onion_ebpf(Arc::clone(&ebpf)).await;
     let task = tokio::spawn(async move { agent.run().await });
     let config = Config::parse(
@@ -2506,14 +2575,14 @@ async fn agent_adoption_restores_durable_egress_ownership_before_live_checks() {
     grill.set_adopt_result(&id, true);
     let shutdown = CancellationToken::new();
     let (commands, receiver) = mpsc::channel(64);
-    let mut restored = BunAgent::new(
+    let mut restored = test_agent(
         grill,
         PortAllocator::new(43400, 43500),
         receiver,
         shutdown.clone(),
+        &root.path().join("volumes"),
     );
     restored.set_records_dir(records.clone());
-    restored.set_volumes_dir(root.path().join("volumes"));
     restored.set_onion_ebpf(Arc::clone(&ebpf)).await;
     assert_eq!(restored.adopt_recorded_instances().await.unwrap(), 1);
     let task = tokio::spawn(async move { restored.run().await });
@@ -2638,14 +2707,14 @@ impl EgressRecoveryFixture {
     ) {
         let (commands, receiver) = tokio::sync::mpsc::channel(64);
         let shutdown = CancellationToken::new();
-        let mut agent = reliaburger::bun::agent::BunAgent::new(
+        let mut agent = test_agent(
             self.grill.clone(),
             reliaburger::grill::port::PortAllocator::new(43400, 43500),
             receiver,
             shutdown.clone(),
+            &self.root.path().join("volumes"),
         );
         agent.set_records_dir(self.root.path().join("records"));
-        agent.set_volumes_dir(self.root.path().join("volumes"));
         agent
             .set_onion_ebpf(std::sync::Arc::clone(&self.ebpf))
             .await;
@@ -3180,7 +3249,7 @@ async fn agent_retirement_confirms_backend_absence_before_forgetting_ownership()
 }
 
 async fn assert_source_policy_precedes_start(job: bool) {
-    use reliaburger::bun::agent::{AgentCommand, ApplyEvent, BunAgent};
+    use reliaburger::bun::agent::{AgentCommand, ApplyEvent};
     use reliaburger::grill::{mock::MockGrill, port::PortAllocator};
     use reliaburger::sesame::{egress, firewall};
     use std::sync::Arc;
@@ -3207,14 +3276,14 @@ async fn assert_source_policy_precedes_start(job: bool) {
     grill.set_pid(std::process::id());
     let (commands, receiver) = mpsc::channel(64);
     let shutdown = CancellationToken::new();
-    let mut agent = BunAgent::new(
+    let mut agent = test_agent(
         grill.clone(),
         PortAllocator::new(43400, 43500),
         receiver,
         shutdown.clone(),
+        &root.path().join("volumes"),
     );
     agent.set_records_dir(records.clone());
-    agent.set_volumes_dir(root.path().join("volumes"));
     agent.set_onion_ebpf(Arc::clone(&ebpf)).await;
     let task = tokio::spawn(async move { agent.run().await });
     let _tasks = TestTasks::new(shutdown.clone(), vec![task]);
@@ -3709,7 +3778,7 @@ impl reliaburger::grill::Grill for InitPolicyGrill {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Linux root, runc, static BusyBox and RELIABURGER_EBPF_TESTS=1"]
 async fn init_exit_preserves_policy_before_the_next_container_starts() {
-    use reliaburger::bun::agent::{AgentCommand, ApplyEvent, BunAgent};
+    use reliaburger::bun::agent::{AgentCommand, ApplyEvent};
     use reliaburger::grill::{Grill, ImageStore, port::PortAllocator, runc::RuncGrill};
     use std::sync::Arc;
     use tokio::sync::{Mutex, mpsc, oneshot};
@@ -3737,14 +3806,14 @@ async fn init_exit_preserves_policy_before_the_next_container_starts() {
     };
     let (commands, receiver) = mpsc::channel(64);
     let shutdown = CancellationToken::new();
-    let mut agent = BunAgent::new(
+    let mut agent = test_agent(
         grill,
         PortAllocator::new(43500, 43600),
         receiver,
         shutdown.clone(),
+        &root.path().join("volumes"),
     );
     agent.set_records_dir(root.path().join("records"));
-    agent.set_volumes_dir(root.path().join("volumes"));
     agent.set_onion_ebpf(Arc::clone(&ebpf)).await;
     let task = tokio::spawn(async move { agent.run().await });
     let config = reliaburger::config::Config::parse(
@@ -3812,7 +3881,7 @@ async fn init_exit_preserves_policy_before_the_next_container_starts() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Linux root, runc, static BusyBox and RELIABURGER_EBPF_TESTS=1"]
 async fn uncertain_initialiser_preserves_parent_policy_until_confirmed_retirement() {
-    use reliaburger::bun::agent::{AgentCommand, ApplyEvent, BunAgent};
+    use reliaburger::bun::agent::{AgentCommand, ApplyEvent};
     use reliaburger::grill::{Grill, ImageStore, port::PortAllocator, runc::RuncGrill};
     use std::sync::Arc;
     use tokio::sync::{Mutex, mpsc, oneshot};
@@ -3842,14 +3911,14 @@ async fn uncertain_initialiser_preserves_parent_policy_until_confirmed_retiremen
     refusal.store(true, std::sync::atomic::Ordering::SeqCst);
     let (commands, receiver) = mpsc::channel(64);
     let shutdown = CancellationToken::new();
-    let mut agent = BunAgent::new(
+    let mut agent = test_agent(
         grill.clone(),
         PortAllocator::new(43500, 43600),
         receiver,
         shutdown.clone(),
+        &root.path().join("volumes"),
     );
     agent.set_records_dir(root.path().join("records"));
-    agent.set_volumes_dir(root.path().join("volumes"));
     agent.set_onion_ebpf(Arc::clone(&ebpf)).await;
     let task = tokio::spawn(async move { agent.run().await });
     let config = reliaburger::config::Config::parse(
@@ -3897,14 +3966,14 @@ async fn uncertain_initialiser_preserves_parent_policy_until_confirmed_retiremen
     task.abort();
     let _ = task.await;
     let (_, receiver) = mpsc::channel(64);
-    let mut recovered = BunAgent::new(
+    let mut recovered = test_agent(
         grill,
         PortAllocator::new(43500, 43600),
         receiver,
         CancellationToken::new(),
+        &root.path().join("volumes"),
     );
     recovered.set_records_dir(root.path().join("records"));
-    recovered.set_volumes_dir(root.path().join("volumes"));
     recovered.set_onion_ebpf(Arc::clone(&ebpf)).await;
     let recovery_refused = recovered.adopt_recorded_instances().await.is_err();
     let recovered_namespace =
@@ -4102,7 +4171,7 @@ async fn check_backend_retirement(
 ) {
     let durable = !matches!(discovery, DiscoveryExercise::Disabled);
     let restart_original = matches!(discovery, DiscoveryExercise::Restart);
-    use reliaburger::bun::agent::{AgentCommand, ApplyEvent, BunAgent};
+    use reliaburger::bun::agent::{AgentCommand, ApplyEvent};
     use reliaburger::grill::{Grill, ImageStore, InstanceId, port::PortAllocator, runc::RuncGrill};
     use std::sync::Arc;
     use tokio::sync::{Mutex, mpsc, oneshot};
@@ -4129,14 +4198,14 @@ async fn check_backend_retirement(
     };
     let (mut commands, receiver) = mpsc::channel(64);
     let shutdown = CancellationToken::new();
-    let mut agent = BunAgent::new(
+    let mut agent = test_agent(
         grill.clone(),
         PortAllocator::new(43600, 43700),
         receiver,
         shutdown.clone(),
+        &root.path().join("volumes"),
     );
     agent.set_records_dir(root.path().join("records"));
-    agent.set_volumes_dir(root.path().join("volumes"));
     agent.set_onion_ebpf(Arc::clone(&ebpf)).await;
     if durable {
         agent
@@ -4186,9 +4255,8 @@ async fn check_backend_retirement(
                     map.update_backends_bpf(&mut *ebpf.lock().await, foreign_entry.vip, foreign_entry.port, foreign_entry)?;
                     for refuse in [true, false] {
                         let (next_commands, receiver) = mpsc::channel(64);
-                        let mut recovered = BunAgent::new(grill.clone(), PortAllocator::new(43600, 43700), receiver, shutdown.clone());
+                        let mut recovered = test_agent(grill.clone(), PortAllocator::new(43600, 43700), receiver, shutdown.clone(), &root.path().join("volumes"));
                         recovered.set_records_dir(root.path().join("records"));
-                        recovered.set_volumes_dir(root.path().join("volumes"));
                         recovered.set_onion_ebpf(Arc::clone(&ebpf)).await;
                         let recovery = recovered.recover_discovery_ownership(&root.path().join("discovery")).await;
                         if refuse {
@@ -4336,7 +4404,7 @@ async fn check_backend_retirement(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
 async fn refused_backend_publication_cannot_report_a_completed_deployment() {
-    use reliaburger::bun::agent::{AgentCommand, ApplyEvent, BunAgent};
+    use reliaburger::bun::agent::{AgentCommand, ApplyEvent};
     use reliaburger::grill::{
         Grill, GrillError, InstanceId, port::PortAllocator, process::ProcessGrill,
     };
@@ -4351,14 +4419,14 @@ async fn refused_backend_publication_cannot_report_a_completed_deployment() {
     let (commands, receiver) = mpsc::channel(64);
     let shutdown = CancellationToken::new();
     let runtime = ProcessGrill::new();
-    let mut agent = BunAgent::new(
+    let mut agent = test_agent(
         runtime.clone(),
         PortAllocator::new(43800, 43900),
         receiver,
         shutdown.clone(),
+        &root.path().join("volumes"),
     );
     agent.set_records_dir(root.path().join("records"));
-    agent.set_volumes_dir(root.path().join("volumes"));
     agent.set_onion_ebpf(Arc::clone(&ebpf)).await;
     let task = tokio::spawn(async move { agent.run().await });
     let config = reliaburger::config::Config::parse("[app.publication-refusal]\nimage = 'proc-grill:image-ignored'\ncommand = ['sleep', '60']\nport = 8080\n").unwrap();
@@ -4549,7 +4617,7 @@ async fn durable_discovery_retains_original_reference_after_controller_loss() {
 }
 
 async fn check_stopped_address_retention(lose_enforcement: bool, durable_discovery: bool) {
-    use reliaburger::bun::agent::{AgentCommand, ApplyEvent, BunAgent};
+    use reliaburger::bun::agent::{AgentCommand, ApplyEvent};
     use reliaburger::grill::{
         ContainerState, Grill, ImageStore, InstanceId, port::PortAllocator, runc::RuncGrill,
     };
@@ -4577,14 +4645,14 @@ async fn check_stopped_address_retention(lose_enforcement: bool, durable_discove
         refuse_init_cleanup: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
     let (commands, receiver) = mpsc::channel(64);
-    let mut agent = BunAgent::new(
+    let mut agent = test_agent(
         grill.clone(),
         PortAllocator::new(43600, 43700),
         receiver,
         CancellationToken::new(),
+        &root.path().join("volumes"),
     );
     agent.set_records_dir(root.path().join("records"));
-    agent.set_volumes_dir(root.path().join("volumes"));
     agent.set_onion_ebpf(Arc::clone(&ebpf)).await;
     if durable_discovery {
         agent
@@ -4722,7 +4790,7 @@ async fn check_stopped_address_retention(lose_enforcement: bool, durable_discove
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
 async fn refused_health_publication_prevents_restart_and_preserves_ownership() {
-    use reliaburger::bun::agent::{AgentCommand, ApplyEvent, BunAgent};
+    use reliaburger::bun::agent::{AgentCommand, ApplyEvent};
     use reliaburger::grill::{Grill, InstanceId, port::PortAllocator, process::ProcessGrill};
     use std::sync::{
         Arc,
@@ -4763,14 +4831,14 @@ async fn refused_health_publication_prevents_restart_and_preserves_ownership() {
     let runtime = ProcessGrill::new();
     let (commands, receiver) = mpsc::channel(64);
     let shutdown = CancellationToken::new();
-    let mut agent = BunAgent::new(
+    let mut agent = test_agent(
         runtime.clone(),
         PortAllocator::new(43900, 44000),
         receiver,
         shutdown.clone(),
+        &root.path().join("volumes"),
     );
     agent.set_records_dir(root.path().join("records"));
-    agent.set_volumes_dir(root.path().join("volumes"));
     agent.set_onion_ebpf(Arc::clone(&ebpf)).await;
     let task = tokio::spawn(async move { agent.run().await });
     let id = InstanceId("default__health-refusal-0".into());
@@ -4853,6 +4921,7 @@ async fn consumer_kernel_agent(
         "consumer".into(),
     );
     agent.set_records_dir(root.join("records"));
+    agent.set_volumes_dir(root.join("volumes"));
     agent.set_onion_ebpf(ebpf).await;
     agent
         .recover_consumer_ownership(
