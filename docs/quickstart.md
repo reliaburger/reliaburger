@@ -9,12 +9,20 @@ not a measured guarantee.
 
 ```sh
 curl -fsSL https://reliaburger.com/install.sh | sh
-export PATH="$HOME/.reliaburger/bin:$PATH"
 relish nodes
 relish status
 relish logs hello
 relish dashboard             # Ctrl-C stops the browser connection
 ```
+
+The installer keeps `relish` in `~/.reliaburger/bin`. If `~/.local/bin` is
+already on your `PATH`, it links `~/.local/bin/relish` there and you're done.
+Otherwise it prints the one line to add for your shell (`~/.zshrc`,
+`~/.bash_profile` on macOS, `~/.bashrc` on Linux, `fish_add_path` for fish)
+and asks, on the terminal, whether to add it for you. It never edits a file
+without a yes. Pass `--no-modify-path` (`sh -s -- --no-modify-path`) or set
+`RELIABURGER_NO_MODIFY_PATH=1` to keep everything inside `~/.reliaburger`.
+Until you open a new terminal, setup prints next steps with the full path.
 
 The default is three Linux VMs, running real OCI containers with runc. Relish
 installs Lima in your user directory, downloads a pinned Ubuntu image and

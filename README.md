@@ -227,7 +227,6 @@ path will be:
 
 ```sh
 curl -fsSL https://reliaburger.com/install.sh | sh
-export PATH="$HOME/.reliaburger/bin:$PATH"
 relish nodes
 relish status
 relish logs hello
@@ -237,6 +236,9 @@ relish local stop
 relish local start
 relish local destroy --yes   # permanently remove the cluster's VMs and data
 ```
+
+The installer links `relish` into `~/.local/bin` when that's on your `PATH`;
+otherwise it prints the line to add and offers to add it for you.
 
 See the [laptop quickstart](docs/quickstart.md) for prerequisites, single-node
 setup, retries and development qualification. The public release is still pending.

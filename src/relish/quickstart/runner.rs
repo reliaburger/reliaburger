@@ -103,9 +103,13 @@ pub async fn run(options: Options) -> Result<()> {
                 "  app: http://localhost:{}",
                 operation.state.spec.ingress_port
             );
-            println!("  next: relish nodes; relish status; relish logs hello; relish dashboard");
+            // Straight after install.sh, `relish` may not be on PATH yet.
+            let relish = crate::relish::install::invocation();
             println!(
-                "  lifecycle: relish local status|stop|start|destroy --name {}",
+                "  next: {relish} nodes; {relish} status; {relish} logs hello; {relish} dashboard"
+            );
+            println!(
+                "  lifecycle: {relish} local status|stop|start|destroy --name {}",
                 operation.state.spec.name
             );
             Ok(())

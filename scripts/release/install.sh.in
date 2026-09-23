@@ -3,6 +3,11 @@
 # HTTPS authenticates this bootstrap; the embedded digest pins the first CLI.
 # POSIX sh: no arrays, no [[ ]], no pipefail. Every pipeline below either ends
 # in a comparison that fails closed or feeds a value we check afterwards.
+#
+# Installer options come before any `relish setup` options:
+#   --install-only     install the CLI and stop
+#   --no-modify-path   touch nothing outside ~/.reliaburger (also
+#                      RELIABURGER_NO_MODIFY_PATH=1)
 set -eu
 
 fail() { printf 'reliaburger: %s\n' "$*" >&2; exit 1; }
@@ -13,6 +18,67 @@ checksum() {
   else
     shasum -a 256 "$1" | awk '{print $1}'
   fi
+}
+
+on_path() {
+  case ":${PATH:-}:" in
+    *":$1:"*) return 0 ;;
+  esac
+  return 1
+}
+
+# Link ~/.local/bin/relish to the store when that directory is already on
+# PATH. Only a missing file is created and only our own link is kept; anything
+# else there belongs to the user and is left alone.
+link_into_local_bin() {
+  link_dir="$HOME/.local/bin"
+  link="$link_dir/relish"
+  on_path "$link_dir" || return 1
+  if [ -L "$link" ]; then
+    current=$(readlink "$link" 2>/dev/null) || current=
+    [ "$current" = "$bin_dir/relish" ] && return 0
+    printf 'reliaburger: left %s alone; it points at %s\n' "$link" "$current" >&2
+    return 1
+  fi
+  if [ -e "$link" ]; then
+    printf 'reliaburger: left %s alone; it is not a link to this installation\n' "$link" >&2
+    return 1
+  fi
+  mkdir -p "$link_dir" && ln -s "$bin_dir/relish" "$link"
+}
+
+# Print the one line that puts the store on PATH for the user's shell, and
+# offer to append it to the rc file. Nothing is written without a "y" typed at
+# the terminal; with `curl | sh` the script is on stdin, so ask on /dev/tty.
+offer_path_line() {
+  line="export PATH=\"$shown_dir:\$PATH\""
+  case ${SHELL:-} in
+    */zsh) rc="${ZDOTDIR:-$HOME}/.zshrc" ;;
+    */bash)
+      # Terminal.app starts login shells, which read .bash_profile, not .bashrc.
+      if [ "$system" = Darwin ]; then rc="$HOME/.bash_profile"; else rc="$HOME/.bashrc"; fi ;;
+    */fish)
+      rc="${XDG_CONFIG_HOME:-$HOME/.config}/fish/config.fish"
+      line="fish_add_path \"$shown_dir\"" ;;
+    *) rc="$HOME/.profile" ;;
+  esac
+  printf '\nrelish is not on your PATH yet. Add this line to %s:\n\n  %s\n\n' "$rc" "$line"
+  [ "$modify_path" = true ] || return 0
+  if [ -f "$rc" ] && grep -Fqx "$line" "$rc"; then
+    printf '%s already has it; open a new terminal to pick it up.\n' "$rc"
+    return 0
+  fi
+  (exec </dev/tty) 2>/dev/null || return 0
+  printf 'Add it to %s now? [y/N] ' "$rc" >/dev/tty
+  answer=
+  read -r answer </dev/tty || answer=
+  case $answer in
+    [Yy]|[Yy][Ee][Ss]) ;;
+    *) printf 'Left %s unchanged.\n' "$rc"; return 0 ;;
+  esac
+  mkdir -p "$(dirname "$rc")" || fail "could not create the directory for $rc"
+  printf '\n# Added by the Reliaburger installer\n%s\n' "$line" >>"$rc" || fail "could not update $rc"
+  printf 'Added it to %s. Open a new terminal to pick it up.\n' "$rc"
 }
 
 main() {
@@ -26,9 +92,12 @@ main() {
   release_base=${release_base%/}
 
   install_only=false
+  modify_path=true
+  [ -z "${RELIABURGER_NO_MODIFY_PATH:-}" ] || modify_path=false
   while [ "$#" -gt 0 ]; do
     case $1 in
       --install-only) install_only=true; shift ;;
+      --no-modify-path) modify_path=false; shift ;;
       *) break ;;
     esac
   done
@@ -51,7 +120,25 @@ main() {
   fi
   [ -n "${HOME:-}" ] || fail 'HOME must be set'
 
-  bin_dir="$HOME/.reliaburger/bin"
+  # The binary lives in the Reliaburger store. PATH gets a link to it, or a
+  # line in an rc file, so `relish uninstall` knows exactly what is ours.
+  if [ -n "${RELIABURGER_HOME:-}" ]; then
+    case $RELIABURGER_HOME in
+      /*) ;;
+      *) fail 'RELIABURGER_HOME must be an absolute path' ;;
+    esac
+    # It may end up inside double quotes in an rc file.
+    case $RELIABURGER_HOME in
+      *[\"\$\`\\]*) fail 'RELIABURGER_HOME must not contain quotes, $, backquotes or backslashes' ;;
+    esac
+    bin_dir="$RELIABURGER_HOME/bin"
+    shown_dir=$bin_dir
+  else
+    bin_dir="$HOME/.reliaburger/bin"
+    # Written to rc files unexpanded, so the line survives a moved home.
+    # shellcheck disable=SC2016
+    shown_dir='$HOME/.reliaburger/bin'
+  fi
   mkdir -p "$bin_dir" || fail "could not create $bin_dir"
   [ ! -d "$bin_dir/relish" ] || fail "$bin_dir/relish is a directory"
   staging=$(mktemp -d "$bin_dir/.install.XXXXXXXX") || fail 'could not create a staging directory'
@@ -68,7 +155,20 @@ main() {
   # Same directory, so the rename is atomic: a reader sees the old binary or the new one.
   mv -f "$staging/relish" "$bin_dir/relish"
   printf 'Installed Relish @VERSION@ in %s\n' "$bin_dir"
-  printf 'Add this directory to PATH: %s\n' "$bin_dir"
+
+  # An isolated RELIABURGER_HOME never reaches into ~/.local/bin.
+  if on_path "$bin_dir"; then
+    :
+  elif [ "$modify_path" = true ] && [ -z "${RELIABURGER_HOME:-}" ] && link_into_local_bin; then
+    printf 'Linked %s to it; that directory is on your PATH\n' "$link"
+  else
+    offer_path_line
+  fi
+  found=$(command -v relish 2>/dev/null) || found=
+  case $found in
+    ''|"$bin_dir/relish"|"$HOME/.local/bin/relish") ;;
+    *) printf 'reliaburger: note: %s comes first on your PATH\n' "$found" >&2 ;;
+  esac
 
   if [ "$install_only" = true ]; then
     exit 0

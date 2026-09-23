@@ -971,3 +971,15 @@ Both scripts are now plain POSIX sh. A regular expression becomes a `case` patte
 The body sits in a `main` function called on the last line. A piped shell executes the script as it arrives, so a download cut off halfway through would otherwise run half an installer. With the function, a truncated script defines nothing and runs nothing.
 
 The packaging tests run both scripts under every POSIX shell they find, with a fake `curl` that serves fixtures, and under `shellcheck -s sh` when it's installed. On a Mac, `sh` is bash pretending to be POSIX, and it forgives things dash won't, so the tests run `dash` too when it's there (it ships with macOS).
+
+### Getting onto `PATH` without editing your files behind your back
+
+An installer that ends with "now add this directory to PATH" has handed you homework, and the next command in the tutorial fails until you do it. But an installer that quietly appends to your `.zshrc` has edited a file you care about without asking. We wanted neither.
+
+The binary always lives in one place we own, `~/.reliaburger/bin`. Then there are three cases. If that directory is already on `PATH`, there's nothing to do. If `~/.local/bin` is on `PATH` (most Linux desktops, and plenty of Macs), we put a symbolic link to the binary there. Otherwise we print the one line your shell needs, choosing the file by `$SHELL`: `~/.zshrc` for zsh, `~/.bash_profile` for bash on macOS (Terminal starts login shells, which don't read `.bashrc`), `~/.bashrc` on Linux, and `fish_add_path` for fish. Then we ask whether to add it.
+
+Why a link rather than a second copy? One real file means one checksum to verify, one atomic rename on upgrade, and an uninstaller that can tell our link from someone else's `relish`: it only removes a link that points into the store. For the same reason the installer never replaces anything already at `~/.local/bin/relish` unless it's our own link.
+
+Asking has a catch. With `curl … | sh`, the shell's standard input *is* the script, so `read` would swallow the next line of the installer instead of your answer. We ask on `/dev/tty`, the controlling terminal, and only if the subshell `(exec </dev/tty)` can open it; in CI or over a pipe with no terminal, we print the line and move on. The default answer is no, the line is added at most once, and `--no-modify-path` keeps everything inside `~/.reliaburger`. The tests give the installer a pseudo-terminal as its controlling terminal and type the answer, which is the only honest way to exercise that prompt.
+
+The last step is the quickstart's own "next:" message. Straight after installation your current shell still has the old `PATH`, so `relish status` would fail. `relish::install::invocation()` looks up `relish` on `PATH` the way a shell would, canonicalises both paths (resolving the link), and prints `relish` only if the lookup lands on the running executable. Otherwise it prints the full path, quoted for the shell if it contains a space.
