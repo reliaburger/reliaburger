@@ -25,6 +25,7 @@ pub mod process;
 pub mod registry;
 pub mod reservation;
 pub mod resource;
+pub mod routing;
 pub mod safety;
 pub mod scenario;
 pub mod types;

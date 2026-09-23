@@ -110,7 +110,17 @@ All fault injection requests flow through the cluster API on the leader node:
   `alter_node_state`; node pressure uses Admin plus `saturate_capacity`.
   Injection also needs explicit acknowledgement.
 - **Safety rail enforcement.** The leader evaluates blast radius protection rules (quorum, replica, leader guards) before approving a fault.
-- **Distribution.** The leader instructs target node(s) via the reporting tree to activate the fault.
+- **Distribution.** The node that receives the request routes it. Node
+  faults go to the named node. Workload faults go to the nodes that run the
+  target: the receiving node reads every node's live `/v1/status`, checks the
+  replica rail against the cluster-wide replica count, then sends each owner
+  its share over the node-to-node API with the caller's own credential (a
+  counted kill is split by how many targets each owner holds). The owner
+  repeats the policy and rail checks with its own cluster-wide evidence
+  before its agent signals anything, so forwarding grants no authority. A
+  fault spread over several owners becomes one node-local fault per owner,
+  returned together; `GET /v1/fault?cluster=true` lists every node's faults
+  and a clear without an id reaches every node.
 - **Audit logging.** Every successful injection and reversal is logged as a
   structured cluster event with the authenticated credential principal,
   action, target, type and duration. Source address is not yet an event field.
@@ -209,21 +219,21 @@ relish fault delay redis 200ms --duration 5m --acknowledge
 Relish CLI -> Unix socket or cluster API
   |
   v
-Cluster leader (permission check, safety rail evaluation)
+Receiving node (permission check, cluster-wide safety rail evaluation)
   |
   v
-Leader identifies target nodes (nodes running redis instances)
+Receiving node reads every node's /v1/status: which nodes run redis?
   |
   v
-Leader sends FaultActivate message via reporting tree
+POST /v1/fault to each owner, target_node = owner, caller's credential
   |
   v
-Bun on target node(s):
+Bun on target node(s), after repeating the checks:
   1. Validates fault parameters
   2. Calculates expiry timestamp = now + duration
   3. Writes BpfFaultEntry to fault_connect_map via bpf() syscall
   4. Registers expiry timer in local fault registry
-  5. Acknowledges activation to leader
+  5. Returns the fault summary to the receiving node
   |
   v
 eBPF program on next connect() to redis VIP:

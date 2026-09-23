@@ -540,6 +540,7 @@ async fn agent_drop_fault_refuses_vip_with_eperm() {
     cmd_tx
         .send(AgentCommand::InjectFault {
             reservation: None,
+            replica_evidence: None,
             request: FaultRequest {
                 fault_type: FaultType::Drop { probability: 100 },
                 target_service: name.clone(),

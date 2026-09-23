@@ -467,6 +467,7 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
                 safety_class: reliaburger::testkit::safety::ClusterSafetyClass::Development,
                 allowed_operations: std::collections::BTreeSet::from([
                     reliaburger::testkit::safety::OperationPermission::AlterNodeState,
+                    reliaburger::testkit::safety::OperationPermission::InjectWorkloadFaults,
                     reliaburger::testkit::safety::OperationPermission::ProvisionIsolatedWorkloads,
                     reliaburger::testkit::safety::OperationPermission::SaturateCapacity,
                 ]),

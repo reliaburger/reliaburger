@@ -393,6 +393,73 @@ reversal and rolls back a partial write. The old quorum test moved onto the
 separate `CouncilPartition` transport operation, so an eBPF-free cluster no
 longer needs a pretend service partition to test Raft safety.
 
+### Where does the replica live?
+
+Try this on a three-node laptop cluster: `relish fault kill web --count 1
+--acknowledge`. Your CLI talks to node 1. The three `web` replicas run one per
+node. What happens?
+
+For a long time, the answer was "it depends where you're lucky". A workload
+fault acts on processes, and the agent that received it only looked at its own
+processes. If node 1 happened to hold a replica, that one died. If it didn't,
+you got `no running instances of web`. Worse, the replica rail counted only
+node 1's replicas: one. Killing one of one leaves zero, so the rail refused a
+kill that the cluster, with three replicas, could easily take.
+
+Node faults never had this problem, because they name their node and the API
+already forwarded them there. Workload faults name a service, so the receiving
+node has to work out the owners first. It asks every node for its live status
+(the same fan-out `relish status` uses), keeps the target's instances, and
+hands them to a pure planning function in `smoker::routing`:
+
+```rust
+let mut shares: BTreeMap<&str, Option<u32>> = BTreeMap::new();
+match request.fault_type {
+    FaultType::Kill { count } if count > 0 => {
+        for instance in candidates.iter().take(count as usize) {
+            let share = shares.entry(instance.node.as_str()).or_insert(Some(0));
+            *share = share.map(|taken| taken + 1);
+        }
+    }
+    _ => {
+        for instance in &candidates {
+            shares.insert(instance.node.as_str(), None);
+        }
+    }
+}
+```
+
+The map holds borrowed `&str` keys pointing into the instance list, so building
+it copies no node names. The borrow checker holds us to that: `shares` can't
+outlive `candidates`, which is why the function turns every key into an owned
+`String` before it returns. `entry(...).or_insert(...)` is Rust's
+look-up-or-create in one call (Go would need an `if _, ok := m[k]; !ok`), and
+it hands back a mutable reference, so `*share = ...` updates the value in
+place. `None` means "every candidate on that node"; `Some(n)` means "kill `n`
+of them".
+
+Before anything is sent, the receiving node runs the replica rail against
+cluster-wide numbers: running replicas on every node, and active faults
+against the service on every node. Then it forwards each owner its share with
+`target_node` set to the owner, carrying the caller's own bearer token rather
+than the node's service identity. That matters. The owner treats the request
+exactly as if you'd sent it yourself: it checks your role, its own
+`[testing]` policy and the replica rail (with its own fresh cluster-wide
+counts, passed to the agent as `ReplicaEvidence`) before it signals anything.
+Forwarding moves a request; it never adds authority.
+
+Fault ids stay node-local, so a routed fault comes back tagged with the node
+that holds it, and `relish fault clear 3` looks the id up in the cluster-wide
+listing to find its owner. A request that spreads over several owners creates
+one fault per owner and returns them together, so nothing you started is
+invisible to you.
+
+The quickstart turns all of this on. A laptop cluster writes
+`safety_class = "development"` with `inject_workload_faults` and
+`alter_node_state` into every node's `[testing]` section. It's a throwaway
+cluster, and breaking it on purpose is half the fun. A server install still
+writes nothing, which still means "unknown", which still refuses everything.
+
 ## One experiment at a time
 
 The quorum rail counts faults on the node that receives the request. Now picture

@@ -113,7 +113,7 @@ tutorial, because a tutorial over a broken path is a lie.
 
 ### Phase 2: observe and break it from the laptop (product)
 
-- [ ] **Z2.1 Workload faults on laptop clusters.** The quickstart writes a
+- [x] **Z2.1 Workload faults on laptop clusters.** The quickstart writes a
   `[testing]` policy of `safety_class = "development"` with workload faults
   allowed (see D3). Workload faults are forwarded to the node that owns the
   target instance, like node faults already are.

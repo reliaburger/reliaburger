@@ -206,17 +206,27 @@ impl ChaosGuard {
     }
 
     async fn complete_injection(&self, operation: &Arc<()>, summary: &FaultSummary) {
-        if let Some(fault) = self
-            .faults
-            .lock()
-            .await
+        let mut faults = self.faults.lock().await;
+        let Some(fault) = faults
             .iter_mut()
             .find(|fault| Arc::ptr_eq(&fault.operation, operation))
-        {
-            fault.id = Some(summary.id);
-            if summary.target_node.is_some() {
-                fault.owner_node.clone_from(&summary.target_node);
-            }
+        else {
+            return;
+        };
+        fault.id = Some(summary.id);
+        if summary.target_node.is_some() {
+            fault.owner_node.clone_from(&summary.target_node);
+        }
+        // A workload fault routed to several nodes created one fault on each;
+        // every one of them is this guard's to reverse.
+        let owner = fault.owner.clone();
+        for routed in &summary.routed {
+            faults.push(OwnedFault {
+                operation: Arc::new(()),
+                id: Some(routed.id),
+                owner: owner.clone(),
+                owner_node: routed.node.clone().or_else(|| routed.target_node.clone()),
+            });
         }
     }
 
@@ -564,6 +574,8 @@ mod tests {
                     target_node: Some("node-a".into()),
                     remaining_secs: 30,
                     injected_by: "test".into(),
+                    node: None,
+                    routed: Vec::new(),
                 },
             )
             .await;
@@ -629,6 +641,8 @@ mod tests {
                         target_node: Some("node-a".to_string()),
                         remaining_secs: 30,
                         injected_by: "test".to_string(),
+                        node: None,
+                        routed: Vec::new(),
                     },
                 )
                 .await;

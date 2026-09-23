@@ -918,6 +918,178 @@ async fn authenticated_node_kill_fails_and_restores_a_real_cluster_member() {
     }
 }
 
+/// Start three authenticated nodes and wait until a 3-replica `web` runs one
+/// replica on each. Used by the tests that act on a replica somewhere else.
+async fn start_spread_web_cluster(
+    prefix: &str,
+    first_port: u16,
+    shutdown: &CancellationToken,
+) -> [Node; 3] {
+    let auth = NodeFaultAuth::admin(&format!("{prefix}-admin"));
+    let n1 = start_node_with_auth(
+        &format!("{prefix}1"),
+        first_port,
+        vec![],
+        shutdown,
+        Some(auth.clone()),
+    )
+    .await;
+    let n2 = start_node_with_auth(
+        &format!("{prefix}2"),
+        first_port + 4,
+        vec![local(first_port)],
+        shutdown,
+        Some(auth.clone()),
+    )
+    .await;
+    let n3 = start_node_with_auth(
+        &format!("{prefix}3"),
+        first_port + 8,
+        vec![local(first_port)],
+        shutdown,
+        Some(auth),
+    )
+    .await;
+    {
+        let nodes = [&n1, &n2, &n3];
+        let ready = wait_until(Duration::from_secs(30), || {
+            nodes.iter().any(|n| *n.thinks_leader.borrow())
+        })
+        .await;
+        assert!(ready, "no leader elected");
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let config = reliaburger::config::Config::parse(
+            r#"
+            [app.web]
+            image = "proc-grill:image-ignored"
+            command = ["sh", "-c", "while true; do echo tick from $$; sleep 0.3; done"]
+            replicas = 3
+        "#,
+        )
+        .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let mut last_apply: Option<tokio::time::Instant> = None;
+        loop {
+            if live_web_instances(&nodes).await == 3 && nodes_running_web(&nodes).await == 3 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "web never spread one replica per node"
+            );
+            if last_apply.is_none_or(|t| t.elapsed() >= Duration::from_secs(8)) {
+                let _ =
+                    tokio::time::timeout(Duration::from_secs(15), n1.client.apply(&config)).await;
+                last_apply = Some(tokio::time::Instant::now());
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+    [n1, n2, n3]
+}
+
+/// The pid and restart count of `node`'s `web` replica.
+async fn web_process(node: &Node) -> Option<(u32, u32)> {
+    node.client
+        .status()
+        .await
+        .ok()?
+        .into_iter()
+        .find(|status| status.app_name == "web" && status.state == "running")
+        .and_then(|status| Some((status.pid?, status.restart_count)))
+}
+
+/// Z2.1: a workload fault sent to one node kills the replica that runs on
+/// another. The laptop only talks to node 1, so `relish fault kill` has to
+/// reach wherever the replica lives, and the replica rail has to count the
+/// replicas on every node rather than node 1's share.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
+async fn a_kill_sent_to_one_node_kills_a_replica_on_another() {
+    use reliaburger::smoker::types::{FaultRequest, FaultType};
+
+    let shutdown = CancellationToken::new();
+    let nodes = start_spread_web_cluster("wk", 19541, &shutdown).await;
+    let [entry, target, bystander] = &nodes;
+
+    let (target_pid, _) = web_process(target).await.expect("target runs web");
+    let (bystander_pid, _) = web_process(bystander).await.expect("bystander runs web");
+
+    let kill = |count, node: Option<&str>| FaultRequest {
+        fault_type: FaultType::Kill { count },
+        target_service: "web".to_string(),
+        namespace: None,
+        target_instance: None,
+        target_node: node.map(str::to_string),
+        duration: Duration::from_secs(0),
+        injected_by: String::new(),
+        reason: Some("cross-node workload fault".to_string()),
+        include_leader: false,
+        override_safety: false,
+        acknowledged: true,
+    };
+
+    // Killing every replica is refused, even though the entry node holds
+    // only one of them.
+    let refused = entry.client.inject_fault(&kill(3, None)).await;
+    assert!(
+        matches!(&refused, Err(reliaburger::relish::RelishError::ApiError { status: 400, body })
+            if body.contains("replica")),
+        "expected the replica rail to refuse, got {refused:?}"
+    );
+
+    let summary = entry
+        .client
+        .inject_fault(&kill(1, Some(&target.name)))
+        .await
+        .expect("the entry node should route the kill to the owner");
+    assert_eq!(summary.node.as_deref(), Some(target.name.as_str()));
+
+    let restarted = {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some((pid, restarts)) = web_process(target).await
+                && pid != target_pid
+                && restarts > 0
+            {
+                break true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break false;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    };
+    assert!(
+        restarted,
+        "{}'s web replica was not killed and restarted",
+        target.name
+    );
+    assert_eq!(
+        web_process(bystander).await.map(|(pid, _)| pid),
+        Some(bystander_pid),
+        "a replica on an untargeted node must not be touched"
+    );
+
+    // The routed fault is listed with its owner, cluster-wide.
+    let listing = entry.client.list_cluster_faults().await.unwrap();
+    assert!(
+        listing
+            .faults
+            .iter()
+            .all(|fault| fault.node.as_deref() == Some(target.name.as_str())),
+        "{:?}",
+        listing.faults
+    );
+
+    shutdown.cancel();
+    for node in &nodes {
+        if let Some(council) = &node.handle.council {
+            council.shutdown().await.ok();
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 #[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
 async fn ingress_reaches_nodes_without_local_replicas() {

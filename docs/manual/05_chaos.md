@@ -37,6 +37,32 @@ Clearing remains possible with the same role and grant without a destructive
 acknowledgement. Bun gets audit identity from the authenticated credential,
 not `$USER` or the request body.
 
+A server install writes no `[testing]` section, so its class is `unknown` and
+every fault is refused until an operator opts in. A laptop cluster from
+`relish setup --quickstart` is the exception: it's a throwaway development
+cluster, so each node's config says
+
+```toml
+[testing]
+safety_class = "development"
+allowed_operations = ["inject_workload_faults", "alter_node_state"]
+```
+
+That admits workload faults and `node-kill`/`node-drain`, but not
+`node-pressure` (which could starve a small VM's own control plane).
+`relish local status` prints the policy the first node actually serves.
+
+You don't need to know where a replica runs. The node you talk to looks up
+which nodes run the target, checks the replica rail against every replica in
+the cluster (so `kill web --count 3` on a three-replica app is refused even
+though each node holds one), and forwards each owner its share under your own
+credential, so the owner repeats every check. Add `--node NAME` to pick the
+node. A fault spread over several nodes becomes one fault per node, and the
+command prints each one. `relish fault list` shows every node's faults with a
+`NODE` column, and `relish fault clear <id>` finds the node that holds that
+id (pass `--node` if two nodes happen to use the same number). `relish fault
+clear` with no id, or with a service name, clears on every node.
+
 ## Recovery catalogue
 
 `relish test --chaos` runs five destructive recovery checks, one at a time:

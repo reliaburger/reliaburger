@@ -124,6 +124,25 @@ pub async fn run(action: Action, name: &str, confirmed: bool) -> Result<()> {
                 unhealthy += 1;
             }
         }
+        // Report the policy the first node actually serves, not the one setup
+        // meant to write, so an edited node.toml shows up here.
+        if nodes
+            .first()
+            .is_some_and(|node| node.condition == NodeCondition::Ready)
+        {
+            let client = bootstrap.client(&format!(
+                "https://127.0.0.1:{}",
+                operation.state.spec.api_port
+            ))?;
+            match tokio::time::timeout(Duration::from_secs(3), client.capabilities()).await {
+                Ok(Ok(report)) => println!(
+                    "{}",
+                    super::provision::describe_test_policy(&report.test_policy)
+                ),
+                Ok(Err(error)) => println!("fault policy: unknown ({error})"),
+                Err(_) => println!("fault policy: unknown (capabilities timed out)"),
+            }
+        }
         if nodes.is_empty() || unhealthy > 0 {
             bail!(
                 "managed cluster is not ready: {unhealthy} of {} nodes unhealthy or unknown",

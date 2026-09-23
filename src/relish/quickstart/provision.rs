@@ -76,7 +76,48 @@ pub fn node_config(
     config.dns.enabled = true;
     config.dns.listen = format!("{address}:53");
     config.ingress.enabled = true;
+    config.testing = laptop_test_policy();
     Ok(toml::to_string_pretty(&config)?)
+}
+
+/// The fault policy every quickstart node serves (decision D3).
+///
+/// A laptop cluster is a throwaway development cluster, and breaking it on
+/// purpose is half the point of having one. So it admits workload faults
+/// (kill, pause, CPU, memory, network) and node faults (`node-kill`,
+/// `node-drain`), which the quorum and leader rails still guard and which
+/// expire on their own. It leaves out node pressure, which could starve a
+/// 2 GiB VM's own control plane, external trace probes, and isolated test
+/// workloads. Server installs keep the protected default: a missing
+/// `[testing]` section still means `unknown`, which allows nothing.
+pub fn laptop_test_policy() -> crate::testkit::safety::ClusterTestPolicy {
+    use crate::testkit::safety::{ClusterSafetyClass, ClusterTestPolicy, OperationPermission};
+    ClusterTestPolicy {
+        safety_class: ClusterSafetyClass::Development,
+        allowed_operations: [
+            OperationPermission::InjectWorkloadFaults,
+            OperationPermission::AlterNodeState,
+        ]
+        .into(),
+        ..ClusterTestPolicy::default()
+    }
+}
+
+/// One line describing a node's live fault policy, for `relish local status`.
+pub fn describe_test_policy(policy: &crate::testkit::safety::ClusterTestPolicy) -> String {
+    let class = serde_json::to_value(policy.safety_class)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| "unknown".to_string());
+    if policy.allowed_operations.is_empty() {
+        return format!("fault policy: {class}; faults are refused");
+    }
+    let operations: Vec<String> = policy
+        .allowed_operations
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    format!("fault policy: {class}; allows {}", operations.join(", "))
 }
 
 /// Guest service supervised and restarted by systemd; logs go to its journal.
@@ -155,5 +196,67 @@ mod tests {
         let node: crate::config::node::NodeConfig = toml::from_str(&peer).unwrap();
         assert!(node.security.bootstrap_path.is_none());
         assert_eq!(node.cluster.join, vec!["192.168.104.2:9443"]);
+    }
+
+    #[test]
+    fn laptop_nodes_admit_workload_and_node_faults_but_not_pressure() {
+        use crate::sesame::types::ApiRole;
+        use crate::testkit::safety::{OperationAuthorisation, OperationPermission};
+
+        let text = node_config(
+            "laptop",
+            "rb-laptop-123-1",
+            "192.168.104.2".parse().unwrap(),
+            None,
+            &[],
+        )
+        .unwrap();
+        assert!(text.contains("[testing]"), "{text}");
+        assert!(text.contains("safety_class = \"development\""), "{text}");
+        let node: crate::config::node::NodeConfig = toml::from_str(&text).unwrap();
+        node.testing.validate().unwrap();
+        let admin = OperationAuthorisation {
+            principal: "laptop",
+            role: ApiRole::Admin,
+            acknowledged: true,
+        };
+        for allowed in [
+            OperationPermission::InjectWorkloadFaults,
+            OperationPermission::AlterNodeState,
+        ] {
+            assert!(node.testing.authorise(allowed, &admin).is_ok(), "{allowed}");
+        }
+        for refused in [
+            OperationPermission::SaturateCapacity,
+            OperationPermission::ProbeExternalDestination,
+            OperationPermission::ProvisionIsolatedWorkloads,
+        ] {
+            assert!(
+                node.testing.authorise(refused, &admin).is_err(),
+                "{refused}"
+            );
+        }
+        // Consent is still required: the policy grants permission, not intent.
+        let unacknowledged = OperationAuthorisation {
+            acknowledged: false,
+            ..admin
+        };
+        assert!(
+            node.testing
+                .authorise(OperationPermission::InjectWorkloadFaults, &unacknowledged)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn local_status_describes_the_live_fault_policy() {
+        assert_eq!(
+            describe_test_policy(&laptop_test_policy()),
+            "fault policy: development; allows inject_workload_faults, alter_node_state"
+        );
+        assert_eq!(
+            describe_test_policy(&crate::testkit::safety::ClusterTestPolicy::default()),
+            "fault policy: unknown; faults are refused"
+        );
     }
 }

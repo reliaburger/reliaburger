@@ -1716,6 +1716,13 @@ impl BunClient {
         })
     }
 
+    /// List every node's active faults, each tagged with its node.
+    pub async fn list_cluster_faults(
+        &self,
+    ) -> Result<crate::bun::api::ClusterFaultList, RelishError> {
+        self.get_typed_json("/v1/fault?cluster=true").await
+    }
+
     /// Resolve a service name to its VIP and backends.
     pub async fn resolve(
         &self,

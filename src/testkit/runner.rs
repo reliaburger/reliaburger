@@ -1053,6 +1053,8 @@ mod tests {
             target_node: request.target_node,
             remaining_secs: request.duration.as_secs(),
             injected_by: "runner-test".to_string(),
+            node: None,
+            routed: Vec::new(),
         })
     }
 

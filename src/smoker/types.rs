@@ -604,6 +604,20 @@ pub struct SafetyContext {
     pub target_service_faulted_replicas: u32,
 }
 
+/// Cluster-wide replica counts for a workload fault's target service.
+///
+/// The API gathers these from every node's live status and fault list, so the
+/// replica-minimum rail judges the whole service. Without them an agent only
+/// sees its own replicas and would refuse to kill the one copy it holds even
+/// when two more run elsewhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplicaEvidence {
+    /// Running replicas of the target service across the cluster.
+    pub replicas: u32,
+    /// Active faults against the target service across the cluster.
+    pub faulted_replicas: u32,
+}
+
 // ---------------------------------------------------------------------------
 // ScriptedScenario
 // ---------------------------------------------------------------------------
@@ -658,6 +672,14 @@ pub struct FaultSummary {
     pub remaining_secs: u64,
     /// Who injected it.
     pub injected_by: String,
+    /// Node that holds the fault. Set by cluster-wide listings and by a
+    /// routed injection, so `relish fault clear ID` can find the owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
+    /// Further faults the same request created on other nodes. A workload
+    /// fault whose targets span several nodes becomes one fault per owner.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub routed: Vec<FaultSummary>,
 }
 
 impl From<&FaultRule> for FaultSummary {
@@ -670,6 +692,8 @@ impl From<&FaultRule> for FaultSummary {
             target_node: rule.target_node.clone(),
             remaining_secs: rule.remaining().as_secs(),
             injected_by: rule.injected_by.clone(),
+            node: None,
+            routed: Vec::new(),
         }
     }
 }

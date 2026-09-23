@@ -508,8 +508,13 @@ pub enum AgentCommand {
     },
     /// Apply a workload fault, or a node fault carrying a committed grant.
     InjectFault {
-        reservation: Option<crate::smoker::reservation::NodeFaultReservation>,
+        /// Boxed: a reservation embeds a whole fault request, and keeping it
+        /// inline would make every other command as large as this one.
+        reservation: Option<Box<crate::smoker::reservation::NodeFaultReservation>>,
         request: crate::smoker::types::FaultRequest,
+        /// Cluster-wide replica counts for a workload fault, gathered by the
+        /// API from every node. `None` falls back to this node's own view.
+        replica_evidence: Option<crate::smoker::types::ReplicaEvidence>,
         response: oneshot::Sender<Result<crate::smoker::types::FaultSummary, BunError>>,
     },
     /// Clear a specific fault by ID.
@@ -4276,6 +4281,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             AgentCommand::InjectFault {
                 reservation,
                 mut request,
+                replica_evidence,
                 response,
             } => {
                 // Duration bounds first (server-side, so a direct API call
@@ -4302,7 +4308,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
                 if request.fault_type.is_node_targeted() {
                     let result = reservation
-                        .as_ref()
+                        .as_deref()
                         .ok_or_else(|| {
                             "node faults require a committed cluster reservation".to_string()
                         })
@@ -4318,7 +4324,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 // leader, or exceed the node-percentage cap — unless
                 // explicitly overridden. The context is built even with no
                 // cluster handle so the replica-minimum rail still runs (M1).
-                let context = self.build_safety_context(&request).await;
+                let context = self.build_safety_context(&request, replica_evidence).await;
                 let check = crate::smoker::safety::evaluate_safety(&request, &context);
                 if !check.approved {
                     let reason = check
@@ -4833,9 +4839,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// --count 0` from taking out a service's last replica, so it must run even
     /// with no cluster handle; the old code returned `None` there and skipped
     /// safety entirely.
+    ///
+    /// `replica_evidence`, when the API supplies it, replaces the local
+    /// replica counts with cluster-wide ones, so a routed kill of the one
+    /// replica this node holds is judged against the whole service.
     async fn build_safety_context(
         &self,
         request: &crate::smoker::types::FaultRequest,
+        replica_evidence: Option<crate::smoker::types::ReplicaEvidence>,
     ) -> crate::smoker::types::SafetyContext {
         // Replicas of the target service running locally (an approximation —
         // the leader has the cluster-wide count, but this node protects at
@@ -4904,6 +4915,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 (council_size, leader_node_id, total_nodes)
             }
             None => (0, String::new(), 0),
+        };
+
+        let (target_service_replicas, target_service_faulted_replicas) = match replica_evidence {
+            Some(evidence) => (evidence.replicas, evidence.faulted_replicas),
+            None => (target_service_replicas, target_service_faulted_replicas),
         };
 
         crate::smoker::types::SafetyContext {
@@ -19719,6 +19735,7 @@ host = "remote.local"
             agent
                 .handle_command(AgentCommand::InjectFault {
                     reservation: None,
+                    replica_evidence: None,
                     request: crate::smoker::types::FaultRequest {
                         fault_type: crate::smoker::types::FaultType::DnsNxdomain,
                         target_service: "redis".into(),
@@ -19747,6 +19764,7 @@ host = "remote.local"
         agent
             .handle_command(AgentCommand::InjectFault {
                 reservation: None,
+                replica_evidence: None,
                 request: crate::smoker::types::FaultRequest {
                     fault_type: crate::smoker::types::FaultType::Pause,
                     target_service: "web".into(),
@@ -19809,6 +19827,7 @@ host = "remote.local"
             agent
                 .handle_command(AgentCommand::InjectFault {
                     reservation: None,
+                    replica_evidence: None,
                     request: crate::smoker::types::FaultRequest {
                         fault_type: crate::smoker::types::FaultType::DnsNxdomain,
                         target_service: "redis".into(),
@@ -19883,7 +19902,8 @@ host = "remote.local"
         let (response, result) = oneshot::channel();
         agent
             .handle_command(AgentCommand::InjectFault {
-                reservation: Some(grant.clone()),
+                reservation: Some(Box::new(grant.clone())),
+                replica_evidence: None,
                 request: request.clone(),
                 response,
             })
@@ -19897,7 +19917,8 @@ host = "remote.local"
         let (response, result) = oneshot::channel();
         agent
             .handle_command(AgentCommand::InjectFault {
-                reservation: Some(grant.clone()),
+                reservation: Some(Box::new(grant.clone())),
+                replica_evidence: None,
                 request: request.clone(),
                 response,
             })
@@ -19909,7 +19930,8 @@ host = "remote.local"
         let (response, result) = oneshot::channel();
         agent
             .handle_command(AgentCommand::InjectFault {
-                reservation: Some(grant.clone()),
+                reservation: Some(Box::new(grant.clone())),
+                replica_evidence: None,
                 request,
                 response,
             })
@@ -19955,7 +19977,8 @@ host = "remote.local"
         let (response, result) = oneshot::channel();
         agent
             .handle_command(AgentCommand::InjectFault {
-                reservation: Some(grant.clone()),
+                reservation: Some(Box::new(grant.clone())),
+                replica_evidence: None,
                 request,
                 response,
             })
@@ -20267,7 +20290,7 @@ host = "remote.local"
             override_safety: false,
             acknowledged: false,
         };
-        let context = agent.build_safety_context(&request).await;
+        let context = agent.build_safety_context(&request, None).await;
         let check = crate::smoker::safety::evaluate_safety(&request, &context);
         assert!(
             !check.approved,
@@ -20277,6 +20300,43 @@ host = "remote.local"
             check.violation,
             Some(crate::smoker::types::SafetyViolation::ReplicaMinimum { .. })
         ));
+    }
+
+    /// Z2.1: a routed kill of the only replica this node holds is judged
+    /// against the cluster-wide count the API gathered, not the local one.
+    #[tokio::test]
+    async fn cluster_replica_evidence_replaces_the_local_count() {
+        let (mut agent, _tx, _shutdown, _grill) = test_agent_with_grill();
+        let config =
+            Config::parse("[app.web]\nimage = \"web:v1\"\nport = 8080\nreplicas = 1\n").unwrap();
+        let (ev_tx, mut ev_rx) = mpsc::channel(64);
+        agent.deploy(config, &ev_tx).await;
+        drop(ev_tx);
+        while ev_rx.recv().await.is_some() {}
+
+        let request = crate::smoker::types::FaultRequest {
+            fault_type: crate::smoker::types::FaultType::Kill { count: 1 },
+            target_service: "web".into(),
+            namespace: Some("default".into()),
+            target_instance: None,
+            target_node: None,
+            duration: std::time::Duration::from_secs(0),
+            injected_by: "test".into(),
+            reason: None,
+            include_leader: false,
+            override_safety: false,
+            acknowledged: true,
+        };
+        let local = agent.build_safety_context(&request, None).await;
+        assert!(!crate::smoker::safety::evaluate_safety(&request, &local).approved);
+
+        let evidence = crate::smoker::types::ReplicaEvidence {
+            replicas: 3,
+            faulted_replicas: 0,
+        };
+        let cluster = agent.build_safety_context(&request, Some(evidence)).await;
+        assert_eq!(cluster.target_service_replicas, 3);
+        assert!(crate::smoker::safety::evaluate_safety(&request, &cluster).approved);
     }
 
     #[tokio::test]
