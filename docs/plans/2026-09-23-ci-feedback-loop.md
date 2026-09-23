@@ -192,6 +192,13 @@ Chapter 15 of the book gets a section on how and why the pipeline is laid out.
   `src/relish/manual`. #175 spent 274 runner-minutes proving that Markdown
   compiles.
 
+- [ ] **C1.10 Light path for stacked PRs (D5).** PRs whose base isn't `main`
+  skip the acceptance suites (wall-clock, cluster, upgrade, privileged Linux)
+  unless labelled `full-ci`. They still run lint, the portable suites and
+  minimum Rust. PRs into `main`, pushes to `main` and the nightly run get
+  everything. Before merging a stacked PR that GitHub retargeted to `main`,
+  push or re-run it so the full set runs.
+
 ### Phase 2: build once, run everywhere (about −30 runner-min, shorter critical path)
 
 - [ ] **C2.1 `cargo nextest archive`.**
