@@ -481,6 +481,8 @@ async fn stop_and_wait_for_exit(&self, id: &InstanceId, grace: Duration) {
 
 SIGTERM, poll for the exit up to a grace period, then SIGKILL whatever's left. The `shutdown_all` path had this pattern already; now the ordinary stop and the rolling retire share it. Only once the runtime confirms the exit does the supervisor record `Stopped`. Container state and supervisor state can't diverge, because we don't write the second one down until the first one is true.
 
+Well, almost. Look at the last line of that listing: `let _ =` throws away the result of `kill`, and nothing checks that SIGKILL actually worked. We come back to that hole in "A deploy owns what it starts" below.
+
 The tests pin all three behaviours honestly. One holds an in-flight request open through the live proxy and asserts the drain doesn't complete until the request returns. One drives a rolling redeploy and asserts the new instance's `start` lands before the old instance's `stop` — surge-first, availability preserved. And one makes the mock runtime ignore SIGTERM, then asserts the stop escalates to `kill` rather than lying that the app is down.
 
 ## What we learned
@@ -586,9 +588,20 @@ async fn deploy_succeeded(mut events: mpsc::Receiver<ApplyEvent>) -> bool {
 
 If the deploy fails, `applied` is left untouched, so the next tick retries it. "Applied" now means what it says.
 
-Second, the map lived only in memory. Restart bun — a crash, a self-upgrade — and it forgot everything it had applied. On the next tick it would re-deploy *every* assigned app from scratch, even ones already happily running, churning containers for no reason. So the applied map is now durable: a tiny JSON checkpoint written atomically (temp file, then rename, so a crash mid-write can't leave a torn file) and reloaded on boot. A restarted reconciler picks up where it left off. If the checkpoint is missing or corrupt, it loads empty and re-derives applied-state against the leader on the next tick — one wasted cycle, never a wedged node. The checkpoint is self-describing JSON with a `schema` field, so a future format change fails loudly instead of mis-parsing an old file into nonsense.
+Second, the map lived only in memory. Restart bun — a crash, a self-upgrade — and it forgot everything it had applied. On the next tick it would re-deploy *every* assigned app from scratch, even ones already happily running, churning containers for no reason. So the applied map is now durable: a tiny JSON checkpoint written atomically (temp file, then rename, so a crash mid-write can't leave a torn file) and reloaded on boot. A restarted reconciler picks up where it left off. A missing checkpoint loads empty. A corrupt or unreadable one refuses to reconcile, because treating it as empty would forget apps this node still runs. The checkpoint is self-describing JSON with a `schema` field, so a future format change fails loudly instead of mis-parsing an old file into nonsense.
 
-Put the two fixes together and the restart story is finally correct: a bun that comes back after a crash doesn't double-deploy work that already converged (the checkpoint remembers it), and it doesn't forget an in-flight deploy that never reached `Complete` (that app isn't in the checkpoint, so it gets driven again).
+Put the two fixes together and the restart story is nearly correct. The remaining gap: a worker receives `api`, starts a container and dies before recording success. While it's down, you remove `api`. On restart the checkpoint has no entry for it, so nothing ever retires that container. It has fallen between two records. So each entry is now one of two states:
+
+```rust
+pub enum AssignmentState {
+    /// Ownership is durable, but deployment has not been confirmed.
+    Pending,
+    /// The assignment completed successfully at this serialised specification.
+    Applied { fingerprint: String },
+}
+```
+
+Rust enum variants can carry data: `Pending` carries nothing, `Applied { fingerprint }` carries a string, a bit like a tagged union in C where the compiler checks the tag for you. The reconciler writes `Pending` *before* it queues the `Deploy` command and upgrades it to `Applied` only on `Complete`. Both states mean "this node owns resources for the app", so a withdrawn assignment in either state needs a confirmed retirement before its entry disappears. A restarted bun now neither double-deploys converged work nor forgets an interrupted deploy.
 
 ## Stopping an app is a decision, not a signal
 
@@ -901,6 +914,75 @@ let mut quotas = crate::meat::quota::ledger_from_namespaces(&desired.namespaces)
 
 Declare a namespace with `cpu = "2000m"`, apply an app that wants three replicas at 800 millicores each, and the scheduler does the arithmetic — 2,400 > 2,000 — and refuses the placement with a clear reason in the log, instead of over-committing the budget you set. A namespace with headroom admits the same app without complaint. The enforcement was built and proven long ago; all this theme did was hand it the numbers.
 
+## A deploy owns what it starts
+
+A later audit went looking for every place where a deploy said "done" before it was. There were a lot of them, and they all had the same shape: a step reported success, and something (a process, a port, a file, a route) was left with nobody responsible for it. So the rule we settled on is simple to say. A deploy *owns* everything it starts: the replacement containers, their ports, their on-disk adoption records, their routes. It keeps each of those in the supervisor until it has seen, with its own eyes, that the thing is gone. A failure never releases ownership; it just stops the deploy and leaves the leftovers where Stop or Retire can find them.
+
+Start with the hole the stop listing above left open. Here's what the retire path uses now:
+
+```rust
+/// Preserve ownership until both force-kill and observed runtime exit succeed.
+async fn kill_runtime_instance<G: Grill>(grill: &G, id: &InstanceId) -> Result<(), BunError> {
+    let signal_timeout = std::time::Duration::from_secs(2);
+    tokio::time::timeout(signal_timeout, grill.kill(id))
+        .await
+        .map_err(|_| BunError::StopUnconfirmed {
+            instance_id: id.clone(),
+            reason: "force-kill request timed out",
+        })??;
+    if observe_runtime_exit(grill, id, signal_timeout).await? {
+        return Ok(());
+    }
+    Err(BunError::StopUnconfirmed {
+        instance_id: id.clone(),
+        reason: "runtime did not confirm exit after force-kill",
+    })
+}
+```
+
+That `??` looks like a typo, but it isn't. `tokio::time::timeout` wraps a future and gives back a `Result` of its own: `Err(Elapsed)` if time ran out, otherwise `Ok(...)` containing whatever the inner future returned, which is another `Result`. So we have `Result<Result<(), BunError>, Elapsed>`. The `map_err` turns the outer error into a `BunError`, the first `?` unwraps the timeout layer, and the second `?` unwraps `kill`'s own result. Either failure returns early. The trailing `observe_runtime_exit` asks the runtime again, because a successful signal isn't a stopped process. Rolling, blue-green, rollback and plain `relish stop` all go through this helper, so they can't drift apart again.
+
+When it fails, the deploy worker emits an error instead of `Complete`, and both generations stay in ordinary supervision. The same goes for everything after the process exits. Deleting the identity directory and the adoption record returns `Result<(), BunError>` over the command channel. `()` is Rust's unit type (think `void`, but as a real value), so success carries no payload and failure explains which instance still has work outstanding. Only when both deletions succeed do we release the port and forget the instance. Rollback follows the same rule, and history tells the truth about it: `RolledBack` only when every replacement is confirmed gone, `Halted` when some old instances had already retired, `Failed` when cleanup couldn't be confirmed.
+
+Several smaller races had the same flavour:
+
+- **An error event isn't the end.** The worker reports an error *before* it rolls back. Releasing the app's deploy lock at that moment let a corrective deploy start while the old worker was still killing containers. Two owners, one workload. The observer now waits on the worker task's `JoinHandle` (the Tokio equivalent of joining a thread) before it writes history and releases the lock. A panicked worker is recorded as `Unknown`, whatever it said earlier.
+- **Cancel is a request.** `relish cancel-deploy <id>` signals a `CancellationToken` and waits for the worker to notice. The worker checks it at safe points: health waits are read-only, so `tokio::select!` can abandon them, but a `create`, `start` or cleanup call always finishes first. The operation becomes `Cancelled` only after the worker returns. It cancels one node's attempt and doesn't touch Raft's desired state, so apply the corrected config too.
+- **Tell the restart driver first.** Between our `kill` and our observing the exit, the one-second crash detector could see an instance marked `Running` exit unexpectedly and restart it. The worker now sends `BeginRetire`, which marks the instance `Stopping` and turns off retries, before it signals anything.
+- **Names must not collide.** An app and a job called `web` in the same namespace both mapped to `default__web-0`, so config validation now requires distinct names. An app called `worker-g1` could collide with generation one of `worker`, so fresh deploys check every proposed ID against existing owners. After a self-upgrade, the generation counter restarts in memory, so it now starts above every adopted instance's generation, using checked arithmetic that errors instead of wrapping. Each generation also gets its own cgroup (`web/0`, `web/g7-0`): when two generations shared one, removing the old group stopped the new container as well.
+- **Routes are confirmed before they're published.** The replacement's backend goes into the kernel map first; only if that works does the new map reach DNS and Wrapper. The map has 32 backend slots per app; replica 33 used to fail with a log line while the deploy reported `Complete`. Now it's a deploy error. Ordinary stops and automatic restarts also drain in-flight requests the way a rollout does.
+- **Replacements are recorded before they serve.** A replacement's adoption record is written before its health wait, so a bun that dies mid-rollout adopts it instead of leaking it. Replacements now run their init containers too; they used to skip them.
+
+Most of these were found by tests that hold a runtime call open (a `kill` that doesn't return, a `create` that hangs) and then poke the agent from another direction. When every mock call returns instantly, you never see the interleavings. What they don't prove is recovery from a power cut mid-rollout; we test controlled interruption, not arbitrary crashes.
+
+## Jobs that might already have run
+
+Apps are easy to recover: if a web server's fate is unclear, you start it again. Jobs aren't. A job that sends invoices, migrates a schema or charges a card must not run twice just because bun crashed at an awkward moment. So bun records each attempt in a durable checkpoint, and it's honest about what it doesn't know:
+
+```rust
+pub(super) enum JobPhase {
+    /// Budget claimed before create; execution has not been authorised.
+    Preparing,
+    /// Runtime preparation completed and execution was authorised durably.
+    Launching,
+    /// The runtime reported an actual exit status.
+    Exited {
+        /// Observed process exit code, including zero for success.
+        code: i32,
+    },
+    /// The attempt may have run, but its outcome cannot be established.
+    Unknown,
+    /// Operator stop intent; retirement must still be confirmed.
+    Stopping,
+    /// Operator stop completed without authorising another automatic retry.
+    Stopped,
+}
+```
+
+(`pub(super)` makes the enum visible to the parent module, `bun`, and nowhere else; it's finer-grained than Go's upper-case export rule.) After a restart, bun adopts a job that's still running. A job that has gone, with an exit code the runtime can still report, becomes `Exited`. Anything else caught in `Preparing` or `Launching` becomes `Unknown`, and stays that way. Bun never guesses "probably failed, let's retry".
+
+`relish apply` refuses to start a job whose previous outcome is unknown, and says why: `previous outcome is unknown; use apply --rerun-jobs for an explicit rerun`. `--rerun-jobs` is the human saying "I've checked, run it again". The API accepts it only from a user with the Deployer role, and only for a file containing nothing but non-scheduled jobs. GitOps and the reconciler never set it. Cron jobs are the one exception: once bun has confirmed the old run's container is gone, the next scheduled occurrence runs normally. That's a new occurrence, not a replay of the uncertain one. Chapter 8 covers the retry budget and the crash tests behind this.
+
 ## What we deferred
 
 Blue-green deploys, autoscaling, the Lettuce GitOps engine, and Kubernetes migration tools are all Phase 9. The `DeployPhase` enum already carries the blue-green states (you'll have spotted `StartingGreen` and friends in the transition tests), and `execute` delegates to a separate blue-green path — but we'll cover that in Chapter 9. Rolling deploys with automatic rollback cover the vast majority of production deployment needs, and they're the foundation everything else builds on.
@@ -920,527 +1002,3 @@ delivery ID for replay protection; doing that before discovering a full queue
 would make the provider's retry look like a replay. We reserve before validation,
 so a rejected delivery can be retried after capacity becomes available. Tests
 close the receiver and fill the queue, then drain one slot and retry the same ID.
-
-### Record replacements before they serve traffic
-
-A rolling worker starts its replacement before the supervisor installs the final
-instance list. Asking the supervisor for that replacement's launch details at
-this point returns nothing. That was why our record-writing call silently did
-nothing, even on successful rollouts.
-
-The worker now sends a `RollingInstance` containing the launch spec, app spec,
-allocated port and identity. The command loop persists those details directly,
-before the worker enters its health wait or publishes a backend. Keeping this
-message separate from supervisor registration avoids exposing a not-yet-healthy
-replacement as a normal running instance. The reply carries a result: a failed
-record write aborts the rollout instead of quietly sacrificing adoption.
-
-Records use private temporary files and durable atomic replacement. The blocking
-write owns its record and path inside a `spawn_blocking` closure, keeping filesystem
-sync off Tokio's worker threads. Rollback cleans every prepared replacement,
-including the one that failed before becoming healthy. Port ownership is recorded
-as soon as allocation succeeds, so that failure path can release it too.
-
-The regression reads the replacement record while the rollout is still emitting
-health progress, then constructs a fresh agent and adopts it without creating a
-second workload. Another test replaces the record-directory path with a regular file
-and verifies both rolling and blue-green deployment preserve the old workload,
-kill the replacement and return its allocated port.
-
-Apple Container has no host workload PID. Its record retains the Bun launcher's
-PID and start time as provenance; adoption still inspects the named container,
-not that host process. A mock-runtime regression checks record creation without
-inventing a host workload PID. Real Apple adoption remains in its explicit runtime
-suite, and crash injection around create/start and partial rollout belongs to the
-release recovery qualification.
-
-## An error event doesn't end a deployment
-
-A replacement fails its health probe. The deploy worker reports an error, kills
-the replacement and restores the old routing. If we release the target lock when
-that first error reaches the event stream, a corrective deploy can start while
-the old worker is still changing the same workload. Two owners. One bad race.
-
-The operation observer now remembers error and completion events without marking
-the operation terminal. It drains the worker's internal channel, then awaits its
-`JoinHandle`. In Tokio, awaiting this handle observes whether the spawned task
-returned normally or panicked. Only then does the observer write terminal history
-and release the namespace/name reservation. A panic records `Unknown`, even if
-an earlier event suggested success. A normal failure records `Failed` after the
-rollback work returns. Successful completion also waits for trailing bookkeeping.
-
-The external event stream is an observer. If its bounded queue fills or its
-reader disconnects, we close that stream and keep draining the worker internally.
-The CLI treats a stream without completion as incomplete; the accepted operation
-ID remains queryable. This prevents a slow client from blocking terminal
-accounting. Busy-target errors include the owning ID, age and phase.
-
-The regression holds the runtime's `kill()` call open after a failed health
-probe, for both rolling and blue-green strategies. The operation must remain
-active until we release that call and rollback finishes. A corrective deployment
-then succeeds. A second test leaves the event reader alive without reading and
-still requires terminal history. The next sections cover cooperative cancellation and the app/job naming
-contract. An error event is no longer an accidental unlock.
-
-## Apps and jobs share the runtime name space
-
-An app called `web` and a job called `web`, both in `default`, used to generate
-the same runtime ID: `default__web-0`. The job deployment could replace the app's
-supervisor record. Going the other way was worse: the rolling-app code could see
-the job as the old app generation and stop it.
-
-For 0.1.0, these kinds must use distinct names within a namespace. Config
-validation rejects a conflicting pair in one file. On a node, admission refuses
-the opposite kind while any of its instances still own the name, including
-retained terminal records. The same name in a different namespace is fine.
-This keeps the existing runtime identity format and its adoption records intact.
-
-The check runs before an accepted deployment can register schedules or change
-specs. The supervisor repeats it before allocating or inserting instances, so
-imperative job paths receive the same protection. The agent also checks before
-recording an app spec, and app replacement selects only app instances. A test
-tries both kind orderings and verifies that refusal preserves the original owner;
-an agent test proves that an app cannot roll over a live job. These are runtime
-ownership checks, not a new cluster-wide catalogue of jobs. Jobs still have the
-separate ownership work tracked in C34.
-
-## Cancelling the work, not its ownership
-
-A replacement is waiting thirty seconds for a health check that you already know
-will fail. You want to deploy the correction now. `relish cancel-deploy <id>`
-requests cancellation of that node's accepted operation and waits up to thirty
-seconds for terminal evidence. Use the ID from the apply stream or
-`GET /v1/deploys/operations`, against the same node's endpoint.
-
-Cancellation has two steps. The tracker first records `cancellation_requested_at`
-and signals a `CancellationToken`, keeping the target reservation. The worker
-then observes the token at a safe boundary. Health waits are read-only and can be
-interrupted with `tokio::select!`. Runtime creation, start, drain and cleanup are
-allowed to finish: dropping an in-flight mutation and immediately admitting a
-successor would recreate the race we just fixed. Prerequisite jobs and init work
-can therefore keep a request pending until their current step returns. There is
-no force-abort option.
-
-The worker stops between workloads and replacement steps. Cancelling a rolling
-or blue-green health wait uses the existing rollback or halt policy, including
-`auto_rollback = false`. Completed work isn't undone. The operation becomes
-`Cancelled` only after the worker observed the request and returned from its
-cleanup; a panic is still `Unknown`. A request that arrives too late can return
-the ordinary completed or failed outcome. Retrying the same ID is idempotent
-while its record remains in the node's bounded history.
-
-The API returns 202 for a pending request and 200 for a terminal record. It
-checks the Deployer role, token scope and deploy permission for every target,
-before signalling anything. A missing local ID returns 404. The CLI polls the
-same node for up to thirty seconds; a timeout says that ownership is still
-pending, and failed or unknown terminal evidence returns a non-zero exit status.
-An interrupted client can query or retry the same ID safely.
-
-This cancels one local attempt. It doesn't change Raft desired state, undo
-completed workloads or remove a cron schedule. Apply the corrected configuration
-as well, so reconciliation doesn't retry the old desired version. There is no
-automatic cluster-wide supersede operation hidden behind the command.
-
-The tests hold `create()` open and prove that cancellation can't release its
-reservation early. They interrupt a thirty-second health wait in each rollout
-strategy, hold the subsequent `kill()` open, and require the same reservation to
-survive until cleanup completes. A corrective deployment then succeeds. API
-tests cover role and namespace scope, including repeated requests for a terminal
-record. A real CLI process receives 202, polls for terminal evidence, and refuses
-to report an unknown outcome as success.
-
-
-### Record ownership before starting work
-
-Suppose a worker receives an assignment for `api`, starts a container, and dies
-before saving its successful deployment. While it's down, the operator removes
-the application. On restart, the old checkpoint has no `api` entry, so a loop
-that only compares assignments against completed deployments never retires it.
-The container has fallen between two records.
-
-The placement checkpoint now distinguishes Pending from Applied. We persist
-Pending before putting a Deploy command on the agent's queue. Applied carries
-the specification fingerprint only after the terminal success event. Both
-states own resources. If the leader withdraws an assignment, either state
-requires a successful Retire response before we remove its record.
-
-An `enum` expresses these alternatives directly: `Pending` has no payload,
-while `Applied { fingerprint: String }` owns the serialised specification. A
-`match` on this enum makes the compiler check that callers handle both states.
-After restart, an inventory mismatch changes Applied back to Pending; it never
-removes ownership. This lets the reconciler retry an incomplete deployment or
-retire its resources when the assignment has disappeared.
-
-The journal uses a private unique temporary file, file sync, rename and directory
-sync before acknowledgement. Blocking filesystem operations run in
-`spawn_blocking`. A failed write prevents deployment; malformed data, duplicate
-owners, symlinks and unsupported schemas refuse reconciliation. The worker
-retries loading instead of treating an unreadable file as an empty inventory.
-The file has a 64 MiB size limit to bound decoding.
-
-A real HTTP and agent-channel regression checks the journal at the instant the
-agent receives Deploy. It then aborts the reconciler, withdraws the assignment,
-restarts from disk and drops the first retirement reply. Ownership must survive
-until a later confirmed reply. Separate tests cover durable round trips, private
-atomic replacement and rejected checkpoints. This is controlled interruption,
-not proof against power loss. Runtime discovery before the first adoption
-record is written still needs separate crash qualification.
-
-Checkpoint schema 2 changes durable state, so the binary now advertises state
-generation 5 while protocol generation 5 is unchanged. Earlier development
-clusters require fresh state; a rolling upgrade must match both generations.
-
-### A deadline must include the reply body
-
-An HTTP peer can send `200 OK` and then stop sending bytes. Timing only the
-request's `send()` call doesn't bound JSON decoding, because receiving headers
-is enough for that call to finish. The placement poll now puts request, status
-validation and body decoding inside one ten-second timeout. Shutdown can cancel
-this read without changing ownership.
-
-Agent retirement needs the same treatment. One owner whose reply never arrives
-must not block every later owner. Queueing and the retirement reply share a
-ten-second deadline; an unknown outcome leaves the journal entry intact and
-allows the loop to try the next resource. A later iteration can retry the first
-one. Routing updates and deployment queueing also have bounded waits. Deployment
-completion retains its existing five-minute deadline and its durable Pending
-record if shutdown interrupts observation.
-
-Two regressions exercise the actual reconciler. A TCP server sends headers and
-an unfinished JSON body; another fixture withholds one agent retirement reply.
-The first must receive another poll, and the second must retire a different
-owner while keeping the stalled owner's journal entry. Both stalled before the
-repair. Neither test treats elapsed time as proof that the original work stopped.
-
-### A successful signal isn't a successful retirement
-
-A failed force-kill exposed a gap between two stop paths. Normal Stop waited for
-observed exit. Rolling and blue-green deployments ignored the signal result and
-continued to finalise, even when the old process remained alive. The deployment
-then reported Complete and removed its old instance from supervision.
-
-Both callers now share the same runtime stop helper. It bounds the stop request,
-waits for exit, and, if necessary, bounds force-kill and waits again. Inspection
-errors propagate through `Result`; a successful kill call without an observed
-Stopped state isn't enough. The deploy worker emits an error before finalisation,
-keeping old and already-started new instances owned for inspection and cleanup.
-Before ending the failed operation, the command loop adds the replacements to
-ordinary supervision, so Stop and Retire can find both generations.
-Their traffic remains subject to the existing drain state.
-
-The command-channel regression runs rolling and blue-green replacements with
-failed, ignored and stalled kills, plus an inspection error only on the old
-instance. It checks the deployment events, both retained generations, and successful
-Retire after the fault clears. Ordinary Stop
-still uses this helper too, so the two paths cannot drift apart again. Artifact
-removal needs its own acknowledgement too, as the next section explains.
-
-
-### Keep a stopped owner until its files are retired
-
-The old process can be gone while its identity directory or adoption record is
-still present. If finalisation only logs that error, the deploy reports success
-and loses the owner needed to retry cleanup. A later Bun could then encounter
-an apparently live adoption record from a completed rollout.
-
-Rolling and blue-green finalisation now return `Result<(), BunError>` through
-the command channel. `()` is Rust's unit type: successful cleanup has no payload,
-while the error variant explains which instance still owns unfinished work.
-The worker propagates that error instead of emitting Complete, and retains the
-started replacements in ordinary supervision alongside the old cleanup owner.
-
-Before removing files, the command loop marks every retired old instance Stopped,
-cancels pending retries and unregisters health checks. A two-replica regression
-caught why the whole fleet must change state before the first fallible deletion:
-otherwise a failure on the first owner leaves the next eligible for restart. We've already observed runtime
-exit. Keeping this entry must not make the restart driver revive it. Identity
-cleanup and adoption-record removal must both succeed before releasing its port
-and dropping the entry. We also removed the blanket app-removal helper, which
-ignored kill errors and could discard unrelated members of the same app.
-
-The regression blocks each filesystem operation for each deployment strategy,
-checks the stopped owner and replacement through the command channel, then
-clears the fault and retries Retire. Unit fixtures now own private temporary
-volume directories for their entire lifetime. A small test wrapper owns both
-Bun and its directory; Rust drops fields in declaration order, so the directory
-outlives the agent. `Deref` and `DerefMut` let existing tests borrow the wrapped
-agent without moving the directory guard away from it.
-
-Rollback and halt still need the same checked cleanup treatment. These checks
-do not establish crash recovery before the first adoption record exists.
-
-### Tell the restart task before asking the runtime to stop
-
-There's a smaller window before artifact cleanup begins. Runtime exit can
-become visible while the worker is still waiting for its stop or kill request
-to return. If supervision still says Running, the periodic crash detector sees
-an unexpected exit and queues a restart. We've just asked that instance to stop.
-
-The deploy worker now sends a `BeginRetire` command first and awaits its reply.
-The command loop marks the owner Stopping, disables retries and unregisters
-health checks. Only then does the worker drain traffic and signal the runtime.
-Stopping describes intent; it doesn't claim the process has exited. The later
-observation and artifact acknowledgements still have to succeed.
-
-The regression holds a kill request in flight, makes runtime exit observable,
-and invokes the actual restart task before allowing retirement to finish.
-Before the fix, it moves the old instance to Pending and increments its restart
-count. Afterwards, the owner stays Stopping with no retry. The same check covers
-stepped rolling replacement, rolling surplus retirement and blue-green cut-over.
-Late health replies also use the existing state check, so they cannot revive a
-Stopping owner. This command-channel ordering protects one Bun lifetime; durable
-intent before initial runtime creation remains separate release work.
-
-### An upgrade must not reset instance identity
-
-Suppose `default__web-g1-0` survives Bun's binary replacement. The new Bun adopts
-it, but its in-memory deployment counter starts at one again. The next rollout
-used to create `default__web-g1-0` a second time, overwriting the very ownership
-it needed to retire. A counter that is unique within one process isn't enough.
-
-Generation reservation now advances beyond both the counter and every restored
-owner's generation. It uses each owner's stored namespace and app name when
-reading the suffix, so an ordinary app called `worker-g9` isn't mistaken for
-generation nine of `worker`. Checked arithmetic returns a deployment error on
-exhaustion; it cannot wrap to a previously used identity or panic the command
-loop. A closed command channel also returns an error instead of generation zero.
-
-Stopped and Failed entries still count as owners. A failed artifact deletion can
-leave either state behind, so filtering them out made a subsequent apply take
-the fresh-deploy path and overwrite the original ID. Replacement now retires
-these entries through the same checked path as a running old instance.
-
-Three failing-first regressions cover adoption followed by another rollout,
-counter exhaustion and replacement while a terminal owner's record cannot be
-removed. The real binary-upgrade test now rolls an app once before exec, checks
-that its PID survives the swap, then rolls it again and requires generation two.
-This tests recovery where it matters: at the next mutation after adoption.
-
-
-### A failed rollback still owns its replacements
-
-Cancel a deployment while its replacement is waiting for health. Now make
-`kill` fail. The old rollback path ignored that error, deleted the replacement's
-record, released its port and wrote `RolledBack` into history. The process could
-still exist, but the supervisor no longer knew about it. Our regression sees
-one owner where there should be two.
-
-The command loop now reserves a replacement ID and its port together, before
-creating identity files or attempting a runtime launch. It records a Preparing
-owner in both supervisor inventories. A failed preparation leaves that owner
-available for cleanup; an already-owned ID refuses before allocating another
-port. The prepared OCI specification joins the owner before runtime creation.
-This is in-memory preparation ownership. Durable recovery of resources created
-before their first adoption record remains separate release work.
-
-Rolling and blue-green workers share one abort path. They distinguish a reserved
-ID that never attempted creation from a creation attempt that may have changed
-the runtime before returning an error. The latter always requires bounded kill
-and observed exit. Only then can checked identity/record removal, directory
-sync, backend removal and port release forget the owner. A failed cleanup keeps
-its owner and reports the failure; the worker tries its other replacements too.
-The runtime waits happen off the command loop, so status and cancellation remain
-responsive.
-
-With automatic rollback disabled, healthy replacements enter ordinary
-supervision and remain available for a later Stop or Retire. With automatic
-rollback enabled, cleanup includes them. History says RolledBack only when
-cleanup succeeds and no old instance has already retired. After partial cutover,
-removing replacements cannot recreate an old instance, so history says Halted.
-Unconfirmed cleanup records Failed. Those outcomes describe what happened.
-
-The failure matrix covers rolling and blue-green, rollback and halt, and six
-faults: failed, ignored and stalled kills; failed inspection; blocked records;
-and blocked identity cleanup. Each retained owner becomes retireable after the
-fault is repaired. Additional cases keep a healthy replacement after a partial
-halt, then retire every owner through the ordinary path. A blocked record
-directory keeps the replacement's port until directory recovery and confirmed
-artifact removal; releasing it early would forget part of that ownership.
-
-
-### Two valid names can still claim the same ID
-
-Generation one of `worker` uses `default__worker-g1-0`. A fresh app named
-`worker-g1` would use that same string for replica zero. Both names satisfy the
-label rules. Before the repair, applying the fresh app overwrites the running
-owner and reports success.
-
-Fresh app admission now checks every proposed replica ID before reserving any
-ports. Job admission checks its ID too. If an existing entry belongs to another
-structured app or namespace, admission refuses and keeps its runtime, port and
-record untouched. The check includes stopped cleanup owners. The rolling
-reservation path already refuses any occupied ID, so the guard works in both
-allocation directions.
-
-We keep the existing identity encoding for this release. A generation-like name
-is allowed, but it can't be allocated while its textual ID belongs to another
-workload; use another name or retire that owner first. Changing the encoding
-would require a separate compatibility decision. The regression drives a real
-Bun deployment worker with a mock runtime, rolls `worker` to generation one,
-and attempts both fresh app and job collisions against Running and Stopped
-owners. It checks refusal, unchanged records and ports, and no runtime mutation.
-
-
-### A replacement needs its own cgroup
-
-We ran two real containers, then retired the older one. Both stopped. The
-runtime had done what we asked: both generations occupied the same cgroup, and
-removing that group affected its remaining member too.
-
-The allocator had kept only the replica ordinal. Both `default__web-0` and
-`default__web-g7-0` became `/reliaburger/default/web/0`. A unique container name
-wasn't enough. Every runtime resource used for independent retirement needs the
-same distinction.
-
-Cgroup allocation now keeps the suffix belonging to the structured workload
-owner. The steady instance still uses `web/0`; generation seven uses `web/g7-0`.
-We validate the namespace, app and canonical suffix before constructing the
-path. A mismatched owner, parent traversal or ambiguous numeric spelling fails
-instead of falling back to replica zero. An ordinary app named `web-g7` remains
-under its own app directory; we don't guess its identity from a suffix alone.
-
-Rolling and blue-green preparation use this exact path for the OCI specification
-and pre-start policy. Resource faults use the stored original specification;
-CPU diagnostics retain the generation when locating `cpu.stat`. Restart and
-adoption already retain the original specification. State generation 22 refuses
-older development records whose canaries may have shared their predecessor's
-cgroup.
-
-The agent regression compares the stored paths across both deployment
-strategies. The physical regression starts both containers, retires the old
-one, and requires the successor to remain Running before cleaning it up. This
-checks the consequence of the allocation, not just whether two strings differ.
-
-
-## Confirm the replacement before retiring its predecessor
-
-Freeze the kernel backend map during a rollout. The old route still works, but
-the kernel refuses to add the replacement. Previously, Bun put that replacement
-into its userspace service map and told DNS and Wrapper about it. The subsequent
-retirement failed, leaving different consumers with different routing views.
-Our real-container regression catches the premature userspace publication.
-
-The replacement operation now builds a candidate service map, validates the
-backend and requires the kernel update to succeed before publishing the candidate
-to readers. Its channel reply carries `Result<(), BunError>`: `()` is Rust's unit
-type, so success carries no extra value, while failure carries the reason. A
-closed agent channel is a failure too. Both rolling and blue-green workers stop
-cutover on that error and use their existing abort path, retaining any runtime
-whose cleanup cannot be confirmed. They do not retire a predecessor on the
-strength of an unacknowledged replacement.
-
-This orders one live publication boundary. It does not persist attempted routing
-across Bun death or prove remote consumers withdrew an old endpoint. The durable
-discovery journal and remote acknowledgement work must cover those boundaries.
-
-
-### Refuse before the first launch too
-
-The same rule applies before a fresh deployment. Previously, initial service
-registration printed a kernel error and replied with unit success. The worker
-continued to create and start the workload; only its final backend publication
-reported failure. The stronger frozen-map test observes that unexpected Running
-process and its adoption record.
-
-Registration now returns `Result<(), BunError>` through the channel, including
-when the agent loop closes. The worker stops before its create/start loop on
-failure. Logical allocations remain owned while their cleanup is uncertain;
-there is no runtime to adopt. The restart driver requires a previous restart
-count, so it cannot turn this untouched fresh Pending instance into a delayed
-launch. This checked boundary is also where future journal-write failures must
-prevent publication and execution.
-
-
-### Runtime count is not endpoint count
-
-Ask one node to publish 33 replicas into a service map with 32 backend slots.
-Previously, the last backend insertion printed an error, but the worker still
-reported Complete for all 33 running instances. The deployment regression catches
-that false acknowledgement and checks that every created runtime retains its
-cleanup owner.
-
-Fresh and final rollout bookkeeping now propagate backend insertion failures as
-publication errors. Final service registration is checked too. A restart that
-cannot insert its backend enters the existing failed-restart path. The worker
-reports failure while retaining the resources that still need cleanup. Updating
-an existing endpoint at the limit remains valid; only a new endpoint consumes
-another slot.
-
-### A restart needs a new routing snapshot
-
-A container exits and its replacement receives a different IP. Updating the
-agent's private service map is only half the job: DNS and Wrapper consume a
-published snapshot. Our regression runs the ordinary exit/restart path and
-observes that those readers still have the predecessor's IP.
-
-The restart now builds a candidate map, confirms kernel publication, then swaps
-in that map and refreshes the shared snapshot. A failed publication retains the
-previous view and the runtime's cleanup owner. If the application has a health
-check, the new backend stays unhealthy until a successful probe. Starting a
-process proves that it started, not that it can answer requests. A second
-regression drives an unhealthy application through restart, checks HealthWait
-and the unpublished health, then supplies a successful probe and checks the
-routing view again. These live checks do not replace the durable recovery and
-remote withdrawal proofs still required before reusing an address.
-
-### Ordinary stops and retries share the ingress boundary
-
-A correct deployment drain does not help if an ordinary stop bypasses it. The
-new regression captures a request, starts Stop, and checks that Bun has neither
-stopped nor killed the runtime before the request releases. Stop now uses the
-same drain-and-stop helper as a rollout, after withdrawing routing and fencing
-supervision.
-
-Automatic retry needs the same ordering, but waiting for an entire drain inside
-the one-second agent tick would delay unrelated commands and health checks.
-The retry driver instead withdraws the predecessor, starts its drain and checks
-for completion. If requests remain, it keeps the instance Pending and tries
-again on a later tick. Failed-start cleanup follows the same gate. The deadline
-still cancels captured requests; positive guard release permits runtime cleanup
-and successor creation. The test holds a captured request through one tick,
-checks that no kill happened and the old endpoint disappeared, then releases it
-and verifies that a later tick starts the replacement.
-
-These are local live-runtime gates. Recovered artifact cleanup, remote catalogue
-acknowledgements and durable discovery reconstruction remain separate release
-requirements.
-
-### Runtime exit does not finish discovery cleanup
-
-Suppose the runtime has exited, but Wrapper still holds a captured endpoint for
-a pending request. Deleting the adoption record and releasing the address at
-that point forgets an owner too early. The artifact-cleanup regression records a
-real adoption file and identity directory, marks the mock runtime stopped, and
-keeps a request captured while asking Bun to retire the artifacts. Previously,
-cleanup succeeded and deleted both paths.
-
-Artifact retirement now polls the same local withdrawal gate before clearing
-policy, releasing a runtime network reference or deleting those paths. Since the
-runtime is already absent, it requests immediate cancellation. If a request guard
-still exists, cleanup returns a retained-ownership error and can be retried.
-After the guard releases, the test retries and requires both paths to disappear.
-Automatic restarts use the same poll with their normal grace period. Neither path
-turns a cancellation request into permission to forget an owner.
-
-This gate covers local request ownership at the shared cleanup boundary. It does
-not supply missing original discovery metadata or acknowledgements from remote
-nodes. Those must still be reconstructed and confirmed separately.
-
-### A replacement needs its initialisers too
-
-The OCI crash matrix caught a plain deployment bug: a fresh application ran its
-initialisers, but a rolling replacement skipped them and started the main process.
-Pausing the replacement's first initialiser therefore never reached the gate.
-The replacement was already serving. Wrong order.
-
-Fresh and rolling deployments now call the same `drive_initialisers` method.
-It registers each child before creation, observes its actual exit, confirms its
-retirement, and refreshes network policy before the next child or main workload.
-A failed initialiser prevents main startup and leaves the previous serving
-instance intact under the existing rolling-deployment cleanup rules.
-
-The method borrows the original cgroup path as `&Path`: it uses the caller's path
-without taking ownership or manufacturing a second identity. Each `await?` waits
-for positive completion and propagates an error to the deployment worker. The
-new regression checks both a successful initialiser before main startup and a
-failed initialiser that cannot start main or retire the old serving workload.
