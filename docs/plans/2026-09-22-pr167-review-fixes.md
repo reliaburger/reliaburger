@@ -399,12 +399,25 @@ Discovery and API:
       withdrawal that shrinks the list; at `MAX_PUBLICATIONS` (1,024)
       `save_consumer` fails validation before reaching it. Collapse repeated
       unfinished publications, or withdraw before pushing. Related to T1.2.
-- [ ] **T2.11 Startup retirement may retry forever after partial success.**
+- [x] **T2.11 Startup retirement may retry forever after partial success.**
+      Investigated, no change. The runtime inventory keeps Retired intents and
+      owned cleanup returns early for them, so a partially completed retirement
+      re-matches and finishes on retry. "Execution changed" needs a successor
+      generation for the same instance, which can only be published after the
+      original is Retired; the remaining steps are keyed by instance ID, so
+      finishing them would touch the successor, and refusing is right. A
+      pending startup retirement also keeps a critical readiness subsystem
+      degraded and its port reserved, so the scheduler avoids placing one.
       `src/bun/startup_recovery.rs:75-85` requires the original launch to
       still exist unchanged, but `retire_instance_artifacts` isn't atomic.
       *Investigate first* (reviewer marked it plausible), then make each step
       idempotent against an already-completed earlier step.
-- [ ] **T2.12 Execution evidence can be dropped silently.**
+- [x] **T2.12 Execution evidence can be dropped silently.** Investigated, no
+      change. `launch_inventory` returns `Ok(None)` only for runtimes without
+      ownership, and durable discovery is only enabled with owned Runc, whose
+      inventory is always `Some`; T4.2 removes the unowned Runc path entirely.
+      The historical backend list is superseded by T1.1's retained consumer
+      views, which drain removed backends before forgetting them.
       `src/bun/discovery_ownership.rs:67-81`: `launch_inventory` returning
       `Ok(None)` records empty `executions`; `*previous = owner` overwrites the
       historical backend list the drain relies on. *Investigate first.*
