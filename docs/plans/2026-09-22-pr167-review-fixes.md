@@ -543,9 +543,11 @@ spot-checked by hand.
       runtime" from "durable discovery" first, and qualify rootful Runc without
       eBPF on the owned path. Also removes a less crash-safe mode. Needs a
       scope decision (F below).
-- [ ] **T4.3 `ask_agent` helper in `src/bun/api.rs` (~250–350 lines; low
+- [x] **T4.3 `ask_agent` helper in `src/bun/api.rs` (~250–350 lines; low
       risk).** The oneshot + `cmd_tx.send` + "agent unavailable" + await
       pattern repeats 36 times (e.g. `:853-858`, `:920-927`, `:988-1000`).
+      Done. 29 call sites use `ask_agent`; the 9 left have their own timeout
+      or distinct error text. `api.rs` −344 lines (+209/−553).
 - [x] **T4.4 Shared private-record reader (~150–250 lines; low risk).** One
       `read_private_json(path, limit)` for the O_NOFOLLOW → regular/private
       file → size → bounded read → parse pattern in `process_owner.rs`,

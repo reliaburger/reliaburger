@@ -1660,19 +1660,12 @@ async fn upgrade_apply_handler(
         }
     };
 
-    let (tx, rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(AgentCommand::UpgradeApply {
-            directive,
-            response: tx,
-        })
-        .await
-        .is_err()
+    match ask_agent(&state.cmd_tx, |response| AgentCommand::UpgradeApply {
+        directive,
+        response,
+    })
+    .await
     {
-        return agent_unavailable();
-    }
-    match rx.await {
         Ok(Ok(())) => (
             StatusCode::ACCEPTED,
             Json(serde_json::json!({ "status": "upgrading" })),
@@ -1697,16 +1690,11 @@ async fn upgrade_status_handler(
     {
         return resp;
     }
-    let (tx, rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(AgentCommand::UpgradeStatus { response: tx })
-        .await
-        .is_err()
+    match ask_agent(&state.cmd_tx, |response| AgentCommand::UpgradeStatus {
+        response,
+    })
+    .await
     {
-        return agent_unavailable();
-    }
-    match rx.await {
         Ok(Ok(status)) => Json(status).into_response(),
         Ok(Err(e)) => (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1748,19 +1736,12 @@ async fn upgrade_rollback_handler(
         }
     };
 
-    let (tx, rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(AgentCommand::UpgradeRollback {
-            version: request.version,
-            response: tx,
-        })
-        .await
-        .is_err()
+    match ask_agent(&state.cmd_tx, |response| AgentCommand::UpgradeRollback {
+        version: request.version,
+        response,
+    })
+    .await
     {
-        return agent_unavailable();
-    }
-    match rx.await {
         Ok(Ok(())) => (
             StatusCode::ACCEPTED,
             Json(serde_json::json!({ "status": "rolling back" })),
@@ -1773,6 +1754,35 @@ async fn upgrade_rollback_handler(
             .into_response(),
         Err(_) => agent_unavailable(),
     }
+}
+
+/// Send one command to the agent loop and wait for its reply.
+///
+/// `build` receives the reply half of a fresh oneshot channel and returns the
+/// command that carries it. If the agent loop has gone away, either before it
+/// accepts the command or before it answers, the error is the 500 response the
+/// handlers return for that case.
+// `Response` is large, but it is the reply the handler sends as-is.
+#[allow(clippy::result_large_err)]
+async fn ask_agent<T>(
+    cmd_tx: &mpsc::Sender<AgentCommand>,
+    build: impl FnOnce(oneshot::Sender<T>) -> AgentCommand,
+) -> Result<T, Response> {
+    let (response, reply) = oneshot::channel();
+    if cmd_tx.send(build(response)).await.is_err() {
+        return Err(internal_error("agent unavailable"));
+    }
+    reply
+        .await
+        .map_err(|_| internal_error("agent dropped response"))
+}
+
+fn internal_error(message: &str) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({ "error": message })),
+    )
+        .into_response()
 }
 
 fn agent_unavailable() -> Response {
@@ -3391,13 +3401,10 @@ async fn current_apps_handler(State(state): State<ApiState>) -> Response {
     let mut resources: std::collections::BTreeMap<String, Option<String>> =
         std::collections::BTreeMap::new();
 
-    let (resp_tx, resp_rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(AgentCommand::CurrentResources { response: resp_tx })
-        .await
-        .is_ok()
-        && let Ok(local) = resp_rx.await
+    if let Ok(local) = ask_agent(&state.cmd_tx, |response| AgentCommand::CurrentResources {
+        response,
+    })
+    .await
     {
         for entry in local {
             resources.insert(entry.resource, entry.image);
@@ -3558,18 +3565,11 @@ async fn cluster_statuses(
 
 /// List all run-to-completion workload instances.
 async fn jobs_handler(State(state): State<ApiState>) -> Response {
-    let (response_tx, response_rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(AgentCommand::JobStatus {
-            response: response_tx,
-        })
-        .await
-        .is_err()
+    match ask_agent(&state.cmd_tx, |response| AgentCommand::JobStatus {
+        response,
+    })
+    .await
     {
-        return agent_unavailable();
-    }
-    match response_rx.await {
         Ok(statuses) => Json(statuses).into_response(),
         Err(_) => agent_unavailable(),
     }
@@ -3655,21 +3655,7 @@ async fn status_app_handler(
     if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
         return resp;
     }
-    let (resp_tx, resp_rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(AgentCommand::Status { response: resp_tx })
-        .await
-        .is_err()
-    {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent unavailable" })),
-        )
-            .into_response();
-    }
-
-    match resp_rx.await {
+    match ask_agent(&state.cmd_tx, |response| AgentCommand::Status { response }).await {
         Ok(statuses) => {
             let filtered: Vec<&InstanceStatus> = statuses
                 .iter()
@@ -3685,11 +3671,7 @@ async fn status_app_handler(
                 Json(serde_json::json!(filtered)).into_response()
             }
         }
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent dropped response" })),
-        )
-            .into_response(),
+        Err(response) => response,
     }
 }
 
@@ -3793,41 +3775,25 @@ async fn cluster_stop(
     // The desired state is gone; stop the local replica if we have one.
     // A missing local instance is expected on a leader that holds no
     // replica, so it is not an error here.
-    let (resp_tx, resp_rx) = oneshot::channel();
-    let _ = state
-        .cmd_tx
-        .send(AgentCommand::Stop {
-            app_name: app,
-            namespace,
-            response: resp_tx,
-        })
-        .await;
-    let _ = resp_rx.await;
+    let _ = ask_agent(&state.cmd_tx, |response| AgentCommand::Stop {
+        app_name: app,
+        namespace,
+        response,
+    })
+    .await;
 
     Json(serde_json::json!({ "status": "stopped" })).into_response()
 }
 
 /// Stop an app on this node only (standalone mode).
 async fn stop_local(state: &ApiState, app: String, namespace: String) -> Response {
-    let (resp_tx, resp_rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(AgentCommand::Stop {
-            app_name: app,
-            namespace,
-            response: resp_tx,
-        })
-        .await
-        .is_err()
+    match ask_agent(&state.cmd_tx, |response| AgentCommand::Stop {
+        app_name: app,
+        namespace,
+        response,
+    })
+    .await
     {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent unavailable" })),
-        )
-            .into_response();
-    }
-
-    match resp_rx.await {
         Ok(Ok(())) => Json(serde_json::json!({ "status": "stopped" })).into_response(),
         Ok(Err(error)) => {
             let status = match error {
@@ -3841,11 +3807,7 @@ async fn stop_local(state: &ApiState, app: String, namespace: String) -> Respons
             )
                 .into_response()
         }
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent dropped response" })),
-        )
-            .into_response(),
+        Err(response) => response,
     }
 }
 
@@ -3899,37 +3861,21 @@ async fn logs_handler(
         return Sse::new(stream).into_response();
     }
 
-    let (resp_tx, resp_rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(AgentCommand::Logs {
-            app_name: app,
-            namespace,
-            tail: query.tail,
-            response: resp_tx,
-        })
-        .await
-        .is_err()
+    match ask_agent(&state.cmd_tx, |response| AgentCommand::Logs {
+        app_name: app,
+        namespace,
+        tail: query.tail,
+        response,
+    })
+    .await
     {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent unavailable" })),
-        )
-            .into_response();
-    }
-
-    match resp_rx.await {
         Ok(Ok(logs)) => Json(serde_json::json!({ "logs": logs })).into_response(),
         Ok(Err(e)) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "error": e.to_string() })),
         )
             .into_response(),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent dropped response" })),
-        )
-            .into_response(),
+        Err(response) => response,
     }
 }
 
@@ -4200,57 +4146,27 @@ async fn exec_handler(
     {
         return resp;
     }
-    let (resp_tx, resp_rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(AgentCommand::Exec {
-            app_name: app,
-            namespace,
-            command: body.command,
-            response: resp_tx,
-        })
-        .await
-        .is_err()
+    match ask_agent(&state.cmd_tx, |response| AgentCommand::Exec {
+        app_name: app,
+        namespace,
+        command: body.command,
+        response,
+    })
+    .await
     {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent unavailable" })),
-        )
-            .into_response();
-    }
-
-    match resp_rx.await {
         Ok(Ok(output)) => Json(serde_json::json!({ "output": output })).into_response(),
         Ok(Err(e)) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "error": e.to_string() })),
         )
             .into_response(),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent dropped response" })),
-        )
-            .into_response(),
+        Err(response) => response,
     }
 }
 
 /// List cluster nodes.
 async fn nodes_handler(State(state): State<ApiState>) -> Response {
-    let (resp_tx, resp_rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(AgentCommand::Nodes { response: resp_tx })
-        .await
-        .is_err()
-    {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent unavailable" })),
-        )
-            .into_response();
-    }
-
-    match resp_rx.await {
+    match ask_agent(&state.cmd_tx, |response| AgentCommand::Nodes { response }).await {
         Ok(mut nodes) => {
             if let Some(membership) = &state.membership {
                 let members = membership.read().await;
@@ -4263,37 +4179,15 @@ async fn nodes_handler(State(state): State<ApiState>) -> Response {
             }
             Json(nodes).into_response()
         }
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent dropped response" })),
-        )
-            .into_response(),
+        Err(response) => response,
     }
 }
 
 /// Show council (Raft) status.
 async fn council_handler(State(state): State<ApiState>) -> Response {
-    let (resp_tx, resp_rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(AgentCommand::Council { response: resp_tx })
-        .await
-        .is_err()
-    {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent unavailable" })),
-        )
-            .into_response();
-    }
-
-    match resp_rx.await {
+    match ask_agent(&state.cmd_tx, |response| AgentCommand::Council { response }).await {
         Ok(council) => Json(serde_json::json!(council)).into_response(),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent dropped response" })),
-        )
-            .into_response(),
+        Err(response) => response,
     }
 }
 
@@ -4637,37 +4531,21 @@ async fn join_handler(
                 .into_response();
         }
     };
-    let (resp_tx, resp_rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(AgentCommand::JoinIssue {
-            token: body.token,
-            node_id: body.node_id,
-            csr_der,
-            response: resp_tx,
-        })
-        .await
-        .is_err()
+    match ask_agent(&state.cmd_tx, |response| AgentCommand::JoinIssue {
+        token: body.token,
+        node_id: body.node_id,
+        csr_der,
+        response,
+    })
+    .await
     {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent unavailable" })),
-        )
-            .into_response();
-    }
-
-    match resp_rx.await {
         Ok(Ok(bundle)) => Json(bundle).into_response(),
         Ok(Err(e)) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": e.to_string() })),
         )
             .into_response(),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent dropped response" })),
-        )
-            .into_response(),
+        Err(response) => response,
     }
 }
 
@@ -4741,27 +4619,15 @@ async fn chaos_partition_handler(
         Err(response) => return *response,
     };
     let duration_secs = reservation.request.duration.as_secs();
-    let (resp_tx, resp_rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(AgentCommand::InjectPartition {
-            reservation: Some(reservation),
-            peers: body.peers,
-            duration_secs,
-            injected_by,
-            response: resp_tx,
-        })
-        .await
-        .is_err()
+    match ask_agent(&state.cmd_tx, |response| AgentCommand::InjectPartition {
+        reservation: Some(reservation),
+        peers: body.peers,
+        duration_secs,
+        injected_by,
+        response,
+    })
+    .await
     {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent unavailable" })),
-        )
-            .into_response();
-    }
-
-    match resp_rx.await {
         Ok(Ok((msg, summary))) => {
             record_fault_audit(
                 &state,
@@ -4791,11 +4657,7 @@ async fn chaos_partition_handler(
             Json(serde_json::json!({ "error": e.to_string() })),
         )
             .into_response(),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent dropped response" })),
-        )
-            .into_response(),
+        Err(response) => response,
     }
 }
 
@@ -4823,21 +4685,11 @@ async fn chaos_heal_handler(
     ) {
         return (StatusCode::FORBIDDEN, error.to_string()).into_response();
     }
-    let (resp_tx, resp_rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(AgentCommand::HealPartition { response: resp_tx })
-        .await
-        .is_err()
+    match ask_agent(&state.cmd_tx, |response| AgentCommand::HealPartition {
+        response,
+    })
+    .await
     {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent unavailable" })),
-        )
-            .into_response();
-    }
-
-    match resp_rx.await {
         Ok(Ok(msg)) => {
             record_fault_audit(
                 &state,
@@ -4859,31 +4711,17 @@ async fn chaos_heal_handler(
             Json(serde_json::json!({ "error": e.to_string() })),
         )
             .into_response(),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent dropped response" })),
-        )
-            .into_response(),
+        Err(response) => response,
     }
 }
 
 /// Query chaos status.
 async fn chaos_status_handler(State(state): State<ApiState>) -> Response {
-    let (resp_tx, resp_rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(AgentCommand::ChaosStatus { response: resp_tx })
-        .await
-        .is_err()
+    match ask_agent(&state.cmd_tx, |response| AgentCommand::ChaosStatus {
+        response,
+    })
+    .await
     {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent unavailable" })),
-        )
-            .into_response();
-    }
-
-    match resp_rx.await {
         Ok(status) => {
             let reservation = match &state.council {
                 Some(council) => council.desired_state().await.node_fault_reservations.active,
@@ -4900,11 +4738,7 @@ async fn chaos_status_handler(State(state): State<ApiState>) -> Response {
             }))
             .into_response()
         }
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent dropped response" })),
-        )
-            .into_response(),
+        Err(response) => response,
     }
 }
 
@@ -4962,33 +4796,18 @@ async fn snapshot_create_handler(
         return resp;
     }
     let Json(body) = body.unwrap_or_default();
-    let (resp_tx, resp_rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(AgentCommand::SnapshotCreate {
-            namespace,
-            app_name: app,
-            volume: body.volume,
-            name: body.name,
-            response: resp_tx,
-        })
-        .await
-        .is_err()
+    match ask_agent(&state.cmd_tx, |response| AgentCommand::SnapshotCreate {
+        namespace,
+        app_name: app,
+        volume: body.volume,
+        name: body.name,
+        response,
+    })
+    .await
     {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent unavailable" })),
-        )
-            .into_response();
-    }
-    match resp_rx.await {
         Ok(Ok(metas)) => (StatusCode::CREATED, Json(serde_json::json!(metas))).into_response(),
         Ok(Err(e)) => snapshot_error_response(&e),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent dropped response" })),
-        )
-            .into_response(),
+        Err(response) => response,
     }
 }
 
@@ -5000,31 +4819,16 @@ async fn snapshot_list_handler(
     if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
         return resp;
     }
-    let (resp_tx, resp_rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(AgentCommand::SnapshotList {
-            namespace,
-            app_name: app,
-            response: resp_tx,
-        })
-        .await
-        .is_err()
+    match ask_agent(&state.cmd_tx, |response| AgentCommand::SnapshotList {
+        namespace,
+        app_name: app,
+        response,
+    })
+    .await
     {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent unavailable" })),
-        )
-            .into_response();
-    }
-    match resp_rx.await {
         Ok(Ok(metas)) => Json(serde_json::json!(metas)).into_response(),
         Ok(Err(e)) => snapshot_error_response(&e),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent dropped response" })),
-        )
-            .into_response(),
+        Err(response) => response,
     }
 }
 
@@ -5042,32 +4846,17 @@ async fn snapshot_restore_handler(
     if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
         return resp;
     }
-    let (resp_tx, resp_rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(AgentCommand::SnapshotRestore {
-            namespace,
-            app_name: app,
-            name: body.name,
-            response: resp_tx,
-        })
-        .await
-        .is_err()
+    match ask_agent(&state.cmd_tx, |response| AgentCommand::SnapshotRestore {
+        namespace,
+        app_name: app,
+        name: body.name,
+        response,
+    })
+    .await
     {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent unavailable" })),
-        )
-            .into_response();
-    }
-    match resp_rx.await {
         Ok(Ok(())) => Json(serde_json::json!({ "restored": true })).into_response(),
         Ok(Err(e)) => snapshot_error_response(&e),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent dropped response" })),
-        )
-            .into_response(),
+        Err(response) => response,
     }
 }
 
@@ -5084,32 +4873,17 @@ async fn snapshot_delete_handler(
     if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
         return resp;
     }
-    let (resp_tx, resp_rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(AgentCommand::SnapshotDelete {
-            namespace,
-            app_name: app,
-            name,
-            response: resp_tx,
-        })
-        .await
-        .is_err()
+    match ask_agent(&state.cmd_tx, |response| AgentCommand::SnapshotDelete {
+        namespace,
+        app_name: app,
+        name,
+        response,
+    })
+    .await
     {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent unavailable" })),
-        )
-            .into_response();
-    }
-    match resp_rx.await {
         Ok(Ok(())) => Json(serde_json::json!({ "deleted": true })).into_response(),
         Ok(Err(e)) => snapshot_error_response(&e),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent dropped response" })),
-        )
-            .into_response(),
+        Err(response) => response,
     }
 }
 
@@ -5239,25 +5013,13 @@ async fn fault_inject_handler(
         .unwrap_or_else(|| request.fault_type.to_string());
     let audit_duration_seconds = request.duration.as_secs();
     let audit_reason = request.reason.clone();
-    let (resp_tx, resp_rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(AgentCommand::InjectFault {
-            reservation,
-            request,
-            response: resp_tx,
-        })
-        .await
-        .is_err()
+    match ask_agent(&state.cmd_tx, |response| AgentCommand::InjectFault {
+        reservation,
+        request,
+        response,
+    })
+    .await
     {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent unavailable" })),
-        )
-            .into_response();
-    }
-
-    match resp_rx.await {
         Ok(Ok(summary)) => {
             if let Some(events) = &state.events {
                 let timestamp = std::time::SystemTime::now()
@@ -5304,11 +5066,7 @@ async fn fault_inject_handler(
             Json(serde_json::json!({ "error": e.to_string() })),
         )
             .into_response(),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent dropped response" })),
-        )
-            .into_response(),
+        Err(response) => response,
     }
 }
 
@@ -5966,27 +5724,15 @@ async fn fault_clear_handler(
         )
             .into_response();
     }
-    let (resp_tx, resp_rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(AgentCommand::ClearFault {
-            fault_id: id,
-            allow_workload_fault,
-            allow_node_fault,
-            allow_node_pressure,
-            response: resp_tx,
-        })
-        .await
-        .is_err()
+    match ask_agent(&state.cmd_tx, |response| AgentCommand::ClearFault {
+        fault_id: id,
+        allow_workload_fault,
+        allow_node_fault,
+        allow_node_pressure,
+        response,
+    })
+    .await
     {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent unavailable" })),
-        )
-            .into_response();
-    }
-
-    match resp_rx.await {
         Ok(Ok(msg)) => {
             record_fault_audit(
                 &state,
@@ -6011,11 +5757,7 @@ async fn fault_clear_handler(
             Json(serde_json::json!({ "error": e.to_string() })),
         )
             .into_response(),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent dropped response" })),
-        )
-            .into_response(),
+        Err(response) => response,
     }
 }
 
@@ -6070,13 +5812,12 @@ async fn fault_clear_all_handler(
     ) {
         return (StatusCode::FORBIDDEN, error.to_string()).into_response();
     }
-    let (resp_tx, resp_rx) = oneshot::channel();
     // `?service=NAME` clears only that service's faults; no query clears all
     // workload faults. An *empty* `?service=` is neither: every node-class
     // fault carries an empty `target_service`, so it would match them all —
     // reject it rather than let this Deployer-authorised path reverse Admin
     // faults by omission.
-    let command = match params.get("service") {
+    let target = match params.get("service") {
         Some(service) if service.is_empty() => {
             return (
                 StatusCode::BAD_REQUEST,
@@ -6096,11 +5837,7 @@ async fn fault_clear_all_handler(
                 {
                     return response;
                 }
-                AgentCommand::ClearFaultsByService {
-                    service: service.clone(),
-                    namespace: Some(namespace.clone()),
-                    response: resp_tx,
-                }
+                Some((service.clone(), Some(namespace.clone())))
             }
             // Cross-namespace clear: reversing a service's faults in every
             // namespace is a cluster-wide action, so a scoped token is refused
@@ -6109,24 +5846,20 @@ async fn fault_clear_all_handler(
                 if let Err(response) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
                     return response;
                 }
-                AgentCommand::ClearFaultsByService {
-                    service: service.clone(),
-                    namespace: None,
-                    response: resp_tx,
-                }
+                Some((service.clone(), None))
             }
         },
-        None => AgentCommand::ClearAllFaults { response: resp_tx },
+        None => None,
     };
-    if state.cmd_tx.send(command).await.is_err() {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent unavailable" })),
-        )
-            .into_response();
-    }
-
-    match resp_rx.await {
+    let command = |response| match target {
+        Some((service, namespace)) => AgentCommand::ClearFaultsByService {
+            service,
+            namespace,
+            response,
+        },
+        None => AgentCommand::ClearAllFaults { response },
+    };
+    match ask_agent(&state.cmd_tx, command).await {
         Ok(Ok(msg)) => {
             let service = params.get("service").cloned();
             let mut details = std::collections::BTreeMap::new();
@@ -6156,123 +5889,57 @@ async fn fault_clear_all_handler(
             Json(serde_json::json!({ "error": e.to_string() })),
         )
             .into_response(),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent dropped response" })),
-        )
-            .into_response(),
+        Err(response) => response,
     }
 }
 
 /// List all active faults.
 async fn fault_list_handler(State(state): State<ApiState>) -> Response {
-    let (resp_tx, resp_rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(AgentCommand::ListFaults { response: resp_tx })
-        .await
-        .is_err()
+    match ask_agent(&state.cmd_tx, |response| AgentCommand::ListFaults {
+        response,
+    })
+    .await
     {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent unavailable" })),
-        )
-            .into_response();
-    }
-
-    match resp_rx.await {
         Ok(summaries) => Json(serde_json::json!(summaries)).into_response(),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent dropped response" })),
-        )
-            .into_response(),
+        Err(response) => response,
     }
 }
 
 /// Resolve a service name to its VIP and backends.
 async fn resolve_handler(State(state): State<ApiState>, Path(name): Path<String>) -> Response {
-    let (resp_tx, resp_rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(AgentCommand::Resolve {
-            app_name: name.clone(),
-            response: resp_tx,
-        })
-        .await
-        .is_err()
+    match ask_agent(&state.cmd_tx, |response| AgentCommand::Resolve {
+        app_name: name.clone(),
+        response,
+    })
+    .await
     {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent unavailable" })),
-        )
-            .into_response();
-    }
-
-    match resp_rx.await {
         Ok(Some(info)) => Json(serde_json::json!(info)).into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "error": format!("service {name:?} not found") })),
         )
             .into_response(),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent dropped response" })),
-        )
-            .into_response(),
+        Err(response) => response,
     }
 }
 
 /// List all registered services.
 async fn resolve_all_handler(State(state): State<ApiState>) -> Response {
-    let (resp_tx, resp_rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(AgentCommand::ResolveAll { response: resp_tx })
-        .await
-        .is_err()
+    match ask_agent(&state.cmd_tx, |response| AgentCommand::ResolveAll {
+        response,
+    })
+    .await
     {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent unavailable" })),
-        )
-            .into_response();
-    }
-
-    match resp_rx.await {
         Ok(entries) => Json(serde_json::json!(entries)).into_response(),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent dropped response" })),
-        )
-            .into_response(),
+        Err(response) => response,
     }
 }
 
 /// List all ingress routes.
 async fn routes_handler(State(state): State<ApiState>) -> Response {
-    let (resp_tx, resp_rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(AgentCommand::Routes { response: resp_tx })
-        .await
-        .is_err()
-    {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent unavailable" })),
-        )
-            .into_response();
-    }
-
-    match resp_rx.await {
+    match ask_agent(&state.cmd_tx, |response| AgentCommand::Routes { response }).await {
         Ok(routes) => Json(serde_json::json!(routes)).into_response(),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent dropped response" })),
-        )
-            .into_response(),
+        Err(response) => response,
     }
 }
 
@@ -6427,12 +6094,9 @@ async fn metrics_summary_handler(
 
 /// Gather instance statuses from the agent.
 async fn gather_statuses(state: &ApiState) -> Vec<InstanceStatus> {
-    let (tx, rx) = oneshot::channel();
-    let _ = state
-        .cmd_tx
-        .send(AgentCommand::Status { response: tx })
-        .await;
-    rx.await.unwrap_or_default()
+    ask_agent(&state.cmd_tx, |response| AgentCommand::Status { response })
+        .await
+        .unwrap_or_default()
 }
 
 /// Build dashboard app rows from instance statuses.
@@ -6806,17 +6470,13 @@ async fn app_env_handler(
     if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
         return resp;
     }
-    let (tx, rx) = oneshot::channel();
-    let _ = state
-        .cmd_tx
-        .send(AgentCommand::AppConfig {
-            app_name: app,
-            namespace,
-            response: tx,
-        })
-        .await;
-
-    match rx.await {
+    match ask_agent(&state.cmd_tx, |response| AgentCommand::AppConfig {
+        app_name: app,
+        namespace,
+        response,
+    })
+    .await
+    {
         Ok(Some(spec)) => Json(safe_env(&spec.env)).into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,
@@ -7772,16 +7432,12 @@ async fn identity_sign_handler(
         }
     };
 
-    let (tx, rx) = oneshot::channel();
-    let _ = state
-        .cmd_tx
-        .send(AgentCommand::SignImage {
-            manifest_digest: req.digest,
-            response: tx,
-        })
-        .await;
-
-    match rx.await {
+    match ask_agent(&state.cmd_tx, |response| AgentCommand::SignImage {
+        manifest_digest: req.digest,
+        response,
+    })
+    .await
+    {
         Ok(Ok(msg)) => Json(serde_json::json!({ "message": msg })).into_response(),
         Ok(Err(e)) => (
             StatusCode::INTERNAL_SERVER_ERROR,

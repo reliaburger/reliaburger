@@ -2476,6 +2476,22 @@ async fn status_handler(
 
 Create a oneshot channel. Send the command with the sender half. Await the receiver half. Return the result as JSON. The handler doesn't know how the agent processes commands — it just sends and waits. This separation means we can test the API layer independently from the agent logic.
 
+Write that dance thirty times and it stops being a pattern and starts being noise. So the API now has one helper that does it:
+
+```rust
+async fn ask_agent<T>(
+    cmd_tx: &mpsc::Sender<AgentCommand>,
+    build: impl FnOnce(oneshot::Sender<T>) -> AgentCommand,
+) -> Result<T, Response> { /* channel, send, await, 500 on failure */ }
+
+match ask_agent(&state.cmd_tx, |response| AgentCommand::Status { response }).await {
+    Ok(statuses) => Json(statuses).into_response(),
+    Err(response) => response,
+}
+```
+
+Two Rust features make this work. `T` is a generic type parameter, so one function serves every command, whatever it replies with. The `build` argument is a closure, the `|response| ...` part, which is Rust's lambda syntax. `impl FnOnce(oneshot::Sender<T>) -> AgentCommand` says "any closure that takes the sender and returns a command, called at most once". Why `FnOnce`? Because the closure *moves* its captured values (an app name, a request body) into the command, and you can only move something once. The compiler infers `T` from the variant the closure builds, so the call site never names a type.
+
 The `apply` handler does a bit more work: it parses the TOML body and validates the config before sending the command, returning 400 for invalid input:
 
 ```rust
