@@ -290,6 +290,17 @@ pub enum ApplyEvent {
     Error { message: String },
 }
 
+/// The outcome of clearing one fault on this node.
+#[derive(Debug)]
+pub struct FaultClearance {
+    /// Human-readable result for the API response.
+    pub message: String,
+    /// The committed node-fault reservation the fault held, until the leader
+    /// has fenced it. The council releases that reservation asynchronously,
+    /// so the API waits for it before reporting the clear as complete.
+    pub reservation: Option<u64>,
+}
+
 /// Commands sent to the agent over the command channel.
 pub enum AgentCommand {
     /// Deploy workloads from a parsed Config.
@@ -497,7 +508,7 @@ pub enum AgentCommand {
         allow_node_fault: bool,
         /// Whether the authenticated API caller may remove node pressure.
         allow_node_pressure: bool,
-        response: oneshot::Sender<Result<String, BunError>>,
+        response: oneshot::Sender<Result<FaultClearance, BunError>>,
     },
     /// Clear all active faults.
     ClearAllFaults {
@@ -4289,6 +4300,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 response,
             } => {
                 let fault_id = crate::smoker::types::FaultId(fault_id);
+                // The fence keeps the grant after the effect is reversed, until
+                // the leader fences it, so a retried clear still reports it.
+                let reservation = self
+                    .node_fault_fence
+                    .active
+                    .and_then(|(sequence, id)| (id == fault_id).then_some(sequence));
                 if let Some(rule) = self.fault_registry.get(fault_id) {
                     let denied = if rule.fault_type.is_node_operation() {
                         (!allow_node_fault).then_some(
@@ -4337,7 +4354,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     }
                     None => format!("fault {} not found", fault_id.0),
                 };
-                let _ = response.send(Ok(msg));
+                let _ = response.send(Ok(FaultClearance {
+                    message: msg,
+                    reservation,
+                }));
             }
             AgentCommand::ClearAllFaults { response } => {
                 let removed = self.fault_registry.clear_workload_faults();
@@ -19635,6 +19655,70 @@ host = "remote.local"
         );
         agent.fence_node_fault(&grant, false).await.unwrap();
         assert!(!gate.is_quiesced());
+    }
+
+    #[tokio::test]
+    async fn clearing_a_reserved_node_fault_reports_its_reservation_until_fenced() {
+        use crate::smoker::{
+            reservation::NodeFaultReservation,
+            types::{FaultRequest, FaultType},
+        };
+        let (mut agent, gate, _) = test_cluster_fault_agent().await;
+        let request = FaultRequest {
+            fault_type: FaultType::NodeKill {
+                kill_containers: false,
+            },
+            target_service: String::new(),
+            namespace: None,
+            target_instance: None,
+            target_node: Some("node-a".into()),
+            duration: std::time::Duration::from_secs(30),
+            injected_by: "operator".into(),
+            reason: None,
+            include_leader: true,
+            override_safety: true,
+            acknowledged: true,
+        };
+        let grant = NodeFaultReservation {
+            sequence: 7,
+            boot_id: agent.node_fault_fence.boot_id.clone(),
+            cleanup_after_unix_ms: 30_000,
+            request: request.clone(),
+        };
+        let (response, result) = oneshot::channel();
+        agent
+            .handle_command(AgentCommand::InjectFault {
+                reservation: Some(grant.clone()),
+                request,
+                response,
+            })
+            .await;
+        let fault_id = result.await.unwrap().unwrap().id;
+        let clear = async |agent: &mut BunAgent<MockGrill>| {
+            let (response, result) = oneshot::channel();
+            agent
+                .handle_command(AgentCommand::ClearFault {
+                    fault_id,
+                    allow_workload_fault: false,
+                    allow_node_fault: true,
+                    allow_node_pressure: false,
+                    response,
+                })
+                .await;
+            result.await.unwrap().unwrap()
+        };
+
+        // The API waits on this sequence, so "cleared" can mean the cluster
+        // has released the slot, not just that this node reopened its gate.
+        assert_eq!(clear(&mut agent).await.reservation, Some(7));
+        assert!(!gate.is_quiesced());
+        assert_eq!(
+            clear(&mut agent).await.reservation,
+            Some(7),
+            "a retried clear must keep waiting until the leader fences the grant"
+        );
+        agent.fence_node_fault(&grant, true).await.unwrap();
+        assert_eq!(clear(&mut agent).await.reservation, None);
     }
 
     #[tokio::test]

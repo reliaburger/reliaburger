@@ -98,6 +98,10 @@ pub struct MustardNode<T: MustardTransport> {
     directory: NodeDirectory,
     /// Optional watch channel publishing the directory on change.
     directory_watch: Option<watch::Sender<NodeDirectory>>,
+    /// The Smoker node-kill switch shared with this node's transports.
+    /// While it is closed this node is "dead": it forms no opinions about
+    /// its peers, so it has no stale suspicions to spread once it reopens.
+    node_gate: crate::smoker::node_fault::NodeTransportGate,
 }
 
 impl<T: MustardTransport> MustardNode<T> {
@@ -138,7 +142,14 @@ impl<T: MustardTransport> MustardNode<T> {
             council_roles_rx: None,
             directory: NodeDirectory::default(),
             directory_watch: None,
+            node_gate: crate::smoker::node_fault::NodeTransportGate::new(),
         }
+    }
+
+    /// Share the Smoker node-kill switch that also gates this node's
+    /// transports, so failure detection pauses while the node plays dead.
+    pub fn set_node_gate(&mut self, gate: crate::smoker::node_fault::NodeTransportGate) {
+        self.node_gate = gate;
     }
 
     /// Advertise this node's control-plane endpoints (API and reporting
@@ -472,6 +483,12 @@ impl<T: MustardTransport> MustardNode<T> {
     /// probing), and promotes expired suspects to dead. Exposed publicly
     /// so tests can drive the protocol step-by-step.
     pub async fn run_one_cycle(&mut self) {
+        // A node-kill fault makes this node play dead. A dead process runs
+        // no failure detector, and every probe would fail anyway, so any
+        // verdict reached now would be about the gate, not the peer.
+        if self.node_gate.is_quiesced() {
+            return;
+        }
         // An explicit departure retires a contact; a failure does not. Inspect
         // Left before reaping, while that distinction still exists.
         self.rejoin_contacts.retain(|(node, _)| {
@@ -543,8 +560,9 @@ impl<T: MustardTransport> MustardNode<T> {
             }
         }
 
-        // No ACK at all — mark as suspect
-        if self.membership.suspect(&target_id) {
+        // No ACK at all — mark as suspect, unless the gate closed while we
+        // waited: then the silence is ours, not the target's.
+        if !self.node_gate.is_quiesced() && self.membership.suspect(&target_id) {
             self.dissemination.enqueue(
                 MembershipUpdate {
                     node_id: target_id.clone(),
@@ -1162,6 +1180,52 @@ mod tests {
         assert!(
             !*rejoin_rx.borrow(),
             "unreachable membership cannot prove rejoin"
+        );
+    }
+
+    #[tokio::test]
+    async fn quiesced_node_forms_no_opinions_about_its_peers() {
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        // n2 is unreachable, exactly as every peer is while n1's node-kill
+        // gate drops all of its datagrams.
+        let gate = crate::smoker::node_fault::NodeTransportGate::new();
+        let mut node1 = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
+        node1.set_node_gate(gate.clone());
+        node1.membership.add_node(
+            NodeId::new("n2"),
+            addr(2),
+            1,
+            BTreeMap::new(),
+            Instant::now(),
+        );
+
+        gate.quiesce();
+        for _ in 0..3 {
+            node1.run_one_cycle().await;
+            tokio::time::sleep(fast_config().suspicion_timeout).await;
+        }
+
+        // A killed node runs no failure detector. Suspicions formed while it
+        // was cut off would spread after the gate reopens and knock healthy
+        // peers out of everyone's live membership.
+        let n2 = node1.membership.get(&NodeId::new("n2")).unwrap();
+        assert_eq!(n2.state, NodeState::Alive);
+        assert!(
+            node1
+                .dissemination
+                .select_updates()
+                .iter()
+                .all(|update| update.node_id != NodeId::new("n2")),
+            "no rumour about n2 may be queued while n1 is quiesced"
+        );
+
+        gate.restore();
+        node1.run_one_cycle().await;
+        assert_eq!(
+            node1.membership.get(&NodeId::new("n2")).unwrap().state,
+            NodeState::Suspect,
+            "failure detection resumes once the gate reopens"
         );
     }
 

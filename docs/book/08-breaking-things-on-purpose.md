@@ -475,6 +475,66 @@ Council membership changes wait behind the same slot, and
 `GET /v1/chaos/status` shows the outstanding reservation's sequence, target and
 cleanup deadline, so you can see why a new experiment is refused.
 
+What does "cleared" mean, then? Our first answer was "the target reopened its
+gate", and a cluster test caught us out. It killed a follower, cleared the
+fault, waited until every node's membership table showed all three nodes alive
+and no reservation held, then killed the leader. Once in a few dozen runs on a
+busy machine, the second kill came back `quorum risk: 1 council nodes already
+affected`. Nothing was affected. Everyone was healthy.
+
+A trace of the membership tables showed the culprit. The killed node's gossip
+loop had kept running behind the closed gate. Every probe it sent vanished, so
+it concluded that its two healthy peers were suspect and queued rumours saying
+so. The moment the gate reopened, those rumours went out. At equal incarnation,
+SWIM ranks `Suspect` above `Alive` (Chapter 2), so the other nodes believed them
+and dropped perfectly healthy voters from their live membership until the
+victims noticed and refuted. The refutations ricocheted for a second or so,
+incarnation numbers climbing, and our safety check counted whichever voter was
+mid-ricochet as down.
+
+A real dead process doesn't form opinions about its neighbours. So now the
+gossip node shares the node-kill gate with its transports, and while the gate
+is closed it skips the failure detector entirely, including a probe that was
+already waiting for an ACK when the gate shut:
+
+```rust
+if self.node_gate.is_quiesced() {
+    return;
+}
+```
+
+After the gate reopens, only the returning node's own refutation travels. The
+healthy peers keep their incarnation numbers, and there's nothing stale to
+spread.
+
+The second half is the ordering of the reply. The target used to answer the
+clear as soon as its local effect was reversed, while the reservation stayed
+held until the leader's reaper came round, fenced the grant and committed the
+release. So an inject straight after a clear could still be refused. The agent
+now reports the reservation the fault held (`FaultClearance { message,
+reservation }`), and the API waits, for up to four seconds, until the council
+has released it. The reaper can only fence the target by reaching it through
+the leader's own live membership, so a clear that succeeds means the leader
+that'll judge your next experiment has already seen this node come back. If the
+release doesn't arrive in time, you get a 504 telling you so. The agent keeps
+reporting the reservation until the grant is fenced, so retrying the clear
+waits again rather than returning an empty "not found" success.
+
+The lookup uses `bool::then_some`, which turns a condition into an `Option`:
+
+```rust
+let reservation = self
+    .node_fault_fence
+    .active
+    .and_then(|(sequence, id)| (id == fault_id).then_some(sequence));
+```
+
+`active` is an `Option<(u64, FaultId)>`. `and_then` runs the closure only when
+it holds a value, and the closure destructures the tuple right in its parameter
+list. `(id == fault_id).then_some(sequence)` is `Some(sequence)` when the ids
+match and `None` otherwise, so the clear of some other fault on the same node
+doesn't wait on a reservation it never owned.
+
 This is also why `relish chaos` had to go. Its `council-partition` command picked
 a node in its narrative but sent the fault through whichever node the CLI
 happened to talk to, and its `chaos heal` cleared *everything*, including faults

@@ -5559,7 +5559,21 @@ async fn fault_clear_handler(
     })
     .await
     {
-        Ok(Ok(msg)) => {
+        Ok(Ok(clearance)) => {
+            if let Some(sequence) = clearance.reservation
+                && !wait_for_node_fault_release(&state, sequence).await
+            {
+                return (
+                    StatusCode::GATEWAY_TIMEOUT,
+                    Json(serde_json::json!({
+                        "error": format!(
+                            "fault {id} is reversed on this node, but the cluster has not yet \
+                             released its reservation; retry the clear before injecting again"
+                        )
+                    })),
+                )
+                    .into_response();
+            }
             record_fault_audit(
                 &state,
                 FaultAudit {
@@ -5576,7 +5590,7 @@ async fn fault_clear_handler(
                 },
             )
             .await;
-            Json(serde_json::json!({ "message": msg })).into_response()
+            Json(serde_json::json!({ "message": clearance.message })).into_response()
         }
         Ok(Err(e)) => (
             StatusCode::BAD_REQUEST,
@@ -5584,6 +5598,40 @@ async fn fault_clear_handler(
         )
             .into_response(),
         Err(response) => response,
+    }
+}
+
+/// How long a clear waits for the council to release a node fault's
+/// reservation. It stays under the 5-second deadline a forwarding node gives
+/// the owning node, so a forwarded clear reports this node's own verdict.
+const NODE_FAULT_RELEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// Wait until the council no longer holds the reservation a cleared node fault
+/// owned, or the deadline passes. Returns whether it was released.
+///
+/// The leader's reaper releases a reservation only after it has fenced the
+/// target node through its own live membership view. So once this returns
+/// `true`, the leader that will judge the next node fault has already seen
+/// this node back, and the single experiment slot is free again.
+async fn wait_for_node_fault_release(state: &ApiState, sequence: u64) -> bool {
+    let Some(council) = &state.council else {
+        return true;
+    };
+    let deadline = tokio::time::Instant::now() + NODE_FAULT_RELEASE_TIMEOUT;
+    loop {
+        let released = council
+            .desired_state()
+            .await
+            .node_fault_reservations
+            .active
+            .is_none_or(|grant| grant.sequence != sequence);
+        if released {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 }
 

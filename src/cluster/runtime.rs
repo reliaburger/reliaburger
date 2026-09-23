@@ -233,6 +233,7 @@ pub async fn start(
         GossipConfig::default(),
         transport,
     );
+    node.set_node_gate(node_gate.clone());
     node.set_seeds(params.seeds.clone());
 
     let (membership_tx, membership_rx) = watch::channel::<Vec<MembershipSnapshot>>(Vec::new());

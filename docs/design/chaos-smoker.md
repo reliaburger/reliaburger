@@ -1078,6 +1078,8 @@ Simulates an abrupt node failure. Bun on the target node immediately stops respo
 
 Running containers on the "killed" node continue serving traffic that reaches them directly (simulating the real-world scenario where a node's network is partially reachable), but the cluster stops routing new traffic to them.
 
+> **Status (shipped).** One reference-counted `NodeTransportGate` drops the node's gossip, Raft and reporting traffic. The gossip node shares that gate and skips its failure detector while it is closed: a dead process forms no opinions, so the node has no stale `Suspect`/`Dead` rumours about healthy peers to spread when it returns. Only its own refutation travels. `DELETE /v1/fault/{id}` on the target reverses the effect and then waits (up to 4 s) until the council has released the fault's reservation. The leader's reaper releases it only after fencing the target through its own live membership, so a successful clear means the next node fault is judged on a cluster that has seen the node back; a timeout returns 504 and a retried clear waits again.
+
 ```rust
 fn simulate_node_kill(
     node_id: &str,
