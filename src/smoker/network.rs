@@ -7,9 +7,12 @@
 //! the agent recomputes the state every active fault *should* produce from
 //! the instances running right now, and converges on it. This module is the
 //! pure half of that: given the active faults and the local callers, what
-//! should the eBPF `fault_connect_map` hold?
+//! should the eBPF `fault_connect_map` hold, and whose open connections should
+//! a newly landed fault cut? It also runs the few host tools (`ss`) the agent
+//! needs inside a container's network namespace.
 
 use std::collections::BTreeMap;
+use std::net::SocketAddrV4;
 
 use super::types::{FaultRule, FaultType};
 
@@ -167,6 +170,161 @@ pub fn connect_fault_changes(
     }
 }
 
+/// Whether writing `entry` over `previous` is a fault *landing* on its key:
+/// the key is new, or it changed what it does (a drop became a partition).
+/// A refreshed expiry is not a landing.
+pub fn lands(previous: Option<&ConnectFaultEntry>, entry: &ConnectFaultEntry) -> bool {
+    previous.is_none_or(|previous| previous.action != entry.action)
+}
+
+/// A caller's established connections that a newly landed fault should cut.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectionCut {
+    /// The caller instance whose network namespace holds the connections.
+    pub instance_id: String,
+    /// Backend addresses (after the VIP rewrite) to cut connections to.
+    pub backends: Vec<SocketAddrV4>,
+}
+
+/// Which callers' open connections the newly landed keys should cut.
+///
+/// The connect hook only sees *new* connections, so a pooled client (a Redis
+/// or database pool, an HTTP keep-alive) would carry on as if nothing had
+/// happened. Cutting its established sockets makes it reconnect, and the
+/// reconnect meets the fault. A wildcard key cuts every local caller; a
+/// source-scoped key cuts the instance with that cgroup. `backends` gives the
+/// post-rewrite addresses behind a (virtual IP, port) pair: the sockets are
+/// connected to those, never to the VIP.
+pub fn connections_to_cut(
+    landed: &[ConnectFaultKey],
+    callers: &[LocalCaller],
+    backends: impl Fn(u32, u16) -> Vec<SocketAddrV4>,
+) -> Vec<ConnectionCut> {
+    let mut cuts: BTreeMap<&str, Vec<SocketAddrV4>> = BTreeMap::new();
+    for key in landed {
+        let addresses = backends(key.virtual_ip, key.port);
+        if addresses.is_empty() {
+            continue;
+        }
+        for caller in callers {
+            let affected =
+                key.source_cgroup_id == 0 || caller.cgroup_id == Some(key.source_cgroup_id);
+            if affected {
+                cuts.entry(caller.instance_id.as_str())
+                    .or_default()
+                    .extend(addresses.iter().copied());
+            }
+        }
+    }
+    cuts.into_iter()
+        .map(|(instance_id, mut backends)| {
+            backends.sort_unstable();
+            backends.dedup();
+            ConnectionCut {
+                instance_id: instance_id.to_string(),
+                backends,
+            }
+        })
+        .collect()
+}
+
+/// `ss` arguments that destroy every established TCP connection to one of
+/// `backends` (`ss -K` needs a kernel built with `CONFIG_INET_DIAG_DESTROY`).
+pub fn socket_destroy_args(backends: &[SocketAddrV4]) -> Vec<String> {
+    let mut args: Vec<String> = ["-K", "-tn", "state", "established", "("]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    for (index, backend) in backends.iter().enumerate() {
+        if index > 0 {
+            args.push("or".to_string());
+        }
+        args.push("dst".to_string());
+        args.push(backend.to_string());
+    }
+    args.push(")".to_string());
+    args
+}
+
+/// Why a command in a container's network namespace failed.
+#[derive(Debug, thiserror::Error)]
+pub enum NetnsCommandError {
+    /// The instance has no named network namespace (not a rootful runc
+    /// container, or it has gone).
+    #[error("instance {instance} has no network namespace")]
+    NoNamespace { instance: String },
+    /// The command could not be started.
+    #[error("failed to run {program} in {instance}'s network namespace: {source}")]
+    Spawn {
+        instance: String,
+        program: String,
+        source: std::io::Error,
+    },
+    /// The command ran and failed.
+    #[error("{program} in {instance}'s network namespace failed: {stderr}")]
+    Failed {
+        instance: String,
+        program: String,
+        stderr: String,
+    },
+    /// The command did not finish in time.
+    #[error("{program} in {instance}'s network namespace timed out")]
+    TimedOut { instance: String, program: String },
+}
+
+/// Run a host tool inside a runc container's network namespace
+/// (`ip netns exec rb-<instance> <program> <args>`), returning its stdout.
+///
+/// The tool comes from the host, not the image, so a distroless container
+/// gets the same treatment as a full one.
+#[cfg(target_os = "linux")]
+pub async fn run_in_instance_netns(
+    instance_id: &str,
+    program: &str,
+    args: &[String],
+) -> Result<String, NetnsCommandError> {
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    let path =
+        crate::grill::netns::namespace_path(&crate::grill::InstanceId(instance_id.to_string()));
+    let exists = tokio::fs::try_exists(&path).await.unwrap_or(false);
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return Err(NetnsCommandError::NoNamespace {
+            instance: instance_id.to_string(),
+        });
+    };
+    if !exists {
+        return Err(NetnsCommandError::NoNamespace {
+            instance: instance_id.to_string(),
+        });
+    }
+    let output = tokio::time::timeout(
+        TIMEOUT,
+        tokio::process::Command::new("ip")
+            .args(["netns", "exec", name, program])
+            .args(args)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| NetnsCommandError::TimedOut {
+        instance: instance_id.to_string(),
+        program: program.to_string(),
+    })?
+    .map_err(|source| NetnsCommandError::Spawn {
+        instance: instance_id.to_string(),
+        program: program.to_string(),
+        source,
+    })?;
+    if !output.status.success() {
+        return Err(NetnsCommandError::Failed {
+            instance: instance_id.to_string(),
+            program: program.to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -303,6 +461,77 @@ mod tests {
         let dns = rule(2, FaultType::DnsNxdomain);
         assert!(desired_connect_faults([&drop], |_| None, &[]).is_empty());
         assert!(desired_connect_faults([&dns], resolve, &[]).is_empty());
+    }
+
+    fn address(text: &str) -> SocketAddrV4 {
+        text.parse().unwrap()
+    }
+
+    #[test]
+    fn only_a_new_key_or_a_changed_action_is_a_landing() {
+        let drop = ConnectFaultEntry {
+            action: ConnectFaultAction::Drop { probability: 50 },
+            expires_ns: 10,
+        };
+        let later = ConnectFaultEntry {
+            expires_ns: 20,
+            ..drop
+        };
+        let partition = ConnectFaultEntry {
+            action: ConnectFaultAction::Partition,
+            expires_ns: 20,
+        };
+        assert!(lands(None, &drop));
+        assert!(!lands(Some(&drop), &later));
+        assert!(lands(Some(&drop), &partition));
+    }
+
+    #[test]
+    fn a_wildcard_key_cuts_every_caller_and_a_scoped_key_only_its_cgroup() {
+        let callers = [
+            caller("default/frontend-0", "frontend", "default", Some(11)),
+            caller("default/worker-0", "worker", "default", None),
+        ];
+        let backends = |_vip: u32, _port: u16| vec![address("10.1.0.5:6379")];
+
+        let everyone = connections_to_cut(&[key(0)], &callers, backends);
+        assert_eq!(
+            everyone
+                .iter()
+                .map(|cut| cut.instance_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["default/frontend-0", "default/worker-0"]
+        );
+
+        let scoped = connections_to_cut(&[key(11)], &callers, backends);
+        assert_eq!(
+            scoped,
+            vec![ConnectionCut {
+                instance_id: "default/frontend-0".to_string(),
+                backends: vec![address("10.1.0.5:6379")],
+            }]
+        );
+        assert!(connections_to_cut(&[key(11)], &callers, |_, _| Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn socket_destroy_arguments_match_any_backend() {
+        assert_eq!(
+            socket_destroy_args(&[address("10.1.0.5:6379"), address("192.168.5.2:30001")]),
+            [
+                "-K",
+                "-tn",
+                "state",
+                "established",
+                "(",
+                "dst",
+                "10.1.0.5:6379",
+                "or",
+                "dst",
+                "192.168.5.2:30001",
+                ")",
+            ]
+        );
     }
 
     #[test]

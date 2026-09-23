@@ -73,6 +73,18 @@ replica that starts, restarts or moves while the fault is active picks it up
 within a second, and when the fault expires or is cleared every node removes
 it. `relish fault clear redis` clears all of them at once.
 
+A drop or partition also cuts the connections the callers already hold open
+to the target's backends (Bun runs `ss -K` in each affected container's
+network namespace). Without that, a client with a connection pool, like
+podinfo's redis pool, would keep using its old connections and never notice.
+With it, the pool reconnects straight into the fault. In the podinfo demo the
+frontend's log says `cache set failed ... connect: operation not permitted`
+on the very next call. A `dns` fault doesn't cut anything: open connections
+were resolved before the fault, and only new lookups fail. Cutting needs a
+kernel built with `CONFIG_INET_DIAG_DESTROY` (stock Ubuntu has it), and only
+applies to containers with their own network namespace (runc), not to process
+workloads, whose sockets share the host's.
+
 ## Recovery catalogue
 
 `relish test --chaos` runs five destructive recovery checks, one at a time:

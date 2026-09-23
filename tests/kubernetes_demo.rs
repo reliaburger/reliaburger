@@ -63,9 +63,77 @@ impl Drop for Cleanup {
     }
 }
 
-#[tokio::test]
-#[ignore = "requires root, runc, nftables, bpffs and internet access (provisioned Linux VM)"]
-async fn podinfo_demo_frontend_reaches_backend_and_redis_by_name() {
+/// A podinfo demo applied to one real Runc node, cleaned up when dropped.
+struct Demo {
+    root: PathBuf,
+    api: std::net::SocketAddr,
+    /// Talks to the ingress by the demo's host name.
+    http: reqwest::Client,
+    /// `http://podinfo.localhost:<ingress port>`.
+    base: String,
+    // Field order is drop order: stop Bun, then clean up after it.
+    _bun: BunProcess,
+    _cleanup: Cleanup,
+}
+
+impl Demo {
+    fn log(&self) -> String {
+        std::fs::read_to_string(self.root.join("bun.log")).unwrap_or_default()
+    }
+
+    fn client(&self) -> BunClient {
+        BunClient::new(&format!("http://{}", self.api))
+    }
+
+    /// The frontends' recent log lines about the cache, for the record.
+    async fn frontend_cache_logs(&self) -> String {
+        let options = reliaburger::relish::client::LogOptions {
+            tail: Some(12),
+            follow: false,
+            grep: Some("cache".to_string()),
+            start: None,
+            json_field: None,
+        };
+        self.client()
+            .logs("frontend", "default", &options)
+            .await
+            .unwrap_or_else(|error| format!("(logs unavailable: {error})"))
+    }
+
+    /// Write a value through the frontend into redis and read it back.
+    async fn cache_round_trip(&self, value: &str) -> Result<String, String> {
+        let stored = self
+            .http
+            .post(format!("{}/cache/demo", self.base))
+            .body(value.to_string())
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        if !stored.status().is_success() {
+            let status = stored.status();
+            let body = stored.text().await.unwrap_or_default();
+            return Err(format!("store: {status} {body}"));
+        }
+        let read = self
+            .http
+            .get(format!("{}/cache/demo", self.base))
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        let status = read.status();
+        let body = read.text().await.unwrap_or_default();
+        if status.is_success() && body.contains(value) {
+            Ok(body)
+        } else {
+            Err(format!("read: {status} {body}"))
+        }
+    }
+}
+
+/// Start one Runc Bun with eBPF, DNS and ingress, apply the podinfo manifest
+/// and wait until the frontend answers and reaches the backend and redis by
+/// name. `extra_config` is appended to the node config.
+async fn start_demo(extra_config: &str) -> Demo {
     assert!(nix::unistd::geteuid().is_root(), "run as root");
     let root = tempfile::tempdir().unwrap().keep();
     let mut cleanup = Cleanup {
@@ -96,6 +164,7 @@ listen = "0.0.0.0:53"
 enabled = true
 http_port = {ingress}
 https_port = {https}
+{extra_config}
 "#,
             root = root.display(),
             https = reserve_address().port(),
@@ -174,36 +243,113 @@ https_port = {https}
     .unwrap_or_else(|| panic!("frontend never reached the backend by name:\n{}", log()));
     assert!(echoed.contains("reliaburger-demo"), "{echoed}");
 
+    let demo = Demo {
+        root,
+        api,
+        http,
+        base,
+        _bun: bun,
+        _cleanup: cleanup,
+    };
     // The frontend's /cache API stores in --cache-server=tcp://redis:6379.
     let cached = eventually(Duration::from_secs(60), || async {
-        let stored = http
-            .post(format!("{base}/cache/demo"))
-            .body("kept-in-redis")
-            .send()
-            .await
-            .ok()?;
-        if !stored.status().is_success() {
-            return None;
-        }
-        let read = http.get(format!("{base}/cache/demo")).send().await.ok()?;
-        let body = read.text().await.ok()?;
-        body.contains("kept-in-redis").then_some(body)
+        demo.cache_round_trip("kept-in-redis").await.ok()
     })
     .await;
     assert!(
         cached.is_some(),
         "frontend never reached redis by name:\n{}",
-        log()
+        demo.log()
     );
+    demo
+}
+
+#[tokio::test]
+#[ignore = "requires root, runc, nftables, bpffs and internet access (provisioned Linux VM)"]
+async fn podinfo_demo_frontend_reaches_backend_and_redis_by_name() {
+    let demo = start_demo("").await;
 
     // Three frontends, as the manifest asks.
-    let client = BunClient::new(&format!("http://{api}"));
-    let statuses = client.cluster_status().await.unwrap();
+    let statuses = demo.client().cluster_status().await.unwrap();
     let frontends = statuses
         .iter()
         .filter(|row| row.instance.app_name == "frontend")
         .count();
     assert_eq!(frontends, 3, "{statuses:?}");
+}
+
+/// The tour's fault beats on the real demo: network faults act on the
+/// frontend's own connections to redis, including the ones its pool already
+/// holds open.
+#[tokio::test]
+#[ignore = "requires root, runc, nftables, bpffs and internet access (provisioned Linux VM)"]
+async fn podinfo_demo_feels_network_faults_between_frontend_and_redis() {
+    use reliaburger::smoker::types::{FaultRequest, FaultType};
+
+    let demo = start_demo(
+        r#"
+[testing]
+safety_class = "development"
+allowed_operations = ["inject_workload_faults"]
+"#,
+    )
+    .await;
+    let client = demo.client();
+    let fault = |fault_type| FaultRequest {
+        fault_type,
+        target_service: "redis".to_string(),
+        namespace: Some("default".to_string()),
+        target_instance: None,
+        target_node: None,
+        duration: Duration::from_secs(120),
+        injected_by: String::new(),
+        reason: Some("tour".to_string()),
+        include_leader: false,
+        override_safety: false,
+        acknowledged: true,
+    };
+
+    // Z6.1 + Z6.2: a partition from the frontend cuts the connections its
+    // redis pool already holds, so the very next cache call fails instead of
+    // riding an old connection.
+    demo.cache_round_trip("before-the-partition")
+        .await
+        .expect("the pool is warm before the fault");
+    client
+        .inject_fault(&fault(FaultType::Partition {
+            source_app: Some("frontend".to_string()),
+        }))
+        .await
+        .unwrap_or_else(|error| panic!("partition refused: {error}\n{}", demo.log()));
+    // The ingress spreads calls over the three frontends, so six calls
+    // reach each one's pool twice. Every one must fail straight away.
+    let mut outcomes = Vec::new();
+    for attempt in 0..6 {
+        outcomes.push(
+            demo.cache_round_trip(&format!("during-the-partition-{attempt}"))
+                .await,
+        );
+    }
+    eprintln!("under partition, podinfo says: {outcomes:?}");
+    eprintln!(
+        "frontend logs under partition:\n{}",
+        demo.frontend_cache_logs().await
+    );
+    assert!(
+        outcomes.iter().all(Result::is_err),
+        "a frontend kept reaching redis through a partition: {outcomes:?}\n{}",
+        demo.log()
+    );
+
+    client
+        .clear_faults_by_service("redis", Some("default"))
+        .await
+        .unwrap();
+    let healed = eventually(Duration::from_secs(20), || async {
+        demo.cache_round_trip("after-the-partition").await.ok()
+    })
+    .await;
+    assert!(healed.is_some(), "redis never came back:\n{}", demo.log());
 }
 
 /// Poll `check` until it returns `Some`, for at most `limit`.

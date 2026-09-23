@@ -533,6 +533,66 @@ really running first), so the agent caches the id per instance and restart
 count. A restart bumps the count, the next tick looks the cgroup up again, and
 the new cgroup gets its key.
 
+### The pool that didn't notice
+
+With the partition landing on the right node, we ran the demo again. `relish
+fault partition redis --from frontend`, then a cache call through podinfo.
+It worked. So did the next one, and the one after that.
+
+The connect hook is a *connect* hook. It decides whether a new connection may
+start; a connection that already exists never calls `connect()` again.
+podinfo's redis client keeps a small pool of open connections, as nearly every
+database or cache client does, so it never asked. The partition was real, and
+completely invisible, which is the worst kind of chaos experiment: you walk
+away believing your app survives losing redis.
+
+Linux can close someone else's socket for you. The `inet_diag` interface that
+`ss` uses to list sockets also has a destroy operation (when the kernel is
+built with `CONFIG_INET_DIAG_DESTROY`, as stock Ubuntu is), and `ss -K` exposes
+it. So when a drop or partition key *lands* on a node (a new key, or a drop
+that became a partition, but not a refreshed expiry), the agent works out
+whose connections it should cut, in another pure function:
+
+```rust
+let affected =
+    key.source_cgroup_id == 0 || caller.cgroup_id == Some(key.source_cgroup_id);
+if affected {
+    cuts.entry(caller.instance_id.as_str())
+        .or_default()
+        .extend(addresses.iter().copied());
+}
+```
+
+A wildcard key cuts every local caller; a scoped one only the instance with
+that cgroup. `caller.cgroup_id == Some(...)` compares an `Option<u64>` with a
+wrapped value, so a caller whose cgroup we couldn't prove simply doesn't
+match. There's no null to trip over. `addresses` are the *backend* addresses
+from the service map, not the VIP: by the time a socket exists, the connect
+hook has already rewritten its destination.
+
+Then, for each cut, the agent runs the host's `ss` inside the container's
+network namespace:
+
+```text
+ip netns exec rb-default__frontend-0 ss -K -tn state established ( dst 10.202.142.7:6379 )
+```
+
+Using the host's tools rather than the image's means a distroless container
+gets the same treatment as a full Debian one. We considered the eBPF
+alternative, a `bpf_sock_destroy()` socket iterator, which avoids the
+subprocess. It needs kernel 6.5 or later and a second BPF program to load and
+keep working; `ss` was already on every host that runs `ip netns`.
+
+The demo now fails the way it should. The frontend's very next cache call
+redials, and its log says so:
+
+```text
+cache set failed: dial tcp 127.128.202.174:6379: connect: operation not permitted
+```
+
+We checked the claim the honest way, too: with the cut switched off, the same
+test's six cache calls through a partition all succeeded.
+
 ## One experiment at a time
 
 The quorum rail counts faults on the node that receives the request. Now picture

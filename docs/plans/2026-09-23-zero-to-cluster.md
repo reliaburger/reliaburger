@@ -209,7 +209,7 @@ beat needs product work first:
   faults go to every node; source-scoped ones (`--from`) to the nodes running
   the source. Filter sources by namespace, and apply a running fault to source
   instances that start while it's active.
-- [ ] **Z6.2 Affect existing connections.** When a drop or partition lands,
+- [x] **Z6.2 Affect existing connections.** When a drop or partition lands,
   destroy the matching established sockets in each source container's network
   namespace, so pooled clients reconnect into the fault.
 - [ ] **Z6.3 A latency fault.** `relish fault delay redis 300ms --from frontend`

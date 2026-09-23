@@ -5769,7 +5769,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             BpfConnectFaultValue, FAULT_ACTION_DROP, FAULT_ACTION_PARTITION, partition_fault_key,
         };
         use crate::smoker::network::{
-            ConnectFaultAction, connect_fault_changes, desired_connect_faults,
+            ConnectFaultAction, connect_fault_changes, connections_to_cut, desired_connect_faults,
+            lands,
         };
 
         let Some(handle) = self.onion_ebpf.clone() else {
@@ -5788,6 +5789,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
 
         let mut failures = Vec::new();
+        let mut landed = Vec::new();
         let mut ebpf = handle.lock().await;
         for key in changes.delete {
             let bpf_key = partition_fault_key(key.virtual_ip, key.port, key.source_cgroup_id);
@@ -5814,9 +5816,30 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             let bpf_key = partition_fault_key(key.virtual_ip, key.port, key.source_cgroup_id);
             match bpf_maps::write_connect_fault(&mut ebpf.bpf, bpf_key, value) {
                 Ok(()) => {
+                    if lands(self.network_faults.connect.get(&key), &entry) {
+                        landed.push(key);
+                    }
                     self.network_faults.connect.insert(key, entry);
                 }
                 Err(error) => failures.push(format!("write {key:?}: {error}")),
+            }
+        }
+        drop(ebpf);
+
+        // The hook only refuses new connections, so cut the ones already
+        // open: a pooled client reconnects straight into the fault.
+        let cuts = connections_to_cut(&landed, &callers, |virtual_ip, port| {
+            backend_addresses(&services, virtual_ip, port)
+        });
+        for cut in cuts {
+            let args = crate::smoker::network::socket_destroy_args(&cut.backends);
+            match crate::smoker::network::run_in_instance_netns(&cut.instance_id, "ss", &args).await
+            {
+                // Process and host-network workloads have no namespace of
+                // their own; their sockets live in the host's, among every
+                // other caller's, so they are left alone.
+                Ok(_) | Err(crate::smoker::network::NetnsCommandError::NoNamespace { .. }) => {}
+                Err(error) => eprintln!("smoker: cutting open connections: {error}"),
             }
         }
         if failures.is_empty() {
@@ -11867,6 +11890,26 @@ fn fault_vip_port(
         rule.target_service.as_str(),
     ))?;
     Some((entry.vip.to_network_byte_order(), entry.port.to_be()))
+}
+
+/// The post-rewrite backend addresses behind a service's (virtual IP, port),
+/// both in network byte order: what a caller's sockets are connected to once
+/// the connect hook has picked a backend.
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+fn backend_addresses(
+    services: &crate::onion::service_map::ServiceMap,
+    virtual_ip: u32,
+    port: u16,
+) -> Vec<std::net::SocketAddrV4> {
+    services
+        .resolve_all()
+        .into_iter()
+        .filter(|entry| {
+            entry.vip.to_network_byte_order() == virtual_ip && entry.port.to_be() == port
+        })
+        .flat_map(|entry| entry.backends.iter())
+        .map(|backend| std::net::SocketAddrV4::new(backend.node_ip, backend.host_port))
+        .collect()
 }
 
 const DNS_TRACE_SCRIPT: &str = r#"

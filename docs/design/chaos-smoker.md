@@ -138,6 +138,20 @@ All fault injection requests flow through the cluster API on the leader node:
   a tick; two faults that want the same `fault_connect_map` key resolve to the
   stronger one (partition over drop, likelier drop over gentler), and clearing
   one rewrites the key for the other rather than deleting it.
+- **Cutting open connections.** The connect hook only sees new connections,
+  so when a drop or partition key *lands* (a new key, or a drop turning into a
+  partition) Bun destroys the matching established TCP sockets in each
+  affected caller's network namespace: `ip netns exec rb-<instance> ss -K -tn
+  state established ( dst <backend> or ... )`, with the post-rewrite backend
+  addresses from the service map. A wildcard key cuts every local runc
+  caller, a source-scoped key only the instance with that cgroup. Pooled
+  clients reconnect and meet the fault. We chose `ss -K` (SOCK_DESTROY over
+  inet_diag, `CONFIG_INET_DIAG_DESTROY`, present in stock Ubuntu kernels) over
+  a `bpf_sock_destroy()` iterator: the kfunc needs kernel 6.5+ and a second
+  BPF program, while `ss` ships with iproute2 on every host that already runs
+  `ip netns`. DNS faults cut nothing (open connections resolved before the
+  fault), and process workloads, whose sockets share the host namespace, are
+  left alone.
 - **Audit logging.** Every successful injection and reversal is logged as a
   structured cluster event with the authenticated credential principal,
   action, target, type and duration. Source address is not yet an event field.
