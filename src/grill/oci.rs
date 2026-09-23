@@ -27,8 +27,8 @@ pub struct OciSpec {
     /// Host-port publication for the workload, when the app declares a
     /// port. Not part of the OCI runtime spec proper — runtimes with
     /// per-container networking (runc) read it to install the DNAT map
-    /// element alongside the network namespace. `#[serde(default)]`
-    /// keeps instance records written before this field readable.
+    /// element alongside the network namespace. `None` is omitted from
+    /// the serialised spec, so `#[serde(default)]` reads it back.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port_mapping: Option<PortMapping>,
 }
@@ -758,7 +758,7 @@ mod tests {
     }
 
     #[test]
-    fn port_mapping_survives_record_round_trip_and_old_records_default() {
+    fn port_mapping_survives_record_round_trip() {
         // New records carry the mapping through serde…
         let spec: AppSpec = toml::from_str(r#"image = "t:v1""#).unwrap();
         let mut oci = generate_oci_spec("web", "default", &spec, "web-0", None, "/cg", None, None);
@@ -770,11 +770,12 @@ mod tests {
         let back: OciSpec = serde_json::from_str(&json).unwrap();
         assert_eq!(back.port_mapping, oci.port_mapping);
 
-        // …and records written before the field existed still parse.
-        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
-        value.as_object_mut().unwrap().remove("port_mapping");
-        let old: OciSpec = serde_json::from_value(value).unwrap();
-        assert_eq!(old.port_mapping, None);
+        // …and so does its absence, which serde omits from the record.
+        oci.port_mapping = None;
+        let json = serde_json::to_string(&oci).unwrap();
+        assert!(!json.contains("port_mapping"));
+        let back: OciSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.port_mapping, None);
     }
 
     #[test]

@@ -28,9 +28,6 @@ pub struct UpgradeDirective {
     /// the artefact and stages it as a `LocalFile`, but it is still a network
     /// upgrade and must require the operator's external signature. Verification
     /// treats the upgrade as network when this is set OR the source is network.
-    /// `#[serde(default)]` so directives from older peers still parse (as
-    /// non-network, matching their old behaviour).
-    #[serde(default)]
     pub network_provenance: bool,
 }
 

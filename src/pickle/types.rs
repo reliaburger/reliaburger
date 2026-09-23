@@ -170,7 +170,6 @@ impl ImageManifest {
 pub struct ManifestCommit {
     /// GC generation observed while verifying the publishing node's local blobs.
     /// Cluster publication refuses if collection advanced any declared holder.
-    #[serde(default)]
     pub observed_gc_generation: u64,
     /// The manifest to store.
     pub manifest: ImageManifest,
@@ -246,7 +245,6 @@ pub struct ImageSummary {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ManifestCatalog {
     /// Exact lease generation owning each reserved repository, even before a manifest.
-    #[serde(default)]
     pub repository_owners: BTreeMap<String, String>,
     /// Per-repository manifest rows, carrying their content digest as the key.
     /// Identical content may have independent tags in several repositories.
