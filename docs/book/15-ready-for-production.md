@@ -137,6 +137,91 @@ involve the real world, so their acceptance tests keep real deadlines in `make t
 the cluster suite. We haven't weakened those assertions merely to make the quick suite look
 quick.
 
+### Waiting out a timeout is still sleeping
+
+A sleep hides in plenty of tests that never call `sleep`. When we sorted the portable suite
+by duration, nineteen tests took an exact multiple of five seconds: 231 seconds between them,
+spent proving that a stalled peer, an ignored SIGTERM or a silent socket hits its deadline.
+The assertion was right. The wait was the production deadline, served in full, every run.
+
+We used three tools, and choosing between them is the interesting part.
+
+**Pause the clock, when every deadline in play is a Tokio timer.** A registry route that must
+answer 408 to a body that never arrives, a cluster status request to a member that accepts
+the connection and says nothing, a compatibility probe of a binary that sleeps forever: in
+each, the only thing that can end the wait is a `tokio::time::timeout`. Calling
+`tokio::time::pause()` just before the request makes Tokio jump straight to the next timer
+whenever the runtime has nothing else to do. The outer guard in the test is a later timer, so
+a missing deadline still fails instead of passing. We call `pause()` mid-test rather than
+using `start_paused`, after the fixtures are up, and only where nothing in flight needs real
+time to make progress. Paused time treats "waiting on a socket" as idle, so a test whose
+server must genuinely answer first can't use it: the clock would expire the request before
+the reply arrived, and the test would pass for the wrong reason.
+
+**Inject the deadline, when real time is involved.** The agent's ten-second stop grace, the
+placement reconciler's I/O deadline, the registry forwarder's proposal deadline, the Apple CLI
+inspection bound and the renewal worker's retry pause are all now fields with the production
+value as their default. Tests whose peer stalls *permanently* set a short one:
+
+```rust
+pub fn set_stop_grace(&mut self, grace: std::time::Duration) {
+    self.stop_grace = grace;
+}
+```
+
+It's a setter, not a global and not an environment variable, so one test's short grace can't
+leak into another running in the same process. The rule we held to: shorten a deadline only
+when the thing it bounds never happens in the test. A runtime that ignores SIGTERM for the
+whole test proves escalation just as well after 200 milliseconds as after ten seconds. The
+`relish wtf --watch` refresh became a real `--interval` flag rather than a test-only knob,
+since an operator watching an incident wants a faster refresh too.
+
+**Observe the end of the work, when proving that something didn't happen.** The hardest four
+checked that a cancelled process-owner mutation can't touch the generation that replaced it.
+Dropping the caller's future doesn't cancel a `spawn_blocking` closure that's already queued,
+which is the whole point of the test, so the old version watched the owner record for twenty
+seconds. A shorter window would have let a slow regression pass silently. Instead, the process
+control layer now counts its blocking operations, and the count lives inside the closure:
+
+```rust
+struct InFlight(Arc<AtomicUsize>);
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+let in_flight = InFlight::enter(&self.in_flight);
+tokio::task::spawn_blocking(move || {
+    let _in_flight = in_flight;
+    operation(this, id)
+})
+```
+
+`Arc<AtomicUsize>` is a reference-counted pointer to an integer that several threads can
+update without a lock; `fetch_add` and `fetch_sub` are atomic increments and decrements.
+`impl Drop` is Rust's destructor hook, the same idea as a C++ destructor or Go's `defer`
+attached to a value instead of a function. The `move` closure takes ownership of the guard,
+so it's dropped when the closure finishes, not when the caller stops waiting. The leading
+underscore in `_in_flight` keeps the binding alive to the end of the closure; a bare `_`
+would drop it immediately. When the count reaches zero, nothing queued can still change the
+record, so the test checks it at once. We confirmed it still bites by reintroducing the old
+bug: the start, stop and kill variants each failed within half a second.
+
+Not everything in the slow list was a timeout. Most of the API authorisation tests spent
+their time in Argon2id, which is slow by design and much slower again without optimisation. Cargo lets one
+crate be optimised inside an otherwise debug build, and we already did that for SHA-256, so
+`argon2` and `blake2` joined it. The slowest of those tests fell from nearly nine seconds to
+a third of a second. One test unpacked 65,537 empty files to prove the entry cap; the cap
+counts entries, not files, so the same directory repeated 65,537 times proves the same limit
+without half a minute of file creation.
+
+A few stayed slow on purpose. Two job tests wait four seconds to prove no spurious retry
+follows a success, and the retry backoff they cross runs on `std::time::Instant`, which no
+paused clock can move. The rollout ownership tests are bounded by the two-second force-kill
+confirmation, which has its own configuration work ahead of it.
+
 ## A harness owns what it starts
 
 Spawning a task transfers ownership of its captured values into that task. Tokio returns a
