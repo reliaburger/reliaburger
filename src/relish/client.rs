@@ -1120,6 +1120,32 @@ impl BunClient {
             .await
     }
 
+    /// Fetch one app's metrics from `start` (unix seconds) on, optionally
+    /// one metric by name and only the newest `per_series` samples of each
+    /// series. The node answering fans out to every node running the app.
+    pub async fn app_metrics_since(
+        &self,
+        app: &str,
+        namespace: &str,
+        name: Option<&str>,
+        start: u64,
+        per_series: Option<u32>,
+    ) -> Result<crate::mayo::rollup::MetricsQueryResult, RelishError> {
+        let mut query = url::form_urlencoded::Serializer::new(String::new());
+        query.append_pair("start", &start.to_string());
+        if let Some(name) = name {
+            query.append_pair("name", name);
+        }
+        if let Some(per_series) = per_series {
+            query.append_pair("per_series", &per_series.to_string());
+        }
+        self.get_typed_json(&format!(
+            "/v1/metrics/app/{app}/{namespace}?{}",
+            query.finish()
+        ))
+        .await
+    }
+
     async fn get_typed_json<T: serde::de::DeserializeOwned>(
         &self,
         path: &str,

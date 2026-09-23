@@ -49,6 +49,43 @@ few seconds). A `-` means no sample yet. A node that doesn't answer becomes a
 relish top                       # every node's workloads, with CPU and memory
 ```
 
+### Your app's own metrics
+
+An app that serves Prometheus text declares it, and each node scrapes its own
+instances every 10 seconds. You don't install Prometheus, and the metrics port
+needn't be published:
+
+```toml
+[app.web]
+port = 8080
+metrics = {}                     # http://<instance>:8080/metrics
+# metrics = { port = 9797, path = "/prom" }
+```
+
+Kubernetes manifests get this from their `prometheus.io/scrape`, `port` and
+`path` pod annotations. `relish metrics` reads what was scraped, through
+whichever node you talk to:
+
+```sh
+relish metrics web                           # every metric, one number each
+relish metrics web --name http_requests_total   # per instance, with a trend
+relish metrics web --name http_request_duration_seconds --since 1h
+```
+
+```text
+METRIC                         TYPE       SERIES  INSTANCES  VALUE
+http_request_duration_seconds  histogram       2          2  mean 11.9ms
+http_requests_total            counter         4          2  8.40/s
+up                             gauge           2          2  2
+```
+
+A counter (`_total`) shows its per-second rate, a histogram its mean
+observation, anything else its latest value, each added up across instances.
+With `--name` you get one line per instance, a rate for counters and a
+sparkline; a histogram named by its base shows mean latency per instance.
+`up` is 1 while an instance's last scrape worked and 0 when it failed. The
+app's page in the web dashboard charts the same data, one line per instance.
+
 Alert rules evaluate in the agent; `[[alerts.destinations]]` webhooks (with
 optional HMAC signing) deliver them. Council members hold cluster-wide
 rollups so one node can answer for the fleet.

@@ -15,6 +15,23 @@ pub enum OutputFormat {
     Yaml,
 }
 
+/// A one-line chart of `values` in block characters, scaled from the
+/// smallest value (`▁`) to the largest (`█`). Shared by the TUI and
+/// `relish metrics`.
+pub fn sparkline(values: &[f64]) -> String {
+    const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let min = values.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let range = (max - min).max(f64::EPSILON);
+    values
+        .iter()
+        .map(|value| {
+            let index = (((value - min) / range) * (BARS.len() - 1) as f64).round() as usize;
+            BARS[index.min(BARS.len() - 1)]
+        })
+        .collect()
+}
+
 /// Format a value for display in the chosen output format.
 ///
 /// - `Human` calls the value's `Display` implementation.

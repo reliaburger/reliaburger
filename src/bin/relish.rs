@@ -126,6 +126,24 @@ enum Command {
     },
     /// Show every workload on every node, with its latest CPU and memory.
     Top,
+    /// Show an app's own Prometheus metrics, scraped by the nodes running it.
+    ///
+    /// Without --name, lists every metric with one number: a gauge's value,
+    /// a counter's rate, a histogram's mean. With --name, one line per
+    /// instance with a sparkline.
+    Metrics {
+        /// App name.
+        app: String,
+        /// Namespace the app lives in.
+        #[arg(long, default_value = "default")]
+        namespace: String,
+        /// One metric to show per instance (a histogram by its base name).
+        #[arg(long)]
+        name: Option<String>,
+        /// How far back to look (e.g. "90s", "15m", "1h").
+        #[arg(long, default_value = "15m")]
+        since: String,
+    },
     /// Execute a command inside a running container.
     Exec {
         /// App name.
@@ -1162,6 +1180,21 @@ async fn main() -> ExitCode {
             ref sql,
         } => commands::logs_search(source, sql).await,
         Command::Top => commands::top(cli.output).await,
+        Command::Metrics {
+            ref app,
+            ref namespace,
+            ref name,
+            ref since,
+        } => {
+            reliaburger::relish::metrics_cmd::metrics(
+                app,
+                namespace,
+                name.as_deref(),
+                since,
+                cli.output,
+            )
+            .await
+        }
         Command::Exec {
             ref app,
             ref command,
@@ -2573,6 +2606,33 @@ mod tests {
     fn parse_top_command() {
         let cli = parse(&["relish", "top"]).unwrap();
         assert!(matches!(cli.command, Command::Top));
+    }
+
+    #[test]
+    fn parse_metrics_command_defaults_and_flags() {
+        let cli = parse(&["relish", "metrics", "web"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Metrics { ref app, ref namespace, name: None, ref since }
+                if app == "web" && namespace == "default" && since == "15m"
+        ));
+        let cli = parse(&[
+            "relish",
+            "metrics",
+            "web",
+            "--namespace",
+            "shop",
+            "--name",
+            "http_requests_total",
+            "--since",
+            "1h",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Metrics { ref namespace, name: Some(ref name), ref since, .. }
+                if namespace == "shop" && name == "http_requests_total" && since == "1h"
+        ));
     }
 
     #[test]

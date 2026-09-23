@@ -30,6 +30,7 @@ pub mod k8s_import;
 pub mod local_context;
 pub mod manifest;
 pub mod manual;
+pub mod metrics_cmd;
 pub mod output;
 pub mod plan;
 pub mod quickstart;

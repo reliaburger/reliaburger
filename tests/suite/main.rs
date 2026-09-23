@@ -20,6 +20,7 @@ use cluster_support::task_harness;
 mod agent_cluster;
 mod api_tls;
 mod api_tokens;
+mod app_metrics;
 mod batch;
 mod bun_auth_startup;
 mod compatibility;

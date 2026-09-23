@@ -657,7 +657,8 @@ Commands:
 | `bench [--quick] [--compare <file>]` | Run reproducible data-plane benchmarks (`--disruptive`/`--capacity` need `--yes`) |
 | `resolve <name>` | Resolve a service name to its VIP and backends |
 | `routes` | Show ingress routing table |
-| `top` | Print a workload table (app, namespace, state, PID, restarts); it does not show live CPU/memory |
+| `top` | Every workload on every node with its latest CPU and memory |
+| `metrics <app> [--name <metric>] [--since 15m]` | An app's scraped Prometheus metrics: one number per metric, or one line per instance with a rate and sparkline |
 | `deploy <path>` | Trigger a rolling deploy for an app |
 | `history <app>` | Show deploy history for an app |
 | `rollback <app>` | Rollback an app to the previous version |
