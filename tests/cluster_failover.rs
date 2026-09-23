@@ -112,6 +112,38 @@ impl NodeHarness {
     }
 }
 
+/// The voter set that every listed member has applied, once they all agree.
+///
+/// A node's Raft metrics show a membership entry as soon as it is appended,
+/// before it commits, and a joint configuration reports the union of its old
+/// and new voters. So the leader can show three voters while it is still
+/// half-way from `{a, b}` to `{a, b, c}`. Killing it then leaves the
+/// survivors on a joint configuration whose old half needs the dead leader,
+/// and no election can succeed. Only a uniform configuration which every
+/// survivor has applied (so it is committed) makes a leader kill safe.
+fn settled_voters(nodes: &[&NodeHarness]) -> Option<BTreeSet<u64>> {
+    let mut agreed: Option<(openraft::LogId<u64>, BTreeSet<u64>)> = None;
+    for node in nodes {
+        let metrics = node.metrics_rx.borrow();
+        let stored = &metrics.membership_config;
+        let membership = stored.membership();
+        let log_id = (*stored.log_id())?;
+        if membership.get_joint_config().len() != 1
+            || metrics.last_applied.is_none_or(|applied| applied < log_id)
+        {
+            return None;
+        }
+        let voters: BTreeSet<u64> = membership.voter_ids().collect();
+        match &agreed {
+            None => agreed = Some((log_id, voters)),
+            Some((agreed_id, agreed_voters))
+                if *agreed_id == log_id && *agreed_voters == voters => {}
+            Some(_) => return None,
+        }
+    }
+    agreed.map(|(_, voters)| voters)
+}
+
 /// Start one fully wired node: the same subsystems `bun --cluster` runs.
 async fn start_node(index: usize, seeds: Vec<SocketAddr>, root: &CancellationToken) -> NodeHarness {
     start_node_with_scheduler(index, seeds, root, true).await
@@ -398,9 +430,14 @@ async fn service_on_one_node_resolves_and_survives_leader_change_from_another() 
     // Wait for the council to commit all three as voters before deploying:
     // killing the leader before the voter set settles can leave the survivors
     // without a committed quorum, and election stalls.
-    wait_until("three voters", Duration::from_secs(60), async || {
-        nodes[0].voter_count() == N
-    })
+    wait_until(
+        "three settled voters",
+        Duration::from_secs(60),
+        async || {
+            settled_voters(&nodes.iter().collect::<Vec<_>>())
+                .is_some_and(|voters| voters.len() == N)
+        },
+    )
     .await;
     wait_until(
         "all nodes reporting to the leader",
@@ -652,7 +689,10 @@ async fn lease_retirement_waits_for_paused_worker_across_leader_change() {
     wait_until(
         "three committed voters",
         Duration::from_secs(60),
-        async || nodes[0].voter_count() == 3,
+        async || {
+            settled_voters(&nodes.iter().collect::<Vec<_>>())
+                .is_some_and(|voters| voters.len() == 3)
+        },
     )
     .await;
     let now = now_unix_millis();
@@ -824,9 +864,14 @@ async fn decommissioned_worker_releases_cleanup_and_stays_retired_after_leader_c
             .await,
         );
     }
-    wait_until("three voters", Duration::from_secs(60), async || {
-        nodes[0].voter_count() == 3
-    })
+    wait_until(
+        "three settled voters",
+        Duration::from_secs(60),
+        async || {
+            settled_voters(&nodes.iter().collect::<Vec<_>>())
+                .is_some_and(|voters| voters.len() == 3)
+        },
+    )
     .await;
     let now = now_unix_millis();
     let lease = TestLease::new(
@@ -896,9 +941,12 @@ async fn decommissioned_worker_releases_cleanup_and_stays_retired_after_leader_c
         .await
         .unwrap();
     wait_until(
-        "retired voter removed",
+        "retired voter removed on both survivors",
         Duration::from_secs(30),
-        async || !nodes[0].voter_ids().contains(&nodes[2].raft_id),
+        async || {
+            settled_voters(&[&nodes[0], &nodes[1]])
+                .is_some_and(|voters| !voters.contains(&nodes[2].raft_id))
+        },
     )
     .await;
     assert!(
@@ -926,10 +974,16 @@ async fn decommissioned_worker_releases_cleanup_and_stays_retired_after_leader_c
         )
         .await,
     );
+    // Every survivor, not just the leader, must have applied the promotion
+    // before the leader dies, or the election below can never be won.
     wait_until(
-        "fresh replacement voter",
+        "fresh replacement voter applied by every member",
         Duration::from_secs(60),
-        async || nodes[0].voter_count() == 3 && nodes[0].voter_ids().contains(&nodes[3].raft_id),
+        async || {
+            settled_voters(&[&nodes[0], &nodes[1], &nodes[3]]).is_some_and(|voters| {
+                voters == BTreeSet::from([nodes[0].raft_id, nodes[1].raft_id, nodes[3].raft_id])
+            })
+        },
     )
     .await;
     nodes[0].shutdown.cancel();
