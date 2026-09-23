@@ -326,15 +326,22 @@ VM). A fix counts only when the loop that used to fail passes.
   member permanently, and more rounds don't help. Add a periodic push-pull
   sync (SWIM's usual answer) and an unseeded property test.
 
-- [ ] **C6.6 Say why an initialiser failed.** When Runc refuses to start a
+- [x] **C6.6 Say why an initialiser failed.** When Runc refuses to start a
   container in an occupied cgroup, the deploy reports only "init container 0
   failed"; the real reason sits in the owner's captured stderr, and the
   reconciler drops the error text. Surface both.
-- [ ] **C6.7 Unique names in the remaining crash tests.** Other `oci_crash`
+- [x] **C6.7 Unique names in the remaining crash tests.** Other `oci_crash`
   tests still use fixed app names (`restart-crash`, `upgrade-owned`), so a test
   binary killed with SIGKILL can still leave a cgroup that breaks the next run.
-- [ ] **C6.8 eBPF tests that write to the host's volumes directory.** Some
+- [x] **C6.8 eBPF tests that write to the host's volumes directory.** Some
   never call `set_volumes_dir` and write under `/var/lib/reliaburger/volumes`.
+
+- [ ] **C6.9 Unique names in the eBPF tests.** Several `tests/ebpf.rs` tests
+  still use fixed app names (`prestart`, `recycled`, `guarded`, `badcidr`, …)
+  with host-wide cgroup paths, the same risk C6.7 removed from `oci_crash`.
+- [ ] **C6.10 One failed crash test still poisons the next.** After a failure,
+  later `oci_crash` tests can fail at `apply` on left-over state the C6.2 guard
+  doesn't cover. Find what survives and tear it down.
 
 ## Decisions
 
