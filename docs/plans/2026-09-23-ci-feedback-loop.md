@@ -249,7 +249,7 @@ VM). A fix counts only when the loop that used to fail passes.
 
 ### Phase 4: tidy the layout (smaller builds, less duplication)
 
-- [ ] **C4.1 Merge the small integration binaries.**
+- [x] **C4.1 Merge the small integration binaries.**
   - Move the 47 small `tests/*.rs` files (1–18 tests each, no gating) into one
     `tests/suite/` binary with a module per file.
   - Keep the gated, heavy binaries separate: ebpf, oci_crash, owned_*, cluster,
