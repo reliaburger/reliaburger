@@ -32,8 +32,10 @@ impl fmt::Display for FaultId {
 
 /// The type of fault being injected.
 ///
-/// Packet-level network faults (Delay, Drop, Partition, Bandwidth)
-/// require eBPF on Linux. DnsNxdomain is a network fault too, but it
+/// Connect-time network faults (Drop, Partition) require eBPF on Linux.
+/// Delay is a netem qdisc on each caller container's interface, so it needs
+/// Linux traffic control and runc's per-container network namespaces;
+/// Bandwidth is not implemented yet. DnsNxdomain is a network fault too, but it
 /// acts in the userspace DNS responder (Onion's `.internal` resolver),
 /// not the kernel, so it works wherever the responder runs. Resource
 /// faults (CpuStress, MemoryPressure, DiskIoThrottle) require cgroups on
@@ -305,13 +307,13 @@ impl FaultType {
     /// never loaded), so the fault takes effect there and needs no eBPF. It
     /// used to be listed, which made it look implemented while it silently did
     /// nothing (the 12b.6 gate caught this).
+    ///
+    /// `Delay` isn't here either: it is a netem qdisc on each caller's
+    /// interface, which needs traffic control, not the connect hook.
     pub fn requires_ebpf(&self) -> bool {
         matches!(
             self,
-            Self::Delay { .. }
-                | Self::Drop { .. }
-                | Self::Partition { .. }
-                | Self::Bandwidth { .. }
+            Self::Drop { .. } | Self::Partition { .. } | Self::Bandwidth { .. }
         )
     }
 
@@ -827,7 +829,7 @@ mod tests {
     #[test]
     fn fault_type_requires_ebpf() {
         assert!(
-            FaultType::Delay {
+            !FaultType::Delay {
                 delay_ns: 1,
                 jitter_ns: 0,
                 source_app: None

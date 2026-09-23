@@ -144,8 +144,9 @@ The loaded Onion program adds one map alongside its existing maps:
 
 Earlier designs also named `fault_bw_map` and `fault_state_map`. No loaded
 program consumes them. Keeping their Rust structs didn't make bandwidth
-shaping real, so Bun now refuses delay and bandwidth until a TC packet path
-owns the maps and proves the effect.
+shaping real, so Bun refuses bandwidth until something proves the effect.
+Delay found a different home, a netem qdisc rather than a map, as "Slowing
+things down" explains later in the chapter.
 
 There's no `fault_dns_map`. DNS resolution moved out of the kernel and into a userspace responder (Chapter 3), so the DNS fault lives there too. More on that in a moment — it's a good lesson in keeping a fault pointed at the code that actually runs.
 
@@ -254,8 +255,9 @@ The application's `getaddrinfo("redis.internal")` now fails with `EAI_NONAME`. F
 
 Two things fall out of this. First, `DnsNxdomain` no longer counts as an "eBPF
 fault": it works wherever the responder runs, so `requires_ebpf()` returns
-`false` for it. Drop and partition need the connect hook. Delay and bandwidth
-need a future TC hook and are rejected on every current node. Second, reversal
+`false` for it. Drop and partition need the connect hook. Delay needs traffic
+control on the caller's interface (more on that later), and bandwidth isn't
+implemented. Second, reversal
 is free: clearing or expiring the DNS fault removes it from the registry, we
 republish the remaining owners, and the name resolves again when its last owner
 is gone.
@@ -351,9 +353,9 @@ Each fault type now maps to a mechanism, and the mechanism is the truth:
   separate scheduler and transport effects. They never borrow a workload
   fault's implementation.
 - **Drop and service partition** need the eBPF data path from Chapter 3.
-  Without it, the API rejects them. **Delay and bandwidth** need packet-time TC
-  control and are rejected even when the connect hook is loaded. A 400, not a
-  fake 200.
+  Without it, the API rejects them. **Delay** needs runc's per-container
+  network namespaces and is rejected on any other runtime; **bandwidth** is
+  rejected everywhere. A 400, not a fake 200.
 - **DNS NXDOMAIN** acts in the userspace `.internal` responder (see above), so it needs no eBPF — it takes effect wherever the responder runs, and reverses on clear or expiry by republishing the faulted-service set.
 - **Council partition** populates the real gossip/Raft transport blocklists.
 - **Service partition** populates source-cgroup/VIP/port keys in
@@ -592,6 +594,81 @@ cache set failed: dial tcp 127.128.202.174:6379: connect: operation not permitte
 
 We checked the claim the honest way, too: with the cut switched off, the same
 test's six cache calls through a partition all succeeded.
+
+### Slowing things down
+
+Outright failure is the easy case. Most outages start with something getting
+*slow*: a cache that answers in 300 ms instead of 1, a database with a bad
+disk. Does your frontend time out sensibly, or does it pile up requests until
+it falls over? `relish fault delay` is how you find out, and for a long time
+Bun refused it.
+
+Why couldn't the connect hook do it? A cgroup `connect4` program runs inside
+the `connect()` system call, synchronously, and the verifier won't let it
+sleep. It returns one of two answers: carry on (perhaps with a rewritten
+address), or `EPERM`. There's no "carry on in 300 ms". And, as the pool
+episode showed, it never sees a connection again once it's open, which is
+exactly where a slow dependency hurts.
+
+What *can* hold a packet back is the kernel's traffic-control layer, and it
+already ships a delayer: the netem queueing discipline. A qdisc sits on a
+network interface's transmit path; netem holds each packet for a configured
+time before passing it on. That works on every packet, so it slows open
+connections, new ones and UDP alike.
+
+We need two things netem doesn't give us out of the box. It should only slow
+traffic *to redis*, and only *from the frontend*. The second is free: every
+runc container has its own network namespace with one interface, `eth0`, so
+shaping the frontend's `eth0` touches nobody else. For the first, the root of
+`eth0` gets a `prio` qdisc (a classifier with numbered bands), the netem goes
+in an extra band, and a u32 filter sends packets for each redis backend into
+it:
+
+```text
+tc qdisc add dev eth0 root handle fa01: prio bands 4 priomap 1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1
+tc qdisc add dev eth0 parent fa01:4 handle fa10: netem delay 300000us
+tc filter add dev eth0 parent fa01: protocol ip prio 1 u32 \
+    match ip dst 10.202.142.7/32 match ip dport 6379 0xffff flowid fa01:4
+```
+
+The priomap sends every ordinary packet to bands 1 to 3, so nothing but the
+filtered traffic reaches band 4. The filter matches the *backend* address,
+not the VIP: by the time a packet leaves the container, the connect hook has
+rewritten it. Bun runs the host's `tc` inside the namespace (`ip netns exec
+rb-<instance> tc ...`), so the image needs no tools of its own.
+
+Building those argument lists is another pure function, which makes the
+fiddly parts testable on a Mac:
+
+```rust
+let class = format!("{DELAY_ROOT_HANDLE}{:x}", 4 + index);
+```
+
+`{:x}` formats a number in hexadecimal. tc reads class minors as hex, so the
+tenth delay band is `fa01:d`, not `fa01:13`, and a unit test pins exactly
+that. `{DELAY_ROOT_HANDLE}` is an inline format argument: since Rust 2021,
+`format!` can name a variable in scope directly inside the braces, the way
+Python's f-strings do.
+
+Everything else follows the connect-map pattern. `desired_delays` works out
+which bands each local caller should carry right now; the agent rebuilds any
+caller whose bands changed, or that restarted since (a restarted container may
+have a fresh namespace), and removes the tree from callers nothing delays any
+more. Rebuilding means "delete Smoker's root if it's there, then add". We only
+ever delete a root with our handle, `fa01:`, so a qdisc someone else installed
+makes the `add` fail loudly instead of vanishing. Deleting ours restores the
+interface's default. One more wrinkle: a netem qdisc lives in the container's
+namespace, not in Bun, so a Bun that crashed mid-experiment would leave its
+callers slow forever. The first reconcile after start-up sweeps any `fa01:`
+root it finds.
+
+On the podinfo demo, `relish fault delay redis 300ms --from frontend` took a
+cache read from 43 ms to 945 ms: about three redis round trips (podinfo's
+read runs `EXISTS` and then `GET`, and its pool talks to redis too), each
+paying 300 ms on the way out.
+Clearing the fault brought it back to 42 ms. The test also kills a frontend
+replica mid-fault and waits for its replacement to carry the netem qdisc
+again, which it does within a tick.
 
 ## One experiment at a time
 

@@ -100,6 +100,24 @@ impl Demo {
             .unwrap_or_else(|error| format!("(logs unavailable: {error})"))
     }
 
+    /// The median time of five `GET /cache/demo` calls through the ingress.
+    async fn median_cache_read(&self) -> Duration {
+        let mut samples = Vec::new();
+        for _ in 0..5 {
+            let started = Instant::now();
+            let response = self
+                .http
+                .get(format!("{}/cache/demo", self.base))
+                .send()
+                .await
+                .expect("cache read answered");
+            let _ = response.bytes().await;
+            samples.push(started.elapsed());
+        }
+        samples.sort();
+        samples[samples.len() / 2]
+    }
+
     /// Write a value through the frontend into redis and read it back.
     async fn cache_round_trip(&self, value: &str) -> Result<String, String> {
         let stored = self
@@ -350,6 +368,117 @@ allowed_operations = ["inject_workload_faults"]
     })
     .await;
     assert!(healed.is_some(), "redis never came back:\n{}", demo.log());
+
+    // Z6.3: a 300ms delay from the frontend to redis. Reading a key is two
+    // redis commands (EXISTS, then GET), each held back 300ms on the way
+    // out, over connections the pool already has open.
+    let before = demo.median_cache_read().await;
+    let mut delay = fault(FaultType::Delay {
+        delay_ns: 300_000_000,
+        jitter_ns: 0,
+        source_app: Some("frontend".to_string()),
+    });
+    delay.duration = Duration::from_secs(60);
+    client
+        .inject_fault(&delay)
+        .await
+        .unwrap_or_else(|error| panic!("delay refused: {error}\n{}", demo.log()));
+    let during = demo.median_cache_read().await;
+    eprintln!("cache read median: {before:?} before the delay, {during:?} during it");
+    assert!(
+        during >= before + Duration::from_millis(500),
+        "a 300ms delay only moved the cache read from {before:?} to {during:?}"
+    );
+
+    // Every frontend carries the delay, and one that restarts mid-fault
+    // gets it back: the agent reconciles delays against the instances
+    // running now, not the ones that ran at injection.
+    for replica in 0..3 {
+        let qdisc = frontend_qdisc(replica);
+        assert!(qdisc.contains("netem"), "frontend-{replica}: {qdisc}");
+    }
+    let restarts_before = frontend_restarts(&client, "default__frontend-1").await;
+    let mut kill = fault(FaultType::Kill { count: 1 });
+    kill.target_service = "frontend".to_string();
+    kill.target_instance = Some("default__frontend-1".to_string());
+    kill.duration = Duration::ZERO;
+    client
+        .inject_fault(&kill)
+        .await
+        .unwrap_or_else(|error| panic!("kill refused: {error}\n{}", demo.log()));
+    let restarted = eventually(Duration::from_secs(60), || async {
+        let restarts = frontend_restarts(&client, "default__frontend-1").await;
+        (restarts > restarts_before).then_some(restarts)
+    })
+    .await;
+    assert!(
+        restarted.is_some(),
+        "frontend-1 never restarted:\n{}",
+        demo.log()
+    );
+    let reshaped = eventually(Duration::from_secs(10), || async {
+        let qdisc = frontend_qdisc(1);
+        qdisc.contains("netem").then_some(qdisc)
+    })
+    .await;
+    assert!(
+        reshaped.is_some(),
+        "the restarted frontend lost its delay: {}",
+        frontend_qdisc(1)
+    );
+    eprintln!(
+        "frontend-1 restarted ({restarts_before} -> {:?}) and carries: {}",
+        restarted,
+        reshaped.unwrap().trim()
+    );
+
+    client
+        .clear_faults_by_service("redis", Some("default"))
+        .await
+        .unwrap();
+    for replica in 0..3 {
+        let qdisc = frontend_qdisc(replica);
+        assert!(
+            !qdisc.contains("fa01:"),
+            "frontend-{replica} kept its delay: {qdisc}"
+        );
+    }
+    let after = demo.median_cache_read().await;
+    eprintln!("cache read median after clearing the delay: {after:?}");
+    assert!(
+        after < before + Duration::from_millis(200),
+        "the delay outlived its clear: {before:?} before, {after:?} after"
+    );
+}
+
+/// The root qdiscs on a frontend replica's container interface.
+fn frontend_qdisc(replica: u32) -> String {
+    let output = std::process::Command::new("ip")
+        .args([
+            "netns",
+            "exec",
+            &format!("rb-default__frontend-{replica}"),
+            "tc",
+            "qdisc",
+            "show",
+            "dev",
+            "eth0",
+        ])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// How many times Bun has restarted a frontend instance.
+async fn frontend_restarts(client: &BunClient, instance: &str) -> u32 {
+    client
+        .status()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .find(|status| status.id == instance && status.state == "running")
+        .map(|status| status.restart_count)
+        .unwrap_or_default()
 }
 
 /// Poll `check` until it returns `Some`, for at most `limit`.

@@ -316,7 +316,7 @@ Smaller fixes that CI runs turned up along the way:
 - [ ] **F06** (feature) Complete the metrics/query and reporting architecture, including event production and versioned chunking beyond C21's explicit admission limits.
 - [ ] **F07** (feature) Finish cross-node views and log-stream capabilities.
 - [ ] **F08** (feature) Complete WebSocket ingress parity and certificate automation.
-- [ ] **F09** (feature) Implement packet-level delay/bandwidth faults if retained.
+- [ ] **F09** (feature) Implement packet-level delay/bandwidth faults if retained. Delay is done (Z6.3: tc netem on each runc caller's interface); bandwidth remains.
 - [ ] **F10** (feature) Provide explicit managed-volume retirement and runtime parity. Direct Apple Container is deferred beyond 0.1.0: finish interrupted CLI/daemon recovery before restoring selection. macOS containers use the managed Linux VM.
 - [ ] **F11** (feature) Finish supported Kubernetes translations.
 - [ ] **F12** (future) Keep the long-term vision explicitly separate.

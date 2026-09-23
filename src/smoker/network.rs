@@ -7,8 +7,9 @@
 //! the agent recomputes the state every active fault *should* produce from
 //! the instances running right now, and converges on it. This module is the
 //! pure half of that: given the active faults and the local callers, what
-//! should the eBPF `fault_connect_map` hold, and whose open connections should
-//! a newly landed fault cut? It also runs the few host tools (`ss`) the agent
+//! should the eBPF `fault_connect_map` hold, whose open connections should a
+//! newly landed fault cut, and which netem delays should each caller's
+//! interface carry? It also runs the few host tools (`ss`, `tc`) the agent
 //! needs inside a container's network namespace.
 
 use std::collections::BTreeMap;
@@ -244,6 +245,206 @@ pub fn socket_destroy_args(backends: &[SocketAddrV4]) -> Vec<String> {
     }
     args.push(")".to_string());
     args
+}
+
+/// One group of destinations whose traffic a caller's interface delays.
+///
+/// Each band becomes one netem qdisc under the caller's `eth0` root `prio`
+/// qdisc, with a u32 filter per destination steering packets into it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DelayBand {
+    /// Added one-way latency, nanoseconds.
+    pub delay_ns: u64,
+    /// Random variation around the delay, nanoseconds.
+    pub jitter_ns: u64,
+    /// Backend addresses (after the VIP rewrite) whose traffic is delayed.
+    pub destinations: Vec<SocketAddrV4>,
+}
+
+/// The most delay bands one interface can carry. A `prio` qdisc has at most
+/// 16 bands, and the first three keep carrying ordinary traffic.
+pub const MAX_DELAY_BANDS: usize = 13;
+
+/// The delay bands each local caller's interface should carry, by instance.
+///
+/// `backends` maps a delay fault to its target's backend addresses; a fault
+/// whose target has no backends yet delays nothing until it has some. A
+/// caller outside every delay fault is absent from the result, which is how
+/// the agent knows to take a previous qdisc away.
+pub fn desired_delays<'a>(
+    rules: impl IntoIterator<Item = &'a FaultRule>,
+    backends: impl Fn(&FaultRule) -> Vec<SocketAddrV4>,
+    callers: &[LocalCaller],
+) -> BTreeMap<String, Vec<DelayBand>> {
+    let mut rules: Vec<&FaultRule> = rules
+        .into_iter()
+        .filter(|rule| matches!(rule.fault_type, FaultType::Delay { .. }))
+        .collect();
+    // Band order follows fault ids, so the same faults always build the same
+    // qdisc tree and an unchanged plan compares equal.
+    rules.sort_by_key(|rule| rule.id.0);
+    let mut desired: BTreeMap<String, Vec<DelayBand>> = BTreeMap::new();
+    for rule in rules {
+        let FaultType::Delay {
+            delay_ns,
+            jitter_ns,
+            ..
+        } = rule.fault_type
+        else {
+            continue;
+        };
+        let mut destinations = backends(rule);
+        destinations.sort_unstable();
+        destinations.dedup();
+        if destinations.is_empty() {
+            continue;
+        }
+        for caller in callers {
+            if !applies_to_caller(rule, &caller.app, &caller.namespace) {
+                continue;
+            }
+            let bands = desired.entry(caller.instance_id.clone()).or_default();
+            if bands.len() < MAX_DELAY_BANDS {
+                bands.push(DelayBand {
+                    delay_ns,
+                    jitter_ns,
+                    destinations: destinations.clone(),
+                });
+            }
+        }
+    }
+    desired
+}
+
+/// The interface inside a runc container that netem shapes.
+pub const CONTAINER_INTERFACE: &str = "eth0";
+
+/// Handle of the root `prio` qdisc Smoker installs. Anything else at the root
+/// isn't ours, and Bun never deletes it.
+pub const DELAY_ROOT_HANDLE: &str = "fa01:";
+
+/// The `tc` argument lists that build `bands` on a container's interface,
+/// in order. The caller removes any previous Smoker tree first.
+///
+/// The root is a `prio` qdisc with three ordinary bands (the default priomap
+/// keeps every packet in them) plus one band per delay. Each delay band holds
+/// a netem qdisc, and a u32 filter per destination (IPv4 address and TCP or
+/// UDP destination port) steers matching packets into it.
+pub fn delay_install_args(bands: &[DelayBand]) -> Vec<Vec<String>> {
+    let text = |parts: &[&str]| parts.iter().map(|part| part.to_string()).collect();
+    let mut commands: Vec<Vec<String>> = Vec::new();
+    let band_count = (3 + bands.len()).to_string();
+    let mut root: Vec<String> = text(&[
+        "qdisc",
+        "add",
+        "dev",
+        CONTAINER_INTERFACE,
+        "root",
+        "handle",
+        DELAY_ROOT_HANDLE,
+        "prio",
+        "bands",
+        &band_count,
+        "priomap",
+    ]);
+    root.extend(
+        [
+            "1", "2", "2", "2", "1", "2", "0", "0", "1", "1", "1", "1", "1", "1", "1", "1",
+        ]
+        .map(str::to_string),
+    );
+    commands.push(root);
+    for (index, band) in bands.iter().enumerate() {
+        // Class minors are hexadecimal in tc's syntax; bands 1-3 are the
+        // ordinary ones, so delays start at 4.
+        let class = format!("{DELAY_ROOT_HANDLE}{:x}", 4 + index);
+        let handle = format!("{:x}:", 0xfa10 + index);
+        let mut netem = text(&[
+            "qdisc",
+            "add",
+            "dev",
+            CONTAINER_INTERFACE,
+            "parent",
+            &class,
+            "handle",
+            &handle,
+            "netem",
+            "delay",
+            &format!("{}us", band.delay_ns / 1_000),
+        ]);
+        if band.jitter_ns > 0 {
+            netem.push(format!("{}us", band.jitter_ns / 1_000));
+        }
+        commands.push(netem);
+        for destination in &band.destinations {
+            commands.push(text(&[
+                "filter",
+                "add",
+                "dev",
+                CONTAINER_INTERFACE,
+                "parent",
+                DELAY_ROOT_HANDLE,
+                "protocol",
+                "ip",
+                "prio",
+                "1",
+                "u32",
+                "match",
+                "ip",
+                "dst",
+                &format!("{}/32", destination.ip()),
+                "match",
+                "ip",
+                "dport",
+                &destination.port().to_string(),
+                "0xffff",
+                "flowid",
+                &class,
+            ]));
+        }
+    }
+    commands
+}
+
+/// The `tc` arguments that show the interface's root qdiscs.
+pub fn delay_show_args() -> Vec<String> {
+    ["qdisc", "show", "dev", CONTAINER_INTERFACE]
+        .map(str::to_string)
+        .to_vec()
+}
+
+/// The `tc` arguments that remove Smoker's tree and restore the interface's
+/// default qdisc. Only run them when [`has_delay_root`] says the root is ours.
+pub fn delay_remove_args() -> Vec<String> {
+    ["qdisc", "del", "dev", CONTAINER_INTERFACE, "root"]
+        .map(str::to_string)
+        .to_vec()
+}
+
+/// Whether `tc qdisc show` output has Smoker's `prio` qdisc at the root.
+pub fn has_delay_root(show_output: &str) -> bool {
+    show_output.lines().any(|line| {
+        let mut words = line.split_whitespace();
+        words.next() == Some("qdisc")
+            && words.next() == Some("prio")
+            && words.next() == Some(DELAY_ROOT_HANDLE)
+            && words.next() == Some("root")
+    })
+}
+
+/// The netem delays `tc qdisc show` reports under Smoker's root, e.g.
+/// `["delay 300ms 20ms"]`, for the trace to show as live evidence.
+pub fn installed_delays(show_output: &str) -> Vec<String> {
+    show_output
+        .lines()
+        .filter(|line| {
+            line.contains(" netem ") && line.contains(&format!("parent {DELAY_ROOT_HANDLE}"))
+        })
+        .filter_map(|line| {
+            line.find("delay")
+                .map(|start| line[start..].trim().to_string())
+        })
+        .collect()
 }
 
 /// Why a command in a container's network namespace failed.
@@ -532,6 +733,113 @@ mod tests {
                 ")",
             ]
         );
+    }
+
+    #[test]
+    fn a_delay_from_one_source_shapes_only_that_source_towards_the_backends() {
+        let delay = rule(
+            3,
+            FaultType::Delay {
+                delay_ns: 300_000_000,
+                jitter_ns: 0,
+                source_app: Some("frontend".to_string()),
+            },
+        );
+        let callers = [
+            caller("default/frontend-0", "frontend", "default", None),
+            caller("default/backend-0", "backend", "default", None),
+        ];
+        let backends = |_: &FaultRule| {
+            vec![
+                address("10.1.0.9:6379"),
+                address("10.1.0.5:6379"),
+                address("10.1.0.5:6379"),
+            ]
+        };
+        let desired = desired_delays([&delay], backends, &callers);
+        assert_eq!(
+            desired,
+            BTreeMap::from([(
+                "default/frontend-0".to_string(),
+                vec![DelayBand {
+                    delay_ns: 300_000_000,
+                    jitter_ns: 0,
+                    destinations: vec![address("10.1.0.5:6379"), address("10.1.0.9:6379")],
+                }],
+            )])
+        );
+        // No backends yet: nothing to delay, so no qdisc at all.
+        assert!(desired_delays([&delay], |_| Vec::new(), &callers).is_empty());
+    }
+
+    #[test]
+    fn delay_bands_follow_fault_ids_whatever_the_registry_order() {
+        let fault = |id, delay_ns| {
+            rule(
+                id,
+                FaultType::Delay {
+                    delay_ns,
+                    jitter_ns: 0,
+                    source_app: None,
+                },
+            )
+        };
+        let (first, second) = (fault(1, 100), fault(2, 200));
+        let callers = [caller("default/web-0", "web", "default", None)];
+        let backends = |_: &FaultRule| vec![address("10.1.0.5:80")];
+        assert_eq!(
+            desired_delays([&second, &first], backends, &callers),
+            desired_delays([&first, &second], backends, &callers)
+        );
+    }
+
+    #[test]
+    fn delay_install_builds_a_prio_root_a_netem_band_and_a_filter_per_backend() {
+        let commands = delay_install_args(&[DelayBand {
+            delay_ns: 300_000_000,
+            jitter_ns: 20_000_000,
+            destinations: vec![address("10.1.0.5:6379"), address("10.1.0.9:6379")],
+        }]);
+        let joined: Vec<String> = commands.iter().map(|args| args.join(" ")).collect();
+        assert_eq!(
+            joined,
+            vec![
+                "qdisc add dev eth0 root handle fa01: prio bands 4 priomap 1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1",
+                "qdisc add dev eth0 parent fa01:4 handle fa10: netem delay 300000us 20000us",
+                "filter add dev eth0 parent fa01: protocol ip prio 1 u32 match ip dst 10.1.0.5/32 match ip dport 6379 0xffff flowid fa01:4",
+                "filter add dev eth0 parent fa01: protocol ip prio 1 u32 match ip dst 10.1.0.9/32 match ip dport 6379 0xffff flowid fa01:4",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_tenth_band_uses_hexadecimal_class_minors() {
+        let band = DelayBand {
+            delay_ns: 1_000_000,
+            jitter_ns: 0,
+            destinations: vec![address("10.1.0.5:80")],
+        };
+        let commands = delay_install_args(&vec![band; 10]);
+        let last_netem = commands
+            .iter()
+            .rfind(|args| args.contains(&"netem".to_string()))
+            .unwrap()
+            .join(" ");
+        assert!(
+            last_netem.contains("parent fa01:d handle fa19:"),
+            "{last_netem}"
+        );
+    }
+
+    #[test]
+    fn only_smokers_own_root_is_recognised_and_its_delays_read_back() {
+        let ours = "qdisc prio fa01: root refcnt 5 bands 4 priomap 1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1\n\
+                    qdisc netem fa10: parent fa01:4 limit 1000 delay 300ms  20ms\n";
+        assert!(has_delay_root(ours));
+        assert_eq!(installed_delays(ours), vec!["delay 300ms  20ms"]);
+        assert!(!has_delay_root("qdisc noqueue 0: root refcnt 2\n"));
+        assert!(!has_delay_root("qdisc prio 1: root refcnt 2 bands 3\n"));
+        assert!(installed_delays("qdisc noqueue 0: root refcnt 2\n").is_empty());
     }
 
     #[test]

@@ -1580,6 +1580,12 @@ struct InstalledNetworkFaults {
     /// Proven workload cgroup per caller instance, with the restart count it
     /// was read at, so a restarted container is looked up again.
     caller_cgroups: std::collections::HashMap<InstanceId, (u32, u64)>,
+    /// netem delay bands installed per caller instance id, with the restart
+    /// count they were installed at.
+    delays: std::collections::HashMap<String, (u32, Vec<crate::smoker::network::DelayBand>)>,
+    /// Whether this Bun has swept delay trees a previous Bun left behind.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    delays_swept: bool,
 }
 
 /// The Bun agent. Generic over `G: Grill` so tests can inject mocks.
@@ -5116,12 +5122,21 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     rule.fault_type
                 ))
             }
-            FaultType::Delay { .. } => Err(
-                "delay faults need a TC packet hook; the current cgroup connect hook cannot delay packets"
-                    .to_string(),
-            ),
+            FaultType::Delay { .. } => {
+                // The connect hook decides whether a connection may start; it
+                // can't hold packets back. A netem qdisc on the caller's own
+                // interface can, for new and open connections alike.
+                #[cfg(target_os = "linux")]
+                {
+                    self.apply_delay_fault(rule).await
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    Err("delay faults need Linux traffic control (tc netem) in each caller's network namespace".to_string())
+                }
+            }
             FaultType::Bandwidth { .. } => Err(
-                "bandwidth faults need a TC packet hook; no bandwidth program is attached"
+                "bandwidth faults are not implemented yet; delay traffic with `relish fault delay` instead"
                     .to_string(),
             ),
             FaultType::MemoryPressure { percentage } => {
@@ -5645,7 +5660,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// cgroup id (the connect hook keys source-scoped faults by cgroup), and
     /// those are cached per restart, so the reconcile that runs on every
     /// health tick doesn't ask the runtime again for an unchanged container.
-    #[cfg_attr(not(all(feature = "ebpf", target_os = "linux")), allow(dead_code))]
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     async fn local_callers(&mut self) -> Vec<crate::smoker::network::LocalCaller> {
         use crate::smoker::network::{LocalCaller, applies_to_caller};
 
@@ -5715,16 +5730,192 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// active, so a source replica that restarts or is scheduled here picks
     /// the fault up. Failures are logged; the next tick retries.
     async fn reconcile_network_faults(&mut self) {
+        #[cfg(target_os = "linux")]
+        self.sweep_stale_delays().await;
         let active = self
             .fault_registry
             .iter()
             .any(|rule| rule.fault_type.acts_on_callers());
-        if !active && self.network_faults.connect.is_empty() {
+        if !active
+            && self.network_faults.connect.is_empty()
+            && self.network_faults.delays.is_empty()
+        {
             return;
         }
         if let Err(error) = self.reconcile_connect_faults().await {
             eprintln!("smoker: network fault reconcile: {error}");
         }
+        #[cfg(target_os = "linux")]
+        for (instance, error) in self.reconcile_delays().await {
+            eprintln!("smoker: delay on {instance}: {error}");
+        }
+    }
+    /// Check and install a delay fault on this node (Linux only).
+    ///
+    /// A delay is a netem qdisc on each caller container's own `eth0`, so it
+    /// needs runc's per-container network namespaces, a target with backends
+    /// to steer towards, and (for `--from`) a local instance of the source.
+    /// The rule is already in the registry: reconciling installs it, and any
+    /// caller that couldn't be shaped fails the injection.
+    #[cfg(target_os = "linux")]
+    async fn apply_delay_fault(
+        &mut self,
+        rule: &crate::smoker::types::FaultRule,
+    ) -> Result<(), String> {
+        let runtime = self.supervisor.grill().runtime_kind();
+        if runtime != crate::grill::records::RuntimeKind::Runc {
+            return Err(format!(
+                "delay faults shape each caller container's own network interface, which needs the runc runtime; this node runs {runtime:?}"
+            ));
+        }
+        let services = self.merged_service_map();
+        if fault_backend_addresses(&services, rule).is_empty() {
+            return Err(format!(
+                "{}/{} has no backends to delay traffic to",
+                rule.namespace.as_deref().unwrap_or("default"),
+                rule.target_service
+            ));
+        }
+        let callers: Vec<String> = self
+            .local_callers()
+            .await
+            .into_iter()
+            .filter(|caller| {
+                crate::smoker::network::applies_to_caller(rule, &caller.app, &caller.namespace)
+            })
+            .map(|caller| caller.instance_id)
+            .collect();
+        if let Some(source) = rule.fault_type.source_app()
+            && callers.is_empty()
+        {
+            return Err(format!(
+                "no running instance of source app {source} runs on this node"
+            ));
+        }
+        let failures: Vec<String> = self
+            .reconcile_delays()
+            .await
+            .into_iter()
+            .filter(|(instance, _)| callers.contains(instance))
+            .map(|(_, error)| error)
+            .collect();
+        match failures.first() {
+            None => Ok(()),
+            Some(error) => Err(format!("cannot delay traffic: {error}")),
+        }
+    }
+
+    /// Remove any delay tree a previous Bun left on this node's containers.
+    ///
+    /// Faults don't survive a restart, but a netem qdisc lives in the
+    /// container's network namespace, not in Bun, so a crashed Bun would
+    /// leave its callers slowed forever. Runs once, on the first reconcile.
+    #[cfg(target_os = "linux")]
+    async fn sweep_stale_delays(&mut self) {
+        if self.network_faults.delays_swept
+            || self.supervisor.grill().runtime_kind() != crate::grill::records::RuntimeKind::Runc
+        {
+            return;
+        }
+        self.network_faults.delays_swept = true;
+        let instances: Vec<String> = self
+            .supervisor
+            .list_instances()
+            .into_iter()
+            .map(|instance| instance.id.0.clone())
+            .collect();
+        for instance in instances {
+            match remove_delay_tree(&instance).await {
+                Ok(true) => eprintln!("smoker: removed a stale delay from {instance}"),
+                Ok(false) | Err(crate::smoker::network::NetnsCommandError::NoNamespace { .. }) => {}
+                Err(error) => eprintln!("smoker: stale delay sweep: {error}"),
+            }
+        }
+    }
+
+    /// Converge every local caller's netem delays on what the active delay
+    /// faults ask for. Returns `(instance, error)` for each caller whose
+    /// interface couldn't be programmed; those are retried next tick.
+    #[cfg(target_os = "linux")]
+    async fn reconcile_delays(&mut self) -> Vec<(String, String)> {
+        use crate::smoker::network::{NetnsCommandError, desired_delays};
+
+        let delaying = self.fault_registry.iter().any(|rule| {
+            matches!(
+                rule.fault_type,
+                crate::smoker::types::FaultType::Delay { .. }
+            )
+        });
+        if !delaying && self.network_faults.delays.is_empty() {
+            return Vec::new();
+        }
+        let callers = self.local_callers().await;
+        let services = self.merged_service_map();
+        let desired = desired_delays(
+            self.fault_registry.iter(),
+            |rule| fault_backend_addresses(&services, rule),
+            &callers,
+        );
+        let restarts: std::collections::HashMap<String, u32> = self
+            .supervisor
+            .list_instances()
+            .into_iter()
+            .map(|instance| (instance.id.0.clone(), instance.restart_count))
+            .collect();
+        // A caller that has gone took its network namespace, and its qdisc,
+        // with it.
+        self.network_faults
+            .delays
+            .retain(|id, _| restarts.contains_key(id));
+
+        let mut instances: std::collections::BTreeSet<String> = desired.keys().cloned().collect();
+        instances.extend(self.network_faults.delays.keys().cloned());
+        let mut failures = Vec::new();
+        for instance in instances {
+            let wanted = desired.get(&instance);
+            let restart = restarts.get(&instance).copied().unwrap_or_default();
+            let unchanged = match (wanted, self.network_faults.delays.get(&instance)) {
+                (Some(wanted), Some((seen_at, installed))) => {
+                    *seen_at == restart && installed == wanted
+                }
+                (None, None) => true,
+                _ => false,
+            };
+            if unchanged {
+                continue;
+            }
+            let bands = wanted.map(Vec::as_slice).unwrap_or_default();
+            match program_delay_tree(&instance, bands).await {
+                Ok(()) => match wanted {
+                    Some(wanted) => {
+                        self.network_faults
+                            .delays
+                            .insert(instance, (restart, wanted.clone()));
+                    }
+                    None => {
+                        self.network_faults.delays.remove(&instance);
+                    }
+                },
+                // A caller without its own namespace (host networking)
+                // can't be shaped; remember that so we don't retry every
+                // tick, and report it once.
+                Err(error @ NetnsCommandError::NoNamespace { .. }) => {
+                    if let Some(wanted) = wanted {
+                        self.network_faults
+                            .delays
+                            .insert(instance.clone(), (restart, wanted.clone()));
+                        failures.push((instance, error.to_string()));
+                    } else {
+                        self.network_faults.delays.remove(&instance);
+                    }
+                }
+                Err(error) => {
+                    self.network_faults.delays.remove(&instance);
+                    failures.push((instance, delay_error_hint(&error)));
+                }
+            }
+        }
+        failures
     }
 
     /// Check that a drop or partition can take effect here before reporting
@@ -11890,6 +12081,85 @@ fn fault_vip_port(
         rule.target_service.as_str(),
     ))?;
     Some((entry.vip.to_network_byte_order(), entry.port.to_be()))
+}
+
+/// The post-rewrite backend addresses of a fault's target service, as this
+/// node's merged service map knows them.
+#[cfg(target_os = "linux")]
+fn fault_backend_addresses(
+    services: &crate::onion::service_map::ServiceMap,
+    rule: &crate::smoker::types::FaultRule,
+) -> Vec<std::net::SocketAddrV4> {
+    let Some(namespace) = rule.namespace.as_deref() else {
+        return Vec::new();
+    };
+    services
+        .resolve(&crate::onion::service_id::ServiceId::new(
+            namespace,
+            rule.target_service.as_str(),
+        ))
+        .map(|entry| {
+            entry
+                .backends
+                .iter()
+                .map(|backend| std::net::SocketAddrV4::new(backend.node_ip, backend.host_port))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Remove Smoker's delay tree from an instance's interface if it has one,
+/// restoring the default qdisc. Returns whether there was one.
+#[cfg(target_os = "linux")]
+async fn remove_delay_tree(
+    instance: &str,
+) -> Result<bool, crate::smoker::network::NetnsCommandError> {
+    use crate::smoker::network::{
+        delay_remove_args, delay_show_args, has_delay_root, run_in_instance_netns,
+    };
+    let shown = run_in_instance_netns(instance, "tc", &delay_show_args()).await?;
+    if !has_delay_root(&shown) {
+        return Ok(false);
+    }
+    run_in_instance_netns(instance, "tc", &delay_remove_args()).await?;
+    Ok(true)
+}
+
+/// Replace an instance's delay tree with `bands` (none: just remove it).
+///
+/// Rebuilding the whole tree keeps this simple and idempotent: a qdisc that
+/// someone else added at the root makes the `add` fail rather than be
+/// overwritten, and a failure half-way takes our partial tree back out.
+#[cfg(target_os = "linux")]
+async fn program_delay_tree(
+    instance: &str,
+    bands: &[crate::smoker::network::DelayBand],
+) -> Result<(), crate::smoker::network::NetnsCommandError> {
+    use crate::smoker::network::{delay_install_args, run_in_instance_netns};
+    remove_delay_tree(instance).await?;
+    if bands.is_empty() {
+        return Ok(());
+    }
+    for args in delay_install_args(bands) {
+        if let Err(error) = run_in_instance_netns(instance, "tc", &args).await {
+            let _ = remove_delay_tree(instance).await;
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+/// Say what to do when the kernel has no netem, rather than echo tc.
+#[cfg(target_os = "linux")]
+fn delay_error_hint(error: &crate::smoker::network::NetnsCommandError) -> String {
+    let text = error.to_string();
+    if text.contains("netem") && (text.contains("Unknown") || text.contains("not found")) {
+        format!(
+            "{text} (the kernel has no sch_netem module; install the linux-modules package for this kernel)"
+        )
+    } else {
+        text
+    }
 }
 
 /// The post-rewrite backend addresses behind a service's (virtual IP, port),
@@ -20368,7 +20638,7 @@ host = "remote.local"
     }
 
     #[tokio::test]
-    async fn unimplemented_packet_faults_are_refused_even_if_the_cli_can_describe_them() {
+    async fn delay_without_runc_namespaces_and_bandwidth_are_refused_honestly() {
         let (mut agent, _tx, _shutdown) = test_agent();
         let delay = fault_rule(crate::smoker::types::FaultType::Delay {
             delay_ns: 10_000_000,
@@ -20376,13 +20646,16 @@ host = "remote.local"
             source_app: None,
         });
         let error = agent.apply_fault(&delay).await.unwrap_err();
-        assert!(error.contains("TC packet hook"), "{error}");
+        assert!(
+            error.contains("runc runtime") || error.contains("Linux traffic control"),
+            "{error}"
+        );
 
         let bandwidth = fault_rule(crate::smoker::types::FaultType::Bandwidth {
             bytes_per_sec: 125_000,
         });
         let error = agent.apply_fault(&bandwidth).await.unwrap_err();
-        assert!(error.contains("no bandwidth program"), "{error}");
+        assert!(error.contains("not implemented"), "{error}");
     }
 
     #[cfg(not(target_os = "linux"))]

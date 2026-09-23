@@ -6,7 +6,7 @@ tested is a guess.
 ## One-shot faults
 
 ```sh
-relish fault delay redis 200ms --jitter 50ms --acknowledge # reserved; refused (TC pending)
+relish fault delay redis 200ms --jitter 50ms --acknowledge # slow every caller down
 relish fault drop api 10% --acknowledge                    # failed connections
 relish fault dns redis nxdomain --acknowledge              # DNS misery
 relish fault partition web --from payment --acknowledge    # block traffic between apps
@@ -25,10 +25,12 @@ relish fault list
 relish fault clear          # or: relish fault clear <id>
 ```
 
-`drop` and `partition` need the Linux eBPF connect hook. `delay` and
-`bandwidth` are accepted by the parser as forward-compatible contracts, but Bun
-refuses to activate them until a TC packet program can provide real delay and
-pacing. A rejected command hasn't injected a fault.
+`drop` and `partition` need the Linux eBPF connect hook. `delay` needs runc
+containers: it adds a `tc` netem qdisc to each caller container's own `eth0`,
+matching only packets to the target's backends, so it slows open connections
+as well as new ones (add `--from APP` to slow just one caller). `bandwidth` is
+accepted by the parser as a forward-compatible contract, but Bun refuses it for
+now. A rejected command hasn't injected a fault.
 
 Injection needs at least a Deployer credential, explicit `--acknowledge`, and
 `"inject_workload_faults"` in the server's
@@ -65,7 +67,8 @@ clear` with no id, or with a service name, clears on every node.
 
 Network faults (`delay`, `drop`, `dns`, `partition`) are the other way round.
 They change what happens when something *calls* the target, and that happens
-on the caller's node: the eBPF connect hook and the DNS responder run there. So
+on the caller's node: the eBPF connect hook, the delay's netem qdisc and the
+DNS responder all act there. So
 `relish fault drop redis 20%` lands on every node, because any of them may run
 something that calls redis, and `relish fault partition redis --from frontend`
 lands only on the nodes that run `frontend` in redis's namespace. A frontend
@@ -84,6 +87,12 @@ were resolved before the fault, and only new lookups fail. Cutting needs a
 kernel built with `CONFIG_INET_DIAG_DESTROY` (stock Ubuntu has it), and only
 applies to containers with their own network namespace (runc), not to process
 workloads, whose sockets share the host's.
+
+A delay needs no cutting: it holds back packets, not connections. In the
+podinfo demo, `relish fault delay redis 300ms --from frontend --acknowledge`
+took a cache read (a couple of redis commands over the pool's open
+connections) from about 43 ms to about 945 ms, and `relish fault clear redis`
+brought it straight back.
 
 ## Recovery catalogue
 

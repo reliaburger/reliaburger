@@ -212,7 +212,7 @@ beat needs product work first:
 - [x] **Z6.2 Affect existing connections.** When a drop or partition lands,
   destroy the matching established sockets in each source container's network
   namespace, so pooled clients reconnect into the fault.
-- [ ] **Z6.3 A latency fault.** `relish fault delay redis 300ms --from frontend`
+- [x] **Z6.3 A latency fault.** `relish fault delay redis 300ms --from frontend`
   adds a `tc` netem qdisc on each source container's `eth0`, filtered to the
   destination's backend addresses and port, removed on expiry or clear, and
   applied to new source instances while active. It works on existing

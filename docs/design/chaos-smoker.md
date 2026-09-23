@@ -4,12 +4,14 @@ Design document for the Smoker subsystem of Reliaburger. Smoker provides built-i
 
 Sourced from whitepaper section 18 (Fault Injection).
 
-> **Implementation status (29 July 2026).** Drop and directional service
-> partition faults run in the loaded cgroup `connect4` hook. DNS NXDOMAIN runs
-> in the userspace resolver. Delay and bandwidth remain design work: no TC
-> packet program is attached, so Bun rejects both instead of recording a fault
-> that can't affect traffic. The pseudocode below describes the intended TC
-> implementation where it says so; it is not evidence that the code ships.
+> **Implementation status (23 September 2026).** Drop and directional service
+> partition faults run in the loaded cgroup `connect4` hook, and cut the
+> callers' open connections when they land. DNS NXDOMAIN runs in the userspace
+> resolver. Delay is a tc netem qdisc on each runc caller's interface (§5.1.1).
+> Bandwidth remains design work, and Bun rejects it instead of recording a
+> fault that can't affect traffic. The pseudocode below describes the intended
+> TC bandwidth implementation where it says so; it is not evidence that the
+> code ships.
 
 ---
 
@@ -30,7 +32,7 @@ Fault injection is exposed through the `relish fault` CLI subcommand. Every faul
 
 ```bash
 # Network faults
-relish fault delay redis 200ms --acknowledge              # reserved: rejected until TC ships
+relish fault delay redis 200ms --from web --acknowledge   # tc netem on web's interface
 relish fault drop api 10% --acknowledge
 relish fault partition web --from payment-service --acknowledge
 relish fault dns redis nxdomain --acknowledge
@@ -79,8 +81,9 @@ Smoker is not a standalone subsystem. It extends three existing components:
 The shipped network path extends Onion's cgroup `connect4` program with one
 `fault_connect_map` lookup. That implements connect-time drop and directional
 service partition. DNS does not use an eBPF DNS hook: the supervised userspace
-responder applies NXDOMAIN (see §5.1.3). Delay and bandwidth need packet-time
-control, so they require a TC program that is not loaded today.
+responder applies NXDOMAIN (see §5.1.3). Delay needs packet-time control, so
+it uses a netem qdisc on each caller container's interface instead (§5.1.1).
+Bandwidth would need the same and is not implemented.
 
 The existing Onion maps (`backend_map`, `firewall_map`) are unmodified.
 `fault_connect_map` is the only fault map consumed by a loaded program.
@@ -608,94 +611,63 @@ pub struct BpfFaultStateValue {
 ### 5.1 Network Faults
 
 Drop and service partition are implemented at connect time. DNS NXDOMAIN is
-implemented in userspace. Delay and bandwidth are deliberately unavailable
-until Reliaburger owns a TC packet hook and can prove effect and cleanup.
+implemented in userspace. Delay is a netem qdisc on each caller's interface.
+Bandwidth is deliberately unavailable until it can prove effect and cleanup.
 
-#### 5.1.1 Delay (via sock_ops TCP_BPF_DELACK)
+#### 5.1.1 Delay (via tc netem on the caller's interface)
 
-> **Status: unimplemented.** The loaded `connect4` hook cannot sleep and no
-> `sock_ops`, `sk_msg` or TC delay program is attached. `relish fault delay`
-> still parses the intended contract, but Bun rejects activation. The sketch
-> below is retained as design work only; a production implementation should
-> prefer a TC/netem-style packet path and must prove TCP and UDP semantics,
-> jitter, expiry, detach and concurrent ownership.
+> **Status: implemented (Z6.3, September 2026)** for runc containers. Process
+> and Apple workloads have no per-container interface to shape, so Bun refuses
+> a delay on those nodes.
 
-The original design proposed a `sock_ops` program that intercepts the TCP state
-machine after the connect hook. If a delay is configured, it would defer
-traffic by the specified duration.
+The connect hook can't delay anything: a cgroup `connect4` program runs
+synchronously inside `connect()`, may not sleep, and only chooses between
+"allow (maybe rewritten)" and "EPERM". It also never sees an established
+connection again. The earlier `sock_ops` sketch (defer the ACK) had the same
+blind spot for open connections and no answer for UDP.
 
-From the application's perspective, `connect()` takes 200ms longer than usual. For HTTP-level delays on established connections, the `sk_msg` program can hold data in a BPF ring buffer before releasing it to the socket.
+Linux already has a packet delayer: the netem qdisc. Every runc container has
+its own network namespace with one interface, `eth0`, so Bun shapes that
+interface's egress. For each caller container a delay applies to, it runs
+(inside the container's namespace, with the host's `tc`):
 
-```c
-// eBPF pseudocode: delay fault in sock_ops program
-SEC("sockops")
-int smoker_delay_sockops(struct bpf_sock_ops *skops) {
-    // Only act on SYN-ACK received (active connection established)
-    if (skops->op != BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB)
-        return SK_PASS;
-
-    // Build lookup key from the destination IP:port
-    struct bpf_connect_fault_key key = {
-        .virtual_ip = skops->remote_ip4,
-        .port       = bpf_ntohs(skops->remote_port),
-        .source_cgroup_id = 0,  // match-all first
-    };
-
-    struct bpf_connect_fault_value *val =
-        bpf_map_lookup_elem(&fault_connect_map, &key);
-    if (!val)
-        return SK_PASS;
-
-    // Check expiry
-    __u64 now = bpf_ktime_get_ns();
-    if (val->expires_ns != 0 && now > val->expires_ns) {
-        // Fault expired -- delete from map asynchronously (or let
-        // userspace cleanup handle it). Pass through.
-        return SK_PASS;
-    }
-
-    if (val->action != FAULT_ACTION_DELAY)
-        return SK_PASS;
-
-    // Compute actual delay with jitter
-    __u64 delay = val->delay_ns;
-    if (val->jitter_ns > 0) {
-        // Read per-CPU PRNG state
-        __u32 state_key = 0;
-        struct bpf_fault_state_value *state =
-            bpf_map_lookup_elem(&fault_state_map, &state_key);
-        if (state) {
-            // xorshift64 PRNG
-            __u64 x = state->prng_state;
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            state->prng_state = x;
-
-            // jitter range: [-jitter_ns, +jitter_ns]
-            __s64 jitter = (x % (2 * val->jitter_ns + 1)) - val->jitter_ns;
-            delay = (__u64)((__s64)delay + jitter);
-            if ((__s64)delay < 0) delay = 0;
-
-            state->faults_injected++;
-        }
-    }
-
-    // Set TCP_BPF_DELACK to defer connection completion
-    // The kernel will delay the ACK by `delay` nanoseconds,
-    // making the connect() call appear to take longer.
-    __u64 delay_us = delay / 1000;  // convert ns to us
-    if (delay_us > 0) {
-        bpf_sock_ops_cb_flags_set(skops,
-            BPF_SOCK_OPS_ALL_CB_FLAGS);
-        // Store delay in socket local storage for the timer
-        bpf_setsockopt(skops, SOL_TCP, TCP_BPF_DELACK_MAX,
-                        &delay_us, sizeof(delay_us));
-    }
-
-    return SK_PASS;
-}
+```text
+tc qdisc add dev eth0 root handle fa01: prio bands 4 priomap 1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1
+tc qdisc add dev eth0 parent fa01:4 handle fa10: netem delay 300000us [20000us]
+tc filter add dev eth0 parent fa01: protocol ip prio 1 u32 \
+    match ip dst <backend-ip>/32 match ip dport <backend-port> 0xffff flowid fa01:4
 ```
+
+The `prio` root keeps three ordinary bands (the default priomap sends every
+packet there) and adds one band per active delay, up to 13. A u32 filter per
+backend address (after the VIP rewrite, from the merged service map) steers
+the caller's packets to that backend into the netem band. Everything else the
+container sends is untouched. Because the delay acts on packets, it applies to
+connections that were already open, and to UDP. It is one-way: requests and
+the SYN are held, replies aren't, so a request/response pays the delay once
+per round trip. In the podinfo demo a cache read (two redis commands, plus the
+pool's own check) went from 43 ms to 945 ms under `delay redis 300ms --from
+frontend`, and back to 42 ms after `relish fault clear redis`.
+
+Bun converges delays the same way it converges connect keys
+(`smoker::network::desired_delays`): the desired bands per caller come from
+the active delay faults, the target's current backends and the instances
+running now. Any caller whose bands differ from what Bun installed (or that
+restarted since) has its tree rebuilt: delete Smoker's root if present, then
+add the new one. A root qdisc that isn't `fa01:` belongs to someone else, so
+Bun never deletes it and the `add` fails loudly instead. Deleting our root
+restores the veth's default (`noqueue`). New callers, restarted callers and
+moved backends are picked up on the next one-second tick; on clear or expiry
+every tree is removed. A Bun that starts up sweeps any `fa01:` root a crashed
+predecessor left behind, since faults never survive a restart.
+
+Injection refuses honestly: on a non-runc node, when the target has no
+backends, when a `--from` source has no local instance, or when `tc` fails
+(the error names a missing `sch_netem` module). `sch_netem`, `sch_prio` and
+`cls_u32` ship in Ubuntu's base `linux-modules` package.
+
+Bandwidth could use the same tree (netem has a `rate` option), but it stays
+unimplemented until it has its own tests.
 
 #### 5.1.2 Drop (via PRNG in connect hook)
 
