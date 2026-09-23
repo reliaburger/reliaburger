@@ -499,8 +499,11 @@ Config:
       section: rootless Runc is standalone only, container clusters are rootful
       Linux Runc/eBPF, declarative image workloads need root mode. Fix the
       "opt-in owned Runc" contradiction at `README.md:52` versus `:319`.
-- [ ] **T3.5 Decide on `docs/talks/`.** It arrived via PR #171 merged into this
+- [x] **T3.5 Decide on `docs/talks/`.** It arrived via PR #171 merged into this
       branch. Keep it, or move it to its own PR against `main`.
+      Kept. #171 landed on `main` as its own PR; it tracks five files (the
+      keynote deck generator, 1.3k lines). The untracked `node_modules` only
+      inflated `make loc`, which T4.8 fixed by counting tracked files.
 
 ## Tier 4: reduce code size
 
