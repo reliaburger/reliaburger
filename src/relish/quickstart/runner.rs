@@ -4,7 +4,7 @@ use super::{
     artifacts,
     download::Downloader,
     lima::{GuestFile, Lima},
-    progress::{Progress, Stage, Step},
+    progress::{Progress, Stage, Step, Timings},
     provision,
     security::{self, Bootstrap},
     state::{ClusterSpec, NodePhase, NodeState, Operation},
@@ -37,6 +37,8 @@ pub struct Options {
     pub development_binaries: Option<PathBuf>,
     /// HTTPS directory containing unchanged signed release candidate assets.
     pub release_mirror: Option<String>,
+    /// Print every step's timing, not just the per-stage summary.
+    pub timings: bool,
 }
 
 /// How long a download may go without receiving a byte before it fails.
@@ -106,6 +108,25 @@ pub async fn run(options: Options) -> Result<()> {
     .await;
     let timings = progress.finish().await;
     println!("{}", timings.summary());
+    if options.timings {
+        println!("every step (duration, start offset):\n{}", timings.table());
+    }
+    let report = TimingsReport {
+        schema: 1,
+        version: env!("CARGO_PKG_VERSION"),
+        os: std::env::consts::OS,
+        arch: std::env::consts::ARCH,
+        nodes: operation.state.spec.nodes,
+        development_binaries: options.development_binaries.is_some(),
+        succeeded: result.is_ok(),
+        timings: &timings,
+    };
+    let timings_path = operation.directory.join("timings.json");
+    // Timings are a diagnostic; failing to save them mustn't fail setup.
+    match save_timings(&timings_path, &report).await {
+        Ok(()) => println!("timings saved to {}", timings_path.display()),
+        Err(error) => eprintln!("could not save timings: {error:#}"),
+    }
     match result {
         Ok(()) => {
             println!(
@@ -131,6 +152,30 @@ pub async fn run(options: Options) -> Result<()> {
             operation.directory.display()
         ))),
     }
+}
+
+/// What `timings.json` in the cluster directory holds after every run.
+#[derive(serde::Serialize)]
+struct TimingsReport<'a> {
+    schema: u32,
+    version: &'static str,
+    os: &'static str,
+    arch: &'static str,
+    nodes: usize,
+    development_binaries: bool,
+    succeeded: bool,
+    #[serde(flatten)]
+    timings: &'a Timings,
+}
+
+async fn save_timings(path: &Path, report: &TimingsReport<'_>) -> Result<()> {
+    let bytes = serde_json::to_vec_pretty(report)?;
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || {
+        crate::sesame::identity::atomic_write_mode(&path, &bytes, Some(0o600))
+    })
+    .await??;
+    Ok(())
 }
 
 /// Check the host, fetch everything, then build the cluster, each under its deadline.
@@ -839,6 +884,33 @@ mod tests {
                 assert_eq!(file.mode, expected, "{}", file.destination);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn timings_file_records_the_run_and_every_step() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("timings.json");
+        let timings = Timings {
+            total_seconds: 12.5,
+            steps: Vec::new(),
+        };
+        let report = TimingsReport {
+            schema: 1,
+            version: "0.1.0",
+            os: "macos",
+            arch: "aarch64",
+            nodes: 3,
+            development_binaries: true,
+            succeeded: false,
+            timings: &timings,
+        };
+        save_timings(&path, &report).await.unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["schema"], 1);
+        assert_eq!(saved["succeeded"], false);
+        assert_eq!(saved["total_seconds"], 12.5);
+        assert!(saved["steps"].as_array().unwrap().is_empty());
     }
 
     #[test]

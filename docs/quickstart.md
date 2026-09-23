@@ -91,7 +91,9 @@ quorum. Both are fair experiments; neither should happen by accident.
 
 Setup shows a line per step as it goes: each download with its size and
 speed, each VM boot, and each node's install, enrolment and start. It ends with
-a short summary of where the time went.
+a short summary of where the time went. Add `--timings` to also print every
+step's duration. Each run, successful or not, saves the same data as JSON in
+`~/.reliaburger/clusters/laptop/timings.json`.
 
 Setup saves ownership and credentials before creating VMs. Building the
 cluster, from the first VM boot to the demo app, has a five-minute deadline.

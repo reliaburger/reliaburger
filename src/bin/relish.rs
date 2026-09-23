@@ -429,6 +429,9 @@ enum Command {
         /// HTTPS directory containing unchanged signed release candidate assets.
         #[arg(long, requires = "quickstart", conflicts_with = "development_binaries")]
         release_mirror: Option<String>,
+        /// Also print every setup step's timing (always saved as timings.json).
+        #[arg(long, requires = "quickstart")]
+        timings: bool,
 
         /// Accept the default answer to every question (non-interactive).
         #[arg(long)]
@@ -1615,6 +1618,7 @@ async fn main() -> ExitCode {
             registry_port,
             development_binaries,
             release_mirror,
+            timings,
             yes,
             ref dir,
             ref release_url,
@@ -1630,6 +1634,7 @@ async fn main() -> ExitCode {
                         registry_port: registry_port.unwrap_or(15050),
                         development_binaries,
                         release_mirror,
+                        timings,
                     },
                 )
                 .await
@@ -2328,6 +2333,8 @@ mod tests {
     #[test]
     fn parse_managed_quickstart_and_explicit_destroy() {
         assert!(parse(&["relish", "setup", "--quickstart", "--nodes", "3"]).is_ok());
+        assert!(parse(&["relish", "setup", "--quickstart", "--timings"]).is_ok());
+        assert!(parse(&["relish", "setup", "--timings"]).is_err());
         assert!(parse(&["relish", "local", "status"]).is_ok());
         let cli = parse(&["relish", "local", "stop", "node-3"]).unwrap();
         assert!(matches!(
