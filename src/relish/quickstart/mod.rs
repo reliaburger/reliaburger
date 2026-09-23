@@ -8,5 +8,6 @@ pub mod artifacts;
 pub mod lifecycle;
 pub mod lima;
 pub mod preflight;
+pub mod progress;
 pub mod provision;
 pub mod runner;

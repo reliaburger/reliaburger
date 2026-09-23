@@ -89,9 +89,17 @@ down the cluster keeps running but `relish` can't reach it. And stopping a
 node that would leave fewer than two of three running costs the council its
 quorum. Both are fair experiments; neither should happen by accident.
 
-Setup saves ownership and credentials before creating VMs. If it fails or
-hits its five-minute deadline, rerun the same command. It reuses verified
-cached assets, the original CA and the owned VMs. A retry won't silently
+Setup shows a line per step as it goes: each download with its size and
+speed, each VM boot, and each node's install, enrolment and start. It ends with
+a short summary of where the time went.
+
+Setup saves ownership and credentials before creating VMs. Building the
+cluster, from the first VM boot to the demo app, has a five-minute deadline.
+Downloads don't count towards it, because their speed is your network's: a
+download fails only if no data arrives for 30 seconds (or after 30 minutes in
+total), and an interrupted download resumes from where it stopped. If setup
+fails or runs out of time, rerun the same command. It reuses verified cached
+assets, the original CA and the owned VMs. A retry won't silently
 change the version, topology or ports, or replace a previously running VM
 that disappeared. The error tells you where the checkpoint lives.
 

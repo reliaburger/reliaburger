@@ -4,6 +4,7 @@ use super::{
     artifacts,
     download::Downloader,
     lima::{GuestFile, Lima},
+    progress::{Progress, Stage, Step},
     provision,
     security::{self, Bootstrap},
     state::{ClusterSpec, NodePhase, NodeState, Operation},
@@ -38,13 +39,25 @@ pub struct Options {
     pub release_mirror: Option<String>,
 }
 
-/// Create or resume a cluster under one five-minute deadline, preserving checkpoints.
+/// How long a download may go without receiving a byte before it fails.
+const DOWNLOAD_STALL: Duration = Duration::from_secs(30);
+
+/// Backstop for all downloads together. A transfer that keeps making progress
+/// is left alone until then, and its partial file survives for a re-run.
+const DOWNLOAD_DEADLINE: Duration = Duration::from_secs(30 * 60);
+
+/// Budget for everything after the downloads: VMs, nodes, quorum and demo.
+const CLUSTER_DEADLINE: Duration = Duration::from_secs(300);
+
+/// Create or resume a cluster, preserving checkpoints. Building the cluster
+/// has a five-minute deadline; downloads have their own, because their speed
+/// depends on the network rather than on us.
 pub async fn run(options: Options) -> Result<()> {
     if options.release_mirror.is_some() && options.development_binaries.is_some() {
         bail!("a release mirror cannot be combined with development binaries");
     }
     let version = env!("CARGO_PKG_VERSION").parse::<BinaryVersion>()?;
-    let mut downloader = Downloader::new(Duration::from_secs(180))?;
+    let mut downloader = Downloader::new(DOWNLOAD_STALL)?;
     if let Some(mirror) = &options.release_mirror {
         downloader = downloader.with_release_mirror(&version, mirror)?;
         eprintln!("using an explicit release mirror with checksum and signature verification");
@@ -81,24 +94,23 @@ pub async fn run(options: Options) -> Result<()> {
         })
         .await??;
     super::preflight::socket_paths(&root, operation.state.nodes.iter().map(|node| &node.name))?;
-    let started = std::time::Instant::now();
-    let result = tokio::time::timeout(
-        Duration::from_secs(300),
-        provision_cluster(
-            &root,
-            &mut operation,
-            &bootstrap,
-            options.development_binaries.as_deref(),
-            &downloader,
-        ),
+    let progress = Progress::stdout();
+    let result = setup(
+        &root,
+        &mut operation,
+        &bootstrap,
+        options.development_binaries.as_deref(),
+        &downloader,
+        &progress,
     )
     .await;
+    let timings = progress.finish().await;
+    println!("{}", timings.summary());
     match result {
-        Ok(Ok(())) => {
+        Ok(()) => {
             println!(
                 "cluster {} ready in {:.1}s",
-                operation.state.spec.name,
-                started.elapsed().as_secs_f64()
+                operation.state.spec.name, timings.total_seconds
             );
             println!(
                 "  app: http://localhost:{}",
@@ -114,58 +126,142 @@ pub async fn run(options: Options) -> Result<()> {
             );
             Ok(())
         }
-        Ok(Err(error)) => Err(error.context(format!(
+        Err(error) => Err(error.context(format!(
             "setup stopped; checkpoints are in {}. Re-run the same setup command to resume",
             operation.directory.display()
         ))),
-        Err(_) => bail!(
-            "setup exceeded five minutes; progress is saved in {}. Re-run the same setup command to resume",
-            operation.directory.display()
-        ),
     }
 }
 
-async fn provision_cluster(
+/// Check the host, fetch everything, then build the cluster, each under its deadline.
+async fn setup(
     root: &Path,
     operation: &mut Operation,
     bootstrap: &Bootstrap,
     development: Option<&Path>,
     downloader: &Downloader,
+    progress: &Progress,
 ) -> Result<()> {
-    let spec = operation.state.spec.clone();
+    let host = progress.step(Stage::Host, "check host");
+    host.record(super::preflight::host(root).await)?;
+    let artifacts = tokio::time::timeout(
+        DOWNLOAD_DEADLINE,
+        prepare_artifacts(
+            root,
+            &operation.state.spec.version,
+            development,
+            downloader,
+            progress,
+        ),
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "downloads did not finish within {} minutes; partial files are kept and a re-run resumes them",
+            DOWNLOAD_DEADLINE.as_secs() / 60
+        )
+    })??;
+    tokio::time::timeout(
+        CLUSTER_DEADLINE,
+        build_cluster(root, operation, bootstrap, &artifacts, progress),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("building the cluster took longer than five minutes"))?
+}
+
+/// Verified local inputs for building the cluster.
+struct Artifacts {
+    lima: Lima,
+    image: PathBuf,
+    bun: PathBuf,
+    relish: PathBuf,
+}
+
+/// Fetch Lima, the guest image and the Linux binaries concurrently.
+async fn prepare_artifacts(
+    root: &Path,
+    version: &BinaryVersion,
+    development: Option<&Path>,
+    downloader: &Downloader,
+    progress: &Progress,
+) -> Result<Artifacts> {
     let cache = root.join("cache");
     tokio::fs::create_dir_all(&cache).await?;
-    super::preflight::host(root).await?;
-    println!("preparing verified Linux image and tooling");
     let binaries = async {
         if let Some(directory) = development {
-            eprintln!(
-                "development binaries selected explicitly; this run does not qualify a published release"
+            progress.note(
+                "development binaries selected explicitly; this run does not qualify a published release",
             );
-            let bun = tokio::fs::canonicalize(directory.join("bun")).await?;
-            let relish = tokio::fs::canonicalize(directory.join("relish")).await?;
-            return Ok::<_, anyhow::Error>((bun, relish));
+            let step = progress.step(Stage::Download, "use development binaries");
+            let result = async {
+                let bun = tokio::fs::canonicalize(directory.join("bun")).await?;
+                let relish = tokio::fs::canonicalize(directory.join("relish")).await?;
+                Ok::<_, anyhow::Error>((bun, relish))
+            }
+            .await;
+            return step.record(result);
         }
+        let bun = progress.step(Stage::Download, "download bun");
+        let relish = progress.step(Stage::Download, "download relish");
         tokio::try_join!(
-            artifacts::binary(&cache, &spec.version, "bun", downloader),
-            artifacts::binary(&cache, &spec.version, "relish", downloader)
+            async { bun.record(artifacts::binary(&cache, version, "bun", downloader, &bun).await) },
+            async {
+                relish
+                    .record(artifacts::binary(&cache, version, "relish", downloader, &relish).await)
+            }
         )
     };
     let image = async {
-        if development.is_some() {
-            let image = artifacts::guest_image(std::env::consts::ARCH)?;
-            let path = cache.join(&image.asset);
-            downloader
-                .fetch(&image.url, &image.sha256, &path, 2 * 1024 * 1024 * 1024)
-                .await?;
-            Ok::<_, anyhow::Error>(path)
+        let step = progress.step(Stage::Download, "download guest image");
+        let result = if development.is_some() {
+            async {
+                let image = artifacts::guest_image(std::env::consts::ARCH)?;
+                let path = cache.join(&image.asset);
+                downloader
+                    .fetch(
+                        &image.url,
+                        &image.sha256,
+                        &path,
+                        2 * 1024 * 1024 * 1024,
+                        Some(&step),
+                    )
+                    .await?;
+                Ok::<_, anyhow::Error>(path)
+            }
+            .await
         } else {
-            artifacts::image(&cache, &spec.version, downloader).await
-        }
+            artifacts::image(&cache, version, downloader, &step).await
+        };
+        step.record(result)
     };
-    let (lima, image, (bun, relish)) =
-        tokio::try_join!(artifacts::tooling(root, downloader), image, binaries)?;
-    println!("starting {} Linux VM(s)", spec.nodes);
+    let tooling = async {
+        let step = progress.step(Stage::Download, "install Lima 2.1.0");
+        step.record(artifacts::tooling(root, downloader, &step).await)
+    };
+    let (lima, image, (bun, relish)) = tokio::try_join!(tooling, image, binaries)?;
+    Ok(Artifacts {
+        lima,
+        image,
+        bun,
+        relish,
+    })
+}
+
+/// Boot, configure and verify the cluster from verified local inputs.
+async fn build_cluster(
+    root: &Path,
+    operation: &mut Operation,
+    bootstrap: &Bootstrap,
+    artifacts: &Artifacts,
+    progress: &Progress,
+) -> Result<()> {
+    let spec = operation.state.spec.clone();
+    let Artifacts {
+        lima,
+        image,
+        bun,
+        relish,
+    } = artifacts;
     let mut statuses = Vec::new();
     for node in &operation.state.nodes {
         statuses.push(lima.status(&node.name).await?);
@@ -195,6 +291,7 @@ async fn provision_cluster(
         if index == 0 {
             ports.extend([spec.ingress_port, spec.registry_port]);
         }
+        let step = progress.step(Stage::Boot, format!("boot VM {}", index + 1));
         boots.push(boot_vm(
             lima.clone(),
             node,
@@ -202,12 +299,13 @@ async fn provision_cluster(
             statuses[index].clone(),
             config_path,
             ports,
+            step,
         ));
         // The first start also launches Lima's shared network daemon, which
         // Lima does not guard against a concurrent second launch. Peers start
         // as soon as it runs, while the first VM is still booting.
         if index == 0 && to_start > 1 {
-            wait_for_shared_network(&lima, &mut boots, operation).await?;
+            wait_for_shared_network(lima, &mut boots, operation).await?;
         }
     }
     while let Some(result) = boots.next().await {
@@ -227,14 +325,15 @@ async fn provision_cluster(
     let service_path = operation.directory.join("reliaburger.service");
     tokio::fs::write(&service_path, provision::SERVICE).await?;
     let setup = NodeSetup {
-        lima: &lima,
+        lima,
+        progress,
         spec: &spec,
         bootstrap,
         client: &client,
         directory: operation.directory.clone(),
         sources: NodeSources {
-            bun: &bun,
-            relish: &relish,
+            bun,
+            relish,
             service: &service_path,
             security: &bootstrap.directory,
         },
@@ -253,18 +352,23 @@ async fn provision_cluster(
             result?;
         }
     }
-    println!("checking quorum and deploying the hello container");
     let names: Vec<_> = operation
         .state
         .nodes
         .iter()
         .map(|node| node.name.clone())
         .collect();
-    wait_for_quorum(&client, &names).await?;
-    let demo = demo_config();
-    tokio::fs::write(operation.directory.join("hello.toml"), &demo).await?;
-    client.apply(&crate::config::Config::parse(&demo)?).await?;
-    probe_demo(spec.ingress_port).await?;
+    let quorum = progress.step(Stage::Verify, "form council quorum");
+    quorum.record(wait_for_quorum(&client, &names).await)?;
+    let demo_step = progress.step(Stage::Verify, "run hello through ingress");
+    let result = async {
+        let demo = demo_config();
+        tokio::fs::write(operation.directory.join("hello.toml"), &demo).await?;
+        client.apply(&crate::config::Config::parse(&demo)?).await?;
+        probe_demo(spec.ingress_port).await
+    }
+    .await;
+    demo_step.record(result)?;
     let context = LocalContext {
         schema: 1,
         owner: operation.state.id.clone(),
@@ -285,6 +389,7 @@ async fn provision_cluster(
 /// Everything shared by the per-node configuration steps.
 struct NodeSetup<'a> {
     lima: &'a Lima,
+    progress: &'a Progress,
     spec: &'a ClusterSpec,
     bootstrap: &'a Bootstrap,
     client: &'a BunClient,
@@ -364,59 +469,78 @@ async fn configure_node(
 ) -> Result<()> {
     let node = operation.lock().await.state.nodes[index].clone();
     let lima = setup.lima;
+    let number = index + 1;
     if node.phase != NodePhase::Started {
-        println!("configuring {}", node.name);
-        let config = provision::node_config(
-            &setup.spec.name,
-            &node.name,
-            node.address.context("VM has no address")?,
-            (index > 0).then_some(setup.first_address),
-            setup.peers,
-        )?;
-        let config_path = setup.directory.join(format!("{}.toml", node.name));
-        tokio::fs::write(&config_path, config).await?;
-        lima.install_files(&node.name, node_files(&setup.sources, index, config_path))
-            .await?;
+        let step = setup
+            .progress
+            .step(Stage::Configure, format!("install files on node {number}"));
+        let result = async {
+            let config = provision::node_config(
+                &setup.spec.name,
+                &node.name,
+                node.address.context("VM has no address")?,
+                (index > 0).then_some(setup.first_address),
+                setup.peers,
+            )?;
+            let config_path = setup.directory.join(format!("{}.toml", node.name));
+            tokio::fs::write(&config_path, config).await?;
+            lima.install_files(&node.name, node_files(&setup.sources, index, config_path))
+                .await
+        }
+        .await;
+        step.record(result)?;
         checkpoint(operation, index, NodePhase::Configured).await?;
         if index > 0 {
-            enrol(setup, &node.name).await?;
+            let step = setup
+                .progress
+                .step(Stage::Configure, format!("enrol node {number}"));
+            step.record(enrol(setup, &node.name, &step).await)?;
         }
         checkpoint(operation, index, NodePhase::Enrolled).await?;
-        lima.command(&[
-            "shell",
-            &node.name,
-            "sudo",
-            "sh",
-            "-c",
-            "systemctl daemon-reload && systemctl enable --now reliaburger.service",
-        ])
-        .await?;
-        checkpoint(operation, index, NodePhase::Started).await?;
-    } else {
-        lima.command(&[
-            "shell",
-            &node.name,
-            "sudo",
-            "systemctl",
-            "start",
-            "reliaburger.service",
-        ])
-        .await?;
     }
-    let node_client = setup.bootstrap.client(&format!(
-        "https://127.0.0.1:{}",
-        setup.spec.api_port + index as u16
-    ))?;
-    crate::relish::readiness::wait_for_node(&node_client, Duration::from_secs(45)).await?;
-    let version: BinaryVersion = node_client.node_version().await?.parse()?;
-    if version != setup.spec.version {
-        bail!(
-            "VM {} is running {version}, expected {}",
-            node.name,
-            setup.spec.version
-        );
+    let step = setup
+        .progress
+        .step(Stage::Configure, format!("start node {number}"));
+    let result = async {
+        if node.phase != NodePhase::Started {
+            lima.command(&[
+                "shell",
+                &node.name,
+                "sudo",
+                "sh",
+                "-c",
+                "systemctl daemon-reload && systemctl enable --now reliaburger.service",
+            ])
+            .await?;
+            checkpoint(operation, index, NodePhase::Started).await?;
+        } else {
+            lima.command(&[
+                "shell",
+                &node.name,
+                "sudo",
+                "systemctl",
+                "start",
+                "reliaburger.service",
+            ])
+            .await?;
+        }
+        let node_client = setup.bootstrap.client(&format!(
+            "https://127.0.0.1:{}",
+            setup.spec.api_port + index as u16
+        ))?;
+        crate::relish::readiness::wait_for_node(&node_client, Duration::from_secs(45)).await?;
+        let version: BinaryVersion = node_client.node_version().await?.parse()?;
+        if version != setup.spec.version {
+            bail!(
+                "VM {} is running {version}, expected {}",
+                node.name,
+                setup.spec.version
+            );
+        }
+        Ok(())
     }
-    Ok(())
+    .await;
+    step.record(result)
 }
 
 /// Guest script that stores a join token from standard input only for as
@@ -427,7 +551,7 @@ trap 'rm -f -- \"$token\"' EXIT\ncat > \"$token\"\n\
 --identity-dir /etc/reliaburger/identity --ca-fingerprint \"$2\" \"$3\"\n";
 
 /// Enrol a peer through the first node, unless it already has an identity.
-async fn enrol(setup: &NodeSetup<'_>, name: &str) -> Result<()> {
+async fn enrol(setup: &NodeSetup<'_>, name: &str, step: &Step) -> Result<()> {
     let lima = setup.lima;
     let enrolled = lima
         .command(&[
@@ -441,6 +565,7 @@ async fn enrol(setup: &NodeSetup<'_>, name: &str) -> Result<()> {
         .await
         .is_ok();
     if enrolled {
+        step.note("already enrolled");
         return Ok(());
     }
     let token = setup.client.join_token_create(name, 300).await?;
@@ -484,11 +609,29 @@ async fn boot_vm(
     status: Option<String>,
     config_path: PathBuf,
     ports: Vec<u16>,
+    step: Step,
 ) -> Result<(usize, std::net::Ipv4Addr)> {
-    if status.as_deref() != Some("Running") {
-        super::preflight::ports(&ports).await?;
+    let result = async {
+        start_vm(&lima, &node, status.as_deref(), &config_path, &ports, &step).await?;
+        lima.wait_for_guest(&node.name).await?;
+        Ok((index, lima.address(&node.name).await?))
     }
-    match status.as_deref() {
+    .await;
+    step.record(result)
+}
+
+async fn start_vm(
+    lima: &Lima,
+    node: &NodeState,
+    status: Option<&str>,
+    config_path: &Path,
+    ports: &[u16],
+    step: &Step,
+) -> Result<()> {
+    if status != Some("Running") {
+        super::preflight::ports(ports).await?;
+    }
+    match status {
         None if node.phase != NodePhase::Planned => bail!(
             "owned VM {} disappeared; refusing to create a replacement cluster implicitly",
             node.name
@@ -502,14 +645,14 @@ async fn boot_vm(
             ])
             .await?;
         }
-        Some("Running") => {}
+        Some("Running") => step.note("already running"),
         Some("Stopped") => {
+            step.note("restarted");
             lima.command(&["start", "--tty=false", &node.name]).await?;
         }
         Some(status) => bail!("VM {} is in unexpected state {status}", node.name),
     }
-    lima.wait_for_guest(&node.name).await?;
-    Ok((index, lima.address(&node.name).await?))
+    Ok(())
 }
 
 /// Wait until Lima's shared network runs, or the first boot finishes.

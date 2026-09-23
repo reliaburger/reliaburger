@@ -1,6 +1,6 @@
 //! Version-pinned tooling, guest images and signed Linux release binaries.
 
-use super::{download::Downloader, lima::Lima};
+use super::{download::Downloader, lima::Lima, progress::Step};
 use crate::upgrade::{
     BinaryVersion, keys,
     signing::{SignatureEnvelope, verify_binary},
@@ -65,7 +65,7 @@ pub fn lima_archive(os: &str, arch: &str) -> Result<(String, &'static str)> {
 }
 
 /// Install a private pinned Lima distribution without modifying system packages.
-pub async fn tooling(root: &Path, downloader: &Downloader) -> Result<Lima> {
+pub async fn tooling(root: &Path, downloader: &Downloader, step: &Step) -> Result<Lima> {
     let (url, checksum) = lima_archive(std::env::consts::OS, std::env::consts::ARCH)?;
     let tools = root.join("tools");
     tokio::fs::create_dir_all(&tools).await?;
@@ -74,7 +74,7 @@ pub async fn tooling(root: &Path, downloader: &Downloader) -> Result<Lima> {
     if !executable.exists() {
         let archive = tools.join("lima-2.1.0.tar.gz");
         downloader
-            .fetch(&url, checksum, &archive, 256 * 1024 * 1024)
+            .fetch(&url, checksum, &archive, 256 * 1024 * 1024, Some(step))
             .await?;
         let staging = tempfile::Builder::new()
             .prefix("lima-")
@@ -95,6 +95,8 @@ pub async fn tooling(root: &Path, downloader: &Downloader) -> Result<Lima> {
         }
         tokio::fs::rename(staging.path(), &installed).await?;
         let _ = staging.keep();
+    } else {
+        step.note("installed");
     }
     let lima = Lima::new(executable, Duration::from_secs(240)).with_home(root.join("lima"));
     let version = lima.command(&["--version"]).await?;
@@ -109,6 +111,7 @@ pub async fn image(
     cache: &Path,
     version: &BinaryVersion,
     downloader: &Downloader,
+    step: &Step,
 ) -> Result<PathBuf> {
     let image = guest_image(std::env::consts::ARCH)?;
     let path = cache.join(&image.asset);
@@ -118,6 +121,7 @@ pub async fn image(
             &image.sha256,
             &path,
             2 * 1024 * 1024 * 1024,
+            Some(step),
         )
         .await?;
     Ok(path)
@@ -129,6 +133,7 @@ pub async fn binary(
     version: &BinaryVersion,
     name: &str,
     downloader: &Downloader,
+    step: &Step,
 ) -> Result<PathBuf> {
     let manifest = match name {
         "bun" => "metadata.json",
@@ -144,7 +149,13 @@ pub async fn binary(
         .clone();
     let path = cache.join(format!("{name}-{version}-linux-{}", std::env::consts::ARCH));
     downloader
-        .fetch(&artifact.url, &artifact.sha256, &path, 256 * 1024 * 1024)
+        .fetch(
+            &artifact.url,
+            &artifact.sha256,
+            &path,
+            256 * 1024 * 1024,
+            Some(step),
+        )
         .await?;
     let checked_path = path.clone();
     tokio::task::spawn_blocking(move || -> Result<()> {

@@ -820,11 +820,31 @@ ownership, private bootstrap files and damaged bundles.
 
 The installer needs a guest image and prebuilt binaries. A partial download
 mustn't become tomorrow's cached executable. The downloader streams each body
-to a randomly named private file beside its destination, checks a running
+to a private `<name>.partial` file beside its destination, checks a running
 SHA-256 digest, flushes it, and renames it into place. A bad checksum leaves an
 existing file untouched. Cached files get checked again before reuse.
 
-Request deadlines include the response body. Size limits apply both to the
+Our first downloader gave each request 180 seconds, body included. That sounds
+generous until you do the arithmetic: the Ubuntu image is about 600 MB, so any
+link slower than about 27 Mbit/s failed every time, and each retry started from
+zero. A time limit on the whole transfer can't tell a slow link from a dead one.
+What we actually want to detect is a transfer that has stopped. So each chunk
+now has 30 seconds to arrive (`tokio::time::timeout` around `response.chunk()`),
+and there's no limit on a transfer that keeps moving.
+
+When a transfer does stop, or you press Ctrl-C, the partial file stays. The
+next run hashes what's there, asks for the rest with an HTTP `Range:
+bytes=N-` header, and appends. If the server answers `206 Partial Content`
+starting at exactly our offset, we carry on; if it ignores the range and sends
+the whole file with `200`, we truncate and start again. Either way the digest
+covers every byte of the final file, so a resumed download is trusted exactly
+as much as a fresh one. A partial whose final digest is wrong gets deleted,
+because retrying from the same bytes can never succeed. We mark that case with
+a tiny `thiserror` type, `Unrecoverable`, and check for it with anyhow's
+`downcast_ref`, which asks an `anyhow::Error` whether it wraps a particular
+concrete error type. It's Rust's rough equivalent of Go's `errors.As`.
+
+Size limits apply both to the
 advertised length and the bytes actually received, so chunked responses don't
 bypass them. Redirects must keep using HTTPS, and URLs can't contain credentials.
 Loopback HTTP is allowed only in test builds for the local fixture server.
@@ -847,8 +867,13 @@ that you supply exactly one source; both routes use the same pinned-CA join.
 
 ### Put the steps together
 
-`setup --quickstart` wraps the whole operation in one five-minute deadline.
-Each completed external step gets a durable checkpoint. Our first version
+`setup --quickstart` used to wrap the whole operation in one five-minute
+deadline. That deadline guards against a setup that hangs, but downloads made
+it a guard against slow networks too: at 20 Mbit/s the image alone takes four
+minutes. Now the five minutes cover what we control, from the first VM boot to
+the ingress probe. Downloads get the stall detection above and a separate
+30-minute backstop, and since partial files survive, running out of time costs
+nothing but the wait. Each completed external step gets a durable checkpoint. Our first version
 booted VM 1 alone, because concurrent first boots corrupted Lima's shared SSH
 key, and only then started the others. That cost a whole boot, 40 seconds or
 more. Reading Lima 2.1.0's source showed why: `limactl start` checks whether
@@ -932,6 +957,44 @@ and removes the active context only if its owner matches. We preserve the lock
 file's inode: deleting it while holding the lock would let another process
 create a new file at the same path and acquire a different lock.
 
+
+### Progress you can trust
+
+For a long time quickstart printed five lines in four minutes. "Preparing
+verified Linux image and tooling", then nothing for two minutes while 600 MB
+arrived. Is it downloading? Stuck? Would Ctrl-C lose everything? You couldn't
+tell, and neither could we when we measured it.
+
+Now every step gets a line: each download with bytes, total and speed, each VM
+boot, each node's install, enrolment and start, then quorum and the demo. On a
+terminal the lines redraw in place, with a status, the elapsed time and any
+note such as `cached` or `already running`. In a CI log or a pipe, where
+cursor movement would be garbage, each step prints once when it starts and
+once when it ends. At the end comes a short "where the time went" table.
+
+The interesting part is how a download on one Tokio task tells the display
+about its bytes without anyone taking a lock. A step is an `Arc<StepState>`;
+`Arc` is a reference-counted pointer that several threads can hold at once
+(Go programmers get this for free from the garbage collector). Inside it the
+byte counter is an `AtomicU64`, which the downloader bumps with `fetch_add` and
+the display reads with `load`. Things that are set exactly once, like the total
+size, a note or the finish time, live in `std::sync::OnceLock`, a cell that
+can be written once and then read by anyone without locking. Rust's type
+system is doing real work here. `Arc<T>` only lets you share `&T`, a shared
+reference, so we *can't* mutate a plain `u64` through it. The compiler forces
+us to pick a type that is safe to change through a shared reference.
+
+The display itself runs on a plain `std::thread`, not a Tokio task. Writing to
+a terminal can block, and a blocked write on a Tokio worker would stall
+whatever else that worker was polling. Steps reach the thread through a
+`std::sync::mpsc` channel; the thread wakes every 125 ms, drains the channel
+and redraws. When setup ends it marks anything still running as `stop` rather
+than leaving it spinning, and hands back every step so we can total the times.
+
+The summary groups steps by stage and reports each stage's wall-clock span,
+from its first start to its last finish. Adding up the three VM boots would
+say we spent three minutes booting when we spent one; they overlap, and the
+point of the summary is to say where the minutes actually went.
 
 ### Keep the host predictable
 
