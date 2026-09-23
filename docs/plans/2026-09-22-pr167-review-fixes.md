@@ -12,12 +12,15 @@ Tick an item only when its commit is on the branch and `make ci` passes.
 
 Each tier is its own PR, stacked on the previous one:
 
-| Tier | Branch | Base |
-| --- | --- | --- |
-| 1 | `fix/tier-1-merge-blockers` | `main` |
-| 2 | `fix/tier-2-release-fixes` | `fix/tier-1-merge-blockers` |
-| 3 | `fix/tier-3-docs` | `fix/tier-2-release-fixes` |
-| 4 | `fix/tier-4-size` | `fix/tier-3-docs` |
+| Tier | Branch | Base | PR |
+| --- | --- | --- | --- |
+| 1 | `fix/tier-1-merge-blockers` | `main` | #172 |
+| 2 | `fix/tier-2-release-fixes` | `fix/tier-1-merge-blockers` | #173 |
+| 4 | `fix/tier-4-size` | `fix/tier-2-release-fixes` | |
+| 3 | `fix/tier-3-docs` | `fix/tier-4-size` | |
+
+The docs tier comes last (decided 23 September 2026) so the book condensation
+describes the final code, including T4's single Runc lifecycle.
 
 Line numbers below were recorded at `9d8eb3d`; re-find each location before
 editing, since earlier fixes move them.
