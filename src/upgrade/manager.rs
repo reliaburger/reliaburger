@@ -418,20 +418,29 @@ impl UpgradeManager {
         // of already being on disk / executing, so there is nothing to check.
         // An envelope with an external signature is verified as a network
         // artefact (both signatures required); otherwise just the embedded one.
-        if let Ok(envelope) = SignatureEnvelope::load(&self.store.envelope_path(&target))
-            && !envelope.embedded.is_empty()
-        {
-            let bytes = std::fs::read(self.store.binary_path(&target))?;
-            signing::verify_binary(
-                &bytes,
-                &envelope,
-                &self.release_keys,
-                self.external_key.as_ref(),
-                envelope.external.is_some(),
-            )?;
-        }
-
-        let bytes = std::fs::read(self.store.binary_path(&target))?;
+        // Hashing a whole Bun binary is too slow for an async task, and one
+        // read serves both the signature check and the compatibility check.
+        let binary = self.store.binary_path(&target);
+        let envelope_path = self.store.envelope_path(&target);
+        let release_keys = self.release_keys.clone();
+        let external_key = self.external_key.clone();
+        let bytes = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, UpgradeError> {
+            let bytes = std::fs::read(&binary)?;
+            if let Ok(envelope) = SignatureEnvelope::load(&envelope_path)
+                && !envelope.embedded.is_empty()
+            {
+                signing::verify_binary(
+                    &bytes,
+                    &envelope,
+                    &release_keys,
+                    external_key.as_ref(),
+                    envelope.external.is_some(),
+                )?;
+            }
+            Ok(bytes)
+        })
+        .await
+        .map_err(|error| UpgradeError::IncompatibleBinary(error.to_string()))??;
         super::compatibility::check_binary(
             bytes,
             self.store.binary_path(&target).parent().ok_or_else(|| {

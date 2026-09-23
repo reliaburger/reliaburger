@@ -3312,7 +3312,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         // Identity dirs with no live owner — legacy app-scoped layouts and
         // instances that died while bun was down — are stale key material.
         self.finish_discovery_recovery().await?;
-        self.sweep_orphaned_identity_dirs();
+        self.sweep_orphaned_identity_dirs().await;
 
         Ok(adopted_count)
     }
@@ -8637,28 +8637,38 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// instance. Runs once after adoption: legacy app-scoped directories
     /// and instances that died while bun was down both get swept, so
     /// stale key material never lingers (PKI7).
-    fn sweep_orphaned_identity_dirs(&self) {
+    async fn sweep_orphaned_identity_dirs(&self) {
         let root = self.volumes_dir.join(".identity");
-        let Ok(entries) = std::fs::read_dir(&root) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let tracked = self
-                .supervisor
-                .get_instance(&InstanceId(name.clone()))
-                .is_some();
-            if tracked
-                || self
-                    .startup_retirements
+        // Decide what to keep here, then leave the directory walk and file
+        // removal to a blocking worker.
+        let keep: std::collections::HashSet<String> = self
+            .supervisor
+            .list_instances()
+            .iter()
+            .map(|instance| instance.id.0.clone())
+            .chain(
+                self.startup_retirements
                     .iter()
-                    .any(|pending| pending.instance_id.0 == name)
-            {
-                continue;
+                    .map(|pending| pending.instance_id.0.clone()),
+            )
+            .collect();
+        let swept = tokio::task::spawn_blocking(move || {
+            let Ok(entries) = std::fs::read_dir(&root) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if keep.contains(&name) {
+                    continue;
+                }
+                if let Err(e) = crate::sesame::identity::cleanup_identity_dir(&entry.path()) {
+                    eprintln!("bun: warning: failed to sweep stale identity dir {name}: {e}");
+                }
             }
-            if let Err(e) = crate::sesame::identity::cleanup_identity_dir(&entry.path()) {
-                eprintln!("bun: warning: failed to sweep stale identity dir {name}: {e}");
-            }
+        })
+        .await;
+        if let Err(error) = swept {
+            eprintln!("bun: warning: identity sweep worker failed: {error}");
         }
     }
 
@@ -12955,6 +12965,21 @@ mod tests {
         recovered.set_records_dir(root.path().join("records"));
         recovered.set_volumes_dir(root.path().join("volumes"));
         (recovered, grill, root, reference)
+    }
+
+    #[tokio::test]
+    async fn discovery_recovery_gives_up_on_a_wedged_runtime_inventory() {
+        let (mut agent, grill, root, _) = discovery_recovery_fixture().await;
+        grill.set_inventory_delay(Some(std::time::Duration::from_secs(300)));
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            agent.recover_discovery_ownership(&root.path().join("discovery")),
+        )
+        .await
+        .expect("discovery recovery hung on the runtime inventory");
+        assert!(result.is_err(), "recovery proceeded without an inventory");
+        assert!(started.elapsed() < std::time::Duration::from_secs(20));
     }
 
     #[tokio::test]

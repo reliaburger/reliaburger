@@ -3472,6 +3472,22 @@ could inject a second fault. Production safety checks are unchanged. The repaire
 live scenario passes on macOS (27.087s) and Linux (26.890s).
 
 
+### Keeping the runtime threads free
+
+Tokio runs async tasks on a handful of worker threads. A task that blocks one,
+by reading a large file or walking a directory with `std::fs`, stalls every
+other task scheduled there. Three places still did that. Startup swept stale
+workload identity directories with `std::fs::read_dir` on the agent's task;
+it now decides which names to keep while it can see the agent's state, then
+hands the directory walk and deletions to `spawn_blocking`. Rollback read the
+stored Bun binary twice, once to verify its signature and once to check its
+compatibility, hashing hundreds of megabytes on an async thread; it now reads
+it once in a blocking worker and passes the bytes on. And discovery recovery
+waited on the runtime inventory with no deadline at all, so a wedged runtime
+could hold startup forever. It gets the same five-second bound as the other
+inventory reads, and a test with an inventory that never answers checks it
+gives up.
+
 ### Closing an evidence gap
 
 An application exits. Bun starts its replacement, then dies before saving the

@@ -405,7 +405,10 @@ Discovery and API:
       `refuse_retired_tls_peer` calls `council.security_state()`, which clones
       all of `DesiredState`. Add a borrowing accessor for the security part.
       Also make it fail closed when SAN parsing fails.
-- [ ] **T2.14 Blocking filesystem calls on async tasks.**
+- [x] **T2.14 Blocking filesystem calls on async tasks.** Done. The identity
+      sweep and rollback verification run in `spawn_blocking` (rollback now
+      reads the binary once); discovery recovery bounds its inventory read at
+      5 s. `io_device_major_minor` keeps its single `stat`.
       `sweep_orphaned_identity_dirs` (`src/bun/agent.rs:8590`), `:5360`,
       `prepare_rollback` in `src/upgrade/manager.rs`. Wrap in
       `spawn_blocking`. Add a timeout to `recover_discovery`'s
