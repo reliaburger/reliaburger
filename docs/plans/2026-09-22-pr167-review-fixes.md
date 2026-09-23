@@ -592,9 +592,16 @@ spot-checked by hand.
       "legacy", "compat", "deprecated", "migrate", `#[serde(default)]` on
       durable formats and version fallbacks. Delete paths that exist only for
       unreleased formats or superseded implementations, and their docs.
-- [ ] **T4.8 Make `make loc` honest.** Count tracked files (`git ls-files`)
+- [x] **T4.8 Make `make loc` honest.** Count tracked files (`git ls-files`)
       so `node_modules` Markdown under `docs/talks/` stops inflating `.md`, and
       treat `#[cfg(test)] mod x;` files as tests.
+      Done. `make loc` runs `scripts/loc.sh`, which counts only tracked
+      files and counts `#[cfg(test)] mod x;` files (today
+      `src/bun/job_lifecycle_tests.rs`, 349 lines) as tests without letting
+      the declaration flip the rest of its parent into the test tail. On
+      this tree `.rs (src)` drops 347 lines to 132,488 and `.rs (test)`
+      rises to 132,260; in a checkout with `target/` and `docs/talks`
+      `node_modules`, the old recipe reported 449k `.md` and 2.06M total.
 
 Not worth it: marking `ProcessGrill`'s unowned branches test-only (~450
 lines, but 40 test sites depend on them, so no lines are saved), and merging
