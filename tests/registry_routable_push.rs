@@ -12,8 +12,7 @@
 //! by monolithic `POST`, then the top manifest `PUT` by tag, all carrying the
 //! service token as a bearer) round-trips.
 //!
-//! Gated behind `RELIABURGER_ROUTABLE_TESTS=1` to match the suite taxonomy; it
-//! needs no external tooling, so it is safe to run anywhere the env var is set.
+//! It needs no external tooling, so it runs in the portable suite.
 
 use std::sync::Arc;
 
@@ -24,14 +23,6 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 const SERVICE_TOKEN: &str = "rbrg_test_service_token";
-
-fn gate() -> bool {
-    if std::env::var("RELIABURGER_ROUTABLE_TESTS").is_err() {
-        eprintln!("skipping: set RELIABURGER_ROUTABLE_TESTS=1 to run the routable-push suite");
-        return false;
-    }
-    true
-}
 
 /// A Pickle registry with the routable-cluster auth policy: reads and writes
 /// both require a principal, and there is no open bootstrap window.
@@ -135,9 +126,6 @@ fn write_oci_layout(dir: &std::path::Path) -> (String, String) {
 /// service-token bearer (what the runner's OCI-layout upload sends) succeed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_routable_push_needs_the_service_token_bearer() {
-    if !gate() {
-        return;
-    }
     let (port, shutdown, _dir) = start_authenticated_registry().await;
     let layout = tempfile::tempdir().unwrap();
     let (config_digest, _layer_digest) = write_oci_layout(layout.path());
