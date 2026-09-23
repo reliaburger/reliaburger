@@ -39,7 +39,7 @@ test-group = "cluster-heavy"
 slow-timeout = { period = "60s", terminate-after = 2 }
 
 [[profile.default.overrides]]
-filter = 'binary(integration) | binary(placement)'
+filter = 'binary(integration) | binary(placement) | binary(job_recovery)'
 test-group = "process-heavy"
 slow-timeout = { period = "60s", terminate-after = 3 }
 
@@ -66,7 +66,7 @@ test-group = "cluster-heavy"
 slow-timeout = { period = "60s", terminate-after = 2 }
 
 [[profile.ci.overrides]]
-filter = 'binary(integration) | binary(placement)'
+filter = 'binary(integration) | binary(placement) | binary(job_recovery)'
 test-group = "process-heavy"
 slow-timeout = { period = "60s", terminate-after = 3 }
 
