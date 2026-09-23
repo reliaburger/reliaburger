@@ -42,6 +42,9 @@ pub fn vm_config(
             "#!/bin/bash\nset -eu\nexport DEBIAN_FRONTEND=noninteractive\n",
             // Lima changes the user manager during first boot. Reconnect logind
             // after that transition so subsequent PAM sessions do not stall.
+            // A graceful stop sometimes spins until systemd's 90 s stop
+            // timeout kills it, stalling boot. Kill it straight away instead.
+            "systemctl kill --signal=SIGKILL systemd-logind.service || true\n",
             "systemctl restart systemd-logind.service\n",
             "apt-get update -qq\napt-get install -y -qq runc uidmap btrfs-progs nftables iptables iproute2\n",
             "install -d -m 700 /etc/reliaburger\n")
@@ -161,6 +164,20 @@ mod tests {
         assert_eq!(forwards[3]["proto"], "any");
         assert_eq!(forwards[3]["guestIP"], "0.0.0.0");
         assert_eq!(value["networks"][0]["lima"], "user-v2");
+    }
+
+    #[test]
+    fn provisioning_never_waits_for_a_graceful_logind_stop() {
+        let yaml = vm_config("/private/cache/ubuntu.img", "aarch64", 19117, None, None).unwrap();
+        let value: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        let script = value["provision"][0]["script"].as_str().unwrap();
+        let kill = script
+            .find("systemctl kill --signal=SIGKILL systemd-logind.service")
+            .unwrap();
+        let restart = script
+            .find("systemctl restart systemd-logind.service")
+            .unwrap();
+        assert!(kill < restart, "{script}");
     }
 
     #[test]
