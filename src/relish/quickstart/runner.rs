@@ -3,7 +3,7 @@
 use super::{
     artifacts,
     download::Downloader,
-    lima::Lima,
+    lima::{GuestFile, Lima},
     provision,
     security::{self, Bootstrap},
     state::{ClusterSpec, NodePhase, NodeState, Operation},
@@ -224,175 +224,33 @@ async fn provision_cluster(
         .context("bootstrap VM has no address")?;
     let endpoint = format!("https://127.0.0.1:{}", spec.api_port);
     let client = bootstrap.client(&endpoint)?;
-    for index in 0..spec.nodes {
-        let node = operation.state.nodes[index].clone();
-        if node.phase != NodePhase::Started {
-            println!("configuring {}", node.name);
-            lima.install(&node.name, &bun, "/usr/local/bin/bun", true)
-                .await?;
-            lima.install(&node.name, &relish, "/usr/local/bin/relish", true)
-                .await?;
-            let config = provision::node_config(
-                &spec.name,
-                &node.name,
-                node.address.context("VM has no address")?,
-                (index > 0).then_some(first_address),
-                &peers,
-            )?;
-            let config_path = operation.directory.join(format!("{}.toml", node.name));
-            tokio::fs::write(&config_path, config).await?;
-            lima.install(
-                &node.name,
-                &config_path,
-                "/etc/reliaburger/node.toml",
-                false,
-            )
-            .await?;
-            lima.install(
-                &node.name,
-                &bootstrap.directory.join("master.key"),
-                "/etc/reliaburger/master.key",
-                false,
-            )
-            .await?;
-            if index == 0 {
-                lima.install(
-                    &node.name,
-                    &bootstrap.directory.join("security-bootstrap.json"),
-                    "/etc/reliaburger/security-bootstrap.json",
-                    false,
-                )
-                .await?;
-                // Copy the commit marker last, just as the local identity store does.
-                for file in [
-                    "node.crt",
-                    "node.key",
-                    "node-ca.crt",
-                    "root-ca.crt",
-                    "meta.json",
-                    "node.bundle.json",
-                    "bundle.committed",
-                ] {
-                    lima.install(
-                        &node.name,
-                        &bootstrap.directory.join("identity").join(file),
-                        &format!("/etc/reliaburger/identity/{file}"),
-                        false,
-                    )
-                    .await?;
-                }
-            }
-            operation.state.nodes[index].phase = NodePhase::Configured;
-            operation.save_async().await?;
-            if index > 0 {
-                let enrolled = lima
-                    .command(&[
-                        "shell",
-                        &node.name,
-                        "sudo",
-                        "test",
-                        "-f",
-                        "/etc/reliaburger/identity/bundle.committed",
-                    ])
-                    .await
-                    .is_ok();
-                if !enrolled {
-                    let token = client.join_token_create(&node.name, 300).await?;
-                    let token_path = operation.directory.join("join.token");
-                    crate::sesame::identity::atomic_write_mode(
-                        &token_path,
-                        token.as_bytes(),
-                        Some(0o600),
-                    )?;
-                    let result = async {
-                        lima.install(
-                            &node.name,
-                            &token_path,
-                            "/etc/reliaburger/join.token",
-                            false,
-                        )
-                        .await?;
-                        lima.command(&[
-                            "shell",
-                            &node.name,
-                            "sudo",
-                            "/usr/local/bin/relish",
-                            "join",
-                            "--token-file",
-                            "/etc/reliaburger/join.token",
-                            "--node-id",
-                            &node.name,
-                            "--identity-dir",
-                            "/etc/reliaburger/identity",
-                            "--ca-fingerprint",
-                            &bootstrap.root_fingerprint,
-                            &format!("https://{first_address}:9117"),
-                        ])
-                        .await?;
-                        Ok::<_, anyhow::Error>(())
-                    }
-                    .await;
-                    let _ = tokio::fs::remove_file(&token_path).await;
-                    let _ = lima
-                        .command(&[
-                            "shell",
-                            &node.name,
-                            "sudo",
-                            "rm",
-                            "-f",
-                            "/etc/reliaburger/join.token",
-                        ])
-                        .await;
-                    result?;
-                }
-            }
-            operation.state.nodes[index].phase = NodePhase::Enrolled;
-            operation.save_async().await?;
-            let service_path = operation.directory.join("reliaburger.service");
-            tokio::fs::write(&service_path, provision::SERVICE).await?;
-            lima.install(
-                &node.name,
-                &service_path,
-                "/etc/systemd/system/reliaburger.service",
-                false,
-            )
-            .await?;
-            lima.command(&["shell", &node.name, "sudo", "systemctl", "daemon-reload"])
-                .await?;
-            lima.command(&[
-                "shell",
-                &node.name,
-                "sudo",
-                "systemctl",
-                "enable",
-                "--now",
-                "reliaburger.service",
-            ])
-            .await?;
-            operation.state.nodes[index].phase = NodePhase::Started;
-            operation.save_async().await?;
-        }
-        lima.command(&[
-            "shell",
-            &node.name,
-            "sudo",
-            "systemctl",
-            "start",
-            "reliaburger.service",
-        ])
-        .await?;
-        let node_client = bootstrap.client(&format!(
-            "https://127.0.0.1:{}",
-            spec.api_port + index as u16
-        ))?;
-        crate::relish::readiness::wait_for_node(&node_client, Duration::from_secs(45)).await?;
-        let version: BinaryVersion = node_client.node_version().await?.parse()?;
-        if version != spec.version {
-            bail!(
-                "VM {} is running {version}, expected {}",
-                node.name,
-                spec.version
-            );
+    let service_path = operation.directory.join("reliaburger.service");
+    tokio::fs::write(&service_path, provision::SERVICE).await?;
+    let setup = NodeSetup {
+        lima: &lima,
+        spec: &spec,
+        bootstrap,
+        client: &client,
+        directory: operation.directory.clone(),
+        sources: NodeSources {
+            bun: &bun,
+            relish: &relish,
+            service: &service_path,
+            security: &bootstrap.directory,
+        },
+        peers: &peers,
+        first_address,
+    };
+    {
+        // Peers enrol through the first node, so it must be ready first. The
+        // rest configure concurrently; each writes only its own checkpoint.
+        let checkpoints = tokio::sync::Mutex::new(&mut *operation);
+        configure_node(&setup, 0, &checkpoints).await?;
+        let mut peers: FuturesUnordered<_> = (1..spec.nodes)
+            .map(|index| configure_node(&setup, index, &checkpoints))
+            .collect();
+        while let Some(result) = peers.next().await {
+            result?;
         }
     }
     println!("checking quorum and deploying the hello container");
@@ -422,6 +280,200 @@ async fn provision_cluster(
     let path = root.join("context.json");
     tokio::task::spawn_blocking(move || context.save(&path)).await??;
     Ok(())
+}
+
+/// Everything shared by the per-node configuration steps.
+struct NodeSetup<'a> {
+    lima: &'a Lima,
+    spec: &'a ClusterSpec,
+    bootstrap: &'a Bootstrap,
+    client: &'a BunClient,
+    directory: PathBuf,
+    sources: NodeSources<'a>,
+    peers: &'a [std::net::Ipv4Addr],
+    first_address: std::net::Ipv4Addr,
+}
+
+/// Host files installed on every node.
+struct NodeSources<'a> {
+    bun: &'a Path,
+    relish: &'a Path,
+    service: &'a Path,
+    /// The private bootstrap directory: master key and first identity.
+    security: &'a Path,
+}
+
+/// Save one node's checkpoint while other nodes configure concurrently.
+async fn checkpoint(
+    operation: &tokio::sync::Mutex<&mut Operation>,
+    index: usize,
+    phase: NodePhase,
+) -> Result<()> {
+    let mut operation = operation.lock().await;
+    operation.state.nodes[index].phase = phase;
+    operation.save_async().await?;
+    Ok(())
+}
+
+/// The files a node needs, in install order. The first node also gets the
+/// cluster's bootstrap identity, with its commit marker last, just as the
+/// local identity store writes it.
+fn node_files(sources: &NodeSources<'_>, index: usize, config: PathBuf) -> Vec<GuestFile> {
+    let security = sources.security;
+    let mut files = vec![
+        GuestFile::executable(sources.bun.to_owned(), "/usr/local/bin/bun"),
+        GuestFile::executable(sources.relish.to_owned(), "/usr/local/bin/relish"),
+        GuestFile::private(config, "/etc/reliaburger/node.toml"),
+        GuestFile::private(security.join("master.key"), "/etc/reliaburger/master.key"),
+        GuestFile {
+            mode: 0o644,
+            ..GuestFile::private(
+                sources.service.to_owned(),
+                "/etc/systemd/system/reliaburger.service",
+            )
+        },
+    ];
+    if index == 0 {
+        files.push(GuestFile::private(
+            security.join("security-bootstrap.json"),
+            "/etc/reliaburger/security-bootstrap.json",
+        ));
+        for file in [
+            "node.crt",
+            "node.key",
+            "node-ca.crt",
+            "root-ca.crt",
+            "meta.json",
+            "node.bundle.json",
+            "bundle.committed",
+        ] {
+            files.push(GuestFile::private(
+                security.join("identity").join(file),
+                &format!("/etc/reliaburger/identity/{file}"),
+            ));
+        }
+    }
+    files
+}
+
+/// Install, enrol and start one node, then wait until it's ready.
+async fn configure_node(
+    setup: &NodeSetup<'_>,
+    index: usize,
+    operation: &tokio::sync::Mutex<&mut Operation>,
+) -> Result<()> {
+    let node = operation.lock().await.state.nodes[index].clone();
+    let lima = setup.lima;
+    if node.phase != NodePhase::Started {
+        println!("configuring {}", node.name);
+        let config = provision::node_config(
+            &setup.spec.name,
+            &node.name,
+            node.address.context("VM has no address")?,
+            (index > 0).then_some(setup.first_address),
+            setup.peers,
+        )?;
+        let config_path = setup.directory.join(format!("{}.toml", node.name));
+        tokio::fs::write(&config_path, config).await?;
+        lima.install_files(&node.name, node_files(&setup.sources, index, config_path))
+            .await?;
+        checkpoint(operation, index, NodePhase::Configured).await?;
+        if index > 0 {
+            enrol(setup, &node.name).await?;
+        }
+        checkpoint(operation, index, NodePhase::Enrolled).await?;
+        lima.command(&[
+            "shell",
+            &node.name,
+            "sudo",
+            "sh",
+            "-c",
+            "systemctl daemon-reload && systemctl enable --now reliaburger.service",
+        ])
+        .await?;
+        checkpoint(operation, index, NodePhase::Started).await?;
+    } else {
+        lima.command(&[
+            "shell",
+            &node.name,
+            "sudo",
+            "systemctl",
+            "start",
+            "reliaburger.service",
+        ])
+        .await?;
+    }
+    let node_client = setup.bootstrap.client(&format!(
+        "https://127.0.0.1:{}",
+        setup.spec.api_port + index as u16
+    ))?;
+    crate::relish::readiness::wait_for_node(&node_client, Duration::from_secs(45)).await?;
+    let version: BinaryVersion = node_client.node_version().await?.parse()?;
+    if version != setup.spec.version {
+        bail!(
+            "VM {} is running {version}, expected {}",
+            node.name,
+            setup.spec.version
+        );
+    }
+    Ok(())
+}
+
+/// Guest script that stores a join token from standard input only for as
+/// long as `relish join` needs it. Arguments: node name, CA fingerprint, URL.
+const JOIN_SCRIPT: &str = "set -eu\numask 077\ntoken=/etc/reliaburger/join.token\n\
+trap 'rm -f -- \"$token\"' EXIT\ncat > \"$token\"\n\
+/usr/local/bin/relish join --token-file \"$token\" --node-id \"$1\" \
+--identity-dir /etc/reliaburger/identity --ca-fingerprint \"$2\" \"$3\"\n";
+
+/// Enrol a peer through the first node, unless it already has an identity.
+async fn enrol(setup: &NodeSetup<'_>, name: &str) -> Result<()> {
+    let lima = setup.lima;
+    let enrolled = lima
+        .command(&[
+            "shell",
+            name,
+            "sudo",
+            "test",
+            "-f",
+            "/etc/reliaburger/identity/bundle.committed",
+        ])
+        .await
+        .is_ok();
+    if enrolled {
+        return Ok(());
+    }
+    let token = setup.client.join_token_create(name, 300).await?;
+    // One file per node, because peers enrol concurrently.
+    let token_path = setup.directory.join(format!("{name}.join-token"));
+    let result = async {
+        let path = token_path.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::sesame::identity::atomic_write_mode(&path, token.as_bytes(), Some(0o600))
+        })
+        .await??;
+        let input = tokio::fs::File::open(&token_path).await?.into_std().await;
+        lima.command_with_input(
+            &[
+                "shell",
+                name,
+                "sudo",
+                "sh",
+                "-c",
+                JOIN_SCRIPT,
+                "sh",
+                name,
+                &setup.bootstrap.root_fingerprint,
+                &format!("https://{}:9117", setup.first_address),
+            ],
+            input,
+        )
+        .await?;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    let _ = tokio::fs::remove_file(&token_path).await;
+    result
 }
 
 /// Create, restart or adopt one owned VM and return its shared address.
@@ -608,6 +660,42 @@ mod tests {
         assert!(quorum_ready(&names, &council));
         council.leader = Some("foreign".into());
         assert!(!quorum_ready(&names, &council));
+    }
+
+    #[test]
+    fn only_the_first_node_receives_the_bootstrap_identity_with_its_marker_last() {
+        let sources = NodeSources {
+            bun: Path::new("/host/bun"),
+            relish: Path::new("/host/relish"),
+            service: Path::new("/host/reliaburger.service"),
+            security: Path::new("/host/security"),
+        };
+        let first = node_files(&sources, 0, "/host/one.toml".into());
+        assert_eq!(
+            first.last().unwrap().destination,
+            "/etc/reliaburger/identity/bundle.committed"
+        );
+        assert!(
+            first
+                .iter()
+                .any(|file| file.destination.ends_with("security-bootstrap.json"))
+        );
+        let peer = node_files(&sources, 1, "/host/two.toml".into());
+        assert!(
+            peer.iter()
+                .all(|file| !file.destination.contains("identity")
+                    && !file.destination.contains("security-bootstrap"))
+        );
+        for files in [&first, &peer] {
+            for file in files.iter() {
+                let expected = match file.destination.as_str() {
+                    "/usr/local/bin/bun" | "/usr/local/bin/relish" => 0o755,
+                    "/etc/systemd/system/reliaburger.service" => 0o644,
+                    _ => 0o600,
+                };
+                assert_eq!(file.mode, expected, "{}", file.destination);
+            }
+        }
     }
 
     #[test]

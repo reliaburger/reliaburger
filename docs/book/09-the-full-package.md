@@ -840,8 +840,8 @@ leaving Ubuntu's loopback resolver alone. Systemd owns the agent process and
 its journal instead of a detached shell process with an uncertain lifetime.
 
 A join token can now come from `relish join --token-file`. It must be a small,
-nonempty, owner-only file. This lets provisioning copy the token into a private
-guest directory without exposing it in the host or guest process arguments.
+nonempty, owner-only file. This lets provisioning hand the token to the guest
+without exposing it in the host or guest process arguments.
 The existing `--token` option remains available for manual use. Clap enforces
 that you supply exactly one source; both routes use the same pinned-CA join.
 
@@ -875,9 +875,40 @@ resume or explicit cleanup.
 
 The first node receives the saved bootstrap identity. Subsequent nodes generate
 their own keys through the ordinary pinned-CA join protocol, using short-lived,
-node-bound tokens. The host never invents a second CA on a retry. Guest file
-replacement uses a staging file and rename, which also permits recovery when
-a previous attempt already started the executable being installed.
+node-bound tokens. The host never invents a second CA on a retry.
+
+Getting files into a guest used to take five `limactl` calls per file: make a
+private directory, copy, `install` with a mode, rename, clean up. Each call is a
+fresh SSH session, and with binaries, config, key, unit file and seven identity
+files that came to about 140 calls, one node after another. Now the host writes
+every file for a node into one tar stream, with root ownership and each file's
+final mode in its header, and pipes it into a single `sudo sh -c` on the
+guest. The `tar` crate's `Builder` writes the archive; `tempfile::tempfile()`
+gives us an anonymous file to hold it, which disappears when the last handle
+closes, so there's nothing to clean up on the host. The guest script unpacks
+into a private staging directory, then renames each file into place in the
+order we listed them. A rename is atomic, so a reader sees the old file or the
+new one, never half of each; it also works when a previous attempt already
+started the executable we're replacing. The identity's commit marker goes
+last, as before.
+
+Because those paths end up inside a shell script, `GuestFile` accepts only
+absolute paths made of plain letters, digits, dots, dashes and underscores.
+We test that the script refuses `..` and quoting tricks, and we run the real
+script with `/bin/sh` against a temporary directory to check modes, order and
+cleanup. The join token takes the same route: it travels on standard input into
+an owner-only file that a shell `trap` removes when `relish join` finishes.
+
+With one copy per node, the nodes themselves can go in parallel. The first
+node must be ready before the others, because they enrol through it. After
+that, nodes 2 and 3 install, enrol and start concurrently. They share the
+operation's checkpoint file, so each future borrows the `Operation` through a
+`tokio::sync::Mutex<&mut Operation>`. This is worth a second look if you're
+coming from Go. The mutex doesn't own the operation; it holds a mutable
+*borrow* of it. The futures aren't spawned, they're polled by a
+`FuturesUnordered` inside our function, so they can borrow local variables and
+the compiler proves the borrow ends before we use `operation` again. Only the
+checkpoint writes take the lock; the slow work doesn't.
 
 API readiness alone isn't the finish line. We check the running binary version,
 all owned nodes, council membership and leader, then deploy a digest-pinned
