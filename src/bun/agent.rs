@@ -1541,7 +1541,9 @@ mod discovery_ownership;
 mod discovery_recovery;
 mod egress_ownership;
 mod producer_release;
+mod runtime_inventory;
 use discovery_ownership::DiscoveryOwnership;
+use runtime_inventory::{LOOP_RUNTIME_INVENTORY_TIMEOUT, RUNTIME_INVENTORY_TIMEOUT};
 
 /// An immutable, owned connectivity trace that can run outside the agent
 /// command loop. Workload probes have explicit timeouts, but even a bounded
@@ -3087,7 +3089,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.recorded_jobs = jobs.clone();
         self.job_store_uncertain = false;
         let mut recovered_jobs = jobs;
-        let launch_inventory = self.supervisor.grill().launch_inventory().await?;
+        let launch_inventory = self
+            .runtime_inventory(RUNTIME_INVENTORY_TIMEOUT, |reason| {
+                BunError::AdoptionState(format!("startup adoption {reason}"))
+            })
+            .await?;
         self.require_discovery_recovery(
             !records.is_empty(),
             launch_inventory
@@ -3459,13 +3465,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
         // The report deadline is two seconds. Bound the evidence read without
         // hiding capacity when inventory is unavailable or internally ambiguous.
-        let launches = match tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            self.supervisor.grill().launch_inventory(),
-        )
-        .await
+        let launches = match self
+            .runtime_inventory(LOOP_RUNTIME_INVENTORY_TIMEOUT, BunError::AdoptionState)
+            .await
         {
-            Ok(Ok(Some(launches))) => {
+            Ok(Some(launches)) => {
                 let count = launches.len();
                 let by_instance: std::collections::HashMap<_, _> = launches
                     .into_iter()
@@ -9549,15 +9553,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         timeout: std::time::Duration,
     ) -> Result<bool, BunError> {
         self.withdraw_instance_backend(id).await?;
-        self.drains
-            .start_drain(&crate::wrapper::draining::DrainCommand {
+        Ok(self
+            .drains
+            .drain_all(&[crate::wrapper::draining::DrainCommand {
                 app_name: String::new(),
                 instance_id: id.0.clone(),
                 timeout,
-            })
-            .await;
-        self.drains.check_completions().await;
-        Ok(!self.drains.is_draining(&id.0).await)
+            }])
+            .await)
     }
 
     /// Preserve ownership until both force-kill and observed runtime exit succeed.

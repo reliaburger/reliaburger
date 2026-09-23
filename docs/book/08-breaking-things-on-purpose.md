@@ -648,6 +648,17 @@ are excluded because no start operation can authorise them. The return type is
 even if it is empty; `None` means it cannot establish one. Keeping these cases
 separate prevents an unsupported runtime from accidentally proving absence.
 
+Seven places in Bun read that inventory, and each wrapped the call in its own
+`tokio::time::timeout`. Two agent methods now do it: `runtime_inventory` keeps
+the `Option`, and `complete_runtime_inventory` refuses `None`. Each caller
+passes its deadline (five seconds, or one second inside the agent loop's own
+turn) and a closure that builds its own error, so a consumer publication still
+fails as a publication error and a producer release as a retirement error. The
+second method takes `impl Fn(String) -> BunError` rather than `FnOnce` because
+it may need the closure twice. It hands `&refuse` to the first method, which
+asks only for `FnOnce`. That works because a shared reference to any `Fn`
+closure is itself callable, as many times as you like.
+
 Filesystem operations run through `spawn_blocking`, which moves blocking work
 off Tokio's executor threads. Cancelling the caller doesn't abort that worker,
 so its generation record and lock remain owned until the operation finishes.

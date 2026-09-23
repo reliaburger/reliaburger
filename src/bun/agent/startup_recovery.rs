@@ -2,6 +2,10 @@
 
 use super::{BunAgent, BunError, Grill, InstanceId};
 
+fn startup_refusal(reason: String) -> BunError {
+    BunError::AdoptionState(format!("startup cleanup {reason}"))
+}
+
 impl<G: Grill + Clone + 'static> BunAgent<G> {
     pub(super) async fn defer_startup_retirement(
         &mut self,
@@ -10,15 +14,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         if self.consumer_owner().is_none() {
             return Ok(false);
         }
-        let launches = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            self.supervisor.grill().launch_inventory(),
-        )
-        .await
-        .map_err(|_| BunError::AdoptionState("startup runtime inventory timed out".into()))??
-        .ok_or_else(|| {
-            BunError::AdoptionState("startup cleanup has no runtime inventory".into())
-        })?;
+        let launches = self
+            .complete_runtime_inventory(super::RUNTIME_INVENTORY_TIMEOUT, startup_refusal)
+            .await?;
         let launch = launches
             .into_iter()
             .find(|launch| launch.instance_id == *id)
@@ -61,15 +59,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             return;
         };
         let cleanup = async {
-            let launches = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                self.supervisor.grill().launch_inventory(),
-            )
-            .await
-            .map_err(|_| BunError::AdoptionState("startup runtime inventory timed out".into()))??
-            .ok_or_else(|| {
-                BunError::AdoptionState("startup cleanup lost runtime inventory".into())
-            })?;
+            let launches = self
+                .complete_runtime_inventory(super::RUNTIME_INVENTORY_TIMEOUT, startup_refusal)
+                .await?;
             if !launches.iter().any(|current| {
                 current.instance_id == original.instance_id
                     && current.generation == original.generation

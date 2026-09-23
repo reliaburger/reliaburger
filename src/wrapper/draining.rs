@@ -122,6 +122,22 @@ impl SharedDrains {
         self.0.lock().await.check_completions().await
     }
 
+    /// Start draining every command's instance, sweep finished drains, and
+    /// report whether all of those instances have released their requests.
+    /// An instance that is already draining keeps its earlier deadline.
+    pub async fn drain_all(&self, commands: &[DrainCommand]) -> bool {
+        for command in commands {
+            self.start_drain(command).await;
+        }
+        self.check_completions().await;
+        for command in commands {
+            if self.is_draining(&command.instance_id).await {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Wait until `instance_id` has no in-flight requests. Its deadline asks
     /// those requests to cancel; their guards must still release. Returns once it is no longer
     /// tracked. Polls rather than blocks, so it never wedges the runtime.
@@ -388,6 +404,18 @@ mod tests {
         assert_eq!(drains.check_completions().await, vec!["web-0"]);
         assert_eq!(rx.recv().await.unwrap().instance_id, "web-0");
         assert!(!drains.is_draining("web-0").await);
+    }
+
+    #[tokio::test]
+    async fn drain_all_reports_released_only_when_every_instance_is_idle() {
+        let (tx, _rx) = mpsc::channel(16);
+        let drains = SharedDrains::new(DrainTracker::new(tx));
+        drains.increment_connections("web-1").await;
+        let commands = [drain_cmd("web", "web-0", 30), drain_cmd("web", "web-1", 30)];
+        assert!(!drains.drain_all(&commands).await);
+        assert!(!drains.is_draining("web-0").await);
+        drains.decrement_connections("web-1").await;
+        assert!(drains.drain_all(&commands).await);
     }
 
     #[tokio::test]

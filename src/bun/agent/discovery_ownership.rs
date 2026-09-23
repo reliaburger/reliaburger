@@ -61,12 +61,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         if matches!(self.discovery_ownership, DiscoveryOwnership::Disabled) {
             return Ok(());
         }
-        let launches = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            self.supervisor.grill().launch_inventory(),
-        )
-        .await
-        .map_err(|_| BunError::AdoptionState("publication runtime inventory timed out".into()))??;
+        let launches = self
+            .runtime_inventory(super::RUNTIME_INVENTORY_TIMEOUT, |reason| {
+                BunError::AdoptionState(format!("publication {reason}"))
+            })
+            .await?;
         self.update_discovery_inventory(id, |next| {
             // Absence from the candidate is not withdrawal proof. Preserve
             // earlier allocations until their confirmed retirement removes them.
@@ -307,23 +306,20 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
         // Include historical candidates: private metadata loss cannot prove that
         // a request which already captured an endpoint released it.
-        let backends = original.entry.backends.clone();
-        for backend in &backends {
-            self.drains
-                .start_drain(&crate::wrapper::draining::DrainCommand {
-                    app_name: service.name.clone(),
-                    instance_id: backend.instance_id.clone(),
-                    timeout: std::time::Duration::ZERO,
-                })
-                .await;
-        }
-        self.drains.check_completions().await;
-        for backend in &backends {
-            if self.drains.is_draining(&backend.instance_id).await {
-                return Err(refuse(
-                    "captured ingress requests still require confirmed release",
-                ));
-            }
+        let drains: Vec<_> = original
+            .entry
+            .backends
+            .iter()
+            .map(|backend| crate::wrapper::draining::DrainCommand {
+                app_name: service.name.clone(),
+                instance_id: backend.instance_id.clone(),
+                timeout: std::time::Duration::ZERO,
+            })
+            .collect();
+        if !self.drains.drain_all(&drains).await {
+            return Err(refuse(
+                "captured ingress requests still require confirmed release",
+            ));
         }
         self.update_discovery_inventory(service, |next| {
             for owner in &mut next.services {

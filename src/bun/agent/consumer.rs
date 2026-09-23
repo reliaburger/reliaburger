@@ -140,13 +140,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         catalog.validate_allocations().map_err(failure)?;
         // Cluster allocation is authoritative. Locally prepared or retiring
         // allocations remain reserved internally, but cannot invent a public VIP.
-        let launches = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            self.supervisor.grill().launch_inventory(),
-        )
-        .await
-        .map_err(|_| failure("consumer runtime inventory timed out"))??
-        .ok_or_else(|| failure("consumer publication requires complete runtime inventory"))?;
+        let launches = self
+            .complete_runtime_inventory(super::RUNTIME_INVENTORY_TIMEOUT, |reason| {
+                failure(format!("consumer {reason}"))
+            })
+            .await?;
         let local: Vec<_> = self
             .service_map
             .resolve_all()
@@ -401,21 +399,18 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 }
             }
         }
-        for (instance_id, app_name) in &retiring {
-            // Already-draining backends keep their earlier deadline.
-            self.drains
-                .start_drain(&crate::wrapper::draining::DrainCommand {
-                    app_name: app_name.clone(),
-                    instance_id: instance_id.clone(),
+        let retiring: Vec<_> = retiring
+            .into_iter()
+            .map(
+                |(instance_id, app_name)| crate::wrapper::draining::DrainCommand {
+                    app_name,
+                    instance_id,
                     timeout: CONSUMER_DRAIN_TIMEOUT,
-                })
-                .await;
-        }
-        self.drains.check_completions().await;
-        for instance_id in retiring.keys() {
-            if self.drains.is_draining(instance_id).await {
-                return Ok(());
-            }
+                },
+            )
+            .collect();
+        if !self.drains.drain_all(&retiring).await {
+            return Ok(());
         }
         owner.publications = vec![current];
         for receipt in owner.receipts.values_mut() {

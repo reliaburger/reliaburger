@@ -66,17 +66,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
         }
         // A wedged runtime must not hold startup forever.
-        let launches = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            self.supervisor.grill().launch_inventory(),
-        )
-        .await
-        .map_err(|_| {
-            BunError::AdoptionState("discovery recovery runtime inventory timed out".into())
-        })??
-        .ok_or_else(|| {
-            BunError::AdoptionState("discovery recovery requires complete runtime inventory".into())
-        })?;
+        let launches = self
+            .complete_runtime_inventory(super::RUNTIME_INVENTORY_TIMEOUT, |reason| {
+                BunError::AdoptionState(format!("discovery recovery {reason}"))
+            })
+            .await?;
         let inventory = match &consumer {
             Some(identity) => journal.reconcile_consumer_runtime_inventory(&launches, identity),
             None => journal.reconcile_runtime_inventory(&launches),

@@ -39,13 +39,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         {
             return Ok(None);
         }
-        let launches = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            self.supervisor.grill().launch_inventory(),
-        )
-        .await
-        .map_err(|_| refuse("producer runtime inventory timed out".into()))??
-        .ok_or_else(|| refuse("producer runtime inventory is unavailable".into()))?;
+        let launches = self
+            .complete_runtime_inventory(super::LOOP_RUNTIME_INVENTORY_TIMEOUT, |reason| {
+                refuse(format!("producer {reason}"))
+            })
+            .await?;
         let mut originals = launches.iter().filter(|launch| launch.instance_id == *id);
         let original = originals
             .next()
