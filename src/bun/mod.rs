@@ -153,10 +153,12 @@ pub enum BunError {
     },
 
     /// An init container failed during startup.
-    #[error("init container {init_index} failed for instance {instance_id}")]
+    #[error("init container {init_index} failed for instance {instance_id}: {reason}")]
     InitContainerFailed {
         instance_id: InstanceId,
         init_index: usize,
+        /// How it failed, with the runtime's captured stderr tail when it has one.
+        reason: String,
     },
 
     /// A security or identity operation failed.

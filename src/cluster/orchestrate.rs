@@ -1319,9 +1319,9 @@ fn spawn_placement_reconciler_with_io_timeout(
                 if !matches!(queued, Ok(Ok(()))) {
                     continue;
                 }
-                let terminal = deploy_succeeded(event_rx, DEPLOY_TERMINAL_TIMEOUT);
+                let terminal = deploy_outcome(event_rx, DEPLOY_TERMINAL_TIMEOUT);
                 tokio::pin!(terminal);
-                let succeeded = loop {
+                let outcome = loop {
                     tokio::select! {
                         _ = shutdown.cancelled() => return,
                         result = &mut terminal => break result,
@@ -1336,13 +1336,18 @@ fn spawn_placement_reconciler_with_io_timeout(
                         }
                     }
                 };
-                if succeeded {
-                    let mut next = applied.clone();
-                    next.insert(key, AssignmentState::Applied { fingerprint });
-                    match persist_placements(checkpoint_path.as_deref(), &next).await {
-                        Ok(()) => applied = next,
-                        Err(error) => eprintln!("orchestrator: cannot record convergence: {error}"),
-                    }
+                if let Err(error) = outcome {
+                    eprintln!(
+                        "orchestrator: deploy of {}/{} failed, will retry: {error}",
+                        key.0, key.1
+                    );
+                    continue;
+                }
+                let mut next = applied.clone();
+                next.insert(key, AssignmentState::Applied { fingerprint });
+                match persist_placements(checkpoint_path.as_deref(), &next).await {
+                    Ok(()) => applied = next,
+                    Err(error) => eprintln!("orchestrator: cannot record convergence: {error}"),
                 }
             }
 
@@ -1451,34 +1456,41 @@ fn spawn_placement_reconciler_with_io_timeout(
 /// the placement is treated as not-yet-applied and retried next tick.
 const DEPLOY_TERMINAL_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Drain a deploy's event stream and report whether it reached `Complete`
-/// within `timeout`.
+/// Why a deploy the reconciler handed to the agent did not converge.
+#[derive(Debug, thiserror::Error)]
+enum DeployWaitError {
+    /// The agent reported the deploy failed, with its reason.
+    #[error("{0}")]
+    Failed(String),
+    /// The agent dropped the event stream without a terminal event.
+    #[error("the agent closed the deploy's event stream without an outcome")]
+    Closed,
+    /// No terminal event arrived in time.
+    #[error("the deploy did not reach a terminal event within {}s", .0.as_secs())]
+    TimedOut(Duration),
+}
+
+/// Drain a deploy's event stream until it reaches `Complete` within `timeout`.
 ///
-/// Returns `false` if the deploy emitted `Error`, the channel closed without a
-/// terminal event (the agent dropped it), or `timeout` elapsed first — in every
-/// case the caller leaves the placement unapplied and retries next tick.
-async fn deploy_succeeded(mut events: mpsc::Receiver<ApplyEvent>, timeout: Duration) -> bool {
+/// Every error leaves the placement unapplied, so the caller retries it next
+/// tick. `Failed` carries the agent's own message, so the caller can say why.
+async fn deploy_outcome(
+    mut events: mpsc::Receiver<ApplyEvent>,
+    timeout: Duration,
+) -> Result<(), DeployWaitError> {
     let drain = async {
         while let Some(event) = events.recv().await {
             match event {
-                ApplyEvent::Complete { .. } => return true,
-                ApplyEvent::Error { .. } => return false,
+                ApplyEvent::Complete { .. } => return Ok(()),
+                ApplyEvent::Error { message } => return Err(DeployWaitError::Failed(message)),
                 _ => {}
             }
         }
-        false
+        Err(DeployWaitError::Closed)
     };
-    match tokio::time::timeout(timeout, drain).await {
-        Ok(result) => result,
-        Err(_) => {
-            eprintln!(
-                "reconciler: deploy did not reach a terminal event within {}s; \
-                 leaving it unapplied and retrying next tick",
-                timeout.as_secs()
-            );
-            false
-        }
-    }
+    tokio::time::timeout(timeout, drain)
+        .await
+        .unwrap_or(Err(DeployWaitError::TimedOut(timeout)))
 }
 
 #[cfg(test)]
@@ -2285,7 +2297,7 @@ image = "busybox:latest"
     // -- M14: reconciler deploy-wait timeout ---------------------------------
 
     #[tokio::test]
-    async fn deploy_succeeded_returns_true_on_complete() {
+    async fn deploy_outcome_is_ok_on_complete() {
         let (tx, rx) = mpsc::channel(4);
         tx.send(ApplyEvent::Complete {
             created: 1,
@@ -2293,30 +2305,56 @@ image = "busybox:latest"
         })
         .await
         .unwrap();
-        assert!(deploy_succeeded(rx, Duration::from_secs(5)).await);
+        assert!(deploy_outcome(rx, Duration::from_secs(5)).await.is_ok());
     }
 
     #[tokio::test]
-    async fn deploy_succeeded_returns_false_on_error() {
+    async fn deploy_outcome_carries_the_agents_error_message() {
         let (tx, rx) = mpsc::channel(4);
+        let message = "init container 0 failed for instance default__web-0: \
+                       exited with code 1: runc run failed: container's cgroup is not empty";
         tx.send(ApplyEvent::Error {
-            message: "boom".to_string(),
+            message: message.to_string(),
         })
         .await
         .unwrap();
-        assert!(!deploy_succeeded(rx, Duration::from_secs(5)).await);
+        let error = deploy_outcome(rx, Duration::from_secs(5))
+            .await
+            .expect_err("an Error event must fail the deploy");
+        assert!(
+            matches!(&error, DeployWaitError::Failed(reason) if reason == message),
+            "the agent's reason was dropped: {error:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("container's cgroup is not empty")
+        );
     }
 
     #[tokio::test]
-    async fn deploy_succeeded_times_out_on_a_hung_deploy() {
+    async fn deploy_outcome_reports_a_closed_stream() {
+        let (tx, rx) = mpsc::channel::<ApplyEvent>(4);
+        drop(tx);
+        assert!(matches!(
+            deploy_outcome(rx, Duration::from_secs(5)).await,
+            Err(DeployWaitError::Closed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn deploy_outcome_times_out_on_a_hung_deploy() {
         // The sender is held open and never emits a terminal event — modelling
         // a stuck image pull / hung runtime. Without the timeout this would
         // wedge the reconcile tick forever; with it, the deploy is treated as
         // not-applied so the tick returns and retries.
         let (tx, rx) = mpsc::channel::<ApplyEvent>(4);
         let started = Instant::now();
-        let result = deploy_succeeded(rx, Duration::from_millis(100)).await;
-        assert!(!result, "a hung deploy must time out to `false`, not block");
+        let result = deploy_outcome(rx, Duration::from_millis(100)).await;
+        assert!(
+            matches!(result, Err(DeployWaitError::TimedOut(_))),
+            "a hung deploy must time out, not block: {result:?}"
+        );
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "it must not block"

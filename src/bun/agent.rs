@@ -39,6 +39,11 @@ const EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 /// init wait so a hung init can't wedge the agent event loop indefinitely.
 const INIT_TIMEOUT_SECS: u64 = 300;
 
+/// Most bytes of an init container's captured stderr carried into its failure.
+/// Runc prints why it refused to start (an occupied cgroup, a missing binary)
+/// in its last line or two, so a short tail says why without flooding logs.
+const INIT_FAILURE_STDERR_BYTES: u64 = 400;
+
 /// Maximum time a `run_before` prerequisite job may run before the gated
 /// deploy is aborted. Migrations are the classic case; a hung one must not
 /// wedge the deploy forever.
@@ -10156,6 +10161,34 @@ struct DeployWorker<G: Grill> {
     stop_confirmation_timeout: std::time::Duration,
 }
 
+/// The last few hundred bytes of a runtime's captured stderr (`{stem}.stderr`),
+/// on one line. `None` when nothing was captured or the file can't be read:
+/// the caller still has the exit status to report.
+async fn captured_stderr_tail(stem: &std::path::Path) -> Option<String> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let mut file = tokio::fs::File::open(stem.with_extension("stderr"))
+        .await
+        .ok()?;
+    let length = file.metadata().await.ok()?.len();
+    file.seek(std::io::SeekFrom::Start(
+        length.saturating_sub(INIT_FAILURE_STDERR_BYTES),
+    ))
+    .await
+    .ok()?;
+    let mut bytes = Vec::new();
+    file.take(INIT_FAILURE_STDERR_BYTES)
+        .read_to_end(&mut bytes)
+        .await
+        .ok()?;
+    let text = String::from_utf8_lossy(&bytes);
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    (!lines.is_empty()).then(|| lines.join("; "))
+}
+
 impl<G: Grill + Clone + 'static> DeployWorker<G> {
     async fn report_cancellation(&self, events: &mpsc::Sender<ApplyEvent>) -> bool {
         if self
@@ -10592,27 +10625,38 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             // no longer wedges the loop at all — this poll is off it).
             let deadline =
                 std::time::Instant::now() + std::time::Duration::from_secs(INIT_TIMEOUT_SECS);
-            let failed = loop {
+            let failure = loop {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 let state = self.grill.state(&init_id).await?;
                 if state == ContainerState::Stopped {
-                    let exit_code = self.grill.exit_code(&init_id).await;
-                    break exit_code != Some(0);
+                    break match self.grill.exit_code(&init_id).await {
+                        Some(0) => None,
+                        Some(code) => Some(format!("exited with code {code}")),
+                        None => Some("stopped without an exit code".to_string()),
+                    };
                 }
                 if std::time::Instant::now() >= deadline {
                     let _ = self.grill.kill(&init_id).await;
-                    break true;
+                    break Some(format!("did not finish within {INIT_TIMEOUT_SECS}s"));
                 }
             };
 
-            if failed {
+            if let Some(failure) = failure {
                 let _ = self
                     .ops
                     .transition_state(instance_id, ContainerState::Failed)
                     .await;
+                let reason = match self.grill.log_stem(&init_id).await {
+                    Some(stem) => match captured_stderr_tail(&stem).await {
+                        Some(stderr) => format!("{failure}: {stderr}"),
+                        None => failure,
+                    },
+                    None => failure,
+                };
                 return Err(BunError::InitContainerFailed {
                     instance_id: instance_id.clone(),
                     init_index: i,
+                    reason,
                 });
             }
             kill_runtime_instance(&self.grill, &init_id, self.stop_confirmation_timeout).await?;
@@ -18303,12 +18347,59 @@ host = "remote.local"
         let events = send_deploy(&tx, config_with_init_container()).await;
         let last = events.last().expect("no events");
         assert!(
-            matches!(last, ApplyEvent::Error { .. }),
-            "expected Error event, got {last:?}"
+            matches!(last, ApplyEvent::Error { message } if message.contains("exited with code 1")),
+            "expected an Error event naming the exit code, got {last:?}"
         );
 
         shutdown.cancel();
         agent_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failing_init_container_reports_the_runtimes_stderr() {
+        let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+        let init_id = InstanceId("default__web-0__init-0".to_string());
+        grill.set_state(&init_id, ContainerState::Stopped);
+        grill.set_exit_code(&init_id, Some(1));
+        let owner = tempfile::tempdir().unwrap();
+        let stem = owner.path().join("output");
+        let reason = "runc run failed: container's cgroup is not empty: 1 process(es) found";
+        // Enough earlier noise that only a bounded tail can reach the error.
+        let noise = "EARLY-NOISE ".repeat(1_000);
+        std::fs::write(
+            stem.with_extension("stderr"),
+            format!("{noise}\n{reason}\n"),
+        )
+        .unwrap();
+        grill.set_log_stem(&init_id, stem);
+
+        let agent_handle = tokio::spawn(async move {
+            agent.run().await;
+        });
+        let events = send_deploy(&tx, config_with_init_container()).await;
+        shutdown.cancel();
+        agent_handle.await.unwrap();
+
+        let message = events
+            .iter()
+            .find_map(|event| match event {
+                ApplyEvent::Error { message } => Some(message.clone()),
+                _ => None,
+            })
+            .expect("the failed initialiser produced no Error event");
+        assert!(
+            message.contains(reason),
+            "the runtime's reason is missing: {message}"
+        );
+        assert!(
+            message.contains("exited with code 1"),
+            "the exit code is missing: {message}"
+        );
+        assert!(
+            message.len() < 1_024,
+            "the stderr tail is unbounded ({} bytes)",
+            message.len()
+        );
     }
 
     #[test]

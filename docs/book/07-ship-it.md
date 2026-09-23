@@ -588,6 +588,20 @@ async fn deploy_succeeded(mut events: mpsc::Receiver<ApplyEvent>) -> bool {
 
 If the deploy fails, `applied` is left untouched, so the next tick retries it. "Applied" now means what it says.
 
+That `bool` had a cost we only noticed while chasing a flaky test. A Runc init container kept failing its first deploy, and all a node's log said was that it had retried. The agent's `Error` event said which init container failed, but the `ApplyEvent::Error { .. }` pattern threw the message away (`..` means "ignore the remaining fields"). Even the agent's message was thin: "init container 0 failed". The real reason, `runc run failed: container's cgroup is not empty`, sat in a file on disk that nobody read.
+
+So the function became `deploy_outcome`, and it returns a `Result` whose error says why:
+
+```rust
+enum DeployWaitError {
+    Failed(String),      // the agent's own message
+    Closed,              // the stream ended without an outcome
+    TimedOut(Duration),  // no terminal event in time
+}
+```
+
+The reconciler logs that error before it retries. At the other end, when an init container fails the agent reads the last 400 bytes of what the runtime wrote to its stderr and appends them to the failure, next to the exit code. It reads a tail with a seek rather than the whole file, because an init container that dumps megabytes of output and then fails shouldn't get megabytes into a log line. Now the node's log says `init container 0 failed for instance default__web-0: exited with code 1: runc run failed: container's cgroup is not empty: 1 process(es) found`, and you know where to look.
+
 Second, the map lived only in memory. Restart bun — a crash, a self-upgrade — and it forgot everything it had applied. On the next tick it would re-deploy *every* assigned app from scratch, even ones already happily running, churning containers for no reason. So the applied map is now durable: a tiny JSON checkpoint written atomically (temp file, then rename, so a crash mid-write can't leave a torn file) and reloaded on boot. A restarted reconciler picks up where it left off. A missing checkpoint loads empty. A corrupt or unreadable one refuses to reconcile, because treating it as empty would forget apps this node still runs. The checkpoint is self-describing JSON with a `schema` field, so a future format change fails loudly instead of mis-parsing an old file into nonsense.
 
 Put the two fixes together and the restart story is nearly correct. The remaining gap: a worker receives `api`, starts a container and dies before recording success. While it's down, you remove `api`. On restart the checkpoint has no entry for it, so nothing ever retires that container. It has fallen between two records. So each entry is now one of two states:

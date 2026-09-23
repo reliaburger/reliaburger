@@ -62,6 +62,8 @@ pub struct MockGrill {
     fail_start: Arc<AtomicBool>,
     fail_state: Arc<AtomicBool>,
     inspection_failures: Arc<Mutex<std::collections::HashSet<InstanceId>>>,
+    /// Per-instance captured-output stems, as a file-capturing runtime reports.
+    log_stems: Arc<Mutex<HashMap<InstanceId, std::path::PathBuf>>>,
 }
 
 impl Default for MockGrill {
@@ -105,6 +107,7 @@ impl Default for MockGrill {
             fail_start: Arc::default(),
             fail_state: Arc::default(),
             inspection_failures: Arc::default(),
+            log_stems: Arc::default(),
         }
     }
 }
@@ -113,6 +116,15 @@ impl MockGrill {
     /// Create a new MockGrill.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Report `stem` as the instance's captured-output base path
+    /// (`{stem}.stdout` / `{stem}.stderr`), as Runc's owner does.
+    pub fn set_log_stem(&self, instance: &InstanceId, stem: std::path::PathBuf) {
+        self.log_stems
+            .lock()
+            .unwrap()
+            .insert(instance.clone(), stem);
     }
 
     /// Keep reporting the existing state after an acknowledged kill.
@@ -574,6 +586,10 @@ impl super::Grill for MockGrill {
     async fn exit_code(&self, instance: &InstanceId) -> Option<i32> {
         let codes = self.exit_codes.lock().unwrap();
         codes.get(instance).copied().flatten()
+    }
+
+    async fn log_stem(&self, instance: &InstanceId) -> Option<std::path::PathBuf> {
+        self.log_stems.lock().unwrap().get(instance).cloned()
     }
 
     async fn container_ip(&self, _instance: &InstanceId) -> Option<std::net::Ipv4Addr> {
