@@ -91,6 +91,19 @@ cluster's saved record, along with its credentials and checkpoints. It keeps
 the downloaded tool and image cache for future clusters. `--name NAME` selects
 a different saved cluster; setup currently supports one active CLI context.
 
+To remove Reliaburger from the laptop afterwards, destroy each cluster, then:
+
+```sh
+relish uninstall            # asks first; --yes skips the question
+```
+
+It removes the CLI, its `~/.local/bin` link, the private Lima tools, the
+download cache and the managed Lima home. It refuses while a quickstart cluster
+or managed VM still exists and names the `relish local destroy` command to run.
+Anything else under `~/.reliaburger` stays, and it lists what it kept. It
+doesn't edit your shell's rc file; if you added the `PATH` line, it reminds
+you to remove it.
+
 The API forwards bind loopback ports 19117–19119. The first node's HTTP ingress
 uses 18080, and its authenticated HTTPS Pickle registry uses 15050. Change these
 with `setup --quickstart --api-port PORT --ingress-port PORT --registry-port PORT`

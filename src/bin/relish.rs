@@ -371,6 +371,12 @@ enum Command {
         /// Open with this search query pre-seeded (e.g. "ebpf").
         query: Option<String>,
     },
+    /// Remove the CLI, its PATH link, the managed Lima tools and the image cache.
+    Uninstall {
+        /// Don't ask for confirmation (required without a terminal).
+        #[arg(long)]
+        yes: bool,
+    },
     /// Manage a laptop cluster created by setup --quickstart.
     Local {
         #[arg(value_enum)]
@@ -1554,6 +1560,7 @@ async fn main() -> ExitCode {
             None => reliaburger::relish::manual::run().await,
         },
         Command::Source { query } => reliaburger::relish::source::run(query).await,
+        Command::Uninstall { yes } => reliaburger::relish::uninstall::run(yes).map_err(Into::into),
         Command::Local { action, name, yes } => {
             use reliaburger::relish::quickstart::lifecycle::{self, Action};
             let action = match action {

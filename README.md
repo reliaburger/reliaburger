@@ -235,6 +235,7 @@ relish dashboard             # Ctrl-C stops the browser connection
 relish local stop
 relish local start
 relish local destroy --yes   # permanently remove the cluster's VMs and data
+relish uninstall             # then remove the CLI, tools and image cache
 ```
 
 The installer links `relish` into `~/.local/bin` when that's on your `PATH`;

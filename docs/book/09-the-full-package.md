@@ -983,3 +983,15 @@ Why a link rather than a second copy? One real file means one checksum to verify
 Asking has a catch. With `curl … | sh`, the shell's standard input *is* the script, so `read` would swallow the next line of the installer instead of your answer. We ask on `/dev/tty`, the controlling terminal, and only if the subshell `(exec </dev/tty)` can open it; in CI or over a pipe with no terminal, we print the line and move on. The default answer is no, the line is added at most once, and `--no-modify-path` keeps everything inside `~/.reliaburger`. The tests give the installer a pseudo-terminal as its controlling terminal and type the answer, which is the only honest way to exercise that prompt.
 
 The last step is the quickstart's own "next:" message. Straight after installation your current shell still has the old `PATH`, so `relish status` would fail. `relish::install::invocation()` looks up `relish` on `PATH` the way a shell would, canonicalises both paths (resolving the link), and prints `relish` only if the lookup lands on the running executable. Otherwise it prints the full path, quoted for the shell if it contains a space.
+
+### `relish uninstall`
+
+A one-line install deserves a one-line way out. `relish local destroy` already removes a cluster; `relish uninstall` removes the rest: the CLI, its `~/.local/bin` link, the private Lima distribution in `tools/`, the guest images and binaries in `cache/`, and the managed Lima home.
+
+The hard part is deciding what *not* to remove. `~/.reliaburger` is also where a server install keeps node data, and a saved context holds an administrator credential for a cluster that might still be running somewhere. So the module works from an allow-list: a handful of names the installer and the quickstart create, plus a link in `~/.local/bin` only if `read_link` says it points at our binary. Everything else under the home directory goes into the plan's `keep` list and gets printed, so you can see what stayed and why. `plan()` is a pure function of the directory tree, which makes it easy to test against a temporary home; `execute()` does the deleting.
+
+Order matters too. While `clusters/` has a saved cluster, or the Lima home has a VM directory (Lima keeps `_config` and `_networks` beside one directory per VM), removing `tools/` would strand a running VM with no `limactl` to stop it. Uninstall refuses and names `relish local destroy`.
+
+Two small Rust details. `std::fs::remove_dir_all` doesn't follow a symbolic link at the top level, so if someone made `cache` a link to a directory they care about, we remove the link and not their files; a test proves it. And the binary deletes itself. On Unix that's fine: unlinking removes the name from the directory, and the kernel keeps the file's contents alive until the running process closes it.
+
+The shape of the errors follows the rest of the crate: a `thiserror` enum, `UninstallError`, whose messages say what to do next, and a `#[from]` conversion into `RelishError` so the binary's `?` just works. `#[from]` generates the `From` impl that the `?` operator calls to convert one error type into another.

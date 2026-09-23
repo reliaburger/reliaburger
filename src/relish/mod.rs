@@ -40,6 +40,7 @@ pub mod test_cmd;
 mod tls;
 pub mod trace_cmd;
 pub mod tui;
+pub mod uninstall;
 pub mod upgrade;
 pub mod wtf;
 pub mod wtf_cmd;
@@ -168,4 +169,8 @@ pub enum RelishError {
     /// Council disaster recovery failed (12b.2 D21/CP12).
     #[error("council recover failed: {0}")]
     Recovery(String),
+
+    /// `relish uninstall` refused or could not remove something.
+    #[error("{0}")]
+    Uninstall(#[from] uninstall::UninstallError),
 }
