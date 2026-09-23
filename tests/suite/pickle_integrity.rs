@@ -225,7 +225,7 @@ async fn gc_past_grace_keeps_manifest_fetchable_and_peer_pullable() {
         .await
         .unwrap()
         .expect("the catalogue knows the image");
-    assert_eq!(paths.len(), 1, "one layer expected");
+    assert_eq!(paths.layers.len(), 1, "one layer expected");
     assert!(
         node2.state.store.has_blob(&manifest_digest),
         "the peer pull must fetch the manifest blob too"
@@ -416,7 +416,7 @@ async fn peer_pull_uses_the_verified_digest_when_the_tag_moves() {
         .unwrap()
         .expect("the catalogue knows the pinned digest");
 
-    let layer_bytes = std::fs::read(&paths[0]).unwrap();
+    let layer_bytes = std::fs::read(&paths.layers[0]).unwrap();
     assert_eq!(
         layer_bytes, b"layer-bytes-image-a",
         "the pulled layer must belong to the verified image"

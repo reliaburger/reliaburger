@@ -841,6 +841,8 @@ mod tests {
                 env: vec!["TEST_VAR=hello".to_string()],
                 cwd: "/".to_string(),
                 user: OciUser { uid: 0, gid: 0 },
+                capabilities: None,
+                overrides: None,
             },
             mounts: vec![],
             linux: OciLinux {

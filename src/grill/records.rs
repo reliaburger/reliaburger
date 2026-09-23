@@ -294,6 +294,8 @@ mod tests {
                 env: vec![],
                 cwd: "/".to_string(),
                 user: OciUser { uid: 0, gid: 0 },
+                capabilities: None,
+                overrides: None,
             },
             mounts: vec![],
             linux: OciLinux {

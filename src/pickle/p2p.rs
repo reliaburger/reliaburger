@@ -7,12 +7,13 @@
 //! planner across arbitrary topologies.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+
 use std::sync::Arc;
 use std::time::Duration;
 
 use super::replication::Peer;
 use super::types::{Digest, ManifestCatalog, PickleError};
+use crate::grill::image::LocalImageBlobs;
 
 /// One planned fetch: this digest, from this peer.
 #[derive(Debug, Clone)]
@@ -231,13 +232,13 @@ impl ClusterSource {
     /// Resolve `repository:tag` in the catalog and materialise every
     /// blob locally, fetching missing layers from peers in parallel.
     ///
-    /// Returns the layer blob paths in manifest order (ready to
-    /// unpack), or `None` when the catalog doesn't know the image.
+    /// Returns the config and layer blob paths (layers in manifest order,
+    /// ready to unpack), or `None` when the catalog doesn't know the image.
     pub async fn ensure_image_local(
         &self,
         repository: &str,
         tag: &str,
-    ) -> Result<Option<Vec<PathBuf>>, PickleError> {
+    ) -> Result<Option<LocalImageBlobs>, PickleError> {
         let peers = match &self.members {
             Some(rx) => crate::cluster::identity::pickle_peers_scheme(
                 &rx.borrow(),
@@ -259,7 +260,7 @@ impl ClusterSource {
         repository: &str,
         tag: &str,
         peers: &[Peer],
-    ) -> Result<Option<Vec<PathBuf>>, PickleError> {
+    ) -> Result<Option<LocalImageBlobs>, PickleError> {
         let catalog = self.state.catalog_snapshot(repository).await?;
         // A digest in the tag position (`repo@sha256:…` references put
         // it there) resolves content-addressed, so the bytes verified
@@ -327,13 +328,7 @@ impl ClusterSource {
         self.state
             .confirm_image_copy_with_access(repository, &manifest.digest, Some(access))
             .await?;
-        Ok(Some(
-            manifest
-                .layers
-                .iter()
-                .map(|layer| self.state.store.blob_path(&layer.digest))
-                .collect(),
-        ))
+        Ok(Some(local_blobs(&self.state.store, &manifest)))
     }
 }
 
@@ -346,7 +341,7 @@ impl ClusterSource {
     pub async fn ensure_external_image(
         &self,
         image: &crate::grill::image::ImageReference,
-    ) -> Result<Option<Vec<PathBuf>>, PickleError> {
+    ) -> Result<Option<LocalImageBlobs>, PickleError> {
         let peers = match &self.members {
             Some(rx) => crate::cluster::identity::pickle_peers_scheme(
                 &rx.borrow(),
@@ -364,7 +359,7 @@ impl ClusterSource {
         &self,
         image: &crate::grill::image::ImageReference,
         peers: &[Peer],
-    ) -> Result<Option<Vec<PathBuf>>, PickleError> {
+    ) -> Result<Option<LocalImageBlobs>, PickleError> {
         use super::upstream::{CacheDecision, CacheState, decide, refresh_or_refetch};
 
         if !self.pull_through {
@@ -445,11 +440,6 @@ impl ClusterSource {
         }
 
         let total_size = manifest.layers.iter().map(|l| l.size).sum();
-        let layer_paths = manifest
-            .layers
-            .iter()
-            .map(|layer| self.state.store.blob_path(&layer.digest))
-            .collect();
         let image_manifest = super::types::ImageManifest {
             digest: manifest.digest,
             config: manifest.config,
@@ -463,9 +453,26 @@ impl ClusterSource {
             // repositories are exempt from require_signatures.
             signature: None,
         };
+        let blobs = local_blobs(&self.state.store, &image_manifest);
         super::api::record_commit(&self.state, image_manifest, image.tag.clone()).await?;
 
-        Ok(Some(layer_paths))
+        Ok(Some(blobs))
+    }
+}
+
+/// Where a catalogued image's blobs sit in this node's store.
+fn local_blobs(
+    store: &super::store::BlobStore,
+    manifest: &super::types::ImageManifest,
+) -> LocalImageBlobs {
+    LocalImageBlobs {
+        layers: manifest
+            .layers
+            .iter()
+            .map(|layer| store.blob_path(&layer.digest))
+            .collect(),
+        config: store.blob_path(&manifest.config.digest),
+        config_digest: manifest.config.digest.to_string(),
     }
 }
 

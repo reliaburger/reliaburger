@@ -86,6 +86,48 @@ port map and network namespace, but does not delete the shared lower. A real
 rootful-runc suite covers two-replica isolation, restart persistence, failed
 create rollback, process-death adoption and absence of leaked mountpoints.
 
+### 1.2 Image config and the container user
+
+Runc resolves each container's process against the image's verified config
+blob, with Kubernetes rules: app `command` replaces `Entrypoint` (and drops
+`Cmd`), app `args` replaces `Cmd`, image `Env` sits under the app's env (the
+app wins), and image `WorkingDir` and `User` apply unless the app sets
+`working_dir` or `run_as_user`/`run_as_group`. A named user or group is looked
+up in the image's own `/etc/passwd` and `/etc/group`, following symlinks inside
+the image only. The spec generator records the app's wishes in
+`OciProcess::overrides`; runc consumes that field after the pull, so
+`config.json` stays pure OCI. Process workloads and the Apple runtime ignore it
+and run `command` followed by `args`.
+
+Every rootful runc container runs in a user namespace (decision D1 of the
+zero-to-cluster plan). Container ids `0..65536` map onto the node's range
+`2000000000..2000065536`, so image root is an unprivileged host uid. The one
+range is shared by every container on the node, like Docker's
+`userns-remap`, which keeps the unpacked image cache shareable:
+
+- `ImageStore::with_owner_shift` unpacks each layer entry with its uid and gid
+  plus the base (restoring set-id bits `chown` clears), and gives directories
+  the unpacker creates to container root. Shifted trees live in their own
+  `gen-{hash}-owner-{base}` generation.
+- The private overlay's upper directory copies the image root's owner and
+  mode, since the overlay's `/` takes them from the upper.
+- The container gets Docker's default capability set, which only acts on what
+  the namespace owns.
+- `/sys` is a read-only bind of the host's: a user namespace may not mount a
+  fresh sysfs in a network namespace it doesn't own.
+- The node-created network namespace sets
+  `net.ipv4.ip_unprivileged_port_start=0` and an open `ping_group_range`, so
+  container root can bind port 80 without `CAP_NET_BIND_SERVICE` over it.
+- The workload identity directory is handed to the container user's host uid
+  at create time, and Bun writes rotated identity files with the directory's
+  owner.
+
+Operators must keep `2000000000..2000065536` out of `/etc/subuid` and any
+directory service. Managed and host-path volumes are bind-mounted with their
+host ownership; a container that needs to write one must own it (planned:
+hand managed volumes to the container user at first mount). Rootless runc
+maps a single id, so every image user runs as its container root there.
+
 Rootless runc has no host privilege with which to mount OverlayFS, and the
 project does not yet own a FUSE snapshotter. It therefore accepts a shared image
 generation only when `root.readonly = true`. A writable rootless image fails

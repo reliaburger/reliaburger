@@ -56,19 +56,7 @@ pub fn make_rootless(spec: &mut OciSpec, _instance_name: &str) {
 
     // Adjust /sys mount: sysfs requires CAP_SYS_ADMIN outside the user
     // namespace, so bind-mount the host's /sys read-only instead
-    for mount in &mut spec.mounts {
-        if mount.destination == Path::new("/sys") {
-            mount.source = Some(PathBuf::from("/sys"));
-            mount.mount_type = Some("none".to_string());
-            mount.options = vec![
-                "rbind".to_string(),
-                "nosuid".to_string(),
-                "noexec".to_string(),
-                "nodev".to_string(),
-                "ro".to_string(),
-            ];
-        }
-    }
+    super::userns::bind_host_sys(spec);
 
     // Add /dev/pts for terminal support in rootless mode
     let has_devpts = spec
@@ -129,6 +117,8 @@ mod tests {
                     uid: 65534,
                     gid: 65534,
                 },
+                capabilities: None,
+                overrides: None,
             },
             mounts: vec![
                 OciMount {

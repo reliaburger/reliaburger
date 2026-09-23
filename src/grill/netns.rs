@@ -414,6 +414,25 @@ pub async fn setup_container_network_with_commands(
     )
     .await?;
 
+    // The namespace belongs to the node's user namespace, not the
+    // container's, so container root has no CAP_NET_BIND_SERVICE here.
+    // Let any container user bind any port and open ICMP echo sockets, as
+    // Docker does: the namespace holds only this container, so there's no
+    // one to impersonate on port 80.
+    for sysctl in [
+        "net.ipv4.ip_unprivileged_port_start=0",
+        "net.ipv4.ping_group_range=0 2147483647",
+    ] {
+        run_cmd(
+            executor,
+            "ip",
+            &["netns", "exec", &ns_name, "sysctl", "-w", sysctl],
+            instance_id,
+            "open low ports to the container user",
+        )
+        .await?;
+    }
+
     // Peers are behind other veth pairs, not on this link. Reach the gateway
     // directly and send every other destination through the host.
     run_cmd(

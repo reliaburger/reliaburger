@@ -89,7 +89,7 @@ tutorial, because a tutorial over a broken path is a lie.
 
 ### Phase 1: run real Kubernetes apps (product)
 
-- [ ] **Z1.1 Honour the image config on Runc.** Read the OCI image config at
+- [x] **Z1.1 Honour the image config on Runc.** Read the OCI image config at
   prepare time. Use its `Entrypoint` + `Cmd` when the app sets no `command`, the
   way Kubernetes does (`command` replaces `Entrypoint`, `args` replaces `Cmd`),
   merge its `Env` under the app's, and use its `WorkingDir`. For `User`, see D1.

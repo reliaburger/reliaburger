@@ -84,6 +84,13 @@ impl RuncGrill {
 
         let bundle_base = std::path::absolute(&bundle_base)?;
         let state_dir = std::path::absolute(&state_dir)?;
+        // Rootful containers run in the node's user namespace, so their
+        // image files must be owned by ids that namespace maps (D1).
+        let image_store = if rootless {
+            image_store
+        } else {
+            image_store.with_owner_shift(super::userns::HOST_ID_BASE)
+        };
         Ok(Self {
             network_leases: super::network_leases::NetworkLeases::new(bundle_base.clone()),
             lifecycle: Arc::new(Mutex::new(HashMap::new())),
@@ -290,11 +297,13 @@ impl RuncGrill {
 
         // If root.path looks like an image reference, pull and unpack it
         if looks_like_image_ref(&spec.root.path) {
-            let lower = self
+            let pulled = self
                 .image_store
                 .pull_and_unpack(&spec.root.path)
                 .await
                 .map_err(GrillError::ImagePull)?;
+            let lower = pulled.rootfs;
+            self.apply_image_config(instance, &mut spec, &pulled.config, &lower)?;
 
             if spec.root.readonly {
                 // A read-only OCI root cannot mutate the shared generation, so
@@ -316,6 +325,9 @@ impl RuncGrill {
                 rootfs_mount = Some(mounted);
             }
         } else {
+            // Without an image there is no config to resolve against: the
+            // process is what the spec says.
+            spec.process.overrides = None;
             // No image to pull — create an empty rootfs directory and point the
             // spec at its absolute path (same rationale as above).
             let rootfs = bundle_dir.join("rootfs");
@@ -392,6 +404,44 @@ impl RuncGrill {
         Ok(())
     }
 }
+
+impl RuncGrill {
+    /// Resolve the process against the image config, then (rootful) move it
+    /// into the node's user namespace and hand it its identity directory.
+    fn apply_image_config(
+        &self,
+        instance: &InstanceId,
+        spec: &mut OciSpec,
+        config: &super::image_config::ImageConfig,
+        rootfs: &std::path::Path,
+    ) -> Result<(), GrillError> {
+        let failed = |reason: String| GrillError::StartFailed {
+            instance: instance.clone(),
+            reason,
+        };
+        super::image_config::resolve_process(&mut spec.process, config, rootfs)
+            .map_err(|e| failed(e.to_string()))?;
+        if self.rootless {
+            return Ok(());
+        }
+        super::userns::apply(spec).map_err(|e| failed(e.to_string()))?;
+        if let Some(identity) =
+            super::userns::bind_source(spec, std::path::Path::new(IDENTITY_MOUNT)).cloned()
+            && identity.is_dir()
+        {
+            super::userns::chown_to_container_user(&identity, spec).map_err(|e| {
+                failed(format!(
+                    "failed to hand identity directory {} to the container user: {e}",
+                    identity.display()
+                ))
+            })?;
+        }
+        Ok(())
+    }
+}
+
+/// Where the workload identity directory appears inside a container.
+const IDENTITY_MOUNT: &str = "/run/reliaburger/identity";
 
 impl super::Grill for RuncGrill {
     async fn create(&self, instance: &InstanceId, spec: &OciSpec) -> Result<(), GrillError> {
@@ -696,6 +746,8 @@ mod tests {
                 env: vec![],
                 cwd: "/".to_string(),
                 user: crate::grill::oci::OciUser { uid: 0, gid: 0 },
+                capabilities: None,
+                overrides: None,
             },
             mounts: crate::grill::oci::standard_mounts(),
             linux: crate::grill::oci::OciLinux {
@@ -753,6 +805,8 @@ mod tests {
                 env: vec![],
                 cwd: "/".into(),
                 user: crate::grill::oci::OciUser { uid: 0, gid: 0 },
+                capabilities: None,
+                overrides: None,
             },
             mounts: vec![],
             linux: crate::grill::oci::OciLinux {
@@ -814,6 +868,8 @@ mod tests {
                 env: vec![],
                 cwd: "/".to_string(),
                 user: crate::grill::oci::OciUser { uid: 0, gid: 0 },
+                capabilities: None,
+                overrides: None,
             },
             mounts: vec![],
             linux: crate::grill::oci::OciLinux {
@@ -909,6 +965,8 @@ mod tests {
                 env: vec!["PATH=/usr/sbin:/usr/bin:/sbin:/bin".to_string()],
                 cwd: "/".to_string(),
                 user: crate::grill::oci::OciUser { uid: 0, gid: 0 },
+                capabilities: None,
+                overrides: None,
             },
             mounts: crate::grill::oci::standard_mounts(),
             linux: crate::grill::oci::OciLinux {
@@ -1040,6 +1098,8 @@ mod tests {
                     env: vec!["PATH=/usr/sbin:/usr/bin:/sbin:/bin".to_string()],
                     cwd: "/".to_string(),
                     user: crate::grill::oci::OciUser { uid: 0, gid: 0 },
+                    capabilities: None,
+                    overrides: None,
                 },
                 mounts: crate::grill::oci::standard_mounts(),
                 linux: crate::grill::oci::OciLinux {
@@ -1181,6 +1241,8 @@ mod tests {
                 env: vec![],
                 cwd: "/".to_string(),
                 user: crate::grill::oci::OciUser { uid: 0, gid: 0 },
+                capabilities: None,
+                overrides: None,
             },
             mounts: crate::grill::oci::standard_mounts(),
             linux: crate::grill::oci::OciLinux {
@@ -1240,6 +1302,8 @@ mod tests {
                 env: vec!["PATH=/usr/sbin:/usr/bin:/sbin:/bin".to_string()],
                 cwd: "/".to_string(),
                 user: crate::grill::oci::OciUser { uid: 0, gid: 0 },
+                capabilities: None,
+                overrides: None,
             },
             mounts: crate::grill::oci::standard_mounts(),
             linux: crate::grill::oci::OciLinux {
@@ -1425,6 +1489,8 @@ mod tests {
                 env: vec![],
                 cwd: "/".to_string(),
                 user: crate::grill::oci::OciUser { uid: 0, gid: 0 },
+                capabilities: None,
+                overrides: None,
             },
             mounts: crate::grill::oci::standard_mounts(),
             linux: crate::grill::oci::OciLinux {
@@ -1457,6 +1523,190 @@ mod tests {
             output, "reliaburger-pinned-workload",
             "unexpected output from the selected platform manifest"
         );
+
+        grill.kill(&id).await.unwrap();
+    }
+
+    /// Redis 8.8.0 from the ECR mirror of the official image, pinned.
+    const REDIS_IMAGE: &str = "public.ecr.aws/docker/library/redis@sha256:234c902a2db49461a129e2d4aeff85b28cf20187ed274a67f6e50995fa713c7b";
+    /// nginx 1.29-alpine from the ECR mirror of the official image, pinned.
+    const NGINX_IMAGE: &str = "public.ecr.aws/docker/library/nginx@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de";
+
+    /// A rootful grill and the spec Bun would generate for `app_toml`.
+    fn image_app(tmp: &std::path::Path, id: &InstanceId, app_toml: &str) -> (RuncGrill, OciSpec) {
+        let grill = RuncGrill::new(
+            tmp.join("bundles"),
+            ImageStore::new(tmp.join("images")),
+            false,
+            tmp.join("state"),
+            test_owner(),
+        )
+        .unwrap();
+        let app: crate::config::app::AppSpec = toml::from_str(app_toml).unwrap();
+        let identity = super::super::InstanceIdentity::parse(&id.0).unwrap();
+        let volumes = tmp.join("volumes");
+        let mut spec = crate::grill::oci::generate_oci_spec(
+            &identity.app,
+            &identity.namespace,
+            &app,
+            &id.0,
+            None,
+            "/unused",
+            Some(&volumes),
+            None,
+        );
+        spec.linux.cgroups_path = None;
+        (grill, spec)
+    }
+
+    async fn wait_for_log(grill: &RuncGrill, id: &InstanceId, needle: &str) -> String {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let logs = grill.logs(id).await.unwrap_or_default();
+            if logs.contains(needle) {
+                return logs;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{id} never logged {needle:?}: {logs}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Z1.1: an app that sets nothing but its image runs the image's own
+    /// entrypoint, env and working directory, as the image's user, and
+    /// that user is root only inside the container's user namespace.
+    #[tokio::test]
+    #[ignore = "requires rootful runc, network access to public.ecr.aws, and RELIABURGER_RUNC_TESTS=1"]
+    async fn runc_runs_an_image_by_its_own_entrypoint_env_and_working_dir() {
+        assert!(runc_tests_enabled(), "set RELIABURGER_RUNC_TESTS=1");
+        assert!(nix::unistd::geteuid().is_root(), "rootful runc needs root");
+        let tmp = tempfile::tempdir().unwrap();
+        let id = InstanceId("default__image-config-0".to_string());
+        remove_test_network(&id);
+        let _network_cleanup = TestNetworkCleanup(vec![id.clone()]);
+        let (grill, spec) = image_app(
+            tmp.path(),
+            &id,
+            &format!("image = \"{REDIS_IMAGE}\"\nenv = {{ GREETING = \"hello\" }}"),
+        );
+
+        grill.create(&id, &spec).await.unwrap();
+        grill.start(&id).await.unwrap();
+        // docker-entrypoint.sh chowns /data and drops to `redis` with gosu:
+        // both need capabilities that only exist inside the user namespace.
+        wait_for_log(&grill, &id, "Ready to accept connections").await;
+
+        let probe = grill
+            .exec(
+                &id,
+                &[
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "echo \"$REDIS_VERSION|$GREETING|$(pwd)|$(id -u)|$(stat -c %U /data)\"; \
+                     grep ^Uid: /proc/1/status; cat /proc/self/uid_map"
+                        .to_string(),
+                ],
+            )
+            .await
+            .unwrap();
+        assert!(
+            probe.contains("8.8.0|hello|/data|0|redis"),
+            "image env, app env, working dir, image user and image-owned files: {probe}"
+        );
+        assert!(
+            probe.contains("Uid:\t999\t999"),
+            "the entrypoint should have dropped redis-server to the redis user: {probe}"
+        );
+        let mapping: Vec<&str> = probe.lines().last().unwrap().split_whitespace().collect();
+        assert_eq!(
+            mapping,
+            [
+                "0",
+                crate::grill::userns::HOST_ID_BASE.to_string().as_str(),
+                "65536"
+            ],
+            "container root must map to the node's unprivileged range"
+        );
+
+        let bundle: OciSpec = serde_json::from_slice(
+            &std::fs::read(tmp.path().join("bundles").join(&id.0).join("config.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            bundle.process.args,
+            ["docker-entrypoint.sh", "redis-server"]
+        );
+        assert!(
+            bundle.process.overrides.is_none(),
+            "config.json is pure OCI"
+        );
+
+        grill.kill(&id).await.unwrap();
+    }
+
+    /// Z1.1/D1: image root binds port 80 and nginx's workers drop to their
+    /// own user, yet no container process is root on the node.
+    #[tokio::test]
+    #[ignore = "requires rootful runc, network access to public.ecr.aws, and RELIABURGER_RUNC_TESTS=1"]
+    async fn runc_image_root_binds_port_80_without_being_host_root() {
+        use std::os::unix::fs::MetadataExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        assert!(runc_tests_enabled(), "set RELIABURGER_RUNC_TESTS=1");
+        assert!(nix::unistd::geteuid().is_root(), "rootful runc needs root");
+        let tmp = tempfile::tempdir().unwrap();
+        let id = InstanceId("default__image-root-0".to_string());
+        remove_test_network(&id);
+        let _network_cleanup = TestNetworkCleanup(vec![id.clone()]);
+        let (grill, spec) = image_app(tmp.path(), &id, &format!("image = \"{NGINX_IMAGE}\""));
+
+        grill.create(&id, &spec).await.unwrap();
+        grill.start(&id).await.unwrap();
+        wait_for_log(&grill, &id, "start worker process").await;
+
+        let address = grill.container_ip(&id).await.expect("rootful address");
+        let mut stream = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tokio::net::TcpStream::connect((address, 80)),
+        )
+        .await
+        .unwrap()
+        .expect("nginx listens on port 80");
+        stream
+            .write_all(b"GET / HTTP/1.0\r\nHost: test\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+
+        // Find the container's processes by their user namespace, which
+        // differs from ours, and check their host uids.
+        let own_namespace = std::fs::read_link("/proc/self/ns/user").unwrap();
+        let mut container_uids = Vec::new();
+        for entry in std::fs::read_dir("/proc").unwrap().flatten() {
+            let Ok(namespace) = std::fs::read_link(entry.path().join("ns/user")) else {
+                continue;
+            };
+            let Ok(cmdline) = std::fs::read(entry.path().join("cmdline")) else {
+                continue;
+            };
+            if namespace != own_namespace && cmdline.starts_with(b"nginx") {
+                container_uids.push(entry.metadata().unwrap().uid());
+            }
+        }
+        assert!(
+            container_uids.len() >= 2,
+            "expected an nginx master and worker: {container_uids:?}"
+        );
+        for uid in container_uids {
+            assert!(
+                uid >= crate::grill::userns::HOST_ID_BASE,
+                "an nginx process runs as host uid {uid}"
+            );
+        }
 
         grill.kill(&id).await.unwrap();
     }

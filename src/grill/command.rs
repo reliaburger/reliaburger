@@ -135,6 +135,8 @@ impl OwnedCommands {
                     .collect(),
                 cwd: "/".into(),
                 user: OciUser { uid: 0, gid: 0 },
+                capabilities: None,
+                overrides: None,
             },
             mounts: Vec::new(),
             linux: OciLinux {

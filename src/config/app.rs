@@ -20,9 +20,26 @@ pub struct AppSpec {
     pub image: Option<String>,
     /// Command and arguments to run inside the container.
     /// For ProcessGrill, this is the process that gets spawned.
-    /// For runc/Apple Container, this overrides the image entrypoint.
+    /// For runc/Apple Container, this overrides the image entrypoint
+    /// (and, like Kubernetes, drops the image's `Cmd`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub command: Vec<String>,
+    /// Arguments that replace the image's `Cmd`, keeping its `Entrypoint`
+    /// unless `command` is also set (Kubernetes `args`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    /// Working directory inside the container. Defaults to the image's
+    /// `WorkingDir`, or `/`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub working_dir: Option<PathBuf>,
+    /// User id to run as inside the container, replacing the image's
+    /// `User` (Kubernetes `runAsUser`). Container ids live in a user
+    /// namespace, so 0 is never root on the host.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_as_user: Option<u32>,
+    /// Group id to run as inside the container (Kubernetes `runAsGroup`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_as_group: Option<u32>,
     /// Host binary path (Phase 8: process workloads).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exec: Option<PathBuf>,

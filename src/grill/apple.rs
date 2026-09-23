@@ -920,6 +920,8 @@ mod tests {
                 env: vec!["TEST=1".to_string()],
                 cwd: "/".to_string(),
                 user: crate::grill::oci::OciUser { uid: 0, gid: 0 },
+                capabilities: None,
+                overrides: None,
             },
             mounts: vec![],
             linux: crate::grill::oci::OciLinux {
@@ -988,6 +990,8 @@ mod tests {
                 env: vec![],
                 cwd: "/".to_string(),
                 user: crate::grill::oci::OciUser { uid: 0, gid: 0 },
+                capabilities: None,
+                overrides: None,
             },
             mounts: vec![],
             linux: crate::grill::oci::OciLinux {

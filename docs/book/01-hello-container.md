@@ -2808,6 +2808,75 @@ if looks_like_image_ref(&spec.root.path) {
 
 The `detect_runtime()` function now auto-detects rootless mode and configures paths accordingly. Non-root users get `~/.local/share/reliaburger/` for images and bundles; root uses `/var/lib/reliaburger/`.
 
+### Doing what the image says
+
+For a long time we pulled the layers and threw the config blob away. Every container ran the app's `command`, with the app's `env`, in `/`, as uid 65534. That works for a test image you built yourself. Now try the official Redis image. Its config says:
+
+```json
+{"Entrypoint": ["docker-entrypoint.sh"], "Cmd": ["redis-server"],
+ "Env": ["PATH=...", "REDIS_VERSION=8.8.0"], "WorkingDir": "/data"}
+```
+
+With no `command`, runc had nothing to run. With one, the entrypoint script never ran, `REDIS_VERSION` was missing, and the process couldn't write to `/data`. Podinfo's image says `"User": "app", "WorkingDir": "/home/app", "Cmd": ["./podinfo"]`, a relative path that only works from the right directory. Almost every public image leans on at least one of these fields, so a Kubernetes manifest that runs fine on a real cluster fell over on ours.
+
+The fix is to do what Kubernetes does. The app's `command` replaces the image's `Entrypoint` (and drops its `Cmd`); the app's `args` replaces `Cmd`; the image's `Env` goes underneath the app's, so the app wins a clash; the image's `WorkingDir` and `User` apply unless the app sets `working_dir` or `run_as_user`. The rule for the argv is small enough to read at a glance:
+
+```rust
+process.args = if overrides.command.is_empty() {
+    let cmd = if overrides.args.is_empty() { &image.cmd } else { &overrides.args };
+    image.entrypoint.iter().chain(cmd).cloned().collect()
+} else {
+    overrides.command.iter().chain(&overrides.args).cloned().collect()
+};
+```
+
+`if` is an expression in Rust, so both branches produce the new argument vector and we assign it once. `.iter().chain(other)` walks one sequence and then the next without building an intermediate vector (think `itertools.chain` in Python). `.cloned()` turns the borrowed `&String`s into owned `String`s, and `.collect()` gathers them into whatever type the left-hand side needs, here a `Vec<String>`.
+
+Where does `overrides` come from? Only runc unpacks images itself, so only runc can read the config. The spec generator can't resolve anything yet: it doesn't have the image. So it records what the app asked for in a field the OCI spec doesn't have, `OciProcess::overrides`, and runc resolves it after the pull:
+
+```rust
+let Some(overrides) = process.overrides.take() else {
+    return Ok(());
+};
+```
+
+`Option::take()` moves the value out and leaves `None` behind. That does two jobs at once: we own the overrides without cloning them, and the field is empty by the time we write `config.json`, so runc sees a pure OCI document. A `None` means the process is already final, which is how our hand-built test specs keep working.
+
+The config blob decides what runs, and as whom, so it has to be the bytes we verified. The direct pull path already checks the config against the digest in the manifest before it fetches a single layer; `pull_and_unpack` now returns that parsed config alongside the rootfs in a `PulledImage`. The cluster path (Pickle and its peers) hands back the config blob's path and digest, and we hash the file again before parsing it. It's a few kilobytes. We'd rather pay for the hash than trust a file on disk.
+
+The `User` field needs one more step. `"app"` is a name, and names live in the image's `/etc/passwd`. We read that file from the unpacked image, but the image controls its own symlinks: `/etc/passwd -> /etc/shadow` must mean the image's shadow file, not the host's. So `resolve_in_root` walks the path one component at a time, restarts absolute link targets from the image root, and never lets `..` climb above it, the way the kernel would inside the container.
+
+### Root, but not really
+
+Honouring `User` raises an awkward question. Neither Redis nor nginx sets a user, which means root. Their entrypoints rely on it: Redis `chown`s `/data` and then drops to the `redis` user with `gosu`; nginx binds port 80 as root and starts its workers as `nginx`. Keep running everything as 65534 and a large slice of the Kubernetes ecosystem won't start. Run them as real root and a container escape owns the node.
+
+The answer is a user namespace. We already met one for rootless mode, where it maps your uid to root inside the container. Rootful containers now get one too, with a bigger mapping: container ids 0 to 65,535 map onto host ids 2,000,000,000 to 2,000,065,535. Inside, Redis is root and can `chown` and `setuid`. Outside, it's uid two billion, which owns nothing on the node.
+
+```rust
+pub const HOST_ID_BASE: u32 = 2_000_000_000;
+pub const CONTAINER_ID_COUNT: u32 = 65_536;
+```
+
+The underscores are just digit separators, like `2_000_000_000` in Python. We picked two billion because it sits above systemd's container range and below its dynamic ranges near 2^31, so it collides with neither `/etc/subuid` allocations nor systemd-nspawn.
+
+With the namespace comes Docker's default capability set: `CAP_CHOWN`, `CAP_SETUID`, `CAP_NET_BIND_SERVICE` and a handful more. Inside a user namespace a capability only acts on what the namespace owns, so these let an entrypoint manage its own files and processes without any say over the host's.
+
+Three details make it actually work. First, the files. Container root is host uid 2,000,000,000, and the unpacked image was owned by host root, which the namespace doesn't map at all. So the image store shifts ownership once, at unpack time: a file owned by uid 999 in the layer is owned by 2,000,000,999 on disk, and any directory the unpacker invents goes to container root. `chown` quietly clears set-uid bits, so we put the mode back afterwards. Every container on a node shares this one range (like Docker's `userns-remap`), which is what keeps the unpacked image cache shareable. Per-container ranges would need idmapped mounts for every rootfs, and we don't need that yet.
+
+Second, `/sys`. The kernel only lets a user namespace mount a fresh `sysfs` if it also owns the network namespace, and ours was created by the node beforehand. Rootless mode already had the answer, a read-only bind of the host's `/sys`, so both paths share it now.
+
+Third, port 80. For the same ownership reason, container root has no `CAP_NET_BIND_SERVICE` over its network namespace. When we create the namespace we set `net.ipv4.ip_unprivileged_port_start=0` inside it, as Docker does. The namespace holds one container, so there's nobody to impersonate on a low port.
+
+The destructuring assignment in the user resolution is worth a glance, because it's newer Rust:
+
+```rust
+if let Some(run_as_user) = overrides.user {
+    (uid, gid, home) = by_id(run_as_user)?;
+}
+```
+
+`by_id` is a closure that returns a `Result` of a three-element tuple. Assigning a tuple to existing `mut` variables in one go works the way it does in Python or Go (`uid, gid, home = ...`). Rust only allowed it on plain assignment, not just in `let`, from version 1.59.
+
 ### Testing image pulling
 
 The unit tests for `ImageReference::parse` and layer unpacking run unconditionally. They create synthetic gzipped tarballs in temp directories and verify that whiteouts, symlinks, and multi-layer ordering work correctly.
@@ -2817,6 +2886,16 @@ The fixture serves a small synthetic manifest, config and compressed layer over 
 the tests can verify manifest fetching, digest checks, unpacking and cache reuse without a
 mutable Docker Hub tag or network access. The real runc acceptance remains a separate
 provisioned Linux suite because its promise is runtime execution, not registry protocol.
+
+The image-config rules are pure functions over a parsed config and a scratch rootfs, so
+`image_config`'s unit tests cover every combination of `command`, `args`, env, working
+directory and the `User` forms (`app`, `100`, `100:50`, `app:staff`, an unknown name, a
+passwd symlink that points at the host) on any machine. The user namespace mapping is
+unit-tested the same way. Two provisioned-Linux tests then run the real thing, pinned by
+digest: Redis with no `command` must reach "Ready to accept connections", show
+`REDIS_VERSION`, run in `/data`, drop `redis-server` to uid 999 and map container root to
+2,000,000,000; nginx must answer on port 80 while every one of its processes has a host uid
+of at least two billion.
 
 ## Surviving our own crash
 

@@ -22,6 +22,8 @@ fn spec(script: &str) -> OciSpec {
             env: vec!["OWNER_TEST=preserved".into()],
             cwd: "/".into(),
             user: OciUser { uid: 0, gid: 0 },
+            capabilities: None,
+            overrides: None,
         },
         mounts: vec![],
         linux: OciLinux {

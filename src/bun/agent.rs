@@ -8448,18 +8448,22 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     /// The uid/gid identity files should be owned by, so the container
-    /// process can read its owner-only key: the OCI runtime user (65534),
-    /// but only when we're root and can actually chown. In rootless mode
-    /// the files stay owned by the bun user — the same user namespace the
-    /// workload runs in.
-    fn workload_identity_owner() -> Option<(u32, u32)> {
-        #[cfg(unix)]
-        {
-            nix::unistd::geteuid().is_root().then_some((65534, 65534))
+    /// process can read its owner-only key. Only when we're root and can
+    /// actually chown: in rootless mode the files stay owned by the bun
+    /// user, the same user namespace the workload runs in.
+    ///
+    /// Runc hands the directory to the container's (user-namespaced) host
+    /// uid when it creates the container, so files follow the directory's
+    /// owner. A directory still owned by root belongs to a runtime without
+    /// that step, whose workloads run as nobody (65534).
+    fn workload_identity_owner(dir: &std::path::Path) -> Option<(u32, u32)> {
+        use std::os::unix::fs::MetadataExt;
+        if !nix::unistd::geteuid().is_root() {
+            return None;
         }
-        #[cfg(not(unix))]
-        {
-            None
+        match std::fs::metadata(dir) {
+            Ok(metadata) if metadata.uid() != 0 => Some((metadata.uid(), metadata.gid())),
+            _ => Some((65534, 65534)),
         }
     }
 
@@ -8686,7 +8690,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 if let Err(e) = crate::sesame::identity::write_identity_files(
                     &identity,
                     &identity_dir,
-                    Self::workload_identity_owner(),
+                    Self::workload_identity_owner(&identity_dir),
                 ) {
                     let _ = events
                         .send(ApplyEvent::Progress {
@@ -18604,6 +18608,8 @@ host = "remote.local"
                     env: vec![],
                     cwd: "/".to_string(),
                     user: crate::grill::oci::OciUser { uid: 0, gid: 0 },
+                    capabilities: None,
+                    overrides: None,
                 },
                 mounts: vec![],
                 linux: crate::grill::oci::OciLinux {

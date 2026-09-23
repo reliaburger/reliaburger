@@ -1021,6 +1021,20 @@ timeout = 5
 
 The `image` field is required for the Linux runc runtime but **ignored by ProcessGrill**, which runs the `command` directly as an OS process. ProcessGrill examples use `proc-grill:image-ignored` to make this explicit. If no `command` is set, ProcessGrill falls back to `sleep 86400`.
 
+On runc, an image app runs the way Kubernetes would run it. Everything below is optional:
+
+```toml
+[app.cache]
+image = "public.ecr.aws/docker/library/redis:8.8.0"
+# command = ["redis-server"]        # replaces the image's Entrypoint (and drops its Cmd)
+args = ["--maxmemory", "64mb"]      # replaces the image's Cmd, keeps its Entrypoint
+# working_dir = "/data"             # default: the image's WorkingDir, else /
+# run_as_user = 999                 # default: the image's User, else 0
+# run_as_group = 999
+```
+
+The image's `Env` is merged under the app's `env` (the app wins on a clash). Every rootful runc container runs in a user namespace: container uid 0 is host uid 2,000,000,000, so an image that runs as root (Redis, nginx) can `chown` its files and bind port 80 without being root on the node. Keep host ids `2000000000`–`2000065535` out of `/etc/subuid` and your directory service.
+
 ### Jobs
 
 Jobs are run-to-completion tasks. They retry up to 3 times with exponential backoff on failure.

@@ -254,6 +254,27 @@ fn validate_app(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError
         });
     }
 
+    // `args` and `working_dir` describe a container's process against its
+    // image config; a process workload has no image to resolve them against.
+    if (app.exec.is_some() || app.script.is_some())
+        && (!app.args.is_empty() || app.working_dir.is_some())
+    {
+        return Err(ConfigError::Validation {
+            field: "args/working_dir".to_string(),
+            context: format!("app {name:?}"),
+            reason: "args and working_dir apply to image workloads, not exec or script".to_string(),
+        });
+    }
+    if let Some(dir) = &app.working_dir
+        && !dir.is_absolute()
+    {
+        return Err(ConfigError::Validation {
+            field: "working_dir".to_string(),
+            context: format!("app {name:?}"),
+            reason: format!("{:?} must be absolute", dir.display()),
+        });
+    }
+
     // Port range
     if let Some(port) = app.port
         && port == 0
@@ -768,6 +789,50 @@ mod tests {
     fn validate_valid_app_passes() {
         let config = config_with_app("test", minimal_app());
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn image_process_fields_parse_and_validate() {
+        let app: AppSpec = toml::from_str(
+            r#"
+            image = "ghcr.io/stefanprodan/podinfo:6.15.0"
+            args = ["--port=9898"]
+            working_dir = "/home/app"
+            run_as_user = 100
+            run_as_group = 101
+            "#,
+        )
+        .unwrap();
+        assert_eq!(app.args, ["--port=9898"]);
+        assert_eq!(app.run_as_user, Some(100));
+        config_with_app("podinfo", app).validate().unwrap();
+    }
+
+    #[test]
+    fn relative_working_dir_rejected() {
+        let mut app = minimal_app();
+        app.working_dir = Some(PathBuf::from("home/app"));
+        let err = config_with_app("test", app).validate().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Validation { ref field, .. } if field == "working_dir"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn args_on_a_process_workload_rejected() {
+        let app: AppSpec = toml::from_str(
+            r#"
+            script = "echo hi"
+            args = ["--verbose"]
+            "#,
+        )
+        .unwrap();
+        let err = config_with_app("test", app).validate().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Validation { ref field, .. } if field == "args/working_dir"),
+            "{err:?}"
+        );
     }
 
     #[test]

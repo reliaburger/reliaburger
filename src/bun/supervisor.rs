@@ -853,6 +853,10 @@ mod tests {
             egress: None,
             autoscale: None,
             namespace: None,
+            args: Vec::new(),
+            working_dir: None,
+            run_as_user: None,
+            run_as_group: None,
         }
     }
 

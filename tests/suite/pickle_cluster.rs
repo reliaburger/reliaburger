@@ -653,7 +653,7 @@ async fn p2p_pull_fetches_all_layers_in_parallel() {
         .await
         .unwrap()
         .expect("catalog should know the image");
-    assert_eq!(paths.len(), 5);
+    assert_eq!(paths.layers.len(), 5);
     for digest in &layer_digests {
         assert!(puller.state.store.has_blob(digest), "missing {digest}");
     }
@@ -856,7 +856,7 @@ async fn pull_through_caches_once_then_serves_peers() {
         .await
         .unwrap()
         .expect("pull-through should serve the image");
-    assert_eq!(paths.len(), 1);
+    assert_eq!(paths.layers.len(), 1);
     let first_pull_hits = upstream_hits.load(Ordering::SeqCst);
     assert!(first_pull_hits > 0, "first pull must reach upstream");
     {
