@@ -20475,6 +20475,45 @@ host = "remote.local"
     }
 
     #[tokio::test]
+    async fn durable_consumer_history_compacts_once_a_long_capture_releases() {
+        let (mut agent, _root, catalog) = clustered_allocation_fixture().await;
+        let (_, ingress) = cluster_publication_fixture();
+        let backend = agent.service_map_tx.borrow().resolve_all()[0].backends[0]
+            .instance_id
+            .clone();
+        agent
+            .drains
+            .capture_requests(std::slice::from_ref(&backend), false)
+            .await
+            .unwrap();
+        // The backend leaves the catalogue while a request still holds it, and
+        // the cluster keeps publishing. Every change stays retained...
+        let empty = crate::onion::catalog::EndpointCatalog::default();
+        for generation in 2..=40 {
+            let next = if generation % 2 == 0 {
+                &empty
+            } else {
+                &catalog
+            };
+            let _ = agent
+                .synchronise_consumer(generation, next.clone(), ingress.clone(), vec![])
+                .await;
+        }
+        let retained = agent.consumer_owner().unwrap().publications.len();
+        assert!(
+            retained > 1,
+            "views were forgotten while a request held one"
+        );
+        // ...until the request releases, and then one pass compacts them all.
+        agent.drains.decrement_connections(&backend).await;
+        agent
+            .synchronise_consumer(41, empty, ingress, vec![])
+            .await
+            .unwrap();
+        assert_eq!(agent.consumer_owner().unwrap().publications.len(), 1);
+    }
+
+    #[tokio::test]
     async fn durable_consumer_local_change_keeps_the_published_view() {
         let (mut agent, _root, _catalog) = clustered_allocation_fixture().await;
         let service = crate::onion::service_id::ServiceId::new("default", "remote");

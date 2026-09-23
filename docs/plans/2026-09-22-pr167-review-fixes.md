@@ -385,7 +385,12 @@ Execution (grill):
 
 Discovery and API:
 
-- [ ] **T2.10 The consumer publication list can hit its cap and wedge.**
+- [x] **T2.10 The consumer publication list can hit its cap and wedge.**
+      Resolved by T1.1, now pinned by a test. Views accumulate only while a
+      removed backend still holds captured requests, which its 30 s drain
+      deadline bounds; the test publishes 39 changes during one capture and
+      checks a single pass compacts them after release. Reaching 1,024 would
+      need over a thousand catalogue changes inside one drain window.
       `src/bun/agent/consumer.rs:236-239` pushes and persists before the
       withdrawal that shrinks the list; at `MAX_PUBLICATIONS` (1,024)
       `save_consumer` fails validation before reaching it. Collapse repeated
