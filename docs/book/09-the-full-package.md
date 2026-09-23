@@ -636,7 +636,24 @@ A migration story needs a real application to migrate, not a toy we wrote to pas
 
 `examples/kubernetes/podinfo.yaml` keeps as close to upstream as we could and lists every edit in its header: images pinned by digest (redis from the ECR mirror to dodge Docker Hub rate limits), no `webapp` namespace or service account, HTTP probes instead of `exec: podcli check http`, three frontend replicas, redis's config file turned into arguments, and an ingress on `podinfo.localhost`. The import report still lists what it can't keep, and that's the point.
 
-Two tests hold it in place. A portable one imports the file and checks the three apps it should produce. A provisioned-Linux one starts a real Bun with runc, eBPF, the DNS responder and ingress, runs `relish apply -f` on the file, and then goes through the ingress by host name: the home page must answer, `POST /api/echo` must come back as the backend's list of responses, and a value written to `/cache/demo` must read back from redis.
+One edit isn't a migration at all. An idle demo gives the tour's metrics nothing to count and its faults nothing to hurt, so the manifest adds a `loadgen` Deployment: BusyBox, pinned by digest, running a shell loop.
+
+```yaml
+command:
+  - /bin/sh
+  - -c
+  - |
+    while true; do
+      wget -q -T 5 -O /dev/null http://frontend:9898/
+      wget -q -T 5 -O /dev/null --post-data "$(date)" http://frontend:9898/cache/loadgen
+      wget -q -T 5 -O /dev/null http://frontend:9898/cache/loadgen
+      sleep 0.5
+    done
+```
+
+It calls the frontend by its short service name, the way any other client in the cluster would, and the two `/cache` calls go through to redis. There's no `set -e`, so a failed request (and during a fault, plenty fail) just moves the loop on. `-T 5` caps each one, so a black-holed connection costs five seconds rather than forever. Why not a proper load tester? Because the job is "some traffic, always", not "measure throughput", and BusyBox is already the image our own tests pin.
+
+Two tests hold it in place. A portable one imports the file and checks the four apps it should produce. A provisioned-Linux one starts a real Bun with runc, eBPF, the DNS responder and ingress, runs `relish apply -f` on the file, and then goes through the ingress by host name: the home page must answer, `POST /api/echo` must come back as the backend's list of responses, and a value written to `/cache/demo` must read back from redis, and so must whatever the load generator wrote to `/cache/loadgen`.
 
 It paid for itself on its first run. Every image the node's Pickle cache served failed with `digest mismatch for layer sha256:8d0c5e505441...: expected sha256:8d0c5e505441..., got sha256:8d0c5e5054411ef2...`. The two digests were the same; one of them had been printed. The cluster image source passed the config blob's digest along with `to_string()`, and `Digest`'s `Display` impl abbreviates to twelve hex digits for humans. In Rust, `Display` is the trait behind `{}` and `to_string()`, and nothing stops a type from making it lossy. The fix was `as_str()`, and the pickle suite now re-hashes the config blob against the digest it returns. Unit tests of the pull path never noticed, because they went round the cluster source rather than through it.
 

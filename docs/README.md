@@ -889,7 +889,7 @@ The first deploy will pull the image from Docker Hub, which takes a few seconds.
 
 The `proc-*` examples use `command` to run local binaries and work without any container runtime. The `container-*` examples use `image` to pull and run real OCI containers.
 
-`examples/kubernetes/podinfo.yaml` is a real Kubernetes application: the three-tier podinfo demo (a frontend, the backend it calls as `backend`, and redis as `redis`), pinned by digest, with an ingress on `podinfo.localhost`. It needs a runc node with `[ebpf]`, `[dns]` and `[ingress]` enabled, which is what `relish setup --quickstart` builds. Its header lists every edit we made to upstream's manifests.
+`examples/kubernetes/podinfo.yaml` is a real Kubernetes application: the three-tier podinfo demo (a frontend, the backend it calls as `backend`, and redis as `redis`) plus a BusyBox load generator that keeps calling the frontend as `frontend`, all pinned by digest, with an ingress on `podinfo.localhost`. It needs a runc node with `[ebpf]`, `[dns]` and `[ingress]` enabled, which is what `relish setup --quickstart` builds. Its header lists every edit we made to upstream's manifests.
 
 ```bash
 relish apply -f examples/kubernetes/podinfo.yaml

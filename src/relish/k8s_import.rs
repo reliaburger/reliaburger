@@ -2819,16 +2819,16 @@ spec:
         );
     }
 
-    /// Z1.5: the tutorial's demo manifest imports cleanly into the three
-    /// apps it describes, and the result is a valid config.
+    /// Z1.5, Z6.7: the tutorial's demo manifest imports cleanly into the
+    /// four apps it describes, and the result is a valid config.
     #[test]
-    fn the_podinfo_demo_manifest_imports_into_three_apps() {
+    fn the_podinfo_demo_manifest_imports_into_four_apps() {
         let yaml = include_str!("../../examples/kubernetes/podinfo.yaml");
         let result = import_from_yaml(yaml).unwrap();
         result.config.validate().unwrap();
         assert!(result.report.dropped.is_empty(), "{}", result.report);
         let names: Vec<&str> = result.config.app.keys().map(String::as_str).collect();
-        assert_eq!(names, ["backend", "frontend", "redis"]);
+        assert_eq!(names, ["backend", "frontend", "loadgen", "redis"]);
 
         let frontend = &result.config.app["frontend"];
         assert_eq!(frontend.replicas, Replicas::Fixed(3));
@@ -2870,5 +2870,21 @@ spec:
         assert!(redis.command.is_empty());
         assert_eq!(redis.args[0], "redis-server");
         assert_eq!(redis.port, Some(6379));
+
+        // The load generator calls the frontend by service name, forever,
+        // and serves nothing itself.
+        let loadgen = &result.config.app["loadgen"];
+        assert_eq!(loadgen.replicas, Replicas::Fixed(1));
+        assert_eq!(loadgen.port, None);
+        assert!(loadgen.ingress.is_none());
+        assert_eq!(loadgen.command[..2], ["/bin/sh", "-c"]);
+        assert!(loadgen.command[2].contains("http://frontend:9898/cache/loadgen"));
+        assert!(
+            loadgen
+                .image
+                .as_deref()
+                .unwrap()
+                .starts_with("public.ecr.aws/docker/library/busybox@sha256:")
+        );
     }
 }

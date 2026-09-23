@@ -22,7 +22,7 @@ use bun_process::{BunProcess, BunStart, reserve_address, wait_for_bind};
 use reliaburger::onion::trace::TraceVerdict;
 use reliaburger::relish::client::BunClient;
 
-const APPS: [&str; 3] = ["frontend", "backend", "redis"];
+const APPS: [&str; 4] = ["frontend", "backend", "redis", "loadgen"];
 
 /// Stops the demo and removes what it leaves on the host, including while a
 /// failed assertion unwinds. Best-effort: nothing here may panic.
@@ -351,6 +351,29 @@ async fn podinfo_demo_frontend_reaches_backend_and_redis_by_name() {
         .filter(|row| row.instance.app_name == "frontend")
         .count();
     assert_eq!(frontends, 3, "{statuses:?}");
+
+    // The load generator calls the frontend as `frontend` and writes the
+    // time into /cache/loadgen; seeing a value there through the ingress
+    // proves its traffic goes all the way to redis (Z6.7).
+    let written = eventually(Duration::from_secs(90), || async {
+        let response = demo
+            .http
+            .get(format!("{}/cache/loadgen", demo.base))
+            .send()
+            .await
+            .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let body = response.text().await.ok()?;
+        (!body.trim().is_empty()).then_some(body)
+    })
+    .await;
+    assert!(
+        written.is_some(),
+        "the load generator never wrote to the cache:\n{}",
+        demo.log()
+    );
 }
 
 /// The tour's fault beats on the real demo: network faults act on the

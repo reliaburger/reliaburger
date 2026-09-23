@@ -1,5 +1,6 @@
 # podinfo in its three-tier shape: a frontend that calls a backend and caches
-# in redis, reached through an ingress. Apply it as it is:
+# in redis, reached through an ingress, plus a small load generator. Apply it
+# as it is:
 #
 #   relish apply -f examples/kubernetes/podinfo.yaml
 #   curl -H 'Host: podinfo.localhost' http://127.0.0.1/
@@ -23,6 +24,13 @@
 #     allkeys-lru --save "" --appendonly no` (upstream's redis.conf). With no
 #     `command`, the image's own entrypoint runs, exactly as in Kubernetes.
 #  6. An Ingress routes host podinfo.localhost to the frontend.
+#  7. A `loadgen` Deployment (not in upstream) keeps traffic flowing so the
+#     metrics and faults in the tour have something to act on. It's a
+#     BusyBox shell loop, pinned by digest like the rest, that calls the
+#     frontend by service name about six times a second: the home page, then
+#     a write and a read of /cache/loadgen, which go through to redis. A
+#     failed request is ignored and the loop carries on, so it keeps going
+#     through every fault you inject.
 #
 # The `prometheus.io/*` annotations import as `metrics = { port = 9797 }`:
 # each node scrapes podinfo's metrics listener on its own instances, so
@@ -277,3 +285,38 @@ spec:
       port: 6379
       protocol: TCP
       targetPort: redis
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loadgen
+spec:
+  selector:
+    matchLabels:
+      app: loadgen
+  template:
+    metadata:
+      labels:
+        app: loadgen
+    spec:
+      containers:
+        - name: loadgen
+          image: public.ecr.aws/docker/library/busybox@sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - -c
+            - |
+              while true; do
+                wget -q -T 5 -O /dev/null http://frontend:9898/
+                wget -q -T 5 -O /dev/null --post-data "$(date)" http://frontend:9898/cache/loadgen
+                wget -q -T 5 -O /dev/null http://frontend:9898/cache/loadgen
+                sleep 0.5
+              done
+          resources:
+            limits:
+              cpu: 100m
+              memory: 16Mi
+            requests:
+              cpu: 10m
+              memory: 8Mi
