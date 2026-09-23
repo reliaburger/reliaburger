@@ -69,18 +69,60 @@ pub async fn resources(to_start: usize, to_create: usize, root: &Path) -> Result
     if to_start == 0 {
         return Ok(());
     }
+    let memory_level = macos_memory_level().await?;
     let root = root.to_owned();
     tokio::task::spawn_blocking(move || {
         let mut system = sysinfo::System::new();
         system.refresh_memory();
-        validate_capacity(
-            to_start,
-            to_create,
-            system.available_memory(),
-            free_disk(&root)?,
-        )
+        let available = match memory_level {
+            Some(level) => level_to_bytes(system.total_memory(), level),
+            None => system.available_memory(),
+        };
+        validate_capacity(to_start, to_create, available, free_disk(&root)?)
     })
     .await?
+}
+
+/// The percentage of memory macOS considers free before it comes under
+/// pressure (`memory_pressure` prints the same figure).
+///
+/// sysinfo's macOS "available" subtracts the pages holding compressed memory
+/// from free and inactive pages, which never held them. On a busy Mac with a
+/// few GiB compressed it reports almost nothing available while the kernel
+/// reports 60% free, and we'd refuse to start. Linux's MemAvailable is fine.
+async fn macos_memory_level() -> Result<Option<u64>> {
+    if !cfg!(target_os = "macos") {
+        return Ok(None);
+    }
+    let output = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::process::Command::new("/usr/sbin/sysctl")
+            .args(["-n", "kern.memorystatus_level"])
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await??;
+    if !output.status.success() {
+        bail!("could not read the macOS memory pressure level");
+    }
+    Ok(Some(parse_memory_level(&String::from_utf8_lossy(
+        &output.stdout,
+    ))?))
+}
+
+fn parse_memory_level(text: &str) -> Result<u64> {
+    let level: u64 = text
+        .trim()
+        .parse()
+        .context("invalid macOS memory pressure level")?;
+    if level > 100 {
+        bail!("invalid macOS memory pressure level");
+    }
+    Ok(level)
+}
+
+fn level_to_bytes(total: u64, level: u64) -> u64 {
+    total / 100 * level
 }
 
 fn validate_capacity(
@@ -163,6 +205,24 @@ mod tests {
         assert!(validate_capacity(3, 3, 8 * GIB, 14 * GIB).is_err());
         assert!(validate_capacity(0, 0, 0, 0).is_ok());
         assert!(validate_capacity(3, 0, 8 * GIB, 0).is_ok());
+    }
+
+    #[test]
+    fn macos_memory_follows_the_kernel_pressure_level() {
+        assert_eq!(parse_memory_level("60\n").unwrap(), 60);
+        assert!(parse_memory_level("101").is_err());
+        assert!(parse_memory_level("").is_err());
+        // A 32 GiB Mac at 60% free has room for three VMs.
+        let available = level_to_bytes(32 * GIB, 60);
+        assert!(available > 19 * GIB && available < 20 * GIB);
+        assert!(validate_capacity(3, 3, available, 15 * GIB).is_ok());
+        assert!(validate_capacity(3, 3, level_to_bytes(8 * GIB, 60), 15 * GIB).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn macos_reports_a_memory_pressure_level() {
+        assert!(macos_memory_level().await.unwrap().is_some());
     }
 
     #[tokio::test]
