@@ -31,10 +31,12 @@ changed=$(git diff --name-only "${BASE_SHA}...${HEAD_SHA:-HEAD}")
 # Documentation that neither the build nor any test reads. The manual is
 # compiled into relish, and documentation_first_run checks snippets in the
 # READMEs, the whitepaper, the relish design doc and book chapters 2 and 4.
+# tests/suite/website.rs parses the homepage tour's commands with relish.
 is_docs_only() {
     case "$1" in
         docs/manual/* | README.md | docs/README.md | docs/whitepaper.md | \
-            docs/design/cli-relish.md | docs/book/02-* | docs/book/04-*)
+            docs/design/cli-relish.md | docs/book/02-* | docs/book/04-* | \
+            docs/website/index.html)
             return 1 ;;
         docs/* | website/* | *.md) return 0 ;;
         *) return 1 ;;

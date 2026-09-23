@@ -61,5 +61,6 @@ mod security_integration;
 mod service_endpoints;
 mod tls_connection_lifetime;
 mod uninstall;
+mod website;
 mod workload_trust_domain;
 mod wtf_watch;

@@ -1003,3 +1003,15 @@ The homepage has a "Try it in five minutes" section, and the CLI has the same to
 `relish manual` had no way to open one chapter, so it gained an optional positional argument. Clap already had a subcommand in that position (`relish manual examples`); it tries subcommand names first, so `examples` still means the subcommand and anything else becomes the chapter. A parser test pins that down, because it's the sort of precedence rule that changes quietly in a refactor.
 
 `find_chapter` takes what you typed and tries, in order: an exact short name (`chaos`), a part of exactly one short name (`tour`), and a part of exactly one title. Ambiguity is an error that lists every short name rather than a guess. The short name comes from the file name, with `split_once('_')` dropping the number: `split_once` returns an `Option` of the two halves around the first match, and `map_or(stem, |(_, rest)| rest)` means "the part after the underscore, or the whole stem if there isn't one". The reader gained `open_document`, which selects the chapter and gives the content pane the keyboard, so the arrow keys scroll the tour straight away.
+
+### A tutorial that can't lie
+
+A tutorial is documentation that people copy and paste, so every stale flag in it becomes someone's first error message. The homepage tour runs about a dozen `relish` commands, and nothing stopped us renaming one of them next month.
+
+So each command on the page carries a `data-tour` attribute, and `tests/suite/website.rs` pulls them out (the chapter's ```` ```sh ```` blocks too) and runs each one through the real command-line parser. Not a copy of the parser: the compiled `relish` binary, started with `RELISH_PARSE_ONLY=1`, which makes `main` return straight after `Cli::parse()`. That's a two-line hook, and it means the test exercises exactly what users run, including clap's global options and value parsers. We could have moved the `Cli` struct into the library so a test could call `Cli::try_parse_from`, but that would mean reshuffling a 3,000-line file several people are editing at once, for no extra coverage.
+
+The same test checks that the page and the chapter list the same commands, that `relish manual tour` resolves to the tour chapter, and that the Pages workflow publishes the demo manifest from `examples/kubernetes/`, the file CI imports, rather than a second copy that could drift.
+
+Some tour commands describe features still being built: `relish apply -f` for Kubernetes YAML and `relish local stop NODE`. They sit in a `PENDING` list, and the test requires them to *fail* to parse. The day one starts parsing, the test fails and says to delete its entry. An exemption that turns itself into a failure can't quietly outlive its reason, which is the whole point of the exercise.
+
+CI skips the Rust jobs for documentation-only changes, and until now the website counted as documentation. `scripts/ci/select-jobs.sh` now treats `docs/website/index.html` as code, for the same reason it already treats the manual as code: a test reads it.

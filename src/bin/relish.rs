@@ -1074,6 +1074,11 @@ enum FaultAction {
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
+    // Parse, then stop: tests/suite/website.rs checks the documented tour
+    // commands against this exact parser without running any of them.
+    if std::env::var_os("RELISH_PARSE_ONLY").is_some() {
+        return ExitCode::SUCCESS;
+    }
 
     // Record the global connection overrides before any client is built.
     reliaburger::relish::client::set_cli_token(cli.token.clone());
