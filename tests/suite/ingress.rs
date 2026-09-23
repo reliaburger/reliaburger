@@ -22,8 +22,7 @@ use reliaburger::wrapper::types::WrapperConfig;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-#[path = "support/task_harness.rs"]
-mod task_harness;
+use crate::task_harness;
 use task_harness::TestTasks;
 
 /// Agent + API + bound ingress listeners, all on ephemeral ports.

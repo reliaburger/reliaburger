@@ -9778,7 +9778,7 @@ schedule = "* * * * *"
             get_authenticated(app.clone(), path, "internal").await.0,
             StatusCode::OK
         );
-        // Receipts need a TLS identity; tests/endpoint_withdrawal.rs covers
+        // Receipts need a TLS identity; tests/suite/endpoint_withdrawal.rs covers
         // registration for authenticated consumers.
         assert!(
             council.desired_state().await.endpoint_consumers.is_empty(),

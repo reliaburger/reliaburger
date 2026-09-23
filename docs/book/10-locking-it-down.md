@@ -988,7 +988,7 @@ The per-instance lifecycle has its own regression suite spread across the layers
 
 Two integration files drive whole features through the library, no running agent required:
 
-- **`tests/security_integration.rs`** is the lifecycle suite: `join_token_single_use_enforced` and `join_token_expiry_enforced` (the loop we left open in Chapter 4), `secret_rotation_dual_key_window` and `secret_rotation_finalize_drops_old_key` (the dual-key window), and `crl_revoked_cert_rejected` / `crl_valid_cert_allowed` / `crl_empty_allows_all` (revocation).
+- **`tests/suite/security_integration.rs`** is the lifecycle suite: `join_token_single_use_enforced` and `join_token_expiry_enforced` (the loop we left open in Chapter 4), `secret_rotation_dual_key_window` and `secret_rotation_finalize_drops_old_key` (the dual-key window), and `crl_revoked_cert_rejected` / `crl_valid_cert_allowed` / `crl_empty_allows_all` (revocation).
 - **`tests/identity_demo.rs`** doubles as a runnable walkthrough. Each test is a stage of the SPIFFE story — `demo_cluster_init_and_ca_hierarchy`, `demo_csr_generation_and_signing`, `demo_oidc_jwt`, `demo_identity_bundle_and_tmpfs`, `demo_rotation_state_machine` — and they print as they go.
 
 ### Running them
@@ -996,9 +996,9 @@ Two integration files drive whole features through the library, no running agent
 No gating — crypto needs only a CPU:
 
 ```sh
-cargo test --lib sesame pickle::signing      # unit tests
-cargo test --test security_integration        # token / rotation / CRL lifecycle
-cargo test --test identity_demo -- --nocapture # the SPIFFE walkthrough, printed
+cargo test --lib sesame pickle::signing               # unit tests
+cargo test --test suite security_integration::        # token / rotation / CRL lifecycle
+cargo test --test identity_demo -- --nocapture        # the SPIFFE walkthrough, printed
 ```
 
 The `--nocapture` on the last one is the point: it turns the test into a guided tour of cluster init, CSR signing, JWT minting, and rotation, printed to your terminal.

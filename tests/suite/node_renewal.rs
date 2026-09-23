@@ -29,8 +29,7 @@ use std::{
 };
 use tower::ServiceExt;
 
-#[path = "support/bun_process.rs"]
-mod bun_process;
+use crate::bun_process;
 use bun_process::{
     BunProcess, WAIT, assert_success, reserve_address, reserve_ports, run_relish,
     spawn_bun_with_port_retry, wait_for_relish,

@@ -730,19 +730,19 @@ The merge strategies get tested head to head, because their difference is the wh
 
 ### Integration tests — many nodes in one process
 
-- **`tests/metrics_aggregation.rs`** is the roadmap's headline test. `five_node_cluster_hierarchical_aggregation` builds five workers' rollups, ingests them into three council `RollupStore`s, and asserts the cluster total is exactly 150.0 (10+20+30+40+50). `partial_results_when_aggregator_down` proves graceful degradation, and `multi_metric_aggregation_with_labels` checks label-scoped sums.
-- **`tests/logs_cross_node.rs`** spins up one axum server per simulated node, each backed by a `LogStore` with known entries, then drives `fan_out_query`: `three_nodes_merge_sorted`, `deduplicates_overlapping_entries`, `grep_filter_across_nodes`, `time_range_filter_across_nodes`, and `partial_results_when_node_unreachable`. No Raft — the coordination layer is tested in isolation.
-- **`tests/log_export.rs`** covers the export round-trip: `export_and_query_round_trip`, `incremental_export` (the checkpoint skips already-exported files), and `query_exported_with_filter` / `query_exported_aggregation` (full SQL over the archives via DataFusion).
+- **`tests/suite/metrics_aggregation.rs`** is the roadmap's headline test. `five_node_cluster_hierarchical_aggregation` builds five workers' rollups, ingests them into three council `RollupStore`s, and asserts the cluster total is exactly 150.0 (10+20+30+40+50). `partial_results_when_aggregator_down` proves graceful degradation, and `multi_metric_aggregation_with_labels` checks label-scoped sums.
+- **`tests/suite/logs_cross_node.rs`** spins up one axum server per simulated node, each backed by a `LogStore` with known entries, then drives `fan_out_query`: `three_nodes_merge_sorted`, `deduplicates_overlapping_entries`, `grep_filter_across_nodes`, `time_range_filter_across_nodes`, and `partial_results_when_node_unreachable`. No Raft — the coordination layer is tested in isolation.
+- **`tests/suite/log_export.rs`** covers the export round-trip: `export_and_query_round_trip`, `incremental_export` (the checkpoint skips already-exported files), and `query_exported_with_filter` / `query_exported_aggregation` (full SQL over the archives via DataFusion).
 
 ### Running them
 
 No gating — all in-memory or local-disk Parquet:
 
 ```sh
-cargo test --lib mayo::rollup mayo::query brioche   # merges, masking, charts
-cargo test --test metrics_aggregation                # hierarchical correctness
-cargo test --test logs_cross_node                     # cross-node log fan-out
-cargo test --test log_export                          # Parquet export + remote SQL
+cargo test --lib mayo::rollup mayo::query brioche  # merges, masking, charts
+cargo test --test suite metrics_aggregation::      # hierarchical correctness
+cargo test --test suite logs_cross_node::          # cross-node log fan-out
+cargo test --test suite log_export::               # Parquet export + remote SQL
 ```
 
 Phase 11 adds 147 tests, bringing the total to 1595.

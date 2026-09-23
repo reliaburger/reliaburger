@@ -253,6 +253,12 @@ tests and terminates a hung test after a bounded interval. Retries are zero. Aut
 rerunning a flaky distributed test makes the dashboard greener while preserving the race.
 We're trying to remove the race.
 
+Per-test processes also let us cut the build down. Cargo compiles every file directly under
+`tests/` as its own crate, and each one links the entire `reliaburger` library, so 77 test
+binaries meant 77 links and about 9 GB of debug executables. The small, ungated files now
+live as modules of one `tests/suite/` binary, and only the suites a Makefile target or a
+nextest group picks out by `binary(...)` keep a binary of their own.
+
 ## Alive isn't ready
 
 An HTTP listener can answer while the agent command loop is dead. It can also answer while

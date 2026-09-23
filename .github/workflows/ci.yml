@@ -208,7 +208,7 @@ jobs:
 
   build-tests:
     # Compile the portable test binaries once. The acceptance jobs download
-    # this nextest archive instead of each rebuilding all 75 test binaries.
+    # this nextest archive instead of each rebuilding every test binary.
     # Runners check out to the same path, so the archive's compiled-in binary
     # paths still resolve after extraction.
     name: build tests

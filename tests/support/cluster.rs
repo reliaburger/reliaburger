@@ -13,7 +13,8 @@
 //!   API, the leader scheduler and the placement reconciler), on one host
 //!   with per-node port blocks.
 //!
-//! Included with `#[path = "support/cluster.rs"] mod cluster_support;`.
+//! Included with `#[path = "support/cluster.rs"] mod cluster_support;` (or
+//! `"../support/cluster.rs"` from `tests/suite/main.rs`).
 //!
 //! Every test binary compiles its own copy of this module and uses only part
 //! of it, so the module allows dead code rather than making each consumer
@@ -54,7 +55,7 @@ use reliaburger::sesame::auth::TokenStore;
 use reliaburger::sesame::types::ApiToken;
 
 #[path = "task_harness.rs"]
-mod task_harness;
+pub(crate) mod task_harness;
 use task_harness::TestTasks;
 
 // ---------------------------------------------------------------------------

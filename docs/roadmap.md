@@ -704,7 +704,7 @@ files under `tests/`):
 Current test locations: runner and comparison regressions live in
 `src/testkit/runner.rs` and `src/testkit/bench/compare.rs`; diagnostic and trace
 regressions live under `src/relish/wtf/` and in `src/relish/trace_cmd.rs`.
-`tests/wtf_watch.rs` exercises the real CLI process. Live cases live under
+`tests/suite/wtf_watch.rs` exercises the real CLI process. Live cases live under
 `src/testkit/cases/` and `src/testkit/chaos/`; their complete three-node run is a
 release gate, not something the unit-test count establishes.
 

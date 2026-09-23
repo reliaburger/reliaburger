@@ -21,8 +21,7 @@ use reliaburger::relish::client::BunClient;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-#[path = "support/task_harness.rs"]
-mod task_harness;
+use crate::task_harness;
 use task_harness::TestTasks;
 
 /// Test harness: starts a real agent with ProcessGrill on an ephemeral port.

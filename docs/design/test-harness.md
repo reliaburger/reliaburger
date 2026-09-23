@@ -172,6 +172,17 @@ to `bun` or `relish`. Use snapshots for structured rendering, properties for lar
 spaces and Criterion for measurements. A test that can pass without executing its promised
 behaviour is worse than no test: it gives us confidence we didn't earn.
 
+A new portable integration test goes in `tests/suite/` as a module: add the file and a
+`mod` line in `tests/suite/main.rs`. Every file directly under `tests/` is a separate crate
+that links the whole library, so each one costs a link step and hundreds of megabytes of
+debug executable. Merging 45 small files into `suite` roughly halved the crate-only
+rebuild. Its tests are named `<module>::<test>`, so filter them with
+`test(/^module::/)`, not `binary(module)`. Add a new top-level binary only when the tests
+need gating by a Makefile target, their own nextest group or override (selected with
+`binary(...)`), or process isolation that nextest doesn't already give, such as a fixture
+that re-executes the test binary by name. Shared helpers under `tests/support/` are
+included once at the suite root and reached through `crate::`.
+
 Multi-node tests start their clusters through `tests/support/cluster.rs`: the fully wired
 `bun --cluster` node, the in-memory five-node council, `local`, `wait_until` and the leader
 waits all live there, so include it rather than copying another start-up helper.

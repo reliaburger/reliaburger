@@ -20,8 +20,7 @@ use reliaburger::reporting::types::{
     AppResourceUsage, ReportHealthStatus, ResourceUsage, RunningApp, StateReport,
 };
 
-#[path = "support/cluster.rs"]
-mod cluster_support;
+use crate::cluster_support;
 use cluster_support::wait_for_leader;
 
 fn fast_council_config() -> CouncilConfig {

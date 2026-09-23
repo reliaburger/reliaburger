@@ -4,7 +4,7 @@
 /// rollups are ingested into council RollupStores (mirroring what
 /// ReportAggregator does), and cluster-wide queries merge results correctly.
 ///
-/// Transport routing is already tested in `tests/reporting_tree.rs`.
+/// Transport routing is already tested in `tests/suite/reporting_tree.rs`.
 /// These tests focus on the aggregation maths.
 use std::sync::Arc;
 

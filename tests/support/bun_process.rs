@@ -3,7 +3,8 @@
 //! Each test gets a Bun child process with its own config and ports, drives
 //! it through the compiled `relish` CLI (or `BunClient`), and tears it down on
 //! `Drop`, including while unwinding from a panic. Included with
-//! `#[path = "support/bun_process.rs"] mod bun_process;`.
+//! `#[path = "support/bun_process.rs"] mod bun_process;` (or
+//! `"../support/bun_process.rs"` from `tests/suite/main.rs`).
 //!
 //! Not every consumer uses every helper, so the module allows dead code
 //! rather than making each test binary import everything.

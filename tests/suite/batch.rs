@@ -28,8 +28,7 @@ use reliaburger::relish::client::BunClient;
 use tokio::sync::{RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 
-#[path = "support/task_harness.rs"]
-mod task_harness;
+use crate::task_harness;
 use task_harness::TestTasks;
 
 /// The internal node-to-node endpoints (`/v1/batch/run`, `/report`) require the

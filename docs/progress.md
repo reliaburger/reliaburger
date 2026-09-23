@@ -304,7 +304,7 @@ Smaller fixes that CI runs turned up along the way:
 - [x] **H09** Complete node-pressure diagnostic hygiene: continuous bounded stderr draining and creator-thread checks before pressure starts.
 - [x] **H10** Reuse the enforcement check's capability for readiness within one health tick.
 - [x] **H11** Declare Rust 1.97 as the minimum, pin release/CI builds to 1.98.0 and add a locked minimum-compiler CI job for both feature configurations.
-- [x] **H12** Remove the Thrift advisory path (GHSA-2f9f-gq7v-9h6m) by upgrading DataFusion 45 → 55, which brings Parquet 59 without the Thrift crate. Until DataFusion moves to Parquet ≥ 60, `[patch.crates-io]` pins arrow-rs to a fork of 59.3.0 plus upstream fix apache/arrow-rs#10979, because 59 still aborts on impossible list counts on Linux. `tests/parquet_safety.rs` checks the shipped reader through the public API.
+- [x] **H12** Remove the Thrift advisory path (GHSA-2f9f-gq7v-9h6m) by upgrading DataFusion 45 → 55, which brings Parquet 59 without the Thrift crate. Until DataFusion moves to Parquet ≥ 60, `[patch.crates-io]` pins arrow-rs to a fork of 59.3.0 plus upstream fix apache/arrow-rs#10979, because 59 still aborts on impossible list counts on Linux. `tests/suite/parquet_safety.rs` checks the shipped reader through the public API.
 
 ### Missing capabilities and longer-term scope
 
@@ -694,7 +694,7 @@ Implementation plan: [docs/plans/2026-07-07-plan-wiring.md](plans/2026-07-07-pla
 - [x] `L8` / `L9` Load the Onion eBPF programs in production; start the DNS responder (fix `M8` fragility) — **`L9`+`M8` done**: `[dns]` config section (off by default), responder spawned from bun, full hardening (recv errors non-fatal, per-query spawned forwards behind a semaphore, connected sockets + transaction-ID checks, NXDOMAIN for unmatched `.internal` with no upstream leak, QTYPE honoured, SERVFAIL on dead upstream), runc containers get `resolv.conf` pointed at the responder. **`L8` done**: `[ebpf]` config section (off by default; `program_dir` defaults to the build-time `OUT_DIR` baked in via `build.rs` `RELIABURGER_BPF_DIR`, so dev/Lima builds self-locate their `.bpf.o`), `bun` loads + attaches `OnionEbpf` at startup (load failure logs and continues without enforcement; non-`ebpf` builds warn that enforcement is off). Verified in the `reliaburger-test` Lima VM: `cargo build --features ebpf` compiles the objects and all 9 `tests/ebpf.rs` integration tests pass (load/attach, backend-map read/write/remove, connect→VIP rewrite, no-backend deny `EPERM`, non-VIP passthrough, `.internal` DNS). Not covered by `make ci` (needs root + kernel 5.7+ + cgroup v2)
   - **Backend/fault/egress eBPF wiring landed** (Phase 11b follow-up, P0–P3): the agent writes the live `backend_map`, fault maps and DNS-refresh egress entries. Namespace firewall maps and rolling-deploy egress (with fail-closed programming) are closed in Phase 12b (NET5/NET6); IPv6/CIDR enforcement remains under the 12b network-policy theme.
 - [x] `L10` / `M2` Pickle wired: catalog persists to disk + loads at boot; pushes record real raft-id holders and propose to Raft on council nodes (worker proposal forwarding lands with W6); leader replication loop keeps layers at `[images] redundancy`; scheduled two-phase GC — nominate → Raft-arbitrated approval (`CouncilResponse::GcApproved`) → delete, with an orphan grace window for in-flight pushes. `X1` fixed: `relish build` targets the registry port, `/v1/build` executes buildah for real (honest 501 without it)
-- [x] `L13` / `H12` GitOps wired: new `src/lettuce/runner.rs` spawns a leader-only sync loop (clone → poll/webhook → `execute_sync` in `spawn_blocking` → apply changes as `AppSpec`/`AppDelete` Raft writes). Webhook endpoint gets a real channel (was unconditional 503); `[gitops]` config now read. `H12`: `is_key_trusted` no longer falls through to `true` — a valid signature from an unlisted key is rejected. Fixed a latent first-sync bug (a fresh clone has nothing to fetch but nothing applied either → now syncs when HEAD ≠ last-applied). Integration tests in `tests/gitops.rs` (real git repo → Raft; webhook triggers sync)
+- [x] `L13` / `H12` GitOps wired: new `src/lettuce/runner.rs` spawns a leader-only sync loop (clone → poll/webhook → `execute_sync` in `spawn_blocking` → apply changes as `AppSpec`/`AppDelete` Raft writes). Webhook endpoint gets a real channel (was unconditional 503); `[gitops]` config now read. `H12`: `is_key_trusted` no longer falls through to `true` — a valid signature from an unlisted key is rejected. Fixed a latent first-sync bug (a fresh clone has nothing to fetch but nothing applied either → now syncs when HEAD ≠ last-applied). Integration tests in `tests/suite/gitops.rs` (real git repo → Raft; webhook triggers sync)
 - [x] `L14` / `L15` Smoker safety context, process/network plumbing and chaos transport blocklists wired; Kill/Pause/Resume, eBPF network faults and partitions have binary-driven tests. **Post-Phase-12 audit:** several advertised resource/node faults are no-ops that return success, CPU stress runs in Bun's cgroup and clear/expiry does not reverse every effect; the measurable-effect/cleanup work is Phase 12b.
 - [x] `L16` Initial IPv4 egress allowlist programming and DNS refresh wired and Lima-tested. Phase 12b (NET6) made it fail closed, extended it to rolling deploy and crash-restart, and deletes per-cgroup entries on stop; IPv6/CIDR enforcement remains under the 12b network-policy theme.
 - [x] `M17` K8s import fidelity (`command`/`args` concatenated, `env.valueFrom` warned not dropped, namespace preserved, same-name-two-namespaces no longer overwrites)
@@ -861,7 +861,7 @@ whole theme lands.
     manifest digest and the agent deploys the digest-pinned `repo@sha256:…` reference,
     which parses through `ImageReference`/`ClusterSource` content-addressed — a tag moved
     between verify and pull cannot swap the image (IMG1). Acceptance test drives push →
-    GC past grace → manifest GET 200 → peer pull in `tests/pickle_integrity.rs`.
+    GC past grace → manifest GET 200 → peer pull in `tests/suite/pickle_integrity.rs`.
 - [x] **Network policy enforcement** — write namespace/cgroup firewall maps for every
   instance; program egress before process start and on rolling deploy; fail deployment
   closed when required policy cannot be installed; reconcile kernel truth and delete every
@@ -921,7 +921,7 @@ whole theme lands.
     to "fresh": an unreadable store is fatal at startup, never a re-bootstrap (the C3
     split-brain through the error path); `truncate`/`purge` propagate row read errors instead
     of silently skipping keys (CP3).
-  - [x] Acceptance test through the real startup seam (`tests/council_persistence.rs`): a
+  - [x] Acceptance test through the real startup seam (`tests/suite/council_persistence.rs`): a
     single-node council on durable storage writes state, snapshots, purges the log, then a
     flipped payload byte or a deleted snapshot makes restart return an error, while a clean
     compact restores every entry (CP3).
@@ -2353,7 +2353,7 @@ Post-12b user-experience work (not a roadmap phase). Plan:
   auth, so buildah `--creds` couldn't work); `ClusterHttp` gained an optional bearer
   and `UpgradeManager::fetch_binary` uses it (no more self-upgrade 401); a keyless
   cluster now warns and the startup banner is honest. New gated
-  `tests/registry_routable_push.rs` proves bearer-less push is 401 and the bearer
+  `tests/suite/registry_routable_push.rs` proves bearer-less push is 401 and the bearer
   round-trip succeeds.
 - [x] **Cluster lease-cleanup snapshot race** — `cleanup_cluster_lease` re-reads
   `desired_state()` *after* `TestLeaseBeginCleanup` commits and iterates that fresh

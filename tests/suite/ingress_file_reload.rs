@@ -10,8 +10,7 @@ use tokio::net::TcpStream;
 use tokio_rustls::{TlsConnector, client::TlsStream};
 use tokio_util::sync::CancellationToken;
 
-#[path = "support/task_harness.rs"]
-mod task_harness;
+use crate::task_harness;
 
 async fn connect(
     address: std::net::SocketAddr,
