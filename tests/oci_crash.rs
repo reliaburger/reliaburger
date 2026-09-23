@@ -238,6 +238,24 @@ async fn wait_file(path: &Path) {
     .unwrap_or_else(|_| panic!("fixture never reached {}", path.display()));
 }
 
+/// An app name unique to this test root.
+///
+/// Instance cgroups live at a host-wide path built from the namespace, app
+/// and ordinal. A fixed name shares that path with every earlier run, so one
+/// leaked workload makes Runc refuse the next run's first container ("cgroup
+/// is not empty") and the deploy rolls to a new generation instead.
+#[cfg(feature = "ebpf")]
+fn root_app_name(prefix: &str, root: &Path) -> String {
+    let suffix = root
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .trim_start_matches('.')
+        .to_ascii_lowercase();
+    format!("{prefix}-{suffix}")
+}
+
 #[tokio::test]
 #[ignore = "requires isolated Linux root, real runc/ip/nft and static BusyBox"]
 async fn actual_bun_sigkill_and_cancelled_caller_preserve_oci_init_and_retry_ownership() {
@@ -890,6 +908,7 @@ async fn normal_clustered_bun_recovers_enrolled_consumer_before_adoption() {
         node_id: reliaburger::meat::NodeId::new("activation-node"),
         cluster_identity: Sha256::digest(&identity.root_ca_der).into(),
     };
+    let name = root_app_name("cluster-owned", &root);
     let mut node = Node::start(&root).await;
     let active = root.join("data/discovery/discovery.json").exists();
     if !active {
@@ -899,18 +918,22 @@ async fn normal_clustered_bun_recovers_enrolled_consumer_before_adoption() {
         active,
         "normal clustered startup did not activate consumer ownership"
     );
-    node.client
-        .apply(&durable_app("cluster-owned"))
-        .await
-        .unwrap();
+    node.client.apply(&durable_app(&name)).await.unwrap();
     wait_file(&root.join("shared/main")).await;
-    wait_cluster_publication(&node.client).await;
+    wait_cluster_publication(&node.client, &name).await;
     // Publication precedes the deploy's terminal event. A crash before the
     // reconciler records the placement as applied leaves it pending, and
     // recovery then rightly redeploys instead of adopting the original.
-    wait_placement_applied(&root).await;
+    wait_placement_applied(&root, &name).await;
     let original = node.client.status().await.unwrap().remove(0);
     node.crash().await;
+    // A failed first launch rolls to a new generation and would still pass
+    // the rest of this test, hiding whatever made the first one fail.
+    assert_eq!(
+        original.id,
+        format!("default__{name}-0"),
+        "first deploy did not start"
+    );
     let journal =
         reliaburger::bun::discovery_owners::DiscoveryJournal::open(&root.join("data/discovery"))
             .unwrap();
@@ -920,7 +943,7 @@ async fn normal_clustered_bun_recovers_enrolled_consumer_before_adoption() {
     );
     drop(journal);
     let mut recovered = Node::start(&root).await;
-    wait_cluster_publication(&recovered.client).await;
+    wait_cluster_publication(&recovered.client, &name).await;
     let adopted = recovered.client.status().await.unwrap().remove(0);
     assert_eq!(adopted.pid, original.pid);
     assert_eq!(adopted.host_port, original.host_port);
@@ -928,11 +951,7 @@ async fn normal_clustered_bun_recovers_enrolled_consumer_before_adoption() {
         std::fs::read_to_string(root.join("shared/main")).unwrap(),
         "main\n"
     );
-    recovered
-        .client
-        .stop("cluster-owned", "default")
-        .await
-        .unwrap();
+    recovered.client.stop(&name, "default").await.unwrap();
     tokio::time::timeout(Duration::from_secs(45), async {
         loop {
             let checkpoint: serde_json::Value = serde_json::from_slice(
@@ -972,7 +991,7 @@ async fn normal_clustered_bun_recovers_enrolled_consumer_before_adoption() {
 }
 
 #[cfg(feature = "ebpf")]
-async fn wait_placement_applied(root: &Path) {
+async fn wait_placement_applied(root: &Path, name: &str) {
     let checkpoint = root.join("data/applied-placements.json");
     tokio::time::timeout(Duration::from_secs(45), async {
         loop {
@@ -982,8 +1001,7 @@ async fn wait_placement_applied(root: &Path) {
                 .is_some_and(|value| {
                     value["entries"].as_array().is_some_and(|entries| {
                         entries.iter().any(|entry| {
-                            entry["name"] == "cluster-owned"
-                                && entry["assignment"]["state"] == "applied"
+                            entry["name"] == name && entry["assignment"]["state"] == "applied"
                         })
                     })
                 })
@@ -998,10 +1016,10 @@ async fn wait_placement_applied(root: &Path) {
 }
 
 #[cfg(feature = "ebpf")]
-async fn wait_cluster_publication(client: &BunClient) {
+async fn wait_cluster_publication(client: &BunClient, name: &str) {
     tokio::time::timeout(Duration::from_secs(45), async {
         loop {
-            if let Ok(service) = client.resolve("cluster-owned").await
+            if let Ok(service) = client.resolve(name).await
                 && service.healthy_backends == 1
             {
                 break;
@@ -1162,15 +1180,15 @@ async fn three_enrolled_oci_nodes_preserve_ownership_through_upgrade_and_rollbac
     })
     .await
     .unwrap_or_else(|_| panic!("three enrolled voters did not converge: {last_views:?}"));
-    let mut app = durable_app("cluster-owned");
-    app.app.get_mut("cluster-owned").unwrap().placement =
-        Some(reliaburger::config::app::PlacementSpec {
-            required: vec!["fixture=rolling-0".into()],
-            preferred: vec![],
-        });
+    let name = root_app_name("cluster-owned", &root);
+    let mut app = durable_app(&name);
+    app.app.get_mut(&name).unwrap().placement = Some(reliaburger::config::app::PlacementSpec {
+        required: vec!["fixture=rolling-0".into()],
+        preferred: vec![],
+    });
     nodes[0].client.apply(&app).await.unwrap();
     for node in &nodes {
-        wait_cluster_publication(&node.client).await;
+        wait_cluster_publication(&node.client, &name).await;
     }
     let original = nodes[0].client.status().await.unwrap().remove(0);
     let manifests: Vec<_> = roots.iter().map(|root| kernel_manifest(root)).collect();
@@ -1202,7 +1220,7 @@ async fn three_enrolled_oci_nodes_preserve_ownership_through_upgrade_and_rollbac
             .await
             .expect("clustered owned upgrade did not settle");
             for node in &nodes {
-                wait_cluster_publication(&node.client).await;
+                wait_cluster_publication(&node.client, &name).await;
             }
             let current = nodes[0].client.status().await.unwrap().remove(0);
             assert_eq!(current.id, original.id);
@@ -1217,11 +1235,7 @@ async fn three_enrolled_oci_nodes_preserve_ownership_through_upgrade_and_rollbac
             }
         }
     }
-    nodes[0]
-        .client
-        .stop("cluster-owned", "default")
-        .await
-        .unwrap();
+    nodes[0].client.stop(&name, "default").await.unwrap();
     tokio::time::timeout(Duration::from_secs(60), async {
         loop {
             let mut cleared = true;
