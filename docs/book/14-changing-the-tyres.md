@@ -709,7 +709,7 @@ remaining candidate-qualification gates.
 
 ### Shipping 0.1.0
 
-A tag and a lockfile don't identify the compiler, so release builds pin Rust 1.98.0 and CI separately tests the declared minimum, 1.97. Changing either is a reviewed build-policy change, followed by a new candidate with its own checksum. We never swap the bytes behind an existing tag.
+A tag and a lockfile don't identify the compiler, so release builds pin Rust 1.98.0 and CI separately checks that the declared minimum, 1.97, builds every target with and without default features. Running the whole suite again on 1.97 would repeat the stable run, so we don't. Changing either is a reviewed build-policy change, followed by a new candidate with its own checksum. We never swap the bytes behind an existing tag.
 
 The first release also needed a new signing identity: the development key's private half was gone. That was only possible because 0.1.0 starts with fresh clusters. After a supported release, swapping the public key would strand every installed node, which would reject our next binary. That's why `EMBEDDED_RELEASE_KEYS` is a slice rather than a single key: a future rotation ships a release trusting both old and new keys, then switches the signer, then drops the retired key a release later.
 

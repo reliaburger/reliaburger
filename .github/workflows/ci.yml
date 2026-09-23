@@ -35,15 +35,15 @@ jobs:
       - run: make audit
 
   minimum-rust:
+    # The declared minimum compiler must build every target with and without
+    # default features. The stable jobs run the tests, so running them again
+    # on 1.97 would only repeat the same suite.
     name: minimum Rust 1.97.0
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.0
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-nextest@0.9.145
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: minimum-rust
@@ -56,8 +56,8 @@ jobs:
           sudo apt-get install -y -qq clang libbpf-dev llvm
       - name: Check every target and feature with the locked graph
         run: cargo check --locked --all-targets --all-features
-      - name: Test the minimum compiler with default features
-        run: cargo nextest run --locked --profile ci --no-tests=fail
+      - name: Check every target without default features
+        run: cargo check --locked --all-targets --no-default-features
 
   portable:
     name: portable Linux

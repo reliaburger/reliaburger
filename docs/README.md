@@ -160,8 +160,8 @@ before reporting success; a startup timeout returns an error with the log path.
 
 ### Rust toolchain
 
-Reliaburger requires Rust 1.97 or later (2024 edition). CI tests the minimum
-compiler against `Cargo.lock`; release builds use Rust 1.98.0. Install via
+Reliaburger requires Rust 1.97 or later (2024 edition). CI checks every target
+with the minimum compiler against `Cargo.lock`; release builds use Rust 1.98.0. Install via
 [rustup](https://rustup.rs/):
 
 ```sh
