@@ -144,30 +144,21 @@ fn roots(root: &Path, namespace: &str, app: &str) -> [PathBuf; 3] {
 fn load(root: &Path, namespace: &str, app: &str) -> Result<Option<Journal>, VolumeError> {
     let path = journal_path(root, namespace, app);
     checked_path(root, &path)?;
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
-    }
-    let file = match options.open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+    const MAX_BYTES: u64 = 1024 * 1024;
+    use std::io::ErrorKind::{FileTooLarge, InvalidData, UnexpectedEof};
+    // Malformed or oversized state refuses ownership; other I/O stays I/O.
+    let journal: Journal = match crate::durable::read_json_if_exists(
+        &path,
+        MAX_BYTES,
+        crate::durable::Access::Regular,
+    ) {
+        Ok(Some(journal)) => journal,
+        Ok(None) => return Ok(None),
+        Err(error) if matches!(error.kind(), InvalidData | FileTooLarge | UnexpectedEof) => {
+            return Err(refuse(error.to_string()));
+        }
         Err(error) => return Err(error.into()),
     };
-    const MAX_BYTES: u64 = 1024 * 1024;
-    let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.len() > MAX_BYTES {
-        return Err(refuse("invalid test storage checkpoint file"));
-    }
-    let mut bytes = Vec::new();
-    file.take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_BYTES {
-        return Err(refuse("test storage checkpoint is too large"));
-    }
-    let journal: Journal =
-        serde_json::from_slice(&bytes).map_err(|error| refuse(error.to_string()))?;
     if journal.schema != 1
         || journal.namespace != namespace
         || journal.app != app

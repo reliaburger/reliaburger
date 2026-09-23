@@ -1,7 +1,7 @@
 //! Durable ownership of the rootful runtime's finite container address pool.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{Read, Result};
+use std::io::Result;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -135,31 +135,16 @@ impl NetworkLeases {
                 .map_err(|e| std::io::Error::other(format!("network address pool is busy: {e}")))?;
             let _lock = JournalLock(lock);
             let path = directory.join(".network-leases.json");
-            let mut journal = match std::fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-                .open(&path)
-            {
-                Ok(file) => {
-                    if !file.metadata()?.is_file() {
-                        return Err(std::io::Error::other(
-                            "network lease journal is not a regular file",
-                        ));
-                    }
-                    let mut bytes = Vec::new();
-                    file.take(MAX_JOURNAL_BYTES + 1).read_to_end(&mut bytes)?;
-                    if bytes.len() as u64 > MAX_JOURNAL_BYTES {
-                        return Err(std::io::Error::other("network lease journal is too large"));
-                    }
-                    serde_json::from_slice::<Journal>(&bytes).map_err(std::io::Error::other)?
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Journal {
-                    version: 1,
-                    node_index: node,
-                    allocations: BTreeMap::new(),
-                },
-                Err(e) => return Err(e),
-            };
+            let mut journal = crate::durable::read_json_if_exists::<Journal>(
+                &path,
+                MAX_JOURNAL_BYTES,
+                crate::durable::Access::Regular,
+            )?
+            .unwrap_or_else(|| Journal {
+                version: 1,
+                node_index: node,
+                allocations: BTreeMap::new(),
+            });
             let unique: BTreeSet<_> = journal.allocations.values().copied().collect();
             if journal.version != 1
                 || journal.node_index != node

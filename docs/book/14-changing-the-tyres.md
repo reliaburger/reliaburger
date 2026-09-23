@@ -829,6 +829,22 @@ symlink target and `O_NONBLOCK` prevents a FIFO named `.json` from hanging the
 open. We check that the opened descriptor describes a regular file before
 parsing it. `BufReader` batches filesystem reads for the JSON parser.
 
+Ten other journals and checkpoints read their files the same way, plus a size
+limit. They used to repeat the same fifteen lines each, with small drifts in
+which checks they remembered. Now they call one function in `src/durable.rs`:
+
+```rust
+let record: OwnerRecord = durable::read_json(&path, RECORD_LIMIT, Access::Regular)?;
+```
+
+`Access` says how private the file must be: any regular file, owned by us with
+no group or other bits, or exactly `0600` with a single hard link. The signature
+is `read_json<T: DeserializeOwned>(...) -> io::Result<T>`. `DeserializeOwned` is
+the serde trait for types that can be built from bytes without borrowing from
+them, and the compiler picks `T` from the annotated binding on the left. A
+sibling, `read_json_if_exists`, turns only `NotFound` into `None`, so a missing
+checkpoint still means an empty inventory while a dangling symlink still refuses.
+
 We load the complete inventory on `spawn_blocking` before adopting any record.
 The outer result reports a failed worker task; the inner result reports a failed
 filesystem read or parse. Both must succeed. For a confirmed dead owner, identity

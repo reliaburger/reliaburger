@@ -6,8 +6,7 @@
 //! registration. Timeouts retain command ownership; they never prove absence.
 
 use std::collections::BTreeMap;
-use std::io::{self, Read};
-use std::os::unix::fs::OpenOptionsExt;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -292,18 +291,11 @@ fn transient_control_error(error: &io::Error) -> bool {
 }
 
 fn read_output(path: &Path, remaining: &mut u64) -> Result<Vec<u8>, CommandError> {
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
-        .open(path)?;
-    if !file.metadata()?.is_file() {
-        return Err(io::Error::other("invalid runtime command output file").into());
-    }
-    let mut bytes = Vec::new();
-    file.take(*remaining + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > *remaining {
-        return Err(CommandError::OutputTooLarge);
-    }
+    let bytes = crate::durable::read_bounded(path, *remaining, crate::durable::Access::Regular)
+        .map_err(|error| match error.kind() {
+            io::ErrorKind::FileTooLarge => CommandError::OutputTooLarge,
+            _ => error.into(),
+        })?;
     *remaining -= bytes.len() as u64;
     Ok(bytes)
 }

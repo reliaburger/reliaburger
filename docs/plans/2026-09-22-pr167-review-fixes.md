@@ -546,13 +546,24 @@ spot-checked by hand.
 - [ ] **T4.3 `ask_agent` helper in `src/bun/api.rs` (~250–350 lines; low
       risk).** The oneshot + `cmd_tx.send` + "agent unavailable" + await
       pattern repeats 36 times (e.g. `:853-858`, `:920-927`, `:988-1000`).
-- [ ] **T4.4 Shared private-record reader (~150–250 lines; low risk).** One
+- [x] **T4.4 Shared private-record reader (~150–250 lines; low risk).** One
       `read_private_json(path, limit)` for the O_NOFOLLOW → regular/private
       file → size → bounded read → parse pattern in `process_owner.rs`,
       `runc_intent.rs`, `discovery_owners.rs`, `egress_owners.rs`,
       `volume/owned.rs`, `network_leases.rs`, `command.rs`, `jobs.rs`,
       `schedules.rs`; dedupe `validate_file`/`validate_directory`. Keep the
       domain-specific `validate()`/`validate_transition()` as they are.
+      Done. `src/durable.rs` holds `read_bounded`/`read_json`/
+      `read_json_if_exists` with an `Access` level (regular, owner-only,
+      exclusive 0600 single-link) plus the shared `validate_file`/
+      `validate_directory`. All nine loaders converted, plus
+      `cluster/applied.rs`; each keeps its own privacy level, NotFound
+      handling and error type (volume maps refusals to `Ownership`, command
+      maps oversize to `OutputTooLarge`). Left alone: `grill/records.rs`
+      (unbounded `BufReader` with per-path context), the eBPF ownership
+      manifest (mode 0600 without the link check, Linux-only), and
+      directory checks demanding exactly 0700. Production code −64 lines
+      (loaders −183, new module +119); +100 lines of tests for the reader.
 - [ ] **T4.5 Remove dead functions (~130–200 lines; low risk).** No callers
       at all: `query_apps` (`ketchup/log_store.rs:605`),
       `spawn_council_reconciler` (`cluster/runtime.rs:973`),

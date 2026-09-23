@@ -1,7 +1,6 @@
 //! Durable node-local job attempts, including executions with unknown outcomes.
 
 use std::collections::BTreeMap;
-use std::io::Read;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -86,29 +85,14 @@ fn validate(jobs: &BTreeMap<String, RecordedJob>) -> std::io::Result<()> {
 
 /// Only a missing file means an empty inventory; malformed state refuses startup.
 pub(super) fn load(directory: &Path) -> std::io::Result<BTreeMap<String, RecordedJob>> {
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
-    }
-    let file = match options.open(directory.join(CHECKPOINT_FILE)) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
-        Err(error) => return Err(error),
+    let Some(checkpoint) = crate::durable::read_json_if_exists::<Checkpoint>(
+        &directory.join(CHECKPOINT_FILE),
+        MAX_CHECKPOINT_BYTES,
+        crate::durable::Access::Regular,
+    )?
+    else {
+        return Ok(BTreeMap::new());
     };
-    let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.len() > MAX_CHECKPOINT_BYTES {
-        return Err(std::io::Error::other("invalid job attempt checkpoint file"));
-    }
-    let mut bytes = Vec::new();
-    file.take(MAX_CHECKPOINT_BYTES + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_CHECKPOINT_BYTES {
-        return Err(std::io::Error::other("job attempt checkpoint is too large"));
-    }
-    let checkpoint: Checkpoint = serde_json::from_slice(&bytes)?;
     if checkpoint.schema != 2 {
         return Err(std::io::Error::other(
             "unsupported job attempt checkpoint schema",

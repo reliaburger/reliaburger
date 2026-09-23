@@ -94,19 +94,11 @@ pub(crate) fn socket_path(directory: &Path, record: &OwnerRecord) -> PathBuf {
 }
 
 pub(crate) fn load(directory: &Path) -> io::Result<OwnerRecord> {
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
-        .open(directory.join("owner.json"))?;
-    if !file.metadata()?.is_file() || file.metadata()?.len() > RECORD_LIMIT {
-        return Err(io::Error::other("invalid process owner record file"));
-    }
-    let mut bytes = Vec::new();
-    file.take(RECORD_LIMIT + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > RECORD_LIMIT {
-        return Err(io::Error::other("process owner record exceeds size limit"));
-    }
-    let record: OwnerRecord = serde_json::from_slice(&bytes)?;
+    let record: OwnerRecord = crate::durable::read_json(
+        &directory.join("owner.json"),
+        RECORD_LIMIT,
+        crate::durable::Access::Regular,
+    )?;
     if !matches!(record.schema, 1..=3)
         || record.nonce.is_empty()
         || record.nonce.len() > 128

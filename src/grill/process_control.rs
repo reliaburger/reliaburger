@@ -14,6 +14,7 @@ use ring::rand::{SecureRandom, SystemRandom};
 use super::InstanceId;
 use super::oci::OciSpec;
 use super::process_owner::{self, OwnerPhase, OwnerRecord, ProcessLaunch};
+use crate::durable::validate_directory;
 
 mod prune;
 
@@ -541,20 +542,6 @@ fn environment(spec: &OciSpec) -> std::collections::BTreeMap<String, String> {
         .filter_map(|value| value.split_once('='))
         .map(|(key, value)| (key.to_owned(), value.to_owned()))
         .collect()
-}
-
-fn validate_directory(path: &Path) -> io::Result<()> {
-    use std::os::unix::fs::MetadataExt;
-    let metadata = std::fs::symlink_metadata(path)?;
-    if !metadata.is_dir()
-        || metadata.uid() != nix::unistd::geteuid().as_raw()
-        || metadata.mode() & 0o077 != 0
-    {
-        return Err(io::Error::other(
-            "invalid private process ownership directory",
-        ));
-    }
-    Ok(())
 }
 
 fn create_parent_directories(path: &Path) -> io::Result<()> {
