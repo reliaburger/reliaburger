@@ -63,9 +63,148 @@ Collection runs every 10 seconds. Each sample is a `(timestamp, metric_name, lab
 
 ## Prometheus scraping
 
-Not everything comes from system stats. Your apps might expose custom metrics via a `/metrics` endpoint in the Prometheus text format. Reliaburger scrapes these automatically.
+Not everything comes from system stats. Your apps expose their own numbers (requests served, queue depth, how long a checkout takes) on a `/metrics` endpoint in the Prometheus text format. For a long time Reliaburger could only scrape a fixed list of URLs from the node config, which is fine for a node exporter and useless for an app with three replicas that move between nodes. Who writes those URLs? And who rewrites them after a deploy?
 
-The `prometheus-parse` crate handles the parsing. Configure `(job, url)` targets in `[metrics]` using `scrape_targets`; Bun's scrape task calls `scrape_once` at `scrape_interval_secs`. A health check does not automatically register a scrape target. Valid samples enter the same Arrow schema and SQL queries as system metrics. An empty target list starts no scrape task.
+So an app now says where its metrics live, and the cluster works out the rest:
+
+```toml
+[app.web]
+port = 8080
+metrics = {}                     # scrape http://<instance>:8080/metrics
+# metrics = { port = 9797, path = "/prom" }
+```
+
+`port` defaults to the app's port and `path` to `/metrics`. A Kubernetes manifest gets the same thing from the `prometheus.io/scrape`, `prometheus.io/port` and `prometheus.io/path` annotations on its pod template, which is how half the charts on Artifact Hub already say "scrape me". The podinfo demo declares `prometheus.io/port: "9797"`, so `relish apply -f podinfo.yaml` gives you `metrics = { port = 9797 }`, and the importer stops listing 9797 among the ports it drops.
+
+### Every node scrapes its own
+
+Prometheus runs one server that discovers every target and pulls from all of them. We already have a process on every node that knows exactly which instances it's running and at what address: Bun. So each Bun scrapes its *own* instances and nobody else's.
+
+That choice pays for itself three times. There's no discovery to get wrong, because the agent that started the container is the one asking. The scrape never crosses the network: a runc container is reached at its container IP, the same address health checks use, and a process workload on loopback. The metrics port doesn't need publishing or routing, because the node is already inside the right network. And the samples land in the local Mayo store, next to that instance's CPU and memory, so the query fan-out we built for per-app metrics finds them with no changes.
+
+The scrape loop runs beside the collector in `src/bin/bun.rs`. Every `app_scrape_interval_secs` (10 by default, the same as the collector, so an app's own series and its CPU line up) it asks the agent for targets over the command channel and does the HTTP work itself:
+
+```rust
+let (response, targets) = tokio::sync::oneshot::channel();
+if scrape_cmd_tx
+    .send(AgentCommand::ScrapeTargets { response })
+    .await
+    .is_err()
+{
+    break;
+}
+let Ok(targets) = targets.await else { continue };
+scrape_app_targets(&scrape_mayo, &client, &targets, &scrape_node, timeout).await;
+```
+
+The agent answers from state it already holds (the deployed specs and each instance's container IP) and goes straight back to its loop. A hung app can stall the scrape task, but never the agent.
+
+### A bounded fan-out with streams
+
+A node might run forty instances. Scraping them one after another means one slow app delays the other thirty-nine; spawning forty tasks means no limit at all. The `futures` crate has exactly the tool:
+
+```rust
+let results: Vec<(AppScrapeTarget, Result<Vec<CollectedMetric>, ScrapeError>)> =
+    futures_util::stream::iter(targets.to_vec())
+        .map(|target| {
+            let client = client.clone();
+            async move {
+                let result = fetch_metrics(&client, &target.url, timeout).await;
+                (target, result)
+            }
+        })
+        .buffer_unordered(MAX_CONCURRENT_SCRAPES)
+        .collect()
+        .await;
+```
+
+A *stream* is the async cousin of an iterator: it yields values over time, and you drive it with `.await` instead of a `for` loop. `stream::iter` turns our list into one. `.map` turns each target into a *future*, the not-yet-run work of scraping it (an `async move { ... }` block is an anonymous function body that runs later and takes ownership of what it uses). `buffer_unordered(16)` is the interesting part: it keeps at most sixteen of those futures running at once and hands results back in whatever order they finish. If you know Go, it's a worker pool with a semaphore, in one line. `.collect()` gathers everything into a `Vec`.
+
+The first version borrowed `target` and `client` inside the future instead of owning them. It compiled as a plain function and failed the moment the loop ran inside `tokio::spawn`, with the wonderfully opaque "implementation of `FnOnce` is not general enough". The borrowed version ties each future's lifetime to the function's borrows, and the compiler can't prove that combination is `Send` (safe to move between threads, which the multi-threaded runtime requires). Giving every future its own copy fixed it. A `reqwest::Client` is an `Arc` inside, so cloning it costs a reference count, not a connection pool.
+
+Each fetch is also bounded three ways: a timeout (half the interval, at most five seconds), an 8 MiB body cap, and a 20,000-sample cap. The endpoint belongs to the app, and a node shouldn't buffer whatever an app feels like sending.
+
+### Labels are the whole point
+
+A sample with no labels is a number without a story. Every scraped sample gets four:
+
+| Label | Example | Why |
+|---|---|---|
+| `app` | `default/web` | What every per-app query already filters on, and what process metrics use |
+| `namespace` | `default` | Tenancy |
+| `instance` | `default__web-0` | One line per replica on a chart |
+| `node` | `node-02` | Where to go looking |
+
+What if the app already sets `instance` itself? Prometheus renames the app's label to `exported_instance`, and so do we. Silently overwriting it would throw the app's data away; keeping it would mean two labels fighting over one name.
+
+All samples from one sweep also share one timestamp. That sounds pedantic until you add series up: `http_requests_total{status="200"}` plus `{status="500"}` is the instance's total only if both were recorded at the same instant. The old code stamped each sample as it was inserted, so a scrape that straddled a second boundary split in two.
+
+Finally, every target gets an `up` sample: 1 when the scrape worked, 0 when it didn't. A dead metrics endpoint then shows up as data you can query, not as a quiet gap.
+
+### Histograms, stored properly
+
+The previous parser had a bug hiding in one line:
+
+```rust
+prometheus_parse::Value::Histogram(buckets) => {
+    buckets.iter().map(|b| b.count).sum::<f64>()
+}
+```
+
+A Prometheus histogram's buckets are *cumulative*: `le="0.1"` counts requests up to 100 ms, `le="0.5"` counts those plus everything up to 500 ms, and so on. Summing them counts fast requests several times over and produces a number that means nothing. The fix stores what Prometheus stores, one series per bucket plus `_sum` and `_count`:
+
+```rust
+prometheus_parse::Value::Histogram(buckets) => {
+    for bucket in buckets {
+        let mut labels = labels.clone();
+        labels.insert("le".to_string(), format_bound(bucket.less_than));
+        push_finite(&mut metrics, format!("{}_bucket", sample.metric), labels, bucket.count);
+    }
+}
+```
+
+With `_sum` and `_count` side by side, mean latency over an interval is simply the increase in `_sum` divided by the increase in `_count`.
+
+### Rates, and the counter that went down
+
+Counters only go up. So when one goes *down*, the process restarted and started again from zero. `mayo::series::rates` turns a counter's points into per-second rates and treats a drop as a reset, the way Prometheus's `rate()` does:
+
+```rust
+pub fn rates(points: &[Point]) -> Vec<Point> {
+    points
+        .windows(2)
+        .filter_map(|pair| {
+            let [(before_at, before), (at, value)] = [pair[0], pair[1]];
+            let elapsed = at.checked_sub(before_at).filter(|elapsed| *elapsed > 0)?;
+            let increase = if value >= before { value - before } else { value };
+            Some((at, increase / elapsed as f64))
+        })
+        .collect()
+}
+```
+
+`windows(2)` walks a slice two elements at a time, overlapping: `[a, b]`, `[b, c]`, `[c, d]`. It hands you a borrowed sub-slice, not a copy, so there's no allocation. The next line *destructures* both pairs at once: `let [(before_at, before), (at, value)] = ...` pulls four named values out of an array of two tuples, the way Python's `(a, b), (c, d) = ...` does. The `?` after `filter(...)` works inside the closure because the closure returns an `Option`: no elapsed time means `None`, and `filter_map` drops that step.
+
+This module is shared. `relish metrics` and the dashboard both start from the same raw rows and need the same arithmetic, so it lives in one place, away from HTTP and rendering, with unit tests for resets, gaps and division by zero.
+
+### Reading it back
+
+`relish metrics web` lists what was scraped, one number per metric, added up across instances:
+
+```text
+METRIC                         TYPE       SERIES  INSTANCES  VALUE
+http_request_duration_seconds  histogram       2          2  mean 11.9ms
+http_requests_total            counter         4          2  8.40/s
+up                             gauge           2          2  2
+```
+
+How does it know a counter from a gauge without a `TYPE` line? By name, the way Prometheus's own conventions intend: `_total` is a counter, and `_sum`/`_count` are when they come as a pair. `--name` shows one metric per instance with a rate and a sparkline, and a histogram named by its base (`--name http_request_duration_seconds`) shows mean latency per instance. It asks for only the newest two samples of each series (`per_series=2`), which is plenty for a rate and cheap across a big cluster.
+
+That parameter fixed a real bug on the way. The per-app query sorted oldest first and stopped at 10,000 rows, so on a busy app the newest samples, the ones anything called "latest" needs, were the first to be cut. The query now sorts newest first before the limit and flips the rows back, and the endpoint defaults to the last fifteen minutes instead of the beginning of time.
+
+The dashboard's app charts had a bug of their own: `brioche.js` expected an array, the per-app endpoint answered `{data, warnings}`, and the script returned early. Every app chart was empty, always. They now read from a small chart endpoint that returns series already lined up per instance, `{timestamps, series: [{label, values}]}`, with counters as rates and histograms as means, so the browser only draws. A Rust test pins that shape, because that's the contract the JavaScript relies on. An app with scraped metrics also gets a requests-per-second chart (its `http_requests_total`, or failing that its own first counter) and a latency chart.
+
+Configure fixed URLs with `[[metrics.scrape_targets]]` when there's no app to hang them on (a node exporter, say); those keep their `job` as the `app` label.
 
 ## Alert evaluation
 
