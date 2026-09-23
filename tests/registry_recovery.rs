@@ -519,29 +519,44 @@ async fn qualify_registry_owner_crash(with_followers: bool) {
         if response.status() == 404 {
             break;
         }
-        assert_eq!(response.status(), 200);
+        // The writer's node just died and leadership may still be moving, so
+        // "lease leader is unavailable; retry shortly" is an answer to retry,
+        // not a failure. Any other status is.
+        let status = response.status().as_u16();
+        assert!(
+            status == 200 || status == 503,
+            "unexpected lease status {status}"
+        );
         let pending = response.text().await.unwrap();
         assert!(
             Instant::now() < deadline,
-            "registry lease did not retire: {pending}"
+            "registry lease did not retire: {status} {pending}"
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     for peer in &followers {
         let url = &peer.endpoint;
-        let response = peer
-            .client
-            .http()
-            .unwrap()
-            .get(format!("{url}/v1/test/leases/{}", lease.lease_id))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(
-            response.status(),
-            404,
-            "retirement did not reach the surviving council"
-        );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let status = peer
+                .client
+                .http()
+                .unwrap()
+                .get(format!("{url}/v1/test/leases/{}", lease.lease_id))
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16();
+            if status == 404 {
+                break;
+            }
+            assert!(
+                status == 503 && Instant::now() < deadline,
+                "retirement did not reach the surviving council: {status}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
     let registry = observer
         .capabilities()
