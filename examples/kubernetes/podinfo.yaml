@@ -24,9 +24,13 @@
 #     `command`, the image's own entrypoint runs, exactly as in Kubernetes.
 #  6. An Ingress routes host podinfo.localhost to the frontend.
 #
+# The `prometheus.io/*` annotations import as `metrics = { port = 9797 }`:
+# each node scrapes podinfo's metrics listener on its own instances, so
+# `relish metrics frontend` works with no Prometheus install.
+#
 # What the import reports rather than keeps: the frontend Service's port 80
 # (clients inside the cluster use frontend:9898; the ingress is unaffected),
-# the metrics and gRPC ports, the liveness probes, and redis's tcpSocket and
+# the backend's gRPC port, the liveness probes, and redis's tcpSocket and
 # exec probes.
 apiVersion: apps/v1
 kind: Deployment

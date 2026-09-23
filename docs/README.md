@@ -1046,6 +1046,19 @@ args = ["--maxmemory", "64mb"]      # replaces the image's Cmd, keeps its Entryp
 
 The image's `Env` is merged under the app's `env` (the app wins on a clash). Every rootful runc container runs in a user namespace: container uid 0 is host uid 2,000,000,000, so an image that runs as root (Redis, nginx) can `chown` its files and bind port 80 without being root on the node. Keep host ids `2000000000`–`2000065535` out of `/etc/subuid` and your directory service.
 
+An app that serves Prometheus metrics declares where, and every node scrapes its own instances of it (no Prometheus install needed):
+
+```toml
+[app.web]
+image = "proc-grill:image-ignored"
+command = ["target/debug/testapp", "--port", "8080"]
+port = 8080
+metrics = {}                              # scrape http://<instance>:8080/metrics
+# metrics = { port = 9797, path = "/prom" } # a separate metrics listener
+```
+
+`port` defaults to the app's `port` and `path` to `/metrics`; an app with neither port is rejected. The metrics port needn't be published: the node scrapes the instance's own address. Samples are labelled `app` (`namespace/app`), `namespace`, `instance` and `node`, plus an `up` gauge per instance (1 when the last scrape succeeded). Read them with `relish metrics <app>` or on the app's dashboard page. The node-level `[metrics] app_scrape_interval_secs` (default 10) sets how often; `[[metrics.scrape_targets]]` still scrapes fixed URLs outside any app. Kubernetes imports fill `metrics` from the pod template's `prometheus.io/scrape`, `prometheus.io/port` and `prometheus.io/path` annotations.
+
 ### Jobs
 
 Jobs are run-to-completion tasks. They retry up to 3 times with exponential backoff on failure.

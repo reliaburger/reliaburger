@@ -94,6 +94,9 @@ pub struct AppSpec {
     /// Autoscaling configuration.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub autoscale: Option<AutoscaleSpec>,
+    /// Prometheus metrics the node should scrape from each instance.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<MetricsSpec>,
     /// Namespace this app belongs to.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
@@ -107,11 +110,52 @@ impl AppSpec {
             .map(String::as_str)
             .chain(self.init.iter().filter_map(|init| init.image.as_deref()))
     }
+
+    /// Where to scrape this app's Prometheus metrics inside each instance:
+    /// `(port, path)`. `None` when the app declares no `metrics` block, or
+    /// declares one with no port of its own and no app port to fall back on
+    /// (validation rejects that case).
+    pub fn metrics_endpoint(&self) -> Option<(u16, &str)> {
+        let metrics = self.metrics.as_ref()?;
+        let port = metrics.port.or(self.port)?;
+        Some((port, metrics.path.as_str()))
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Sub-specs
 // ---------------------------------------------------------------------------
+
+/// A Prometheus `/metrics` endpoint every instance serves.
+///
+/// `metrics = {}` scrapes `/metrics` on the app's own port; both fields
+/// can be overridden, e.g. `metrics = { port = 9797 }` for an app with a
+/// separate metrics listener. The node running each instance scrapes it
+/// directly, so the port needn't be published or routed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetricsSpec {
+    /// Port the metrics endpoint listens on. Defaults to the app's `port`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// HTTP path of the endpoint. Defaults to `/metrics`.
+    #[serde(default = "default_metrics_path")]
+    pub path: String,
+}
+
+impl Default for MetricsSpec {
+    fn default() -> Self {
+        Self {
+            port: None,
+            path: default_metrics_path(),
+        }
+    }
+}
+
+/// The conventional Prometheus exposition path.
+pub fn default_metrics_path() -> String {
+    "/metrics".to_string()
+}
 
 /// Health check configuration.
 ///
@@ -295,6 +339,53 @@ mod tests {
         // Wrap in [app.test] table for top-level parsing,
         // or parse directly as an AppSpec
         toml::from_str(toml_str).unwrap()
+    }
+
+    #[test]
+    fn empty_metrics_block_scrapes_the_app_port_at_slash_metrics() {
+        let app = parse_app(
+            r#"
+            image = "myapp:v1"
+            port = 8080
+            metrics = {}
+            "#,
+        );
+        assert_eq!(app.metrics, Some(MetricsSpec::default()));
+        assert_eq!(app.metrics_endpoint(), Some((8080, "/metrics")));
+    }
+
+    #[test]
+    fn metrics_port_and_path_override_the_defaults() {
+        let app = parse_app(
+            r#"
+            image = "myapp:v1"
+            port = 9898
+            metrics = { port = 9797, path = "/prom" }
+            "#,
+        );
+        assert_eq!(app.metrics_endpoint(), Some((9797, "/prom")));
+    }
+
+    #[test]
+    fn an_app_without_a_metrics_block_is_not_scraped() {
+        let app = parse_app(
+            r#"
+            image = "myapp:v1"
+            port = 8080
+            "#,
+        );
+        assert_eq!(app.metrics_endpoint(), None);
+    }
+
+    #[test]
+    fn metrics_block_rejects_unknown_fields() {
+        let result: Result<AppSpec, _> = toml::from_str(
+            r#"
+            image = "myapp:v1"
+            metrics = { port = 9797, interval = 5 }
+            "#,
+        );
+        assert!(result.is_err());
     }
 
     #[test]

@@ -852,6 +852,7 @@ mod tests {
             firewall: None,
             egress: None,
             autoscale: None,
+            metrics: None,
             namespace: None,
             args: Vec::new(),
             working_dir: None,

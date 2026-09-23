@@ -14,7 +14,7 @@ use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Secret, Service};
 use k8s_openapi::api::networking::v1::Ingress;
 
 use crate::config::app::{
-    AppSpec, AutoscaleSpec, DeploySpec, HealthSpec, IngressSpec, PlacementSpec,
+    AppSpec, AutoscaleSpec, DeploySpec, HealthSpec, IngressSpec, MetricsSpec, PlacementSpec,
 };
 use crate::config::types::{EnvValue, Replicas};
 use crate::config::{Config, JobSpec, NamespaceSpec};
@@ -321,7 +321,12 @@ fn correlate_and_convert(resources: Vec<K8sResource>) -> (Config, MigrationRepor
             apply_service(&mut app, name, svc, pod_spec, &mut report);
             used_services.insert(name.clone());
         }
-        warn_unimported_ports(&format!("Deployment/{name}"), pod_spec, &app, &mut report);
+        warn_unimported_ports(
+            &format!("Deployment/{name}"),
+            pod_spec,
+            &mut app,
+            &mut report,
+        );
 
         // Correlate Ingress by backend service name
         if let Some(ing_name) = find_ingress_for_service(&ingresses, name) {
@@ -355,7 +360,12 @@ fn correlate_and_convert(resources: Vec<K8sResource>) -> (Config, MigrationRepor
             apply_service(&mut app, name, svc, pod_spec, &mut report);
             used_services.insert(name.clone());
         }
-        warn_unimported_ports(&format!("DaemonSet/{name}"), pod_spec, &app, &mut report);
+        warn_unimported_ports(
+            &format!("DaemonSet/{name}"),
+            pod_spec,
+            &mut app,
+            &mut report,
+        );
         if let Some(ing_name) = find_ingress_for_service(&ingresses, name) {
             if let Some(ing) = ingresses.get(&ing_name) {
                 apply_ingress(&mut app, &ing_name, ing, &mut report);
@@ -377,7 +387,12 @@ fn correlate_and_convert(resources: Vec<K8sResource>) -> (Config, MigrationRepor
             apply_service(&mut app, name, svc, pod_spec, &mut report);
             used_services.insert(name.clone());
         }
-        warn_unimported_ports(&format!("StatefulSet/{name}"), pod_spec, &app, &mut report);
+        warn_unimported_ports(
+            &format!("StatefulSet/{name}"),
+            pod_spec,
+            &mut app,
+            &mut report,
+        );
         if let Some(ing_name) = find_ingress_for_service(&ingresses, name) {
             if let Some(ing) = ingresses.get(&ing_name) {
                 apply_ingress(&mut app, &ing_name, ing, &mut report);
@@ -752,17 +767,78 @@ fn import_security_context(
     }
 }
 
+/// Fill the app's `metrics` from the pod template's Prometheus annotations.
+///
+/// `prometheus.io/scrape: "true"` opts in; `prometheus.io/port` and
+/// `prometheus.io/path` override the app port and `/metrics`, the same
+/// defaults a Prometheus `kubernetes_sd` scrape config applies. Anything but
+/// `"true"` leaves the app unscraped, as it would in Kubernetes.
+fn import_scrape_annotations(
+    resource: &str,
+    template_metadata: Option<&k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta>,
+    app: &mut AppSpec,
+    report: &mut MigrationReport,
+) {
+    let Some(annotations) = template_metadata.and_then(|meta| meta.annotations.as_ref()) else {
+        return;
+    };
+    if annotations.get("prometheus.io/scrape").map(String::as_str) != Some("true") {
+        return;
+    }
+    let mut metrics = MetricsSpec::default();
+    if let Some(port) = annotations.get("prometheus.io/port") {
+        match port.parse::<u16>() {
+            Ok(number) if number > 0 => metrics.port = Some(number),
+            _ => report.warnings.push(MigrationWarning {
+                resource: resource.to_string(),
+                message: format!(
+                    "prometheus.io/port {port:?} is not a port number; scraping the app's port"
+                ),
+            }),
+        }
+    }
+    if let Some(path) = annotations.get("prometheus.io/path") {
+        if path.starts_with('/') && !path.contains(char::is_whitespace) {
+            metrics.path = path.clone();
+        } else {
+            report.warnings.push(MigrationWarning {
+                resource: resource.to_string(),
+                message: format!("prometheus.io/path {path:?} is not a path; scraping /metrics"),
+            });
+        }
+    }
+    app.metrics = Some(metrics);
+}
+
 /// Report container ports the app doesn't carry. An app exposes one port:
-/// the one its Service targets, or the first declared.
+/// the one its Service targets, or the first declared. A port the node
+/// scrapes for metrics is carried too, so it isn't reported.
+///
+/// Runs after the Service is folded in, because that can still change the
+/// app's port: this is also where a scrape annotation that ends up with no
+/// port to scrape is reported and dropped.
 fn warn_unimported_ports(
     resource: &str,
     pod_spec: Option<&k8s_openapi::api::core::v1::PodSpec>,
-    app: &AppSpec,
+    app: &mut AppSpec,
     report: &mut MigrationReport,
 ) {
+    if app.metrics.is_some() && app.metrics_endpoint().is_none() {
+        app.metrics = None;
+        report.warnings.push(MigrationWarning {
+            resource: resource.to_string(),
+            message: "prometheus.io/scrape is set but the pod has no port to scrape \
+                      (no prometheus.io/port and no container port); metrics are not scraped"
+                .to_string(),
+        });
+    }
+    let metrics_port = app.metrics_endpoint().map(|(port, _)| port);
     let dropped: Vec<String> = container_ports(pod_spec)
         .iter()
-        .filter(|p| u16::try_from(p.container_port).ok() != app.port)
+        .filter(|p| {
+            let port = u16::try_from(p.container_port).ok();
+            port != app.port && port != metrics_port
+        })
         .map(|p| match &p.name {
             Some(name) => format!("{} ({name})", p.container_port),
             None => p.container_port.to_string(),
@@ -790,6 +866,12 @@ fn deployment_to_app(name: &str, deploy: &Deployment, report: &mut MigrationRepo
         &format!("Deployment/{name}"),
         deploy.metadata.namespace.as_ref(),
         pod_spec,
+        report,
+    );
+    import_scrape_annotations(
+        &format!("Deployment/{name}"),
+        spec.and_then(|s| s.template.metadata.as_ref()),
+        &mut app,
         report,
     );
 
@@ -836,6 +918,12 @@ fn daemonset_to_app(name: &str, ds: &DaemonSet, report: &mut MigrationReport) ->
         pod_spec,
         report,
     );
+    import_scrape_annotations(
+        &format!("DaemonSet/{name}"),
+        ds.spec.as_ref().and_then(|s| s.template.metadata.as_ref()),
+        &mut app,
+        report,
+    );
     app.replicas = Replicas::DaemonSet;
     app
 }
@@ -847,6 +935,12 @@ fn statefulset_to_app(name: &str, ss: &StatefulSet, report: &mut MigrationReport
         &format!("StatefulSet/{name}"),
         ss.metadata.namespace.as_ref(),
         pod_spec,
+        report,
+    );
+    import_scrape_annotations(
+        &format!("StatefulSet/{name}"),
+        spec.and_then(|s| s.template.metadata.as_ref()),
+        &mut app,
         report,
     );
     app.replicas = spec
@@ -992,6 +1086,7 @@ fn empty_app_spec() -> AppSpec {
         firewall: None,
         egress: None,
         autoscale: None,
+        metrics: None,
         namespace: None,
         args: Vec::new(),
         working_dir: None,
@@ -1065,7 +1160,17 @@ fn apply_service(
             ),
         });
     }
+    let metrics_port = app.metrics_endpoint().map(|(port, _)| port);
     for extra in &service_ports[1..] {
+        let extra_target = match &extra.target_port {
+            Some(target) => resolve_port(target, container_ports(pod_spec)),
+            None => u16::try_from(extra.port).ok(),
+        };
+        // The node scrapes the metrics port on each instance itself; nothing
+        // needs the Service to carry it.
+        if extra_target.is_some() && extra_target == metrics_port {
+            continue;
+        }
         report.warnings.push(MigrationWarning {
             resource: resource.clone(),
             message: format!(
@@ -2350,6 +2455,128 @@ spec:
     targetPort: http-metrics
 "#;
 
+    /// A Deployment with the given pod-template annotations and container
+    /// ports, plus a matching Service on the first port.
+    fn annotated_deployment(annotations: &str, ports: &str) -> String {
+        format!(
+            r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  template:
+    metadata:
+      annotations:
+{annotations}
+    spec:
+      containers:
+      - name: web
+        image: podinfo:6
+{ports}
+"#
+        )
+    }
+
+    #[test]
+    fn prometheus_annotations_become_the_apps_metrics() {
+        let yaml = annotated_deployment(
+            "        prometheus.io/scrape: \"true\"\n        prometheus.io/port: \"9797\"\n        prometheus.io/path: /prom",
+            "        ports:\n        - name: http\n          containerPort: 9898\n        - name: http-metrics\n          containerPort: 9797",
+        );
+        let result = import_from_yaml(&yaml).unwrap();
+        let app = &result.config.app["web"];
+        assert_eq!(app.port, Some(9898));
+        assert_eq!(app.metrics_endpoint(), Some((9797, "/prom")));
+    }
+
+    #[test]
+    fn scrape_without_a_port_annotation_uses_the_app_port_and_slash_metrics() {
+        let yaml = annotated_deployment(
+            "        prometheus.io/scrape: \"true\"",
+            "        ports:\n        - containerPort: 8080",
+        );
+        let result = import_from_yaml(&yaml).unwrap();
+        let app = &result.config.app["web"];
+        assert_eq!(app.metrics_endpoint(), Some((8080, "/metrics")));
+        assert!(
+            warnings_of(&result).is_empty(),
+            "{:?}",
+            warnings_of(&result)
+        );
+    }
+
+    #[test]
+    fn scrape_false_or_absent_leaves_metrics_unset() {
+        let yaml = annotated_deployment(
+            "        prometheus.io/scrape: \"false\"\n        prometheus.io/port: \"9797\"",
+            "        ports:\n        - containerPort: 8080",
+        );
+        let result = import_from_yaml(&yaml).unwrap();
+        assert!(result.config.app["web"].metrics.is_none());
+    }
+
+    #[test]
+    fn scrape_with_no_port_anywhere_is_warned_and_skipped() {
+        let yaml = annotated_deployment("        prometheus.io/scrape: \"true\"", "");
+        let result = import_from_yaml(&yaml).unwrap();
+        assert!(result.config.app["web"].metrics.is_none());
+        let warnings = warnings_of(&result);
+        assert!(
+            warnings.iter().any(|w| w.starts_with("Deployment/web")
+                && w.contains("prometheus.io/scrape")
+                && w.contains("no port")),
+            "{warnings:?}"
+        );
+        // The imported config must still validate.
+        result.config.validate().unwrap();
+    }
+
+    #[test]
+    fn an_unparseable_port_annotation_is_warned_and_falls_back_to_the_app_port() {
+        let yaml = annotated_deployment(
+            "        prometheus.io/scrape: \"true\"\n        prometheus.io/port: metrics",
+            "        ports:\n        - containerPort: 8080",
+        );
+        let result = import_from_yaml(&yaml).unwrap();
+        assert_eq!(
+            result.config.app["web"].metrics_endpoint(),
+            Some((8080, "/metrics"))
+        );
+        assert!(
+            warnings_of(&result)
+                .iter()
+                .any(|w| w.contains("prometheus.io/port \"metrics\"")),
+            "{:?}",
+            warnings_of(&result)
+        );
+    }
+
+    #[test]
+    fn the_shipped_podinfo_demo_scrapes_its_metrics_port_without_dropping_it() {
+        let manifest = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("examples/kubernetes/podinfo.yaml"),
+        )
+        .unwrap();
+        let result = import_from_yaml(&manifest).unwrap();
+        for name in ["frontend", "backend"] {
+            assert_eq!(
+                result.config.app[name].metrics_endpoint(),
+                Some((9797, "/metrics")),
+                "{name}"
+            );
+        }
+        assert!(result.config.app["redis"].metrics.is_none());
+        let warnings = warnings_of(&result);
+        assert!(
+            !warnings.iter().any(|w| w.contains("9797")),
+            "the scraped metrics port is reported as dropped: {warnings:?}"
+        );
+        // The gRPC port is still honestly reported.
+        assert!(warnings.iter().any(|w| w.contains("9999")), "{warnings:?}");
+    }
+
     #[test]
     fn args_alone_keep_the_image_entrypoint() {
         let result = import_from_yaml(PODINFO_FRONTEND).unwrap();
@@ -2397,6 +2624,25 @@ spec:
                     && w.contains("port 9797 (metrics) dropped")),
             "{warnings:?}"
         );
+    }
+
+    /// With `prometheus.io/scrape`, the metrics port is scraped directly on
+    /// each instance, so neither the Service nor the container port that
+    /// carries it is "dropped".
+    #[test]
+    fn a_scraped_metrics_port_is_not_reported_as_dropped() {
+        let yaml = PODINFO_FRONTEND.replacen(
+            "  template:\n    spec:",
+            "  template:\n    metadata:\n      annotations:\n        prometheus.io/scrape: \"true\"\n        prometheus.io/port: \"9797\"\n    spec:",
+            1,
+        );
+        let result = import_from_yaml(&yaml).unwrap();
+        assert_eq!(
+            result.config.app["frontend"].metrics_endpoint(),
+            Some((9797, "/metrics"))
+        );
+        let warnings = warnings_of(&result);
+        assert!(!warnings.iter().any(|w| w.contains("9797")), "{warnings:?}");
     }
 
     #[test]

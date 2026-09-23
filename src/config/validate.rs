@@ -285,6 +285,30 @@ fn validate_app(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError
         });
     }
 
+    // Metrics: the scrape needs a port (its own or the app's) and a path.
+    if let Some(metrics) = &app.metrics {
+        let metrics_error = |reason: String| ConfigError::Validation {
+            field: "metrics".to_string(),
+            context: format!("app {name:?}"),
+            reason,
+        };
+        match metrics.port.or(app.port) {
+            None => {
+                return Err(metrics_error(
+                    "no port to scrape: set metrics.port or the app's port".to_string(),
+                ));
+            }
+            Some(0) => return Err(metrics_error("port must not be 0".to_string())),
+            Some(_) => {}
+        }
+        if !metrics.path.starts_with('/') || metrics.path.contains(char::is_whitespace) {
+            return Err(metrics_error(format!(
+                "path {:?} must start with '/' and contain no whitespace",
+                metrics.path
+            )));
+        }
+    }
+
     // Config files: exactly one of content/source
     for cf in &app.config_file {
         match (&cf.content, &cf.source) {
@@ -583,6 +607,47 @@ mod tests {
 
     fn minimal_app() -> AppSpec {
         toml::from_str(r#"image = "test:v1""#).unwrap()
+    }
+
+    fn app_with_metrics(extra: &str) -> AppSpec {
+        toml::from_str(&format!("image = \"test:v1\"\n{extra}")).unwrap()
+    }
+
+    #[test]
+    fn metrics_on_the_app_port_is_valid() {
+        let config = config_with_app("web", app_with_metrics("port = 8080\nmetrics = {}"));
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn metrics_without_any_port_is_rejected() {
+        let config = config_with_app("web", app_with_metrics("metrics = {}"));
+        let err = config.validate().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Validation { ref field, ref reason, .. }
+                if field == "metrics" && reason.contains("no port")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn metrics_port_zero_is_rejected() {
+        let config = config_with_app("web", app_with_metrics("metrics = { port = 0 }"));
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn metrics_path_must_be_absolute() {
+        let config = config_with_app(
+            "web",
+            app_with_metrics("metrics = { port = 9797, path = \"metrics\" }"),
+        );
+        let err = config.validate().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Validation { ref reason, .. }
+                if reason.contains("start with '/'")),
+            "{err:?}"
+        );
     }
 
     #[test]
