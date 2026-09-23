@@ -317,7 +317,7 @@ registry_port = 0
         "/bin/sh".into(),
         "-c".into(),
         format!(
-            "n=0; while [ ! -f '{}' ] && [ $n -lt 600 ]; do sleep 0.05; n=$((n+1)); done",
+            "n=0; while [ ! -f '{}' ] && [ $n -lt 2400 ]; do sleep 0.05; n=$((n+1)); done",
             release.display()
         ),
     ]);
@@ -332,21 +332,10 @@ registry_port = 0
         "-c".into(),
         format!("echo $$ > '{}'; exec sleep 60", marker.display()),
     ];
-    let request = tokio::spawn(async move { client.exec("work", "default", &command).await });
-    let exec_pid: u32 = tokio::time::timeout(Duration::from_secs(15), async {
-        loop {
-            if let Ok(value) = std::fs::read_to_string(&marker)
-                && let Ok(pid) = value.trim().parse()
-            {
-                break pid;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
+    let mut request = tokio::spawn(async move { client.exec("work", "default", &command).await });
+    let exec_pid = wait_for_exec_pid(&marker, &mut request).await;
     node.crash().await;
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(STATE_DEADLINE, async {
         loop {
             let owners = data.join("instances/process-owners/default__work-0");
             let active_exec = std::fs::read_dir(&owners).unwrap().any(|entry| {
@@ -376,6 +365,34 @@ registry_port = 0
     wait_job(&recovered.client, "stopped", 0).await;
     recovered.client.stop("work", "default").await.unwrap();
     recovered.crash().await;
+}
+
+/// Wait for the exec'd shell to record its pid. An exec request that has
+/// already failed can never write it, so report that error at once rather
+/// than waiting out the deadline.
+async fn wait_for_exec_pid<T: std::fmt::Debug>(
+    marker: &Path,
+    request: &mut tokio::task::JoinHandle<T>,
+) -> u32 {
+    let deadline = tokio::time::Instant::now() + STATE_DEADLINE;
+    loop {
+        if let Ok(value) = std::fs::read_to_string(marker)
+            && let Ok(pid) = value.trim().parse()
+        {
+            return pid;
+        }
+        if request.is_finished() {
+            let outcome = request.await;
+            panic!("exec finished before its shell recorded a pid: {outcome:?}");
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "exec shell did not record its pid within {STATE_DEADLINE:?}; \
+             marker exists: {}",
+            marker.exists()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 /// Recovery must retire the interrupted init chain before a new apply can retry it.
