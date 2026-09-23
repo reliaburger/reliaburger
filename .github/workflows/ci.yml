@@ -46,7 +46,9 @@ jobs:
       - id: select
         env:
           EVENT: ${{ github.event_name }}
-          BASE_REF: ${{ github.base_ref }}
+          # The PR event names the branch it targets; github.base_ref reported
+          # main for a PR stacked on another branch (run 35921062344).
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           FULL_CI: ${{ contains(github.event.pull_request.labels.*.name, 'full-ci') }}
         run: scripts/ci/select-jobs.sh
