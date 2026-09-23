@@ -16,9 +16,9 @@ use crate::meat::NodeId;
 use super::assignment::assign_parent;
 use super::transport::ReportingTransport;
 use super::types::{
-    AppResourceUsage, DnsCapabilityReport, EgressAffectedWorkload, EgressEnforcementEvidence,
-    EgressEnforcementStatus, NodeCapabilityReport, NodeReadinessReport, ReportHealthStatus,
-    ReportingMessage, ResourceUsage, RunningApp, StateReport,
+    AppResourceUsage, EgressAffectedWorkload, EgressEnforcementEvidence, EgressEnforcementStatus,
+    NodeCapabilityReport, NodeReadinessReport, ReportHealthStatus, ReportingMessage, ResourceUsage,
+    RunningApp, StateReport,
 };
 
 /// Snapshot of a single workload instance, provided by the agent.
@@ -219,10 +219,6 @@ impl<T: ReportingTransport> ReportWorker<T> {
         };
 
         let capability_report = self.build_capability_report(&snapshot);
-        let dns_report = DnsCapabilityReport {
-            node_id: self.node_id.clone(),
-            capability: snapshot.capabilities.dns,
-        };
         let readiness_report = snapshot
             .readiness
             .clone()
@@ -234,7 +230,6 @@ impl<T: ReportingTransport> ReportWorker<T> {
         let mut messages = vec![
             ReportingMessage::Report(report),
             ReportingMessage::CapabilityReport(capability_report),
-            ReportingMessage::DnsCapabilityReport(dns_report),
         ];
         if let Some(report) = readiness_report {
             messages.push(ReportingMessage::NodeReadinessReport(report));
@@ -331,9 +326,7 @@ impl<T: ReportingTransport> ReportWorker<T> {
         }
     }
 
-    /// Build the additive capability message. An old peer may reject this
-    /// separate extension frame, but it still accepts the preceding legacy
-    /// `StateReport` frame.
+    /// Build the capability message sent after each `StateReport`.
     fn build_capability_report(&self, snapshot: &AgentSnapshot) -> NodeCapabilityReport {
         NodeCapabilityReport {
             node_id: self.node_id.clone(),
@@ -538,16 +531,7 @@ mod tests {
                 namespace: "default".to_string(),
             }]
         );
-
-        let (_, _, msg) = tokio::time::timeout(Duration::from_secs(1), council_transport.recv())
-            .await
-            .expect("should receive DNS capability after egress capability")
-            .unwrap();
-        let ReportingMessage::DnsCapabilityReport(dns) = msg else {
-            panic!("expected DnsCapabilityReport");
-        };
-        assert_eq!(dns.node_id, NodeId::new("w1"));
-        assert!(dns.capability.can_resolve_internal());
+        assert!(capability.capabilities.dns.can_resolve_internal());
 
         let (_, _, msg) = tokio::time::timeout(Duration::from_secs(1), council_transport.recv())
             .await

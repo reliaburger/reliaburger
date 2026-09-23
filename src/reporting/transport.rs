@@ -831,8 +831,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_reporting_frame_never_reaches_the_inbox() {
-        let payload = bincode::serialize(&sample_msg("legacy")).unwrap();
+    async fn unversioned_reporting_frame_never_reaches_the_inbox() {
+        let payload = bincode::serialize(&sample_msg("unversioned")).unwrap();
         let mut frame = (payload.len() as u32).to_be_bytes().to_vec();
         frame.extend(payload);
         let (tx, mut rx) = mpsc::channel(1);

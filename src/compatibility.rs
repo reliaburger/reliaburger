@@ -17,7 +17,7 @@ pub struct Compatibility {
 
 /// Supported formats, including committed generation-bound consumer withdrawal receipts.
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 20,
+    protocol: 21,
     state: 39,
 };
 

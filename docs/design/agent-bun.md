@@ -834,7 +834,7 @@ pub struct UpgradeConfig {
 - `WorkloadStateReport` -- periodic batch of workload states (instance ID, state, health, resource usage)
 - `EventStream` -- real-time events (starts, stops, health changes, OOMs)
 - `SchedulingDirective` -- from parent to Bun: start/stop/update workloads
-- `NodeReadinessReport` -- an additive, independently expiring lease carrying
+- `NodeReadinessReport` -- an independently expiring lease carrying
   the live `Starting`, `Ready`, `Degraded` or `Stopped` state of every critical
   long-lived subsystem, with transition and last-error times
 
@@ -869,9 +869,9 @@ Readiness and local capability inputs are direct reads from a process-wide
 evidence tracker, so a dead agent command loop cannot make the endpoint hang or
 fabricate a healthy answer.
 
-The reporting worker sends readiness in its own extension frame. The leader
+The reporting worker sends readiness in its own frame. The leader
 leases it by aggregator receive time and leadership epoch, independently of
-ordinary state, DNS and egress frames. A missing or stale readiness lease makes
+ordinary state and capability frames. A missing or stale readiness lease makes
 the scheduler mark the node unready. One healthy heartbeat cannot keep another
 dead subsystem looking alive.
 

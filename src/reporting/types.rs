@@ -33,7 +33,6 @@ pub struct StateReport {
     /// Whether this node can run image builds (`buildah` on PATH,
     /// probed once at worker startup). Build submissions are routed to
     /// a capable node (Phase 12 F2).
-    #[serde(default)]
     pub has_buildah: bool,
 }
 
@@ -67,36 +66,19 @@ pub struct RunningApp {
 pub struct NodeCapabilityReport {
     /// Node that observed this evidence.
     pub node_id: NodeId,
-    /// Live node capabilities used for placement.
-    #[serde(default)]
+    /// Live node capabilities used for placement, including DNS readiness.
     pub capabilities: NodeCapabilities,
     /// Per-workload egress enforcement evidence.
-    #[serde(default)]
     pub egress_enforcement: Vec<EgressEnforcementEvidence>,
     /// A live enforcement incident has fenced at least one workload and has
     /// not yet recovered. The scheduler treats the node as unready meanwhile.
-    #[serde(default)]
     pub egress_degraded: bool,
     /// Workloads fenced by the current incident. This remains present after
     /// they stop so operators don't lose the evidence before the next report.
-    #[serde(default)]
     pub egress_affected_workloads: Vec<EgressAffectedWorkload>,
 }
 
-/// Additive DNS readiness message.
-///
-/// DNS is deliberately separate from [`NodeCapabilityReport`]. That report
-/// shipped with H2 as positional bincode, so appending a field would make H2
-/// and H3 nodes reject each other's capability frame during a rolling update.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DnsCapabilityReport {
-    /// Node that bound and tested this resolver path.
-    pub node_id: NodeId,
-    /// Live resolver transports and workload reachability.
-    pub capability: crate::onion::dns::DnsCapability,
-}
-
-/// Additive critical-subsystem readiness lease.
+/// Critical-subsystem readiness lease.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeReadinessReport {
     /// Node that observed the subsystem states.
@@ -179,11 +161,9 @@ pub struct ResourceUsage {
     pub disk_used_mb: u64,
     pub gpu_used: u8,
     pub allocated_ports: Vec<u16>,
-    /// Schedulable CPU capacity. Zero from pre-capacity nodes.
-    #[serde(default)]
+    /// Schedulable CPU capacity.
     pub cpu_total_millicores: u32,
-    /// Schedulable memory capacity. Zero from pre-capacity nodes.
-    #[serde(default)]
+    /// Schedulable memory capacity.
     pub memory_total_mb: u32,
 }
 
@@ -232,13 +212,9 @@ pub enum ReportingMessage {
     /// Pre-aggregated metrics rollup from worker to council aggregator.
     MetricsRollup(NodeRollup),
     /// Live scheduling capabilities and per-workload security evidence.
-    /// Added at the end so existing bincode variant discriminants stay put.
     CapabilityReport(NodeCapabilityReport),
-    /// Live DNS readiness in its own rolling-upgrade-safe extension frame.
-    /// Added at the end so every earlier discriminant stays unchanged.
-    DnsCapabilityReport(DnsCapabilityReport),
-    /// Live critical-subsystem readiness in a rolling-upgrade-safe extension
-    /// frame. Absence or lease expiry is not ready.
+    /// Live critical-subsystem readiness, sent only once the agent has
+    /// evidence. Absence or lease expiry is not ready.
     NodeReadinessReport(NodeReadinessReport),
 }
 
@@ -249,61 +225,6 @@ pub enum ReportingMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Wire shape before report extensions were added. Rolling upgrades need
-    /// old and new reporters to share the existing bincode envelope.
-    #[allow(dead_code)]
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    struct LegacyStateReport {
-        node_id: NodeId,
-        timestamp: SystemTime,
-        running_apps: Vec<RunningApp>,
-        cached_specs: Vec<CachedSpec>,
-        resource_usage: ResourceUsage,
-        event_log: Vec<NodeEvent>,
-        has_buildah: bool,
-    }
-
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    enum LegacyReportingMessage {
-        Report(LegacyStateReport),
-        Ack {
-            node_id: NodeId,
-        },
-        AggregatedReport {
-            reports: HashMap<NodeId, LegacyStateReport>,
-        },
-        MetricsRollup(NodeRollup),
-    }
-
-    /// Exact H2 capability wire shape, before DNS readiness was added as its
-    /// own extension frame.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    struct H2NodeCapabilities {
-        egress: crate::sesame::egress::EgressEnforcementCapability,
-    }
-
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    struct H2NodeCapabilityReport {
-        node_id: NodeId,
-        capabilities: H2NodeCapabilities,
-        egress_enforcement: Vec<EgressEnforcementEvidence>,
-        egress_degraded: bool,
-        egress_affected_workloads: Vec<EgressAffectedWorkload>,
-    }
-
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    enum H2ReportingMessage {
-        Report(StateReport),
-        Ack {
-            node_id: NodeId,
-        },
-        AggregatedReport {
-            reports: HashMap<NodeId, StateReport>,
-        },
-        MetricsRollup(NodeRollup),
-        CapabilityReport(H2NodeCapabilityReport),
-    }
 
     fn sample_report(name: &str) -> StateReport {
         StateReport {
@@ -361,38 +282,6 @@ mod tests {
     }
 
     #[test]
-    fn capability_message_preserves_legacy_state_report_envelope() {
-        let report = sample_report("node-1");
-        let legacy = LegacyStateReport {
-            node_id: report.node_id.clone(),
-            timestamp: report.timestamp,
-            running_apps: report.running_apps.clone(),
-            cached_specs: report.cached_specs.clone(),
-            resource_usage: report.resource_usage.clone(),
-            event_log: report.event_log.clone(),
-            has_buildah: report.has_buildah,
-        };
-
-        let old_bytes = bincode::serialize(&legacy).unwrap();
-        let decoded_new: StateReport = bincode::deserialize(&old_bytes).unwrap();
-        assert_eq!(decoded_new.node_id, report.node_id);
-
-        let new_bytes = bincode::serialize(&report).unwrap();
-        let decoded_old: LegacyStateReport = bincode::deserialize(&new_bytes).unwrap();
-        assert_eq!(decoded_old.node_id, report.node_id);
-        assert_eq!(decoded_old.running_apps.len(), 1);
-
-        let new_report_message = ReportingMessage::Report(report);
-        let message_bytes = bincode::serialize(&new_report_message).unwrap();
-        let decoded_old_message: LegacyReportingMessage =
-            bincode::deserialize(&message_bytes).unwrap();
-        assert!(matches!(
-            decoded_old_message,
-            LegacyReportingMessage::Report(_)
-        ));
-    }
-
-    #[test]
     fn capability_report_message_round_trip() {
         let capability = NodeCapabilityReport {
             node_id: NodeId::new("node-1"),
@@ -427,47 +316,15 @@ mod tests {
             panic!("expected capability report");
         };
         assert!(decoded.capabilities.egress.can_enforce_allowlist());
-        assert_eq!(decoded.capabilities.dns, Default::default());
+        assert!(decoded.capabilities.dns.can_resolve_internal());
         assert_eq!(
             decoded.egress_enforcement[0].status,
             EgressEnforcementStatus::Enforced
         );
-        assert!(
-            bincode::deserialize::<LegacyReportingMessage>(&encoded).is_err(),
-            "an old peer may reject the separate extension frame, but its report frame stays valid"
-        );
-
-        let decoded_h2: H2ReportingMessage = bincode::deserialize(&encoded).unwrap();
-        let H2ReportingMessage::CapabilityReport(decoded_h2) = decoded_h2 else {
-            panic!("expected the unchanged H2 capability discriminant");
-        };
-        assert!(decoded_h2.capabilities.egress.can_enforce_allowlist());
     }
 
     #[test]
-    fn dns_capability_extension_round_trip() {
-        let message = ReportingMessage::DnsCapabilityReport(DnsCapabilityReport {
-            node_id: NodeId::new("node-1"),
-            capability: crate::onion::dns::DnsCapability {
-                enabled: true,
-                ready: true,
-                ipv4: true,
-                ipv6: false,
-                workload_reachable: true,
-            },
-        });
-        let encoded = bincode::serialize(&message).unwrap();
-        let decoded: ReportingMessage = bincode::deserialize(&encoded).unwrap();
-        let ReportingMessage::DnsCapabilityReport(decoded) = decoded else {
-            panic!("expected DNS capability report");
-        };
-        assert_eq!(decoded.node_id, NodeId::new("node-1"));
-        assert!(decoded.capability.can_resolve_internal());
-        assert!(bincode::deserialize::<H2ReportingMessage>(&encoded).is_err());
-    }
-
-    #[test]
-    fn readiness_extension_round_trip() {
+    fn readiness_report_message_round_trip() {
         let message = ReportingMessage::NodeReadinessReport(NodeReadinessReport {
             node_id: NodeId::new("node-1"),
             evidence: crate::bun::readiness::NodeReadinessEvidence {
@@ -490,34 +347,6 @@ mod tests {
             panic!("expected node readiness report");
         };
         assert!(decoded.evidence.ready);
-        assert!(bincode::deserialize::<H2ReportingMessage>(&encoded).is_err());
-    }
-
-    #[test]
-    fn h2_capability_frame_decodes_with_dns_default() {
-        let h2 = H2ReportingMessage::CapabilityReport(H2NodeCapabilityReport {
-            node_id: NodeId::new("node-1"),
-            capabilities: H2NodeCapabilities {
-                egress: crate::sesame::egress::EgressEnforcementCapability {
-                    connect_ipv4: true,
-                    connect_ipv6: true,
-                    udp_ipv4: true,
-                    udp_ipv6: true,
-                    pre_start: true,
-                },
-            },
-            egress_enforcement: Vec::new(),
-            egress_degraded: false,
-            egress_affected_workloads: Vec::new(),
-        });
-
-        let encoded = bincode::serialize(&h2).unwrap();
-        let decoded: ReportingMessage = bincode::deserialize(&encoded).unwrap();
-        let ReportingMessage::CapabilityReport(decoded) = decoded else {
-            panic!("expected CapabilityReport");
-        };
-        assert!(decoded.capabilities.egress.can_enforce_allowlist());
-        assert_eq!(decoded.capabilities.dns, Default::default());
     }
 
     #[test]

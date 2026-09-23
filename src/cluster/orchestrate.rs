@@ -944,7 +944,7 @@ fn build_cluster_cache(
         let usage = &report.resource_usage;
         let capability_report = reports.capabilities.get(&member.node_id);
         if usage.cpu_total_millicores == 0 {
-            continue; // pre-capacity node (or capacity unset)
+            continue; // capacity unset
         }
 
         let running_apps = report
