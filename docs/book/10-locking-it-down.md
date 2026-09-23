@@ -865,11 +865,100 @@ Proving the ordering in a test is neat: the Lima test deploys through a mock gri
 
 ### Sweeping against kernel truth
 
-Everything so far maintains the maps *transactionally*: deploy writes, stop deletes. But the kernel's map state and the agent's in-memory picture can still drift — Bun restarts and adopts running workloads (their bindings were in the dead process's memory), a transient map write fails, an unclean shutdown leaves entries behind for cgroup ids the kernel will happily recycle.
+Everything so far maintains the maps *transactionally*: deploy writes, stop deletes. But the kernel's map state and the agent's in-memory picture can still drift — Bun restarts and adopts running workloads, a transient map write fails, an unclean shutdown leaves entries behind for cgroup ids the kernel will happily recycle.
 
 So the agent now treats the kernel as something to *reconcile against*, not just write to. Every one-second tick checks all four live hooks and every expected enforcement flag. A missing flag gets one immediate rewrite and verification. If a hook vanished, the map can't be read, or verification still fails, Bun stops the affected workload. It also reports the capability and keeps the affected app as incident evidence after the process has stopped. The node stays unready until all four hooks recover, which forces the scheduler to re-plan elsewhere. Keeping a process alive and hoping the 60-second sweep repairs its security boundary isn't recovery. It's a window.
 
-The slower `[ebpf] sweep_interval_secs` pass still does the housekeeping: state belonging to no live instance is scrubbed across all four maps plus the flag, and every live binding's entries are rewritten. It does *not* install a policy late for an adopted process. An adopted policy-bearing workload has already run ahead of anything Bun could now write, so the one-second check stops it and the scheduler replaces it cleanly. A sweep with nothing to do logs nothing. You only hear from it when it found drift, which is exactly when you want to hear from it.
+The slower `[ebpf] sweep_interval_secs` pass still does the housekeeping: state belonging to no live instance is scrubbed across all four maps plus the flag, and every live binding's entries are rewritten. It does *not* install a policy late for an adopted process. An adopted policy-bearing workload whose original policy didn't survive in the kernel (see "Surviving the agent's death" below) has already run ahead of anything Bun could now write, so the one-second check stops it and the scheduler replaces it cleanly. A sweep with nothing to do logs nothing. You only hear from it when it found drift, which is exactly when you want to hear from it.
+
+### A refused deletion hasn't happened
+
+Freeze a kernel map with `BPF_MAP_FREEZE` (after which the kernel rejects every write from userspace) and ask Bun to retire a container. Our first answer was embarrassing. The map helper did `let _ = map.remove(&key)`, which throws away the `Result`, so it reported success. The agent then forgot the binding and deleted the adoption record. The operator saw a clean retirement while the old entry sat in the kernel, waiting for the cgroup id to be recycled. `Result` is marked `#[must_use]`, so Rust made us *write* `let _ =` rather than silently dropping it, which is more than C would have done. But the compiler can't know whether ignoring that error is fine. Here it wasn't.
+
+Every delete now goes through one small function:
+
+```rust
+fn deletion_result(result: Result<(), aya::maps::MapError>) -> Result<(), FirewallMapError> {
+    match result {
+        Ok(()) | Err(aya::maps::MapError::KeyNotFound) => Ok(()),
+        Err(aya::maps::MapError::SyscallError(error))
+            if error.io_error.kind() == std::io::ErrorKind::NotFound =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+```
+
+Two bits of `match` syntax appear here. The `|` in the first arm is an *or-pattern*: either a successful delete or "no such key" counts as the entry being gone, so retrying a delete that already worked is harmless. The `if` after the second pattern is a *match guard*: the arm only matches when the condition also holds. Anything else, a frozen map or a permission error, goes back to the caller through `error.into()`, which converts aya's error into ours via a `From` implementation.
+
+The callers had to change too, because a helper that returns an error doesn't help if the caller drops it. The agent now works out what the policy *should* be without the retiring instance, but keeps the old binding until the kernel confirms every write and delete. Only then does it forget the binding, remove the identity directory and delete the adoption record. The reconciler that keeps the namespace firewall in sync records a key *before* writing it and forgets it only after a confirmed removal, so a failed write can't leave an entry that nobody remembers. Allow rules come out before namespace identities, so a half-finished cleanup never leaves a source with grants but no namespace.
+
+Addresses follow the same rule. With the backend map frozen, Retire used to stop the old container first and then fail to remove its VIP entry. Runc released the container's IP, a new, unrelated container got it, and a request to the old VIP came back HTTP 200 from the stranger. Stop, Retire and rolling replacements now confirm the backend is withdrawn *before* they stop the runtime. The same goes for grants that name a service as their destination: before a VIP can be reused, every firewall entry pointing at it goes.
+
+```rust
+pub fn delete_destination_firewall_state(
+    bpf: &mut aya::Ebpf,
+    destination_app_id: u32,
+) -> Result<(), FirewallMapError> {
+    for key in list_firewall_keys(bpf)? {
+        if key.dst_app_id == destination_app_id {
+            delete_firewall_entry(bpf, key)?;
+        }
+    }
+    Ok(())
+}
+```
+
+It reads the keys from the kernel rather than from the agent's cached set. A cache isn't proof of what's in the map.
+
+### Both ends of a rule need the right identity
+
+A firewall rule says "this source may reach that destination", and we had both halves subtly wrong.
+
+The destination id used to be a hash of the service name. So `permitted/database` and `private/database` shared an id, and a rule allowing one allowed both; the physical test connected to both happily. The id is now the service's allocated VIP as an integer, `u32::from(vip.0)` (Rust's standard `From` conversion from an IPv4 address). VIP allocation already resolves collisions between namespaced services, so the firewall inherits that decision instead of inventing another hash.
+
+The source side had three holes. First, under Runc there's a launcher process on the host that watches the container, and we were looking up *its* cgroup, while traffic comes from the container's. `Grill::workload_cgroup` now asks the runtime for the container's own init process and checks it's in the cgroup we requested. Second, sources were taken from the service catalogue, so a worker that only makes outgoing calls, and advertises no port, never got a namespace identity. Sources now come from verified workload cgroups, and the agent publishes a workload's source policy before it lets the workload (or a job) start: the same create, program, start ordering as egress. Third, init containers. When the first of two init containers exited, Runc removed the shared cgroup; recreating the same path gave it a new kernel id, and the old entries no longer applied to anything. The agent now reruns the pre-start policy step after every init container. Each init container also gets its own instance id (`default__web-0__init-0`) and stays owned until its exit is observed, so a failed init can't be retired while it's still running.
+
+### Surviving the agent's death
+
+Kill Bun with SIGKILL while a container keeps running. Is its allowlist still enforced? Our first test said no. The loader's file descriptors kept the programs attached to the cgroup, and when the kernel closed those descriptors on process death, it detached the programs. The container carried on with no policy at all.
+
+The fix is *pinning*: placing a BPF object in bpffs, the kernel's BPF filesystem, so a path holds a reference and the object outlives the process. You have to pin both the maps (the policy data) and the links (the attachments that enforce it); pinning only one half gets you nothing. On rootful Runc with eBPF, Bun loads through an owned loader that pins everything under a private directory, `/sys/fs/bpf/reliaburger-<hash>`, and keeps a small manifest on normal disk saying which cgroup it belongs to. A new Bun reopens the pinned maps, checks their layout, and swaps its fresh programs onto the existing links without ever detaching them:
+
+```rust
+pub(super) fn replace_link(fd: &OwnedFd, new_program: RawFd, old_program: RawFd) -> io::Result<()> {
+    let input = UpdateAttributes {
+        link_fd: fd.as_raw_fd() as u32,
+        new_program_fd: new_program as u32,
+        flags: BPF_F_REPLACE,
+        old_program_fd: old_program as u32,
+    };
+    // SAFETY: all three descriptors are held by the caller for this syscall.
+    // The initialised repr(C) input matches Linux's link_update attributes.
+    let result = unsafe {
+        nix::libc::syscall(
+            nix::libc::SYS_bpf,
+            BPF_LINK_UPDATE,
+            &input,
+            std::mem::size_of_val(&input),
+        )
+    };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+```
+
+This is a raw `bpf(2)` syscall, so it's `unsafe`: the compiler can't check what the kernel does with the pointer we pass. `UpdateAttributes` is `#[repr(C)]`, which tells Rust to lay the fields out in declaration order, exactly as the kernel's C struct expects (by default Rust may reorder them). `OwnedFd` is a file descriptor that closes itself when dropped, and `as_raw_fd()` borrows its integer for the call without giving up ownership. `BPF_F_REPLACE` makes this a compare-and-swap: if the link no longer runs `old_program`, the kernel refuses, so we can't overwrite a change we didn't expect.
+
+Keeping the kernel state alive is half the job. After a restart Bun also has to know *which workload* each piece of policy belongs to. Otherwise the next health check sees a protected workload with no binding and stops it, or a sweep mistakes the retained policy for an orphan. So before programming any policy, the agent writes a record to a private checkpoint: the instance, its original launch spec, its allowlist, its namespace identity, its cgroup id and the kernel's boot id. The cgroup id stays in the record after the runtime deletes the cgroup, so cleanup can remove the right map entries without guessing from a missing directory. The boot id stops a cgroup number from a previous boot being mistaken for the same number today. The resolved IP addresses are deliberately left out (`#[serde(skip)]` on that field): they're a DNS answer, not policy, so recovery resolves the recorded allowlist again, keeping enforcement on (deny everything) in the meantime. Each record stays in the file, marked `Retired`, until the identity files and adoption record are gone too, so a crash between those steps doesn't look like a lost checkpoint. And if a checkpoint write fails, Bun refuses further policy changes until a restart re-reads the file, because it can't know whether the old contents survived.
+
+On recovery, a surviving workload keeps running only if its original cgroup, boot id, hooks and enforcement flag all check out. Anything that doesn't match is refused rather than swept. We'd rather stop a workload than guess who owns a kernel entry.
+
+These tests need a real kernel, so they run in the Lima VM: frozen maps, a loader killed mid-connection, real Runc stepping through two init containers. They cover the interruptions we could stage, not a power cut at every possible instant.
 
 ## What we learned
 
@@ -1052,482 +1141,3 @@ This remains an audit guard, not the authorisation mechanism. The existing
 request tests still prove that read-only users cannot mutate resources and
 scoped users cannot access another tenant. The new regression places a GET and
 a POST on one path and verifies that both are collected independently.
-
-### Keep ownership when the kernel refuses cleanup
-
-A stopped container still has one last job for us: remove its egress policy.
-Suppose the kernel rejects that deletion. Our earlier implementation discarded
-the error, removed the in-memory binding and deleted the adoption record. The
-operator saw successful retirement while the old map entry remained.
-
-We reproduced this with `BPF_MAP_FREEZE`, a kernel operation that makes a map
-readable but rejects further userspace writes. One test freezes a destination
-map; another freezes the enforcement flag. A third drives the public agent
-`Retire` command against a real frozen map and checks the adoption record. All
-three fail before the repair. We own the test maps and destroy them afterwards
-by dropping their unpinned loader; no unrelated policy is frozen.
-
-The map functions now return deletion errors. An explicit missing-key result is
-successful absence, while permission failures and unavailable maps retain the
-cleanup obligation. Enumeration needs the same discipline. This expression:
-
-```rust
-let keys = map.keys().collect::<Result<Vec<_>, _>>()?;
-```
-
-turns an iterator of individual key results into one result containing every
-key. It stops at the first error. The `::<...>` supplies type arguments to
-`collect`; each `_` asks Rust to infer that part of the type. The final `?`
-returns an error to the caller instead of presenting a partial inventory as a
-complete one.
-
-The agent computes the proposed policy without the retiring instance, but keeps
-its existing binding until the kernel confirms every operation. This matters
-when instances share a cgroup: the remaining policy is the union of the other
-bindings. Only after that rewrite succeeds do we forget the retiring binding,
-remove identity material and delete the adoption record. A failed operation
-leaves a stopped owner that the operator can retry.
-
-Periodic policy rewrites also propagate errors. If rewriting fails, the agent
-stops the affected workloads. A failed deletion can leave an old destination
-allowed, so merely logging the failure would not preserve the requested policy.
-The stopped workloads retain their cleanup obligations if the kernel still
-refuses removal. This repair concerns live cleanup; proving policy lifetime and
-restoration across actual Bun death remains a separate release gate.
-
-### Let the policy outlive the agent
-
-Kill Bun while a container keeps running. Does its allowlist still apply? Our
-first isolated-cgroup test answered that with an unwanted successful connection.
-The loader's file descriptors owned the kernel attachments. SIGKILL closed them,
-so the kernel detached the programs even though the container remained alive.
-
-A pinned BPF object has another reference in bpffs, the kernel's BPF filesystem.
-Closing the process's descriptor no longer removes that object. We need to pin
-both the maps (the policy data) and the links (the attachments that enforce it).
-Pinning just one half doesn't solve the problem.
-
-The explicit owned loader uses a private bpffs directory and a separate private
-ownership directory on normal storage. It records the original cgroup identity,
-paths and format version before creating kernel resources. A file lock prevents
-two processes from recovering the same owner at once. The ordinary loader stays
-ephemeral for tests that expect dropping it to destroy their private resources.
-Bun integration also needs workload reconciliation; adding pins alone is not a
-complete restart protocol.
-
-Recovery opens the existing maps and checks their layout, capacity and flags.
-Each retained link must target the original cgroup and hook, and its program must
-refer to the same map IDs as the replacement. `BPF_LINK_UPDATE` replaces the
-program on that link while retaining the attachment. Its compare-and-replace
-flag names the previous program, so an unexpected concurrent replacement fails
-instead of overwriting somebody else's change. There is no deliberate detach
-window and we don't rebuild the policy from an empty map.
-
-Rust's `OwnedFd` owns a file descriptor and closes it on drop. `AsRawFd` borrows
-its integer value for a syscall; it doesn't transfer ownership. The small kernel
-adapter uses `#[repr(C)]` structures, explicit padding and documented `unsafe`
-blocks because the kernel expects a particular byte layout. A successful syscall
-that creates a descriptor is the only place we construct a new `OwnedFd` from a
-raw integer. Constructing two owners for one descriptor would let one close the
-other's resource.
-
-The ownership journal distinguishes `Preparing`, `Active`, `Retiring` and
-`Retired`. Missing attachments during preparation can be completed before any
-workload is admitted. Missing attachments from an active owner are an error.
-Explicit retirement records its intent before unlinking resources, removes links
-before maps and supports resuming an interrupted removal. A retired owner cannot
-be activated again. Ordinary handle destruction preserves the pins.
-
-The physical tests use a private cgroup and a local listener outside it. They
-probe before loader death, while it is absent and after recovery, then explicitly
-remove policy and check that connectivity returns. Separate cases exercise
-conflicting owners, changed cgroup identity, partial startup, missing active pins
-and interrupted retirement. These tests establish the loader contract. Actual
-Bun restart and upgrade must also prove that the new agent doesn't erase retained
-policy before it has accounted for every original workload.
-
-### Recover the policy's workload owner too
-
-Keeping maps alive solves only half the restart problem. The old adoption path
-rebuilt the supervisor but left its egress bindings empty. On the next health
-check, Bun treated the surviving protected workload as unbound and stopped it.
-A later sweep could also mistake retained policy for an orphan.
-
-The agent now has an egress ownership checkpoint separate from its final
-adoption records. Before programming a policy, it records the instance identity,
-original OCI input, runtime, allowlist, cgroup number and kernel boot identity.
-An error after a checkpoint write makes persistence uncertain. Bun refuses
-further ownership changes until restart reloads the durable inventory; it cannot
-assume a failed write left the old file unchanged.
-
-Recovery validates the whole inventory against adoption records and, when the
-runtime provides it, original launch intent. A policy created before its final
-adoption record still has an owner. The runtime must positively retire that
-launch before Bun removes its policy. A surviving recorded workload must have
-matching original policy, cgroup and boot identities, all required hooks and an
-existing enforcement flag before Bun publishes it as running.
-
-DNS results aren't original authority. Recovery resolves the recorded allowlist
-again with a bounded wait; an unavailable resolver produces an empty allowlist
-until a later retry. While rebuilding destinations, Bun retains the enforcement
-flag. Removing and recreating that flag would briefly allow everything, and a
-rollout can have two instances sharing the same cgroup. The replacement policy
-is their union, excluding an instance only after its runtime has retired.
-
-The checkpoint keeps the cgroup number after the runtime deletes the cgroup.
-That lets cleanup remove the corresponding map entries without guessing from a
-missing directory. It also records the kernel boot identity: a cgroup number
-from an earlier boot cannot authorise deletion of the same number in the new
-kernel. Workload retirement still needs its own positive runtime evidence.
-
-There is a second checkpoint boundary during removal. Suppose policy cleanup
-succeeds, but removing identity material fails. If we immediately delete the
-policy owner, restart sees an adoption record with no policy evidence. That is
-indistinguishable from a lost checkpoint. We reproduced this by blocking identity
-cleanup after successful kernel removal.
-
-The policy journal now retains `PolicyPhase::Retired` until identity and adoption
-records are durably gone. This enum records positive evidence; an absent owner
-never means the same thing. Restart can finish a retired owner's metadata
-cleanup, while a protected record missing both ownership and retirement evidence
-refuses recovery. Completed markers are then removed, so successful cleanup does
-not accumulate one permanent journal entry per deployment.
-
-`#[serde(skip)]` on the resolved-destination field tells Serde to omit that
-transient field when writing the checkpoint and initialise it with its default
-value when reading. The recorded allowlist remains the authority. Recovery
-resolves it again before rewriting policy, and never reactivates a retired
-binding. Uncertain checkpoint persistence also blocks subsequent kernel rewrites:
-otherwise the old in-memory owner could recreate policy after the disk had
-already recorded its retirement.
-
-
-### The launcher isn't the source of container traffic
-
-Runc has a host process that launches and watches a container. Bun needs that
-launcher's identity for adoption and owned command control. But network traffic
-comes from the container's cgroup. Looking up the launcher's cgroup for a
-namespace rule protects the wrong source, even when the container's OCI path is
-correct.
-
-`Grill::workload_cgroup` now separates those two questions. The owned rootful
-adapter reads its original launch specification under the generation claim,
-asks Runc for the running init PID, and opens that process's `/proc` directory.
-Through the retained descriptor it checks the parent, nested PID namespace and
-actual cgroup membership. The parent must be the authenticated launcher and the
-cgroup must match the original request. It retains the cgroup directory too,
-then rechecks the launcher's ownership before returning the kernel identity.
-
-The local bindings `_process` and `_cgroup` are still variables with destructors.
-Their leading underscores silence unused-variable warnings; they don't discard
-the files. Both descriptors remain owned until the check finishes. Dropping a
-file closes its descriptor. This keeps the inspection tied to kernel objects
-rather than looking up a potentially reused numeric PID again.
-
-Unsupported runtimes return no verified source identity. Conflicting ownership
-returns an error. Firewall reconciliation keeps its previous maps on an
-inspection error, trace reports unknown evidence, and a source-specific network
-fault refuses an unverified target. Recovered egress checks compare the original
-policy with this verified runtime identity before keeping the workload live.
-
-The actual-Runc regressions distinguish launcher and container cgroups, recover
-the same identity after reconstructing the adapter, and refuse a live container
-moved into another cgroup. A separate public-agent regression checks the real
-kernel namespace map. Pre-start namespace binding, complete discovery ownership
-and positive removal remain their own integration boundary; a correct identity
-lookup alone doesn't close those gaps.
-
-### A refused deletion is still an obligation
-
-Freeze a kernel firewall map, then ask Bun's map helper to delete an entry. The
-kernel refuses the operation, but our helper used to return `Ok(())` anyway.
-`let _ = map.remove(&key)` explicitly discards the `Result`. Rust allows that;
-the compiler can't decide whether ignoring an error fits our cleanup contract.
-Here it didn't.
-
-Firewall and namespace deletion now match the result. Successful deletion and
-an explicit missing-key response both establish absence. Permission errors,
-frozen maps and other failures return to the caller. The physical regression
-freezes both maps, attempts removal and checks that the original entries remain
-readable. Another check removes ordinary entries twice, proving that retries
-accept confirmed absence.
-
-This fixes the map helpers' evidence. Agent reconciliation must also retain
-failed obligations, and durable recovery must preserve original source owners.
-Those are separate steps. A helper returning an error isn't enough if its
-caller throws that error away.
-
-The next boundary is the caller's inventory. Replacing a remembered key set with
-the desired set loses any entry whose deletion failed. Reconciliation now
-records a key before attempting its write and forgets it only after confirmed
-removal. A failed write can therefore leave a cleanup obligation too. Retrying
-can inspect or remove it; silently dropping it can't.
-
-We remove obsolete allow rules before namespace identities. If removing an allow
-rule fails, its source keeps its namespace identity and both keys remain
-tracked. If namespace deletion fails after the allow rule was removed, only the
-namespace obligation remains. The real frozen-map regression repeats cleanup
-twice for each case. The mutable set references (`&mut HashSet<...>`) let the
-reconciler record this partial progress in the caller's inventory without moving
-ownership of the sets. Durable recovery still needs a journal; these sets alone
-only survive within the current agent.
-
-### A worker can connect without serving a port
-
-Imagine a worker in `frontend` that only sends requests to a database in
-`backend`. It doesn't advertise a service port. Our rule builder used the
-service catalogue to find both ends of a connection, so it omitted the worker's
-namespace identity and ignored an explicit `frontend/worker` allowance. The
-connect hook needs to know who sent the request even when nobody can connect
-back to that sender.
-
-Source selection now comes from verified workload cgroups, keyed by namespace
-and application name. Destination selection still comes from the service
-catalogue. Namespace identities use the same deterministic name mapping as
-service registration. An explicit allowance looks up the named source directly;
-it doesn't require that source to advertise a service.
-
-The portable regression supplies only a database service and a worker cgroup.
-The physical agent regression deploys an application without a port and checks
-its actual kernel namespace entry. This corrects source selection during
-reconciliation. Publishing and recording that identity before the first workload
-instruction remains the next lifecycle boundary, including the job-start path.
-
-### Stop waits for backend withdrawal
-
-The backend map can refuse deletion too. In that case Stop used to log the error,
-remove the application record and return success. The next Retire request also
-returned success because the application was already forgotten. The kernel still
-held its backend entry.
-
-The first repair withdrew the exact allocated VIP and port before removing any
-workload record. Failure returned `BunError::BackendRetirement` and preserved the
-service entry and stopped workload owners for retry. The address-reuse repair
-below moves that withdrawal ahead of runtime termination too. Once withdrawal succeeds,
-we remove the userspace backends and retire the remaining artifacts. If that
-later cleanup fails, the retained empty service entry still identifies the same
-key for the next attempt. Rollout finalisation also propagates a refused backend
-deletion instead of proceeding past it.
-
-The physical regression freezes the backend map, calls Retire twice and checks
-both error responses, both retained records and the still-readable kernel entry.
-The successful case checks actual backend absence and repeated retirement.
-Durable service-map ownership across Bun death and per-instance rollout updates
-remain separate integration work; this check establishes the live Stop/Retire
-boundary.
-
-### Publish the source before starting it
-
-Stop a portless worker at its runtime Start call and inspect the kernel. Our
-first regression found no namespace entry. The same happened for a job. Updating
-rules after startup leaves time for the first request to bypass namespace
-isolation, so the agent now prepares the cgroup and publishes its source policy
-before allowing Start. Existing services' explicit allow rules must also be present
-then: otherwise an authorised first connection races reconciliation and fails.
-The controlled-start tests pause both an application and a job at this boundary,
-then inspect the actual namespace and grant maps.
-
-The private policy checkpoint now records `source_namespace: Option<u32>` beside
-the original OCI input, runtime, cgroup identity and kernel boot identity.
-`Some(id)` records namespace ownership. An empty external allowlist doesn't mean
-we should deny all outgoing traffic: source ownership and external egress
-filtering answer different questions. The checkpoint can own the former without
-enabling the latter. Jobs publish their original OCI input before taking this
-same pre-start path. The internal command returns an error if the agent loop
-closes, so losing the policy owner cannot grant permission to execute.
-
-We write the checkpoint before touching kernel maps. An uncertain write fences
-later mutation until recovery reads the file again. Reconciliation includes
-these prepared owners even when the runtime can't yet report a running process;
-otherwise a concurrent reconciliation could delete the very entry Start needs.
-
-Recovery restores the source inventory before adoption. Retained map entries
-must belong to original owners. A surviving workload must still have its original
-cgroup and namespace entry, and a required source identity cannot disappear from
-the checkpoint. We refuse unknown ownership instead of treating an empty
-in-memory set as permission to sweep kernel entries. Live monitoring also stops
-executing workloads whose namespace binding or required hooks disappear.
-
-Retirement removes a source's firewall grants before removing its namespace
-entry. Only then does the checkpoint record `Retired`. A failed deletion keeps
-the owner and adoption record, even through another Bun recovery attempt. The
-same source-only policy must survive without gaining an external egress flag;
-the controlled-start tests check that distinction directly.
-
-Checkpoint schema 2 and durable state 23 make this boundary explicit. Older
-development records don't contain the required source evidence and need a fresh
-cluster. Init-container cgroup lifetime and the production persistent loader
-still need their own physical qualification; this implementation doesn't waive
-those release gates.
-
-### An allow rule belongs to one destination
-
-Suppose `frontend/client` may connect to `permitted/database`, while
-`private/database` should refuse it. The physical connection test showed both
-connections succeeding. The backend entries had different VIPs and namespaces,
-but both stored the hash of `database` as their firewall destination ID. One
-allow entry therefore authorised both destinations.
-
-The destination ID now uses the allocated service VIP. Allocation already
-resolves collisions between namespace-qualified services, so the firewall
-inherits that decision instead of introducing another truncated name hash.
-`u32::from(vip.0)` calls Rust's `From` conversion to represent the IPv4 address as
-an integer. The kernel treats this value as an opaque identity; it isn't the
-network-byte-order field used to match packet addresses. Remote-only service
-views use the catalogue's assigned address, including a collision-resolved one.
-
-The regression uses actual backend and firewall maps, then makes both TCP
-connections. The permitted service must remain reachable and the private one
-must return a permission error. Portable tests also cover distinct namespace
-identities, collision-probed local allocation and a remote catalogue's chosen
-address. State 24 and kernel ownership manifest 2 refuse older development
-state and pinned maps whose grants used bare-name identities. Confirming grant
-retirement before an address can be reused remains a separate lifecycle task.
-
-### An init exit can change the cgroup
-
-Two short init containers followed by a main workload exposed another execution
-boundary. The first init had the expected namespace and egress maps. The second
-init and main workload did not. Runc had removed the shared cgroup when the first
-init exited; recreating the same filesystem path produced a different kernel
-identity. The old map entries still existed, but they no longer governed the
-process about to start.
-
-After each successful init, the agent runs the same checked pre-start policy
-path again. It prepares the cgroup, retires policy bound to the predecessor's
-identity, durably records the new binding and installs its namespace, grants and
-external allowlist. Only then may another init or the main workload start. A
-failed policy update propagates to deployment failure instead of granting
-execution. The physical regression uses real owned Runc with an offline BusyBox
-rootfs and observes policy immediately before all three Start calls.
-
-This closes successful init sequencing. Failed or interrupted init launch and
-cleanup still need separate lifecycle evidence; a completed happy path cannot
-prove that an unknown child has stopped.
-
-### Failed initialisers still own execution
-
-An initialiser can start successfully and then become impossible to inspect.
-The parent never reaches Running, but that does not mean its child stopped.
-Both the agent regression and real Runc fixture showed Retire reporting success
-while the initialiser still owned execution. In the physical case, parent
-cleanup also removed the initialiser's namespace policy.
-
-Bun now reserves each initialiser before calling the runtime. A small parent-to-
-children registry keeps the obligation until force-kill and observed exit both
-succeed. Parent artifact cleanup retires those children first; a refusal keeps
-policy and metadata for another attempt. Successful init sequencing also confirms
-runtime cleanup before releasing the reservation and refreshing policy. We clone
-the small set of child IDs before awaiting retirement, so a mutable borrow of the
-registry does not span the runtime operation.
-
-Auxiliary IDs use `parent__init-N`. The extra underscore separator cannot occur
-inside an ordinary DNS-label workload name. With the previous hyphen-only form,
-`web`'s first initialiser could reuse the ordinary instance ID of `web-0-init`.
-A deployment regression checks that the foreign application's create is never
-repeated for the initialiser. Durable state 25 excludes the old ambiguous form.
-Keep that ordinary application running in the fixture: marking it Stopped lets
-normal supervision restart it, which would count as a second create without an
-identity collision. A bounded deployment wait also makes an accidental attempt
-to run the initialiser under the live application's identity fail promptly.
-
-The in-memory registry is not recovery evidence. After controller failure, the
-runtime's original launch inventory supplies every unacknowledged initialiser.
-Recovery first stops all unacknowledged launches. Only a second pass retires
-policy and metadata. Clearing a parent during the first pass would otherwise
-lift a shared cgroup's policy before recovery reaches its child. The physical
-fixture refuses initialiser cleanup, aborts the controller task, and checks that
-another refused recovery keeps the original namespace map. Removing the injected
-failure then permits confirmed runtime and policy retirement. Actual Bun process
-death and production-path qualification remain the broader release gates.
-
-### Withdraw the route before releasing the address
-
-Freezing the backend map exposed a more direct failure than a stale record.
-Retire stopped the old container, then failed to remove its VIP entry. Runc had
-already released the container's private address. A new, unrelated container
-received that address, and a request to the old VIP returned HTTP 200 with the
-new container's identity. The successor didn't even advertise a service port.
-
-Explicit Stop and Retire now confirm kernel backend withdrawal before stopping
-the runtime. After withdrawal, Bun empties the userspace backends and republishes
-routing state before termination can release the address. If withdrawal fails,
-the original runtime and address remain owned. The caller gets an error and can
-retry after fixing the kernel failure; the request has not stopped the workload.
-
-The physical regression serves each container's identity from an offline
-BusyBox HTTP server. It verifies the successor's direct endpoint independently,
-then requests the old VIP after injecting backend-deletion refusal. That VIP
-must keep reaching its original owner, and must never serve the successor.
-Natural-exit cleanup, per-instance rollout updates, durable service ownership
-and stale cluster routing snapshots remain separate qualification boundaries.
-
-### A rolling replacement needs the same withdrawal boundary
-
-The ordinary Stop repair did not cover the deployment worker. Freeze the backend
-map during a rolling replacement and it still stopped the original container,
-leaving the kernel pointed at an address whose runtime had retired. Finalisation
-reported an error, but the earlier stop had already happened.
-
-The command loop now prepares a service entry without the retiring instance and
-requires the kernel update to succeed before changing the userspace entry. We
-clone the entry before modifying its backend vector: the original remains retry
-evidence if the syscall refuses. The replacement stays in the proposed entry,
-so withdrawing one instance does not delete every backend for the service.
-Only after that confirmed update and routing publication does Bun fence the
-old instance's restart/health supervision and permit the off-loop drain and stop.
-Final artifact cleanup repeats the checked withdrawal as an idempotent guard.
-
-The physical tests cover frozen-map refusal during rolling and blue-green
-replacement, plus a successful rolling replacement whose VIP serves the new
-container. Each also starts an unrelated portless container and checks that the
-VIP still selects its intended endpoint. This boundary covers requested
-per-instance retirement; natural exits and recovery still need durable address
-and discovery ownership.
-
-### Failed publication is a deployment error
-
-Freeze the backend map before deploying an app. Bun used to print the failed
-kernel write and still send the client a Complete event. The process was running,
-but its VIP had no backend. Logging the failure was not enough.
-
-Deployment finalisation now awaits a checked backend publication and propagates
-its typed error. Rust's `Result<(), BunError>` makes the distinction explicit:
-`Ok(())` confirms the operation, while `Err` carries the service and failure.
-The `?` operator returns that failure to the deployment worker, which emits an
-Error event instead of Complete. Restart finalisation feeds the same failure
-into the existing bounded cleanup/retry path instead of marking the restart
-Running.
-
-This write occurs after runtime startup. Failure therefore retains the adoption
-record and does not claim execution stopped or rollback succeeded. The physical
-regression checks all three facts: the kernel has no backend, the caller receives
-an error, and the runtime's ownership record survives. Durable discovery recovery
-and intermediate/background map updates remain separate work.
-
-
-## Permissions outlive their destination unless we remove them
-
-Suppose a frontend may connect to a backend's virtual IP. The backend stops, and
-we release that VIP. If its old allow grant remains, a later service using that
-address can inherit permission the frontend was never meant to have.
-
-Removing the backend's source rules doesn't remove this grant. The grant belongs
-to the frontend's cgroup and names the backend as its destination. Live service
-retirement now removes the backend route, reads the actual firewall keys and
-removes those naming the service's allocated destination ID. Only then may it
-release the service entry and its VIP. We keep the original allocation because
-hash collisions can make it differ from the first address derived from the name.
-
-The kernel test seeds two grants from the same source: one to the retiring
-service and one elsewhere. With a frozen map, two retirement attempts must both
-refuse and retain ownership. With a writable map, both attempts succeed, the old
-grant disappears and the unrelated grant survives. The agent's cached key set is
-empty in both cases. A cache is not proof of what remains in the kernel.
-
-`delete_destination_firewall_state` returns `Result<(), FirewallMapError>`:
-`()` is Rust's unit type, meaning successful completion has no extra value.
-The `?` on each deletion propagates failure immediately. The caller turns it into
-a service-specific error and keeps the owner available for another attempt.
-This live boundary still needs the separate durable discovery journal to recover
-an exact original destination after Bun dies.
