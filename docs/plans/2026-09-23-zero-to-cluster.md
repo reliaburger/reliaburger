@@ -176,6 +176,61 @@ tutorial, because a tutorial over a broken path is a lie.
   tutorial exists in `relish --help` and that the demo manifest imports, so the
   page can't drift from the product.
 
+### Phase 6: show what Kubernetes can't do (killer features)
+
+The first draft proved Reliaburger does what Kubernetes does. The tour should
+lead with what you'd otherwise have to install, wire and learn separately:
+tracing a connection hop by hop, metrics scraped without a Prometheus install,
+and network faults between two services. A survey on 23 September found each
+beat needs product work first:
+
+- Network faults (`drop`, `partition`, `dns`) were installed only on the nodes
+  running the *target*, but the eBPF connect hook acts on the *caller's* node,
+  so a frontend replica elsewhere never saw the fault. Faults also only affect
+  new connections, and a pooled Redis client keeps its old ones. `delay` is
+  refused: there is no traffic-control hook.
+- `relish trace` doesn't report faults on the path, and its latency figure
+  times the whole `runc exec`.
+- Apps' own Prometheus metrics are only scraped from a static node list. The
+  importer ignores `prometheus.io/*` annotations, histograms are summed wrongly,
+  there's no `relish metrics`, and the dashboard's app charts are always empty
+  (brioche.js expects an array and gets `{data, warnings}`).
+
+- [ ] **Z6.1 Install network faults where the callers are.** Destination-wide
+  faults go to every node; source-scoped ones (`--from`) to the nodes running
+  the source. Filter sources by namespace, and apply a running fault to source
+  instances that start while it's active.
+- [ ] **Z6.2 Affect existing connections.** When a drop or partition lands,
+  destroy the matching established sockets in each source container's network
+  namespace, so pooled clients reconnect into the fault.
+- [ ] **Z6.3 A latency fault.** `relish fault delay redis 300ms --from frontend`
+  adds a `tc` netem qdisc on each source container's `eth0`, filtered to the
+  destination's backend addresses and port, removed on expiry or clear, and
+  applied to new source instances while active. It works on existing
+  connections too.
+- [ ] **Z6.4 Trace shows the fault.** A new "Active faults" step names any
+  fault on the path (id, kind, remaining time). `--count N` repeats the probe
+  and reports how many connects succeeded; the latency figure measures the
+  connect itself; the output names the backend the VIP chose and trims the raw
+  resolver noise.
+- [ ] **Z6.5 Metrics without a Prometheus install.** The app spec gains
+  `metrics = { port, path }`, filled by the importer from `prometheus.io/scrape`,
+  `port` and `path`. Each Bun scrapes its own local instances of such apps
+  every few seconds, labels samples with app, namespace, instance and node, and
+  handles histograms properly. `relish metrics <app>` lists what was scraped,
+  and `--name` shows one metric per instance with a sparkline and rate for
+  counters.
+- [ ] **Z6.6 Charts that draw.** Fix the dashboard's empty app charts, draw one
+  series per instance, show counters as rates, and add a requests-per-second
+  and latency chart for apps with scraped metrics.
+- [ ] **Z6.7 Traffic and the new tour.** The demo manifest gains a tiny load
+  generator that calls the frontend by service name, so there's always traffic
+  for metrics and faults to act on. The tour becomes: install, apply, status,
+  open, **trace frontend → redis**, **metrics frontend**, **delay redis for the
+  frontend**, trace again (the fault is on the path), metrics again (latency
+  jumps), dashboard, kill a replica, lose a node, `wtf`. Checked end to end on a
+  real laptop cluster before the homepage copy changes.
+
 ## Decisions
 
 Answered on 23 September 2026: D1 honour the image user in a user namespace;
