@@ -302,6 +302,22 @@ VM). A fix counts only when the loop that used to fail passes.
   targets in `docs/README.md`'s testing section, so "not in CI" is a written
   decision.
 
+## Follow-ups found while fixing flakes
+
+- [ ] **C6.1 First Runc deploy of `cluster-owned` fails its init container.** In
+  every VM run of `oci_crash::normal_clustered_bun_recovers_enrolled_consumer_before_adoption`
+  the first deploy of `cluster-owned-0` failed with "init container 0 failed". The
+  reconciler then rolled to `-g1-0`, which widened the window that exposed F1.
+  Find whether the test's wrapper or Runc's exit-code read is wrong.
+- [ ] **C6.2 Failed `oci_crash` runs leak Runc containers.** They keep running
+  after a failure and slow or break later runs until cleaned by hand. The
+  harness needs a drop guard that kills and deletes what it started.
+- [ ] **C6.3 An eBPF recovery test leaves a tmpfs identity mount** on the host
+  (`.identity/default__address-successor-0`).
+- [ ] **C6.4 Entry-node fault pre-checks read their own gossip view.** After a
+  clear, only the leader's view is guaranteed fresh, so a lagging entry node can
+  refuse briefly. That errs on the safe side; decide whether it matters.
+
 ## Decisions
 
 All five accepted as recommended on 23 September 2026. For D5, stacked PRs
