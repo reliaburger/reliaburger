@@ -18,16 +18,9 @@ use std::process::Command;
 /// branches. Each must FAIL to parse today; once it parses, the test fails
 /// and asks for its entry to be removed, so an exemption can't outlive its
 /// reason.
-const PENDING: &[(&str, &str)] = &[
-    // TODO(Z1.4): remove once `relish apply -f <file or https URL>` lands.
-    (
-        "relish apply -f https://reliaburger.com/demo/podinfo.yaml",
-        "Z1.4",
-    ),
-];
+const PENDING: &[(&str, &str)] = &[];
 
-/// TODO(Z1.5): set to false once `examples/kubernetes/podinfo.yaml` exists.
-const DEMO_MANIFEST_PENDING: bool = true;
+const DEMO_MANIFEST_PENDING: bool = false;
 
 const INSTALL_LINE: &str = "curl -fsSL https://reliaburger.com/install.sh | sh";
 const DEMO_URL: &str = "https://reliaburger.com/demo/podinfo.yaml";

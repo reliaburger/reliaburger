@@ -82,7 +82,7 @@
               </li>
               <li>
                 <pre><code data-tour>relish status</code></pre>
-                <p>Three replicas, spread over three nodes. The scheduler did that, not you.</p>
+                <p>Three frontend replicas, spread over three nodes. The scheduler did that, not you.</p>
               </li>
               <li>
                 <pre><code>open http://podinfo.localhost:18080</code></pre>
@@ -90,7 +90,7 @@
                   ingress, and the page shows which replica answered.</p>
               </li>
               <li>
-                <pre><code data-tour>relish logs podinfo --since 1m</code></pre>
+                <pre><code data-tour>relish logs frontend --since 1m</code></pre>
                 <p>Logs from every replica on every node, in one stream. No log shipper to install.</p>
               </li>
               <li>
@@ -99,7 +99,7 @@
                   connection. Ctrl-C closes it; the cluster keeps running.</p>
               </li>
               <li>
-                <pre><code data-tour>relish fault kill podinfo --count 1 --acknowledge</code></pre>
+                <pre><code data-tour>relish fault kill frontend --count 1 --acknowledge</code></pre>
                 <p>Break it on purpose. Fault injection is built in, and on a laptop cluster it’s
                   switched on.</p>
               </li>

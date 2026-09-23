@@ -33,7 +33,7 @@ same manifest is `examples/kubernetes/podinfo.yaml` in `relish manual examples`.
 relish status
 ```
 
-Three replicas, spread over three nodes. The scheduler did that, not you.
+Three frontend replicas, spread over three nodes. The scheduler did that, not you.
 
 Now open <http://podinfo.localhost:18080> in a browser. The request comes in
 through the built-in ingress, and the page shows which replica answered.
@@ -41,7 +41,7 @@ through the built-in ingress, and the page shows which replica answered.
 ## Watch it
 
 ```sh
-relish logs podinfo --since 1m
+relish logs frontend --since 1m
 ```
 
 Logs from every replica on every node, in one stream. No log shipper to
@@ -57,7 +57,7 @@ connection. Ctrl-C closes it; the cluster keeps running.
 ## Break it
 
 ```sh
-relish fault kill podinfo --count 1 --acknowledge
+relish fault kill frontend --count 1 --acknowledge
 relish status
 ```
 
