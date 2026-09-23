@@ -210,7 +210,7 @@ check the examples:
 ```sh
 make test                    # run the portable nextest suite
 make audit                   # check dependency advisories
-make examples                # validate and dry-run every example config
+cargo nextest run --test examples  # dry-run every example config
 ```
 
 With a running, configured cluster and `relish` on your PATH:

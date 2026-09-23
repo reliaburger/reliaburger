@@ -67,8 +67,10 @@ New example configurations go under the appropriate `examples/phase-N/` director
 `container-*`, `apple-*`, or `runc-*`. Validate examples with:
 
 ```sh
-make examples
+cargo nextest run --test examples
 ```
+
+`make test` runs it too.
 
 ## Pull Requests
 

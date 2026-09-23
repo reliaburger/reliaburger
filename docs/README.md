@@ -316,7 +316,6 @@ make test-linux  # provisioned Linux runtime/kernel suite
 make test-rootless-runc # non-root runc/slirp replacement proof
 make lint        # clippy with warnings as errors
 make audit       # RustSec advisory and dependency-maintenance gate
-make examples    # validate and dry-run every checked-in workload config
 make fmt         # format with rustfmt
 make ci          # portable format, lint and test checks
 make clean       # remove build artefacts

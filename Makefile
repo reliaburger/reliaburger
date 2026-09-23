@@ -1,4 +1,4 @@
-.PHONY: build test test-cargo test-doc test-slow test-linux test-rootless-runc test-cluster test-upgrade test-upgrade-node test-upgrade-cluster test-apple coverage check fmt lint audit clean pdf loc help examples bench bench-large pickle-test-macos ci ci-full observability-demo kubernetes-demo toml-demo
+.PHONY: build test test-cargo test-doc test-slow test-linux test-rootless-runc test-cluster test-upgrade test-upgrade-node test-upgrade-cluster test-apple coverage check fmt lint audit clean pdf loc help bench bench-large pickle-test-macos ci ci-full observability-demo kubernetes-demo toml-demo
 
 CARGO = cargo
 NEXTEST_PROFILE ?= default
@@ -74,28 +74,6 @@ audit: ## Fail on new RustSec findings or an expired advisory exception
 		exit 1; \
 	fi
 	$(CARGO) audit
-
-examples: build ## Dry-run every example config with relish
-	@failed=0; total=0; output=$$(mktemp); \
-	trap 'rm -f "$$output"' EXIT HUP INT TERM; \
-	for f in $$(find examples -name '*.toml' | sort); do \
-		total=$$((total + 1)); \
-		if grep -q '^\[\[step\]\]' "$$f"; then \
-			cmd="fault scenario $$f --dry-run"; \
-		else \
-			cmd="apply $$f --dry-run"; \
-		fi; \
-		if target/debug/relish $$cmd >"$$output" 2>&1; then \
-			printf "  ✓ %s\n" "$$f"; \
-		else \
-			printf "  ✗ %s\n" "$$f"; \
-			sed 's/^/    /' "$$output" >&2; \
-			failed=$$((failed + 1)); \
-		fi; \
-	done; \
-	echo ""; \
-	echo "$$total examples, $$failed failed."; \
-	[ $$failed -eq 0 ]
 
 bench: ## Run reproducible transport and 5-250 node gossip benchmarks
 	$(CARGO) bench --bench gossip

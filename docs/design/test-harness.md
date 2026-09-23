@@ -65,7 +65,7 @@ be visible until we remove its race.
 | `make bench-large` | Criterion 500- and 1,000-node measurements | `main`, nightly, and PRs touching gossip |
 | `make coverage` | The portable suite, run once under line coverage; this is the Linux test gate too | Linux |
 | `make audit` | Current RustSec database, with new vulnerabilities and maintenance warnings denied | Pull requests, release gate and weekly schedule |
-| `make examples` | Every checked-in workload config parses, validates and plans through Relish without deployment | Linux pull requests |
+| `tests/examples.rs` (part of `make test`) | Every checked-in workload config parses, validates and plans through Relish without deployment | Linux and hosted macOS |
 
 Direct Apple Container is disabled for 0.1.0. Its manual development tests remain
 separate because hosted macOS runners cannot provide its nested virtualisation.

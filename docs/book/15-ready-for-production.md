@@ -425,10 +425,13 @@ reported every file as broken because no agent was running. It managed to test t
 of Bun 21 times. Two configs really were stale, but the useful errors went into the same
 bin.
 
-The repaired target builds Relish once, sends every file through the real parser, validator
-and planner, and keeps a failed command's diagnostic. Successful plans stay quiet. That
-makes `make examples` cheap enough for every pull request, and it catches the same drift a
-reader would hit after copying an example.
+The repaired check sends every file through the real parser, validator and planner, and
+keeps a failed command's diagnostic. Successful plans stay quiet. It started as a Makefile
+target that paid for its own `cargo build`; it's now `tests/examples.rs`, an ordinary
+integration test that finds the binary through `env!("CARGO_BIN_EXE_relish")`. Cargo sets
+that variable at compile time to the path of the `relish` it built for the tests, so the
+check costs nothing extra and runs on every platform `make test` does. It catches the same
+drift a reader would hit after copying an example.
 
 We apply the same rule to platform promises. The `ebpf` Cargo feature can be selected on
 macOS even though Aya and the kernel hooks exist only on Linux. An Aya-using branch therefore
