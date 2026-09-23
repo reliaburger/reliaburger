@@ -195,6 +195,16 @@ impl ProcessGrill {
         }
     }
 
+    /// Owner-backed lifecycle operations that are still running, including
+    /// ones whose caller dropped its future: cancellation never cancels a
+    /// queued mutation. Zero means none can still change owner state. Always
+    /// zero without an owner.
+    pub fn owner_operations_in_flight(&self) -> usize {
+        self.control
+            .as_ref()
+            .map_or(0, ProcessControl::operations_in_flight)
+    }
+
     /// Get captured stdout for an instance.
     pub async fn stdout(&self, instance: &InstanceId) -> Result<Vec<u8>, GrillError> {
         self.read_stream(instance, true).await

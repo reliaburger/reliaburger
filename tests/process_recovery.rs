@@ -789,18 +789,19 @@ async fn cancelled_queued_mutation_preserves_successor(mutation: QueuedMutation)
     persist_record(&record);
     let expected = serde_json::to_value(&record).unwrap();
     drop(lock);
-    // Cover the owner's bounded startup interval too, including cold debug
-    // executable loading. The broken implementation changes the record first.
-    let changed = tokio::time::timeout(Duration::from_secs(20), async {
-        loop {
-            if serde_json::to_value(read_record()).unwrap() != expected || marker.exists() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+    // Wait for the cancelled caller's blocking work to finish instead of
+    // watching a fixed window. A queued mutation holds its in-flight count
+    // until it returns, and the broken implementation changes the record
+    // (start waits for its owner to run) before returning. The ceiling only
+    // turns a wedged operation into a failure.
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while grill.owner_operations_in_flight() > 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .is_ok();
+    .expect("the cancelled caller's queued work never finished");
+    let changed = serde_json::to_value(read_record()).unwrap() != expected || marker.exists();
     grill.kill(&id).await.unwrap();
     stopped(&grill, &id).await;
     assert!(

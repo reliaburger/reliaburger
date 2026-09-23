@@ -7,6 +7,8 @@ use std::io;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use ring::rand::{SecureRandom, SystemRandom};
@@ -23,6 +25,25 @@ pub(crate) struct ProcessControl {
     root: PathBuf,
     executable: PathBuf,
     inventory_reader: super::inventory::InventoryReader,
+    /// Blocking owner operations still running, shared by every clone.
+    in_flight: Arc<AtomicUsize>,
+}
+
+/// Counts one blocking operation for as long as its closure exists, so a
+/// caller that drops the future does not end the count early.
+struct InFlight(Arc<AtomicUsize>);
+
+impl InFlight {
+    fn enter(counter: &Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self(Arc::clone(counter))
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl ProcessControl {
@@ -31,7 +52,14 @@ impl ProcessControl {
             root,
             executable,
             inventory_reader: Default::default(),
+            in_flight: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Blocking owner operations that have not finished, including ones
+    /// whose caller was cancelled. See `ProcessGrill::owner_operations_in_flight`.
+    pub(crate) fn operations_in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::SeqCst)
     }
 
     fn directory(&self, id: &InstanceId) -> io::Result<PathBuf> {
@@ -71,9 +99,13 @@ impl ProcessControl {
     ) -> io::Result<T> {
         let this = self.clone();
         let id = id.clone();
-        tokio::task::spawn_blocking(move || operation(this, id))
-            .await
-            .map_err(io::Error::other)?
+        let in_flight = InFlight::enter(&self.in_flight);
+        tokio::task::spawn_blocking(move || {
+            let _in_flight = in_flight;
+            operation(this, id)
+        })
+        .await
+        .map_err(io::Error::other)?
     }
 
     pub(crate) async fn inventory(&self) -> io::Result<Vec<super::RuntimeLaunch>> {
