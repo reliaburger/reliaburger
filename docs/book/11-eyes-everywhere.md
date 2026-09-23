@@ -174,13 +174,9 @@ That one stamp broke both directions of reassignment. Reassigned back to an aggr
 
 The fix wasn't cleverer dedup. It was making the data honest: `generate_backfill` emits five ordinary one-minute rollups, each stamped at its own minute start — exactly the keys the ordinary ticks would have used. Now dedup does the right thing with no new logic at all: an aggregator that already holds a minute drops that minute and keeps the rest. The worker clears its backfill flag only after every send succeeds; a partial failure re-sends some minutes next tick, and idempotent keys make the re-send free.
 
-We deliberately did *not* add a "window length" field to `NodeRollup`. The reporting messages cross the wire as bincode, where enum discriminants and struct layouts are pinned for rolling upgrades — an old node receiving a new field mid-upgrade would fail to decode the frame. Five sends of the unchanged type cost a few extra kilobytes once per reassignment and keep the wire format stable. When a schema is pinned, change the *usage*, not the shape.
+We deliberately did *not* add a "window length" field to `NodeRollup`. The reporting messages cross the wire as bincode, where enum discriminants and struct layouts are part of the wire format: a new field means a new protocol generation, and nodes of different generations refuse to talk to each other at all. Five sends of the unchanged type cost a few extra kilobytes once per reassignment and keep the wire format stable. When a schema is pinned, change the *usage*, not the shape.
 
-The query must also retain the worker's identity. Both aggregators can hold the
-same minute after reassignment, so the owned-rollup endpoint returns individual
-worker/minute/series contributions. The coordinator deduplicates those keys
-before summing across workers. We don't need to delete history from the old
-aggregator to make the answer correct.
+That leaves the old and new aggregators both holding the same minutes. Rather than teach them to hand history over, the cluster query keeps each worker's identity until after it has removed duplicates, as we'll see in "Two merge strategies" below.
 
 ### Switching it on
 
@@ -201,6 +197,12 @@ The same wiring pass fixed the other zeroed field: `StateReport.resource_usage` 
 One honesty note baked into the field docs: "used" is the sum of *requested* resources across running instances, not measured consumption. Requests are what the scheduler must respect when placing new work — a node with 4000m capacity and 3000m requested has 1000m to offer, however idle the workloads are right now. Measured consumption is Mayo's job, and it flows through the rollups above. Two numbers, two purposes; conflating them is how you end up with schedulers that overcommit a node because its workloads happened to be quiet during the measurement window.
 
 "Running instances" turned out to hide a lie of its own. The first version summed over *every* supervisor entry — including stopped apps, failed instances, and batch jobs that had finished days ago (finding CP6). Run twenty short jobs on a node and its report claimed twenty apps' worth of committed CPU, forever; the scheduler would route around a machine that was actually idle. The report builder now classifies instances first: terminal states (`Stopped`, `Failed`) are excluded from `running_apps`, from the request sums, and from the allocated-port list. `Stopping` deliberately stays counted — a draining instance still holds its port and memory until it's done. The test is the plainest sentence in the suite: a node with 2 running and 3 completed instances reports 2 apps and only their resources.
+
+### Reporting has an admission boundary
+
+How big can a report get? Counting series doesn't answer that, since one enormous label can outweigh a thousand small series. So the sender asks bincode for the exact encoded size and refuses anything over 1 MiB before it allocates a buffer; we don't truncate a batch and call it delivered. The receiver runs at most 16 connection tasks in a tokio `JoinSet` (a collection that owns spawned tasks and cancels them when dropped), queues at most 16 reports, and gives each connection ten seconds for handshake and body together.
+
+A successful socket write doesn't prove the leader took the report, so the receiver answers with a one-byte acknowledgement once it has decoded and queued it. A lost acknowledgement can cause a duplicate, which is harmless: snapshots replace older ones and rollups are deduplicated by worker and minute. A failed rollup send asks for the same five-minute backfill a reassignment uses. Longer outages leave a gap in the cluster view; the node-local metrics keep the data until retention removes it.
 
 Two related fixes from the same review live in chapter 2, where the aggregator is introduced: report freshness is now judged on the aggregator's own receive time rather than the sender's wall clock (a future-dated clock used to make a report immortal), and every report is tagged with the leadership term it arrived under, so a new leader's aggregator never mistakes pre-failover leftovers for current truth. If you're reading this chapter to understand what the metrics *mean*, the one-line summary is: everything the leader aggregates is now bounded by when it was heard and who was leading when it was heard.
 
@@ -225,12 +227,31 @@ pub fn merge_metrics_results(mut sources: Vec<Vec<MetricsQueryRow>>) -> Vec<Metr
 }
 ```
 
-**Cluster-wide queries** fan out to the council aggregators. Each returns rows
-with the original worker identity. `merge_owned_rollups` removes duplicate
-worker/minute/metric/label keys, then passes the remaining contributions to the
-sum below. Different workers' values add together; copies of one worker's value
-do not. Conflicting copies produce an unavailable-data warning instead of an
-arbitrary choice.
+**Cluster-wide queries** fan out to the council aggregators, and here the partial results must be *summed*. If c1 reports `cpu_sum=30` (from workers w1 and w2) and c2 reports `cpu_sum=70` (from w3 and w4), the cluster total is 100. But after a reassignment both aggregators can hold the same worker's minute, and summing their totals counts it twice: our HTTP fan-out test got 60 where the answer was 50. Once you've summed, you can't tell which part was the overlap. So the aggregators return individual contributions tagged with the worker that measured them, and the coordinator deduplicates *before* it sums:
+
+```rust
+pub fn merge_owned_rollups(sources: Vec<Vec<OwnedRollupRow>>) -> MetricsQueryResult {
+    let mut contributions: BTreeMap<(String, u64, String, String), Option<f64>> = BTreeMap::new();
+    for owned in sources.into_iter().flatten() {
+        let row = owned.row;
+        let key = (owned.node_id, row.timestamp, row.metric_name, row.labels);
+        contributions
+            .entry(key)
+            .and_modify(|value| {
+                if *value != Some(row.value) {
+                    *value = None;
+                }
+            })
+            .or_insert(Some(row.value));
+    }
+    // ... Some(v) becomes a row, None becomes a DataUnavailable warning,
+    // then the rows go through merge_cluster_results below
+}
+```
+
+The key is a tuple of worker, minute, metric and labels. `entry(key)` looks the slot up once and handles both cases: `and_modify` runs when the key exists, `or_insert` fills it when it doesn't. The `Option<f64>` value does double duty: `Some` is the agreed contribution, and `None` means two copies of the same worker's minute *disagreed*, which becomes a `DataUnavailable` warning rather than a coin toss. (`OwnedRollupRow` is a query row plus a `node_id`; `#[serde(flatten)]` puts the row's fields beside `node_id` in the JSON instead of nesting them.) A query over 10,000 contributions is refused with a hint to narrow the range, because truncating would quietly shrink the sum.
+
+The surviving contributions then go through the plain summing merge:
 
 ```rust
 pub fn merge_cluster_results(mut sources: Vec<Vec<MetricsQueryRow>>) -> Vec<MetricsQueryRow> {
@@ -255,8 +276,8 @@ You might wonder why `merge_cluster_results` uses `BTreeMap` instead of `HashMap
 
 These endpoints expose the aggregation:
 
-- `GET /v1/metrics/rollup` -- legacy local aggregate view.
-- `GET /v1/metrics/rollup/owned` -- internal fan-out endpoint retaining worker identity.
+- `GET /v1/metrics/rollup` -- this aggregator's own summed view of its rollups.
+- `GET /v1/metrics/rollup/owned` -- internal fan-out endpoint returning per-worker contributions.
 - `GET /v1/metrics/cluster` -- cluster-wide query. Fans out to council aggregators, deduplicates ownership, then sums.
 - `GET /v1/metrics/app/{app}/{namespace}` -- single-app query. Queries local metrics filtered by app labels.
 
@@ -756,59 +777,3 @@ state, so an unscheduled replica remains visible. Environment values come from
 the replicated spec, with the existing encrypted-value masking; standalone
 agents answer through a bounded command request. Local deployment history also
 filters by namespace, because two tenants can use the same app name.
-
-### Keep identity until after the merge
-
-Summing first destroys the information needed to recognise an overlapping
-worker. `OwnedRollupRow` therefore wraps a query row with its originating node.
-The `#[serde(flatten)]` attribute places the wrapped row's fields beside
-`node_id` in JSON, while Rust keeps the nested types explicit. The ordered map
-uses `(node, minute, metric, labels)` as its key and `Option<f64>` as its value:
-`Some` holds the agreed contribution; `None` records conflicting copies.
-
-The owned endpoint is separate from the legacy aggregate endpoint. An older
-aggregator returns 404, producing a visible partial-result warning. Malformed
-responses also remain unknown, and the timeout covers both headers and body.
-Queries exceeding 10,000 contributions are refused with a narrower-range hint,
-so truncation cannot quietly reduce the sum.
-
-Tests reproduce 60 instead of 50 through HTTP fan-out, then prove 50 after the
-fix. Real Parquet stores retain overlapping history across reopening and retry;
-the merge still counts each contribution once. The existing backfill integration
-test now expects one for every minute, including the two both parents hold.
-
-## Reporting has an admission boundary (C21)
-
-A rollup can contain one series with a very long label, or thousands of small
-series. Counting series alone doesn't bound its wire size. Before encoding, the
-sender asks bincode for the serialised size, including the format header. Anything
-above 1 MiB returns `ReportTooLarge` before allocating an encoded copy or opening
-a socket. Reports with more than 100 events also refuse. We don't truncate a
-batch and call that delivery. Automatic chunking remains future work.
-
-The receiver admits at most 16 connection tasks and queues at most 16 reports.
-Each connection shares a ten-second budget across its TLS handshake and body
-read. `JoinSet` owns those tasks: its length is the admission count, completed
-tasks are reaped, and shutdown aborts and joins the remainder. Rust drops each
-aborted task's socket and payload. This bounds queued and in-flight wire data to
-32 MiB, with additional bounded decoding/container overhead; it isn't a promise
-about the whole process's memory use or stored metrics. Neither a half-written
-prefix nor a full inbox creates a waiting task outside that limit.
-
-A successful socket write isn't proof that the receiver accepted the report.
-Protocol generation 3 adds a one-byte acknowledgement after decoding and queue
-admission. Missing acknowledgements, exhausted capacity and node-fault gates
-return send errors. The receipt means volatile queue admission, not persistence
-or successful application by the aggregator. A receiver can die after sending
-it. A lost acknowledgement can also cause a duplicate: state snapshots replace
-older observations and rollups retain their existing worker/minute ownership and
-deduplication rules.
-
-The state worker prints admission failures and collects fresh state next tick;
-its snapshot queue and response share a two-second deadline, and shutdown can
-interrupt the whole send cycle. Normal rollup failures now request the same
-five-minute backfill as failed reassignment sends. This is bounded recovery, not
-an infinite delivery queue. The failure message names that window; older gaps
-remain in node-local metrics until normal retention removes them. The agent still
-doesn't populate report events (F06), and custom `max_events_per_report` values
-refuse validation instead of pretending to control an unwired event producer.
