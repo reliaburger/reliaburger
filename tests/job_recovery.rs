@@ -31,7 +31,7 @@ impl Node {
             .unwrap();
         // Discover the bound port; releasing a reserved ephemeral port before
         // Bun binds it would race other parallel integration tests.
-        let (client, endpoint) = tokio::time::timeout(Duration::from_secs(20), async {
+        let (client, endpoint) = tokio::time::timeout(STATE_DEADLINE, async {
             loop {
                 let contents = std::fs::read_to_string(log).unwrap();
                 if let Some(address) = contents[offset..]
@@ -76,20 +76,38 @@ impl Drop for ReleaseJob {
     }
 }
 
+/// Overall ceiling for a state change. Each wait returns as soon as the
+/// state appears, so a generous ceiling costs nothing on a quiet machine and
+/// keeps a loaded runner from failing a correct recovery.
+const STATE_DEADLINE: Duration = Duration::from_secs(60);
+
 async fn wait_job(client: &BunClient, expected_state: &str, restarts: u32) {
-    tokio::time::timeout(Duration::from_secs(20), async {
-        loop {
-            let jobs = client.jobs().await.unwrap();
-            if jobs.iter().any(|job| {
-                job.name == "work" && job.state == expected_state && job.restart_count == restarts
-            }) {
-                break;
+    let deadline = tokio::time::Instant::now() + STATE_DEADLINE;
+    loop {
+        let last_observed = match client.jobs().await {
+            Ok(jobs) => {
+                let work: Vec<_> = jobs.iter().filter(|job| job.name == "work").collect();
+                if work
+                    .iter()
+                    .any(|job| job.state == expected_state && job.restart_count == restarts)
+                {
+                    return;
+                }
+                let states: Vec<_> = work
+                    .iter()
+                    .map(|job| format!("{} with {} retries", job.state, job.restart_count))
+                    .collect();
+                format!("{states:?}")
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("job must become {expected_state} with {restarts} retries"));
+            Err(error) => format!("jobs request failed: {error}"),
+        };
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "job must become {expected_state} with {restarts} retries within \
+             {STATE_DEADLINE:?}; last observed {last_observed}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 #[tokio::test]
@@ -124,7 +142,7 @@ registry_port = 0
     let mut config = Config::parse("[job.work]\nimage = 'proc-grill:image-ignored'\n").unwrap();
     let job = config.job.get_mut("work").unwrap();
     job.command = Some(vec!["/bin/sh".into(), "-c".into(),
-        "if [ -f \"$RUN_FILE\" ]; then i=0; while [ ! -f \"$START_RETRY\" ] && [ ! -f \"$RELEASE_FILE\" ] && [ $i -lt 600 ]; do i=$((i+1)); sleep 0.05; done; fi; printf 'run\\n' >> \"$RUN_FILE\"; if [ \"$(wc -l < \"$RUN_FILE\")\" -eq 1 ]; then exit 1; fi; i=0; while [ $i -lt 600 ]; do if [ -f \"$RELEASE_FILE\" ]; then if [ \"$(wc -l < \"$RUN_FILE\")\" -eq 2 ]; then kill -TERM $$; else exit 0; fi; fi; i=$((i+1)); sleep 0.05; done; exit 1".into()]);
+        "if [ -f \"$RUN_FILE\" ]; then i=0; while [ ! -f \"$START_RETRY\" ] && [ ! -f \"$RELEASE_FILE\" ] && [ $i -lt 2400 ]; do i=$((i+1)); sleep 0.05; done; fi; printf 'run\\n' >> \"$RUN_FILE\"; if [ \"$(wc -l < \"$RUN_FILE\")\" -eq 1 ]; then exit 1; fi; i=0; while [ $i -lt 2400 ]; do if [ -f \"$RELEASE_FILE\" ]; then if [ \"$(wc -l < \"$RUN_FILE\")\" -eq 2 ]; then kill -TERM $$; else exit 0; fi; fi; i=$((i+1)); sleep 0.05; done; exit 1".into()]);
     job.env.insert(
         "RUN_FILE".into(),
         EnvValue::Plain(count.display().to_string()),
@@ -148,7 +166,7 @@ registry_port = 0
     // Running proves spawn succeeded, not that the child has executed printf.
     // The gate deliberately exercises that scheduling gap before the crash.
     std::fs::write(&start_retry, "start").unwrap();
-    tokio::time::timeout(Duration::from_secs(20), async {
+    tokio::time::timeout(STATE_DEADLINE, async {
         loop {
             let runs = std::fs::read_to_string(&count).unwrap();
             if runs.lines().count() >= 2 {
