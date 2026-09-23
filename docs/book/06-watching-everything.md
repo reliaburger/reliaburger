@@ -298,6 +298,80 @@ A rejected query is a `400`, not a `500` — the client asked for something the 
 
 One more, quieter fix rode along: a clean shutdown used to drop whatever the flush loops had buffered since their last tick. The stop path now forces a final flush of both the metrics and log buffers after the workers have joined, so the last minute survives a restart. And we deleted the dead `KetchupStore` — a second, older log store that Bun constructed and never used, whose calendar/index code and `logs.max_file_size_mb` setting drove nothing. `LogStore` is the live path; the dead one is gone.
 
+## When nothing looks like success
+
+Both hardening passes share a pattern, and later reviews kept finding more of it: a failure that comes back dressed as an empty, successful answer. A directory called `blocked.parquet` made the exporter and both retention loops report success. A peer that sent `200 OK` and then went quiet hung a log query. A node that answered `{}` convinced the diagnostic collector there were no alerts. None of these crash. They lie quietly, which is worse.
+
+### Report export failures before the disk fills
+
+The disk-pressure loop already refused to delete content that hadn't been
+exported, but it discarded export errors. A broken destination could therefore
+leave the disk filling with no explanation. `PressureResult` now carries an
+optional export error, and Bun prints it with the affected store's name.
+
+The regression writes a log file, configures an unsupported export destination,
+and sets the pressure threshold below the file's size. It asserts both that the
+failure is reported and that the local file survives. Reporting a failed backup
+mustn't turn it into permission to delete the only copy.
+
+### Offline exports must report partial success
+
+Copying the archive is only half an incremental export. We also need to persist
+which files were copied. The offline CLI used to discard a checkpoint write
+failure and print success. It now returns an error that says the files arrived
+but a later export may repeat them. The `?` operator propagates that error before
+we print the success message. A CLI regression makes the checkpoint path a
+directory, then checks both the copied bytes and the non-zero exit status.
+
+`relish logs-export --source PATH --dest PATH` explicitly selects a local store,
+including a custom store whose agent is stopped. A second regression exports
+twice and verifies that the saved checkpoint suppresses the second copy.
+Destinations must be UTF-8 because the object-store interface takes text;
+rejecting an invalid path is safer than silently exporting to a different one.
+
+### One exporter at a time
+
+Keying the checkpoint on content wasn't the whole story: the *archive* still used the plain filename, so a reused `logs_000000.parquet` overwrote its predecessor in S3. The object key now carries the SHA-256 too (`{node}/{sha256}-logs_000000.parquet`), so an archived object never changes. The checkpoint also records a hash of the destination and node it covers, because a receipt from bucket A says nothing about bucket B. Change either and the old receipts are cleared; the worst case is a repeated upload to an immutable key.
+
+The last hole was concurrency. The periodic export, the disk-pressure loop, the API handler and an offline `relish logs-export` could each load the checkpoint, export, and save a stale copy over a newer one. Now they all go through `export_logs`, which takes a non-blocking lock on a separate `_export_checkpoint.lock` file (separate, because the checkpoint itself is replaced by an atomic rename), reloads the latest checkpoint, uploads, and persists before returning. Its tail:
+
+```rust
+let committed = tokio::task::spawn_blocking(move || {
+    let _lock = lock;
+    current.save(&path).map_err(|error| {
+        KetchupError::Io(std::io::Error::other(format!(
+            "files exported but checkpoint could not be saved: {error}; retry is safe"
+        )))
+    })?;
+    Ok::<_, KetchupError>(current)
+})
+.await
+.map_err(|error| KetchupError::Io(std::io::Error::other(error.to_string())))??;
+*checkpoint = committed;
+```
+
+`move || { ... }` is a closure (an anonymous function) that takes ownership of what it captures: `lock`, `current` and `path`. If the async caller is cancelled, the blocking thread keeps running and still *owns* the lock, so no second exporter gets in before the rename finishes. `let _lock = lock;` keeps the lock alive until the closure ends; a name starting with `_` just silences the unused-variable warning. Writing `let _ = lock;` would be a bug, because a bare `_` binds nothing and the lock would drop (and unlock) on the spot.
+
+`Ok::<_, KetchupError>(current)` uses the "turbofish" `::<>` to name the closure's error type, which the compiler can't infer by itself; `_` lets it fill in the rest. The `??` unwraps two layers: `spawn_blocking` returns an error if the thread panicked, and inside that sits our own `Result`. Finally, `*checkpoint = committed` writes through the caller's `&mut` reference, so the caller only ever sees a committed snapshot.
+
+### Errors that used to vanish
+
+Retention in the metrics and rollup stores ignored `remove_file` errors and counted the file as deleted anyway; now only successful removals count. The exporter forgives exactly one read failure, `NotFound`, because retention can delete a file between listing the directory and opening it.
+
+Log fan-out had two ownership bugs. Timing `request.send()` isn't enough, because that future finishes when the headers arrive and a peer can then stall mid-body, so the timeout now covers the body read too. And dropping a Tokio `JoinHandle` *detaches* its task rather than cancelling it, so an abandoned query left its requests running. `fan_out_query` now spawns into a `tokio::task::JoinSet`, which owns its tasks and aborts them all when it's dropped.
+
+The alert inventory used to decode `{}` as "no alerts". Bun and Relish now share one response type with a required list:
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlertsResponse {
+    /// Observed statuses; a missing field is not evidence of an empty list.
+    pub alerts: Vec<AlertStatus>,
+}
+```
+
+Serde refuses to decode a struct when a field without `#[serde(default)]` is missing, so only an explicit `{"alerts": []}` now means "nothing is firing".
+
 ## What we learned
 
 ### Reuse the query engine, don't build one
@@ -314,37 +388,34 @@ The lesson: don't build config for things that have obvious defaults. Ship the d
 
 ### "How far back do we look?" is not "how stale may this be?"
 
-Node A reports 95% CPU. A second later, node B reports 10%. If we keep only
-one reading per metric name, B's healthy reading hides A's problem. The regression
-`healthy_series_cannot_hide_another_nodes_alert` reproduces exactly that failure.
+The first evaluator queried the last 120 seconds and kept the newest row per metric *name*, discarding the timestamp and the labels. Dropping the timestamp made the query window double as a freshness guarantee, so a metric that stopped arriving 110 seconds ago still looked live. Those are different questions, and they now have different names: `QUERY_WINDOW_SECS` and `MAX_VALUE_AGE_SECS`.
 
-The evaluator now keeps each `MetricKey`: the metric name plus its sorted label
-map. Its state belongs to `(rule_name, labels)`. Two nodes, or two namespaces
-running an app with the same name, have independent pending timers, firing
-states and recoveries. `BTreeMap` gives the labels a stable order; deriving `Ord`
-and `PartialOrd` on our private `AlertInstance` lets Rust compare those compound
-keys without hand-written comparison code. We reuse the existing metric type
-rather than inventing another representation at the query boundary.
+Dropping the labels was worse. Node A reports 95% CPU; a second later node B reports 10%. Keep one reading per name and B's healthy number hides A's problem. So an alert is keyed on the rule *and* the series:
 
-Freshness remains a separate decision. `QUERY_WINDOW_SECS` bounds the query;
-`MAX_VALUE_AGE_SECS` decides whether a returned reading is usable. Memory and disk
-percentages require fresh numerator and denominator readings with identical
-labels. Invalid labels and non-finite values provide no recovery evidence.
-Missing data cancels an inconclusive pending timer but leaves a firing alert
-active. Only a healthy reading from that same series resolves it.
+```rust
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct AlertInstance {
+    rule_name: String,
+    labels: BTreeMap<String, String>,
+}
+```
 
-Labels travel with API statuses, dashboard rows and webhook notifications.
-PagerDuty's deduplication key includes a SHA-256 digest of the canonical label
-JSON, so resolving A cannot close B's incident. Diagnostic collection also keeps
-the labels when deduplicating repeated reports of the same incident. App-scoped
-diagnostic collection remains explicitly unsupported; not every metric carries
-an application identity.
+The evaluator keeps a `BTreeMap<AlertInstance, AlertState>`. A `BTreeMap` is sorted, so its keys must be orderable, and deriving `PartialOrd` and `Ord` gives us that: Rust compares fields in declaration order, with no hand-written comparison. Each series now has its own pending timer, firing state and recovery, and only a fresh healthy reading from the *same* series resolves an alert. The labels reach the webhooks too, so resolving A can't close B's PagerDuty incident.
 
-The tests exercise independent pending, firing and recovery transitions, missing
-and stale data, namespace collisions and notification identities. One writes two
-labelled series to a real Parquet-backed store and queries them through the same
-path the production evaluator uses. Keeping labels in a unit-test map wouldn't
-help if the SQL path discarded them first.
+### A test that passed for the wrong reason
+
+A dependency advisory flagged the Thrift crate that Parquet used to decode file metadata: a crafted length could make it reserve absurd amounts of memory. Parquet 59 replaced Thrift with its own decoder, and DataFusion 55 uses Parquet 59, so we upgraded DataFusion by ten major versions. It changed two lines of ours, because we never name `parquet` in `Cargo.toml`; we use DataFusion's re-export (`datafusion::parquet::...`) and always get the version DataFusion was built against. We kept regression tests that corrupt a real Parquet file's metadata and check that the reader refuses it.
+
+We ran them on a Mac, they passed, and we moved on. Then Linux CI aborted the entire test process: "memory allocation of 206158430112 bytes failed". The impossible-count test declares two billion schema elements, and Parquet 59 calls `Vec::with_capacity` with that count before checking there are bytes to back it. macOS happily hands out 206 GB of address space you never touch, and the decoder fails on the next byte with an ordinary error. Linux refuses the reservation, and Rust's default response to a failed allocation is to abort the process. The same corrupted archive that returned `Err` on a laptop would take down a production node.
+
+Upstream had fixed it in Parquet 60, but DataFusion 55 still needs 59. So we forked arrow-rs, applied that one commit to the 59.3.0 tag, and pointed Cargo at the fork:
+
+```toml
+[patch.crates-io]
+parquet = { git = "https://github.com/reliaburger/arrow-rs", rev = "34ac1864f214da1648b05fbd1a2b6de4f2b4a952" }
+```
+
+`[patch.crates-io]` replaces a crates.io package everywhere in the build, so DataFusion picks up the fixed decoder too. We patch all fifteen arrow-rs crates to the same revision: patching only `parquet` would build a second copy of the Arrow crates, and Rust treats a type from one copy as unrelated to the "same" type from the other. The block goes once DataFusion moves to a fixed Parquet. The lesson: a test only proves something on the platform where it ran.
 
 ### Server-rendered HTML with meta refresh beats React
 
@@ -388,313 +459,3 @@ make observability-demo      # live, end-to-end
 The cross-node and aggregation pieces — querying logs across the whole cluster, hierarchical metric rollups, exporting to S3 — are *advanced* observability, and their integration tests (`tests/metrics_aggregation.rs`, `tests/logs_cross_node.rs`, `tests/log_export.rs`) belong to Chapter 11. This chapter is the single-node foundation they build on.
 
 All of these run in the portable suite: `make test` (which drives them through nextest). No root, no eBPF, no network, no platform-specific runtime, and no fixed sleeps — the flush concurrency test drives both the write and the read to completion with `tokio::join!` rather than guessing at a delay. Chapter 15 covers the suite taxonomy and why a test that can pass without executing its promised behaviour is worse than no test.
-
-### Report export failures before the disk fills
-
-The disk-pressure loop already refused to delete content that hadn't been
-exported, but it discarded export errors. A broken destination could therefore
-leave the disk filling with no explanation. `PressureResult` now carries an
-optional export error, and Bun prints it with the affected store's name.
-
-The regression writes a log file, configures an unsupported export destination,
-and sets the pressure threshold below the file's size. It asserts both that the
-failure is reported and that the local file survives. Reporting a failed backup
-mustn't turn it into permission to delete the only copy.
-
-### Offline exports must report partial success
-
-Copying the archive is only half an incremental export. We also need to persist
-which files were copied. The offline CLI used to discard a checkpoint write
-failure and print success. It now returns an error that says the files arrived
-but a later export may repeat them. The `?` operator propagates that error before
-we print the success message. A CLI regression makes the checkpoint path a
-directory, then checks both the copied bytes and the non-zero exit status.
-
-`relish logs-export --source PATH --dest PATH` explicitly selects a local store,
-including a custom store whose agent is stopped. A second regression exports
-twice and verifies that the saved checkpoint suppresses the second copy.
-Destinations must be UTF-8 because the object-store interface takes text;
-rejecting an invalid path is safer than silently exporting to a different one.
-
-### Preserve each archive generation
-
-A local flush counter can restart at zero after retention removes every file.
-That makes `logs_000000.parquet` a reusable filename, not a permanent identity.
-Previously the checkpoint noticed new bytes, but the remote write still replaced
-the old object. We now put the full SHA-256 digest in both the checkpoint identity
-and the archive filename. The `.parquet` extension remains at the end so existing
-SQL archive queries discover both generations.
-
-The regression uses actual Parquet files and DataFusion. It exports one batch,
-saves and reloads the checkpoint, removes the local file, restarts the store and
-exports a second batch under the same local name. Querying the archive must return
-both rows. Checking only the number of successful uploads missed the original bug.
-
-Old short-hash checkpoints cannot establish that an immutable object exists.
-Surviving source files are therefore exported again under the new names. Existing
-legacy archive objects are left untouched; a mixed legacy/new archive can contain
-duplicate rows for that migration batch. We prefer that explicit migration
-limitation to deleting an old object whose provenance we cannot establish.
-
-### An acknowledgement belongs to one destination
-
-Exporting to archive A doesn't mean the same bytes exist in archive B. The
-checkpoint now includes a scope derived from the destination URL and node prefix.
-Changing either clears its acknowledgements. We store a hash of the scope rather
-than the URL itself, so a checkpoint doesn't copy credentials embedded in a URL.
-This hash identifies the export context; it is not an authentication mechanism.
-
-An old checkpoint without a scope is also untrusted for skipping uploads. The
-immutable names from the previous fix make repeated exports safe. Keeping one
-active scope is deliberately simple: switching back to an earlier destination
-may repeat writes, but it cannot mistake another archive's receipt for this one.
-
-The pruner checks the scope as well as the content identity. Our regression
-exports to a working destination, switches to an unwritable destination, then
-forces disk pressure. The source must survive. Another test changes both the
-destination and node prefix across checkpoint reloads and queries every archive.
-
-### Own the whole export transaction
-
-Sharing a checkpoint pathname didn't serialise its writers. The periodic task,
-disk-pressure task, API handler and offline CLI could each load an old snapshot
-and later replace a newer one. They now call the same transaction: acquire a
-non-blocking file lock, load the latest checkpoint, export, then persist it before
-returning success. A competing writer gets a busy error and can retry. Corrupt or
-unreadable state is an error, not an empty receipt.
-
-The lock is a separate persistent file. Replacing the JSON atomically must not
-replace the inode that other processes lock. Checkpoint writes use a private
-unique temporary file, sync its contents, rename it, and sync the parent directory.
-Disk-pressure cleanup stops if export or checkpoint persistence fails. The agent
-reports the error through its existing export-error path instead of discarding it.
-
-The blocking persistence closure takes ownership of the lock with `move`. A
-closure is Rust's anonymous function; `move` transfers captured values into it.
-Here that matters if the async caller is cancelled: the blocking filesystem write
-can finish while still holding its lock. Dropping the caller must not admit the
-next writer before the old rename finishes. On return, the committed snapshot
-replaces the caller's borrowed checkpoint; stale caller state never drives uploads.
-
-Regressions exercise a held lock, stale snapshots, corrupt checkpoint data,
-agent exports and the offline CLI's non-zero error result. Actual power-loss and
-storage-device durability qualification remains part of the release recovery gate.
-
-### Report source failures
-
-A directory whose name ends in `.parquet` used to look like an empty successful
-export: the read failed and the loop continued. We now reject non-regular entries
-and invalid filenames, and propagate directory and file I/O errors with their
-source path. The only skipped read error is `NotFound`, because retention can
-remove an immutable file between enumeration and opening it.
-
-Directory enumeration and file reads use Tokio's asynchronous filesystem API.
-The directory regression runs on both supported host platforms. The invalid-byte
-filename regression is Linux-only: macOS APFS rejects that filename when creating
-the fixture, before our exporter can inspect it. That platform boundary belongs
-in the test definition rather than a silent successful early return.
-
-### Retention counts successful removals
-
-Metrics and rollup pruning previously ignored `remove_file` errors and incremented
-the deletion count anyway. A directory named `blocked.parquet` was enough to make
-both stores claim they had reclaimed a file that still existed. They now increment
-only after a successful removal and return filesystem failures with the affected
-path. A concurrent `NotFound` is harmless but does not count as our deletion;
-a not-yet-created store directory remains an empty store. Directory enumeration
-errors also reach the caller. A failed pass can have removed earlier files, so
-callers must treat its error as incomplete retention, not an all-or-nothing rollback.
-Both store regressions verify that the failed candidate's contents survive.
-
-### Keep receipts for live source generations
-
-An export checkpoint is evidence that a current source file reached its configured
-destination. It need not be a permanent catalogue of the archive. After a complete
-successful scan, we retain only IDs read from current source files. The same locked,
-durable transaction commits this compacted set. Failed scans leave the previous
-checkpoint intact.
-
-This bounds receipt count by live source generations rather than export history;
-unlimited source retention still means unlimited live receipts. Archived objects
-remain immutable and untouched. If an old source reappears, writing its content
-hash key again is safe. A 32-generation retention/restart regression keeps one
-receipt throughout, skips an immediate duplicate export, and queries all 32
-archived generations afterwards. Destination and pruning tests still apply to
-the smaller checkpoint.
-
-Local rollup receipts prevent repeated ingestion by one aggregator. Cluster query
-merging also retains the original worker/minute/series key, so reassignment to
-another aggregator cannot double-count overlapping history. Chapter 11 explains
-the owned-row endpoint and its persistence and HTTP regressions.
-
-
-### A worker does not need a listening socket
-
-During Linux upgrade qualification, one node could not bind its API. A reporting
-worker on another node had taken that port with an ephemeral listener. Why was
-it listening? The same transport type had been used for both ends of reporting,
-even though workers only send snapshots and rollups.
-
-`TcpReportingSender` implements the existing `ReportingTransport` trait with the
-same framing, TLS connector and node fault gate. Its receive method returns
-`None` immediately. It owns no listener or accept task. The aggregator keeps the
-full transport because it actually receives reports. This also removes two
-unused sockets and tasks from every node.
-
-The transport regression checks fault-gated delivery and the absence of an
-inbound stream. The integration test sends reports from two outbound-only
-workers to a real TCP aggregator. Upgrade tests also bound HTTP requests, so a
-socket that accepts connections without answering cannot hide the failure
-behind an unbounded read. These checks fix the observed listener collision;
-they do not establish that every upgrade failure has the same cause.
-
-
-### Qualifying the parser behind an archive
-
-A dependency advisory named Thrift, which the Parquet reader used to decode file
-metadata. The advisory is about allocation: a crafted length can make the
-decoder reserve far more memory than the file could possibly hold. Who can hand
-us a crafted Parquet file? Mostly nobody. Bun reads archives it wrote itself,
-plus whatever an operator points the remote log query at. But "mostly nobody"
-is a compensating control, not a fix.
-
-Our first attempt copied Parquet 54 into the repository and patched its decoder.
-It worked, and it was honest (the patch was recorded line by line), but it meant
-maintaining 90,000 lines of someone else's code. So we looked again. Parquet 59
-no longer uses the Thrift crate at all: it ships its own metadata decoder.
-DataFusion 55 depends on Parquet 59. Upgrading DataFusion from 45 to 55 removes
-Thrift from our dependency graph, and the unmaintained `paste` macro crate with
-it.
-
-Ten major versions sounds like a migration project. It wasn't, and the reason
-is worth knowing. Our code never names the `parquet` crate in `Cargo.toml`; it
-reaches it through DataFusion's re-export:
-
-```rust
-use datafusion::parquet::file::properties::WriterProperties;
-```
-
-A `pub use` in DataFusion makes its Parquet dependency part of its public API.
-Cargo resolves one version, and we always get the one DataFusion was built and
-tested against. Depending on `parquet` directly as well would risk two copies in
-the build, whose types don't mix: a `WriterProperties` from Parquet 58 isn't a
-`WriterProperties` from Parquet 59, as far as the compiler is concerned.
-
-The upgrade changed exactly two lines of ours. Parquet 59 marks two writer
-methods with `#[deprecated]`, an attribute that makes the compiler warn at every
-call site. We build with warnings as errors, so the old names had to go:
-
-```rust
-let mut builder = WriterProperties::builder()
-    .set_compression(Compression::ZSTD(ZstdLevel::default()))
-    .set_max_row_group_row_count(Some(LOG_ROW_GROUP_SIZE));
-```
-
-The new method takes an `Option<usize>`, where `None` means "no row limit".
-We read the deprecated implementations before renaming: both simply forward to
-their replacements, so the files we write are unchanged.
-
-The regression tests stay, because they check the parser we actually ship
-rather than a version number. That turned out to matter more than we expected. Each one writes a real one-row Parquet file,
-edits a metadata field, fixes up the footer length and asks the public reader
-to open it. An impossible list count must be refused before allocation. A
-truncated `double` must return an error, not panic. An unknown field must be
-skipped with the same bounds as a known one.
-
-Two tests changed their minds. Parquet's varint decoder is lenient: extra
-continuation bytes wrap around instead of failing, and oversized `i32` values
-truncate. That can garble a metadata integer, but the loop stops when the input
-runs out, so it can't hang or run away with memory. We now assert only that
-opening such a file returns:
-
-```rust
-let _ = accepts(&bytes);
-```
-
-`let _ =` evaluates the expression and deliberately throws the result away.
-Here it says "accept or refuse, we don't mind". A panic would still fail the
-test.
-
-### A test that passed for the wrong reason
-
-We ran the upgrade on a Mac, every safety test passed, and we deleted the
-vendored copy. Then Linux CI aborted the whole test process: "memory allocation
-of 206158430112 bytes failed". The impossible-count test declares a list of two
-billion schema elements, and Parquet 59 calls `Vec::with_capacity` with that
-count before checking there are enough bytes to back it. On macOS, asking for
-206 GB of address space succeeds as long as you never touch it, and the
-decoder then fails on the next byte with an ordinary error. Linux refuses the
-reservation, and Rust's default response to a failed allocation is to abort
-the process, not to return an error. The same crafted or corrupted archive
-that returned `Err` on a laptop would take down a production node.
-
-Upstream had already fixed it in Parquet 60 by bounding every list count by
-the bytes that remain. DataFusion 55 still requires Parquet 59, though, and
-the fix wasn't backported. Rather than vendoring 90,000 lines again, we forked
-the upstream repository, applied that one commit to the 59.3.0 tag, and told
-Cargo to use the fork:
-
-```toml
-[patch.crates-io]
-parquet = { git = "https://github.com/reliaburger/arrow-rs", rev = "34ac1864f214da1648b05fbd1a2b6de4f2b4a952" }
-```
-
-`[patch.crates-io]` replaces a crates.io package everywhere in the build, not
-just in our own dependencies, so DataFusion picks up the fixed decoder too. We
-patch all fifteen arrow-rs crates to the same revision. Patching only
-`parquet` would have made Cargo build a second copy of the Arrow crates it
-depends on, and Rust treats a type from one copy as unrelated to the "same"
-type from the other. The block goes away as soon as DataFusion moves to a
-Parquet release that contains the fix. The tests, and running them on the
-platform we ship to, are what tell us when that is.
-
-The metric, rollup and log restart and query suites complete the picture: a
-dependency scan and a parser regression are different evidence, and we want
-both.
-
-### A log query owns its response bodies
-
-A peer can send `200 OK` and then stop sending the JSON body. Timing only
-`request.send()` doesn't protect us: that future completes when the headers
-arrive. The query can still wait indefinitely while reading the entries. We
-wrap the whole request and body-read future in the node's existing timeout.
-Expiry contributes a named node failure; responsive nodes' entries still count.
-
-Cancellation has another ownership trap. Dropping a Tokio `JoinHandle` detaches
-its task, so dropping a vector of handles doesn't stop the network requests.
-We use `JoinSet` instead. This collection owns its spawned tasks and aborts them
-when the set is dropped. `join_next().await` yields one completed task at a time:
-`None` means the set is empty, while `Some` contains either the task's result or
-a task failure. We retain both sorts of failure in the fan-out result.
-
-Two socket fixtures reproduce the old mistakes. One sends headers and the
-first byte of a body, then stalls. The other waits until those headers have
-been sent before cancelling the parent query and checks that the peer sees its
-connection close. The fixture accepts either EOF or a TCP reset after
-cancellation: macOS can reset a connection when its client discards unread
-response bytes. Both prove closure. Other I/O errors still fail, and the
-original two-second observation deadline remains. A caller's timeout is useful
-only if the work it owns ends too.
-
-### An empty alert list needs evidence
-
-Suppose a node returns `200 OK` with `{}`. Does that mean there are no alerts?
-The old client used a missing-field fallback and answered yes. The diagnostic
-collector could then present a healthy result without having received an alert
-inventory at all.
-
-Bun and Relish now share `AlertsResponse`, whose `alerts` field contains
-`Vec<AlertStatus>`. Serde must find that list and decode each required field.
-`AlertPhase` is an enum with `Inactive`, `Pending` and `Firing` variants;
-`#[serde(rename_all = "lowercase")]` keeps their existing JSON spellings.
-An unknown phase fails decoding instead of disappearing from the report.
-The evaluator's separate `AlertState` still owns its evaluation timestamps;
-the API carries the small serialisable snapshot consumers need.
-
-The client, TUI and `wtf` collector carry these typed statuses all the way
-through. A malformed inventory stays a collection error. An explicit
-`{"alerts": []}` is valid evidence of an empty inventory. Labels remain
-optional for older responses, and pending/firing timestamps remain optional;
-neither changes whether the required rule, phase, severity and description
-can be decoded. HTTP fixtures exercise both refusals and a labelled firing
-response, preserving the existing wire values without contacting a cluster.
