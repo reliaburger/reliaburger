@@ -249,3 +249,121 @@ fn job_rerun_rejects_non_job_manifests_before_contacting_the_agent() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("only non-scheduled jobs"));
 }
+
+/// Z1.4: `relish apply -f app.yaml` imports Kubernetes YAML in memory,
+/// prints the migration report to stderr and applies the converted
+/// config to the agent.
+#[cfg(feature = "kubernetes")]
+#[tokio::test]
+async fn apply_file_flag_applies_kubernetes_yaml_to_the_agent() {
+    use axum::{
+        Router,
+        routing::{get, post},
+    };
+    let applied = std::sync::Arc::new(tokio::sync::Mutex::new(None::<String>));
+    let captured = applied.clone();
+    let complete = serde_json::json!({
+        "type": "Complete", "created": 2, "instances": ["default__web-0", "default__web-1"],
+    });
+    let app = Router::new()
+        .route(
+            "/v1/health",
+            get(|| async { axum::Json(serde_json::json!({"status": "ok"})) }),
+        )
+        .route(
+            "/v1/apply",
+            post(move |body: String| {
+                let captured = captured.clone();
+                let complete = complete.clone();
+                async move {
+                    *captured.lock().await = Some(body);
+                    (
+                        [("content-type", "text/event-stream")],
+                        format!("data: {complete}\n\n"),
+                    )
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let directory = tempfile::tempdir().unwrap();
+    let manifest = directory.path().join("web.yaml");
+    std::fs::write(
+        &manifest,
+        r#"apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 2
+  template:
+    spec:
+      containers:
+      - name: web
+        image: nginx:1
+        args: ["-g", "daemon off;"]
+        ports:
+        - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+spec:
+  ports:
+  - port: 8080
+    targetPort: 80
+"#,
+    )
+    .unwrap();
+
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_relish"))
+            .args(["apply", "-f", manifest.to_str().unwrap()])
+            .env("RELIABURGER_ENDPOINT", &endpoint)
+            .env_remove("RELIABURGER_TOKEN")
+            .env_remove("RELIABURGER_CA_CERT")
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    server.abort();
+    let _ = server.await;
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr: {stderr}");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("deployed 2 instance(s)"));
+    assert!(stderr.contains("Deployment/web → [app.web]"), "{stderr}");
+    assert!(
+        stderr.contains("port 8080 forwards to container port 80"),
+        "the migration report must reach the operator: {stderr}"
+    );
+
+    let body = applied
+        .lock()
+        .await
+        .clone()
+        .expect("agent received the apply");
+    let config = reliaburger::config::Config::parse(&body).unwrap();
+    let web = &config.app["web"];
+    assert_eq!(web.image.as_deref(), Some("nginx:1"));
+    assert_eq!(web.args, ["-g", "daemon off;"]);
+    assert_eq!(web.port, Some(80));
+    assert_eq!(web.replicas, reliaburger::config::Replicas::Fixed(2));
+}
+
+#[test]
+fn apply_refuses_plain_http_manifest_urls() {
+    let output = run(&["apply", "-f", "http://example.com/app.yaml", "--dry-run"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("only https:// URLs are accepted"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

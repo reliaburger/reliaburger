@@ -102,7 +102,7 @@ tutorial, because a tutorial over a broken path is a lie.
   Service `port` → `targetPort` mapping, warn on non-HTTP readiness probes and
   extra ports instead of dropping them silently, and import `args` separately
   from `command` so Z1.1's rules apply.
-- [ ] **Z1.4 Apply Kubernetes YAML directly.** `relish apply -f app.yaml` (and
+- [x] **Z1.4 Apply Kubernetes YAML directly.** `relish apply -f app.yaml` (and
   an `https://` URL) runs the import in memory and prints the migration report,
   so "run your Kubernetes app" is one command. `relish import` stays for people
   who want the TOML.

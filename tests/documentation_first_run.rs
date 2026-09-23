@@ -564,8 +564,8 @@ fn published_first_run_snippets_do_not_drift() {
     for document in documents {
         let text = std::fs::read_to_string(&document).unwrap();
         assert!(
-            text.contains("relish apply") && !text.contains("relish apply -f"),
-            "{} publishes the wrong apply syntax",
+            text.contains("relish apply"),
+            "{} no longer shows how to apply a manifest",
             document.display()
         );
         // A published join command must show the required node id. The
@@ -610,12 +610,9 @@ command = ["true"]
 
     let apply = run_relish(&["apply", app.to_str().unwrap(), "--dry-run"]);
     assert_success(&apply, "positional apply path");
-    let stale_apply = run_relish(&["apply", "-f", app.to_str().unwrap()]);
-    assert_eq!(
-        stale_apply.status.code(),
-        Some(2),
-        "the old -f shape should remain a visible clap error"
-    );
+    // Z1.4: `-f` is the kubectl spelling, and it takes Kubernetes YAML too.
+    let file_apply = run_relish(&["apply", "-f", app.to_str().unwrap(), "--dry-run"]);
+    assert_success(&file_apply, "apply -f path");
 
     // Port 1 refuses immediately. Exit 1 proves clap accepted the complete
     // documented shape and dispatched the join handler; a syntax error is 2.

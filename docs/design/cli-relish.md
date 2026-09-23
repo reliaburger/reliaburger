@@ -626,6 +626,7 @@ relish --help                       # Print help and exit
 # Core operations
 relish status                       # Per-instance status table (app, state, PID, restarts)
 relish apply <path>                 # Apply a TOML config file or directory
+relish apply -f <path-or-https-url> # Same; also takes Kubernetes YAML (imported in memory)
 relish apply <path> --dry-run       # Print the plan, contact no agent (always exits 0)
 relish deploy <path>                # Health-gated rolling deploy from a config file
 relish deploy <path> --dry-run      # Print the plan without deploying
@@ -859,6 +860,14 @@ confirmation prompt and no `--yes` flag. Exits 0 on success, 1 on failure.
 With `--dry-run`, it prints the apply plan and contacts no agent — always
 exiting 0, even when no agent is running. The plan uses `ApplyPlan`'s display
 (see `relish deploy` below for the format).
+
+The manifest can be given positionally or with `-f`/`--file` (the kubectl
+spelling), as a local path or an `https://` URL. Plain `http://` is refused.
+Downloads are limited to 1 MiB and 30 seconds, and redirects must stay on
+HTTPS. A document with top-level `apiVersion:` and `kind:` lines is Kubernetes
+YAML: `relish apply` runs the `relish import` conversion in memory, prints the
+migration report to stderr, validates the result and applies it. Anything else
+is parsed as Reliaburger TOML.
 
 **`relish deploy <path>`**
 

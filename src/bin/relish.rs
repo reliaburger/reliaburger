@@ -53,10 +53,23 @@ enum Command {
         #[arg(long)]
         no_open: bool,
     },
-    /// Apply configuration from a file or directory.
+    /// Apply a Reliaburger TOML or Kubernetes YAML manifest.
+    ///
+    /// Kubernetes YAML (a document with `apiVersion` and `kind`) is imported
+    /// in memory; its migration report goes to stderr.
+    #[command(group(clap::ArgGroup::new("manifest").required(true)))]
     Apply {
-        /// Path to a TOML config file or directory.
-        path: PathBuf,
+        /// Manifest path or https:// URL.
+        #[arg(group = "manifest", value_name = "PATH_OR_URL")]
+        path: Option<String>,
+        /// Manifest path or https:// URL (the kubectl spelling).
+        #[arg(
+            short = 'f',
+            long = "file",
+            group = "manifest",
+            value_name = "PATH_OR_URL"
+        )]
+        file: Option<String>,
         /// Show the plan without deploying (exits 0 even with no agent).
         #[arg(long)]
         dry_run: bool,
@@ -1101,15 +1114,17 @@ async fn main() -> ExitCode {
         Command::Tui => reliaburger::relish::tui::run().await,
         Command::Apply {
             ref path,
+            ref file,
             dry_run,
             rerun_jobs,
-        } => {
-            if rerun_jobs {
-                commands::rerun_jobs(path).await
-            } else {
-                commands::apply(path, cli.output, dry_run).await
-            }
-        }
+        } => match reliaburger::relish::manifest::ManifestSource::parse(
+            // The ArgGroup makes exactly one of the two present.
+            path.as_deref().or(file.as_deref()).unwrap_or_default(),
+        ) {
+            Err(error) => Err(error),
+            Ok(source) if rerun_jobs => commands::rerun_jobs(&source).await,
+            Ok(source) => commands::apply(&source, cli.output, dry_run).await,
+        },
         Command::Status => commands::status(cli.output).await,
         Command::Dashboard { port, no_open } => {
             reliaburger::relish::dashboard::run(port, no_open).await
@@ -2080,7 +2095,32 @@ mod tests {
     fn parse_apply_command() {
         let cli = parse(&["relish", "apply", "config.toml"]).unwrap();
         assert!(
-            matches!(cli.command, Command::Apply { ref path, dry_run: false, rerun_jobs: false } if path.to_str() == Some("config.toml"))
+            matches!(cli.command, Command::Apply { ref path, file: None, dry_run: false, rerun_jobs: false } if path.as_deref() == Some("config.toml"))
+        );
+    }
+
+    /// Z1.4: `-f` takes a path or URL, the kubectl way; the positional
+    /// form keeps working, and exactly one of them is required.
+    #[test]
+    fn parse_apply_file_flag_and_url() {
+        for flag in ["-f", "--file"] {
+            let cli = parse(&["relish", "apply", flag, "app.yaml"]).unwrap();
+            assert!(
+                matches!(cli.command, Command::Apply { path: None, ref file, .. } if file.as_deref() == Some("app.yaml"))
+            );
+        }
+        let url = "https://reliaburger.com/demo/podinfo.yaml";
+        let cli = parse(&["relish", "apply", "-f", url, "--dry-run"]).unwrap();
+        assert!(
+            matches!(cli.command, Command::Apply { ref file, dry_run: true, .. } if file.as_deref() == Some(url))
+        );
+        assert!(
+            parse(&["relish", "apply"]).is_err(),
+            "a manifest is required"
+        );
+        assert!(
+            parse(&["relish", "apply", "a.toml", "-f", "b.yaml"]).is_err(),
+            "one manifest at a time"
         );
     }
 

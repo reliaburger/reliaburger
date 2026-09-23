@@ -28,6 +28,7 @@ pub mod k8s_export;
 )]
 pub mod k8s_import;
 pub mod local_context;
+pub mod manifest;
 pub mod manual;
 pub mod output;
 pub mod plan;
@@ -152,6 +153,10 @@ pub enum RelishError {
     /// TOML formatting failed.
     #[error("format failed: {0}")]
     FormatFailed(String),
+
+    /// A manifest URL could not be downloaded.
+    #[error("failed to fetch manifest {url}: {reason}")]
+    ManifestFetch { url: String, reason: String },
 
     /// IO error.
     #[error("{0}")]

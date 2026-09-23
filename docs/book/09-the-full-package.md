@@ -605,6 +605,31 @@ Dropped (no Reliaburger equivalent):
 
 CRDs, ServiceAccounts, PodDisruptionBudgets, RBAC — these either have no equivalent or are handled automatically by Reliaburger (SPIFFE replaces ServiceAccounts, deploy config replaces PDBs). The report tells you exactly what to review.
 
+### Skipping the TOML
+
+Import-then-apply is two commands and a file you didn't want. So `relish apply` takes Kubernetes YAML directly, from a path or an `https://` URL:
+
+```sh
+relish apply -f https://reliaburger.com/demo/podinfo.yaml
+```
+
+How does it know? A top-level `apiVersion:` line isn't valid TOML, so a document with `apiVersion:` and `kind:` at the start of a line can only be Kubernetes. That document goes through the same importer in memory, its migration report still lands on stderr (applying mustn't hide what it approximated), and the resulting `Config` is validated and applied like any TOML file.
+
+The download is where a convenience turns into an attack surface, so it's deliberately narrow: HTTPS only (redirects too, via reqwest's `https_only`), a 30-second timeout and a 1 MiB cap enforced while reading, not just from the `Content-Length` header a server can lie about. The CLI accepts the manifest positionally or with `-f`, and clap's `ArgGroup` makes exactly one of them required:
+
+```rust
+#[command(group(clap::ArgGroup::new("manifest").required(true)))]
+Apply {
+    #[arg(group = "manifest")]
+    path: Option<String>,
+    #[arg(short = 'f', long = "file", group = "manifest")]
+    file: Option<String>,
+    // ...
+}
+```
+
+A group is clap's way of saying "these arguments are alternatives": `required(true)` demands one, and membership in the group makes any two of them a usage error. The compiler can't express "exactly one of two `Option`s is `Some`" in the type, so clap checks it at parse time and the handler can rely on it.
+
 ### Export: the reverse direction
 
 `relish export` reads a TOML config and produces multi-document K8s YAML. Each app becomes a Deployment + Service (or DaemonSet). Ingress, HPA, ConfigMap, and Secret resources are added when the relevant config sections exist.

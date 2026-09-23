@@ -23,14 +23,32 @@ use crate::bun::agent::CouncilStatus;
 /// Without `--dry-run`, an unreachable agent is an error: the plan is
 /// still printed for reference, but the exit code is non-zero so
 /// scripts and CI cannot mistake "nothing happened" for a deploy.
-pub async fn apply(path: &Path, output: OutputFormat, dry_run: bool) -> Result<(), RelishError> {
-    apply_with_client(path, output, dry_run, &BunClient::default_local()).await
+///
+/// The manifest is Reliaburger TOML or Kubernetes YAML, from a file or an
+/// `https://` URL. Kubernetes YAML is imported in memory and its migration
+/// report printed to stderr before anything is applied.
+pub async fn apply(
+    source: &super::manifest::ManifestSource,
+    output: OutputFormat,
+    dry_run: bool,
+) -> Result<(), RelishError> {
+    apply_with_client(source, output, dry_run, &BunClient::default_local()).await
+}
+
+/// Read a manifest for `apply`, printing any migration report to stderr.
+async fn load_manifest(source: &super::manifest::ManifestSource) -> Result<Config, RelishError> {
+    let loaded = super::manifest::load(source).await?;
+    if let Some(report) = &loaded.migration_report {
+        eprint!("{report}");
+        eprintln!();
+    }
+    loaded.config.validate()?;
+    Ok(loaded.config)
 }
 
 /// Explicitly rerun a node-local job manifest, including unknown prior outcomes.
-pub async fn rerun_jobs(path: &Path) -> Result<(), RelishError> {
-    let config = Config::from_file(path)?;
-    config.validate()?;
+pub async fn rerun_jobs(source: &super::manifest::ManifestSource) -> Result<(), RelishError> {
+    let config = load_manifest(source).await?;
     let result = BunClient::default_local()
         .apply_rerunning_jobs(&config)
         .await?;
@@ -43,13 +61,12 @@ pub async fn rerun_jobs(path: &Path) -> Result<(), RelishError> {
 }
 
 async fn apply_with_client(
-    path: &Path,
+    source: &super::manifest::ManifestSource,
     output: OutputFormat,
     dry_run: bool,
     client: &BunClient,
 ) -> Result<(), RelishError> {
-    let config = Config::from_file(path)?;
-    config.validate()?;
+    let config = load_manifest(source).await?;
 
     if dry_run {
         // Diff against the live agent's current state when one answers, so
@@ -2165,6 +2182,38 @@ mod tests {
         f
     }
 
+    fn source(path: &Path) -> crate::relish::manifest::ManifestSource {
+        crate::relish::manifest::ManifestSource::File(path.to_path_buf())
+    }
+
+    /// Z1.4: Kubernetes YAML applies directly, through the importer.
+    #[cfg(feature = "kubernetes")]
+    #[tokio::test]
+    async fn apply_dry_run_accepts_kubernetes_yaml() {
+        let f = write_temp_config(
+            r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  template:
+    spec:
+      containers:
+      - name: web
+        image: nginx:1
+"#,
+        );
+        apply_with_client(
+            &source(f.path()),
+            OutputFormat::Human,
+            true,
+            &bogus_client(),
+        )
+        .await
+        .unwrap();
+    }
+
     /// X5 regression: an unreachable agent used to fall back to a
     /// dry-run plan and exit 0, making dead-agent deploys look green.
     #[tokio::test]
@@ -2176,9 +2225,14 @@ mod tests {
             port = 8080
         "#,
         );
-        let err = apply_with_client(f.path(), OutputFormat::Human, false, &bogus_client())
-            .await
-            .unwrap_err();
+        let err = apply_with_client(
+            &source(f.path()),
+            OutputFormat::Human,
+            false,
+            &bogus_client(),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, RelishError::AgentUnreachable), "got: {err:?}");
     }
 
@@ -2192,16 +2246,21 @@ mod tests {
         "#,
         );
         assert!(
-            apply_with_client(f.path(), OutputFormat::Human, true, &bogus_client())
-                .await
-                .is_ok()
+            apply_with_client(
+                &source(f.path()),
+                OutputFormat::Human,
+                true,
+                &bogus_client()
+            )
+            .await
+            .is_ok()
         );
     }
 
     #[tokio::test]
     async fn apply_with_missing_file_errors() {
         let result = apply_with_client(
-            Path::new("/nonexistent/config.toml"),
+            &source(Path::new("/nonexistent/config.toml")),
             OutputFormat::Human,
             false,
             &bogus_client(),
@@ -2218,7 +2277,13 @@ mod tests {
     #[tokio::test]
     async fn apply_with_invalid_toml_errors() {
         let f = write_temp_config("this is not valid toml [[[");
-        let result = apply_with_client(f.path(), OutputFormat::Human, false, &bogus_client()).await;
+        let result = apply_with_client(
+            &source(f.path()),
+            OutputFormat::Human,
+            false,
+            &bogus_client(),
+        )
+        .await;
         assert!(result.is_err());
     }
 
@@ -2230,7 +2295,13 @@ mod tests {
             replicas = 3
         "#,
         );
-        let result = apply_with_client(f.path(), OutputFormat::Human, false, &bogus_client()).await;
+        let result = apply_with_client(
+            &source(f.path()),
+            OutputFormat::Human,
+            false,
+            &bogus_client(),
+        )
+        .await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(

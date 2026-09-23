@@ -634,7 +634,7 @@ Commands:
 | `manual --web` | Serve the manual as one HTML page and open the browser |
 | `manual examples` | Write the embedded example configs into the current directory |
 | `source [query]` | Browse and fuzzy-search the embedded source tree (e.g. `relish source ebpf`) |
-| `apply <path>` | Deploy workloads from a TOML config file |
+| `apply <path>`, `apply -f <path-or-url>` | Deploy workloads from a TOML config file, or from Kubernetes YAML (imported in memory; migration report on stderr); `-f` also takes an `https://` URL |
 | `dashboard` | Open a read-only web dashboard using the current authenticated CLI context |
 | `status` | List workloads across the cluster with node names; fail if a member cannot answer |
 | `logs <name>` | Show captured stdout/stderr for an app |
