@@ -903,7 +903,7 @@ whole theme lands.
     the rolling path did).
   - [x] Restart-safe rotation (D9): a `meta.json` sidecar (SPIFFE URI + schedule, no secrets)
     lets adoption rebuild each instance's identity and rotation timetable from disk instead of
-    `identity: None`; orphaned/legacy identity dirs are swept at adoption; a rate-limited
+    `identity: None`; orphaned identity dirs are swept at adoption; a rate-limited
     retry provisions running instances that still lack an identity.
   - [x] Verify-before-retire (PKI8): applying an `AppSpec` records the sealing generation per
     encrypted env value (`SecurityState.secret_seals`, self-describing JSON with

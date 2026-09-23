@@ -421,8 +421,8 @@ pub fn write_identity_files(
 /// Load a workload identity back from its per-instance directory.
 ///
 /// Returns `Ok(None)` when no identity has been written there (no
-/// `meta.json`) — a legacy app-scoped directory or a not-yet-provisioned
-/// instance. Used at adoption so a restarted Bun keeps each workload's
+/// `meta.json`, which is written last) — a not-yet-provisioned instance or
+/// an interrupted write. Used at adoption so a restarted Bun keeps each workload's
 /// identity and rotation schedule instead of `identity: None` (D9).
 pub fn load_identity(dir: &Path) -> Result<Option<WorkloadIdentity>, IdentityError> {
     let meta_path = dir.join(IDENTITY_META_FILE);
@@ -1031,13 +1031,13 @@ mod tests {
         assert!(!loaded.grace_extended);
     }
 
-    /// A directory without `meta.json` (legacy app-scoped layout, or a
-    /// not-yet-provisioned instance) loads as `None`, never an error.
+    /// A directory without `meta.json` (a not-yet-provisioned instance or
+    /// an interrupted write) loads as `None`, never an error.
     #[test]
     fn load_identity_returns_none_without_metadata() {
         let dir = tempfile::tempdir().unwrap();
         assert!(load_identity(dir.path()).unwrap().is_none());
-        // A legacy-style dir with stray files but no sidecar: still None.
+        // Stray files from an interrupted write but no sidecar: still None.
         std::fs::write(dir.path().join("cert.pem"), b"stale").unwrap();
         assert!(load_identity(dir.path()).unwrap().is_none());
     }

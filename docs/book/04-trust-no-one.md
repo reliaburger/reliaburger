@@ -1045,11 +1045,10 @@ an enrolment problem.
 
 The store now commits a complete `node.bundle.json` in one private atomic
 replacement. It contains the leaf, matching key, CA certificates and metadata.
-The existing PEM files remain exports, but Bun loads the snapshot. A layout-2
-marker requires that snapshot: a missing or corrupt snapshot cannot silently
-fall back to older exports. Initial installation still writes the marker last.
-A validated layout-1 identity is snapshotted before its exports are replaced,
-so importing that layout doesn't create another partial-write window.
+The existing PEM files remain exports, but Bun loads the snapshot. The marker
+requires that snapshot: a missing or corrupt snapshot cannot silently fall back
+to older exports, and a marker naming any other layout is refused. Initial
+installation still writes the marker last.
 
 Before writing, we verify the chain, issuer names, signed node URI and serial,
 and the private key's match to the leaf. Validity comes from X.509 dates, not

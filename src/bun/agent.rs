@@ -3273,8 +3273,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             println!("bun: adopted {adopted_count} running instance(s) from a previous process");
         }
 
-        // Identity dirs with no live owner — legacy app-scoped layouts and
-        // instances that died while bun was down — are stale key material.
+        // Identity dirs of instances that died while bun was down have no
+        // live owner, so they are stale key material.
         self.finish_discovery_recovery().await?;
         self.sweep_orphaned_identity_dirs().await;
 
@@ -8446,9 +8446,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     /// Remove identity directories that don't belong to any tracked
-    /// instance. Runs once after adoption: legacy app-scoped directories
-    /// and instances that died while bun was down both get swept, so
-    /// stale key material never lingers (PKI7).
+    /// instance. Runs once after adoption, so the key material of instances
+    /// that died while bun was down never lingers (PKI7).
     async fn sweep_orphaned_identity_dirs(&self) {
         let root = self.volumes_dir.join(".identity");
         // Decide what to keep here, then leave the directory walk and file
@@ -18949,9 +18948,9 @@ host = "remote.local"
         );
     }
 
-    /// PKI7: identity directories with no live owner — a legacy
-    /// app-scoped layout, or an instance that died while bun was down —
-    /// are swept at adoption, so stale key material never lingers.
+    /// PKI7: identity directories with no live owner (an instance that died
+    /// while bun was down) are swept at adoption, so stale key material
+    /// never lingers.
     #[tokio::test]
     async fn adoption_sweeps_orphaned_identity_dirs() {
         let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
@@ -18960,12 +18959,8 @@ host = "remote.local"
         agent.set_volumes_dir(volumes.path().to_path_buf());
         agent.set_records_dir(records.path().to_path_buf());
 
-        // A live instance's dir, a legacy app-scoped dir, and a dead
-        // instance's leftovers.
+        // A live instance's dir and a dead instance's leftovers.
         write_test_identity(volumes.path(), "default__web-0");
-        let legacy = volumes.path().join(".identity/default");
-        std::fs::create_dir_all(legacy.join("web")).unwrap();
-        std::fs::write(legacy.join("web/key.pem"), b"legacy key").unwrap();
         let dead = volumes.path().join(".identity/old-app-0");
         std::fs::create_dir_all(&dead).unwrap();
         std::fs::write(dead.join("key.pem"), b"dead key").unwrap();
