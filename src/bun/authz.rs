@@ -110,6 +110,7 @@ pub const ROUTE_MATRIX: &[Route] = &[
     route(Get, "/v1/ws/events", AnyToken),
     route(Get, "/v1/ws/logs/{app}/{namespace}", AnyToken),
     route(Get, "/v1/status/{app}/{namespace}", AnyToken),
+    route(Get, "/v1/top", AnyToken),
     route(Post, "/v1/stop/{app}/{namespace}", Deployer),
     route(Get, "/v1/logs/{app}/{namespace}", AnyToken),
     route(Get, "/v1/logs/entries/{app}/{namespace}", AnyToken),
@@ -130,6 +131,10 @@ pub const ROUTE_MATRIX: &[Route] = &[
     route(Post, "/v1/test/leases/{id}/renew", Deployer),
     route(Delete, "/v1/test/leases/{id}", Deployer),
     route(Get, "/v1/cluster/nodes", AnyToken),
+    // The relay only authenticates; the target node applies the forwarded
+    // route's own requirement to the caller's credential.
+    route(Get, "/v1/nodes/{node}/relay/{*path}", AnyToken),
+    route(Post, "/v1/nodes/{node}/relay/{*path}", AnyToken),
     route(Get, "/v1/cluster/council", AnyToken),
     route(Post, "/v1/upgrade/apply", Admin),
     route(Get, "/v1/upgrade/status", AnyToken),
