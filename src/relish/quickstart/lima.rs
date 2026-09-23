@@ -114,6 +114,30 @@ impl Lima {
         Ok(())
     }
 
+    /// True once the VM has written anything to its serial console.
+    ///
+    /// Lima's VZ driver logs to `serialv.log` and QEMU to `serial.log`; a
+    /// guest that has started its firmware and kernel always writes one.
+    pub async fn console_started(&self, name: &str) -> bool {
+        let Some(home) = &self.home else {
+            return true;
+        };
+        let Ok(mut entries) = tokio::fs::read_dir(home.join(name)).await else {
+            return false;
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let file_name = entry.file_name();
+            let file_name = file_name.to_string_lossy();
+            if file_name.starts_with("serial")
+                && file_name.ends_with(".log")
+                && entry.metadata().await.is_ok_and(|meta| meta.len() > 0)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     /// True once Lima's shared `user-v2` network daemon is running.
     ///
     /// The first `limactl start` launches it, again without re-checking under

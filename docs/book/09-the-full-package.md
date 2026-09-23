@@ -996,6 +996,46 @@ from its first start to its last finish. Adding up the three VM boots would
 say we spent three minutes booting when we spent one; they overlap, and the
 point of the summary is to say where the minutes actually went.
 
+### Measure it, then believe it
+
+We said quickstart took about four minutes, and that was true of one run. So
+we added `--timings`, which prints every step's duration and start offset, and
+made every run save the same data as `timings.json` in the cluster directory,
+failed runs included. Then we ran it over and over on one M2 Max, before and
+after the changes above. The numbers are in `docs/qualification/`; here's what
+they taught us.
+
+The first lesson came before the first VM. The memory preflight refused to
+start three VMs on a 32 GiB Mac because it saw half a GiB available. The
+`sysinfo` crate computes macOS "available" memory as free plus inactive pages,
+*minus* the pages the compressor occupies. Compressed pages never counted as
+free in the first place, so on a busy Mac with ten GiB compressed the result
+is nearly zero while `memory_pressure` reports 60% free. We now ask the kernel
+for that same figure, `kern.memorystatus_level`, and keep `sysinfo` on Linux,
+where `MemAvailable` means what it says.
+
+The second lesson was about variance. Two warm runs out of four had one VM
+boot 90 seconds late. The journal showed why: our own provisioning script
+restarts `systemd-logind`, and sometimes logind spins in `stop-sigterm` until
+systemd's 90-second stop timeout kills it. Lima's "user session is ready"
+check waits with it. A plain restart had been the fix for an earlier SSH
+stall, so we kept the restart and made it brutal: kill logind first, then
+start it. That's the state systemd reached anyway, 90 seconds sooner.
+
+The third was the nastiest. Now and then a VM started and never booted:
+Lima said "running", the serial console stayed completely empty, and SSH
+never answered. We reproduced it with plain `limactl start` and a bare
+Ubuntu image, no Reliaburger code at all, so it lives somewhere between Lima
+and Apple's Virtualization.framework. We can't fix that, but we can notice
+it. A healthy guest prints its login prompt within seconds, so
+`start_watched` races the start command against a 60-second watchdog with
+`tokio::select!`. If the console is still silent when the watchdog fires,
+the `select!` drops the start future, which kills `limactl` (we built its
+`Command` with `kill_on_drop(true)`), then forces the VM off and starts it
+once more. Dropping a future is how you cancel it in Rust; there's no
+`cancel()` method, and no context object to thread through as in Go. A resumed
+setup applies the same test to a VM left "running" by an earlier attempt.
+
 ### Keep the host predictable
 
 The managed Lima home lives inside `RELIABURGER_HOME`, so a user's global Lima

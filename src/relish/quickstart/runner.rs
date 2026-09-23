@@ -676,27 +676,67 @@ async fn start_vm(
     if status != Some("Running") {
         super::preflight::ports(ports).await?;
     }
+    let name = node.name.as_str();
     match status {
         None if node.phase != NodePhase::Planned => bail!(
-            "owned VM {} disappeared; refusing to create a replacement cluster implicitly",
-            node.name
+            "owned VM {name} disappeared; refusing to create a replacement cluster implicitly"
         ),
         None => {
-            lima.command(&[
-                "start",
-                "--tty=false",
-                &format!("--name={}", node.name),
-                config_path.to_str().context("invalid VM config path")?,
-            ])
-            .await?;
+            let config = config_path.to_str().context("invalid VM config path")?;
+            let create = ["start", "--tty=false", &format!("--name={name}"), config];
+            start_watched(lima, name, &create, BOOT_SILENCE, step).await?;
+        }
+        Some("Running") if !lima.console_started(name).await => {
+            // A previous run left a VM that never booted; see BOOT_SILENCE.
+            step.note("restarted a VM that never booted");
+            lima.command(&["stop", "--force", name]).await?;
+            lima.command(&["start", "--tty=false", name]).await?;
         }
         Some("Running") => step.note("already running"),
         Some("Stopped") => {
             step.note("restarted");
-            lima.command(&["start", "--tty=false", &node.name]).await?;
+            let start = ["start", "--tty=false", name];
+            start_watched(lima, name, &start, BOOT_SILENCE, step).await?;
         }
-        Some(status) => bail!("VM {} is in unexpected state {status}", node.name),
+        Some(status) => bail!("VM {name} is in unexpected state {status}",),
     }
+    Ok(())
+}
+
+/// How long a starting VM may print nothing at all on its console.
+///
+/// Measuring showed Apple's Virtualization.framework occasionally starts a VM
+/// that never runs its firmware: Lima reports it running, the console stays
+/// empty and SSH never answers, even with plain `limactl start` and no
+/// Reliaburger involved. A healthy guest prints its login prompt within
+/// seconds of starting, and disk preparation before that takes about ten.
+const BOOT_SILENCE: Duration = Duration::from_secs(60);
+
+/// Run a Lima start command, and if the VM's console is still silent after
+/// `silence`, force it off and start it once more without the watchdog.
+async fn start_watched(
+    lima: &Lima,
+    name: &str,
+    args: &[&str],
+    silence: Duration,
+    step: &Step,
+) -> Result<()> {
+    let start = lima.command(args);
+    let watchdog = async {
+        tokio::time::sleep(silence).await;
+        if lima.console_started(name).await {
+            std::future::pending::<()>().await;
+        }
+    };
+    tokio::select! {
+        result = start => return result.map(drop),
+        () = watchdog => {}
+    }
+    // Dropping the start command above killed limactl; the VM itself is
+    // still registered with Lima, so stop it by name and start it again.
+    step.note("restarted a VM that never booted");
+    lima.command(&["stop", "--force", name]).await?;
+    lima.command(&["start", "--tty=false", name]).await?;
     Ok(())
 }
 
@@ -884,6 +924,62 @@ mod tests {
                 assert_eq!(file.mode, expected, "{}", file.destination);
             }
         }
+    }
+
+    /// A stand-in `limactl` that logs its arguments; a create never returns,
+    /// and writes a console line first only when `boots` is true.
+    fn fake_lima(home: &Path, boots: bool) -> Lima {
+        let script = home.join("limactl");
+        let console = if boots {
+            "mkdir -p \"$LIMA_HOME/vm\"; echo login > \"$LIMA_HOME/vm/serialv.log\"; exit 0"
+        } else {
+            "sleep 30"
+        };
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho \"$*\" >> \"$LIMA_HOME/calls\"\n\
+                 case \"$3\" in --name=*) {console};; esac\n"
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        Lima::new(script, Duration::from_secs(5)).with_home(home.to_owned())
+    }
+
+    #[tokio::test]
+    async fn a_vm_that_never_prints_to_its_console_is_restarted_once() {
+        let home = tempfile::tempdir().unwrap();
+        let lima = fake_lima(home.path(), false);
+        let step = super::super::progress::tests_support::detached_step();
+        let create = ["start", "--tty=false", "--name=vm", "vm.yaml"];
+        start_watched(&lima, "vm", &create, Duration::from_millis(200), &step)
+            .await
+            .unwrap();
+        let calls = std::fs::read_to_string(home.path().join("calls")).unwrap();
+        assert_eq!(
+            calls.lines().collect::<Vec<_>>(),
+            [
+                "start --tty=false --name=vm vm.yaml",
+                "stop --force vm",
+                "start --tty=false vm"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_vm_that_boots_is_left_alone() {
+        let home = tempfile::tempdir().unwrap();
+        let lima = fake_lima(home.path(), true);
+        let step = super::super::progress::tests_support::detached_step();
+        let create = ["start", "--tty=false", "--name=vm", "vm.yaml"];
+        start_watched(&lima, "vm", &create, Duration::from_millis(200), &step)
+            .await
+            .unwrap();
+        assert!(lima.console_started("vm").await);
+        let calls = std::fs::read_to_string(home.path().join("calls")).unwrap();
+        assert_eq!(calls.lines().count(), 1, "{calls}");
     }
 
     #[tokio::test]
