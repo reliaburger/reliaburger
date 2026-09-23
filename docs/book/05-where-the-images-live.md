@@ -609,17 +609,17 @@ wrote a layer to `blobs/sha256/<digest>`, while Pickle wrote it to
 runtime created a flat file, the registry could no longer create its directory.
 The fallback then pulled upstream again instead of using the bytes on disk.
 
-Both stores now use one path resolver. New blobs use the registry layout, and
-existing flat files remain readable and writable. Enumeration recognises both
-forms and ignores temporary filenames. A regression writes through the registry
-and reads through the runtime, then repeats with a legacy flat file.
+Both stores now use one path resolver and one layout, the registry's. Nothing
+has shipped yet, so there's no flat-file cache in the wild to keep reading.
+Enumeration ignores temporary filenames. A regression writes through the
+registry and reads through the runtime.
 
 That exposed a second assumption: rootfs generation IDs hashed each layer's
 filename. Every registry layer's filename is `data`, so replacing a layer could
-reuse the previous rootfs generation. We now extract the digest from its parent
-for that layout. The same ordered digests produce the same generation in both
-layouts, and changed digests produce a new generation without touching a running
-container's files. The tests exercise those properties directly.
+reuse the previous rootfs generation. We now take the digest from the parent
+directory's name instead. Changed digests produce a new generation without
+touching a running container's files. The tests exercise that property
+directly.
 
 Digest pins also contain a colon (`sha256:...`), as do registries with explicit
 ports. That character separates lower layers in overlayfs mount options. We

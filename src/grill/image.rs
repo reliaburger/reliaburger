@@ -177,7 +177,7 @@ pub type ClusterFetchFuture<'a> = std::pin::Pin<
 /// Disk layout:
 /// ```text
 /// {store_root}/
-///   blobs/sha256/{digest}                    — raw layer blobs
+///   blobs/sha256/{digest}/data               — raw layer blobs
 ///   rootfs/{registry}/{repo}/{tag}/          — unpacked filesystem
 ///   manifests/{registry}/{repo}/{tag}.json   — cached manifests
 /// ```
@@ -195,14 +195,9 @@ pub struct ImageStore {
     unpack_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
 
-/// Resolve shared registry/runtime storage, retaining older flat cache entries.
+/// The path of a blob in the storage shared by the registry and the runtime.
 pub(crate) fn cached_blob_path(root: &Path, digest: &str) -> PathBuf {
-    let legacy = root.join("blobs").join("sha256").join(digest);
-    if legacy.is_file() {
-        legacy
-    } else {
-        legacy.join("data")
-    }
+    root.join("blobs").join("sha256").join(digest).join("data")
 }
 
 impl ImageStore {
@@ -272,15 +267,12 @@ impl ImageStore {
     pub fn rootfs_generation_path(&self, tag_rootfs: &Path, layer_paths: &[PathBuf]) -> PathBuf {
         let mut hasher = Sha256::new();
         for path in layer_paths {
-            // The blob filename is the layer's sha256 hex — immutable
-            // content identity. Hash the ordered set into one generation id.
-            let digest_path = if path.file_name().is_some_and(|name| name == "data") {
-                path.parent().unwrap_or(path)
-            } else {
-                path.as_path()
-            };
-            let name = digest_path
-                .file_name()
+            // Every blob sits at `{digest}/data`, so the parent directory's
+            // name is the layer's sha256 hex — immutable content identity.
+            // Hash the ordered set into one generation id.
+            let name = path
+                .parent()
+                .and_then(Path::file_name)
                 .unwrap_or_default()
                 .to_string_lossy();
             hasher.update(name.as_bytes());
@@ -791,7 +783,7 @@ mod tests {
     // -- Store path construction -----------------------------------------------
 
     #[test]
-    fn registry_and_runtime_share_new_and_legacy_blobs() {
+    fn registry_and_runtime_share_blobs() {
         let root = tempfile::tempdir().unwrap();
         let image = ImageStore::new(root.path().to_path_buf());
         let registry = crate::pickle::store::BlobStore::new(root.path());
@@ -806,14 +798,6 @@ mod tests {
             image.blob_path(digest.as_str()),
             registry.blob_path(&digest)
         );
-
-        let legacy = crate::pickle::store::compute_sha256(b"old layer");
-        let path = root.path().join("blobs/sha256").join(legacy.hex());
-        std::fs::write(&path, b"old layer").unwrap();
-        registry.write_blob(b"old layer", &legacy).unwrap();
-        assert_eq!(registry.read_blob(&legacy).unwrap(), b"old layer");
-        assert_eq!(image.blob_path(legacy.as_str()), path);
-        assert!(registry.list_blobs().unwrap().contains(&legacy));
     }
 
     #[test]
@@ -823,10 +807,6 @@ mod tests {
         let first = store.rootfs_generation_path(root, &[PathBuf::from("/blobs/aaaa/data")]);
         let second = store.rootfs_generation_path(root, &[PathBuf::from("/blobs/bbbb/data")]);
         assert_ne!(first, second);
-        assert_eq!(
-            first,
-            store.rootfs_generation_path(root, &[PathBuf::from("/blobs/aaaa")])
-        );
     }
 
     #[test]
@@ -867,22 +847,22 @@ mod tests {
         let gen_a = store.rootfs_generation_path(
             &tag_rootfs,
             &[
-                PathBuf::from("/b/sha256/aaaa"),
-                PathBuf::from("/b/sha256/bbbb"),
+                PathBuf::from("/b/sha256/aaaa/data"),
+                PathBuf::from("/b/sha256/bbbb/data"),
             ],
         );
         let gen_a_again = store.rootfs_generation_path(
             &tag_rootfs,
             &[
-                PathBuf::from("/b/sha256/aaaa"),
-                PathBuf::from("/b/sha256/bbbb"),
+                PathBuf::from("/b/sha256/aaaa/data"),
+                PathBuf::from("/b/sha256/bbbb/data"),
             ],
         );
         let gen_b = store.rootfs_generation_path(
             &tag_rootfs,
             &[
-                PathBuf::from("/b/sha256/cccc"),
-                PathBuf::from("/b/sha256/dddd"),
+                PathBuf::from("/b/sha256/cccc/data"),
+                PathBuf::from("/b/sha256/dddd/data"),
             ],
         );
 
