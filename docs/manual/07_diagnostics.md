@@ -11,6 +11,13 @@ evidence, and prints a categorised report: CRITICAL, WARNING, UNKNOWN and OK.
 It doesn't just list problems — it links a crashloop to the recent deploy and
 the error log line behind it.
 
+You only need to reach one node. `wtf` and `trace` send every per-node request
+through the node you're connected to (`/v1/nodes/<node>/relay/...`), carrying
+your own credential, so they work from a laptop whose VMs sit behind Lima's
+private network. The relay forwards only the handful of read-only diagnostic
+calls these two commands make, plus the trace probe itself, and each target
+repeats every authentication and authorisation check.
+
 ```sh
 relish wtf                       # diagnose the whole cluster
 relish wtf --app payments        # scope to one app for a faster, deeper look

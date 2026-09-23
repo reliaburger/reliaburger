@@ -463,6 +463,7 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
     let app = if fault_injection {
         let static_capabilities = reliaburger::bun::capabilities::StaticCapabilities {
             cluster_mode: true,
+            node_id: name.clone(),
             test_policy: reliaburger::testkit::safety::ClusterTestPolicy {
                 safety_class: reliaburger::testkit::safety::ClusterSafetyClass::Development,
                 allowed_operations: std::collections::BTreeSet::from([

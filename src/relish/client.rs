@@ -419,6 +419,27 @@ impl BunClient {
         Ok(self.with_base_url(&endpoint))
     }
 
+    /// Address one node through this entry node's relay
+    /// (`/v1/nodes/{node}/relay/...`), with this client's credential.
+    ///
+    /// The entry node reaches its peers on the cluster network even when the
+    /// caller can't, as on a laptop behind Lima's user-mode network. The
+    /// relay forwards only the per-node reads `wtf` and `trace` need, and the
+    /// target repeats every check against the caller's own credential.
+    pub fn via_node(&self, node_id: &str) -> Result<Self, RelishError> {
+        let valid = !node_id.is_empty()
+            && node_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte));
+        if !valid {
+            return Err(RelishError::ApiError {
+                status: 0,
+                body: format!("node name {node_id:?} can't be used in a relay path"),
+            });
+        }
+        Ok(self.with_base_url(&format!("{}/v1/nodes/{node_id}/relay", self.base_url)))
+    }
+
     /// Use another bearer credential with this connection's existing trust roots and forwards.
     pub fn with_token(&self, token: &str) -> Self {
         let mut client = Self::build(&self.base_url, Some(token), self.ca_pem.as_deref());

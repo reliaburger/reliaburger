@@ -120,7 +120,7 @@ tutorial, because a tutorial over a broken path is a lie.
 - [x] **Z2.2 Cluster-wide follow and top.** `relish logs -f` streams from every
   node that runs the app (fan-out over the existing SSE endpoint), and
   `relish top` shows every node, with CPU and memory.
-- [ ] **Z2.3 `wtf` and `trace` from the host.** Route the per-node calls through
+- [x] **Z2.3 `wtf` and `trace` from the host.** Route the per-node calls through
   the endpoint node (the API already forwards to peers) instead of dialling
   guest addresses.
 - [ ] **Z2.4 Name a node for `relish local stop`.** `relish local stop <node>`

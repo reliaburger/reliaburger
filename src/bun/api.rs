@@ -394,6 +394,12 @@ pub fn router_with_upgrade(
             axum::routing::delete(test_lease_release_handler),
         )
         .route("/v1/cluster/nodes", get(nodes_handler))
+        .route(
+            "/v1/nodes/{node}/relay/{*path}",
+            get(node_relay_handler).post(node_relay_handler).layer(
+                axum::extract::DefaultBodyLimit::max(MAX_RELAY_REQUEST_BYTES),
+            ),
+        )
         .route("/v1/cluster/council", get(council_handler))
         .route("/v1/upgrade/apply", post(upgrade_apply_handler))
         .route("/v1/upgrade/status", get(upgrade_status_handler))
@@ -4611,6 +4617,133 @@ async fn nodes_handler(State(state): State<ApiState>) -> Response {
         }
         Err(response) => response,
     }
+}
+
+/// Largest request body the node relay forwards (a trace request is tiny).
+const MAX_RELAY_REQUEST_BYTES: usize = 64 * 1024;
+/// Largest response the node relay passes back (an events page is the biggest).
+const MAX_RELAY_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+/// A trace probes for up to 25 seconds on the target; allow for the hop.
+const RELAY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The per-node reads `relish wtf` and `relish trace` make, and nothing else.
+/// The relay is a reachability aid, not a general proxy.
+fn relay_allows(method: &axum::http::Method, path: &str) -> bool {
+    const READS: &[&str] = &[
+        "v1/health",
+        "v1/status",
+        "v1/diagnostics",
+        "v1/diagnostics/apps",
+        "v1/events",
+        "v1/deploys/operations",
+        "v1/alerts",
+        "v1/fault",
+        "v1/cluster/council",
+        "v1/capabilities",
+    ];
+    match *method {
+        axum::http::Method::GET => READS.contains(&path),
+        axum::http::Method::POST => path == "v1/trace",
+        _ => false,
+    }
+}
+
+/// `GET|POST /v1/nodes/{node}/relay/{path}`: send one of a few per-node
+/// diagnostic requests to a named node and return its answer.
+///
+/// A laptop host can reach node 1's forwarded port but not the guests' own
+/// addresses, so `relish wtf` and `relish trace` reach every other node
+/// through this. The caller's own credential travels with the request and the
+/// target repeats every authentication and authorisation check; the relay
+/// never adds the node's service identity.
+async fn node_relay_handler(
+    State(state): State<ApiState>,
+    Path((node, path)): Path<(String, String)>,
+    method: axum::http::Method,
+    uri: axum::http::Uri,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    if !relay_allows(&method, &path) {
+        return (
+            StatusCode::NOT_FOUND,
+            format!("the node relay does not forward {method} /{path}"),
+        )
+            .into_response();
+    }
+    let mut url = match target_node_api_url(&state, &node, &format!("/{path}")).await {
+        Ok(url) => url,
+        Err(response) => return response,
+    };
+    if let Some(query) = uri.query() {
+        url.push('?');
+        url.push_str(query);
+    }
+    let mut request = state.cluster_http.client().request(method.clone(), url);
+    if method == axum::http::Method::POST {
+        request = request
+            .header(
+                axum::http::header::CONTENT_TYPE.as_str(),
+                "application/json",
+            )
+            .body(body);
+    }
+    let request = copy_forwarded_auth(request, &headers);
+    let response = match tokio::time::timeout(RELAY_TIMEOUT, request.send()).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("node {node} did not answer: {error}"),
+            )
+                .into_response();
+        }
+        Err(_) => {
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                format!(
+                    "node {node} did not answer within {}s",
+                    RELAY_TIMEOUT.as_secs()
+                ),
+            )
+                .into_response();
+        }
+    };
+    let status =
+        StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let Ok(chunk) = chunk else {
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("node {node} broke off its answer"),
+            )
+                .into_response();
+        };
+        if bytes.len() + chunk.len() > MAX_RELAY_RESPONSE_BYTES {
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("node {node} answered with more than the relay's 8 MiB limit"),
+            )
+                .into_response();
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let mut relayed = (status, bytes).into_response();
+    if let Some(content_type) = content_type
+        && let Ok(value) = axum::http::HeaderValue::from_str(&content_type)
+    {
+        relayed
+            .headers_mut()
+            .insert(axum::http::header::CONTENT_TYPE, value);
+    }
+    relayed
 }
 
 /// Show council (Raft) status.
@@ -14166,6 +14299,8 @@ mod cluster_routing_tests {
         nodes: Vec<FakeNode>,
         membership: Arc<RwLock<Vec<NodeMembershipInfo>>>,
         operator: String,
+        /// A read-only token confined to the `api` app.
+        api_reader: String,
         stop: CancellationToken,
     }
 
@@ -14292,6 +14427,16 @@ mod cluster_routing_tests {
             None,
         )
         .unwrap();
+        let api_reader = crate::sesame::token::create_token(
+            "api-reader",
+            crate::sesame::types::ApiRole::ReadOnly,
+            crate::sesame::types::TokenScope {
+                apps: Some(vec!["api".to_string()]),
+                namespaces: None,
+            },
+            None,
+        )
+        .unwrap();
         let stop = CancellationToken::new();
         let mut listeners = Vec::new();
         let mut membership = Vec::new();
@@ -14316,7 +14461,7 @@ mod cluster_routing_tests {
                 stop.clone(),
             );
             let store = crate::sesame::auth::new_token_store();
-            *store.write().await = vec![created.token.clone()];
+            *store.write().await = vec![created.token.clone(), api_reader.token.clone()];
             let static_capabilities = crate::bun::capabilities::StaticCapabilities {
                 test_policy: crate::testkit::safety::ClusterTestPolicy {
                     safety_class: crate::testkit::safety::ClusterSafetyClass::Development,
@@ -14372,6 +14517,7 @@ mod cluster_routing_tests {
             nodes,
             membership,
             operator: created.plaintext,
+            api_reader: api_reader.plaintext,
             stop,
         }
     }
@@ -14585,5 +14731,134 @@ mod cluster_routing_tests {
         let local: Vec<crate::bun::top::TopRow> = cluster.get_json(1, "/v1/top").await;
         assert!(local.iter().all(|row| row.node == "node-2"));
         assert_eq!(local.len(), 2);
+    }
+
+    async fn relay(
+        cluster: &FakeCluster,
+        method: reqwest::Method,
+        path: &str,
+        token: Option<&str>,
+    ) -> (StatusCode, String) {
+        let mut request =
+            reqwest::Client::new().request(method, format!("{}{path}", cluster.nodes[0].url));
+        if let Some(token) = token {
+            request = request.bearer_auth(token);
+        }
+        let response = request.send().await.unwrap();
+        let status = StatusCode::from_u16(response.status().as_u16()).unwrap();
+        (status, response.text().await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn the_relay_reaches_a_peer_with_the_callers_own_credential() {
+        let cluster = start_cluster(vec![
+            ("node-1", vec![]),
+            (
+                "node-2",
+                vec![
+                    instance("default/web-0", "web", "running"),
+                    instance("default/api-0", "api", "running"),
+                ],
+            ),
+        ])
+        .await;
+        let operator = Some(cluster.operator.as_str());
+
+        let (status, body) = relay(
+            &cluster,
+            reqwest::Method::GET,
+            "/v1/nodes/node-2/relay/v1/status",
+            operator,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let statuses: Vec<InstanceStatus> = serde_json::from_str(&body).unwrap();
+        assert_eq!(statuses.len(), 2);
+
+        // A scoped caller stays scoped on the far side: the peer filtered with
+        // the caller's token, not a node identity that sees everything.
+        let (status, body) = relay(
+            &cluster,
+            reqwest::Method::GET,
+            "/v1/nodes/node-2/relay/v1/status",
+            Some(&cluster.api_reader),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let statuses: Vec<InstanceStatus> = serde_json::from_str(&body).unwrap();
+        let apps: Vec<_> = statuses.iter().map(|s| s.app_name.as_str()).collect();
+        assert_eq!(apps, vec!["api"]);
+
+        // No credential, no relay.
+        let (status, _) = relay(
+            &cluster,
+            reqwest::Method::GET,
+            "/v1/nodes/node-2/relay/v1/status",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn the_relay_forwards_only_the_diagnostic_reads() {
+        let cluster = start_cluster(vec![
+            ("node-1", vec![]),
+            ("node-2", vec![instance("default/web-0", "web", "running")]),
+        ])
+        .await;
+        let operator = Some(cluster.operator.as_str());
+        for (method, path) in [
+            (reqwest::Method::POST, "/v1/nodes/node-2/relay/v1/fault"),
+            (reqwest::Method::GET, "/v1/nodes/node-2/relay/v1/token/list"),
+            (reqwest::Method::DELETE, "/v1/nodes/node-2/relay/v1/fault"),
+            (
+                reqwest::Method::GET,
+                "/v1/nodes/node-2/relay/v1/nodes/node-1/relay/v1/status",
+            ),
+        ] {
+            let (status, body) = relay(&cluster, method.clone(), path, operator).await;
+            assert!(
+                status == StatusCode::NOT_FOUND || status == StatusCode::METHOD_NOT_ALLOWED,
+                "{method} {path} was relayed: {status} {body}"
+            );
+        }
+        assert_eq!(injected_count(&cluster).await, 0);
+
+        let (status, body) = relay(
+            &cluster,
+            reqwest::Method::GET,
+            "/v1/nodes/node-9/relay/v1/status",
+            operator,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert!(body.contains("node-9"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn the_relay_keeps_the_query_string() {
+        let cluster = start_cluster(vec![
+            ("node-1", vec![]),
+            (
+                "node-2",
+                vec![
+                    instance("default/web-0", "web", "running"),
+                    instance("default/web-1", "web", "running"),
+                ],
+            ),
+        ])
+        .await;
+        assert_eq!(inject(&cluster, 1, &kill(1)).await.0, StatusCode::OK);
+        let (status, body) = relay(
+            &cluster,
+            reqwest::Method::GET,
+            "/v1/nodes/node-2/relay/v1/fault?cluster=true",
+            Some(&cluster.operator),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let listing: ClusterFaultList = serde_json::from_str(&body).unwrap();
+        assert_eq!(listing.faults.len(), 1);
     }
 }

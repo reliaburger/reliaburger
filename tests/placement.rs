@@ -964,6 +964,7 @@ async fn start_spread_web_cluster(
             [app.web]
             image = "proc-grill:image-ignored"
             command = ["sh", "-c", "while true; do echo tick from $$; sleep 0.3; done"]
+            port = 8080
             replicas = 3
         "#,
         )
@@ -1225,6 +1226,76 @@ async fn follow_and_top_cover_every_node_and_survive_one_leaving() {
         !survivors.is_empty() && !survivors.contains(&doomed.name),
         "the follow should keep streaming the survivors, got {survivors:?}"
     );
+
+    shutdown.cancel();
+    for node in &nodes {
+        if let Some(council) = &node.handle.council {
+            council.shutdown().await.ok();
+        }
+    }
+}
+
+/// Z2.3: `relish wtf` and `relish trace` reach every node through the node
+/// the CLI talks to. A laptop host can only reach node 1's forwarded port, so
+/// neither may dial a node's own advertised address.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
+async fn wtf_and_trace_reach_every_node_through_the_entry_node() {
+    let shutdown = CancellationToken::new();
+    let nodes = start_spread_web_cluster("wt", 19741, &shutdown).await;
+    // Enter through the middle node, so the trace's source (the lowest-named
+    // node running `web`) is somewhere else.
+    let entry = &nodes[1];
+    // wtf reads the council from the leader, which it finds through the
+    // entry node's view; wait until every node knows the full council.
+    let voters_ready = wait_until(Duration::from_secs(60), || {
+        nodes.iter().all(|node| {
+            node.handle.council.as_ref().is_some_and(|council| {
+                let metrics = council.metrics().borrow().clone();
+                metrics.membership_config.membership().voter_ids().count() == 3
+                    && metrics.current_leader.is_some()
+            })
+        })
+    })
+    .await;
+    assert!(voters_ready, "council never grew to three voters");
+
+    let inputs = reliaburger::relish::wtf::collect(&entry.client, Some("web"))
+        .await
+        .expect("wtf collects through the entry node");
+    let observed = inputs
+        .cluster
+        .nodes
+        .value()
+        .expect("node evidence is available")
+        .clone();
+    let mut reachable: Vec<_> = observed
+        .iter()
+        .filter(|node| node.agent_reachable)
+        .map(|node| node.node_id.clone())
+        .collect();
+    reachable.sort();
+    let names: Vec<_> = nodes.iter().map(|node| node.name.clone()).collect();
+    assert_eq!(reachable, names, "every node answered through the relay");
+    assert!(
+        inputs.cluster.council.value().is_some(),
+        "the leader's council view came through the relay: {:?}",
+        inputs.cluster.council
+    );
+
+    let result = reliaburger::relish::trace_cmd::trace(
+        &reliaburger::onion::trace::TraceRequest {
+            source: "web".to_string(),
+            source_namespace: "default".to_string(),
+            destination: "web".to_string(),
+            destination_namespace: "default".to_string(),
+            port: None,
+        },
+        &entry.client,
+    )
+    .await
+    .expect("trace runs on the source node through the relay");
+    assert_eq!(result.source_node, nodes[0].name);
 
     shutdown.cancel();
     for node in &nodes {

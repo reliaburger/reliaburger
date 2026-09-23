@@ -2306,6 +2306,34 @@ finding, and 2 for warnings or unknown evidence. `--app` removes unrelated
 cluster checks structurally. `--watch` repeats the human report every 30
 seconds, while JSON and YAML remain one schema-versioned report per process.
 
+### One door in
+
+The first laptop cluster broke that fan-out without a single error message.
+Each node advertises its API on its own guest address, say
+`192.168.104.3:9117`. From inside the cluster that's fine. From a Mac, behind
+Lima's user-mode network, only node 1's port is forwarded to `127.0.0.1`.
+Every peer request timed out, and `wtf` dutifully reported two of three nodes
+as unreachable on a perfectly healthy cluster. Honest about what it saw, and
+wrong about the cluster.
+
+We could have tried each advertised address first and fallen back when it
+didn't answer. That means a ten-second wait per unreachable node on every run,
+and two code paths whose difference only shows up on somebody's laptop. So
+there's one path: every per-node request goes through the entry node. The
+client builds a relayed client with `BunClient::via_node`, whose base URL is
+`{entry}/v1/nodes/{node}/relay`, and every existing method (`health`,
+`diagnostics`, `events`, `trace` and friends) just works, because each one
+formats its path onto the base URL.
+
+The relay on the server is deliberately not a proxy. It forwards ten `GET`
+paths and one `POST` (`/v1/trace`), refuses everything else with a 404,
+forwards the caller's own `Authorization` header and never the node's service
+token. So a relayed request can't do anything the caller couldn't do by
+dialling the node directly. A test proves it: a token scoped to one app asks a
+peer's `/v1/status` through the relay and gets back only that app's
+instances. If the relay had quietly used the node's identity, the peer would
+have shown everything.
+
 ## Trace the connection you actually care about
 
 Say `web` can't reach `redis`. Checking Bun's own DNS and TCP access might tell

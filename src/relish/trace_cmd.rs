@@ -45,12 +45,18 @@ pub async fn run_with_client(
         destination_namespace: args.destination_namespace,
         port: args.port,
     };
-    let source = find_source_client(entry, &request.source, &request.source_namespace).await?;
-    let result = tokio::time::timeout(Duration::from_secs(25), source.trace(&request))
-        .await
-        .map_err(|_| RelishError::RequestTimeout)??;
+    let result = trace(&request, entry).await?;
     println!("{}", render_result(&result, args.output)?);
     Ok(outcome(&result.overall_result))
+}
+
+/// Run a trace on a node that runs the source workload, reached through the
+/// entry node's relay.
+pub async fn trace(request: &TraceRequest, entry: &BunClient) -> Result<TraceResult, RelishError> {
+    let source = find_source_client(entry, &request.source, &request.source_namespace).await?;
+    tokio::time::timeout(Duration::from_secs(25), source.trace(request))
+        .await
+        .map_err(|_| RelishError::RequestTimeout)?
 }
 
 async fn find_source_client(
