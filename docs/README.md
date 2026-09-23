@@ -345,6 +345,10 @@ make coverage              # portable suite under line coverage (HTML and LCOV)
 make audit                 # fail on new RustSec dependency findings
 ```
 
+Tests that need hardware, credentials or a reboot (Apple Container, NVIDIA GPU,
+S3, host reboot) aren't run by CI. The [test harness design](design/test-harness.md#tests-no-ci-job-runs)
+lists them and how to run each.
+
 `make test` runs only tests that can execute truthfully on an ordinary developer machine.
 Provisioned tests use `#[ignore = "requires …"]`; their named target enables the prerequisite,
 selects ignored tests only and fails if its filter finds no tests. Target-specific code uses

@@ -55,11 +55,11 @@ be visible until we remove its race.
 | `make lint` | Clippy for every target, with all features and with none, so the build without default features stays healthy | Linux and hosted macOS |
 | `make test` | Portable unit, component and integration correctness via nextest | Linux and hosted macOS |
 | `make test-doc` | Rust documentation examples | Linux and hosted macOS |
-| `make test-slow` | Required wall-clock health and retry acceptance | Linux |
-| `make test-linux` | runc, namespaces, eBPF, Btrfs, Buildah and root-only tmpfs | Privileged Linux |
-| `make test-cluster` | Gossip, placement, failover, healing, recovery and chaos | Linux, serial resource group |
-| `make test-upgrade-node` | Real single-node binary replacement | Linux |
-| `make test-upgrade-cluster` | Real rolling cluster replacement | Linux |
+| `make test-slow` | Required wall-clock health and retry acceptance | Linux; PRs into `main`, `main` and nightly |
+| `make test-linux` | runc, namespaces, eBPF, Btrfs, Buildah and root-only tmpfs | Privileged Linux; PRs into `main`, `main` and nightly |
+| `make test-cluster` | Gossip, placement, failover, healing, recovery and chaos | Linux, serial resource group; PRs into `main`, `main` and nightly |
+| `make test-upgrade-node` | Real single-node binary replacement | Linux; PRs into `main`, `main` and nightly |
+| `make test-upgrade-cluster` | Real rolling cluster replacement | Linux; PRs into `main`, `main` and nightly |
 | `make test-apple` | Deferred Apple adapter | Manual Apple-silicon development check, outside 0.1.0 |
 | `make bench` | Criterion transport and 5–250-node measurements | `main`, nightly, and PRs touching gossip |
 | `make bench-large` | Criterion 500- and 1,000-node measurements | `main`, nightly, and PRs touching gossip |
@@ -72,6 +72,26 @@ separate because hosted macOS runners cannot provide its nested virtualisation.
 The supported runtime gates run on pull requests, and release tags must pass the
 same reusable validation workflow before publication. Managed macOS laptop
 acceptance uses Linux VMs (see V04 in the release checklist).
+
+Pull requests stacked on another branch skip the acceptance suites (wall-clock,
+cluster, upgrade and privileged Linux) unless labelled `full-ci`; they run once the
+PR targets `main`. Documentation-only pull requests skip the Rust jobs entirely,
+except for the manual and the snippets `documentation_first_run` checks.
+
+### Tests no CI job runs
+
+These need hardware, credentials or a reboot that hosted runners can't provide. They
+are `#[ignore]`d with the reason, and each has a named way to run it:
+
+| Test | Needs | How to run |
+|---|---|---|
+| `grill::apple::tests::*` | Apple silicon with Apple Container | `make test-apple` |
+| `bun::gpu::tests::nvidia_detector_finds_hardware` | An NVIDIA GPU and `nvidia-smi` | `RELIABURGER_GPU_TESTS=1 cargo nextest run --run-ignored=only -E 'test(nvidia_detector_finds_hardware)'` |
+| `ketchup::export::tests::export_to_real_s3_manual` | AWS credentials and a bucket | `RELIABURGER_TEST_S3_URL=s3://bucket/prefix cargo nextest run --run-ignored=only -E 'test(export_to_real_s3_manual)'` |
+| `owned_runc::actual_host_reboot_*`, `oci_crash::actual_bun_kernel_discovery_host_reboot` | A Linux VM that can be rebooted mid-test | `scripts/release/qualify-oci-reboot.sh`, `scripts/release/qualify-discovery-reboot.sh` |
+
+A gated test must be `#[ignore]`d. One that returns early when its variable is unset
+reports a pass without testing anything.
 
 The dependency audit refreshes its database on every run. It denies new
 vulnerabilities, unsoundness, yanked packages and unmaintained-package notices.
