@@ -237,6 +237,21 @@ mod tests {
                 .contains(&port.to_string())
         );
         drop(listener);
-        ports(&[port]).await.unwrap();
+        // A released ephemeral port can be handed straight to another test's
+        // outgoing connection, so allow a few fresh ports before failing.
+        let mut last = None;
+        for _ in 0..5 {
+            let free = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port();
+            match ports(&[free]).await {
+                Ok(()) => return,
+                Err(error) => last = Some(error),
+            }
+        }
+        panic!("no free port was accepted: {last:?}");
     }
 }
