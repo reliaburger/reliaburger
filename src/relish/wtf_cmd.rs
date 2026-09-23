@@ -13,8 +13,10 @@ use super::{CommandOutcome, OutputFormat, RelishError};
 pub struct WtfArgs {
     /// Optional application name to diagnose.
     pub app: Option<String>,
-    /// Re-run collection every 30 seconds until interrupted.
+    /// Re-run collection every `interval` until interrupted.
     pub watch: bool,
+    /// Pause between `watch` collections (30 seconds from the CLI).
+    pub interval: Duration,
     /// Human, JSON or YAML output.
     pub output: OutputFormat,
 }
@@ -87,7 +89,7 @@ async fn run_watch(args: &WtfArgs, client: &BunClient) -> Result<CommandOutcome,
                 signal?;
                 return Ok(last_outcome);
             }
-            _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+            _ = tokio::time::sleep(args.interval) => {}
         }
     }
 }
@@ -289,6 +291,7 @@ mod tests {
             let error = validate_args(&WtfArgs {
                 app: None,
                 watch: true,
+                interval: Duration::from_secs(30),
                 output,
             })
             .unwrap_err();

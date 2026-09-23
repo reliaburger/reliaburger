@@ -465,9 +465,12 @@ enum Command {
         /// Scope application checks and log correlation to one app.
         #[arg(long)]
         app: Option<String>,
-        /// Re-run diagnosis every 30 seconds until Ctrl-C.
+        /// Re-run diagnosis every `--interval` seconds until Ctrl-C.
         #[arg(long)]
         watch: bool,
+        /// Seconds between `--watch` collections.
+        #[arg(long, default_value_t = 30, requires = "watch", value_parser = clap::value_parser!(u64).range(1..))]
+        interval: u64,
     },
     /// Trace DNS, service-map, firewall and TCP evidence from a workload.
     Trace {
@@ -1645,11 +1648,16 @@ async fn main() -> ExitCode {
                 .await,
             );
         }
-        Command::Wtf { app, watch } => {
+        Command::Wtf {
+            app,
+            watch,
+            interval,
+        } => {
             return finish_outcome(
                 reliaburger::relish::wtf_cmd::run(reliaburger::relish::wtf_cmd::WtfArgs {
                     app,
                     watch,
+                    interval: std::time::Duration::from_secs(interval),
                     output: cli.output,
                 })
                 .await,
@@ -1963,7 +1971,8 @@ mod tests {
             bare.command,
             Command::Wtf {
                 app: None,
-                watch: false
+                watch: false,
+                interval: 30
             }
         ));
 
@@ -1976,9 +1985,22 @@ mod tests {
             scoped.command,
             Command::Wtf {
                 app: Some(ref app),
-                watch: true
+                watch: true,
+                interval: 30
             } if app == "payments"
         ));
+
+        let fast = parse(&["relish", "wtf", "--watch", "--interval", "5"]).unwrap();
+        assert!(matches!(
+            fast.command,
+            Command::Wtf {
+                watch: true,
+                interval: 5,
+                ..
+            }
+        ));
+        assert!(parse(&["relish", "wtf", "--interval", "5"]).is_err());
+        assert!(parse(&["relish", "wtf", "--watch", "--interval", "0"]).is_err());
     }
 
     #[test]

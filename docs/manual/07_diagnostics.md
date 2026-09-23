@@ -15,6 +15,7 @@ the error log line behind it.
 relish wtf                       # diagnose the whole cluster
 relish wtf --app payments        # scope to one app for a faster, deeper look
 relish wtf --watch               # re-run every 30s until Ctrl-C (human output only)
+relish wtf --watch --interval 5  # re-run every 5s instead
 relish --output json wtf         # one exact report for machines
 ```
 

@@ -659,6 +659,7 @@ relish top                          # Workload table: state, PID, restarts (no l
 relish wtf                          # Correlated cluster health diagnosis
 relish wtf --app <app>              # Scope to one app
 relish wtf --watch                  # Re-run every 30s until Ctrl-C
+relish wtf --watch --interval 5     # Re-run every 5s instead
 
 # Forensics
 relish history <app>                # Deploy history for an app

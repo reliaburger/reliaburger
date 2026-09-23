@@ -37,7 +37,14 @@ async fn watch_recovers_from_collection_failure_and_retains_warning_exit() {
         axum::serve(listener, app).await.unwrap();
     });
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_relish"))
-        .args(["--endpoint", &format!("http://{address}"), "wtf", "--watch"])
+        .args([
+            "--endpoint",
+            &format!("http://{address}"),
+            "wtf",
+            "--watch",
+            "--interval",
+            "1",
+        ])
         .env_remove("RELIABURGER_TOKEN")
         .env_remove("RELIABURGER_CA_CERT")
         .stdout(std::process::Stdio::piped())

@@ -643,7 +643,7 @@ Commands:
 | `logs-export --dest <dir>` | Export Parquet log files to a directory |
 | `logs-search <dir> <sql>` | Run SQL over an exported Parquet log archive |
 | `inspect <name>` | Detailed info about an app (bare app name) |
-| `wtf [--app <app>] [--watch]` | Correlated cluster-health diagnosis (exit 0 OK / 1 criticals / 2 warnings-only) |
+| `wtf [--app <app>] [--watch [--interval <secs>]]` | Correlated cluster-health diagnosis (exit 0 OK / 1 criticals / 2 warnings-only) |
 | `trace <src> --to <dst>` | Probe DNS, service-map, firewall and TCP from a workload (exit 0/1/2) |
 | `exec <app> <cmd...>` | Execute a command inside a running instance |
 | `stop <app>` | Stop all instances of an app |
@@ -1194,7 +1194,7 @@ authenticated client identity. It diagnoses node and council health,
 crashloops, stalled deploys, missing service backends, active faults and alerts,
 disk pressure, actual cgroup throttling, certificate lifecycle and Pickle
 redundancy. Use `--app <name>` for application scope or `--watch` for a
-30-second human refresh. JSON and YAML use schema version 1. Exit status 0 means
+human refresh every 30 seconds (`--interval <secs>` changes the period). JSON and YAML use schema version 1. Exit status 0 means
 all selected evidence was observed and healthy, 1 means a critical finding,
 and 2 means warnings or unknown evidence. Bounded in-memory restart and deploy
 history is deliberately reported as degraded, not silently accepted as a
