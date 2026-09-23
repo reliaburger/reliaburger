@@ -99,6 +99,7 @@ async fn drain_and_stop_instance<G: Grill>(
     grill: &G,
     id: &InstanceId,
     drain_timeout: std::time::Duration,
+    confirmation_timeout: std::time::Duration,
 ) -> Result<(), BunError> {
     let cmd = crate::wrapper::draining::DrainCommand {
         app_name: String::new(),
@@ -108,17 +109,21 @@ async fn drain_and_stop_instance<G: Grill>(
     drains.start_drain(&cmd).await;
     drains.wait_drained(&id.0).await;
 
-    stop_runtime_instance(grill, id, drain_timeout).await
+    stop_runtime_instance(grill, id, drain_timeout, confirmation_timeout).await
 }
 
 /// Stop one instance, requiring observed exit even after force-kill.
+///
+/// `confirmation_timeout` (`[runtime] stop_confirmation_timeout_secs`) bounds
+/// the runtime's own work: accepting the stop request, accepting a kill, and
+/// reporting exit after it. `grace` is the workload's time to exit.
 async fn stop_runtime_instance<G: Grill>(
     grill: &G,
     id: &InstanceId,
     grace: std::time::Duration,
+    confirmation_timeout: std::time::Duration,
 ) -> Result<(), BunError> {
-    let signal_timeout = std::time::Duration::from_secs(2);
-    tokio::time::timeout(signal_timeout, grill.stop(id))
+    tokio::time::timeout(confirmation_timeout, grill.stop(id))
         .await
         .map_err(|_| BunError::StopUnconfirmed {
             instance_id: id.clone(),
@@ -127,19 +132,22 @@ async fn stop_runtime_instance<G: Grill>(
     if observe_runtime_exit(grill, id, grace).await? {
         return Ok(());
     }
-    kill_runtime_instance(grill, id).await
+    kill_runtime_instance(grill, id, confirmation_timeout).await
 }
 
 /// Preserve ownership until both force-kill and observed runtime exit succeed.
-async fn kill_runtime_instance<G: Grill>(grill: &G, id: &InstanceId) -> Result<(), BunError> {
-    let signal_timeout = std::time::Duration::from_secs(2);
-    tokio::time::timeout(signal_timeout, grill.kill(id))
+async fn kill_runtime_instance<G: Grill>(
+    grill: &G,
+    id: &InstanceId,
+    confirmation_timeout: std::time::Duration,
+) -> Result<(), BunError> {
+    tokio::time::timeout(confirmation_timeout, grill.kill(id))
         .await
         .map_err(|_| BunError::StopUnconfirmed {
             instance_id: id.clone(),
             reason: "force-kill request timed out",
         })??;
-    if observe_runtime_exit(grill, id, signal_timeout).await? {
+    if observe_runtime_exit(grill, id, confirmation_timeout).await? {
         return Ok(());
     }
     Err(BunError::StopUnconfirmed {
@@ -1724,6 +1732,9 @@ pub struct BunAgent<G: Grill> {
     /// drain and waits for it to finish (or time out) before killing the
     /// old container.
     drains: crate::wrapper::draining::SharedDrains,
+    /// Per-step deadline for the runtime to confirm a stop or force-kill
+    /// (`[runtime] stop_confirmation_timeout_secs`).
+    stop_confirmation_timeout: std::time::Duration,
 }
 
 impl<G: Grill + Clone + 'static> BunAgent<G> {
@@ -1769,6 +1780,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             trust_domain: "default".to_string(),
             fault_registry: crate::smoker::registry::FaultRegistry::new(),
             smoker_config: crate::smoker::config::SmokerConfig::default(),
+            stop_confirmation_timeout: crate::config::node::RuntimeSection::default()
+                .stop_confirmation_timeout(),
             node_fault_fence: crate::smoker::reservation::NodeFaultFence::default(),
             node_drain_gate: crate::smoker::node_fault::NodeDrainGate::new(),
             node_pressure: crate::smoker::node_pressure::NodePressureController::default(),
@@ -1871,6 +1884,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             trust_domain,
             fault_registry: crate::smoker::registry::FaultRegistry::new(),
             smoker_config: crate::smoker::config::SmokerConfig::default(),
+            stop_confirmation_timeout: crate::config::node::RuntimeSection::default()
+                .stop_confirmation_timeout(),
             node_fault_fence: crate::smoker::reservation::NodeFaultFence::default(),
             node_drain_gate: crate::smoker::node_fault::NodeDrainGate::new(),
             node_pressure: crate::smoker::node_pressure::NodePressureController::default(),
@@ -2082,6 +2097,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// by config rather than only the hardcoded 24h backstop.
     pub fn set_smoker_config(&mut self, config: crate::smoker::config::SmokerConfig) {
         self.smoker_config = config;
+    }
+
+    /// Thread `[runtime] stop_confirmation_timeout_secs` in: how long each
+    /// step of a stop or force-kill may wait for the runtime to confirm it.
+    pub fn set_stop_confirmation_timeout(&mut self, timeout: std::time::Duration) {
+        self.stop_confirmation_timeout = timeout;
     }
 
     /// Configure the opt-in node-pressure helper and clean owned crash
@@ -2884,7 +2905,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             // an uncertain outcome. Fence it before ordinary desired-state
             // reconciliation can authorise any replacement.
             if state != ContainerState::Stopped {
-                kill_runtime_instance(self.supervisor.grill(), id).await?;
+                kill_runtime_instance(self.supervisor.grill(), id, self.stop_confirmation_timeout)
+                    .await?;
             }
             if let Some(job) = jobs.get_mut(&id.0) {
                 job.runtime_absent = true;
@@ -3130,7 +3152,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             if let Err(error) = self.restore_live_egress(&runtime_id, &record).await {
                 // Adoption has proved this is our surviving runtime. Do not
                 // publish it as Running without confirmed policy ownership.
-                kill_runtime_instance(self.supervisor.grill(), &runtime_id).await?;
+                kill_runtime_instance(
+                    self.supervisor.grill(),
+                    &runtime_id,
+                    self.stop_confirmation_timeout,
+                )
+                .await?;
                 return Err(error);
             }
 
@@ -3841,6 +3868,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             },
             drains: self.drains.clone(),
             operation: Some(operation),
+            stop_confirmation_timeout: self.stop_confirmation_timeout,
         };
         let worker_task = tokio::spawn(async move {
             worker.run_deploy(config, forward_tx).await;
@@ -8410,7 +8438,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     async fn retire_initialisers(&mut self, parent: &InstanceId) -> Result<(), BunError> {
         let children = self.initialisers.get(parent).cloned().unwrap_or_default();
         for child in children {
-            kill_runtime_instance(self.supervisor.grill(), &child).await?;
+            kill_runtime_instance(
+                self.supervisor.grill(),
+                &child,
+                self.stop_confirmation_timeout,
+            )
+            .await?;
             if let Some(remaining) = self.initialisers.get_mut(parent) {
                 remaining.remove(&child);
             }
@@ -9370,7 +9403,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         {
             return Ok(());
         }
-        drain_and_stop_instance(&self.drains, self.supervisor.grill(), id, grace).await
+        drain_and_stop_instance(
+            &self.drains,
+            self.supervisor.grill(),
+            id,
+            grace,
+            self.stop_confirmation_timeout,
+        )
+        .await
     }
 
     /// Withdraw local routing and poll request release without blocking the agent loop.
@@ -9399,7 +9439,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         {
             return Ok(());
         }
-        kill_runtime_instance(self.supervisor.grill(), id).await
+        kill_runtime_instance(self.supervisor.grill(), id, self.stop_confirmation_timeout).await
     }
 
     /// Add one freshly-healthy replacement to the service map and rebuild the
@@ -10070,6 +10110,8 @@ struct DeployWorker<G: Grill> {
     /// to the loop as an op.
     drains: crate::wrapper::draining::SharedDrains,
     operation: Option<crate::bun::deploy_operations::DeployOperationHandle>,
+    /// The agent's `[runtime] stop_confirmation_timeout_secs`.
+    stop_confirmation_timeout: std::time::Duration,
 }
 
 impl<G: Grill + Clone + 'static> DeployWorker<G> {
@@ -10531,7 +10573,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                     init_index: i,
                 });
             }
-            kill_runtime_instance(&self.grill, &init_id).await?;
+            kill_runtime_instance(&self.grill, &init_id, self.stop_confirmation_timeout).await?;
             self.ops.forget_initialiser(instance_id, &init_id).await?;
             // Runc can remove the shared cgroup when an init exits. Its
             // successor must receive policy for the new kernel identity
@@ -11162,7 +11204,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 // A failed create may already own runtime resources. Only a
                 // reservation that never attempted create proves their absence.
                 if runtime_attempted.contains(id) {
-                    kill_runtime_instance(&self.grill, id).await?;
+                    kill_runtime_instance(&self.grill, id, self.stop_confirmation_timeout).await?;
                 }
                 self.ops.finish_retire(id).await
             }
@@ -11221,7 +11263,14 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         drain_timeout: std::time::Duration,
     ) -> Result<(), BunError> {
         self.ops.begin_retire(id).await?;
-        drain_and_stop_instance(&self.drains, &self.grill, id, drain_timeout).await
+        drain_and_stop_instance(
+            &self.drains,
+            &self.grill,
+            id,
+            drain_timeout,
+            self.stop_confirmation_timeout,
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -13581,6 +13630,10 @@ mod tests {
         assert!(view.borrow().resolve(&service).is_none());
     }
 
+    /// The stop-confirmation deadline test agents use: the pre-configuration
+    /// constant, well under the timeouts the stall tests assert against.
+    const TEST_STOP_CONFIRMATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
     fn test_agent_with_grill() -> (
         TestAgent,
         mpsc::Sender<AgentCommand>,
@@ -13595,6 +13648,9 @@ mod tests {
         let mut agent = BunAgent::new(grill, port_allocator, rx, shutdown.clone());
         let volumes = tempfile::tempdir().unwrap();
         agent.set_volumes_dir(volumes.path().to_path_buf());
+        // MockGrill answers instantly unless a test stalls it, so a short
+        // deadline keeps injected stalls fast without changing any outcome.
+        agent.set_stop_confirmation_timeout(TEST_STOP_CONFIRMATION_TIMEOUT);
         let agent = TestAgent {
             agent,
             _volumes: volumes,
@@ -13663,6 +13719,7 @@ mod tests {
                 },
                 drains: self.drains.clone(),
                 operation: None,
+                stop_confirmation_timeout: self.stop_confirmation_timeout,
             };
             let events = events.clone();
             let mut task = tokio::spawn(async move { worker.run_deploy(config, events).await });
@@ -19090,6 +19147,65 @@ host = "remote.local"
         );
     }
 
+    /// `runc kill` on a loaded host can take seconds to answer. The default
+    /// confirmation deadline must wait that out rather than report an
+    /// unconfirmed stop and leave the workload owned for another retry.
+    #[tokio::test(start_paused = true)]
+    async fn force_kill_waits_out_a_slow_runtime_within_the_default_deadline() {
+        let grill = MockGrill::new();
+        let id = InstanceId("default__web-0".to_string());
+        grill.set_state(&id, ContainerState::Running);
+        grill.set_kill_delay(Some(std::time::Duration::from_secs(5)));
+
+        let deadline = crate::config::node::RuntimeSection::default().stop_confirmation_timeout();
+        kill_runtime_instance(&grill, &id, deadline).await.unwrap();
+
+        assert_eq!(grill.state(&id).await.unwrap(), ContainerState::Stopped);
+    }
+
+    /// A runtime slower than the configured deadline still yields an
+    /// unconfirmed stop, so ownership is kept rather than guessed away.
+    #[tokio::test(start_paused = true)]
+    async fn force_kill_is_unconfirmed_when_the_runtime_outlasts_the_deadline() {
+        let grill = MockGrill::new();
+        let id = InstanceId("default__web-0".to_string());
+        grill.set_state(&id, ContainerState::Running);
+        grill.set_kill_delay(Some(std::time::Duration::from_secs(5)));
+
+        let error = kill_runtime_instance(&grill, &id, std::time::Duration::from_secs(2))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                BunError::StopUnconfirmed {
+                    reason: "force-kill request timed out",
+                    ..
+                }
+            ),
+            "expected an unconfirmed force-kill, got {error:?}"
+        );
+    }
+
+    /// The agent's kill path uses the configured deadline, not a constant:
+    /// a kill that outlasts a short configured deadline is unconfirmed.
+    #[tokio::test]
+    async fn kill_uses_the_configured_confirmation_deadline() {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        let id = InstanceId("default__web-0".to_string());
+        grill.set_state(&id, ContainerState::Running);
+        grill.set_kill_delay(Some(std::time::Duration::from_millis(500)));
+        agent.set_stop_confirmation_timeout(std::time::Duration::from_millis(50));
+
+        let error = agent.kill_and_wait_for_exit(&id).await.unwrap_err();
+
+        assert!(
+            error.to_string().contains("force-kill request timed out"),
+            "expected the configured deadline to expire, got {error}"
+        );
+    }
+
     /// A cooperative stop reports Stopped once the runtime confirms exit, and
     /// does not needlessly escalate to kill.
     #[tokio::test]
@@ -19155,8 +19271,13 @@ host = "remote.local"
         drains.increment_connections(&id.0).await;
 
         // Kick off the retire on a task; it must block on the drain.
-        let retire =
-            drain_and_stop_instance(&drains, &grill, &id, std::time::Duration::from_secs(30));
+        let retire = drain_and_stop_instance(
+            &drains,
+            &grill,
+            &id,
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(10),
+        );
         tokio::pin!(retire);
 
         // While the request is in flight, the retire has not killed anything.
@@ -19210,8 +19331,13 @@ host = "remote.local"
         drains.increment_connections(&id.0).await;
         drains.increment_websocket(&id.0).await;
 
-        let retire =
-            drain_and_stop_instance(&drains, &grill, &id, std::time::Duration::from_secs(30));
+        let retire = drain_and_stop_instance(
+            &drains,
+            &grill,
+            &id,
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(10),
+        );
         tokio::pin!(retire);
 
         // The HTTP half of the splice completes, but the WebSocket is still

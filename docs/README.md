@@ -79,6 +79,19 @@ workload it can't prove has stopped. Rolling and blue-green deployments keep
 both generations when the old one's exit is uncertain. A failed final kernel
 backend publication is a deployment error, and the running workload stays owned.
 
+Each runtime confirmation step (accepting a stop request, accepting a
+force-kill, and reporting exit after the kill) has its own deadline, separate
+from the workload's drain grace:
+
+```toml
+[runtime]
+stop_confirmation_timeout_secs = 10  # default; zero is rejected
+```
+
+Raise it on hosts where `runc kill` routinely answers slowly under load. A
+stop that outlasts it is reported as unconfirmed and retried, never as
+Stopped.
+
 ### Jobs and cron
 
 Jobs record execution intent and their three-retry budget before launching, and

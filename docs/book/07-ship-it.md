@@ -922,15 +922,18 @@ Start with the hole the stop listing above left open. Here's what the retire pat
 
 ```rust
 /// Preserve ownership until both force-kill and observed runtime exit succeed.
-async fn kill_runtime_instance<G: Grill>(grill: &G, id: &InstanceId) -> Result<(), BunError> {
-    let signal_timeout = std::time::Duration::from_secs(2);
-    tokio::time::timeout(signal_timeout, grill.kill(id))
+async fn kill_runtime_instance<G: Grill>(
+    grill: &G,
+    id: &InstanceId,
+    confirmation_timeout: std::time::Duration,
+) -> Result<(), BunError> {
+    tokio::time::timeout(confirmation_timeout, grill.kill(id))
         .await
         .map_err(|_| BunError::StopUnconfirmed {
             instance_id: id.clone(),
             reason: "force-kill request timed out",
         })??;
-    if observe_runtime_exit(grill, id, signal_timeout).await? {
+    if observe_runtime_exit(grill, id, confirmation_timeout).await? {
         return Ok(());
     }
     Err(BunError::StopUnconfirmed {
@@ -941,6 +944,8 @@ async fn kill_runtime_instance<G: Grill>(grill: &G, id: &InstanceId) -> Result<(
 ```
 
 That `??` looks like a typo, but it isn't. `tokio::time::timeout` wraps a future and gives back a `Result` of its own: `Err(Elapsed)` if time ran out, otherwise `Ok(...)` containing whatever the inner future returned, which is another `Result`. So we have `Result<Result<(), BunError>, Elapsed>`. The `map_err` turns the outer error into a `BunError`, the first `?` unwraps the timeout layer, and the second `?` unwraps `kill`'s own result. Either failure returns early. The trailing `observe_runtime_exit` asks the runtime again, because a successful signal isn't a stopped process. Rolling, blue-green, rollback and plain `relish stop` all go through this helper, so they can't drift apart again.
+
+How long should Bun wait for the runtime? The first version hard-coded two seconds, and CI caught it out. On a busy runner `runc kill` alone took longer than that: it's a fork and exec of a Go binary that reads its state file and signals through the kernel, and every one of those steps queues behind whatever else the host is doing. A process stuck in uninterruptible I/O doesn't even die on `SIGKILL` until the I/O completes. The stop wasn't wrong, just slow, and Bun reported "stop not confirmed" and kept ownership of a container that was about to exit anyway. So the deadline is now `[runtime] stop_confirmation_timeout_secs`, read once at startup and threaded down to every stop and kill. It defaults to ten seconds, five times the budget CI outran. We didn't go higher because some of these waits run on the agent's command loop, which can spend up to two deadlines on one wedged instance (the kill request, then the exit check), and twenty seconds still sits inside the thirty-second window before a council marks a silent node's report stale. A test gives `MockGrill` a five-second kill and checks the default waits it out, while a two-second deadline still reports the stop as unconfirmed.
 
 When it fails, the deploy worker emits an error instead of `Complete`, and both generations stay in ordinary supervision. The same goes for everything after the process exits. Deleting the identity directory and the adoption record returns `Result<(), BunError>` over the command channel. `()` is Rust's unit type (think `void`, but as a real value), so success carries no payload and failure explains which instance still has work outstanding. Only when both deletions succeed do we release the port and forget the instance. Rollback follows the same rule, and history tells the truth about it: `RolledBack` only when every replacement is confirmed gone, `Halted` when some old instances had already retired, `Failed` when cleanup couldn't be confirmed.
 

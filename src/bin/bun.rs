@@ -1164,6 +1164,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         config.security.bootstrap_peers.clone(),
     );
     agent.set_smoker_config(config.smoker.to_smoker_config());
+    agent.set_stop_confirmation_timeout(config.runtime.stop_confirmation_timeout());
     let node_pressure_available = agent.configure_node_pressure(
         reliaburger::smoker::node_pressure::NodePressureLimits {
             max_cpu_percentage: config.testing.max_node_pressure_cpu_percent,

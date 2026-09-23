@@ -56,6 +56,8 @@ pub struct MockGrill {
     fail_kill: Arc<AtomicBool>,
     fail_stop: Arc<AtomicBool>,
     inventory_delay: Arc<Mutex<Option<std::time::Duration>>>,
+    /// Time each force-kill request takes, as `runc kill` does on a loaded host.
+    kill_delay: Arc<Mutex<Option<std::time::Duration>>>,
     fail_create: Arc<AtomicBool>,
     fail_start: Arc<AtomicBool>,
     fail_state: Arc<AtomicBool>,
@@ -98,6 +100,7 @@ impl Default for MockGrill {
             fail_kill: Arc::default(),
             fail_stop: Arc::default(),
             inventory_delay: Arc::default(),
+            kill_delay: Arc::default(),
             fail_create: Arc::default(),
             fail_start: Arc::default(),
             fail_state: Arc::default(),
@@ -337,6 +340,11 @@ impl MockGrill {
         *self.inventory_delay.lock().unwrap() = delay;
     }
 
+    /// Delay every force-kill request, as a slow runtime on a loaded host would.
+    pub fn set_kill_delay(&self, delay: Option<std::time::Duration>) {
+        *self.kill_delay.lock().unwrap() = delay;
+    }
+
     /// Supply a complete original runtime inventory for recovery tests.
     pub async fn set_launch_inventory(&self, launches: Vec<super::RuntimeLaunch>) {
         *self.launch_inventory.lock().await = Some(launches);
@@ -523,6 +531,10 @@ impl super::Grill for MockGrill {
             self.kill_started.add_permits(1);
             let permit = self.kill_release.acquire().await.unwrap();
             permit.forget();
+        }
+        let delay = *self.kill_delay.lock().unwrap();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
         }
         if self.fail_kill.load(Ordering::SeqCst) {
             return Err(GrillError::StartFailed {

@@ -456,6 +456,16 @@ impl NodeConfig {
             });
         }
 
+        // A zero deadline would fail every stop before the runtime answered,
+        // leaving every workload owned and unstoppable.
+        if self.runtime.stop_confirmation_timeout_secs == 0 {
+            return Err(ConfigError::Validation {
+                field: "runtime.stop_confirmation_timeout_secs".into(),
+                context: "node config".into(),
+                reason: "must be greater than zero".into(),
+            });
+        }
+
         self.testing
             .validate()
             .map_err(|error| ConfigError::Validation {
@@ -571,6 +581,18 @@ mod tests {
             matches!(err, ConfigError::Validation { ref field, .. }
                 if field == "metrics.collection_interval_secs"),
             "expected a collection-interval validation error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn node_config_rejects_a_zero_stop_confirmation_timeout() {
+        let mut node = crate::config::NodeConfig::default();
+        node.runtime.stop_confirmation_timeout_secs = 0;
+        let err = node.validate().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Validation { ref field, .. }
+                if field == "runtime.stop_confirmation_timeout_secs"),
+            "expected a stop-confirmation validation error, got {err:?}"
         );
     }
 

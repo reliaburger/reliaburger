@@ -33,6 +33,7 @@ pub struct NodeConfig {
     pub ebpf: EbpfSection,
     pub upgrades: UpgradeSection,
     pub smoker: SmokerSection,
+    pub runtime: RuntimeSection,
     /// Server-owned permissions and limits for Phase 15 diagnostics.
     pub testing: crate::testkit::safety::ClusterTestPolicy,
 }
@@ -86,6 +87,35 @@ impl SmokerSection {
             default_duration: std::time::Duration::from_secs(self.default_duration_secs),
             max_duration: std::time::Duration::from_secs(self.max_duration_secs),
         }
+    }
+}
+
+/// Container runtime command limits (`[runtime]`).
+///
+/// Bun never reports a workload stopped until the runtime confirms its exit.
+/// `stop_confirmation_timeout_secs` bounds each step of that proof: the
+/// runtime accepting a graceful stop request, accepting a force-kill request,
+/// and reporting the exit after a kill. It is separate from an app's drain
+/// grace, which is how long the workload itself gets to finish.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RuntimeSection {
+    /// Seconds each stop or kill confirmation step may take. Default 10.
+    pub stop_confirmation_timeout_secs: u64,
+}
+
+impl Default for RuntimeSection {
+    fn default() -> Self {
+        Self {
+            stop_confirmation_timeout_secs: 10,
+        }
+    }
+}
+
+impl RuntimeSection {
+    /// The per-step deadline for confirming a stop or force-kill.
+    pub fn stop_confirmation_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.stop_confirmation_timeout_secs)
     }
 }
 
@@ -875,6 +905,24 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("release_url"));
+    }
+
+    #[test]
+    fn runtime_stop_confirmation_defaults_to_ten_seconds() {
+        let config = NodeConfig::parse("").unwrap();
+        assert_eq!(
+            config.runtime.stop_confirmation_timeout(),
+            std::time::Duration::from_secs(10)
+        );
+    }
+
+    #[test]
+    fn runtime_stop_confirmation_parses_from_toml() {
+        let config = NodeConfig::parse("[runtime]\nstop_confirmation_timeout_secs = 30\n").unwrap();
+        assert_eq!(
+            config.runtime.stop_confirmation_timeout(),
+            std::time::Duration::from_secs(30)
+        );
     }
 
     #[test]
