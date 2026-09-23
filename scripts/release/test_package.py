@@ -4,10 +4,16 @@ import hashlib
 import json
 from pathlib import Path
 import subprocess
+import shutil
 import tempfile
 import unittest
 
 from package import package_release
+
+# The installers promise `curl ... | sh`. CI's `sh` is dash; macOS's is bash in
+# POSIX mode. Run every installer test under each POSIX shell present.
+POSIX_SHELLS = [shell for shell in ("sh", "dash") if shutil.which(shell)]
+BOOTSTRAP = Path(__file__).resolve().parents[2] / "docs/website/install.sh"
 
 
 class ReleasePackageTests(unittest.TestCase):
@@ -62,14 +68,24 @@ class ReleasePackageTests(unittest.TestCase):
             tool.chmod(0o755)
         import os
         env = dict(os.environ, HOME=str(home), PATH=str(tools) + os.pathsep + os.environ["PATH"], FIXTURE=str(self.assets / "relish-macos-aarch64"))
-        result = subprocess.run(["bash", str(installer), "--install-only"], env=env, capture_output=True)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        installed = home / ".reliaburger/bin/relish"
-        original = installed.read_bytes()
-        (self.assets / "relish-macos-aarch64").write_bytes(b"tampered")
-        result = subprocess.run(["bash", str(installer), "--install-only"], env=env, capture_output=True)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(installed.read_bytes(), original)
+        genuine = (self.assets / "relish-macos-aarch64").read_bytes()
+        for shell in POSIX_SHELLS:
+            with self.subTest(shell=shell):
+                (self.assets / "relish-macos-aarch64").write_bytes(genuine)
+                result = subprocess.run([shell, str(installer), "--install-only"], env=env, capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                installed = home / ".reliaburger/bin/relish"
+                original = installed.read_bytes()
+                self.assertEqual(original, genuine)
+                (self.assets / "relish-macos-aarch64").write_bytes(b"tampered")
+                result = subprocess.run([shell, str(installer), "--install-only"], env=env, capture_output=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(b"checksum mismatch", result.stderr)
+                self.assertEqual(installed.read_bytes(), original)
+                self.assertEqual([p.name for p in (home / ".reliaburger/bin").iterdir()], ["relish"],
+                                 "a failed install left its staging directory behind")
+                result = subprocess.run([shell, str(installer), "--install-only", "--nodes", "1"], env=env, capture_output=True)
+                self.assertNotEqual(result.returncode, 0)
 
     def test_candidate_mirror_keeps_installer_bytes_and_forwards_signed_source(self):
         import os
@@ -104,11 +120,12 @@ esac
         env = dict(os.environ, HOME=str(home), PATH=str(tools) + os.pathsep + os.environ["PATH"],
                    RELIABURGER_RELEASE_BASE_URL=mirror, FIXTURE=str(binary), URLS=str(urls),
                    ARGUMENTS=str(arguments), INSTALLER=str(self.assets / "install.sh"))
-        bootstrap = Path(__file__).resolve().parents[2] / "docs/website/install.sh"
-        for script in [self.assets / "install.sh", bootstrap]:
-            with self.subTest(script=script):
+        bootstrap = BOOTSTRAP
+        for shell, script in [(shell, script) for shell in POSIX_SHELLS for script in [self.assets / "install.sh", bootstrap]]:
+            with self.subTest(shell=shell, script=script):
                 urls.unlink(missing_ok=True)
-                result = subprocess.run(["bash", str(script), "--nodes", "1"], env=env, capture_output=True)
+                arguments.unlink(missing_ok=True)
+                result = subprocess.run([shell, str(script), "--nodes", "1"], env=env, capture_output=True)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 expected = [mirror + "/relish-macos-aarch64"]
                 if script == bootstrap:
@@ -119,10 +136,49 @@ esac
                 self.assertEqual((self.assets / "install.sh").read_bytes(), installer_bytes)
                 for invalid in ["http://example.com", "https://user:pass@example.com", "https://example.com/?key=x", "https://example.com/#fragment", "https://example.com/a b"]:
                     urls.unlink(missing_ok=True)
-                    result = subprocess.run(["bash", str(script), "--install-only"],
+                    result = subprocess.run([shell, str(script), "--install-only"],
                                             env=dict(env, RELIABURGER_RELEASE_BASE_URL=invalid), capture_output=True)
                     self.assertNotEqual(result.returncode, 0)
                     self.assertFalse(urls.exists(), "invalid mirror reached curl")
+
+    def test_bootstrap_runs_when_piped_to_sh(self):
+        import os
+        tools = self.root / "pipe-tools"
+        tools.mkdir()
+        (tools / "curl").write_text("""#!/bin/sh
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = -o ]; then printf '%s\\n' 'printf "installer:%s\\n" "$@"' > "$2"; exit 0; fi
+  shift
+done
+exit 1
+""")
+        (tools / "curl").chmod(0o755)
+        env = dict(os.environ, PATH=str(tools) + os.pathsep + os.environ["PATH"])
+        for shell in POSIX_SHELLS:
+            with self.subTest(shell=shell):
+                result = subprocess.run([shell, "-s", "--", "--nodes", "1"], input=BOOTSTRAP.read_bytes(), env=env, capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.decode().splitlines(), ["installer:--nodes", "installer:1"])
+                for invalid in ["v0.1", "0.1.0", "v0.1.0\nv0.1.0", "v0.1.0;id", "v0.1.0 "]:
+                    result = subprocess.run([shell, str(BOOTSTRAP)], env=dict(env, RELIABURGER_VERSION=invalid), capture_output=True)
+                    self.assertNotEqual(result.returncode, 0, invalid)
+                    self.assertIn(b"invalid RELIABURGER_VERSION", result.stderr)
+
+    def test_installers_are_posix_sh(self):
+        self.package()
+        scripts = [self.assets / "install.sh", BOOTSTRAP]
+        for script in scripts:
+            text = script.read_text()
+            self.assertTrue(text.startswith("#!/bin/sh\n"), script)
+            code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+            for bashism in ("[[", "=~", "pipefail", "local ", "function ", "<<<", "declare "):
+                self.assertNotIn(bashism, code, f"{script} uses {bashism!r}")
+            for shell in POSIX_SHELLS:
+                result = subprocess.run([shell, "-n", str(script)], capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+        if shutil.which("shellcheck"):
+            result = subprocess.run(["shellcheck", "-s", "sh", *map(str, scripts)], capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stdout)
 
     def test_untrusted_key_cannot_publish_metadata(self):
         self.trusted = ["ed25519:" + base64.b64encode(bytes(32)).decode()]

@@ -8,7 +8,7 @@ not a measured guarantee.
 ## Install and boot
 
 ```sh
-curl -fsSL https://reliaburger.com/install.sh | bash
+curl -fsSL https://reliaburger.com/install.sh | sh
 export PATH="$HOME/.reliaburger/bin:$PATH"
 relish nodes
 relish status
@@ -41,7 +41,7 @@ Ubuntu's repositories. No host directories are mounted into the VMs. Managed Lim
 For a smaller single-node cluster:
 
 ```sh
-curl -fsSL https://reliaburger.com/install.sh | bash -s -- --nodes 1
+curl -fsSL https://reliaburger.com/install.sh | sh -s -- --nodes 1
 ```
 
 To install only the CLI, pass `--install-only`. Then start it separately:
@@ -55,7 +55,8 @@ curl, so the site's root is HTML. The bootstrap downloads a complete,
 version-specific installer over HTTPS before running it. That installer pins
 the native CLI's SHA-256; Relish separately requires the compiled-in release
 signing key for guest binaries. Guest images and Lima archives have fixed
-checksums. The initial shell bootstrap trusts HTTPS.
+checksums. The initial shell bootstrap trusts HTTPS. Both scripts are plain POSIX sh,
+so any `sh` runs them; pass installer options after `sh -s --`.
 
 ## Resume, stop and remove
 

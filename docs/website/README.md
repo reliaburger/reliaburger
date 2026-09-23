@@ -26,6 +26,9 @@ Update the release-status paragraph when the installer actually ships. The
 source quickstart intentionally matches `examples/phase-1/proc-first-run.toml`.
 
 `install.sh` is a small HTTPS bootstrap for the versioned release installer.
+Both it and the generated installer are POSIX sh, so `curl … | sh` works where
+`sh` is dash or busybox, not only bash. `scripts/release/test_package.py` runs
+them under every POSIX shell it finds and under `shellcheck -s sh` when present.
 It intentionally fails with a release-not-published message until v0.1.0 exists.
 The page labels this path as pending; remove that label only after published
 candidate qualification passes. The generated installer itself lives in the

@@ -226,7 +226,7 @@ qualification. Once the signed release and website are published, the install
 path will be:
 
 ```sh
-curl -fsSL https://reliaburger.com/install.sh | bash
+curl -fsSL https://reliaburger.com/install.sh | sh
 export PATH="$HOME/.reliaburger/bin:$PATH"
 relish nodes
 relish status

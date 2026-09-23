@@ -959,3 +959,15 @@ Rust integer overflow panics in debug builds and silently wraps in release build
 ### Ship the bytes you tested
 
 If a laptop test passes with one binary and the release tag then builds it again, we've tested one executable and published another. So the candidate workflow builds and signs once, from a commit on `main`, and records every asset's SHA-256 in `candidate.json`. Promotion checks the saved candidate against the digest kept at qualification time and publishes those exact bytes, with no compiler or signing key involved. It does hold a token that can write releases, so it runs only from `main` with `main`'s scripts and treats the tag strictly as data. Our first version ran the tagged tree's `candidate.py`, which let anyone who could push a tag hand that token a script of their own.
+
+### `| sh`, not `| bash`
+
+The homepage tells you to pipe the installer to `sh`. Our first installer said `bash` on its first line and used `[[ … =~ … ]]` to validate the version and the mirror URL, so `curl … | sh` failed on Ubuntu and Debian, where `sh` is dash, and in any container image with busybox. Bash's features were convenient. They weren't necessary.
+
+Both scripts are now plain POSIX sh. A regular expression becomes a `case` pattern: `https:///*|*[?#@\\[:space:]]*` rejects an empty host and any credentials, query, fragment, backslash or whitespace, and `https://?*` accepts the rest. The version check first rejects every character outside `[A-Za-z0-9.-]`, which includes newlines, so the `grep -E` that checks its shape sees exactly one line and can't be fooled by a second.
+
+`set -o pipefail` isn't POSIX either. Without it a pipeline's status is its last command's, so a failed `sha256sum | awk` looks like success with empty output. We don't rely on the status: the result is compared with the pinned digest, and an empty string never matches. That's the pattern throughout: every pipeline ends in a check that fails closed.
+
+The body sits in a `main` function called on the last line. A piped shell executes the script as it arrives, so a download cut off halfway through would otherwise run half an installer. With the function, a truncated script defines nothing and runs nothing.
+
+The packaging tests run both scripts under every POSIX shell they find, with a fake `curl` that serves fixtures, and under `shellcheck -s sh` when it's installed. On a Mac, `sh` is bash pretending to be POSIX, and it forgives things dash won't, so the tests run `dash` too when it's there (it ships with macOS).

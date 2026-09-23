@@ -175,7 +175,7 @@ the candidate installer from empty caches:
 curl --fail --location --proto '=https' --proto-redir '=https' \
   https://YOUR_HOST/candidate/install.sh -o /tmp/reliaburger-candidate-install.sh
 RELIABURGER_RELEASE_BASE_URL=https://YOUR_HOST/candidate \
-  bash /tmp/reliaburger-candidate-install.sh
+  sh /tmp/reliaburger-candidate-install.sh
 ```
 
 The static bootstrap accepts the same environment variable and fetches the
