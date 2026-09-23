@@ -24,8 +24,6 @@ const PENDING: &[(&str, &str)] = &[
         "relish apply -f https://reliaburger.com/demo/podinfo.yaml",
         "Z1.4",
     ),
-    // TODO(Z2.4): remove once `relish local stop <node>` lands.
-    ("relish local stop NODE", "Z2.4"),
 ];
 
 /// TODO(Z1.5): set to false once `examples/kubernetes/podinfo.yaml` exists.
