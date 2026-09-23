@@ -384,9 +384,13 @@ enum Command {
     Local {
         #[arg(value_enum)]
         action: LocalAction,
+        /// One node to start or stop: its name as `relish nodes` shows it,
+        /// its number (1, 2, 3) or `node-N`. Omit to act on every node.
+        node: Option<String>,
         #[arg(long, default_value = "laptop")]
         name: String,
-        /// Confirm permanent deletion of the owned VMs and their data.
+        /// Confirm destroying the cluster, stopping node 1 (which carries the
+        /// CLI endpoint and ingress) or stopping a node the quorum needs.
         #[arg(long)]
         yes: bool,
     },
@@ -1570,7 +1574,12 @@ async fn main() -> ExitCode {
         },
         Command::Source { query } => reliaburger::relish::source::run(query).await,
         Command::Uninstall { yes } => reliaburger::relish::uninstall::run(yes).map_err(Into::into),
-        Command::Local { action, name, yes } => {
+        Command::Local {
+            action,
+            node,
+            name,
+            yes,
+        } => {
             use reliaburger::relish::quickstart::lifecycle::{self, Action};
             let action = match action {
                 LocalAction::Status => Action::Status,
@@ -1578,7 +1587,7 @@ async fn main() -> ExitCode {
                 LocalAction::Stop => Action::Stop,
                 LocalAction::Destroy => Action::Destroy,
             };
-            lifecycle::run(action, &name, yes)
+            lifecycle::run(action, &name, node.as_deref(), yes)
                 .await
                 .map_err(|error| reliaburger::relish::RelishError::InitFailed(format!("{error:#}")))
         }
@@ -2280,6 +2289,17 @@ mod tests {
     fn parse_managed_quickstart_and_explicit_destroy() {
         assert!(parse(&["relish", "setup", "--quickstart", "--nodes", "3"]).is_ok());
         assert!(parse(&["relish", "local", "status"]).is_ok());
+        let cli = parse(&["relish", "local", "stop", "node-3"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Local { node: Some(ref node), yes: false, .. } if node == "node-3"
+        ));
+        let cli = parse(&["relish", "local", "start", "2", "--name", "demo"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Local { node: Some(ref node), ref name, .. } if node == "2" && name == "demo"
+        ));
+        assert!(parse(&["relish", "local", "stop", "1", "--yes"]).is_ok());
         assert!(parse(&["relish", "local", "destroy", "--name", "laptop", "--yes"]).is_ok());
         assert!(parse(&["relish", "setup", "--nodes", "3"]).is_err());
     }

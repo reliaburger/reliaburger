@@ -945,6 +945,20 @@ pub enum NodeCondition {
 
 Unlike a C enum, a Rust variant can carry its own fields, so "not running" arrives with the state Lima reported. The command prints every node and exits 1 unless all are `Ready`. `Unknown` counts as unhealthy: if we couldn't look, we can't claim it's fine. The older `relish dev` commands likewise validate their saved state file (cluster name, node list, VM ownership) before touching Lima, because parsing JSON proves we have Rust values, not that they describe *our* cluster.
 
+The tutorial's "lose a node" step used to mean typing a `limactl` path and a
+generated VM name. Now it's `relish local stop node-3`. `select_node` accepts
+the name `relish nodes` prints (which is the VM name), a number from 1 or
+`node-N`, and an unknown selector lists the valid ones. Stopping one node goes
+through a pure function first, `stop_consequences`, which returns a sentence
+for each reason the stop deserves a second thought: node 1 carries every host
+port forward, and a stop that leaves fewer than a majority running takes the
+council's quorum with it. Any reason means `--yes`. We didn't refuse outright;
+killing the node the CLI talks to is a perfectly good experiment, just not one
+you want to run by typing the wrong digit. The tests drive a fake `limactl`, a
+five-line shell script that logs its arguments and answers `list --json` from
+a file, so they can assert exactly which VM was stopped and that a refused
+stop touched nothing.
+
 Numbers are the other trap. `relish fault --duration 5m` must fit the request's seconds field:
 
 ```rust

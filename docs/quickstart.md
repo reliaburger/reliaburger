@@ -75,6 +75,20 @@ relish local start
 relish local destroy --yes
 ```
 
+`stop` and `start` also take one node, by the name `relish nodes` shows, its
+number or `node-N`, so losing a machine is one command:
+
+```sh
+relish local stop node-3     # the other two keep the council's quorum
+relish local start node-3    # boots it and waits for its API
+```
+
+Two stops ask for `--yes` first. Node 1 carries every host forward (the CLI
+endpoint, the ingress on `localhost:18080` and the registry), so while it's
+down the cluster keeps running but `relish` can't reach it. And stopping a
+node that would leave fewer than two of three running costs the council its
+quorum. Both are fair experiments; neither should happen by accident.
+
 Setup saves ownership and credentials before creating VMs. If it fails or
 hits its five-minute deadline, rerun the same command. It reuses verified
 cached assets, the original CA and the owned VMs. A retry won't silently

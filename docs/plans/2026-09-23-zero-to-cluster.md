@@ -123,7 +123,7 @@ tutorial, because a tutorial over a broken path is a lie.
 - [x] **Z2.3 `wtf` and `trace` from the host.** Route the per-node calls through
   the endpoint node (the API already forwards to peers) instead of dialling
   guest addresses.
-- [ ] **Z2.4 Name a node for `relish local stop`.** `relish local stop <node>`
+- [x] **Z2.4 Name a node for `relish local stop`.** `relish local stop <node>`
   stops one VM, so "lose a node" doesn't mean typing a `limactl` path and a
   generated VM name.
 
