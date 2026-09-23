@@ -602,10 +602,22 @@ spot-checked by hand.
       mechanical); `NodeFaultAuth::admin(name)` the 7 token setups in
       `tests/placement.rs` (−55); `repo_config(repo, poll)` the 5 configs in
       `tests/gitops.rs` (−35). Total −232 test lines.
-- [ ] **T4.9 Sweep remaining legacy code (decision G).** Search for
+- [x] **T4.9 Sweep remaining legacy code (decision G).** Search for
       "legacy", "compat", "deprecated", "migrate", `#[serde(default)]` on
       durable formats and version fallbacks. Delete paths that exist only for
       unreleased formats or superseded implementations, and their docs.
+      Done in 17 commits. Chaos: `relish chaos` and the `/v1/chaos/partition`
+      and `/heal` endpoints are gone; council partitions are a node-targeted
+      `FaultType::CouncilPartition` on `/v1/fault` with the usual reservation,
+      fence and exact-id reversal; workload faults need a namespace; the OOM
+      flag, the partition cgroup field and the unkeyed eBPF cleanup are gone.
+      Runtime: one blob layout, no per-port DNAT sweep, canonical instance ids
+      only, a required process start time, schema-3 owner records and
+      schema-2 instance records only. State and wire: no layout-1 identity
+      import, DNS readiness inside the one capability report, no serde
+      defaults kept for pre-release snapshots, no reserved gossip timestamp
+      (protocol generation 20 → 22). What remains under "legacy" is refusal
+      checks and test fixtures. The sweep is +795/−2,440 lines.
 - [x] **T4.8 Make `make loc` honest.** Count tracked files (`git ls-files`)
       so `node_modules` Markdown under `docs/talks/` stops inflating `.md`, and
       treat `#[cfg(test)] mod x;` files as tests.
