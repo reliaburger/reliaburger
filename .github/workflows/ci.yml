@@ -33,7 +33,7 @@ jobs:
   minimum-rust:
     name: minimum Rust 1.97.0
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.0
