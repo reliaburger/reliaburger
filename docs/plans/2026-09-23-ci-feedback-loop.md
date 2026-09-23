@@ -336,10 +336,10 @@ VM). A fix counts only when the loop that used to fail passes.
 - [x] **C6.8 eBPF tests that write to the host's volumes directory.** Some
   never call `set_volumes_dir` and write under `/var/lib/reliaburger/volumes`.
 
-- [ ] **C6.9 Unique names in the eBPF tests.** Several `tests/ebpf.rs` tests
+- [x] **C6.9 Unique names in the eBPF tests.** Several `tests/ebpf.rs` tests
   still use fixed app names (`prestart`, `recycled`, `guarded`, `badcidr`, …)
   with host-wide cgroup paths, the same risk C6.7 removed from `oci_crash`.
-- [ ] **C6.10 One failed crash test still poisons the next.** After a failure,
+- [x] **C6.10 One failed crash test still poisons the next.** After a failure,
   later `oci_crash` tests can fail at `apply` on left-over state the C6.2 guard
   doesn't cover. Find what survives and tear it down.
 
