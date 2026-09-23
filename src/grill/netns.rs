@@ -784,36 +784,17 @@ async fn ensure_nft_table(executor: &impl RuntimeCommandExecutor) -> Result<(), 
     // The named port map (`add map` is idempotent, like table/chain).
     run_nft(executor, &portmap::portmap_definition()).await?;
 
-    // The single lookup rule that consults the map, guarded the same
-    // way — and a one-time sweep of legacy per-port DNAT rules left by
-    // the pre-map scheme, which would otherwise match ahead of it.
+    // The single lookup rule that consults the map, guarded the same way.
     let prerouting = list_chain(executor, "prerouting").await?;
     if !prerouting.contains("@portmap") {
         run_nft(executor, &portmap::map_rule()).await?;
-    }
-    for handle in portmap::legacy_rule_handles(&prerouting) {
-        run_cmd_raw_with(
-            executor,
-            "nft",
-            &[
-                "delete",
-                "rule",
-                "ip",
-                "reliaburger",
-                "prerouting",
-                "handle",
-                &handle.to_string(),
-            ],
-            "sweep legacy dnat rule",
-        )
-        .await?;
     }
 
     Ok(())
 }
 
 /// List a chain with rule handles (`nft -a list chain`). Used to guard
-/// one-shot rules and to sweep legacy per-port DNAT rules.
+/// one-shot rules.
 async fn list_chain(executor: &impl RuntimeCommandExecutor, chain: &str) -> Result<String, String> {
     let output = executor
         .output("nft", &["-a", "list", "chain", "ip", "reliaburger", chain])
