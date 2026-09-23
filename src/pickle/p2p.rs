@@ -472,7 +472,8 @@ fn local_blobs(
             .map(|layer| store.blob_path(&layer.digest))
             .collect(),
         config: store.blob_path(&manifest.config.digest),
-        config_digest: manifest.config.digest.to_string(),
+        // Digest's Display abbreviates; the image store re-checks the full value.
+        config_digest: manifest.config.digest.as_str().to_string(),
     }
 }
 
