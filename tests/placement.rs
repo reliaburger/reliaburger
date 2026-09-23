@@ -48,6 +48,23 @@ struct NodeFaultAuth {
     plaintext: String,
 }
 
+impl NodeFaultAuth {
+    /// A fresh unscoped admin token, shared by every node in the test cluster.
+    fn admin(name: &str) -> Self {
+        let created = reliaburger::sesame::token::create_token(
+            name,
+            reliaburger::sesame::types::ApiRole::Admin,
+            reliaburger::sesame::types::TokenScope::default(),
+            None,
+        )
+        .unwrap();
+        Self {
+            token: created.token,
+            plaintext: created.plaintext,
+        }
+    }
+}
+
 use tokio::sync::watch;
 
 async fn start_node(
@@ -769,17 +786,7 @@ async fn autoscaler_scales_up_on_high_metric() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 #[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
 async fn fault_injection_rejected_when_quorum_at_risk() {
-    let created = reliaburger::sesame::token::create_token(
-        "partition-admin",
-        reliaburger::sesame::types::ApiRole::Admin,
-        reliaburger::sesame::types::TokenScope::default(),
-        None,
-    )
-    .unwrap();
-    let auth = NodeFaultAuth {
-        token: created.token,
-        plaintext: created.plaintext,
-    };
+    let auth = NodeFaultAuth::admin("partition-admin");
     let shutdown = CancellationToken::new();
     let n1 = start_node_with_auth("r1", 18741, vec![], &shutdown, Some(auth.clone())).await;
     let n2 = start_node_with_auth(
@@ -921,17 +928,7 @@ fn peer_state(observer: &Node, target: &str) -> Option<reliaburger::mustard::sta
 async fn partition_isolates_a_node_for_real() {
     use reliaburger::mustard::state::NodeState;
 
-    let created = reliaburger::sesame::token::create_token(
-        "partition-admin",
-        reliaburger::sesame::types::ApiRole::Admin,
-        reliaburger::sesame::types::TokenScope::default(),
-        None,
-    )
-    .unwrap();
-    let auth = NodeFaultAuth {
-        token: created.token,
-        plaintext: created.plaintext,
-    };
+    let auth = NodeFaultAuth::admin("partition-admin");
     let shutdown = CancellationToken::new();
     let n1 = start_node_with_auth("q1", 18641, vec![], &shutdown, Some(auth.clone())).await;
     let n2 = start_node_with_auth(
@@ -1025,20 +1022,9 @@ async fn partition_isolates_a_node_for_real() {
 #[ignore = "slow multi-node node-failure acceptance; run with make test-cluster"]
 async fn authenticated_node_kill_fails_and_restores_a_real_cluster_member() {
     use reliaburger::mustard::state::NodeState;
-    use reliaburger::sesame::types::{ApiRole, TokenScope};
     use reliaburger::smoker::types::{FaultRequest, FaultType};
 
-    let created = reliaburger::sesame::token::create_token(
-        "chaos-admin",
-        ApiRole::Admin,
-        TokenScope::default(),
-        None,
-    )
-    .unwrap();
-    let auth = NodeFaultAuth {
-        token: created.token,
-        plaintext: created.plaintext,
-    };
+    let auth = NodeFaultAuth::admin("chaos-admin");
     let shutdown = CancellationToken::new();
     let n1 = start_node_with_auth("f1", 18941, vec![], &shutdown, Some(auth.clone())).await;
     let n2 = start_node_with_auth(
@@ -1329,19 +1315,8 @@ async fn wait_for_fault_admission_views(nodes: &[&Node]) -> usize {
 #[ignore = "slow multi-node reservation acceptance; run with make test-cluster"]
 async fn concurrent_node_kills_and_leader_change_preserve_reserved_capacity() {
     use reliaburger::mustard::state::NodeState;
-    use reliaburger::sesame::types::{ApiRole, TokenScope};
     use reliaburger::smoker::types::{FaultRequest, FaultType};
-    let created = reliaburger::sesame::token::create_token(
-        "reservation-admin",
-        ApiRole::Admin,
-        TokenScope::default(),
-        None,
-    )
-    .unwrap();
-    let auth = NodeFaultAuth {
-        token: created.token,
-        plaintext: created.plaintext,
-    };
+    let auth = NodeFaultAuth::admin("reservation-admin");
     let shutdown = CancellationToken::new();
     let n1 =
         start_node_with_auth("reservation1", 20341, vec![], &shutdown, Some(auth.clone())).await;
@@ -1538,17 +1513,7 @@ async fn concurrent_node_kills_and_leader_change_preserve_reserved_capacity() {
 #[ignore = "multi-node apply forwarding acceptance; run with make test-cluster"]
 async fn follower_apply_preserves_user_authority_for_administrative_manifests() {
     use reliaburger::sesame::types::{ApiRole, TokenScope};
-    let created = reliaburger::sesame::token::create_token(
-        "apply-admin",
-        ApiRole::Admin,
-        TokenScope::default(),
-        None,
-    )
-    .unwrap();
-    let auth = NodeFaultAuth {
-        token: created.token,
-        plaintext: created.plaintext,
-    };
+    let auth = NodeFaultAuth::admin("apply-admin");
     let shutdown = CancellationToken::new();
     let n1 = start_node_with_auth("apply1", 20401, vec![], &shutdown, Some(auth.clone())).await;
     let n2 = start_node_with_auth(
@@ -1651,17 +1616,7 @@ async fn follower_apply_preserves_user_authority_for_administrative_manifests() 
 async fn capacity_refusal_from_the_live_scheduler_forwards_without_committing_an_app() {
     use reliaburger::meat::scheduler::ScheduleError;
     use reliaburger::relish::RelishError;
-    let created = reliaburger::sesame::token::create_token(
-        "capacity-admin",
-        reliaburger::sesame::types::ApiRole::Admin,
-        Default::default(),
-        None,
-    )
-    .unwrap();
-    let auth = NodeFaultAuth {
-        token: created.token,
-        plaintext: created.plaintext,
-    };
+    let auth = NodeFaultAuth::admin("capacity-admin");
     let shutdown = CancellationToken::new();
     let n1 = start_node_with_auth("cap1", 26341, vec![], &shutdown, Some(auth.clone())).await;
     let n2 = start_node_with_auth(
@@ -1828,17 +1783,7 @@ async fn capacity_refusal_from_the_live_scheduler_forwards_without_committing_an
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 #[ignore = "slow multi-node leased storage acceptance; run with make test-cluster"]
 async fn leased_storage_cleanup_waits_for_former_placements_and_failed_deletion() {
-    let created = reliaburger::sesame::token::create_token(
-        "storage-admin",
-        reliaburger::sesame::types::ApiRole::Admin,
-        Default::default(),
-        None,
-    )
-    .unwrap();
-    let auth = NodeFaultAuth {
-        token: created.token,
-        plaintext: created.plaintext,
-    };
+    let auth = NodeFaultAuth::admin("storage-admin");
     let shutdown = CancellationToken::new();
     let n1 = start_node_with_auth("storage1", 26841, vec![], &shutdown, Some(auth.clone())).await;
     let n2 = start_node_with_auth(

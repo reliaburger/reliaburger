@@ -76,6 +76,21 @@ fn git(dir: &std::path::Path, args: &[&str]) {
 }
 
 /// Create a git repo containing `apps.toml`, return its path.
+/// Track `main` at the repository root, unsigned and without a webhook secret.
+fn repo_config(repo: &str, poll_interval_secs: u64) -> GitOpsConfig {
+    GitOpsConfig {
+        repo: repo.to_string(),
+        branch: "main".to_string(),
+        path: "/".to_string(),
+        poll_interval_secs,
+        require_signed_commits: false,
+        trusted_signing_keys: vec![],
+        webhook_secret: None,
+        recursive: false,
+        webhook_rate_limit: 10,
+    }
+}
+
 fn make_repo(dir: &std::path::Path, toml: &str) {
     git(dir, &["init", "-q", "-b", "main"]);
     std::fs::write(dir.join("apps.toml"), toml).unwrap();
@@ -121,17 +136,7 @@ async fn sync_loop_applies_repo_apps_to_raft() {
     let (_webhook_tx, webhook_rx) = mpsc::channel::<()>(4);
     let data_dir = tempfile::tempdir().unwrap();
 
-    let config = GitOpsConfig {
-        repo: repo_dir.path().to_string_lossy().to_string(),
-        branch: "main".to_string(),
-        path: "/".to_string(),
-        poll_interval_secs: 1,
-        require_signed_commits: false,
-        trusted_signing_keys: vec![],
-        webhook_secret: None,
-        recursive: false,
-        webhook_rate_limit: 10,
-    };
+    let config = repo_config(&repo_dir.path().to_string_lossy(), 1);
     spawn_gitops_sync(
         Arc::clone(&council),
         config,
@@ -180,17 +185,7 @@ async fn webhook_triggers_immediate_sync() {
     let data_dir = tempfile::tempdir().unwrap();
 
     // Long poll interval: only a webhook can make the sync happen quickly.
-    let config = GitOpsConfig {
-        repo: repo_dir.path().to_string_lossy().to_string(),
-        branch: "main".to_string(),
-        path: "/".to_string(),
-        poll_interval_secs: 3600,
-        require_signed_commits: false,
-        trusted_signing_keys: vec![],
-        webhook_secret: None,
-        recursive: false,
-        webhook_rate_limit: 10,
-    };
+    let config = repo_config(&repo_dir.path().to_string_lossy(), 3600);
     spawn_gitops_sync(
         Arc::clone(&council),
         config,
@@ -289,17 +284,7 @@ async fn sync_loop_applies_every_declarative_kind() {
     let (_webhook_tx, webhook_rx) = mpsc::channel::<()>(4);
     let data_dir = tempfile::tempdir().unwrap();
 
-    let config = GitOpsConfig {
-        repo: repo_dir.path().to_string_lossy().to_string(),
-        branch: "main".to_string(),
-        path: "/".to_string(),
-        poll_interval_secs: 1,
-        require_signed_commits: false,
-        trusted_signing_keys: vec![],
-        webhook_secret: None,
-        recursive: false,
-        webhook_rate_limit: 10,
-    };
+    let config = repo_config(&repo_dir.path().to_string_lossy(), 1);
     spawn_gitops_sync(
         Arc::clone(&council),
         config,
@@ -430,17 +415,7 @@ async fn sync_deletes_the_namespaced_app_not_the_default_one() {
     let shutdown = CancellationToken::new();
     let (_webhook_tx, webhook_rx) = mpsc::channel::<()>(4);
     let data_dir = tempfile::tempdir().unwrap();
-    let config = GitOpsConfig {
-        repo: repo_dir.path().to_string_lossy().to_string(),
-        branch: "main".to_string(),
-        path: "/".to_string(),
-        poll_interval_secs: 1,
-        require_signed_commits: false,
-        trusted_signing_keys: vec![],
-        webhook_secret: None,
-        recursive: false,
-        webhook_rate_limit: 10,
-    };
+    let config = repo_config(&repo_dir.path().to_string_lossy(), 1);
     spawn_gitops_sync(
         Arc::clone(&council),
         config,
@@ -485,17 +460,7 @@ async fn a_failed_sync_is_recorded_in_sync_state() {
     let data_dir = tempfile::tempdir().unwrap();
 
     // A repo path that doesn't exist: the clone fails on every attempt.
-    let config = GitOpsConfig {
-        repo: "/nonexistent/repo/does/not/exist.git".to_string(),
-        branch: "main".to_string(),
-        path: "/".to_string(),
-        poll_interval_secs: 1,
-        require_signed_commits: false,
-        trusted_signing_keys: vec![],
-        webhook_secret: None,
-        recursive: false,
-        webhook_rate_limit: 10,
-    };
+    let config = repo_config("/nonexistent/repo/does/not/exist.git", 1);
     spawn_gitops_sync(
         Arc::clone(&council),
         config,

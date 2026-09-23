@@ -32,6 +32,15 @@ fn ebpf_tests_enabled() -> bool {
     std::env::var("RELIABURGER_EBPF_TESTS").is_ok()
 }
 
+/// Load and attach the Onion programs, refusing to run without the eBPF gate.
+fn load_ebpf() -> OnionEbpf {
+    assert!(
+        ebpf_tests_enabled(),
+        "set RELIABURGER_EBPF_TESTS=1 after provisioning eBPF prerequisites"
+    );
+    OnionEbpf::load(&find_bpf_obj_dir(), CGROUP_PATH.as_ref()).expect("failed to load eBPF program")
+}
+
 /// Find the directory containing compiled .bpf.o files.
 ///
 /// build.rs puts them in OUT_DIR, which is under the target directory.
@@ -93,14 +102,7 @@ fn embedded_program_loads_without_an_object_directory() {
 #[tokio::test]
 #[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
 async fn ebpf_load_and_attach() {
-    assert!(
-        ebpf_tests_enabled(),
-        "set RELIABURGER_EBPF_TESTS=1 after provisioning eBPF prerequisites"
-    );
-
-    let obj_dir = find_bpf_obj_dir();
-    let mut ebpf =
-        OnionEbpf::load(&obj_dir, CGROUP_PATH.as_ref()).expect("failed to load eBPF program");
+    let mut ebpf = load_ebpf();
 
     assert!(ebpf.is_attached());
     assert!(ebpf.connect6_attached());
@@ -112,14 +114,7 @@ async fn ebpf_load_and_attach() {
 #[tokio::test]
 #[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
 async fn ebpf_backend_map_write_and_read() {
-    assert!(
-        ebpf_tests_enabled(),
-        "set RELIABURGER_EBPF_TESTS=1 after provisioning eBPF prerequisites"
-    );
-
-    let obj_dir = find_bpf_obj_dir();
-    let mut ebpf =
-        OnionEbpf::load(&obj_dir, CGROUP_PATH.as_ref()).expect("failed to load eBPF program");
+    let mut ebpf = load_ebpf();
 
     let mut bpf_map = BpfServiceMap::new();
 
@@ -166,14 +161,7 @@ async fn ebpf_backend_map_write_and_read() {
 #[tokio::test]
 #[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
 async fn ebpf_backend_map_remove() {
-    assert!(
-        ebpf_tests_enabled(),
-        "set RELIABURGER_EBPF_TESTS=1 after provisioning eBPF prerequisites"
-    );
-
-    let obj_dir = find_bpf_obj_dir();
-    let mut ebpf =
-        OnionEbpf::load(&obj_dir, CGROUP_PATH.as_ref()).expect("failed to load eBPF program");
+    let mut ebpf = load_ebpf();
 
     let mut bpf_map = BpfServiceMap::new();
 
@@ -211,14 +199,7 @@ async fn ebpf_backend_map_remove() {
 #[tokio::test]
 #[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
 async fn ebpf_service_map_sync_multiple() {
-    assert!(
-        ebpf_tests_enabled(),
-        "set RELIABURGER_EBPF_TESTS=1 after provisioning eBPF prerequisites"
-    );
-
-    let obj_dir = find_bpf_obj_dir();
-    let mut ebpf =
-        OnionEbpf::load(&obj_dir, CGROUP_PATH.as_ref()).expect("failed to load eBPF program");
+    let mut ebpf = load_ebpf();
 
     let mut bpf_map = BpfServiceMap::new();
     let mut svc_map = ServiceMap::new();
@@ -275,14 +256,7 @@ async fn ebpf_service_map_sync_multiple() {
 #[tokio::test]
 #[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
 async fn ebpf_connect_to_vip_rewrites_destination() {
-    assert!(
-        ebpf_tests_enabled(),
-        "set RELIABURGER_EBPF_TESTS=1 after provisioning eBPF prerequisites"
-    );
-
-    let obj_dir = find_bpf_obj_dir();
-    let mut ebpf =
-        OnionEbpf::load(&obj_dir, CGROUP_PATH.as_ref()).expect("failed to load eBPF program");
+    let mut ebpf = load_ebpf();
 
     // Start a TCP listener on an ephemeral port
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -338,14 +312,7 @@ async fn ebpf_connect_to_vip_rewrites_destination() {
 #[tokio::test]
 #[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
 async fn ebpf_connect_to_vip_no_backends_refused() {
-    assert!(
-        ebpf_tests_enabled(),
-        "set RELIABURGER_EBPF_TESTS=1 after provisioning eBPF prerequisites"
-    );
-
-    let obj_dir = find_bpf_obj_dir();
-    let mut ebpf =
-        OnionEbpf::load(&obj_dir, CGROUP_PATH.as_ref()).expect("failed to load eBPF program");
+    let mut ebpf = load_ebpf();
 
     // Register a service with no backends
     let vip = VirtualIP::from_service_id(&ServiceId::new("default", "empty-service"));
@@ -382,14 +349,7 @@ async fn ebpf_connect_to_vip_no_backends_refused() {
 #[tokio::test]
 #[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
 async fn ebpf_connect_non_vip_passes_through() {
-    assert!(
-        ebpf_tests_enabled(),
-        "set RELIABURGER_EBPF_TESTS=1 after provisioning eBPF prerequisites"
-    );
-
-    let obj_dir = find_bpf_obj_dir();
-    let mut ebpf =
-        OnionEbpf::load(&obj_dir, CGROUP_PATH.as_ref()).expect("failed to load eBPF program");
+    let mut ebpf = load_ebpf();
 
     // Start a listener on localhost (not a VIP)
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -426,16 +386,8 @@ async fn agent_deploy_populates_backend_map() {
     use tokio::sync::{Mutex, mpsc};
     use tokio_util::sync::CancellationToken;
 
-    assert!(
-        ebpf_tests_enabled(),
-        "set RELIABURGER_EBPF_TESTS=1 after provisioning eBPF prerequisites"
-    );
-
-    let obj_dir = find_bpf_obj_dir();
     // Keep our own clone of the handle to read the map after the deploy.
-    let ebpf = Arc::new(Mutex::new(
-        OnionEbpf::load(&obj_dir, CGROUP_PATH.as_ref()).expect("failed to load eBPF program"),
-    ));
+    let ebpf = Arc::new(Mutex::new(load_ebpf()));
 
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
     let shutdown = CancellationToken::new();
@@ -516,15 +468,7 @@ async fn agent_drop_fault_refuses_vip_with_eperm() {
     use tokio::sync::{Mutex, mpsc, oneshot};
     use tokio_util::sync::CancellationToken;
 
-    assert!(
-        ebpf_tests_enabled(),
-        "set RELIABURGER_EBPF_TESTS=1 after provisioning eBPF prerequisites"
-    );
-
-    let obj_dir = find_bpf_obj_dir();
-    let ebpf = Arc::new(Mutex::new(
-        OnionEbpf::load(&obj_dir, CGROUP_PATH.as_ref()).expect("failed to load eBPF program"),
-    ));
+    let ebpf = Arc::new(Mutex::new(load_ebpf()));
 
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
     let shutdown = CancellationToken::new();
@@ -648,14 +592,7 @@ async fn partition_fault_blocks_its_source_cgroup_and_clears() {
     };
     use std::io::ErrorKind;
 
-    assert!(
-        ebpf_tests_enabled(),
-        "set RELIABURGER_EBPF_TESTS=1 after provisioning eBPF prerequisites"
-    );
-
-    let obj_dir = find_bpf_obj_dir();
-    let mut ebpf =
-        OnionEbpf::load(&obj_dir, CGROUP_PATH.as_ref()).expect("failed to load eBPF program");
+    let mut ebpf = load_ebpf();
     let vip = VirtualIP::from_service_id(&ServiceId::new("default", "partition-target"));
     let port = 18_080u16;
     let address = SocketAddr::new(vip.0.into(), port);
@@ -752,14 +689,7 @@ async fn partition_fault_blocks_its_source_cgroup_and_clears() {
 async fn egress_denied_by_default_allowed_when_listed() {
     use reliaburger::sesame::egress::{self, EGRESS_ALLOW, EgressKey, EgressValue};
 
-    assert!(
-        ebpf_tests_enabled(),
-        "set RELIABURGER_EBPF_TESTS=1 after provisioning eBPF prerequisites"
-    );
-
-    let obj_dir = find_bpf_obj_dir();
-    let mut ebpf =
-        OnionEbpf::load(&obj_dir, CGROUP_PATH.as_ref()).expect("failed to load eBPF program");
+    let mut ebpf = load_ebpf();
 
     // Two real listeners: one we'll allow, one we won't.
     let allowed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -861,14 +791,7 @@ async fn egress_denied_by_default_allowed_when_listed() {
 async fn egress_cleanup_deletes_destinations_not_just_the_flag() {
     use reliaburger::sesame::egress::{self, EGRESS_ALLOW, EgressKey, EgressValue};
 
-    assert!(
-        ebpf_tests_enabled(),
-        "set RELIABURGER_EBPF_TESTS=1 after provisioning eBPF prerequisites"
-    );
-
-    let obj_dir = find_bpf_obj_dir();
-    let mut ebpf =
-        OnionEbpf::load(&obj_dir, CGROUP_PATH.as_ref()).expect("failed to load eBPF program");
+    let mut ebpf = load_ebpf();
 
     // A synthetic cgroup id (well outside the real range) with two allowed
     // destinations and enforcement enabled.
@@ -948,14 +871,7 @@ async fn namespace_isolation_denies_cross_namespace_by_default() {
         self, FIREWALL_ALLOW, ResolvedFirewallRule, rules_to_bpf_entries,
     };
 
-    assert!(
-        ebpf_tests_enabled(),
-        "set RELIABURGER_EBPF_TESTS=1 after provisioning eBPF prerequisites"
-    );
-
-    let obj_dir = find_bpf_obj_dir();
-    let mut ebpf =
-        OnionEbpf::load(&obj_dir, CGROUP_PATH.as_ref()).expect("failed to load eBPF program");
+    let mut ebpf = load_ebpf();
 
     // A destination service in "backend-ns" with one real backend, mirrored
     // into backend_map so the VIP resolves (count >= 1) and the hook reaches
@@ -1241,14 +1157,7 @@ async fn connect6_denies_unlisted_and_allows_listed_ipv6() {
     use reliaburger::sesame::egress::{self, EGRESS_ALLOW, EgressValue, exact_v6_key};
     use std::net::Ipv6Addr;
 
-    assert!(
-        ebpf_tests_enabled(),
-        "set RELIABURGER_EBPF_TESTS=1 after provisioning eBPF prerequisites"
-    );
-
-    let obj_dir = find_bpf_obj_dir();
-    let mut ebpf =
-        OnionEbpf::load(&obj_dir, CGROUP_PATH.as_ref()).expect("failed to load eBPF program");
+    let mut ebpf = load_ebpf();
     assert!(
         ebpf.connect6_attached(),
         "connect6 must attach on the test kernel"
@@ -1334,14 +1243,7 @@ async fn v4_only_allowlist_no_longer_bypassed_over_ipv6() {
     use reliaburger::sesame::egress::{self, EGRESS_ALLOW, EgressValue, exact_v4_key};
     use std::net::{Ipv6Addr, SocketAddrV6};
 
-    assert!(
-        ebpf_tests_enabled(),
-        "set RELIABURGER_EBPF_TESTS=1 after provisioning eBPF prerequisites"
-    );
-
-    let obj_dir = find_bpf_obj_dir();
-    let mut ebpf =
-        OnionEbpf::load(&obj_dir, CGROUP_PATH.as_ref()).expect("failed to load eBPF program");
+    let mut ebpf = load_ebpf();
 
     // A v4 listener we allow, and a v6 listener we do not.
     let v4_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1420,14 +1322,7 @@ async fn cidr_egress_allowed_via_lpm_trie() {
     use reliaburger::sesame::egress::{self, EgressDestination, merge_cidr_ports};
     use std::net::IpAddr;
 
-    assert!(
-        ebpf_tests_enabled(),
-        "set RELIABURGER_EBPF_TESTS=1 after provisioning eBPF prerequisites"
-    );
-
-    let obj_dir = find_bpf_obj_dir();
-    let mut ebpf =
-        OnionEbpf::load(&obj_dir, CGROUP_PATH.as_ref()).expect("failed to load eBPF program");
+    let mut ebpf = load_ebpf();
 
     // Two loopback listeners; 127.0.0.0/8 covers both addresses, but only
     // one port is allowed.
@@ -1485,14 +1380,7 @@ async fn sweep_scrubs_orphaned_cgroup_state() {
     use std::collections::HashSet;
     use std::net::IpAddr;
 
-    assert!(
-        ebpf_tests_enabled(),
-        "set RELIABURGER_EBPF_TESTS=1 after provisioning eBPF prerequisites"
-    );
-
-    let obj_dir = find_bpf_obj_dir();
-    let mut ebpf =
-        OnionEbpf::load(&obj_dir, CGROUP_PATH.as_ref()).expect("failed to load eBPF program");
+    let mut ebpf = load_ebpf();
 
     // A synthetic cgroup id (well outside the real range) with exact v4,
     // exact v6 and CIDR entries, plus the enforcement flag.
@@ -1564,15 +1452,7 @@ async fn egress_programmed_before_start_via_cgroup_path() {
     use tokio::sync::{Mutex, mpsc};
     use tokio_util::sync::CancellationToken;
 
-    assert!(
-        ebpf_tests_enabled(),
-        "set RELIABURGER_EBPF_TESTS=1 after provisioning eBPF prerequisites"
-    );
-
-    let obj_dir = find_bpf_obj_dir();
-    let ebpf = Arc::new(Mutex::new(
-        OnionEbpf::load(&obj_dir, CGROUP_PATH.as_ref()).expect("failed to load eBPF program"),
-    ));
+    let ebpf = Arc::new(Mutex::new(load_ebpf()));
 
     let grill = MockGrill::new();
     grill.set_honours_cgroup_path(true);
@@ -1665,10 +1545,7 @@ async fn pre_start_programming_scrubs_recycled_cgroup_allows() {
     use tokio::sync::{Mutex, mpsc};
     use tokio_util::sync::CancellationToken;
 
-    assert!(ebpf_tests_enabled());
-    let ebpf = Arc::new(Mutex::new(
-        OnionEbpf::load(&find_bpf_obj_dir(), CGROUP_PATH.as_ref()).unwrap(),
-    ));
+    let ebpf = Arc::new(Mutex::new(load_ebpf()));
 
     let cgroup_dir = std::path::Path::new("/sys/fs/cgroup/reliaburger/default/recycled/0");
     std::fs::create_dir_all(cgroup_dir).unwrap();
@@ -1750,10 +1627,7 @@ async fn live_egress_hook_loss_stops_protected_workload() {
     use tokio::sync::{Mutex, mpsc};
     use tokio_util::sync::CancellationToken;
 
-    assert!(ebpf_tests_enabled());
-    let ebpf = Arc::new(Mutex::new(
-        OnionEbpf::load(&find_bpf_obj_dir(), CGROUP_PATH.as_ref()).unwrap(),
-    ));
+    let ebpf = Arc::new(Mutex::new(load_ebpf()));
     let grill = MockGrill::new();
     grill.set_honours_cgroup_path(true);
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
@@ -1834,15 +1708,7 @@ async fn pre_start_programming_error_fails_deploy_with_no_running_process() {
     use tokio::sync::{Mutex, mpsc};
     use tokio_util::sync::CancellationToken;
 
-    assert!(
-        ebpf_tests_enabled(),
-        "set RELIABURGER_EBPF_TESTS=1 after provisioning eBPF prerequisites"
-    );
-
-    let obj_dir = find_bpf_obj_dir();
-    let ebpf = Arc::new(Mutex::new(
-        OnionEbpf::load(&obj_dir, CGROUP_PATH.as_ref()).expect("failed to load eBPF program"),
-    ));
+    let ebpf = Arc::new(Mutex::new(load_ebpf()));
 
     let grill = MockGrill::new();
     grill.set_honours_cgroup_path(true);
@@ -1966,8 +1832,7 @@ fn freeze_egress_map(ebpf: &OnionEbpf, name: &str) {
 #[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
 fn egress_cleanup_refuses_a_frozen_destination_map_and_keeps_enforcement() {
     use reliaburger::sesame::egress::{self, EGRESS_ALLOW, EgressKey, EgressValue};
-    assert!(ebpf_tests_enabled());
-    let mut ebpf = OnionEbpf::load(&find_bpf_obj_dir(), CGROUP_PATH.as_ref()).unwrap();
+    let mut ebpf = load_ebpf();
     let cgroup = 0xDEAD_BEEF_CAFE_6101;
     let key = EgressKey {
         src_cgroup_id: cgroup,
@@ -2000,8 +1865,7 @@ fn egress_cleanup_refuses_a_frozen_destination_map_and_keeps_enforcement() {
 #[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
 fn egress_cleanup_refuses_a_frozen_enforcement_flag() {
     use reliaburger::sesame::egress;
-    assert!(ebpf_tests_enabled());
-    let mut ebpf = OnionEbpf::load(&find_bpf_obj_dir(), CGROUP_PATH.as_ref()).unwrap();
+    let mut ebpf = load_ebpf();
     let cgroup = 0xDEAD_BEEF_CAFE_6102;
     egress::set_egress_enforced(&mut ebpf.bpf, cgroup).unwrap();
     freeze_egress_map(&ebpf, "egress_enabled_map");
@@ -2028,9 +1892,7 @@ async fn agent_retirement_keeps_its_record_when_kernel_egress_cleanup_fails() {
     let root = tempfile::tempdir().unwrap();
     let records = root.path().join("records");
     std::fs::create_dir(&records).unwrap();
-    let ebpf = Arc::new(Mutex::new(
-        OnionEbpf::load(&find_bpf_obj_dir(), CGROUP_PATH.as_ref()).unwrap(),
-    ));
+    let ebpf = Arc::new(Mutex::new(load_ebpf()));
     let grill = MockGrill::new();
     grill.set_honours_cgroup_path(true);
     grill.set_pid(std::process::id());
@@ -2995,8 +2857,7 @@ async fn agent_namespace_binding_uses_the_workload_cgroup_instead_of_its_launche
 fn firewall_cleanup_refuses_frozen_maps_and_preserves_their_entries() {
     use reliaburger::onion::types::{FirewallKey, FirewallValue};
     use reliaburger::sesame::firewall;
-    assert!(ebpf_tests_enabled());
-    let mut ebpf = OnionEbpf::load(&find_bpf_obj_dir(), CGROUP_PATH.as_ref()).unwrap();
+    let mut ebpf = load_ebpf();
     let cgroup = 0xDEAD_BEEF_CAFE_6201;
     let key = FirewallKey {
         src_cgroup_id: cgroup,
@@ -3032,8 +2893,7 @@ fn firewall_cleanup_refuses_frozen_maps_and_preserves_their_entries() {
 fn firewall_cleanup_confirms_removal_and_accepts_already_absent_entries() {
     use reliaburger::onion::types::{FirewallKey, FirewallValue};
     use reliaburger::sesame::firewall;
-    assert!(ebpf_tests_enabled());
-    let mut ebpf = OnionEbpf::load(&find_bpf_obj_dir(), CGROUP_PATH.as_ref()).unwrap();
+    let mut ebpf = load_ebpf();
     let cgroup = 0xDEAD_BEEF_CAFE_6202;
     let key = FirewallKey {
         src_cgroup_id: cgroup,
@@ -3071,7 +2931,7 @@ fn firewall_reconciliation_retains_refused_cleanup_for_repeated_attempts() {
     use reliaburger::sesame::firewall::{self, CgroupNamespaceEntry};
     assert!(ebpf_tests_enabled());
     for frozen in ["firewall_map", "cgroup_namespace_map"] {
-        let mut ebpf = OnionEbpf::load(&find_bpf_obj_dir(), CGROUP_PATH.as_ref()).unwrap();
+        let mut ebpf = load_ebpf();
         let cgroup = 0xDEAD_BEEF_CAFE_6301;
         let key = FirewallKey {
             src_cgroup_id: cgroup,
@@ -3127,8 +2987,7 @@ fn firewall_reconciliation_retains_refused_cleanup_for_repeated_attempts() {
 fn firewall_reconciliation_retains_partial_publication_and_unrelated_entries() {
     use reliaburger::onion::types::{FirewallKey, FirewallValue};
     use reliaburger::sesame::firewall::{self, CgroupNamespaceEntry};
-    assert!(ebpf_tests_enabled());
-    let mut ebpf = OnionEbpf::load(&find_bpf_obj_dir(), CGROUP_PATH.as_ref()).unwrap();
+    let mut ebpf = load_ebpf();
     let cgroup = 0xDEAD_BEEF_CAFE_6302;
     let other = cgroup + 1;
     let key = FirewallKey {
@@ -3172,8 +3031,7 @@ fn firewall_reconciliation_retains_partial_publication_and_unrelated_entries() {
 fn firewall_reconciliation_forgets_confirmed_removals_only() {
     use reliaburger::onion::types::{FirewallKey, FirewallValue};
     use reliaburger::sesame::firewall::{self, CgroupNamespaceEntry};
-    assert!(ebpf_tests_enabled());
-    let mut ebpf = OnionEbpf::load(&find_bpf_obj_dir(), CGROUP_PATH.as_ref()).unwrap();
+    let mut ebpf = load_ebpf();
     let cgroup = 0xDEAD_BEEF_CAFE_6304;
     let key = FirewallKey {
         src_cgroup_id: cgroup,

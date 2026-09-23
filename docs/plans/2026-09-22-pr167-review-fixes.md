@@ -576,12 +576,18 @@ spot-checked by hand.
 - [ ] **T4.6 Small helpers (~50–70 lines).** One `launch_inventory` with a
       single timeout (7 copies, 1 s/5 s/none; this also fixes the missing
       timeout in T2.14) and one drain-then-check helper (3 copies).
-- [ ] **T4.7 Shared test fixtures (~1.2–1.8k test lines; low risk).** The
+- [x] **T4.7 Shared test fixtures (~1.2–1.8k test lines; low risk).** The
       eBPF enable-and-load preamble repeats 15 times in `tests/ebpf.rs`;
       `NodeFaultAuth` setup 7 times; `spawn_gitops_sync` config 5 times; the
       `router(cmd_tx, None ×11, …)` + agent spawn 12–20 times in the
       `api.rs` test module. Table-driving saves little: only 5
       near-duplicate test pairs exist.
+      Done except `api.rs` (being edited in a parallel session, so its router
+      fixture is still open). `load_ebpf()` replaces the gate-and-load
+      preamble at all 29 sites in `tests/ebpf.rs` (−142 lines, Linux-only,
+      mechanical); `NodeFaultAuth::admin(name)` the 7 token setups in
+      `tests/placement.rs` (−55); `repo_config(repo, poll)` the 5 configs in
+      `tests/gitops.rs` (−35). Total −232 test lines.
 - [ ] **T4.9 Sweep remaining legacy code (decision G).** Search for
       "legacy", "compat", "deprecated", "migrate", `#[serde(default)]` on
       durable formats and version fallbacks. Delete paths that exist only for
