@@ -162,25 +162,6 @@ jobs:
           path: target/coverage
           if-no-files-found: warn
 
-  slow:
-    name: wall-clock acceptance
-    needs: changes
-    if: needs.changes.outputs.heavy == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.98.0
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-nextest@0.9.145
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: linux-debug
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-          cache-on-failure: true
-      - run: make test-slow
-
   linux:
     name: privileged Linux
     needs: changes
@@ -227,62 +208,80 @@ jobs:
           sudo -E env PATH="$PATH" NEXTEST_PROFILE=ci make test-linux
           LINUX_EXCLUDE='& not binary(owned_runc) & not binary(owned_network)'
 
+  build-tests:
+    # Compile the portable test binaries once. The acceptance jobs download
+    # this nextest archive instead of each rebuilding all 75 test binaries.
+    # Runners check out to the same path, so the archive's compiled-in binary
+    # paths still resolve after extraction.
+    name: build tests
+    needs: changes
+    if: needs.changes.outputs.heavy == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.145
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux-debug
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
+      - run: cargo nextest archive --locked --archive-file tests.tar.zst
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nextest-archive
+          path: tests.tar.zst
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+
   cluster:
     name: multi-node cluster
-    needs: changes
+    needs: [changes, build-tests]
     if: needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      ARCHIVED: cargo nextest run --archive-file tests.tar.zst --extract-to . --extract-overwrite --workspace-remap . --profile ci --no-tests=fail
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.98.0
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.145
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v4
         with:
-          shared-key: linux-debug
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-          cache-on-failure: true
-      - run: make test-cluster
+          name: nextest-archive
+      - run: make test-cluster NEXTEST="$ARCHIVED"
 
-  upgrade-node:
-    name: single-node upgrade
-    needs: changes
+  acceptance:
+    # Wall-clock, single-node upgrade and cluster upgrade suites: 13 tests
+    # that each used to pay for their own full test build.
+    name: acceptance
+    needs: [changes, build-tests]
     if: needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 40
+    env:
+      ARCHIVED: cargo nextest run --archive-file tests.tar.zst --extract-to . --extract-overwrite --workspace-remap . --profile ci --no-tests=fail
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.98.0
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.145
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v4
         with:
-          shared-key: linux-debug
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-          cache-on-failure: true
-      - run: make test-upgrade-node
-
-  upgrade-cluster:
-    name: cluster upgrade
-    needs: changes
-    if: needs.changes.outputs.heavy == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.98.0
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-nextest@0.9.145
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: linux-debug
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-          cache-on-failure: true
-      - run: make test-upgrade-cluster
+          name: nextest-archive
+      - name: Wall-clock acceptance
+        run: make test-slow NEXTEST="$ARCHIVED"
+      - name: Single-node upgrade
+        if: ${{ !cancelled() }}
+        run: make test-upgrade-node NEXTEST="$ARCHIVED"
+      - name: Cluster upgrade
+        if: ${{ !cancelled() }}
+        run: make test-upgrade-cluster NEXTEST="$ARCHIVED"
 
   macos:
     name: portable macOS
