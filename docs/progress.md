@@ -990,9 +990,8 @@ whole theme lands.
     default (CP3).
   - [x] Persisted snapshots carry a versioned envelope: format version + SHA-256 payload
     checksum written in the same redb transaction as the payload. Load rejects a checksum
-    mismatch (naming both sums) and an unknown version (naming both versions); a pre-envelope
-    legacy snapshot still loads with a warning and is rewritten enveloped on the next persist,
-    pinned by a fixture test (CP3).
+    mismatch (naming both sums) and an unknown version (naming both versions); a store with
+    no envelope is refused and left untouched (CP3).
   - [x] Snapshot/log purge-boundary validation at startup (`council::validate_purge_boundary`,
     called from `cluster::runtime::open_raft_storage` before Raft starts): a log purged past
     what the snapshot covers — or purged with no snapshot at all — refuses startup with the
@@ -1258,8 +1257,7 @@ whole theme lands.
   converge" tier.**
   - [x] Namespaces and permissions as desired state (DEP7): append-only serde-default
     `NamespaceSpec`/`NamespaceDelete`/`PermissionSpec`/`PermissionDelete` Raft variants and
-    `namespaces`/`permissions` `BTreeMap`s in `DesiredState`; a pre-theme snapshot without
-    those keys loads cleanly (fixture test through the strict loader). `Config::validate`
+    `namespaces`/`permissions` `BTreeMap`s in `DesiredState`. `Config::validate`
     rejects negative/overflowing namespace budgets, zero caps, unknown permission actions,
     and permissions/builds referencing a namespace that exists in neither the config nor
     committed desired state (`validate_against`).
@@ -1427,10 +1425,9 @@ whole theme lands.
     fail-closed bind, config reject. `make ci` green.
   - [x] **PR 2 — replicated global endpoint catalogue.** New `EndpointCatalog`
     (`onion/catalog.rs`) — namespaced services → VIP + cluster-wide backends, cluster-wide
-    deterministic collision-free VIP allocation. Added a distinct, additive, serde-default
-    `endpoint_catalog` field to `DesiredState` (separate from Pickle's `manifest_catalog`)
-    plus a `RaftRequest::PublishEndpoints` variant + apply (wholesale replace); pre-theme
-    snapshots load cleanly (fixture test). The leader builds the catalogue from aggregated
+    deterministic collision-free VIP allocation. Added a distinct `endpoint_catalog` field
+    to `DesiredState` (separate from Pickle's `manifest_catalog`) plus a
+    `RaftRequest::PublishEndpoints` variant + apply (wholesale replace). The leader builds the catalogue from aggregated
     health reports (namespace/app/port/health) + gossip node IPs and publishes it via Raft
     only when it changes. Every node overlays it onto its local service map
     (`ServiceMap::with_cluster_catalog`, non-mutating merge) so DNS + ingress resolve

@@ -379,12 +379,9 @@ pub struct DesiredState {
     pub scheduling: HashMap<AppId, Vec<Placement>>,
     pub manifest_catalog: ManifestCatalog,
     // ... other fields ...
-    #[serde(default)]
     pub security_state: SecurityState,
 }
 ```
-
-The `#[serde(default)]` annotation means old Raft snapshots (from before this field existed) deserialise cleanly with an empty `SecurityState`. No migration needed.
 
 Six new `RaftRequest` variants handle security state mutations:
 
@@ -714,14 +711,14 @@ pub struct SecretSeal {
 pub secret_seals: BTreeMap<String, SecretSeal>,  // "namespace/app/ENV_KEY"
 ```
 
-A `BTreeMap` rather than a `HashMap`, because it serialises in key order — snapshots stay byte-deterministic across nodes. Finalise now walks every stored app, and any encrypted value whose recorded generation is older than the newest — or that has no record at all, which is what state persisted before this field existed looks like — blocks the retirement and gets named in the error:
+A `BTreeMap` rather than a `HashMap`, because it serialises in key order — snapshots stay byte-deterministic across nodes. Finalise now walks every stored app, and any encrypted value whose recorded generation is older than the newest — or that has no record at all — blocks the retirement and gets named in the error:
 
 ```
 409 cannot finalise secret rotation: secrets still sealed under an old
 generation (re-encrypt and re-apply them first): default/web/DB_PASSWORD
 ```
 
-The operator's re-encrypt step (encrypt against the new public key, `relish apply`) re-records the seal at the new generation, and the finalise goes through. The `#[serde(default)]` on the field is doing quiet compatibility work here: old snapshots load with an empty map, their secrets count as "unknown generation", and the system fails towards *keeping* the key — the recoverable direction.
+The operator's re-encrypt step (encrypt against the new public key, `relish apply`) re-records the seal at the new generation, and the finalise goes through. A secret with no seal record counts as "unknown generation", so the system fails towards *keeping* the key, the recoverable direction.
 
 Is the record proof? No — it's the write-time assumption made explicit. Re-apply an unchanged config and the seal updates without any real re-encryption. What it catches is the case that actually eats data: finalising while a secret demonstrably hasn't been touched since the old generation.
 

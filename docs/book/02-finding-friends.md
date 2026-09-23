@@ -862,7 +862,7 @@ fn persist_snapshot(db: &Database, data: &[u8], index: u64) -> Result<(), redb::
 
 All four keys land in one write transaction, so they're always coherent: there is no window where the payload is new but the checksum is old. On load, the rules are strict. A checksum mismatch is a hard error naming both sums. A version we don't recognise is a hard error naming both versions. No cleverness, no "best effort". The operator gets told exactly what's wrong and the node refuses to start.
 
-One case gets gentler treatment. A snapshot written before the envelope existed has neither a version nor a checksum key. That's not corruption, it's history — every cluster that predates this change has one. So a missing envelope loads as legacy (with a warning in the logs), and the next snapshot rewrites the store in the enveloped format. A fixture test pins this: it plants a raw pre-envelope blob exactly as an old binary wrote it and asserts it still loads. Backwards compatibility isn't a nice-to-have here; without it, upgrading a node would look exactly like the corruption we're trying to detect.
+A store with a payload but no version key gets no special treatment either. We refuse it and leave the bytes where they are, so an operator can still recover them with a binary that understands them. A fixture test plants exactly that blob and checks both halves: the error, and the untouched payload.
 
 Why SHA-256 rather than a cheaper CRC? Because `sha2` was already in the dependency tree and snapshots are written rarely (every few thousand log entries). Spending a millisecond hashing at snapshot time to make on-disk corruption *provable* at startup is a good trade. We're not defending against an attacker here, just against disks and torn writes, so no key, no signature — that's Chapter 10's problem.
 
@@ -2332,7 +2332,7 @@ separate acceptance gate. One passing measurement is evidence, not a guarantee.
 
 ### The first supported compatibility boundary
 
-A development snapshot might deserialize successfully and still represent a different contract. Before 0.1.0 we therefore require fresh clusters. Startup stamps a fresh data directory with its state generation and refuses an existing unmarked directory. Snapshot loading no longer silently rewrites pre-envelope development state.
+A development snapshot might deserialize successfully and still represent a different contract. Before 0.1.0 we therefore require fresh clusters. Startup stamps a fresh data directory with its state generation and refuses an existing unmarked directory.
 
 A Raft request now carries protocol and state generations as well as its recovery epoch. All three checks run before dispatch to Raft. Responses carry the format contract too, so a new caller cannot mistake a development server's reply for an accepted negotiation. Gossip checks both generations before learning membership; reporting checks both generations before decoding its payload. Chapter 14 explains how the same contract gates binary replacement and rollback. Different product versions are supported only when they explicitly advertise equal formats.
 

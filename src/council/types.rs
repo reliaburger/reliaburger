@@ -391,74 +391,52 @@ pub struct DesiredState {
     /// Cluster-wide configuration key-value pairs.
     pub config: HashMap<String, String>,
     /// Pickle image registry manifest catalog.
-    #[serde(default)]
     pub manifest_catalog: ManifestCatalog,
     /// Monotonic per-node fencing generations for registry blob collection.
-    #[serde(default)]
     pub registry_gc_generations: std::collections::BTreeMap<u64, u64>,
     /// Autoscale replica overrides (runtime adjustments above/below baseline).
-    #[serde(default)]
     pub autoscale_overrides: Vec<(String, u32)>,
     /// GitOps sync state.
-    #[serde(default)]
     pub gitops_sync_state: Option<crate::lettuce::types::SyncState>,
     /// GitOps coordinator election.
-    #[serde(default)]
     pub gitops_coordinator: Option<crate::lettuce::types::CoordinatorElection>,
     /// Cluster security state: CAs, tokens, age keypairs, OIDC config.
     /// Contains wrapped (encrypted) private keys — safe to replicate.
-    #[serde(default)]
     pub security_state: SecurityState,
     /// The rolling binary upgrade in progress, if any (at most one).
-    #[serde(default)]
     pub active_upgrade: Option<crate::upgrade::types::ClusterUpgradeState>,
     /// Completed/abandoned cluster upgrades, newest last (bounded to 20).
-    #[serde(default)]
     pub upgrade_history: Vec<crate::upgrade::types::ClusterUpgradeState>,
     /// Durable batch tracker: monotonic id counter plus in-flight and
-    /// recently terminal batches (12b.2 JOB4). Defaults empty so
-    /// pre-12b.2 snapshots load cleanly.
-    #[serde(default)]
+    /// recently terminal batches (12b.2 JOB4).
     pub batch_state: crate::meat::batch_tracker::BatchDurableState,
     /// Durable build tracker, same shape and rationale as `batch_state`.
-    #[serde(default)]
     pub build_state: crate::bun::build_runner::BuildDurableState,
     /// Monotonic disaster-recovery epoch (12b.2 D21/CP12). Zero on a cluster
     /// that has never been recovered; the recovery path stamps a strictly
     /// higher value into the restored state so anything issued before the
     /// loss (stale reports, tokens tied to the old term line) is
-    /// distinguishable from post-recovery state. Defaults to zero so
-    /// pre-12b.2 snapshots load cleanly.
-    #[serde(default)]
+    /// distinguishable from post-recovery state.
     pub recovery_epoch: u64,
     /// Declared namespaces keyed by name (12b.2 T6). Their resource
     /// budgets feed the scheduler's quota ledger. Uses a `BTreeMap` so
-    /// the JSON snapshot is deterministic. Defaults empty so pre-T6
-    /// snapshots load cleanly.
-    #[serde(default)]
+    /// the JSON snapshot is deterministic.
     pub namespaces: std::collections::BTreeMap<String, crate::config::NamespaceSpec>,
-    /// Declared permission grants keyed by name (12b.2 T6). Defaults
-    /// empty so pre-T6 snapshots load cleanly.
-    #[serde(default)]
+    /// Declared permission grants keyed by name (12b.2 T6).
     pub permissions: std::collections::BTreeMap<String, crate::config::PermissionSpec>,
     /// Cluster-wide service endpoint catalogue (12b.4): every namespace's
     /// services, their VIPs and healthy backends across all nodes. Built by
     /// the leader from health reports and replicated so any node resolves
     /// any service. Distinct from `manifest_catalog` (Pickle images).
-    /// Defaults empty so pre-12b.4 snapshots load cleanly.
-    #[serde(default)]
     pub endpoint_catalog: crate::onion::catalog::EndpointCatalog,
     /// Original discovery exposures awaiting remote withdrawal confirmation.
-    #[serde(default)]
     pub endpoint_withdrawals: crate::onion::withdrawal::EndpointWithdrawals,
     /// Nodes that may retain discovery publications, including offline nodes.
-    #[serde(default)]
     pub endpoint_consumers: std::collections::BTreeSet<String>,
     /// Permanent fences preventing stale reports from reviving retired executions.
     pub producer_retirements: crate::onion::producer::ProducerRetirements,
     /// Active or interrupted-cleanup Phase 15 leases. Replication lets a new
     /// leader resume cleanup after the issuing process dies.
-    #[serde(default)]
     pub test_leases: std::collections::BTreeMap<String, crate::testkit::lease::TestLease>,
     /// Durable ownership of the single cluster-wide node-chaos slot.
     pub node_fault_reservations: crate::smoker::reservation::NodeFaultReservations,
@@ -704,18 +682,6 @@ mod tests {
             let decoded: RaftRequest = serde_json::from_str(&json).unwrap();
             assert_eq!(*req, decoded);
         }
-    }
-
-    #[test]
-    fn compatible_snapshot_may_omit_optional_namespace_and_endpoint_fields() {
-        let mut snapshot = serde_json::to_value(DesiredState::default()).unwrap();
-        for field in ["namespaces", "permissions", "endpoint_catalog"] {
-            snapshot.as_object_mut().unwrap().remove(field);
-        }
-        let state: DesiredState = serde_json::from_value(snapshot).unwrap();
-        assert!(state.namespaces.is_empty());
-        assert!(state.permissions.is_empty());
-        assert!(state.endpoint_catalog.is_empty());
     }
 
     #[test]
