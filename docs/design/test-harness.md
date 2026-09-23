@@ -64,7 +64,7 @@ be visible until we remove its race.
 | `make bench` | Criterion transport and 5–250-node measurements | Pull requests |
 | `make bench-large` | Criterion 500- and 1,000-node measurements | Pull requests |
 | `make bench-10k` | Deterministic 10,000-member per-node scale acceptance | Pull requests |
-| `make coverage` | Combined default and no-default portable line coverage | Pull requests |
+| `make coverage` | The portable suite, run once under line coverage; this is the Linux test gate too | Linux |
 | `make audit` | Current RustSec database, with new vulnerabilities and maintenance warnings denied | Pull requests, release gate and weekly schedule |
 | `make examples` | Every checked-in workload config parses, validates and plans through Relish without deployment | Linux pull requests |
 
@@ -139,8 +139,9 @@ one runner needs 100 million records and confuses distributed scale with single-
 capacity. Criterion data is uploaded from CI, but we will not set a regression threshold
 until runs are stable on consistent hardware.
 
-`cargo-llvm-cov` combines the portable default and `--no-default-features` runs into LCOV
-and HTML artefacts. The measured Linux CI line baseline is 79.65%, so CI starts at 78.65%,
+`cargo-llvm-cov` runs the portable suite once, instrumented, and writes LCOV and HTML
+artefacts. On Linux that run is also the test gate and the JUnit source, so the suite isn't
+compiled and run a second time uninstrumented. The measured Linux CI line baseline is 79.65%, so CI starts at 78.65%,
 one percentage point lower. Raise it when coverage improves; do not lower it to land
 unrelated work.
 

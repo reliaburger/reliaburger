@@ -342,7 +342,7 @@ make test-rootless-runc    # rootless runc port and replacement test (never sudo
 make test-cluster          # failover, healing, recovery, placement and chaos
 make test-upgrade-node     # real single-node binary replacement
 make test-upgrade-cluster  # real rolling cluster replacement
-make coverage              # combined HTML and LCOV coverage
+make coverage              # portable suite under line coverage (HTML and LCOV)
 make audit                 # fail on new RustSec dependency findings
 ```
 

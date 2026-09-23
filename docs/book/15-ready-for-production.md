@@ -408,8 +408,8 @@ real world it touched.
 ## Coverage is a map, not a target
 
 `cargo-llvm-cov` instruments the compiled programme and records which source regions execute.
-Our `make coverage` runs both the default feature set and `--no-default-features`, merges the
-profiles, and emits LCOV plus an HTML report. The first combined Linux CI measurement covered
+Our `make coverage` runs the portable suite once under instrumentation and emits LCOV plus an
+HTML report. On Linux CI that same run is the test gate, so we don't pay for the suite twice. The first combined Linux CI measurement covered
 79.65% of lines, so CI starts at 78.65%, one percentage point lower, and can ratchet upwards.
 
 Coverage finds unvisited code. It does not tell us whether an assertion is useful, whether a

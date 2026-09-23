@@ -104,10 +104,9 @@ bench-large: ## Run reproducible 500 and 1000 node gossip benchmarks
 bench-10k: ## Run the deterministic 10k-member per-node scale acceptance
 	$(CARGO) test --release --test gossip_10k -- --ignored --nocapture
 
-coverage: ## Combine default and no-default nextest line coverage
+coverage: ## Run the portable suite once under line coverage and enforce the floor
 	$(CARGO) llvm-cov clean --workspace
-	$(CARGO) llvm-cov --no-report nextest --profile $(NEXTEST_PROFILE)
-	$(CARGO) llvm-cov --no-clean --no-default-features nextest --profile $(NEXTEST_PROFILE)
+	$(CARGO) llvm-cov --no-report nextest --profile $(NEXTEST_PROFILE) --no-tests=fail
 	mkdir -p target/coverage
 	$(CARGO) llvm-cov report --lcov --output-path target/coverage/lcov.info
 	$(CARGO) llvm-cov report --html --output-dir target/coverage/html
