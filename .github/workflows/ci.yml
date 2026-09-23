@@ -64,6 +64,8 @@ jobs:
     # default features. The stable jobs run the tests, so running them again
     # on 1.97 would only repeat the same suite.
     name: minimum Rust 1.97.0
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -88,6 +90,8 @@ jobs:
     # The Linux portable suite runs once, instrumented: the same run is the
     # test gate, the coverage gate and the JUnit source.
     name: portable Linux
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
@@ -137,6 +141,8 @@ jobs:
 
   slow:
     name: wall-clock acceptance
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -154,6 +160,8 @@ jobs:
 
   linux:
     name: privileged Linux
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
@@ -198,6 +206,8 @@ jobs:
 
   cluster:
     name: multi-node cluster
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -215,6 +225,8 @@ jobs:
 
   upgrade-node:
     name: single-node upgrade
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -232,6 +244,8 @@ jobs:
 
   upgrade-cluster:
     name: cluster upgrade
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -249,6 +263,8 @@ jobs:
 
   macos:
     name: portable macOS
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
