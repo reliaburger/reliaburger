@@ -93,10 +93,7 @@ pub fn step_to_fault_request(
             FaultType::Drop { probability }
         }
         "dns" => FaultType::DnsNxdomain,
-        "partition" => FaultType::Partition {
-            source_app: None,
-            source_cgroup_id: 0,
-        },
+        "partition" => FaultType::Partition { source_app: None },
         "bandwidth" => {
             let bytes_per_sec = crate::relish::fault::parse_bandwidth(&step.value)?;
             FaultType::Bandwidth { bytes_per_sec }
@@ -154,14 +151,13 @@ pub fn step_to_fault_request(
     Ok(FaultRequest {
         fault_type,
         target_service: step.target.clone(),
-        // Scenario files target a service by bare name across namespaces
-        // (legacy match); a namespace-qualified scenario is future work.
+        // Scenario steps name a bare service; the API places it in `default`.
         namespace: None,
         target_instance: None,
         target_node: None,
         duration,
-        // Compatibility wire field only. Bun attributes the request from the
-        // authenticated context, never from client-controlled JSON.
+        // Bun attributes the request from the authenticated context, never
+        // from client-controlled JSON.
         injected_by: String::new(),
         reason: Some(step.description.clone()),
         include_leader: false,

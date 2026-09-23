@@ -329,7 +329,6 @@ mod tests {
         let req = FaultRequest {
             fault_type: FaultType::Partition {
                 source_app: Some("web".to_string()),
-                source_cgroup_id: 0,
             },
             target_service: "payments".to_string(),
             namespace: None,

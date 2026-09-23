@@ -264,9 +264,10 @@ pub enum FaultType {
     DnsNxdomain,
 
     /// Block traffic from a specific source service to the target.
-    /// source_cgroup_id: cgroup ID of the calling app.
+    /// Bun resolves the source app's cgroup ids itself; `None` blocks
+    /// every caller.
     Partition {
-        source_cgroup_id: u64,
+        source_app: Option<String>,
     },
 
     /// Throttle bandwidth to target service.

@@ -1216,17 +1216,16 @@ by naming them separately:
 
 ```rust
 pub enum FaultType {
-    Partition {
-        source_app: Option<String>,
-        source_cgroup_id: u64,
-    },
+    Partition { source_app: Option<String> },
     CouncilPartition { peers: Vec<String> },
     // ...
 }
 ```
 
-Why leave `source_cgroup_id` on the wire at all? Compatibility. Why refuse a
-non-zero value from a client? Authority. The kernel compares the key against
+Where did the source cgroup id go? An earlier version carried a
+`source_cgroup_id` on the wire and refused any non-zero value. Nothing had
+shipped, so we deleted the field instead: a client can't name a cgroup at all.
+That's about authority. The kernel compares the key against
 `bpf_get_current_cgroup_id()`, and only Bun can reliably tie that number to the
 instances it supervises. Trusting an arbitrary integer from a caller would let
 the caller fault some other cgroup or create a convincing no-op with a made-up

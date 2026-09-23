@@ -252,7 +252,6 @@ pub async fn partition(
     let request = make_request(
         FaultType::Partition {
             source_app: from.map(|s| s.to_string()),
-            source_cgroup_id: 0,
         },
         target.into(),
         get_duration(duration)?,

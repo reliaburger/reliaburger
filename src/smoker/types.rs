@@ -62,12 +62,9 @@ pub enum FaultType {
 
     /// Block traffic from a specific source service to the target.
     Partition {
-        /// Source app name (the caller that gets blocked).
+        /// Source app name (the caller that gets blocked). Bun resolves its
+        /// cgroups itself; `None` blocks every caller.
         source_app: Option<String>,
-        /// Legacy wire field. Bun resolves source cgroups server-side; API
-        /// requests must leave this as zero.
-        #[serde(default)]
-        source_cgroup_id: u64,
     },
 
     /// Cut the target node off from named peers on the gossip and Raft
@@ -361,10 +358,8 @@ pub struct FaultRule {
     pub fault_type: FaultType,
     /// Target service name (e.g. "redis", "api", "payment-service").
     pub target_service: String,
-    /// Namespace of the target service, when the fault is namespace-qualified.
-    /// `None` keeps the legacy behaviour of matching the service in every
-    /// namespace; the workload-fault API always sets it (defaulting to
-    /// `default`) so injected faults hit only the intended tenant.
+    /// Namespace of the target service. Every workload fault carries one;
+    /// node faults, which have no service, carry `None`.
     pub namespace: Option<String>,
     /// Optional: target a specific instance by name (e.g. "redis-1").
     pub target_instance: Option<String>,
@@ -423,14 +418,11 @@ impl FaultRule {
 
     /// Whether an instance in `namespace` is in scope for this fault.
     ///
-    /// A namespace-qualified fault (the API path) matches only its own
-    /// namespace, so a fault on `web` in `team-a` never touches `team-b`'s
-    /// `web`. A legacy fault with no namespace (`None`) matches any namespace,
-    /// preserving the historical behaviour for internal/test callers.
+    /// A fault matches only its own namespace, so a fault on `web` in
+    /// `team-a` never touches `team-b`'s `web`. A fault with no namespace
+    /// (a node fault) matches no workload at all.
     pub fn matches_namespace(&self, namespace: &str) -> bool {
-        self.namespace
-            .as_deref()
-            .is_none_or(|target| target == namespace)
+        self.namespace.as_deref() == Some(namespace)
     }
 
     /// How long until this fault expires (zero if already expired).
@@ -496,11 +488,11 @@ pub struct FaultRequest {
     pub fault_type: FaultType,
     /// Target service name.
     pub target_service: String,
-    /// Namespace of the target service. `None` on node-targeted faults (which
-    /// have no service) and on legacy callers; the workload-fault API defaults
-    /// it to `default` and enforces the caller's token scope against it, so a
-    /// scoped Deployer cannot fault another tenant's same-named service.
-    #[serde(default)]
+    /// Namespace of the target service. `None` on node-targeted faults, which
+    /// have no service. The workload-fault API fills in `default` when a
+    /// caller omits it and enforces the caller's token scope against it, so a
+    /// scoped Deployer cannot fault another tenant's same-named service. The
+    /// agent refuses a workload fault that reaches it without one.
     pub namespace: Option<String>,
     /// Optional: target a specific instance.
     pub target_instance: Option<String>,
@@ -706,7 +698,7 @@ mod tests {
     }
 
     #[test]
-    fn matches_namespace_confines_qualified_faults_but_not_legacy_ones() {
+    fn matches_namespace_confines_a_fault_to_its_own_namespace() {
         let mut rule = FaultRule::new(
             FaultId(1),
             FaultType::Pause,
@@ -714,10 +706,9 @@ mod tests {
             Duration::from_secs(1),
             "tester".to_string(),
         );
-        // No namespace = legacy behaviour: matches every namespace.
-        assert!(rule.matches_namespace("team-a"));
-        assert!(rule.matches_namespace("team-b"));
-        // Qualified = matches only its own namespace.
+        // No namespace (a node fault) matches no workload.
+        assert!(!rule.matches_namespace("team-a"));
+        assert!(!rule.matches_namespace("default"));
         rule.namespace = Some("team-a".to_string());
         assert!(rule.matches_namespace("team-a"));
         assert!(!rule.matches_namespace("team-b"));
@@ -756,7 +747,6 @@ mod tests {
     fn fault_type_partition_display() {
         let ft = FaultType::Partition {
             source_app: Some("web".into()),
-            source_cgroup_id: 0,
         };
         assert_eq!(ft.to_string(), "partition from web");
     }
@@ -862,7 +852,6 @@ mod tests {
             FaultType::DnsNxdomain,
             FaultType::Partition {
                 source_app: Some("web".into()),
-                source_cgroup_id: 123,
             },
             FaultType::CouncilPartition {
                 peers: vec!["node-2".into(), "node-3".into()],

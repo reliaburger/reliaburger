@@ -4232,6 +4232,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     }
                 }
 
+                if !request.fault_type.is_node_targeted() && request.namespace.is_none() {
+                    let _ = response.send(Err(BunError::FaultRejected {
+                        reason: "workload faults require a namespace".into(),
+                    }));
+                    return;
+                }
+
                 if request.fault_type.is_node_targeted() {
                     let result = reservation
                         .as_ref()
@@ -4769,10 +4776,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .iter()
             .filter(|i| {
                 i.app_name == request.target_service
-                    && request
-                        .namespace
-                        .as_deref()
-                        .is_none_or(|ns| ns == i.namespace)
+                    && request.namespace.as_deref() == Some(i.namespace.as_str())
             })
             .count() as u32;
 
@@ -5500,19 +5504,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// comes from the service entry. Connect/bandwidth fault keys need both.
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
     fn fault_vip_port(&self, rule: &crate::smoker::types::FaultRule) -> Option<(u32, u16)> {
-        // A namespace-qualified fault resolves the exact service identity, so a
-        // network fault on `web` in `team-a` never picks up `team-b`'s `web`
-        // VIP. A legacy fault with no namespace falls back to the first entry
-        // in any namespace.
-        let entry = match rule.namespace.as_deref() {
-            Some(namespace) => self
-                .service_map
-                .resolve(&crate::onion::service_id::ServiceId::new(
-                    namespace,
-                    rule.target_service.as_str(),
-                )),
-            None => self.service_map.resolve_by_name(&rule.target_service),
-        }?;
+        // Resolve the exact service identity, so a network fault on `web` in
+        // `team-a` never picks up `team-b`'s `web` VIP.
+        let entry = self
+            .service_map
+            .resolve(&crate::onion::service_id::ServiceId::new(
+                rule.namespace.as_deref()?,
+                rule.target_service.as_str(),
+            ))?;
         Some((entry.vip.to_network_byte_order(), entry.port.to_be()))
     }
 
@@ -5522,14 +5521,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     async fn partition_source_cgroup_ids(
         &self,
         source_app: Option<&str>,
-        client_supplied_id: u64,
     ) -> Result<Vec<u64>, String> {
-        if client_supplied_id != 0 {
-            return Err(
-                "source_cgroup_id is server-resolved and must be zero in fault requests"
-                    .to_string(),
-            );
-        }
         let Some(source_app) = source_app else {
             return Ok(vec![0]);
         };
@@ -5581,11 +5573,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         use crate::smoker::types::{FaultReversal, FaultType};
 
         let source_cgroup_ids = match &rule.fault_type {
-            FaultType::Partition {
-                source_app,
-                source_cgroup_id,
-            } => {
-                self.partition_source_cgroup_ids(source_app.as_deref(), *source_cgroup_id)
+            FaultType::Partition { source_app } => {
+                self.partition_source_cgroup_ids(source_app.as_deref())
                     .await?
             }
             _ => vec![0],
@@ -5618,10 +5607,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     key.source_cgroup_id,
                 )]))
             }
-            FaultType::Partition {
-                source_app: _,
-                source_cgroup_id: _,
-            } => {
+            FaultType::Partition { .. } => {
                 let value = BpfConnectFaultValue {
                     action: FAULT_ACTION_PARTITION,
                     probability: 100,
@@ -19504,6 +19490,34 @@ host = "remote.local"
     }
 
     #[tokio::test]
+    async fn workload_fault_without_a_namespace_is_refused_before_recording() {
+        let (mut agent, _tx, _shutdown) = test_agent();
+        let (response, result) = oneshot::channel();
+        agent
+            .handle_command(AgentCommand::InjectFault {
+                reservation: None,
+                request: crate::smoker::types::FaultRequest {
+                    fault_type: crate::smoker::types::FaultType::Pause,
+                    target_service: "web".into(),
+                    namespace: None,
+                    target_instance: None,
+                    target_node: None,
+                    duration: std::time::Duration::from_secs(60),
+                    injected_by: "test".into(),
+                    reason: None,
+                    include_leader: false,
+                    override_safety: false,
+                    acknowledged: true,
+                },
+                response,
+            })
+            .await;
+        let error = result.await.unwrap().unwrap_err().to_string();
+        assert!(error.contains("require a namespace"), "{error}");
+        assert_eq!(agent.fault_registry.iter().count(), 0);
+    }
+
+    #[tokio::test]
     async fn dns_fault_keeps_its_namespace_and_each_owner_until_clear() {
         use crate::onion::dns::{BoundDnsResponder, DnsConfig};
         let (mut agent, _tx, shutdown) = test_agent();
@@ -19815,7 +19829,6 @@ host = "remote.local"
         let (mut agent, _tx, _shutdown) = test_agent();
         let rule = fault_rule(crate::smoker::types::FaultType::Partition {
             source_app: Some("web".to_string()),
-            source_cgroup_id: 0,
         });
         let error = agent
             .apply_fault(&rule)
@@ -19945,7 +19958,7 @@ host = "remote.local"
         let request = crate::smoker::types::FaultRequest {
             fault_type: crate::smoker::types::FaultType::Kill { count: 0 },
             target_service: "web".into(),
-            namespace: None,
+            namespace: Some("default".into()),
             target_instance: None,
             target_node: None,
             duration: std::time::Duration::from_secs(30),
