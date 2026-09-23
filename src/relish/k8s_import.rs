@@ -2534,4 +2534,57 @@ spec:
             warnings_of(&result)
         );
     }
+
+    /// Z1.5: the tutorial's demo manifest imports cleanly into the three
+    /// apps it describes, and the result is a valid config.
+    #[test]
+    fn the_podinfo_demo_manifest_imports_into_three_apps() {
+        let yaml = include_str!("../../examples/kubernetes/podinfo.yaml");
+        let result = import_from_yaml(yaml).unwrap();
+        result.config.validate().unwrap();
+        assert!(result.report.dropped.is_empty(), "{}", result.report);
+        let names: Vec<&str> = result.config.app.keys().map(String::as_str).collect();
+        assert_eq!(names, ["backend", "frontend", "redis"]);
+
+        let frontend = &result.config.app["frontend"];
+        assert_eq!(frontend.replicas, Replicas::Fixed(3));
+        assert_eq!(frontend.port, Some(9898));
+        assert!(
+            frontend
+                .command
+                .iter()
+                .any(|arg| arg == "--backend-url=http://backend:9898/echo")
+        );
+        assert!(
+            frontend
+                .command
+                .iter()
+                .any(|arg| arg == "--cache-server=tcp://redis:6379")
+        );
+        assert_eq!(frontend.health.as_ref().unwrap().path, "/readyz");
+        assert_eq!(
+            frontend
+                .ingress
+                .as_ref()
+                .map(|ingress| ingress.host.as_str()),
+            Some("podinfo.localhost")
+        );
+        assert!(
+            frontend
+                .image
+                .as_deref()
+                .unwrap()
+                .starts_with("ghcr.io/stefanprodan/podinfo@sha256:")
+        );
+
+        let backend = &result.config.app["backend"];
+        assert_eq!(backend.port, Some(9898));
+        assert_eq!(backend.health.as_ref().unwrap().path, "/readyz");
+
+        // No command: the official image's entrypoint must run.
+        let redis = &result.config.app["redis"];
+        assert!(redis.command.is_empty());
+        assert_eq!(redis.args[0], "redis-server");
+        assert_eq!(redis.port, Some(6379));
+    }
 }

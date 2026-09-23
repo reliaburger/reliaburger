@@ -106,7 +106,7 @@ tutorial, because a tutorial over a broken path is a lie.
   an `https://` URL) runs the import in memory and prints the migration report,
   so "run your Kubernetes app" is one command. `relish import` stays for people
   who want the TOML.
-- [ ] **Z1.5 A known-good demo manifest.** `examples/kubernetes/podinfo.yaml`,
+- [x] **Z1.5 A known-good demo manifest.** `examples/kubernetes/podinfo.yaml`,
   three-tier podinfo, pinned by digest, with an integration test that imports it
   and a VM test that runs it on a three-node Runc cluster and checks the
   frontend reaches the backend and redis by name.

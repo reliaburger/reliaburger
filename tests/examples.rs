@@ -1,8 +1,8 @@
 //! Every example config under `examples/` must pass a `relish` dry run.
 //!
 //! Scenario files (those with `[[step]]` tables) go through
-//! `relish fault scenario --dry-run`; everything else through
-//! `relish apply --dry-run`. Neither needs a running agent.
+//! `relish fault scenario --dry-run`; everything else, Kubernetes YAML
+//! included, through `relish apply --dry-run`. Neither needs a running agent.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -12,10 +12,9 @@ fn example_configs(directory: &Path, found: &mut Vec<PathBuf>) {
         let path = entry.unwrap().path();
         if path.is_dir() {
             example_configs(&path, found);
-        } else if path
-            .extension()
-            .is_some_and(|extension| extension == "toml")
-        {
+        } else if path.extension().is_some_and(|extension| {
+            extension == "toml" || (cfg!(feature = "kubernetes") && extension == "yaml")
+        }) {
             found.push(path);
         }
     }

@@ -28,6 +28,13 @@ process-heavy = { max-threads = 2 }
 upgrade-heavy = { max-threads = 1 }
 crash-recovery = { max-threads = 1 }
 
+# The podinfo demo pulls three real images on a cold cache before it can
+# check anything, so it gets longer than the other host-network tests.
+[[profile.default.overrides]]
+filter = 'binary(kubernetes_demo)'
+test-group = "host-network"
+slow-timeout = { period = "120s", terminate-after = 5 }
+
 [[profile.default.overrides]]
 filter = 'binary(ebpf) | binary(owned_network) | binary(owned_runc) | binary(owned_rootless) | test(/(runc_|_runc|runc::|netns|btrfs|buildah|image_pull)/)'
 test-group = "host-network"
@@ -54,6 +61,13 @@ slow-timeout = { period = "120s", terminate-after = 3 }
 [[profile.default.overrides]]
 filter = 'binary(node_pressure)'
 threads-required = "num-test-threads"
+
+# The podinfo demo pulls three real images on a cold cache before it can
+# check anything, so it gets longer than the other host-network tests.
+[[profile.ci.overrides]]
+filter = 'binary(kubernetes_demo)'
+test-group = "host-network"
+slow-timeout = { period = "120s", terminate-after = 5 }
 
 [[profile.ci.overrides]]
 filter = 'binary(ebpf) | binary(owned_network) | binary(owned_runc) | binary(owned_rootless) | test(/(runc_|_runc|runc::|netns|btrfs|buildah|image_pull)/)'

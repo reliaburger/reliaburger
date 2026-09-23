@@ -630,6 +630,16 @@ Apply {
 
 A group is clap's way of saying "these arguments are alternatives": `required(true)` demands one, and membership in the group makes any two of them a usage error. The compiler can't express "exactly one of two `Option`s is `Some`" in the type, so clap checks it at parse time and the handler can rely on it.
 
+### A demo that has to keep working
+
+A migration story needs a real application to migrate, not a toy we wrote to pass. We picked podinfo in its three-tier shape: a frontend that calls a backend through `--backend-url=http://backend:9898/echo` and caches in redis through `--cache-server=tcp://redis:6379`. It's a widely used Kubernetes demo, and it leans on everything this chapter and the first one promise: the podinfo image runs `./podinfo` as user `app` from `/home/app`, the official Redis image needs its entrypoint to run as root and drop privileges, and both talk to each other by short Kubernetes names.
+
+`examples/kubernetes/podinfo.yaml` keeps as close to upstream as we could and lists every edit in its header: images pinned by digest (redis from the ECR mirror to dodge Docker Hub rate limits), no `webapp` namespace or service account, HTTP probes instead of `exec: podcli check http`, three frontend replicas, redis's config file turned into arguments, and an ingress on `podinfo.localhost`. The import report still lists what it can't keep, and that's the point.
+
+Two tests hold it in place. A portable one imports the file and checks the three apps it should produce. A provisioned-Linux one starts a real Bun with runc, eBPF, the DNS responder and ingress, runs `relish apply -f` on the file, and then goes through the ingress by host name: the home page must answer, `POST /api/echo` must come back as the backend's list of responses, and a value written to `/cache/demo` must read back from redis.
+
+It paid for itself on its first run. Every image the node's Pickle cache served failed with `digest mismatch for layer sha256:8d0c5e505441...: expected sha256:8d0c5e505441..., got sha256:8d0c5e5054411ef2...`. The two digests were the same; one of them had been printed. The cluster image source passed the config blob's digest along with `to_string()`, and `Digest`'s `Display` impl abbreviates to twelve hex digits for humans. In Rust, `Display` is the trait behind `{}` and `to_string()`, and nothing stops a type from making it lossy. The fix was `as_str()`, and the pickle suite now re-hashes the config blob against the digest it returns. Unit tests of the pull path never noticed, because they went round the cluster source rather than through it.
+
 ### Export: the reverse direction
 
 `relish export` reads a TOML config and produces multi-document K8s YAML. Each app becomes a Deployment + Service (or DaemonSet). Ingress, HPA, ConfigMap, and Secret resources are added when the relevant config sections exist.
