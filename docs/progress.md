@@ -1942,15 +1942,16 @@ verification alone; its separate gossip-rejoin deadline remains unfinished.
     requires the same role and server grant but never destructive
     acknowledgement. Bun ignores client-supplied audit identity and emits
     additive `action`, stable authenticated `principal` and machine-readable
-    `details` fields for every successful inject and clear path. The deprecated
-    council API cannot bypass this boundary.
+    `details` fields for every successful inject and clear path. Council
+    partitions take the same `/v1/fault` path.
   - [x] Guarded five-scenario chaos catalogue: serial execution on the
     digest-pinned runc/Apple workload; server policy and consent preflight;
     missing node kill/pressure prerequisites refuse rather than green-skip;
     fresh per-case capability snapshots; and runner-owned exact-id reversal
-    after pass, failure, timeout or panic. The legacy council-partition
-    response now exposes its node-local fault id additively, so catalogue
-    cleanup never needs the blanket heal endpoint.
+    after pass, failure, timeout or panic. Council partitions are ordinary
+    node faults on `POST /v1/fault`, so catalogue cleanup reverses their exact
+    ids; the separate `/v1/chaos/partition` and blanket `/v1/chaos/heal`
+    endpoints are gone.
   - [x] Fingerprinted benchmark report and comparison contract: exact schema,
     topology and per-node build/runtime/kernel evidence, direction-aware
     thresholds, metric-method compatibility and informational hosted results.

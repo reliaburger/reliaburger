@@ -391,7 +391,7 @@ Wiring a pipeline honestly is one thing; wiring *every* path through it is anoth
 
 The council-level partition — `relish chaos council-partition`, which blocks a node's gossip and Raft transports — took effect but never cleaned up after itself. `chaos heal` cleared the registry and wiped the blocklists, but never ran the per-fault reversal loop, so a SIGSTOPped workload frozen by an *earlier* fault stayed frozen and a `cpu.max` cap stayed capped, with no record a fault had ever existed. Heal now runs the same reverse-each-fault loop as "clear all faults": SIGCONT the paused, restore the capped, unblock the partitioned, *then* wipe anything left over. And a partition now records its reversal — the peer ids it blocked — so both `heal` and TTL expiry unblock precisely those peers and leave any other partition in force. A Ctrl-C'd partition no longer outlives the terminal that started it.
 
-The safety context had the subtlest gap. It was built "every time a fault arrives" — except when the node had no council, where it returned nothing and the caller skipped the rails entirely. That's backwards: the rail that stops you killing a service's last replica doesn't need a council at all, only a local replica count. So the context is now built unconditionally; with no council the quorum, leader, and node-percentage rails self-neutralise on zeroed fields, but the replica-minimum rail still fires. `fault kill --count 0` against a single-replica service is refused whether or not the node is part of a cluster. The legacy `chaos council-partition` path runs the rails too now, so a partition that would strand quorum is refused on the old API just as it is on the new one.
+The safety context had the subtlest gap. It was built "every time a fault arrives" — except when the node had no council, where it returned nothing and the caller skipped the rails entirely. That's backwards: the rail that stops you killing a service's last replica doesn't need a council at all, only a local replica count. So the context is now built unconditionally; with no council the quorum, leader, and node-percentage rails self-neutralise on zeroed fields, but the replica-minimum rail still fires. `fault kill --count 0` against a single-replica service is refused whether or not the node is part of a cluster. A council partition runs the same rails, so a partition that would strand quorum is refused like any other node fault.
 
 Last, a partial failure. A resource fault writes a cgroup limit to each replica in turn; if the third write failed, the caller dropped the fault from the registry — discarding the reversal state for the two replicas already throttled, which stayed throttled forever. The apply loop now rolls back the replicas it already changed before returning the error, so a fault that can't be applied to all of its targets is applied to none of them.
 
@@ -1104,7 +1104,7 @@ capacity that another request is about to consume.
 
 Node experiments now acquire one cluster-wide reservation through Raft. For
 0.1.0 we deliberately allow only one node experiment at a time, including drains,
-pressure and the legacy council-partition endpoint. Pressure can starve a voter
+pressure and council partitions. Pressure can starve a voter
 just as effectively as closing its socket. Draining only withdraws scheduling
 readiness, so it doesn't require spare voting capacity, but it still occupies
 the experiment slot. Workload faults keep their separate replica safety checks.

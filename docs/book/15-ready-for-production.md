@@ -1220,7 +1220,7 @@ pub enum FaultType {
         source_app: Option<String>,
         source_cgroup_id: u64,
     },
-    CouncilPartition,
+    CouncilPartition { peers: Vec<String> },
     // ...
 }
 ```
@@ -1257,7 +1257,7 @@ VIP backed by a local listener, and resolves the test process's own cgroup id.
 The control connection succeeds. After inserting the source-scoped partition
 key, the kernel returns `EPERM` and the backend sees no connection. Delete the
 key and the connection succeeds again. The three-node quorum test now drives
-the actual `/v1/chaos/partition` transport operation, so neither mechanism
+the actual `CouncilPartition` transport operation, so neither mechanism
 borrows credibility from the other.
 
 That pass uncovered two more lies hiding behind the phrase "requires eBPF".
@@ -1554,7 +1554,7 @@ disabled. Unknown and production clusters also require the server's
 `allow_protected_mutation` switch. Finally, `--acknowledge` records the
 operator's intent. It grants nothing by itself.
 
-Node drain, node kill and the deprecated council-partition route remain
+Node drain, node kill and council partitions remain
 stricter: Admin plus `alter_node_state`. Node pressure uses Admin plus
 `saturate_capacity`. The target node repeats these checks after forwarding, so
 a permissive source can't confer authority on a stricter target.
@@ -1824,10 +1824,11 @@ Every ledger entry contains the target-local fault id, owning node and the
 direct client which created it. Teardown removes entries newest first and
 calls the specific delete endpoint. If a delete fails, the entry stays in the
 ledger for a retry and cleanup becomes `Unknown`. We never call blanket
-`fault clear` or `chaos heal`: those could reverse an operator's unrelated
-experiment. The older council-partition endpoint now returns its exact fault
-summary as an additive response field, which gives legacy callers the same
-ownership evidence without breaking their existing `message` field.
+`fault clear`: it could reverse an operator's unrelated experiment. A council
+partition is an ordinary node fault on `POST /v1/fault`, so it hands back the
+same fault summary as every other injection. It used to have its own
+`/v1/chaos/partition` endpoint with a `chaos heal` that cleared everything.
+Nothing had shipped, so we deleted both rather than keep a second path.
 
 The regression tests drive that guard through both timeout and panic, observe
 two exact injections and two exact reversals, and require confirmed cleanup.

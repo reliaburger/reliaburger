@@ -68,7 +68,7 @@ fn check_quorum_risk(request: &FaultRequest, context: &SafetyContext) -> Option<
     // failure and transport partitions can remove a voter from quorum.
     let targets_node = matches!(
         request.fault_type,
-        FaultType::NodeKill { .. } | FaultType::CouncilPartition
+        FaultType::NodeKill { .. } | FaultType::CouncilPartition { .. }
     );
     if !targets_node {
         return None;

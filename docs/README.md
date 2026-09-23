@@ -1149,9 +1149,7 @@ The bun agent exposes a local HTTP API on port 9117:
 | `GET` | `/v1/cluster/council` | Council (Raft) status |
 | `POST` | `/v1/cluster/join` | Join with a single-use token, node ID, CSR and format compatibility |
 | `POST` | `/v1/cluster/renew` | Renew the authenticated TLS node’s CSR on the leader; requires the service token, current peer certificate and format compatibility |
-| `POST` | `/v1/chaos/partition` | Inject an acknowledged council partition and return its exact fault id |
-| `POST` | `/v1/chaos/heal` | Remove all active partitions |
-| `GET` | `/v1/chaos/status` | Query active chaos state |
+| `GET` | `/v1/chaos/status` | Show the replicated node-experiment reservation, if any |
 
 The CLI uses this API internally. You can also call it directly:
 

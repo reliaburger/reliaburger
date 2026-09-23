@@ -1331,8 +1331,8 @@ server-owned workload lease, and records every injected fault by exact
 target-local id, owning node and direct client. Teardown clears those exact
 faults newest first, then releases the workload lease. It takes the same path
 after failure, timeout or panic; any unconfirmed reversal makes cleanup
-`Unknown`. Blanket `fault clear` and `chaos heal` aren't used as ownership
-substitutes.
+`Unknown`. Blanket `fault clear` isn't used as an ownership
+substitute.
 
 Node drain and kill use an Admin with the server's `alter_node_state` grant
 and explicit acknowledgement to withdraw scheduler readiness or

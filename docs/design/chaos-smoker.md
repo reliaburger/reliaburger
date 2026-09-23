@@ -790,7 +790,7 @@ what that fault owns. Omitting `--from` installs the explicit wildcard key.
 Bidirectional partitions require two rules.
 
 This service-data-plane operation is separate from
-`relish chaos council-partition`, which blocks gossip and Raft transports and
+the `CouncilPartition` node fault, which blocks gossip and Raft transports and
 therefore consumes the quorum safety budget. Conflating the two used to make a
 service partition look like a node failure while allowing the service operation
 to report success without eBPF.

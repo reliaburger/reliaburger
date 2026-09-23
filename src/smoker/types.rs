@@ -70,11 +70,15 @@ pub enum FaultType {
         source_cgroup_id: u64,
     },
 
-    /// Legacy gossip/Raft transport partition used by `relish chaos`.
+    /// Cut the target node off from named peers on the gossip and Raft
+    /// transports.
     ///
     /// This is distinct from a service-to-service eBPF partition: only this
     /// variant can remove a council voter from quorum.
-    CouncilPartition,
+    CouncilPartition {
+        /// Node names the target stops talking to.
+        peers: Vec<String>,
+    },
 
     /// Throttle bandwidth to the target service.
     Bandwidth {
@@ -153,7 +157,7 @@ impl FaultType {
     pub fn is_node_operation(&self) -> bool {
         matches!(
             self,
-            Self::NodeDrain | Self::NodeKill { .. } | Self::CouncilPartition
+            Self::NodeDrain | Self::NodeKill { .. } | Self::CouncilPartition { .. }
         )
     }
 
@@ -171,7 +175,10 @@ impl FaultType {
     pub fn is_node_targeted(&self) -> bool {
         matches!(
             self,
-            Self::NodeDrain | Self::NodeKill { .. } | Self::NodePressure { .. }
+            Self::NodeDrain
+                | Self::NodeKill { .. }
+                | Self::NodePressure { .. }
+                | Self::CouncilPartition { .. }
         )
     }
 }
@@ -200,7 +207,9 @@ impl fmt::Display for FaultType {
                     write!(f, "partition (all callers)")
                 }
             }
-            Self::CouncilPartition => write!(f, "council-partition"),
+            Self::CouncilPartition { peers } => {
+                write!(f, "council-partition from {}", peers.join(","))
+            }
             Self::Bandwidth { bytes_per_sec } => {
                 // The parser reads megabits/s (`1mbps` = 125_000 bytes/s), so
                 // invert that here rather than dividing by 1024² — otherwise
@@ -835,7 +844,11 @@ mod tests {
         assert!(!pressure.is_node_operation());
         assert!(FaultType::NodeDrain.is_node_targeted());
         assert!(FaultType::NodeDrain.is_node_operation());
-        assert!(FaultType::CouncilPartition.is_node_operation());
+        let partition = FaultType::CouncilPartition {
+            peers: vec!["node-2".into()],
+        };
+        assert!(partition.is_node_targeted());
+        assert!(partition.is_node_operation());
     }
 
     #[test]
@@ -851,7 +864,9 @@ mod tests {
                 source_app: Some("web".into()),
                 source_cgroup_id: 123,
             },
-            FaultType::CouncilPartition,
+            FaultType::CouncilPartition {
+                peers: vec!["node-2".into(), "node-3".into()],
+            },
             FaultType::Bandwidth {
                 bytes_per_sec: 1_000_000,
             },

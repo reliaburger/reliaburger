@@ -65,6 +65,30 @@ impl NodeFaultAuth {
     }
 }
 
+/// Cut `node` off from `peers` on the gossip and Raft transports.
+async fn partition(
+    node: &Node,
+    peers: &[String],
+) -> Result<reliaburger::smoker::types::FaultSummary, reliaburger::relish::RelishError> {
+    node.client
+        .inject_fault(&reliaburger::smoker::types::FaultRequest {
+            fault_type: reliaburger::smoker::types::FaultType::CouncilPartition {
+                peers: peers.to_vec(),
+            },
+            target_service: String::new(),
+            namespace: None,
+            target_instance: None,
+            target_node: Some(node.name.clone()),
+            duration: Duration::from_secs(60),
+            injected_by: String::new(),
+            reason: None,
+            include_leader: true,
+            override_safety: false,
+            acknowledged: true,
+        })
+        .await
+}
+
 use tokio::sync::watch;
 
 async fn start_node(
@@ -781,7 +805,7 @@ async fn autoscaler_scales_up_on_high_metric() {
 /// would risk Raft majority. On a 3-member council `max_allowed = 1`, so
 /// fully isolating one follower is accepted, but a second partition while
 /// that voter is gone from the live view is refused by the quorum rail.
-/// Drives the real transport-blocklist path through `/v1/chaos/partition`;
+/// Drives the real transport-blocklist path through a council partition;
 /// a service-to-service eBPF partition does not affect Raft quorum.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 #[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
@@ -836,9 +860,7 @@ async fn fault_injection_rejected_when_quorum_at_risk() {
 
     // First node-level fault: cut one follower off from both peers. One
     // unavailable voter is within the quorum budget, so it's accepted.
-    isolated
-        .client
-        .inject_partition(&[leader.name.clone(), other.name.clone()], 60, true)
+    partition(isolated, &[leader.name.clone(), other.name.clone()])
         .await
         .expect("first partition should be within the quorum budget");
 
@@ -855,10 +877,7 @@ async fn fault_injection_rejected_when_quorum_at_risk() {
 
     // Second node-level fault: would take a second voter of the 3-member
     // council out, so the quorum rail must reject it.
-    let rejected = leader
-        .client
-        .inject_partition(std::slice::from_ref(&other.name), 60, true)
-        .await;
+    let rejected = partition(leader, std::slice::from_ref(&other.name)).await;
     assert_quorum_refusal(&rejected);
 
     shutdown.cancel();
@@ -921,7 +940,7 @@ fn peer_state(observer: &Node, target: &str) -> Option<reliaburger::mustard::sta
 /// W11 (L15): a chaos partition populates the real gossip + Raft
 /// transport blocklists, so the isolated node stops answering SWIM
 /// probes and its peers mark it Dead. Healing clears the blocklists and
-/// the node rejoins. This drives the binary path: `/v1/chaos/partition`
+/// the node rejoins. This drives the binary path: a council partition fault
 /// on the isolated node, membership observed through the peers' watch.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 #[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
@@ -971,8 +990,7 @@ async fn partition_isolates_a_node_for_real() {
     // Cut q3 off from q1 and q2. The partition is injected ON q3, whose
     // agent holds the real blocklist handles; the transport drops traffic
     // both to and from the blocked peers, so detection is symmetric.
-    n3.client
-        .inject_partition(&["q1".to_string(), "q2".to_string()], 60, true)
+    let fault = partition(&n3, &["q1".to_string(), "q2".to_string()])
         .await
         .expect("partition injection should succeed");
 
@@ -992,7 +1010,7 @@ async fn partition_isolates_a_node_for_real() {
 
     // Heal: clear q3's blocklists and it should rejoin and be Alive again.
     n3.client
-        .heal_partition()
+        .clear_fault(fault.id, Some("q3"), true)
         .await
         .expect("heal should succeed");
 

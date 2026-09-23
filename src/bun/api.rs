@@ -405,10 +405,8 @@ pub fn router_with_upgrade(
             post(upgrade_cluster_rollback_handler),
         )
         .route("/v1/cluster/elect", post(cluster_elect_handler))
-        .route("/v1/chaos/partition", post(chaos_partition_handler))
         .route("/v1/chaos/reserve", post(node_fault_reserve_handler))
         .route("/v1/chaos/fence", post(node_fault_fence_handler))
-        .route("/v1/chaos/heal", post(chaos_heal_handler))
         .route("/v1/chaos/status", get(chaos_status_handler))
         .route(
             "/v1/snapshots/{namespace}/{app}",
@@ -4553,193 +4551,21 @@ async fn join_handler(
 // Chaos testing endpoints
 // ---------------------------------------------------------------------------
 
-/// Request body for partition injection.
-#[derive(Deserialize)]
-struct ChaosPartitionRequest {
-    peers: Vec<String>,
-    duration_secs: u64,
-    #[serde(default)]
-    acknowledged: bool,
-}
-
-/// Inject a network partition.
-async fn chaos_partition_handler(
-    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
-    State(state): State<ApiState>,
-    Json(body): Json<ChaosPartitionRequest>,
-) -> Response {
-    // AUTH4: fault injection is an operator action, not a node-to-node one.
-    if let Err(resp) =
-        crate::sesame::auth::authorize_user(auth.as_deref(), crate::sesame::types::ApiRole::Admin)
-    {
-        return resp;
-    }
-    let (principal, role) = auth
-        .as_deref()
-        .map(|auth| (auth.principal_id.as_str(), auth.role))
-        .unwrap_or(("local-bootstrap", crate::sesame::types::ApiRole::Admin));
-    if let Err(error) = state.static_capabilities.test_policy.authorise(
-        crate::testkit::safety::OperationPermission::AlterNodeState,
-        &crate::testkit::safety::OperationAuthorisation {
-            principal,
-            role,
-            acknowledged: body.acknowledged,
-        },
-    ) {
-        return (StatusCode::FORBIDDEN, error.to_string()).into_response();
-    }
-    let audit_peers = body.peers.clone();
-    let audit_duration_seconds = body.duration_secs;
-    let injected_by = auth
-        .as_deref()
-        .map(|auth| auth.token_name.clone())
-        .unwrap_or_else(|| "local-bootstrap".to_string());
-    let Some(target_node) = state.node_name.clone() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "node fault safety requires a cluster identity",
-        )
-            .into_response();
-    };
-    let request = crate::smoker::types::FaultRequest {
-        fault_type: crate::smoker::types::FaultType::CouncilPartition,
-        target_service: body.peers.join(","),
-        namespace: None,
-        target_instance: None,
-        target_node: Some(target_node),
-        duration: std::time::Duration::from_secs(body.duration_secs),
-        injected_by: injected_by.clone(),
-        reason: Some("legacy chaos partition".into()),
-        include_leader: true,
-        override_safety: false,
-        acknowledged: body.acknowledged,
-    };
-    let reservation = match prepare_and_reserve_node_fault(&state, request).await {
-        Ok(grant) => grant,
-        Err(response) => return *response,
-    };
-    let duration_secs = reservation.request.duration.as_secs();
-    match ask_agent(&state.cmd_tx, |response| AgentCommand::InjectPartition {
-        reservation: Some(reservation),
-        peers: body.peers,
-        duration_secs,
-        injected_by,
-        response,
-    })
-    .await
-    {
-        Ok(Ok((msg, summary))) => {
-            record_fault_audit(
-                &state,
-                FaultAudit {
-                    action: "fault.injected",
-                    principal,
-                    severity: crate::bun::events::EventSeverity::Warning,
-                    app: None,
-                    node: None,
-                    details: std::collections::BTreeMap::from([
-                        ("fault_type".to_string(), "CouncilPartition".to_string()),
-                        (
-                            "duration_seconds".to_string(),
-                            audit_duration_seconds.to_string(),
-                        ),
-                        ("peers".to_string(), audit_peers.join(",")),
-                        ("fault_id".to_string(), summary.id.to_string()),
-                    ]),
-                    message: format!("{msg} by principal {principal}"),
-                },
-            )
-            .await;
-            Json(serde_json::json!({ "message": msg, "fault": summary })).into_response()
-        }
-        Ok(Err(e)) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": e.to_string() })),
-        )
-            .into_response(),
-        Err(response) => response,
-    }
-}
-
-/// Remove all network partitions.
-async fn chaos_heal_handler(
-    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
-    State(state): State<ApiState>,
-) -> Response {
-    if let Err(resp) =
-        crate::sesame::auth::authorize_user(auth.as_deref(), crate::sesame::types::ApiRole::Admin)
-    {
-        return resp;
-    }
-    let (principal, role) = auth
-        .as_deref()
-        .map(|auth| (auth.principal_id.as_str(), auth.role))
-        .unwrap_or(("local-bootstrap", crate::sesame::types::ApiRole::Admin));
-    if let Err(error) = state.static_capabilities.test_policy.authorise_reversal(
-        crate::testkit::safety::OperationPermission::AlterNodeState,
-        &crate::testkit::safety::OperationAuthorisation {
-            principal,
-            role,
-            acknowledged: false,
-        },
-    ) {
-        return (StatusCode::FORBIDDEN, error.to_string()).into_response();
-    }
-    match ask_agent(&state.cmd_tx, |response| AgentCommand::HealPartition {
-        response,
-    })
-    .await
-    {
-        Ok(Ok(msg)) => {
-            record_fault_audit(
-                &state,
-                FaultAudit {
-                    action: "fault.cleared-council-partition",
-                    principal,
-                    severity: crate::bun::events::EventSeverity::Info,
-                    app: None,
-                    node: None,
-                    details: std::collections::BTreeMap::new(),
-                    message: format!("{msg} by principal {principal}"),
-                },
-            )
-            .await;
-            Json(serde_json::json!({ "message": msg })).into_response()
-        }
-        Ok(Err(e)) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": e.to_string() })),
-        )
-            .into_response(),
-        Err(response) => response,
-    }
-}
-
-/// Query chaos status.
+/// Show the locally replicated node-experiment reservation, if any.
 async fn chaos_status_handler(State(state): State<ApiState>) -> Response {
-    match ask_agent(&state.cmd_tx, |response| AgentCommand::ChaosStatus {
-        response,
-    })
-    .await
-    {
-        Ok(status) => {
-            let reservation = match &state.council {
-                Some(council) => council.desired_state().await.node_fault_reservations.active,
-                None => None,
-            };
-            Json(serde_json::json!({
-                "active_partition": status.active_partition,
-                "node_fault_reservation": reservation.map(|grant| serde_json::json!({
-                    "sequence": grant.sequence,
-                    "target_node": grant.request.target_node,
-                    "fault_type": grant.request.fault_type,
-                    "cleanup_after_unix_ms": grant.cleanup_after_unix_ms,
-                })),
-            }))
-            .into_response()
-        }
-        Err(response) => response,
-    }
+    let reservation = match &state.council {
+        Some(council) => council.desired_state().await.node_fault_reservations.active,
+        None => None,
+    };
+    Json(serde_json::json!({
+        "node_fault_reservation": reservation.map(|grant| serde_json::json!({
+            "sequence": grant.sequence,
+            "target_node": grant.request.target_node,
+            "fault_type": grant.request.fault_type,
+            "cleanup_after_unix_ms": grant.cleanup_after_unix_ms,
+        })),
+    }))
+    .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -8674,12 +8500,22 @@ mod tests {
     }
 
     fn council_partition_body(acknowledged: bool) -> String {
-        serde_json::json!({
-            "peers": ["node-b"],
-            "duration_secs": 30,
-            "acknowledged": acknowledged,
+        serde_json::to_string(&crate::smoker::types::FaultRequest {
+            fault_type: crate::smoker::types::FaultType::CouncilPartition {
+                peers: vec!["node-b".to_string()],
+            },
+            target_service: String::new(),
+            namespace: None,
+            target_instance: None,
+            target_node: Some("node-a".to_string()),
+            duration: std::time::Duration::from_secs(30),
+            injected_by: "untrusted-client-value".to_string(),
+            reason: Some("api policy test".to_string()),
+            include_leader: true,
+            override_safety: false,
+            acknowledged,
         })
-        .to_string()
+        .unwrap()
     }
 
     fn node_kill_body(acknowledged: bool) -> String {
@@ -8739,7 +8575,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_partition_route_does_not_bypass_the_admin_role() {
+    async fn deployer_cannot_partition_a_council_member() {
         let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::Deployer);
         let (app, shutdown) = setup_with_auth_readiness_and_leases(
             vec![token],
@@ -8750,21 +8586,13 @@ mod tests {
         )
         .await;
 
-        assert_eq!(
-            post_status(
-                app,
-                "/v1/chaos/partition",
-                &plaintext,
-                &council_partition_body(true),
-            )
-            .await,
-            StatusCode::FORBIDDEN
-        );
+        let status = post_status(app, "/v1/fault", &plaintext, &council_partition_body(true)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
         shutdown.cancel();
     }
 
     #[tokio::test]
-    async fn legacy_partition_route_requires_explicit_acknowledgement() {
+    async fn council_partition_requires_explicit_acknowledgement() {
         let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::Admin);
         let (app, shutdown) = setup_with_auth_readiness_and_leases(
             vec![token],
@@ -8777,7 +8605,7 @@ mod tests {
 
         let (status, body) = post_authenticated(
             app,
-            "/v1/chaos/partition",
+            "/v1/fault",
             &plaintext,
             &council_partition_body(false),
             None,
@@ -8785,31 +8613,6 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert!(String::from_utf8_lossy(&body).contains("acknowledgement"));
-        shutdown.cancel();
-    }
-
-    #[tokio::test]
-    async fn legacy_partition_requires_cluster_reservation_evidence() {
-        let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::Admin);
-        let (app, shutdown) = setup_with_auth_readiness_and_leases(
-            vec![token],
-            None,
-            crate::bun::readiness::ReadinessTracker::new(),
-            node_fault_static_capabilities(),
-            None,
-        )
-        .await;
-
-        let (status, body) = post_authenticated(
-            app,
-            "/v1/chaos/partition",
-            &plaintext,
-            &council_partition_body(true),
-            None,
-        )
-        .await;
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert!(String::from_utf8_lossy(&body).contains("cluster identity"));
         shutdown.cancel();
     }
 

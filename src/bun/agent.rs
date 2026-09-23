@@ -405,22 +405,6 @@ pub enum AgentCommand {
         csr_der: Vec<u8>,
         response: oneshot::Sender<Result<crate::sesame::join::JoinBundle, BunError>>,
     },
-    /// Inject a network partition (chaos testing).
-    InjectPartition {
-        reservation: Option<crate::smoker::reservation::NodeFaultReservation>,
-        peers: Vec<String>,
-        duration_secs: u64,
-        injected_by: String,
-        response: oneshot::Sender<Result<(String, crate::smoker::types::FaultSummary), BunError>>,
-    },
-    /// Remove all network partitions (chaos testing).
-    HealPartition {
-        response: oneshot::Sender<Result<String, BunError>>,
-    },
-    /// Query active chaos state.
-    ChaosStatus {
-        response: oneshot::Sender<ChaosState>,
-    },
     /// Snapshot an app's managed volumes (one volume, or all of them).
     SnapshotCreate {
         namespace: String,
@@ -1351,26 +1335,6 @@ impl DeployOps {
         )
         .await
     }
-}
-
-/// Active chaos fault injection state.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ChaosState {
-    /// Currently active partition, if any.
-    pub active_partition: Option<PartitionInfo>,
-}
-
-/// Details of an active partition injection.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PartitionInfo {
-    /// Addresses being blocked.
-    pub peers: Vec<String>,
-    /// When the partition was injected (seconds since UNIX epoch).
-    pub injected_at_epoch: u64,
-    /// Duration in seconds before auto-heal.
-    pub duration_secs: u64,
-    /// Seconds remaining before auto-heal.
-    pub remaining_secs: u64,
 }
 
 /// Result of a deploy operation.
@@ -4149,96 +4113,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 let result = self.handle_join_issue(&token, &node_id, &csr_der).await;
                 let _ = response.send(result);
             }
-            AgentCommand::InjectPartition {
-                reservation,
-                peers,
-                duration_secs,
-                injected_by,
-                response,
-            } => {
-                let Some(grant) = reservation else {
-                    let _ = response.send(Err(BunError::FaultRejected {
-                        reason: "partitions require a committed cluster reservation".into(),
-                    }));
-                    return;
-                };
-                let request = grant.request.clone();
-                if request.target_service != peers.join(",")
-                    || request.duration != std::time::Duration::from_secs(duration_secs)
-                    || request.injected_by != injected_by
-                    || !matches!(
-                        request.fault_type,
-                        crate::smoker::types::FaultType::CouncilPartition
-                    )
-                {
-                    let _ = response.send(Err(BunError::FaultRejected {
-                        reason: "partition grant does not match the operation".into(),
-                    }));
-                    return;
-                }
-                if let Err(reason) = self.node_fault_fence.activate(&grant, &request) {
-                    let _ = response.send(Err(BunError::FaultRejected { reason }));
-                    return;
-                }
-                // Safety rails apply to the legacy path too (M1): a partition
-                // that would strand quorum must be refused, not waved through
-                // just because it came in on the old chaos API.
-                let context = self.build_safety_context(&request).await;
-                let check = crate::smoker::safety::evaluate_safety(&request, &context);
-                if !check.approved {
-                    let reason = check
-                        .violation
-                        .map(|v| v.to_string())
-                        .unwrap_or_else(|| "safety check failed".into());
-                    let _ = response.send(Err(BunError::FaultRejected { reason }));
-                    return;
-                }
-                let rule = self.fault_registry.insert(&request);
-                self.node_fault_fence.active = Some((grant.sequence, rule.id));
-                // L15: actually partition. Resolve each peer (by name)
-                // to its gossip address from membership, then block both
-                // the gossip and Raft transports to it — the old code
-                // only recorded a registry entry and dropped nothing.
-                let blocked = self.apply_partition(&peers).await;
-                // Record the reversal so heal and TTL-expiry unblock exactly
-                // these peers (M1): without it a Ctrl-C'd partition stayed in
-                // force forever with no record it existed.
-                self.record_reversal(
-                    rule.id,
-                    crate::smoker::types::FaultReversal::Partition {
-                        peers: peers.clone(),
-                    },
-                );
-                let msg =
-                    format!("partition injected: blocking {blocked} peer(s) for {duration_secs}s");
-                let summary = crate::smoker::types::FaultSummary::from(&rule);
-                let _ = response.send(Ok((msg, summary)));
-            }
-            AgentCommand::HealPartition { response } => {
-                // Legacy chaos API — clear all faults, reversing each so no
-                // persistent effect (a SIGSTOPped workload, a cgroup cap, a
-                // transport blocklist) outlives the heal (M1). The old code
-                // cleared the registry and the blocklists but never ran
-                // `reverse_fault`, so a frozen process stayed frozen.
-                let removed = self.fault_registry.clear();
-                for rule in &removed {
-                    self.delete_fault_bpf_entry(rule).await;
-                    self.reverse_fault(rule).await;
-                }
-                // Belt and braces: drop any blocklist entries no fault owned.
-                self.clear_partition().await;
-                self.publish_dns_faults();
-                let msg = if removed.is_empty() {
-                    "partition healed".to_string()
-                } else {
-                    format!("cleared {} fault(s); partition healed", removed.len())
-                };
-                let _ = response.send(Ok(msg));
-            }
-            AgentCommand::ChaosStatus { response } => {
-                let state = self.get_chaos_state();
-                let _ = response.send(state);
-            }
             AgentCommand::SnapshotCreate {
                 namespace,
                 app_name,
@@ -4915,7 +4789,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     crate::smoker::types::FaultType::NodeKill { .. }
                         | crate::smoker::types::FaultType::NodeDrain
                         | crate::smoker::types::FaultType::NodePressure { .. }
-                        | crate::smoker::types::FaultType::CouncilPartition
+                        | crate::smoker::types::FaultType::CouncilPartition { .. }
                 )
             })
             .count() as u32;
@@ -5245,10 +5119,19 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 self.record_reversal(rule.id, crate::smoker::types::FaultReversal::NodePressure);
                 Ok(())
             }
-            FaultType::CouncilPartition => Err(
-                "council partitions must use the authenticated /v1/chaos/partition operation"
-                    .to_string(),
-            ),
+            FaultType::CouncilPartition { peers } => {
+                // Block both the gossip and Raft transports to each named
+                // peer, and record exactly which peers so clear and expiry
+                // unblock these and leave any other partition in force.
+                self.apply_partition(peers).await;
+                self.record_reversal(
+                    rule.id,
+                    crate::smoker::types::FaultReversal::Partition {
+                        peers: peers.clone(),
+                    },
+                );
+                Ok(())
+            }
         }
     }
 
@@ -5415,7 +5298,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         if let Some(id) = self.node_fault_fence.fence(grant) {
             if matches!(
                 grant.request.fault_type,
-                crate::smoker::types::FaultType::CouncilPartition
+                crate::smoker::types::FaultType::CouncilPartition { .. }
             ) {
                 // The single node-experiment slot owns these transport lists.
                 // Peer addresses may have changed since activation; removing
@@ -5570,36 +5453,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 Some((id.clone(), path, value.clone()))
             })
             .collect()
-    }
-
-    /// Build the current chaos state for the API (legacy format).
-    fn get_chaos_state(&self) -> ChaosState {
-        // Find the first partition-type fault for backward compatibility
-        let active_partition = self
-            .fault_registry
-            .iter()
-            .find(|f| {
-                matches!(
-                    f.fault_type,
-                    crate::smoker::types::FaultType::CouncilPartition
-                )
-            })
-            .map(|f| {
-                let remaining = f.remaining();
-                let epoch = SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                PartitionInfo {
-                    peers: vec![f.target_service.clone()],
-                    injected_at_epoch: epoch.saturating_sub(
-                        (f.duration_ns / 1_000_000_000).saturating_sub(remaining.as_secs()),
-                    ),
-                    duration_secs: f.duration_ns / 1_000_000_000,
-                    remaining_secs: remaining.as_secs(),
-                }
-            });
-        ChaosState { active_partition }
     }
 
     /// Drain expired faults from the registry. Called on every health tick.
