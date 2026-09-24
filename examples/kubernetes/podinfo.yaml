@@ -318,7 +318,7 @@ spec:
               done
           resources:
             limits:
-              cpu: 100m
+              cpu: 500m
               memory: 16Mi
             requests:
               cpu: 10m
