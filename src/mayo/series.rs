@@ -20,6 +20,9 @@ pub type Point = (u64, f64);
 /// Label that names an instance in scraped and process metrics.
 pub const INSTANCE_LABEL: &str = "instance";
 
+/// Label naming the node that scraped or collected a sample.
+pub const NODE_LABEL: &str = "node";
+
 /// One instance's view of one metric.
 #[derive(Debug, Clone, PartialEq)]
 pub struct InstanceSeries {
@@ -51,18 +54,20 @@ pub fn is_counter(name: &str, all_names: &BTreeSet<&str>) -> bool {
     false
 }
 
-/// Group rows by instance, adding up samples that share a timestamp.
+/// Group rows by instance and node, adding up samples that share a
+/// timestamp.
 ///
 /// Every sample from one scrape of one instance carries the same timestamp,
-/// so the sum at a timestamp is that instance's total at that moment.
-/// Instances come back sorted by id.
+/// so the sum at a timestamp is that instance's total at that moment. The
+/// node is part of the key because instance ids are only unique per node:
+/// three frontend replicas on three nodes are each `default__frontend-0`.
+/// Instances come back sorted by id, then node.
 pub fn per_instance(rows: &[MetricsQueryRow]) -> Vec<InstanceSeries> {
     struct Accumulator {
-        node: Option<String>,
         label_sets: BTreeSet<String>,
         sums: BTreeMap<u64, f64>,
     }
-    let mut by_instance: BTreeMap<String, Accumulator> = BTreeMap::new();
+    let mut by_instance: BTreeMap<(String, Option<String>), Accumulator> = BTreeMap::new();
     for row in rows {
         let labels: BTreeMap<String, String> =
             serde_json::from_str(&row.labels).unwrap_or_default();
@@ -70,26 +75,40 @@ pub fn per_instance(rows: &[MetricsQueryRow]) -> Vec<InstanceSeries> {
             .get(INSTANCE_LABEL)
             .cloned()
             .unwrap_or_else(|| "-".to_string());
-        let entry = by_instance.entry(instance).or_insert_with(|| Accumulator {
-            node: None,
-            label_sets: BTreeSet::new(),
-            sums: BTreeMap::new(),
-        });
-        if entry.node.is_none() {
-            entry.node = labels.get("node").cloned();
-        }
+        let node = labels.get(NODE_LABEL).cloned();
+        let entry = by_instance
+            .entry((instance, node))
+            .or_insert_with(|| Accumulator {
+                label_sets: BTreeSet::new(),
+                sums: BTreeMap::new(),
+            });
         entry.label_sets.insert(row.labels.clone());
         *entry.sums.entry(row.timestamp).or_insert(0.0) += row.value;
     }
     by_instance
         .into_iter()
-        .map(|(instance, accumulator)| InstanceSeries {
+        .map(|((instance, node), accumulator)| InstanceSeries {
             instance,
-            node: accumulator.node,
+            node,
             series_count: accumulator.label_sets.len(),
             points: accumulator.sums.into_iter().collect(),
         })
         .collect()
+}
+
+impl InstanceSeries {
+    /// What identifies this instance across the cluster: its id and node.
+    pub fn key(&self) -> (String, Option<String>) {
+        (self.instance.clone(), self.node.clone())
+    }
+
+    /// A chart legend entry: the instance id, and the node when known.
+    pub fn label(&self) -> String {
+        match &self.node {
+            Some(node) => format!("{} on {node}", self.instance),
+            None => self.instance.clone(),
+        }
+    }
 }
 
 /// Per-second rate between consecutive points of a counter.
@@ -191,11 +210,12 @@ pub fn instance_chart(kind: ChartKind, rows: &[MetricsQueryRow]) -> ChartData {
         per_instance(rows)
             .into_iter()
             .map(|instance| {
+                let label = instance.label();
                 let points = match kind {
                     ChartKind::Rate => rates(&instance.points),
                     ChartKind::Gauge | ChartKind::Mean => instance.points,
                 };
-                (instance.instance, points)
+                (label, points)
             })
             .collect(),
     )
@@ -204,19 +224,19 @@ pub fn instance_chart(kind: ChartKind, rows: &[MetricsQueryRow]) -> ChartData {
 /// One line per instance of a histogram's mean observation:
 /// `rate(_sum) / rate(_count)` over each scrape interval.
 pub fn mean_chart(sum_rows: &[MetricsQueryRow], count_rows: &[MetricsQueryRow]) -> ChartData {
-    let sums: BTreeMap<String, Vec<Point>> = per_instance(sum_rows)
+    let sums: BTreeMap<(String, Option<String>), Vec<Point>> = per_instance(sum_rows)
         .into_iter()
-        .map(|instance| (instance.instance, rates(&instance.points)))
+        .map(|instance| (instance.key(), rates(&instance.points)))
         .collect();
     align(
         per_instance(count_rows)
             .into_iter()
             .map(|count| {
                 let means = sums
-                    .get(&count.instance)
+                    .get(&count.key())
                     .map(|sum_rates| ratio(sum_rates, &rates(&count.points)))
                     .unwrap_or_default();
-                (count.instance, means)
+                (count.label(), means)
             })
             .collect(),
     )
@@ -337,6 +357,50 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// Z6.7: each node numbers its own replicas, so three frontends on three
+    /// nodes are all `default__frontend-0`. Grouping by id alone merged them
+    /// into one instance whose points jumped between replicas.
+    #[test]
+    fn replicas_with_the_same_id_on_different_nodes_stay_apart() {
+        let rows = vec![
+            row(10, "req_total", r#"{"instance":"f-0","node":"n1"}"#, 100.0),
+            row(20, "req_total", r#"{"instance":"f-0","node":"n1"}"#, 150.0),
+            row(11, "req_total", r#"{"instance":"f-0","node":"n2"}"#, 7.0),
+            row(21, "req_total", r#"{"instance":"f-0","node":"n2"}"#, 17.0),
+        ];
+        let series = per_instance(&rows);
+        assert_eq!(series.len(), 2);
+        assert_eq!(series[0].node.as_deref(), Some("n1"));
+        assert_eq!(series[0].points, vec![(10, 100.0), (20, 150.0)]);
+        assert_eq!(series[1].node.as_deref(), Some("n2"));
+        assert_eq!(series[1].points, vec![(11, 7.0), (21, 17.0)]);
+
+        let chart = instance_chart(ChartKind::Rate, &rows);
+        let labels: Vec<&str> = chart.series.iter().map(|s| s.label.as_str()).collect();
+        assert_eq!(labels, ["f-0 on n1", "f-0 on n2"]);
+        assert_eq!(chart.series[0].values, vec![Some(5.0), None]);
+        assert_eq!(chart.series[1].values, vec![None, Some(1.0)]);
+    }
+
+    #[test]
+    fn a_mean_chart_pairs_sum_and_count_by_instance_and_node() {
+        let sum = vec![
+            row(10, "lat_sum", r#"{"instance":"f-0","node":"n1"}"#, 0.0),
+            row(20, "lat_sum", r#"{"instance":"f-0","node":"n1"}"#, 1.0),
+            row(10, "lat_sum", r#"{"instance":"f-0","node":"n2"}"#, 0.0),
+            row(20, "lat_sum", r#"{"instance":"f-0","node":"n2"}"#, 30.0),
+        ];
+        let count = vec![
+            row(10, "lat_count", r#"{"instance":"f-0","node":"n1"}"#, 0.0),
+            row(20, "lat_count", r#"{"instance":"f-0","node":"n1"}"#, 100.0),
+            row(10, "lat_count", r#"{"instance":"f-0","node":"n2"}"#, 0.0),
+            row(20, "lat_count", r#"{"instance":"f-0","node":"n2"}"#, 100.0),
+        ];
+        let chart = mean_chart(&sum, &count);
+        assert_eq!(chart.series[0].values, vec![Some(0.01)]);
+        assert_eq!(chart.series[1].values, vec![Some(0.3)]);
     }
 
     #[test]

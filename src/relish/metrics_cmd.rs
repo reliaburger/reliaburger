@@ -301,16 +301,16 @@ pub fn histogram_instances(
     sum_rows: &[MetricsQueryRow],
     count_rows: &[MetricsQueryRow],
 ) -> Vec<InstanceMetric> {
-    let sums: BTreeMap<String, InstanceSeries> = series::per_instance(sum_rows)
+    let sums: BTreeMap<(String, Option<String>), InstanceSeries> = series::per_instance(sum_rows)
         .into_iter()
-        .map(|s| (s.instance.clone(), s))
+        .map(|s| (s.key(), s))
         .collect();
     series::per_instance(count_rows)
         .into_iter()
         .map(|count| {
             let count_rates = series::rates(&count.points);
             let means = sums
-                .get(&count.instance)
+                .get(&count.key())
                 .map(|sum| series::ratio(&series::rates(&sum.points), &count_rates))
                 .unwrap_or_default();
             InstanceMetric {
@@ -654,6 +654,28 @@ mod tests {
             MetricType::Histogram,
             &instances
         ));
+    }
+
+    /// Z6.7: every node numbers its own replicas from 0.
+    #[test]
+    fn replicas_numbered_alike_on_different_nodes_count_as_separate_instances() {
+        let rows: Vec<MetricsQueryRow> = ["n1", "n2", "n3"]
+            .iter()
+            .flat_map(|node| {
+                (0..2u64).map(move |step| MetricsQueryRow {
+                    timestamp: 10 + step * 10,
+                    metric_name: "http_requests_total".to_string(),
+                    labels: format!(r#"{{"instance":"default__frontend-0","node":"{node}"}}"#),
+                    value: (step * 50) as f64,
+                })
+            })
+            .collect();
+        let summaries = summarise(&rows);
+        assert_eq!(summaries[0].instances, 3);
+        assert_eq!(summaries[0].value, Some(15.0));
+        let detail = instance_metrics(MetricType::Counter, &rows);
+        let nodes: Vec<_> = detail.iter().map(|line| line.node.as_deref()).collect();
+        assert_eq!(nodes, [Some("n1"), Some("n2"), Some("n3")]);
     }
 
     #[test]
