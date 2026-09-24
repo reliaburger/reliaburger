@@ -5,6 +5,41 @@ use crate::cluster::producer::ProducerRelease;
 use crate::onion::producer::ProducerReleaseConfirmation;
 
 impl<G: Grill + Clone + 'static> BunAgent<G> {
+    /// Keep a stopped, withdrawn old instance until the leader confirms that
+    /// every node has stopped routing to it. Its rollout carries on.
+    pub(super) fn defer_retirement(&mut self, id: &InstanceId) {
+        self.retain_stopped_instance(id);
+        if self.deferred_retirements.insert(id.clone()) {
+            eprintln!(
+                "bun: {} stopped; its addresses are released once every node confirms the withdrawal",
+                id.0
+            );
+        }
+    }
+
+    /// Release the addresses of instances a finished rollout left behind,
+    /// as soon as the leader confirms their withdrawal.
+    pub(super) async fn drive_deferred_retirements(&mut self) {
+        let deferred: Vec<InstanceId> = self.deferred_retirements.iter().cloned().collect();
+        for id in deferred {
+            if self.supervisor.get_instance(&id).is_none() {
+                self.deferred_retirements.remove(&id);
+                continue;
+            }
+            // The backend was withdrawn when the rollout stopped it; what's
+            // left is the release itself and the bookkeeping after it.
+            match self.retire_instance_artifacts(&id).await {
+                Ok(()) => {
+                    self.supervisor.retire_instance(&id).await;
+                    self.deferred_retirements.remove(&id);
+                    self.sync_firewall_ebpf().await;
+                    self.rebuild_routing_table().await;
+                }
+                Err(BunError::ProducerReleasePending { .. }) => {}
+                Err(error) => eprintln!("bun: releasing {} awaits retry: {error}", id.0),
+            }
+        }
+    }
     /// Configure enrolled leader transport. Durable discovery enables the release gate.
     pub fn set_producer_release_client(
         &mut self,

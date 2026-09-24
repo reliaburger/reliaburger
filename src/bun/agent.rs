@@ -799,6 +799,12 @@ enum DeployOp {
         old_id: InstanceId,
         reply: oneshot::Sender<Result<(), BunError>>,
     },
+    /// Hand a stopped old instance whose addresses still await remote
+    /// withdrawal confirmations to the agent loop, so the rollout can finish.
+    DeferRetire {
+        old_id: InstanceId,
+        reply: oneshot::Sender<()>,
+    },
     /// Append an entry to the deploy history.
     PushDeployHistory {
         entry: Box<crate::meat::deploy_types::DeployHistoryEntry>,
@@ -841,9 +847,11 @@ struct PreparedInstance {
 }
 
 /// How long a deploy worker keeps asking the leader to release a retired
-/// instance's addresses before it gives up and fails the deploy. Consumers
-/// confirm withdrawals on their placement poll, every couple of seconds.
-const PRODUCER_RELEASE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(30);
+/// instance's addresses before it hands the release to the agent loop and
+/// carries on. Consumers confirm withdrawals on their placement poll, every
+/// couple of seconds, so a healthy cluster answers well within it; a lost
+/// node holds it up until the leader discharges it (`onion::lease`).
+const PRODUCER_RELEASE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Pause between two producer release attempts.
 const PRODUCER_RELEASE_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
@@ -1370,6 +1378,19 @@ impl DeployOps {
         .await
     }
 
+    /// Let the agent loop finish releasing a stopped old instance's addresses
+    /// once every node has confirmed the withdrawal.
+    async fn defer_retire(&self, old_id: &InstanceId) {
+        self.call(
+            |reply| DeployOp::DeferRetire {
+                old_id: old_id.clone(),
+                reply,
+            },
+            (),
+        )
+        .await
+    }
+
     async fn push_deploy_history(&self, entry: crate::meat::deploy_types::DeployHistoryEntry) {
         self.call(
             |reply| DeployOp::PushDeployHistory {
@@ -1740,6 +1761,9 @@ pub struct BunAgent<G: Grill> {
         std::collections::HashMap<(String, String), crate::config::app::IngressSpec>,
     /// A local change awaits in-place republication of the consumer view.
     consumer_view_stale: bool,
+    /// Stopped instances retired by a finished rollout whose addresses still
+    /// wait for other nodes to confirm the withdrawal. The loop releases them.
+    deferred_retirements: std::collections::HashSet<InstanceId>,
     /// How long this node may keep routing with its published cluster view
     /// (shared with Wrapper, mirrored into the kernel's `view_lease_map`).
     view_lease: std::sync::Arc<crate::onion::lease::ViewLease>,
@@ -1922,6 +1946,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             ingress_configs: std::collections::HashMap::new(),
             cluster_ingress_configs: std::collections::HashMap::new(),
             consumer_view_stale: false,
+            deferred_retirements: Default::default(),
             view_lease: Default::default(),
             discovery_reopen: None,
             // Single-node mode: no nftables needed (no cluster ports to protect)
@@ -2030,6 +2055,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             ingress_configs: std::collections::HashMap::new(),
             cluster_ingress_configs: std::collections::HashMap::new(),
             consumer_view_stale: false,
+            deferred_retirements: Default::default(),
             view_lease: Default::default(),
             discovery_reopen: None,
             #[cfg(target_os = "linux")]
@@ -3537,6 +3563,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         eprintln!("bun: withdrawing the lapsed cluster view awaits retry: {error}");
                     }
                     self.drive_startup_retirements().await;
+                    self.drive_deferred_retirements().await;
                     self.refresh_egress_readiness().await;
                     self.run_health_checks().await;
                     self.check_jobs().await;
@@ -6571,7 +6598,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
 
         for old_id in existing {
-            self.finish_retire_bookkeeping(old_id).await?;
+            match self.finish_retire_bookkeeping(old_id).await {
+                Err(BunError::ProducerReleasePending { .. }) => self.defer_retirement(old_id),
+                result => result?,
+            }
         }
         self.withdraw_service_ebpf(&service_id).await?;
         // Re-registration can be refused: a stop that withdrew the council's
@@ -10319,6 +10349,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     .list_instances()
                     .iter()
                     .filter(|i| !i.is_job && i.app_name == app_name && i.namespace == namespace)
+                    // Retired by an earlier rollout; only its release remains.
+                    .filter(|i| !self.deferred_retirements.contains(&i.id))
                     .map(|i| i.id.clone())
                     .collect();
                 let _ = reply.send(ids);
@@ -10676,6 +10708,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             DeployOp::FinishRetire { old_id, reply } => {
                 let result = self.finish_retire_bookkeeping(&old_id).await;
                 let _ = reply.send(result);
+            }
+            DeployOp::DeferRetire { old_id, reply } => {
+                self.defer_retirement(&old_id);
+                let _ = reply.send(());
             }
             DeployOp::PushDeployHistory { entry, reply } => {
                 self.deploy_history.write().await.push(*entry);
@@ -11522,26 +11558,36 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                             .await;
                         return std::ops::ControlFlow::Break(());
                     }
-                    if let Err(error) = self.ops.finish_retire(&old_id).await {
-                        let retention = self
-                            .retain_started_replacements(
-                                app_name, namespace, spec, &new_ids, &new_ports, &new_specs,
-                            )
-                            .await;
-                        let detail = match retention {
-                            Ok(()) => "started replacements retained for cleanup".into(),
-                            Err(error) => {
-                                format!("could not retain replacement ownership: {error}")
-                            }
-                        };
-                        let _ = events
-                            .send(ApplyEvent::Error {
-                                message: format!(
-                                    "old instance artifact retirement failed: {error}; {detail}"
-                                ),
-                            })
-                            .await;
-                        return std::ops::ControlFlow::Break(());
+                    match self.ops.finish_retire(&old_id).await {
+                        // Stopped, drained and withdrawn locally; only other
+                        // nodes' confirmations are outstanding. That can take
+                        // as long as a lost node's view lease, and starting
+                        // another generation wouldn't make it any shorter.
+                        Err(BunError::ProducerReleasePending { .. }) => {
+                            self.ops.defer_retire(&old_id).await;
+                        }
+                        Ok(()) => {}
+                        Err(error) => {
+                            let retention = self
+                                .retain_started_replacements(
+                                    app_name, namespace, spec, &new_ids, &new_ports, &new_specs,
+                                )
+                                .await;
+                            let detail = match retention {
+                                Ok(()) => "started replacements retained for cleanup".into(),
+                                Err(error) => {
+                                    format!("could not retain replacement ownership: {error}")
+                                }
+                            };
+                            let _ = events
+                                .send(ApplyEvent::Error {
+                                    message: format!(
+                                        "old instance artifact retirement failed: {error}; {detail}"
+                                    ),
+                                })
+                                .await;
+                            return std::ops::ControlFlow::Break(());
+                        }
                     }
                     retired += 1;
                     continue;
@@ -13299,6 +13345,98 @@ mod tests {
                 crate::grill::records::record_path(&root.path().join("records"), &id.0).exists()
             );
         }
+    }
+
+    /// Z6.7: with a node stopped, the old instance's release waited for that
+    /// node's receipt. The rollout failed, the orchestrator retried it, and
+    /// every retry took the retained replacements for "existing" instances
+    /// and stopped a healthy one. A rollout now finishes and leaves the
+    /// release to the agent loop.
+    #[tokio::test]
+    async fn a_rollout_finishes_while_the_old_instance_waits_for_remote_release() {
+        let grill = MockGrill::new();
+        grill.set_pid(std::process::id());
+        let allocator = PortAllocator::new(30000, 30010);
+        let (_, receiver) = mpsc::channel(8);
+        let mut agent = BunAgent::new(
+            grill.clone(),
+            allocator.clone(),
+            receiver,
+            CancellationToken::new(),
+        );
+        let root = tempfile::tempdir().unwrap();
+        agent.set_volumes_dir(root.path().join("volumes"));
+        agent.set_records_dir(root.path().join("records"));
+        agent
+            .enable_fresh_discovery_ownership(&root.path().join("discovery"))
+            .await
+            .unwrap();
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        let old = InstanceId("default__web-0".into());
+        let original = agent.supervisor.get_instance(&old).unwrap();
+        let old_port = original.host_port.unwrap();
+        let execution = crate::grill::RuntimeExecution {
+            instance_id: old.clone(),
+            generation: crate::grill::RuntimeGeneration::process("original"),
+        };
+        grill
+            .set_launch_inventory(vec![crate::grill::RuntimeLaunch {
+                instance_id: old.clone(),
+                generation: execution.generation.clone(),
+                spec: original.oci_spec.clone().unwrap(),
+                network_reference: None,
+            }])
+            .await;
+        let (mut clustered, _, _) = test_cluster_fault_agent().await;
+        agent.cluster = clustered.cluster.take();
+        // A stopped node never sends its receipt: the leader answers 202.
+        let (client, pending) =
+            crate::cluster::producer::test_fixture(axum::http::StatusCode::ACCEPTED, String::new())
+                .await;
+        agent.set_producer_release_client(client);
+
+        let replacement = Config::parse("[app.web]\nimage = 'web:v2'\nport = 8080\n").unwrap();
+        expect_complete(&drain_deploy(&mut agent, replacement).await);
+
+        assert!(agent.deferred_retirements.contains(&old));
+        assert_eq!(
+            agent.supervisor.get_instance(&old).unwrap().state,
+            ContainerState::Stopped
+        );
+        assert!(allocator.is_allocated(old_port).await, "released too early");
+        let (reply, existing) = oneshot::channel();
+        agent
+            .handle_deploy_op(DeployOp::ListExistingOwned {
+                app_name: "web".into(),
+                namespace: "default".into(),
+                reply,
+            })
+            .await;
+        let existing = existing.await.unwrap();
+        assert!(
+            !existing.contains(&old),
+            "a later rollout must not retire the old instance again"
+        );
+        assert_eq!(existing.len(), 1, "{existing:?}");
+
+        // Still pending: the agent loop keeps waiting, nothing else happens.
+        agent.drive_deferred_retirements().await;
+        assert!(agent.deferred_retirements.contains(&old));
+        pending.abort();
+        let _ = pending.await;
+
+        // The leader confirms; the next tick releases the address.
+        let confirmation =
+            serde_json::json!({"node_id": "test", "execution": execution}).to_string();
+        let (client, confirmed) =
+            crate::cluster::producer::test_fixture(axum::http::StatusCode::OK, confirmation).await;
+        agent.set_producer_release_client(client);
+        agent.drive_deferred_retirements().await;
+        assert!(agent.deferred_retirements.is_empty());
+        assert!(agent.supervisor.get_instance(&old).is_none());
+        assert!(!allocator.is_allocated(old_port).await);
+        confirmed.abort();
+        let _ = confirmed.await;
     }
 
     #[tokio::test]
