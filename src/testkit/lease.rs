@@ -1010,21 +1010,30 @@ pub async fn cleanup_local_lease(
     for resource in lease.resources {
         match resource {
             LeasedResource::App { app_id } | LeasedResource::Job { job_id: app_id } => {
-                let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+                // A cron firing can start a deploy of a leased job just before
+                // cleanup. The agent refuses to stop a workload a deploy still
+                // owns, so wait for that deploy inside the step's budget.
                 let cleanup = async {
-                    cmd_tx
-                        .send(crate::bun::agent::AgentCommand::RetireTestResources {
-                            app_name: app_id.name,
-                            namespace: app_id.namespace,
-                            response: response_tx,
-                        })
-                        .await
-                        .map_err(|_| {
-                            LeaseError::Cleanup("agent command channel is closed".to_string())
+                    loop {
+                        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+                        cmd_tx
+                            .send(crate::bun::agent::AgentCommand::RetireTestResources {
+                                app_name: app_id.name.clone(),
+                                namespace: app_id.namespace.clone(),
+                                response: response_tx,
+                            })
+                            .await
+                            .map_err(|_| {
+                                LeaseError::Cleanup("agent command channel is closed".to_string())
+                            })?;
+                        let result = response_rx.await.map_err(|_| {
+                            LeaseError::Cleanup("agent dropped the cleanup response".to_string())
                         })?;
-                    response_rx.await.map_err(|_| {
-                        LeaseError::Cleanup("agent dropped the cleanup response".to_string())
-                    })
+                        if !matches!(result, Err(crate::bun::BunError::WorkloadBusy { .. })) {
+                            return Ok::<_, LeaseError>(result);
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
                 };
                 let result = tokio::time::timeout(CLEANUP_STEP_TIMEOUT, cleanup).await;
                 match result {
@@ -1465,6 +1474,47 @@ mod tests {
             job_id: AppId::new("batch", &record.namespace),
         });
         assert!(matches!(record.validate(), Err(LeaseError::InvalidScope)));
+    }
+
+    #[tokio::test]
+    async fn node_job_cleanup_waits_for_a_deploy_that_still_owns_the_job() {
+        use crate::bun::agent::AgentCommand;
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalLeaseStore::open(dir.path().join("node-test-leases.json"))
+            .await
+            .unwrap();
+        let record = node_job_lease(10, 100);
+        let id = record.lease_id.clone();
+        let job_id = AppId::new("cron", &record.namespace);
+        store.create(record).await.unwrap();
+        drop(
+            store
+                .begin_job_operation(&id, "token:ci", vec![job_id.clone()], 20)
+                .await
+                .unwrap(),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let cleanup = tokio::spawn({
+            let store = store.clone();
+            let id = id.clone();
+            async move { cleanup_local_lease(&store, &tx, &id, None).await }
+        });
+        let Some(AgentCommand::RetireTestResources { response, .. }) = rx.recv().await else {
+            panic!("expected retirement")
+        };
+        response
+            .send(Err(crate::bun::BunError::WorkloadBusy {
+                app_name: job_id.name.clone(),
+                namespace: job_id.namespace.clone(),
+                operation_id: "deploy-1".into(),
+            }))
+            .unwrap();
+        let Some(AgentCommand::RetireTestResources { response, .. }) = rx.recv().await else {
+            panic!("expected a retry once the deploy finished")
+        };
+        response.send(Ok(())).unwrap();
+        cleanup.await.unwrap().unwrap();
+        assert!(store.get(&id).await.is_none());
     }
 
     #[tokio::test]
