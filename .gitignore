@@ -34,3 +34,6 @@ __pycache__/
 
 # Copied from examples/kubernetes/ by the Pages workflow; never committed
 docs/website/demo/
+
+# MAcBook specific files
+.DS_Store
