@@ -192,6 +192,26 @@ impl BpfServiceMap {
         }
     }
 
+    /// Write this node's view lease where the connect hook reads it.
+    #[cfg(feature = "ebpf")]
+    pub fn write_view_lease(
+        &self,
+        ebpf: &mut super::loader::OnionEbpf,
+        value: super::super::types::ViewLeaseValue,
+    ) -> Result<(), BpfMapError> {
+        let name = "view_lease_map";
+        let map = ebpf
+            .bpf
+            .map_mut(name)
+            .ok_or(BpfMapError::MissingMap { name })?;
+        let mut lease: aya::maps::HashMap<_, u32, super::super::types::ViewLeaseValue> =
+            aya::maps::HashMap::try_from(map)
+                .map_err(|source| BpfMapError::Operation { name, source })?;
+        lease
+            .insert(super::super::types::VIEW_LEASE_KEY, value, 0)
+            .map_err(|source| BpfMapError::Operation { name, source })
+    }
+
     /// Whether the BPF maps have been initialised.
     pub fn is_initialised(&self) -> bool {
         self.initialised
@@ -210,7 +230,7 @@ pub fn service_entry_to_backend_value(entry: &super::super::types::ServiceEntry)
         host_ip: 0,
         host_port: 0,
         healthy: 0,
-        _pad: 0,
+        local: 0,
     }; MAX_BACKENDS];
 
     let count = entry.backends.len().min(MAX_BACKENDS);
@@ -218,8 +238,8 @@ pub fn service_entry_to_backend_value(entry: &super::super::types::ServiceEntry)
         backends[i] = BackendEndpoint {
             host_ip: ip_to_network_byte_order(backend.node_ip),
             host_port: backend.host_port.to_be(),
-            healthy: if backend.healthy { 1 } else { 0 },
-            _pad: 0,
+            healthy: u8::from(backend.healthy),
+            local: u8::from(backend.local),
         };
     }
 
@@ -257,12 +277,14 @@ mod tests {
                     node_ip: Ipv4Addr::new(10, 0, 2, 2),
                     host_port: 30891,
                     healthy: true,
+                    local: false,
                 },
                 BackendInstance {
                     instance_id: "redis-1".to_string(),
                     node_ip: Ipv4Addr::new(10, 0, 4, 2),
                     host_port: 31022,
                     healthy: false,
+                    local: true,
                 },
             ],
             firewall_allow_from: None,
@@ -280,6 +302,15 @@ mod tests {
         assert_eq!(value.rr_index, 0);
         assert_eq!(value.backends[0].healthy, 1);
         assert_eq!(value.backends[1].healthy, 0);
+    }
+
+    /// The connect hook reads this flag to keep routing to this node's own
+    /// backends after the view lease lapses.
+    #[test]
+    fn backend_value_marks_only_local_backends() {
+        let value = service_entry_to_backend_value(&test_entry());
+        assert_eq!(value.backends[0].local, 0);
+        assert_eq!(value.backends[1].local, 1);
     }
 
     #[test]

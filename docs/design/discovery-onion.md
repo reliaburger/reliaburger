@@ -25,7 +25,7 @@ Onion also enforces namespace isolation and per-app firewall rules at the `conne
 
 ### Kernel
 
-- **Linux kernel 5.7+** (mandatory). The shipped connect-rewrite program uses the `BPF_CGROUP_INET4_CONNECT` hook, available since kernel 5.7. The loader (`src/onion/ebpf/loader.rs`) also attaches three more programs — `connect6`, `sendmsg4`, and `sendmsg6` — as **egress-firewall enforcement** for IPv6 and unconnected UDP. These are best-effort: `connect4` is mandatory (its failure aborts the load), while the other three log and continue on attach failure and expose their state via `connect6_attached()` / `sendmsg4_attached()` / `sendmsg6_attached()`. Note that VIP rewrite (the service-discovery half) is IPv4/TCP-`connect()` only; the v6 and sendmsg hooks enforce policy, they do not do VIP load-balancing. (The `RECVMSG` response-injection hook belonged to the abandoned in-kernel DNS program, §3; DNS now runs in userspace and needs no BPF hook.) Bun checks the kernel version at startup and refuses to start on older kernels with a clear error message and exit code 1.
+- **Linux kernel 5.8+** (mandatory). The shipped connect-rewrite program uses the `BPF_CGROUP_INET4_CONNECT` hook, available since kernel 5.7, and its view-lease check reads `bpf_ktime_get_boot_ns()`, available since 5.8 (§7.6). The loader (`src/onion/ebpf/loader.rs`) also attaches three more programs — `connect6`, `sendmsg4`, and `sendmsg6` — as **egress-firewall enforcement** for IPv6 and unconnected UDP. These are best-effort: `connect4` is mandatory (its failure aborts the load), while the other three log and continue on attach failure and expose their state via `connect6_attached()` / `sendmsg4_attached()` / `sendmsg6_attached()`. Note that VIP rewrite (the service-discovery half) is IPv4/TCP-`connect()` only; the v6 and sendmsg hooks enforce policy, they do not do VIP load-balancing. (The `RECVMSG` response-injection hook belonged to the abandoned in-kernel DNS program, §3; DNS now runs in userspace and needs no BPF hook.) Bun checks the kernel version at startup and refuses to start on older kernels with a clear error message and exit code 1.
 - **BPF Type Format (BTF)** enabled in the kernel (`CONFIG_DEBUG_INFO_BTF=y`). Required for CO-RE (Compile Once, Run Everywhere) portability of eBPF programs across kernel versions. Most distribution kernels since Ubuntu 20.10, Fedora 33, and Debian 12 ship with BTF enabled.
 - **cgroup v2** mounted at `/sys/fs/cgroup`. Required for cgroup-scoped eBPF program attachment and for identifying the source application by cgroup ID in the firewall path.
 - **Rootful runc for transparent DNS.** Rootless runc, ProcessGrill and Apple Container don't yet install a supervised workload resolver. Bun refuses `[dns] enabled = true` with those runtimes before adoption or workload creation.
@@ -88,7 +88,7 @@ Onion consists of one eBPF program (`onion_connect`) and the BPF hash maps that 
 
 Once the maps are populated, the data path is entirely in-kernel. Bun is not consulted for any connection. The eBPF programs read from BPF maps in kernel memory. This means:
 
-- Bun crashing does not break running connections or new connections to unchanged backends.
+- Bun crashing does not break running connections or new connections to unchanged backends, for as long as the node's view lease runs (§7.6).
 - DNS resolution takes sub-microsecond (hash map lookup, no network round trip).
 - `connect()` rewrite adds zero measurable latency to connection establishment.
 - There is no userspace proxy in the data path at any point.
@@ -181,7 +181,7 @@ struct backend_endpoint {
     __u32 host_ip;    // real node IP, network byte order
     __u16 host_port;  // dynamically allocated host port, network byte order
     __u8  healthy;    // 1 = healthy, 0 = unhealthy (excluded from selection)
-    __u8  _pad;
+    __u8  local;      // 1 = runs on this node; still routable once the view lease lapses (§7.6)
 };
 
 struct backend_value {
@@ -212,7 +212,7 @@ pub struct BackendEndpoint {
     pub host_ip: u32,    // network byte order
     pub host_port: u16,  // network byte order
     pub healthy: u8,     // 1 or 0
-    pub _pad: u8,
+    pub local: u8,       // 1 = runs on this node
 }
 
 #[repr(C)]
@@ -277,6 +277,20 @@ pub struct FirewallValue {
     pub action: u32,  // FIREWALL_DENY = 0, FIREWALL_ALLOW = 1
 }
 ```
+
+### Supplementary BPF Map: `view_lease_map`
+
+One entry (key 0), pinned with the other maps. Bun writes it; the connect hook reads it before any backend lookup.
+
+```c
+struct view_lease_value {
+    __u64 expires_ns;  /* CLOCK_BOOTTIME, as bpf_ktime_get_boot_ns() */
+    __u32 enforced;    /* 1 = refuse virtual addresses once expired */
+    __u32 _pad;
+};
+```
+
+A clustered consumer sets `enforced` when it recovers its consumer ownership (expired until the first leader answer) and moves `expires_ns` forward each time it publishes an answer. When `enforced == 1` and the boot clock has passed `expires_ns`, the hook selects only among backends whose `local` flag is set; a virtual address with no healthy local backend fails with `EPERM`. No entry means a standalone node. Rust mirror: `onion::types::ViewLeaseValue`. See §7.6 for why it exists.
 
 ### Supplementary BPF Map: `cgroup_namespace_map`
 
@@ -501,6 +515,11 @@ int onion_connect(struct bpf_sock_addr *ctx) {
     if ((dst_ip & 0xFFFF0000) != 0x7F800000)
         return 1;  // not a VIP, pass through
 
+    // A lapsed view lease routes only to this node's own backends (§7.6)
+    struct view_lease_value *lease = bpf_map_lookup_elem(&view_lease_map, &lease_key);
+    int local_only = lease && lease->enforced == 1 &&
+                     bpf_ktime_get_boot_ns() >= lease->expires_ns;
+
     // Look up the backend list for this (VIP, port)
     struct backend_key key = {
         .vip = ctx->user_ip4,       // keep network byte order
@@ -555,7 +574,8 @@ int onion_connect(struct bpf_sock_addr *ctx) {
 
         __u32 idx = __sync_fetch_and_add(&val->rr_index, 1) % val->count;
 
-        if (idx < MAX_BACKENDS && val->backends[idx].healthy == 1) {
+        if (idx < MAX_BACKENDS && val->backends[idx].healthy == 1 &&
+            (!local_only || val->backends[idx].local == 1)) {
             selected_idx = idx;
             found = 1;
             break;
@@ -750,9 +770,11 @@ These are embedded in the `reliaburger` binary and extracted to disk at install 
 
 **Mitigation:** Bun prioritizes a full service map refresh on startup. It queries the reporting tree for current cluster state and writes all map entries before accepting any other work. The refresh window is typically <1 second for clusters with fewer than 5,000 services.
 
+**Bound (cluster nodes):** the stale map's remote backends are honoured only while the node's view lease runs. Once it lapses, the connect hook refuses every backend on another node even though Bun isn't there to withdraw anything, and keeps routing to backends on this node, whose addresses nothing can reuse while Bun is down (§7.6). A Bun that restarts within the lease loses nothing; one that stays down longer cuts its node off from the rest of the cluster rather than risk routing to a reused address.
+
 ### 7.2 Kernel Version Incompatibility
 
-**Scenario:** Bun starts on a node running kernel < 5.7, or a kernel without BTF or cgroup v2.
+**Scenario:** Bun starts on a node running kernel < 5.8, or a kernel without BTF or cgroup v2.
 
 **Impact:** Bun cannot load the eBPF programs. Service discovery is not functional on this node.
 
@@ -796,6 +818,37 @@ This is the most significant failure mode. It combines 7.1 (stale map) with a re
 
 **Mitigation:** Bun monitors the eBPF program attachment state via a periodic health check (every 5 seconds). If the programs are no longer attached, Bun reloads and reattaches them, then logs a warning. Recovery is automatic and takes <1 second.
 
+### 7.6 A Node That Is Gone (View Leases)
+
+**Scenario:** A node stops, loses power or is cut off by a partition. It was a registered *consumer* of the endpoint catalogue, so every withdrawal published after it went quiet names it as a node that must confirm, and every producer release waits for that confirmation. It never comes.
+
+**Impact before view leases:** one stopped node froze every address release in the cluster. On a three-node laptop cluster, stopping node-3 left node-1's rolling deploy unable to retire its old instance for as long as node-3 stayed down (Z6.7).
+
+**Why not simply stop waiting?** Because "silent" doesn't mean "not routing". A partitioned node, or one whose Bun has died but whose pinned eBPF programs are still attached, may keep sending connections to an address the cluster believes is free. Discharging it on silence alone trades a visible stall for invisible misrouting.
+
+**Behaviour:** the node gives up its right to route before the leader gives up waiting for it. Two halves, deliberately independent (`src/onion/lease.rs`):
+
+1. **The consumer's lease.** Just before each placement poll, the reconciler reads `CLOCK_BOOTTIME`. When the leader's answer has been *published* (kernel map, DNS, Wrapper), Bun extends its view lease to that reading plus `CONSUMER_VIEW_LEASE` (60 s). The lease lives in three places, and all three drop *remote* backends once it lapses while keeping *local* ones (backends of instances this node's own agent runs, marked by `BackendInstance::local` and the kernel's `backend_endpoint.local`): an atomic that Wrapper checks on every request (a lapsed lease serves only local backends, and answers 503 for a route with none), the agent loop, which installs the local part of its last publication in place of the whole (`fence_lapsed_view`; the durable publications stay as they are, because they record what the node may still expose) and restores the rest only from a fresh leader answer, and a one-entry `view_lease_map` that the connect hook checks before selecting a backend. The kernel copy is what makes the bound hold when Bun is dead: `bpf_ktime_get_boot_ns()` keeps advancing without anyone renewing it. A node without an entry (standalone, or a plaintext development cluster, which never registers as a consumer) is never fenced.
+2. **The leader's patience.** The placement handler records, per consumer, when this leader last served it (`ConsumerContacts`, volatile, reset on every term change so a new leader counts silence from its own takeover). Each scheduling tick, `discharge_lapsed_consumers` proposes `DischargeEndpointConsumer` for a registered consumer only when both hold: this leader hasn't served it for `CONSUMER_DISCHARGE_AFTER` (lease + 20 s margin), and gossip doesn't list it as alive. Applying the entry removes the node from `endpoint_consumers` and from every pending withdrawal's consumer set; withdrawals whose set empties complete, and blocked producer releases confirm.
+
+**What the lease guards against.** The hazard is routing to an address that another node released and reused after the leader discharged this one. Every address a backend entry names belongs to exactly one node's agent. A remote backend's `node_ip:host_port` is released by the node that owns it, once the leader confirms (and after a discharge the leader no longer waits for this node's receipt). A local backend names either a container address from this node's own `/23`, reserved in Bun's `network_leases` journal and reached through a `/32` host route to the instance's own veth, or `127.0.0.1:host_port` from this node's port allocator (process and rootless workloads). Nothing but this node's agent reserves or releases either. Another node whose name hashes to the same `/23` owns identical-looking addresses, but they sit behind *its* veths; container addresses are never routed between nodes, and cross-node traffic always goes to `node_ip:host_port`. So nothing on another node can make a local entry point somewhere new.
+
+That leaves this node's own agent. Normally its receipt proves it stopped routing to a local backend before the leader confirms the release, but a discharged node's receipt is no longer awaited. So `confirm_producer_release` refuses on its own: while any retained publication this node made (every phase but `Withdrawn`) still names the instance as a local backend, the release is `ProducerReleasePending`. When the node isn't discharged, that condition is implied by its own receipt, so it never delays a release that would otherwise have gone through. A frozen Bun (SIGSTOP, a wedged loop) allocates and releases nothing, so the kernel's local entries stay correct for as long as it's frozen. If one of those containers dies meanwhile, its named network namespace, and with it the veth and the address, stays put until Bun tears it down, so connections are refused on this node rather than handed to anything else.
+
+Two things the argument doesn't cover, neither of them new. A process that isn't Reliaburger's can bind a freed `127.0.0.1` host port; that was equally true inside the lease, and on a standalone node. And the Apple runtime's container addresses come from Apple's own allocator, not Bun's, so on macOS a local backend is safe only in the sense it always was: Bun withdraws it before it deletes the container. There's no kernel data path there, and Wrapper freezes with Bun. A Bun that restarts withdraws the whole recovered view before it launches or adopts anything.
+
+**Safety argument.** Let `t_s` be the boot-clock time a consumer sent its last answered poll and `t_h` the leader's clock when it served that poll, recorded before it read the desired state. Causality gives `t_s ≤ t_h` in real time. The consumer stops routing to other nodes at `t_s + 60 s` (Wrapper and kernel check the clock directly; the agent shrinks the view within a tick). The leader discharges no earlier than `t_h + 80 s`. Clocks only need to agree on *rates*, not values: the 20 s margin absorbs rate drift over 80 s many times over, plus a late agent tick. The remaining cases:
+
+- *A poll racing a discharge.* Serving a consumer and deciding to discharge it take the same lock. The handler records its contact before reading the registration; a discharge in flight makes the handler answer 503 for that node until the outcome is known. A discharge write that times out keeps its node refused until a no-op barrier write proves the log applied, so an entry that commits late can't strand a freshly renewed lease.
+- *A leader change.* A new leader starts counting at its takeover, never earlier, so it waits at least as long as the old one would have. A deposed leader's discharge that commits in the new term is ordered before the new leader's first read (`ensure_linearizable` precedes serving), so the new leader sees the node unregistered and registers it again before serving it.
+- *Suspend.* `CLOCK_BOOTTIME` counts suspended time, so a consumer VM that sleeps wakes with its lease expired. A leader that sleeps only waits longer.
+- *The node comes back.* Its first poll registers it again. A restarted Bun withdraws the recovered view at startup (§ "Recovering after Bun dies" in the book) and publishes the answer from scratch. A Bun that lived through the partition holds only its local view, and the answer replaces that in place, even when it's the same catalogue generation it last published: that catalogue is current, so every remote address in it is live. Receipts it still holds for discharged generations are acknowledged as no-ops.
+- *Wedged but gossiping.* A node whose agent can't poll but whose gossip still answers is never discharged: it may be alive enough to route. Releases wait, as before, until an operator decommissions it.
+
+**Cost:** a node that can't hear from any leader for 60 s stops routing to other nodes until one answers. Calls that a local replica can serve keep working, so a service with a replica on every node (a daemon set, or enough replicas) rides out a council outage; a call whose only backends are elsewhere fails with `EPERM` from `connect()` or 503 from Wrapper. A Bun that restarts during the outage withdraws everything, local backends included, and routes nothing until a leader answers, because it can't prove what it published before it died. Local instances that crash can't restart either, since releasing their old addresses needs the leader. Routing to a reused address would be worse than all of these.
+
+**Rollouts:** a rolling deploy no longer fails when the old instance's release is still waiting. After a short patience the worker hands the stopped, withdrawn instance to the agent loop (`deferred_retirements`), which keeps asking the leader each tick, and the rollout finishes. The retained instance no longer counts as one of the app's existing instances, so a later rollout can't retire it twice or mistake the replacements for surplus.
+
 ---
 
 ## 8. Security Considerations
@@ -810,7 +863,7 @@ All eBPF programs are verified by the kernel's in-kernel BPF verifier before loa
 - No access to kernel memory outside of explicitly permitted map data.
 - The program terminates within a bounded number of instructions.
 
-Onion's eBPF programs are compiled with `clang -O2 -target bpf` and designed to pass the verifier on kernel 5.7+. The programs are statically compiled and shipped as part of the `reliaburger` binary -- they are not dynamically generated, which eliminates injection risk.
+Onion's eBPF programs are compiled with `clang -O2 -target bpf` and designed to pass the verifier on kernel 5.8+. The programs are statically compiled and shipped as part of the `reliaburger` binary -- they are not dynamically generated, which eliminates injection risk.
 
 ### 8.2 Namespace Isolation Enforcement
 
@@ -908,7 +961,7 @@ For comparison, a single Envoy sidecar proxy process typically consumes 50-200 M
 | DNS resolution | 0.5-5ms (CoreDNS) | 0.5-5ms (CoreDNS) | <1us (BPF map) |
 | Per-connection latency | 0.1-0.5ms (iptables traversal) | 0.2-1ms (userspace proxy) | 0 (kernel rewrite) |
 | Memory per node | 100+ MB (iptables rules) | 50-200MB per sidecar | <6 MB (BPF maps) |
-| Failure mode | kube-proxy crash = stale rules | Envoy crash = broken connections | Bun crash = stale map, connections continue |
+| Failure mode | kube-proxy crash = stale rules | Envoy crash = broken connections | Bun crash = stale map, connections continue until the view lease lapses (§7.6) |
 | Listening ports | 1+ per service | 1 per sidecar | 0 |
 | Configuration | kube-proxy + CoreDNS config | Envoy xDS + CoreDNS | None (Bun manages automatically) |
 | Rule update time | O(n) iptables reprogramming | Seconds (xDS push) | Microseconds (BPF map update) |

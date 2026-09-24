@@ -83,8 +83,9 @@ pub struct BackendEndpoint {
     pub host_port: u16,
     /// 1 = healthy, 0 = unhealthy (excluded from selection).
     pub healthy: u8,
-    /// Alignment padding.
-    pub _pad: u8,
+    /// 1 = runs on this node. Once the view lease lapses, the connect hook
+    /// still routes to these and refuses the rest.
+    pub local: u8,
 }
 
 /// Value for the `backend_map` BPF hash map.
@@ -123,6 +124,42 @@ pub struct FirewallValue {
     pub action: u32,
 }
 
+/// Key of the single `view_lease_map` entry.
+pub const VIEW_LEASE_KEY: u32 = 0;
+
+/// Value for the `view_lease_map` BPF hash map: the kernel's copy of this
+/// node's [`crate::onion::lease::ViewLease`]. Once `enforced` is 1 and the
+/// boot clock passes `expires_ns`, the connect hook routes only to backends
+/// marked local, even if Bun has died.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ViewLeaseValue {
+    /// Expiry on `CLOCK_BOOTTIME`, in nanoseconds.
+    pub expires_ns: u64,
+    /// 1 when the lease is enforced, 0 when it never lapses.
+    pub enforced: u32,
+    /// Alignment padding.
+    pub _pad: u32,
+}
+
+impl ViewLeaseValue {
+    /// The kernel value for a lease's current state.
+    pub fn from_lease(lease: &crate::onion::lease::ViewLease) -> Self {
+        match lease.expires_ns() {
+            Some(expires_ns) => Self {
+                expires_ns,
+                enforced: 1,
+                _pad: 0,
+            },
+            None => Self {
+                expires_ns: 0,
+                enforced: 0,
+                _pad: 0,
+            },
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // aya Pod implementations (Linux + ebpf feature only)
 // ---------------------------------------------------------------------------
@@ -144,6 +181,8 @@ unsafe impl aya::Pod for DnsMapValue {}
 unsafe impl aya::Pod for FirewallKey {}
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 unsafe impl aya::Pod for FirewallValue {}
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+unsafe impl aya::Pod for ViewLeaseValue {}
 
 // ---------------------------------------------------------------------------
 // Rust-side service state (userspace, not sent to BPF directly)
@@ -220,6 +259,12 @@ pub struct BackendInstance {
     pub host_port: u16,
     /// Whether this backend is currently healthy.
     pub healthy: bool,
+    /// Whether this node's own agent runs the backend. Only this node can
+    /// hand a local backend's address to anything else, so local backends
+    /// stay routable after the view lease lapses. Absent means remote, which
+    /// fails closed.
+    #[serde(default)]
+    pub local: bool,
 }
 
 /// Response type for `relish resolve`.
@@ -359,12 +404,14 @@ mod tests {
                     node_ip: Ipv4Addr::new(10, 0, 2, 2),
                     host_port: 30891,
                     healthy: true,
+                    local: false,
                 },
                 BackendInstance {
                     instance_id: "redis-1".to_string(),
                     node_ip: Ipv4Addr::new(10, 0, 4, 2),
                     host_port: 31022,
                     healthy: false,
+                    local: false,
                 },
             ],
             firewall_allow_from: None,

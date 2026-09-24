@@ -379,15 +379,28 @@ The first run didn't get past step 3. Each fix has its own commit and test.
    (the new one exercises frontend → backend). Its CPU limit also rose from 100m
    to 500m after `wtf` flagged it as throttled.
 
+## Fixed after this run
+
+Recording the tour afterwards hit step 12 harder than this run did: in two
+recording runs of three the frontend stayed at two replicas for over five
+minutes. `docs/qualification/2026-09-24-node-loss.md` has the causes, the
+fixes and five full tours plus a re-recording that pass step 12 every time.
+
+- **A stopped node blocked address releases.** Every node had to confirm an
+  endpoint withdrawal before its producer could reuse the address, and a
+  stopped node never could. Now each node holds a 60 s view lease, enforced in
+  Wrapper, the agent and the kernel's connect hook, and the leader discharges a
+  node it hasn't served for 80 s that gossip calls gone.
+- **A retirement that had to wait failed the rollout,** and each retry retired
+  a healthy replacement or started another generation. The rollout now
+  finishes and leaves the release to the agent loop.
+- **A new leader could move a survivor's replica** while that node's
+  readiness report was still on its way. Such a placement now holds.
+- **`wtf` didn't flag the missing replica.** It now warns `under-replicated`
+  and names the nodes whose placements aren't running.
+
 ## Still open
 
-- **A stopped node blocks address releases.** Every node must confirm an
-  endpoint withdrawal before its producer may reuse the address, and a stopped
-  node can't. While node-3 was down, node-1's rolling redeploy (step 12) kept
-  retrying its retirement; traffic was unaffected because the new replicas were
-  already serving. It finished once node-3 came back. This is the protocol's
-  safety rule (a partitioned node could still route to the old address), but a
-  node that's known to be stopped could be discharged sooner.
 - **A replica-count change is a rolling redeploy on that node**, not "start one
   more", so gaining a replica restarts the node's existing one.
 - **Trace right after `status` can fail** for redis, which has no importable

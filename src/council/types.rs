@@ -311,6 +311,10 @@ pub enum RaftRequest {
     RegisterEndpointConsumer { node_id: String },
     /// Discharge one authenticated consumer's exact original withdrawal generation.
     AcknowledgeEndpointWithdrawal { node_id: String, generation: u64 },
+    /// Stop waiting for a consumer whose view lease has lapsed: the leader
+    /// hasn't served it for longer than the lease plus a margin and gossip
+    /// doesn't report it alive. It re-registers on its next placement poll.
+    DischargeEndpointConsumer { node_id: String },
     /// Fence an authenticated producer execution before authorising address reuse.
     RetireEndpointExecution {
         node_id: String,

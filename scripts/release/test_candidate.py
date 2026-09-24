@@ -139,9 +139,10 @@ class CandidateTests(unittest.TestCase):
         assets = [{"name": path.name, "size": path.stat().st_size,
                    "digest": "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest(),
                    "state": "uploaded"} for path in self.directory.iterdir()]
-        release = dict(tag_name="v0.1.0", draft=True, assets=assets)
+        release = dict(tag_name="v0.1.0", draft=True, prerelease=False, assets=assets)
         verify_uploaded_assets(release, document, digest, (self.directory / "candidate.json").stat().st_size)
-        for change in [dict(tag_name="v0.2.0"), dict(draft=False), dict(assets=assets[:-1]),
+        for change in [dict(tag_name="v0.2.0"), dict(draft=False), dict(prerelease=True),
+                       dict(assets=assets[:-1]),
                        dict(assets=assets + assets[:1]),
                        dict(assets=[dict(assets[0], digest="sha256:" + "0" * 64)] + assets[1:]),
                        dict(assets=[dict(assets[0], state="new")] + assets[1:]),

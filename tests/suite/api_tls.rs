@@ -298,6 +298,7 @@ async fn consumer_reconciler_retries_lost_receipts_after_tls_leader_change() {
             catalog: Box::new(catalog),
             ingress: vec![],
             withdrawals: vec![],
+            requested_at_ns: reliaburger::onion::lease::boot_clock_ns(),
             response,
         })
         .await

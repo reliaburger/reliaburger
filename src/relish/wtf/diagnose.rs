@@ -42,6 +42,7 @@ pub fn diagnose(inputs: &WtfInputs) -> WtfReport {
     record_application_unknowns(&inputs.applications, inputs.app.as_deref(), &mut report);
     check_crashloops(inputs, &mut report);
     check_services(inputs, &mut report);
+    check_replicas(inputs, &mut report);
     check_deploys(inputs, &mut report);
     check_alerts(inputs, &mut report);
     check_cpu_throttling(inputs, &mut report);
@@ -87,6 +88,7 @@ fn record_application_unknowns(
     record_unknown("restarts", &evidence.restarts, &resource, report);
     record_unknown("deploys", &evidence.deploys, &resource, report);
     record_unknown("services", &evidence.services, &resource, report);
+    record_unknown("replicas", &evidence.replicas, &resource, report);
     record_unknown("alerts", &evidence.alerts, &resource, report);
     record_unknown(
         "cpu_throttling",
@@ -405,6 +407,81 @@ fn check_services(inputs: &WtfInputs, report: &mut WtfReport) {
         report.ok.push(WtfOk {
             id: "services".to_string(),
             description: "all deployed services have a healthy backend".to_string(),
+        });
+    }
+}
+
+/// An app running fewer replicas than it wants is degraded even when every
+/// replica that does run is healthy, so `check_services` can't see it.
+fn check_replicas(inputs: &WtfInputs, report: &mut WtfReport) {
+    let Some(apps) = inputs.applications.replicas.value() else {
+        return;
+    };
+    let mut found = false;
+    for app in apps
+        .iter()
+        .filter(|app| app_matches(inputs.app.as_deref(), &app.app))
+    {
+        let running: u32 = app.running.values().sum();
+        if running >= app.desired_replicas {
+            continue;
+        }
+        found = true;
+        let replicas = |count: u32| {
+            if count == 1 {
+                "1 replica".to_string()
+            } else {
+                format!("{count} replicas")
+            }
+        };
+        let mut details = Vec::new();
+        for (node, placed) in &app.placed {
+            let here = app.running.get(node).copied().unwrap_or(0);
+            if here >= *placed {
+                continue;
+            }
+            let missing = placed - here;
+            let verb = if missing == 1 { "is" } else { "are" };
+            let mut line = format!("{} placed on {node} {verb} not running", replicas(missing));
+            let member = inputs
+                .cluster
+                .nodes
+                .value()
+                .map(|nodes| nodes.iter().any(|known| known.node_id == *node));
+            if app.unanswered.contains(node) {
+                line.push_str(&format!(" ({node} did not answer)"));
+            } else if member == Some(false) {
+                line.push_str(&format!(" ({node} is not a live member)"));
+            }
+            details.push(line);
+        }
+        let placed: u32 = app.placed.values().sum();
+        if placed < app.desired_replicas {
+            let unplaced = app.desired_replicas - placed;
+            let verb = if unplaced == 1 { "has" } else { "have" };
+            details.push(format!("{} {verb} no placement yet", replicas(unplaced)));
+        }
+        report.warnings.push(WtfFinding {
+            id: "under-replicated".to_string(),
+            title: format!(
+                "app {}/{} runs {running} of {} replicas",
+                app.app, app.namespace, app.desired_replicas
+            ),
+            details,
+            suggestion: format!(
+                "the scheduler replaces replicas on a lost node within a minute or two; \
+                 if this persists, check `relish status` and `relish logs {}`, and bring a \
+                 stopped node back with `relish local start <node>` on a laptop cluster",
+                app.app
+            ),
+            correlated_events: Vec::new(),
+            affected_resource: app_resource(&app.app, &app.namespace),
+        });
+    }
+    if !found {
+        report.ok.push(WtfOk {
+            id: "replicas".to_string(),
+            description: "every app runs its desired replicas".to_string(),
         });
     }
 }
@@ -795,7 +872,7 @@ mod tests {
     use crate::relish::wtf::{
         AlertObservation, CertificateObservation, CouncilObservation, CpuThrottleObservation,
         DeployObservation, DiskObservation, FaultObservation, LogObservation, NodeObservation,
-        RegistryObservation, RestartObservation, ServiceObservation,
+        RegistryObservation, ReplicaObservation, RestartObservation, ServiceObservation,
     };
 
     const NOW: u64 = 2_000_000;
@@ -853,6 +930,14 @@ mod tests {
                     desired_replicas: 1,
                     healthy_backends: 1,
                     total_backends: 1,
+                }]),
+                replicas: available(vec![ReplicaObservation {
+                    app: "api".to_string(),
+                    namespace: "default".to_string(),
+                    desired_replicas: 1,
+                    placed: BTreeMap::from([("node-1".to_string(), 1)]),
+                    running: BTreeMap::from([("node-1".to_string(), 1)]),
+                    unanswered: Vec::new(),
                 }]),
                 alerts: available(Vec::new()),
                 cpu_throttling: available(Vec::new()),
@@ -1310,6 +1395,103 @@ mod tests {
         let report = diagnose(&inputs);
 
         assert!(report.unknown.iter().any(|item| item.source == "restarts"));
+    }
+
+    /// Z6.7: with one of three frontends gone, `wtf` said every service had a
+    /// healthy backend. Under-replication is its own finding, and it names
+    /// the nodes whose placements aren't running.
+    #[test]
+    fn an_app_running_fewer_replicas_than_desired_is_flagged_with_its_placements() {
+        let mut inputs = healthy_inputs();
+        inputs.applications.replicas = available(vec![ReplicaObservation {
+            app: "frontend".to_string(),
+            namespace: "default".to_string(),
+            desired_replicas: 3,
+            placed: BTreeMap::from([
+                ("node-1".to_string(), 1),
+                ("node-2".to_string(), 1),
+                ("node-3".to_string(), 1),
+            ]),
+            running: BTreeMap::from([("node-1".to_string(), 1), ("node-2".to_string(), 1)]),
+            unanswered: vec!["node-3".to_string()],
+        }]);
+
+        let report = diagnose(&inputs);
+
+        let finding = report
+            .warnings
+            .iter()
+            .find(|finding| finding.id == "under-replicated")
+            .expect("under-replication is a warning");
+        assert_eq!(finding.title, "app frontend/default runs 2 of 3 replicas");
+        assert_eq!(finding.affected_resource, "app.frontend/default");
+        assert_eq!(
+            finding.details,
+            ["1 replica placed on node-3 is not running (node-3 did not answer)"]
+        );
+        assert!(!report.ok.iter().any(|ok| ok.id == "replicas"));
+
+        // Placed nowhere yet: the scheduler has no room for them.
+        let mut inputs = healthy_inputs();
+        inputs.applications.replicas = available(vec![ReplicaObservation {
+            app: "frontend".to_string(),
+            namespace: "default".to_string(),
+            desired_replicas: 3,
+            placed: BTreeMap::from([("node-1".to_string(), 2)]),
+            running: BTreeMap::from([("node-1".to_string(), 1)]),
+            unanswered: Vec::new(),
+        }]);
+        let report = diagnose(&inputs);
+        let finding = report
+            .warnings
+            .iter()
+            .find(|finding| finding.id == "under-replicated")
+            .unwrap();
+        assert_eq!(
+            finding.details,
+            [
+                "1 replica placed on node-1 is not running",
+                "1 replica has no placement yet"
+            ]
+        );
+
+        // A node that has left the membership isn't asked at all.
+        let mut inputs = healthy_inputs();
+        inputs.applications.replicas = available(vec![ReplicaObservation {
+            app: "frontend".to_string(),
+            namespace: "default".to_string(),
+            desired_replicas: 2,
+            placed: BTreeMap::from([("node-1".to_string(), 1), ("node-3".to_string(), 1)]),
+            running: BTreeMap::from([("node-1".to_string(), 1)]),
+            unanswered: Vec::new(),
+        }]);
+        let report = diagnose(&inputs);
+        let finding = report
+            .warnings
+            .iter()
+            .find(|finding| finding.id == "under-replicated")
+            .unwrap();
+        assert_eq!(
+            finding.details,
+            ["1 replica placed on node-3 is not running (node-3 is not a live member)"]
+        );
+    }
+
+    #[test]
+    fn apps_at_or_above_their_desired_replicas_are_ok() {
+        let mut inputs = healthy_inputs();
+        // A rolling deploy briefly runs one more than desired.
+        inputs.applications.replicas = available(vec![ReplicaObservation {
+            app: "api".to_string(),
+            namespace: "default".to_string(),
+            desired_replicas: 1,
+            placed: BTreeMap::from([("node-1".to_string(), 1)]),
+            running: BTreeMap::from([("node-1".to_string(), 2)]),
+            unanswered: Vec::new(),
+        }]);
+        let report = diagnose(&inputs);
+        assert!(report.warnings.is_empty());
+        assert!(report.ok.iter().any(|ok| ok.id == "replicas"));
     }
 
     fn restart(timestamp: u64) -> RestartObservation {

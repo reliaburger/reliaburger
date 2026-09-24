@@ -834,6 +834,7 @@ mod tests {
                 node_ip: Ipv4Addr::new(10, 0, 2, 2),
                 host_port: 30001,
                 healthy: true,
+                local: false,
             },
         )
         .unwrap();

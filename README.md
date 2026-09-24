@@ -18,7 +18,7 @@ No sidecars. No add-on shopping list. No YAML archaeology. You get:
 
 - **A built-in guide.** `relish manual` provides searchable documentation
   and runnable examples without a repo checkout or internet connection.
-- **A cluster that heals itself.** SWIM gossip membership, a self-healing
+- **A cluster that heals itself.** SWIM gossip membership with anti-entropy, a self-healing
   Raft council, automatic rescheduling, council disaster recovery, and
   rolling binary upgrades where workloads survive the swap.
 - **Security that's on by default.** Generated clusters require mTLS;

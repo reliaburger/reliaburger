@@ -170,10 +170,18 @@ tutorial, because a tutorial over a broken path is a lie.
 - [ ] **Z4.2 Put `relish` on `PATH`.** Install to `~/.local/bin` when it's on
   `PATH`, otherwise print the one line to add, and offer (with a prompt when
   interactive) to add it to the shell's rc file. See D6.
-- [ ] **Z4.3 A staging mirror before 0.1.0.** So the whole path can be tested
+- [x] **Z4.3 A staging mirror before 0.1.0.** So the whole path can be tested
   end to end before the release: publish a signed candidate to a pre-release
   (or Pages path) and point the bootstrap at it with
-  `RELIABURGER_RELEASE_BASE_URL`. See D5.
+  `RELIABURGER_RELEASE_BASE_URL`. See D5. Done: `stage.yml` verifies a
+  candidate with promotion's own `candidate.py` code and publishes it
+  unchanged as a pre-release tagged `staging-v0.1.0-<run>-<attempt>`, which
+  promotion refuses and GitHub never marks latest;
+  `scripts/release/qualify-staged-install.sh` runs the real `curl | sh`
+  against it in an isolated home, with a short tour and teardown, and writes a
+  record. The runbook is in [releasing.md](../releasing.md#staging-a-candidate).
+  The first real staging run happens after this lands on `main`; its records
+  feed V03 and V04.
 - [ ] **Z4.4 Uninstall.** `relish local destroy` exists; add
   `relish uninstall` for the CLI, tools and image cache.
 
@@ -185,7 +193,7 @@ tutorial, because a tutorial over a broken path is a lie.
 - [ ] **Z5.2 The same tutorial in the product.** `relish manual` gets a
   "Five-minute tour" chapter generated from the same source, and the quickstart's
   final message points at it.
-- [ ] **Z5.3 A recording.** A scripted, reproducible run of the tutorial
+- [x] **Z5.3 A recording.** A scripted, reproducible run of the tutorial
   (`scripts/demo/tour.sh`) recorded with asciinema and embedded on the homepage with the
   vendored asciinema player (D2); the site README and footer say where JavaScript
   is used and why.
@@ -249,7 +257,9 @@ beat needs product work first:
   real laptop cluster before the homepage copy changes. Done 24 September: the
   run, its timings (4 min 34 s from `setup --quickstart` to `wtf` with warm
   downloads) and the eight bugs it found are in
-  `docs/qualification/2026-09-24-tour-transcript.md`.
+  `docs/qualification/2026-09-24-tour-transcript.md`. Losing a node (step 12)
+  was fixed afterwards and qualified with five full tours:
+  `docs/qualification/2026-09-24-node-loss.md`.
 
 ## Decisions
 

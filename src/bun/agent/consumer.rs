@@ -7,7 +7,7 @@ use crate::bun::consumer_owners::{
 };
 use crate::cluster::orchestrate::IngressAssignment;
 use crate::onion::{
-    catalog::EndpointCatalog, service_id::ServiceId, service_map::ServiceMap,
+    catalog::EndpointCatalog, service_id::ServiceId, service_map::ServiceMap, types::ServiceEntry,
     withdrawal::EndpointWithdrawalInstruction,
 };
 
@@ -117,7 +117,130 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 "previous consumer requests still retain publication",
             ));
         }
+        // From here on this node routes cluster services only while the
+        // leader keeps answering. Until the first answer, nothing routes.
+        self.view_lease.enforce();
+        self.sync_view_lease_kernel().await
+    }
+
+    /// Mirror the view lease into the kernel, so the connect hook enforces
+    /// it even if this process dies.
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    pub(super) async fn sync_view_lease_kernel(&self) -> Result<(), BunError> {
+        let Some(handle) = self.onion_ebpf.as_ref() else {
+            return Ok(());
+        };
+        let value = crate::onion::types::ViewLeaseValue::from_lease(&self.view_lease);
+        let mut ebpf = handle.lock().await;
+        crate::onion::ebpf::maps::BpfServiceMap::new()
+            .write_view_lease(&mut ebpf, value)
+            .map_err(failure)
+    }
+
+    #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
+    pub(super) async fn sync_view_lease_kernel(&self) -> Result<(), BunError> {
         Ok(())
+    }
+
+    /// Once the lease has lapsed, shrink the published view to this node's
+    /// own backends. The leader may discharge this node soon after, and from
+    /// then on nothing stops another node reusing a remote address this view
+    /// names. A local backend's address is different: only this agent can
+    /// release it, and [`confirm_producer_release`] refuses while any view
+    /// this node published still names it.
+    ///
+    /// The durable publications stay as they are. They record what this node
+    /// may still expose, and the whole view is a superset of the local one.
+    ///
+    /// [`confirm_producer_release`]: BunAgent::confirm_producer_release
+    pub(super) async fn fence_lapsed_view(&mut self) -> Result<(), BunError> {
+        if self.view_lease.is_valid() {
+            return Ok(());
+        }
+        let Some(last) = self
+            .consumer_owner()
+            .filter(|owner| owner.phase == ConsumerPhase::Active)
+            .and_then(|owner| owner.publications.last())
+            .cloned()
+        else {
+            return Ok(());
+        };
+        let local = self.local_view(&last.effective_services);
+        if self.lapsed_view.as_ref() == Some(&local) {
+            return Ok(());
+        }
+        if self.lapsed_view.is_none() {
+            eprintln!(
+                "bun: the leader hasn't answered for {}s; routing only to this node's own \
+                 backends until it does",
+                crate::onion::lease::CONSUMER_VIEW_LEASE.as_secs()
+            );
+        }
+        self.install_consumer_view(&local, &last.ingress).await?;
+        self.lapsed_view = Some(local);
+        Ok(())
+    }
+
+    /// The part of `published` that runs on this node now: local backends
+    /// the agent still owns at the same address, with their current health.
+    /// It never names anything `published` doesn't. Services keep
+    /// their entries even with no local backend left, so their virtual
+    /// addresses refuse connections instead of vanishing from DNS.
+    fn local_view(&self, published: &[ServiceEntry]) -> Vec<ServiceEntry> {
+        published
+            .iter()
+            .map(|entry| {
+                let current = self
+                    .service_map
+                    .resolve(&ServiceId::new(&entry.namespace, &entry.app_name));
+                let mut entry = entry.clone();
+                entry.backends = entry
+                    .backends
+                    .iter()
+                    .filter(|backend| backend.local)
+                    .filter_map(|backend| {
+                        current?
+                            .backends
+                            .iter()
+                            .find(|owned| {
+                                owned.local
+                                    && owned.instance_id == backend.instance_id
+                                    && owned.node_ip == backend.node_ip
+                                    && owned.host_port == backend.host_port
+                            })
+                            .cloned()
+                    })
+                    .collect();
+                entry
+            })
+            .collect()
+    }
+
+    /// Whether any view this node published may still route to `id`, one of
+    /// its own instances. Its address can't be released until none does.
+    pub(super) fn own_view_names(&self, id: &crate::grill::InstanceId) -> bool {
+        self.consumer_owner()
+            .filter(|owner| owner.phase != ConsumerPhase::Withdrawn)
+            .is_some_and(|owner| {
+                owner.publications.iter().any(|publication| {
+                    publication.effective_services.iter().any(|entry| {
+                        entry
+                            .backends
+                            .iter()
+                            .any(|backend| backend.local && backend.instance_id == id.0)
+                    })
+                })
+            })
+    }
+
+    /// Extend the view lease after publishing a leader's answer to a request
+    /// sent at `requested_at_ns` on the boot clock.
+    pub(super) async fn renew_view_lease(&mut self, requested_at_ns: u64) {
+        self.view_lease.renew(requested_at_ns);
+        if let Err(error) = self.sync_view_lease_kernel().await {
+            // The kernel keeps its older expiry, so it fences early: safe.
+            eprintln!("bun: cannot extend the kernel's view lease: {error}");
+        }
     }
 
     async fn consumer_candidate(
@@ -270,6 +393,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             self.save_consumer(owner.clone()).await?;
             self.apply_consumer_publication(&publication).await?;
             owner.phase = ConsumerPhase::Active;
+        } else if self.lapsed_view.is_some() {
+            // The leader answered with the view this node last published;
+            // only the local part of it is installed while the lease lapsed.
+            self.apply_consumer_publication(&publication).await?;
         }
         if Some(&owner) != self.consumer_owner() {
             self.save_consumer(owner).await?;
@@ -323,27 +450,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         &mut self,
         publication: &ConsumerPublication,
     ) -> Result<(), BunError> {
-        let services =
-            ServiceMap::from_snapshot(&publication.effective_services).map_err(failure)?;
-        let routes = publication
-            .ingress
-            .iter()
-            .map(|route| {
-                (
-                    (route.namespace.clone(), route.name.clone()),
-                    route.config.clone(),
-                )
-            })
-            .collect();
-        let mut table = crate::wrapper::routing::RoutingTable::new();
-        table.rebuild(&services, &routes).map_err(failure)?;
-        for entry in &publication.effective_services {
-            self.publish_backend_kernel(
-                &ServiceId::new(&entry.namespace, &entry.app_name),
-                &services,
-            )
-            .await?;
-        }
         let previous = self
             .service_map_tx
             .borrow()
@@ -351,8 +457,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .into_iter()
             .cloned()
             .collect::<Vec<_>>();
-        *self.routing_table.write().await = table;
-        self.service_map_tx.send_replace(services);
+        self.install_consumer_view(&publication.effective_services, &publication.ingress)
+            .await?;
+        self.lapsed_view = None;
         self.cluster_catalog = publication.catalog.clone();
         self.cluster_catalog_generation = Some(publication.generation);
         for entry in previous.iter().filter(|entry| {
@@ -364,6 +471,34 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             self.withdraw_discovery_entry(entry).await?;
         }
         self.sync_firewall_ebpf().await;
+        Ok(())
+    }
+
+    /// Point the kernel, then DNS and Wrapper, at `services`, updating each
+    /// service's entry in place.
+    async fn install_consumer_view(
+        &mut self,
+        services: &[ServiceEntry],
+        ingress: &[IngressAssignment],
+    ) -> Result<(), BunError> {
+        let map = ServiceMap::from_snapshot(services).map_err(failure)?;
+        let routes = ingress
+            .iter()
+            .map(|route| {
+                (
+                    (route.namespace.clone(), route.name.clone()),
+                    route.config.clone(),
+                )
+            })
+            .collect();
+        let mut table = crate::wrapper::routing::RoutingTable::new();
+        table.rebuild(&map, &routes).map_err(failure)?;
+        for entry in services {
+            self.publish_backend_kernel(&ServiceId::new(&entry.namespace, &entry.app_name), &map)
+                .await?;
+        }
+        *self.routing_table.write().await = table;
+        self.service_map_tx.send_replace(map);
         Ok(())
     }
 
@@ -428,6 +563,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// local change, such as a health transition or a replaced instance.
     pub(super) async fn refresh_consumer_view(&mut self) -> Result<(), BunError> {
         if !self.consumer_view_stale {
+            return Ok(());
+        }
+        // A lapsed view keeps only local backends; only a fresh leader answer
+        // brings the rest back. A local change still reaches the local part.
+        if !self.view_lease.is_valid() {
+            self.fence_lapsed_view().await?;
+            self.consumer_view_stale = false;
             return Ok(());
         }
         // Before the first synchronisation after recovery, the next committed
@@ -500,6 +642,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.cluster_catalog = EndpointCatalog::default();
         self.cluster_catalog_generation = None;
         self.cluster_ingress_configs.clear();
+        self.lapsed_view = None;
     }
 
     pub(super) async fn withdraw_consumer_view(&mut self) -> Result<bool, BunError> {

@@ -1,0 +1,53 @@
+name: Stage candidate
+
+# Publishes a signed candidate, unchanged, as a GitHub pre-release under a
+# `staging-v<version>-<run>-<attempt>` tag, so the real `curl ... | sh` install
+# can run against it before promotion (RELIABURGER_RELEASE_BASE_URL). Nothing
+# is tagged `v<version>` and nothing is marked latest; promote.yml does that.
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_run:
+        description: Successful manual Build & Release run on main that produced the candidate
+        required: true
+        type: string
+      qualified_digest:
+        description: SHA-256 of candidate.json from that run's job summary
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: stage-candidate-${{ inputs.candidate_run }}
+  cancel-in-progress: false
+
+jobs:
+  stage:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_REPOSITORY: ${{ github.repository }}
+      CANDIDATE_RUN: ${{ inputs.candidate_run }}
+      QUALIFIED_DIGEST: ${{ inputs.qualified_digest }}
+    steps:
+      # Scripts come from main, like promotion: this job holds a write token.
+      - uses: actions/checkout@v4
+      - name: Download and verify the candidate
+        run: |
+          python3 scripts/release/candidate.py stage-fetch --directory dist \
+            --repository "$RELEASE_REPOSITORY" --run-id "$CANDIDATE_RUN" \
+            --qualified-digest "$QUALIFIED_DIGEST"
+      - name: Publish unchanged assets as a staging pre-release
+        run: |
+          base=$(python3 scripts/release/candidate.py stage --directory dist \
+            --repository "$RELEASE_REPOSITORY" --run-id "$CANDIDATE_RUN" \
+            --qualified-digest "$QUALIFIED_DIGEST")
+          printf 'Staged base URL: `%s`\n\nQualify with:\n\n```sh\nscripts/release/qualify-staged-install.sh --base-url %s --qualified-digest %s\n```\n' \
+            "$base" "$base" "$QUALIFIED_DIGEST" >> "$GITHUB_STEP_SUMMARY"

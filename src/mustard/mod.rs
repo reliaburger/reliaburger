@@ -3,6 +3,8 @@
 /// SWIM-based cluster membership and failure detection. Every node
 /// participates in the gossip mesh, probing random peers each protocol
 /// period and piggybacking membership updates on PING/ACK exchanges.
+/// A periodic push-pull exchange of full membership with one random peer
+/// (anti-entropy) repairs whatever the bounded piggybacking misses.
 ///
 /// This module is built incrementally across Phase 2:
 /// - Step 2: state machine, membership table, messages, dissemination
@@ -22,7 +24,7 @@ pub use dissemination::DisseminationQueue;
 pub use membership::{MembershipSnapshot, MembershipTable, NodeMembership, ResourceSummary};
 pub use message::{
     DirectoryExtension, GossipMessage, GossipPayload, LeaderHint, MAX_PIGGYBACK_UPDATES,
-    MembershipUpdate,
+    MAX_SYNC_DATAGRAMS, MAX_SYNC_ENTRIES, MembershipUpdate,
 };
 pub use protocol::MustardNode;
 pub use state::NodeState;

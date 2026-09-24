@@ -1186,7 +1186,106 @@ The return type says "some iterator yielding `VirtualIP`s" without naming the co
 
 The producer's side mirrors this. Before a node frees the host port or container address of a stopped instance, it asks the leader to *retire* that exact execution at `/v1/discovery/retire`. The leader records a permanent retirement (the code calls it a *fence*: any late report from that execution is ignored from then on, rather than put back in the catalogue) and answers "confirmed" only once every consumer has sent its receipt. Executions are identified by a runtime generation, an opaque SHA-256 fingerprint of the original launch record. A restart gets a new fingerprint even if it reuses the same name and port, so a delayed receipt for the old execution can't free the new one. The request runs as its own task with a one-second wait, so an unreachable leader makes retirement slow, not the whole agent.
 
-Why not just expire an entry when a node has been silent for a while? Because a partitioned node that's still alive may still be serving old routes, and handing its addresses to someone else is worse than asking an operator to confirm it's really gone. Decommissioning the node discharges what it owed. To make this visible before the ledger fills, the leader degrades a `discovery:withdrawal-backlog` readiness subsystem at 75% occupancy and exports `discovery_withdrawal_ledger_occupancy_ratio` for alerting.
+To make a growing backlog visible before the ledger fills, the leader degrades a `discovery:withdrawal-backlog` readiness subsystem at 75% occupancy and exports `discovery_withdrawal_ledger_occupancy_ratio` for alerting.
+
+### When a node goes quiet
+
+What happens when a consumer never sends its receipt? For a long time the answer was: we wait. A partitioned node that's still alive may still be routing to old addresses, and handing those addresses to someone else is worse than asking an operator to confirm the node is really gone. Decommissioning it discharges what it owed.
+
+Then we recorded the homepage tour. Step 12 stops one of the three laptop nodes and invites you to watch the cluster put its frontend back. It didn't. Node-1 had started two new frontends and was retiring its old one, and the leader answered every release with "202, still waiting for node-3". Node-3 was a stopped virtual machine. It was never going to answer, and nothing else in the cluster could release an address until it did.
+
+Waiting forever for a stopped node is safe, and useless. But silence is the only thing the leader can actually observe, and silence alone proves nothing: a stopped node and a partitioned one look identical from the outside. So we turned the question around. Instead of the leader deciding when a node has stopped routing, the node promises in advance to stop routing if the leader stops answering, and the leader waits a little longer than that promise. It's a lease, and its two halves never talk to each other.
+
+The node's half is a `ViewLease`. Just before each placement poll, the reconciler reads the clock. Once the leader's answer has been published into the kernel map, DNS and Wrapper, the lease is extended to that reading plus 60 seconds:
+
+```rust
+pub struct ViewLease {
+    enforced: AtomicBool,
+    /// Expiry on [`boot_clock_ns`]; zero means already expired.
+    expires_ns: AtomicU64,
+}
+
+impl ViewLease {
+    pub fn renew(&self, requested_at_ns: u64) -> u64 {
+        let lease = u64::try_from(CONSUMER_VIEW_LEASE.as_nanos()).unwrap_or(u64::MAX);
+        let expires = requested_at_ns.saturating_add(lease);
+        self.expires_ns
+            .fetch_max(expires, Ordering::SeqCst)
+            .max(expires)
+    }
+}
+```
+
+Look at the receiver: `&self`, not `&mut self`. Rust normally lets you change a value only through an exclusive `&mut` reference, but Wrapper checks this lease on every request while the agent renews it, and both hold it through an `Arc`. Atomic types are the escape hatch. Their methods take `&self` and change the value anyway, because the hardware makes each operation indivisible (Rust calls this *interior mutability*). `fetch_max` stores the larger of the current and the new value and returns the old one, in one step, so a slow answer to an older poll can never shorten a newer lease. We met `Ordering::Relaxed` on Wrapper's round-robin counter; here we use `SeqCst`, the strictest ordering, because the lease is written a few times a second and being easy to reason about is worth far more than a few nanoseconds. Finally, `Duration::as_nanos` returns a `u128`, and `u64::try_from` turns it into a `u64` or an error rather than silently truncating, the way a C cast would.
+
+What exactly should a node stop doing when its lease lapses? Our first answer was "everything". That's the simplest thing that's obviously safe, and it has an ugly consequence: lose the council's quorum for a minute and every node stops routing, including a web server calling the cache replica sitting next to it on the same machine. A control-plane outage becomes a full traffic outage.
+
+So let's be precise about the hazard. The danger is an address that some *other* node released and handed to something new after the leader stopped waiting for us. Now look at what a backend entry actually names. A remote backend is `node_ip:host_port` on another machine, and that machine releases it as soon as the leader says so. A local backend is one of this node's own container addresses (from its own `/23`, reserved in Bun's journal, reached through a `/32` route to the instance's own veth) or a `127.0.0.1` host port from this node's own allocator. Nobody but this node's Bun can release either of those. Another node can't reuse our local addresses, whatever the leader decides.
+
+So a lapsed lease drops remote backends and keeps local ones. Every backend now carries a flag saying which it is:
+
+```rust
+pub struct BackendInstance {
+    pub instance_id: String,
+    pub node_ip: Ipv4Addr,
+    pub host_port: u16,
+    pub healthy: bool,
+    #[serde(default)]
+    pub local: bool,
+}
+```
+
+Only one place sets it to `true`: `local_backend`, the function Bun uses to describe an instance it runs itself. Everything built from the leader's catalogue says `false`, and so does a record that predates the field (that's what `#[serde(default)]` does on a `bool`), which fails closed: a backend we can't prove is local is treated as remote.
+
+The lease is then enforced in three places. Wrapper keeps routing, but asks its route for local backends only, and answers 503 when there aren't any. The choice is an enum rather than a `bool` argument, so a call site reads `select_backends(3, BackendScope::LocalOnly)` instead of a mysterious `true`. The agent loop installs the local part of its last publication in place of the whole, and brings the rest back only from a fresh leader answer. And the kernel gets its own copy, a one-entry `view_lease_map` that the connect hook reads before it picks a backend:
+
+```c
+int local_only = 0;
+__u32 lease_key = VIEW_LEASE_KEY;
+struct view_lease_value *lease =
+    bpf_map_lookup_elem(&view_lease_map, &lease_key);
+if (lease && lease->enforced == 1 &&
+    bpf_ktime_get_boot_ns() >= lease->expires_ns)
+    local_only = 1;
+/* ... later, in the round-robin loop ... */
+if (val->backends[idx].healthy == 1 &&
+    (!local_only || val->backends[idx].local == 1))
+```
+
+The flag cost nothing in the map. `struct backend_endpoint` already had a spare padding byte after `healthy`, so `_pad` became `local` and the struct stayed eight bytes; the Rust mirror fills it with `u8::from(backend.local)`, the standard `From` conversion that turns `false` into 0 and `true` into 1 without a cast.
+
+The kernel copy is the one that matters when things go properly wrong. If Bun dies, its pinned programs and maps stay attached and keep routing; that's a feature, since a Bun restart shouldn't break anyone's connections. But now the kernel's clock keeps moving with nobody renewing the lease, so after a minute the stale view's remote backends stop being honoured on their own. Its local ones carry on, and that's fine for exactly the reason above: a dead or frozen Bun releases nothing. If one of its containers dies meanwhile, the container's named network namespace, and the address in it, stays put until Bun tears it down, so a connection gets refused on this node instead of landing somewhere new. The clock is `CLOCK_BOOTTIME` rather than `CLOCK_MONOTONIC`, because the monotonic clock stops while a machine is suspended, and a laptop VM that slept through its lease must wake up with it expired, not paused. That helper arrived in Linux 5.8, which became Onion's minimum kernel. (Reading the same clock from Rust takes a `libc::clock_gettime` call inside an `unsafe` block, with the usual `// SAFETY:` comment explaining why handing the kernel a pointer to a local `timespec` is fine.)
+
+There's one more hole, and it's in our own node. Normally, before the leader confirms that an address of ours can be released, it waits for every consumer's receipt, *including ours*: our receipt is what proves our own view stopped routing to the instance. After a discharge, nobody waits for our receipt any more. If the leader then confirmed a release while our lapsed view still routed to that local instance, we could hand its address to a new container and send traffic there. So the producer side now checks for itself:
+
+```rust
+if self.own_view_names(id) {
+    return Err(BunError::ProducerReleasePending {
+        instance_id: id.clone(),
+        reason: "this node's own view still routes to it",
+    });
+}
+```
+
+`own_view_names` looks through every publication this node still retains, the ones the kernel or an in-flight Wrapper request might still be using. When the node hasn't been discharged, its own receipt already implies the same thing, so the check never delays a release that would otherwise have gone through. It only bites in the one case where it's needed.
+
+The leader's half is a note of when it last served each consumer, kept in memory and thrown away whenever the Raft term changes. A consumer lapses when the leader hasn't served it for the lease plus a 20-second margin and gossip doesn't list it as alive. The leader then commits `DischargeEndpointConsumer`, which removes the node from the consumer set and from every pending withdrawal it still owed. Withdrawals whose sets empty complete, and the blocked releases go through.
+
+```rust
+pub const CONSUMER_VIEW_LEASE: Duration = Duration::from_secs(60);
+pub const CONSUMER_DISCHARGE_MARGIN: Duration = Duration::from_secs(20);
+pub const CONSUMER_DISCHARGE_AFTER: Duration = Duration::from_secs(
+    CONSUMER_VIEW_LEASE.as_secs() + CONSUMER_DISCHARGE_MARGIN.as_secs(),
+);
+```
+
+That third constant looks roundabout. Why not `CONSUMER_VIEW_LEASE + CONSUMER_DISCHARGE_MARGIN`? A `const` is evaluated by the compiler, so everything in its initialiser must be a `const fn`. `Duration::from_secs` and `as_secs` are; the `+` operator on `Duration` comes from the `Add` trait, and trait methods can't be called in a constant yet. So we add plain seconds and rebuild the `Duration`. The payoff is that the relationship between the two sides lives in one place, and a test pins that the leader always waits longer than any node routes.
+
+Is this safe? Follow one poll. The node reads its clock at `t_s`, just before sending. The leader records its contact at `t_h`, before it even reads who's registered, and causality puts `t_s` before `t_h`. The node stops routing to other nodes at `t_s + 60 s`. The leader discharges no earlier than `t_h + 80 s`. Nobody compares wall clocks; the two machines only need their clocks to tick at roughly the same rate, and 20 seconds of margin over 80 covers far more drift than real hardware has. The awkward cases get the same treatment. Serving a consumer and deciding to discharge it take the same lock, so a poll can't sneak a fresh lease in while its discharge is being written, and a discharge whose write timed out keeps its node unserved until a no-op write proves the log has settled. A new leader counts silence from its own takeover, so it can only wait longer than its predecessor would have. And a node that's partitioned but still gossiping is never discharged at all: it may be alive enough to route, so its releases wait for an operator, exactly as before.
+
+When the node comes back, its first poll registers it again. A restarted Bun withdraws everything it recovered before it publishes anything, as described above. A Bun that lived through a partition holds only its local view, and the answer replaces that in place. That's true even when the answer is the very catalogue generation it published before the lapse, which is the usual case after a short outage: the agent remembers it's running on the local part and installs the whole thing again. The answer is the current catalogue, so every remote address in it is live.
+
+The price is still real, just smaller. A node that can't hear from any leader for a minute stops routing to *other* nodes until one answers. A service with a replica on every node (a daemon set, or simply enough replicas) rides out a council outage untouched; a call whose only backends live elsewhere fails with `EPERM` from `connect()` or 503 from Wrapper. Two corners stay fully closed. A Bun that restarts during the outage routes nothing until a leader answers, because it can't prove what it published before it died. And a local instance that crashes can't be restarted, because releasing its old address needs the leader. That's a council outage long enough to stop scheduling too, and failing closed on the cross-node traffic is the whole point of the protocol. Running out of connections is an outage you can see.
 
 ### What went wrong on the way
 
@@ -1197,5 +1296,7 @@ The first consumer registration included plaintext development clusters. But a r
 The first way of replacing a view was painfully correct: hide DNS and ingress, empty the kernel map, cancel every captured request, wait for zero, publish the new view. The catalogue generation changes whenever anything deploys anywhere, so a single rolling deploy made every node drop every in-flight request for every service. No test noticed, because none kept traffic flowing while the catalogue changed. Now the journal keeps a short list of views that *might* still be exposed, Bun updates the kernel map in place, drains only the backends that actually left, and marks a receipt ready once no remaining view contains the withdrawn endpoint. The full withdraw-and-wait sequence survives only for the first publication after a restart, when we genuinely can't know what the previous process had captured.
 
 And a small one with a big effect: reading a kernel map entry used `.ok()`, which turns *any* error into `None`. A permission error therefore looked exactly like "the entry is absent", and cleanup would have treated an unreadable route as already gone. The lookup now matches Aya's `KeyNotFound` explicitly and propagates everything else. A failed lookup is not proof of absence.
+
+The lease came out of the tour, and so did two smaller bugs it had been hiding. A rolling deploy whose old instance couldn't be released yet *failed*, so the orchestrator retried it with a new generation of replacements. Each retry counted the replacements it had already started as "existing" instances, and with one more instance than the node wanted, the rollout's first move was to retire one of them: a healthy one. The frontend sat at two running replicas out of three for five minutes, with node-1 logging the same failure every thirty seconds. A release that's merely waiting isn't a failure. The deploy worker now hands the stopped, withdrawn instance to the agent loop, which keeps asking the leader each tick, and the rollout finishes; the retained instance no longer counts as part of the app, so nothing retires it twice. And `relish wtf` had cheerfully reported that every service had a healthy backend throughout, which was true and beside the point. It now compares running replicas with desired ones and names the nodes whose placements aren't running.
 
 Finally, a limit. Rootless Runc can prove who owns its local host port, but nothing yet carries that proof through remote withdrawal. So for 0.1.0 rootless Runc is standalone only: Bun refuses `--cluster` as soon as it selects a rootless runtime, before it touches any state. Container clusters are rootful Linux Runc with eBPF, which is what the macOS quickstart runs inside its Linux VM.

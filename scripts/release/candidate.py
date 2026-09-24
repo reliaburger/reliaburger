@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Record and verify an exact release candidate; never compile or sign at promotion."""
+"""Record, verify, stage and promote an exact release candidate; never compile or sign."""
 import argparse
 import hashlib
 import json
@@ -7,10 +7,14 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 
 from package import GUEST_METADATA, PLATFORMS, sha256
 
 RECORD = "candidate.json"
+# Staging tags start with this, so nothing that expects a `v1.2.3` release tag
+# (promotion, `v*` tag rules, version parsers) can mistake one for a release.
+STAGING_PREFIX = "staging-"
 PDFS = {"building-reliaburger.pdf", "reliaburger-design-docs.pdf",
         "reliaburger-roadmap.pdf", "reliaburger-whitepaper.pdf"}
 
@@ -100,10 +104,36 @@ def verify_run(run, repository, commit, run_id):
         raise ValueError("candidate run attempt is invalid")
 
 
-def verify_uploaded_assets(release, document, qualified_digest, record_size):
-    """Require GitHub's stored asset hashes before making the draft public."""
-    if release.get("tag_name") != document["version"] or release.get("draft") is not True:
-        raise ValueError("publication requires the exact version's unpublished draft")
+def staging_tag(version, run_id, run_attempt):
+    """The pre-release tag a candidate is staged under: never a release tag."""
+    identity(version, "reliaburger/reliaburger", "0" * 40, run_id, run_attempt)
+    return f"{STAGING_PREFIX}{version}-{run_id}-{run_attempt}"
+
+
+def staging_step(release, tag):
+    """What a staging run does next, given the release already under `tag` (or None).
+
+    Re-running stage.yml for the same candidate attempt resumes an unfinished
+    draft or re-verifies the published pre-release; it never replaces one.
+    """
+    if release is None:
+        return "create"
+    if release.get("tag_name") != tag or release.get("prerelease") is not True:
+        raise ValueError(f"{tag} exists but is not this candidate's staging pre-release")
+    return "resume" if release.get("draft") is True else "verify"
+
+
+def verify_uploaded_assets(release, document, qualified_digest, record_size,
+                           tag=None, draft=True, prerelease=False):
+    """Require GitHub's stored asset hashes before making the draft public.
+
+    Promotion checks the version's own unpublished, final draft; staging passes
+    its staging tag and checks a pre-release, before and after publishing it.
+    """
+    if (release.get("tag_name") != (tag or document["version"])
+            or release.get("draft") is not draft
+            or release.get("prerelease") is not prerelease):
+        raise ValueError("release tag, draft or pre-release state differs from what publication expects")
     expected = dict(document["assets"], **{RECORD: {"sha256": qualified_digest, "size": record_size}})
     assets = release.get("assets", [])
     if len(assets) != len(expected) or {asset["name"] for asset in assets} != set(expected):
@@ -120,25 +150,140 @@ def gh_json(*arguments):
     return json.loads(result.stdout)
 
 
+def gh(*arguments):
+    # stdout stays clean for the one line callers capture (the staged URL).
+    subprocess.run(["gh", *arguments], check=True, stdout=sys.stderr)
+
+
+def candidate_run(repository, run_id, commit=None):
+    """Fetch a build run and require a successful manual main build of `commit`.
+
+    Staging has no tag yet, so it takes the commit from the run itself; the
+    run still has to be a manual main build, and the recorded digest still
+    has to match every byte.
+    """
+    run = gh_json(f"repos/{repository}/actions/runs/{run_id}")
+    verify_run(run, repository, run.get("head_sha") if commit is None else commit, run_id)
+    return run
+
+
+def download_candidate(directory, repository, run):
+    if directory.exists():
+        raise FileExistsError("candidate download directory must be new")
+    gh("run", "download", str(run["id"]), "--repo", repository,
+       "--name", f"candidate-{run['head_sha']}-{run['run_attempt']}", "--dir", str(directory))
+
+
+def verify_downloaded(directory, pins, repository, run, qualified_digest, version=None):
+    """Verify a downloaded candidate against its run and the qualified digest.
+
+    Without a tag, the version comes from the record, which is safe only
+    because the record itself must hash to the operator's qualified digest.
+    """
+    if version is None:
+        path = directory / RECORD
+        if path.is_symlink() or not path.is_file() or sha256(path) != qualified_digest:
+            raise ValueError("candidate record differs from the qualified digest")
+        version = json.loads(path.read_text()).get("version", "")
+    return verify_candidate(directory, pins, qualified_digest, version=version,
+                            repository=repository, commit=run["head_sha"],
+                            run_id=run["id"], run_attempt=run["run_attempt"])
+
+
+def find_release(repository, tag):
+    """The release under `tag`, drafts included, or None when there isn't one."""
+    result = subprocess.run(["gh", "release", "view", tag, "--repo", repository,
+                             "--json", "databaseId"], capture_output=True, text=True)
+    if result.returncode:
+        if "not found" in result.stderr.lower():
+            return None
+        raise RuntimeError(f"could not look up release {tag}: {result.stderr.strip()}")
+    return gh_json(f"repos/{repository}/releases/{json.loads(result.stdout)['databaseId']}")
+
+
+def staging_notes(document, tag, qualified_digest):
+    base = f"https://github.com/{document['repository']}/releases/download/{tag}"
+    return (
+        f"**Staging candidate, not a release.** These are the unchanged signed "
+        f"{document['version']} candidate files from build run {document['run_id']} "
+        f"(attempt {document['run_attempt']}) at commit {document['commit']}, staged "
+        f"so the real installer can be qualified before promotion. Every version "
+        f"string inside them still says {document['version']}.\n\n"
+        f"`candidate.json` SHA-256: `{qualified_digest}`\n\n"
+        f"Qualification only:\n\n"
+        f"```sh\ncurl -fsSL https://reliaburger.com/install.sh | "
+        f"RELIABURGER_RELEASE_BASE_URL={base} sh\n```\n"
+    )
+
+
+def stage(directory, document, qualified_digest):
+    """Publish a verified candidate as a pre-release under its staging tag, or
+    re-verify the one an earlier run published. Never marks anything latest."""
+    tag = staging_tag(document["version"], document["run_id"], document["run_attempt"])
+    repository = document["repository"]
+    record_size = (directory / RECORD).stat().st_size
+    step = staging_step(find_release(repository, tag), tag)
+    if step == "resume":
+        # An unpublished draft from an interrupted run: nobody can have
+        # installed from it, so start it again rather than patch it up.
+        gh("release", "delete", tag, "--repo", repository, "--yes")
+    if step in ("create", "resume"):
+        gh("release", "create", tag, "--repo", repository, "--target", document["commit"],
+           "--draft", "--prerelease", "--latest=false",
+           "--title", f"Staging candidate {document['version']} (run {document['run_id']}, "
+                      f"attempt {document['run_attempt']})",
+           "--notes", staging_notes(document, tag, qualified_digest),
+           *sorted(str(path) for path in directory.iterdir()))
+        verify_uploaded_assets(find_release(repository, tag), document, qualified_digest,
+                               record_size, tag=tag, draft=True, prerelease=True)
+        gh("release", "edit", tag, "--repo", repository,
+           "--draft=false", "--prerelease", "--latest=false")
+    verify_uploaded_assets(find_release(repository, tag), document, qualified_digest,
+                           record_size, tag=tag, draft=False, prerelease=True)
+    if gh_json(f"repos/{repository}/commits/{tag}")["sha"] != document["commit"]:
+        raise ValueError(f"{tag} does not point at the candidate commit")
+    return tag
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("operation", choices=["record", "verify", "fetch", "verify-upload"])
+    parser.add_argument("operation", choices=["record", "verify", "fetch", "verify-upload",
+                                              "stage-fetch", "stage"])
     parser.add_argument("--directory", type=Path, default=Path("dist"))
-    parser.add_argument("--version", required=True)
+    parser.add_argument("--version", help="release tag; staging reads it from the record")
     parser.add_argument("--repository", required=True)
-    parser.add_argument("--commit", required=True)
+    parser.add_argument("--commit", help="candidate commit; staging reads it from the run")
     parser.add_argument("--run-id", type=int, required=True)
     parser.add_argument("--run-attempt", type=int, default=1)
     parser.add_argument("--qualified-digest")
     args = parser.parse_args()
-    expected = identity(args.version, args.repository, args.commit, args.run_id, args.run_attempt)
     pins = json.loads(Path(__file__).with_name("guest-images.json").read_text())
+    digest = args.qualified_digest or ""
+
+    if args.operation in ("stage-fetch", "stage"):
+        # No tag exists yet and none is read: the run names the commit and the
+        # digest-pinned record names the version.
+        run = candidate_run(args.repository, args.run_id)
+        if args.operation == "stage-fetch":
+            download_candidate(args.directory, args.repository, run)
+        document = verify_downloaded(args.directory, pins, args.repository, run, digest)
+        if args.operation == "stage-fetch":
+            print(f"verified candidate {run['head_sha']} from run {args.run_id}, "
+                  f"attempt {run['run_attempt']}")
+            return
+        tag = stage(args.directory, document, digest)
+        print(f"https://github.com/{args.repository}/releases/download/{tag}")
+        return
+
+    if not args.version or not args.commit:
+        parser.error(f"{args.operation} requires --version and --commit")
+    expected = identity(args.version, args.repository, args.commit, args.run_id, args.run_attempt)
     if args.operation == "record":
         print(record_candidate(args.directory, pins, **expected))
         return
 
     if args.operation == "verify":
-        verify_candidate(args.directory, pins, args.qualified_digest or "", **expected)
+        verify_candidate(args.directory, pins, digest, **expected)
         print(f"verified local candidate {args.commit}")
         return
 
@@ -146,23 +291,15 @@ def main():
     commit = gh_json(f"repos/{args.repository}/commits/{args.version}")["sha"]
     if commit != args.commit:
         raise ValueError("release tag no longer points to the qualified candidate commit")
-    run = gh_json(f"repos/{args.repository}/actions/runs/{args.run_id}")
-    verify_run(run, args.repository, args.commit, args.run_id)
-    expected["run_attempt"] = run["run_attempt"]
+    run = candidate_run(args.repository, args.run_id, args.commit)
     if args.operation == "fetch":
-        if args.directory.exists():
-            raise FileExistsError("candidate download directory must be new")
-        subprocess.run(["gh", "run", "download", str(args.run_id), "--repo", args.repository,
-                        "--name", f"candidate-{args.commit}-{run['run_attempt']}",
-                        "--dir", str(args.directory)], check=True)
-    document = verify_candidate(args.directory, pins, args.qualified_digest or "", **expected)
+        download_candidate(args.directory, args.repository, run)
+    document = verify_downloaded(args.directory, pins, args.repository, run, digest, args.version)
     if args.operation == "verify-upload":
-        result = subprocess.run(["gh", "release", "view", args.version, "--repo", args.repository,
-                                 "--json", "databaseId"], check=True, capture_output=True, text=True)
-        release_id = json.loads(result.stdout)["databaseId"]
-        release = gh_json(f"repos/{args.repository}/releases/{release_id}")
-        verify_uploaded_assets(release, document, args.qualified_digest,
-                               (args.directory / RECORD).stat().st_size)
+        release = find_release(args.repository, args.version)
+        if release is None:
+            raise ValueError(f"no draft release for {args.version}")
+        verify_uploaded_assets(release, document, digest, (args.directory / RECORD).stat().st_size)
     print(f"verified candidate {args.commit} from run {args.run_id}, attempt {run['run_attempt']}")
 
 

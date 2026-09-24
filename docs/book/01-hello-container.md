@@ -1364,6 +1364,8 @@ pub fn pop_due(&mut self, now: Instant) -> Option<(InstanceId, HealthCheckConfig
 
 This is called lazy deletion. The stale entries sit in the heap until they naturally rise to the top, at which point they're discarded. It's a well-known trick in priority queue implementations. The trade-off is memory: stale entries take up space until they're popped. For our scale (hundreds of containers, not millions), this is fine.
 
+There's a flip side. `pop_due` takes an instance's only entry off the heap, and nothing puts one back until someone calls `schedule_next`. So every path that pops a check has to reschedule it, including the boring ones. We learnt that while recording the homepage tour: a probe was in flight when `relish fault kill` killed its frontend, the answer came back to an instance that was now restarting, and the agent threw the answer away without rescheduling. The restart reuses the same registration, so the new process sat in `health-wait` forever, perfectly healthy and never asked. The fix is one call: a probe that lands on an instance in the wrong state still books the next one. The test, `a_probe_that_lands_after_a_kill_keeps_the_restarted_instance_probed`, pops the check, marks the instance as restarting, delivers the late result and asserts the check is back on the heap.
+
 ### Explicit time injection
 
 Every method on `HealthChecker` that deals with time takes a `now: Instant` parameter instead of calling `Instant::now()` internally:

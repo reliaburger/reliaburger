@@ -320,7 +320,7 @@ VM). A fix counts only when the loop that used to fail passes.
   clear, only the leader's view is guaranteed fresh, so a lagging entry node can
   refuse briefly. That errs on the safe side; decide whether it matters.
 
-- [ ] **C6.5 Mustard needs anti-entropy.** Seeding the five-node convergence
+- [x] **C6.5 Mustard needs anti-entropy.** Seeding the five-node convergence
   test (C3.7) exposed a real protocol property: with bounded re-broadcasts and
   no full-membership resync, about 1 in 1,300 unseeded schedules strands a
   member permanently, and more rounds don't help. Add a periodic push-pull

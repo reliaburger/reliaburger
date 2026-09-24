@@ -334,6 +334,7 @@ in repository Actions. Signed candidate qualification is still V03.
 - [ ] **V03** (gate) Publish and install the exact signed candidate.
   - [x] Preserve a complete signed candidate with source/run identity and per-file hashes; promote only the qualified bytes without rebuilding.
   - [x] Add explicit HTTPS candidate mirrors to both installers and managed setup without bypassing checksums or signatures.
+  - [x] Stage a verified candidate as a pre-release that promotion refuses, and script the real `curl | sh` qualification against it ([runbook](releasing.md#staging-a-candidate)).
   - [ ] Qualify hosted candidate creation, staged HTTPS delivery and actual signed installation before promotion.
 - [ ] **V04** (gate) Measure repeated cold installs on the advertised host matrix.
 - [x] **V05** Review all dependency exceptions against the current RustSec database and [record their reachability and migration dispositions](qualification/2026-09-18-dependency-exceptions.md). `make audit` also refuses an active rkyv graph.
@@ -350,9 +351,10 @@ that used to fail passes.
 | `placement::concurrent_node_kills_and_leader_change_preserve_reserved_capacity` | 22 Sep | Product: a returning node spread stale suspicions; a clear didn't wait for re-admission | Fixed (C3.2) |
 | `cluster_failover::decommissioned_worker_releases_cleanup_and_stays_retired_after_leader_change` | 20 Sep | Harness: waited on the leader's appended, not applied, membership | Fixed (C3.4) |
 | `job_recovery::killed_bun_*` (two tests) | 19 Sep | Harness: fixed 15–20 s budgets on loaded macOS runners | Fixed (C3.6) |
-| `mustard::protocol::tests::gossip_convergence_five_nodes` | 22 Sep | Unseeded RNG; exposed missing anti-entropy (C6.5) | Test fixed (C3.7) |
+| `mustard::protocol::tests::gossip_convergence_five_nodes` | 22 Sep | Unseeded RNG; exposed missing anti-entropy (C6.5) | Fixed: push-pull anti-entropy (C6.5); unseeded again |
 | `ebpf::standalone_discovery_recovery_preserves_original_routing_and_cleanup` | 22 Sep | Product: 2 s force-kill deadline too short under load | Fixed (C3.3) |
 | `registry_recovery::new_leader_retains_registry_cleanup_until_the_killed_writer_returns` | 23 Sep | Harness: treated the retryable lease-leader 503 as fatal | Fixed |
+| `owned_rootless::rootless_port_and_launcher_survive_recovery_and_helper_replacement` | 22 Sep | The replacement slirp4netns helper sometimes exits before readiness after the test kills the old one, and `state()` reports it as an error mid-recovery | Open: decide whether recovery retries the helper or reports the error |
 
 ## Current release checklist
 
@@ -429,6 +431,7 @@ the later hardening sections and the dated review documents.
 - [x] Shared types: `NodeId`, `AppId`, `Resources`, `NodeCapacity`, `SchedulingDecision` (`src/meat/types.rs`)
 - [x] Mustard state machine: NodeState enum, incarnation conflicts, membership table, piggyback dissemination
 - [x] Mustard transport and protocol: `MustardTransport` trait, SWIM probe cycle, gossip convergence tests
+- [x] Mustard anti-entropy (C6.5): periodic bounded push-pull (`Sync`, 10 s, ≤ 8 datagrams × 8 entries per side) plus a join sync; protocol generation 23; 0 of 100,000 five-node schedules strand (was 73)
 - [x] Indirect probe (PING-REQ) ACK routing, proptest for conflict resolution, broadcast count lambda=3
 - [x] Dead node reap timer (cleanup_timeout=60s), graceful leave protocol (Left state broadcast on shutdown)
 - [x] Raft integration (openraft): storage, network, and state machine adapters; leader election and log replication

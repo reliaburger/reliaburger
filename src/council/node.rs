@@ -50,6 +50,8 @@ pub struct CouncilNode {
     state_machine: CouncilStateMachine,
     /// Order grant proposals against membership transitions on this leader.
     node_fault_membership: tokio::sync::Mutex<()>,
+    /// When this node, as leader, last served each endpoint consumer.
+    consumer_contacts: tokio::sync::Mutex<crate::onion::lease::ConsumerContacts>,
     /// Master secret for unwrapping CA private keys (in-memory only).
     wrapping_ikm: Option<[u8; 32]>,
 }
@@ -95,6 +97,9 @@ impl CouncilNode {
             raft_id,
             state_machine,
             node_fault_membership: tokio::sync::Mutex::new(()),
+            consumer_contacts: tokio::sync::Mutex::new(crate::onion::lease::ConsumerContacts::new(
+                std::time::Instant::now(),
+            )),
             wrapping_ikm,
         })
     }
@@ -148,6 +153,18 @@ impl CouncilNode {
     /// Return `true` if this node is the current leader.
     pub async fn is_leader(&self) -> bool {
         self.raft.ensure_linearizable().await.is_ok()
+    }
+
+    /// The leader's volatile record of when it last served each endpoint
+    /// consumer. Serving a consumer and discharging one both take this lock,
+    /// so a discharge can never race a poll that renews the same lease.
+    pub fn consumer_contacts(&self) -> &tokio::sync::Mutex<crate::onion::lease::ConsumerContacts> {
+        &self.consumer_contacts
+    }
+
+    /// The Raft term this node currently knows.
+    pub fn current_term(&self) -> u64 {
+        self.raft.metrics().borrow().current_term
     }
 
     /// Subscribe to Raft metrics changes.

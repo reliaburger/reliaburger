@@ -265,6 +265,19 @@ pub fn spawn_leader_scheduler(
                 .filter(|member| member.state == NodeState::Alive)
                 .map(|member| member.node_id.0.as_str())
                 .collect();
+            // A stopped node can never confirm a withdrawal. Once its view
+            // lease has certainly run out, stop waiting for it (Z6.7).
+            let discharged = super::consumer::discharge_lapsed_consumers(
+                &council,
+                &alive_names,
+                crate::onion::lease::CONSUMER_DISCHARGE_AFTER,
+            )
+            .await;
+            let desired = if discharged.is_empty() {
+                desired
+            } else {
+                council.desired_state().await
+            };
             withdrawal_ledger_gauge().record(&desired.endpoint_withdrawals);
             let warning = withdrawal_backlog_warning(&desired.endpoint_withdrawals, &alive_names);
             if warning != backlog_warning {
@@ -375,12 +388,14 @@ pub fn spawn_leader_scheduler(
             // deploy time, with the reason surfaced through the log.
             let mut quotas = crate::meat::quota::ledger_from_namespaces(&desired.namespaces);
 
+            let unheard = unheard_nodes(&alive, &reports);
             let decisions = plan_scheduling_pass_with_dns(
                 &mut cache,
                 &desired,
                 &alive,
                 &mut quotas,
                 dns_required,
+                &unheard,
             );
 
             if let Some(request) = capacity_request {
@@ -489,7 +504,7 @@ fn plan_scheduling_pass(
     alive: &HashSet<NodeId>,
     quotas: &mut crate::meat::quota::QuotaLedger,
 ) -> Vec<crate::meat::types::SchedulingDecision> {
-    plan_scheduling_pass_with_dns(cache, desired, alive, quotas, false)
+    plan_scheduling_pass_with_dns(cache, desired, alive, quotas, false, &HashSet::new())
 }
 
 /// Plan a pass with the cluster's configured DNS requirement.
@@ -503,6 +518,7 @@ fn plan_scheduling_pass_with_dns(
     alive: &HashSet<NodeId>,
     quotas: &mut crate::meat::quota::QuotaLedger,
     dns_required: bool,
+    unheard: &HashSet<NodeId>,
 ) -> Vec<crate::meat::types::SchedulingDecision> {
     use crate::meat::scheduler::Scheduler;
 
@@ -557,7 +573,7 @@ fn plan_scheduling_pass_with_dns(
                 placements.len() == want
                     && placements
                         .iter()
-                        .all(|p| placement_holds(p, spec, cache, alive, dns_required))
+                        .all(|p| placement_holds(p, spec, cache, alive, unheard, dns_required))
             })
             .unwrap_or(false);
         planned.push((app_id, spec, override_replicas, want, converged));
@@ -617,7 +633,7 @@ fn plan_scheduling_pass_with_dns(
                 .map(|placements| {
                     placements
                         .iter()
-                        .filter(|p| placement_holds(p, spec, cache, alive, dns_required))
+                        .filter(|p| placement_holds(p, spec, cache, alive, unheard, dns_required))
                         .take(want)
                         .cloned()
                         .collect()
@@ -668,21 +684,27 @@ fn plan_scheduling_pass_with_dns(
 /// Whether an existing placement can stay where it is: its node is alive and
 /// ready and can enforce what the spec needs.
 ///
-/// A live node that hasn't reported to this leader yet keeps its placements.
-/// A new leader hears from nodes over several seconds, and a node whose
-/// report went to a council member that just died can take longer still;
-/// "not heard from yet" is not evidence of trouble, and moving its replicas
-/// would restart healthy workloads. A node that reported and went stale, or
-/// reported not ready, does lose them.
+/// A live node that hasn't reported to this leader yet keeps its placements,
+/// and so does one in `unheard`, whose state report has arrived but whose
+/// readiness or capability evidence hasn't. A new leader hears from nodes
+/// over several seconds, one report at a time, and a node whose report went
+/// to a council member that just died can take longer still; "not heard from
+/// yet" is not evidence of trouble, and moving its replicas would restart
+/// healthy workloads. A node that reported and went stale, or reported not
+/// ready or not capable, does lose them.
 fn placement_holds(
     placement: &crate::meat::types::Placement,
     spec: &AppSpec,
     cache: &ClusterStateCache,
     alive: &HashSet<NodeId>,
+    unheard: &HashSet<NodeId>,
     dns_required: bool,
 ) -> bool {
     if !alive.contains(&placement.node_id) {
         return false;
+    }
+    if unheard.contains(&placement.node_id) {
+        return true;
     }
     let Some(node) = cache.get_node(&placement.node_id) else {
         return true;
@@ -691,6 +713,23 @@ fn placement_holds(
     node.ready
         && (!requires_egress || node.capabilities.egress.can_enforce_allowlist())
         && (!dns_required || node.capabilities.dns.can_resolve_internal())
+}
+
+/// Live nodes whose state report is fresh but whose readiness or capability
+/// report this leader hasn't received yet. The three travel separately, and a
+/// new leader starts with none of them, so for a moment a healthy node looks
+/// unready. That's reason enough not to place anything new there, but not to
+/// move what it already runs.
+fn unheard_nodes(alive: &HashSet<NodeId>, reports: &AggregatedState) -> HashSet<NodeId> {
+    alive
+        .iter()
+        .filter(|node| reports.reports.contains_key(*node))
+        .filter(|node| !reports.stale_nodes.contains(*node))
+        .filter(|node| {
+            !reports.readiness.contains_key(*node) || !reports.capabilities.contains_key(*node)
+        })
+        .cloned()
+        .collect()
 }
 
 /// The number of nodes a daemon set of `spec` can currently be placed on
@@ -1121,6 +1160,9 @@ async fn poll_consumer(
     if let Some(token) = service_token {
         request = request.bearer_auth(token);
     }
+    // The view lease runs from before the request leaves, so it can only
+    // end earlier than the leader's own count of this node's silence.
+    let requested_at_ns = crate::onion::lease::boot_clock_ns();
     // The deadline covers both headers and body. An incomplete body
     // must not prevent the next placement poll or graceful shutdown.
     let poll = async {
@@ -1150,6 +1192,7 @@ async fn poll_consumer(
                 catalog: Box::new(assignments.endpoint_catalog.clone()),
                 ingress: assignments.ingress.clone(),
                 withdrawals: assignments.endpoint_withdrawals.clone(),
+                requested_at_ns,
                 response,
             })
             .await
@@ -2995,6 +3038,95 @@ image = "busybox:latest"
         assert_eq!(nodes_of(&decisions[0]), ["n1", "n1", "n1"]);
     }
 
+    /// Z6.7: after node-3 (the leader) stopped, the new leader moved node-2's
+    /// untouched frontend to node-1. It had node-2's state report but not yet
+    /// its readiness and capability reports, so node-2 looked unready.
+    #[test]
+    fn a_node_whose_readiness_has_not_arrived_keeps_its_replicas() {
+        let app = AppId::new("frontend", "default");
+        let mut desired = DesiredState::default();
+        desired.apps.insert(app.clone(), app_spec(100, 3));
+        desired
+            .scheduling
+            .insert(app.clone(), placed_on(&["n1", "n2", "n3"]));
+        let alive = HashSet::from([NodeId::new("n1"), NodeId::new("n2")]);
+        let cache_with_n2_unready = || {
+            let mut cache = ClusterStateCache::new();
+            cache.set_node(sched_node("n1", 4000, BTreeMap::new()));
+            let mut n2 = sched_node("n2", 4000, BTreeMap::new());
+            n2.ready = false;
+            cache.set_node(n2);
+            cache
+        };
+
+        let unheard = HashSet::from([NodeId::new("n2")]);
+        let decisions = plan_scheduling_pass_with_dns(
+            &mut cache_with_n2_unready(),
+            &desired,
+            &alive,
+            &mut QuotaLedger::default(),
+            false,
+            &unheard,
+        );
+        let nodes = nodes_of(&decisions[0]);
+        assert_eq!(nodes[..2], ["n1", "n2"], "{nodes:?}");
+
+        // Heard, and not ready: that's evidence, and the replica moves.
+        let decisions = plan_scheduling_pass_with_dns(
+            &mut cache_with_n2_unready(),
+            &desired,
+            &alive,
+            &mut QuotaLedger::default(),
+            false,
+            &HashSet::new(),
+        );
+        assert_eq!(nodes_of(&decisions[0]), ["n1", "n1", "n1"]);
+    }
+
+    #[test]
+    fn only_fresh_nodes_missing_readiness_or_capability_evidence_are_unheard() {
+        let alive: HashSet<NodeId> = [
+            "complete",
+            "no-readiness",
+            "no-capability",
+            "stale",
+            "silent",
+        ]
+        .into_iter()
+        .map(NodeId::new)
+        .collect();
+        let mut reports = AggregatedState::default();
+        for name in ["complete", "no-readiness", "no-capability", "stale"] {
+            reports.reports.insert(NodeId::new(name), report(4000, 0));
+        }
+        for name in ["complete", "no-capability"] {
+            reports
+                .readiness
+                .insert(NodeId::new(name), readiness(name, true));
+        }
+        for name in ["complete", "no-readiness"] {
+            reports.capabilities.insert(
+                NodeId::new(name),
+                crate::reporting::types::NodeCapabilityReport {
+                    node_id: NodeId::new(name),
+                    capabilities: Default::default(),
+                    egress_enforcement: Vec::new(),
+                    egress_degraded: false,
+                    egress_affected_workloads: Vec::new(),
+                },
+            );
+        }
+        reports.stale_nodes.push(NodeId::new("stale"));
+
+        let unheard = unheard_nodes(&alive, &reports);
+
+        assert_eq!(
+            unheard,
+            HashSet::from([NodeId::new("no-readiness"), NodeId::new("no-capability")]),
+            "a stale node lost its evidence; a silent one isn't in the cache at all"
+        );
+    }
+
     #[test]
     fn scaling_down_keeps_the_first_placements() {
         let app = AppId::new("frontend", "default");
@@ -3348,6 +3480,7 @@ image = "busybox:latest"
             &alive,
             &mut QuotaLedger::default(),
             true,
+            &HashSet::new(),
         );
 
         assert_eq!(decisions.len(), 1, "DNS capability loss must re-plan");
@@ -3375,6 +3508,7 @@ image = "busybox:latest"
             &alive,
             &mut QuotaLedger::default(),
             true,
+            &HashSet::new(),
         );
         assert!(
             decisions.is_empty(),

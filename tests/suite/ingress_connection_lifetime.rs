@@ -42,6 +42,7 @@ async fn upgraded_ingress_connection_retires_and_a_new_connection_still_works() 
                 node_ip: std::net::Ipv4Addr::LOCALHOST,
                 host_port: port,
                 healthy: true,
+                local: false,
             },
         )
         .unwrap();
@@ -74,6 +75,7 @@ async fn upgraded_ingress_connection_retires_and_a_new_connection_still_works() 
         Arc::new(tokio::sync::RwLock::new(routes)),
         None,
         Some(config.cert_resolver.clone()),
+        None,
         shutdown.clone(),
     )
     .await

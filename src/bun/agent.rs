@@ -492,6 +492,9 @@ pub enum AgentCommand {
         catalog: Box<crate::onion::catalog::EndpointCatalog>,
         ingress: Vec<crate::cluster::orchestrate::IngressAssignment>,
         withdrawals: Vec<crate::onion::withdrawal::EndpointWithdrawalInstruction>,
+        /// When the placement request that carried this answer was sent, on
+        /// [`crate::onion::lease::boot_clock_ns`]. The view lease runs from here.
+        requested_at_ns: u64,
         response: oneshot::Sender<Result<ConsumerUpdate, BunError>>,
     },
     /// Confirm the leader acknowledged one original, locally proven receipt.
@@ -796,6 +799,12 @@ enum DeployOp {
         old_id: InstanceId,
         reply: oneshot::Sender<Result<(), BunError>>,
     },
+    /// Hand a stopped old instance whose addresses still await remote
+    /// withdrawal confirmations to the agent loop, so the rollout can finish.
+    DeferRetire {
+        old_id: InstanceId,
+        reply: oneshot::Sender<()>,
+    },
     /// Append an entry to the deploy history.
     PushDeployHistory {
         entry: Box<crate::meat::deploy_types::DeployHistoryEntry>,
@@ -838,9 +847,11 @@ struct PreparedInstance {
 }
 
 /// How long a deploy worker keeps asking the leader to release a retired
-/// instance's addresses before it gives up and fails the deploy. Consumers
-/// confirm withdrawals on their placement poll, every couple of seconds.
-const PRODUCER_RELEASE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(30);
+/// instance's addresses before it hands the release to the agent loop and
+/// carries on. Consumers confirm withdrawals on their placement poll, every
+/// couple of seconds, so a healthy cluster answers well within it; a lost
+/// node holds it up until the leader discharges it (`onion::lease`).
+const PRODUCER_RELEASE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Pause between two producer release attempts.
 const PRODUCER_RELEASE_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
@@ -1367,6 +1378,19 @@ impl DeployOps {
         .await
     }
 
+    /// Let the agent loop finish releasing a stopped old instance's addresses
+    /// once every node has confirmed the withdrawal.
+    async fn defer_retire(&self, old_id: &InstanceId) {
+        self.call(
+            |reply| DeployOp::DeferRetire {
+                old_id: old_id.clone(),
+                reply,
+            },
+            (),
+        )
+        .await
+    }
+
     async fn push_deploy_history(&self, entry: crate::meat::deploy_types::DeployHistoryEntry) {
         self.call(
             |reply| DeployOp::PushDeployHistory {
@@ -1737,6 +1761,16 @@ pub struct BunAgent<G: Grill> {
         std::collections::HashMap<(String, String), crate::config::app::IngressSpec>,
     /// A local change awaits in-place republication of the consumer view.
     consumer_view_stale: bool,
+    /// While the view lease has lapsed, the local-only view installed in
+    /// place of the last publication: this node's own backends and nothing
+    /// else. `None` while the published view is the whole cluster's.
+    lapsed_view: Option<Vec<crate::onion::types::ServiceEntry>>,
+    /// Stopped instances retired by a finished rollout whose addresses still
+    /// wait for other nodes to confirm the withdrawal. The loop releases them.
+    deferred_retirements: std::collections::HashSet<InstanceId>,
+    /// How long this node may keep routing with its published cluster view
+    /// (shared with Wrapper, mirrored into the kernel's `view_lease_map`).
+    view_lease: std::sync::Arc<crate::onion::lease::ViewLease>,
     /// Journal to reopen after a discovery write whose outcome is unknown,
     /// and whether it had been recovered from an earlier process.
     discovery_reopen: Option<(std::path::PathBuf, bool)>,
@@ -1916,6 +1950,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             ingress_configs: std::collections::HashMap::new(),
             cluster_ingress_configs: std::collections::HashMap::new(),
             consumer_view_stale: false,
+            lapsed_view: None,
+            deferred_retirements: Default::default(),
+            view_lease: Default::default(),
             discovery_reopen: None,
             // Single-node mode: no nftables needed (no cluster ports to protect)
             perimeter_config: crate::firewall::rules::PerimeterConfig {
@@ -2023,6 +2060,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             ingress_configs: std::collections::HashMap::new(),
             cluster_ingress_configs: std::collections::HashMap::new(),
             consumer_view_stale: false,
+            lapsed_view: None,
+            deferred_retirements: Default::default(),
+            view_lease: Default::default(),
             discovery_reopen: None,
             #[cfg(target_os = "linux")]
             perimeter_config: {
@@ -2078,6 +2118,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// `wait_drained`, not the notification stream.
     pub fn drains_handle(&self) -> crate::wrapper::draining::SharedDrains {
         self.drains.clone()
+    }
+
+    /// The lease Wrapper checks before routing a cluster request.
+    pub fn view_lease_handle(&self) -> std::sync::Arc<crate::onion::lease::ViewLease> {
+        self.view_lease.clone()
     }
 
     /// Get a shared handle to the deploy history for the API.
@@ -3520,7 +3565,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 }
                 _ = health_interval.tick() => {
                     self.reopen_uncertain_discovery().await;
+                    if let Err(error) = self.fence_lapsed_view().await {
+                        eprintln!("bun: withdrawing the lapsed cluster view awaits retry: {error}");
+                    }
                     self.drive_startup_retirements().await;
+                    self.drive_deferred_retirements().await;
                     self.refresh_egress_readiness().await;
                     self.run_health_checks().await;
                     self.check_jobs().await;
@@ -4157,6 +4206,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                                 .count()
                                 .try_into()
                                 .unwrap_or(u32::MAX),
+                            placements: Default::default(),
                             service_port: spec.port,
                         },
                     )
@@ -4613,11 +4663,19 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 catalog,
                 ingress,
                 withdrawals,
+                requested_at_ns,
                 response,
             } => {
+                // An answer after a lapse replaces the view in place. The
+                // kernel and Wrapper route only locally until the lease is
+                // renewed below, and the answer is the current catalogue, so
+                // every remote address it names is live.
                 let result = self
                     .synchronise_consumer(generation, *catalog, ingress, withdrawals)
                     .await;
+                if matches!(&result, Ok(update) if update.published) {
+                    self.renew_view_lease(requested_at_ns).await;
+                }
                 let result = match result {
                     Err(error) => {
                         let retry = self.consumer_update(false);
@@ -6545,7 +6603,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
 
         for old_id in existing {
-            self.finish_retire_bookkeeping(old_id).await?;
+            match self.finish_retire_bookkeeping(old_id).await {
+                Err(BunError::ProducerReleasePending { .. }) => self.defer_retirement(old_id),
+                result => result?,
+            }
         }
         self.withdraw_service_ebpf(&service_id).await?;
         // Re-registration can be refused: a stop that withdrew the council's
@@ -7637,19 +7698,25 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     ) {
         self.health_inflight.remove(&instance_id);
         let now = Instant::now();
-        if !self
-            .supervisor
-            .get_instance(&instance_id)
-            .is_some_and(|instance| {
-                instance.created_at == created_at
-                    && matches!(
-                        instance.state,
-                        ContainerState::HealthWait
-                            | ContainerState::Running
-                            | ContainerState::Unhealthy
-                    )
-            })
-        {
+        let Some(instance) = self.supervisor.get_instance(&instance_id) else {
+            return;
+        };
+        // A newer registration owns the cadence of a replaced instance.
+        if instance.created_at != created_at {
+            return;
+        }
+        if !matches!(
+            instance.state,
+            ContainerState::HealthWait | ContainerState::Running | ContainerState::Unhealthy
+        ) {
+            // The instance left the probed states while this probe was in
+            // flight (killed, restarting). Discard the result but keep its
+            // cadence, as `run_health_checks` does for a skipped check: a
+            // restart reuses this registration, so dropping it here would
+            // leave the restarted instance in HealthWait with no probes.
+            self.supervisor
+                .health_checker_mut()
+                .schedule_next(instance_id, now);
             return;
         }
         let status = match status {
@@ -8726,6 +8793,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             node_ip: container_ip.unwrap_or(std::net::Ipv4Addr::LOCALHOST),
             host_port: port,
             healthy,
+            local: true,
         }
     }
 
@@ -10287,6 +10355,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     .list_instances()
                     .iter()
                     .filter(|i| !i.is_job && i.app_name == app_name && i.namespace == namespace)
+                    // Retired by an earlier rollout; only its release remains.
+                    .filter(|i| !self.deferred_retirements.contains(&i.id))
                     .map(|i| i.id.clone())
                     .collect();
                 let _ = reply.send(ids);
@@ -10644,6 +10714,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             DeployOp::FinishRetire { old_id, reply } => {
                 let result = self.finish_retire_bookkeeping(&old_id).await;
                 let _ = reply.send(result);
+            }
+            DeployOp::DeferRetire { old_id, reply } => {
+                self.defer_retirement(&old_id);
+                let _ = reply.send(());
             }
             DeployOp::PushDeployHistory { entry, reply } => {
                 self.deploy_history.write().await.push(*entry);
@@ -11490,26 +11564,36 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                             .await;
                         return std::ops::ControlFlow::Break(());
                     }
-                    if let Err(error) = self.ops.finish_retire(&old_id).await {
-                        let retention = self
-                            .retain_started_replacements(
-                                app_name, namespace, spec, &new_ids, &new_ports, &new_specs,
-                            )
-                            .await;
-                        let detail = match retention {
-                            Ok(()) => "started replacements retained for cleanup".into(),
-                            Err(error) => {
-                                format!("could not retain replacement ownership: {error}")
-                            }
-                        };
-                        let _ = events
-                            .send(ApplyEvent::Error {
-                                message: format!(
-                                    "old instance artifact retirement failed: {error}; {detail}"
-                                ),
-                            })
-                            .await;
-                        return std::ops::ControlFlow::Break(());
+                    match self.ops.finish_retire(&old_id).await {
+                        // Stopped, drained and withdrawn locally; only other
+                        // nodes' confirmations are outstanding. That can take
+                        // as long as a lost node's view lease, and starting
+                        // another generation wouldn't make it any shorter.
+                        Err(BunError::ProducerReleasePending { .. }) => {
+                            self.ops.defer_retire(&old_id).await;
+                        }
+                        Ok(()) => {}
+                        Err(error) => {
+                            let retention = self
+                                .retain_started_replacements(
+                                    app_name, namespace, spec, &new_ids, &new_ports, &new_specs,
+                                )
+                                .await;
+                            let detail = match retention {
+                                Ok(()) => "started replacements retained for cleanup".into(),
+                                Err(error) => {
+                                    format!("could not retain replacement ownership: {error}")
+                                }
+                            };
+                            let _ = events
+                                .send(ApplyEvent::Error {
+                                    message: format!(
+                                        "old instance artifact retirement failed: {error}; {detail}"
+                                    ),
+                                })
+                                .await;
+                            return std::ops::ControlFlow::Break(());
+                        }
                     }
                     retired += 1;
                     continue;
@@ -13269,6 +13353,98 @@ mod tests {
         }
     }
 
+    /// Z6.7: with a node stopped, the old instance's release waited for that
+    /// node's receipt. The rollout failed, the orchestrator retried it, and
+    /// every retry took the retained replacements for "existing" instances
+    /// and stopped a healthy one. A rollout now finishes and leaves the
+    /// release to the agent loop.
+    #[tokio::test]
+    async fn a_rollout_finishes_while_the_old_instance_waits_for_remote_release() {
+        let grill = MockGrill::new();
+        grill.set_pid(std::process::id());
+        let allocator = PortAllocator::new(30000, 30010);
+        let (_, receiver) = mpsc::channel(8);
+        let mut agent = BunAgent::new(
+            grill.clone(),
+            allocator.clone(),
+            receiver,
+            CancellationToken::new(),
+        );
+        let root = tempfile::tempdir().unwrap();
+        agent.set_volumes_dir(root.path().join("volumes"));
+        agent.set_records_dir(root.path().join("records"));
+        agent
+            .enable_fresh_discovery_ownership(&root.path().join("discovery"))
+            .await
+            .unwrap();
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        let old = InstanceId("default__web-0".into());
+        let original = agent.supervisor.get_instance(&old).unwrap();
+        let old_port = original.host_port.unwrap();
+        let execution = crate::grill::RuntimeExecution {
+            instance_id: old.clone(),
+            generation: crate::grill::RuntimeGeneration::process("original"),
+        };
+        grill
+            .set_launch_inventory(vec![crate::grill::RuntimeLaunch {
+                instance_id: old.clone(),
+                generation: execution.generation.clone(),
+                spec: original.oci_spec.clone().unwrap(),
+                network_reference: None,
+            }])
+            .await;
+        let (mut clustered, _, _) = test_cluster_fault_agent().await;
+        agent.cluster = clustered.cluster.take();
+        // A stopped node never sends its receipt: the leader answers 202.
+        let (client, pending) =
+            crate::cluster::producer::test_fixture(axum::http::StatusCode::ACCEPTED, String::new())
+                .await;
+        agent.set_producer_release_client(client);
+
+        let replacement = Config::parse("[app.web]\nimage = 'web:v2'\nport = 8080\n").unwrap();
+        expect_complete(&drain_deploy(&mut agent, replacement).await);
+
+        assert!(agent.deferred_retirements.contains(&old));
+        assert_eq!(
+            agent.supervisor.get_instance(&old).unwrap().state,
+            ContainerState::Stopped
+        );
+        assert!(allocator.is_allocated(old_port).await, "released too early");
+        let (reply, existing) = oneshot::channel();
+        agent
+            .handle_deploy_op(DeployOp::ListExistingOwned {
+                app_name: "web".into(),
+                namespace: "default".into(),
+                reply,
+            })
+            .await;
+        let existing = existing.await.unwrap();
+        assert!(
+            !existing.contains(&old),
+            "a later rollout must not retire the old instance again"
+        );
+        assert_eq!(existing.len(), 1, "{existing:?}");
+
+        // Still pending: the agent loop keeps waiting, nothing else happens.
+        agent.drive_deferred_retirements().await;
+        assert!(agent.deferred_retirements.contains(&old));
+        pending.abort();
+        let _ = pending.await;
+
+        // The leader confirms; the next tick releases the address.
+        let confirmation =
+            serde_json::json!({"node_id": "test", "execution": execution}).to_string();
+        let (client, confirmed) =
+            crate::cluster::producer::test_fixture(axum::http::StatusCode::OK, confirmation).await;
+        agent.set_producer_release_client(client);
+        agent.drive_deferred_retirements().await;
+        assert!(agent.deferred_retirements.is_empty());
+        assert!(agent.supervisor.get_instance(&old).is_none());
+        assert!(!allocator.is_allocated(old_port).await);
+        confirmed.abort();
+        let _ = confirmed.await;
+    }
+
     #[tokio::test]
     async fn slow_producer_release_does_not_stall_the_agent_loop() {
         let grill = MockGrill::new();
@@ -14433,6 +14609,43 @@ mod tests {
             )
             .await;
         assert!(view.borrow().resolve(&service).unwrap().backends[0].healthy);
+        agent.retire_workload("web", "default").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_probe_that_lands_after_a_kill_keeps_the_restarted_instance_probed() {
+        let (mut agent, _commands, _shutdown) = test_agent();
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        let id = InstanceId("default__web-0".into());
+        let health = super::super::health::HealthCheckConfig::from_spec(
+            config_with_health().app["web"].health.as_ref().unwrap(),
+            8080,
+        );
+        let now = Instant::now();
+        agent.supervisor.register_health(id.clone(), health, now);
+        // The check is taken off the queue for a probe, as run_health_checks does.
+        let far = now + std::time::Duration::from_secs(3600);
+        while agent.supervisor.health_checker_mut().pop_due(far).is_some() {}
+        // The process is killed while the probe is in flight.
+        let instance = agent.supervisor.get_instance_mut(&id).unwrap();
+        instance.state = ContainerState::Pending;
+        let created_at = instance.created_at;
+        agent
+            .complete_health_probe(
+                id.clone(),
+                created_at,
+                Ok(super::super::health::HealthStatus::Unhealthy),
+            )
+            .await;
+        assert_eq!(
+            agent
+                .supervisor
+                .health_checker_mut()
+                .pop_due(far)
+                .map(|(due, _)| due),
+            Some(id.clone()),
+            "the late probe dropped the check, so the restart would never be probed"
+        );
         agent.retire_workload("web", "default").await.unwrap();
     }
 
@@ -21396,6 +21609,157 @@ host = "remote.local"
             );
         }
     }
+    /// Z6.7: the leader may stop waiting for a node that has been silent past
+    /// its view lease. That's only safe if the node has stopped routing to
+    /// other nodes by then. Its own backends are different: only this agent
+    /// can release their addresses, so they keep serving through a lapse, and
+    /// the agent refuses to release one while any view it published names it.
+    #[tokio::test]
+    async fn a_lapsed_view_lease_keeps_local_backends_until_the_leader_answers() {
+        use crate::bun::consumer_owners::{ConsumerIdentity, ConsumerPhase};
+        use crate::onion::service_id::ServiceId;
+        let root = tempfile::tempdir().unwrap();
+        let identity = ConsumerIdentity {
+            node_id: crate::meat::NodeId::new("test"),
+            cluster_identity: [42; 32],
+        };
+        let (mut agent, _, _) = test_cluster_fault_agent().await;
+        agent.set_records_dir(root.path().to_owned());
+        let local = InstanceId("default__web-0".into());
+        let execution = crate::grill::RuntimeExecution {
+            instance_id: local.clone(),
+            generation: crate::grill::RuntimeGeneration::process("original"),
+        };
+        let spec: crate::grill::OciSpec = serde_json::from_value(serde_json::json!({
+            "root": {"path": "/fixture", "readonly": true},
+            "process": {"args": ["/app"], "env": [], "cwd": "/", "user": {"uid": 0, "gid": 0}},
+            "mounts": [], "linux": {"namespaces": []},
+        }))
+        .unwrap();
+        agent
+            .supervisor
+            .grill()
+            .set_launch_inventory(vec![crate::grill::RuntimeLaunch {
+                instance_id: local.clone(),
+                generation: execution.generation.clone(),
+                spec,
+                network_reference: None,
+            }])
+            .await;
+        let (mut catalog, ingress) = cluster_publication_fixture();
+        let web = ServiceId::new("default", "web");
+        let with_web = crate::onion::catalog::EndpointCatalog::rebuild(
+            catalog
+                .services
+                .iter()
+                .map(|(qualified, service)| {
+                    (
+                        ServiceId::parse(qualified).unwrap(),
+                        service.port,
+                        service.backends.clone(),
+                    )
+                })
+                .chain([(
+                    web.clone(),
+                    8080,
+                    vec![crate::onion::catalog::CatalogBackend {
+                        execution: Some(execution),
+                        node_id: "test".into(),
+                        node_ip: "192.168.1.1".parse().unwrap(),
+                        host_port: 30002,
+                        healthy: true,
+                    }],
+                )]),
+        )
+        .unwrap();
+        catalog = with_web;
+        let vip = catalog.resolve(&web).unwrap().vip;
+        let lease = agent.view_lease_handle();
+        assert!(lease.is_valid(), "a standalone view never lapses");
+        agent
+            .recover_consumer_ownership(&root.path().join("discovery"), identity)
+            .await
+            .unwrap();
+        assert!(!lease.is_valid(), "nothing routes before the first answer");
+        // The instance this node runs, as adoption would register it.
+        let own = agent.local_backend(&local, &web, Some("10.0.2.2".parse().unwrap()), 30002, true);
+        agent.service_map = crate::onion::service_map::ServiceMap::from_snapshot(&[
+            crate::onion::types::ServiceEntry {
+                app_name: "web".into(),
+                namespace: "default".into(),
+                namespace_id: crate::onion::vip::name_to_id("default"),
+                app_id: u32::from(vip.0),
+                vip,
+                port: 8080,
+                backends: vec![own.clone()],
+                firewall_allow_from: None,
+            },
+        ])
+        .unwrap();
+
+        let answer = |generation, response| AgentCommand::SyncClusterConsumer {
+            generation,
+            catalog: Box::new(catalog.clone()),
+            ingress: ingress.clone(),
+            withdrawals: vec![],
+            requested_at_ns: crate::onion::lease::boot_clock_ns(),
+            response,
+        };
+        let backends = |agent: &BunAgent<MockGrill>, app: &str| {
+            agent
+                .service_map_tx
+                .borrow()
+                .resolve(&ServiceId::new("default", app))
+                .map(|entry| entry.backends.clone())
+        };
+        let (response, reply) = oneshot::channel();
+        agent.handle_command(answer(1, response)).await;
+        assert!(reply.await.unwrap().unwrap().published);
+        assert!(lease.is_valid(), "publishing the leader's answer renews it");
+        assert_eq!(backends(&agent, "web"), Some(vec![own.clone()]));
+        assert_eq!(backends(&agent, "remote").unwrap().len(), 1);
+
+        // The leader stops answering for longer than the lease.
+        lease.expire();
+        agent.fence_lapsed_view().await.unwrap();
+        assert_eq!(
+            backends(&agent, "web"),
+            Some(vec![own.clone()]),
+            "this node's own backend keeps serving"
+        );
+        assert_eq!(
+            backends(&agent, "remote"),
+            Some(vec![]),
+            "another node's backend stops"
+        );
+        assert_eq!(agent.consumer_owner().unwrap().phase, ConsumerPhase::Active);
+        let routes = agent.routing_table.read().await.list_routes();
+        assert!(routes.iter().all(|route| route.healthy_backends == 0));
+        assert!(
+            matches!(
+                agent.confirm_producer_release(&local).await,
+                Err(BunError::ProducerReleasePending { .. })
+            ),
+            "a routed local address must not be released"
+        );
+
+        // A local change still reaches the local view, but never remote ones.
+        agent.service_map.remove_backend(&web, &local.0).unwrap();
+        agent.consumer_view_stale = true;
+        agent.refresh_consumer_view().await.unwrap();
+        assert_eq!(backends(&agent, "web"), Some(vec![]));
+        assert_eq!(backends(&agent, "remote"), Some(vec![]));
+
+        // The next answer, even for the same catalogue, restores the rest.
+        let (response, reply) = oneshot::channel();
+        agent.handle_command(answer(1, response)).await;
+        assert!(reply.await.unwrap().unwrap().published);
+        assert!(lease.is_valid());
+        assert_eq!(agent.consumer_owner().unwrap().phase, ConsumerPhase::Active);
+        assert_eq!(backends(&agent, "remote").unwrap().len(), 1);
+        assert_eq!(backends(&agent, "web"), Some(vec![]));
+    }
+
     #[tokio::test]
     async fn durable_consumer_waits_for_http_and_websocket_release_then_recovers_receipt_retry() {
         use crate::bun::consumer_owners::ConsumerIdentity;
@@ -21505,6 +21869,7 @@ host = "remote.local"
                 catalog: Box::default(),
                 ingress: vec![],
                 withdrawals: vec![],
+                requested_at_ns: crate::onion::lease::boot_clock_ns(),
                 response,
             })
             .await;
@@ -21793,6 +22158,11 @@ host = "remote.local"
             .synchronise_consumer(1, catalog.clone(), ingress, vec![])
             .await
             .unwrap();
+        // As if the leader had just answered: a lapsed lease would shrink
+        // the view to local backends on the next refresh.
+        agent
+            .renew_view_lease(crate::onion::lease::boot_clock_ns())
+            .await;
         (agent, root, catalog)
     }
 

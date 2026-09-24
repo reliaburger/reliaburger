@@ -5,11 +5,49 @@ fonts, analytics or third-party requests. Publish the contents of this directory
 with the GitHub Pages workflow (`.github/workflows/static.yml`); workflow and
 custom-domain configuration are managed separately.
 
-JavaScript: none today. The one planned exception (decision D2 in
-`docs/plans/2026-09-23-zero-to-cluster.md`) is a vendored copy of the
-asciinema player, served from this directory, to embed the recording of the
-tour. Everything else, including the tour itself, must keep working with
-scripts disabled. Don't add other scripts.
+JavaScript: one script, for one thing (decision D2 in
+`docs/plans/2026-09-23-zero-to-cluster.md`). `assets/tour-player.js` plays the
+tour's recording, `assets/tour.cast`, with a vendored copy of the asciinema
+player in `assets/asciinema/`. It loads the player and the recording from this
+site, and only when someone opens the tour; nothing is fetched from anywhere
+else. With scripts disabled a `<noscript>` note links the `.cast` file, and the
+written tour works as before. Don't add other scripts. The footer says the same,
+so change both together.
+
+The player is asciinema-player 3.17.0 (Apache 2.0, `assets/asciinema/LICENSE`),
+the `dist/bundle/asciinema-player.min.js` and `asciinema-player.css` files from
+the npm tarball
+`https://registry.npmjs.org/asciinema-player/-/asciinema-player-3.17.0.tgz`
+(integrity `sha512-JbjNJmA2TLIeYNaOEja+kVSzXadKoqpIzVVmfBGNj2DmdtE/vExBCnkE8NYEcpaQcDvUYg8Ltt0urT80frACmw==`).
+The bundle is self-contained: no fonts, workers or other files to fetch. To
+upgrade, replace those three files from a newer tarball and check the
+recording still plays.
+
+### Re-recording the tour
+
+`scripts/demo/tour.sh` runs the tour for real: it reads the commands from this
+page's `data-tour` elements, types each one, runs it and waits on the
+cluster's real state where the tour says to wait. `tests/suite/website.rs`
+runs `tour.sh --check`, which fails if the page gains a command the script
+doesn't know how to run. To record, with `bun` and `relish` for Linux in
+`target/tour-bins` (built `--release --features ebpf`), the host `relish` on
+`PATH` or in `RELISH`, and no other quickstart cluster on the default ports:
+
+```sh
+RELIABURGER_HOME=~/.rbtour scripts/demo/tour.sh \
+  --record docs/website/assets/tour.cast --setup target/tour-bins
+RELIABURGER_HOME=~/.rbtour relish local destroy --yes
+```
+
+`--record` runs the tour inside `asciinema rec` (110x32, idle time cut to two
+seconds) and then plays the setup step four times faster, because setup redraws
+its timers several times a second and idle trimming can't shorten it. The
+narration says both, and every wait prints how long it really took. Until the
+release is published, the recording shows `relish setup --quickstart
+--development-binaries` where the tour says `curl … | sh`; the script says so on
+screen. It applies the demo URL when it answers, and
+`examples/kubernetes/podinfo.yaml` (with a note) when it doesn't.
+`asciinema play docs/website/assets/tour.cast` plays the result in a terminal.
 
 The "Try it in five minutes" tour is a `<details>` element, so it opens and
 closes without script. Each command in it carries a `data-tour` attribute.
