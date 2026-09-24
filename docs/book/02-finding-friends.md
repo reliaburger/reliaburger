@@ -427,7 +427,9 @@ Each protocol interval, the node runs one probe cycle:
 
 5. **Indirect probing.** If no direct ACK arrives, we send PING-REQ to a few random relay nodes, asking them to probe the target on our behalf. This distinguishes "the target is down" from "the network between us and the target is down."
 
-6. **Mark as suspect.** If neither the direct nor indirect probes produce an ACK, the target is marked suspect and a Suspect update is enqueued for dissemination.
+6. **Mark as suspect.** We wait one more `probe_timeout` for a relayed ACK, or a late direct one. If nothing arrives, the target becomes suspect and a Suspect update is enqueued for dissemination.
+
+That second wait happens even when there's no relay to ask. We first skipped it in that case, which sounds harmless until you picture a three-node cluster that has just lost a member. The lost member is the only possible relay, so the leader has none, and a single ACK that took more than 200 ms on a busy CI runner was enough to make it suspect its one healthy follower. Nothing broke, since the follower refuted the suspicion a moment later. But for that moment the leader's fault-safety rail counted two of its three voters as gone. Waiting both windows every time costs at most 200 ms of detection, and only in a cluster too small to have a relay.
 
 ### Handling incoming messages
 

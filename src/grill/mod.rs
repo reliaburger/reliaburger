@@ -46,7 +46,7 @@ use std::fmt;
 use tokio::sync::mpsc;
 
 pub use cgroup::{CgroupParams, cgroup_path, compute_cgroup_params, cpu_max_from_millicores};
-pub use image::ImageStore;
+pub use image::{ImageMirrors, ImageStore};
 pub use oci::{OciSpec, generate_job_oci_spec, generate_oci_spec};
 pub use port::{PortAllocator, PortError};
 pub use process::ProcessGrill;

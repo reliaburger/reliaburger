@@ -4,8 +4,9 @@
 /// 1. Picks a random alive peer to probe.
 /// 2. Sends a PING (with piggybacked membership updates).
 /// 3. Waits for an ACK within `probe_timeout`.
-/// 4. If no ACK, sends PING-REQ to `indirect_probe_count` random peers.
-/// 5. If still no ACK, marks the target as Suspect.
+/// 4. If no ACK, sends PING-REQ to up to `indirect_probe_count` random peers.
+/// 5. Waits one more `probe_timeout` for a relayed or late direct ACK
+///    (even when no relay exists), then marks the target as Suspect.
 /// 6. Promotes expired suspects to Dead.
 ///
 /// Every `push_pull_interval` (and on the first cycle, so a joining node
@@ -575,14 +576,16 @@ impl<T: MustardTransport> MustardNode<T> {
                 .await;
         }
 
-        // Wait for indirect ACK
-        if !relays.is_empty() {
-            let got_indirect = self
-                .wait_for_ack(&target_id, self.config.probe_timeout)
-                .await;
-            if got_indirect {
-                return;
-            }
+        // Wait for an indirect ACK, or a late direct one. Wait even with no
+        // relays: in a three-node cluster that has lost one member, the lost
+        // member is the only possible relay, and suspecting the healthy peer
+        // after a single `probe_timeout` would halve the evidence every other
+        // probe gets. One slow ACK on a loaded host was enough.
+        let got_late_or_indirect = self
+            .wait_for_ack(&target_id, self.config.probe_timeout)
+            .await;
+        if got_late_or_indirect {
+            return;
         }
 
         // No ACK at all — mark as suspect, unless the gate closed while we
@@ -1225,7 +1228,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn ping_receives_ack() {
         let net = InMemoryNetwork::new();
         let t1 = net.register(addr(1)).await;
@@ -1245,16 +1248,8 @@ mod tests {
             "seed membership is not rejoin evidence"
         );
 
-        // Spawn n2 to handle incoming messages
-        let shutdown = CancellationToken::new();
-        let shutdown2 = shutdown.clone();
-        let handle = tokio::spawn(async move {
-            node2.run(shutdown2).await;
-            node2
-        });
-
         // n1 runs one probe cycle — should ping n2 and get ACK
-        node1.run_one_cycle().await;
+        probe_answered_by(&mut node1, answer(&mut node2)).await;
 
         assert!(
             *rejoin_rx.borrow(),
@@ -1264,9 +1259,6 @@ mod tests {
         // n2 should still be alive (not suspected)
         let n2_state = node1.membership.get(&NodeId::new("n2")).unwrap().state;
         assert_eq!(n2_state, NodeState::Alive);
-
-        shutdown.cancel();
-        let _ = handle.await;
     }
 
     #[tokio::test]
@@ -1574,7 +1566,7 @@ mod tests {
         assert!(node2.membership.get(&NodeId::new("n3")).is_some());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn ping_timeout_triggers_ping_req() {
         // 3 nodes: A, B, C. Partition A↔B. When A probes B, the direct
         // PING times out. A should then send a PingReq to C (the only
@@ -1614,17 +1606,10 @@ mod tests {
         // Partition A↔B so direct PING is dropped
         net.partition(addr(1), addr(2)).await;
 
-        // Spawn C so it responds to A's pings and PingReqs
-        let shutdown = CancellationToken::new();
-        let shutdown_c = shutdown.clone();
-        let handle_c = tokio::spawn(async move {
-            node_c.run(shutdown_c).await;
-            node_c
-        });
-
-        // Run cycles until A picks B and marks it Suspect
+        // Run cycles until A picks B and marks it Suspect, with C answering
+        // A's pings and PingReqs on the same task.
         for _ in 0..20 {
-            node_a.run_one_cycle().await;
+            probe_answered_by(&mut node_a, answer(&mut node_c)).await;
             if node_a
                 .membership
                 .get(&NodeId::new("b"))
@@ -1633,9 +1618,6 @@ mod tests {
                 break;
             }
         }
-
-        shutdown.cancel();
-        let _node_c = handle_c.await.unwrap();
 
         // A should have marked B as Suspect
         assert_eq!(
@@ -1660,7 +1642,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn ping_req_relay_forwards_to_target_and_requester() {
         // When C receives a PingReq from A asking to probe B, C should:
         // 1. Send a Ping to B
@@ -1688,21 +1670,14 @@ mod tests {
         );
         ta.send(addr(3), &ping_req).await.unwrap();
 
-        // C processes the PingReq — spawns a Ping to B and waits for ACK.
-        // We need B to respond, so spawn B's handler concurrently.
-        let shutdown = CancellationToken::new();
-        let shutdown_b = shutdown.clone();
-        let handle_b = tokio::spawn(async move {
-            node_b.run(shutdown_b).await;
-            node_b
-        });
-
-        // C handles the PingReq (will send Ping to B, wait for ACK, forward to A)
+        // C handles the PingReq (will send Ping to B, wait for ACK, forward
+        // to A) while B answers on the same task.
         let (from, msg) = node_c.transport.recv().await.unwrap();
-        node_c.handle_message(from, msg).await;
-
-        shutdown.cancel();
-        let _node_b = handle_b.await.unwrap();
+        tokio::select! {
+            biased;
+            () = answer(&mut node_b) => {}
+            () = node_c.handle_message(from, msg) => {}
+        }
 
         // A should have received a forwarded ACK with sender=B
         let mut saw_forwarded_ack = false;
@@ -1717,7 +1692,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn indirect_probe_success_prevents_suspect() {
         // A↔B partitioned, but A↔C and B↔C are fine. When A probes B,
         // the direct PING fails, but C relays successfully. B should
@@ -1740,30 +1715,18 @@ mod tests {
         node_a.add_seed(NodeId::new("b"), addr(2));
         node_a.add_seed(NodeId::new("c"), addr(3));
 
-        // Spawn B and C so they can handle messages while A runs its probe cycle.
-        // A's run_one_cycle will: PING B (dropped), timeout, PingReq to C,
-        // C probes B (succeeds), C forwards ACK to A, A receives it.
-        let shutdown = CancellationToken::new();
-        let shutdown_b = shutdown.clone();
-        let shutdown_c = shutdown.clone();
-        let handle_b = tokio::spawn(async move {
-            node_b.run(shutdown_b).await;
-            node_b
-        });
-        let handle_c = tokio::spawn(async move {
-            node_c.run(shutdown_c).await;
-            node_c
-        });
-
+        // B and C answer while A runs its probe cycles. A's cycle will:
+        // PING B (dropped), timeout, PingReq to C, C probes B (succeeds),
+        // C forwards ACK to A, A receives it.
+        //
         // Run cycles until A probes B. If A picks C, the cycle succeeds
         // normally. We keep going until A has probed B at least once.
         for _ in 0..20 {
-            node_a.run_one_cycle().await;
+            let peers = async {
+                tokio::join!(answer(&mut node_b), answer(&mut node_c));
+            };
+            probe_answered_by(&mut node_a, peers).await;
         }
-
-        shutdown.cancel();
-        let _ = handle_b.await;
-        let _ = handle_c.await;
 
         // B should still be Alive (indirect probe via C saved it)
         let b_state = node_a.membership.get(&NodeId::new("b")).unwrap().state;
@@ -1772,6 +1735,65 @@ mod tests {
             NodeState::Alive,
             "B should be Alive thanks to indirect probe via C, but was {b_state}"
         );
+    }
+
+    /// Answer everything that reaches `node` for as long as it is polled.
+    async fn answer(node: &mut MustardNode<InMemoryTransport>) {
+        while let Some((from, message)) = node.transport.recv().await {
+            node.handle_message(from, message).await;
+        }
+    }
+
+    /// Run one probe cycle on `prober` while `peers` answer on the same task.
+    ///
+    /// Spawned peer `run` loops let a loaded host starve them past the
+    /// prober's 20 ms probe window. Here `biased` polls the peers first, so
+    /// every message already delivered is answered before the prober looks
+    /// again, and under paused time the clock only moves once both sides are
+    /// idle.
+    async fn probe_answered_by(
+        prober: &mut MustardNode<InMemoryTransport>,
+        peers: impl std::future::Future<Output = ()>,
+    ) {
+        tokio::select! {
+            biased;
+            () = peers => {}
+            () = prober.run_one_cycle() => {}
+        }
+    }
+
+    /// Probe `b` from `a` once, with `b` answering the PING after `delay`.
+    /// Neither node has a relay for the other, like a three-node cluster
+    /// that has already lost one member. Paused time and no spawned task
+    /// make the ACK's lateness exact.
+    async fn probe_without_relays(delay: Duration) -> NodeState {
+        let net = InMemoryNetwork::new();
+        let ta = net.register(addr(1)).await;
+        let tb = net.register(addr(2)).await;
+        let mut a = MustardNode::new(NodeId::new("a"), addr(1), fast_config(), ta);
+        let mut b = MustardNode::new(NodeId::new("b"), addr(2), fast_config(), tb);
+        a.add_seed(NodeId::new("b"), addr(2));
+        a.next_push_pull = Instant::now() + Duration::from_secs(3600);
+
+        let b_answers = async {
+            let (from, ping) = b.transport.recv().await.expect("a pings b");
+            tokio::time::sleep(delay).await;
+            b.handle_message(from, ping).await;
+        };
+        tokio::join!(a.run_one_cycle(), b_answers);
+        a.membership.get(&NodeId::new("b")).unwrap().state
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn late_ack_without_relays_keeps_the_target_alive() {
+        let late = fast_config().probe_timeout * 3 / 2;
+        assert_eq!(probe_without_relays(late).await, NodeState::Alive);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silence_past_both_probe_windows_without_relays_suspects_the_target() {
+        let too_late = fast_config().probe_timeout * 5 / 2;
+        assert_eq!(probe_without_relays(too_late).await, NodeState::Suspect);
     }
 
     /// Rounds between anti-entropy exchanges in the manual simulations: the
@@ -2129,7 +2151,7 @@ mod tests {
 
     // -- directory extension propagation (12b.2) ------------------------------
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn ack_carries_advertised_endpoints_to_the_prober() {
         let net = InMemoryNetwork::new();
         let t1 = net.register(addr(1)).await;
@@ -2140,17 +2162,8 @@ mod tests {
         node2.set_advertised_endpoints(9117, 9445, BTreeMap::new());
         node1.add_seed(NodeId::new("n2"), addr(2));
 
-        let shutdown = CancellationToken::new();
-        let shutdown2 = shutdown.clone();
-        let handle = tokio::spawn(async move {
-            node2.run(shutdown2).await;
-            node2
-        });
-
         // n1 probes n2; n2's ACK carries its directory extension.
-        node1.run_one_cycle().await;
-        shutdown.cancel();
-        let _ = handle.await;
+        probe_answered_by(&mut node1, answer(&mut node2)).await;
 
         let endpoints = node1
             .directory()
@@ -2303,7 +2316,7 @@ mod tests {
         assert!(rx.borrow().endpoints.contains_key(&NodeId::new("n2")));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn advertised_disk_pressure_reaches_a_remote_member_via_gossip() {
         // n2 advertises disk pressure; n1 probes it and must record n2 in its
         // directory's `disk_pressured` set — the wire path the leader's
@@ -2319,16 +2332,7 @@ mod tests {
         node2.set_disk_pressured_watch(pressure_rx);
         node1.add_seed(NodeId::new("n2"), addr(2));
 
-        let shutdown = CancellationToken::new();
-        let shutdown2 = shutdown.clone();
-        let handle = tokio::spawn(async move {
-            node2.run(shutdown2).await;
-            node2
-        });
-
-        node1.run_one_cycle().await;
-        shutdown.cancel();
-        let _ = handle.await;
+        probe_answered_by(&mut node1, answer(&mut node2)).await;
         drop(pressure_tx);
 
         assert!(
@@ -2340,7 +2344,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn advertised_labels_reach_a_remote_member_via_gossip() {
         // n2 advertises a zone label; n1 probes it and must learn that
         // label on n2's membership record — the wire path that makes
@@ -2358,16 +2362,7 @@ mod tests {
         );
         node1.add_seed(NodeId::new("n2"), addr(2));
 
-        let shutdown = CancellationToken::new();
-        let shutdown2 = shutdown.clone();
-        let handle = tokio::spawn(async move {
-            node2.run(shutdown2).await;
-            node2
-        });
-
-        node1.run_one_cycle().await;
-        shutdown.cancel();
-        let _ = handle.await;
+        probe_answered_by(&mut node1, answer(&mut node2)).await;
 
         let member = node1
             .membership

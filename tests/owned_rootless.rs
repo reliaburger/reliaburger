@@ -220,6 +220,100 @@ async fn rootless_port_and_launcher_survive_recovery_and_helper_replacement() {
     );
 }
 
+/// A published rootless httpd, started through `bun-wrapper` so a test can
+/// break later helper starts. Returns the runtime, its helper and its URL.
+async fn start_published_with_wrapper(
+    data: &Path,
+    id: &InstanceId,
+) -> (
+    RuncGrill,
+    reliaburger::grill::records::RootlessNetworkRecord,
+    String,
+) {
+    use reliaburger::grill::oci::PortMapping;
+    use std::os::unix::fs::PermissionsExt;
+    let quote = |path: &Path| format!("'{}'", path.to_str().unwrap().replace('\'', "'\\''"));
+    // With the marker present, every new helper exits before it serves its API.
+    std::fs::write(
+        data.join("bun-wrapper"),
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = __rootless-network ] && [ -e {} ]; then\n  echo broken-helper >&2\n  exit 1\nfi\nexec {} \"$@\"\n",
+            quote(&data.join("break-helper")),
+            quote(Path::new(env!("CARGO_BIN_EXE_bun")))
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        data.join("bun-wrapper"),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let mut spec = specification(data, "exec /bin/busybox httpd -f -p 8080 -h /work");
+    spec.port_mapping = Some(PortMapping {
+        host_port: port,
+        container_port: 8080,
+    });
+    std::fs::write(data.join("shared/index.html"), "owned-rootless").unwrap();
+    let runtime = runtime(data);
+    runtime.create(id, &spec).await.unwrap();
+    install_fixture(data, id);
+    runtime.start(id).await.unwrap();
+    let network = runtime.rootless_network_record(id).await.unwrap();
+    let url = format!("http://127.0.0.1:{port}");
+    assert_eq!(read_page(&url).await, "owned-rootless");
+    (runtime, network, url)
+}
+
+#[tokio::test]
+#[ignore = "requires unprivileged Linux user, rootless runc, slirp4netns and static busybox"]
+async fn rootless_helper_dying_while_its_readiness_is_probed_is_replaced() {
+    let root = tempfile::tempdir().unwrap();
+    let id = InstanceId("rootless-probed".into());
+    let (runtime, network, url) = start_published_with_wrapper(root.path(), &id).await;
+    // Leave a dead socket file where the helper's API was, so supervision sees
+    // a helper its owner still reports running but whose API refuses. That is
+    // the window between a helper's death and its owner reaping it.
+    std::fs::remove_file(&network.api_socket).unwrap();
+    drop(std::os::unix::net::UnixListener::bind(&network.api_socket).unwrap());
+    let helper = nix::unistd::Pid::from_raw(network.owner_pid as i32);
+    let killer = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        nix::sys::signal::kill(helper, nix::sys::signal::Signal::SIGKILL).unwrap();
+    });
+    assert_eq!(runtime.state(&id).await.unwrap(), ContainerState::Running);
+    killer.await.unwrap();
+    let replacement = runtime.rootless_network_record(&id).await.unwrap();
+    assert_ne!(replacement.owner_pid, network.owner_pid);
+    assert_eq!(read_page(&url).await, "owned-rootless");
+    runtime.kill(&id).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires unprivileged Linux user, rootless runc, slirp4netns and static busybox"]
+async fn rootless_helper_that_keeps_dying_is_reported_then_recovers() {
+    let root = tempfile::tempdir().unwrap();
+    let id = InstanceId("rootless-broken".into());
+    let (runtime, network, url) = start_published_with_wrapper(root.path(), &id).await;
+    std::fs::write(root.path().join("break-helper"), "").unwrap();
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(network.owner_pid as i32),
+        nix::sys::signal::Signal::SIGKILL,
+    )
+    .unwrap();
+    let error = runtime.state(&id).await.unwrap_err().to_string();
+    assert!(
+        error.contains("exited before readiness") && error.contains("broken-helper"),
+        "{error}"
+    );
+    std::fs::remove_file(root.path().join("break-helper")).unwrap();
+    assert_eq!(runtime.state(&id).await.unwrap(), ContainerState::Running);
+    assert_eq!(read_page(&url).await, "owned-rootless");
+    runtime.kill(&id).await.unwrap();
+}
+
 #[tokio::test]
 #[ignore = "requires unprivileged Linux user, rootless runc, slirp4netns and static busybox"]
 async fn rootless_caller_death_recovers_without_an_adoption_record() {

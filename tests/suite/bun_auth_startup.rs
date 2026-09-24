@@ -4,10 +4,12 @@
 //! administrative API reachable beyond an IP-literal loopback listener.
 
 use std::io::Read as _;
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
+
+use crate::bun_process::reserve_ports;
 
 fn write_config(root: &Path) -> std::path::PathBuf {
     let config = root.join("node.toml");
@@ -44,15 +46,6 @@ registry_port = 0
     )
     .unwrap();
     config
-}
-
-fn reserve_ports() -> [u16; 3] {
-    let listeners = [
-        TcpListener::bind("127.0.0.1:0").unwrap(),
-        TcpListener::bind("127.0.0.1:0").unwrap(),
-        TcpListener::bind("127.0.0.1:0").unwrap(),
-    ];
-    listeners.map(|listener| listener.local_addr().unwrap().port())
 }
 
 fn bun_command(config: &Path, listen: &str, clustered: bool) -> Command {

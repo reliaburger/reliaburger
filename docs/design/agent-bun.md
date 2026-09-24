@@ -181,7 +181,14 @@ socket and optional host forward. Schema-v2 instance records persist those
 recreation parameters plus a PID/start-time fingerprint. During adoption Grill
 reclaims a matching live owner, or replaces a missing owner and reapplies the
 forward before returning success. It never signals a PID whose start time no
-longer matches. Rootless cgroup limits remain an admission-time refusal: Bun
+longer matches. A helper that dies while supervision probes it (its owner can
+still report it running until the next 10 ms reaping tick) is replaced, not
+reported. Each supervision pass starts at most three helpers, with 100 ms
+linear backoff; only when all of them exit before serving the API does
+`state()` return "exited before readiness" with the last attempt's stderr.
+Connection-level API failures (missing or refused socket, reset, EOF) are
+retried within the 5 s readiness window; API refusals and conflicting
+forwarding inventories fail immediately. Rootless cgroup limits remain an admission-time refusal: Bun
 doesn't create a delegated user scope, so the OCI rewrite removes the rootful
 cgroup path rather than fabricating a path runc cannot write.
 
@@ -1347,6 +1354,7 @@ join = ["10.0.1.5:9443"]
 | `[images]` | `gc_retain_days` | `30` | 1-365 | Keep images accessed within this many days. |
 | `[images]` | `pre_pull` | `true` | bool | Pre-pull images referenced by scheduled workloads. |
 | `[images]` | `external_registries` | `[]` | list of registry objects | External OCI registries for pulling images not in Pickle. |
+| `[images]` | `mirrors` | `{}` | map of upstream host to mirror `host[:port]` | Registries tried first for digest-pinned images; the upstream is the fallback. |
 | `[logs]` | `retention_days` | `7` | 1-365 | Days to retain uncompressed logs. |
 | `[logs]` | `compressed_retention_days` | `30` | 1-3650 | Days to retain compressed logs. |
 | `[logs]` | `max_storage` | `"20Gi"` | resource string (bytes) | Maximum disk space for logs. |

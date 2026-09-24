@@ -1697,6 +1697,16 @@ again. Using the cluster service token here would be convenient, but it would
 also turn any compromised follower into the owner of every test lease.
 Convenience doesn't get a vote on authority.
 
+A forwarded create has one more wrinkle. The leader answers once a quorum
+has committed the lease, and that quorum doesn't have to include the follower
+that forwarded it. The caller's very next request is an apply under the new
+lease, usually sent to the same follower, which checks the lease against its
+own replica before forwarding. A multi-node CI run caught it answering "lease
+not found" for a lease it had handed out a millisecond earlier. So the
+follower now holds the `201 Created` until its own replica has applied the
+lease, for up to five seconds: read-your-writes for anyone who stays on the
+same node.
+
 The runner now creates one lease after capability gating and before it runs a
 case. It asks for the case budget plus the fixed cleanup budget; if the server's
 maximum can't cover both, the case becomes `Unknown` without touching the
@@ -2666,6 +2676,29 @@ one hostname across concurrently deployed test apps lets one case accidentally
 route to another case's backend. Namespace isolation must extend to the ingress
 name, not just the app record.
 
+
+## Don't let the internet grade your tests
+
+One release candidate failed on a line we'd never touched:
+`registry read deadline exceeded`, while staging BusyBox from ECR. Nothing in
+Reliaburger was broken. A CDN edge had a slow minute. Two fixes, one for users
+and one for us. Chapter 5 covers the product side: stalled reads now retry
+inside a bounded total, and digest-pinned images can come from a mirror.
+
+The harness side uses that same mirror feature. Every public image the Linux
+suites run is pinned by digest in `testkit::pinned_images`. A small
+standard-library Python script fetches them once, with retries, into a
+content-addressed cache and serves it as a read-only registry on loopback.
+`make test-linux` runs nextest under it, and the tests hand
+`[images] mirrors` to every Bun they start. Why a mirror rather than, say,
+copying files into Bun's image store? Because the mirror goes through exactly
+the code users run: the same client, the same index resolution, the same digest
+checks. Pre-seeding the store would test a path nobody takes. And because the
+content is addressed by digest, the mirror can't lie: bad bytes fail
+verification and Bun falls back to the real registry.
+
+The proof we wanted was blunt. Warm the cache, cut the VM's uplink, run the
+image-pulling suites. They pass.
 
 ## Lessons learned: audit the evidence too
 

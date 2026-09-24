@@ -679,11 +679,83 @@ Both now resolve the location with `url::Url` and refuse any change of scheme,
 host or port. Second, public registries rate-limit and drop connections. A
 privileged CI run lost its BusyBox pull to `Rate exceeded` after 42 other checks
 passed. Reads now retry rate limits, temporary gateway errors and interrupted
-streams, at most four attempts with jittered backoff, all inside *one* deadline
-(30 seconds for metadata, 120 per layer), so a stalled request can't reset the
-clock. Each attempt starts from an empty buffer, so a half-received body never
-prefixes the next one. Authentication failures, missing images and integrity
-failures don't retry: asking again won't change the answer.
+streams, at most four attempts with jittered backoff, all inside *one* deadline,
+so a stalled request can't reset the clock. Each attempt starts from an empty
+buffer, so a half-received body never prefixes the next one. Authentication
+failures, missing images and integrity failures don't retry: asking again won't
+change the answer.
+
+That first version had a blind spot, and a release candidate found it. The
+deadline covered the whole read, so one stalled connection could spend all 30
+seconds of a manifest budget and leave no time to retry. A slow CDN edge does
+exactly that: one connection hangs while a fresh one would answer at once. The
+run failed with `registry read deadline exceeded` after a single attempt. Now
+each read has two limits, a ceiling per attempt and a total:
+
+```rust
+pub(crate) struct RegistryReadBudget {
+    pub(crate) attempt: Duration,
+    pub(crate) total: Duration,
+}
+
+pub(crate) const METADATA_READ: RegistryReadBudget = RegistryReadBudget {
+    attempt: Duration::from_secs(30),
+    total: Duration::from_secs(120),
+};
+```
+
+A `const` is evaluated at compile time and inlined wherever it's used, which is
+why `Duration::from_secs` has to be a `const fn` to appear here. The retry loop
+gives each attempt `min(now + attempt, deadline)` through
+`tokio::time::timeout_at`, and treats an expired attempt like any other
+transient failure. A single attempt keeps the old ceiling (30 seconds for
+metadata, 120 per layer); the totals (two and six minutes) leave room for the
+retries. Server errors (500, 408) and refused connections joined the transient
+list too. The unit tests drive it with `#[tokio::test(start_paused = true)]` and
+`std::future::pending()`, a future that never completes, so "the registry hung
+for 30 seconds" takes no real time at all.
+
+Retries help when the internet is slow. They can't help when it's gone, and
+some clusters never had it: air-gapped sites, or a CI job that shouldn't depend
+on a CDN's mood. So digest-pinned images can come from a mirror:
+
+```toml
+[images]
+mirrors = { "public.ecr.aws" = "mirror.internal:5000" }
+```
+
+Why only digest-pinned ones? Because a digest makes the mirror harmless. When a
+deployment asks for `busybox@sha256:9532…`, Bun hashes the index, the platform
+manifest, the config and every layer it receives, whoever sent them. A mirror
+that serves anything else fails verification, and Bun falls back to the real
+registry. A tag is different. `busybox:1.37` means whatever the registry says
+today, so a mirror answering it would be choosing the image for us. Tags always
+go home.
+
+Validation happens while the config parses, not when the first pull fails:
+
+```rust
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "BTreeMap<String, String>", into = "BTreeMap<String, String>")]
+pub struct ImageMirrors(BTreeMap<String, String>);
+
+impl TryFrom<BTreeMap<String, String>> for ImageMirrors {
+    type Error = ImageError;
+
+    fn try_from(mirrors: BTreeMap<String, String>) -> Result<Self, Self::Error> {
+        Self::new(mirrors)
+    }
+}
+```
+
+`TryFrom` is the standard library's trait for fallible conversions, and `type
+Error = ImageError;` is an *associated type*: each implementation names its own
+error type, where Go would return a bare `error` interface. The `try_from`
+attribute tells serde to deserialise a plain map first, then run it through our
+conversion. There's no way to build an `ImageMirrors` holding `https://…` or a
+path, so the pull code never has to check again. Loopback mirrors use plain
+HTTP, like the loopback registries the tests already use; everything else stays
+on HTTPS.
 
 ## Who owns these bytes?
 

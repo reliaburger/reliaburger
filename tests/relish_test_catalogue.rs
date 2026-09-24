@@ -217,6 +217,9 @@ fn qualify_runc_catalogue(group: &str) {
     node.storage.metrics = root.path().join("metrics");
     node.storage.volumes = root.path().join("volumes");
     node.images.registry_port = 0;
+    // Pull the pinned workload from the local test mirror when the harness
+    // runs one, so a slow public registry can't fail the timed catalogue.
+    node.images.mirrors = reliaburger::testkit::pinned_images::local_test_mirrors().unwrap();
     node.testing.safety_class = reliaburger::testkit::safety::ClusterSafetyClass::Development;
     node.testing
         .allowed_operations

@@ -486,6 +486,35 @@ fn chown_identity_dir(_dir: &Path, _uid: u32, _gid: u32) -> Result<(), IdentityE
     Ok(())
 }
 
+/// Name prefix of the temporary file behind every atomic write.
+const ATOMIC_WRITE_PREFIX: &str = ".reliaburger-";
+
+/// Delete temporaries that atomic writes into `directory` left behind.
+///
+/// A writer killed between creating its temporary and renaming it leaves
+/// the temporary in place. Call this only once nothing can still be writing
+/// into `directory`, before removing it.
+// Only the Linux rootless runtime needs it today.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn remove_abandoned_atomic_writes(directory: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(ATOMIC_WRITE_PREFIX)
+            && entry.file_type()?.is_file()
+        {
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Write data to a temp file then atomically rename.
 pub(crate) fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
     atomic_write_mode(path, data, None)
@@ -506,7 +535,7 @@ pub(crate) fn atomic_write_mode(
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     let mut builder = tempfile::Builder::new();
-    builder.prefix(".reliaburger-");
+    builder.prefix(ATOMIC_WRITE_PREFIX);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -597,6 +626,24 @@ mod tests {
             workload_ca_cert_der,
             root_ca_cert_der,
         )
+    }
+
+    #[test]
+    fn abandoned_atomic_write_temporaries_are_removed_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        atomic_write(&dir.path().join("init.json"), b"42").unwrap();
+        // What a writer killed before its rename leaves behind.
+        std::fs::write(dir.path().join(".reliaburger-UdANTP"), b"3853049").unwrap();
+        std::fs::create_dir(dir.path().join(".reliaburger-dir")).unwrap();
+
+        remove_abandoned_atomic_writes(dir.path()).unwrap();
+
+        let mut left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(left, [".reliaburger-dir", "init.json"]);
     }
 
     /// M25: the private key is written owner-only; public certs are not

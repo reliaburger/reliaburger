@@ -143,21 +143,26 @@ impl IngressHarness {
 ///
 /// The routing table rebuilds asynchronously after a deploy, so the
 /// first requests may 404 while the route is still being registered.
+/// The deadline only bounds a broken build: a healthy one returns as soon
+/// as the route answers. The old 40 × 20 ms budget ran out on a loaded
+/// macOS runner before the backend's first health check had passed.
 async fn wait_for_status(
     http_client: &reqwest::Client,
     url: &str,
     host: &str,
     expected: u16,
 ) -> reqwest::Response {
-    for _ in 0..40 {
-        if let Ok(response) = http_client.get(url).header("host", host).send().await
-            && response.status().as_u16() == expected
-        {
-            return response;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let mut last = None;
+    while tokio::time::Instant::now() < deadline {
+        match http_client.get(url).header("host", host).send().await {
+            Ok(response) if response.status().as_u16() == expected => return response,
+            Ok(response) => last = Some(format!("status {}", response.status())),
+            Err(error) => last = Some(error.to_string()),
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    panic!("proxy never returned {expected} for host {host} at {url}");
+    panic!("proxy never returned {expected} for host {host} at {url}; last saw {last:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -374,7 +379,8 @@ async fn ingress_proxies_websocket_handshake_and_bytes() {
 
     // Wait until the route is live (a non-WS GET stops returning 404).
     let http_client = reqwest::Client::new();
-    for _ in 0..40 {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
         let status = http_client
             .get(harness.http_url("/"))
             .header("host", "ws.test")
@@ -385,6 +391,10 @@ async fn ingress_proxies_websocket_handshake_and_bytes() {
         if status != 404 {
             break;
         }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the ws.test route never went live"
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 

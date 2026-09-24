@@ -96,6 +96,79 @@ async fn forwards(
     Ok(true)
 }
 
+/// How many helpers one supervision pass may start before it reports failure.
+const HELPER_START_ATTEMPTS: u32 = 3;
+/// Linear backoff between helper starts within one supervision pass.
+const HELPER_RESTART_BACKOFF: Duration = Duration::from_millis(100);
+
+/// Connection-level failures a starting or dying helper produces. Refusals and
+/// conflicting forwarding inventories are semantic errors and never retried.
+fn transient_api_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::NotFound
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::UnexpectedEof
+    )
+}
+
+async fn helper_running(context: &ClaimedCommandExecutor) -> io::Result<bool> {
+    Ok(matches!(
+        context.role_state(RuntimeRole::RootlessNetwork).await?,
+        Some(CommandState::Running { .. })
+    ))
+}
+
+/// Install (or confirm) the original forward on the bound helper. `Ok(false)`
+/// means the helper exited first: the owner can still report a SIGKILLed helper
+/// as running until it reaps it, so an unanswered socket is only an error while
+/// the owner keeps confirming the helper alive past the deadline.
+async fn helper_ready(
+    context: &ClaimedCommandExecutor,
+    socket: &Path,
+    mapping: Option<crate::grill::oci::PortMapping>,
+) -> io::Result<bool> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if !helper_running(context).await? {
+            return Ok(false);
+        }
+        let error = match install_forward(socket, mapping).await {
+            Ok(()) => return Ok(true),
+            Err(error) => error,
+        };
+        if !helper_running(context).await? {
+            return Ok(false);
+        }
+        if !transient_api_error(&error) || tokio::time::Instant::now() >= deadline {
+            return Err(error);
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn install_forward(
+    socket: &Path,
+    mapping: Option<crate::grill::oci::PortMapping>,
+) -> io::Result<()> {
+    if forwards(socket, mapping).await? {
+        return Ok(());
+    }
+    let mapping = mapping.ok_or_else(|| io::Error::other("missing original port mapping"))?;
+    let added = api(socket, serde_json::json!({"execute": "add_hostfwd", "arguments": {"proto": "tcp", "host_addr": "0.0.0.0", "host_port": mapping.host_port, "guest_addr": "10.0.2.100", "guest_port": mapping.container_port}})).await?;
+    if added["return"]["id"].as_u64().is_none_or(|id| id == 0) {
+        return Err(io::Error::other(
+            "invalid rootless forwarding acknowledgement",
+        ));
+    }
+    if !forwards(socket, Some(mapping)).await? {
+        return Err(io::Error::other("rootless forwarding was not installed"));
+    }
+    Ok(())
+}
+
 impl RuncGrill {
     pub(super) async fn owned_prepare_rootless(
         &self,
@@ -119,6 +192,9 @@ impl RuncGrill {
         }).await.map_err(io::Error::other)?
     }
 
+    /// Ensure the owned helper is running and serving the original forward.
+    /// A helper that dies before or during this check is replaced; only a
+    /// helper this call started that keeps dying before readiness is an error.
     pub(super) async fn owned_rootless_network(
         &self,
         context: &ClaimedCommandExecutor,
@@ -128,95 +204,76 @@ impl RuncGrill {
         let directory = directory(&intent);
         crate::grill::process_owner::validate_socket_directory(&directory)?;
         let socket = directory.join("api.sock");
-        let state = context.role_state(RuntimeRole::RootlessNetwork).await?;
-        match state {
-            Some(CommandState::Running { .. }) => {}
-            None
-            | Some(
-                CommandState::Prepared | CommandState::Cancelled | CommandState::Retired { .. },
-            ) => {
+        let mut started = 0;
+        loop {
+            match context.role_state(RuntimeRole::RootlessNetwork).await? {
+                Some(CommandState::Running { .. }) => {}
                 // Only terminal roles (or fenced, never-started preparations) may
                 // replace this socket. start_role performs the final admission check.
-                if matches!(state, Some(CommandState::Prepared)) {
+                Some(CommandState::Prepared) => {
                     return Err(io::Error::other(
                         "prepared rootless helper requires retirement",
                     ));
                 }
-                crate::grill::process_owner::remove_socket(&socket)?;
-                let stem = context
-                    .role_log_stem(RuntimeRole::Launcher)
-                    .await?
-                    .ok_or_else(|| io::Error::other("rootless launcher has no owner"))?;
-                let launcher = stem
-                    .parent()
-                    .ok_or_else(|| io::Error::other("invalid launcher owner path"))?;
-                let args = vec![
-                    "__rootless-network".into(),
-                    "--launcher".into(),
-                    launcher
-                        .to_str()
-                        .ok_or_else(|| io::Error::other("non-UTF-8 launcher path"))?
-                        .into(),
-                    "--container-pid".into(),
-                    pid.to_string(),
-                    "--api-socket".into(),
-                    socket
-                        .to_str()
-                        .ok_or_else(|| io::Error::other("non-UTF-8 rootless socket path"))?
-                        .into(),
-                ];
-                context
-                    .start_role(
-                        RuntimeRole::RootlessNetwork,
-                        &self.ownership()?.executable,
-                        &args,
-                        &BTreeMap::new(),
-                    )
-                    .await?;
+                None | Some(CommandState::Cancelled | CommandState::Retired { .. }) => {
+                    if started == HELPER_START_ATTEMPTS {
+                        return Err(role_failure(
+                            context,
+                            RuntimeRole::RootlessNetwork,
+                            "rootless network helper exited before readiness",
+                        )
+                        .await);
+                    }
+                    if started > 0 {
+                        tokio::time::sleep(HELPER_RESTART_BACKOFF * started).await;
+                    }
+                    self.start_rootless_helper(context, &socket, pid).await?;
+                    started += 1;
+                }
+            }
+            if helper_ready(context, &socket, intent.spec.port_mapping).await? {
+                return Ok(());
             }
         }
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            if !matches!(
-                context.role_state(RuntimeRole::RootlessNetwork).await?,
-                Some(CommandState::Running { .. })
-            ) {
-                return Err(role_failure(
-                    context,
-                    RuntimeRole::RootlessNetwork,
-                    "rootless network helper exited before readiness",
-                )
-                .await);
-            }
-            match forwards(&socket, intent.spec.port_mapping).await {
-                Ok(true) => return Ok(()),
-                Ok(false) => {
-                    let mapping = intent
-                        .spec
-                        .port_mapping
-                        .ok_or_else(|| io::Error::other("missing original port mapping"))?;
-                    let added = api(&socket, serde_json::json!({"execute": "add_hostfwd", "arguments": {"proto": "tcp", "host_addr": "0.0.0.0", "host_port": mapping.host_port, "guest_addr": "10.0.2.100", "guest_port": mapping.container_port}})).await?;
-                    if added["return"]["id"].as_u64().is_none_or(|id| id == 0) {
-                        return Err(io::Error::other(
-                            "invalid rootless forwarding acknowledgement",
-                        ));
-                    }
-                    if !forwards(&socket, Some(mapping)).await? {
-                        return Err(io::Error::other("rootless forwarding was not installed"));
-                    }
-                    return Ok(());
-                }
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
-                    ) && tokio::time::Instant::now() < deadline =>
-                {
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-                Err(error) => return Err(error),
-            }
-        }
+    }
+
+    async fn start_rootless_helper(
+        &self,
+        context: &ClaimedCommandExecutor,
+        socket: &Path,
+        pid: u32,
+    ) -> io::Result<()> {
+        crate::grill::process_owner::remove_socket(socket)?;
+        let stem = context
+            .role_log_stem(RuntimeRole::Launcher)
+            .await?
+            .ok_or_else(|| io::Error::other("rootless launcher has no owner"))?;
+        let launcher = stem
+            .parent()
+            .ok_or_else(|| io::Error::other("invalid launcher owner path"))?;
+        let args = vec![
+            "__rootless-network".into(),
+            "--launcher".into(),
+            launcher
+                .to_str()
+                .ok_or_else(|| io::Error::other("non-UTF-8 launcher path"))?
+                .into(),
+            "--container-pid".into(),
+            pid.to_string(),
+            "--api-socket".into(),
+            socket
+                .to_str()
+                .ok_or_else(|| io::Error::other("non-UTF-8 rootless socket path"))?
+                .into(),
+        ];
+        context
+            .start_role(
+                RuntimeRole::RootlessNetwork,
+                &self.ownership()?.executable,
+                &args,
+                &BTreeMap::new(),
+            )
+            .await
     }
 
     pub(super) async fn owned_open_rootless_gate(
@@ -276,6 +333,10 @@ impl RuncGrill {
                     Err(error) => return Err(error),
                 }
             }
+            // The OCI hook writes init.json atomically. One killed before its
+            // rename leaves a temporary behind, and removing the directory then
+            // failed with "Directory not empty" on every retry.
+            crate::sesame::identity::remove_abandoned_atomic_writes(&directory)?;
             std::fs::remove_dir(directory)
         })
         .await
@@ -311,5 +372,40 @@ impl RuncGrill {
         .await
         .ok()
         .flatten()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_dying_helper_socket_is_transient() {
+        for kind in [
+            io::ErrorKind::NotFound,
+            io::ErrorKind::ConnectionRefused,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::BrokenPipe,
+        ] {
+            assert!(transient_api_error(&io::Error::from(kind)), "{kind:?}");
+        }
+        // A helper killed mid-request closes the socket without a response.
+        let empty = serde_json::from_slice::<serde_json::Value>(b"").unwrap_err();
+        assert!(transient_api_error(&io::Error::from(empty)));
+    }
+
+    #[test]
+    fn helper_refusals_and_conflicts_are_not_retried() {
+        assert!(!transient_api_error(&io::Error::other(
+            "rootless API refused: bind failed"
+        )));
+        assert!(!transient_api_error(&io::Error::other(
+            "rootless forwarding conflicts with original intent"
+        )));
+        let garbage = serde_json::from_slice::<serde_json::Value>(b"{oops").unwrap_err();
+        assert!(!transient_api_error(&io::Error::from(garbage)));
+        assert!(!transient_api_error(&io::Error::from(
+            io::ErrorKind::TimedOut
+        )));
     }
 }

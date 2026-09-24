@@ -89,19 +89,53 @@ impl Drop for BunProcess {
     }
 }
 
-/// A loopback address whose port the OS just handed out and released.
-pub fn reserve_address() -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap()
+/// Where test ports come from: below every ephemeral range the runners use
+/// (Linux 32768–60999, macOS 49152–65535) and clear of the fixed ports the
+/// in-process cluster suites hard-code (15000–26999, 30000 and up).
+///
+/// Ports the OS hands out with `bind(0)` are the wrong source. macOS assigns
+/// ephemeral ports sequentially to `bind(0)` and `connect()` alike, so the
+/// released port, and the next few after it, are exactly what the next
+/// outgoing connections anywhere on the host receive. On a busy runner one of
+/// them usually has before Bun binds, and Bun exits with "Address already in
+/// use" however often the harness retries.
+const TEST_PORTS: std::ops::Range<u16> = 27000..30000;
+
+/// `count` consecutive loopback ports, each free for both TCP and UDP right now.
+///
+/// They come from [`TEST_PORTS`], which no outgoing connection can be given,
+/// so only another test's concurrent random pick can take one before its
+/// owner binds it.
+pub fn reserve_port_block(count: u16) -> u16 {
+    use rand::Rng;
+    let mut random = rand::thread_rng();
+    for _ in 0..1_000 {
+        let base = random.gen_range(TEST_PORTS.start..TEST_PORTS.end - count);
+        // Holding every socket until the whole block checks out keeps a port
+        // from being counted twice.
+        let held: Option<Vec<_>> = (base..base + count)
+            .map(|port| {
+                let tcp = TcpListener::bind(("127.0.0.1", port)).ok()?;
+                let udp = std::net::UdpSocket::bind(("127.0.0.1", port)).ok()?;
+                Some((tcp, udp))
+            })
+            .collect();
+        if held.is_some() {
+            return base;
+        }
+    }
+    panic!("no free block of {count} test ports in {TEST_PORTS:?}");
 }
 
-/// Three released loopback ports for gossip, Raft and reporting.
+/// A free loopback address for a Bun listener.
+pub fn reserve_address() -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], reserve_port_block(1)))
+}
+
+/// Three free loopback ports for gossip, Raft and reporting.
 pub fn reserve_ports() -> [u16; 3] {
-    [
-        reserve_address().port(),
-        reserve_address().port(),
-        reserve_address().port(),
-    ]
+    let base = reserve_port_block(3);
+    [base, base + 1, base + 2]
 }
 
 /// How a freshly spawned bun came up.

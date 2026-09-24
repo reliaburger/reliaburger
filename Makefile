@@ -1,4 +1,4 @@
-.PHONY: build test test-cargo test-doc test-slow test-linux test-rootless-runc test-cluster test-upgrade test-upgrade-node test-upgrade-cluster test-apple coverage check fmt lint audit clean pdf loc help bench bench-large pickle-test-macos ci ci-full observability-demo kubernetes-demo toml-demo
+.PHONY: build test test-cargo test-doc test-slow test-images test-linux test-rootless-runc test-cluster test-upgrade test-upgrade-node test-upgrade-cluster test-apple coverage check fmt lint audit clean pdf loc help bench bench-large pickle-test-macos ci ci-full observability-demo kubernetes-demo toml-demo
 
 CARGO = cargo
 NEXTEST_PROFILE ?= default
@@ -6,6 +6,10 @@ NEXTEST = $(CARGO) nextest run --profile $(NEXTEST_PROFILE) --no-tests=fail
 COVERAGE_MIN_LINES ?= 78.65
 # Extra nextest filter for test-linux, e.g. to skip suites a job already ran.
 LINUX_EXCLUDE ?=
+# Pinned public images for the Linux suites, fetched once and served on loopback.
+TEST_IMAGE_CACHE ?= $(HOME)/.cache/reliaburger/test-images
+TEST_IMAGE_MIRROR ?= 127.0.0.1:5099
+WITH_TEST_IMAGES = python3 scripts/test-images/mirror.py run --cache "$(TEST_IMAGE_CACHE)" --listen $(TEST_IMAGE_MIRROR) --
 
 # --- Rust targets ---
 
@@ -27,9 +31,12 @@ test-doc: ## Run doctests (nextest does not run them)
 test-slow: ## Run required wall-clock acceptance tests
 	$(NEXTEST) --run-ignored=only -E 'binary(integration)'
 
+test-images: ## Fetch the pinned test images (with retries) into the local mirror cache
+	python3 scripts/test-images/mirror.py warm --cache "$(TEST_IMAGE_CACHE)"
+
 test-linux: ## Run provisioned Linux runtime, network, eBPF, Btrfs and Buildah tests
 	$(CARGO) build --features ebpf --bin bun
-	RELIABURGER_RUNC_TESTS=1 RELIABURGER_NETNS_TESTS=1 RELIABURGER_EBPF_TESTS=1 RELIABURGER_BTRFS_TESTS=1 RELIABURGER_BUILDAH_TESTS=1 RELIABURGER_CGROUP_TESTS=1 RELIABURGER_NODE_PRESSURE_TESTS=1 RELIABURGER_BUN_BINARY="$(CURDIR)/target/debug/bun" $(NEXTEST) --features ebpf --run-ignored=only -E '(binary(ebpf) | binary(build) | binary(node_pressure) | binary(test_storage) | binary(owned_network) | binary(owned_runc) | binary(kubernetes_demo) | test(/(runc_|netns|btrfs_|cgroup_|identity_dir_is_tmpfs)/)) & not binary(oci_crash) & !test(/^actual_(host_reboot|bun_kernel_discovery_host_reboot)/) $(LINUX_EXCLUDE)'
+	RELIABURGER_RUNC_TESTS=1 RELIABURGER_NETNS_TESTS=1 RELIABURGER_EBPF_TESTS=1 RELIABURGER_BTRFS_TESTS=1 RELIABURGER_BUILDAH_TESTS=1 RELIABURGER_CGROUP_TESTS=1 RELIABURGER_NODE_PRESSURE_TESTS=1 RELIABURGER_BUN_BINARY="$(CURDIR)/target/debug/bun" $(WITH_TEST_IMAGES) $(NEXTEST) --features ebpf --run-ignored=only -E '(binary(ebpf) | binary(build) | binary(node_pressure) | binary(test_storage) | binary(owned_network) | binary(owned_runc) | binary(kubernetes_demo) | test(/(runc_|netns|btrfs_|cgroup_|identity_dir_is_tmpfs|pinned_images_serve)/)) & not binary(oci_crash) & !test(/^actual_(host_reboot|bun_kernel_discovery_host_reboot)/) $(LINUX_EXCLUDE)'
 
 test-rootless-runc: ## Prove rootless runc networking and port adoption as a non-root user
 	RELIABURGER_ROOTLESS_RUNC_TESTS=1 $(NEXTEST) --features ebpf --run-ignored=only -E 'binary(owned_rootless) | test(rootless_published_port_survives_bun_replacement) | test(normal_rootless_bun)'

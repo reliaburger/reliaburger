@@ -82,7 +82,10 @@ async fn deploy_from_cluster_registry(ctx: TestContext) -> Result<(), String> {
         .lease_id
         .as_deref()
         .ok_or("registry fixture requires its server-issued lease")?;
+    // Stage from the node's own mirrors, falling back to the upstream, so an
+    // air-gapped or rate-limited cluster qualifies the same exact bytes.
     let upstream = crate::pickle::upstream::OciUpstream::new(Default::default())
+        .with_mirrors(ctx.capabilities.image_mirrors.clone())
         .with_linux_architecture(&ctx.capabilities.runtime.architecture)
         .map_err(|error| error.to_string())?;
     let image = crate::grill::image::ImageReference::parse(PINNED_TEST_WORKLOAD_IMAGE)
