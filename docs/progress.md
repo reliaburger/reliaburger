@@ -351,7 +351,7 @@ that used to fail passes.
 | `placement::concurrent_node_kills_and_leader_change_preserve_reserved_capacity` | 22 Sep | Product: a returning node spread stale suspicions; a clear didn't wait for re-admission | Fixed (C3.2) |
 | `cluster_failover::decommissioned_worker_releases_cleanup_and_stays_retired_after_leader_change` | 20 Sep | Harness: waited on the leader's appended, not applied, membership | Fixed (C3.4) |
 | `job_recovery::killed_bun_*` (two tests) | 19 Sep | Harness: fixed 15–20 s budgets on loaded macOS runners | Fixed (C3.6) |
-| `mustard::protocol::tests::gossip_convergence_five_nodes` | 22 Sep | Unseeded RNG; exposed missing anti-entropy (C6.5) | Test fixed (C3.7) |
+| `mustard::protocol::tests::gossip_convergence_five_nodes` | 22 Sep | Unseeded RNG; exposed missing anti-entropy (C6.5) | Fixed: push-pull anti-entropy (C6.5); unseeded again |
 | `ebpf::standalone_discovery_recovery_preserves_original_routing_and_cleanup` | 22 Sep | Product: 2 s force-kill deadline too short under load | Fixed (C3.3) |
 | `registry_recovery::new_leader_retains_registry_cleanup_until_the_killed_writer_returns` | 23 Sep | Harness: treated the retryable lease-leader 503 as fatal | Fixed |
 
@@ -430,6 +430,7 @@ the later hardening sections and the dated review documents.
 - [x] Shared types: `NodeId`, `AppId`, `Resources`, `NodeCapacity`, `SchedulingDecision` (`src/meat/types.rs`)
 - [x] Mustard state machine: NodeState enum, incarnation conflicts, membership table, piggyback dissemination
 - [x] Mustard transport and protocol: `MustardTransport` trait, SWIM probe cycle, gossip convergence tests
+- [x] Mustard anti-entropy (C6.5): periodic bounded push-pull (`Sync`, 10 s, ≤ 8 datagrams × 8 entries per side) plus a join sync; protocol generation 23; 0 of 100,000 five-node schedules strand (was 73)
 - [x] Indirect probe (PING-REQ) ACK routing, proptest for conflict resolution, broadcast count lambda=3
 - [x] Dead node reap timer (cleanup_timeout=60s), graceful leave protocol (Left state broadcast on shutdown)
 - [x] Raft integration (openraft): storage, network, and state machine adapters; leader election and log replication

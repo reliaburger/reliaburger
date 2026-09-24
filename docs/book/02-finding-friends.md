@@ -292,7 +292,7 @@ pub enum GossipPayload {
 }
 ```
 
-Three message types, each carrying piggybacked updates. `Ping` is a direct probe. `PingReq` asks a third party to probe on your behalf (the indirect probe). `Ack` is the response. That's the entire protocol vocabulary.
+Three message types, each carrying piggybacked updates. `Ping` is a direct probe. `PingReq` asks a third party to probe on your behalf (the indirect probe). `Ack` is the response. That was the entire protocol vocabulary until a test found a hole in it; later in this chapter we add a fourth, `Sync`, for anti-entropy.
 
 The `hmac` field is zeroed out for now. Phase 4 will fill it in with HMAC-SHA256 computed from the node's mTLS certificate, so nodes can verify that gossip messages are authentic. The field exists from day one so the message format doesn't change later.
 
@@ -628,9 +628,9 @@ Each round, every node sends one PING, then we drain all inboxes twice: first to
 
 Why a round cap at all? Because gossip propagation depends on random target selection, and with a ring topology each node initially knows only one peer. Information has to hop through intermediaries, and random target selection means some rounds are "wasted" pinging a node that already knows the update. We started with 50 rounds, later raised it to 100, and believed that was enough margin for even the unluckiest sequence.
 
-It wasn't. In one full-suite run the test finished with one node seeing four members instead of five. More rounds would not have helped, and that's the interesting part. We ran twenty thousand unseeded schedules and about one in 1,300 got stuck for good: every update about some member spent its bounded re-broadcasts before reaching one particular node, every dissemination queue drained, and from then on the PINGs carried nothing new. Nothing in Mustard resynchronises full membership (the push-pull sync that production SWIM implementations such as HashiCorp's memberlist add on top), so a stranded node stays stranded until something changes. That's a property of the protocol, not of the test, and the fix belongs in Mustard rather than in a longer test.
+It wasn't. In one full-suite run the test finished with one node seeing four members instead of five. More rounds would not have helped, and that's the interesting part. We ran twenty thousand unseeded schedules and about one in 1,700 got stuck for good (a hundred thousand gave 73, one in 1,370): every update about some member spent its bounded re-broadcasts before reaching one particular node, every dissemination queue drained, and from then on the PINGs carried nothing new. Nothing in Mustard resynchronised full membership, so a stranded node stayed stranded until something changed. That's a property of the protocol, not of the test, and the fix belongs in Mustard rather than in a longer test. We'll get to the fix in a moment. First, we needed to be able to replay a failure.
 
-So the test now replays fixed schedules. Each `MustardNode` owns its random number generator instead of reaching for `rand::thread_rng()` on every probe:
+Each `MustardNode` owns its random number generator instead of reaching for `rand::thread_rng()` on every probe:
 
 ```rust
 use rand::SeedableRng;
@@ -652,9 +652,141 @@ fn seed_rng(&mut self, seed: u64) {
 
 `StdRng::from_entropy()` seeds from the operating system, so production behaves exactly as before. `seed_from_u64` comes from the `SeedableRng` trait, and here's a Rust rule that surprises Go and Python programmers: a trait's methods are only callable when the trait is in scope. Without `use rand::SeedableRng;` the compiler reports that `StdRng` has no function called `seed_from_u64`, even though the type implements it. The `#[cfg(test)]` attribute compiles `seed_rng` only into test builds, so the seam doesn't leak into the public API.
 
-A seed alone wasn't enough. The membership table is a `HashMap`, and Rust's `HashMap` randomises its hashing per instance to resist denial-of-service attacks, so the candidate list came out in a different order every run. The same random index then picked a different peer. `pick_probe_target()` now sorts candidates by node ID before choosing. The choice is still uniform; it just depends only on the generator. The test drives sixteen seeds and asserts that every one converges, typically within two to four rounds.
+A seed alone wasn't enough. The membership table is a `HashMap`, and Rust's `HashMap` randomises its hashing per instance to resist denial-of-service attacks, so the candidate list came out in a different order every run. The same random index then picked a different peer. `pick_probe_target()` now sorts candidates by node ID before choosing. The choice is still uniform; it just depends only on the generator. With the generator seeded, a schedule that strands a member strands it every time, so we can study it, and later prove it rescued.
 
 The test passes because of the dissemination mechanism. When n0 pings n1, n1 learns about n0 and enqueues a dissemination update. When n1 later pings n2, that update piggybacks on the PING. n2 receives it, re-enqueues it for further dissemination, and the ripple continues. The `MembershipUpdate` struct carries the node's address alongside its state, so nodes discovered via gossip (not direct contact) know how to reach each other.
+
+### Anti-entropy: when the rumours run out
+
+Why does a member get stranded at all? Look at the re-broadcast count again. Each update goes out `3 * ceil(log2(N))` times, six for our five nodes, and then it's gone. SWIM promises that's enough *with high probability*. It never promised every time. Now and then the random probe targets line up badly: the six copies of "n3 is alive" all land on nodes that already knew, the queue forgets the update, and n1 never hears about n3. Nobody will ever mention n3 to n1 again, because nobody has anything new to say.
+
+Production SWIM implementations know this. HashiCorp's memberlist (the library under Consul and Nomad) adds a *push-pull* exchange on top of the rumour mill: every so often, a node picks a random peer and the two swap their entire membership tables. It's called anti-entropy because it undoes the slow drift between replicas that nothing else is correcting. Rumours are fast and cheap but can miss someone. The full exchange is slow and a little expensive, but it can't miss what the peer knows.
+
+Mustard now does the same. Every `push_pull_interval` (10 seconds by default, twenty probe periods) the probe cycle starts an exchange with one random live peer:
+
+```rust
+// in run_one_cycle
+if now >= self.next_push_pull && self.push_pull().await {
+    self.next_push_pull = now + self.config.push_pull_interval;
+}
+```
+
+`next_push_pull` starts at the node's creation time, so the very first cycle with a live peer syncs. That's the join sync: a new node pulls the seed's whole table straight away instead of waiting for the membership to trickle in as rumours. If `push_pull()` finds no live peer it returns `false`, the deadline stays in the past, and the node syncs as soon as it meets someone.
+
+The exchange itself is a new message type:
+
+```rust
+pub enum GossipPayload {
+    // ...Ping, PingReq, Ack...
+    Sync {
+        entries: Vec<MembershipUpdate>,
+        wants_reply: bool,
+    },
+}
+```
+
+The node that starts the exchange sends its table as a burst of `Sync` datagrams, and only the first one sets `wants_reply`. The peer merges the entries and answers once with its own table, with `wants_reply` always `false`. That rule matters more than it looks. If a reply could ask for a reply, two nodes would bounce their tables back and forth for ever.
+
+How do the entries get merged? Exactly like piggybacked updates, and this is the part that makes push-pull safe. `GossipPayload::updates()` returns a `Sync`'s entries alongside every other variant's updates:
+
+```rust
+pub fn updates(&self) -> &[MembershipUpdate] {
+    match self {
+        GossipPayload::Ping { updates }
+        | GossipPayload::PingReq { updates, .. }
+        | GossipPayload::Ack { updates, .. }
+        | GossipPayload::Sync { entries: updates, .. } => updates,
+    }
+}
+```
+
+The `entries: updates` pattern is new. In a struct pattern, `field: name` binds the field to a variable with a *different* name. We need it because the arms of an or-pattern (the `|` between them) must all bind the same variables with the same types. Three variants call their vector `updates`; `Sync` calls it `entries`; the rename makes all four arms agree, and the match compiles to a single arm body.
+
+Since `handle_message` already walks `message.payload.updates()`, every entry in a `Sync` goes through `apply_update` and `resolve_conflict`, the same incarnation-then-state precedence we built at the start of the chapter. A stale table can't resurrect a node we hold `Dead` at the same incarnation, can't override a refutation at a higher one, and can't introduce a member we've only heard is `Dead` or `Left`. An entry saying *we* are `Suspect` triggers the usual refutation. There's no second merge path to get subtly wrong. The unit tests pin each of those cases, and they pin them through the public message handler rather than a private merge helper.
+
+### Keeping the exchange bounded
+
+memberlist swaps tables over TCP, because a table can be large: at 10,000 members it's hundreds of kilobytes. Mustard's gossip has only a UDP transport. We could add a TCP listener, with its own framing and authentication, for one message type. Or we could keep each exchange small enough for UDP. We chose the second.
+
+Each `Sync` datagram carries at most eight entries, the same as a PING's piggyback, and no directory extension (the extension can take 700 bytes with a full label set, and every probe carries it anyway). That keeps a datagram under 1,400 bytes even with 63-byte node names and IPv6 addresses, and a test builds exactly that worst case. One side of an exchange is at most `MAX_SYNC_DATAGRAMS` (eight) datagrams, so at most 64 entries. A table that fits goes whole every time. A bigger one goes out as a window that rotates through the table:
+
+```rust
+fn membership_window(&mut self) -> Vec<MembershipUpdate> {
+    let mut entries: Vec<MembershipUpdate> = /* every member, any state */;
+    if entries.len() <= MAX_SYNC_ENTRIES {
+        return entries;
+    }
+    entries.sort_unstable_by(|a, b| a.node_id.cmp(&b.node_id));
+    let start = self.sync_cursor % entries.len();
+    self.sync_cursor = start + MAX_SYNC_ENTRIES;
+    entries
+        .iter()
+        .cycle()
+        .skip(start)
+        .take(MAX_SYNC_ENTRIES)
+        .cloned()
+        .collect()
+}
+```
+
+That iterator chain reads left to right. `cycle()` turns the slice into an endless iterator that starts over when it reaches the end, which is how a window near the end of the table wraps round to the beginning. `skip(start)` throws away the first `start` items, `take(64)` stops after 64, and `cloned()` copies each borrowed entry into an owned one so `collect()` can build a new `Vec`. Nothing runs until `collect()` pulls on the chain; Rust iterators are lazy, like Python generators, so the "endless" iterator never allocates anything endless. `sort_unstable_by` sorts in place with a comparison closure. "Unstable" means equal elements may swap places, which can't matter here because node ids are unique, and it's a little faster.
+
+Sending is a loop over `chunks`:
+
+```rust
+for (index, entries) in window.chunks(MAX_PIGGYBACK_UPDATES).enumerate() {
+    let sync = GossipMessage::new(
+        self.node_id.clone(),
+        self.incarnation,
+        GossipPayload::Sync {
+            entries: entries.to_vec(),
+            wants_reply: wants_reply && index == 0,
+        },
+    );
+    let _ = self.transport.send(target, &sync).await;
+}
+```
+
+`chunks(8)` yields borrowed sub-slices (`&[MembershipUpdate]`) of eight items, the last one shorter. They point into `window` without copying, so `to_vec()` makes the owned `Vec` the message needs.
+
+Because an exchange is capped, the cost per node doesn't grow with the cluster: at most about sixteen datagrams per ten seconds, counting the exchange a node starts and the one it answers. That's why the interval doesn't need to scale with cluster size, as memberlist's does. The trade-off is honest, though. In a 10,000-member cluster one exchange carries 64 entries, so sweeping a whole table takes 157 of them. At that size anti-entropy is a slow backstop and piggybacking does the real work. In a cluster of a few dozen nodes, every exchange is a full resync. `tests/gossip_10k.rs` gained a test for the large case: one node holding 10,000 members answers push-pull requests, every reply stays within eight datagrams of eight entries, and successive replies cover all 10,000 members within 157 exchanges.
+
+Authentication came for free. `Sync` is just another `GossipPayload` variant, so the message HMAC from Phase 4 covers its entries, and a forged "n3 is alive at incarnation 2^64 - 1" fails verification like any other tampered datagram. The wire did change, though: a peer that doesn't know variant 3 of the payload enum can't decode it. That's what the protocol generation is for. It moved from 22 to 23, and a node refuses datagrams from any other generation before it decodes a single field.
+
+### Proving the rescue
+
+The five-node test now runs the simulation with an exchange every twenty rounds, starting at round 20 rather than round 0. Leaving the first twenty rounds to piggybacking alone means a seeded schedule replays exactly as it used to until the first exchange, so we can point at a specific failure and watch it get fixed:
+
+```rust
+#[tokio::test]
+async fn a_stranding_schedule_is_rescued_by_push_pull() {
+    assert_eq!(converge_five_node_ring(830, None).await, None);
+    let rounds = converge_five_node_ring(830, Some(PUSH_PULL_EVERY_ROUNDS)).await;
+    assert!(rounds.is_some_and(|round| round >= PUSH_PULL_EVERY_ROUNDS));
+}
+```
+
+Seed 830 is the first of those 73 stranding schedules. The first assertion checks that it still strands without push-pull, so the test can't quietly stop exercising the failure. The second checks that it converges, and only once an exchange has happened.
+
+The main convergence test went back to being unseeded, which is the whole point. Each run takes a random base from the operating system and drives 2,000 consecutive seeds from it, allowing two exchanges' worth of rounds. The seeds wrap on overflow with `base.wrapping_add(offset)`: Rust panics on integer overflow in debug builds instead of wrapping silently like C, so when wrapping is what you want you say so. A failure prints the seed, and the seed replays it. Here are the numbers, over the same 100,000 seeds:
+
+| | Stranded | Slowest to converge |
+|---|---:|---:|
+| Piggybacking only | 73 | never |
+| With push-pull | 0 | round 23 |
+
+Round 23 is three rounds after the first exchange. Not "more rounds", which never helped. A different mechanism.
+
+Last, a test for the join sync. A seed node knows three members it learnt long ago, so its dissemination queue is empty and has nothing left to say about them. A new node with only the seed's address runs one probe cycle while the test serves the seed:
+
+```rust
+let ((), requests) = tokio::join!(
+    joiner.run_one_cycle(),
+    serve(&mut seed, Duration::from_millis(100))
+);
+```
+
+`tokio::join!` polls several futures concurrently on the current task and waits for all of them, returning their outputs as a tuple (here `()` from the cycle and a count from `serve`). Unlike `tokio::spawn`, it doesn't need the futures to be `'static`, so each one can borrow a different node mutably. The borrow checker is happy because the two borrows don't overlap. After that one cycle the joiner knows all four other members, and a second cycle straight afterwards sends no request, because the next exchange isn't due for another ten seconds.
 
 ### Benchmarking with criterion
 

@@ -395,8 +395,9 @@ than returning a sentinel duration.
 
 The 10k target checks the per-node production invariant: one real Mustard node ingests a
 10,000-member table through bounded gossip messages, can select a probe target and exposes
-every learned update through fixed-size dissemination batches. Full 10,000-node all-to-all
-simulation would allocate 100 million membership records on one runner. That measures one
+every learned update through fixed-size dissemination batches. It also answers
+anti-entropy push-pull requests within eight datagrams each, sweeping all 10,000 members.
+Full 10,000-node all-to-all simulation would allocate 100 million membership records on one runner. That measures one
 machine pretending to be a datacentre, and did not finish inside its 90-minute budget.
 CI uploads Criterion data; it does not enforce regression percentages until measurements
 are stable on consistent hardware.
