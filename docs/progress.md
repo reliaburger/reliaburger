@@ -334,6 +334,7 @@ in repository Actions. Signed candidate qualification is still V03.
 - [ ] **V03** (gate) Publish and install the exact signed candidate.
   - [x] Preserve a complete signed candidate with source/run identity and per-file hashes; promote only the qualified bytes without rebuilding.
   - [x] Add explicit HTTPS candidate mirrors to both installers and managed setup without bypassing checksums or signatures.
+  - [x] Stage a verified candidate as a pre-release that promotion refuses, and script the real `curl | sh` qualification against it ([runbook](releasing.md#staging-a-candidate)).
   - [ ] Qualify hosted candidate creation, staged HTTPS delivery and actual signed installation before promotion.
 - [ ] **V04** (gate) Measure repeated cold installs on the advertised host matrix.
 - [x] **V05** Review all dependency exceptions against the current RustSec database and [record their reachability and migration dispositions](qualification/2026-09-18-dependency-exceptions.md). `make audit` also refuses an active rkyv graph.

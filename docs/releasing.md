@@ -133,9 +133,10 @@ The digest input must come from the qualification record. Copying a fresh digest
 from unqualified downloads defeats the gate. Workflow verification establishes
 identity and byte preservation; it cannot establish that somebody actually ran
 the cold-install and recovery tests. Those remain operator acceptance criteria.
-The complete hosted candidate and promotion paths have not yet been exercised.
-Actual pre-publication mirror delivery remains part of V03; downloading an
-Actions artefact alone does not qualify the public quickstart.
+The complete hosted candidate, staging and promotion paths have not yet been
+exercised. Actual pre-publication mirror delivery (see
+[Staging a candidate](#staging-a-candidate)) remains part of V03; downloading
+an Actions artefact alone does not qualify the public quickstart.
 
 GitHub documents the [default-branch requirement for manual workflows](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/manually-run-a-workflow)
 and the [release asset digest fields](https://docs.github.com/en/rest/releases/releases).
@@ -159,10 +160,99 @@ release plan. Record timing from an empty cache, the actual artefact digests,
 host and guest versions, memory use, and the successful sample workload. Don't
 publish a five-minute claim from a source build or a warmed VM.
 
-## Qualifying a staged candidate
+## Staging a candidate
 
-Download the candidate artefact and verify it against the separately recorded
-source/run identity and manifest digest before staging it:
+Before promoting 0.1.0, publish the exact signed candidate to HTTPS and run
+the real `curl … | sh` install against it on every host we advertise. The
+workflows below need to be on `main`; the first real staging run happens once
+this lands.
+
+1. **Build the candidate on main.**
+
+   ```sh
+   gh workflow run build.yml --ref main
+   ```
+
+   When it finishes, open the run's summary and note three things: the run ID
+   (from the URL), the candidate commit and the *Qualification manifest
+   SHA-256*. That digest is `QUALIFIED_DIGEST` from here on. Keep it with the
+   qualification records; never copy it from a later download.
+
+2. **Stage it.**
+
+   ```sh
+   gh workflow run stage.yml --ref main \
+     -f candidate_run=RUN_ID -f qualified_digest=QUALIFIED_DIGEST
+   ```
+
+   `stage.yml` runs `main`'s own `candidate.py`: it requires the run to be a
+   successful manual build of `main`, downloads `candidate-<commit>-<attempt>`,
+   and checks the exact inventory and every byte against the digest, the same
+   code promotion runs. Then it uploads the unchanged files as a draft
+   pre-release, checks GitHub's stored digests for every asset, publishes it as
+   a pre-release (never `--latest`) and checks the tag points at the candidate
+   commit. The job summary prints the staged base URL:
+
+   ```
+   https://github.com/reliaburger/reliaburger/releases/download/staging-v0.1.0-RUN_ID-ATTEMPT
+   ```
+
+   Re-running it for the same candidate is safe: a published staging
+   pre-release is only re-verified, an unfinished draft is deleted and staged
+   again, and one whose bytes differ stops the run without changing anything.
+   A rebuilt candidate (a new attempt) gets its own tag.
+
+3. **Qualify it on every host in the matrix**: Apple silicon, Intel macOS,
+   Linux x86_64 and Linux arm64. From a checkout of the same `main`:
+
+   ```sh
+   scripts/release/qualify-staged-install.sh \
+     --base-url https://github.com/reliaburger/reliaburger/releases/download/staging-v0.1.0-RUN_ID-ATTEMPT \
+     --qualified-digest QUALIFIED_DIGEST
+   ```
+
+   It creates a fresh, short `RELIABURGER_HOME` under `/tmp` and runs
+   `curl -fsSL https://reliaburger.com/install.sh | RELIABURGER_RELEASE_BASE_URL=… sh -s -- --timings`,
+   exactly as a user would. Use `--bootstrap docs/website/install.sh` if the
+   website doesn't serve the current bootstrap yet (the record notes which one
+   ran). It checks `candidate.json` against the digest, `SHA256SUMS` against
+   `candidate.json`, that setup used the mirror, and that the installed CLI,
+   both Linux binaries and the guest image are candidate assets. Then it
+   applies the podinfo tour, runs `status`, `trace` and `metrics`, destroys the
+   cluster, uninstalls, and writes a Markdown record with the timings. It never
+   uses `~/.reliaburger` and fails if that directory's top level or
+   `~/.local/bin/relish` changed. Pass `setup --quickstart` options after
+   `--`, for example `-- --api-port 29117 --ingress-port 28080` when another
+   cluster holds the default ports, and `--keep` to leave a failed run for
+   debugging (then `relish local destroy --yes` and `relish uninstall --yes`
+   with the same `RELIABURGER_HOME`).
+
+   Run it at least twice per host for V04: once with nothing cached (the
+   script always starts empty) and again for repeatability.
+
+4. **Record it.** Copy each host's record into
+   `docs/qualification/DATE-staged-install-HOST.md`, alongside the run ID,
+   attempt, commit and digest. Gates V03 and V04 in
+   [progress.md](progress.md) point at these records.
+
+5. **Clean up the staging pre-releases.** Delete them before promotion so the
+   release page and the release notes' "previous tag" don't pick them up:
+
+   ```sh
+   gh release delete staging-v0.1.0-RUN_ID-ATTEMPT --cleanup-tag --yes
+   ```
+
+6. **Promote** as described above, with the same run ID and digest. The
+   staging tag can't be promoted: it doesn't match `v1.2.3`, `candidate.py`
+   refuses it as a version, and `promote.yml` refuses any tag containing
+   `staging`.
+
+## Qualifying a candidate from another host
+
+`stage.yml` is the usual way to get the candidate onto HTTPS. Any other HTTPS
+directory works the same way. Download the candidate artefact and verify it
+against the separately recorded source/run identity and manifest digest before
+staging it:
 
 ```sh
 python3 scripts/release/candidate.py verify --directory candidate \
@@ -199,8 +289,8 @@ which complete file set is under qualification.
 
 Record the mirror URL and all downloaded hashes with the cold-run measurements.
 A staged run qualifies those signed bytes; final public URL/Pages checks still
-need their own evidence after publication. No staging host or public candidate
-has been created by this code change.
+need their own evidence after publication. No candidate has been staged yet:
+`stage.yml` first runs once it is on `main`.
 
 ## Guest images and bootstrap installer
 

@@ -170,10 +170,18 @@ tutorial, because a tutorial over a broken path is a lie.
 - [ ] **Z4.2 Put `relish` on `PATH`.** Install to `~/.local/bin` when it's on
   `PATH`, otherwise print the one line to add, and offer (with a prompt when
   interactive) to add it to the shell's rc file. See D6.
-- [ ] **Z4.3 A staging mirror before 0.1.0.** So the whole path can be tested
+- [x] **Z4.3 A staging mirror before 0.1.0.** So the whole path can be tested
   end to end before the release: publish a signed candidate to a pre-release
   (or Pages path) and point the bootstrap at it with
-  `RELIABURGER_RELEASE_BASE_URL`. See D5.
+  `RELIABURGER_RELEASE_BASE_URL`. See D5. Done: `stage.yml` verifies a
+  candidate with promotion's own `candidate.py` code and publishes it
+  unchanged as a pre-release tagged `staging-v0.1.0-<run>-<attempt>`, which
+  promotion refuses and GitHub never marks latest;
+  `scripts/release/qualify-staged-install.sh` runs the real `curl | sh`
+  against it in an isolated home, with a short tour and teardown, and writes a
+  record. The runbook is in [releasing.md](../releasing.md#staging-a-candidate).
+  The first real staging run happens after this lands on `main`; its records
+  feed V03 and V04.
 - [ ] **Z4.4 Uninstall.** `relish local destroy` exists; add
   `relish uninstall` for the CLI, tools and image cache.
 
