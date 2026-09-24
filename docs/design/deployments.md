@@ -490,8 +490,11 @@ impl Default for DeployConfig {
 pub struct AutoscaleConfig {
     /// The metric to scale on.
     pub metric: AutoscaleMetric,
-    /// Target value for the metric (e.g., 70 for 70% CPU utilisation).
-    pub target: u32,
+    /// Per-replica request in the collector series' unit (percent of one
+    /// core for CPU, bytes for memory).
+    pub request: f64,
+    /// Target utilisation of the request as a fraction (0.70 for "70%").
+    pub target: f64,
     /// Minimum number of replicas (autoscaler will never scale below this).
     pub min: u32,
     /// Maximum number of replicas (autoscaler will never scale above this).
@@ -804,15 +807,17 @@ Autoscaling adjusts the runtime replica count based on observed metrics. The aut
 
 ```toml
 [app.web.autoscale]
-metric = "cpu"      # or "memory"
-target = 70         # target 70% utilisation
+metric = "cpu"      # or "memory"; anything else fails validation
+target = "70%"      # target 70% utilisation of the request
 min = 2             # never scale below 2 replicas
 max = 10            # never scale above 10 replicas
 ```
 
+**What "utilisation" means:** average per-replica use divided by the per-replica request, the Kubernetes HPA convention. CPU reads the collector's `process_cpu_percent` (percent of one core) against the `cpu` request (500m = half a core); an app with no CPU request is measured against one whole core, because ProcessGrill and rootless nodes refuse apps that declare `cpu`. Memory reads `process_memory_bytes` against the `memory` request, and fails validation without one. See `design/scheduler-meat.md` §5.4 for the full semantics and limits.
+
 **Evaluation algorithm:**
 
-1. Every 30 seconds, the autoscaler queries Mayo for the average metric value across all instances of the app over the `evaluation_window` (default: 5 minutes).
+1. Every 30 seconds, the autoscaler queries Mayo for the average utilisation across all instances of the app over the `evaluation_window` (default: 5 minutes).
 2. If the average exceeds `target`, compute the desired replica count: `desired = ceil(current_replicas * (current_metric / target))`.
 3. If the average is below `target * 0.8` (80% of target, to avoid flapping), compute the desired replica count using the same formula (this will produce a lower number).
 4. Clamp `desired` to `[min, max]`.
@@ -850,7 +855,7 @@ auto_rollback = false       # halt on failure instead of the default active reve
 # Per-app autoscale configuration (optional)
 [app.web.autoscale]
 metric = "cpu"              # "cpu" or "memory"
-target = 70                 # target utilisation percentage
+target = "70%"              # target utilisation of the request
 min = 2                     # minimum replicas
 max = 10                    # maximum replicas
 ```
@@ -880,8 +885,8 @@ health_timeout = "60s"
 | `drain_timeout` | duration string | `"30s"` | How long to wait for in-flight connections to complete before force-stopping |
 | `health_timeout` | duration string | `"60s"` | How long to wait for a new instance's health check endpoint to return success |
 | `auto_rollback` | boolean | `true` | `true`: actively revert all upgraded instances on failure. `false`: halt and leave the mixed old/new state for the operator to decide. |
-| `autoscale.metric` | `"cpu"` or `"memory"` | (none) | Metric to scale on. Autoscaling is disabled if this section is absent. |
-| `autoscale.target` | integer (1-100) | (required if autoscale set) | Target utilisation percentage |
+| `autoscale.metric` | `"cpu"` or `"memory"` | (none) | Metric to scale on. Autoscaling is disabled if this section is absent. Any other value fails validation; `"memory"` also requires a `memory` request. |
+| `autoscale.target` | string (`"70%"` or `"0.7"`) | (required if autoscale set) | Target utilisation of the per-replica request (of one core for CPU with no request) |
 | `autoscale.min` | integer | (required if autoscale set) | Minimum replica count |
 | `autoscale.max` | integer | (required if autoscale set) | Maximum replica count |
 
@@ -1094,7 +1099,7 @@ Two integration tests cover rollback:
 
 **"autoscale up on CPU pressure, scale down on relief":**
 
-1. Deploy a test app with `autoscale.metric = "cpu"`, `target = 50`, `min = 1`, `max = 5`.
+1. Deploy a test app with `autoscale.metric = "cpu"`, `target = "50%"`, `min = 1`, `max = 5`.
 2. Generate CPU load on the test app instances.
 3. Verify that the autoscaler increases replicas within the evaluation window + cooldown period.
 4. Remove CPU load.

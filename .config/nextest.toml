@@ -45,6 +45,13 @@ filter = 'binary(cluster_failover) | binary(council_self_healing) | binary(counc
 test-group = "cluster-heavy"
 slow-timeout = { period = "60s", terminate-after = 2 }
 
+# The real-collector autoscale test waits for a complete one-minute rollup
+# window to reach the leader (60–120 s) on top of cluster start-up.
+[[profile.default.overrides]]
+filter = 'binary(placement) & test(autoscaler_scales_up_from_real_collector_cpu)'
+test-group = "process-heavy"
+slow-timeout = { period = "120s", terminate-after = 3 }
+
 [[profile.default.overrides]]
 filter = 'binary(integration) | binary(placement) | binary(job_recovery)'
 test-group = "process-heavy"
@@ -78,6 +85,11 @@ slow-timeout = { period = "60s", terminate-after = 2 }
 filter = 'binary(cluster_failover) | binary(council_self_healing) | binary(council_disaster_recovery) | binary(cluster_gossip) | binary(reporting_tcp)'
 test-group = "cluster-heavy"
 slow-timeout = { period = "60s", terminate-after = 2 }
+
+[[profile.ci.overrides]]
+filter = 'binary(placement) & test(autoscaler_scales_up_from_real_collector_cpu)'
+test-group = "process-heavy"
+slow-timeout = { period = "120s", terminate-after = 3 }
 
 [[profile.ci.overrides]]
 filter = 'binary(integration) | binary(placement) | binary(job_recovery)'

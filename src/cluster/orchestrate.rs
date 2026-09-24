@@ -807,7 +807,7 @@ pub fn spawn_autoscaler(
                 let Some(autoscale) = &spec.autoscale else {
                     continue;
                 };
-                let config = match AutoscaleConfig::from_spec(autoscale) {
+                let config = match AutoscaleConfig::from_spec(autoscale, spec.cpu, spec.memory) {
                     Ok(config) => config,
                     Err(e) => {
                         // Config validation catches this on apply, so a bad
@@ -829,15 +829,9 @@ pub fn spawn_autoscaler(
                         Replicas::DaemonSet => continue, // daemon sets don't autoscale
                     });
 
-                // Metric utilisation for this app over the CONFIGURED window
+                // Utilisation of the app's request over the CONFIGURED window
                 // (was hardcoded to five minutes regardless of the spec).
-                let Some(metric) = app_metric_utilisation(
-                    &rollup_store,
-                    &config.metric,
-                    app_id,
-                    config.evaluation_window,
-                )
-                .await
+                let Some(metric) = app_metric_utilisation(&rollup_store, &config, app_id).await
                 else {
                     continue; // no data yet
                 };
@@ -872,28 +866,32 @@ pub fn spawn_autoscaler(
     });
 }
 
-/// Average utilisation of `metric` for `app` over the given `window`,
-/// as a fraction, from the leader's rollup store. The window comes from
-/// the app's `[autoscale] evaluation_window`, not a hardcoded default.
+/// Average utilisation of the app's resource request over the app's
+/// `[autoscale] evaluation_window`, as a fraction, from the leader's
+/// rollup store.
 ///
-/// Returns `None` when there's no data. The value is interpreted as a
-/// utilisation fraction (0.0–1.0) to compare against the autoscale
-/// target; the metric Mayo records must be scaled accordingly.
+/// Reads the per-instance series the node collector really records
+/// (`process_cpu_percent`, percent of one core, or `process_memory_bytes`),
+/// averages it across the app's instances and minutes, then divides by the
+/// per-replica request: 1.0 means each replica uses exactly what it asked
+/// for. The autoscaler used to query a series literally named `cpu`, which
+/// nothing records, so it never scaled a real cluster.
+///
+/// Returns `None` when there's no data.
 async fn app_metric_utilisation(
     rollup_store: &tokio::sync::RwLock<crate::mayo::rollup_store::RollupStore>,
-    metric: &str,
+    config: &crate::meat::autoscaler::AutoscaleConfig,
     app_id: &crate::meat::types::AppId,
-    window: Duration,
 ) -> Option<f64> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()?
         .as_secs();
-    let window_start = now.saturating_sub(window.as_secs());
+    let window_start = now.saturating_sub(config.evaluation_window.as_secs());
 
     let store = rollup_store.read().await;
     let aggregates = store
-        .query_cluster_aggregates(metric, window_start, now)
+        .query_cluster_aggregates(config.metric.series_name(), window_start, now)
         .await
         .ok()?;
     let mut total = 0.0;
@@ -904,7 +902,11 @@ async fn app_metric_utilisation(
             n += 1;
         }
     }
-    if n == 0 { None } else { Some(total / n as f64) }
+    if n == 0 {
+        None
+    } else {
+        Some(config.utilisation(total / n as f64))
+    }
 }
 
 /// Whether a rollup aggregate's labels belong to exactly `app_id` (M26).
@@ -2863,44 +2865,85 @@ image = "busybox:latest"
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs();
-            let mut labels = Map::new();
-            labels.insert("app".to_string(), "prod/web".to_string());
+            // Two instances, labelled exactly as `mayo::collector` labels them,
+            // reporting `process_cpu_percent` (percent of ONE core).
+            let entry = |instance: &str, sum: f64, count: u32| {
+                let mut labels = Map::new();
+                labels.insert("app".to_string(), "prod/web".to_string());
+                labels.insert("namespace".to_string(), "prod".to_string());
+                labels.insert("instance".to_string(), instance.to_string());
+                RollupEntry {
+                    metric_name: "process_cpu_percent".to_string(),
+                    labels,
+                    aggregate: RollupAggregate {
+                        min: 0.0,
+                        max: sum,
+                        sum,
+                        count,
+                    },
+                }
+            };
             let rollup = NodeRollup {
                 node_id: NodeId::new("n1"),
                 timestamp: now.saturating_sub(60),
-                entries: vec![RollupEntry {
-                    metric_name: "cpu".to_string(),
-                    labels,
-                    // sum 1.6 over 2 samples → mean 0.8 utilisation.
-                    aggregate: RollupAggregate {
-                        min: 0.7,
-                        max: 0.9,
-                        sum: 1.6,
-                        count: 2,
-                    },
-                }],
+                // Instance means: 30% and 50% of a core → 40% on average.
+                entries: vec![
+                    entry("prod__web-0", 60.0, 2),
+                    entry("prod__web-1", 100.0, 2),
+                ],
             };
             let mut w = store.write().await;
             w.ingest(&rollup);
             w.flush().await.unwrap();
         }
 
-        let window = Duration::from_secs(300);
-        let value = app_metric_utilisation(&store, "cpu", &AppId::new("web", "prod"), window).await;
+        // 200m requested = 20% of a core; 40% used → 2.0 utilisation.
+        let spec = crate::config::app::AutoscaleSpec {
+            metric: "cpu".to_string(),
+            target: "50%".to_string(),
+            min: 1,
+            max: 5,
+            evaluation_window: Some("5m".to_string()),
+            cooldown: None,
+            scale_down_threshold: None,
+        };
+        let cpu = Some(crate::config::types::ResourceRange {
+            request: 200,
+            limit: 1000,
+        });
+        let config = crate::meat::autoscaler::AutoscaleConfig::from_spec(&spec, cpu, None).unwrap();
+        let value = app_metric_utilisation(&store, &config, &AppId::new("web", "prod")).await;
         assert!(
-            value.is_some_and(|v| (v - 0.8).abs() < 1e-9),
-            "expected mean utilisation 0.8, got {value:?}"
+            value.is_some_and(|v| (v - 2.0).abs() < 1e-9),
+            "expected utilisation 2.0 of the request, got {value:?}"
         );
 
         // Same app name, different namespace → no data (M26).
         assert!(
-            app_metric_utilisation(&store, "cpu", &AppId::new("web", "staging"), window)
+            app_metric_utilisation(&store, &config, &AppId::new("web", "staging"))
                 .await
                 .is_none()
         );
         // Unknown app → no data.
         assert!(
-            app_metric_utilisation(&store, "cpu", &AppId::new("other", "prod"), window)
+            app_metric_utilisation(&store, &config, &AppId::new("other", "prod"))
+                .await
+                .is_none()
+        );
+        // Memory scaling reads a different series, which this store lacks.
+        let memory_spec = crate::config::app::AutoscaleSpec {
+            metric: "memory".to_string(),
+            ..spec
+        };
+        let memory = Some(crate::config::types::ResourceRange {
+            request: 1 << 20,
+            limit: 1 << 20,
+        });
+        let memory_config =
+            crate::meat::autoscaler::AutoscaleConfig::from_spec(&memory_spec, None, memory)
+                .unwrap();
+        assert!(
+            app_metric_utilisation(&store, &memory_config, &AppId::new("web", "prod"))
                 .await
                 .is_none()
         );

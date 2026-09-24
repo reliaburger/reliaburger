@@ -281,6 +281,9 @@ pub struct WiredNode {
     pub directory_rx: watch::Receiver<NodeDirectory>,
     pub partition_blocklists: PartitionBlocklists,
     pub rollup_store: Arc<RwLock<RollupStore>>,
+    /// This node's local metrics store, when `metrics_rollup` is set. The
+    /// rollup worker ships its per-minute aggregates to the leader.
+    pub mayo: Option<Arc<RwLock<reliaburger::mayo::store::MayoStore>>>,
     /// This node's agent command channel.
     pub cmd_tx: mpsc::Sender<AgentCommand>,
     pub membership_table: Arc<RwLock<Vec<NodeMembershipInfo>>>,
@@ -343,7 +346,7 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
             wrapping_ikm: None,
             bootstrap_security_state: None,
             data_dir,
-            mayo,
+            mayo: mayo.clone(),
             rollup_interval: metrics_rollup.unwrap_or(Duration::from_secs(60)),
             identity: None,
             backup: Default::default(),
@@ -564,6 +567,7 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
         directory_rx,
         partition_blocklists,
         rollup_store,
+        mayo,
         cmd_tx,
         membership_table,
         token_store,

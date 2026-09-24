@@ -419,18 +419,18 @@ async fn total_scaler_instances(nodes: &[&Node]) -> usize {
     total
 }
 
-/// W8 (L3): a high metric drives the autoscaler to raise the replica
-/// override, and the scheduler + reconcilers grow the app to max.
-#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
-#[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
-async fn autoscaler_scales_up_on_high_metric() {
-    use reliaburger::mayo::rollup::{NodeRollup, RollupAggregate, RollupEntry};
-
-    let shutdown = CancellationToken::new();
-    let n1 = start_node("s1", 18541, vec![], &shutdown).await;
-    let n2 = start_node("s2", 18545, vec![local(18541)], &shutdown).await;
-    let n3 = start_node("s3", 18549, vec![local(18541)], &shutdown).await;
-    let nodes = [&n1, &n2, &n3];
+/// Start three placement nodes on `base`, `base + 4` and `base + 8`, wait
+/// for a leader, and deploy `config` until the single "scaler" replica
+/// places.
+async fn start_autoscale_cluster(
+    base: u16,
+    config: &reliaburger::config::Config,
+    shutdown: &CancellationToken,
+) -> [Node; 3] {
+    let n1 = start_node("s1", base, vec![], shutdown).await;
+    let n2 = start_node("s2", base + 4, vec![local(base)], shutdown).await;
+    let n3 = start_node("s3", base + 8, vec![local(base)], shutdown).await;
+    let nodes = [n1, n2, n3];
 
     let ready = wait_until(Duration::from_secs(30), || {
         nodes.iter().any(|n| *n.thinks_leader.borrow())
@@ -439,7 +439,70 @@ async fn autoscaler_scales_up_on_high_metric() {
     assert!(ready, "no leader elected");
     tokio::time::sleep(Duration::from_secs(3)).await;
 
-    // Deploy a 1-replica app that autoscales on cpu, target 50%, max 3.
+    // Apply and wait for the single replica to place, re-applying
+    // periodically in case a first attempt races leadership under load
+    // (the spec is desired state, so re-applying is idempotent).
+    let refs = [&nodes[0], &nodes[1], &nodes[2]];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut last_apply: Option<tokio::time::Instant> = None;
+    while tokio::time::Instant::now() < deadline {
+        if total_scaler_instances(&refs).await >= 1 {
+            break;
+        }
+        if last_apply.is_none_or(|t| t.elapsed() >= Duration::from_secs(8)) {
+            let applier = refs
+                .iter()
+                .find(|n| *n.thinks_leader.borrow())
+                .or_else(|| refs.first())
+                .expect("at least one node");
+            let _ =
+                tokio::time::timeout(Duration::from_secs(15), applier.client.apply(config)).await;
+            last_apply = Some(tokio::time::Instant::now());
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    nodes
+}
+
+/// Wait up to `timeout` for the "scaler" app to reach `want` instances;
+/// on failure print every node's autoscale overrides and panic.
+async fn assert_scaler_reaches(nodes: &[&Node], want: usize, timeout: Duration) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while tokio::time::Instant::now() < deadline {
+        if total_scaler_instances(nodes).await >= want {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    for n in nodes {
+        if let Some(c) = &n.handle.council {
+            let ds = c.desired_state().await;
+            eprintln!("node {}: overrides={:?}", n.name, ds.autoscale_overrides);
+        }
+    }
+    panic!(
+        "autoscaler did not scale up; instances: {}",
+        total_scaler_instances(nodes).await
+    );
+}
+
+/// W8 (L3): a high CPU reading drives the autoscaler to raise the replica
+/// override, and the scheduler + reconcilers grow the app to max.
+///
+/// Feeds the leader's rollup store directly with the series the node
+/// collector really records: `process_cpu_percent`, percent of one core,
+/// labelled like `mayo::collector` labels it. The app declares no CPU
+/// request (ProcessGrill refuses one), so utilisation is measured against a
+/// whole core: 90% of a core is well above the 50% target.
+/// This test once fed a fake series named `cpu` that nothing in production
+/// records, which let it pass while the feature never fired.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
+async fn autoscaler_scales_up_on_high_metric() {
+    use reliaburger::mayo::rollup::{NodeRollup, RollupAggregate, RollupEntry};
+
+    let shutdown = CancellationToken::new();
+    // A 1-replica app that autoscales on cpu, target 50%, max 3.
     let config = reliaburger::config::Config::parse(
         r#"
         [app.scaler]
@@ -456,51 +519,33 @@ async fn autoscaler_scales_up_on_high_metric() {
     "#,
     )
     .unwrap();
-    // Apply and wait for the single replica to place, re-applying
-    // periodically in case a first attempt races leadership under load
-    // (the spec is desired state, so re-applying is idempotent).
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    let mut last_apply: Option<tokio::time::Instant> = None;
-    while tokio::time::Instant::now() < deadline {
-        if total_scaler_instances(&nodes).await >= 1 {
-            break;
-        }
-        if last_apply.is_none_or(|t| t.elapsed() >= Duration::from_secs(8)) {
-            let applier = nodes
-                .iter()
-                .find(|n| *n.thinks_leader.borrow())
-                .or_else(|| nodes.first())
-                .expect("at least one node");
-            let _ =
-                tokio::time::timeout(Duration::from_secs(15), applier.client.apply(&config)).await;
-            last_apply = Some(tokio::time::Instant::now());
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
+    let [n1, n2, n3] = start_autoscale_cluster(18541, &config, &shutdown).await;
+    let nodes = [&n1, &n2, &n3];
 
-    // Feed a sustained HIGH cpu metric (0.95 » 0.50 target) into every
-    // node's rollup store, labelled for the app. The leader's autoscaler
-    // reads its own store.
+    // The leader's autoscaler reads its own store; feed every node's so it
+    // doesn't matter which one leads.
     for node in &nodes {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        // The real collector labels per-app metrics `namespace/app` (see
-        // mayo::collector), and the autoscaler match is namespace-qualified
-        // (M26). Feed the metric in that same form, not the bare app name.
+        // The collector labels per-app metrics `namespace/app`, and the
+        // autoscaler match is namespace-qualified (M26).
         let mut labels = std::collections::BTreeMap::new();
         labels.insert("app".to_string(), "default/scaler".to_string());
+        labels.insert("namespace".to_string(), "default".to_string());
+        labels.insert("instance".to_string(), "default__scaler-0".to_string());
+        labels.insert("node".to_string(), node.name.clone());
         let rollup = NodeRollup {
             node_id: reliaburger::meat::NodeId::new(&node.name),
             timestamp: now.saturating_sub(30),
             entries: vec![RollupEntry {
-                metric_name: "cpu".to_string(),
+                metric_name: "process_cpu_percent".to_string(),
                 labels,
                 aggregate: RollupAggregate {
-                    min: 0.95,
-                    max: 0.95,
-                    sum: 0.95,
+                    min: 90.0,
+                    max: 90.0,
+                    sum: 90.0,
                     count: 1,
                 },
             }],
@@ -510,33 +555,79 @@ async fn autoscaler_scales_up_on_high_metric() {
         w.flush().await.unwrap();
     }
 
-    // The autoscaler should raise the override; scheduler + reconcilers
-    // grow the app toward max (3).
-    let scaled = {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        let mut ok = false;
-        while tokio::time::Instant::now() < deadline {
-            if total_scaler_instances(&nodes).await >= 3 {
-                ok = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
-        ok
-    };
+    assert_scaler_reaches(&nodes, 3, Duration::from_secs(30)).await;
 
-    if !scaled {
-        for n in &nodes {
-            if let Some(c) = &n.handle.council {
-                let ds = c.desired_state().await;
-                eprintln!("node {}: overrides={:?}", n.name, ds.autoscale_overrides);
-            }
+    shutdown.cancel();
+    for n in nodes {
+        if let Some(c) = &n.handle.council {
+            c.shutdown().await.ok();
         }
-        panic!(
-            "autoscaler did not scale up; instances: {}",
-            total_scaler_instances(&nodes).await
-        );
     }
+}
+
+/// The autoscaler fires from the REAL metrics path, with nothing faked:
+/// a ProcessGrill replica busy-loops, each node samples its instances with
+/// the same `SystemCollector::collect_agent_instance_metrics` call Bun's
+/// collection loop makes, the real rollup worker ships the per-minute
+/// aggregates to the leader, and the leader's autoscaler scales the app.
+///
+/// The only glue the test supplies is the one-second tick that Bun runs in
+/// its binary. Rollups cover the previous COMPLETE minute, so the first
+/// signal reaches the leader 60–120 s after the burn starts; hence the long
+/// timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
+async fn autoscaler_scales_up_from_real_collector_cpu() {
+    let shutdown = CancellationToken::new();
+    // One busy-looping shell burns ~100% of a core; with no CPU request
+    // that is ~4x the 25% target, headroom for a loaded CI host.
+    let config = reliaburger::config::Config::parse(
+        r#"
+        [app.scaler]
+        image = "proc-grill:image-ignored"
+        command = ["sh", "-c", "while :; do :; done"]
+        replicas = 1
+
+        [app.scaler.autoscale]
+        metric = "cpu"
+        target = "25%"
+        min = 1
+        max = 2
+        evaluation_window = "3m"
+        cooldown = "0s"
+    "#,
+    )
+    .unwrap();
+    let [n1, n2, n3] = start_autoscale_cluster(27341, &config, &shutdown).await;
+    let nodes = [&n1, &n2, &n3];
+
+    for node in &nodes {
+        let mayo = node._wired.mayo.clone().expect("placement nodes run Mayo");
+        let agent = node._wired.cmd_tx.clone();
+        let name = node.name.clone();
+        let stop = shutdown.clone();
+        tokio::spawn(async move {
+            let mut collector = reliaburger::mayo::collector::SystemCollector::new();
+            let mut tick = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                tokio::select! {
+                    _ = stop.cancelled() => break,
+                    _ = tick.tick() => {}
+                }
+                collector.refresh();
+                let samples = collector
+                    .collect_agent_instance_metrics(&agent, &name)
+                    .await;
+                let mut store = mayo.write().await;
+                for sample in &samples {
+                    store.insert_now(&sample.key, sample.value);
+                }
+            }
+        });
+    }
+
+    // Max is 2 so the test burns at most two cores while it runs.
+    assert_scaler_reaches(&nodes, 2, Duration::from_secs(240)).await;
 
     shutdown.cancel();
     for n in nodes {

@@ -84,11 +84,14 @@ Three replicas at 2am is wasteful. Three replicas during a product launch is sui
 
 The autoscaler runs on the Raft leader, evaluating every 30 seconds. For each app with an `[autoscale]` section, it:
 
-1. Queries Mayo for the average metric (CPU or memory) over a 5-minute window
-2. Computes the desired replica count
-3. Applies it if it differs from the current count
+1. Queries Mayo for the average per-replica CPU or memory use over a 5-minute window
+2. Turns that into *utilisation*: use divided by what each replica asked for
+3. Computes the desired replica count
+4. Applies it if it differs from the current count
 
 The formula: `desired = ceil(current * (metric / target))`. If you have 3 replicas at 90% CPU and your target is 70%, the desired count is `ceil(3 * 0.90 / 0.70) = ceil(3.86) = 4`. One more replica should bring the average down to roughly 67%.
+
+"90% CPU" of what, though? We follow the Kubernetes HPA convention: utilisation of the replica's *request*. An app with `cpu = "500m-1000m"` asked for half a core, so a replica burning a quarter of a core sits at 50%. An app that declares no CPU request is measured against one whole core instead, so `target = "50%"` means "half a core per replica". That fallback isn't laziness. ProcessGrill and rootless nodes refuse any app that declares `cpu` (they can't enforce the limit), so without it CPU autoscaling would be impossible on them. Memory has no such natural unit, so `metric = "memory"` without a `memory` request fails validation.
 
 ```rust
 fn compute_desired(current: u32, metric: f64, config: &AutoscaleConfig) -> u32 {
@@ -149,7 +152,7 @@ cooldown = "3m"             # optional, default 3m
 scale_down_threshold = 0.8  # optional, default 0.8
 ```
 
-All three optional fields have sensible defaults. Most users will only set metric, target, min, and max.
+All three optional fields have sensible defaults. Most users will only set metric, target, min, and max. `metric` accepts exactly two values, `"cpu"` and `"memory"`; anything else fails validation rather than quietly never scaling.
 
 ### Wiring it to the cluster
 
@@ -161,9 +164,50 @@ We later deleted `run_autoscale_loop` outright. Nothing called it, and it starte
 
 The loop lives where every leader-only loop in Reliaburger lives — spawned once, checking leadership each tick, no start/stop dance. Each cycle: read the desired apps, keep only those with an `[autoscale]` section, query the rollup store for each app's recent metric, run `evaluate`, and on a decision commit an `AutoscaleOverride` to Raft.
 
-That last word is the whole trick. The autoscaler doesn't deploy anything or talk to nodes. It writes one number to Raft — the desired replica count — and stops. The scheduler from Chapter 2 already watches desired state; it now reads the *effective* replica count (the override if one exists, else the spec's) and re-places accordingly, and the per-node reconcilers converge. Scaling is just another edit to desired state, flowing through the exact machinery a manual `relish apply` uses. No parallel path, no special case. The integration test drives it end to end: deploy a one-replica app, feed a sustained 95% CPU metric into the rollup stores, and watch the cluster grow the app to its `max` of three — purely because a number changed in Raft.
+That last word is the whole trick. The autoscaler doesn't deploy anything or talk to nodes. It writes one number to Raft — the desired replica count — and stops. The scheduler from Chapter 2 already watches desired state; it now reads the *effective* replica count (the override if one exists, else the spec's) and re-places accordingly, and the per-node reconcilers converge. Scaling is just another edit to desired state, flowing through the exact machinery a manual `relish apply` uses. No parallel path, no special case.
 
-One honesty note on the metric. The autoscaler compares the rollup value against the target as a *utilisation fraction* (0.95 vs 0.70). What Mayo actually records for an app therefore has to be scaled that way; a metric reported in raw millicores would need a target expressed to match. The code documents this at the query seam rather than silently assuming.
+### The autoscaler that never scaled
+
+Here's an embarrassing one. For months the whole loop above was wired, tested and green, and it couldn't scale a real cluster. Not once.
+
+The autoscaler asked the rollup store for a metric literally named after the `[autoscale] metric` field. Write `metric = "cpu"` and it queried a series called `cpu`. Nothing records a series called `cpu`. The node collector (Chapter 6) records `process_cpu_percent` and `process_memory_bytes` for every instance it can find a PID for, labelled `app = "<namespace>/<app>"`. So every tick the query came back empty, the loop hit its "no data yet" branch and moved on. Forever.
+
+Why didn't a test catch it? Because the end-to-end test *injected* a rollup row named `cpu` with a value of 0.95. It exercised the evaluation, the Raft write, the scheduler and the reconcilers perfectly, and it fed them a series that production never produces. The test agreed with the code about a contract nobody else honoured. A fake is only as good as its resemblance to the real thing, and this one resembled nothing.
+
+The fix has three parts. First, `metric` stops being a free-form string. It parses into an enum at validation time, and each variant knows which real series it reads:
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoscaleMetric {
+    Cpu,
+    Memory,
+}
+
+impl AutoscaleMetric {
+    pub fn series_name(self) -> &'static str {
+        match self {
+            Self::Cpu => "process_cpu_percent",
+            Self::Memory => "process_memory_bytes",
+        }
+    }
+}
+```
+
+`&'static str` is a borrowed string that lives for the whole program. String literals are baked into the binary, so the function can hand them out without allocating. Anything other than `"cpu"` or `"memory"` now fails `relish apply` with `autoscale metric "requests_per_second" is not supported`. The design doc once floated custom (scraped) metrics as a third option; we dropped that promise rather than ship another silent no-op.
+
+Second, units. `process_cpu_percent` comes from `sysinfo`, which reports percent of *one* core: a process saturating two cores reads 200. CPU requests are in millicores, where 1000m is one core. So `AutoscaleConfig::from_spec` converts the request into the series' own unit once (500m becomes 50.0), and `utilisation` is a single division:
+
+```rust
+pub fn utilisation(&self, series_value: f64) -> f64 {
+    series_value / self.request
+}
+```
+
+The query averages each instance's per-minute mean across the evaluation window, then divides. That's the same "average across pods" the HPA uses.
+
+Third, the tests. The integration test now feeds `process_cpu_percent` with collector-shaped labels. And a second one fakes nothing at all: a ProcessGrill replica runs `while :; do :; done`, each node samples its instances through `SystemCollector::collect_agent_instance_metrics` (the very call Bun's collection loop makes, extracted so the test can share it), the real rollup worker ships the per-minute aggregates to the leader, and the leader scales the app. It's slow, because rollups cover the previous *complete* minute, so it needs up to two minutes before the first signal lands. It's also the only test that would have caught this bug.
+
+Two limits remain, and we'd rather state them than bury them. The collector samples an instance's main process, not its children, so a shell that forks workers under-reports. And direct Apple Container instances (disabled in 0.1.0 anyway) run inside a VM with no host PID, so they produce no per-app metrics and can't autoscale.
 
 ### Getting the lifecycle right
 
@@ -742,7 +786,7 @@ Six features, and nearly all of them turn out to be pure functions hiding inside
 ### Unit tests by feature
 
 - **Blue-green** — the orchestrator against `MockDriver` (6), plus the new state-machine transitions (`StartingGreen`, `HealthCheckingGreen`, `RoutingSwitching` and their failure paths, 7). The mock had to be refactored to count operations rather than lifecycle phases — see the lessons below.
-- **Autoscaling** — `compute_desired` with hysteresis and cooldown is the heart of it (12 tests covering scale-up, scale-down-only-below-threshold, clamping to min/max, oscillation), plus config parsing and the `AutoscaleTracker` baseline/override logic (6).
+- **Autoscaling** — `compute_desired` with hysteresis and cooldown is the heart of it (12 tests covering scale-up, scale-down-only-below-threshold, clamping to min/max, oscillation), plus config parsing and the `AutoscaleTracker` baseline/override logic (6), and the metric mapping: `cpu`/`memory` to the collector series, utilisation of the request (or of one core), and refusing unsupported metrics or memory scaling without a request (7).
 - **WebSocket** — header detection edge cases (case-insensitive, multi-value `Connection`, opt-in routes) and the 4-byte close frame (8).
 - **Config tooling** — compilation and defaults merging (7), `fmt` idempotency and section ordering (4), structural `diff` (8).
 - **Lettuce** — types serde (4), git clone/fetch/list (4), webhook HMAC/replay/rate-limit (7), autoscaler-aware diff (7), sync-loop TOML parsing (3), coordinator election (5), signature verification (1).

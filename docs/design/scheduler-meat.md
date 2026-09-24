@@ -32,7 +32,7 @@ Meat is the single decision-maker for "what runs where." Every App placement, Jo
 | **Bun (Agent)** | Hard | Executes scheduling decisions on each node. Bun starts/stops containers, enforces cgroups, and reports back via the reporting tree. |
 | **Grill (Container Runtime)** | Indirect | Bun uses Grill to start containers. Meat does not interact with Grill directly but must account for Grill's startup latency in scheduling decisions. |
 | **Lettuce (GitOps)** | Soft | When GitOps is enabled, Lettuce prepares change sets from git and forwards deploy requests to the leader. Meat processes these identically to CLI/API deploys. |
-| **Mayo (Metrics)** | Soft | Meat reads Mayo metrics for autoscaling decisions (CPU utilisation, custom metrics). Mayo runs on every node; the leader queries aggregated metrics from council members. |
+| **Mayo (Metrics)** | Soft | The leader's autoscaler reads per-instance `process_cpu_percent` and `process_memory_bytes` from its rollup store, which every node's rollup worker feeds once a minute. No custom metrics. |
 | **Pickle (Registry)** | Soft | Meat checks image availability on target nodes when making placement decisions. Scheduling to a node that already has the image cached avoids pull latency. |
 | **Wrapper (Ingress)** | Soft | During rolling deploys, Meat coordinates with Wrapper to add/remove instances from the routing pool and wait for connection draining. |
 | **Sesame (Security)** | Soft | Meat validates that deployers have the required permissions (e.g., `host-exec` for process workloads) before accepting scheduling requests. |
@@ -293,24 +293,33 @@ impl Default for DeployStrategy {
     }
 }
 
-/// Autoscaling configuration for an App.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// Autoscaling configuration for an App (`meat::autoscaler`).
+#[derive(Clone, Debug)]
 pub struct AutoscaleConfig {
-    /// Metric to scale on: "cpu", "memory", or a custom metric path.
+    /// Resource to scale on. Config validation rejects anything but
+    /// "cpu" and "memory".
     pub metric: AutoscaleMetric,
-    /// Target value for the metric (e.g., 70 for 70% CPU utilisation).
-    pub target: u32,
+    /// Per-replica request in the collector series' unit: percent of one
+    /// core for CPU (500m = 50.0; no CPU request = 100.0, one core),
+    /// bytes for memory (a memory request is required).
+    pub request: f64,
+    /// Target utilisation of the request as a fraction (0.70 for "70%").
+    pub target: f64,
     /// Minimum replica count. Autoscaler will never scale below this.
     pub min: u32,
     /// Maximum replica count. Autoscaler will never scale above this.
     pub max: u32,
+    // ... evaluation_window, cooldown, scale_down_threshold
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// Each variant reads the per-instance series the node collector records,
+/// labelled `app = "<namespace>/<app>"`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AutoscaleMetric {
+    /// `process_cpu_percent`: percent of ONE core (two busy cores = 200).
     Cpu,
+    /// `process_memory_bytes`: resident bytes.
     Memory,
-    Custom(String),
 }
 
 /// Init container spec, runs to completion before the main app starts.
@@ -779,6 +788,15 @@ Dependencies are expressed as a DAG. Meat performs a topological sort at deploy 
 ### 5.4 Autoscaling Logic
 
 The autoscaler runs as a periodic task within Meat (default interval: 30 seconds).
+
+#### Metric semantics
+
+Utilisation follows the Kubernetes HPA convention: the average per-replica use divided by the per-replica **request**. The leader reads the rollup store for the metric's collector series (`process_cpu_percent` or `process_memory_bytes`), filtered to the app's exact `namespace/app` label, over `evaluation_window`; averages the per-instance, per-minute means; and divides by the request. `target = "50%"` on `cpu` with `cpu = "500m-1000m"` therefore means "a quarter of a core per replica on average".
+
+- **CPU with no CPU request** is measured against one whole core. ProcessGrill and rootless nodes refuse apps that declare `cpu` (they can't enforce the limit), so refusing here would make CPU autoscaling impossible on them.
+- **Memory with no memory request** fails config validation: there's no natural unit to fall back on.
+- **Any other `metric`** fails config validation. Custom (scraped) metrics are not supported.
+- **Limits.** The collector samples each instance's main process (children aren't counted), and only runtimes that report a host PID produce per-app metrics: ProcessGrill and runc do; direct Apple Container (VM-isolated, disabled in 0.1.0) doesn't, so its apps can't autoscale. Rollups cover the previous complete minute, so the first signal reaches the leader 60–120 s after load changes.
 
 #### Algorithm
 
@@ -1399,7 +1417,7 @@ Should Meat understand rack topology (from node labels like `rack = "rack-3"`) a
 
 ### 13.6 Autoscaler Custom Metrics
 
-The autoscaler currently supports `cpu`, `memory`, and a `Custom(String)` metric path that queries Mayo. The interface for custom metrics is not fully specified. **Open question: should custom metrics be PromQL expressions evaluated by Mayo, or simple metric-name + aggregation-function pairs?** PromQL is more powerful but adds a dependency on Mayo's query engine. Simple pairs are easier to implement and validate.
+The autoscaler supports exactly `cpu` and `memory`; config validation rejects any other `metric`. An earlier draft of this doc listed a `Custom(String)` metric path. Nothing implemented it, and the loop quietly never scaled on it, so 0.1.0 drops the promise. **Open question for later: should custom metrics be PromQL expressions evaluated by Mayo, or simple metric-name + aggregation-function pairs?** Either way they'd need a stated unit (utilisation against what?) before they could share the `target` field with `cpu` and `memory`.
 
 ### 13.7 Scheduling Latency SLO Enforcement
 

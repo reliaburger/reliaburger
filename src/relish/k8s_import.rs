@@ -340,7 +340,7 @@ fn correlate_and_convert(resources: Vec<K8sResource>) -> (Config, MigrationRepor
         // conventionally `{app}-hpa`, which a name-keyed lookup never matched).
         if let Some(hpa_name) = find_hpa_for_workload(&hpas, name, "Deployment") {
             if let Some(hpa) = hpas.get(&hpa_name) {
-                apply_hpa(&mut app, hpa);
+                apply_hpa(&mut app, &hpa_name, hpa, &mut report);
                 used_hpas.insert(hpa_name);
             }
         }
@@ -401,7 +401,7 @@ fn correlate_and_convert(resources: Vec<K8sResource>) -> (Config, MigrationRepor
         }
         if let Some(hpa_name) = find_hpa_for_workload(&hpas, name, "StatefulSet") {
             if let Some(hpa) = hpas.get(&hpa_name) {
-                apply_hpa(&mut app, hpa);
+                apply_hpa(&mut app, &hpa_name, hpa, &mut report);
                 used_hpas.insert(hpa_name);
             }
         }
@@ -1323,7 +1323,12 @@ fn apply_ingress(
     }
 }
 
-fn apply_hpa(app: &mut AppSpec, hpa: &HorizontalPodAutoscaler) {
+fn apply_hpa(
+    app: &mut AppSpec,
+    hpa_name: &str,
+    hpa: &HorizontalPodAutoscaler,
+    report: &mut MigrationReport,
+) {
     if let Some(spec) = &hpa.spec {
         let min = spec.min_replicas.unwrap_or(1) as u32;
         let max = spec.max_replicas as u32;
@@ -1346,7 +1351,7 @@ fn apply_hpa(app: &mut AppSpec, hpa: &HorizontalPodAutoscaler) {
             })
             .unwrap_or_else(|| ("cpu".to_string(), "70%".to_string()));
 
-        app.autoscale = Some(AutoscaleSpec {
+        let autoscale = AutoscaleSpec {
             metric,
             target,
             min,
@@ -1354,7 +1359,20 @@ fn apply_hpa(app: &mut AppSpec, hpa: &HorizontalPodAutoscaler) {
             evaluation_window: None,
             cooldown: None,
             scale_down_threshold: None,
-        });
+        };
+        // Reliaburger only scales on cpu/memory utilisation of a request. Say
+        // so now rather than let the imported config fail on apply.
+        if let Err(e) =
+            crate::meat::autoscaler::AutoscaleConfig::from_spec(&autoscale, app.cpu, app.memory)
+        {
+            report.warnings.push(MigrationWarning {
+                resource: format!("HorizontalPodAutoscaler/{hpa_name}"),
+                message: format!(
+                    "imported [autoscale] will not validate: {e}; fix it before applying"
+                ),
+            });
+        }
+        app.autoscale = Some(autoscale);
     }
 }
 
@@ -1730,6 +1748,67 @@ spec:
         assert_eq!(auto.target, "70%");
         assert_eq!(auto.min, 2);
         assert_eq!(auto.max, 10);
+        // CPU scaling without a CPU request measures against one core, so
+        // the block validates and there's nothing to warn about.
+        assert!(
+            !result
+                .report
+                .warnings
+                .iter()
+                .any(|w| w.resource.starts_with("HorizontalPodAutoscaler/")),
+            "{:?}",
+            result.report.warnings
+        );
+        result.config.validate().unwrap();
+    }
+
+    #[test]
+    fn import_memory_hpa_without_a_memory_request_warns() {
+        let yaml = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+spec:
+  replicas: 3
+  template:
+    spec:
+      containers:
+      - name: api
+        image: api:v1
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api-hpa
+spec:
+  scaleTargetRef:
+    name: api
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+"#;
+        let result = import_from_yaml(yaml).unwrap();
+        assert_eq!(
+            result.config.app["api"].autoscale.as_ref().unwrap().metric,
+            "memory"
+        );
+        assert!(
+            result
+                .report
+                .warnings
+                .iter()
+                .any(|w| w.resource == "HorizontalPodAutoscaler/api-hpa"
+                    && w.message.contains("needs a non-zero memory request")),
+            "{:?}",
+            result.report.warnings
+        );
     }
 
     #[test]
