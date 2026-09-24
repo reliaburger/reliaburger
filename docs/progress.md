@@ -354,7 +354,7 @@ that used to fail passes.
 | `mustard::protocol::tests::gossip_convergence_five_nodes` | 22 Sep | Unseeded RNG; exposed missing anti-entropy (C6.5) | Fixed: push-pull anti-entropy (C6.5); unseeded again |
 | `ebpf::standalone_discovery_recovery_preserves_original_routing_and_cleanup` | 22 Sep | Product: 2 s force-kill deadline too short under load | Fixed (C3.3) |
 | `registry_recovery::new_leader_retains_registry_cleanup_until_the_killed_writer_returns` | 23 Sep | Harness: treated the retryable lease-leader 503 as fatal | Fixed |
-| `owned_rootless::rootless_port_and_launcher_survive_recovery_and_helper_replacement` | 22 Sep | The replacement slirp4netns helper sometimes exits before readiness after the test kills the old one, and `state()` reports it as an error mid-recovery | Open: decide whether recovery retries the helper or reports the error |
+| `owned_rootless::rootless_port_and_launcher_survive_recovery_and_helper_replacement` | 22 Sep | Product: supervision saw the killed helper still `Running` (its owner reaps every 10 ms), probed its dead API, then reported the owner's late exit as "exited before readiness" (the old helper's log) instead of replacing it | Fixed: a helper that dies while probed is replaced; three bounded starts per pass before an error |
 | `placement::fault_injection_rejected_when_quorum_at_risk` | 24 Sep | Harness: asserted the rail's exact count; under CI load the leader briefly suspected the healthy follower too and counted 2 (run on #180, passed on re-run and 12/12 locally) | Fixed: any quorum-rail refusal counts |
 
 ## Current release checklist
