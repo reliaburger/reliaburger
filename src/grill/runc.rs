@@ -667,6 +667,7 @@ impl Drop for RuncGrill {
 mod tests {
     use super::*;
     use crate::grill::Grill;
+    use crate::testkit::pinned_images::{ALPINE_IMAGE, NGINX_IMAGE, REDIS_IMAGE};
 
     /// The Bun binary that owns runtime commands in these tests.
     fn test_owner() -> PathBuf {
@@ -749,6 +750,13 @@ mod tests {
         assert!(state.join(&id.0).is_dir());
     }
 
+    /// An image store that pulls the pinned test images from the local test
+    /// mirror when the harness provides one (see `testkit::pinned_images`).
+    fn pinned_image_store(root: &std::path::Path) -> ImageStore {
+        ImageStore::new(root.join("images"))
+            .with_mirrors(crate::testkit::pinned_images::local_test_mirrors().unwrap())
+    }
+
     fn runc_tests_enabled() -> bool {
         std::env::var("RELIABURGER_RUNC_TESTS").is_ok()
     }
@@ -804,7 +812,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let grill = RuncGrill::new(
             tmp.path().join("bundles"),
-            ImageStore::new(tmp.path().join("images")),
+            pinned_image_store(tmp.path()),
             true,
             tmp.path().join("state"),
             test_owner(),
@@ -856,7 +864,7 @@ mod tests {
         std::fs::create_dir_all(&bundle_base).unwrap();
         let grill = RuncGrill::new(
             bundle_base.clone(),
-            ImageStore::new(tmp.path().join("images")),
+            pinned_image_store(tmp.path()),
             false,
             tmp.path().join("state"),
             test_owner(),
@@ -925,7 +933,7 @@ mod tests {
         // is about verifying the runc CLI interaction, not networking.
         let grill = RuncGrill::new(
             tmp.path().join("bundles"),
-            ImageStore::new(tmp.path().join("images")),
+            pinned_image_store(tmp.path()),
             true,
             state_dir,
             test_owner(),
@@ -972,7 +980,7 @@ mod tests {
     // Validates the run-and-capture model end-to-end: the container's exit code
     // is captured (so jobs don't get retried) and its stdout is readable.
     #[tokio::test]
-    #[ignore = "requires runc, network access to a runnable OCI image, and RELIABURGER_RUNC_TESTS=1"]
+    #[ignore = "requires runc, a pinned OCI image (local test mirror or registry access), and RELIABURGER_RUNC_TESTS=1"]
     async fn runc_netns_resolves_internal_name_through_mounted_resolv_conf() {
         assert!(
             runc_tests_enabled(),
@@ -982,7 +990,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let grill = RuncGrill::new(
             tmp.path().join("bundles"),
-            ImageStore::new(tmp.path().join("images")),
+            pinned_image_store(tmp.path()),
             false,
             tmp.path().join("state"),
             test_owner(),
@@ -1026,7 +1034,7 @@ mod tests {
         let spec = crate::grill::oci::OciSpec {
             port_mapping: None,
             root: crate::grill::oci::OciRoot {
-                path: "alpine:latest".to_string(),
+                path: ALPINE_IMAGE.to_string(),
                 readonly: false,
             },
             process: crate::grill::oci::OciProcess {
@@ -1141,7 +1149,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires rootful runc, overlayfs, network access to a runnable OCI image, and RELIABURGER_RUNC_TESTS=1"]
+    #[ignore = "requires rootful runc, overlayfs, a pinned OCI image (local test mirror or registry access), and RELIABURGER_RUNC_TESTS=1"]
     async fn runc_replicas_cannot_observe_each_others_rootfs_writes() {
         assert!(
             runc_tests_enabled(),
@@ -1156,7 +1164,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let grill = RuncGrill::new(
             tmp.path().join("bundles"),
-            ImageStore::new(tmp.path().join("images")),
+            pinned_image_store(tmp.path()),
             false,
             tmp.path().join("state"),
             test_owner(),
@@ -1175,7 +1183,7 @@ mod tests {
             |value: &str, initial_delay: u64, final_delay: u64| crate::grill::oci::OciSpec {
                 port_mapping: None,
                 root: crate::grill::oci::OciRoot {
-                    path: "alpine:latest".to_string(),
+                    path: ALPINE_IMAGE.to_string(),
                     readonly: false,
                 },
                 process: crate::grill::oci::OciProcess {
@@ -1303,7 +1311,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires rootful runc, overlayfs, network access to an OCI image, and RELIABURGER_RUNC_TESTS=1"]
+    #[ignore = "requires rootful runc, overlayfs, a pinned OCI image (local test mirror or registry access), and RELIABURGER_RUNC_TESTS=1"]
     async fn runc_create_failure_rolls_back_private_rootfs_mount() {
         assert!(runc_tests_enabled());
         assert_eq!(nix::unistd::Uid::effective().as_raw(), 0);
@@ -1316,7 +1324,7 @@ mod tests {
         std::fs::create_dir_all(bundle.join("config.json")).unwrap();
         let grill = RuncGrill::new(
             tmp.path().join("bundles"),
-            ImageStore::new(tmp.path().join("images")),
+            pinned_image_store(tmp.path()),
             false,
             tmp.path().join("state"),
             test_owner(),
@@ -1325,7 +1333,7 @@ mod tests {
         let spec = crate::grill::oci::OciSpec {
             port_mapping: None,
             root: crate::grill::oci::OciRoot {
-                path: "alpine:latest".to_string(),
+                path: ALPINE_IMAGE.to_string(),
                 readonly: false,
             },
             process: crate::grill::oci::OciProcess {
@@ -1364,7 +1372,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires rootful runc, overlayfs, network access to a runnable OCI image, and RELIABURGER_RUNC_TESTS=1"]
+    #[ignore = "requires rootful runc, overlayfs, a pinned OCI image (local test mirror or registry access), and RELIABURGER_RUNC_TESTS=1"]
     async fn runc_adoption_keeps_private_rootfs_and_releases_mount() {
         assert!(
             runc_tests_enabled(),
@@ -1374,7 +1382,7 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let bundle_base = tmp.path().join("bundles");
-        let image_store = ImageStore::new(tmp.path().join("images"));
+        let image_store = pinned_image_store(tmp.path());
         let state_dir = tmp.path().join("state");
         let id = InstanceId("payments__runc-rootfs-adoption-0".to_string());
         remove_test_network(&id);
@@ -1382,7 +1390,7 @@ mod tests {
         let spec = crate::grill::oci::OciSpec {
             port_mapping: None,
             root: crate::grill::oci::OciRoot {
-                path: "alpine:latest".to_string(),
+                path: ALPINE_IMAGE.to_string(),
                 readonly: false,
             },
             process: crate::grill::oci::OciProcess {
@@ -1460,7 +1468,7 @@ mod tests {
             app_name: "rootfs-adoption".to_string(),
             replica_index: 0,
             is_job: false,
-            image: "alpine:latest".to_string(),
+            image: ALPINE_IMAGE.to_string(),
             runtime: crate::grill::records::RuntimeKind::Runc,
             pid,
             pid_started_at: started_at,
@@ -1553,7 +1561,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires runc, network access to the pinned OCI workload, and RELIABURGER_RUNC_TESTS=1"]
+    #[ignore = "requires runc, a pinned OCI image (local test mirror or registry access), and RELIABURGER_RUNC_TESTS=1"]
     async fn runc_runs_pinned_multiarchitecture_test_workload() {
         assert!(
             runc_tests_enabled(),
@@ -1563,7 +1571,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let grill = RuncGrill::new(
             tmp.path().join("bundles"),
-            ImageStore::new(tmp.path().join("images")),
+            pinned_image_store(tmp.path()),
             true,
             tmp.path().join("state"),
             test_owner(),
@@ -1619,16 +1627,11 @@ mod tests {
         grill.kill(&id).await.unwrap();
     }
 
-    /// Redis 8.8.0 from the ECR mirror of the official image, pinned.
-    const REDIS_IMAGE: &str = "public.ecr.aws/docker/library/redis@sha256:234c902a2db49461a129e2d4aeff85b28cf20187ed274a67f6e50995fa713c7b";
-    /// nginx 1.29-alpine from the ECR mirror of the official image, pinned.
-    const NGINX_IMAGE: &str = "public.ecr.aws/docker/library/nginx@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de";
-
     /// A rootful grill and the spec Bun would generate for `app_toml`.
     fn image_app(tmp: &std::path::Path, id: &InstanceId, app_toml: &str) -> (RuncGrill, OciSpec) {
         let grill = RuncGrill::new(
             tmp.join("bundles"),
-            ImageStore::new(tmp.join("images")),
+            pinned_image_store(tmp),
             false,
             tmp.join("state"),
             test_owner(),
@@ -1670,7 +1673,7 @@ mod tests {
     /// entrypoint, env and working directory, as the image's user, and
     /// that user is root only inside the container's user namespace.
     #[tokio::test]
-    #[ignore = "requires rootful runc, network access to public.ecr.aws, and RELIABURGER_RUNC_TESTS=1"]
+    #[ignore = "requires rootful runc, a pinned OCI image (local test mirror or registry access), and RELIABURGER_RUNC_TESTS=1"]
     async fn runc_runs_an_image_by_its_own_entrypoint_env_and_working_dir() {
         assert!(runc_tests_enabled(), "set RELIABURGER_RUNC_TESTS=1");
         assert!(nix::unistd::geteuid().is_root(), "rootful runc needs root");
@@ -1741,7 +1744,7 @@ mod tests {
     /// Z1.1/D1: image root binds port 80 and nginx's workers drop to their
     /// own user, yet no container process is root on the node.
     #[tokio::test]
-    #[ignore = "requires rootful runc, network access to public.ecr.aws, and RELIABURGER_RUNC_TESTS=1"]
+    #[ignore = "requires rootful runc, a pinned OCI image (local test mirror or registry access), and RELIABURGER_RUNC_TESTS=1"]
     async fn runc_image_root_binds_port_80_without_being_host_root() {
         use std::os::unix::fs::MetadataExt;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1835,7 +1838,7 @@ mod tests {
     /// directly (no entrypoint chown to help), then as image root after a
     /// user change.
     #[tokio::test]
-    #[ignore = "requires rootful runc, network access to public.ecr.aws, and RELIABURGER_RUNC_TESTS=1"]
+    #[ignore = "requires rootful runc, a pinned OCI image (local test mirror or registry access), and RELIABURGER_RUNC_TESTS=1"]
     async fn runc_redis_persists_to_a_managed_volume_across_restarts() {
         use std::os::unix::fs::MetadataExt;
 

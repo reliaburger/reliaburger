@@ -2677,6 +2677,29 @@ route to another case's backend. Namespace isolation must extend to the ingress
 name, not just the app record.
 
 
+## Don't let the internet grade your tests
+
+One release candidate failed on a line we'd never touched:
+`registry read deadline exceeded`, while staging BusyBox from ECR. Nothing in
+Reliaburger was broken. A CDN edge had a slow minute. Two fixes, one for users
+and one for us. Chapter 5 covers the product side: stalled reads now retry
+inside a bounded total, and digest-pinned images can come from a mirror.
+
+The harness side uses that same mirror feature. Every public image the Linux
+suites run is pinned by digest in `testkit::pinned_images`. A small
+standard-library Python script fetches them once, with retries, into a
+content-addressed cache and serves it as a read-only registry on loopback.
+`make test-linux` runs nextest under it, and the tests hand
+`[images] mirrors` to every Bun they start. Why a mirror rather than, say,
+copying files into Bun's image store? Because the mirror goes through exactly
+the code users run: the same client, the same index resolution, the same digest
+checks. Pre-seeding the store would test a path nobody takes. And because the
+content is addressed by digest, the mirror can't lie: bad bytes fail
+verification and Bun falls back to the real registry.
+
+The proof we wanted was blunt. Warm the cache, cut the VM's uplink, run the
+image-pulling suites. They pass.
+
 ## Lessons learned: audit the evidence too
 
 Export a log file, replace it with new contents under the same name, then export

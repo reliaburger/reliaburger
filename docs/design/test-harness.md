@@ -125,6 +125,38 @@ Do not inspect the host inside a test and return successfully. If a portable pre
 such as `git` is missing, fail with a useful message. If behaviour depends on whether a tool
 is installed, inject capability state or put the two environments in separate suites.
 
+## Public images: pinned, warmed once, served locally
+
+The privileged Linux suites run real public images (BusyBox, Alpine, Redis, nginx,
+podinfo). A release candidate once failed because one ECR read stalled mid-test, so no
+timed test pulls from the internet any more:
+
+- `src/testkit/pinned_images.rs` names every image by digest, and
+  `tests/fixtures/pinned-images.txt` lists the same references for tooling. A portable
+  unit test fails if the two drift or if `examples/kubernetes/podinfo.yaml` uses an image
+  outside the list.
+- `make test-images` runs `scripts/test-images/mirror.py warm`, which fetches each image's
+  index, this host's platform manifest, config and layers once, with retries, into a
+  digest-checked content-addressed cache (`TEST_IMAGE_CACHE`, default
+  `~/.cache/reliaburger/test-images`).
+- `make test-linux` wraps nextest in `mirror.py run`: it warms (a no-op on a verified
+  cache), serves the cache as a read-only OCI registry on `127.0.0.1:5099` and sets
+  `RELIABURGER_TEST_IMAGE_MIRROR`. Tests turn that into `[images] mirrors` for every
+  pinned registry (`local_test_mirrors()`): Bun nodes get it in their config, image stores
+  in runc unit tests get it directly, and `relish test` stages its fixture through the
+  node's reported mirrors.
+- `pinned_images_serve_verified_from_the_local_test_mirror` reads every image from the
+  mirror alone, so a gap in the warm list fails in one place, not mid-suite.
+- CI caches the warmed directory keyed on the list, warms in its own step, and passes
+  `TEST_IMAGE_CACHE` to `make test-linux`. A registry outage then fails "Warm the pinned
+  test images", clearly labelled, instead of a random acceptance test.
+
+The mirror is untrusted by design: Bun verifies the full digest chain whichever registry
+answers, and falls back to the upstream when a mirror fails. Adding an image means adding
+its digest to both lists and running `make test-images`. The OCI interruption
+qualification (`scripts/release/qualify-oci-interruptions.sh`) needs neither: its
+fixtures use local root filesystems inside a network namespace with no uplink.
+
 ## Deterministic asynchronous tests
 
 The preferred order is:

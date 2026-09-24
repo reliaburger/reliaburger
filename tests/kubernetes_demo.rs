@@ -7,8 +7,9 @@
 //! Kubernetes names (Z1.2), the images' own entrypoints, users and working
 //! directories (Z1.1), and the import (Z1.3, Z1.4) all have to work for that.
 //!
-//! Needs root, runc, nftables, bpffs, a cgroup v2 host and internet access
-//! for the image pulls, so it runs in the provisioned Linux VM only.
+//! Needs root, runc, nftables, bpffs and a cgroup v2 host, so it runs in the
+//! provisioned Linux VM only. The pinned images come from the local test
+//! mirror (`make test-linux` starts one) or, without it, the internet.
 #![cfg(all(target_os = "linux", feature = "ebpf", feature = "kubernetes"))]
 
 #[path = "support/bun_process.rs"]
@@ -189,6 +190,17 @@ impl Demo {
     }
 }
 
+/// The local test mirrors as a TOML inline table, `{}` without a mirror.
+fn inline_mirrors() -> String {
+    let mirrors = reliaburger::testkit::pinned_images::local_test_mirrors().unwrap();
+    let pairs: Vec<String> = mirrors
+        .as_map()
+        .iter()
+        .map(|(upstream, mirror)| format!("{upstream:?} = {mirror:?}"))
+        .collect();
+    format!("{{ {} }}", pairs.join(", "))
+}
+
 /// Start one Runc Bun with eBPF, DNS and ingress, apply the podinfo manifest
 /// and wait until the frontend answers and reaches the backend and redis by
 /// name. `extra_config` is appended to the node config.
@@ -214,6 +226,7 @@ volumes = "{root}/volumes"
 [images]
 registry_bind = "127.0.0.1"
 registry_port = 0
+mirrors = {mirrors}
 [ebpf]
 enabled = true
 [dns]
@@ -227,6 +240,9 @@ https_port = {https}
 "#,
             root = root.display(),
             https = reserve_address().port(),
+            // The pinned podinfo, redis and busybox images come from the
+            // local test mirror when the harness runs one.
+            mirrors = inline_mirrors(),
         ),
     )
     .unwrap();
@@ -340,7 +356,7 @@ https_port = {https}
 }
 
 #[tokio::test]
-#[ignore = "requires root, runc, nftables, bpffs and internet access (provisioned Linux VM)"]
+#[ignore = "requires root, runc, nftables, bpffs and the pinned images (local test mirror or internet access)"]
 async fn podinfo_demo_frontend_reaches_backend_and_redis_by_name() {
     let demo = start_demo("").await;
 
@@ -380,7 +396,7 @@ async fn podinfo_demo_frontend_reaches_backend_and_redis_by_name() {
 /// frontend's own connections to redis, including the ones its pool already
 /// holds open.
 #[tokio::test]
-#[ignore = "requires root, runc, nftables, bpffs and internet access (provisioned Linux VM)"]
+#[ignore = "requires root, runc, nftables, bpffs and the pinned images (local test mirror or internet access)"]
 async fn podinfo_demo_feels_network_faults_between_frontend_and_redis() {
     use reliaburger::smoker::types::{FaultRequest, FaultType};
 
