@@ -8,7 +8,7 @@ import shutil
 import tempfile
 import unittest
 
-from package import package_release
+from package import GUEST_METADATA, guest_image_statement, package_release
 
 # The installers promise `curl ... | sh`. CI's `sh` is dash; macOS's is bash in
 # POSIX mode. Run every installer test under each POSIX shell present.
@@ -29,9 +29,52 @@ class ReleasePackageTests(unittest.TestCase):
         self.assets.mkdir()
         for name in ("bun-linux-aarch64", "bun-linux-x86_64", "relish-linux-aarch64", "relish-linux-x86_64", "relish-macos-aarch64", "relish-macos-x86_64"):
             (self.assets / name).write_bytes(b"test binary: " + name.encode())
+        self.pins = json.loads((Path(__file__).with_name("guest-images.json")).read_text())
+        for image in self.pins["images"].values():
+            (self.assets / image["asset"]).write_bytes(b"test image: " + image["asset"].encode())
 
     def package(self):
-        package_release(self.assets, "v0.1.0", "reliaburger/reliaburger", self.key, self.trusted)
+        package_release(self.assets, "v0.1.0", "reliaburger/reliaburger", self.key, self.trusted, self.pins)
+
+    def verify_signature(self, data, encoded):
+        message, signature = self.root / "message", self.root / "signature"
+        message.write_bytes(data)
+        signature.write_bytes(base64.b64decode(encoded))
+        return subprocess.run(["openssl", "pkeyutl", "-verify", "-rawin", "-keyform", "DER", "-inkey", str(self.key),
+                               "-in", str(message), "-sigfile", str(signature)], capture_output=True).returncode == 0
+
+    def test_statement_text_matches_the_cli(self):
+        # artifacts.rs asserts the same text for the same inputs.
+        self.assertEqual(guest_image_statement("v0.1.0", "aarch64", "guest.qcow2", "ab", "cd"),
+                         b"reliaburger guest image v1\nversion v0.1.0\narch aarch64\nasset guest.qcow2\n"
+                         b"sha256 ab\nsource-sha256 cd\n")
+
+    def test_guest_images_are_signed_with_their_pinned_source(self):
+        self.package()
+        metadata = json.loads((self.assets / GUEST_METADATA).read_text())
+        self.assertEqual(metadata["schema"], 1)
+        self.assertEqual(metadata["version"], "v0.1.0")
+        self.assertEqual(set(metadata["images"]), set(self.pins["images"]))
+        sums = (self.assets / "SHA256SUMS").read_text()
+        for arch, pin in self.pins["images"].items():
+            image = metadata["images"][arch]
+            path = self.assets / pin["asset"]
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            self.assertEqual(image["sha256"], digest)
+            self.assertEqual(image["size"], path.stat().st_size)
+            self.assertEqual(image["source"], {"url": pin["source"]["url"], "sha256": pin["source"]["sha256"]})
+            self.assertIn(f"{digest}  {pin['asset']}\n", sums)
+            statement = guest_image_statement("v0.1.0", arch, pin["asset"], digest, pin["source"]["sha256"])
+            self.assertTrue(self.verify_signature(statement, image["signature"]))
+            forged = guest_image_statement("v0.1.0", arch, pin["asset"], "0" * 64, pin["source"]["sha256"])
+            self.assertFalse(self.verify_signature(forged, image["signature"]))
+
+    def test_missing_guest_image_cannot_publish_metadata(self):
+        (self.assets / self.pins["images"]["x86_64"]["asset"]).unlink()
+        with self.assertRaises(ValueError):
+            self.package()
+        self.assertFalse((self.assets / "metadata.json").exists())
+        self.assertFalse((self.assets / GUEST_METADATA).exists())
 
     def test_metadata_keeps_bun_and_cli_selection_separate(self):
         self.package()
@@ -194,7 +237,7 @@ exit 1
 
     def test_invalid_release_tag_is_rejected(self):
         with self.assertRaises(ValueError):
-            package_release(self.assets, "../main", "reliaburger/reliaburger", self.key, self.trusted)
+            package_release(self.assets, "../main", "reliaburger/reliaburger", self.key, self.trusted, self.pins)
 
 
 if __name__ == "__main__":

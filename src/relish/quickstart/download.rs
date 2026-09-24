@@ -137,8 +137,9 @@ impl Downloader {
         Ok(chunk)
     }
 
-    /// Fetch a release manifest, refusing unsupported schemas and oversized bodies.
-    pub async fn metadata(&self, url: &str) -> Result<ReleaseMetadata> {
+    /// Fetch a small JSON release document (at most 1 MiB) and parse it.
+    /// Nothing about its contents is trusted yet: callers verify it.
+    pub async fn json<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T> {
         const LIMIT: u64 = 1024 * 1024;
         let mut response = self.response(url, LIMIT, 0).await?;
         let mut body = Vec::new();
@@ -148,7 +149,12 @@ impl Downloader {
             }
             body.extend_from_slice(&chunk);
         }
-        let metadata: ReleaseMetadata = serde_json::from_slice(&body)?;
+        Ok(serde_json::from_slice(&body)?)
+    }
+
+    /// Fetch a release manifest, refusing unsupported schemas and oversized bodies.
+    pub async fn metadata(&self, url: &str) -> Result<ReleaseMetadata> {
+        let metadata: ReleaseMetadata = self.json(url).await?;
         if metadata.schema != 1 {
             bail!("unsupported release metadata schema {}", metadata.schema);
         }

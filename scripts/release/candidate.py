@@ -8,18 +8,18 @@ from pathlib import Path
 import re
 import subprocess
 
-from package import PLATFORMS, sha256
+from package import GUEST_METADATA, PLATFORMS, sha256
 
 RECORD = "candidate.json"
 PDFS = {"building-reliaburger.pdf", "reliaburger-design-docs.pdf",
         "reliaburger-roadmap.pdf", "reliaburger-whitepaper.pdf"}
 
 
-def candidate_names(images):
+def candidate_names(pins):
     names = {f"{binary}-{platform}" for binary, platforms in PLATFORMS.items() for platform in platforms}
     return names | {name + ".sig" for name in names} | PDFS | {
-        "metadata.json", "cli-metadata.json", "SHA256SUMS", "install.sh",
-    } | {image["asset"] for image in images.values()}
+        "metadata.json", "cli-metadata.json", "SHA256SUMS", "install.sh", GUEST_METADATA,
+    } | {image["asset"] for image in pins["images"].values()}
 
 
 def identity(version, repository, commit, run_id, run_attempt):
@@ -35,8 +35,21 @@ def identity(version, repository, commit, run_id, run_attempt):
                 run_id=run_id, run_attempt=run_attempt)
 
 
-def inventory(directory, images, recorded=False):
-    expected = candidate_names(images) | ({RECORD} if recorded else set())
+def check_guest_images(directory, pins, assets):
+    """Every built image must be the one its signed metadata names, built from the pinned source."""
+    images = json.loads((directory / GUEST_METADATA).read_text()).get("images", {})
+    if set(images) != set(pins["images"]):
+        raise ValueError("guest image metadata must cover exactly the pinned architectures")
+    for arch, pin in pins["images"].items():
+        image = images[arch]
+        if (image.get("asset") != pin["asset"]
+                or image.get("sha256") != assets[pin["asset"]]["sha256"]
+                or image.get("source", {}).get("sha256") != pin["source"]["sha256"]):
+            raise ValueError("candidate guest image does not match its metadata or its pinned source")
+
+
+def inventory(directory, pins, recorded=False):
+    expected = candidate_names(pins) | ({RECORD} if recorded else set())
     paths = list(directory.iterdir())
     if {path.name for path in paths} != expected:
         raise ValueError("candidate asset inventory does not match the complete release matrix")
@@ -44,18 +57,16 @@ def inventory(directory, images, recorded=False):
         raise ValueError("candidate assets must be non-empty regular files")
     assets = {path.name: {"sha256": sha256(path), "size": path.stat().st_size}
               for path in sorted(paths) if path.name != RECORD}
-    for image in images.values():
-        if assets[image["asset"]]["sha256"] != image["sha256"]:
-            raise ValueError("candidate guest image does not match its compiled-in digest")
+    check_guest_images(directory, pins, assets)
     return assets
 
 
-def record_candidate(directory, images, **expected):
+def record_candidate(directory, pins, **expected):
     expected = identity(**expected)
     path = directory / RECORD
     if path.exists() or path.is_symlink():
         raise FileExistsError("candidate record already exists")
-    document = dict(schema=1, **expected, assets=inventory(directory, images))
+    document = dict(schema=1, **expected, assets=inventory(directory, pins))
     encoded = (json.dumps(document, indent=2, sort_keys=True) + "\n").encode()
     with path.open("xb") as output:
         output.write(encoded)
@@ -64,7 +75,7 @@ def record_candidate(directory, images, **expected):
     return hashlib.sha256(encoded).hexdigest()
 
 
-def verify_candidate(directory, images, qualified_digest, **expected):
+def verify_candidate(directory, pins, qualified_digest, **expected):
     expected = identity(**expected)
     if not re.fullmatch(r"[0-9a-f]{64}", qualified_digest):
         raise ValueError("qualification must supply the candidate record's SHA-256")
@@ -72,7 +83,7 @@ def verify_candidate(directory, images, qualified_digest, **expected):
     if path.is_symlink() or not path.is_file() or sha256(path) != qualified_digest:
         raise ValueError("candidate record differs from the qualified digest")
     document = json.loads(path.read_text())
-    if document != dict(schema=1, **expected, assets=inventory(directory, images, recorded=True)):
+    if document != dict(schema=1, **expected, assets=inventory(directory, pins, recorded=True)):
         raise ValueError("candidate identity or bytes differ from qualification")
     return document
 
@@ -121,13 +132,13 @@ def main():
     parser.add_argument("--qualified-digest")
     args = parser.parse_args()
     expected = identity(args.version, args.repository, args.commit, args.run_id, args.run_attempt)
-    images = json.loads(Path(__file__).with_name("guest-images.json").read_text())
+    pins = json.loads(Path(__file__).with_name("guest-images.json").read_text())
     if args.operation == "record":
-        print(record_candidate(args.directory, images, **expected))
+        print(record_candidate(args.directory, pins, **expected))
         return
 
     if args.operation == "verify":
-        verify_candidate(args.directory, images, args.qualified_digest or "", **expected)
+        verify_candidate(args.directory, pins, args.qualified_digest or "", **expected)
         print(f"verified local candidate {args.commit}")
         return
 
@@ -144,7 +155,7 @@ def main():
         subprocess.run(["gh", "run", "download", str(args.run_id), "--repo", args.repository,
                         "--name", f"candidate-{args.commit}-{run['run_attempt']}",
                         "--dir", str(args.directory)], check=True)
-    document = verify_candidate(args.directory, images, args.qualified_digest or "", **expected)
+    document = verify_candidate(args.directory, pins, args.qualified_digest or "", **expected)
     if args.operation == "verify-upload":
         result = subprocess.run(["gh", "release", "view", args.version, "--repo", args.repository,
                                  "--json", "databaseId"], check=True, capture_output=True, text=True)

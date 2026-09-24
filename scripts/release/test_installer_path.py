@@ -34,7 +34,11 @@ class InstallerPathTests(unittest.TestCase):
         assets.mkdir()
         for name in ("bun-linux-aarch64", "bun-linux-x86_64", "relish-linux-aarch64", "relish-linux-x86_64", "relish-macos-aarch64", "relish-macos-x86_64"):
             (assets / name).write_bytes(b"test binary: " + name.encode())
-        package_release(assets, "v0.1.0", "reliaburger/reliaburger", key, ["ed25519:" + base64.b64encode(public[-32:]).decode()])
+        pins = {"packages": ["runc"], "images": {"fixture": {"asset": "guest.qcow2", "source": {
+            "file": "ubuntu.img", "url": "https://images.example/ubuntu.img", "sha256": "5" * 64}}}}
+        (assets / "guest.qcow2").write_bytes(b"test image")
+        package_release(assets, "v0.1.0", "reliaburger/reliaburger", key,
+                        ["ed25519:" + base64.b64encode(public[-32:]).decode()], pins)
         self.installer = assets / "install.sh"
         self.tools = self.root / "tools"
         self.tools.mkdir()

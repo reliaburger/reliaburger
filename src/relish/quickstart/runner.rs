@@ -259,13 +259,16 @@ async fn prepare_artifacts(
     let image = async {
         let step = progress.step(Stage::Download, "download guest image");
         let result = if development.is_some() {
+            // Development runs have no release to take a built image from, so
+            // they boot the stock Ubuntu image it's built from, and the VM
+            // installs the packages at first boot.
             async {
-                let image = artifacts::guest_image(std::env::consts::ARCH)?;
-                let path = cache.join(&image.asset);
+                let source = artifacts::guest_image(std::env::consts::ARCH)?.source;
+                let path = cache.join(&source.file);
                 downloader
                     .fetch(
-                        &image.url,
-                        &image.sha256,
+                        &source.url,
+                        &source.sha256,
                         &path,
                         2 * 1024 * 1024 * 1024,
                         Some(&step),

@@ -19,14 +19,16 @@ permissions:
 jobs:
   changes:
     # Pushes and manual runs build everything. A pull request builds the PDF
-    # only when the docs change, and only the Linux x86-64 binaries when Rust
-    # or packaging inputs change; main builds the whole matrix.
+    # only when the docs change, only the Linux x86-64 binaries when Rust
+    # or packaging inputs change, and the guest images only when their build
+    # script or pins change; main builds the whole matrix.
     name: select builds
     runs-on: ubuntu-latest
     outputs:
       pdf: ${{ steps.select.outputs.pdf }}
       binaries: ${{ steps.select.outputs.binaries }}
       matrix: ${{ steps.select.outputs.matrix }}
+      guest_images: ${{ steps.select.outputs.guest_images }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -38,16 +40,17 @@ jobs:
         run: |
           all='[{"target":"aarch64-unknown-linux-gnu","suffix":"linux-aarch64","runner":"ubuntu-22.04-arm","arguments":"--features ebpf --bin bun --bin relish"},{"target":"x86_64-unknown-linux-gnu","suffix":"linux-x86_64","runner":"ubuntu-22.04","arguments":"--features ebpf --bin bun --bin relish"},{"target":"aarch64-apple-darwin","suffix":"macos-aarch64","runner":"macos-15","arguments":"--bin relish"},{"target":"x86_64-apple-darwin","suffix":"macos-x86_64","runner":"macos-15-intel","arguments":"--bin relish"}]'
           if [ "$EVENT" != pull_request ]; then
-            pdf=true binaries=true matrix="$all"
+            pdf=true binaries=true guest_images=true matrix="$all"
           else
             changed=$(git diff --name-only "$BASE_SHA...HEAD")
-            pdf=false binaries=false
+            pdf=false binaries=false guest_images=false
             grep -qE '^docs/|^Makefile$|^\.github/workflows/build\.yml$' <<<"$changed" && pdf=true
             grep -qE '^(src|ebpf|brioche|assets|docs/manual|scripts/release)/|^(build\.rs|Cargo\.(toml|lock)|rust-toolchain.*|\.github/workflows/build\.yml)$' <<<"$changed" && binaries=true
+            grep -qE '^scripts/release/(build_guest_image\.sh|guest-images\.json)$|^\.github/workflows/build\.yml$' <<<"$changed" && guest_images=true
             matrix=$(jq -c '[.[] | select(.suffix == "linux-x86_64")]' <<<"$all")
           fi
-          { echo "pdf=$pdf"; echo "binaries=$binaries"; echo "matrix=$matrix"; } >>"$GITHUB_OUTPUT"
-          echo "pdf=$pdf binaries=$binaries"
+          { echo "pdf=$pdf"; echo "binaries=$binaries"; echo "matrix=$matrix"; echo "guest_images=$guest_images"; } >>"$GITHUB_OUTPUT"
+          echo "pdf=$pdf binaries=$binaries guest_images=$guest_images"
 
   validate-release:
     if: github.event_name == 'workflow_dispatch'
@@ -134,9 +137,45 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  build-guest-images:
+    # The quickstart's VM image: pinned Ubuntu plus the node packages, so a
+    # VM's first boot runs no apt. Built natively per architecture: package
+    # scripts run in a chroot, which can't execute a foreign CPU's binaries.
+    needs: changes
+    if: needs.changes.outputs.guest_images == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+          - arch: x86_64
+            runner: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install image tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-utils
+      - name: Build the guest image
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          sudo scripts/release/build_guest_image.sh --output guest > guest-record.json
+          { echo "### Guest image ($ARCH)"; echo '```json'; cat guest-record.json; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload guest image
+        uses: actions/upload-artifact@v4
+        with:
+          name: guest-image-${{ matrix.arch }}
+          path: guest/*.qcow2
+          if-no-files-found: error
+          # The qcow2 clusters are compressed already.
+          compression-level: 0
+
   candidate:
     if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
-    needs: [validate-release, build-pdf, build-binaries, test-packaging]
+    needs: [validate-release, build-pdf, build-binaries, build-guest-images, test-packaging]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -151,8 +190,12 @@ jobs:
           pattern: binaries-*
           merge-multiple: true
           path: dist
-      - name: Mirror checksum-pinned Ubuntu guest images
-        run: python3 scripts/release/fetch_guest_images.py --directory dist
+      - name: Download both built guest images
+        uses: actions/download-artifact@v4
+        with:
+          pattern: guest-image-*
+          merge-multiple: true
+          path: dist
       - name: Read candidate version
         run: |
           python3 - <<'PYCODE' >> "$GITHUB_ENV"

@@ -38,19 +38,45 @@ pub fn vm_config(
         "containerd":{"system":false,"user":false},
         "networks":[{"lima":"user-v2"}],
         "portForwards":forwards,
-        "provision":[{"mode":"system","script": concat!(
-            "#!/bin/bash\nset -eu\nexport DEBIAN_FRONTEND=noninteractive\n",
+        "provision":[{"mode":"system","script": format!(
+            "#!/bin/bash\nset -eu\nexport DEBIAN_FRONTEND=noninteractive\n{}{}{}",
             // Lima changes the user manager during first boot. Reconnect logind
             // after that transition so subsequent PAM sessions do not stall.
             // A graceful stop sometimes spins until systemd's 90 s stop
             // timeout kills it, stalling boot. Kill it straight away instead.
-            "systemctl kill --signal=SIGKILL systemd-logind.service || true\n",
-            "systemctl restart systemd-logind.service\n",
-            "apt-get update -qq\napt-get install -y -qq runc uidmap btrfs-progs nftables iptables iproute2\n",
+            "systemctl kill --signal=SIGKILL systemd-logind.service || true\n\
+             systemctl restart systemd-logind.service\n",
+            install_missing_packages(&super::artifacts::guest_image_pins()?.packages)?,
             "install -d -m 700 /etc/reliaburger\n")
         }]
     });
     Ok(serde_yaml::to_string(&value)?)
+}
+
+/// Shell that installs the node packages unless the image already has them.
+///
+/// The release image has them baked in, so its VMs never touch apt. A stock
+/// Ubuntu image (development runs) installs them at first boot, which costs
+/// 15–40 s of `apt-get update` and downloads from Ubuntu's mirrors.
+fn install_missing_packages(packages: &[String]) -> Result<String> {
+    let valid = |name: &String| {
+        !name.is_empty()
+            && name.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"+-.".contains(&byte)
+            })
+    };
+    if packages.is_empty() || !packages.iter().all(valid) {
+        bail!("guest package pins must be plain Debian package names");
+    }
+    let list = packages.join(" ");
+    // `dpkg-query` prints nothing for a package it has never heard of, so
+    // count the installed ones rather than looking for a missing one.
+    Ok(format!(
+        "installed=$(dpkg-query -W -f='${{db:Status-Abbrev}}\\n' {list} 2>/dev/null | grep -c '^ii' || true)\n\
+         if [ \"$installed\" -ne {count} ]; then\n  \
+         apt-get update -qq\n  apt-get install -y -qq {list}\nfi\n",
+        count = packages.len()
+    ))
 }
 
 /// Generate a node config with pinned identity paths and authenticated transport.
@@ -178,6 +204,75 @@ mod tests {
             .find("systemctl restart systemd-logind.service")
             .unwrap();
         assert!(kill < restart, "{script}");
+    }
+
+    /// Run the generated provision script with stub system tools and
+    /// return every `apt-get` invocation. `missing` is a package the stub
+    /// `dpkg-query` has never heard of.
+    #[cfg(unix)]
+    fn apt_calls_when_provisioning(missing: Option<&str>) -> Vec<String> {
+        use std::os::unix::fs::PermissionsExt;
+        let yaml = vm_config("/private/cache/guest.qcow2", "aarch64", 19117, None, None).unwrap();
+        let value: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        let script = value["provision"][0]["script"].as_str().unwrap();
+        let stubs = tempfile::tempdir().unwrap();
+        let log = stubs.path().join("apt.log");
+        let tools = [
+            (
+                "dpkg-query",
+                "for arg in \"$@\"; do case \"$arg\" in -*) ;; \"$MISSING\") ;; *) echo 'ii ' ;; esac; done",
+            ),
+            ("apt-get", "echo \"$*\" >> \"$APT_LOG\""),
+            ("systemctl", "true"),
+            ("install", "true"),
+        ];
+        for (name, body) in tools {
+            let path = stubs.path().join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let status = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(script)
+            .env("PATH", format!("{}:/usr/bin:/bin", stubs.path().display()))
+            .env("MISSING", missing.unwrap_or(""))
+            .env("APT_LOG", &log)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::fs::read_to_string(&log)
+            .map(|text| text.lines().map(str::to_string).collect())
+            .unwrap_or_default()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provisioning_a_baked_image_never_runs_apt() {
+        assert!(apt_calls_when_provisioning(None).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provisioning_a_stock_image_installs_every_node_package() {
+        let calls = apt_calls_when_provisioning(Some("uidmap"));
+        let packages = crate::relish::quickstart::artifacts::guest_image_pins()
+            .unwrap()
+            .packages
+            .join(" ");
+        assert_eq!(
+            calls,
+            vec![
+                "update -qq".to_string(),
+                format!("install -y -qq {packages}")
+            ]
+        );
+    }
+
+    #[test]
+    fn guest_package_pins_cannot_inject_shell() {
+        assert!(install_missing_packages(&["runc".into(), "x; reboot".into()]).is_err());
+        assert!(install_missing_packages(&[]).is_err());
+        assert!(install_missing_packages(&["libc6".into(), "g++".into()]).is_ok());
     }
 
     #[test]
