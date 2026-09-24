@@ -2400,6 +2400,32 @@ The fix is one mutable reservation cache per planning *pass*, not per app. Build
 
 Two more validations ride the same pass. Nodes mid-binary-upgrade are *cordoned* — marked not-ready in the cache before filtering, so a node being replaced takes no new work (the upgrade helper from Chapter 14 finally has a caller). And because the Raft write that commits a placement is `async`, a node can die between planning and committing; before each commit the pass re-checks the *latest* membership and drops any placement whose target has left. Plan against a snapshot, commit against the present.
 
+### Losing a node shouldn't move the survivors
+
+Stop one node of three and the scheduler has a replica to put back. The first version put back *all* of them: any placement that stopped holding made the leader re-plan the app from scratch, so losing node-3 could restart the perfectly healthy frontends on node-1 and node-2 on the way. A re-plan now keeps every placement that still holds and places only what's missing.
+
+"Still holds" turned out to need more care than it looks. A node's readiness is evidence the leader collects from three separate reports (state, capabilities, readiness), and a leader keeps only the reports it received during its own term. So right after an election, and for a moment between those three messages at any time, the leader can hold a node's state report without its readiness report. The cache treats missing readiness as "not ready", which is the right call for *new* work: don't place anything on a node you can't vouch for. It's the wrong call for work that's already there. It's the likeliest way, in one of our recording runs, that a new leader moved node-2's untouched frontend onto node-1 and then kept asking node-2 to retire it.
+
+So the scheduling pass now carries a set of *unheard* nodes, alive and freshly reporting but with readiness or capability evidence still on its way, and an existing placement on one of them holds:
+
+```rust
+fn unheard_nodes(alive: &HashSet<NodeId>, reports: &AggregatedState) -> HashSet<NodeId> {
+    alive
+        .iter()
+        .filter(|node| reports.reports.contains_key(*node))
+        .filter(|node| !reports.stale_nodes.contains(*node))
+        .filter(|node| {
+            !reports.readiness.contains_key(*node) || !reports.capabilities.contains_key(*node)
+        })
+        .cloned()
+        .collect()
+}
+```
+
+The `*node` is worth a second look. `alive.iter()` yields `&NodeId`, borrowed references into the set, and `filter` hands its closure a reference to each item, so inside the closure `node` is a `&&NodeId`. `contains_key` wants a `&NodeId`, and one `*` peels off the outer layer. At the end, `.cloned()` turns the surviving `&NodeId`s into owned `NodeId`s so they can live in a new set. In Go you'd write the loop and never think about it; in Rust the layers of borrowing are spelled out, which is noisier but means you can't accidentally keep a pointer into a set someone else is about to change.
+
+What still moves a replica is evidence: a node that's dead in gossip, one whose reports went stale, or one that reported itself not ready or unable to enforce what the app needs. Silence while the post is still arriving isn't evidence.
+
 ### An instance id that forgot which namespace it lived in
 
 Here's a bug that hid in plain sight for most of the project. A workload instance had an id like `api-0`: the app name, a hyphen, the replica index. Clean, readable, and wrong.

@@ -2306,6 +2306,15 @@ finding, and 2 for warnings or unknown evidence. `--app` removes unrelated
 cluster checks structurally. `--watch` repeats the human report every 30
 seconds, while JSON and YAML remain one schema-versioned report per process.
 
+One check arrived late, from the homepage tour. With one of three frontends
+gone for five minutes, `wtf` reported that every service had a healthy
+backend. Quite true: two healthy backends is still "a healthy backend". So
+`wtf` now also compares each app's running replicas with its desired count,
+using the placements the leader recorded and each node's own instance list,
+and warns with the missing replicas' whereabouts: `1 replica placed on
+rb-…-3 is not running (rb-…-3 is not a live member)`, or `1 replica has no
+placement yet` when the scheduler hasn't found room.
+
 ### One door in
 
 The first laptop cluster broke that fan-out without a single error message.

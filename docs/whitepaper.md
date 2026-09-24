@@ -109,7 +109,7 @@ Reliaburger is designed to meet the following quantitative targets. These engine
 | Cold start (new node joins and accepts work) | < 60 seconds |
 | Image distribution to N total copies (default 2: the pusher plus one peer) | < 30 seconds per layer (replicated asynchronously by the leader's heal loop) |
 | GPU scheduling | First-class resource, whole-device allocation |
-| Minimum kernel version | Linux 5.7+ (for eBPF CO-RE, BTF, and BPF_LINK support) |
+| Minimum kernel version | Linux 5.8+ (for eBPF CO-RE, BTF, BPF_LINK support and the boot-time clock helper) |
 | cgroup version | v2 (required for eBPF service discovery and resource isolation) |
 
 > **Note on leader election time:** The < 5 second target measures the Raft election itself. The subsequent learning period (up to 15 seconds) runs before the new leader accepts deploys. Total time to full operability after leader loss is < 20 seconds. The data plane is unaffected throughout.
@@ -1041,7 +1041,7 @@ Reliaburger supports directory-mode configuration where each app lives in its ow
 
 ### Q11: Doesn't the eBPF approach require a modern kernel? What about older systems?
 
-Yes, Onion requires Linux kernel 5.7 or later. This covers every actively-maintained Linux distribution as of 2026: Ubuntu 22.04+ (kernel 5.15), Debian 12+ (kernel 6.1), RHEL 9+ (kernel 5.14), Amazon Linux 2023 (kernel 6.1). Older distributions like RHEL 8 (kernel 4.18) remain under extended life support until 2029 but ship a kernel that predates the eBPF features Onion requires. The kernel requirement is a hard line. Bun refuses to start on older kernels with a clear error. This is a deliberate trade-off: eBPF socket interception eliminates the need for a DNS server and proxy process entirely, which is worth more than supporting legacy kernel versions.
+Yes, Onion requires Linux kernel 5.8 or later. This covers every actively-maintained Linux distribution as of 2026: Ubuntu 22.04+ (kernel 5.15), Debian 12+ (kernel 6.1), RHEL 9+ (kernel 5.14), Amazon Linux 2023 (kernel 6.1). Older distributions like RHEL 8 (kernel 4.18) remain under extended life support until 2029 but ship a kernel that predates the eBPF features Onion requires. The kernel requirement is a hard line. Bun refuses to start on older kernels with a clear error. This is a deliberate trade-off: eBPF socket interception eliminates the need for a DNS server and proxy process entirely, which is worth more than supporting legacy kernel versions.
 
 ### Q12: The design goals mention GPU scheduling. Does it support fractional GPUs?
 
