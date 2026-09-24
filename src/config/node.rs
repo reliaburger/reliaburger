@@ -186,7 +186,7 @@ impl DnsSection {
 /// eBPF data-path configuration (Onion service resolution, Smoker
 /// network faults, Sesame egress allowlists).
 ///
-/// Disabled by default: loading eBPF programs needs root, a 5.7+ kernel
+/// Disabled by default: loading eBPF programs needs root, a 5.8+ kernel
 /// and cgroup v2, and it is Linux-only. Builds with the `ebpf` feature embed
 /// the matching object, so packaged binaries need no build directory.
 /// `program_dir` explicitly overrides the embedded object for development.

@@ -11,7 +11,7 @@ use super::super::types::OnionError;
 /// Every map the loaded `onion_connect.bpf.o` object must define. A
 /// missing map used to surface as a panic at first use, deep inside the
 /// agent (NET8); now the load fails up front with the full list.
-pub const REQUIRED_MAPS: [&str; 9] = [
+pub const REQUIRED_MAPS: [&str; 10] = [
     "backend_map",
     "firewall_map",
     "cgroup_namespace_map",
@@ -21,6 +21,7 @@ pub const REQUIRED_MAPS: [&str; 9] = [
     "egress_cidr6_map",
     "egress_enabled_map",
     "fault_connect_map",
+    "view_lease_map",
 ];
 
 /// Every program the object must define.
@@ -385,7 +386,8 @@ fn check_prerequisites() -> Result<(), OnionError> {
     Ok(())
 }
 
-/// Verify the kernel version is 5.7+ (required for cgroup socket hooks).
+/// Verify the kernel version is 5.8+: cgroup socket hooks arrived in 5.7, and
+/// the view lease check reads `bpf_ktime_get_boot_ns()`, which arrived in 5.8.
 fn check_kernel_version() -> Result<(), OnionError> {
     let version =
         std::fs::read_to_string("/proc/version").map_err(|e| OnionError::EbpfLoadFailed {
@@ -406,11 +408,11 @@ fn check_kernel_version() -> Result<(), OnionError> {
         .filter_map(|s| s.parse().ok())
         .collect();
 
-    if nums.len() >= 2 && (nums[0] > 5 || (nums[0] == 5 && nums[1] >= 7)) {
+    if nums.len() >= 2 && (nums[0] > 5 || (nums[0] == 5 && nums[1] >= 8)) {
         Ok(())
     } else {
         Err(OnionError::EbpfLoadFailed {
-            reason: format!("kernel {version_str} is too old; Onion requires 5.7+"),
+            reason: format!("kernel {version_str} is too old; Onion requires 5.8+"),
         })
     }
 }

@@ -117,7 +117,64 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 "previous consumer requests still retain publication",
             ));
         }
+        // From here on this node routes cluster services only while the
+        // leader keeps answering. Until the first answer, nothing routes.
+        self.view_lease.enforce();
+        self.sync_view_lease_kernel().await
+    }
+
+    /// Mirror the view lease into the kernel, so the connect hook enforces
+    /// it even if this process dies.
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    pub(super) async fn sync_view_lease_kernel(&self) -> Result<(), BunError> {
+        let Some(handle) = self.onion_ebpf.as_ref() else {
+            return Ok(());
+        };
+        let value = crate::onion::types::ViewLeaseValue::from_lease(&self.view_lease);
+        let mut ebpf = handle.lock().await;
+        crate::onion::ebpf::maps::BpfServiceMap::new()
+            .write_view_lease(&mut ebpf, value)
+            .map_err(failure)
+    }
+
+    #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
+    pub(super) async fn sync_view_lease_kernel(&self) -> Result<(), BunError> {
         Ok(())
+    }
+
+    /// Withdraw the whole cluster view once its lease has lapsed. The leader
+    /// may discharge this node soon after, and from then on nothing stops a
+    /// producer reusing an address this view still names.
+    pub(super) async fn fence_lapsed_view(&mut self) -> Result<(), BunError> {
+        if self.view_lease.is_valid() {
+            return Ok(());
+        }
+        let Some(mut owner) = self.consumer_owner().cloned() else {
+            return Ok(());
+        };
+        if owner.phase != ConsumerPhase::Active {
+            return Ok(());
+        }
+        eprintln!(
+            "bun: the leader hasn't answered for {}s; withdrawing the cluster view until it does",
+            crate::onion::lease::CONSUMER_VIEW_LEASE.as_secs()
+        );
+        owner.phase = ConsumerPhase::Withdrawing;
+        self.save_consumer(owner).await?;
+        self.consumer_view_stale = false;
+        // Drains still in flight finish on the next synchronisation.
+        self.withdraw_consumer_view().await?;
+        Ok(())
+    }
+
+    /// Extend the view lease after publishing a leader's answer to a request
+    /// sent at `requested_at_ns` on the boot clock.
+    pub(super) async fn renew_view_lease(&mut self, requested_at_ns: u64) {
+        self.view_lease.renew(requested_at_ns);
+        if let Err(error) = self.sync_view_lease_kernel().await {
+            // The kernel keeps its older expiry, so it fences early: safe.
+            eprintln!("bun: cannot extend the kernel's view lease: {error}");
+        }
     }
 
     async fn consumer_candidate(
@@ -428,6 +485,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// local change, such as a health transition or a replaced instance.
     pub(super) async fn refresh_consumer_view(&mut self) -> Result<(), BunError> {
         if !self.consumer_view_stale {
+            return Ok(());
+        }
+        // A lapsed view is withdrawn; only a fresh leader answer republishes it.
+        if !self.view_lease.is_valid() {
             return Ok(());
         }
         // Before the first synchronisation after recovery, the next committed

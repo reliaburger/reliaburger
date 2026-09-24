@@ -950,6 +950,20 @@ impl StateMachineInner {
                     }
                 }
             }
+            RaftRequest::DischargeEndpointConsumer { node_id } => {
+                if let Err(reason) = crate::cluster::retirement::validate_node_id(node_id) {
+                    return Some(CouncilResponse::Refused {
+                        reason: reason.into(),
+                    });
+                }
+                // The leader only proposes this once the consumer's own view
+                // lease has run out (see `onion::lease`), so the node has
+                // stopped routing. On its next poll it registers again and
+                // republishes from scratch.
+                if self.state.endpoint_consumers.remove(node_id) {
+                    self.state.endpoint_withdrawals.retire_consumer(node_id);
+                }
+            }
             RaftRequest::RetireEndpointExecution { node_id, execution } => {
                 if self
                     .state
@@ -3626,6 +3640,88 @@ mod tests {
             ));
             assert_eq!(serde_json::to_value(&inner.state).unwrap(), before);
         }
+    }
+
+    /// Z6.7: a stopped laptop node was still owed every withdrawal, so no
+    /// producer on the surviving nodes could release an address until it came
+    /// back. A lapsed consumer's discharge frees exactly its own obligations.
+    #[test]
+    fn discharging_a_lapsed_consumer_releases_only_its_confirmations() {
+        let mut inner = StateMachineInner::default();
+        for node in ["stopped", "survivor"] {
+            inner.apply_request(&RaftRequest::RegisterEndpointConsumer {
+                node_id: node.into(),
+            });
+        }
+        let original = withdrawal_fixture_catalogue();
+        inner.apply_request(&RaftRequest::PublishEndpoints {
+            expected_generation: 0,
+            catalog: Box::new(original),
+        });
+        inner.apply_request(&RaftRequest::PublishEndpoints {
+            expected_generation: 1,
+            catalog: Box::default(),
+        });
+        assert_eq!(
+            inner.state.endpoint_withdrawals.pending[&1].consumers,
+            std::collections::BTreeSet::from(["stopped".into(), "survivor".into()])
+        );
+
+        assert!(matches!(
+            inner.apply_request(&RaftRequest::DischargeEndpointConsumer {
+                node_id: "stopped".into(),
+            }),
+            None | Some(CouncilResponse::Applied { .. })
+        ));
+        assert_eq!(
+            inner.state.endpoint_consumers,
+            std::collections::BTreeSet::from(["survivor".into()])
+        );
+        assert_eq!(
+            inner.state.endpoint_withdrawals.pending[&1].consumers,
+            std::collections::BTreeSet::from(["survivor".into()]),
+            "the survivor still owes its own receipt"
+        );
+        // Discharge is not retirement: the node may come back and register.
+        assert!(
+            !inner
+                .state
+                .security_state
+                .crl
+                .retired_nodes
+                .contains_key("stopped")
+        );
+        assert!(!matches!(
+            inner.apply_request(&RaftRequest::RegisterEndpointConsumer {
+                node_id: "stopped".into(),
+            }),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        assert!(inner.state.endpoint_consumers.contains("stopped"));
+        assert!(
+            !inner.state.endpoint_withdrawals.pending[&1]
+                .consumers
+                .contains("stopped"),
+            "re-registering doesn't resurrect a discharged obligation"
+        );
+
+        // The last consumer's discharge completes the generation.
+        inner.apply_request(&RaftRequest::DischargeEndpointConsumer {
+            node_id: "survivor".into(),
+        });
+        assert!(inner.state.endpoint_withdrawals.pending.is_empty());
+        // Unknown and invalid identities change nothing.
+        let before = serde_json::to_value(&inner.state).unwrap();
+        inner.apply_request(&RaftRequest::DischargeEndpointConsumer {
+            node_id: "never-registered".into(),
+        });
+        assert!(matches!(
+            inner.apply_request(&RaftRequest::DischargeEndpointConsumer {
+                node_id: String::new(),
+            }),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        assert_eq!(serde_json::to_value(&inner.state).unwrap(), before);
     }
 
     #[tokio::test]

@@ -4,7 +4,7 @@
 //! maps, and verify that connect() calls to VIPs are rewritten to
 //! real backend addresses.
 //!
-//! Requirements: Linux 5.7+, root, cgroup v2, `--features ebpf`.
+//! Requirements: Linux 5.8+, root, cgroup v2, `--features ebpf`.
 //! Gated behind `RELIABURGER_EBPF_TESTS=1`.
 //!
 //! Run via: `relish dev test ebpf`
@@ -306,6 +306,65 @@ async fn ebpf_connect_to_vip_rewrites_destination() {
         }
     }
 
+    ebpf.detach().unwrap();
+}
+
+/// Z6.7: once a cluster node's view lease lapses, the leader may discharge it
+/// and let producers reuse the addresses its maps still name. From then on
+/// the kernel refuses virtual addresses, with or without Bun running.
+#[tokio::test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+async fn a_lapsed_view_lease_refuses_every_virtual_address() {
+    use reliaburger::onion::lease::{ViewLease, boot_clock_ns};
+    use reliaburger::onion::types::ViewLeaseValue;
+
+    let mut ebpf = load_ebpf();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let backend = listener.local_addr().unwrap();
+    let id = ServiceId::new("default", "lease-service");
+    let vip = VirtualIP::from_service_id(&id);
+    let mut services = ServiceMap::new();
+    services
+        .register_app("lease-service", "default", 9998, None)
+        .unwrap();
+    services
+        .add_backend(
+            &id,
+            BackendInstance {
+                instance_id: "lease-0".to_string(),
+                node_ip: Ipv4Addr::LOCALHOST,
+                host_port: backend.port(),
+                healthy: true,
+            },
+        )
+        .unwrap();
+    let mut maps = BpfServiceMap::new();
+    maps.sync_from_service_map(&services, &mut ebpf).unwrap();
+    let vip_address = SocketAddr::new(vip.0.into(), 9998);
+    let connect = || TcpStream::connect_timeout(&vip_address, Duration::from_secs(2));
+
+    assert!(connect().is_ok(), "a node without a lease is standalone");
+    let lease = ViewLease::default();
+    lease.enforce();
+    lease.renew(boot_clock_ns());
+    maps.write_view_lease(&mut ebpf, ViewLeaseValue::from_lease(&lease))
+        .unwrap();
+    assert!(connect().is_ok(), "a current lease routes");
+
+    lease.expire();
+    maps.write_view_lease(&mut ebpf, ViewLeaseValue::from_lease(&lease))
+        .unwrap();
+    let refused = connect().unwrap_err();
+    assert_eq!(refused.kind(), std::io::ErrorKind::PermissionDenied);
+    assert!(
+        TcpStream::connect_timeout(&backend, Duration::from_secs(2)).is_ok(),
+        "addresses outside the VIP range are not the lease's business"
+    );
+
+    lease.renew(boot_clock_ns());
+    maps.write_view_lease(&mut ebpf, ViewLeaseValue::from_lease(&lease))
+        .unwrap();
+    assert!(connect().is_ok(), "a renewed lease routes again");
     ebpf.detach().unwrap();
 }
 
@@ -5122,6 +5181,7 @@ async fn exercise_consumer_kernel_withdrawal(freeze: bool) {
             catalog: Box::new(catalog),
             ingress: vec![],
             withdrawals: vec![],
+            requested_at_ns: reliaburger::onion::lease::boot_clock_ns(),
             response,
         })
         .await
@@ -5143,6 +5203,7 @@ async fn exercise_consumer_kernel_withdrawal(freeze: bool) {
             catalog: Box::default(),
             ingress: vec![],
             withdrawals: vec![instruction.clone()],
+            requested_at_ns: reliaburger::onion::lease::boot_clock_ns(),
             response,
         })
         .await
@@ -5193,6 +5254,7 @@ async fn exercise_consumer_kernel_withdrawal(freeze: bool) {
                 catalog: Box::default(),
                 ingress: vec![],
                 withdrawals: vec![instruction],
+                requested_at_ns: reliaburger::onion::lease::boot_clock_ns(),
                 response,
             })
             .await

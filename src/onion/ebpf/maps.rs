@@ -192,6 +192,26 @@ impl BpfServiceMap {
         }
     }
 
+    /// Write this node's view lease where the connect hook reads it.
+    #[cfg(feature = "ebpf")]
+    pub fn write_view_lease(
+        &self,
+        ebpf: &mut super::loader::OnionEbpf,
+        value: super::super::types::ViewLeaseValue,
+    ) -> Result<(), BpfMapError> {
+        let name = "view_lease_map";
+        let map = ebpf
+            .bpf
+            .map_mut(name)
+            .ok_or(BpfMapError::MissingMap { name })?;
+        let mut lease: aya::maps::HashMap<_, u32, super::super::types::ViewLeaseValue> =
+            aya::maps::HashMap::try_from(map)
+                .map_err(|source| BpfMapError::Operation { name, source })?;
+        lease
+            .insert(super::super::types::VIEW_LEASE_KEY, value, 0)
+            .map_err(|source| BpfMapError::Operation { name, source })
+    }
+
     /// Whether the BPF maps have been initialised.
     pub fn is_initialised(&self) -> bool {
         self.initialised

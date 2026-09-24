@@ -38,6 +38,10 @@ pub struct ProxyState {
     /// each forwarded request so Bun waits for it to reach zero before
     /// killing the container (DEP5).
     pub drains: Option<super::draining::SharedDrains>,
+    /// On a cluster node, how long it may keep routing with its last view of
+    /// the cluster. A lapsed lease refuses every route: the addresses in that
+    /// view may already belong to something else.
+    pub view_lease: Option<Arc<crate::onion::lease::ViewLease>>,
 }
 
 /// Largest number of backends the proxy will try for one request: the primary
@@ -152,7 +156,7 @@ pub async fn bind_proxy_with_drains(
     drains: Option<super::draining::SharedDrains>,
     shutdown: CancellationToken,
 ) -> Result<BoundProxy, WrapperError> {
-    bind_proxy_with_tls(config, routing_table, drains, None, shutdown).await
+    bind_proxy_with_tls(config, routing_table, drains, None, None, shutdown).await
 }
 
 /// Bind the listeners, optionally resolving TLS certificates per SNI from the
@@ -167,6 +171,7 @@ pub async fn bind_proxy_with_tls(
     routing_table: Arc<RwLock<RoutingTable>>,
     drains: Option<super::draining::SharedDrains>,
     cert_resolver: Option<Arc<dyn rustls::server::ResolvesServerCert>>,
+    view_lease: Option<Arc<crate::onion::lease::ViewLease>>,
     shutdown: CancellationToken,
 ) -> Result<BoundProxy, WrapperError> {
     let client = reqwest::Client::builder()
@@ -182,6 +187,7 @@ pub async fn bind_proxy_with_tls(
         rate_limiter: ShardedRateLimiter::new(),
         max_request_body_bytes: config.max_request_body_bytes,
         drains,
+        view_lease,
     });
 
     let http_listener = bind(config.http_port).await?;
@@ -449,6 +455,14 @@ async fn do_proxy(
         .to_string();
 
     let path = req.uri().path().to_string();
+
+    if state
+        .view_lease
+        .as_ref()
+        .is_some_and(|lease| !lease.is_valid())
+    {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
 
     // Capture request ownership before releasing the routing read lock.
     // Withdrawal takes the write lock before starting a drain, so it cannot
@@ -896,6 +910,91 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::PERMANENT_REDIRECT);
         let location = resp.headers().get("location").unwrap().to_str().unwrap();
         assert_eq!(location, "https://myapp.com/dashboard?tab=1");
+    }
+
+    /// Z6.7: once a cluster node's view lease lapses, the leader may discharge
+    /// it and let producers reuse addresses its routes still name. Wrapper
+    /// must refuse, not forward, until a fresh view renews the lease.
+    #[tokio::test]
+    async fn a_lapsed_view_lease_refuses_every_route() {
+        use crate::onion::types::BackendInstance;
+        use std::net::Ipv4Addr;
+
+        let backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_port = backend.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            while let Ok((mut sock, _)) = backend.accept().await {
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    .await;
+            }
+        });
+        let mut service_map = crate::onion::service_map::ServiceMap::new();
+        service_map
+            .register_app("web", "default", 80, None)
+            .unwrap();
+        service_map
+            .add_backend(
+                &crate::onion::service_id::ServiceId::new("default", "web"),
+                BackendInstance {
+                    instance_id: "default__web-0".to_string(),
+                    node_ip: Ipv4Addr::LOCALHOST,
+                    host_port: backend_port,
+                    healthy: true,
+                },
+            )
+            .unwrap();
+        let ingress = std::collections::HashMap::from([(
+            ("default".to_string(), "web".to_string()),
+            crate::config::app::IngressSpec {
+                host: "web.test".to_string(),
+                path: None,
+                tls: None,
+                websocket: None,
+                rate_limit_rps: None,
+                rate_limit_burst: None,
+            },
+        )]);
+        let mut table = RoutingTable::new();
+        table.rebuild(&service_map, &ingress).unwrap();
+        let lease = Arc::new(crate::onion::lease::ViewLease::default());
+        lease.enforce();
+        lease.renew(crate::onion::lease::boot_clock_ns());
+        let shutdown = CancellationToken::new();
+        let bound = bind_proxy_with_tls(
+            WrapperConfig {
+                http_port: 0,
+                https_port: 0,
+                ..WrapperConfig::default()
+            },
+            Arc::new(RwLock::new(table)),
+            None,
+            None,
+            Some(lease.clone()),
+            shutdown.clone(),
+        )
+        .await
+        .unwrap();
+        let url = format!("http://127.0.0.1:{}/", bound.http_addr.port());
+        tokio::spawn(async move {
+            bound.serve().await.ok();
+        });
+        let get = || async {
+            reqwest::Client::new()
+                .get(&url)
+                .header("host", "web.test")
+                .send()
+                .await
+                .unwrap()
+                .status()
+        };
+        assert_eq!(get().await, StatusCode::OK);
+        lease.expire();
+        assert_eq!(get().await, StatusCode::SERVICE_UNAVAILABLE);
+        lease.renew(crate::onion::lease::boot_clock_ns());
+        assert_eq!(get().await, StatusCode::OK);
+        shutdown.cancel();
     }
 
     /// ING5: a client that supplies its own `X-Forwarded-For`/`-Proto` has

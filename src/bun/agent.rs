@@ -492,6 +492,9 @@ pub enum AgentCommand {
         catalog: Box<crate::onion::catalog::EndpointCatalog>,
         ingress: Vec<crate::cluster::orchestrate::IngressAssignment>,
         withdrawals: Vec<crate::onion::withdrawal::EndpointWithdrawalInstruction>,
+        /// When the placement request that carried this answer was sent, on
+        /// [`crate::onion::lease::boot_clock_ns`]. The view lease runs from here.
+        requested_at_ns: u64,
         response: oneshot::Sender<Result<ConsumerUpdate, BunError>>,
     },
     /// Confirm the leader acknowledged one original, locally proven receipt.
@@ -1737,6 +1740,9 @@ pub struct BunAgent<G: Grill> {
         std::collections::HashMap<(String, String), crate::config::app::IngressSpec>,
     /// A local change awaits in-place republication of the consumer view.
     consumer_view_stale: bool,
+    /// How long this node may keep routing with its published cluster view
+    /// (shared with Wrapper, mirrored into the kernel's `view_lease_map`).
+    view_lease: std::sync::Arc<crate::onion::lease::ViewLease>,
     /// Journal to reopen after a discovery write whose outcome is unknown,
     /// and whether it had been recovered from an earlier process.
     discovery_reopen: Option<(std::path::PathBuf, bool)>,
@@ -1916,6 +1922,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             ingress_configs: std::collections::HashMap::new(),
             cluster_ingress_configs: std::collections::HashMap::new(),
             consumer_view_stale: false,
+            view_lease: Default::default(),
             discovery_reopen: None,
             // Single-node mode: no nftables needed (no cluster ports to protect)
             perimeter_config: crate::firewall::rules::PerimeterConfig {
@@ -2023,6 +2030,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             ingress_configs: std::collections::HashMap::new(),
             cluster_ingress_configs: std::collections::HashMap::new(),
             consumer_view_stale: false,
+            view_lease: Default::default(),
             discovery_reopen: None,
             #[cfg(target_os = "linux")]
             perimeter_config: {
@@ -2078,6 +2086,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// `wait_drained`, not the notification stream.
     pub fn drains_handle(&self) -> crate::wrapper::draining::SharedDrains {
         self.drains.clone()
+    }
+
+    /// The lease Wrapper checks before routing a cluster request.
+    pub fn view_lease_handle(&self) -> std::sync::Arc<crate::onion::lease::ViewLease> {
+        self.view_lease.clone()
     }
 
     /// Get a shared handle to the deploy history for the API.
@@ -3520,6 +3533,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 }
                 _ = health_interval.tick() => {
                     self.reopen_uncertain_discovery().await;
+                    if let Err(error) = self.fence_lapsed_view().await {
+                        eprintln!("bun: withdrawing the lapsed cluster view awaits retry: {error}");
+                    }
                     self.drive_startup_retirements().await;
                     self.refresh_egress_readiness().await;
                     self.run_health_checks().await;
@@ -4613,11 +4629,21 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 catalog,
                 ingress,
                 withdrawals,
+                requested_at_ns,
                 response,
             } => {
+                // An answer after a lapse republishes from scratch: the view
+                // this node held may name addresses reused since.
+                if let Err(error) = self.fence_lapsed_view().await {
+                    let _ = response.send(Err(error));
+                    return;
+                }
                 let result = self
                     .synchronise_consumer(generation, *catalog, ingress, withdrawals)
                     .await;
+                if matches!(&result, Ok(update) if update.published) {
+                    self.renew_view_lease(requested_at_ns).await;
+                }
                 let result = match result {
                     Err(error) => {
                         let retry = self.consumer_update(false);
@@ -21439,6 +21465,63 @@ host = "remote.local"
             );
         }
     }
+    /// Z6.7: the leader may stop waiting for a node that has been silent past
+    /// its view lease. That's only safe if the node itself has stopped
+    /// routing by then, and republishes from scratch when the leader answers.
+    #[tokio::test]
+    async fn a_lapsed_view_lease_withdraws_the_view_until_the_leader_answers() {
+        use crate::bun::consumer_owners::{ConsumerIdentity, ConsumerPhase};
+        let root = tempfile::tempdir().unwrap();
+        let identity = ConsumerIdentity {
+            node_id: crate::meat::NodeId::new("test"),
+            cluster_identity: [42; 32],
+        };
+        let (mut agent, _, _) = test_cluster_fault_agent().await;
+        agent.set_records_dir(root.path().to_owned());
+        agent.supervisor.grill().set_launch_inventory(vec![]).await;
+        let lease = agent.view_lease_handle();
+        assert!(lease.is_valid(), "a standalone view never lapses");
+        agent
+            .recover_consumer_ownership(&root.path().join("discovery"), identity)
+            .await
+            .unwrap();
+        assert!(!lease.is_valid(), "nothing routes before the first answer");
+
+        let (catalog, ingress) = cluster_publication_fixture();
+        let answer = |generation, response| AgentCommand::SyncClusterConsumer {
+            generation,
+            catalog: Box::new(catalog.clone()),
+            ingress: ingress.clone(),
+            withdrawals: vec![],
+            requested_at_ns: crate::onion::lease::boot_clock_ns(),
+            response,
+        };
+        let (response, reply) = oneshot::channel();
+        agent.handle_command(answer(1, response)).await;
+        assert!(reply.await.unwrap().unwrap().published);
+        assert!(lease.is_valid(), "publishing the leader's answer renews it");
+        assert!(!agent.service_map_tx.borrow().resolve_all().is_empty());
+
+        // The leader stops answering for longer than the lease.
+        lease.expire();
+        agent.fence_lapsed_view().await.unwrap();
+        assert!(agent.service_map_tx.borrow().resolve_all().is_empty());
+        assert!(agent.routing_table.read().await.list_routes().is_empty());
+        assert_ne!(agent.consumer_owner().unwrap().phase, ConsumerPhase::Active);
+        // A local change doesn't bring the old view back.
+        agent.consumer_view_stale = true;
+        agent.refresh_consumer_view().await.unwrap();
+        assert!(agent.service_map_tx.borrow().resolve_all().is_empty());
+
+        // The next answer republishes from scratch and renews the lease.
+        let (response, reply) = oneshot::channel();
+        agent.handle_command(answer(1, response)).await;
+        assert!(reply.await.unwrap().unwrap().published);
+        assert!(lease.is_valid());
+        assert_eq!(agent.consumer_owner().unwrap().phase, ConsumerPhase::Active);
+        assert!(!agent.service_map_tx.borrow().resolve_all().is_empty());
+    }
+
     #[tokio::test]
     async fn durable_consumer_waits_for_http_and_websocket_release_then_recovers_receipt_retry() {
         use crate::bun::consumer_owners::ConsumerIdentity;
@@ -21548,6 +21631,7 @@ host = "remote.local"
                 catalog: Box::default(),
                 ingress: vec![],
                 withdrawals: vec![],
+                requested_at_ns: crate::onion::lease::boot_clock_ns(),
                 response,
             })
             .await;

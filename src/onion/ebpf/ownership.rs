@@ -369,6 +369,7 @@ pub(super) fn load(
             "egress_cidr4_map" => (11, 16, 20, 65536),
             "egress_cidr6_map" => (11, 28, 20, 65536),
             "fault_connect_map" => (1, 16, 32, 4096),
+            "view_lease_map" => (1, 4, 16, 1),
             _ => return Err(io::Error::other("unknown persistent map ABI")),
         };
         if info.map_type().map_err(io::Error::other)? as u32 != kind

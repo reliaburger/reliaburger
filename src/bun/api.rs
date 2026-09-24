@@ -3305,8 +3305,29 @@ async fn placements_handler(
         )
             .into_response();
     }
-    // Registration precedes every first exposure. Once committed, an offline
-    // consumer stays accountable until the operator permanently fences it.
+    // Record the contact before reading which consumers are registered. A
+    // discharge takes the same lock, so either it sees this contact and
+    // leaves the node alone, or it finishes first and the read below finds
+    // the node unregistered.
+    if authenticated_consumer {
+        let recorded = {
+            let mut contacts = council.consumer_contacts().lock().await;
+            let now = std::time::Instant::now();
+            contacts.observe_term(council.current_term(), now);
+            contacts.record(&node_id, now)
+        };
+        if !recorded {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "endpoint consumer discharge in progress; poll again",
+            )
+                .into_response();
+        }
+        desired = council.desired_state().await;
+    }
+    // Registration precedes every first exposure. Once committed, a consumer
+    // stays accountable until its view lease lapses and the leader discharges
+    // it, or the operator permanently fences it.
     if authenticated_consumer && !desired.endpoint_consumers.contains(&node_id) {
         let registration = tokio::time::timeout(
             std::time::Duration::from_secs(10),

@@ -265,6 +265,19 @@ pub fn spawn_leader_scheduler(
                 .filter(|member| member.state == NodeState::Alive)
                 .map(|member| member.node_id.0.as_str())
                 .collect();
+            // A stopped node can never confirm a withdrawal. Once its view
+            // lease has certainly run out, stop waiting for it (Z6.7).
+            let discharged = super::consumer::discharge_lapsed_consumers(
+                &council,
+                &alive_names,
+                crate::onion::lease::CONSUMER_DISCHARGE_AFTER,
+            )
+            .await;
+            let desired = if discharged.is_empty() {
+                desired
+            } else {
+                council.desired_state().await
+            };
             withdrawal_ledger_gauge().record(&desired.endpoint_withdrawals);
             let warning = withdrawal_backlog_warning(&desired.endpoint_withdrawals, &alive_names);
             if warning != backlog_warning {
@@ -1121,6 +1134,9 @@ async fn poll_consumer(
     if let Some(token) = service_token {
         request = request.bearer_auth(token);
     }
+    // The view lease runs from before the request leaves, so it can only
+    // end earlier than the leader's own count of this node's silence.
+    let requested_at_ns = crate::onion::lease::boot_clock_ns();
     // The deadline covers both headers and body. An incomplete body
     // must not prevent the next placement poll or graceful shutdown.
     let poll = async {
@@ -1150,6 +1166,7 @@ async fn poll_consumer(
                 catalog: Box::new(assignments.endpoint_catalog.clone()),
                 ingress: assignments.ingress.clone(),
                 withdrawals: assignments.endpoint_withdrawals.clone(),
+                requested_at_ns,
                 response,
             })
             .await

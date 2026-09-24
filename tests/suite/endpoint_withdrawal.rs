@@ -580,3 +580,112 @@ async fn producer_release_without_a_quorum_is_not_confirmation() {
         StatusCode::SERVICE_UNAVAILABLE
     );
 }
+
+/// Z6.7: with one laptop node stopped, every producer release on the others
+/// answered 202 for as long as it stayed down. Once the stopped node's view
+/// lease has lapsed and gossip doesn't list it, the leader stops waiting.
+#[tokio::test]
+async fn a_lapsed_consumer_is_discharged_and_the_producer_release_confirms() {
+    use reliaburger::cluster::consumer::discharge_lapsed_consumers;
+    use std::collections::HashSet;
+
+    let hierarchy = ca::generate_ca_hierarchy("lapsed-consumer", &IKM).unwrap();
+    let council = council(&hierarchy, true).await;
+    let stopped = router(council.clone(), Some(peer(&hierarchy, "stopped", 11)));
+    let survivor = router(council.clone(), Some(peer(&hierarchy, "survivor", 12)));
+    assert_eq!(
+        poll_placements(stopped.clone(), "stopped", "internal-token").await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        poll_placements(survivor.clone(), "survivor", "internal-token").await,
+        StatusCode::OK
+    );
+    let catalog = EndpointCatalog::rebuild([(
+        ServiceId::new("default", "web"),
+        8080,
+        vec![CatalogBackend {
+            node_id: "producer".into(),
+            node_ip: "127.0.0.1".parse().unwrap(),
+            host_port: 18080,
+            healthy: true,
+            execution: Some(producer_execution()),
+        }],
+    )])
+    .unwrap();
+    council
+        .write(RaftRequest::PublishEndpoints {
+            expected_generation: 0,
+            catalog: Box::new(catalog),
+        })
+        .await
+        .unwrap();
+    let producer = router(council.clone(), Some(peer(&hierarchy, "producer", 10)));
+    assert_eq!(
+        retire_producer(producer.clone(), producer_request(), "internal-token").await,
+        StatusCode::ACCEPTED
+    );
+    assert_eq!(
+        acknowledge(survivor, receipt(1), "internal-token").await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        retire_producer(producer.clone(), producer_request(), "internal-token").await,
+        StatusCode::ACCEPTED,
+        "the stopped node still owes its receipt"
+    );
+
+    // Not yet silent long enough: nothing changes.
+    let alive = HashSet::from(["survivor"]);
+    assert!(
+        discharge_lapsed_consumers(&council, &alive, Duration::from_secs(3600))
+            .await
+            .is_empty()
+    );
+    // Gossip still lists it as alive: nothing changes either, however long.
+    let everyone = HashSet::from(["survivor", "stopped"]);
+    assert!(
+        discharge_lapsed_consumers(&council, &everyone, Duration::ZERO)
+            .await
+            .is_empty()
+    );
+    assert_eq!(
+        discharge_lapsed_consumers(&council, &alive, Duration::ZERO).await,
+        ["stopped"]
+    );
+    let desired = council.desired_state().await;
+    assert_eq!(
+        desired.endpoint_consumers,
+        BTreeSet::from(["survivor".into()])
+    );
+    assert!(desired.endpoint_withdrawals.pending.is_empty());
+    assert_eq!(
+        retire_producer(producer, producer_request(), "internal-token").await,
+        StatusCode::OK
+    );
+
+    // A node that comes back registers again on its first poll.
+    assert_eq!(
+        poll_placements(stopped.clone(), "stopped", "internal-token").await,
+        StatusCode::OK
+    );
+    assert!(
+        council
+            .desired_state()
+            .await
+            .endpoint_consumers
+            .contains("stopped")
+    );
+    // While a discharge is in flight the leader won't serve that consumer:
+    // a poll then could renew a lease the ledger is about to stop honouring.
+    council
+        .consumer_contacts()
+        .lock()
+        .await
+        .begin_discharge("stopped");
+    assert_eq!(
+        poll_placements(stopped, "stopped", "internal-token").await,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    council.shutdown().await.unwrap();
+}

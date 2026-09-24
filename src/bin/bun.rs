@@ -1621,6 +1621,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             routing_table,
             Some(drains),
             ingress_resolver,
+            Some(agent.view_lease_handle()),
             ingress_shutdown,
         )
         .await
