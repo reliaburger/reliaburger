@@ -59,6 +59,15 @@ pub enum BunError {
         reason: String,
     },
 
+    /// The leader hasn't confirmed a producer release yet: its request is
+    /// still in flight, or other nodes haven't confirmed the endpoint's
+    /// withdrawal. Asking again shortly is expected to succeed.
+    #[error("cannot retire artifacts for {instance_id} yet: {reason}")]
+    ProducerReleasePending {
+        instance_id: InstanceId,
+        reason: &'static str,
+    },
+
     /// The cluster catalogue and routing views could not be confirmed together.
     #[error("cluster discovery publication failed: {0}")]
     ClusterPublication(String),

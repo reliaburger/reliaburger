@@ -837,6 +837,38 @@ struct PreparedInstance {
     has_init: bool,
 }
 
+/// How long a deploy worker keeps asking the leader to release a retired
+/// instance's addresses before it gives up and fails the deploy. Consumers
+/// confirm withdrawals on their placement poll, every couple of seconds.
+const PRODUCER_RELEASE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Pause between two producer release attempts.
+const PRODUCER_RELEASE_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Run `attempt` until it stops reporting a pending producer release, or
+/// until `patience` runs out; returns the last outcome either way.
+async fn retry_while_release_pending<F, Fut>(
+    patience: std::time::Duration,
+    interval: std::time::Duration,
+    mut attempt: F,
+) -> Result<(), BunError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), BunError>>,
+{
+    let deadline = tokio::time::Instant::now() + patience;
+    loop {
+        match attempt().await {
+            Err(BunError::ProducerReleasePending { .. })
+                if tokio::time::Instant::now() + interval < deadline =>
+            {
+                tokio::time::sleep(interval).await;
+            }
+            outcome => return outcome,
+        }
+    }
+}
+
 /// A handle a deploy task uses to ask the command loop to perform its
 /// authoritative `&mut self` steps. Each method sends a `DeployOp` and awaits
 /// the reply, so the loop stays the single owner of supervisor state.
@@ -1311,17 +1343,27 @@ impl DeployOps {
 
     /// Bookkeeping-only op sent after the worker has already drained+stopped
     /// the instance off the loop (M7).
+    ///
+    /// On a multi-node cluster the leader answers the first producer release
+    /// with "pending" until every node confirms the old endpoint's
+    /// withdrawal, which takes a placement poll or two. That's the normal
+    /// case, not a failure, so the worker asks again for a while instead of
+    /// failing the deploy (which would start yet another generation of
+    /// replacements). The loop stays free between attempts, so this node can
+    /// deliver its own receipt meanwhile.
     async fn finish_retire(&self, old_id: &InstanceId) -> Result<(), BunError> {
-        self.call(
-            |reply| DeployOp::FinishRetire {
-                old_id: old_id.clone(),
-                reply,
-            },
-            Err(BunError::RetirementState {
-                instance_id: old_id.clone(),
-                reason: "agent loop closed before retirement".into(),
-            }),
-        )
+        retry_while_release_pending(PRODUCER_RELEASE_PATIENCE, PRODUCER_RELEASE_RETRY, || {
+            self.call(
+                |reply| DeployOp::FinishRetire {
+                    old_id: old_id.clone(),
+                    reply,
+                },
+                Err(BunError::RetirementState {
+                    instance_id: old_id.clone(),
+                    reason: "agent loop closed before retirement".into(),
+                }),
+            )
+        })
         .await
     }
 
@@ -1666,7 +1708,7 @@ pub struct BunAgent<G: Grill> {
     producer_releases: std::collections::HashMap<
         crate::grill::RuntimeExecution,
         tokio_util::task::AbortOnDropHandle<
-            Result<crate::onion::producer::ProducerReleaseConfirmation, String>,
+            Result<crate::cluster::producer::ProducerRelease, String>,
         >,
     >,
     /// Cluster-wide endpoint catalogue (12b.4), replicated from the leader.
@@ -13395,6 +13437,75 @@ mod tests {
             task.abort();
             let _ = task.await;
         }
+    }
+
+    fn pending_release() -> BunError {
+        BunError::ProducerReleasePending {
+            instance_id: InstanceId("default__web-0".into()),
+            reason: "other nodes have not yet confirmed the endpoint's withdrawal",
+        }
+    }
+
+    /// Z6.7: a rolling deploy on a three-node laptop cluster failed every
+    /// retirement on the leader's first "pending" answer and started a new
+    /// generation of replacements, forever.
+    #[tokio::test(start_paused = true)]
+    async fn a_pending_producer_release_is_asked_again_until_confirmed() {
+        let attempts = std::sync::atomic::AtomicU32::new(0);
+        let outcome = retry_while_release_pending(
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(1),
+            || async {
+                if attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 3 {
+                    Err(pending_release())
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .await;
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_producer_release_still_pending_after_the_patience_fails_the_retirement() {
+        let attempts = std::sync::atomic::AtomicU32::new(0);
+        let started = tokio::time::Instant::now();
+        let outcome = retry_while_release_pending(
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(1),
+            || async {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(pending_release())
+            },
+        )
+        .await;
+        assert!(matches!(
+            outcome,
+            Err(BunError::ProducerReleasePending { .. })
+        ));
+        assert!(started.elapsed() <= std::time::Duration::from_secs(30));
+        assert!(attempts.load(std::sync::atomic::Ordering::SeqCst) >= 29);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_producer_release_is_not_retried() {
+        let attempts = std::sync::atomic::AtomicU32::new(0);
+        let outcome = retry_while_release_pending(
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(1),
+            || async {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(BunError::RetirementState {
+                    instance_id: InstanceId("default__web-0".into()),
+                    reason: "producer release is unconfirmed (409 Conflict)".into(),
+                })
+            },
+        )
+        .await;
+        assert!(matches!(outcome, Err(BunError::RetirementState { .. })));
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     fn original_test_network_reference() -> crate::grill::runc_intent::NetworkReference {

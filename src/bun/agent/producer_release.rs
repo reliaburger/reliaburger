@@ -1,6 +1,7 @@
 //! Retain runtime addresses, host ports and original records until committed remote release.
 
 use super::{BunAgent, BunError, DiscoveryOwnership, Grill, InstanceId};
+use crate::cluster::producer::ProducerRelease;
 use crate::onion::producer::ProducerReleaseConfirmation;
 
 impl<G: Grill + Clone + 'static> BunAgent<G> {
@@ -109,9 +110,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         .map_err(|error| error.to_string())
                 }))
             });
+        let awaiting = |reason| BunError::ProducerReleasePending {
+            instance_id: id.clone(),
+            reason,
+        };
         // Only a fresh request waits; a retry just collects a finished answer.
         if requested && !pending.is_finished() {
-            return Err(refuse("producer release awaits leader confirmation".into()));
+            return Err(awaiting("producer release awaits leader confirmation"));
         }
         let outcome = tokio::select! {
             _ = self.shutdown.cancelled() => {
@@ -120,13 +125,18 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             outcome = tokio::time::timeout(PRODUCER_RELEASE_WAIT, &mut *pending) => outcome,
         };
         let Ok(joined) = outcome else {
-            return Err(refuse("producer release awaits leader confirmation".into()));
+            return Err(awaiting("producer release awaits leader confirmation"));
         };
         self.producer_releases.remove(&execution);
-        let confirmation = joined
+        match joined
             .map_err(|error| refuse(error.to_string()))?
-            .map_err(refuse)?;
-        Ok(Some(confirmation))
+            .map_err(refuse)?
+        {
+            ProducerRelease::Confirmed(confirmation) => Ok(Some(confirmation)),
+            ProducerRelease::Pending => Err(awaiting(
+                "other nodes have not yet confirmed the endpoint's withdrawal",
+            )),
+        }
     }
 }
 
