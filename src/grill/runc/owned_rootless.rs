@@ -370,3 +370,38 @@ impl RuncGrill {
         .flatten()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_dying_helper_socket_is_transient() {
+        for kind in [
+            io::ErrorKind::NotFound,
+            io::ErrorKind::ConnectionRefused,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::BrokenPipe,
+        ] {
+            assert!(transient_api_error(&io::Error::from(kind)), "{kind:?}");
+        }
+        // A helper killed mid-request closes the socket without a response.
+        let empty = serde_json::from_slice::<serde_json::Value>(b"").unwrap_err();
+        assert!(transient_api_error(&io::Error::from(empty)));
+    }
+
+    #[test]
+    fn helper_refusals_and_conflicts_are_not_retried() {
+        assert!(!transient_api_error(&io::Error::other(
+            "rootless API refused: bind failed"
+        )));
+        assert!(!transient_api_error(&io::Error::other(
+            "rootless forwarding conflicts with original intent"
+        )));
+        let garbage = serde_json::from_slice::<serde_json::Value>(b"{oops").unwrap_err();
+        assert!(!transient_api_error(&io::Error::from(garbage)));
+        assert!(!transient_api_error(&io::Error::from(
+            io::ErrorKind::TimedOut
+        )));
+    }
+}
