@@ -2455,20 +2455,31 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         // is what stops same-named apps in different namespaces from sharing a
         // firewall rule or a namespace mapping (H9). Collect the pairs first so
         // the `list_instances` borrow is released before the async workload-identity lookups.
-        let pairs: Vec<((String, String), InstanceId)> = self
+        let pairs: Vec<((String, String), InstanceId, bool)> = self
             .supervisor
             .list_instances()
             .into_iter()
-            .map(|i| ((i.namespace.clone(), i.app_name.clone()), i.id.clone()))
+            .map(|i| {
+                (
+                    (i.namespace.clone(), i.app_name.clone()),
+                    i.id.clone(),
+                    i.is_being_created(),
+                )
+            })
             .collect();
         let mut cgroup_ids: std::collections::HashMap<(String, String), Vec<u64>> =
             std::collections::HashMap::new();
-        for (key, id) in pairs {
+        for (key, id, being_created) in pairs {
             if let Some(owner) = self.egress_bindings.get(&id)
                 && owner.phase == PolicyPhase::Owned
                 && owner.source_namespace.is_some()
             {
                 cgroup_ids.entry(key).or_default().push(owner.cgroup_id);
+                continue;
+            }
+            // No cgroup exists yet, and asking the runtime would hold the
+            // agent loop until the instance's image pull finishes (Z6.7).
+            if being_created {
                 continue;
             }
             match self.supervisor.grill().workload_cgroup(&id).await {
@@ -5352,6 +5363,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 i.app_name == rule.target_service
                     && rule.matches_namespace(&i.namespace)
                     && rule.target_instance.as_ref().is_none_or(|t| &i.id.0 == t)
+                    && !i.is_being_created()
             })
             .map(|i| i.id.clone())
             .collect();
@@ -9284,10 +9296,18 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     async fn get_status(&self) -> Vec<InstanceStatus> {
         let mut statuses = Vec::new();
         for instance in self.supervisor.list_instances() {
-            let pid = self.supervisor.grill().pid(&instance.id).await;
+            // An instance still being created has neither, and asking would
+            // hold the agent loop until its image pull finishes (Z6.7).
+            let creating = instance.is_being_created();
+            let pid = if creating {
+                None
+            } else {
+                self.supervisor.grill().pid(&instance.id).await
+            };
             let exit_code = match self.recorded_jobs.get(&instance.id.0).map(|job| &job.phase) {
                 Some(super::jobs::JobPhase::Exited { code }) => Some(*code),
                 Some(super::jobs::JobPhase::Unknown) => None,
+                _ if creating => None,
                 _ => self.supervisor.grill().exit_code(&instance.id).await,
             };
             statuses.push(InstanceStatus {
@@ -18666,6 +18686,31 @@ host = "remote.local"
             );
             assert!(super::super::jobs::load(records.path()).unwrap().is_empty());
         }
+    }
+
+    /// Z6.7: runc holds an instance's lifecycle lock for its whole create,
+    /// image pull included, so asking it for a creating instance's PID held
+    /// the agent loop for the length of the pull. Status timed out, reports
+    /// went stale, and the leader moved the node's workloads elsewhere.
+    #[tokio::test]
+    async fn status_does_not_ask_the_runtime_about_an_instance_being_created() {
+        let (mut agent, _, _, grill) = test_agent_with_grill();
+        grill.set_pid(4242);
+        let mut config = basic_config();
+        config.app.get_mut("web").unwrap().replicas = crate::config::types::Replicas::Fixed(2);
+        expect_complete(&drain_deploy(&mut agent, config).await);
+        let creating = InstanceId("default__web-1".into());
+        agent.supervisor.get_instance_mut(&creating).unwrap().state = ContainerState::Preparing;
+
+        let statuses = agent.get_status().await;
+        let pid_of = |id: &str| {
+            statuses
+                .iter()
+                .find(|status| status.id == id)
+                .map(|status| status.pid)
+        };
+        assert_eq!(pid_of("default__web-0"), Some(Some(4242)));
+        assert_eq!(pid_of("default__web-1"), Some(None));
     }
 
     #[tokio::test]

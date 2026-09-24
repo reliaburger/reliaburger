@@ -67,6 +67,19 @@ pub struct WorkloadInstance {
     pub identity_mount: Option<std::path::PathBuf>,
 }
 
+impl WorkloadInstance {
+    /// Whether the runtime may be creating this instance right now: pulling
+    /// its image, building its network. It has no process yet, and asking
+    /// the runtime about it waits until the create finishes, which for a
+    /// first image pull takes tens of seconds.
+    pub fn is_being_created(&self) -> bool {
+        matches!(
+            self.state,
+            ContainerState::Pending | ContainerState::Preparing
+        )
+    }
+}
+
 /// What the runtime on this node can actually enforce.
 ///
 /// The supervisor refuses a workload up front when the node can't honour
