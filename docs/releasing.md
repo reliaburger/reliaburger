@@ -66,7 +66,12 @@ pair before advertising it as supported.
 
 Configure the Actions secret `RELIABURGER_RELEASE_KEY` with the base64 encoding
 of the existing Ed25519 PKCS#8 DER private key whose public key is listed in
-`src/upgrade/keys.rs`. Never commit that private key. This workflow does not
+`src/upgrade/keys.rs`, for example
+`base64 < release-key.der | gh secret set RELIABURGER_RELEASE_KEY`. The packaging
+script also accepts the base64 of a PEM private key or of the bare 32-byte seed,
+and converts either to DER; anything else fails with a message saying what it
+found, never the key itself. It then checks the derived public key against
+`src/upgrade/keys.rs`, so a wrong key fails before anything is signed. Never commit that private key. This workflow does not
 rotate the project's identity or generate a replacement when the secret is
 missing.
 

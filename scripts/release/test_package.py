@@ -242,3 +242,53 @@ exit 1
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReleaseKeyFormatTests(unittest.TestCase):
+    """The secret may be set from DER, a PEM file or a bare seed; all must sign."""
+
+    def setUp(self):
+        from package import release_key_der
+
+        self.release_key_der = release_key_der
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        der = self.root / "key.der"
+        subprocess.run(["openssl", "genpkey", "-algorithm", "ED25519", "-outform", "DER", "-out", str(der)], check=True, capture_output=True)
+        self.der = der.read_bytes()
+        self.pem = subprocess.run(["openssl", "pkey", "-inform", "DER", "-in", str(der), "-outform", "PEM"], check=True, capture_output=True).stdout
+        self.public = self.public_key(self.der)
+
+    def public_key(self, der):
+        path = self.root / "check.der"
+        path.write_bytes(der)
+        return subprocess.run(["openssl", "pkey", "-inform", "DER", "-in", str(path), "-pubout", "-outform", "DER"], check=True, capture_output=True).stdout
+
+    def converted(self, raw):
+        scratch = Path(tempfile.mkdtemp(dir=self.root))
+        return self.release_key_der(base64.b64encode(raw).decode(), scratch)
+
+    def test_der_pem_and_seed_all_yield_the_same_key(self):
+        self.assertEqual(self.public_key(self.converted(self.der)), self.public)
+        self.assertEqual(self.public_key(self.converted(self.pem)), self.public)
+        self.assertEqual(self.public_key(self.converted(self.der[-32:])), self.public)
+
+    def test_wrapped_base64_is_accepted(self):
+        encoded = base64.encodebytes(self.pem).decode()
+        self.assertIn("\n", encoded)
+        scratch = Path(tempfile.mkdtemp(dir=self.root))
+        self.assertEqual(self.public_key(self.release_key_der(encoded, scratch)), self.public)
+
+    def test_unrecognised_key_fails_without_revealing_it(self):
+        junk = b"not a key at all, just some text!"
+        with self.assertRaises(ValueError) as caught:
+            self.converted(junk)
+        self.assertIn("33 bytes", str(caught.exception))
+        self.assertNotIn("not a key", str(caught.exception))
+
+    def test_invalid_base64_is_named(self):
+        scratch = Path(tempfile.mkdtemp(dir=self.root))
+        with self.assertRaises(ValueError) as caught:
+            self.release_key_der("***", scratch)
+        self.assertIn("not valid base64", str(caught.exception))

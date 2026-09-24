@@ -26,8 +26,51 @@ ED25519_SPKI = bytes.fromhex("302a300506032b6570032100")
 def openssl(*args):
     result = subprocess.run(["openssl", *map(str, args)], capture_output=True)
     if result.returncode:
-        raise ValueError("OpenSSL release signing operation failed")
+        # OpenSSL's messages name the failing operation, not key material.
+        detail = result.stderr.decode(errors="replace").strip()[:300]
+        raise ValueError(f"OpenSSL release signing operation failed ({args[0]}): {detail}")
     return result.stdout
+
+
+# PKCS#8 prefix for a bare 32-byte Ed25519 seed (RFC 8410).
+ED25519_PKCS8_SEED = bytes.fromhex("302e020100300506032b657004220420")
+
+
+def release_key_der(encoded, scratch):
+    """Return the release key as PKCS#8 DER.
+
+    The secret should be base64 DER, but a base64 PEM file or a base64 raw
+    32-byte seed are easy mistakes when setting it, so both are accepted and
+    converted. A key that is none of these fails with a description of what
+    was found, never with any of its bytes.
+    """
+    try:
+        raw = base64.b64decode("".join(encoded.split()), validate=True)
+    except ValueError:
+        raise ValueError("RELIABURGER_RELEASE_KEY is not valid base64") from None
+    if raw.lstrip().startswith(b"-----BEGIN"):
+        pem = scratch / "key.pem"
+        with pem.open("xb") as stream:
+            os.chmod(pem, 0o600)
+            stream.write(raw)
+        result = subprocess.run(
+            ["openssl", "pkey", "-in", str(pem), "-outform", "DER"], capture_output=True
+        )
+        pem.unlink()
+        if result.returncode:
+            raise ValueError(
+                "RELIABURGER_RELEASE_KEY decodes to a PEM block OpenSSL cannot read as a "
+                "private key: " + result.stderr.decode(errors="replace").strip()[:300]
+            )
+        return result.stdout
+    if len(raw) == 32:
+        return ED25519_PKCS8_SEED + raw
+    if raw[:1] == b"\x30":
+        return raw
+    raise ValueError(
+        f"RELIABURGER_RELEASE_KEY decodes to {len(raw)} bytes that are neither PKCS#8 DER, "
+        "a PEM private key nor a 32-byte Ed25519 seed"
+    )
 
 
 def sha256(path):
@@ -151,7 +194,7 @@ def main():
         key = Path(temporary) / "key.der"
         with key.open("xb") as stream:
             os.chmod(key, 0o600)
-            stream.write(base64.b64decode(encoded_key, validate=True))
+            stream.write(release_key_der(encoded_key, Path(temporary)))
         pins = json.loads(Path(__file__).with_name("guest-images.json").read_text())
         package_release(args.directory, args.version, args.repository, key, trusted, pins)
 
