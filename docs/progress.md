@@ -355,6 +355,7 @@ that used to fail passes.
 | `ebpf::standalone_discovery_recovery_preserves_original_routing_and_cleanup` | 22 Sep | Product: 2 s force-kill deadline too short under load | Fixed (C3.3) |
 | `registry_recovery::new_leader_retains_registry_cleanup_until_the_killed_writer_returns` | 23 Sep | Harness: treated the retryable lease-leader 503 as fatal | Fixed |
 | `owned_rootless::rootless_port_and_launcher_survive_recovery_and_helper_replacement` | 22 Sep | The replacement slirp4netns helper sometimes exits before readiness after the test kills the old one, and `state()` reports it as an error mid-recovery | Open: decide whether recovery retries the helper or reports the error |
+| `placement::fault_injection_rejected_when_quorum_at_risk` | 24 Sep | Harness: asserted the rail's exact count; under CI load the leader briefly suspected the healthy follower too and counted 2 (run on #180, passed on re-run and 12/12 locally) | Fixed: any quorum-rail refusal counts |
 
 ## Current release checklist
 
