@@ -385,7 +385,7 @@ pub fn router_with_upgrade(
         )
         .route("/v1/diagnostics", get(diagnostics_handler))
         .route("/v1/diagnostics/apps", get(desired_apps_handler))
-        .route("/v1/trace", post(trace_handler))
+        .route("/v1/path", post(path_handler))
         .route("/v1/test/leases", post(test_lease_create_handler))
         .route("/v1/test/leases/{id}", get(test_lease_get_handler))
         .route("/v1/test/leases/{id}/renew", post(test_lease_renew_handler))
@@ -885,8 +885,8 @@ async fn gather_desired_apps(
     Ok(apps)
 }
 
-/// `POST /v1/trace` — fixed DNS and TCP probes from a local source workload.
-async fn trace_handler(
+/// `POST /v1/path` — fixed DNS and TCP probes from a local source workload.
+async fn path_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
     Json(mut request): Json<crate::onion::trace::TraceRequest>,
@@ -899,9 +899,7 @@ async fn trace_handler(
     if request.port == Some(0) {
         return (
             StatusCode::BAD_REQUEST,
-            Json(
-                serde_json::json!({"error": "trace destination port must be between 1 and 65535"}),
-            ),
+            Json(serde_json::json!({"error": "path destination port must be between 1 and 65535"})),
         )
             .into_response();
     }
@@ -912,16 +910,16 @@ async fn trace_handler(
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": format!(
-                "trace count must be between 1 and {}",
+                "path probe count must be between 1 and {}",
                 crate::onion::trace::MAX_TRACE_CONNECTS
             )})),
         )
             .into_response();
     }
-    if !valid_trace_label(&request.source) || !valid_trace_label(&request.source_namespace) {
+    if !valid_path_label(&request.source) || !valid_path_label(&request.source_namespace) {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "trace source and namespace must be DNS labels"})),
+            Json(serde_json::json!({"error": "path source and namespace must be DNS labels"})),
         )
             .into_response();
     }
@@ -933,9 +931,9 @@ async fn trace_handler(
         return response;
     }
 
-    let internal_destination = valid_trace_label(&request.destination);
+    let internal_destination = valid_path_label(&request.destination);
     if internal_destination {
-        if !valid_trace_label(&request.destination_namespace) {
+        if !valid_path_label(&request.destination_namespace) {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({"error": "internal destination namespace must be a DNS label"})),
@@ -983,14 +981,14 @@ async fn trace_handler(
         let Some(port) = request.port else {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "external trace destination requires --port"})),
+                Json(serde_json::json!({"error": "external path destination requires --port"})),
             )
                 .into_response();
         };
         let Some(auth) = auth.as_deref() else {
             return (
                 StatusCode::FORBIDDEN,
-                "external trace requires an authenticated Admin credential",
+                "an external path requires an authenticated Admin credential",
             )
                 .into_response();
         };
@@ -1011,7 +1009,7 @@ async fn trace_handler(
         {
             return (
                 StatusCode::FORBIDDEN,
-                "external trace destination is not exactly allowlisted as host:port",
+                "external path destination is not exactly allowlisted as host:port",
             )
                 .into_response();
         }
@@ -1041,20 +1039,20 @@ async fn trace_handler(
             .into_response(),
         Ok(Ok(Err(crate::bun::BunError::TraceBusy))) => (
             StatusCode::TOO_MANY_REQUESTS,
-            "too many connectivity traces are already running on this node",
+            "too many path probes are already running on this node",
         )
             .into_response(),
         Ok(Ok(Err(error))) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
         Ok(Err(_)) => (StatusCode::SERVICE_UNAVAILABLE, "agent dropped response").into_response(),
         Err(_) => (
             StatusCode::GATEWAY_TIMEOUT,
-            "trace timed out after 45 seconds",
+            "path probe timed out after 45 seconds",
         )
             .into_response(),
     }
 }
 
-fn valid_trace_label(value: &str) -> bool {
+fn valid_path_label(value: &str) -> bool {
     crate::config::valid_workload_label(value)
 }
 
@@ -4717,14 +4715,14 @@ async fn nodes_handler(State(state): State<ApiState>) -> Response {
     }
 }
 
-/// Largest request body the node relay forwards (a trace request is tiny).
+/// Largest request body the node relay forwards (a path request is tiny).
 const MAX_RELAY_REQUEST_BYTES: usize = 64 * 1024;
 /// Largest response the node relay passes back (an events page is the biggest).
 const MAX_RELAY_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
-/// A trace probes for up to 25 seconds on the target; allow for the hop.
+/// A path probe runs for up to 25 seconds on the target; allow for the hop.
 const RELAY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// The per-node reads `relish wtf` and `relish trace` make, and nothing else.
+/// The per-node reads `relish wtf` and `relish path` make, and nothing else.
 /// The relay is a reachability aid, not a general proxy.
 fn relay_allows(method: &axum::http::Method, path: &str) -> bool {
     const READS: &[&str] = &[
@@ -4741,7 +4739,7 @@ fn relay_allows(method: &axum::http::Method, path: &str) -> bool {
     ];
     match *method {
         axum::http::Method::GET => READS.contains(&path),
-        axum::http::Method::POST => path == "v1/trace",
+        axum::http::Method::POST => path == "v1/path",
         _ => false,
     }
 }
@@ -4750,7 +4748,7 @@ fn relay_allows(method: &axum::http::Method, path: &str) -> bool {
 /// diagnostic requests to a named node and return its answer.
 ///
 /// A laptop host can reach node 1's forwarded port but not the guests' own
-/// addresses, so `relish wtf` and `relish trace` reach every other node
+/// addresses, so `relish wtf` and `relish path` reach every other node
 /// through this. The caller's own credential travels with the request and the
 /// target repeats every authentication and authorisation check; the relay
 /// never adds the node's service identity.
@@ -9178,12 +9176,12 @@ mod tests {
     }
 
     #[test]
-    fn internal_trace_names_are_single_dns_labels() {
+    fn internal_path_names_are_single_dns_labels() {
         for valid in ["api", "api-v2", "a1"] {
-            assert!(valid_trace_label(valid), "rejected {valid:?}");
+            assert!(valid_path_label(valid), "rejected {valid:?}");
         }
         for invalid in ["", "API", "-api", "api-", "api.default", "api;id"] {
-            assert!(!valid_trace_label(invalid), "accepted {invalid:?}");
+            assert!(!valid_path_label(invalid), "accepted {invalid:?}");
         }
     }
 
@@ -9576,7 +9574,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn external_trace_refuses_the_open_bootstrap_window() {
+    async fn external_path_refuses_the_open_bootstrap_window() {
         let (app, shutdown) = test_setup();
         let body = serde_json::json!({
             "source": "api",
@@ -9589,7 +9587,7 @@ mod tests {
             .oneshot(
                 axum::http::Request::builder()
                     .method("POST")
-                    .uri("/v1/trace")
+                    .uri("/v1/path")
                     .header("content-type", "application/json")
                     .body(Body::from(body.to_string()))
                     .unwrap(),
@@ -9601,7 +9599,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn external_trace_needs_admin_policy_and_exact_destination() {
+    async fn external_path_needs_admin_policy_and_exact_destination() {
         use crate::testkit::safety::{ClusterSafetyClass, OperationPermission};
 
         let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::Admin);
@@ -9632,17 +9630,17 @@ mod tests {
             .to_string()
         };
         assert_eq!(
-            post_status(app.clone(), "/v1/trace", &plaintext, &body(80)).await,
+            post_status(app.clone(), "/v1/path", &plaintext, &body(80)).await,
             StatusCode::FORBIDDEN
         );
         assert_eq!(
-            post_status(app.clone(), "/v1/trace", &plaintext, &body(0)).await,
+            post_status(app.clone(), "/v1/path", &plaintext, &body(0)).await,
             StatusCode::BAD_REQUEST
         );
         // The exact allowlisted destination passes the policy boundary and
         // reaches the local-source check. No workload was seeded, hence 404.
         assert_eq!(
-            post_status(app, "/v1/trace", &plaintext, &body(443)).await,
+            post_status(app, "/v1/path", &plaintext, &body(443)).await,
             StatusCode::NOT_FOUND
         );
         shutdown.cancel();

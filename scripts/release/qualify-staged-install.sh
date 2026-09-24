@@ -267,7 +267,7 @@ until apps_running; do
     sleep 5
 done
 step 'status' status
-step 'trace' trace frontend --to redis
+step 'path' path frontend --to redis
 sleep 10
 step 'metrics' metrics frontend
 result=PASS

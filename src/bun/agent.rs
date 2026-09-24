@@ -9550,7 +9550,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     ) -> Result<PreparedTrace<G>, BunError> {
         if request.port == Some(0) {
             return Err(BunError::SecurityError {
-                reason: "trace destination port must be between 1 and 65535".to_string(),
+                reason: "path destination port must be between 1 and 65535".to_string(),
             });
         }
         let source_instance = self
@@ -9580,7 +9580,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .port
             .or_else(|| service.as_ref().map(|entry| entry.port))
             .ok_or_else(|| BunError::SecurityError {
-                reason: "external trace destination requires an explicit port".to_string(),
+                reason: "external path destination requires an explicit port".to_string(),
             })?;
         let dns_name = if internal_destination {
             format!(
@@ -9595,7 +9595,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         if count == 0 || count > crate::onion::trace::MAX_TRACE_CONNECTS {
             return Err(BunError::SecurityError {
                 reason: format!(
-                    "trace count must be between 1 and {}",
+                    "path probe count must be between 1 and {}",
                     crate::onion::trace::MAX_TRACE_CONNECTS
                 ),
             });
@@ -12515,7 +12515,7 @@ fn trace_dns_command(name: &str) -> Vec<String> {
         "sh".to_string(),
         "-c".to_string(),
         DNS_TRACE_SCRIPT.to_string(),
-        "reliaburger-trace".to_string(),
+        "reliaburger-path".to_string(),
         name.to_string(),
     ]
 }
@@ -12525,7 +12525,7 @@ fn trace_tcp_command(host: &str, port: u16, count: u32, wait_secs: u32) -> Vec<S
         "sh".to_string(),
         "-c".to_string(),
         TCP_TRACE_SCRIPT.to_string(),
-        "reliaburger-trace".to_string(),
+        "reliaburger-path".to_string(),
         host.to_string(),
         port.to_string(),
         count.to_string(),

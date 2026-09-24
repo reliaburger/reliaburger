@@ -93,9 +93,9 @@ impl Demo {
         diagnostics(&self.root, self.api, "").await
     }
 
-    /// `relish trace frontend --to redis --count 5`, printed for the record.
-    async fn trace_frontend_to_redis(&self) -> reliaburger::onion::trace::TraceResult {
-        let result = reliaburger::relish::trace_cmd::trace(
+    /// `relish path frontend --to redis --count 5`, printed for the record.
+    async fn path_frontend_to_redis(&self) -> reliaburger::onion::trace::TraceResult {
+        let result = reliaburger::relish::path_cmd::probe_path(
             &reliaburger::onion::trace::TraceRequest {
                 source: "frontend".to_string(),
                 source_namespace: "default".to_string(),
@@ -107,9 +107,9 @@ impl Demo {
             &self.client(),
         )
         .await
-        .unwrap_or_else(|error| panic!("trace failed: {error}\n{}", self.log()));
+        .unwrap_or_else(|error| panic!("path probe failed: {error}\n{}", self.log()));
         eprintln!(
-            "trace: {}\n{}",
+            "path: {}\n{}",
             serde_json::to_string(&result.overall_result).unwrap(),
             result
                 .steps
@@ -423,8 +423,8 @@ allowed_operations = ["inject_workload_faults"]
         acknowledged: true,
     };
 
-    // Z6.4: with nothing injected, the trace passes end to end.
-    let clean = demo.trace_frontend_to_redis().await;
+    // Z6.4: with nothing injected, the path passes end to end.
+    let clean = demo.path_frontend_to_redis().await;
     assert_eq!(
         clean.overall_result,
         TraceVerdict::Pass,
@@ -458,7 +458,7 @@ allowed_operations = ["inject_workload_faults"]
         "frontend logs under partition:\n{}",
         demo.frontend_cache_logs().await
     );
-    let partitioned = demo.trace_frontend_to_redis().await;
+    let partitioned = demo.path_frontend_to_redis().await;
     assert!(
         matches!(&partitioned.overall_result, TraceVerdict::Fail { reason } if reason.contains("partition from frontend")),
         "{}",
@@ -498,7 +498,7 @@ allowed_operations = ["inject_workload_faults"]
         .unwrap_or_else(|error| panic!("delay refused: {error}\n{}", demo.log()));
     let during = demo.median_cache_read().await;
     eprintln!("cache read median: {before:?} before the delay, {during:?} during it");
-    let delayed = demo.trace_frontend_to_redis().await;
+    let delayed = demo.path_frontend_to_redis().await;
     assert!(
         matches!(&delayed.overall_result, TraceVerdict::Degraded { reason } if reason.contains("delay 300ms from frontend")),
         "{}",
@@ -571,7 +571,7 @@ allowed_operations = ["inject_workload_faults"]
     }
     let after = demo.median_cache_read().await;
     eprintln!("cache read median after clearing the delay: {after:?}");
-    let healed = demo.trace_frontend_to_redis().await;
+    let healed = demo.path_frontend_to_redis().await;
     assert_eq!(healed.overall_result, TraceVerdict::Pass);
     assert!(
         healed.latency_ms.is_some_and(|median| median < 100.0),

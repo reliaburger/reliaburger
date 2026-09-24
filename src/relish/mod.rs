@@ -32,6 +32,7 @@ pub mod manifest;
 pub mod manual;
 pub mod metrics_cmd;
 pub mod output;
+pub mod path_cmd;
 pub mod plan;
 pub mod quickstart;
 pub mod reader;
@@ -40,7 +41,6 @@ pub mod setup;
 pub mod source;
 pub mod test_cmd;
 mod tls;
-pub mod trace_cmd;
 pub mod tui;
 pub mod uninstall;
 pub mod upgrade;
@@ -55,7 +55,7 @@ use crate::config::ConfigError;
 /// The result of a diagnostic-style command whose *exit code* carries meaning
 /// beyond "did the tool itself error".
 ///
-/// `relish test`, `wtf`, `bench` and `trace` need to say three different
+/// `relish test`, `wtf`, `bench` and `path` need to say three different
 /// things a plain `Result<(), _>` cannot. An `Ok(())` collapses to exit 0 and
 /// an `Err` to exit 1 — but "the suite ran and everything passed" and "the
 /// suite ran and something failed" are both `Ok` as far as the *tool* is

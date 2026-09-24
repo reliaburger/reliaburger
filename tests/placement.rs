@@ -1408,15 +1408,15 @@ async fn follow_and_top_cover_every_node_and_survive_one_leaving() {
     }
 }
 
-/// Z2.3: `relish wtf` and `relish trace` reach every node through the node
+/// Z2.3: `relish wtf` and `relish path` reach every node through the node
 /// the CLI talks to. A laptop host can only reach node 1's forwarded port, so
 /// neither may dial a node's own advertised address.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 #[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
-async fn wtf_and_trace_reach_every_node_through_the_entry_node() {
+async fn wtf_and_path_reach_every_node_through_the_entry_node() {
     let shutdown = CancellationToken::new();
     let nodes = start_spread_web_cluster("wt", 19741, &shutdown).await;
-    // Enter through the middle node, so the trace's source (the lowest-named
+    // Enter through the middle node, so the path's source (the lowest-named
     // node running `web`) is somewhere else.
     let entry = &nodes[1];
     // wtf reads the council from the leader, which it finds through the
@@ -1456,7 +1456,7 @@ async fn wtf_and_trace_reach_every_node_through_the_entry_node() {
         inputs.cluster.council
     );
 
-    let result = reliaburger::relish::trace_cmd::trace(
+    let result = reliaburger::relish::path_cmd::probe_path(
         &reliaburger::onion::trace::TraceRequest {
             source: "web".to_string(),
             source_namespace: "default".to_string(),
@@ -1468,7 +1468,7 @@ async fn wtf_and_trace_reach_every_node_through_the_entry_node() {
         &entry.client,
     )
     .await
-    .expect("trace runs on the source node through the relay");
+    .expect("path probe runs on the source node through the relay");
     assert_eq!(result.source_node, nodes[0].name);
 
     shutdown.cancel();

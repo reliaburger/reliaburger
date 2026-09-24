@@ -69,10 +69,10 @@ known_command() {
         "curl -fsSL https://reliaburger.com/install.sh | sh" \
         | "relish apply -f ${DEMO_URL}" \
         | "relish status" \
-        | "relish trace frontend --to redis" \
+        | "relish path frontend --to redis" \
         | "relish metrics frontend" \
         | "relish fault delay redis 300ms --from frontend --duration 2m --acknowledge" \
-        | "relish trace frontend --to redis --count 3" \
+        | "relish path frontend --to redis --count 3" \
         | "relish metrics frontend --name http_request_duration_seconds" \
         | "relish dashboard" \
         | "relish fault kill frontend --count 1 --acknowledge" \
@@ -164,7 +164,7 @@ type_command() {
 }
 
 # Type a command, then run exactly what was typed. Commands that report a
-# problem on purpose (a DEGRADED trace, wtf's warnings) exit non-zero; the
+# problem on purpose (a DEGRADED path, wtf's warnings) exit non-zero; the
 # tour carries on, as a person would.
 show() {
     type_command "$1"
@@ -205,8 +205,8 @@ all_apps_running() {
         && $(running redis) -ge 1 && $(running loadgen) -ge 1 ]]
 }
 
-trace_passes() {
-    relish trace frontend --to redis >/dev/null 2>&1
+path_passes() {
+    relish path frontend --to redis >/dev/null 2>&1
 }
 
 metrics_scraped() {
@@ -303,8 +303,8 @@ while IFS= read -r command <&3; do
                     ;;
             esac
             ;;
-        "relish trace frontend --to redis")
-            wait_for "redis to reach the service map" 120 trace_passes
+        "relish path frontend --to redis")
+            wait_for "redis to reach the service map" 120 path_passes
             show "${command}"
             ;;
         "relish metrics frontend")

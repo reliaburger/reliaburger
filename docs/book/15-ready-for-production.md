@@ -2341,11 +2341,11 @@ and two code paths whose difference only shows up on somebody's laptop. So
 there's one path: every per-node request goes through the entry node. The
 client builds a relayed client with `BunClient::via_node`, whose base URL is
 `{entry}/v1/nodes/{node}/relay`, and every existing method (`health`,
-`diagnostics`, `events`, `trace` and friends) just works, because each one
+`diagnostics`, `events`, `probe_path` and friends) just works, because each one
 formats its path onto the base URL.
 
 The relay on the server is deliberately not a proxy. It forwards ten `GET`
-paths and one `POST` (`/v1/trace`), refuses everything else with a 404,
+paths and one `POST` (`/v1/path`), refuses everything else with a 404,
 forwards the caller's own `Authorization` header and never the node's service
 token. So a relayed request can't do anything the caller couldn't do by
 dialling the node directly. A test proves it: a token scoped to one app asks a
@@ -2353,16 +2353,25 @@ peer's `/v1/status` through the relay and gets back only that app's
 instances. If the relay had quietly used the node's identity, the peer would
 have shown everything.
 
-## Trace the connection you actually care about
+## Walk the path you actually care about
 
 Say `web` can't reach `redis`. Checking Bun's own DNS and TCP access might tell
 us that the node works. It says very little about `web`. The application has
 its own network namespace, cgroup identity, firewall decision and DNS setup.
 The useful question is therefore: can *this workload* make the connection?
 
-`relish trace web --to redis` starts by asking every reachable node for status.
+The command that answers it is `relish path`. It was called `trace` until
+shortly before 0.1.0, and the old name was a trap. To an SRE, "trace" already
+means distributed tracing: OpenTelemetry spans, a Jaeger waterfall, one request
+followed through a dozen services. Anyone reaching for a command called `trace`
+would expect that and get a network probe instead. This command doesn't follow
+requests. It walks the network path between two apps, hop by hop, and asks each
+layer what it sees. So it's `path`. Nothing had shipped yet, so we renamed it
+outright, with no alias left behind for the old name.
+
+`relish path web --to redis` starts by asking every reachable node for status.
 It chooses a node with a running `web` instance, then sends a strict request to
-that node's authenticated `/v1/trace` endpoint. Bun doesn't accept a shell
+that node's authenticated `/v1/path` endpoint. Bun doesn't accept a shell
 command. It accepts application names, namespaces, a destination and an
 optional port.
 
@@ -2383,8 +2392,8 @@ labels, but that isn't our only command-injection defence.
 
 Both commands execute through the runtime's `exec()` implementation. On runc
 and Apple Container that means they run inside the selected workload. The
-image must contain a POSIX shell, `nslookup` and `nc`. If it doesn't, trace says
-`Unknown`. A missing debugging tool isn't proof that the network failed.
+image must contain a POSIX shell, `nslookup` and `nc`. If it doesn't, `relish path`
+says `Unknown`. A missing debugging tool isn't proof that the network failed.
 
 ## Don't stop the control plane to debug it
 
@@ -2394,7 +2403,7 @@ loop would still delay status, shutdown and every command queued behind it.
 
 The agent therefore builds a `PreparedTrace<G>`. It contains owned copies of
 the runtime handle, request, source instance and service state needed by the
-trace. The command arm moves that value and the response channel into a new
+probe. The command arm moves that value and the response channel into a new
 task:
 
 ```rust
@@ -2411,9 +2420,9 @@ It also gives us a useful test. The mock runtime holds `exec()` in flight while
 the test asks Bun for status. Status still returns before the probe is
 released.
 
-Spawning doesn't make capacity free. Bun owns a semaphore with eight trace
+Spawning doesn't make capacity free. Bun owns a semaphore with eight probe
 permits. `try_acquire_owned()` moves one permit into `PreparedTrace`; dropping
-the trace returns it automatically. If all eight are occupied, the ninth
+the probe returns it automatically. If all eight are occupied, the ninth
 request gets HTTP 429 immediately. We test that refusal while all eight mock
 `exec()` calls are held. A bound that merely queues an unlimited number of
 waiting tasks isn't a resource bound.
@@ -2426,7 +2435,7 @@ that path; graceful shutdown doesn't wait for a diagnostic timeout.
 
 ## Five steps, three kinds of evidence
 
-An internal trace reports five layers:
+An internal path probe reports five layers:
 
 1. A real `nslookup` from the source workload for
    `<destination>.<namespace>.internal`. The answer must contain the VIP from
@@ -2436,7 +2445,7 @@ An internal trace reports five layers:
 3. The live firewall decision. Bun resolves the source PID to its cgroup, reads
    `cgroup_namespace_map` and `firewall_map`, then applies the same rule as the
    eBPF connect hook.
-4. The active faults on this path (see "A trace that knows about faults"
+4. The active faults on this path (see "A path that knows about faults"
    below).
 5. A real TCP connect from the source workload to the service VIP and port,
    repeated with `--count`.
@@ -2482,22 +2491,23 @@ protected-cluster gate must allow it where applicable, and
 `external_probe_allowlist` must contain the exact `host:port`. No wildcard or
 CIDR matching. When live egress enforcement is active, the TCP result is still
 observed, but the current kernel map stores resolved addresses rather than the
-requested hostname relationship. Trace calls that firewall evidence Unknown.
+requested hostname relationship. `relish path` calls that firewall evidence
+Unknown.
 Honest again. Slightly annoying again. You can probably see the pattern by
 now.
 
-## A trace that knows about faults
+## A path that knows about faults
 
 Chapter 8's network faults made the tour's best moment possible: inject a
-300 ms delay between the frontend and redis, then *trace* the path and watch
-the tool point at it. The first attempt was a let-down. The trace passed, its
+300 ms delay between the frontend and redis, then *walk* the path and watch
+the tool point at it. The first attempt was a let-down. The probe passed, its
 latency figure timed the whole `runc exec` rather than the connect, and
 nothing in the output hinted that an experiment was running.
 
 Three changes fixed it. First, a new step lists the faults that act on this
 source's calls to this destination. Bun already knows them: it filters its own
 registry with the same `applies_to_caller` rule the fault installer uses, so
-the trace and the kernel can't disagree about scope. Where it can, the step
+the probe and the kernel can't disagree about scope. Where it can, the step
 adds live evidence (the `fault_connect_map` entry the connect hook would find
 for this source's cgroup, and the netem delay on the source's interface), and
 labels the listing `inferred` when it can't. A partition, an NXDOMAIN or a
@@ -2530,7 +2540,7 @@ connects succeeded" with the minimum and median connect time. One connect
 through a 30% drop tells you nothing; ten tell you the path is flaky.
 
 On the podinfo demo the whole story reads the way the tour wants it to. Under
-`relish fault partition redis --from frontend` the trace fails with `fault 1
+`relish fault partition redis --from frontend` the path fails with `fault 1
 (partition from frontend) blocks this path`, the live map entry shows the
 partition for the frontend's cgroup, and 0/5 connects succeed. Under `delay
 redis 300ms --from frontend` it's `DEGRADED`, the netem qdisc is listed, and

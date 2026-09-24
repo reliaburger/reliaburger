@@ -952,7 +952,7 @@ Boring won. Boring usually does. Rule four from earlier, in action.`);
     ["Processes", "Run plain binaries, not just containers."],
     ["Security", "mTLS by default. SPIFFE identity. Secrets in git."],
     ["relish wtf", "What's wrong with my cluster? Across every node."],
-    ["relish trace", "Why can't A talk to B? Follows the real path."],
+    ["relish path", "Why can't A talk to B? Follows the real path."],
     ["K8s import", "relish import turns your YAML into TOML, with a report."],
   ];
   feats.forEach((f, i) => {
@@ -974,7 +974,7 @@ It upgrades itself: rolling binary replacement, and your workloads keep running 
 
 Security's on by default: mTLS between nodes, a SPIFFE identity for every workload, and secrets encrypted so you can keep them in git.
 
-And the two commands I've wanted for ten years. relish wtf goes to every node and tells you what's wrong with your cluster. relish trace follows the real path from A to B and tells you where it breaks. You'll see wtf in the demo.
+And the two commands I've wanted for ten years. relish wtf goes to every node and tells you what's wrong with your cluster. relish path follows the real path from A to B and tells you where it breaks. You'll see wtf in the demo.
 
 If you're coming from Kubernetes, relish import turns your YAML into TOML and tells you what it couldn't translate. relish export goes the other way, so it's never a dead end.`);
 }

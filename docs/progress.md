@@ -176,7 +176,7 @@ Smaller fixes that CI runs turned up along the way:
         - [x] Persist original per-workload egress ownership before map writes and restore it before adoption.
         - [x] Recover correctly from Bun death after an application crash but before its replacement record is published.
         - [x] Correct generated OCI cgroup paths so the container joins the directory where Bun installs pre-start policy.
-        - [x] Resolve namespace rules, trace, source-specific faults and recovered egress through verified container identity.
+        - [x] Resolve namespace rules, `relish path`, source-specific faults and recovered egress through verified container identity.
         - [x] Isolate rolling and blue-green generations in their own cgroups.
         - [x] Propagate refused firewall/namespace deletion from the map helpers.
         - [x] Keep failed namespace/firewall reconciliation keys until confirmed removal.
@@ -1744,7 +1744,7 @@ verification alone; its separate gossip-rejoin deadline remains unfinished.
     metadata without paths, certificate bodies or key material
   - [x] Authenticated cross-node collection with ten-second bounds, desired-app
     and service evidence, rendering, app scope, watch mode and 0/1/2 exit contract
-- [x] `relish trace` (end-to-end connectivity debugging): source-node
+- [x] `relish path` (end-to-end connectivity debugging): source-node
   discovery; fixed bounded DNS/TCP probes inside the source workload; live
   userspace service state and attached Linux eBPF backend/firewall reads;
   explicit observed/inferred/unavailable evidence; strict schema-v1
@@ -1754,7 +1754,7 @@ verification alone; its separate gossip-rejoin deadline remains unfinished.
 - [x] Book chapter 15 test-harness and benchmarking foundations: Rust attributes, ignored
   versus compiled-out tests, deterministic async tests, nextest, benchmarks and coverage
 - [x] Complete chapter 15 with the built-in diagnostics commands (`relish test`, `wtf`,
-  `trace`), including safety, evidence provenance and acceptance limitations
+  `path`), including safety, evidence provenance and acceptance limitations
 - [ ] All Phase 15 tests green (current backlog: V01)
 
 ## Phase 15a: Current-State Hardening
@@ -1885,13 +1885,13 @@ verification alone; its separate gossip-rejoin deadline remains unfinished.
   - [x] Seven-suite benchmark runner and CLI: real source-workload DNS/service
     paths, strict failed-versus-skipped outcomes, fresh preflight evidence,
     explicit destructive consent and unconditional server-owned cleanup.
-  - [x] Authenticated source-workload trace and CLI: fixed positional-argument
+  - [x] Authenticated source-workload path probe and CLI (`relish path`): fixed positional-argument
     DNS/TCP probes run off the agent command loop; live userspace and attached
     kernel state are distinguished from inference; incomplete evidence is
     `Unknown`; external destinations use exact server-owned authorisation.
   - [x] Phase 15 command documentation across both READMEs, the Relish/Bun
     designs, chapter 15 and the implementation plan. Real three-node catalogue,
-    chaos, benchmark and trace acceptance remains the unchecked phase gate.
+    chaos, benchmark and path acceptance remains the unchecked phase gate.
 
 ### Optional
 

@@ -11,11 +11,11 @@ evidence, and prints a categorised report: CRITICAL, WARNING, UNKNOWN and OK.
 It doesn't just list problems — it links a crashloop to the recent deploy and
 the error log line behind it.
 
-You only need to reach one node. `wtf` and `trace` send every per-node request
+You only need to reach one node. `wtf` and `path` send every per-node request
 through the node you're connected to (`/v1/nodes/<node>/relay/...`), carrying
 your own credential, so they work from a laptop whose VMs sit behind Lima's
 private network. The relay forwards only the handful of read-only diagnostic
-calls these two commands make, plus the trace probe itself, and each target
+calls these two commands make, plus the path probe itself, and each target
 repeats every authentication and authorisation check.
 
 ```sh
@@ -34,21 +34,21 @@ is the contract:
 - `1` — at least one CRITICAL finding.
 - `2` — warnings or unknown evidence only, nothing critical.
 
-## `relish trace` — can A reach B?
+## `relish path` — can A reach B?
 
-`trace` locates a running instance of the source app and gathers real evidence
-along the path to a destination: a DNS query, the service-map and eBPF backend
-state (including which backend the VIP sends connects to), the firewall
-verdict, the fault experiments active on the path, and a TCP probe. Each step
-is labelled `observed`, `inferred` or `unavailable`; incomplete evidence can't
-turn green.
+`path` walks the network path from a source app to a destination, hop by hop.
+It locates a running instance of the source and gathers real evidence at each
+hop: a DNS query, the service-map and eBPF backend state (including which
+backend the VIP sends connects to), the firewall verdict, the fault experiments
+active on the path, and a TCP probe. Each step is labelled `observed`,
+`inferred` or `unavailable`; incomplete evidence can't turn green.
 
 ```sh
-relish trace web --to redis                    # internal service, port derived
-relish trace frontend --to redis --count 10    # ten connects: success rate, timing
-relish trace api --namespace frontend \
+relish path web --to redis                    # internal service, port derived
+relish path frontend --to redis --count 10    # ten connects: success rate, timing
+relish path api --namespace frontend \
   --to db --to-namespace storage --port 5432   # cross-namespace, explicit port
-relish --output yaml trace web --to redis      # machine-readable steps
+relish --output yaml path web --to redis      # machine-readable steps
 ```
 
 Flags: `--to <dest>` (required — an app, hostname or IP), `--namespace` for the
@@ -61,7 +61,7 @@ source's calls to this destination (one on the destination for every caller,
 or one `--from` this source), with its id, parameters and time left. Where the
 node can read them it adds the live `fault_connect_map` entry and the netem
 delay on the source's interface. A partition, `dns nxdomain` or 100% drop
-fails the trace and names the fault; a delay or a partial drop makes it
+fails the path and names the fault; a delay or a partial drop makes it
 `DEGRADED`.
 
 The **TCP probe** times each connect inside the source container, not the

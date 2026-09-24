@@ -721,7 +721,7 @@ Relish is the CLI and interactive terminal UI for Reliaburger. Running `relish` 
 | `relish deploy <path>` | Trigger a rolling deploy from a config file | `kubectl set image` |
 | `relish events` *(planned)* | Streaming event log | `kubectl get events` (1h expiry) |
 | `relish logs <app>` | Stream/search logs | `kubectl logs` + `stern` |
-| `relish trace <app> --to <app>` | Connectivity diagnosis | (none — manual iptables/DNS debugging) |
+| `relish path <app> --to <app>` | Connectivity diagnosis | (none — manual iptables/DNS debugging) |
 | `relish inspect <resource>` | Deep resource inspection | `kubectl describe` |
 | `relish top` | Workload state, PID and restart counts (not live CPU/memory) | `kubectl top` (requires metrics-server) |
 | `relish wtf` | Automated health check | (none — requires runbooks + Prometheus alerts) |
@@ -948,7 +948,7 @@ This is an explicit design goal: Reliaburger should never be a dead end, regardl
 | **Image builds** | Separate (Tekton, Jenkins, external CI) | Same | Separate | `docker build` | **Built-in (build jobs → Pickle)** |
 | **Terminal UI** | None (k9s is third-party) | Same | None | None | **Built-in (relish TUI)** |
 | **Change planning** | `kubectl diff` (limited) | Same | Built-in (`nomad job plan`) | None | **Built-in (`relish apply --dry-run`)** |
-| **Connectivity debugging** | Manual (iptables, DNS, endpoints) | Same | Manual | N/A | **Built-in (relish trace)** |
+| **Connectivity debugging** | Manual (iptables, DNS, endpoints) | Same | Manual | N/A | **Built-in (relish path)** |
 | **Health diagnosis** | Manual (requires runbooks) | Same | Manual | N/A | **Built-in (relish wtf)** |
 | **Fault injection** | Separate (Chaos Mesh / Litmus) | Same | Separate (Gremlin) | N/A | **Built-in (Smoker, eBPF-native)** |
 | **Built-in test suite** | None | None | None | None | **Built-in (relish test, relish bench)** |

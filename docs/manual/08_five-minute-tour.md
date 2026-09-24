@@ -1,8 +1,8 @@
 # Five-minute tour
 
 The same tour as the homepage's "Try it in five minutes": install, run a real
-Kubernetes app on a three-node laptop cluster, trace it, measure it, break it
-and watch it heal. Open it any time with `relish manual tour`.
+Kubernetes app on a three-node laptop cluster, walk its network path, measure
+it, break it and watch it heal. Open it any time with `relish manual tour`.
 
 It needs macOS, or Linux with QEMU and KVM, plus about 8 GiB of free memory and
 15 GiB of disk. The one-line install arrives with 0.1.0; until the signed
@@ -46,12 +46,13 @@ answers.
 ## See the whole path
 
 ```sh
-relish trace frontend --to redis
+relish path frontend --to redis
 ```
 
-Every hop from a frontend replica to Redis: the DNS answer, the virtual IP, the
-eBPF service map in the kernel, the firewall, any active faults, and finally a
-real TCP connect from inside the frontend's network namespace. On Kubernetes
+Every hop from a frontend replica to Redis, walked in order: the DNS answer,
+the virtual IP, the eBPF service map in the kernel, the firewall, any active
+faults, and finally a real TCP connect from inside the frontend's network
+namespace. On Kubernetes
 you'd piece that together from `nslookup`, `kubectl`, `bpftool`, `iptables` and
 a debug pod.
 
@@ -74,11 +75,11 @@ anything else calling Redis doesn't notice. The fault lifts itself after two
 minutes. Fault injection is built in, and on a laptop cluster it's switched on.
 
 ```sh
-relish trace frontend --to redis --count 3
+relish path frontend --to redis --count 3
 ```
 
-The same path, now DEGRADED. The trace names the fault, shows the delay it found
-on the frontend's network interface, and every connect takes 300 ms.
+The same path, now DEGRADED. `relish path` names the fault, shows the delay it
+found on the frontend's network interface, and every connect takes 300 ms.
 
 ```sh
 relish metrics frontend --name http_request_duration_seconds
