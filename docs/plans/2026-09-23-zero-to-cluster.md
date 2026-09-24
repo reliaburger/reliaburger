@@ -257,7 +257,9 @@ beat needs product work first:
   real laptop cluster before the homepage copy changes. Done 24 September: the
   run, its timings (4 min 34 s from `setup --quickstart` to `wtf` with warm
   downloads) and the eight bugs it found are in
-  `docs/qualification/2026-09-24-tour-transcript.md`.
+  `docs/qualification/2026-09-24-tour-transcript.md`. Losing a node (step 12)
+  was fixed afterwards and qualified with five full tours:
+  `docs/qualification/2026-09-24-node-loss.md`.
 
 ## Decisions
 
