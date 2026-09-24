@@ -18,7 +18,16 @@ use std::process::Command;
 /// branches. Each must FAIL to parse today; once it parses, the test fails
 /// and asks for its entry to be removed, so an exemption can't outlive its
 /// reason.
-const PENDING: &[(&str, &str)] = &[];
+const PENDING: &[(&str, &str)] = &[
+    (
+        "relish path frontend --to redis",
+        "the trace-to-path rename",
+    ),
+    (
+        "relish path frontend --to redis --count 3",
+        "the trace-to-path rename",
+    ),
+];
 
 const DEMO_MANIFEST_PENDING: bool = false;
 
