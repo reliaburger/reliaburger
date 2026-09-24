@@ -6,15 +6,15 @@
 //! The two lease tests run a real TLS cluster and wait out a 30-second lease,
 //! so `.config/nextest.toml` serialises them in the `cluster-heavy` group.
 
-use std::net::{SocketAddr, TcpListener};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 #[path = "support/bun_process.rs"]
 mod bun_process;
 use bun_process::{
-    BunProcess, WAIT, assert_success, reserve_address, run_relish, spawn_bun_with_port_retry,
-    wait_for_relish, write_portable_node_config,
+    BunProcess, WAIT, assert_success, reserve_address, reserve_port_block, run_relish,
+    spawn_bun_with_port_retry, wait_for_relish, write_portable_node_config,
 };
 
 #[tokio::test]
@@ -623,26 +623,9 @@ async fn qualify_registry_owner_crash(with_followers: bool) {
     );
 }
 
-/// Gossip derives peer transport addresses using cluster-uniform offsets.
-/// Keep TCP and UDP reservations alive together until the whole block is free.
+/// Gossip derives peer transport addresses using cluster-uniform offsets,
+/// so every node takes a consecutive gossip, Raft, reporting and API block.
 fn reserve_cluster_port_block() -> [u16; 4] {
-    for _ in 0..100 {
-        let first = TcpListener::bind("127.0.0.1:0").unwrap();
-        let base = first.local_addr().unwrap().port();
-        if base > u16::MAX - 3 {
-            continue;
-        }
-        let ports = [base, base + 1, base + 2, base + 3];
-        let Ok(_gossip) = std::net::UdpSocket::bind(("127.0.0.1", base)) else {
-            continue;
-        };
-        let remaining: std::io::Result<Vec<_>> = ports[1..]
-            .iter()
-            .map(|port| TcpListener::bind(("127.0.0.1", *port)))
-            .collect();
-        if remaining.is_ok() {
-            return ports;
-        }
-    }
-    panic!("could not reserve a complete cluster transport port block");
+    let base = reserve_port_block(4);
+    [base, base + 1, base + 2, base + 3]
 }
