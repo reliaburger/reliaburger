@@ -101,9 +101,13 @@ and under two minutes with cached downloads; the
 
 Setup saves ownership and credentials before creating VMs. Building the
 cluster, from the first VM boot to the demo app, has a five-minute deadline.
-Downloads don't count towards it, because their speed is your network's: a
-download fails only if no data arrives for 30 seconds (or after 30 minutes in
-total), and an interrupted download resumes from where it stopped. If setup
+Downloads don't count towards it, because their speed is your network's. When a
+connection drops, stalls (no data for 30 seconds) or the server answers with a
+temporary error, setup reconnects and asks for the rest of the file, and the
+progress line says so (`resumed at 113.1 MiB (retry 2)`). It gives up only
+after ten attempts in a row that bring no new data, or after 30 minutes of
+downloads in total; the partial file stays, and the next run resumes it. The
+installer's own `curl` download does the same, up to five attempts. If setup
 fails or runs out of time, rerun the same command. It reuses verified cached
 assets, the original CA and the owned VMs. A retry won't silently
 change the version, topology or ports, or replace a previously running VM

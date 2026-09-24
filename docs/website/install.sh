@@ -10,6 +10,26 @@ set -eu
 
 fail() { printf 'reliaburger: %s\n' "$*" >&2; exit 1; }
 
+# Fetch $1 into $2, retrying a dropped connection. The same loop as the
+# versioned installer's (see scripts/release/install.sh.in for why it isn't
+# curl's --retry-all-errors), kept short: this file is a few kilobytes.
+download() {
+  attempt=1
+  while :; do
+    status=0
+    curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+      --tlsv1.2 --connect-timeout 15 --speed-limit 1 --speed-time 30 \
+      --continue-at - "$1" -o "$2" || status=$?
+    [ "$status" -ne 0 ] || return 0
+    [ "$status" -ne 33 ] || rm -f "$2"
+    [ "$attempt" -lt 5 ] || return "$status"
+    attempt=$((attempt + 1))
+    printf 'reliaburger: download interrupted (curl exit %s); resuming, attempt %s of 5\n' \
+      "$status" "$attempt" >&2
+    sleep 2
+  done
+}
+
 main() {
   umask 077
   command -v curl >/dev/null 2>&1 || fail 'curl is required'
@@ -32,8 +52,7 @@ main() {
   trap 'exit 130' INT
   trap 'exit 143' TERM HUP
   url="$release_base/install.sh"
-  if ! curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
-    --tlsv1.2 --connect-timeout 15 --max-time 60 --retry 2 "$url" -o "$staging/install.sh"; then
+  if ! download "$url" "$staging/install.sh"; then
     fail "could not download the installer for $version; check that the release has been published"
   fi
   sh "$staging/install.sh" "$@"

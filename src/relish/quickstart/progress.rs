@@ -7,7 +7,7 @@ use std::{
     io::Write,
     sync::{
         Arc, OnceLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU32, AtomicU64, Ordering},
         mpsc,
     },
     time::{Duration, Instant},
@@ -76,6 +76,14 @@ struct Transfer {
     total: OnceLock<u64>,
     /// Bytes on disk now, including `resumed`.
     bytes: AtomicU64,
+    /// Bytes received during this run, across every attempt. The speed is
+    /// worked out from these, so neither a resumed partial nor a restart
+    /// distorts it.
+    fresh: AtomicU64,
+    /// How many times a dropped transfer has been retried in this run.
+    retries: AtomicU32,
+    /// Where the latest retry picked up, 0 when it had to start again.
+    retry_offset: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -105,6 +113,22 @@ impl Step {
     /// Count newly received bytes.
     pub fn add_bytes(&self, count: u64) {
         self.0.transfer.bytes.fetch_add(count, Ordering::Relaxed);
+        self.0.transfer.fresh.fetch_add(count, Ordering::Relaxed);
+    }
+
+    /// Record retry number `attempt` of a dropped transfer, which carries
+    /// on from `offset` bytes (0 when the server made it start again).
+    pub fn retry(&self, attempt: u32, offset: u64, total: Option<u64>) {
+        let _ = self.0.transfer.resumed.set(0);
+        if let Some(total) = total {
+            let _ = self.0.transfer.total.set(total);
+        }
+        self.0
+            .transfer
+            .retry_offset
+            .store(offset, Ordering::Relaxed);
+        self.0.transfer.retries.store(attempt, Ordering::Relaxed);
+        self.0.transfer.bytes.store(offset, Ordering::Relaxed);
     }
 
     /// Attach a short explanation, such as "cached". The first one sticks.
@@ -344,12 +368,20 @@ fn line(step: &Step, now: Instant, width: usize) -> String {
             None => bytes(received),
         };
         let seconds = elapsed.as_secs_f64();
-        let fresh = received.saturating_sub(*resumed);
+        let fresh = state.transfer.fresh.load(Ordering::Relaxed);
         if seconds >= 0.5 && fresh > 0 {
             detail.push_str(&format!("  {}/s", bytes((fresh as f64 / seconds) as u64)));
         }
-        if *resumed > 0 {
-            detail.push_str(&format!("  (resumed at {})", bytes(*resumed)));
+        let retries = state.transfer.retries.load(Ordering::Relaxed);
+        if retries > 0 {
+            match state.transfer.retry_offset.load(Ordering::Relaxed) {
+                0 => detail.push_str(&format!("  restarted (retry {retries})")),
+                offset => {
+                    detail.push_str(&format!("  resumed at {} (retry {retries})", bytes(offset)))
+                }
+            }
+        } else if *resumed > 0 {
+            detail.push_str(&format!("  resumed at {}", bytes(*resumed)));
         }
     }
     if let Some(note) = state.note.get() {
@@ -418,13 +450,11 @@ impl Timings {
                         .as_secs_f64(),
                     seconds: end.saturating_duration_since(state.started).as_secs_f64(),
                     outcome: finished.map_or(Outcome::Interrupted, |finished| finished.outcome),
-                    bytes: state.transfer.resumed.get().map(|resumed| {
-                        state
-                            .transfer
-                            .bytes
-                            .load(Ordering::Relaxed)
-                            .saturating_sub(*resumed)
-                    }),
+                    bytes: state
+                        .transfer
+                        .resumed
+                        .get()
+                        .map(|_| state.transfer.fresh.load(Ordering::Relaxed)),
                     note: state.note.get().cloned(),
                 }
             })
@@ -517,6 +547,11 @@ pub(super) mod tests_support {
     pub fn bytes(step: &Step) -> u64 {
         step.0.transfer.bytes.load(Ordering::Relaxed)
     }
+
+    /// The latest retry number the step showed.
+    pub fn retries(step: &Step) -> u32 {
+        step.0.transfer.retries.load(Ordering::Relaxed)
+    }
 }
 
 #[cfg(test)]
@@ -577,6 +612,28 @@ mod tests {
         assert!(text.contains("510.0 MiB / 600.0 MiB"), "{text}");
         assert!(text.contains("  1.0 MiB/s"), "{text}");
         assert!(text.contains("resumed at 500.0 MiB"), "{text}");
+    }
+
+    #[test]
+    fn a_retried_download_shows_where_it_resumed_and_which_retry_it_is() {
+        let start = Instant::now();
+        let download = step("download guest image", Stage::Download, start);
+        download.begin_transfer(0, Some(600 * 1024 * 1024));
+        download.add_bytes(100 * 1024 * 1024);
+        download.retry(2, 100 * 1024 * 1024, Some(600 * 1024 * 1024));
+        download.add_bytes(20 * 1024 * 1024);
+        let text = line(&download, start + Duration::from_secs(10), 200);
+        assert!(text.contains("120.0 MiB / 600.0 MiB"), "{text}");
+        assert!(text.contains("  12.0 MiB/s"), "{text}");
+        assert!(text.contains("resumed at 100.0 MiB (retry 2)"), "{text}");
+        download.retry(3, 0, None);
+        download.add_bytes(10 * 1024 * 1024);
+        let text = line(&download, start + Duration::from_secs(10), 200);
+        assert!(text.contains("10.0 MiB / 600.0 MiB"), "{text}");
+        assert!(text.contains("  13.0 MiB/s"), "{text}");
+        assert!(text.contains("restarted (retry 3)"), "{text}");
+        let timings = Timings::from_steps(start, start, &[download]);
+        assert_eq!(timings.steps[0].bytes, Some(130 * 1024 * 1024));
     }
 
     #[test]
