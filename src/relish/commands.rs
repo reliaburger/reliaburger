@@ -60,6 +60,19 @@ pub async fn rerun_jobs(source: &super::manifest::ManifestSource) -> Result<(), 
     Ok(())
 }
 
+/// The last line of `relish apply`. A single node starts the instances
+/// before it answers and names them; a cluster commits the apps and lets
+/// the scheduler place them, so there are no instances to name yet.
+fn apply_summary(created: usize, instances: &[String]) -> String {
+    if instances.is_empty() {
+        format!(
+            "applied {created} app(s); the scheduler places them now (watch with `relish status`)"
+        )
+    } else {
+        format!("deployed {created} instance(s): {}", instances.join(", "))
+    }
+}
+
 async fn apply_with_client(
     source: &super::manifest::ManifestSource,
     output: OutputFormat,
@@ -91,11 +104,7 @@ async fn apply_with_client(
         Ok(()) => {
             // Agent is alive — send the config (progress streams to stderr)
             let result = client.apply(&config).await?;
-            println!(
-                "deployed {} instance(s): {}",
-                result.created,
-                result.instances.join(", ")
-            );
+            println!("{}", apply_summary(result.created, &result.instances));
             Ok(())
         }
         Err(_) => {
@@ -2059,6 +2068,20 @@ pub async fn snapshot_delete(app: &str, namespace: &str, name: &str) -> Result<(
 mod tests {
     use super::*;
     use std::io::Write as _;
+
+    /// Z6.7: applying podinfo to the laptop cluster ended with
+    /// "deployed 4 instance(s):" and nothing after the colon.
+    #[test]
+    fn a_cluster_apply_says_the_apps_are_being_placed() {
+        assert_eq!(
+            apply_summary(4, &[]),
+            "applied 4 app(s); the scheduler places them now (watch with `relish status`)"
+        );
+        assert_eq!(
+            apply_summary(2, &["default__web-0".into(), "default__web-1".into()]),
+            "deployed 2 instance(s): default__web-0, default__web-1"
+        );
+    }
 
     fn top_row(
         node: &str,
