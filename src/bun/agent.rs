@@ -1761,6 +1761,10 @@ pub struct BunAgent<G: Grill> {
         std::collections::HashMap<(String, String), crate::config::app::IngressSpec>,
     /// A local change awaits in-place republication of the consumer view.
     consumer_view_stale: bool,
+    /// While the view lease has lapsed, the local-only view installed in
+    /// place of the last publication: this node's own backends and nothing
+    /// else. `None` while the published view is the whole cluster's.
+    lapsed_view: Option<Vec<crate::onion::types::ServiceEntry>>,
     /// Stopped instances retired by a finished rollout whose addresses still
     /// wait for other nodes to confirm the withdrawal. The loop releases them.
     deferred_retirements: std::collections::HashSet<InstanceId>,
@@ -1946,6 +1950,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             ingress_configs: std::collections::HashMap::new(),
             cluster_ingress_configs: std::collections::HashMap::new(),
             consumer_view_stale: false,
+            lapsed_view: None,
             deferred_retirements: Default::default(),
             view_lease: Default::default(),
             discovery_reopen: None,
@@ -2055,6 +2060,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             ingress_configs: std::collections::HashMap::new(),
             cluster_ingress_configs: std::collections::HashMap::new(),
             consumer_view_stale: false,
+            lapsed_view: None,
             deferred_retirements: Default::default(),
             view_lease: Default::default(),
             discovery_reopen: None,
@@ -4660,12 +4666,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 requested_at_ns,
                 response,
             } => {
-                // An answer after a lapse republishes from scratch: the view
-                // this node held may name addresses reused since.
-                if let Err(error) = self.fence_lapsed_view().await {
-                    let _ = response.send(Err(error));
-                    return;
-                }
+                // An answer after a lapse replaces the view in place. The
+                // kernel and Wrapper route only locally until the lease is
+                // renewed below, and the answer is the current catalogue, so
+                // every remote address it names is live.
                 let result = self
                     .synchronise_consumer(generation, *catalog, ingress, withdrawals)
                     .await;
@@ -8789,6 +8793,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             node_ip: container_ip.unwrap_or(std::net::Ipv4Addr::LOCALHOST),
             host_port: port,
             healthy,
+            local: true,
         }
     }
 
@@ -21605,11 +21610,14 @@ host = "remote.local"
         }
     }
     /// Z6.7: the leader may stop waiting for a node that has been silent past
-    /// its view lease. That's only safe if the node itself has stopped
-    /// routing by then, and republishes from scratch when the leader answers.
+    /// its view lease. That's only safe if the node has stopped routing to
+    /// other nodes by then. Its own backends are different: only this agent
+    /// can release their addresses, so they keep serving through a lapse, and
+    /// the agent refuses to release one while any view it published names it.
     #[tokio::test]
-    async fn a_lapsed_view_lease_withdraws_the_view_until_the_leader_answers() {
+    async fn a_lapsed_view_lease_keeps_local_backends_until_the_leader_answers() {
         use crate::bun::consumer_owners::{ConsumerIdentity, ConsumerPhase};
+        use crate::onion::service_id::ServiceId;
         let root = tempfile::tempdir().unwrap();
         let identity = ConsumerIdentity {
             node_id: crate::meat::NodeId::new("test"),
@@ -21617,7 +21625,55 @@ host = "remote.local"
         };
         let (mut agent, _, _) = test_cluster_fault_agent().await;
         agent.set_records_dir(root.path().to_owned());
-        agent.supervisor.grill().set_launch_inventory(vec![]).await;
+        let local = InstanceId("default__web-0".into());
+        let execution = crate::grill::RuntimeExecution {
+            instance_id: local.clone(),
+            generation: crate::grill::RuntimeGeneration::process("original"),
+        };
+        let spec: crate::grill::OciSpec = serde_json::from_value(serde_json::json!({
+            "root": {"path": "/fixture", "readonly": true},
+            "process": {"args": ["/app"], "env": [], "cwd": "/", "user": {"uid": 0, "gid": 0}},
+            "mounts": [], "linux": {"namespaces": []},
+        }))
+        .unwrap();
+        agent
+            .supervisor
+            .grill()
+            .set_launch_inventory(vec![crate::grill::RuntimeLaunch {
+                instance_id: local.clone(),
+                generation: execution.generation.clone(),
+                spec,
+                network_reference: None,
+            }])
+            .await;
+        let (mut catalog, ingress) = cluster_publication_fixture();
+        let web = ServiceId::new("default", "web");
+        let with_web = crate::onion::catalog::EndpointCatalog::rebuild(
+            catalog
+                .services
+                .iter()
+                .map(|(qualified, service)| {
+                    (
+                        ServiceId::parse(qualified).unwrap(),
+                        service.port,
+                        service.backends.clone(),
+                    )
+                })
+                .chain([(
+                    web.clone(),
+                    8080,
+                    vec![crate::onion::catalog::CatalogBackend {
+                        execution: Some(execution),
+                        node_id: "test".into(),
+                        node_ip: "192.168.1.1".parse().unwrap(),
+                        host_port: 30002,
+                        healthy: true,
+                    }],
+                )]),
+        )
+        .unwrap();
+        catalog = with_web;
+        let vip = catalog.resolve(&web).unwrap().vip;
         let lease = agent.view_lease_handle();
         assert!(lease.is_valid(), "a standalone view never lapses");
         agent
@@ -21625,8 +21681,22 @@ host = "remote.local"
             .await
             .unwrap();
         assert!(!lease.is_valid(), "nothing routes before the first answer");
+        // The instance this node runs, as adoption would register it.
+        let own = agent.local_backend(&local, &web, Some("10.0.2.2".parse().unwrap()), 30002, true);
+        agent.service_map = crate::onion::service_map::ServiceMap::from_snapshot(&[
+            crate::onion::types::ServiceEntry {
+                app_name: "web".into(),
+                namespace: "default".into(),
+                namespace_id: crate::onion::vip::name_to_id("default"),
+                app_id: u32::from(vip.0),
+                vip,
+                port: 8080,
+                backends: vec![own.clone()],
+                firewall_allow_from: None,
+            },
+        ])
+        .unwrap();
 
-        let (catalog, ingress) = cluster_publication_fixture();
         let answer = |generation, response| AgentCommand::SyncClusterConsumer {
             generation,
             catalog: Box::new(catalog.clone()),
@@ -21635,30 +21705,59 @@ host = "remote.local"
             requested_at_ns: crate::onion::lease::boot_clock_ns(),
             response,
         };
+        let backends = |agent: &BunAgent<MockGrill>, app: &str| {
+            agent
+                .service_map_tx
+                .borrow()
+                .resolve(&ServiceId::new("default", app))
+                .map(|entry| entry.backends.clone())
+        };
         let (response, reply) = oneshot::channel();
         agent.handle_command(answer(1, response)).await;
         assert!(reply.await.unwrap().unwrap().published);
         assert!(lease.is_valid(), "publishing the leader's answer renews it");
-        assert!(!agent.service_map_tx.borrow().resolve_all().is_empty());
+        assert_eq!(backends(&agent, "web"), Some(vec![own.clone()]));
+        assert_eq!(backends(&agent, "remote").unwrap().len(), 1);
 
         // The leader stops answering for longer than the lease.
         lease.expire();
         agent.fence_lapsed_view().await.unwrap();
-        assert!(agent.service_map_tx.borrow().resolve_all().is_empty());
-        assert!(agent.routing_table.read().await.list_routes().is_empty());
-        assert_ne!(agent.consumer_owner().unwrap().phase, ConsumerPhase::Active);
-        // A local change doesn't bring the old view back.
+        assert_eq!(
+            backends(&agent, "web"),
+            Some(vec![own.clone()]),
+            "this node's own backend keeps serving"
+        );
+        assert_eq!(
+            backends(&agent, "remote"),
+            Some(vec![]),
+            "another node's backend stops"
+        );
+        assert_eq!(agent.consumer_owner().unwrap().phase, ConsumerPhase::Active);
+        let routes = agent.routing_table.read().await.list_routes();
+        assert!(routes.iter().all(|route| route.healthy_backends == 0));
+        assert!(
+            matches!(
+                agent.confirm_producer_release(&local).await,
+                Err(BunError::ProducerReleasePending { .. })
+            ),
+            "a routed local address must not be released"
+        );
+
+        // A local change still reaches the local view, but never remote ones.
+        agent.service_map.remove_backend(&web, &local.0).unwrap();
         agent.consumer_view_stale = true;
         agent.refresh_consumer_view().await.unwrap();
-        assert!(agent.service_map_tx.borrow().resolve_all().is_empty());
+        assert_eq!(backends(&agent, "web"), Some(vec![]));
+        assert_eq!(backends(&agent, "remote"), Some(vec![]));
 
-        // The next answer republishes from scratch and renews the lease.
+        // The next answer, even for the same catalogue, restores the rest.
         let (response, reply) = oneshot::channel();
         agent.handle_command(answer(1, response)).await;
         assert!(reply.await.unwrap().unwrap().published);
         assert!(lease.is_valid());
         assert_eq!(agent.consumer_owner().unwrap().phase, ConsumerPhase::Active);
-        assert!(!agent.service_map_tx.borrow().resolve_all().is_empty());
+        assert_eq!(backends(&agent, "remote").unwrap().len(), 1);
+        assert_eq!(backends(&agent, "web"), Some(vec![]));
     }
 
     #[tokio::test]
@@ -22059,6 +22158,11 @@ host = "remote.local"
             .synchronise_consumer(1, catalog.clone(), ingress, vec![])
             .await
             .unwrap();
+        // As if the leader had just answered: a lapsed lease would shrink
+        // the view to local backends on the next refresh.
+        agent
+            .renew_view_lease(crate::onion::lease::boot_clock_ns())
+            .await;
         (agent, root, catalog)
     }
 

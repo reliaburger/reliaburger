@@ -69,6 +69,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 "discovery ownership is uncertain; producer release refused".into(),
             ));
         }
+        // Normally this node's own withdrawal receipt already proves it. But
+        // once the leader discharges this node, nobody waits for that receipt,
+        // and a lapsed view still routes to local backends: this check is
+        // what keeps a local address from being reused while it's routed.
+        if self.own_view_names(id) {
+            return Err(BunError::ProducerReleasePending {
+                instance_id: id.clone(),
+                reason: "this node's own view still routes to it",
+            });
+        }
         let instance = self.supervisor.get_instance(id);
         if instance.is_some_and(|instance| instance.host_port.is_none())
             && !self.network_references.contains_key(id)

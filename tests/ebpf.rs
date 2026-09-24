@@ -131,6 +131,7 @@ async fn ebpf_backend_map_write_and_read() {
                 node_ip: Ipv4Addr::new(10, 0, 2, 2),
                 host_port: 30891,
                 healthy: true,
+                local: false,
             },
         )
         .unwrap();
@@ -279,6 +280,7 @@ async fn ebpf_connect_to_vip_rewrites_destination() {
                 node_ip: Ipv4Addr::LOCALHOST,
                 host_port: backend_port,
                 healthy: true,
+                local: false,
             },
         )
         .unwrap();
@@ -310,61 +312,97 @@ async fn ebpf_connect_to_vip_rewrites_destination() {
 }
 
 /// Z6.7: once a cluster node's view lease lapses, the leader may discharge it
-/// and let producers reuse the addresses its maps still name. From then on
-/// the kernel refuses virtual addresses, with or without Bun running.
+/// and let other nodes reuse the remote addresses its maps still name. Only
+/// this node can reuse the address of a backend running here, so from then
+/// on the kernel keeps routing to local backends and refuses the rest, with
+/// or without Bun running.
 #[tokio::test]
 #[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
-async fn a_lapsed_view_lease_refuses_every_virtual_address() {
+async fn a_lapsed_view_lease_routes_only_to_local_backends() {
     use reliaburger::onion::lease::{ViewLease, boot_clock_ns};
     use reliaburger::onion::types::ViewLeaseValue;
 
     let mut ebpf = load_ebpf();
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let backend = listener.local_addr().unwrap();
-    let id = ServiceId::new("default", "lease-service");
-    let vip = VirtualIP::from_service_id(&id);
+    // Both listeners are on loopback; only the flag says which is remote.
+    let local = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let remote = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    local.set_nonblocking(true).unwrap();
+    remote.set_nonblocking(true).unwrap();
+    let backend = |instance_id: &str, listener: &std::net::TcpListener, local| BackendInstance {
+        instance_id: instance_id.to_string(),
+        node_ip: Ipv4Addr::LOCALHOST,
+        host_port: listener.local_addr().unwrap().port(),
+        healthy: true,
+        local,
+    };
+    let mixed = ServiceId::new("default", "lease-mixed");
+    let far = ServiceId::new("default", "lease-remote");
     let mut services = ServiceMap::new();
     services
-        .register_app("lease-service", "default", 9998, None)
+        .register_app("lease-mixed", "default", 9998, None)
         .unwrap();
     services
-        .add_backend(
-            &id,
-            BackendInstance {
-                instance_id: "lease-0".to_string(),
-                node_ip: Ipv4Addr::LOCALHOST,
-                host_port: backend.port(),
-                healthy: true,
-            },
-        )
+        .register_app("lease-remote", "default", 9997, None)
+        .unwrap();
+    services
+        .add_backend(&mixed, backend("mixed-local", &local, true))
+        .unwrap();
+    services
+        .add_backend(&mixed, backend("mixed-remote", &remote, false))
+        .unwrap();
+    services
+        .add_backend(&far, backend("far-remote", &remote, false))
         .unwrap();
     let mut maps = BpfServiceMap::new();
     maps.sync_from_service_map(&services, &mut ebpf).unwrap();
-    let vip_address = SocketAddr::new(vip.0.into(), 9998);
-    let connect = || TcpStream::connect_timeout(&vip_address, Duration::from_secs(2));
+    let address =
+        |id: &ServiceId, port| SocketAddr::new(VirtualIP::from_service_id(id).0.into(), port);
+    let (mixed_address, far_address) = (address(&mixed, 9998), address(&far, 9997));
+    let connect =
+        |address: &SocketAddr| TcpStream::connect_timeout(address, Duration::from_secs(2));
+    // Accept (and drop) everything a listener has queued, counting it.
+    let accepted =
+        |listener: &std::net::TcpListener| std::iter::from_fn(|| listener.accept().ok()).count();
 
-    assert!(connect().is_ok(), "a node without a lease is standalone");
+    assert!(
+        connect(&far_address).is_ok(),
+        "a node without a lease is standalone"
+    );
     let lease = ViewLease::default();
     lease.enforce();
     lease.renew(boot_clock_ns());
     maps.write_view_lease(&mut ebpf, ViewLeaseValue::from_lease(&lease))
         .unwrap();
-    assert!(connect().is_ok(), "a current lease routes");
+    assert!(
+        connect(&far_address).is_ok(),
+        "a current lease routes to other nodes"
+    );
 
     lease.expire();
     maps.write_view_lease(&mut ebpf, ViewLeaseValue::from_lease(&lease))
         .unwrap();
-    let refused = connect().unwrap_err();
+    let refused = connect(&far_address).unwrap_err();
     assert_eq!(refused.kind(), std::io::ErrorKind::PermissionDenied);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let _ = (accepted(&local), accepted(&remote));
+    let held: Vec<_> = (0..4)
+        .map(|_| connect(&mixed_address).expect("a lapsed lease still routes locally"))
+        .collect();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(accepted(&local), held.len(), "every connection stays here");
+    assert_eq!(accepted(&remote), 0, "no connection leaves this node");
     assert!(
-        TcpStream::connect_timeout(&backend, Duration::from_secs(2)).is_ok(),
+        connect(&remote.local_addr().unwrap()).is_ok(),
         "addresses outside the VIP range are not the lease's business"
     );
 
     lease.renew(boot_clock_ns());
     maps.write_view_lease(&mut ebpf, ViewLeaseValue::from_lease(&lease))
         .unwrap();
-    assert!(connect().is_ok(), "a renewed lease routes again");
+    assert!(
+        connect(&far_address).is_ok(),
+        "a renewed lease routes to other nodes again"
+    );
     ebpf.detach().unwrap();
 }
 
@@ -675,6 +713,7 @@ async fn partition_fault_blocks_its_source_cgroup_and_clears() {
                 node_ip: Ipv4Addr::LOCALHOST,
                 host_port: listener.local_addr().expect("backend address").port(),
                 healthy: true,
+                local: false,
             },
         )
         .expect("register test backend");
@@ -954,6 +993,7 @@ async fn namespace_isolation_denies_cross_namespace_by_default() {
             node_ip: Ipv4Addr::LOCALHOST,
             host_port: backend_port,
             healthy: true,
+            local: false,
         },
     )
     .unwrap();
@@ -1034,6 +1074,7 @@ async fn namespace_grant_cannot_authorise_a_same_named_destination() {
                     node_ip: Ipv4Addr::LOCALHOST,
                     host_port: port,
                     healthy: true,
+                    local: false,
                 },
             )
             .unwrap();
