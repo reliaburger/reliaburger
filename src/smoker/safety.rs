@@ -68,7 +68,7 @@ fn check_quorum_risk(request: &FaultRequest, context: &SafetyContext) -> Option<
     // failure and transport partitions can remove a voter from quorum.
     let targets_node = matches!(
         request.fault_type,
-        FaultType::NodeKill { .. } | FaultType::CouncilPartition
+        FaultType::NodeKill { .. } | FaultType::CouncilPartition { .. }
     );
     if !targets_node {
         return None;
@@ -101,7 +101,7 @@ fn check_replica_minimum(
 ) -> Option<SafetyViolation> {
     let kills_instances = matches!(
         request.fault_type,
-        FaultType::Kill { .. } | FaultType::Pause | FaultType::MemoryPressure { oom: true, .. }
+        FaultType::Kill { .. } | FaultType::Pause
     );
     if !kills_instances {
         return None;
@@ -329,7 +329,6 @@ mod tests {
         let req = FaultRequest {
             fault_type: FaultType::Partition {
                 source_app: Some("web".to_string()),
-                source_cgroup_id: 0,
             },
             target_service: "payments".to_string(),
             namespace: None,
@@ -416,35 +415,13 @@ mod tests {
     }
 
     #[test]
-    fn replica_minimum_applies_to_oom() {
-        let ctx = default_context();
-        let req = FaultRequest {
-            fault_type: FaultType::MemoryPressure {
-                percentage: 0,
-                oom: true,
-            },
-            target_service: "web".into(),
-            namespace: None,
-            target_instance: None,
-            target_node: None,
-            duration: Duration::from_secs(30),
-            injected_by: "test".into(),
-            reason: None,
-            include_leader: false,
-            override_safety: false,
-            acknowledged: false,
-        };
-        let check = evaluate_safety(&req, &ctx);
-        assert!(!check.approved);
-    }
-
-    #[test]
     fn replica_minimum_does_not_apply_to_delay() {
         let ctx = default_context();
         let req = FaultRequest {
             fault_type: FaultType::Delay {
                 delay_ns: 200_000_000,
                 jitter_ns: 0,
+                source_app: None,
             },
             target_service: "web".into(),
             namespace: None,
@@ -591,6 +568,7 @@ mod tests {
             fault_type: FaultType::Delay {
                 delay_ns: 200_000_000,
                 jitter_ns: 0,
+                source_app: None,
             },
             target_service: "redis".into(),
             namespace: None,

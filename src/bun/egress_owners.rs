@@ -1,7 +1,7 @@
 //! Durable namespace and egress ownership before any kernel policy mutation.
 
 use std::collections::HashMap;
-use std::io::{self, Read};
+use std::io;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -94,41 +94,14 @@ fn validate(owners: &HashMap<InstanceId, EgressBinding>) -> io::Result<()> {
 /// Read every original owner before adoption or kernel cleanup. Only a missing
 /// checkpoint denotes no owners; invalid or partial inventories refuse recovery.
 pub(super) fn load(directory: &Path) -> io::Result<HashMap<InstanceId, EgressBinding>> {
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
-    }
-    let file = match options.open(directory.join(CHECKPOINT_FILE)) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(HashMap::new()),
-        Err(error) => return Err(error),
+    let Some(checkpoint) = crate::durable::read_json_if_exists::<Checkpoint>(
+        &directory.join(CHECKPOINT_FILE),
+        MAX_CHECKPOINT_BYTES,
+        crate::durable::Access::Exclusive,
+    )?
+    else {
+        return Ok(HashMap::new());
     };
-    let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.len() > MAX_CHECKPOINT_BYTES {
-        return Err(io::Error::other("invalid egress ownership checkpoint file"));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if metadata.mode() & 0o777 != 0o600
-            || metadata.uid() != nix::unistd::geteuid().as_raw()
-            || metadata.nlink() != 1
-        {
-            return Err(io::Error::other(
-                "egress ownership checkpoint is not private",
-            ));
-        }
-    }
-    let mut bytes = Vec::new();
-    file.take(MAX_CHECKPOINT_BYTES + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_CHECKPOINT_BYTES {
-        return Err(io::Error::other("egress ownership checkpoint is too large"));
-    }
-    let checkpoint: Checkpoint = serde_json::from_slice(&bytes)?;
     if checkpoint.schema != 2 {
         return Err(io::Error::other("unsupported egress ownership schema"));
     }

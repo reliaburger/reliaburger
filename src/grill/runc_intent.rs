@@ -6,8 +6,8 @@
 //! is positively absent. This journal does not establish that evidence itself.
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::io;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use nix::libc;
@@ -15,6 +15,7 @@ use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 
 use super::{InstanceId, OciSpec};
+use crate::durable::{Access, read_json, validate_directory, validate_file};
 
 mod commands;
 use super::command::CommandId;
@@ -215,7 +216,7 @@ impl IntentJournal {
                 .mode(0o600)
                 .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
                 .open(locks.join(&instance.0))?;
-            validate_file(&file)?;
+            validate_file(&file, Access::OwnerOnly)?;
             file.try_lock().map_err(|error| match error {
                 std::fs::TryLockError::WouldBlock => {
                     io::Error::new(io::ErrorKind::WouldBlock, "runtime lifecycle is busy")
@@ -304,17 +305,11 @@ impl IntentJournal {
         if !existing_directory(&directory)? {
             return Ok(None);
         }
-        let file = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(directory.join("intent.json"))?;
-        validate_file(&file)?;
-        let mut bytes = Vec::new();
-        file.take(RECORD_LIMIT + 1).read_to_end(&mut bytes)?;
-        if bytes.len() as u64 > RECORD_LIMIT {
-            return Err(io::Error::other("runtime intent exceeds size limit"));
-        }
-        let record: RuntimeIntent = serde_json::from_slice(&bytes)?;
+        let record: RuntimeIntent = read_json(
+            &directory.join("intent.json"),
+            RECORD_LIMIT,
+            Access::OwnerOnly,
+        )?;
         if record.version != 5
             || record
                 .boot_id
@@ -322,7 +317,6 @@ impl IntentJournal {
                 .is_some_and(|boot| !super::process_owner::valid_boot_id(boot))
             || (cfg!(target_os = "linux") && record.boot_id.is_none())
             || record.instance_id != *instance
-            || record.configuration != self.configuration
             || record.generation.0.len() != 32
             || !record
                 .generation
@@ -331,6 +325,19 @@ impl IntentJournal {
                 .all(|byte| byte.is_ascii_hexdigit())
         {
             return Err(io::Error::other("invalid or incompatible runtime intent"));
+        }
+        // A retired generation owns nothing, so the configuration it ran under
+        // no longer matters. A live one must be recovered with the paths and
+        // resolver it was prepared with.
+        if record.configuration != self.configuration
+            && !matches!(record.phase, IntentPhase::Retired { .. })
+        {
+            return Err(io::Error::other(format!(
+                "instance {} was started with a different runtime configuration; stop its \
+                 workloads before changing the Runc program, runtime directories, DNS \
+                 resolver or node index",
+                instance.0
+            )));
         }
         if let Some(state) = &record.network_reference {
             let reference = match state {
@@ -400,6 +407,18 @@ impl IntentClaim {
                 File::open(&records)?.sync_all()?;
             } else {
                 persist(&directory, &record)?;
+            }
+            // The previous generation retired, so its command records and logs
+            // have no remaining owner. Remove them only after the successor is
+            // durable: a crash in between leaves an orphaned directory, never
+            // a missing record.
+            if let Some(previous) = &self.record {
+                match std::fs::remove_dir_all(
+                    directory.join("generations").join(&previous.generation.0),
+                ) {
+                    Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+                    _ => {}
+                }
             }
             self.record = Some(record);
             Ok(self)
@@ -547,28 +566,6 @@ fn validate_instance(instance: &InstanceId) -> io::Result<()> {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
     {
         return Err(io::Error::other("invalid runtime intent identity"));
-    }
-    Ok(())
-}
-
-fn validate_file(file: &File) -> io::Result<()> {
-    let metadata = file.metadata()?;
-    if !metadata.is_file()
-        || metadata.uid() != nix::unistd::geteuid().as_raw()
-        || metadata.mode() & 0o077 != 0
-    {
-        return Err(io::Error::other("invalid private runtime intent file"));
-    }
-    Ok(())
-}
-
-fn validate_directory(path: &Path) -> io::Result<()> {
-    let metadata = std::fs::symlink_metadata(path)?;
-    if !metadata.is_dir()
-        || metadata.uid() != nix::unistd::geteuid().as_raw()
-        || metadata.mode() & 0o077 != 0
-    {
-        return Err(io::Error::other("invalid private runtime intent directory"));
     }
     Ok(())
 }

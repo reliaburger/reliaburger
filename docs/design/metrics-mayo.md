@@ -43,7 +43,7 @@ A note on this document: the storage engine is **Parquet + DataFusion SQL**, not
 | Webhook notifications | Outbound | **Shipped.** Alert notifications dispatched to generic HTTP, Slack, or PagerDuty destinations. |
 | Prometheus remote-read API | Inbound | **Status: planned -- not yet implemented.** There is no `remote_read` endpoint. |
 | Prometheus scrape endpoint (`/metrics` exposition) | Inbound | **Status: planned -- not yet implemented.** Mayo does not expose its data in Prometheus exposition format. |
-| Application `/metrics` scraping | Outbound (node-local) | **Implemented.** When `[[metrics.scrape_targets]]` is non-empty, Bun spawns a loop that scrapes each target's `/metrics` every `scrape_interval_secs`, parses the Prometheus text (`src/mayo/scrape.rs`), and ingests the samples tagged with the target's `job`. An empty target list means no loop is spawned. |
+| Application `/metrics` scraping | Outbound (node-local) | **Implemented.** An app that declares `metrics = { port, path }` (or imports `prometheus.io/*` annotations) is scraped by each node on its own running instances every `app_scrape_interval_secs` (default 10), at the instance's container IP (loopback for process workloads), up to 16 at a time with a per-request timeout. Samples are labelled `app` (`namespace/app`), `namespace`, `instance` and `node` (an app's own clashing label becomes `exported_<name>`), histograms are stored as `_bucket{le}`, `_sum` and `_count` series, and an `up` gauge per instance records whether the scrape worked (`src/mayo/scrape.rs`). Separately, `[[metrics.scrape_targets]]` scrapes fixed URLs every `scrape_interval_secs`, tagged with the target's `job`. |
 
 ---
 

@@ -202,6 +202,27 @@ fn check_council(inputs: &WtfInputs, report: &mut WtfReport) {
             correlated_events: Vec::new(),
             affected_resource: "council".to_string(),
         });
+    } else if council.reachable_members < council.member_count {
+        // Quorum holds, but a lost member leaves the membership list, so the
+        // node check alone would call the smaller cluster healthy.
+        healthy = false;
+        let missing = council.member_count - council.reachable_members;
+        report.warnings.push(WtfFinding {
+            id: "council-member-down".to_string(),
+            title: format!(
+                "{missing} of {} council members did not answer",
+                council.member_count
+            ),
+            details: vec![format!(
+                "quorum holds with {} of {}; {} more failure(s) would lose it",
+                council.reachable_members,
+                council.member_count,
+                council.reachable_members + 1 - quorum
+            )],
+            suggestion: "bring the missing node back, or replace it: `relish nodes`, `relish local start <node>` on a laptop cluster".to_string(),
+            correlated_events: Vec::new(),
+            affected_resource: "council".to_string(),
+        });
     }
     if healthy {
         report.ok.push(WtfOk {
@@ -957,6 +978,32 @@ mod tests {
 
         assert!(report.critical.iter().any(|item| item.id == "no-leader"));
         assert!(report.critical.iter().any(|item| item.id == "quorum-loss"));
+        assert!(!report.ok.iter().any(|ok| ok.id == "council"));
+    }
+
+    /// Z6.7: after `relish local stop node-3` the stopped node left the
+    /// membership list, and wtf reported "all 2 nodes alive" and a healthy
+    /// council, all OK.
+    #[test]
+    fn a_missing_council_member_is_a_warning_while_quorum_holds() {
+        let mut inputs = healthy_inputs();
+        inputs.cluster.council = available(CouncilObservation {
+            enabled: true,
+            member_count: 3,
+            reachable_members: 2,
+            leader: Some("node-1".to_string()),
+        });
+
+        let report = diagnose(&inputs);
+
+        let finding = report
+            .warnings
+            .iter()
+            .find(|item| item.id == "council-member-down")
+            .unwrap();
+        assert_eq!(finding.title, "1 of 3 council members did not answer");
+        assert!(finding.details[0].contains("1 more failure(s)"));
+        assert!(report.critical.is_empty());
         assert!(!report.ok.iter().any(|ok| ok.id == "council"));
     }
 

@@ -254,6 +254,27 @@ fn validate_app(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError
         });
     }
 
+    // `args` and `working_dir` describe a container's process against its
+    // image config; a process workload has no image to resolve them against.
+    if (app.exec.is_some() || app.script.is_some())
+        && (!app.args.is_empty() || app.working_dir.is_some())
+    {
+        return Err(ConfigError::Validation {
+            field: "args/working_dir".to_string(),
+            context: format!("app {name:?}"),
+            reason: "args and working_dir apply to image workloads, not exec or script".to_string(),
+        });
+    }
+    if let Some(dir) = &app.working_dir
+        && !dir.is_absolute()
+    {
+        return Err(ConfigError::Validation {
+            field: "working_dir".to_string(),
+            context: format!("app {name:?}"),
+            reason: format!("{:?} must be absolute", dir.display()),
+        });
+    }
+
     // Port range
     if let Some(port) = app.port
         && port == 0
@@ -262,6 +283,30 @@ fn validate_app(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError
             name: name.to_string(),
             port,
         });
+    }
+
+    // Metrics: the scrape needs a port (its own or the app's) and a path.
+    if let Some(metrics) = &app.metrics {
+        let metrics_error = |reason: String| ConfigError::Validation {
+            field: "metrics".to_string(),
+            context: format!("app {name:?}"),
+            reason,
+        };
+        match metrics.port.or(app.port) {
+            None => {
+                return Err(metrics_error(
+                    "no port to scrape: set metrics.port or the app's port".to_string(),
+                ));
+            }
+            Some(0) => return Err(metrics_error("port must not be 0".to_string())),
+            Some(_) => {}
+        }
+        if !metrics.path.starts_with('/') || metrics.path.contains(char::is_whitespace) {
+            return Err(metrics_error(format!(
+                "path {:?} must start with '/' and contain no whitespace",
+                metrics.path
+            )));
+        }
     }
 
     // Config files: exactly one of content/source
@@ -456,6 +501,16 @@ impl NodeConfig {
             });
         }
 
+        // A zero deadline would fail every stop before the runtime answered,
+        // leaving every workload owned and unstoppable.
+        if self.runtime.stop_confirmation_timeout_secs == 0 {
+            return Err(ConfigError::Validation {
+                field: "runtime.stop_confirmation_timeout_secs".into(),
+                context: "node config".into(),
+                reason: "must be greater than zero".into(),
+            });
+        }
+
         self.testing
             .validate()
             .map_err(|error| ConfigError::Validation {
@@ -522,6 +577,10 @@ impl NodeConfig {
                 "metrics.rollup_interval_secs",
                 self.metrics.rollup_interval_secs,
             ),
+            (
+                "metrics.app_scrape_interval_secs",
+                self.metrics.app_scrape_interval_secs,
+            ),
             ("logs.export_interval_secs", self.logs.export_interval_secs),
         ] {
             if value == 0 {
@@ -554,6 +613,47 @@ mod tests {
         toml::from_str(r#"image = "test:v1""#).unwrap()
     }
 
+    fn app_with_metrics(extra: &str) -> AppSpec {
+        toml::from_str(&format!("image = \"test:v1\"\n{extra}")).unwrap()
+    }
+
+    #[test]
+    fn metrics_on_the_app_port_is_valid() {
+        let config = config_with_app("web", app_with_metrics("port = 8080\nmetrics = {}"));
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn metrics_without_any_port_is_rejected() {
+        let config = config_with_app("web", app_with_metrics("metrics = {}"));
+        let err = config.validate().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Validation { ref field, ref reason, .. }
+                if field == "metrics" && reason.contains("no port")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn metrics_port_zero_is_rejected() {
+        let config = config_with_app("web", app_with_metrics("metrics = { port = 0 }"));
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn metrics_path_must_be_absolute() {
+        let config = config_with_app(
+            "web",
+            app_with_metrics("metrics = { port = 9797, path = \"metrics\" }"),
+        );
+        let err = config.validate().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Validation { ref reason, .. }
+                if reason.contains("start with '/'")),
+            "{err:?}"
+        );
+    }
+
     #[test]
     fn node_config_defaults_are_valid() {
         // H1: the whole-config validator now runs at startup, so the shipped
@@ -571,6 +671,18 @@ mod tests {
             matches!(err, ConfigError::Validation { ref field, .. }
                 if field == "metrics.collection_interval_secs"),
             "expected a collection-interval validation error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn node_config_rejects_a_zero_stop_confirmation_timeout() {
+        let mut node = crate::config::NodeConfig::default();
+        node.runtime.stop_confirmation_timeout_secs = 0;
+        let err = node.validate().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Validation { ref field, .. }
+                if field == "runtime.stop_confirmation_timeout_secs"),
+            "expected a stop-confirmation validation error, got {err:?}"
         );
     }
 
@@ -746,6 +858,50 @@ mod tests {
     fn validate_valid_app_passes() {
         let config = config_with_app("test", minimal_app());
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn image_process_fields_parse_and_validate() {
+        let app: AppSpec = toml::from_str(
+            r#"
+            image = "ghcr.io/stefanprodan/podinfo:6.15.0"
+            args = ["--port=9898"]
+            working_dir = "/home/app"
+            run_as_user = 100
+            run_as_group = 101
+            "#,
+        )
+        .unwrap();
+        assert_eq!(app.args, ["--port=9898"]);
+        assert_eq!(app.run_as_user, Some(100));
+        config_with_app("podinfo", app).validate().unwrap();
+    }
+
+    #[test]
+    fn relative_working_dir_rejected() {
+        let mut app = minimal_app();
+        app.working_dir = Some(PathBuf::from("home/app"));
+        let err = config_with_app("test", app).validate().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Validation { ref field, .. } if field == "working_dir"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn args_on_a_process_workload_rejected() {
+        let app: AppSpec = toml::from_str(
+            r#"
+            script = "echo hi"
+            args = ["--verbose"]
+            "#,
+        )
+        .unwrap();
+        let err = config_with_app("test", app).validate().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Validation { ref field, .. } if field == "args/working_dir"),
+            "{err:?}"
+        );
     }
 
     #[test]

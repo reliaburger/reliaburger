@@ -567,7 +567,7 @@ The rolling deploy process (Section 13) proceeds one instance at a time (configu
 
 ### 5.6 WebSocket Upgrade Handling
 
-> **Status: shipped and tested.** WebSocket upgrade proxying is fully implemented in `src/wrapper/websocket.rs` (`handle_websocket_upgrade`), wired into the request path in `src/wrapper/proxy.rs`, and covered end-to-end by `tests/ingress.rs` (`ingress_proxies_websocket_handshake_and_bytes`, which drives a real client through the proxy to a raw WebSocket backend and asserts the `101` / `Sec-WebSocket-Accept` relay and byte echo). The `websocket` route flag gates it.
+> **Status: shipped and tested.** WebSocket upgrade proxying is fully implemented in `src/wrapper/websocket.rs` (`handle_websocket_upgrade`), wired into the request path in `src/wrapper/proxy.rs`, and covered end-to-end by `tests/suite/ingress.rs` (`ingress_proxies_websocket_handshake_and_bytes`, which drives a real client through the proxy to a raw WebSocket backend and asserts the `101` / `Sec-WebSocket-Accept` relay and byte echo). The `websocket` route flag gates it.
 
 When Wrapper receives a request with `Connection: Upgrade` and `Upgrade: websocket` headers:
 

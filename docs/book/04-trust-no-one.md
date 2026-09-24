@@ -198,7 +198,11 @@ The fix is `sesame::identity_store`, a small module that owns one directory:
   node-ca.crt   # the intermediate that signed it
   root-ca.crt   # the trust anchor
   meta.json     # node_id, serial, CA generation, validity window
+  node.bundle.json  # the complete identity in one file (mode 0600)
+  bundle.committed  # commit marker, written last on first install
 ```
+
+The last two files arrived later, and we'll get to why in a moment.
 
 `relish init` now writes this for the bootstrap node, fills the `[security]` section of the generated `reliaburger.toml` so `bun` knows where to look, and enables the mTLS requirement in that same file. Two details are worth stealing for your own projects. First, the private key is written with `atomic_write_mode(path, data, Some(0o600))` — the permission is set on the temp file *before* the rename, so there is never a moment when the key sits at its final path world-readable. Second, `load()` returns `Result<Option<NodeIdentity>, _>`, not a bare `Result`. A missing identity isn't an error; it's a state ("this node hasn't enrolled yet") that the caller matches on explicitly. Rust makes the three outcomes — loaded, absent, corrupt — impossible to conflate, which is exactly what you want for a file that decides whether your listeners speak TLS.
 
@@ -264,6 +268,8 @@ cert::validate_chain(&certificate_der, &node_ca_der, &root_ca_der)
 ```
 
 A half-installed bundle now fails loudly at load instead of silently running degraded. It's the filesystem equivalent of the Raft trick above: make the "it's ready" signal a single thing that lands last, so partial states are detectable.
+
+That worked for the first install and broke on the second. Once certificates renew (more on that shortly), the store has to *replace* an identity, not just create one. Clear the marker, write `node.crt`, fail on `node.key`, and the node that had a perfectly valid identity a second ago now refuses to start. A recoverable write error became a re-enrolment. So the authoritative copy is now a single `node.bundle.json` holding the leaf, key, CA certificates and metadata, replaced with one atomic rename. Readers see the old complete identity or the new one, never a mixture. The PEM files are still written, but only as exports for operators and tools like `relish --ca-cert`; Bun loads the snapshot. The marker survives to catch an interrupted *first* install, and `load` validates the chain and the key's match to the leaf every time.
 
 ### A connection that never finishes
 
@@ -334,6 +340,65 @@ Acquiring *before* `accept()` is the part worth pausing on. Excess peers then wa
 
 Naming it `_permit` rather than `_` matters too. A bare `_` doesn't bind, so the permit would drop immediately at the top of the task and the cap would silently do nothing — a bug that only shows up under load, which is exactly when you'd rather not be debugging. The test for this leaks a permit on purpose and asserts the *second* connection is never served.
 
+## Certificates that expire on purpose
+
+A certificate that lasts forever is a key that's compromised forever. So node certificates expire, and a node has to renew its own before that happens, without dropping connections and without anybody logging in to help. That turned out to be four problems stacked on top of each other.
+
+**Time.** Our first issuer converted both ends of the validity window to calendar dates. Issue a 90-second certificate at lunchtime and both ends become midnight: it's expired before it's used. Issuance now captures one instant and adds the lifetime with checked arithmetic, letting the `time` crate handle the calendar. Then the fix was too exact. A joining node whose clock ran one second behind the issuer's saw a certificate that wasn't valid *yet*, refused it, and asked again. Nobody's clocks agree to the second, so every issuer now backdates the start:
+
+```rust
+/// How far every issued certificate's `not_before` is backdated, so a signer
+/// and verifier whose clocks disagree by a few minutes still accept a
+/// freshly issued certificate.
+pub const CLOCK_SKEW_BACKDATE: Duration = Duration::from_secs(300);
+```
+
+A Rust `const` is a compile-time value with no fixed address, closer to a typed C `#define` than to a global variable, so any module can use it for free. The lifetime still counts from the issuing instant, so a 90-second certificate stays usable for 90 seconds. Verification stays exact; only the start of the signed window moved. Issuers also judge themselves at the real issuing instant and cap every leaf at their own expiry, so an intermediate that expires in a minute can't hand out a year-long leaf.
+
+**Swapping credentials under running listeners.** A `rustls::ServerConfig` built with yesterday's key keeps yesterday's key. Rebuilding every listener on renewal would drop connections. Instead, Bun loads one `LiveNodeIdentity`, a handle around a Tokio `watch` channel holding the current certificate and key, and clones it into the API and registry listeners, the Raft and reporting transports and its internal HTTPS clients. rustls asks a *resolver* for credentials on every handshake, and `LiveNodeIdentity` is one:
+
+```rust
+impl rustls::server::ResolvesServerCert for LiveNodeIdentity {
+    fn resolve(&self, _: rustls::server::ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        let current = self.current.borrow();
+        let now = std::time::SystemTime::now();
+        (current.identity.not_before <= now && now < current.identity.not_after)
+            .then(|| Arc::clone(&current.key))
+    }
+}
+
+impl rustls::client::ResolvesClientCert for LiveNodeIdentity {
+    fn resolve(&self, _: &[&[u8]], _: &[rustls::SignatureScheme]) -> Option<Arc<CertifiedKey>> {
+        // None would silently become anonymous client auth on the optional-mTLS
+        // API. Present the configured identity even after expiry so the peer
+        // refuses it, just as with rustls's static client certificate resolver.
+        Some(Arc::clone(&self.current.borrow().key))
+    }
+}
+```
+
+`impl Trait for Type` is how Rust attaches an interface to a type. Unlike Go, you say so explicitly, and here we implement a trait from someone else's crate (rustls) for our own type, which is how libraries let you plug in behaviour. `bool::then` turns `true` into `Some(value)` and `false` into `None`, running the closure only when needed. `Arc::clone` copies a pointer and bumps a reference count; the private key bytes never move. The two resolvers deliberately disagree about expiry. A server can refuse to present an expired leaf. A client returning `None` means "send no certificate", and our API accepts certificate-less clients (browsers, `relish`) because they authenticate with tokens. An expired *node* must not quietly become one of those, so the client side keeps presenting the old certificate and lets the peer refuse it. Session resumption is off everywhere, because a resumed TLS session skips the resolver and would keep yesterday's identity alive.
+
+Replacement writes the new snapshot to disk first and publishes it to the `watch` channel second. It requires the same node ID, the same trust anchors and a newer serial, and a failed save leaves the live identity alone.
+
+**Who is asking?** `POST /v1/cluster/renew` needs the internal service token *and* the client certificate from the TLS connection itself. The service token proves the request came from cluster automation; it doesn't say which node sent it, so trusting a node name in the request body would let one compromised node renew itself as any other. The leader reads the caller's current leaf (Bun puts it in a typed Axum extension after the handshake, where no header can reach it), checks the chain and revocation list again because a long-lived connection can outlive a revocation, and signs a CSR that must name the same node. As with joining, only the CSR's public key reaches the new certificate. Followers refuse rather than forward, since forwarding would present the follower's certificate and change who's asking.
+
+**Who notices it's broken?** A renewal loop runs inside each Bun. Once the current leaf is past the middle of its life, it generates a fresh key locally, asks whoever is leader right now, and retries every five seconds on any failure while the old identity keeps working. An expired identity gets no bypass: the operator re-enrols the node. The loop reports its progress through another `watch` channel, and the reading side has a neat trick:
+
+```rust
+pub fn state(&self) -> RenewalState {
+    if self.0.has_changed().is_err() {
+        RenewalState::Stopped
+    } else {
+        *self.0.borrow()
+    }
+}
+```
+
+`has_changed()` returns an error once the sending half has been dropped. If the renewal task exits or panics, Rust drops its sender, and diagnostics report `Stopped` even though the last value it wrote said `Valid`. A dead background task can't keep claiming it's healthy, and nobody had to remember to write a final status.
+
+The ingress proxy's certificates for your domains follow the same rules with shorter loops. Their serials are 20 random bytes with the top bits fixed (`(serial[0] & 0x3f) | 0x40` keeps the six low bits and sets the next, giving a positive number of full length), because a per-process counter gave two ingress nodes restarting on the same CA identical serials. The handshake sends the leaf *and* its intermediate, since a client that trusts only the root can't connect the two otherwise; a unit test proved the signature correct, and a real client still said `UnknownIssuer`. Cached leaves renew at mid-life, operator-supplied files hot-reload only once the certificate and key match, and API, registry and ingress TLS connections get a one-hour maximum lifetime, so even a WebSocket eventually reconnects to the current certificate.
+
 ## Gossip HMAC
 
 Gossip uses UDP, which can't do TLS. Instead, we authenticate gossip messages with HMAC-SHA256. The HMAC key is derived from the cluster master secret (which members hold, but outsiders don't). Deriving it from the public Root CA certificate would prove nothing. This proves the sender holds cluster key material without the overhead of TLS on every UDP datagram.
@@ -368,6 +433,16 @@ let hash = argon2.hash_password(token.as_bytes(), &salt)?;
 
 The middleware skips authentication for `/v1/health` (so liveness probes still work) and when no user tokens exist yet. That second case is a bootstrap window, not permission to publish an open control plane: Bun only permits it on an IP-literal loopback listener. Wildcard, routable and hostname listeners are refused until the cluster has a real user token.
 
+### A scoped token stays scoped
+
+Tokens can also be scoped to an app or a namespace, and a scope is only worth something if nothing lets you step outside it. An audit found several side doors.
+
+An administrator scoped to namespace `team` could create an *unscoped* administrator token, discarding the boundary with one API call. Token management, join tokens, secret rotation and image signing act on the whole cluster, so there's no app or namespace to check them against; they now need an unscoped administrator. The same goes for overriding someone else's test lease.
+
+The apply handler checked a manifest's apps against the caller's scope and then passed its jobs along unchecked, so a token confined to namespace `a` could run a job in namespace `b`. Worse, the apps were committed before the jobs were looked at. Now apps and jobs feed one iterator of targets (`Iterator::chain` walks the first iterator, then the second, without copying either), and every target is checked before the first Raft write. Jobs that run host commands also need the host-exec permission. A manifest can't rewrite its own rules either: `[permission.*]` and namespace quota declarations need an unscoped administrator, otherwise `ci` could grant itself `host-exec` in the very manifest that's limited by its absence.
+
+Finally, the check has to survive a network hop. A follower that forwards an apply to the leader passes along the *user's* token or session cookie. Swapping in the node's own service token would erase the identity whose permissions the leader needs to check. Each fix got a test that looks at Raft state and the agent's command queue, not just the HTTP status, and a positive test next to it. A permission system that refuses everything is secure and useless.
+
 ## Secret encryption
 
 Application secrets shouldn't live in plaintext in your git repository. Reliaburger uses `age` for asymmetric encryption. You encrypt secrets with the cluster's public key, and only the cluster can decrypt them.
@@ -377,6 +452,8 @@ In your app config:
 [env]
 DATABASE_URL = "ENC[AGE:YWdlLWVuY3J5cH...]"
 ```
+
+You don't need the cluster's key files on your laptop to encrypt a value. `GET /v1/secret/public-key` returns the active public recipient and its generation to any authenticated caller, including read-only ones. A public recipient can encrypt but can't decrypt, so the endpoint returns a two-field `SecretPublicKey` struct rather than serialising the stored keypair, which also holds wrapped private material.
 
 At container startup, Bun decrypts `ENC[AGE:...]` values and injects the plaintext as environment variables. The decrypted value never touches disk — it goes straight from memory into the container's process environment.
 
@@ -748,7 +825,7 @@ No gating here. Crypto needs nothing but a CPU, so the whole chapter runs under 
 cargo test --lib sesame
 ```
 
-The one thing the unit tests *don't* cover is the full token-and-revocation lifecycle across a running cluster — single-use enforcement in the agent, secret rotation windows, certificate revocation lists. That needs `SecurityState` in Raft, so its integration test (`tests/security_integration.rs`, labelled "Phase 10") arrives with Chapter 10. It drives the `sesame` library directly — no running agent — so it too runs under a plain `cargo test`.
+The one thing the unit tests *don't* cover is the full token-and-revocation lifecycle across a running cluster — single-use enforcement in the agent, secret rotation windows, certificate revocation lists. That needs `SecurityState` in Raft, so its integration test (`tests/suite/security_integration.rs`, labelled "Phase 10") arrives with Chapter 10. It drives the `sesame` library directly — no running agent — so it too runs under a plain `cargo test`.
 
 Phase 4 adds 85 tests to the suite, bringing the total to 795.
 
@@ -808,563 +885,3 @@ after startup begins and separately check the empty-store deadline. A shutdown
 guard cancels already spawned tasks when startup exits with an error; Rust drops
 the guard on both the success and error return paths.
 
-### Certificate lifetimes need a clock, not a calendar date
-
-Issue a certificate at lunchtime with a 90-second lifetime. Converting both ends
-of its validity window to year/month/day throws away the entire lifetime: both
-ends become midnight. It is already expired. Our original CA and node issuance
-paths did exactly that, while stored CA metadata kept a different timestamp.
-
-Issuance now captures one instant, rounds to the whole-second precision encoded
-by X.509, and adds the requested lifetime with checked arithmetic. The `time`
-crate handles calendar transitions; the handwritten leap-year conversion is gone.
-We reject lifetimes that cannot produce a valid, positive window. Stored CA
-metadata comes from the same parameters used to sign the certificate. The
-regression decodes a real 90-second certificate and compares both the duration
-and the root CA's encoded timestamps with its stored metadata.
-
-### Bad certificate input is an error, not a panic
-
-A DNS subject alternative name must fit the certificate library's IA5 string
-representation. The public issuer previously called `unwrap()` on that conversion,
-so a non-ASCII name could panic. It now collects conversions into a
-`Result<Vec<_>, _>`: collection stops at the first invalid name and returns its
-context to the caller. The common-name SAN follows the same rule instead of
-silently disappearing. Requesting a root CA through the intermediate-CA function
-also returns an input error. Regression tests exercise both former panic paths.
-
-### A process counter cannot identify certificates across nodes
-
-Restart two ingress nodes using the same CA. If each starts its certificate
-counter at the same number, their first leaves share an issuer and serial.
-An atomic increment only coordinates threads inside one process. It says
-nothing about another node, or tomorrow's restart.
-
-Ingress issuance now asks the operating system for twenty random bytes. It
-clears the sign bit and sets the next bit, leaving 158 random bits and a
-positive, non-zero value that always occupies twenty bytes. That also keeps
-these serials outside the eight-byte range of our Raft-issued node identities.
-[RFC 5280 section 4.1.2.2](https://www.rfc-editor.org/rfc/rfc5280#section-4.1.2.2)
-sets the positive-serial requirement and the twenty-octet ceiling.
-
-The expression `(serial[0] & 0x3f) | 0x40` uses bitwise AND to retain the six
-low bits and bitwise OR to set the next bit. `[0u8; 20]` creates a fixed-size
-array of twenty bytes. The random fill returns a `Result`; `?` propagates a
-failure instead of falling back to a timestamp or a repeatable counter.
-Uniqueness is probabilistic, based on independent cryptographic randomness.
-There is no persistent counter to roll back and no synchronous Raft request
-inside the TLS handshake. The signed certificate carries its serial; the
-resolver owns its cached key and discards that cache at restart.
-
-The regression starts separate processes with the same CA, including a restart
-and concurrent peers. It checks the actual signed certificates, their serial
-shape and the absence of duplicates. The old counter fails this test.
-
-This does not add ingress CRL distribution. Our cluster revocation API owns
-64-bit node identities; it must not truncate a longer ingress serial and claim
-to revoke it. Individual ingress-leaf revocation remains unsupported. Certificate
-renewal and hot reload are tracked separately under C14, and CA rotation remains
-an explicit future capability under F04.
-
-
-### Send the issuer along with the leaf
-
-A certificate signed by the Ingress CA isn't directly signed by the cluster
-root. The client needs the intermediate certificate to connect those two facts.
-Our first SNI resolver sent just the leaf. Unit tests proved its signature was
-correct, but a real client trusting only the documented root returned
-`UnknownIssuer`.
-
-Ingress issuance and the resolver now carry the original root-signed Ingress CA
-certificate and send `[leaf, intermediate]` during the handshake. We don't
-recreate a self-signed copy of that intermediate from its signing parameters;
-that would discard the root's signature. The root itself stays with the client
-as its configured trust anchor and needn't travel in the server's chain.
-
-The regression starts a real TLS listener and a client whose trust store contains
-only the root. It fails against the leaf-only implementation and succeeds with
-the complete chain, checking that the server sends exactly those two certificates.
-This is a prerequisite for testing renewal: a fresh certificate must also be one
-the documented client can validate.
-
-### A cached leaf still has an expiry date
-
-Open a connection, leave the ingress running for ninety days, then open another.
-The original cache returned the same certificate both times. Caching had quietly
-turned a validity period into a suggestion.
-
-The resolver now reads the leaf's X.509 validity dates when it caches the key.
-Before the midpoint it reuses that key. From the midpoint onwards, the next
-handshake issues a replacement and swaps the cache entry. An idle host needs no
-background signing: its first returning client triggers renewal, even if the old
-leaf expired while nobody was using it. Cache keys use lower-case hostnames.
-
-Signing happens outside the short cache lock. If signing fails, an existing leaf
-can still serve until its expiry; an expired or not-yet-valid leaf cannot. The
-issuer's actual certificate sets another boundary: we refuse issuance outside
-its validity window and cap each leaf at the issuer's expiry. Renewing leaves
-cannot extend the lifetime of a CA. CA rotation remains separate work.
-
-`CachedCertificate` owns an `Arc<CertifiedKey>` and a small validity value. Cloning
-the `Arc` gives a handshake ownership of the current key without copying its
-secret bytes. Replacing the entry doesn't invalidate a connection already using
-that key. The lifetime limit for established connections is a separate policy.
-
-The regression uses real TLS connections with a ten-second certificate. It
-checks reuse immediately, a different valid leaf after six seconds, and another
-valid leaf after eleven idle seconds. Two issuance tests also reject an expired
-issuer and prove a leaf cannot outlive it. Operator file replacement and node
-transport renewal still have their own implementation and acceptance work.
-
-### Replacing a certificate while the listener stays open
-
-An operator updates `tls_cert_path` first, then `tls_key_path`. Between those
-writes, the new certificate and the old key don't match. Installing each file
-independently would break every new handshake during that interval.
-
-Wrapper now polls the pair once a second, reads both files on a blocking worker,
-and checks that the key matches the leaf and every certificate in the supplied
-chain is currently valid. Only then does it publish the complete pair. Missing,
-malformed, oversized or mismatched files leave the previous pair in place. The
-resolver checks validity again at handshake time, so retaining a broken
-replacement doesn't make the old certificate immortal. Repeated identical reload
-errors produce one warning until the files recover or the error changes.
-
-A Tokio `watch` channel holds the latest validated pair. Unlike a queue, it
-represents one current value: the resolver briefly borrows it, clones the `Arc`
-and releases the borrow. The polling future belongs to `BoundProxy::serve`,
-alongside the listeners, and stops when that server shuts down. File reads and
-key parsing happen in `spawn_blocking`, so neither can stall an async worker.
-Each input must be a regular file and fit within one MiB; symlink-based atomic
-replacement still works.
-
-The acceptance test runs the real Wrapper listener. It deliberately writes a
-mismatched intermediate pair, finishes the replacement, then writes malformed
-PEM. New connections observe the latest valid certificate; an existing HTTP
-connection keeps working throughout. A separate test rejects expired and
-not-yet-valid certificates at startup. This reload doesn't provision certificates
-for the operator, and it doesn't yet renew the node identity used by the API,
-Raft or reporting.
-
-### A reconnect must check the current certificate
-
-Reloading the key is only half the job. TLS session resumption can establish a
-new connection from a previously negotiated session without asking the resolver
-for a certificate. Our real reconnect test reused a client configuration,
-consumed the server's session tickets and observed exactly that: `Resumed`
-instead of a full handshake.
-
-Ingress now disables the server session cache and TLS 1.3 tickets, matching the
-node/API policy. Every reconnect performs certificate validation against the
-current resolver. Existing connections stay open during renewal or file reload;
-their eventual retirement needs its own connection lifetime limit. This costs a
-full TLS handshake per connection, a deliberate trade-off for an explicit
-certificate lifecycle in 0.1.0.
-
-### Give established connections a retirement date
-
-A WebSocket can keep a TLS session alive long after we replace its certificate.
-Timing out the HTTP serving future doesn't solve that: once Hyper accepts the
-upgrade, it hands the byte stream to the WebSocket forwarding task and finishes
-that future.
-
-API, registry and ingress TLS connections now have a one-hour maximum lifetime.
-For ordinary HTTP, the server starts graceful shutdown thirty seconds before
-that deadline. HTTP/2 stops admitting new streams; HTTP/1 finishes its current
-request. Work still running at the final deadline ends, so clients of long-lived
-streams must reconnect. The API TLS handshake itself also has a ten-second
-limit. Raft and reporting already exchange one RPC per connection under much
-shorter deadlines; they don't need the HTTP retirement policy.
-
-`LifetimeLimitedIo<S>` wraps the stream itself, so the hard limit survives an
-upgrade. The `S` type parameter lets the same wrapper hold each listener's TLS
-stream. It implements Tokio's `AsyncRead` and `AsyncWrite`: every poll first
-checks the deadline, then delegates to the underlying stream. Activity never
-moves the deadline. Polling the timer registers a wakeup, which also retires an
-idle reader or a writer blocked by a peer that stopped reading.
-
-The timer lives in `Pin<Box<Sleep>>`. `Box` gives it a stable heap allocation;
-`Pin` promises not to move the timer while Tokio holds references into its
-state. The stream's `Unpin` bound lets us borrow and poll that field normally.
-We need no `unsafe` pointer manipulation. Returning `Poll::Pending` means
-"wake me when something changes", not "block this thread".
-
-The tests advance Tokio's clock, rather than wait an hour. Three I/O tests prove
-that active traffic cannot extend the limit and that blocked reads and writes
-wake at expiry. A real HTTPS listener upgrades to WebSocket, echoes bytes,
-retires the old stream and still accepts a fresh connection. Bun's actual API
-serving function also completes an in-flight request during the drain grace,
-then closes that connection. Node certificate issuance and hot replacement
-remain the unfinished part of C14.
-
-### Replace a node identity without tearing it in half
-
-Suppose renewal writes `node.crt`, then cannot replace `node.key`. The old store
-had already removed its commit marker. Even the old, still-valid identity could
-no longer be loaded. A process restart turned a recoverable write failure into
-an enrolment problem.
-
-The store now commits a complete `node.bundle.json` in one private atomic
-replacement. It contains the leaf, matching key, CA certificates and metadata.
-The existing PEM files remain exports, but Bun loads the snapshot. A layout-2
-marker requires that snapshot: a missing or corrupt snapshot cannot silently
-fall back to older exports. Initial installation still writes the marker last.
-A validated layout-1 identity is snapshotted before its exports are replaced,
-so importing that layout doesn't create another partial-write window.
-
-Before writing, we verify the chain, issuer names, signed node URI and serial,
-and the private key's match to the leaf. Validity comes from X.509 dates, not
-from sidecar timestamps. Those checks also run when loading. The snapshot and
-key use mode `0600`; the managed installer copies the snapshot before the
-marker and retains private permissions. Parse errors report locations without
-quoting input that could contain key material.
-
-The snapshot uses the existing unique temporary-file, file-sync, rename and
-parent-directory-sync helper. Before replacement, readers see the old complete
-identity. After replacement, they see the new complete identity. A directory
-sync error after rename can still make durability uncertain; a renewal caller
-must treat that as failure and must not publish an unacknowledged write to its
-live TLS resolvers. Atomicity prevents a mixture of identities, not every
-possible storage failure.
-
-`IdentityBundle` is private to the persistence module. Its serde implementations
-encode the complete snapshot without making the public `NodeIdentity` type a
-wire format for private keys. Loading moves those owned vectors into a validated
-identity. A concurrent-reader test checks that replacements never expose a
-half-written pair. Even a lone PEM file from an interrupted first install is an
-incomplete identity, never an unenrolled node that may choose plaintext. Other regressions force an export write failure, substitute
-an unrelated private key, alter identity metadata and corrupt or remove the
-snapshot. Automatic issuance and live transport replacement remain separate
-steps.
-
-### Keep TLS configurations, replace their credentials
-
-Rebuilding a certificate file doesn't change a `rustls::ServerConfig` that
-already owns the old key. The same problem appears in client configurations.
-We need those configurations to ask for the current credentials at each new
-handshake.
-
-`LiveNodeIdentity` loads a validated identity and keeps its persistence directory
-alongside a Tokio `watch` value containing the identity and signing key together.
-Clones share that value. The type implements rustls's server and client
-certificate resolver traits, so existing configurations can select a replacement
-without rebuilding listeners or dropping established connections.
-
-Replacement validates the new certificate, preserves the node identifier and
-trust anchors, and requires a newer signed serial. Replaying the exact current
-certificate is harmless. A shared Tokio mutex serialises writers; the blocking
-worker owns its guard through disk persistence and publication. Dropping the
-requesting future therefore cannot cancel a transaction that has started. A
-failed save leaves the live value unchanged.
-
-Why treat expired client and server identities differently? A server resolver can
-refuse an expired leaf. Returning `None` from a client resolver means "send no
-certificate", which our optional-mTLS API permits for browsers and CLI users.
-An expired node mustn't quietly become one of those anonymous TLS clients. Its
-resolver continues presenting the configured certificate so the peer rejects
-its expiry, matching rustls's static certificate behaviour.
-
-The tests retain existing configurations across replacement and perform real
-handshakes for both required and optional client authentication, with bound and
-unbound peer verification. They also check invalid replacements, persistence
-failure and recovery, concurrent serial ordering and expired client refusal.
-For cancellation, a blocking test worker holds publication after the new snapshot
-is durable. Cancelling the caller and releasing that hold still publishes the
-same identity that disk contains. The authenticated renewal request remains a
-separate implementation step.
-
-
-### Give every transport the same live identity
-
-A replacement in memory only helps if the listeners use it. Bun now loads one
-`LiveNodeIdentity` and clones that handle into the API and registry listeners,
-Raft and reporting transports, and internal HTTPS clients. Their configurations
-keep the existing trust anchors and revocation checks, but ask the shared
-resolver for the current certificate at each handshake. Raft also retains its
-expected-node check. Client session resumption is disabled so reconnects cannot
-silently retain an earlier identity.
-
-The HTTP pool can keep an established connection until its existing lifetime
-limit. Once it reconnects, the same `reqwest::Client` presents the replacement.
-The registry client's service-token header survives this change too. TLS proves
-which node connected; the token still authorises the operation.
-
-Diagnostics read the live snapshot per request. Axum's `Extension<T>` carries
-an application value through the router; `Option<Extension<T>>` also permits
-plaintext development routers where no node identity exists. This isn't input
-from a request header. Bun installs the handle when it constructs the router.
-We report the current public serial and expiry, with automatic renewal still
-false until the issuance loop exists.
-
-The regressions use actual handshakes and HTTPS requests while retaining the
-same configurations and client. A cluster test goes further: replace all three
-node identities, revoke every old leaf, then require a new Raft write to reach
-all voters and new reports to reach the leader. A stale resolver can no longer
-pass just because yesterday's certificate hasn't expired yet.
-
-### A renewed leaf cannot extend its issuer's life
-
-Suppose the Node CA expires in 90 seconds. Issuing the usual one-year node leaf
-would advertise a year of validity even though its chain stops working almost
-immediately. Both locally generated node certificates and CSR-signed leaves now
-cap their expiry at the issuer's expiry, and refuse issuance if the issuer isn't
-currently valid.
-
-Joining and renewal reconstruct signing parameters from the stored CA. Those
-parameters are useful for the subject and constraints, but we explicitly copy
-the original certificate's signed validity dates into them before signing. The
-sidecar dates in cluster state don't get to extend that window. The tests shorten
-an actual root-signed Node CA while deliberately leaving its sidecar unchanged,
-then check all three issuance paths. Separate cases use expired and future-dated
-issuers and require refusal. Renewal can't substitute for CA rotation.
-
-### Renew the caller's identity, not a name from its request
-
-A service token proves that a request came from internal automation. It doesn't
-say which node sent it. Allowing that token alone to request any node name would
-let one compromised node impersonate every other node.
-
-`POST /v1/cluster/renew` therefore requires both the service principal and the
-client certificate from the actual TLS connection. Bun places that public leaf
-in a typed Axum extension after the handshake. Headers cannot populate it, and
-anonymous TLS clients don't receive one. The endpoint takes a CSR and format
-compatibility, not a caller-selected node name.
-
-The leader checks the existing leaf against a quorum-confirmed security state:
-chain, issuer binding, signed validity, node URI and revocation of the leaf and
-its issuers. It then checks that the signed CSR names the same node. The CSR's
-public key is the only request-controlled field that reaches the new
-certificate; issuance rebuilds the identity and usages server-side.
-
-Why check again when TLS already did? An established connection can survive a
-revocation or pass its certificate's expiry. Each renewal request needs current
-admission evidence. After allocating a serial through Raft, the issuer reads
-current security state and validates again before signing. Serial allocation
-may commit even if the request disappears, so a retry can leave a gap in the
-sequence. That's harmless. Reusing an allocated serial would not be.
-
-Followers refuse this request. Forwarding it would present the follower's TLS
-identity and change who is asking. The renewing node must contact the leader
-directly. HTTP admission caps the body at 16 KiB and the operation at ten
-seconds; signing runs in a blocking worker with an owned state snapshot.
-Concurrent requests get distinct committed serials. Callers rejected at
-admission do not spend a serial. The generated private key remains on the
-requesting node throughout.
-
-### Let the node own its renewal loop
-
-Bun now starts one renewal owner when it has a live node identity, a council,
-resolved member API addresses and the internal service token. Once a second the
-owner reads the actual signed validity window. Before the midpoint it waits;
-afterwards it generates a fresh local key and CSR and contacts the current
-leader directly. It resolves the leader again on every retry, so a failed
-request doesn't pin the worker to a former leader.
-
-The renewal HTTP client refuses redirects and opens a new TLS connection for
-each attempt. Its connection, request and whole-attempt deadlines bound waiting;
-the response body is capped at 64 KiB. A successful response still has to pass
-the identity handle's checks for key binding, node and CA continuity and a newer
-serial. Only a durable save permits publication. A network error, refusal,
-malformed response or failed save leaves the current identity installed and
-schedules another attempt after five seconds. An expired identity never gets
-an authentication bypass; an operator must re-enrol it.
-
-The owner publishes an enum through a Tokio `watch` channel: starting, valid,
-renewing, retrying or expired. Diagnostics hold a receiver, not a copy of the
-last result. When the owner exits or panics its sender disappears, and the
-receiver reports stopped even if the last stored value was valid. That small
-ownership detail prevents a dead background task from claiming healthy renewal
-forever. Shutdown cancels pending network work; a persistence transaction that
-has already started still owns its completion.
-
-The tests use real TLS and the real renewal endpoint. They show that the worker
-waits before the midpoint, retains the old identity after a failed save, rejects
-redirects, recovers after server errors and cancels an in-flight request. A
-separate test checks that diagnostics distinguish a starting worker from a
-stopped one. The cluster acceptance test holds a renewal request at the old
-leader, shuts down that council member and requires the worker to reach the new
-leader and reload the resulting identity from disk.
-
-The black-box test starts the actual Bun executable with a generated secure
-configuration and a leaf already past its midpoint. It waits for a newer serial
-on disk, connects with Relish over HTTPS, restarts Bun and checks that the same
-renewed leaf is still installed. Malformed responses and valid bundles padded
-beyond the response limit must leave both disk and live credentials unchanged.
-
-### Reject lifetimes that the clock cannot represent
-
-A token request with `ttl_days = 0` used to create an already expired credential.
-A sufficiently large number could panic while converting days to seconds or
-adding that duration to the system clock. Neither request should reach Raft.
-
-We now use `checked_mul` and `SystemTime::checked_add`. Each returns an
-`Option`: `Some(value)` on success, `None` when the result cannot be represented.
-The `filter` rejects zero, and `and_then` continues only when the previous
-calculation succeeded. Invalid lifetimes return HTTP 400 before hashing or
-committing a token. Omitting the lifetime still means explicitly non-expiring;
-zero is not another spelling of that choice.
-
-The API tests submit both multiplication and clock overflows, then inspect
-the committed token store. They also check zero, an ordinary one-day token
-and an omitted lifetime. The two regressions failed before the repair.
-
-The central route audit must describe renewal too. Its principal is System,
-with the additional TLS peer-certificate requirement enforced by the handler.
-CI caught two omissions when we added its request-size limit: the audit table
-was missing the new route, and the syntax-tree scanner mistook `.layer(...)`
-for an HTTP method. The scanner now follows the receiver through `layer` and
-`route_layer`, retaining every explicit HTTP method before and after them.
-Unknown constructs still fail the audit instead of silently disappearing.
-
-### Admit the whole workload manifest before changing anything
-
-A token confined to namespace `a` must not deploy a job into namespace `b`.
-The apply handler checked apps, then handed jobs to the receiving node without
-the same checks. A mixed manifest could even commit its apps before admitting
-an unauthorised job.
-
-Apps and jobs now contribute to one borrowed iterator of target name, namespace
-and whether the workload executes a host process. `Iterator::chain` visits
-the second iterator after the first; it doesn't allocate another manifest or
-convert job specifications into app specifications. Every target passes the
-token scope and its principal's configured Deploy permission before the first
-Raft write or agent command. Both `exec` and `script` additionally check the
-configured HostExec permission. Principals without a permission specification
-retain the existing role-and-token-scope policy, and the node's host binary
-allowlist remains a separate admission boundary.
-
-The API regressions inspect the agent command queue and Raft desired state,
-not just HTTP status. Refusal must leave both untouched. Positive tests show
-that an in-scope job and an explicitly permitted host job still reach the
-agent. A permission check that refuses everything isn't a working permission
-system either.
-
-### A deployment must not rewrite its own permission grant
-
-Suppose `ci` may deploy `web`, but may not execute host scripts. If that same
-credential can apply `[permission.ci]` with `host-exec`, the restriction buys
-us nothing. Namespace quotas have the same problem: the user constrained by
-a budget must not be able to remove that budget in the next manifest.
-
-Ordinary permission and namespace declarations now require an unscoped user
-administrator. We check this before any part of a mixed manifest changes
-state. The internal service identity cannot grant permissions. A test lease
-remains a separate, bounded exception: its existing ownership checks allow
-only its reserved namespace, and never permission declarations.
-
-The check must survive a network hop. When a follower forwards apply to the
-leader, it preserves the user's bearer token or session cookie. Substituting
-the node's service token would erase the identity whose permissions the
-leader needs to check. The forwarding response also retains the leader's
-status and content type, so an authorisation refusal stays a refusal rather
-than looking like a successful event stream.
-
-### A scoped administrator is still scoped
-
-An administrator restricted to namespace `team` must not create an unrestricted
-administrator token. Otherwise the first call to token creation discards the
-boundary that the original credential was meant to enforce.
-
-Token creation, listing and revocation, node join-token creation, cluster secret
-rotation and image signing now require an unscoped user administrator. These
-operations manage cluster-wide credentials or trust; they have no individual
-workload target against which we could check an app or namespace restriction.
-Scoped administrators can still use workload routes within their own scope.
-The bootstrap path remains governed by authentication middleware, and internal
-service credentials still cannot use user-management routes.
-
-The regression goes through the router with both app-scoped and
-namespace-scoped administrators. Every global management request must return
-403 before changing credential state. An unrestricted administrator then creates,
-lists and revokes a token through the same router. That positive path matters:
-refusing every request would also prevent escalation, but it would leave us
-with a rather unhelpful administration API.
-
-### An administrator's lease override needs global authority
-
-Lease inspection and release usually require the exact credential that created
-the lease. Operators also need a way to inspect or clean up an abandoned run.
-That override now requires an unscoped administrator, just like global
-credential management. Being an administrator for one app or namespace does
-not permit inspecting or deleting another credential's lease.
-
-Both API paths had failing regressions: inspection returned 200 and release
-returned 204 for a scoped outsider. The repaired tests also exercise the two
-legitimate paths, an unscoped operator and the exact scoped Deployer who owns
-the lease. Ownership and the administrator override are distinct authorities;
-a role check alone cannot stand in for both.
-
-### Retiring the extra PEM parser dependency
-
-Rustls already provides PEM parsing through `rustls::pki_types`. The separate
-`rustls-pemfile` crate wraps that parser and is now unmaintained, so we use the
-underlying API directly and remove the dependency and its audit exception.
-The bounded file reader, certificate validation and reload rules stay in place.
-
-`PemObject` is a trait providing parsing functions on certificate and key
-types. Importing the trait lets Rust resolve an associated function such as
-`CertificateDer::pem_slice_iter(bytes)`. The type before `::` determines which
-PEM sections the iterator accepts. For a private key, `next()` produces
-`Option<Result<PrivateKeyDer, Error>>`: there might be no key, or parsing the
-next key might fail. `transpose()` turns that into
-`Result<Option<PrivateKeyDer>, Error>`, letting `?` propagate a parse error
-before we report the separate “no private key” case.
-
-The advisory gate fails with the old dependency when its exception is removed.
-After migration it passes without that exception. TLS file-reload and client
-certificate tests check the behaviour that matters to users; a shorter
-lockfile is useful, but it is not evidence that a TLS connection still works.
-
-
-### Fetch the recipient, keep the private key on the cluster
-
-You have an API token and a manifest to deploy, but no copy of the directory
-created by `relish init`. Encrypting a new environment value should not require
-copying cluster key files onto your laptop.
-
-`GET /v1/secret/public-key` returns the cluster's active age public recipient
-and its generation. Authenticated readers, including scoped readers, can use
-it. A public recipient lets you encrypt a value; it cannot decrypt anything.
-The endpoint returns a dedicated `SecretPublicKey` struct with just two fields,
-instead of serialising the stored `AgeKeypair` that also contains wrapped
-private material. A node without an active cluster key returns 503.
-
-This is a read of the node's applied Raft state. A follower can briefly lag a
-rotation, so the response does not promise a quorum-fresh generation. Rotation
-keeps retiring keys for decryption until finalisation; if a key is retired
-between fetching it and applying a manifest, fetch again and re-encrypt.
-Ordinary apply and decryption still enforce their existing checks.
-
-The API regression uses a scoped read-only credential, verifies anonymous
-refusal after bootstrap, and checks that the response contains exactly the
-public recipient and generation. It rotates the key through Raft and proves
-that values sealed with each returned recipient decrypt with that generation.
-The catalogue goes further: it fetches through TLS, seals two different age
-ciphertexts for the same value, deploys them into a leased OCI workload and
-reads their plaintext from the actual container. Unicode and newline bytes
-must survive; a neighbouring unencrypted value must remain unchanged.
-
-### A health check must distinguish preparation from execution
-
-A deploy can spend seconds pulling an image. Its instance already exists in the
-supervisor, and its egress policy already exists in desired state, but no process
-can execute yet. Our live security check treated that expected interval as a
-lost policy and stopped the deployment. Hosted Linux qualification exposed the
-race; a deterministic regression reproduced a Pending instance becoming Stopped.
-
-Both live monitoring and the reconciliation sweep now allow Pending and Preparing
-instances to reach the existing pre-start policy installation step. From
-Initialising and Starting onwards, an absent binding still fences the workload.
-Existing bindings remain checked during preparation too, so preparing a new
-instance does not excuse losing an already-installed policy. The deployment
-driver must complete policy installation before changing to an execution state.
-
-The test exercises all eight nonterminal lifecycle states through the agent. It
-preserves the two preparation states and requires stopping in each execution or
-shutdown state without kernel ownership. The privileged pre-start test also
-checks the real cgroup map entries and create-before-start ordering. Its failure
-now includes deployment errors, and it joins its agent before finishing.
-
-The eight-state regression fails before the repair and passes afterwards with
-all 483 Linux Bun tests (one explicit gate). Strict Clippy passes on both
-platforms, and all 24 actual privileged eBPF tests pass in 5.90 seconds.

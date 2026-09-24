@@ -144,6 +144,99 @@ async fn incompatible_runtime_configuration_refuses_inventory_and_mutation() {
 }
 
 #[tokio::test]
+async fn retired_intent_from_an_earlier_configuration_does_not_block_inventory() {
+    let root = tempfile::tempdir().unwrap();
+    let original = configuration(root.path());
+    let journal = IntentJournal::new(root.path().join("intents"), original.clone());
+    let id = InstanceId("default__worker-0".into());
+    let guard = journal
+        .claim(&id, None)
+        .await
+        .unwrap()
+        .publish(&spec("original"))
+        .await
+        .unwrap();
+    drop(guard.retire(Some(0)).await.unwrap());
+    // An operator changes the resolver and the Runc binary after the workload
+    // has gone. The retired record owns nothing, so it must not brick startup.
+    let mut changed = original;
+    changed.dns_nameserver = Some("10.0.0.53".parse().unwrap());
+    changed.runc_program = "/different/runc".into();
+    let journal = IntentJournal::new(root.path().join("intents"), changed.clone());
+    let records = journal.inventory().await.unwrap();
+    assert_eq!(records.len(), 1);
+    assert!(matches!(records[0].phase, IntentPhase::Retired { .. }));
+    let guard = journal
+        .claim(&id, Some(records[0].generation.clone()))
+        .await
+        .unwrap()
+        .publish(&spec("replacement"))
+        .await
+        .unwrap();
+    assert_eq!(guard.record().unwrap().configuration, changed);
+}
+
+#[tokio::test]
+async fn live_intent_with_a_changed_configuration_names_the_instance() {
+    let root = tempfile::tempdir().unwrap();
+    let original = configuration(root.path());
+    let journal = IntentJournal::new(root.path().join("intents"), original.clone());
+    let id = InstanceId("default__worker-0".into());
+    drop(
+        journal
+            .claim(&id, None)
+            .await
+            .unwrap()
+            .publish(&spec("original"))
+            .await
+            .unwrap(),
+    );
+    let mut changed = original;
+    changed.dns_nameserver = Some("10.0.0.53".parse().unwrap());
+    let error = IntentJournal::new(root.path().join("intents"), changed)
+        .inventory()
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("default__worker-0"), "{error}");
+    assert!(error.contains("different runtime configuration"), "{error}");
+}
+
+#[tokio::test]
+async fn replacing_a_retired_generation_removes_its_command_directories() {
+    let root = tempfile::tempdir().unwrap();
+    let journal = IntentJournal::new(root.path().join("intents"), configuration(root.path()));
+    let id = InstanceId("default__worker-0".into());
+    let guard = journal
+        .claim(&id, None)
+        .await
+        .unwrap()
+        .publish(&spec("first"))
+        .await
+        .unwrap();
+    let first = guard.record().unwrap().generation.clone();
+    // The generation is a transparent string on disk.
+    let first_directory = serde_json::to_value(&first).unwrap();
+    let first_directory = first_directory.as_str().unwrap().to_owned();
+    let generations = root
+        .path()
+        .join("intents/records")
+        .join(&id.0)
+        .join("generations");
+    let old = generations.join(&first_directory).join("launcher");
+    std::fs::create_dir_all(&old).unwrap();
+    std::fs::write(old.join("output.stdout"), "old logs").unwrap();
+    let guard = guard.retire(Some(0)).await.unwrap();
+    let guard = guard.publish(&spec("second")).await.unwrap();
+    let second = guard.record().unwrap().generation.clone();
+    assert!(
+        !generations.join(&first_directory).exists(),
+        "a retired generation's command records outlived its replacement"
+    );
+    assert_ne!(first, second);
+}
+
+#[tokio::test]
 async fn incomplete_corrupt_or_redirected_intent_refuses_the_complete_inventory() {
     use std::os::unix::fs::symlink;
     let root = tempfile::tempdir().unwrap();

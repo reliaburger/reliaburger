@@ -461,10 +461,15 @@ impl IngressCertResolver {
             &self.issuer_certificate,
         )
         .ok()?;
-        let validity = CertificateValidity::parse(chain.first()?).ok()?;
-        if !validity.contains(time::OffsetDateTime::now_utc().unix_timestamp()) {
+        let issued_at = time::OffsetDateTime::now_utc().unix_timestamp();
+        let mut validity = CertificateValidity::parse(chain.first()?).ok()?;
+        if !validity.contains(issued_at) {
             return None;
         }
+        // The leaf's `not_before` is backdated for other nodes' clocks. This
+        // cache runs on the issuing clock, so it measures the leaf's life, and
+        // its renewal midpoint, from the moment we issued it.
+        validity.not_before = validity.not_before.max(issued_at);
         let certified = certified_key(chain, key).ok()?;
         if let Ok(mut cache) = self.cache.lock()
             && (cache.len() < MAX_SNI_CACHE || cache.contains_key(hostname))

@@ -1,0 +1,8 @@
+---
+source: src/relish/metrics_cmd.rs
+expression: "render_detail(\"default\", \"web\", \"http_request_duration_seconds\", \"15m\",\nMetricType::Histogram, &instances)"
+---
+default/web http_request_duration_seconds (histogram, last 15m)
+INSTANCE        NODE    SERIES       MEAN     OBS/S  TREND
+default__web-0  node-a       1     11.9ms      4.20  ▁
+default__web-1  node-b       1     11.9ms      4.20  ▁

@@ -26,6 +26,7 @@ mod schedules;
 pub mod snapshot_worker;
 pub mod supervisor;
 pub mod testapp;
+pub mod top;
 
 pub use gpu::{GpuDetector, GpuInfo, NvidiaGpuDetector, StubGpuDetector};
 pub use health::{HealthCheckConfig, HealthChecker, HealthCounters, HealthStatus, evaluate_result};
@@ -56,6 +57,15 @@ pub enum BunError {
     RetirementState {
         instance_id: InstanceId,
         reason: String,
+    },
+
+    /// The leader hasn't confirmed a producer release yet: its request is
+    /// still in flight, or other nodes haven't confirmed the endpoint's
+    /// withdrawal. Asking again shortly is expected to succeed.
+    #[error("cannot retire artifacts for {instance_id} yet: {reason}")]
+    ProducerReleasePending {
+        instance_id: InstanceId,
+        reason: &'static str,
     },
 
     /// The cluster catalogue and routing views could not be confirmed together.
@@ -153,10 +163,12 @@ pub enum BunError {
     },
 
     /// An init container failed during startup.
-    #[error("init container {init_index} failed for instance {instance_id}")]
+    #[error("init container {init_index} failed for instance {instance_id}: {reason}")]
     InitContainerFailed {
         instance_id: InstanceId,
         init_index: usize,
+        /// How it failed, with the runtime's captured stderr tail when it has one.
+        reason: String,
     },
 
     /// A security or identity operation failed.

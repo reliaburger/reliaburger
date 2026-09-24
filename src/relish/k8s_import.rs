@@ -14,7 +14,7 @@ use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Secret, Service};
 use k8s_openapi::api::networking::v1::Ingress;
 
 use crate::config::app::{
-    AppSpec, AutoscaleSpec, DeploySpec, HealthSpec, IngressSpec, PlacementSpec,
+    AppSpec, AutoscaleSpec, DeploySpec, HealthSpec, IngressSpec, MetricsSpec, PlacementSpec,
 };
 use crate::config::types::{EnvValue, Replicas};
 use crate::config::{Config, JobSpec, NamespaceSpec};
@@ -309,15 +309,24 @@ fn correlate_and_convert(resources: Vec<K8sResource>) -> (Config, MigrationRepor
     // sweeps below always reported; these two didn't).
     let mut used_ingresses: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut used_hpas: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut used_services: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
     // Convert Deployments → Apps (with correlated Service, Ingress, HPA)
     for (name, deploy) in &deployments {
         let mut app = deployment_to_app(name, deploy, &mut report);
+        let pod_spec = deploy.spec.as_ref().and_then(|s| s.template.spec.as_ref());
 
         // Correlate Service by name match
         if let Some(svc) = services.get(name) {
-            apply_service(&mut app, svc);
+            apply_service(&mut app, name, svc, pod_spec, &mut report);
+            used_services.insert(name.clone());
         }
+        warn_unimported_ports(
+            &format!("Deployment/{name}"),
+            pod_spec,
+            &mut app,
+            &mut report,
+        );
 
         // Correlate Ingress by backend service name
         if let Some(ing_name) = find_ingress_for_service(&ingresses, name) {
@@ -346,9 +355,17 @@ fn correlate_and_convert(resources: Vec<K8sResource>) -> (Config, MigrationRepor
     // correlate the same way; an HPA cannot target a DaemonSet).
     for (name, ds) in &daemonsets {
         let mut app = daemonset_to_app(name, ds, &mut report);
+        let pod_spec = ds.spec.as_ref().and_then(|s| s.template.spec.as_ref());
         if let Some(svc) = services.get(name) {
-            apply_service(&mut app, svc);
+            apply_service(&mut app, name, svc, pod_spec, &mut report);
+            used_services.insert(name.clone());
         }
+        warn_unimported_ports(
+            &format!("DaemonSet/{name}"),
+            pod_spec,
+            &mut app,
+            &mut report,
+        );
         if let Some(ing_name) = find_ingress_for_service(&ingresses, name) {
             if let Some(ing) = ingresses.get(&ing_name) {
                 apply_ingress(&mut app, &ing_name, ing, &mut report);
@@ -365,9 +382,17 @@ fn correlate_and_convert(resources: Vec<K8sResource>) -> (Config, MigrationRepor
     // be Deployment-only, so a StatefulSet's siblings were silently dropped).
     for (name, ss) in &statefulsets {
         let mut app = statefulset_to_app(name, ss, &mut report);
+        let pod_spec = ss.spec.as_ref().and_then(|s| s.template.spec.as_ref());
         if let Some(svc) = services.get(name) {
-            apply_service(&mut app, svc);
+            apply_service(&mut app, name, svc, pod_spec, &mut report);
+            used_services.insert(name.clone());
         }
+        warn_unimported_ports(
+            &format!("StatefulSet/{name}"),
+            pod_spec,
+            &mut app,
+            &mut report,
+        );
         if let Some(ing_name) = find_ingress_for_service(&ingresses, name) {
             if let Some(ing) = ingresses.get(&ing_name) {
                 apply_ingress(&mut app, &ing_name, ing, &mut report);
@@ -406,7 +431,18 @@ fn correlate_and_convert(resources: Vec<K8sResource>) -> (Config, MigrationRepor
             .push(format!("CronJob/{name} → [job.{name}]"));
     }
 
-    // Report uncorrelated Ingresses/HPAs — their routing/autoscaling is lost.
+    // Report uncorrelated Services, Ingresses and HPAs: their names,
+    // routing or autoscaling are lost.
+    for name in services.keys() {
+        if !used_services.contains(name) {
+            report.warnings.push(MigrationWarning {
+                resource: format!("Service/{name}"),
+                message: "no imported workload has this name, so nothing answers to it; an app \
+                          is reachable only by its own name"
+                    .to_string(),
+            });
+        }
+    }
     for name in ingresses.keys() {
         if !used_ingresses.contains(name) {
             report.warnings.push(MigrationWarning {
@@ -553,31 +589,55 @@ fn pod_spec_to_app(
         });
     }
 
-    // K8s splits the entrypoint into `command` (argv prefix) and `args`;
-    // Reliaburger has a single command vector — concatenate them.
+    // Same split as Kubernetes: `command` replaces the image's Entrypoint,
+    // `args` replaces its Cmd. The runtime applies the rules (Z1.1).
     if let Some(c) = container {
-        let mut command = c.command.clone().unwrap_or_default();
-        command.extend(c.args.clone().unwrap_or_default());
-        app.command = command;
+        app.command = c.command.clone().unwrap_or_default();
+        app.args = c.args.clone().unwrap_or_default();
+        app.working_dir = c.working_dir.clone().map(PathBuf::from);
     }
+    import_security_context(resource, pod_spec, container, &mut app, report);
 
-    app.port = container
-        .and_then(|c| c.ports.as_ref())
-        .and_then(|ports| ports.first())
-        .map(|p| p.container_port as u16);
+    let ports = container_ports(pod_spec);
+    app.port = ports.first().map(|p| p.container_port as u16);
 
-    // Health check from readinessProbe
+    // Health check from readinessProbe. Only HTTP probes have an equivalent;
+    // anything else is reported rather than dropped.
     if let Some(probe) = container.and_then(|c| c.readiness_probe.as_ref()) {
         if let Some(http_get) = &probe.http_get {
+            let probe_port = resolve_port(&http_get.port, ports);
             app.health = Some(HealthSpec {
                 path: http_get.path.clone().unwrap_or_else(|| "/".to_string()),
-                port: None,
-                protocol: Default::default(),
+                port: probe_port.filter(|port| Some(*port) != app.port),
+                protocol: match http_get.scheme.as_deref() {
+                    Some("HTTPS") => crate::config::app::HealthProtocol::Https,
+                    _ => crate::config::app::HealthProtocol::Http,
+                },
                 interval: probe.period_seconds.map(|s| s as u64),
                 timeout: probe.timeout_seconds.map(|s| s as u64),
                 threshold_unhealthy: probe.failure_threshold.map(|t| t as u32),
                 threshold_healthy: probe.success_threshold.map(|t| t as u32),
                 initial_delay: probe.initial_delay_seconds.map(|s| s as u64),
+            });
+        } else {
+            let kind = if let Some(exec) = &probe.exec {
+                format!(
+                    "runs a command ({})",
+                    exec.command.clone().unwrap_or_default().join(" ")
+                )
+            } else if probe.tcp_socket.is_some() {
+                "is a tcpSocket check".to_string()
+            } else if probe.grpc.is_some() {
+                "is a gRPC check".to_string()
+            } else {
+                "has no handler".to_string()
+            };
+            report.warnings.push(MigrationWarning {
+                resource: resource.to_string(),
+                message: format!(
+                    "readinessProbe {kind}; only httpGet probes import, so this app has no \
+                     health check. Add a [health] block with an HTTP path"
+                ),
             });
         }
     }
@@ -625,17 +685,188 @@ fn pod_spec_to_app(
         }
     }
 
-    // Init containers
+    // Init containers carry a single argv: command followed by args.
     if let Some(inits) = pod_spec.and_then(|ps| ps.init_containers.as_ref()) {
         for ic in inits {
+            let command = ic.command.clone().unwrap_or_default();
+            let args = ic.args.clone().unwrap_or_default();
+            if command.is_empty() && !args.is_empty() {
+                report.warnings.push(MigrationWarning {
+                    resource: resource.to_string(),
+                    message: format!(
+                        "initContainer {} sets args without a command; its image \
+                         entrypoint is dropped, so add it to the command",
+                        ic.name
+                    ),
+                });
+            }
             app.init.push(crate::config::app::InitContainerSpec {
                 image: ic.image.clone(),
-                command: ic.command.clone().unwrap_or_default(),
+                command: command.into_iter().chain(args).collect(),
             });
         }
     }
 
     app
+}
+
+/// The first container's declared ports, in order.
+fn container_ports(
+    pod_spec: Option<&k8s_openapi::api::core::v1::PodSpec>,
+) -> &[k8s_openapi::api::core::v1::ContainerPort] {
+    pod_spec
+        .and_then(|ps| ps.containers.first())
+        .and_then(|c| c.ports.as_deref())
+        .unwrap_or_default()
+}
+
+/// A numeric port, or a named one looked up in the container's ports.
+fn resolve_port(
+    port: &k8s_openapi::apimachinery::pkg::util::intstr::IntOrString,
+    ports: &[k8s_openapi::api::core::v1::ContainerPort],
+) -> Option<u16> {
+    use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
+    match port {
+        IntOrString::Int(number) => u16::try_from(*number).ok(),
+        IntOrString::String(name) => ports
+            .iter()
+            .find(|p| p.name.as_deref() == Some(name.as_str()))
+            .and_then(|p| u16::try_from(p.container_port).ok()),
+    }
+}
+
+/// `runAsUser` and `runAsGroup`, container-level winning over pod-level
+/// as in Kubernetes. Other security settings have no equivalent.
+fn import_security_context(
+    resource: &str,
+    pod_spec: Option<&k8s_openapi::api::core::v1::PodSpec>,
+    container: Option<&k8s_openapi::api::core::v1::Container>,
+    app: &mut AppSpec,
+    report: &mut MigrationReport,
+) {
+    let pod = pod_spec.and_then(|ps| ps.security_context.as_ref());
+    let own = container.and_then(|c| c.security_context.as_ref());
+    if let Some(fs_group) = pod.and_then(|sc| sc.fs_group) {
+        report.warnings.push(MigrationWarning {
+            resource: resource.to_string(),
+            message: format!(
+                "securityContext.fsGroup {fs_group} dropped: managed volumes are handed to \
+                 the container's user on first mount, and host path volumes keep their \
+                 host ownership"
+            ),
+        });
+    }
+    let user = own
+        .and_then(|sc| sc.run_as_user)
+        .or_else(|| pod.and_then(|sc| sc.run_as_user));
+    let group = own
+        .and_then(|sc| sc.run_as_group)
+        .or_else(|| pod.and_then(|sc| sc.run_as_group));
+    for (field, value, target) in [
+        ("runAsUser", user, &mut app.run_as_user),
+        ("runAsGroup", group, &mut app.run_as_group),
+    ] {
+        let Some(value) = value else { continue };
+        match u32::try_from(value) {
+            Ok(id) => *target = Some(id),
+            Err(_) => report.warnings.push(MigrationWarning {
+                resource: resource.to_string(),
+                message: format!("securityContext.{field} {value} is not a valid id; dropped"),
+            }),
+        }
+    }
+}
+
+/// Fill the app's `metrics` from the pod template's Prometheus annotations.
+///
+/// `prometheus.io/scrape: "true"` opts in; `prometheus.io/port` and
+/// `prometheus.io/path` override the app port and `/metrics`, the same
+/// defaults a Prometheus `kubernetes_sd` scrape config applies. Anything but
+/// `"true"` leaves the app unscraped, as it would in Kubernetes.
+fn import_scrape_annotations(
+    resource: &str,
+    template_metadata: Option<&k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta>,
+    app: &mut AppSpec,
+    report: &mut MigrationReport,
+) {
+    let Some(annotations) = template_metadata.and_then(|meta| meta.annotations.as_ref()) else {
+        return;
+    };
+    if annotations.get("prometheus.io/scrape").map(String::as_str) != Some("true") {
+        return;
+    }
+    let mut metrics = MetricsSpec::default();
+    if let Some(port) = annotations.get("prometheus.io/port") {
+        match port.parse::<u16>() {
+            Ok(number) if number > 0 => metrics.port = Some(number),
+            _ => report.warnings.push(MigrationWarning {
+                resource: resource.to_string(),
+                message: format!(
+                    "prometheus.io/port {port:?} is not a port number; scraping the app's port"
+                ),
+            }),
+        }
+    }
+    if let Some(path) = annotations.get("prometheus.io/path") {
+        if path.starts_with('/') && !path.contains(char::is_whitespace) {
+            metrics.path = path.clone();
+        } else {
+            report.warnings.push(MigrationWarning {
+                resource: resource.to_string(),
+                message: format!("prometheus.io/path {path:?} is not a path; scraping /metrics"),
+            });
+        }
+    }
+    app.metrics = Some(metrics);
+}
+
+/// Report container ports the app doesn't carry. An app exposes one port:
+/// the one its Service targets, or the first declared. A port the node
+/// scrapes for metrics is carried too, so it isn't reported.
+///
+/// Runs after the Service is folded in, because that can still change the
+/// app's port: this is also where a scrape annotation that ends up with no
+/// port to scrape is reported and dropped.
+fn warn_unimported_ports(
+    resource: &str,
+    pod_spec: Option<&k8s_openapi::api::core::v1::PodSpec>,
+    app: &mut AppSpec,
+    report: &mut MigrationReport,
+) {
+    if app.metrics.is_some() && app.metrics_endpoint().is_none() {
+        app.metrics = None;
+        report.warnings.push(MigrationWarning {
+            resource: resource.to_string(),
+            message: "prometheus.io/scrape is set but the pod has no port to scrape \
+                      (no prometheus.io/port and no container port); metrics are not scraped"
+                .to_string(),
+        });
+    }
+    let metrics_port = app.metrics_endpoint().map(|(port, _)| port);
+    let dropped: Vec<String> = container_ports(pod_spec)
+        .iter()
+        .filter(|p| {
+            let port = u16::try_from(p.container_port).ok();
+            port != app.port && port != metrics_port
+        })
+        .map(|p| match &p.name {
+            Some(name) => format!("{} ({name})", p.container_port),
+            None => p.container_port.to_string(),
+        })
+        .collect();
+    if dropped.is_empty() {
+        return;
+    }
+    report.warnings.push(MigrationWarning {
+        resource: resource.to_string(),
+        message: format!(
+            "an app exposes one port ({}); container port(s) {} are not published or \
+             routed, though the process can still listen on them",
+            app.port
+                .map_or_else(|| "none".to_string(), |p| p.to_string()),
+            dropped.join(", ")
+        ),
+    });
 }
 
 fn deployment_to_app(name: &str, deploy: &Deployment, report: &mut MigrationReport) -> AppSpec {
@@ -645,6 +876,12 @@ fn deployment_to_app(name: &str, deploy: &Deployment, report: &mut MigrationRepo
         &format!("Deployment/{name}"),
         deploy.metadata.namespace.as_ref(),
         pod_spec,
+        report,
+    );
+    import_scrape_annotations(
+        &format!("Deployment/{name}"),
+        spec.and_then(|s| s.template.metadata.as_ref()),
+        &mut app,
         report,
     );
 
@@ -691,6 +928,12 @@ fn daemonset_to_app(name: &str, ds: &DaemonSet, report: &mut MigrationReport) ->
         pod_spec,
         report,
     );
+    import_scrape_annotations(
+        &format!("DaemonSet/{name}"),
+        ds.spec.as_ref().and_then(|s| s.template.metadata.as_ref()),
+        &mut app,
+        report,
+    );
     app.replicas = Replicas::DaemonSet;
     app
 }
@@ -702,6 +945,12 @@ fn statefulset_to_app(name: &str, ss: &StatefulSet, report: &mut MigrationReport
         &format!("StatefulSet/{name}"),
         ss.metadata.namespace.as_ref(),
         pod_spec,
+        report,
+    );
+    import_scrape_annotations(
+        &format!("StatefulSet/{name}"),
+        spec.and_then(|s| s.template.metadata.as_ref()),
+        &mut app,
         report,
     );
     app.replicas = spec
@@ -847,7 +1096,12 @@ fn empty_app_spec() -> AppSpec {
         firewall: None,
         egress: None,
         autoscale: None,
+        metrics: None,
         namespace: None,
+        args: Vec::new(),
+        working_dir: None,
+        run_as_user: None,
+        run_as_group: None,
     }
 }
 
@@ -855,23 +1109,90 @@ fn empty_app_spec() -> AppSpec {
 // Correlation helpers
 // ---------------------------------------------------------------------------
 
-fn apply_service(app: &mut AppSpec, svc: &Service) {
-    // If the app doesn't have a port, try to get it from the service
-    if app.port.is_none() {
-        if let Some(spec) = &svc.spec {
-            if let Some(ports) = &spec.ports {
-                if let Some(p) = ports.first() {
-                    if let Some(target) = p.target_port.as_ref() {
-                        match target {
-                            k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(i) => {
-                                app.port = Some(*i as u16);
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
+/// Fold a Service into its workload's app.
+///
+/// An app has one port, reachable as `<app>:<port>` on the same number
+/// inside the container, so the Service's first port decides which
+/// container port the app exposes (`targetPort`, named or numeric). A
+/// Service port that differs from its target, and any further Service
+/// ports, can't be kept; both are reported, because clients using them
+/// will fail to connect.
+fn apply_service(
+    app: &mut AppSpec,
+    svc_name: &str,
+    svc: &Service,
+    pod_spec: Option<&k8s_openapi::api::core::v1::PodSpec>,
+    report: &mut MigrationReport,
+) {
+    let resource = format!("Service/{svc_name}");
+    let service_ports = svc
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.ports.as_deref())
+        .unwrap_or_default();
+    let Some(first) = service_ports.first() else {
+        return;
+    };
+    let target = match &first.target_port {
+        Some(target) => resolve_port(target, container_ports(pod_spec)),
+        None => u16::try_from(first.port).ok(),
+    };
+    let Some(target) = target else {
+        report.warnings.push(MigrationWarning {
+            resource,
+            message: format!(
+                "targetPort {:?} names no container port; the app keeps port {}",
+                first.target_port,
+                app.port
+                    .map_or_else(|| "none".to_string(), |p| p.to_string())
+            ),
+        });
+        return;
+    };
+
+    if app.port != Some(target) {
+        // The probe followed the old port implicitly; pin it before moving.
+        if let (Some(old), Some(health)) = (app.port, app.health.as_mut())
+            && health.port.is_none()
+        {
+            health.port = Some(old);
         }
+        app.port = Some(target);
+    }
+    if u16::try_from(first.port).ok() != Some(target) {
+        report.warnings.push(MigrationWarning {
+            resource: resource.clone(),
+            message: format!(
+                "port {} forwards to container port {target}; Reliaburger has no port \
+                 mapping, so clients must connect to {svc_name}:{target} (ingress is \
+                 unaffected)",
+                first.port
+            ),
+        });
+    }
+    let metrics_port = app.metrics_endpoint().map(|(port, _)| port);
+    for extra in &service_ports[1..] {
+        let extra_target = match &extra.target_port {
+            Some(target) => resolve_port(target, container_ports(pod_spec)),
+            None => u16::try_from(extra.port).ok(),
+        };
+        // The node scrapes the metrics port on each instance itself; nothing
+        // needs the Service to carry it.
+        if extra_target.is_some() && extra_target == metrics_port {
+            continue;
+        }
+        report.warnings.push(MigrationWarning {
+            resource: resource.clone(),
+            message: format!(
+                "port {}{} dropped; an app exposes one port",
+                extra.port,
+                extra
+                    .name
+                    .as_deref()
+                    .map(|name| format!(" ({name})"))
+                    .unwrap_or_default()
+            ),
+        });
     }
 }
 
@@ -1051,11 +1372,20 @@ fn pod_to_jobspec(
 ) -> JobSpec {
     let container = pod_spec.and_then(|ps| ps.containers.first());
 
-    // command + args concatenate, same as the app path; K8s splits them.
+    // A job carries a single argv: command followed by args.
     let command = container.and_then(|c| {
-        let mut cmd = c.command.clone().unwrap_or_default();
-        cmd.extend(c.args.clone().unwrap_or_default());
-        if cmd.is_empty() { None } else { Some(cmd) }
+        let command = c.command.clone().unwrap_or_default();
+        let args = c.args.clone().unwrap_or_default();
+        if command.is_empty() && !args.is_empty() {
+            report.warnings.push(MigrationWarning {
+                resource: resource.to_string(),
+                message: "args without a command: the job's command replaces the image \
+                          entrypoint, so add the entrypoint to it"
+                    .to_string(),
+            });
+        }
+        let argv: Vec<String> = command.into_iter().chain(args).collect();
+        (!argv.is_empty()).then_some(argv)
     });
 
     let mut env = BTreeMap::new();
@@ -1211,8 +1541,10 @@ spec:
         let result = import_from_yaml(yaml).unwrap();
         let app = &result.config.app["worker"];
 
-        // command + args concatenated into the single command vector
-        assert_eq!(app.command, vec!["python", "-m", "worker.main"]);
+        // command and args stay separate, so the runtime applies the
+        // Kubernetes rules against the image (Z1.3)
+        assert_eq!(app.command, vec!["python"]);
+        assert_eq!(app.args, vec!["-m", "worker.main"]);
 
         // namespace preserved
         assert_eq!(app.namespace.as_deref(), Some("staging"));
@@ -1748,7 +2080,8 @@ spec:
         let result = import_from_yaml(yaml).unwrap();
         let agent = &result.config.app["agent"];
         assert_eq!(agent.replicas, Replicas::DaemonSet);
-        assert_eq!(agent.command, vec!["./agent", "--verbose"]);
+        assert_eq!(agent.command, vec!["./agent"]);
+        assert_eq!(agent.args, vec!["--verbose"]);
         assert!(matches!(
             agent.env.get("LEVEL"),
             Some(EnvValue::Plain(v)) if v == "debug"
@@ -2078,6 +2411,480 @@ spec:
                 .iter()
                 .any(|w| w.contains("concurrencyPolicy Forbid")),
             "{warnings:?}"
+        );
+    }
+
+    fn warnings_of(result: &ImportResult) -> Vec<String> {
+        result
+            .report
+            .warnings
+            .iter()
+            .map(|w| format!("{}: {}", w.resource, w.message))
+            .collect()
+    }
+
+    /// The podinfo frontend's shape: named ports, a Service on port 80
+    /// targeting the named `http` port, and exec readiness probes.
+    const PODINFO_FRONTEND: &str = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+spec:
+  template:
+    spec:
+      securityContext:
+        runAsUser: 100
+      containers:
+      - name: frontend
+        image: ghcr.io/stefanprodan/podinfo:6.15.0
+        workingDir: /home/app
+        ports:
+        - name: http-metrics
+          containerPort: 9797
+        - name: http
+          containerPort: 9898
+        args: ["--port=9898", "--backend-url=http://backend:9898/echo"]
+        securityContext:
+          runAsGroup: 101
+        readinessProbe:
+          exec:
+            command: ["podcli", "check", "http", "localhost:9898/readyz"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+spec:
+  ports:
+  - name: http
+    port: 80
+    targetPort: http
+  - name: metrics
+    port: 9797
+    targetPort: http-metrics
+"#;
+
+    /// A Deployment with the given pod-template annotations and container
+    /// ports, plus a matching Service on the first port.
+    fn annotated_deployment(annotations: &str, ports: &str) -> String {
+        format!(
+            r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  template:
+    metadata:
+      annotations:
+{annotations}
+    spec:
+      containers:
+      - name: web
+        image: podinfo:6
+{ports}
+"#
+        )
+    }
+
+    #[test]
+    fn prometheus_annotations_become_the_apps_metrics() {
+        let yaml = annotated_deployment(
+            "        prometheus.io/scrape: \"true\"\n        prometheus.io/port: \"9797\"\n        prometheus.io/path: /prom",
+            "        ports:\n        - name: http\n          containerPort: 9898\n        - name: http-metrics\n          containerPort: 9797",
+        );
+        let result = import_from_yaml(&yaml).unwrap();
+        let app = &result.config.app["web"];
+        assert_eq!(app.port, Some(9898));
+        assert_eq!(app.metrics_endpoint(), Some((9797, "/prom")));
+    }
+
+    #[test]
+    fn scrape_without_a_port_annotation_uses_the_app_port_and_slash_metrics() {
+        let yaml = annotated_deployment(
+            "        prometheus.io/scrape: \"true\"",
+            "        ports:\n        - containerPort: 8080",
+        );
+        let result = import_from_yaml(&yaml).unwrap();
+        let app = &result.config.app["web"];
+        assert_eq!(app.metrics_endpoint(), Some((8080, "/metrics")));
+        assert!(
+            warnings_of(&result).is_empty(),
+            "{:?}",
+            warnings_of(&result)
+        );
+    }
+
+    #[test]
+    fn scrape_false_or_absent_leaves_metrics_unset() {
+        let yaml = annotated_deployment(
+            "        prometheus.io/scrape: \"false\"\n        prometheus.io/port: \"9797\"",
+            "        ports:\n        - containerPort: 8080",
+        );
+        let result = import_from_yaml(&yaml).unwrap();
+        assert!(result.config.app["web"].metrics.is_none());
+    }
+
+    #[test]
+    fn scrape_with_no_port_anywhere_is_warned_and_skipped() {
+        let yaml = annotated_deployment("        prometheus.io/scrape: \"true\"", "");
+        let result = import_from_yaml(&yaml).unwrap();
+        assert!(result.config.app["web"].metrics.is_none());
+        let warnings = warnings_of(&result);
+        assert!(
+            warnings.iter().any(|w| w.starts_with("Deployment/web")
+                && w.contains("prometheus.io/scrape")
+                && w.contains("no port")),
+            "{warnings:?}"
+        );
+        // The imported config must still validate.
+        result.config.validate().unwrap();
+    }
+
+    #[test]
+    fn an_unparseable_port_annotation_is_warned_and_falls_back_to_the_app_port() {
+        let yaml = annotated_deployment(
+            "        prometheus.io/scrape: \"true\"\n        prometheus.io/port: metrics",
+            "        ports:\n        - containerPort: 8080",
+        );
+        let result = import_from_yaml(&yaml).unwrap();
+        assert_eq!(
+            result.config.app["web"].metrics_endpoint(),
+            Some((8080, "/metrics"))
+        );
+        assert!(
+            warnings_of(&result)
+                .iter()
+                .any(|w| w.contains("prometheus.io/port \"metrics\"")),
+            "{:?}",
+            warnings_of(&result)
+        );
+    }
+
+    #[test]
+    fn the_shipped_podinfo_demo_scrapes_its_metrics_port_without_dropping_it() {
+        let manifest = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("examples/kubernetes/podinfo.yaml"),
+        )
+        .unwrap();
+        let result = import_from_yaml(&manifest).unwrap();
+        for name in ["frontend", "backend"] {
+            assert_eq!(
+                result.config.app[name].metrics_endpoint(),
+                Some((9797, "/metrics")),
+                "{name}"
+            );
+        }
+        assert!(result.config.app["redis"].metrics.is_none());
+        let warnings = warnings_of(&result);
+        assert!(
+            !warnings.iter().any(|w| w.contains("9797")),
+            "the scraped metrics port is reported as dropped: {warnings:?}"
+        );
+        // The gRPC port is still honestly reported.
+        assert!(warnings.iter().any(|w| w.contains("9999")), "{warnings:?}");
+    }
+
+    #[test]
+    fn args_alone_keep_the_image_entrypoint() {
+        let result = import_from_yaml(PODINFO_FRONTEND).unwrap();
+        let app = &result.config.app["frontend"];
+        assert!(app.command.is_empty());
+        assert_eq!(
+            app.args,
+            vec!["--port=9898", "--backend-url=http://backend:9898/echo"]
+        );
+    }
+
+    #[test]
+    fn working_dir_and_run_as_ids_import() {
+        let result = import_from_yaml(PODINFO_FRONTEND).unwrap();
+        let app = &result.config.app["frontend"];
+        assert_eq!(
+            app.working_dir.as_deref(),
+            Some(std::path::Path::new("/home/app"))
+        );
+        // Pod-level runAsUser, container-level runAsGroup.
+        assert_eq!(app.run_as_user, Some(100));
+        assert_eq!(app.run_as_group, Some(101));
+    }
+
+    #[test]
+    fn fs_group_is_dropped_with_a_warning() {
+        let yaml = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: db
+spec:
+  template:
+    spec:
+      securityContext:
+        runAsUser: 999
+        fsGroup: 999
+      containers:
+      - name: db
+        image: postgres:17
+"#;
+        let result = import_from_yaml(yaml).unwrap();
+        assert_eq!(result.config.app["db"].run_as_user, Some(999));
+        let warnings = warnings_of(&result);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.starts_with("Deployment/db") && w.contains("fsGroup 999 dropped")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn a_named_service_target_port_picks_the_apps_port() {
+        let result = import_from_yaml(PODINFO_FRONTEND).unwrap();
+        assert_eq!(result.config.app["frontend"].port, Some(9898));
+    }
+
+    #[test]
+    fn a_service_port_that_differs_from_its_target_is_reported() {
+        let result = import_from_yaml(PODINFO_FRONTEND).unwrap();
+        let warnings = warnings_of(&result);
+        assert!(
+            warnings.iter().any(|w| w.starts_with("Service/frontend")
+                && w.contains("port 80 forwards to container port 9898")
+                && w.contains("frontend:9898")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.starts_with("Service/frontend")
+                    && w.contains("port 9797 (metrics) dropped")),
+            "{warnings:?}"
+        );
+    }
+
+    /// With `prometheus.io/scrape`, the metrics port is scraped directly on
+    /// each instance, so neither the Service nor the container port that
+    /// carries it is "dropped".
+    #[test]
+    fn a_scraped_metrics_port_is_not_reported_as_dropped() {
+        let yaml = PODINFO_FRONTEND.replacen(
+            "  template:\n    spec:",
+            "  template:\n    metadata:\n      annotations:\n        prometheus.io/scrape: \"true\"\n        prometheus.io/port: \"9797\"\n    spec:",
+            1,
+        );
+        let result = import_from_yaml(&yaml).unwrap();
+        assert_eq!(
+            result.config.app["frontend"].metrics_endpoint(),
+            Some((9797, "/metrics"))
+        );
+        let warnings = warnings_of(&result);
+        assert!(!warnings.iter().any(|w| w.contains("9797")), "{warnings:?}");
+    }
+
+    #[test]
+    fn a_service_on_its_target_port_is_not_reported() {
+        let yaml = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+spec:
+  template:
+    spec:
+      containers:
+      - name: backend
+        image: podinfo:6
+        ports:
+        - name: http
+          containerPort: 9898
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+spec:
+  ports:
+  - port: 9898
+    targetPort: http
+"#;
+        let result = import_from_yaml(yaml).unwrap();
+        assert_eq!(result.config.app["backend"].port, Some(9898));
+        assert!(
+            warnings_of(&result).is_empty(),
+            "{:?}",
+            warnings_of(&result)
+        );
+    }
+
+    #[test]
+    fn extra_container_ports_are_reported() {
+        let result = import_from_yaml(PODINFO_FRONTEND).unwrap();
+        let warnings = warnings_of(&result);
+        assert!(
+            warnings.iter().any(|w| w.starts_with("Deployment/frontend")
+                && w.contains("one port (9898)")
+                && w.contains("9797 (http-metrics)")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn non_http_readiness_probes_are_reported_not_dropped() {
+        let result = import_from_yaml(PODINFO_FRONTEND).unwrap();
+        assert!(result.config.app["frontend"].health.is_none());
+        let warnings = warnings_of(&result);
+        assert!(
+            warnings.iter().any(|w| w.contains(
+                "readinessProbe runs a command (podcli check http localhost:9898/readyz)"
+            )),
+            "{warnings:?}"
+        );
+
+        let tcp = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cache
+spec:
+  template:
+    spec:
+      containers:
+      - name: redis
+        image: redis:8
+        ports:
+        - containerPort: 6379
+        readinessProbe:
+          tcpSocket:
+            port: 6379
+"#;
+        let result = import_from_yaml(tcp).unwrap();
+        assert!(
+            warnings_of(&result)
+                .iter()
+                .any(|w| w.contains("readinessProbe is a tcpSocket check")),
+            "{:?}",
+            warnings_of(&result)
+        );
+    }
+
+    #[test]
+    fn an_http_probe_on_a_named_port_resolves_it() {
+        let yaml = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  template:
+    spec:
+      containers:
+      - name: web
+        image: web:1
+        ports:
+        - name: http
+          containerPort: 8080
+        - name: admin
+          containerPort: 9090
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: admin
+"#;
+        let result = import_from_yaml(yaml).unwrap();
+        let health = result.config.app["web"].health.as_ref().unwrap();
+        assert_eq!(health.path, "/ready");
+        assert_eq!(health.port, Some(9090));
+    }
+
+    #[test]
+    fn a_service_without_a_matching_workload_is_reported() {
+        let yaml = r#"
+apiVersion: v1
+kind: Service
+metadata:
+  name: cache
+spec:
+  ports:
+  - port: 6379
+"#;
+        let result = import_from_yaml(yaml).unwrap();
+        assert!(
+            warnings_of(&result)
+                .iter()
+                .any(|w| w.starts_with("Service/cache") && w.contains("no imported workload")),
+            "{:?}",
+            warnings_of(&result)
+        );
+    }
+
+    /// Z1.5, Z6.7: the tutorial's demo manifest imports cleanly into the
+    /// four apps it describes, and the result is a valid config.
+    #[test]
+    fn the_podinfo_demo_manifest_imports_into_four_apps() {
+        let yaml = include_str!("../../examples/kubernetes/podinfo.yaml");
+        let result = import_from_yaml(yaml).unwrap();
+        result.config.validate().unwrap();
+        assert!(result.report.dropped.is_empty(), "{}", result.report);
+        let names: Vec<&str> = result.config.app.keys().map(String::as_str).collect();
+        assert_eq!(names, ["backend", "frontend", "loadgen", "redis"]);
+
+        let frontend = &result.config.app["frontend"];
+        assert_eq!(frontend.replicas, Replicas::Fixed(3));
+        assert_eq!(frontend.port, Some(9898));
+        assert!(
+            frontend
+                .command
+                .iter()
+                .any(|arg| arg == "--backend-url=http://backend:9898/echo")
+        );
+        assert!(
+            frontend
+                .command
+                .iter()
+                .any(|arg| arg == "--cache-server=tcp://redis:6379")
+        );
+        assert_eq!(frontend.health.as_ref().unwrap().path, "/readyz");
+        assert_eq!(
+            frontend
+                .ingress
+                .as_ref()
+                .map(|ingress| ingress.host.as_str()),
+            Some("podinfo.localhost")
+        );
+        assert!(
+            frontend
+                .image
+                .as_deref()
+                .unwrap()
+                .starts_with("ghcr.io/stefanprodan/podinfo@sha256:")
+        );
+
+        let backend = &result.config.app["backend"];
+        assert_eq!(backend.port, Some(9898));
+        assert_eq!(backend.health.as_ref().unwrap().path, "/readyz");
+
+        // No command: the official image's entrypoint must run.
+        let redis = &result.config.app["redis"];
+        assert!(redis.command.is_empty());
+        assert_eq!(redis.args[0], "redis-server");
+        assert_eq!(redis.port, Some(6379));
+
+        // The load generator calls the frontend by service name, forever,
+        // and serves nothing itself.
+        let loadgen = &result.config.app["loadgen"];
+        assert_eq!(loadgen.replicas, Replicas::Fixed(1));
+        assert_eq!(loadgen.port, None);
+        assert!(loadgen.ingress.is_none());
+        assert_eq!(loadgen.command[..2], ["/bin/sh", "-c"]);
+        assert!(loadgen.command[2].contains("http://frontend:9898/cache/loadgen"));
+        assert!(
+            loadgen
+                .image
+                .as_deref()
+                .unwrap()
+                .starts_with("public.ecr.aws/docker/library/busybox@sha256:")
         );
     }
 }

@@ -1,7 +1,7 @@
 //! Durable ownership of the rootful runtime's finite container address pool.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{Read, Result};
+use std::io::Result;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -72,39 +72,6 @@ impl NetworkLeases {
         .await
     }
 
-    /// Retain a verified live address across process replacement, refusing any
-    /// different owner or disagreement with the persisted reservation.
-    pub(crate) async fn adopt(&self, instance: &InstanceId, node: u16, index: u16) -> Result<()> {
-        if instance.0.is_empty() || instance.0.len() > 256 {
-            return Err(std::io::Error::other("invalid network reservation owner"));
-        }
-        let owner = instance.0.clone();
-        self.transact(node, move |journal| {
-            if index >= MAX_CONTAINERS_PER_NODE {
-                return Err(std::io::Error::other(
-                    "adopted address is outside the container pool",
-                ));
-            }
-            if let Some(existing) = journal.allocations.get(&owner) {
-                return if *existing == index {
-                    Ok(((), false))
-                } else {
-                    Err(std::io::Error::other(
-                        "adopted address conflicts with the instance reservation",
-                    ))
-                };
-            }
-            if journal.allocations.values().any(|used| *used == index) {
-                return Err(std::io::Error::other(
-                    "adopted address belongs to another instance",
-                ));
-            }
-            journal.allocations.insert(owner, index);
-            Ok(((), true))
-        })
-        .await
-    }
-
     /// Recover an owner's plan, including a cancelled or partially failed setup.
     pub(crate) async fn lookup(&self, instance: &InstanceId, node: u16) -> Result<Option<u16>> {
         if instance.0.is_empty() || instance.0.len() > 256 {
@@ -168,31 +135,16 @@ impl NetworkLeases {
                 .map_err(|e| std::io::Error::other(format!("network address pool is busy: {e}")))?;
             let _lock = JournalLock(lock);
             let path = directory.join(".network-leases.json");
-            let mut journal = match std::fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-                .open(&path)
-            {
-                Ok(file) => {
-                    if !file.metadata()?.is_file() {
-                        return Err(std::io::Error::other(
-                            "network lease journal is not a regular file",
-                        ));
-                    }
-                    let mut bytes = Vec::new();
-                    file.take(MAX_JOURNAL_BYTES + 1).read_to_end(&mut bytes)?;
-                    if bytes.len() as u64 > MAX_JOURNAL_BYTES {
-                        return Err(std::io::Error::other("network lease journal is too large"));
-                    }
-                    serde_json::from_slice::<Journal>(&bytes).map_err(std::io::Error::other)?
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Journal {
-                    version: 1,
-                    node_index: node,
-                    allocations: BTreeMap::new(),
-                },
-                Err(e) => return Err(e),
-            };
+            let mut journal = crate::durable::read_json_if_exists::<Journal>(
+                &path,
+                MAX_JOURNAL_BYTES,
+                crate::durable::Access::Regular,
+            )?
+            .unwrap_or_else(|| Journal {
+                version: 1,
+                node_index: node,
+                allocations: BTreeMap::new(),
+            });
             let unique: BTreeSet<_> = journal.allocations.values().copied().collect();
             if journal.version != 1
                 || journal.node_index != node
@@ -257,7 +209,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn concurrent_reservations_and_adoption_never_share_an_address() {
+    async fn concurrent_reservations_never_share_an_address() {
         let tmp = tempfile::tempdir().unwrap();
         let pool = NetworkLeases::new(tmp.path().to_path_buf());
         let mut tasks = tokio::task::JoinSet::new();
@@ -276,21 +228,7 @@ mod tests {
         let owner = InstanceId("owner-0".into());
         let index = pool.lookup(&owner, 1).await.unwrap().unwrap();
         assert!(pool.reserve(&owner, 1).await.is_err());
-        pool.adopt(&owner, 1, index).await.unwrap();
-        assert!(pool.adopt(&owner, 1, 508).await.is_err());
-        assert!(
-            pool.adopt(&InstanceId("other".into()), 1, index)
-                .await
-                .is_err()
-        );
-        pool.adopt(&InstanceId("recovered".into()), 1, 508)
-            .await
-            .unwrap();
-        assert!(
-            pool.adopt(&InstanceId("outside".into()), 1, 509)
-                .await
-                .is_err()
-        );
+        assert!(addresses.contains(&index));
     }
 
     #[tokio::test]

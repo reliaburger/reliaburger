@@ -328,7 +328,9 @@ async fn record_commit_owned(
     let store = Arc::clone(&state.store);
     let persist = state.persist_path.clone();
     let local_commit = commit.clone();
-    let _catalog = tokio::task::spawn_blocking(move || {
+    // The blocking task hands back the write guard, held through the proposal,
+    // and the catalogue as it was before this publication for rollback.
+    let (mut catalog, previous) = tokio::task::spawn_blocking(move || {
         let _writer = transaction_writer;
         let _operation = local_operation;
         if let Some(lease_id) = lease_id
@@ -348,13 +350,14 @@ async fn record_commit_owned(
                 return Err(PickleError::MissingLayer(digest.clone()));
             }
         }
+        let previous = catalog.clone();
         let mut next = catalog.clone();
         next.apply_manifest_commit(&local_commit);
-        if let Some(path) = persist {
-            next.persist_to(&path)?;
+        if let Some(path) = &persist {
+            next.persist_to(path)?;
         }
         *catalog = next;
-        Ok(catalog)
+        Ok((catalog, previous))
     })
     .await
     .map_err(|error| PickleError::CatalogPersist(error.to_string()))??;
@@ -362,20 +365,43 @@ async fn record_commit_owned(
     let mutation = match &access.lease_id {
         Some(lease_id) => super::authority::RegistryMutation::LeasedManifest {
             lease_id: lease_id.clone(),
-            observed_at_unix_ms: crate::testkit::lease::now_unix_millis(),
             commit: Box::new(commit),
         },
         None => super::authority::RegistryMutation::Manifest(Box::new(commit)),
     };
-    match state.propose(mutation).await? {
-        None
-        | Some(
-            crate::council::CouncilResponse::Ok | crate::council::CouncilResponse::Applied { .. },
-        ) => {}
-        Some(response) => super::lease::require_acceptance(response)?,
-    }
-
-    Ok(())
+    // Only an explicit council answer proves the publication didn't commit.
+    // A timeout or transport failure is uncertain, so local state stays for a
+    // retry to settle.
+    let refusal = match state.propose(mutation).await {
+        Ok(
+            None
+            | Some(
+                crate::council::CouncilResponse::Ok
+                | crate::council::CouncilResponse::Applied { .. },
+            ),
+        ) => return Ok(()),
+        Ok(Some(
+            response @ (crate::council::CouncilResponse::Refused { .. }
+            | crate::council::CouncilResponse::RegistryPublicationStale),
+        )) => response,
+        // The forwarder decodes a leader's 409 refusal into `LeaseDenied`.
+        Err(PickleError::LeaseDenied(reason)) => {
+            crate::council::CouncilResponse::Refused { reason }
+        }
+        Ok(Some(response)) => return super::lease::require_acceptance(response),
+        Err(error) => return Err(error),
+    };
+    let persist = state.persist_path.clone();
+    tokio::task::spawn_blocking(move || {
+        if let Some(path) = &persist {
+            previous.persist_to(path)?;
+        }
+        *catalog = previous;
+        Ok::<_, PickleError>(())
+    })
+    .await
+    .map_err(|error| PickleError::CatalogPersist(error.to_string()))??;
+    super::lease::require_acceptance(refusal)
 }
 
 impl PickleState {
@@ -407,7 +433,9 @@ impl PickleState {
         };
         tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            council.write(mutation.request()),
+            // A follower's council refuses with ForwardToLeader, so only a
+            // leader's own clock is ever stamped here.
+            council.write(mutation.request(crate::testkit::lease::now_unix_millis())),
         )
         .await
         .map_err(|_| {
@@ -1767,12 +1795,13 @@ mod tests {
                     .await
                     .is_err()
             );
-            assert_eq!(
-                std::fs::read_dir(directory.path().join("uploads"))
-                    .unwrap()
-                    .count(),
-                0
-            );
+            // A directory squatting on the blob path can't be read, so the
+            // pull now refuses at cache verification, before any upload
+            // exists; either way no temporary file may survive.
+            let uploads = std::fs::read_dir(directory.path().join("uploads"))
+                .map(Iterator::count)
+                .unwrap_or(0);
+            assert_eq!(uploads, 0);
             assert!(
                 state
                     .sessions
@@ -3003,6 +3032,130 @@ mod tests {
         );
         server.abort();
         let _ = server.await;
+    }
+
+    /// A fake registry leader that answers GC-generation queries with 0 and
+    /// every publication with `reply`.
+    async fn serve_registry_leader(
+        reply: fn() -> Response,
+    ) -> (
+        super::super::authority::RegistryForwarder,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use super::super::authority::{
+            REGISTRY_PROPOSAL_PATH, REGISTRY_QUERY_PATH, RegistryForwarder, RegistryQueryResponse,
+        };
+        let app = Router::new()
+            .route(
+                REGISTRY_QUERY_PATH,
+                axum::routing::post(|| async { Json(RegistryQueryResponse::GcGeneration(0)) }),
+            )
+            .route(
+                REGISTRY_PROPOSAL_PATH,
+                axum::routing::post(move || async move { reply() }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (_tx, rx) = tokio::sync::watch::channel(crate::mustard::directory::NodeDirectory {
+            leader: Some(crate::mustard::message::LeaderHint {
+                node_id: crate::meat::NodeId::new("leader"),
+                term: 1,
+                api_address: address,
+                reporting_address: address,
+            }),
+            ..Default::default()
+        });
+        let forwarder = RegistryForwarder::new(
+            crate::cluster::ClusterHttp::plaintext().with_bearer(Some("internal".into())),
+            rx,
+        );
+        (forwarder, server)
+    }
+
+    /// A publication the council explicitly refuses (or declares stale) must
+    /// leave the local tag where it was; otherwise the node keeps serving a
+    /// digest the cluster never accepted and GC never collects its layers.
+    /// A lost or failed reply is uncertain: the council may have committed,
+    /// so the local catalogue keeps the publication for a retry to settle.
+    #[tokio::test]
+    async fn refused_publication_rolls_back_the_local_tag_but_uncertain_keeps_it() {
+        let refused: fn() -> Response = || {
+            (
+                StatusCode::CONFLICT,
+                Json(crate::council::CouncilResponse::Refused {
+                    reason: "publication lost the collection race".into(),
+                }),
+            )
+                .into_response()
+        };
+        let stale: fn() -> Response =
+            || Json(crate::council::CouncilResponse::RegistryPublicationStale).into_response();
+        let uncertain: fn() -> Response = || StatusCode::SERVICE_UNAVAILABLE.into_response();
+        for (reply, rolled_back) in [(refused, true), (stale, true), (uncertain, false)] {
+            let (mut state, directory) = test_state();
+            let persisted = directory.path().join("catalog.json");
+            state.persist_path = Some(persisted.clone());
+            let manifest = |bytes: &[u8]| {
+                let digest = compute_sha256(bytes);
+                state.store.write_blob(bytes, &digest).unwrap();
+                ImageManifest {
+                    repository: "ordinary".into(),
+                    digest: digest.clone(),
+                    tags: Default::default(),
+                    config: LayerDescriptor {
+                        digest,
+                        size: bytes.len() as u64,
+                        media_type: "config".into(),
+                    },
+                    layers: vec![],
+                    total_size: bytes.len() as u64,
+                    pushed_by: state.node_raft_id,
+                    pushed_at: std::time::SystemTime::now(),
+                    signature: None,
+                }
+            };
+            let original = manifest(b"original");
+            let replacement = manifest(b"replacement");
+            record_commit(&state, original.clone(), "latest".into())
+                .await
+                .unwrap();
+
+            let (forwarder, server) = serve_registry_leader(reply).await;
+            state.forwarder = Some(forwarder);
+            assert!(
+                record_commit(&state, replacement.clone(), "latest".into())
+                    .await
+                    .is_err()
+            );
+
+            let expected = if rolled_back {
+                &original.digest
+            } else {
+                &replacement.digest
+            };
+            let local = state.catalog.read().await.clone();
+            let on_disk = ManifestCatalog::load_from(&persisted).unwrap();
+            for catalog in [&local, &on_disk] {
+                assert_eq!(
+                    &catalog
+                        .get_manifest_by_tag("ordinary", "latest")
+                        .unwrap()
+                        .digest,
+                    expected
+                );
+                assert_eq!(
+                    catalog
+                        .get_repository_manifest("ordinary", replacement.digest.as_str())
+                        .is_some(),
+                    !rolled_back
+                );
+            }
+            server.abort();
+            let _ = server.await;
+        }
     }
 
     #[tokio::test]

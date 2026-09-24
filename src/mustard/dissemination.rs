@@ -264,7 +264,6 @@ mod tests {
             address: std::net::SocketAddr::from(([127, 0, 0, 1], 9000)),
             state,
             incarnation: 1,
-            lamport: 0,
         }
     }
 

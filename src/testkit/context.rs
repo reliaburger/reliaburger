@@ -579,8 +579,8 @@ impl TestContext {
     /// The runner calls this after pass, fail, panic or timeout. Production
     /// cleanup uses the server's lease ownership record and checks runtime
     /// absence independently. An unreachable owner or expired cleanup deadline
-    /// returns unknown, not a guarantee that resources are gone. The legacy
-    /// lease-free test path also checks [`is_test_namespace`](Self::is_test_namespace).
+    /// returns unknown, not a guarantee that resources are gone. The
+    /// lease-free unit-test path also checks [`is_test_namespace`](Self::is_test_namespace).
     pub async fn teardown(&self, deadline: Deadline) -> CleanupOutcome {
         let faults = self.chaos_guard.cleanup(deadline).await;
         let resources = self.teardown_resources(deadline).await;

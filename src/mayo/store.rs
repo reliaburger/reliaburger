@@ -95,6 +95,9 @@ fn batch_to_parquet_bytes(batch: &RecordBatch) -> Result<Vec<u8>, MayoError> {
 /// literal (M1). DataFusion follows standard SQL: a `'` inside a literal is
 /// doubled. Without this, a query param like `x' OR '1'='1` breaks out of
 /// the literal and can read other namespaces' data.
+/// Most rows one per-app query returns from one node.
+pub const APP_QUERY_ROW_LIMIT: usize = 10_000;
+
 pub(crate) fn escape_sql_literal(value: &str) -> String {
     value.replace('\'', "''")
 }
@@ -648,6 +651,52 @@ impl MayoStore {
         Ok(results)
     }
 
+    /// One app's samples in `[start, end]`, oldest first, newest kept.
+    ///
+    /// `app_label` is matched against label values (the `namespace/app`
+    /// every per-app sample carries) and `name`, when given, against the
+    /// metric name. At most [`APP_QUERY_ROW_LIMIT`] rows come back, and they
+    /// are the newest ones: a long window loses its oldest samples, never the
+    /// latest. `per_series` keeps only the newest N samples of each series
+    /// (metric name plus labels), which is how a caller asks for "the latest
+    /// value of everything" without paying for the whole window.
+    pub async fn query_app(
+        &self,
+        app_label: &str,
+        name: Option<&str>,
+        start: u64,
+        end: u64,
+        per_series: Option<u32>,
+    ) -> Result<Vec<(u64, String, String, f64)>, MayoError> {
+        let app_filter = escape_sql_literal(app_label);
+        let name_filter = name
+            .map(|name| format!("metric_name = '{}' AND ", escape_sql_literal(name)))
+            .unwrap_or_default();
+        let filter = format!(
+            "{name_filter}labels LIKE '%\"{app_filter}\"%' \
+             AND timestamp >= {start} AND timestamp <= {end}"
+        );
+        let sql = match per_series {
+            None => format!(
+                "SELECT timestamp, metric_name, labels, value FROM metrics \
+                 WHERE {filter} ORDER BY timestamp DESC LIMIT {APP_QUERY_ROW_LIMIT}"
+            ),
+            Some(keep) => format!(
+                "SELECT timestamp, metric_name, labels, value FROM ( \
+                   SELECT timestamp, metric_name, labels, value, \
+                     ROW_NUMBER() OVER ( \
+                       PARTITION BY metric_name, labels ORDER BY timestamp DESC \
+                     ) AS series_rank \
+                   FROM metrics WHERE {filter} \
+                 ) WHERE series_rank <= {keep} \
+                 ORDER BY timestamp DESC LIMIT {APP_QUERY_ROW_LIMIT}"
+            ),
+        };
+        let mut rows = self.query_sql(&sql).await?;
+        rows.reverse();
+        Ok(rows)
+    }
+
     /// Query by metric name and time range (convenience).
     pub async fn query(
         &self,
@@ -938,6 +987,80 @@ mod tests {
             std::fs::read(blocked.join("survivor")).unwrap(),
             b"preserve"
         );
+    }
+
+    fn app_key(name: &str, app: &str, instance: &str) -> MetricKey {
+        MetricKey::with_labels(
+            name,
+            std::collections::BTreeMap::from([
+                ("app".to_string(), app.to_string()),
+                ("instance".to_string(), instance.to_string()),
+            ]),
+        )
+    }
+
+    /// The old per-app query ordered ascending from `start` and cut at the
+    /// row limit, so a busy app's newest samples, the ones every "latest"
+    /// view wants, were the first thing dropped.
+    #[tokio::test]
+    async fn app_query_keeps_the_newest_rows_when_over_the_limit() {
+        let (mut store, _dir) = test_store();
+        let key = app_key("requests_total", "default/web", "web-0");
+        let total = APP_QUERY_ROW_LIMIT as u64 + 500;
+        for timestamp in 1..=total {
+            store.insert(&key, Sample::at(timestamp, timestamp as f64));
+        }
+        let rows = store
+            .query_app("default/web", Some("requests_total"), 0, total, None)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), APP_QUERY_ROW_LIMIT);
+        assert_eq!(rows.last().unwrap().0, total, "the newest sample was lost");
+        assert!(
+            rows.windows(2).all(|pair| pair[0].0 <= pair[1].0),
+            "rows must come back oldest first"
+        );
+    }
+
+    #[tokio::test]
+    async fn app_query_per_series_keeps_the_newest_n_of_each_series() {
+        let (mut store, _dir) = test_store();
+        for instance in ["web-0", "web-1"] {
+            let key = app_key("requests_total", "default/web", instance);
+            for timestamp in 1..=5 {
+                store.insert(&key, Sample::at(timestamp, timestamp as f64));
+            }
+        }
+        store.insert(
+            &app_key("requests_total", "default/other", "other-0"),
+            Sample::at(5, 99.0),
+        );
+        let rows = store
+            .query_app("default/web", None, 0, 10, Some(2))
+            .await
+            .unwrap();
+        let mut seen: Vec<(u64, String)> = rows
+            .iter()
+            .map(|(timestamp, _, labels, _)| (*timestamp, labels.clone()))
+            .collect();
+        seen.sort();
+        assert_eq!(rows.len(), 4, "{seen:?}");
+        assert!(rows.iter().all(|(timestamp, ..)| *timestamp >= 4));
+        assert!(
+            rows.iter()
+                .all(|(_, _, labels, _)| !labels.contains("other"))
+        );
+    }
+
+    #[tokio::test]
+    async fn app_query_escapes_the_app_and_name() {
+        let (mut store, _dir) = test_store();
+        store.insert(&app_key("m", "default/web", "web-0"), Sample::at(1, 1.0));
+        let rows = store
+            .query_app("x' OR '1'='1", Some("m' OR '1'='1"), 0, 10, Some(1))
+            .await
+            .unwrap();
+        assert!(rows.is_empty());
     }
 
     fn test_store() -> (MayoStore, tempfile::TempDir) {

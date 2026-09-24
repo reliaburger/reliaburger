@@ -3,6 +3,10 @@
 use super::{BunAgent, BunError, Grill};
 use crate::bun::discovery_owners::DiscoveryJournal;
 
+/// Critical readiness subsystem that reports a fenced discovery journal. While
+/// it is degraded the node cannot publish, withdraw or retire services.
+pub(super) const DISCOVERY_JOURNAL_SUBSYSTEM: &str = "discovery:journal";
+
 /// Publication is either unconfigured, exclusively owned, or fenced after uncertainty.
 #[derive(Debug, Default)]
 pub(super) enum DiscoveryOwnership {
@@ -57,12 +61,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         if matches!(self.discovery_ownership, DiscoveryOwnership::Disabled) {
             return Ok(());
         }
-        let launches = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            self.supervisor.grill().launch_inventory(),
-        )
-        .await
-        .map_err(|_| BunError::AdoptionState("publication runtime inventory timed out".into()))??;
+        let launches = self
+            .runtime_inventory(super::RUNTIME_INVENTORY_TIMEOUT, |reason| {
+                BunError::AdoptionState(format!("publication {reason}"))
+            })
+            .await?;
         self.update_discovery_inventory(id, |next| {
             // Absence from the candidate is not withdrawal proof. Preserve
             // earlier allocations until their confirmed retirement removes them.
@@ -283,32 +286,40 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         if self.cluster.is_some() {
             // Release only this node's reservation. The council independently
             // retains the global VIP until every registered consumer confirms.
-            self.invalidate_consumer_view().await?;
-            if !self.withdraw_consumer_view().await? {
+            // Republishing drops this service's local backends from the view;
+            // the drains below prove its captured requests have released.
+            self.mark_consumer_view_stale()?;
+            self.refresh_consumer_view().await?;
+            // A failed publication leaves the kernel view uncertain until the
+            // next synchronisation withdraws it completely.
+            if !self.consumer_owner().is_some_and(|owner| {
+                matches!(
+                    owner.phase,
+                    crate::bun::consumer_owners::ConsumerPhase::Active
+                        | crate::bun::consumer_owners::ConsumerPhase::Withdrawn
+                )
+            }) {
                 return Err(refuse(
-                    "captured consumer requests still require confirmed release",
+                    "consumer view has not settled after a failed publication",
                 ));
             }
         }
         // Include historical candidates: private metadata loss cannot prove that
         // a request which already captured an endpoint released it.
-        let backends = original.entry.backends.clone();
-        for backend in &backends {
-            self.drains
-                .start_drain(&crate::wrapper::draining::DrainCommand {
-                    app_name: service.name.clone(),
-                    instance_id: backend.instance_id.clone(),
-                    timeout: std::time::Duration::ZERO,
-                })
-                .await;
-        }
-        self.drains.check_completions().await;
-        for backend in &backends {
-            if self.drains.is_draining(&backend.instance_id).await {
-                return Err(refuse(
-                    "captured ingress requests still require confirmed release",
-                ));
-            }
+        let drains: Vec<_> = original
+            .entry
+            .backends
+            .iter()
+            .map(|backend| crate::wrapper::draining::DrainCommand {
+                app_name: service.name.clone(),
+                instance_id: backend.instance_id.clone(),
+                timeout: std::time::Duration::ZERO,
+            })
+            .collect();
+        if !self.drains.drain_all(&drains).await {
+            return Err(refuse(
+                "captured ingress requests still require confirmed release",
+            ));
         }
         self.update_discovery_inventory(service, |next| {
             for owner in &mut next.services {
@@ -398,32 +409,85 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             service: id.clone(),
             reason,
         };
-        let (journal, recovered) =
-            match std::mem::replace(&mut self.discovery_ownership, DiscoveryOwnership::Uncertain) {
-                DiscoveryOwnership::Disabled => {
-                    self.discovery_ownership = DiscoveryOwnership::Disabled;
-                    return Ok(());
-                }
-                DiscoveryOwnership::Ready(journal) => (journal, false),
-                DiscoveryOwnership::Recovered(journal) => (journal, true),
-                DiscoveryOwnership::Uncertain => {
-                    return Err(failure(
-                        "discovery ownership is uncertain; recovery required".into(),
-                    ));
-                }
-            };
+        self.reopen_uncertain_discovery().await;
+        let (journal, recovered) = match &self.discovery_ownership {
+            DiscoveryOwnership::Disabled => return Ok(()),
+            DiscoveryOwnership::Ready(journal) => (journal, false),
+            DiscoveryOwnership::Recovered(journal) => (journal, true),
+            DiscoveryOwnership::Uncertain => {
+                return Err(failure(
+                    "discovery ownership is uncertain; recovery required".into(),
+                ));
+            }
+        };
         let mut next = journal.inventory().clone();
         update(&mut next);
-        let journal = journal
-            .persist(next)
-            .await
+        // A refusal decided in memory never touches disk, so it can't make the
+        // durable state uncertain.
+        journal
+            .check(&next)
             .map_err(|error| failure(error.to_string()))?;
-        self.discovery_ownership = if recovered {
-            DiscoveryOwnership::Recovered(journal)
-        } else {
-            DiscoveryOwnership::Ready(journal)
+        let directory = journal.directory().to_owned();
+        let (DiscoveryOwnership::Ready(journal) | DiscoveryOwnership::Recovered(journal)) =
+            std::mem::replace(&mut self.discovery_ownership, DiscoveryOwnership::Uncertain)
+        else {
+            return Err(failure("discovery ownership changed during update".into()));
         };
-        Ok(())
+        match journal.persist(next).await {
+            Ok(journal) => {
+                self.discovery_ownership = if recovered {
+                    DiscoveryOwnership::Recovered(journal)
+                } else {
+                    DiscoveryOwnership::Ready(journal)
+                };
+                Ok(())
+            }
+            Err(error) => {
+                // The write may or may not have reached disk. Reopening later
+                // adopts whichever checkpoint is durable; the journal is written
+                // before any kernel or userspace effect, so either is safe.
+                self.discovery_reopen = Some((directory, recovered));
+                if let Some(readiness) = &self.readiness {
+                    readiness.register(DISCOVERY_JOURNAL_SUBSYSTEM, true).await;
+                    readiness
+                        .degraded(DISCOVERY_JOURNAL_SUBSYSTEM, error.to_string())
+                        .await;
+                }
+                Err(failure(error.to_string()))
+            }
+        }
+    }
+
+    /// Reopen the discovery journal after a write whose outcome is unknown.
+    /// Called before each update and on every agent tick, so any caller path
+    /// recovers once the disk (or a still-running write worker) allows it.
+    pub(super) async fn reopen_uncertain_discovery(&mut self) {
+        if !matches!(self.discovery_ownership, DiscoveryOwnership::Uncertain) {
+            return;
+        }
+        let Some((directory, recovered)) = self.discovery_reopen.clone() else {
+            return;
+        };
+        match DiscoveryJournal::open_async(&directory).await {
+            Ok(journal) => {
+                self.discovery_ownership = if recovered {
+                    DiscoveryOwnership::Recovered(journal)
+                } else {
+                    DiscoveryOwnership::Ready(journal)
+                };
+                self.discovery_reopen = None;
+                if let Some(readiness) = &self.readiness {
+                    readiness.ready(DISCOVERY_JOURNAL_SUBSYSTEM).await;
+                }
+            }
+            Err(error) => {
+                if let Some(readiness) = &self.readiness {
+                    readiness
+                        .degraded(DISCOVERY_JOURNAL_SUBSYSTEM, error.to_string())
+                        .await;
+                }
+            }
+        }
     }
 
     /// Fresh-only configuration cannot guess original allocations during adoption.

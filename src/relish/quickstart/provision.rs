@@ -38,16 +38,45 @@ pub fn vm_config(
         "containerd":{"system":false,"user":false},
         "networks":[{"lima":"user-v2"}],
         "portForwards":forwards,
-        "provision":[{"mode":"system","script": concat!(
-            "#!/bin/bash\nset -eu\nexport DEBIAN_FRONTEND=noninteractive\n",
+        "provision":[{"mode":"system","script": format!(
+            "#!/bin/bash\nset -eu\nexport DEBIAN_FRONTEND=noninteractive\n{}{}{}",
             // Lima changes the user manager during first boot. Reconnect logind
             // after that transition so subsequent PAM sessions do not stall.
-            "systemctl restart systemd-logind.service\n",
-            "apt-get update -qq\napt-get install -y -qq runc uidmap btrfs-progs nftables iptables iproute2\n",
+            // A graceful stop sometimes spins until systemd's 90 s stop
+            // timeout kills it, stalling boot. Kill it straight away instead.
+            "systemctl kill --signal=SIGKILL systemd-logind.service || true\n\
+             systemctl restart systemd-logind.service\n",
+            install_missing_packages(&super::artifacts::guest_image_pins()?.packages)?,
             "install -d -m 700 /etc/reliaburger\n")
         }]
     });
     Ok(serde_yaml::to_string(&value)?)
+}
+
+/// Shell that installs the node packages unless the image already has them.
+///
+/// The release image has them baked in, so its VMs never touch apt. A stock
+/// Ubuntu image (development runs) installs them at first boot, which costs
+/// 15–40 s of `apt-get update` and downloads from Ubuntu's mirrors.
+fn install_missing_packages(packages: &[String]) -> Result<String> {
+    let valid = |name: &String| {
+        !name.is_empty()
+            && name.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"+-.".contains(&byte)
+            })
+    };
+    if packages.is_empty() || !packages.iter().all(valid) {
+        bail!("guest package pins must be plain Debian package names");
+    }
+    let list = packages.join(" ");
+    // `dpkg-query` prints nothing for a package it has never heard of, so
+    // count the installed ones rather than looking for a missing one.
+    Ok(format!(
+        "installed=$(dpkg-query -W -f='${{db:Status-Abbrev}}\\n' {list} 2>/dev/null | grep -c '^ii' || true)\n\
+         if [ \"$installed\" -ne {count} ]; then\n  \
+         apt-get update -qq\n  apt-get install -y -qq {list}\nfi\n",
+        count = packages.len()
+    ))
 }
 
 /// Generate a node config with pinned identity paths and authenticated transport.
@@ -76,15 +105,64 @@ pub fn node_config(
     config.dns.enabled = true;
     config.dns.listen = format!("{address}:53");
     config.ingress.enabled = true;
+    config.testing = laptop_test_policy();
     Ok(toml::to_string_pretty(&config)?)
 }
 
+/// The fault policy every quickstart node serves (decision D3).
+///
+/// A laptop cluster is a throwaway development cluster, and breaking it on
+/// purpose is half the point of having one. So it admits workload faults
+/// (kill, pause, CPU, memory, network) and node faults (`node-kill`,
+/// `node-drain`), which the quorum and leader rails still guard and which
+/// expire on their own. It leaves out node pressure, which could starve a
+/// 2 GiB VM's own control plane, external trace probes, and isolated test
+/// workloads. Server installs keep the protected default: a missing
+/// `[testing]` section still means `unknown`, which allows nothing.
+pub fn laptop_test_policy() -> crate::testkit::safety::ClusterTestPolicy {
+    use crate::testkit::safety::{ClusterSafetyClass, ClusterTestPolicy, OperationPermission};
+    ClusterTestPolicy {
+        safety_class: ClusterSafetyClass::Development,
+        allowed_operations: [
+            OperationPermission::InjectWorkloadFaults,
+            OperationPermission::AlterNodeState,
+        ]
+        .into(),
+        ..ClusterTestPolicy::default()
+    }
+}
+
+/// One line describing a node's live fault policy, for `relish local status`.
+pub fn describe_test_policy(policy: &crate::testkit::safety::ClusterTestPolicy) -> String {
+    let class = serde_json::to_value(policy.safety_class)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| "unknown".to_string());
+    if policy.allowed_operations.is_empty() {
+        return format!("fault policy: {class}; faults are refused");
+    }
+    let operations: Vec<String> = policy
+        .allowed_operations
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    format!("fault policy: {class}; allows {}", operations.join(", "))
+}
+
 /// Guest service supervised and restarted by systemd; logs go to its journal.
-pub const SERVICE: &str = "[Unit]\nDescription=Reliaburger node\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStartPre=/bin/sh -ec 'mountpoint -q /sys/fs/bpf || mount -t bpf bpf /sys/fs/bpf'\nExecStart=/usr/local/bin/bun --cluster --runtime runc --config /etc/reliaburger/node.toml --listen 0.0.0.0:9117\nRestart=on-failure\nRestartSec=2\nLimitNOFILE=1048576\nKillMode=mixed\nTimeoutStopSec=30\n\n[Install]\nWantedBy=multi-user.target\n";
+pub const SERVICE: &str = "[Unit]\nDescription=Reliaburger node\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStartPre=/bin/sh -ec 'mountpoint -q /sys/fs/bpf || mount -t bpf bpf /sys/fs/bpf'\nExecStart=/usr/local/bin/bun --cluster --runtime runc --config /etc/reliaburger/node.toml --listen 0.0.0.0:9117\nRestart=on-failure\nRestartSec=2\nLimitNOFILE=1048576\nKillMode=process\nTimeoutStopSec=30\n\n[Install]\nWantedBy=multi-user.target\n";
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_restarts_leave_durable_owners_running() {
+        // Owners outlive Bun by design; `mixed` or `control-group` would
+        // SIGKILL them on every restart and leave their records unowned.
+        assert!(SERVICE.contains("\nKillMode=process\n"), "{SERVICE}");
+        assert!(!SERVICE.contains("KillMode=mixed"));
+    }
 
     #[test]
     fn managed_vm_has_no_host_mounts_and_only_explicit_loopback_forwards() {
@@ -112,6 +190,89 @@ mod tests {
         assert_eq!(forwards[3]["proto"], "any");
         assert_eq!(forwards[3]["guestIP"], "0.0.0.0");
         assert_eq!(value["networks"][0]["lima"], "user-v2");
+    }
+
+    #[test]
+    fn provisioning_never_waits_for_a_graceful_logind_stop() {
+        let yaml = vm_config("/private/cache/ubuntu.img", "aarch64", 19117, None, None).unwrap();
+        let value: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        let script = value["provision"][0]["script"].as_str().unwrap();
+        let kill = script
+            .find("systemctl kill --signal=SIGKILL systemd-logind.service")
+            .unwrap();
+        let restart = script
+            .find("systemctl restart systemd-logind.service")
+            .unwrap();
+        assert!(kill < restart, "{script}");
+    }
+
+    /// Run the generated provision script with stub system tools and
+    /// return every `apt-get` invocation. `missing` is a package the stub
+    /// `dpkg-query` has never heard of.
+    #[cfg(unix)]
+    fn apt_calls_when_provisioning(missing: Option<&str>) -> Vec<String> {
+        use std::os::unix::fs::PermissionsExt;
+        let yaml = vm_config("/private/cache/guest.qcow2", "aarch64", 19117, None, None).unwrap();
+        let value: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        let script = value["provision"][0]["script"].as_str().unwrap();
+        let stubs = tempfile::tempdir().unwrap();
+        let log = stubs.path().join("apt.log");
+        let tools = [
+            (
+                "dpkg-query",
+                "for arg in \"$@\"; do case \"$arg\" in -*) ;; \"$MISSING\") ;; *) echo 'ii ' ;; esac; done",
+            ),
+            ("apt-get", "echo \"$*\" >> \"$APT_LOG\""),
+            ("systemctl", "true"),
+            ("install", "true"),
+        ];
+        for (name, body) in tools {
+            let path = stubs.path().join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let status = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(script)
+            .env("PATH", format!("{}:/usr/bin:/bin", stubs.path().display()))
+            .env("MISSING", missing.unwrap_or(""))
+            .env("APT_LOG", &log)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::fs::read_to_string(&log)
+            .map(|text| text.lines().map(str::to_string).collect())
+            .unwrap_or_default()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provisioning_a_baked_image_never_runs_apt() {
+        assert!(apt_calls_when_provisioning(None).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provisioning_a_stock_image_installs_every_node_package() {
+        let calls = apt_calls_when_provisioning(Some("uidmap"));
+        let packages = crate::relish::quickstart::artifacts::guest_image_pins()
+            .unwrap()
+            .packages
+            .join(" ");
+        assert_eq!(
+            calls,
+            vec![
+                "update -qq".to_string(),
+                format!("install -y -qq {packages}")
+            ]
+        );
+    }
+
+    #[test]
+    fn guest_package_pins_cannot_inject_shell() {
+        assert!(install_missing_packages(&["runc".into(), "x; reboot".into()]).is_err());
+        assert!(install_missing_packages(&[]).is_err());
+        assert!(install_missing_packages(&["libc6".into(), "g++".into()]).is_ok());
     }
 
     #[test]
@@ -147,5 +308,67 @@ mod tests {
         let node: crate::config::node::NodeConfig = toml::from_str(&peer).unwrap();
         assert!(node.security.bootstrap_path.is_none());
         assert_eq!(node.cluster.join, vec!["192.168.104.2:9443"]);
+    }
+
+    #[test]
+    fn laptop_nodes_admit_workload_and_node_faults_but_not_pressure() {
+        use crate::sesame::types::ApiRole;
+        use crate::testkit::safety::{OperationAuthorisation, OperationPermission};
+
+        let text = node_config(
+            "laptop",
+            "rb-laptop-123-1",
+            "192.168.104.2".parse().unwrap(),
+            None,
+            &[],
+        )
+        .unwrap();
+        assert!(text.contains("[testing]"), "{text}");
+        assert!(text.contains("safety_class = \"development\""), "{text}");
+        let node: crate::config::node::NodeConfig = toml::from_str(&text).unwrap();
+        node.testing.validate().unwrap();
+        let admin = OperationAuthorisation {
+            principal: "laptop",
+            role: ApiRole::Admin,
+            acknowledged: true,
+        };
+        for allowed in [
+            OperationPermission::InjectWorkloadFaults,
+            OperationPermission::AlterNodeState,
+        ] {
+            assert!(node.testing.authorise(allowed, &admin).is_ok(), "{allowed}");
+        }
+        for refused in [
+            OperationPermission::SaturateCapacity,
+            OperationPermission::ProbeExternalDestination,
+            OperationPermission::ProvisionIsolatedWorkloads,
+        ] {
+            assert!(
+                node.testing.authorise(refused, &admin).is_err(),
+                "{refused}"
+            );
+        }
+        // Consent is still required: the policy grants permission, not intent.
+        let unacknowledged = OperationAuthorisation {
+            acknowledged: false,
+            ..admin
+        };
+        assert!(
+            node.testing
+                .authorise(OperationPermission::InjectWorkloadFaults, &unacknowledged)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn local_status_describes_the_live_fault_policy() {
+        assert_eq!(
+            describe_test_policy(&laptop_test_policy()),
+            "fault policy: development; allows inject_workload_faults, alter_node_state"
+        );
+        assert_eq!(
+            describe_test_policy(&crate::testkit::safety::ClusterTestPolicy::default()),
+            "fault policy: unknown; faults are refused"
+        );
     }
 }

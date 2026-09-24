@@ -33,6 +33,11 @@ pub enum CaError {
 const ROOT_CA_LIFETIME: Duration = Duration::from_secs(10 * 365 * 24 * 3600); // 10 years
 const INTERMEDIATE_CA_LIFETIME: Duration = Duration::from_secs(5 * 365 * 24 * 3600); // 5 years
 
+/// How far every issued certificate's `not_before` is backdated, so a signer
+/// and verifier whose clocks disagree by a few minutes still accept a
+/// freshly issued certificate.
+pub const CLOCK_SKEW_BACKDATE: Duration = Duration::from_secs(300);
+
 /// The result of generating a CA: the CA struct for storage, plus
 /// the raw private key DER (for the caller to use before wrapping).
 pub struct GeneratedCa {
@@ -402,11 +407,15 @@ fn bound_leaf_validity(
     params: &mut CertificateParams,
     issuer: &CertificateParams,
 ) -> Result<(), CaError> {
-    if params.not_before < issuer.not_before || params.not_before >= issuer.not_after {
+    // `set_validity` backdated the start; judge the issuer at the real issuing
+    // instant, or an issuer that expired minutes ago could still sign.
+    let issued_at = params.not_before + CLOCK_SKEW_BACKDATE;
+    if issued_at < issuer.not_before || issued_at >= issuer.not_after {
         return Err(CaError::InvalidInput(
             "issuer is outside its validity period".into(),
         ));
     }
+    params.not_before = params.not_before.max(issuer.not_before);
     params.not_after = params.not_after.min(issuer.not_after);
     Ok(())
 }
@@ -613,13 +622,17 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 fn set_validity(params: &mut CertificateParams, lifetime: Duration) -> Result<(), CaError> {
     // X.509 encodes whole seconds. Use that same instant for storage metadata.
     let now = time::OffsetDateTime::now_utc();
-    let not_before = time::OffsetDateTime::from_unix_timestamp(now.unix_timestamp())
+    let now = time::OffsetDateTime::from_unix_timestamp(now.unix_timestamp())
         .map_err(|error| CaError::CertGenFailed(error.to_string()))?;
+    // Backdate the start so a verifier whose clock runs a little behind the
+    // issuer's still accepts the certificate. The lifetime counts from now,
+    // so the backdate never shortens it.
+    let not_before = now - CLOCK_SKEW_BACKDATE;
     let lifetime = time::Duration::try_from(lifetime)
         .map_err(|_| CaError::CertGenFailed("certificate lifetime is out of range".into()))?;
-    let not_after = not_before
+    let not_after = now
         .checked_add(lifetime)
-        .filter(|end| end.unix_timestamp() > not_before.unix_timestamp())
+        .filter(|end| end.unix_timestamp() > now.unix_timestamp())
         .ok_or_else(|| {
             CaError::CertGenFailed(
                 "certificate lifetime must be at least one second and fit the supported date range"
@@ -627,8 +640,7 @@ fn set_validity(params: &mut CertificateParams, lifetime: Duration) -> Result<()
             )
         })?;
     params.not_before = not_before;
-    params.not_after = time::OffsetDateTime::from_unix_timestamp(not_after.unix_timestamp())
-        .map_err(|error| CaError::CertGenFailed(error.to_string()))?;
+    params.not_after = not_after;
     Ok(())
 }
 
@@ -689,11 +701,11 @@ mod tests {
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
-        assert!(cert.validity().not_before.timestamp() <= now);
+        assert!(cert.validity().not_before.timestamp() <= now - 299);
         assert!(cert.validity().not_after.timestamp() >= now + 89);
         assert_eq!(
             cert.validity().not_after.timestamp() - cert.validity().not_before.timestamp(),
-            90
+            90 + CLOCK_SKEW_BACKDATE.as_secs() as i64
         );
         let (_, parsed_root) =
             x509_parser::parse_x509_certificate(&root.ca.certificate_der).unwrap();
@@ -802,6 +814,51 @@ mod tests {
             hierarchy.ingress.ca.issuer_serial,
             Some(hierarchy.root.ca.serial)
         );
+    }
+
+    #[test]
+    fn freshly_issued_certificates_tolerate_a_verifier_clock_one_minute_behind() {
+        let hierarchy = generate_ca_hierarchy("test", b"test-ikm").unwrap();
+        let (node_der, _, _) = issue_node_cert(
+            "node-01",
+            SerialNumber(10),
+            &hierarchy.node.signing_keypair,
+            &hierarchy.node.certificate_params,
+        )
+        .unwrap();
+        let (csr_der, _) = create_node_csr("node-02").unwrap();
+        let (csr_signed_der, _) = sign_node_csr(
+            &csr_der,
+            "node-02",
+            SerialNumber(11),
+            &hierarchy.node.signing_keypair,
+            &hierarchy.node.certificate_params,
+        )
+        .unwrap();
+        let (leaf_der, _, _) = issue_end_entity_cert(
+            "api.test",
+            SerialNumber(12),
+            Duration::from_secs(90),
+            &[],
+            &[ExtendedKeyUsagePurpose::ServerAuth],
+            &hierarchy.ingress.signing_keypair,
+            &hierarchy.ingress.certificate_params,
+        )
+        .unwrap();
+
+        let a_minute_ago = SystemTime::now() - Duration::from_secs(60);
+        for (name, der) in [
+            ("root", &hierarchy.root.ca.certificate_der),
+            ("node CA", &hierarchy.node.ca.certificate_der),
+            ("node", &node_der),
+            ("CSR-signed node", &csr_signed_der),
+            ("end-entity", &leaf_der),
+        ] {
+            assert!(
+                crate::sesame::cert::check_validity_at(der, a_minute_ago).is_ok(),
+                "{name} certificate must be valid for a verifier 60 s behind"
+            );
+        }
     }
 
     #[test]

@@ -46,6 +46,9 @@ impl SharedDrains {
 
     /// Capture every candidate while the caller still holds the routing read lock.
     /// A deadline that has already fired refuses the whole capture.
+    ///
+    /// Returns one termination token per candidate, in the same order as
+    /// `instance_ids`, so the caller can keep only the one it ends up using.
     pub(crate) async fn capture_requests(
         &self,
         instance_ids: &[String],
@@ -55,16 +58,20 @@ impl SharedDrains {
         if instance_ids.iter().any(|id| tracker.is_terminating(id)) {
             return None;
         }
-        let mut tokens = Vec::with_capacity(instance_ids.len());
-        for id in instance_ids {
-            tracker.increment_connections(id);
-            if websocket {
-                tracker.increment_websocket(id);
-            }
-            if let Some(token) = tracker.terminate_token(id) {
-                tokens.push(token);
-            }
-        }
+        let tokens = instance_ids
+            .iter()
+            .map(|id| {
+                let entry = tracker
+                    .draining
+                    .entry(id.clone())
+                    .or_insert_with(DrainEntry::active);
+                entry.active_connections += 1;
+                if websocket {
+                    entry.websocket_connections += 1;
+                }
+                entry.terminate.clone()
+            })
+            .collect();
         Some(tokens)
     }
 
@@ -113,6 +120,22 @@ impl SharedDrains {
     /// Sweep for completed drains, returning the instance IDs that are done.
     pub async fn check_completions(&self) -> Vec<String> {
         self.0.lock().await.check_completions().await
+    }
+
+    /// Start draining every command's instance, sweep finished drains, and
+    /// report whether all of those instances have released their requests.
+    /// An instance that is already draining keeps its earlier deadline.
+    pub async fn drain_all(&self, commands: &[DrainCommand]) -> bool {
+        for command in commands {
+            self.start_drain(command).await;
+        }
+        self.check_completions().await;
+        for command in commands {
+            if self.is_draining(&command.instance_id).await {
+                return false;
+            }
+        }
+        true
     }
 
     /// Wait until `instance_id` has no in-flight requests. Its deadline asks
@@ -381,6 +404,18 @@ mod tests {
         assert_eq!(drains.check_completions().await, vec!["web-0"]);
         assert_eq!(rx.recv().await.unwrap().instance_id, "web-0");
         assert!(!drains.is_draining("web-0").await);
+    }
+
+    #[tokio::test]
+    async fn drain_all_reports_released_only_when_every_instance_is_idle() {
+        let (tx, _rx) = mpsc::channel(16);
+        let drains = SharedDrains::new(DrainTracker::new(tx));
+        drains.increment_connections("web-1").await;
+        let commands = [drain_cmd("web", "web-0", 30), drain_cmd("web", "web-1", 30)];
+        assert!(!drains.drain_all(&commands).await);
+        assert!(!drains.is_draining("web-0").await);
+        drains.decrement_connections("web-1").await;
+        assert!(drains.drain_all(&commands).await);
     }
 
     #[tokio::test]

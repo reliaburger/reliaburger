@@ -43,6 +43,9 @@ pub enum ImageError {
     #[error("failed to unpack layer {digest}: {reason}")]
     UnpackFailed { digest: String, reason: String },
 
+    #[error("invalid image config {digest}: {reason}")]
+    InvalidConfig { digest: String, reason: String },
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -135,14 +138,36 @@ fn split_name_tag(s: &str) -> (&str, String) {
     }
 }
 
+/// An image's blobs, materialised in local storage.
+#[derive(Debug, Clone)]
+pub struct LocalImageBlobs {
+    /// Layer blobs, in manifest order (base first).
+    pub layers: Vec<PathBuf>,
+    /// The config blob.
+    pub config: PathBuf,
+    /// The config blob's digest, as the manifest names it.
+    pub config_digest: String,
+}
+
+/// An unpacked image: its root filesystem and the config that says how
+/// to run it.
+#[derive(Debug, Clone)]
+pub struct PulledImage {
+    /// The shared, read-only rootfs generation.
+    pub rootfs: PathBuf,
+    /// The image's `Entrypoint`, `Cmd`, `Env`, `WorkingDir` and `User`,
+    /// parsed from the digest-verified config blob.
+    pub config: super::image_config::ImageConfig,
+}
+
 /// A cluster-backed layer source consulted before any external
 /// registry (Phase 12 C2). Implemented over the Pickle catalog +
 /// P2P pulls; injected late because the cluster subsystems start
 /// after the runtime is selected.
 ///
 /// `fetch_cluster_image` returns:
-/// - `Ok(Some(layer_paths))` — the catalog knows `repository:tag`;
-///   all layer blobs are now local, in manifest order, at these paths.
+/// - `Ok(Some(blobs))` — the catalog knows `repository:tag`; its
+///   config and layer blobs are now local and digest-verified.
 /// - `Ok(None)` — not a cluster image; fall through to the external
 ///   registry.
 /// - `Err(reason)` — the catalog knows the image but its layers could
@@ -169,7 +194,7 @@ pub trait ClusterImageSource: Send + Sync {
 /// Boxed future returned by [`ClusterImageSource::fetch_cluster_image`]
 /// (the trait must be `dyn`-safe, so no `impl Future` here).
 pub type ClusterFetchFuture<'a> = std::pin::Pin<
-    Box<dyn std::future::Future<Output = Result<Option<Vec<PathBuf>>, String>> + Send + 'a>,
+    Box<dyn std::future::Future<Output = Result<Option<LocalImageBlobs>, String>> + Send + 'a>,
 >;
 
 /// Content-addressed image store on disk.
@@ -177,7 +202,7 @@ pub type ClusterFetchFuture<'a> = std::pin::Pin<
 /// Disk layout:
 /// ```text
 /// {store_root}/
-///   blobs/sha256/{digest}                    — raw layer blobs
+///   blobs/sha256/{digest}/data               — raw layer blobs
 ///   rootfs/{registry}/{repo}/{tag}/          — unpacked filesystem
 ///   manifests/{registry}/{repo}/{tag}.json   — cached manifests
 /// ```
@@ -193,16 +218,16 @@ pub struct ImageStore {
     /// container's rootfs; the completion marker makes subsequent pulls reuse
     /// the published tree instead.
     unpack_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    /// Added to every file's uid and gid at unpack time, so a user
+    /// namespace mapping container id 0 to this host id sees the image's
+    /// own ownership (see `grill::userns`). `None` keeps the unpacking
+    /// user as owner.
+    owner_shift: Option<u32>,
 }
 
-/// Resolve shared registry/runtime storage, retaining older flat cache entries.
+/// The path of a blob in the storage shared by the registry and the runtime.
 pub(crate) fn cached_blob_path(root: &Path, digest: &str) -> PathBuf {
-    let legacy = root.join("blobs").join("sha256").join(digest);
-    if legacy.is_file() {
-        legacy
-    } else {
-        legacy.join("data")
-    }
+    root.join("blobs").join("sha256").join(digest).join("data")
 }
 
 impl ImageStore {
@@ -212,7 +237,16 @@ impl ImageStore {
             store_root,
             cluster_source: std::sync::Arc::new(std::sync::OnceLock::new()),
             unpack_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            owner_shift: None,
         }
+    }
+
+    /// Unpack images with each file owned by `base` plus its uid and gid
+    /// in the layer, for containers in a user namespace mapping container
+    /// id 0 to host id `base`. Needs root.
+    pub fn with_owner_shift(mut self, base: u32) -> Self {
+        self.owner_shift = Some(base);
+        self
     }
 
     /// Directory containing this runtime's selected image storage.
@@ -252,12 +286,15 @@ impl ImageStore {
             return Ok(generation);
         }
         let target = generation.clone();
-        tokio::task::spawn_blocking(move || unpack_layers(&layer_paths, &target))
-            .await
-            .map_err(|e| ImageError::UnpackFailed {
-                digest: "join".to_string(),
-                reason: e.to_string(),
-            })??;
+        let owner_shift = self.owner_shift;
+        tokio::task::spawn_blocking(move || {
+            unpack_layers_with_owner(&layer_paths, &target, owner_shift)
+        })
+        .await
+        .map_err(|e| ImageError::UnpackFailed {
+            digest: "join".to_string(),
+            reason: e.to_string(),
+        })??;
         tokio::fs::write(&complete, b"complete\n").await?;
         Ok(generation)
     }
@@ -272,33 +309,23 @@ impl ImageStore {
     pub fn rootfs_generation_path(&self, tag_rootfs: &Path, layer_paths: &[PathBuf]) -> PathBuf {
         let mut hasher = Sha256::new();
         for path in layer_paths {
-            // The blob filename is the layer's sha256 hex — immutable
-            // content identity. Hash the ordered set into one generation id.
-            let digest_path = if path.file_name().is_some_and(|name| name == "data") {
-                path.parent().unwrap_or(path)
-            } else {
-                path.as_path()
-            };
-            let name = digest_path
-                .file_name()
+            // Every blob sits at `{digest}/data`, so the parent directory's
+            // name is the layer's sha256 hex — immutable content identity.
+            // Hash the ordered set into one generation id.
+            let name = path
+                .parent()
+                .and_then(Path::file_name)
                 .unwrap_or_default()
                 .to_string_lossy();
             hasher.update(name.as_bytes());
             hasher.update(b"\n");
         }
         let generation = hex::encode(hasher.finalize());
-        tag_rootfs.join(format!("gen-{}", &generation[..16]))
-    }
-
-    /// Create a store using the default rootless location.
-    ///
-    /// Uses `~/.local/share/reliaburger/images/` via the `dirs` crate.
-    pub fn rootless_default() -> Self {
-        let base = dirs::data_local_dir()
-            .unwrap_or_else(|| PathBuf::from("/tmp/reliaburger-images"))
-            .join("reliaburger")
-            .join("images");
-        Self::new(base)
+        // Shifted and unshifted trees of the same layers differ on disk.
+        match self.owner_shift {
+            Some(base) => tag_rootfs.join(format!("gen-{}-owner-{base}", &generation[..16])),
+            None => tag_rootfs.join(format!("gen-{}", &generation[..16])),
+        }
     }
 
     /// Path to a cached blob by its SHA-256 digest.
@@ -330,9 +357,9 @@ impl ImageStore {
 
     /// Pull an image and unpack it into a rootfs directory.
     ///
-    /// Returns the path to the unpacked rootfs. Caches blobs and
+    /// Returns the unpacked rootfs and the image's config. Caches blobs and
     /// manifests on disk; subsequent pulls of the same image are fast.
-    pub async fn pull_and_unpack(&self, image: &str) -> Result<PathBuf, ImageError> {
+    pub async fn pull_and_unpack(&self, image: &str) -> Result<PulledImage, ImageError> {
         let image_ref = ImageReference::parse(image)?;
         let oci_ref = image_ref.to_oci_reference()?;
 
@@ -346,8 +373,8 @@ impl ImageStore {
         if let Some(source) = self.cluster_source.get() {
             for (repo, tag) in cluster_candidates(&image_ref) {
                 match source.fetch_cluster_image(&repo, &tag).await {
-                    Ok(Some(layer_paths)) => {
-                        return self.unpack_to(layer_paths, rootfs).await;
+                    Ok(Some(blobs)) => {
+                        return self.unpack_local(blobs, rootfs).await;
                     }
                     Ok(None) => continue,
                     // The catalog knows the image but its layers are
@@ -366,8 +393,8 @@ impl ImageStore {
             // fall through to the direct pull: the upstream identity is
             // the same either way, so degrading is safe (and logged).
             match source.fetch_pull_through(&image_ref).await {
-                Ok(Some(layer_paths)) => {
-                    return self.unpack_to(layer_paths, rootfs).await;
+                Ok(Some(blobs)) => {
+                    return self.unpack_local(blobs, rootfs).await;
                 }
                 Ok(None) => {}
                 Err(reason) => {
@@ -410,6 +437,7 @@ impl ImageStore {
         })?;
 
         let manifest = verified.manifest;
+        let config = parse_config(&verified.config_bytes, &manifest.config.digest)?;
 
         // Save the manifest for cache validation
         let manifest_path = self.manifest_path(&image_ref);
@@ -495,8 +523,41 @@ impl ImageStore {
             .iter()
             .map(|l| self.blob_path(&l.digest))
             .collect();
-        self.unpack_to(layer_paths, rootfs).await
+        let rootfs = self.unpack_to(layer_paths, rootfs).await?;
+        Ok(PulledImage { rootfs, config })
     }
+
+    /// Unpack blobs the cluster already holds, re-checking the config
+    /// blob's digest: it decides what the container runs, and as whom.
+    async fn unpack_local(
+        &self,
+        blobs: LocalImageBlobs,
+        rootfs: PathBuf,
+    ) -> Result<PulledImage, ImageError> {
+        let bytes = tokio::fs::read(&blobs.config).await?;
+        let actual = format!("sha256:{}", sha256_hex(&bytes));
+        if actual != blobs.config_digest {
+            return Err(ImageError::DigestMismatch {
+                digest: blobs.config_digest.clone(),
+                expected: blobs.config_digest,
+                actual,
+            });
+        }
+        let config = parse_config(&bytes, &blobs.config_digest)?;
+        let rootfs = self.unpack_to(blobs.layers, rootfs).await?;
+        Ok(PulledImage { rootfs, config })
+    }
+}
+
+/// Parse a digest-verified config blob.
+fn parse_config(
+    bytes: &[u8],
+    digest: &str,
+) -> Result<super::image_config::ImageConfig, ImageError> {
+    super::image_config::ImageConfig::from_json(bytes).map_err(|e| ImageError::InvalidConfig {
+        digest: digest.to_string(),
+        reason: e.to_string(),
+    })
 }
 
 /// Repository/tag candidates to try against the Pickle catalog for a
@@ -554,6 +615,16 @@ fn safe_join(base: &Path, rel: &Path) -> Option<PathBuf> {
 /// - `.wh.<name>` — delete `<name>` from a lower layer
 /// - `.wh..wh..opq` — clear the entire directory (opaque whiteout)
 pub fn unpack_layers(layer_paths: &[PathBuf], rootfs: &Path) -> Result<(), ImageError> {
+    unpack_layers_with_owner(layer_paths, rootfs, None)
+}
+
+/// [`unpack_layers`], optionally shifting every entry's owner by
+/// `owner_shift` (the layer's uid 0 becomes host uid `owner_shift`).
+pub fn unpack_layers_with_owner(
+    layer_paths: &[PathBuf],
+    rootfs: &Path,
+    owner_shift: Option<u32>,
+) -> Result<(), ImageError> {
     // Clear and recreate rootfs
     if rootfs.exists() {
         std::fs::remove_dir_all(rootfs).map_err(|e| ImageError::UnpackFailed {
@@ -667,15 +738,87 @@ pub fn unpack_layers(layer_paths: &[PathBuf], rootfs: &Path) -> Result<(), Image
             }
 
             // Unpack the entry
-            entry
+            let unpacked = entry
                 .unpack_in(rootfs)
                 .map_err(|e| ImageError::UnpackFailed {
                     digest: digest.clone(),
                     reason: format!("failed to unpack {}: {e}", path.display()),
                 })?;
+            if let Some(base) = owner_shift
+                && unpacked
+            {
+                shift_owner(&entry, rootfs, &path, base).map_err(|reason| {
+                    ImageError::UnpackFailed {
+                        digest: digest.clone(),
+                        reason: format!("failed to set owner of {}: {reason}", path.display()),
+                    }
+                })?;
+            }
         }
     }
 
+    if let Some(base) = owner_shift {
+        own_implicit_directories(rootfs, base).map_err(|e| ImageError::UnpackFailed {
+            digest: "rootfs".to_string(),
+            reason: format!("failed to set owner of implicit directories: {e}"),
+        })?;
+    }
+    Ok(())
+}
+
+/// Hand everything the unpacker created on its own (the rootfs itself, and
+/// parent directories a layer never listed) to container root.
+///
+/// Every listed entry already has an owner at or above `base`, so anything
+/// below it was created by us, as host root.
+fn own_implicit_directories(rootfs: &Path, base: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let mut pending = vec![rootfs.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if metadata.uid() < base || metadata.gid() < base {
+            std::os::unix::fs::lchown(&path, Some(base), Some(base))?;
+        }
+        if metadata.is_dir() {
+            for entry in std::fs::read_dir(&path)? {
+                pending.push(entry?.path());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Give an unpacked entry its layer owner, shifted into the node's
+/// container id range.
+///
+/// `chown` clears set-id bits on regular files, so the mode is restored
+/// afterwards. Symlinks are re-owned without following them.
+fn shift_owner<R: std::io::Read>(
+    entry: &tar::Entry<'_, R>,
+    rootfs: &Path,
+    path: &Path,
+    base: u32,
+) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let header = entry.header();
+    let shifted = |id: u64| -> Result<u32, String> {
+        u32::try_from(id)
+            .ok()
+            .filter(|id| *id < super::userns::CONTAINER_ID_COUNT)
+            .map(|id| base + id)
+            .ok_or_else(|| format!("owner id {id} is outside the container range"))
+    };
+    let uid = shifted(header.uid().map_err(|e| e.to_string())?)?;
+    let gid = shifted(header.gid().map_err(|e| e.to_string())?)?;
+    let target = safe_join(rootfs, path).ok_or("unsafe path")?;
+    std::os::unix::fs::lchown(&target, Some(uid), Some(gid)).map_err(|e| e.to_string())?;
+    if header.entry_type() != tar::EntryType::Symlink {
+        let mode = header.mode().map_err(|e| e.to_string())?;
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode & 0o7777))
+            .map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 
@@ -802,7 +945,7 @@ mod tests {
     // -- Store path construction -----------------------------------------------
 
     #[test]
-    fn registry_and_runtime_share_new_and_legacy_blobs() {
+    fn registry_and_runtime_share_blobs() {
         let root = tempfile::tempdir().unwrap();
         let image = ImageStore::new(root.path().to_path_buf());
         let registry = crate::pickle::store::BlobStore::new(root.path());
@@ -817,14 +960,6 @@ mod tests {
             image.blob_path(digest.as_str()),
             registry.blob_path(&digest)
         );
-
-        let legacy = crate::pickle::store::compute_sha256(b"old layer");
-        let path = root.path().join("blobs/sha256").join(legacy.hex());
-        std::fs::write(&path, b"old layer").unwrap();
-        registry.write_blob(b"old layer", &legacy).unwrap();
-        assert_eq!(registry.read_blob(&legacy).unwrap(), b"old layer");
-        assert_eq!(image.blob_path(legacy.as_str()), path);
-        assert!(registry.list_blobs().unwrap().contains(&legacy));
     }
 
     #[test]
@@ -834,10 +969,6 @@ mod tests {
         let first = store.rootfs_generation_path(root, &[PathBuf::from("/blobs/aaaa/data")]);
         let second = store.rootfs_generation_path(root, &[PathBuf::from("/blobs/bbbb/data")]);
         assert_ne!(first, second);
-        assert_eq!(
-            first,
-            store.rootfs_generation_path(root, &[PathBuf::from("/blobs/aaaa")])
-        );
     }
 
     #[test]
@@ -878,22 +1009,22 @@ mod tests {
         let gen_a = store.rootfs_generation_path(
             &tag_rootfs,
             &[
-                PathBuf::from("/b/sha256/aaaa"),
-                PathBuf::from("/b/sha256/bbbb"),
+                PathBuf::from("/b/sha256/aaaa/data"),
+                PathBuf::from("/b/sha256/bbbb/data"),
             ],
         );
         let gen_a_again = store.rootfs_generation_path(
             &tag_rootfs,
             &[
-                PathBuf::from("/b/sha256/aaaa"),
-                PathBuf::from("/b/sha256/bbbb"),
+                PathBuf::from("/b/sha256/aaaa/data"),
+                PathBuf::from("/b/sha256/bbbb/data"),
             ],
         );
         let gen_b = store.rootfs_generation_path(
             &tag_rootfs,
             &[
-                PathBuf::from("/b/sha256/cccc"),
-                PathBuf::from("/b/sha256/dddd"),
+                PathBuf::from("/b/sha256/cccc/data"),
+                PathBuf::from("/b/sha256/dddd/data"),
             ],
         );
 
@@ -1133,6 +1264,72 @@ mod tests {
         }
 
         tar.into_inner().unwrap().finish().unwrap();
+    }
+
+    /// D1: image ownership survives into the node's container id range, so
+    /// `redis` in the image owns `/data` inside the user namespace too.
+    #[test]
+    #[ignore = "requires root to chown into the container id range"]
+    fn owner_shift_maps_layer_owners_into_the_container_range() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        assert!(nix::unistd::geteuid().is_root(), "run as root");
+        let base = crate::grill::userns::HOST_ID_BASE;
+        let tmp = tempfile::tempdir().unwrap();
+        let layer = tmp.path().join("layer.tar.gz");
+        {
+            let file = std::fs::File::create(&layer).unwrap();
+            let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
+            let mut tar = tar::Builder::new(encoder);
+            let mut data = tar::Header::new_gnu();
+            data.set_entry_type(tar::EntryType::Directory);
+            data.set_size(0);
+            data.set_mode(0o750);
+            data.set_uid(999);
+            data.set_gid(1000);
+            data.set_cksum();
+            tar.append_data(&mut data, "data/", &[][..]).unwrap();
+            let mut tool = tar::Header::new_gnu();
+            tool.set_entry_type(tar::EntryType::Regular);
+            tool.set_size(2);
+            tool.set_mode(0o4755);
+            tool.set_uid(0);
+            tool.set_gid(0);
+            tool.set_cksum();
+            // No `usr/` or `usr/bin/` entries: the unpacker makes them.
+            tar.append_data(&mut tool, "usr/bin/tool", &b"#!"[..])
+                .unwrap();
+            tar.into_inner().unwrap().finish().unwrap();
+        }
+        let rootfs = tmp.path().join("rootfs");
+        unpack_layers_with_owner(&[layer], &rootfs, Some(base)).unwrap();
+
+        let data = std::fs::metadata(rootfs.join("data")).unwrap();
+        assert_eq!((data.uid(), data.gid()), (base + 999, base + 1000));
+        assert_eq!(data.permissions().mode() & 0o7777, 0o750);
+        let tool = std::fs::metadata(rootfs.join("usr/bin/tool")).unwrap();
+        assert_eq!((tool.uid(), tool.gid()), (base, base));
+        assert_eq!(
+            tool.permissions().mode() & 0o7777,
+            0o4755,
+            "chown must not strip the set-id bit"
+        );
+        for implicit in ["", "usr", "usr/bin"] {
+            let meta = std::fs::metadata(rootfs.join(implicit)).unwrap();
+            assert_eq!((meta.uid(), meta.gid()), (base, base), "{implicit:?}");
+        }
+    }
+
+    #[test]
+    fn owner_shift_gets_its_own_rootfs_generation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plain = ImageStore::new(tmp.path().to_path_buf());
+        let shifted = ImageStore::new(tmp.path().to_path_buf()).with_owner_shift(2_000_000_000);
+        let layers = [PathBuf::from("/blobs/aaaa/data")];
+        let root = Path::new("/rootfs/tag");
+        assert_ne!(
+            plain.rootfs_generation_path(root, &layers),
+            shifted.rootfs_generation_path(root, &layers)
+        );
     }
 
     fn create_test_layer_with_symlinks(
@@ -1375,9 +1572,8 @@ mod tests {
         let layer = std::fs::read(layer_path).unwrap();
         let layer_digest = format!("sha256:{}", sha256_hex(&layer));
 
-        let config =
-            br#"{"architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":[]}}"#
-                .to_vec();
+        let config = br#"{"architecture":"amd64","os":"linux","config":{"Entrypoint":["/bin/sh"],"Cmd":["-c","true"],"Env":["FIXTURE=1"],"WorkingDir":"/etc"},"rootfs":{"type":"layers","diff_ids":[]}}"#
+            .to_vec();
         let config_digest = format!("sha256:{}", sha256_hex(&config));
         let mut manifest = serde_json::to_vec(&serde_json::json!({
             "schemaVersion": 2,
@@ -1651,7 +1847,11 @@ mod tests {
                 .await;
         let directory = tempfile::tempdir().unwrap();
         let store = ImageStore::new(directory.path().to_path_buf());
-        let rootfs = store.pull_and_unpack(&fixture.reference).await.unwrap();
+        let rootfs = store
+            .pull_and_unpack(&fixture.reference)
+            .await
+            .unwrap()
+            .rootfs;
         assert_eq!(
             std::fs::read(rootfs.join("bin/sh")).unwrap(),
             b"fixture shell"
@@ -1849,7 +2049,11 @@ mod tests {
             let fixture = start_registry_fixture_with_fault(Some(fault)).await;
             let tmp = tempfile::tempdir().unwrap();
             let store = ImageStore::new(tmp.path().to_path_buf());
-            let rootfs = store.pull_and_unpack(&fixture.reference).await.unwrap();
+            let rootfs = store
+                .pull_and_unpack(&fixture.reference)
+                .await
+                .unwrap()
+                .rootfs;
             assert_eq!(
                 std::fs::read(rootfs.join("bin/sh")).unwrap(),
                 b"fixture shell"
@@ -1905,7 +2109,11 @@ mod tests {
         .await;
         let tmp = tempfile::tempdir().unwrap();
         let store = ImageStore::new(tmp.path().to_path_buf());
-        let rootfs = store.pull_and_unpack(&fixture.reference).await.unwrap();
+        let rootfs = store
+            .pull_and_unpack(&fixture.reference)
+            .await
+            .unwrap()
+            .rootfs;
         assert!(rootfs.join("bin/sh").exists());
         assert_eq!(fixture.manifest_requests.load(Ordering::SeqCst), 3);
     }
@@ -1921,7 +2129,11 @@ mod tests {
         .await;
         let tmp = tempfile::tempdir().unwrap();
         let store = ImageStore::new(tmp.path().to_path_buf());
-        let rootfs = store.pull_and_unpack(&fixture.reference).await.unwrap();
+        let rootfs = store
+            .pull_and_unpack(&fixture.reference)
+            .await
+            .unwrap()
+            .rootfs;
         assert_eq!(
             std::fs::read(rootfs.join("bin/sh")).unwrap(),
             b"fixture shell"
@@ -2001,9 +2213,15 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = ImageStore::new(tmp.path().to_path_buf());
 
-        let rootfs = store.pull_and_unpack(&fixture.reference).await.unwrap();
-        assert!(rootfs.join("bin/sh").exists());
-        assert!(rootfs.join("etc/os-release").exists());
+        let pulled = store.pull_and_unpack(&fixture.reference).await.unwrap();
+        assert!(pulled.rootfs.join("bin/sh").exists());
+        assert!(pulled.rootfs.join("etc/os-release").exists());
+        // The verified config blob comes back with the rootfs, so the
+        // runtime can honour the image's entrypoint, env and working dir.
+        assert_eq!(pulled.config.entrypoint, ["/bin/sh"]);
+        assert_eq!(pulled.config.cmd, ["-c", "true"]);
+        assert_eq!(pulled.config.env, ["FIXTURE=1"]);
+        assert_eq!(pulled.config.working_dir.as_deref(), Some("/etc"));
     }
 
     #[tokio::test]

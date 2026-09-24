@@ -67,13 +67,13 @@ impl super::api::PickleState {
             };
             let store = state.store.clone();
             let verify = digest.clone();
-            let cached = tokio::task::spawn_blocking(move || {
-                store.has_blob(&verify) && store.revalidate_blob(&verify)
-            })
-            .await
-            .map_err(|error| {
-                PickleError::ReplicationFailed(format!("peer cache verification failed: {error}"))
-            })?;
+            let cached = tokio::task::spawn_blocking(move || store.revalidate_blob(&verify))
+                .await
+                .map_err(|error| {
+                    PickleError::ReplicationFailed(format!(
+                        "peer cache verification failed: {error}"
+                    ))
+                })??;
             if cached {
                 return Ok(());
             }
@@ -198,7 +198,7 @@ pub async fn pull_layer_from_peer(
     // blob truncated by a crash mid-write, or corrupted on disk, must not
     // be served as valid — `revalidate_blob` removes it if it no longer
     // hashes to `digest`, so we refetch clean bytes below.
-    if store.has_blob(digest) && store.revalidate_blob(digest) {
+    if store.revalidate_blob(digest)? {
         return Ok(()); // Already cached locally and verified
     }
 
@@ -350,15 +350,16 @@ fn find_peer_for_layer<'a>(holders: &BTreeSet<u64>, peers: &'a [Peer]) -> Option
 /// This read-only library query performs no external pull and promises no
 /// runtime image availability. It is exercised by the Pickle cluster tests;
 /// runtime preparation uses the image store's separate pull/verification path.
-/// Returns `false` for a missing manifest, missing blob or corrupt blob.
+/// Returns `Ok(false)` for a missing manifest, missing blob or corrupt blob,
+/// and an error when a blob can't be read.
 pub fn image_available_locally(
     repository: &str,
     tag: &str,
     catalog: &ManifestCatalog,
     store: &BlobStore,
-) -> bool {
+) -> Result<bool, PickleError> {
     let Some(manifest) = catalog.get_manifest_by_tag(repository, tag) else {
-        return false;
+        return Ok(false);
     };
 
     // Everything the tag pins must be local *and valid* — the manifest
@@ -366,10 +367,12 @@ pub fn image_available_locally(
     // deploy/verify path we revalidate rather than trust existence (REG5):
     // a truncated or corrupt cached blob is not "available", and
     // `revalidate_blob` removes it so the next pull refetches clean bytes.
-    manifest
-        .referenced_digests()
-        .iter()
-        .all(|d| store.revalidate_blob(d))
+    for digest in manifest.referenced_digests() {
+        if !store.revalidate_blob(digest)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -498,7 +501,7 @@ mod tests {
             holder_nodes: BTreeSet::from([1]),
         });
 
-        assert!(image_available_locally("myapp", "latest", &catalog, &store));
+        assert!(image_available_locally("myapp", "latest", &catalog, &store).unwrap());
     }
 
     /// REG5: a locally-cached blob that got corrupted on disk means the
@@ -525,9 +528,7 @@ mod tests {
             holder_nodes: BTreeSet::from([1]),
         });
 
-        assert!(!image_available_locally(
-            "myapp", "latest", &catalog, &store
-        ));
+        assert!(!image_available_locally("myapp", "latest", &catalog, &store).unwrap());
     }
 
     #[test]
@@ -536,9 +537,7 @@ mod tests {
         let store = BlobStore::new(dir.path());
         let catalog = ManifestCatalog::default();
 
-        assert!(!image_available_locally(
-            "myapp", "latest", &catalog, &store
-        ));
+        assert!(!image_available_locally("myapp", "latest", &catalog, &store).unwrap());
     }
 
     /// REG1: without its own manifest blob a node cannot serve the
@@ -565,9 +564,7 @@ mod tests {
             holder_nodes: BTreeSet::from([1]),
         });
 
-        assert!(!image_available_locally(
-            "myapp", "latest", &catalog, &store
-        ));
+        assert!(!image_available_locally("myapp", "latest", &catalog, &store).unwrap());
     }
 
     #[test]
@@ -585,9 +582,7 @@ mod tests {
         });
 
         // Don't write any blobs — they're missing
-        assert!(!image_available_locally(
-            "myapp", "latest", &catalog, &store
-        ));
+        assert!(!image_available_locally("myapp", "latest", &catalog, &store).unwrap());
     }
 
     /// Serve `body` at `GET /v2/{repo}/blobs/{digest}` on an ephemeral port,

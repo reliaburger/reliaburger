@@ -357,24 +357,6 @@ impl ClusterCapabilities {
         Self::derive_with_observations(statics, wired, CapabilityObservations::default())
     }
 
-    /// Compatibility wrapper for callers which only have readiness evidence.
-    pub fn derive_with_evidence(
-        statics: &StaticCapabilities,
-        wired: &WiredSubsystems,
-        readiness: Option<crate::bun::readiness::NodeReadinessEvidence>,
-        placement: Option<crate::bun::readiness::NodeCapabilityEvidence>,
-    ) -> Self {
-        Self::derive_with_observations(
-            statics,
-            wired,
-            CapabilityObservations {
-                readiness,
-                placement,
-                ..CapabilityObservations::default()
-            },
-        )
-    }
-
     /// Derive a timestamped report without guessing unavailable telemetry.
     pub fn derive_with_observations(
         statics: &StaticCapabilities,

@@ -27,7 +27,9 @@ size = "10Gi"
 image = "nginx:latest"
 port = 8080
 
-# HostPath volume — bind-mount a specific host directory.
+# HostPath volume — bind-mount a specific host directory. Bun never
+# chowns it (nginx only reads here); a container that must write needs
+# the directory owned by its mapped host uid, 2000000000 + container uid.
 [[app.nginx.volumes]]
 source = "/var/www/html"
 path = "/usr/share/nginx/html"

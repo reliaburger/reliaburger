@@ -122,7 +122,7 @@ One-command dev cluster using Lima VMs. The Reliaburger equivalent of `minikube 
 4. **GitHub release pipeline.** Cross-compile bun and relish for `linux-aarch64` and `linux-x86_64`. Attach to GitHub releases alongside PDFs.
 5. **Docs.** Whitepaper section, README, book getting-started guide.
 
-**Milestone:** `relish dev create --nodes 3` produces a working 3-node cluster. `relish chaos council-partition` runs against it successfully.
+**Milestone:** `relish dev create --nodes 3` produces a working 3-node cluster. `relish test --chaos` partitions a council member and the cluster recovers.
 
 ---
 
@@ -704,7 +704,7 @@ files under `tests/`):
 Current test locations: runner and comparison regressions live in
 `src/testkit/runner.rs` and `src/testkit/bench/compare.rs`; diagnostic and trace
 regressions live under `src/relish/wtf/` and in `src/relish/trace_cmd.rs`.
-`tests/wtf_watch.rs` exercises the real CLI process. Live cases live under
+`tests/suite/wtf_watch.rs` exercises the real CLI process. Live cases live under
 `src/testkit/cases/` and `src/testkit/chaos/`; their complete three-node run is a
 release gate, not something the unit-test count establishes.
 
@@ -732,7 +732,7 @@ This follow-up repairs correctness gaps and reconciles the implementation,
 manual and book. Its historical checklist is in
 [progress.md](progress.md#phase-16-post-phase-15-audit--truthfulness--hardening),
 with current unresolved work mapped to the
-[completion plan](plans/2026-09-17-codebase-completion-plan.md).
+[completion plan](plans/archive/2026-09-17-codebase-completion-plan.md).
 Each repair updates the relevant existing book chapter. Future architecture
 families and optional refactors remain explicitly separate from release gates.
 

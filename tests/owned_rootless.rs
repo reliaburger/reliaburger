@@ -12,47 +12,42 @@ use reliaburger::grill::{ContainerState, Grill, ImageStore, InstanceId, OciSpec}
 async fn rootless_cluster_refuses_before_ownership_recovery_for_every_selection() {
     assert!(!nix::unistd::geteuid().is_root());
     for runtime in ["runc", "auto"] {
-        for experimental in [false, true] {
-            let root = tempfile::tempdir().unwrap();
-            let config = root.path().join("node.toml");
-            std::fs::write(
-                &config,
-                format!(
-                    "[storage]\ndata = '{0}/data'\nimages = '{0}/images'\nlogs = '{0}/logs'\nmetrics = '{0}/metrics'\nvolumes = '{0}/volumes'\n",
-                    root.path().display()
-                ),
-            ).unwrap();
-            let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_bun"));
-            command
-                .args(["--cluster", "--runtime", runtime, "--listen", "127.0.0.1:0"])
-                .arg("--config")
-                .arg(&config)
-                .kill_on_drop(true);
-            if experimental {
-                command.arg("--experimental-owned-runc");
-            }
-            let output = tokio::time::timeout(Duration::from_secs(10), command.output())
-                .await
-                .expect("unsupported rootless cluster must refuse promptly")
-                .unwrap();
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            assert!(!output.status.success());
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join("node.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "[storage]\ndata = '{0}/data'\nimages = '{0}/images'\nlogs = '{0}/logs'\nmetrics = '{0}/metrics'\nvolumes = '{0}/volumes'\n",
+                root.path().display()
+            ),
+        ).unwrap();
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_bun"));
+        command
+            .args(["--cluster", "--runtime", runtime, "--listen", "127.0.0.1:0"])
+            .arg("--config")
+            .arg(&config)
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(Duration::from_secs(10), command.output())
+            .await
+            .expect("unsupported rootless cluster must refuse promptly")
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success());
+        assert!(
+            stderr.contains("rootless runc clusters are unsupported in 0.1.0"),
+            "runtime={runtime}: {stderr}"
+        );
+        assert!(stderr.contains("without --cluster"));
+        assert!(stderr.contains("rootful Linux Runc"));
+        for path in [
+            "data/discovery",
+            "data/kernel-policy",
+            "data/instances/runc",
+        ] {
             assert!(
-                stderr.contains("rootless runc clusters are unsupported in 0.1.0"),
-                "runtime={runtime}, experimental={experimental}: {stderr}"
+                !root.path().join(path).exists(),
+                "unexpected ownership activation: {path}"
             );
-            assert!(stderr.contains("without --cluster"));
-            assert!(stderr.contains("rootful Linux Runc"));
-            for path in [
-                "data/discovery",
-                "data/kernel-policy",
-                "data/instances/runc",
-            ] {
-                assert!(
-                    !root.path().join(path).exists(),
-                    "unexpected ownership activation: {path}"
-                );
-            }
         }
     }
 }
@@ -63,12 +58,12 @@ fn runtime(root: &Path) -> RuncGrill {
         ImageStore::new(root.join("images")),
         true,
         root.join("state"),
+        if root.join("bun-wrapper").exists() {
+            root.join("bun-wrapper")
+        } else {
+            env!("CARGO_BIN_EXE_bun").into()
+        },
     )
-    .with_owner(if root.join("bun-wrapper").exists() {
-        root.join("bun-wrapper")
-    } else {
-        env!("CARGO_BIN_EXE_bun").into()
-    })
     .unwrap()
 }
 

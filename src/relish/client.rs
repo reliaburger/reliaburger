@@ -10,9 +10,7 @@ use futures_util::StreamExt;
 use rustls::pki_types::{CertificateDer, pem::PemObject};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-use crate::bun::agent::{
-    ApplyEvent, ApplyResult, ChaosState, CouncilStatus, InstanceStatus, NodeStatus,
-};
+use crate::bun::agent::{ApplyEvent, ApplyResult, CouncilStatus, InstanceStatus, NodeStatus};
 use crate::config::Config;
 
 use super::RelishError;
@@ -45,6 +43,16 @@ pub struct LogsExportOutcome {
     /// False when the files landed but the export checkpoint could not be
     /// persisted — a later export may re-ship the same files.
     pub checkpoint_saved: bool,
+}
+
+/// Print one event of a followed log stream: lines to stdout (after the
+/// client-side filters), warnings to stderr.
+fn print_followed_event(event: &crate::ketchup::sse::SseEvent, options: &LogOptions) {
+    if event.event.as_deref() == Some(crate::ketchup::sse::WARNING_EVENT) {
+        eprintln!("warning: {}", event.data);
+    } else if options.matches(&event.data) {
+        println!("{}", event.data);
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -409,6 +417,27 @@ impl BunClient {
             body: format!("node {} API endpoint is invalid: {error}", node.node_id),
         })?;
         Ok(self.with_base_url(&endpoint))
+    }
+
+    /// Address one node through this entry node's relay
+    /// (`/v1/nodes/{node}/relay/...`), with this client's credential.
+    ///
+    /// The entry node reaches its peers on the cluster network even when the
+    /// caller can't, as on a laptop behind Lima's user-mode network. The
+    /// relay forwards only the per-node reads `wtf` and `trace` need, and the
+    /// target repeats every check against the caller's own credential.
+    pub fn via_node(&self, node_id: &str) -> Result<Self, RelishError> {
+        let valid = !node_id.is_empty()
+            && node_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte));
+        if !valid {
+            return Err(RelishError::ApiError {
+                status: 0,
+                body: format!("node name {node_id:?} can't be used in a relay path"),
+            });
+        }
+        Ok(self.with_base_url(&format!("{}/v1/nodes/{node_id}/relay", self.base_url)))
     }
 
     /// Use another bearer credential with this connection's existing trust roots and forwards.
@@ -1091,6 +1120,32 @@ impl BunClient {
             .await
     }
 
+    /// Fetch one app's metrics from `start` (unix seconds) on, optionally
+    /// one metric by name and only the newest `per_series` samples of each
+    /// series. The node answering fans out to every node running the app.
+    pub async fn app_metrics_since(
+        &self,
+        app: &str,
+        namespace: &str,
+        name: Option<&str>,
+        start: u64,
+        per_series: Option<u32>,
+    ) -> Result<crate::mayo::rollup::MetricsQueryResult, RelishError> {
+        let mut query = url::form_urlencoded::Serializer::new(String::new());
+        query.append_pair("start", &start.to_string());
+        if let Some(name) = name {
+            query.append_pair("name", name);
+        }
+        if let Some(per_series) = per_series {
+            query.append_pair("per_series", &per_series.to_string());
+        }
+        self.get_typed_json(&format!(
+            "/v1/metrics/app/{app}/{namespace}?{}",
+            query.finish()
+        ))
+        .await
+    }
+
     async fn get_typed_json<T: serde::de::DeserializeOwned>(
         &self,
         path: &str,
@@ -1323,8 +1378,8 @@ impl BunClient {
         options: &LogOptions,
     ) -> Result<String, RelishError> {
         if options.follow {
-            // Follow mode uses the SSE endpoint (local only). The SSE
-            // path does not filter server-side, so filters apply here.
+            // Follow mode uses the SSE endpoint, which fans out across the
+            // cluster but does not filter server-side, so filters apply here.
             return self.logs_follow(app, namespace, options).await;
         }
 
@@ -1414,7 +1469,10 @@ impl BunClient {
         Ok(filtered.join("\n"))
     }
 
-    /// Follow logs via SSE stream (local node only).
+    /// Follow logs via the SSE stream. On a cluster the node follows every
+    /// node that runs the app and prefixes each line with `[node instance]`;
+    /// a node dropping out arrives as a warning on stderr and the stream
+    /// carries on.
     async fn logs_follow(
         &self,
         app: &str,
@@ -1440,34 +1498,15 @@ impl BunClient {
         }
 
         let mut stream = response.bytes_stream();
-        let mut buffer = Vec::new();
-
+        let mut decoder = crate::ketchup::sse::SseDecoder::default();
         while let Some(chunk) = stream.next().await {
             let bytes = chunk.map_err(classify_error)?;
-            buffer.extend_from_slice(&bytes);
-
-            while let Some(event_end) = buffer.windows(2).position(|pair| pair == b"\n\n") {
-                let event_text = String::from_utf8_lossy(&buffer[..event_end]).into_owned();
-                buffer.drain(..event_end + 2);
-
-                for line in event_text.lines() {
-                    if let Some(data) = line.strip_prefix("data:") {
-                        let data = data.trim();
-                        if options.matches(data) {
-                            println!("{data}");
-                        }
-                    }
-                }
+            for event in decoder.push(&bytes) {
+                print_followed_event(&event, options);
             }
         }
-
-        for line in String::from_utf8_lossy(&buffer).lines() {
-            if let Some(data) = line.strip_prefix("data:") {
-                let data = data.trim();
-                if options.matches(data) {
-                    println!("{data}");
-                }
-            }
+        if let Some(event) = decoder.finish() {
+            print_followed_event(&event, options);
         }
 
         Ok(String::new())
@@ -1580,88 +1619,6 @@ impl BunClient {
         })?;
 
         Ok(council)
-    }
-
-    /// Inject a network partition (chaos testing).
-    pub async fn inject_partition(
-        &self,
-        peers: &[String],
-        duration_secs: u64,
-        acknowledged: bool,
-    ) -> Result<crate::smoker::types::FaultSummary, RelishError> {
-        let url = format!("{}/v1/chaos/partition", self.base_url);
-        let response = self
-            .http()?
-            .post(&url)
-            .json(&serde_json::json!({
-                "peers": peers,
-                "duration_secs": duration_secs,
-                "acknowledged": acknowledged,
-            }))
-            .send()
-            .await
-            .map_err(classify_error)?;
-
-        let status = response.status().as_u16();
-        if !response.status().is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(RelishError::ApiError { status, body });
-        }
-
-        let json: serde_json::Value = response.json().await.map_err(|e| RelishError::ApiError {
-            status: 0,
-            body: format!("failed to parse response: {e}"),
-        })?;
-        serde_json::from_value(json["fault"].clone()).map_err(|error| RelishError::ApiError {
-            status: 0,
-            body: format!("partition response omitted its owned fault: {error}"),
-        })
-    }
-
-    /// Remove all network partitions (chaos testing).
-    pub async fn heal_partition(&self) -> Result<String, RelishError> {
-        let url = format!("{}/v1/chaos/heal", self.base_url);
-        let response = self
-            .http()?
-            .post(&url)
-            .send()
-            .await
-            .map_err(classify_error)?;
-
-        let status = response.status().as_u16();
-        if !response.status().is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(RelishError::ApiError { status, body });
-        }
-
-        let json: serde_json::Value = response.json().await.map_err(|e| RelishError::ApiError {
-            status: 0,
-            body: format!("failed to parse response: {e}"),
-        })?;
-        Ok(json["message"].as_str().unwrap_or("ok").to_string())
-    }
-
-    /// Query chaos status.
-    pub async fn chaos_status(&self) -> Result<ChaosState, RelishError> {
-        let url = format!("{}/v1/chaos/status", self.base_url);
-        let response = self
-            .http()?
-            .get(&url)
-            .send()
-            .await
-            .map_err(classify_error)?;
-
-        let status = response.status().as_u16();
-        if !response.status().is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(RelishError::ApiError { status, body });
-        }
-
-        let state: ChaosState = response.json().await.map_err(|e| RelishError::ApiError {
-            status: 0,
-            body: format!("failed to parse response: {e}"),
-        })?;
-        Ok(state)
     }
 
     /// Inject a fault (Smoker API).
@@ -1798,6 +1755,18 @@ impl BunClient {
             status: 0,
             body: format!("failed to parse response: {e}"),
         })
+    }
+
+    /// Every node's workloads with their latest CPU and memory samples.
+    pub async fn cluster_top(&self) -> Result<crate::bun::top::ClusterTop, RelishError> {
+        self.get_typed_json("/v1/top?cluster=true").await
+    }
+
+    /// List every node's active faults, each tagged with its node.
+    pub async fn list_cluster_faults(
+        &self,
+    ) -> Result<crate::bun::api::ClusterFaultList, RelishError> {
+        self.get_typed_json("/v1/fault?cluster=true").await
     }
 
     /// Resolve a service name to its VIP and backends.

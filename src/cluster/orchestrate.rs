@@ -34,6 +34,105 @@ use crate::reporting::aggregator::AggregatedState;
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
 const RECONCILE_IO_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The leader's latest reading of the endpoint withdrawal ledger, exported as
+/// Mayo metrics by Bun's collection loop. Followers report zero: only the
+/// leader judges the replicated ledger.
+#[derive(Debug, Default)]
+pub struct WithdrawalLedgerGauge {
+    occupancy_permille: std::sync::atomic::AtomicU64,
+    pending_generations: std::sync::atomic::AtomicU64,
+}
+
+impl WithdrawalLedgerGauge {
+    const fn new() -> Self {
+        Self {
+            occupancy_permille: std::sync::atomic::AtomicU64::new(0),
+            pending_generations: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Record the leader's view of the ledger.
+    pub fn record(&self, withdrawals: &crate::onion::withdrawal::EndpointWithdrawals) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let permille = (withdrawals.occupancy() * 1000.0).round() as u64;
+        self.occupancy_permille.store(permille, Relaxed);
+        self.pending_generations
+            .store(withdrawals.pending.len() as u64, Relaxed);
+    }
+
+    /// Forget the reading once this node stops leading.
+    pub fn clear(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.occupancy_permille.store(0, Relaxed);
+        self.pending_generations.store(0, Relaxed);
+    }
+
+    /// Samples for Mayo: occupancy as a 0–1 ratio of the tightest bound, and
+    /// the number of retained generations.
+    pub fn samples(&self) -> [(&'static str, f64); 2] {
+        use std::sync::atomic::Ordering::Relaxed;
+        [
+            (
+                "discovery_withdrawal_ledger_occupancy_ratio",
+                self.occupancy_permille.load(Relaxed) as f64 / 1000.0,
+            ),
+            (
+                "discovery_withdrawal_pending_generations",
+                self.pending_generations.load(Relaxed) as f64,
+            ),
+        ]
+    }
+}
+
+static WITHDRAWAL_LEDGER: WithdrawalLedgerGauge = WithdrawalLedgerGauge::new();
+
+/// The process-wide gauge the leader loop updates.
+pub fn withdrawal_ledger_gauge() -> &'static WithdrawalLedgerGauge {
+    &WITHDRAWAL_LEDGER
+}
+
+/// Ledger occupancy at which the leader starts warning. Publication itself
+/// only stops at 100%, so this leaves room to decommission a lost node.
+const WITHDRAWAL_BACKLOG_WARNING: f64 = 0.75;
+
+/// Readiness subsystem the leader degrades while the withdrawal ledger is
+/// close to refusing catalogue updates. It is informational: scheduling
+/// continues, but operators see which nodes owe receipts.
+pub const WITHDRAWAL_BACKLOG_SUBSYSTEM: &str = "discovery:withdrawal-backlog";
+
+/// Operator warning once the withdrawal ledger nears its bound, naming the
+/// consumers that owe receipts and whether gossip still sees them alive.
+pub(crate) fn withdrawal_backlog_warning(
+    withdrawals: &crate::onion::withdrawal::EndpointWithdrawals,
+    alive: &HashSet<&str>,
+) -> Option<String> {
+    let occupancy = withdrawals.occupancy();
+    if occupancy < WITHDRAWAL_BACKLOG_WARNING {
+        return None;
+    }
+    let mut owing: Vec<_> = withdrawals.owed_by_consumer().into_iter().collect();
+    // Most-owing first; a lost node usually owes every retained generation.
+    owing.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    let owing = owing
+        .iter()
+        .map(|(node, generations)| {
+            let state = if alive.contains(node) {
+                "alive"
+            } else {
+                "not alive"
+            };
+            format!("{node} ({generations} generations, {state})")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "endpoint withdrawal ledger is {:.0}% full; catalogue updates stop at 100%. \
+         Receipts owed by: {owing}. If a node is permanently gone, run \
+         `relish decommission-node <node> --workloads-stopped --reason <why>`",
+        occupancy * 100.0
+    ))
+}
+
 /// One app assigned to a node, as served by `/v1/placements/{node}`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeAssignment {
@@ -101,6 +200,7 @@ pub fn spawn_leader_scheduler(
     aggregated_rx: watch::Receiver<AggregatedState>,
     dns_required: bool,
     reconstruction_config: crate::config::node::ReconstructionSection,
+    readiness: Option<crate::bun::readiness::ReadinessTracker>,
     shutdown: CancellationToken,
 ) -> super::capacity::CapacityAdmission {
     use crate::reconstruction::controller::ReconstructionController;
@@ -110,6 +210,13 @@ pub fn spawn_leader_scheduler(
     tokio::spawn(async move {
         let mut reconstruction = ReconstructionController::new(reconstruction_config);
         let mut was_leader = false;
+        let mut backlog_warning: Option<String> = None;
+        if let Some(readiness) = &readiness {
+            readiness
+                .register(WITHDRAWAL_BACKLOG_SUBSYSTEM, false)
+                .await;
+            readiness.ready(WITHDRAWAL_BACKLOG_SUBSYSTEM).await;
+        }
         let mut tick = tokio::time::interval(RECONCILE_INTERVAL);
         loop {
             let capacity_request = tokio::select! {
@@ -132,6 +239,13 @@ pub fn spawn_leader_scheduler(
             }
             was_leader = is_leader;
             if !is_leader {
+                // Only the leader judges the replicated ledger.
+                withdrawal_ledger_gauge().clear();
+                if backlog_warning.take().is_some()
+                    && let Some(readiness) = &readiness
+                {
+                    readiness.ready(WITHDRAWAL_BACKLOG_SUBSYSTEM).await;
+                }
                 continue;
             }
 
@@ -146,6 +260,30 @@ pub fn spawn_leader_scheduler(
             });
             let reports = aggregated_rx.borrow().clone();
 
+            let alive_names: HashSet<&str> = members
+                .iter()
+                .filter(|member| member.state == NodeState::Alive)
+                .map(|member| member.node_id.0.as_str())
+                .collect();
+            withdrawal_ledger_gauge().record(&desired.endpoint_withdrawals);
+            let warning = withdrawal_backlog_warning(&desired.endpoint_withdrawals, &alive_names);
+            if warning != backlog_warning {
+                if let Some(readiness) = &readiness {
+                    match &warning {
+                        Some(message) => {
+                            readiness
+                                .degraded(WITHDRAWAL_BACKLOG_SUBSYSTEM, message.clone())
+                                .await
+                        }
+                        None => readiness.ready(WITHDRAWAL_BACKLOG_SUBSYSTEM).await,
+                    }
+                }
+                if let Some(message) = &warning {
+                    eprintln!("scheduler: {message}");
+                }
+                backlog_warning = warning;
+            }
+
             // Publish the cluster endpoint catalogue every tick the backends
             // change (12b.4). This runs before the learning-period gate below:
             // cross-node resolution shouldn't wait for a fresh leader to finish
@@ -158,8 +296,18 @@ pub fn spawn_leader_scheduler(
                     None
                 }
             };
+            // The state machine plans with these exact inputs, so a full
+            // ledger would only commit another refusal every tick.
             if let Some(catalog) = catalog
                 && desired.endpoint_catalog != catalog
+                && !matches!(
+                    desired.endpoint_withdrawals.plan_publication(
+                        &desired.endpoint_catalog,
+                        &catalog,
+                        &desired.endpoint_consumers,
+                    ),
+                    Err(crate::onion::withdrawal::WithdrawalError::CapacityReached)
+                )
             {
                 match council
                     .write(RaftRequest::PublishEndpoints {
@@ -402,22 +550,14 @@ fn plan_scheduling_pass_with_dns(
         } else {
             effective_replicas(spec, override_replicas, alive.len())
         };
-        let requires_egress = spec.egress.as_ref().is_some_and(|e| !e.allow.is_empty());
         let converged = desired
             .scheduling
             .get(app_id)
             .map(|placements| {
                 placements.len() == want
-                    && placements.iter().all(|p| {
-                        alive.contains(&p.node_id)
-                            && cache.get_node(&p.node_id).is_some_and(|node| {
-                                node.ready
-                                    && (!requires_egress
-                                        || node.capabilities.egress.can_enforce_allowlist())
-                                    && (!dns_required
-                                        || node.capabilities.dns.can_resolve_internal())
-                            })
-                    })
+                    && placements
+                        .iter()
+                        .all(|p| placement_holds(p, spec, cache, alive, dns_required))
             })
             .unwrap_or(false);
         planned.push((app_id, spec, override_replicas, want, converged));
@@ -466,6 +606,36 @@ fn plan_scheduling_pass_with_dns(
         if let Some(n) = override_replicas {
             effective_spec.replicas = Replicas::Fixed(n);
         }
+        // A fixed-size app keeps the placements that still hold and only
+        // places the rest. Losing one node of three must not move the
+        // replicas on the other two: they're serving, and replacing them
+        // would restart them for nothing.
+        let kept: Vec<crate::meat::types::Placement> = match effective_spec.replicas {
+            Replicas::Fixed(_) => desired
+                .scheduling
+                .get(app_id)
+                .map(|placements| {
+                    placements
+                        .iter()
+                        .filter(|p| placement_holds(p, spec, cache, alive, dns_required))
+                        .take(want)
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default(),
+            Replicas::DaemonSet => Vec::new(),
+        };
+        if !kept.is_empty() {
+            let missing = want - kept.len();
+            if missing == 0 {
+                decisions.push(crate::meat::types::SchedulingDecision {
+                    app_id: app_id.clone(),
+                    placements: kept,
+                });
+                continue;
+            }
+            effective_spec.replicas = Replicas::Fixed(missing as u32);
+        }
         // The scheduler owns its cache, so hand it the shared one and take
         // it back afterwards (Rust move semantics — no shared &mut alias).
         // Snapshot first: a partially-placed fixed-replica app reserves some
@@ -478,8 +648,12 @@ fn plan_scheduling_pass_with_dns(
         let mut scheduler = Scheduler::new(std::mem::take(cache)).with_dns_required(dns_required);
         let result = scheduler.schedule_app(app_id, &effective_spec);
         match result {
-            Ok(decision) => {
+            Ok(mut decision) => {
                 *cache = scheduler.cluster;
+                if !kept.is_empty() {
+                    let added = std::mem::take(&mut decision.placements);
+                    decision.placements = kept.into_iter().chain(added).collect();
+                }
                 decisions.push(decision);
             }
             Err(e) => {
@@ -489,6 +663,34 @@ fn plan_scheduling_pass_with_dns(
         }
     }
     decisions
+}
+
+/// Whether an existing placement can stay where it is: its node is alive and
+/// ready and can enforce what the spec needs.
+///
+/// A live node that hasn't reported to this leader yet keeps its placements.
+/// A new leader hears from nodes over several seconds, and a node whose
+/// report went to a council member that just died can take longer still;
+/// "not heard from yet" is not evidence of trouble, and moving its replicas
+/// would restart healthy workloads. A node that reported and went stale, or
+/// reported not ready, does lose them.
+fn placement_holds(
+    placement: &crate::meat::types::Placement,
+    spec: &AppSpec,
+    cache: &ClusterStateCache,
+    alive: &HashSet<NodeId>,
+    dns_required: bool,
+) -> bool {
+    if !alive.contains(&placement.node_id) {
+        return false;
+    }
+    let Some(node) = cache.get_node(&placement.node_id) else {
+        return true;
+    };
+    let requires_egress = spec.egress.as_ref().is_some_and(|e| !e.allow.is_empty());
+    node.ready
+        && (!requires_egress || node.capabilities.egress.can_enforce_allowlist())
+        && (!dns_required || node.capabilities.dns.can_resolve_internal())
 }
 
 /// The number of nodes a daemon set of `spec` can currently be placed on
@@ -796,7 +998,7 @@ fn build_cluster_cache(
         let usage = &report.resource_usage;
         let capability_report = reports.capabilities.get(&member.node_id);
         if usage.cpu_total_millicores == 0 {
-            continue; // pre-capacity node (or capacity unset)
+            continue; // capacity unset
         }
 
         let running_apps = report
@@ -902,6 +1104,7 @@ async fn poll_consumer(
     shutdown: &CancellationToken,
     cluster_http: &crate::cluster::ClusterHttp,
     receipt_cursor: &mut usize,
+    io_timeout: Duration,
 ) -> Option<(String, NodeAssignments)> {
     let client = cluster_http.client();
     let leader_url = {
@@ -930,7 +1133,7 @@ async fn poll_consumer(
     };
     let polled = tokio::select! {
         _ = shutdown.cancelled() => return None,
-        result = tokio::time::timeout(RECONCILE_IO_TIMEOUT, poll) => result,
+        result = tokio::time::timeout(io_timeout, poll) => result,
     };
     let assignments = match polled {
         Ok(Ok(assignments)) => assignments,
@@ -957,7 +1160,7 @@ async fn poll_consumer(
     };
     let synchronised = tokio::select! {
         _ = shutdown.cancelled() => return None,
-        result = tokio::time::timeout(RECONCILE_IO_TIMEOUT, sync_catalogue) => result,
+        result = tokio::time::timeout(io_timeout, sync_catalogue) => result,
     };
     let update = match synchronised {
         Ok(Ok(update)) => update,
@@ -1028,6 +1231,36 @@ pub fn spawn_placement_reconciler(
     // for ephemeral embedded tests and cannot provide restart recovery.
     state_dir: Option<std::path::PathBuf>,
 ) -> tokio::task::JoinHandle<()> {
+    spawn_placement_reconciler_with_io_timeout(
+        node_name,
+        metrics_rx,
+        directory_rx,
+        raft_to_api_offset,
+        service_token,
+        cmd_tx,
+        shutdown,
+        cluster_http,
+        state_dir,
+        RECONCILE_IO_TIMEOUT,
+    )
+}
+
+/// [`spawn_placement_reconciler`] with an explicit deadline for each leader
+/// request and agent reply, so tests of a stalled peer need not wait out
+/// the production [`RECONCILE_IO_TIMEOUT`].
+#[allow(clippy::too_many_arguments)]
+fn spawn_placement_reconciler_with_io_timeout(
+    node_name: String,
+    metrics_rx: watch::Receiver<openraft::RaftMetrics<u64, CouncilNodeInfo>>,
+    directory_rx: watch::Receiver<crate::mustard::directory::NodeDirectory>,
+    raft_to_api_offset: i32,
+    service_token: Option<String>,
+    cmd_tx: mpsc::Sender<AgentCommand>,
+    shutdown: CancellationToken,
+    cluster_http: crate::cluster::ClusterHttp,
+    state_dir: Option<std::path::PathBuf>,
+    io_timeout: Duration,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let client = cluster_http.client().clone();
         let mut tick = tokio::time::interval(RECONCILE_INTERVAL);
@@ -1095,6 +1328,7 @@ pub fn spawn_placement_reconciler(
                 &shutdown,
                 &cluster_http,
                 &mut receipt_cursor,
+                io_timeout,
             )
             .await
             else {
@@ -1134,34 +1368,40 @@ pub fn spawn_placement_reconciler(
                 });
                 let queued = tokio::select! {
                     _ = shutdown.cancelled() => return,
-                    result = tokio::time::timeout(RECONCILE_IO_TIMEOUT, deploy) => result,
+                    result = tokio::time::timeout(io_timeout, deploy) => result,
                 };
                 if !matches!(queued, Ok(Ok(()))) {
                     continue;
                 }
-                let terminal = deploy_succeeded(event_rx, DEPLOY_TERMINAL_TIMEOUT);
+                let terminal = deploy_outcome(event_rx, DEPLOY_TERMINAL_TIMEOUT);
                 tokio::pin!(terminal);
-                let succeeded = loop {
+                let outcome = loop {
                     tokio::select! {
-                            _ = shutdown.cancelled() => return,
-                            result = &mut terminal => break result,
-                            _ = tick.tick() => {
-                                // The producer can need our own withdrawal receipt before
-                                // it can emit the terminal deployment event.
-                                let _ = poll_consumer(
-                        &node_name, &metrics_rx, &directory_rx, raft_to_api_offset,
-                        &service_token, &cmd_tx, &shutdown, &cluster_http, &mut receipt_cursor,
-                    ).await;
-                            }
+                        _ = shutdown.cancelled() => return,
+                        result = &mut terminal => break result,
+                        _ = tick.tick() => {
+                            // The producer can need our own withdrawal receipt before
+                            // it can emit the terminal deployment event.
+                            let _ = poll_consumer(
+                                &node_name, &metrics_rx, &directory_rx, raft_to_api_offset,
+                                &service_token, &cmd_tx, &shutdown, &cluster_http,
+                                &mut receipt_cursor, io_timeout,
+                            ).await;
                         }
-                };
-                if succeeded {
-                    let mut next = applied.clone();
-                    next.insert(key, AssignmentState::Applied { fingerprint });
-                    match persist_placements(checkpoint_path.as_deref(), &next).await {
-                        Ok(()) => applied = next,
-                        Err(error) => eprintln!("orchestrator: cannot record convergence: {error}"),
                     }
+                };
+                if let Err(error) = outcome {
+                    eprintln!(
+                        "orchestrator: deploy of {}/{} failed, will retry: {error}",
+                        key.0, key.1
+                    );
+                    continue;
+                }
+                let mut next = applied.clone();
+                next.insert(key, AssignmentState::Applied { fingerprint });
+                match persist_placements(checkpoint_path.as_deref(), &next).await {
+                    Ok(()) => applied = next,
+                    Err(error) => eprintln!("orchestrator: cannot record convergence: {error}"),
                 }
             }
 
@@ -1209,7 +1449,7 @@ pub fn spawn_placement_reconciler(
                 };
                 let retired = tokio::select! {
                     _ = shutdown.cancelled() => return,
-                    result = tokio::time::timeout(RECONCILE_IO_TIMEOUT, retire) => result,
+                    result = tokio::time::timeout(io_timeout, retire) => result,
                 };
                 match retired {
                     Ok(Ok(Ok(()))) => {
@@ -1231,7 +1471,7 @@ pub fn spawn_placement_reconciler(
                             }
                             let acknowledged = tokio::select! {
                                 _ = shutdown.cancelled() => return,
-                                result = tokio::time::timeout(RECONCILE_IO_TIMEOUT, request.send()) => result,
+                                result = tokio::time::timeout(io_timeout, request.send()) => result,
                             };
                             if !matches!(acknowledged, Ok(Ok(ref response)) if response.status() == reqwest::StatusCode::NO_CONTENT)
                             {
@@ -1270,34 +1510,41 @@ pub fn spawn_placement_reconciler(
 /// the placement is treated as not-yet-applied and retried next tick.
 const DEPLOY_TERMINAL_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Drain a deploy's event stream and report whether it reached `Complete`
-/// within `timeout`.
+/// Why a deploy the reconciler handed to the agent did not converge.
+#[derive(Debug, thiserror::Error)]
+enum DeployWaitError {
+    /// The agent reported the deploy failed, with its reason.
+    #[error("{0}")]
+    Failed(String),
+    /// The agent dropped the event stream without a terminal event.
+    #[error("the agent closed the deploy's event stream without an outcome")]
+    Closed,
+    /// No terminal event arrived in time.
+    #[error("the deploy did not reach a terminal event within {}s", .0.as_secs())]
+    TimedOut(Duration),
+}
+
+/// Drain a deploy's event stream until it reaches `Complete` within `timeout`.
 ///
-/// Returns `false` if the deploy emitted `Error`, the channel closed without a
-/// terminal event (the agent dropped it), or `timeout` elapsed first — in every
-/// case the caller leaves the placement unapplied and retries next tick.
-async fn deploy_succeeded(mut events: mpsc::Receiver<ApplyEvent>, timeout: Duration) -> bool {
+/// Every error leaves the placement unapplied, so the caller retries it next
+/// tick. `Failed` carries the agent's own message, so the caller can say why.
+async fn deploy_outcome(
+    mut events: mpsc::Receiver<ApplyEvent>,
+    timeout: Duration,
+) -> Result<(), DeployWaitError> {
     let drain = async {
         while let Some(event) = events.recv().await {
             match event {
-                ApplyEvent::Complete { .. } => return true,
-                ApplyEvent::Error { .. } => return false,
+                ApplyEvent::Complete { .. } => return Ok(()),
+                ApplyEvent::Error { message } => return Err(DeployWaitError::Failed(message)),
                 _ => {}
             }
         }
-        false
+        Err(DeployWaitError::Closed)
     };
-    match tokio::time::timeout(timeout, drain).await {
-        Ok(result) => result,
-        Err(_) => {
-            eprintln!(
-                "reconciler: deploy did not reach a terminal event within {}s; \
-                 leaving it unapplied and retrying next tick",
-                timeout.as_secs()
-            );
-            false
-        }
-    }
+    tokio::time::timeout(timeout, drain)
+        .await
+        .unwrap_or(Err(DeployWaitError::TimedOut(timeout)))
 }
 
 #[cfg(test)]
@@ -1306,6 +1553,63 @@ mod tests {
     use crate::reporting::types::{ResourceUsage, StateReport};
     use std::collections::HashMap;
     use std::time::{Instant, SystemTime};
+
+    fn withdrawals_owed_by(
+        consumers: &[&str],
+        generations: u64,
+    ) -> crate::onion::withdrawal::EndpointWithdrawals {
+        use crate::onion::withdrawal::{EndpointWithdrawal, EndpointWithdrawals};
+        EndpointWithdrawals {
+            generation: generations + 1,
+            pending: (1..=generations)
+                .map(|generation| {
+                    (
+                        generation,
+                        EndpointWithdrawal {
+                            services: Default::default(),
+                            consumers: consumers.iter().map(|c| c.to_string()).collect(),
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn withdrawal_ledger_gauge_exports_the_leader_reading() {
+        let gauge = WithdrawalLedgerGauge::default();
+        gauge.record(&withdrawals_owed_by(&["lost"], 512));
+        assert_eq!(
+            gauge.samples(),
+            [
+                ("discovery_withdrawal_ledger_occupancy_ratio", 0.5),
+                ("discovery_withdrawal_pending_generations", 512.0),
+            ]
+        );
+        gauge.clear();
+        assert_eq!(gauge.samples()[0].1, 0.0);
+    }
+
+    #[test]
+    fn withdrawal_backlog_is_quiet_below_three_quarters() {
+        let withdrawals = withdrawals_owed_by(&["lost"], 700);
+        assert!(withdrawal_backlog_warning(&withdrawals, &HashSet::new()).is_none());
+    }
+
+    #[test]
+    fn withdrawal_backlog_names_the_node_that_owes_receipts() {
+        let mut withdrawals = withdrawals_owed_by(&["lost", "worker"], 800);
+        for withdrawal in withdrawals.pending.values_mut().skip(10) {
+            withdrawal.consumers.remove("worker");
+        }
+        let warning = withdrawal_backlog_warning(&withdrawals, &HashSet::from(["worker"])).unwrap();
+        assert!(warning.contains("78% full"), "{warning}");
+        assert!(
+            warning.contains("lost (800 generations, not alive), worker (10 generations, alive)"),
+            "{warning}"
+        );
+        assert!(warning.contains("relish decommission-node"), "{warning}");
+    }
 
     fn reconciler_for_deadline_test(
         address: std::net::SocketAddr,
@@ -1322,7 +1626,11 @@ mod tests {
             }),
             ..Default::default()
         });
-        spawn_placement_reconciler(
+        // Every stall these tests inject is permanent, so a shorter deadline
+        // proves the same bound without waiting out the production ten
+        // seconds. Two seconds still leaves a loaded runner's local round
+        // trips well inside it; a spurious expiry only retries next tick.
+        spawn_placement_reconciler_with_io_timeout(
             "worker".into(),
             metrics_rx,
             directory_rx,
@@ -1332,6 +1640,7 @@ mod tests {
             CancellationToken::new(),
             crate::cluster::ClusterHttp::plaintext(),
             Some(directory.to_path_buf()),
+            Duration::from_secs(2),
         )
     }
 
@@ -2042,7 +2351,7 @@ image = "busybox:latest"
     // -- M14: reconciler deploy-wait timeout ---------------------------------
 
     #[tokio::test]
-    async fn deploy_succeeded_returns_true_on_complete() {
+    async fn deploy_outcome_is_ok_on_complete() {
         let (tx, rx) = mpsc::channel(4);
         tx.send(ApplyEvent::Complete {
             created: 1,
@@ -2050,30 +2359,56 @@ image = "busybox:latest"
         })
         .await
         .unwrap();
-        assert!(deploy_succeeded(rx, Duration::from_secs(5)).await);
+        assert!(deploy_outcome(rx, Duration::from_secs(5)).await.is_ok());
     }
 
     #[tokio::test]
-    async fn deploy_succeeded_returns_false_on_error() {
+    async fn deploy_outcome_carries_the_agents_error_message() {
         let (tx, rx) = mpsc::channel(4);
+        let message = "init container 0 failed for instance default__web-0: \
+                       exited with code 1: runc run failed: container's cgroup is not empty";
         tx.send(ApplyEvent::Error {
-            message: "boom".to_string(),
+            message: message.to_string(),
         })
         .await
         .unwrap();
-        assert!(!deploy_succeeded(rx, Duration::from_secs(5)).await);
+        let error = deploy_outcome(rx, Duration::from_secs(5))
+            .await
+            .expect_err("an Error event must fail the deploy");
+        assert!(
+            matches!(&error, DeployWaitError::Failed(reason) if reason == message),
+            "the agent's reason was dropped: {error:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("container's cgroup is not empty")
+        );
     }
 
     #[tokio::test]
-    async fn deploy_succeeded_times_out_on_a_hung_deploy() {
+    async fn deploy_outcome_reports_a_closed_stream() {
+        let (tx, rx) = mpsc::channel::<ApplyEvent>(4);
+        drop(tx);
+        assert!(matches!(
+            deploy_outcome(rx, Duration::from_secs(5)).await,
+            Err(DeployWaitError::Closed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn deploy_outcome_times_out_on_a_hung_deploy() {
         // The sender is held open and never emits a terminal event — modelling
         // a stuck image pull / hung runtime. Without the timeout this would
         // wedge the reconcile tick forever; with it, the deploy is treated as
         // not-applied so the tick returns and retries.
         let (tx, rx) = mpsc::channel::<ApplyEvent>(4);
         let started = Instant::now();
-        let result = deploy_succeeded(rx, Duration::from_millis(100)).await;
-        assert!(!result, "a hung deploy must time out to `false`, not block");
+        let result = deploy_outcome(rx, Duration::from_millis(100)).await;
+        assert!(
+            matches!(result, Err(DeployWaitError::TimedOut(_))),
+            "a hung deploy must time out, not block: {result:?}"
+        );
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "it must not block"
@@ -2585,6 +2920,99 @@ image = "busybox:latest"
             "second app must not double-book: {decisions:?}"
         );
         assert_eq!(decisions[0].app_id, a);
+    }
+
+    fn placed_on(names: &[&str]) -> Vec<crate::meat::types::Placement> {
+        names
+            .iter()
+            .map(|name| crate::meat::types::Placement {
+                node_id: NodeId::new(*name),
+                resources: Resources::new(100, 0, 0),
+            })
+            .collect()
+    }
+
+    fn nodes_of(decision: &crate::meat::types::SchedulingDecision) -> Vec<&str> {
+        decision
+            .placements
+            .iter()
+            .map(|p| p.node_id.0.as_str())
+            .collect()
+    }
+
+    /// Z6.7: stopping one laptop node moved all three frontends onto a single
+    /// survivor, restarting the two that were serving fine.
+    #[test]
+    fn losing_a_node_replaces_only_its_replicas() {
+        let app = AppId::new("frontend", "default");
+        let mut desired = DesiredState::default();
+        desired.apps.insert(app.clone(), app_spec(100, 3));
+        desired
+            .scheduling
+            .insert(app.clone(), placed_on(&["n1", "n2", "n3"]));
+        let mut cache = ClusterStateCache::new();
+        cache.set_node(sched_node("n1", 4000, BTreeMap::new()));
+        cache.set_node(sched_node("n2", 4000, BTreeMap::new()));
+        let alive = HashSet::from([NodeId::new("n1"), NodeId::new("n2")]);
+
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+
+        assert_eq!(decisions.len(), 1);
+        let nodes = nodes_of(&decisions[0]);
+        assert_eq!(nodes.len(), 3);
+        assert_eq!(nodes[..2], ["n1", "n2"], "survivors keep their replicas");
+        assert!(["n1", "n2"].contains(&nodes[2]), "{nodes:?}");
+    }
+
+    /// A new leader that hasn't heard from a live node yet leaves that
+    /// node's replicas alone.
+    #[test]
+    fn a_live_node_that_has_not_reported_yet_keeps_its_replicas() {
+        let app = AppId::new("frontend", "default");
+        let mut desired = DesiredState::default();
+        desired.apps.insert(app.clone(), app_spec(100, 3));
+        desired
+            .scheduling
+            .insert(app.clone(), placed_on(&["n1", "n2", "n3"]));
+        let mut cache = ClusterStateCache::new();
+        cache.set_node(sched_node("n1", 4000, BTreeMap::new()));
+        let alive = HashSet::from([NodeId::new("n1"), NodeId::new("n2")]);
+
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+
+        assert_eq!(nodes_of(&decisions[0]), ["n1", "n2", "n1"]);
+
+        // Reporting not ready is evidence; that node's replica moves.
+        let mut cache = ClusterStateCache::new();
+        cache.set_node(sched_node("n1", 4000, BTreeMap::new()));
+        let mut unready = sched_node("n2", 4000, BTreeMap::new());
+        unready.ready = false;
+        cache.set_node(unready);
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+        assert_eq!(nodes_of(&decisions[0]), ["n1", "n1", "n1"]);
+    }
+
+    #[test]
+    fn scaling_down_keeps_the_first_placements() {
+        let app = AppId::new("frontend", "default");
+        let mut desired = DesiredState::default();
+        desired.apps.insert(app.clone(), app_spec(100, 2));
+        desired
+            .scheduling
+            .insert(app.clone(), placed_on(&["n1", "n2", "n3"]));
+        let mut cache = ClusterStateCache::new();
+        for name in ["n1", "n2", "n3"] {
+            cache.set_node(sched_node(name, 4000, BTreeMap::new()));
+        }
+        let alive = HashSet::from([NodeId::new("n1"), NodeId::new("n2"), NodeId::new("n3")]);
+
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+
+        assert_eq!(nodes_of(&decisions[0]), ["n1", "n2"]);
     }
 
     /// A cordoned (upgrade) node receives nothing.

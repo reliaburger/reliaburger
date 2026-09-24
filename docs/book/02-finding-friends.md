@@ -187,6 +187,8 @@ Three rules:
 
 Rule 2 is important. If two updates arrive with the same incarnation — say, one marking a node Suspect and one marking it Alive — the Suspect update wins. This biases the protocol towards detecting failures rather than missing them. A false positive (marking a healthy node as suspect) is recoverable: the node just bumps its incarnation. A false negative (thinking a dead node is alive) isn't.
 
+Incarnation and state are the whole conflict rule. Membership updates used to carry a `lamport` field too, which the code incremented locally but never merged from a received message or consulted when resolving a conflict. A counter that nobody compares isn't a Lamport clock, it's a misleading name, so we deleted it.
+
 ### The membership table
 
 Each node maintains a local copy of every known member's state:
@@ -268,7 +270,7 @@ The threshold that remains isn't a ceiling on what we keep, only a trigger for *
 
 Two things worth taking from this. First: when you bound a queue, ask what the data's own structure says the bound should be before reaching for a number. Constants encode an assumption about scale, and assumptions about scale are wrong at the edges — which is where scale problems live.
 
-Second, and more uncomfortable: the unit tests passed. Of course they did, we wrote them to check the cap held, and it held beautifully. The test that caught this drives ten thousand real members through a real protocol state machine, and it's `#[ignore]`d because it takes minutes — so `make test` skips it and `make bench-10k` runs it in CI. A local run that skips the expensive tests is a *fast* signal, not a complete one, and it's worth knowing which of your gates you've actually passed before you push.
+Second, and more uncomfortable: the unit tests passed. Of course they did, we wrote them to check the cap held, and it held beautifully. The test that caught this drives ten thousand real members through a real protocol state machine, and for a long time we `#[ignore]`d it on the assumption that it took minutes, then paid for a 21-minute release build in CI to run it. When we finally timed it, it took about a second in a debug build. It's now an ordinary test in `make test`. Measure before you assume a test is expensive. A local run that skips the expensive tests is a *fast* signal, not a complete one, and it's worth knowing which of your gates you've actually passed before you push.
 
 ### Message types
 
@@ -548,6 +550,12 @@ This means there's a minimum rejoin delay of `cleanup_timeout` (60 seconds). In 
 
 If you absolutely need faster rejoins (testing, development), reduce `cleanup_timeout`. The only constraint is that it must be long enough for the Left update to propagate to all nodes — at least a few seconds for any reasonable cluster size.
 
+### Finding the way home without a seed list
+
+Reaping has a nasty corner. The first node in a cluster starts with no seeds; the others find it, and gossip teaches it their addresses. Now cut that first node off from everyone for longer than the cleanup timeout. It marks every peer dead and reaps them. When the network comes back, it has an empty membership table and an empty seed list, and nobody is probing it either. We found this while testing node-fault expiry: the fault lifted cleanly, but the node had forgotten its way home.
+
+So Mustard remembers up to sixteen peers it has talked to directly, separately from live membership, and each cycle probes one of them if it's missing or not alive. A graceful `Left` removes the contact. On the far side, the peer may still hold the returning node as `Dead` long after the piggyback queue stopped repeating that claim, so a direct ping or ack now carries any non-alive claim about its recipient. The recipient refutes it with a higher incarnation, the normal way; we never flip `Dead` back to `Alive` just because a datagram arrived.
+
 ### Testing convergence
 
 The most satisfying test: five nodes arranged in a ring, where each only knows its immediate neighbour. Can gossip propagate membership information to every node?
@@ -590,7 +598,7 @@ The fix: don't spawn concurrent tasks. Drive the protocol manually from the test
 async fn gossip_convergence_five_nodes() {
     // ...setup 5 nodes in a ring...
 
-    for _ in 0..50 {
+    for _ in 0..100 {
         // Phase 1: each node sends a PING to a random peer
         for node in &mut nodes {
             if let Some((_, target_addr)) = node.pick_probe_target() {
@@ -618,7 +626,33 @@ async fn gossip_convergence_five_nodes() {
 
 Each round, every node sends one PING, then we drain all inboxes twice: first to process PINGs (which generate ACKs), then to process ACKs (which apply piggybacked updates). No timers, no spawned tasks, no flakiness. The `try_recv()` method returns immediately if the channel is empty, so no clock manipulation is needed at all.
 
-Why 50 rounds? Because gossip propagation depends on random target selection, and with a ring topology each node initially knows only one peer. Information has to hop through intermediaries. The minimum broadcast count of 3 ensures updates survive long enough during early cluster formation when the cluster is small, but random target selection means some rounds are "wasted" pinging a node that already knows the update. 50 rounds gives enough margin for even the unluckiest random sequences.
+Why a round cap at all? Because gossip propagation depends on random target selection, and with a ring topology each node initially knows only one peer. Information has to hop through intermediaries, and random target selection means some rounds are "wasted" pinging a node that already knows the update. We started with 50 rounds, later raised it to 100, and believed that was enough margin for even the unluckiest sequence.
+
+It wasn't. In one full-suite run the test finished with one node seeing four members instead of five. More rounds would not have helped, and that's the interesting part. We ran twenty thousand unseeded schedules and about one in 1,300 got stuck for good: every update about some member spent its bounded re-broadcasts before reaching one particular node, every dissemination queue drained, and from then on the PINGs carried nothing new. Nothing in Mustard resynchronises full membership (the push-pull sync that production SWIM implementations such as HashiCorp's memberlist add on top), so a stranded node stays stranded until something changes. That's a property of the protocol, not of the test, and the fix belongs in Mustard rather than in a longer test.
+
+So the test now replays fixed schedules. Each `MustardNode` owns its random number generator instead of reaching for `rand::thread_rng()` on every probe:
+
+```rust
+use rand::SeedableRng;
+use rand::rngs::StdRng;
+
+pub struct MustardNode<T: MustardTransport> {
+    // ...
+    rng: StdRng,
+}
+
+// in MustardNode::new
+rng: StdRng::from_entropy(),
+
+#[cfg(test)]
+fn seed_rng(&mut self, seed: u64) {
+    self.rng = StdRng::seed_from_u64(seed);
+}
+```
+
+`StdRng::from_entropy()` seeds from the operating system, so production behaves exactly as before. `seed_from_u64` comes from the `SeedableRng` trait, and here's a Rust rule that surprises Go and Python programmers: a trait's methods are only callable when the trait is in scope. Without `use rand::SeedableRng;` the compiler reports that `StdRng` has no function called `seed_from_u64`, even though the type implements it. The `#[cfg(test)]` attribute compiles `seed_rng` only into test builds, so the seam doesn't leak into the public API.
+
+A seed alone wasn't enough. The membership table is a `HashMap`, and Rust's `HashMap` randomises its hashing per instance to resist denial-of-service attacks, so the candidate list came out in a different order every run. The same random index then picked a different peer. `pick_probe_target()` now sorts candidates by node ID before choosing. The choice is still uniform; it just depends only on the generator. The test drives sixteen seeds and asserts that every one converges, typically within two to four rounds.
 
 The test passes because of the dissemination mechanism. When n0 pings n1, n1 learns about n0 and enqueues a dissemination update. When n1 later pings n2, that update piggybacks on the PING. n2 receives it, re-enqueues it for further dissemination, and the ripple continues. The `MembershipUpdate` struct carries the node's address alongside its state, so nodes discovered via gossip (not direct contact) know how to reach each other.
 
@@ -679,7 +713,7 @@ the protocol rather than rebuilding and sorting every membership snapshot on eve
 What about 10,000 nodes? A real cluster distributes one 10,000-entry table to each machine.
 Putting all 10,000 tables in one test process creates 100 million membership records and
 asks one hosted runner to impersonate a datacentre. We tried it. It couldn't finish inside
-90 minutes. `make bench-10k` therefore checks the real per-node contract: one Mustard node
+90 minutes. `tests/gossip_10k.rs` therefore checks the real per-node contract: one Mustard node
 learns 10,000 members through fixed-size messages, selects a probe target and makes every
 update available in bounded dissemination batches. Full multi-node convergence remains
 covered at 1,000 nodes. Different tests, different claims. Much less hand-waving.
@@ -862,7 +896,7 @@ fn persist_snapshot(db: &Database, data: &[u8], index: u64) -> Result<(), redb::
 
 All four keys land in one write transaction, so they're always coherent: there is no window where the payload is new but the checksum is old. On load, the rules are strict. A checksum mismatch is a hard error naming both sums. A version we don't recognise is a hard error naming both versions. No cleverness, no "best effort". The operator gets told exactly what's wrong and the node refuses to start.
 
-One case gets gentler treatment. A snapshot written before the envelope existed has neither a version nor a checksum key. That's not corruption, it's history — every cluster that predates this change has one. So a missing envelope loads as legacy (with a warning in the logs), and the next snapshot rewrites the store in the enveloped format. A fixture test pins this: it plants a raw pre-envelope blob exactly as an old binary wrote it and asserts it still loads. Backwards compatibility isn't a nice-to-have here; without it, upgrading a node would look exactly like the corruption we're trying to detect.
+A store with a payload but no version key gets no special treatment either. We refuse it and leave the bytes where they are, so an operator can still recover them with a binary that understands them. A fixture test plants exactly that blob and checks both halves: the error, and the untouched payload.
 
 Why SHA-256 rather than a cheaper CRC? Because `sha2` was already in the dependency tree and snapshots are written rarely (every few thousand log entries). Spending a millisecond hashing at snapshot time to make on-disk corruption *provable* at startup is a good trade. We're not defending against an attacker here, just against disks and torn writes, so no key, no signature — that's Chapter 10's problem.
 
@@ -1375,7 +1409,7 @@ pub enum ReportHealthStatus {
 }
 ```
 
-The wire type has an `event_log` for future event reporting, but the agent currently sends it empty (F06). Protocol generation 3 refuses reports containing more than 100 events rather than truncating them. `max_events_per_report` must remain 100; other values fail configuration validation. The transport also checks the complete encoded size against its 1 MiB limit before allocating a payload.
+The wire type has an `event_log` for event reporting, but the agent doesn't fill it yet, so it travels empty. The receiver refuses a report with more than 100 events rather than truncating it, and `max_events_per_report` only accepts 100 until something produces events. The sender also checks the complete encoded size against a 1 MiB limit before it allocates a buffer (Chapter 11 has the details).
 
 ### The transport trait
 
@@ -1503,11 +1537,11 @@ The leader hint is the interesting part. Only the actual leader *originates* a h
 
 On the receiving side, every node folds extensions into a `NodeDirectory` — a map of node to endpoints plus the best hint — and publishes it on a `watch` channel. The reporting worker's leader-target maintainer and the placement reconciler now resolve the leader through one shared function: Raft metrics stay authoritative when they know a leader (voters, same term or newer), and the gossip directory answers for everyone else. A worker outside the council learns the leader from its very first gossip exchange with anyone who knows.
 
-### Old peers must keep gossiping
+### Keeping the extension out of the message body
 
-Now, the wire problem. Gossip messages are bincode, and bincode is positional — no field names, no tags, just bytes in struct order. Add a field to `GossipMessage` and an old binary misparses every datagram a new binary sends. `#[serde(default)]`, the usual "tolerate missing fields" tool, is useless here: it only helps formats that know which fields are present. During a rolling upgrade (Phase 14 makes this routine), old and new binaries *will* share a cluster, and the membership protocol is the one thing that must not fracture.
+Gossip messages are bincode, and bincode is positional — no field names, no tags, just bytes in struct order. Old and new binaries never share a wire format: the first byte is the protocol generation, and a mismatch is refused before anything else is read. Raft and reporting check their generations the same way, before decoding, because a development snapshot can deserialise cleanly and still mean something different. Until 0.1.0 a format change simply means starting a fresh cluster; Chapter 14 covers the compatibility policy that replaces that. The directory is still worth keeping apart from the membership payload, though. It's optional per datagram, and a bad one should cost us directory data, never membership.
 
-The trick is to not put the extension in the message at all:
+So we don't put the extension in the message at all:
 
 ```rust
 pub struct GossipMessage {
@@ -1517,9 +1551,9 @@ pub struct GossipMessage {
 }
 ```
 
-`#[serde(skip)]` is new syntax for us: it tells serde the field doesn't exist for serialisation purposes — it's never written, and on deserialisation it's filled with its `Default` value (`None`). So the message body's bytes are *identical* to the old wire format. The UDP transport then appends the encoded extension after the message bytes in the same datagram. Old peers deserialise the message and never look at the trailing bytes (bincode's legacy `deserialize` ignores them — a behaviour we pin with a test that decodes a new datagram using a copy of the old struct). New peers read the message, notice the cursor hasn't consumed the whole datagram, and decode the extension from the remainder. Tolerant in both directions. Compatibility tests pin the old bytes, while the 10,000-member scale acceptance feeds the new messages through the same production handler.
+`#[serde(skip)]` is new syntax for us: it tells serde the field doesn't exist for serialisation purposes — it's never written, and on deserialisation it's filled with its `Default` value (`None`). The UDP transport appends the encoded extension after the message bytes in the same datagram. The receiver reads the message, notices the cursor hasn't consumed the whole datagram, and decodes the extension from the remainder. Trailing bytes that don't decode as an extension are dropped; the message still counts. The 10,000-member scale acceptance feeds these datagrams through the same production handler.
 
-Authentication needed one extra step. The message HMAC (Phase 4) deliberately still covers only the message — otherwise old peers couldn't verify new datagrams. The extension carries its own HMAC, computed over the message's canonical bytes plus the extension, under the same cluster key. A keyed receiver that gets an extension with a bad or missing tag drops the extension and keeps the message: worst case you lose directory data, never membership.
+Authentication needed one extra step. The message HMAC (Phase 4) covers only the message, so a datagram whose extension is dropped still verifies. The extension carries its own HMAC, computed over the message's canonical bytes plus the extension, under the same cluster key. A keyed receiver that gets an extension with a bad or missing tag drops the extension and keeps the message: worst case you lose directory data, never membership.
 
 ### Proving it: eight-plus nodes through failover
 
@@ -1680,7 +1714,7 @@ Required labels are hard constraints. If an app says `required = ["gpu=a100"]`, 
 | Spread | 60 | Penalise nodes already running this app |
 | Stability | 5 | Prefer longer-running nodes |
 
-These are points, not percentages. Spread contributes either zero or 60 points, so it outweighs bin-packing when the other dimensions are equal. Once candidates are equal on spread, bin-packing favours density. Image locality only helps when the cache contains image evidence; propagation of remote cached-image evidence remains F01 in the completion plan.
+These are points, not percentages. Spread contributes either zero or 60 points, so it outweighs bin-packing when the other dimensions are equal. Once candidates are equal on spread, bin-packing favours density. Image locality is wired into scoring, but nodes don't report their cached images to the leader yet, so in a live cluster it currently scores zero everywhere.
 
 **Phase 3: Select.** Pick the highest-scoring node. Ties are broken by `NodeId` (alphabetical), which gives us deterministic results. The same inputs always produce the same placement. This matters for debugging and for the property-based tests.
 
@@ -1698,7 +1732,7 @@ Namespaces provide resource isolation. Each namespace can have limits on CPU, me
 namespace "staging" would exceed CPU quota: 1800+500 > 2000m
 ```
 
-The leader builds a quota ledger from desired-state namespaces once per scheduling pass and accounts for each admitted app cumulatively. It also applies the active upgrade cordon before selecting nodes.
+The leader tallies each namespace's usage once per scheduling pass and adds every app it admits as it goes, so two apps admitted in the same pass can't each squeeze under a limit they exceed together. It also skips nodes cordoned by an in-progress upgrade before selecting.
 
 The `check_quota` function is straightforward: for each limit that's set, check if current usage plus the requested resources exceeds it. No limit means unlimited.
 
@@ -1992,6 +2026,8 @@ On top of that sits a proptest. It generates arbitrary voter sets, learner sets,
 
 The full loop runs in three gated acceptance tests (`RELIABURGER_CLUSTER_TESTS=1`): kill a voter and watch a spare walk in while a writer hammers the council and asserts every write lands; kill a learner mid-catch-up (faked by partitioning it at the Raft layer while gossip still likes it) and confirm the voter set refuses to move until a healthy learner catches up; and flap a voter inside the window and confirm nothing changes at all. They use real `CouncilNode`s over the in-memory router with gossip supplied through a watch channel, so the tests control exactly who looks alive and when — the same trick the SWIM tests used, one layer up.
 
+Those tests taught us one more thing, about the tests themselves. A few of them wait for "three voters" by reading the leader's Raft metrics, then kill the leader. That looks sound, and it failed now and then in CI with no successor ever elected. openraft reports a membership in the metrics as soon as the entry is *appended*, not when it commits. Mid-change, the configuration is joint, and `voter_ids()` returns the union of the old and new sets. So the leader could report `{a, b, c}` while it was still half-way from `{a, b}`. In one traced run the leader had appended the final configuration but not yet committed it, and the other old voter was still on the joint one. Kill the leader then, and the survivor sits on a configuration whose old half needs the dead node's vote. Nobody can win an election. That's Raft working exactly as designed; the test was asking the wrong node. The harness now waits until every surviving member reports the same uniform configuration (one config, not a joint pair) and has *applied* it, which means it committed. Only then does it pull the plug. We checked the product for the same shortcut. Decommissioning returns after its own Raft entry commits, and the reconciler's `change_membership` only returns once the final configuration has committed, so nothing in Reliaburger treats an appended membership as a done deal.
+
 ## When the whole council dies
 
 Self-healing has a floor. It keeps the council alive while a majority survives, because every membership change it proposes has to commit through Raft, and Raft needs a quorum to commit anything. Kill two of three voters and the planner does exactly nothing — there's no majority left to vote a replacement in. Kill all three and the cluster is, on paper, dead. Workers keep running whatever they were running, but nothing can elect a leader, schedule a new app, or answer a query about cluster state. There's no quorum to heal from.
@@ -2146,8 +2182,6 @@ It rides gossip. Every datagram already carries a small authenticated directory 
 
 Why gossip and not a new dedicated message? Because the directory extension is already there, already signed, already flowing to everyone on every datagram. Adding a bool to it is nearly free, and it inherits the extension's HMAC for free: the tag covers every field up to (but not including) the zeroed `hmac`, so a flipped `disk_pressured` bit fails verification exactly the way a tampered endpoint would. A test pins that — flip the bit on a signed extension, watch the check reject it.
 
-The wire-compatibility trick is the same one the `labels` field uses. The extension isn't inside the bincode message; it's appended after it as trailing bytes, versioned by position rather than by a per-field default. An old node that doesn't know about `disk_pressured` sends a shorter extension, and our newer decoder — reaching for a bool that isn't there — hits the end of the buffer and simply drops the whole extension, keeping the message body. A new node always emits the field. So a mixed cluster mid-upgrade converges the moment the old binaries roll, with no flag day. Two tests, one in each direction, pin exactly this: a new decoder dropping an old peer's shorter extension, and an old decoder ignoring the extra trailing byte a new peer sends.
-
 Until this wiring existed, the production path fed the reconciler a permanently empty set — the resignation *machinery* was complete and tested, but nothing in a live cluster ever put a name into it. This is the piece that makes it engage.
 
 ### Testing the whole thing
@@ -2162,7 +2196,7 @@ You don't know if your cluster recovers from failure until you actually break so
 
 **Cargo tests** run in-memory clusters with simulated partitions. They're fast, deterministic, and run in CI. The `InMemoryNetwork::partition()` and `InMemoryRaftRouter::partition()` methods silently drop messages between specified nodes, simulating a network split without any real networking.
 
-**`relish chaos`** operates on real running clusters. It talks to actual Bun agents, tells them to inject partitions via the `/v1/chaos/partition` API, and then watches the cluster heal in real time. Every fault injection is time-bound with automatic cleanup — if the CLI crashes, the agent auto-heals when the TTL expires.
+**`relish test --chaos`** operates on real running clusters. It talks to actual Bun agents, asks one of them to cut itself off from its council peers through the fault API, and then watches the cluster heal in real time. Every fault injection is time-bound with automatic cleanup, so if the CLI crashes, the agent heals itself when the TTL expires. (The first version of this was a separate `relish chaos` command. Chapter 8 explains why it went.)
 
 ### The council partition test
 
@@ -2188,25 +2222,9 @@ Partition a worker from all council members:
 
 This tests the key invariant: running workloads survive control plane disruption.
 
-### `relish chaos` in action
+### Running it
 
-```
-$ relish chaos council-partition
-
-CHAOS  Council Partition
-───────────────────────────────────────────────────────
-
-  [0.00s]  DISCOVER  querying cluster topology...
-  [0.12s]  DISCOVER  found 5 nodes: node-1 (leader, council), ...
-  [0.15s]  INJECT    partitioning node-3 from 2 peer(s), duration: 30s
-  [3.20s]  POLL      leader: node-1, term: 1, members: 3
-  [10.0s]  HEAL      removing partition...
-  [12.1s]  VERIFY    cluster has 5 nodes, leader: node-1
-
-  PASSED  council partition scenario in 12.1s
-```
-
-Every injection has a TTL. If you forget to heal, the agent does it for you. `relish chaos status` shows active partitions and their remaining time. `relish chaos heal` cleans up immediately.
+`relish test --chaos --yes` runs the guarded scenario catalogue, including a minority partition. Every injection has a TTL. If you forget to heal, the agent does it for you, and `relish fault list` shows what's still active.
 
 This is a foundation. Phase 8 adds Smoker, which uses eBPF for fine-grained fault injection: network delays, packet drops, DNS failures, CPU stress. But the principle is the same: inject, observe, heal, verify. Make failure routine so recovery is trustworthy.
 
@@ -2280,9 +2298,7 @@ match self.generation {
 }
 ```
 
-One more thing had to work: upgrading a running cluster *across* this change. An older bun that's already running `api-0` writes an adoption record so a restarted bun can re-adopt the still-live process instead of killing and restarting it (Chapter 14 covers adoption in full). Those old records carry the legacy `api-0` string. If the new bun couldn't read them, every workload would be orphaned on upgrade — the exact failure adoption exists to prevent.
-
-So identity parsing has two doors. `parse` reads the new canonical form. `parse_legacy` reads the old namespace-less form, taking the namespace as a separate argument — which adoption always has, because the record stores `namespace`, `app_name` and `replica_index` as their own fields. The runtime keeps talking to the container by the id it was started under (the legacy one), while the supervisor keys the adopted instance under the fresh canonical id. Old workloads survive the upgrade; new ones are namespace-safe. A round-trip test pins both forms so a careless edit can't quietly break either.
+What about records written with the old, namespace-less ids? A restarted bun re-adopts still-live processes from their adoption records (Chapter 14 covers adoption in full), so this could have been a migration problem. It isn't, because nothing has shipped: no node in the wild carries an `api-0` record. `parse` reads only the canonical form, and adoption refuses any record whose id doesn't match the one rebuilt from its own `namespace`, `app_name` and `replica_index` fields. A round-trip test pins the canonical form so a careless edit can't quietly break it.
 
 ## What we built
 
@@ -2346,58 +2362,3 @@ three Linux nodes and passed sample HTTP in 241.75 seconds. We record the
 [conditions and exclusions](../qualification/2026-09-17-laptop.md): it used local
 development binaries, so downloading and verifying a signed release remains a
 separate acceptance gate. One passing measurement is evidence, not a guarantee.
-
-
-### The first supported compatibility boundary
-
-A development snapshot might deserialize successfully and still represent a different contract. Before 0.1.0 we therefore require fresh clusters. Startup stamps a fresh data directory with its state generation and refuses an existing unmarked directory. Snapshot loading no longer silently rewrites pre-envelope development state.
-
-A Raft request now carries protocol and state generations as well as its recovery epoch. All three checks run before dispatch to Raft. Responses carry the format contract too, so a new caller cannot mistake a development server's reply for an accepted negotiation. Gossip checks both generations before learning membership; reporting checks both generations before decoding its payload. Chapter 14 explains how the same contract gates binary replacement and rollback. Different product versions are supported only when they explicitly advertise equal formats.
-
-### Finding the cluster again without a seed list
-
-The first node starts without seeds. Other nodes find it, gossip supplies their
-addresses, and everything works until the first node loses contact with all of
-them. Once it has marked every peer dead and reaped the records, reopening its
-network isn't enough. Its seed list is still empty. Nobody is probing it either.
-
-Mustard now retains at most sixteen previously contacted peers separately from
-live membership. Each cycle considers one retained contact, rotating through the
-queue, and probes it if it is absent or no longer alive. While isolated, it also
-probes configured seeds. Keeping one live neighbour must not suppress recovery of
-the others: a three-node experiment exposed exactly that partial recovery gap.
-Those addresses are discovery candidates, not evidence that a node is alive. Direct messages refresh the bounded
-queue; relayed acknowledgements cannot put a relay's socket under another node's
-identity. An explicit `Left` state removes the contact before membership reaping,
-so a graceful departure doesn't become a permanent fallback seed.
-
-There's a second trap. The returning node may still be marked dead at its peer,
-but the ordinary piggyback queue may have exhausted every retransmission of that
-claim. A direct ping or reply now includes the current non-alive claim about its
-recipient, within the existing eight-update limit. That recipient can refute the
-claim with a higher incarnation. We don't silently turn an old `Dead` into
-`Alive` just because another datagram arrived.
-
-The regression starts a seedless bootstrap node, removes every peer from its
-membership table, and exhausts the other node's piggyback queue. Both sides must
-rediscover each other as alive. A separate test checks the contact bound and
-retirement of explicit departures. Another regression keeps a live neighbour
-while reaping a different peer, then requires a rediscovery probe. This was found
-while testing node-fault expiry:
-the transport gates reopened correctly, but discovery had forgotten its way home.
-
-
-### Keep the wire slot, remove the imaginary clock
-
-Membership updates still carry a field named `lamport`. Earlier code incremented
-it locally but never merged a received timestamp or used it to resolve an update.
-That wasn't a Lamport clock. The actual conflict rules use incarnation and node
-state. For 0.1.0 we remove the unused local counter and send zero in the old slot.
-Receivers ignore that slot, including values from older senders.
-
-Why keep the field? Bincode serialises struct fields in order. Removing the last
-`u64` would change the message layout. The compatibility test compares an update's
-bytes with the legacy field sequence, then decodes them back. A second test sends
-a stale incarnation with the largest possible timestamp and checks that it cannot
-overrule current membership. This preserves the wire representation without
-claiming a causal-ordering feature we don't implement.

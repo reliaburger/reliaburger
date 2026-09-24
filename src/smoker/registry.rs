@@ -224,6 +224,7 @@ mod tests {
             fault_type: FaultType::Delay {
                 delay_ns: 200_000_000,
                 jitter_ns: 0,
+                source_app: None,
             },
             target_service: service.into(),
             namespace: None,
@@ -367,7 +368,7 @@ mod tests {
         let survivor = reg.iter().next().unwrap();
         assert_eq!(survivor.namespace.as_deref(), Some("team-b"));
 
-        // A namespace-less clear still reaches every namespace (legacy/admin).
+        // A namespace-less clear (unscoped tokens only) reaches every namespace.
         let removed = reg.clear_by_service("web", None);
         assert_eq!(removed.len(), 1);
         assert_eq!(reg.len(), 0);

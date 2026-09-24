@@ -13,8 +13,8 @@ fn runtime(root: &Path) -> RuncGrill {
         ImageStore::new(root.join("images")),
         false,
         root.join("state"),
+        env!("CARGO_BIN_EXE_bun").into(),
     )
-    .with_owner(env!("CARGO_BIN_EXE_bun").into())
     .unwrap()
 }
 
@@ -219,7 +219,9 @@ async fn runc_owned_adoption_validates_generation_and_restores_live_network() {
         image: "/empty-fixture".into(),
         runtime: RuntimeKind::Runc,
         pid,
-        pid_started_at: reliaburger::grill::records::process_start_time(pid).unwrap(),
+        // One second off, as an NTP step between launch and recovery would
+        // leave it: the same process, recorded against a moved clock.
+        pid_started_at: reliaburger::grill::records::process_start_time(pid).unwrap() + 1,
         runc_container_id: Some(id.0.clone()),
         log_stem: first.log_stem(&id).await,
         host_port: None,
@@ -293,8 +295,8 @@ async fn runc_owned_cancelled_preparation_keeps_its_worker_until_queued_cleanup(
         ImageStore::new(root.path().join("images")),
         false,
         root.path().join("state"),
+        wrapper,
     )
-    .with_owner(wrapper)
     .unwrap();
     let creator = runtime.clone();
     let preparation_id = id.clone();
@@ -678,9 +680,12 @@ async fn previous_boot_intent_cannot_start_or_remove_conflicting_live_resources(
 #[tokio::test]
 #[ignore = "run only through scripts/release/qualify-oci-reboot.sh in a disposable Linux VM"]
 async fn actual_host_reboot_preserves_holds_and_retires_original_execution() {
-    let Ok(directory) = std::env::var("RELIABURGER_REBOOT_DIRECTORY") else {
-        return;
-    };
+    // A missing variable means an automated driver picked this up by
+    // mistake. Passing would claim reboot evidence nobody collected.
+    let directory = std::env::var("RELIABURGER_REBOOT_DIRECTORY").expect(
+        "RELIABURGER_REBOOT_DIRECTORY unset: run this only through \
+         scripts/release/qualify-oci-reboot.sh, which power-cycles the VM",
+    );
     assert!(nix::unistd::geteuid().is_root());
     let root = Path::new(&directory);
     let id = instance(root);

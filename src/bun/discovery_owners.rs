@@ -5,12 +5,13 @@
 //! runtime release; a saved record alone cannot establish those external facts.
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read};
+use std::io;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::durable::{Access, read_json, validate_file};
 use crate::grill::runc_intent::NetworkReference;
 use crate::onion::{service_id::ServiceId, service_map::ServiceMap, types::ServiceEntry};
 
@@ -91,6 +92,8 @@ pub struct DiscoveryJournal {
         tokio::sync::oneshot::Sender<()>,
         tokio::sync::oneshot::Receiver<()>,
     )>,
+    #[cfg(test)]
+    fail_next_write: bool,
 }
 
 impl DiscoveryJournal {
@@ -282,7 +285,7 @@ impl DiscoveryJournal {
         let claim = options
             .create_new(fresh)
             .open(directory.join("owner.lock"))?;
-        validate_file(&claim)?;
+        validate_file(&claim, Access::Exclusive)?;
         claim.try_lock().map_err(|error| match error {
             std::fs::TryLockError::WouldBlock => {
                 io::Error::new(io::ErrorKind::WouldBlock, "discovery owner is busy")
@@ -311,6 +314,8 @@ impl DiscoveryJournal {
             _claim: claim,
             #[cfg(test)]
             write_pause: None,
+            #[cfg(test)]
+            fail_next_write: false,
         })
     }
 
@@ -324,6 +329,23 @@ impl DiscoveryJournal {
     /// The caller must confirm withdrawal before authorising release and confirm
     /// runtime release before forgetting that permission. Persistence failures
     /// fence this writer until it is dropped and the complete store is reopened.
+    /// Directory this journal owns, for reopening after an uncertain write.
+    pub(crate) fn directory(&self) -> &Path {
+        &self.directory
+    }
+
+    /// Refuse a candidate the journal would reject, without touching disk.
+    pub(crate) fn check(&self, next: &DiscoveryInventory) -> io::Result<()> {
+        validate(next)?;
+        validate_transition(&self.inventory, next)
+    }
+
+    /// Make the next checkpoint write fail as an I/O error would.
+    #[cfg(test)]
+    pub(crate) fn fail_next_write(&mut self) {
+        self.fail_next_write = true;
+    }
+
     pub fn save(&mut self, next: DiscoveryInventory) -> io::Result<()> {
         if self.uncertain {
             return Err(io::Error::other(
@@ -338,6 +360,10 @@ impl DiscoveryJournal {
         if let Some((entered, resume)) = self.write_pause.take() {
             let _ = entered.send(());
             resume.blocking_recv().map_err(io::Error::other)?;
+        }
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_write) {
+            return Err(io::Error::other("injected checkpoint write failure"));
         }
         write_checkpoint(&self.directory, &next)?;
         self.inventory = next;
@@ -384,35 +410,8 @@ fn service_for_launch(
     ))
 }
 
-fn validate_file(file: &File) -> io::Result<()> {
-    let metadata = file.metadata()?;
-    if !metadata.is_file()
-        || metadata.nlink() != 1
-        || metadata.mode() & 0o777 != 0o600
-        || metadata.uid() != nix::unistd::geteuid().as_raw()
-    {
-        return Err(io::Error::other(
-            "discovery file is not private and regular",
-        ));
-    }
-    Ok(())
-}
-
 fn read_checkpoint(directory: &Path) -> io::Result<DiscoveryInventory> {
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
-        .open(directory.join(CHECKPOINT))?;
-    validate_file(&file)?;
-    if file.metadata()?.len() > LIMIT {
-        return Err(io::Error::other("discovery checkpoint exceeds size limit"));
-    }
-    let mut bytes = Vec::new();
-    file.take(LIMIT + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > LIMIT {
-        return Err(io::Error::other("discovery checkpoint exceeds size limit"));
-    }
-    let checkpoint: Checkpoint = serde_json::from_slice(&bytes)?;
+    let checkpoint: Checkpoint = read_json(&directory.join(CHECKPOINT), LIMIT, Access::Exclusive)?;
     if checkpoint.schema != 4 {
         return Err(io::Error::other("unsupported discovery checkpoint schema"));
     }

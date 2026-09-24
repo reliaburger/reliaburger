@@ -506,7 +506,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "requires Linux root, Btrfs tools, and RELIABURGER_BTRFS_TESTS=1"]
-    fn snapshot_restore_recovers_corrupted_data() {
+    fn btrfs_snapshot_restore_recovers_corrupted_data() {
         assert!(
             std::env::var("RELIABURGER_BTRFS_TESTS").is_ok(),
             "set RELIABURGER_BTRFS_TESTS=1 after provisioning Btrfs tools and root access"

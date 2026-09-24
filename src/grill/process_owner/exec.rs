@@ -72,22 +72,20 @@ impl Execution {
         SystemRandom::new()
             .fill(&mut nonce)
             .map_err(|_| io::Error::other("cannot generate exec capability"))?;
-        let mut launch = parent_record
-            .launch
-            .clone()
-            .ok_or_else(|| io::Error::other("exec requires production launch intent"))?;
+        let mut launch = parent_record.launch.clone();
         launch.spec.process.args = command.clone();
         launch.spec.process.env.clear();
         launch.spec.port_mapping = None;
         let record = OwnerRecord {
             schema: 3,
-            boot_id: super::current_boot_id()?,
+            boot_id: super::current_boot_id()?
+                .ok_or_else(|| io::Error::other("kernel boot identity unavailable"))?,
             nonce: hex::encode(nonce),
             command,
             // Process exec has always inherited Bun's host environment.
             environment: BTreeMap::new(),
             phase: OwnerPhase::Prepared,
-            launch: Some(launch),
+            launch,
         };
         persist(temporary.path(), &record)?;
         File::open(parent)?.sync_all()?;
@@ -116,6 +114,12 @@ impl Execution {
             retired: false,
         });
         Ok(())
+    }
+
+    /// The helper's PID while it remains this owner's unreaped child.
+    #[cfg(target_os = "linux")]
+    pub(super) fn child_id(&self) -> Option<u32> {
+        self.child.as_ref().map(Child::id)
     }
 
     fn cancel(&self) -> io::Result<()> {
@@ -182,7 +186,7 @@ impl Execution {
                 record.phase = OwnerPhase::Cancelled;
                 persist(&self.directory, &record)?;
                 // Prepared proves that no user command received activation.
-                let path = socket_path(&self.directory, &record);
+                let path = socket_path(&record);
                 if let Some(parent) = path.parent()
                     && parent.exists()
                 {

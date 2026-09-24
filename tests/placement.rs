@@ -9,23 +9,21 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use reliaburger::bun::agent::{BunAgent, ClusterHandle};
-use reliaburger::bun::api::{self, NodeMembershipInfo};
-use reliaburger::cluster::orchestrate::{spawn_leader_scheduler, spawn_placement_reconciler};
-use reliaburger::cluster::runtime::{self, ClusterParams};
-use reliaburger::config::node::ReportingTreeSection;
-use reliaburger::grill::port::PortAllocator;
-use reliaburger::grill::process::ProcessGrill;
+use reliaburger::bun::agent::ClusterHandle;
+use reliaburger::bun::api::NodeMembershipInfo;
 use reliaburger::relish::client::BunClient;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{RwLock, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
-#[path = "support/task_harness.rs"]
-mod task_harness;
-use task_harness::TestTasks;
+#[path = "support/cluster.rs"]
+mod cluster_support;
+use cluster_support::{MembershipSource, WiredNode, WiredNodeOptions, local, start_wired_node};
 
-fn local(port: u16) -> SocketAddr {
-    SocketAddr::from(([127, 0, 0, 1], port))
+/// How often `wait_until` re-checks its condition in this binary.
+const POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+async fn wait_until(timeout: Duration, cond: impl FnMut() -> bool) -> bool {
+    cluster_support::wait_until(timeout, POLL_INTERVAL, cond).await
 }
 
 /// A fully wired node: everything `bun --cluster` starts, on one host
@@ -38,8 +36,7 @@ struct Node {
     membership_table: Arc<RwLock<Vec<NodeMembershipInfo>>>,
     token_store: Option<reliaburger::sesame::auth::TokenStore>,
     rollup_store: Arc<RwLock<reliaburger::mayo::rollup_store::RollupStore>>,
-    _runtime: runtime::ClusterRuntime,
-    _tasks: TestTasks,
+    _wired: WiredNode,
 }
 
 #[derive(Clone)]
@@ -48,7 +45,46 @@ struct NodeFaultAuth {
     plaintext: String,
 }
 
-use tokio::sync::watch;
+impl NodeFaultAuth {
+    /// A fresh unscoped admin token, shared by every node in the test cluster.
+    fn admin(name: &str) -> Self {
+        let created = reliaburger::sesame::token::create_token(
+            name,
+            reliaburger::sesame::types::ApiRole::Admin,
+            reliaburger::sesame::types::TokenScope::default(),
+            None,
+        )
+        .unwrap();
+        Self {
+            token: created.token,
+            plaintext: created.plaintext,
+        }
+    }
+}
+
+/// Cut `node` off from `peers` on the gossip and Raft transports.
+async fn partition(
+    node: &Node,
+    peers: &[String],
+) -> Result<reliaburger::smoker::types::FaultSummary, reliaburger::relish::RelishError> {
+    node.client
+        .inject_fault(&reliaburger::smoker::types::FaultRequest {
+            fault_type: reliaburger::smoker::types::FaultType::CouncilPartition {
+                peers: peers.to_vec(),
+            },
+            target_service: String::new(),
+            namespace: None,
+            target_instance: None,
+            target_node: Some(node.name.clone()),
+            duration: Duration::from_secs(60),
+            injected_by: String::new(),
+            reason: None,
+            include_leader: true,
+            override_safety: false,
+            acknowledged: true,
+        })
+        .await
+}
 
 async fn start_node(
     name: &str,
@@ -66,268 +102,33 @@ async fn start_node_with_auth(
     shutdown: &CancellationToken,
     auth: Option<NodeFaultAuth>,
 ) -> Node {
-    let raft_port = gossip_port + 1;
-    let reporting_port = gossip_port + 2;
-    let api_port = gossip_port + 3;
-
-    let data_dir = std::env::temp_dir().join(format!("rb-placement-{name}-{gossip_port}"));
-    let _ = std::fs::remove_dir_all(&data_dir);
-    let reconciler_state_dir = data_dir.clone();
-
-    let mayo = Arc::new(RwLock::new(reliaburger::mayo::store::MayoStore::new(
-        data_dir.join("metrics"),
-    )));
-    let readiness = reliaburger::bun::readiness::ReadinessTracker::new();
-    readiness.register("agent", true).await;
-
-    let (handle, cluster_runtime) = runtime::start(
-        ClusterParams {
-            node_name: name.into(),
-            gossip_addr: local(gossip_port),
-            raft_port,
-            reporting_port,
-            api_port,
-            reporting_config: ReportingTreeSection {
-                report_interval_secs: 1,
-                max_events_per_report: 100,
-                stale_report_timeout_secs: 30,
-            },
-            seeds,
-            wrapping_ikm: None,
-            bootstrap_security_state: None,
-            data_dir,
-            mayo: Some(mayo),
-            rollup_interval: Duration::from_millis(500),
-            identity: None,
-            backup: Default::default(),
-            labels: std::collections::BTreeMap::new(),
-            self_disk_pressured_rx: None,
-            readiness: Some(readiness.clone()),
-        },
-        shutdown.clone(),
-    )
-    .await
-    .unwrap();
-
-    let partition_blocklists = handle.partition_blocklists.clone();
-    let council = handle.council.clone();
-    let membership_rx = handle.membership_rx.clone();
-    let metrics_rx = handle.raft_metrics_rx.clone();
-    let aggregated_rx = cluster_runtime.aggregated_rx.clone();
-    let rollup_store = Arc::clone(&cluster_runtime.rollup_store);
-    let directory_rx = cluster_runtime.directory_rx.clone();
-
-    // Real agent with a ProcessGrill, built with the cluster handle so
-    // it answers reporting snapshots with real capacity.
-    let (cmd_tx, cmd_rx) = mpsc::channel(256);
-    let mut agent = BunAgent::with_cluster(
-        ProcessGrill::new(),
-        PortAllocator::new(gossip_port + 100, gossip_port + 400),
-        cmd_rx,
-        shutdown.clone(),
-        // The agent needs its OWN handle clone; ClusterHandle isn't
-        // Clone (it owns snapshot_rx), so build a second runtime handle
-        // by re-taking the pieces. Instead we move `handle` into the
-        // agent and keep clones of the watch receivers above.
-        handle,
-        "default".to_string(),
-    );
-    agent.set_volumes_dir(reconciler_state_dir.join("volumes"));
-    agent.set_node_capacity(8000, 16384);
-    agent.set_readiness_tracker(readiness.clone());
-    // Several agents share this host; don't spawn nft against the real
-    // host firewall (`with_cluster` enables it by default on Linux).
-    agent.set_perimeter_enabled(false);
-    let agent_task = reliaburger::bun::readiness::spawn_owned(
-        "agent",
-        true,
-        readiness.clone(),
-        shutdown.clone(),
-        move |ready| async move { agent.run_with_readiness(ready).await },
-    );
-    let mut tasks = vec![agent_task];
-
-    // DELETE starts cleanup; the leader's reaper finishes it once workers
-    // acknowledge retirement. Match Bun's lifecycle rather than leaving the
-    // fixture permanently at HTTP 202 after the final acknowledgement.
-    if let Some(council) = &council {
-        tasks.push(reliaburger::testkit::lease::spawn_cluster_lease_reaper(
-            Arc::clone(council),
-            shutdown.clone(),
-        ));
-    }
-
-    // Membership table (peer API addresses = gossip IP + offset 3).
-    let membership_table: Arc<RwLock<Vec<NodeMembershipInfo>>> = Arc::new(RwLock::new(Vec::new()));
-    {
-        let mut rx = membership_rx.clone();
-        let table = Arc::clone(&membership_table);
-        let sd = shutdown.clone();
-        let membership_task = tokio::spawn(async move {
-            loop {
-                let snapshot: Vec<NodeMembershipInfo> = rx
-                    .borrow()
-                    .iter()
-                    .filter(|m| m.state == reliaburger::mustard::state::NodeState::Alive)
-                    .map(|m| NodeMembershipInfo {
-                        node_id: m.node_id.clone(),
-                        address: SocketAddr::new(m.address.ip(), m.address.port() + 3),
-                    })
-                    .collect();
-                *table.write().await = snapshot;
-                tokio::select! {
-                    _ = sd.cancelled() => break,
-                    changed = rx.changed() => if changed.is_err() { break },
-                }
-            }
-        });
-        tasks.push(membership_task);
-    }
-
-    // Leader scheduler + autoscaler (fast interval for the test).
-    let mut capacity_admission = None;
-    if let Some(council) = &council {
-        capacity_admission = Some(spawn_leader_scheduler(
-            Arc::clone(council),
-            membership_rx.clone(),
-            aggregated_rx,
-            false,
-            // Fast learning period so the test doesn't wait long.
-            reliaburger::config::node::ReconstructionSection {
-                report_threshold_percent: 95,
-                learning_period_timeout_secs: 2,
-                large_cluster_timeout_secs: 4,
-                large_cluster_node_count: 5000,
-            },
-            shutdown.clone(),
-        ));
-        reliaburger::cluster::orchestrate::spawn_autoscaler(
-            Arc::clone(council),
-            Arc::clone(&rollup_store),
-            Duration::from_millis(500),
-            shutdown.clone(),
-        );
-    }
-
-    // Placement reconciler (API is raft_port + 2 = gossip + 3).
-    if let Some(metrics_rx) = metrics_rx.clone() {
-        spawn_placement_reconciler(
-            name.to_string(),
-            metrics_rx,
-            directory_rx,
-            2, // api_port - raft_port
-            auth.as_ref()
-                .map(|_| "placement-test-internal-service-identity".to_string()),
-            cmd_tx.clone(),
-            shutdown.clone(),
-            reliaburger::cluster::ClusterHttp::plaintext(),
-            Some(reconciler_state_dir),
-        );
-    }
-
-    // API server.
-    let listener = tokio::net::TcpListener::bind(local(api_port))
-        .await
-        .unwrap();
-    let token_store = auth
-        .as_ref()
-        .map(|auth| Arc::new(RwLock::new(vec![auth.token.clone()])));
-    let app = if auth.is_some() {
-        let static_capabilities = reliaburger::bun::capabilities::StaticCapabilities {
-            cluster_mode: true,
-            test_policy: reliaburger::testkit::safety::ClusterTestPolicy {
-                safety_class: reliaburger::testkit::safety::ClusterSafetyClass::Development,
-                allowed_operations: std::collections::BTreeSet::from([
-                    reliaburger::testkit::safety::OperationPermission::AlterNodeState,
-                    reliaburger::testkit::safety::OperationPermission::ProvisionIsolatedWorkloads,
-                    reliaburger::testkit::safety::OperationPermission::SaturateCapacity,
-                ]),
-                ..reliaburger::testkit::safety::ClusterTestPolicy::default()
-            },
-            ..reliaburger::bun::capabilities::StaticCapabilities::default()
-        };
-        api::router_with_upgrade(
-            cmd_tx,
-            None,
-            None,
-            None,
-            None,
-            None,
-            council.clone(),
-            token_store.clone(),
-            Some("placement-test-internal-service-identity".into()),
-            None,
-            Some(Arc::clone(&membership_table)),
-            None,
-            None,
-            api_port,
-            None,
-            None,
-            None,
-            "default".to_string(),
-            Some(name.to_string()),
-            900,
-            reliaburger::cluster::ClusterHttp::plaintext(),
-            5050,
-            "http",
-            256 * 1024 * 1024,
-            false,
-            static_capabilities,
-            readiness,
-            None,
-            None,
-        )
-    } else {
-        api::router(
-            cmd_tx,
-            None,
-            None,
-            None,
-            None,
-            None,
-            council.clone(),
-            None,
-            None,
-            None,
-            Some(Arc::clone(&membership_table)),
-            None,
-            api_port,
-            None,
-        )
-    };
-    let app = match capacity_admission {
-        Some(admission) => app.layer(axum::Extension(admission)),
-        None => app,
-    };
-    let sd = shutdown.clone();
-    let api_task = tokio::spawn(async move {
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async move { sd.cancelled().await })
-            .await
-            .ok();
-    });
-    tasks.push(api_task);
-
-    // Derive a leadership watch from the raft metrics.
-    let (leader_tx, leader_rx) = watch::channel(false);
-    if let Some(mut metrics_rx) = metrics_rx {
-        let leadership_task = tokio::spawn(async move {
-            loop {
-                let is_leader = {
-                    let m = metrics_rx.borrow();
-                    m.current_leader == Some(m.id)
-                };
-                let _ = leader_tx.send(is_leader);
-                if metrics_rx.changed().await.is_err() {
-                    break;
-                }
-            }
-        });
-        tasks.push(leadership_task);
-    }
+    let wired = start_wired_node(WiredNodeOptions {
+        name: name.to_string(),
+        gossip_port,
+        seeds,
+        shutdown: shutdown.clone(),
+        data_dir_prefix: "rb-placement",
+        stale_report_timeout_secs: 30,
+        metrics_rollup: Some(Duration::from_millis(500)),
+        // Fast learning period so the test doesn't wait long.
+        scheduler: Some(reliaburger::config::node::ReconstructionSection {
+            report_threshold_percent: 95,
+            learning_period_timeout_secs: 2,
+            large_cluster_timeout_secs: 4,
+            large_cluster_node_count: 5000,
+        }),
+        lease_reaper: true,
+        membership: MembershipSource::Gossip,
+        service_identity: auth
+            .as_ref()
+            .map(|_| "placement-test-internal-service-identity".to_string()),
+        operator_token: auth.as_ref().map(|auth| auth.token.clone()),
+        fault_injection: auth.is_some(),
+    })
+    .await;
 
     let client = BunClient::new_with_token(
-        &format!("http://127.0.0.1:{api_port}"),
+        &format!("http://127.0.0.1:{}", wired.api_port),
         auth.as_ref().map(|auth| auth.plaintext.as_str()),
     );
     for _ in 0..40 {
@@ -337,40 +138,26 @@ async fn start_node_with_auth(
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    // We moved `handle` into the agent; rebuild a thin stand-in for the
-    // test's own leadership checks from the metrics watch above.
+    // The agent owns the real `ClusterHandle`; rebuild a thin stand-in for
+    // the test's own council and partition checks.
     Node {
         name: name.to_string(),
         client,
         handle: ClusterHandle {
             local_node_id: reliaburger::meat::NodeId::new(name),
-            membership_rx,
+            membership_rx: wired.membership_rx.clone(),
             raft_metrics_rx: None,
-            council,
+            council: Some(Arc::clone(&wired.council)),
             snapshot_rx: mpsc::channel(1).1,
             wrapping_ikm: None,
-            partition_blocklists,
+            partition_blocklists: wired.partition_blocklists.clone(),
             crl_handle: Default::default(),
         },
-        thinks_leader: leader_rx,
-        membership_table,
-        token_store,
-        rollup_store,
-        _runtime: cluster_runtime,
-        _tasks: TestTasks::new(shutdown.clone(), tasks),
-    }
-}
-
-async fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        if cond() {
-            return true;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return false;
-        }
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        thinks_leader: wired.thinks_leader.clone(),
+        membership_table: Arc::clone(&wired.membership_table),
+        token_store: wired.token_store.clone(),
+        rollup_store: Arc::clone(&wired.rollup_store),
+        _wired: wired,
     }
 }
 
@@ -761,24 +548,14 @@ async fn autoscaler_scales_up_on_high_metric() {
 
 /// W11 (L14): the quorum safety rail rejects a node-level fault that
 /// would risk Raft majority. On a 3-member council `max_allowed = 1`, so
-/// the first transport partition is accepted but a second one — which would
-/// put two council members at risk — is rejected with a 4xx. Drives the
-/// real transport-blocklist path through `/v1/chaos/partition`; a
-/// service-to-service eBPF partition does not affect Raft quorum.
+/// fully isolating one follower is accepted, but a second partition while
+/// that voter is gone from the live view is refused by the quorum rail.
+/// Drives the real transport-blocklist path through a council partition;
+/// a service-to-service eBPF partition does not affect Raft quorum.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 #[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
 async fn fault_injection_rejected_when_quorum_at_risk() {
-    let created = reliaburger::sesame::token::create_token(
-        "partition-admin",
-        reliaburger::sesame::types::ApiRole::Admin,
-        reliaburger::sesame::types::TokenScope::default(),
-        None,
-    )
-    .unwrap();
-    let auth = NodeFaultAuth {
-        token: created.token,
-        plaintext: created.plaintext,
-    };
+    let auth = NodeFaultAuth::admin("partition-admin");
     let shutdown = CancellationToken::new();
     let n1 = start_node_with_auth("r1", 18741, vec![], &shutdown, Some(auth.clone())).await;
     let n2 = start_node_with_auth(
@@ -822,41 +599,75 @@ async fn fault_injection_rejected_when_quorum_at_risk() {
         .find(|n| *n.thinks_leader.borrow())
         .expect("leader exists");
 
-    let peer = nodes
-        .iter()
-        .find(|node| node.name != leader.name)
-        .expect("leader has a peer")
-        .name
-        .clone();
+    let mut followers = nodes.iter().filter(|node| node.name != leader.name);
+    let isolated = followers.next().expect("leader has a first follower");
+    let other = followers.next().expect("leader has a second follower");
 
-    // First node-level fault: within the quorum budget, accepted.
-    leader
-        .client
-        .inject_partition(std::slice::from_ref(&peer), 60, true)
+    // First node-level fault: cut one follower off from both peers. One
+    // unavailable voter is within the quorum budget, so it's accepted.
+    partition(isolated, &[leader.name.clone(), other.name.clone()])
         .await
         .expect("first partition should be within the quorum budget");
 
-    // Second node-level fault: would put a majority of the 3-member
-    // council at risk, so the rail must reject it.
-    let rejected = leader
-        .client
-        .inject_partition(std::slice::from_ref(&peer), 60, true)
-        .await;
+    // The quorum rail counts voters missing from the leader's live API
+    // membership. Until SWIM drops the isolated follower, the only thing
+    // refusing a second fault is the single-reservation rule, which would
+    // let this test pass without the quorum rail.
     assert!(
-        rejected.is_err(),
-        "second node fault should be rejected to protect quorum, got {rejected:?}"
+        wait_until_api_view_drops(leader, &isolated.name, Duration::from_secs(30)).await,
+        "{} never dropped the isolated {} from its API membership",
+        leader.name,
+        isolated.name
     );
-    let msg = format!("{}", rejected.unwrap_err()).to_lowercase();
-    assert!(
-        msg.contains("quorum") || msg.contains("capacity is reserved"),
-        "rejection should cite the quorum rail, got: {msg}"
-    );
+
+    // Second node-level fault: would take a second voter of the 3-member
+    // council out, so the quorum rail must reject it.
+    let rejected = partition(leader, std::slice::from_ref(&other.name)).await;
+    assert_quorum_refusal(&rejected);
 
     shutdown.cancel();
     for n in nodes {
         if let Some(c) = &n.handle.council {
             c.shutdown().await.ok();
         }
+    }
+}
+
+/// Assert that a node fault was refused by the quorum rail specifically.
+///
+/// Other refusals (one node fault already holding the cluster reservation,
+/// an unknown leader) would also stop the fault, but they'd pass this test
+/// even if the quorum rail were deleted.
+fn assert_quorum_refusal<T: std::fmt::Debug>(result: &Result<T, reliaburger::relish::RelishError>) {
+    let quorum = matches!(
+        result,
+        Err(reliaburger::relish::RelishError::ApiError { status: 400, body })
+            if body.contains("quorum risk: 1 council nodes already affected, max allowed is 1")
+    );
+    assert!(
+        quorum,
+        "expected the quorum rail's 400 refusal, got {result:?}"
+    );
+}
+
+/// Wait until `observer`'s API membership table (what the fault safety
+/// rails read) no longer lists `target`.
+async fn wait_until_api_view_drops(observer: &Node, target: &str, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let listed = observer
+            .membership_table
+            .read()
+            .await
+            .iter()
+            .any(|member| member.node_id.0 == target);
+        if !listed {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
     }
 }
 
@@ -874,24 +685,14 @@ fn peer_state(observer: &Node, target: &str) -> Option<reliaburger::mustard::sta
 /// W11 (L15): a chaos partition populates the real gossip + Raft
 /// transport blocklists, so the isolated node stops answering SWIM
 /// probes and its peers mark it Dead. Healing clears the blocklists and
-/// the node rejoins. This drives the binary path: `/v1/chaos/partition`
+/// the node rejoins. This drives the binary path: a council partition fault
 /// on the isolated node, membership observed through the peers' watch.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 #[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
 async fn partition_isolates_a_node_for_real() {
     use reliaburger::mustard::state::NodeState;
 
-    let created = reliaburger::sesame::token::create_token(
-        "partition-admin",
-        reliaburger::sesame::types::ApiRole::Admin,
-        reliaburger::sesame::types::TokenScope::default(),
-        None,
-    )
-    .unwrap();
-    let auth = NodeFaultAuth {
-        token: created.token,
-        plaintext: created.plaintext,
-    };
+    let auth = NodeFaultAuth::admin("partition-admin");
     let shutdown = CancellationToken::new();
     let n1 = start_node_with_auth("q1", 18641, vec![], &shutdown, Some(auth.clone())).await;
     let n2 = start_node_with_auth(
@@ -934,8 +735,7 @@ async fn partition_isolates_a_node_for_real() {
     // Cut q3 off from q1 and q2. The partition is injected ON q3, whose
     // agent holds the real blocklist handles; the transport drops traffic
     // both to and from the blocked peers, so detection is symmetric.
-    n3.client
-        .inject_partition(&["q1".to_string(), "q2".to_string()], 60, true)
+    let fault = partition(&n3, &["q1".to_string(), "q2".to_string()])
         .await
         .expect("partition injection should succeed");
 
@@ -955,7 +755,7 @@ async fn partition_isolates_a_node_for_real() {
 
     // Heal: clear q3's blocklists and it should rejoin and be Alive again.
     n3.client
-        .heal_partition()
+        .clear_fault(fault.id, Some("q3"), true)
         .await
         .expect("heal should succeed");
 
@@ -985,20 +785,9 @@ async fn partition_isolates_a_node_for_real() {
 #[ignore = "slow multi-node node-failure acceptance; run with make test-cluster"]
 async fn authenticated_node_kill_fails_and_restores_a_real_cluster_member() {
     use reliaburger::mustard::state::NodeState;
-    use reliaburger::sesame::types::{ApiRole, TokenScope};
     use reliaburger::smoker::types::{FaultRequest, FaultType};
 
-    let created = reliaburger::sesame::token::create_token(
-        "chaos-admin",
-        ApiRole::Admin,
-        TokenScope::default(),
-        None,
-    )
-    .unwrap();
-    let auth = NodeFaultAuth {
-        token: created.token,
-        plaintext: created.plaintext,
-    };
+    let auth = NodeFaultAuth::admin("chaos-admin");
     let shutdown = CancellationToken::new();
     let n1 = start_node_with_auth("f1", 18941, vec![], &shutdown, Some(auth.clone())).await;
     let n2 = start_node_with_auth(
@@ -1087,23 +876,16 @@ async fn authenticated_node_kill_fails_and_restores_a_real_cluster_member() {
         .find(|node| node.name != source.name && node.name != target.name)
         .copied()
         .expect("second follower exists");
+    assert!(
+        wait_until_api_view_drops(other, &target.name, Duration::from_secs(30)).await,
+        "{} never dropped the killed {} from its API membership",
+        other.name,
+        target.name
+    );
     let mut unsafe_second_kill = request.clone();
     unsafe_second_kill.target_node = Some(other.name.clone());
     let refused = other.client.inject_fault(&unsafe_second_kill).await;
-    assert!(
-        refused.as_ref().is_err_and(|error| match error {
-            reliaburger::relish::RelishError::ApiError { status: 400, body } =>
-                body.to_lowercase().contains("quorum"),
-            reliaburger::relish::RelishError::ApiError { status: 409, body } =>
-                body.contains("capacity is reserved") || body.contains("quorum"),
-            reliaburger::relish::RelishError::ApiError { status: 503, body } =>
-                body == "node fault safety cannot map the council leader to live membership"
-                    || body == "node fault safety requires a known council leader",
-            _ => false,
-        }),
-        "second voter failure must be refused after {target_name} is down: {refused:?}",
-        target_name = target.name
-    );
+    assert_quorum_refusal(&refused);
     assert!(
         other.client.list_faults().await.unwrap().is_empty(),
         "a refused second voter fault must leave no active effect"
@@ -1130,6 +912,451 @@ async fn authenticated_node_kill_fails_and_restores_a_real_cluster_member() {
 
     shutdown.cancel();
     for node in nodes {
+        if let Some(council) = &node.handle.council {
+            council.shutdown().await.ok();
+        }
+    }
+}
+
+/// Start three authenticated nodes and wait until a 3-replica `web` runs one
+/// replica on each. Used by the tests that act on a replica somewhere else.
+/// Each node gets a child of `shutdown`, so a test can stop one node alone.
+async fn start_spread_web_cluster(
+    prefix: &str,
+    first_port: u16,
+    shutdown: &CancellationToken,
+) -> [Node; 3] {
+    let auth = NodeFaultAuth::admin(&format!("{prefix}-admin"));
+    let n1 = start_node_with_auth(
+        &format!("{prefix}1"),
+        first_port,
+        vec![],
+        &shutdown.child_token(),
+        Some(auth.clone()),
+    )
+    .await;
+    let n2 = start_node_with_auth(
+        &format!("{prefix}2"),
+        first_port + 4,
+        vec![local(first_port)],
+        &shutdown.child_token(),
+        Some(auth.clone()),
+    )
+    .await;
+    let n3 = start_node_with_auth(
+        &format!("{prefix}3"),
+        first_port + 8,
+        vec![local(first_port)],
+        &shutdown.child_token(),
+        Some(auth),
+    )
+    .await;
+    {
+        let nodes = [&n1, &n2, &n3];
+        let ready = wait_until(Duration::from_secs(30), || {
+            nodes.iter().any(|n| *n.thinks_leader.borrow())
+        })
+        .await;
+        assert!(ready, "no leader elected");
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let config = reliaburger::config::Config::parse(
+            r#"
+            [app.web]
+            image = "proc-grill:image-ignored"
+            command = ["sh", "-c", "while true; do echo tick from $$; sleep 0.3; done"]
+            port = 8080
+            replicas = 3
+        "#,
+        )
+        .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let mut last_apply: Option<tokio::time::Instant> = None;
+        loop {
+            if live_web_instances(&nodes).await == 3 && nodes_running_web(&nodes).await == 3 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "web never spread one replica per node"
+            );
+            if last_apply.is_none_or(|t| t.elapsed() >= Duration::from_secs(8)) {
+                let _ =
+                    tokio::time::timeout(Duration::from_secs(15), n1.client.apply(&config)).await;
+                last_apply = Some(tokio::time::Instant::now());
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+    [n1, n2, n3]
+}
+
+/// The pid and restart count of `node`'s `web` replica.
+async fn web_process(node: &Node) -> Option<(u32, u32)> {
+    node.client
+        .status()
+        .await
+        .ok()?
+        .into_iter()
+        .find(|status| status.app_name == "web" && status.state == "running")
+        .and_then(|status| Some((status.pid?, status.restart_count)))
+}
+
+/// Z2.1: a workload fault sent to one node kills the replica that runs on
+/// another. The laptop only talks to node 1, so `relish fault kill` has to
+/// reach wherever the replica lives, and the replica rail has to count the
+/// replicas on every node rather than node 1's share.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
+async fn a_kill_sent_to_one_node_kills_a_replica_on_another() {
+    use reliaburger::smoker::types::{FaultRequest, FaultType};
+
+    let shutdown = CancellationToken::new();
+    let nodes = start_spread_web_cluster("wk", 19541, &shutdown).await;
+    let [entry, target, bystander] = &nodes;
+
+    let (target_pid, _) = web_process(target).await.expect("target runs web");
+    let (bystander_pid, _) = web_process(bystander).await.expect("bystander runs web");
+
+    let kill = |count, node: Option<&str>| FaultRequest {
+        fault_type: FaultType::Kill { count },
+        target_service: "web".to_string(),
+        namespace: None,
+        target_instance: None,
+        target_node: node.map(str::to_string),
+        duration: Duration::from_secs(0),
+        injected_by: String::new(),
+        reason: Some("cross-node workload fault".to_string()),
+        include_leader: false,
+        override_safety: false,
+        acknowledged: true,
+    };
+
+    // Killing every replica is refused, even though the entry node holds
+    // only one of them.
+    let refused = entry.client.inject_fault(&kill(3, None)).await;
+    assert!(
+        matches!(&refused, Err(reliaburger::relish::RelishError::ApiError { status: 400, body })
+            if body.contains("replica")),
+        "expected the replica rail to refuse, got {refused:?}"
+    );
+
+    let summary = entry
+        .client
+        .inject_fault(&kill(1, Some(&target.name)))
+        .await
+        .expect("the entry node should route the kill to the owner");
+    assert_eq!(summary.node.as_deref(), Some(target.name.as_str()));
+
+    let restarted = {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some((pid, restarts)) = web_process(target).await
+                && pid != target_pid
+                && restarts > 0
+            {
+                break true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break false;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    };
+    assert!(
+        restarted,
+        "{}'s web replica was not killed and restarted",
+        target.name
+    );
+    assert_eq!(
+        web_process(bystander).await.map(|(pid, _)| pid),
+        Some(bystander_pid),
+        "a replica on an untargeted node must not be touched"
+    );
+
+    // The routed fault is listed with its owner, cluster-wide.
+    let listing = entry.client.list_cluster_faults().await.unwrap();
+    assert!(
+        listing
+            .faults
+            .iter()
+            .all(|fault| fault.node.as_deref() == Some(target.name.as_str())),
+        "{:?}",
+        listing.faults
+    );
+
+    shutdown.cancel();
+    for node in &nodes {
+        if let Some(council) = &node.handle.council {
+            council.shutdown().await.ok();
+        }
+    }
+}
+
+/// Z6.1: a network fault acts where a connection starts, so a DNS fault on
+/// `web` sent to one node is installed on every node (any of them may run a
+/// caller), listed with each holder, and cleared everywhere by service name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
+async fn a_network_fault_sent_to_one_node_is_installed_where_every_caller_runs() {
+    use reliaburger::smoker::types::{FaultRequest, FaultType};
+
+    let shutdown = CancellationToken::new();
+    let nodes = start_spread_web_cluster("nf", 19841, &shutdown).await;
+    let entry = &nodes[0];
+
+    let summary = entry
+        .client
+        .inject_fault(&FaultRequest {
+            fault_type: FaultType::DnsNxdomain,
+            target_service: "web".to_string(),
+            namespace: None,
+            target_instance: None,
+            target_node: None,
+            duration: Duration::from_secs(120),
+            injected_by: String::new(),
+            reason: Some("callers everywhere".to_string()),
+            include_leader: false,
+            override_safety: false,
+            acknowledged: true,
+        })
+        .await
+        .expect("a destination-wide network fault should be routed to every node");
+    let mut holders: Vec<String> = std::iter::once(&summary)
+        .chain(&summary.routed)
+        .filter_map(|fault| fault.node.clone())
+        .collect();
+    holders.sort();
+    let mut names: Vec<String> = nodes.iter().map(|node| node.name.clone()).collect();
+    names.sort();
+    assert_eq!(holders, names);
+
+    let listing = entry.client.list_cluster_faults().await.unwrap();
+    assert_eq!(listing.faults.len(), 3, "{:?}", listing.faults);
+
+    entry
+        .client
+        .clear_faults_by_service("web", Some("default"))
+        .await
+        .expect("clear by service reaches every node");
+    let listing = entry.client.list_cluster_faults().await.unwrap();
+    assert!(listing.faults.is_empty(), "{:?}", listing.faults);
+
+    shutdown.cancel();
+    for node in &nodes {
+        if let Some(council) = &node.handle.council {
+            council.shutdown().await.ok();
+        }
+    }
+}
+
+/// Read a followed log stream until `done` says so or `timeout` passes,
+/// returning every event seen so far.
+async fn read_follow_events<B: AsRef<[u8]>>(
+    body: &mut (impl futures_util::Stream<Item = reqwest::Result<B>> + Unpin),
+    decoder: &mut reliaburger::ketchup::sse::SseDecoder,
+    events: &mut Vec<reliaburger::ketchup::sse::SseEvent>,
+    timeout: Duration,
+    mut done: impl FnMut(&[reliaburger::ketchup::sse::SseEvent]) -> bool,
+) {
+    use futures_util::StreamExt;
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    while !done(events) {
+        match tokio::time::timeout_at(deadline, body.next()).await {
+            Ok(Some(Ok(chunk))) => events.extend(decoder.push(chunk.as_ref())),
+            Ok(Some(Err(_)) | None) | Err(_) => return,
+        }
+    }
+}
+
+/// The nodes that produced followed lines, from their `[node instance]` prefix.
+fn followed_nodes(events: &[reliaburger::ketchup::sse::SseEvent]) -> Vec<String> {
+    let mut nodes: Vec<String> = events
+        .iter()
+        .filter(|event| event.event.is_none())
+        .filter_map(|event| {
+            let rest = event.data.strip_prefix('[')?;
+            Some(rest.split_once(' ')?.0.to_string())
+        })
+        .collect();
+    nodes.sort();
+    nodes.dedup();
+    nodes
+}
+
+/// Z2.2: `relish logs -f` and `relish top` from one node see every node.
+/// The follow merges each node's lines under a `[node instance]` prefix, and
+/// when a node dies mid-stream it warns and keeps streaming the others.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
+async fn follow_and_top_cover_every_node_and_survive_one_leaving() {
+    let shutdown = CancellationToken::new();
+    let nodes = start_spread_web_cluster("lf", 19641, &shutdown).await;
+    let entry = &nodes[0];
+    // Lose a follower rather than the leader, so the test watches the
+    // follow's reaction rather than an election.
+    let doomed = nodes[1..]
+        .iter()
+        .find(|node| !*node.thinks_leader.borrow())
+        .expect("a follower other than the entry node");
+    let names: Vec<String> = nodes.iter().map(|node| node.name.clone()).collect();
+
+    let top = entry.client.cluster_top().await.unwrap();
+    assert!(top.warnings.is_empty(), "{:?}", top.warnings);
+    let mut top_nodes: Vec<_> = top
+        .rows
+        .iter()
+        .filter(|row| row.instance.app_name == "web")
+        .map(|row| row.node.clone())
+        .collect();
+    top_nodes.sort();
+    assert_eq!(top_nodes, names);
+
+    let response = entry
+        .client
+        .http()
+        .unwrap()
+        .get(format!("{}/v1/logs/web/default", entry.client.base_url()))
+        .query(&[("follow", "true")])
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+    let mut body = response.bytes_stream();
+    let mut decoder = reliaburger::ketchup::sse::SseDecoder::default();
+    let mut events = Vec::new();
+
+    read_follow_events(
+        &mut body,
+        &mut decoder,
+        &mut events,
+        Duration::from_secs(20),
+        |events| followed_nodes(events).len() == 3,
+    )
+    .await;
+    assert_eq!(followed_nodes(&events), names, "lines from every node");
+    let line = events
+        .iter()
+        .find(|event| event.data.starts_with(&format!("[{} ", doomed.name)))
+        .unwrap();
+    assert!(line.data.contains("tick from"), "{}", line.data);
+
+    // Take a node away mid-stream: the follow warns about it and carries on.
+    doomed._wired.shutdown.cancel();
+    let before = events.len();
+    read_follow_events(
+        &mut body,
+        &mut decoder,
+        &mut events,
+        Duration::from_secs(45),
+        |events| {
+            events[before..].iter().any(|event| {
+                event.event.as_deref() == Some(reliaburger::ketchup::sse::WARNING_EVENT)
+                    && event.data.contains(&doomed.name)
+            })
+        },
+    )
+    .await;
+    let warned = events[before..].iter().any(|event| {
+        event.event.as_deref() == Some(reliaburger::ketchup::sse::WARNING_EVENT)
+            && event.data.contains(&doomed.name)
+    });
+    assert!(
+        warned,
+        "no warning about {}: {:?}",
+        doomed.name,
+        &events[before..]
+    );
+    let after_warning = events.len();
+    read_follow_events(
+        &mut body,
+        &mut decoder,
+        &mut events,
+        Duration::from_secs(10),
+        |events| events.len() >= after_warning + 5,
+    )
+    .await;
+    // The survivors keep streaming. Which of them runs the rescheduled
+    // replicas is the scheduler's business, not this test's.
+    let survivors = followed_nodes(&events[after_warning..]);
+    assert!(
+        !survivors.is_empty() && !survivors.contains(&doomed.name),
+        "the follow should keep streaming the survivors, got {survivors:?}"
+    );
+
+    shutdown.cancel();
+    for node in &nodes {
+        if let Some(council) = &node.handle.council {
+            council.shutdown().await.ok();
+        }
+    }
+}
+
+/// Z2.3: `relish wtf` and `relish trace` reach every node through the node
+/// the CLI talks to. A laptop host can only reach node 1's forwarded port, so
+/// neither may dial a node's own advertised address.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
+async fn wtf_and_trace_reach_every_node_through_the_entry_node() {
+    let shutdown = CancellationToken::new();
+    let nodes = start_spread_web_cluster("wt", 19741, &shutdown).await;
+    // Enter through the middle node, so the trace's source (the lowest-named
+    // node running `web`) is somewhere else.
+    let entry = &nodes[1];
+    // wtf reads the council from the leader, which it finds through the
+    // entry node's view; wait until every node knows the full council.
+    let voters_ready = wait_until(Duration::from_secs(60), || {
+        nodes.iter().all(|node| {
+            node.handle.council.as_ref().is_some_and(|council| {
+                let metrics = council.metrics().borrow().clone();
+                metrics.membership_config.membership().voter_ids().count() == 3
+                    && metrics.current_leader.is_some()
+            })
+        })
+    })
+    .await;
+    assert!(voters_ready, "council never grew to three voters");
+
+    let inputs = reliaburger::relish::wtf::collect(&entry.client, Some("web"))
+        .await
+        .expect("wtf collects through the entry node");
+    let observed = inputs
+        .cluster
+        .nodes
+        .value()
+        .expect("node evidence is available")
+        .clone();
+    let mut reachable: Vec<_> = observed
+        .iter()
+        .filter(|node| node.agent_reachable)
+        .map(|node| node.node_id.clone())
+        .collect();
+    reachable.sort();
+    let names: Vec<_> = nodes.iter().map(|node| node.name.clone()).collect();
+    assert_eq!(reachable, names, "every node answered through the relay");
+    assert!(
+        inputs.cluster.council.value().is_some(),
+        "the leader's council view came through the relay: {:?}",
+        inputs.cluster.council
+    );
+
+    let result = reliaburger::relish::trace_cmd::trace(
+        &reliaburger::onion::trace::TraceRequest {
+            source: "web".to_string(),
+            source_namespace: "default".to_string(),
+            destination: "web".to_string(),
+            destination_namespace: "default".to_string(),
+            port: None,
+            count: None,
+        },
+        &entry.client,
+    )
+    .await
+    .expect("trace runs on the source node through the relay");
+    assert_eq!(result.source_node, nodes[0].name);
+
+    shutdown.cancel();
+    for node in &nodes {
         if let Some(council) = &node.handle.council {
             council.shutdown().await.ok();
         }
@@ -1296,19 +1523,8 @@ async fn wait_for_fault_admission_views(nodes: &[&Node]) -> usize {
 #[ignore = "slow multi-node reservation acceptance; run with make test-cluster"]
 async fn concurrent_node_kills_and_leader_change_preserve_reserved_capacity() {
     use reliaburger::mustard::state::NodeState;
-    use reliaburger::sesame::types::{ApiRole, TokenScope};
     use reliaburger::smoker::types::{FaultRequest, FaultType};
-    let created = reliaburger::sesame::token::create_token(
-        "reservation-admin",
-        ApiRole::Admin,
-        TokenScope::default(),
-        None,
-    )
-    .unwrap();
-    let auth = NodeFaultAuth {
-        token: created.token,
-        plaintext: created.plaintext,
-    };
+    let auth = NodeFaultAuth::admin("reservation-admin");
     let shutdown = CancellationToken::new();
     let n1 =
         start_node_with_auth("reservation1", 20341, vec![], &shutdown, Some(auth.clone())).await;
@@ -1505,17 +1721,7 @@ async fn concurrent_node_kills_and_leader_change_preserve_reserved_capacity() {
 #[ignore = "multi-node apply forwarding acceptance; run with make test-cluster"]
 async fn follower_apply_preserves_user_authority_for_administrative_manifests() {
     use reliaburger::sesame::types::{ApiRole, TokenScope};
-    let created = reliaburger::sesame::token::create_token(
-        "apply-admin",
-        ApiRole::Admin,
-        TokenScope::default(),
-        None,
-    )
-    .unwrap();
-    let auth = NodeFaultAuth {
-        token: created.token,
-        plaintext: created.plaintext,
-    };
+    let auth = NodeFaultAuth::admin("apply-admin");
     let shutdown = CancellationToken::new();
     let n1 = start_node_with_auth("apply1", 20401, vec![], &shutdown, Some(auth.clone())).await;
     let n2 = start_node_with_auth(
@@ -1618,17 +1824,7 @@ async fn follower_apply_preserves_user_authority_for_administrative_manifests() 
 async fn capacity_refusal_from_the_live_scheduler_forwards_without_committing_an_app() {
     use reliaburger::meat::scheduler::ScheduleError;
     use reliaburger::relish::RelishError;
-    let created = reliaburger::sesame::token::create_token(
-        "capacity-admin",
-        reliaburger::sesame::types::ApiRole::Admin,
-        Default::default(),
-        None,
-    )
-    .unwrap();
-    let auth = NodeFaultAuth {
-        token: created.token,
-        plaintext: created.plaintext,
-    };
+    let auth = NodeFaultAuth::admin("capacity-admin");
     let shutdown = CancellationToken::new();
     let n1 = start_node_with_auth("cap1", 26341, vec![], &shutdown, Some(auth.clone())).await;
     let n2 = start_node_with_auth(
@@ -1795,17 +1991,7 @@ async fn capacity_refusal_from_the_live_scheduler_forwards_without_committing_an
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 #[ignore = "slow multi-node leased storage acceptance; run with make test-cluster"]
 async fn leased_storage_cleanup_waits_for_former_placements_and_failed_deletion() {
-    let created = reliaburger::sesame::token::create_token(
-        "storage-admin",
-        reliaburger::sesame::types::ApiRole::Admin,
-        Default::default(),
-        None,
-    )
-    .unwrap();
-    let auth = NodeFaultAuth {
-        token: created.token,
-        plaintext: created.plaintext,
-    };
+    let auth = NodeFaultAuth::admin("storage-admin");
     let shutdown = CancellationToken::new();
     let n1 = start_node_with_auth("storage1", 26841, vec![], &shutdown, Some(auth.clone())).await;
     let n2 = start_node_with_auth(

@@ -26,9 +26,17 @@ host-network = { max-threads = 1 }
 cluster-heavy = { max-threads = 1 }
 process-heavy = { max-threads = 2 }
 upgrade-heavy = { max-threads = 1 }
+crash-recovery = { max-threads = 1 }
+
+# The podinfo demo pulls three real images on a cold cache before it can
+# check anything, so it gets longer than the other host-network tests.
+[[profile.default.overrides]]
+filter = 'binary(kubernetes_demo)'
+test-group = "host-network"
+slow-timeout = { period = "120s", terminate-after = 5 }
 
 [[profile.default.overrides]]
-filter = 'binary(ebpf) | binary(owned_network) | binary(owned_runc) | binary(owned_rootless) | test(/(runc|netns|btrfs|buildah|image_pull)/)'
+filter = 'binary(ebpf) | binary(owned_network) | binary(owned_runc) | binary(owned_rootless) | test(/(runc_|_runc|runc::|netns|btrfs|buildah|image_pull)/)'
 test-group = "host-network"
 slow-timeout = { period = "60s", terminate-after = 2 }
 
@@ -38,7 +46,7 @@ test-group = "cluster-heavy"
 slow-timeout = { period = "60s", terminate-after = 2 }
 
 [[profile.default.overrides]]
-filter = 'binary(integration) | binary(placement) | binary(chaos)'
+filter = 'binary(integration) | binary(placement) | binary(job_recovery)'
 test-group = "process-heavy"
 slow-timeout = { period = "60s", terminate-after = 3 }
 
@@ -54,8 +62,15 @@ slow-timeout = { period = "120s", terminate-after = 3 }
 filter = 'binary(node_pressure)'
 threads-required = "num-test-threads"
 
+# The podinfo demo pulls three real images on a cold cache before it can
+# check anything, so it gets longer than the other host-network tests.
 [[profile.ci.overrides]]
-filter = 'binary(ebpf) | binary(owned_network) | binary(owned_runc) | binary(owned_rootless) | test(/(runc|netns|btrfs|buildah|image_pull)/)'
+filter = 'binary(kubernetes_demo)'
+test-group = "host-network"
+slow-timeout = { period = "120s", terminate-after = 5 }
+
+[[profile.ci.overrides]]
+filter = 'binary(ebpf) | binary(owned_network) | binary(owned_runc) | binary(owned_rootless) | test(/(runc_|_runc|runc::|netns|btrfs|buildah|image_pull)/)'
 test-group = "host-network"
 slow-timeout = { period = "60s", terminate-after = 2 }
 
@@ -65,7 +80,7 @@ test-group = "cluster-heavy"
 slow-timeout = { period = "60s", terminate-after = 2 }
 
 [[profile.ci.overrides]]
-filter = 'binary(integration) | binary(placement) | binary(chaos)'
+filter = 'binary(integration) | binary(placement) | binary(job_recovery)'
 test-group = "process-heavy"
 slow-timeout = { period = "60s", terminate-after = 3 }
 
@@ -84,11 +99,27 @@ threads-required = "num-test-threads"
 # real TLS enrolment and a three-voter election. Serialise the physical cluster
 # fixtures and allow their explicit recovery deadlines to run under nextest.
 [[profile.default.overrides]]
-filter = 'binary(documentation_first_run) & (test(=expired_registry_lease_recovers_after_bun_sigkill_and_preserves_shared_content) | test(=new_leader_retains_registry_cleanup_until_the_killed_writer_returns))'
+filter = 'binary(registry_recovery) & (test(=expired_registry_lease_recovers_after_bun_sigkill_and_preserves_shared_content) | test(=new_leader_retains_registry_cleanup_until_the_killed_writer_returns))'
 test-group = "cluster-heavy"
 slow-timeout = { period = "60s", terminate-after = 4 }
 
 [[profile.ci.overrides]]
-filter = 'binary(documentation_first_run) & (test(=expired_registry_lease_recovers_after_bun_sigkill_and_preserves_shared_content) | test(=new_leader_retains_registry_cleanup_until_the_killed_writer_returns))'
+filter = 'binary(registry_recovery) & (test(=expired_registry_lease_recovers_after_bun_sigkill_and_preserves_shared_content) | test(=new_leader_retains_registry_cleanup_until_the_killed_writer_returns))'
 test-group = "cluster-heavy"
+slow-timeout = { period = "60s", terminate-after = 4 }
+
+# Crash-recovery acceptance kills real Bun and owner processes and reboots
+# their kernel state. The cases share runc, bpffs and cgroup roots, so they
+# run one at a time, with room for the three-node upgrade case.
+[[profile.default.overrides]]
+filter = 'binary(oci_crash)'
+test-group = "crash-recovery"
+slow-timeout = { period = "60s", terminate-after = 4 }
+
+# Crash-recovery acceptance kills real Bun and owner processes and reboots
+# their kernel state. The cases share runc, bpffs and cgroup roots, so they
+# run one at a time, with room for the three-node upgrade case.
+[[profile.ci.overrides]]
+filter = 'binary(oci_crash)'
+test-group = "crash-recovery"
 slow-timeout = { period = "60s", terminate-after = 4 }

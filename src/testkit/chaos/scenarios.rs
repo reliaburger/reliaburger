@@ -313,15 +313,18 @@ async fn minority_partition_degrades_and_heals(context: TestContext) -> Result<(
         ));
     }
 
-    context
-        .chaos()
-        .inject_partition(
-            target_client,
+    inject_node_fault(
+        &context,
+        target_client,
+        node_request(
+            &context,
+            FaultType::CouncilPartition { peers },
             &target,
-            &peers,
-            fault_duration(context.timeout).as_secs(),
-        )
-        .await?;
+            true,
+            "phase15 C3 minority partition",
+        ),
+    )
+    .await?;
     let canary = "chaos-c3-majority";
     apply_with_client(
         &context,

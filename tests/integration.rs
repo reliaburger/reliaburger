@@ -635,6 +635,7 @@ async fn logs_follow_returns_output_for_completed_job() {
             app_name: "echoer2".to_string(),
             namespace: "default".to_string(),
             tail: None,
+            label: None,
             lines: event_tx,
         })
         .await
@@ -941,6 +942,7 @@ async fn network_fault_without_ebpf_is_rejected_not_faked() {
         fault_type: FaultType::Delay {
             delay_ns: 100_000_000,
             jitter_ns: 0,
+            source_app: None,
         },
         target_service: "svc".into(),
         namespace: None,

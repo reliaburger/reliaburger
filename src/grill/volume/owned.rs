@@ -144,30 +144,21 @@ fn roots(root: &Path, namespace: &str, app: &str) -> [PathBuf; 3] {
 fn load(root: &Path, namespace: &str, app: &str) -> Result<Option<Journal>, VolumeError> {
     let path = journal_path(root, namespace, app);
     checked_path(root, &path)?;
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
-    }
-    let file = match options.open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+    const MAX_BYTES: u64 = 1024 * 1024;
+    use std::io::ErrorKind::{FileTooLarge, InvalidData, UnexpectedEof};
+    // Malformed or oversized state refuses ownership; other I/O stays I/O.
+    let journal: Journal = match crate::durable::read_json_if_exists(
+        &path,
+        MAX_BYTES,
+        crate::durable::Access::Regular,
+    ) {
+        Ok(Some(journal)) => journal,
+        Ok(None) => return Ok(None),
+        Err(error) if matches!(error.kind(), InvalidData | FileTooLarge | UnexpectedEof) => {
+            return Err(refuse(error.to_string()));
+        }
         Err(error) => return Err(error.into()),
     };
-    const MAX_BYTES: u64 = 1024 * 1024;
-    let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.len() > MAX_BYTES {
-        return Err(refuse("invalid test storage checkpoint file"));
-    }
-    let mut bytes = Vec::new();
-    file.take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_BYTES {
-        return Err(refuse("test storage checkpoint is too large"));
-    }
-    let journal: Journal =
-        serde_json::from_slice(&bytes).map_err(|error| refuse(error.to_string()))?;
     if journal.schema != 1
         || journal.namespace != namespace
         || journal.app != app
@@ -425,22 +416,29 @@ fn run(program: &str, arguments: &[&std::ffi::OsStr]) -> Result<(), VolumeError>
     {
         use std::os::unix::process::CommandExt;
         let parent = std::process::id();
-        // SAFETY: only async-signal-safe Linux syscalls run between fork and exec.
-        // The synchronous spawning thread remains alive until this child exits;
-        // rechecking the parent closes death before PR_SET_PDEATHSIG was armed.
+        // SAFETY: only async-signal-safe Linux syscalls run between fork and exec,
+        // and neither error path allocates (`last_os_error` and
+        // `from_raw_os_error` build the error inline). The synchronous spawning
+        // thread remains alive until this child exits; rechecking the parent
+        // closes death before PR_SET_PDEATHSIG was armed.
         unsafe {
             command.pre_exec(move || {
                 if nix::libc::prctl(nix::libc::PR_SET_PDEATHSIG, nix::libc::SIGKILL) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
                 if nix::libc::getppid() as u32 != parent {
-                    return Err(std::io::Error::other("storage command owner exited"));
+                    return Err(std::io::Error::from_raw_os_error(nix::libc::ESRCH));
                 }
                 Ok(())
             });
         }
     }
-    let mut child = command.spawn()?;
+    let mut child = match command.spawn() {
+        Err(error) if error.raw_os_error() == Some(nix::libc::ESRCH) => {
+            return Err(refuse("storage command owner exited"));
+        }
+        spawned => spawned?,
+    };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let status = loop {
         if let Some(status) = child.try_wait()? {

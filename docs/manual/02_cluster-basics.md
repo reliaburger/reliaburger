@@ -49,6 +49,36 @@ The council self-heals: lose a voter and the reconciler promotes a worker.
 For total council loss there is `relish council recover` (read its `--help`
 before using it — it rewinds to a backup).
 
+## When a node is gone for good
+
+Every node that reads the service catalogue promises to confirm when it stops
+routing to a retired address. A node that dies never confirms, so its promises
+pile up with every deploy. When they fill three quarters of the ledger, the
+leader's `discovery:withdrawal-backlog` readiness check turns degraded and its
+log names the nodes that owe confirmations:
+
+```text
+scheduler: endpoint withdrawal ledger is 78% full; catalogue updates stop at 100%.
+Receipts owed by: node-03 (800 generations, not alive), ...
+```
+
+The leader also exports the reading as the metrics
+`discovery_withdrawal_ledger_occupancy_ratio` (0 to 1) and
+`discovery_withdrawal_pending_generations`, if you'd rather alert on a trend.
+
+At 100% the cluster stops publishing catalogue changes: new instances and
+scale-ups don't become reachable. If a node is permanently gone, stop or isolate
+whatever it was running, then retire it:
+
+```sh
+relish decommission-node node-03 --workloads-stopped --reason "disk failed"
+```
+
+This discharges only that node's confirmations. The name can't rejoin; a
+replacement machine enrols fresh with `relish join`. Don't decommission a node
+that might still be running, such as one behind a network partition: it could
+still be sending traffic to addresses the cluster would then hand out again.
+
 ## Try it in VMs
 
 `relish dev create` builds a real three-node cluster in Lima VMs:

@@ -208,6 +208,48 @@ On Linux, managed volumes with a size limit get a loop-mounted ext4 filesystem. 
 
 On macOS, there's no loop mount. Reliaburger creates a plain directory and logs a warning. Size limits are soft-only on macOS. This is a development convenience, not a production limitation — production clusters run Linux.
 
+## Whose volume is it?
+
+Chapter 1 put every Runc container in a user namespace: container uid 999 is host uid 2,000,000,999, and container root is nobody special on the node. That fixed a lot, and broke volumes on the spot. Bun creates `/var/lib/reliaburger/volumes/default/redis/data` as root, bind-mounts it at `/data`, and Redis's entrypoint tries to `chown` it to the `redis` user. Inside a user namespace, `CAP_CHOWN` only works on files whose owner the namespace maps. Host root isn't mapped. `chown: Operation not permitted`, and Redis never starts.
+
+Docker's `userns-remap` answers this by chowning a new volume into the remapped range. Kubernetes answers with `fsGroup`, which makes a volume group-owned by a chosen gid and adds that gid to every container in the pod. We copied Docker. A Reliaburger app has one process user, and images that switch users (Redis, Postgres) start as root and hand their data directory over themselves, which works as soon as container root owns the directory. So there's no `fs_group` field, and `relish import` warns that it dropped one.
+
+The interesting part is *when* to chown. Every start? Redis's entrypoint gives `/data` to uid 999; Bun giving it back to root on the next start would fight it, and a recursive `chown` of a 200 GB volume on every restart is a long way to wait. Only when the volume is empty? A loop-mounted ext4 volume is born with `lost+found` in it. So the provisioning sidecar next to the volume (the one that already records its backend) now also records who we handed it to, and a small pure function decides:
+
+```rust
+pub fn plan_ownership(
+    recorded: Option<VolumeOwner>,
+    root: VolumeOwner,
+    wanted: VolumeOwner,
+) -> OwnershipPlan {
+    let root_mapped = super::userns::container_id(root.uid).is_some()
+        && super::userns::container_id(root.gid).is_some();
+    match recorded {
+        _ if !root_mapped => OwnershipPlan::HandOver,
+        None => OwnershipPlan::HandOver,
+        Some(previous) if previous == wanted => OwnershipPlan::Keep,
+        Some(previous) => OwnershipPlan::Rehome { from: previous },
+    }
+}
+```
+
+The `if` after a pattern is a *match guard*: the arm only matches when the condition holds too, and the arms are tried top to bottom. `_ if !root_mapped` matches any `recorded` value, so it catches a root that nothing in the container range owns (a snapshot restored from before the first mount, say) before the other arms get a look. Because `OwnershipPlan` is an enum, the caller's `match` on the result must handle `Keep`, `HandOver` and `Rehome`, and the compiler says so if a fourth variant ever turns up.
+
+`Rehome` is the image-`USER`-changed case. It moves only what the previous user owned, using the same tree walk as `HandOver` with a different rule:
+
+```rust
+fn chown_tree(
+    root: &Path,
+    new_owner: &dyn Fn(VolumeOwner) -> Option<VolumeOwner>,
+) -> Result<(), VolumeError>
+```
+
+`&dyn Fn(...)` is a borrowed *trait object*: any closure with that signature, called through a pointer, much like passing a function pointer plus a context in C. `HandOver` passes `&|_| Some(wanted)` (everything goes to the new user), `Rehome` passes a closure that returns `None` for files the old user never owned. The walk uses `symlink_metadata` and `lchown`, so a symlink the container planted pointing at `/etc/shadow` gets its own ownership changed, not its target's.
+
+Host-path volumes (`source = "/srv/import"`) get none of this. They're the operator's directories, and silently chowning `/srv/import` to uid 2,000,000,999 is exactly the kind of surprise an orchestrator shouldn't spring. Bun checks the mode bits instead and, if the container's user plainly can't write, logs which host uid to `chown` the directory to. It still starts the container, because plenty of host mounts are only ever read.
+
+The proof is a gated test that runs the real Redis image with `--appendonly yes` over a managed volume: first as uid 999 directly (so no entrypoint `chown` can paper over a missing hand-over), writes a key, restarts, reads it back, then restarts as image root and reads it again.
+
 ## Under the hood: key patterns
 
 ### Validate at construction, not at use
@@ -364,6 +406,22 @@ pub fn revalidate_blob(&self, digest: &Digest) -> bool {
 
 The deploy path (`image_available_locally`) and the peer pull both call this instead of `has_blob`. Re-hashing every blob on every read would be wasteful, so we do it where it matters: before trusting a cache for a deploy, and before short-circuiting a peer pull.
 
+That first version had two problems, both hiding in `std::fs::read`. It loads the whole file into a `Vec<u8>`, and the heal loop and P2P resolver call it for every layer they consider. A 4 GB layer meant a 4 GB allocation, on every tick. And `let Ok(data) = ... else { return false }` turned *every* read error into "not cached". A permissions mistake or a dying disk looked like a cache miss, so we'd quietly download the layer again on top of a file we couldn't even read.
+
+Now the hash streams the file through a 64 KiB buffer (`sha256_file`, shared with the copy-confirmation path), and the function returns `Result<bool, PickleError>`:
+
+```rust
+let actual = match sha256_file(&path) {
+    Ok(actual) => actual,
+    Err(PickleError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+        return Ok(false);
+    }
+    Err(error) => return Err(error),
+};
+```
+
+The `if` after a pattern is a *match guard*: the arm only matches when the pattern fits *and* the condition holds. Only "no such file" means "not cached". Any other I/O error propagates to the caller, and a mismatch still deletes the corrupt bytes, now checking that the delete worked too. Tests cover a multi-chunk blob whose last byte flips and a blob path that can't be read, which must be an error and must not be deleted.
+
 ### One rootfs per content, not per tag
 
 Here's a subtle one. The unpacked rootfs used to live at `rootfs/{registry}/{repo}/{tag}/`, and unpacking *cleared and recreated* that directory. Now picture a tag move — `web:v1` re-pointed at new content — while a container is running out of the old rootfs. The re-extract does `remove_dir_all` on the directory the running container is living in. Two concurrent pushes to the same tag race the same way.
@@ -459,24 +517,20 @@ Peer replication follows the OCI upload dance: POST to start an upload, read the
 
 `resolve_same_origin_location` constrains the redirect to the peer's own origin: a relative path is resolved against the peer's base URL; an absolute URL is accepted only if its scheme, host, and port all match; a protocol-relative `//host/…` (which quietly swaps the host) is refused outright. The PUT never leaves for anywhere but the peer we were already talking to. Peer body reads are bounded too — a hard cap and the request timeout, so a hostile peer can't stream an unbounded body to exhaust memory or hold the connection open with a slow trickle.
 
-There was a subtler memory hole behind that hard cap. The pull *enforced* the cap but still buffered the whole blob in a `Vec` before writing it — up to two gigabytes per layer, multiplied by every concurrent pull. The cap stopped a single hostile peer; it did nothing about a handful of honest large pulls landing at once. So the pull now streams: chunks go straight to the upload temp as they arrive, a running SHA-256 hashes them on the way past, and once the digest checks out the temp is committed into the blob store by an atomic rename — no re-read, no second copy. Peak memory per pull is one network chunk, whatever the layer's size. (The push handlers still buffer their request body; streaming those the same way is a Phase 15 job, flagged in `MAX_REQUEST_BYTES`.)
+There was a subtler memory hole behind that hard cap. The pull *enforced* the cap but still buffered the whole blob in a `Vec` before writing it — up to two gigabytes per layer, multiplied by every concurrent pull. The cap stopped a single hostile peer; it did nothing about a handful of honest large pulls landing at once. So the pull now streams: chunks go straight to the upload temp as they arrive, a running SHA-256 hashes them on the way past, and once the digest checks out the temp is committed into the blob store by an atomic rename — no re-read, no second copy. Peak memory per pull is one network chunk, whatever the layer's size. (The push handlers still buffered their request bodies at this point; the release hardening below fixed that too.)
 
 ### Honest push semantics
 
 A push commits locally and to Raft, then the heal loop drives it up to
-`[images] redundancy` copies afterwards. The manifest PUT returns `201 Created`
-with `OCI-Replication: pending` only after authoritative acceptance. A failed or
-timed-out Raft proposal returns `503 Service Unavailable`; the client must retry.
-An earlier version returned 202 with a custom `raft-uncommitted` header. Generic
-OCI clients could treat that success-class response as a completed push without
-reading our header. The status itself now communicates the missing authority.
+`[images] redundancy` copies afterwards. So what should a push *report*? The
+manifest PUT returns `201 Created` with `OCI-Replication: pending` once Raft has
+accepted the commit: authoritative, but not yet fully replicated. If the Raft
+proposal fails or times out, the PUT returns `503 Service Unavailable` and the
+client retries. An earlier version returned `202 Accepted` with a custom header,
+and generic OCI clients happily treated that success-class status as a finished
+push without ever reading our header. The status code is the one part of the
+answer every client reads.
 
-The regression uses a real Raft node: an uninitialised council refuses the push,
-then election followed by the same push succeeds and exposes the tag in cluster
-state. It also checks the actual `CouncilResponse::Applied { log_index }` response
-from the state machine. Accepting only its generic `Ok` variant would reject
-successful commits. Rust's `|` pattern lets the match accept both success forms;
-other response variants remain explicit failures.
 
 The GC arbiter got stricter too. It used to recheck only sole-copy protection at deletion time. Now it rechecks against the *full catalogue reference set* immediately before approving: a blob any manifest still references — its config, a layer, or the manifest blob itself — is never approved for deletion, even if the nominating node saw it as an orphan when it built the report. A fresh push can re-reference a blob between nomination and approval; this serialised recheck is the last chance to refuse, and it takes it.
 
@@ -497,56 +551,6 @@ Two details worth stealing:
 The upgrade path is the interesting counter-example, because it's the one where none of this touched integrity. Binaries are content-addressed and dual-signed; `verify_binary` checks the sha256 and the embedded release signature on every path, plaintext or not. Nobody was going to slip you a modified binary. What plaintext actually cost was *working at all* against a TLS-only registry, plus telling anyone on the path which build you were rolling out. Worth fixing, worth being precise about why — "we added TLS so nobody can tamper with the binary" would have been a nice story and a false one.
 
 The registry's read side moved too, though for a different reason. Reads were open on the assumption of a loopback bind, which is right: a local `docker pull` shouldn't need a token. Published on a routable address, that same openness hands every image in the cluster to anyone who can reach the port — including the `cache/` copies of private upstream registries, pulled with the operator's credentials. So reads now need a principal when the bind isn't loopback. The classifier is deliberately strict: only an IP literal that *is* loopback counts. A hostname could resolve anywhere, and could resolve somewhere else tomorrow; `0.0.0.0` reads like a local default while being the most exposed bind there is. Both count as routable, because the failure we'd rather have is "you needed a token and didn't expect to".
-
-## Tests
-
-Pickle is almost entirely testable in-process. A blob store is a directory, the OCI API is an axum router, and the catalog is a `Vec` — none of that needs the internet or another node. So the default suite spins up a Pickle server in the test, pushes a manifest and its blobs, then pulls them back, all without leaving the process.
-
-### Unit tests — the registry without the network
-
-The 104 tests in `src/pickle/` cover:
-
-- **Digest and manifest** — `Digest::new` accepts well-formed digests and rejects everything else; manifests round-trip through serde unchanged.
-- **Blob store** — write/read, upload sessions, and the digest-mismatch rejection path (`PickleError::DigestMismatch`).
-- **OCI API** — `full_push_pull_round_trip` drives the real `/v2/` handlers end to end against an in-process server; plus the not-found paths (`blob_head_not_found`, `manifest_get_not_found`) that must return the right status codes. The manifest-validation contract gets a rejection matrix: invalid JSON, missing or unknown media type, size mismatch, malformed descriptor digest, missing referenced blob, and a happy path asserting the GET returns byte-identical bytes.
-- **Garbage collection** — the safety rails get a test each: `gc_protects_sole_copy`, `gc_protects_active_deployment_images`, `gc_protects_tagged_manifest_layers`, `gc_protects_within_retention_window`, and the positive case `gc_collects_unreferenced_blob`. These are the tests that let you trust GC won't eat your last copy of a layer. `gc_never_nominates_a_catalogued_manifests_own_blob` pins the REG1 fix, and `tests/pickle_integrity.rs` runs the full push → GC → peer-pull acceptance sequence against real in-process registries.
-
-### Hermetic protocol tests, provisioned runtime tests
-
-The image-pull protocol belongs in the portable suite. An in-process registry serves a
-digest-pinned synthetic image over loopback, so manifest fetching, blob digest validation,
-unpacking and cache reuse don't depend on Docker Hub or a mutable tag.
-
-Real runtimes are different. runc needs Linux and kernel capabilities; Apple Container
-needs Apple silicon and nested virtualisation. Those tests compile with a reasoned
-`#[ignore]` and run through named targets:
-
-```sh
-sudo make test-linux  # runc plus the other provisioned Linux/kernel suites
-make test-apple       # manual Apple Container check
-```
-
-An explicitly requested suite asserts its prerequisites and fails if they are missing. It
-never returns early and appears green without running. Chapter 15 explains the distinction
-between `#[cfg]`, `#[ignore]` and an executed test in detail.
-
-For an end-to-end smoke test of a real push and pull through Pickle on macOS:
-
-```sh
-make pickle-test-macos    # push/pull a real Docker image through Pickle (needs Docker Desktop)
-```
-
-### Running them
-
-The default path needs nothing special:
-
-```sh
-cargo test --lib pickle       # the whole registry, in-process
-```
-
-Reach for the gated commands only when you want to exercise real images or real runtimes. The full env-var table lives in `docs/README.md`.
-
-Phase 5 adds 72 tests, bringing the total to 867.
 
 ## Release hardening: a push shouldn't need a layer's worth of RAM
 
@@ -593,17 +597,17 @@ wrote a layer to `blobs/sha256/<digest>`, while Pickle wrote it to
 runtime created a flat file, the registry could no longer create its directory.
 The fallback then pulled upstream again instead of using the bytes on disk.
 
-Both stores now use one path resolver. New blobs use the registry layout, and
-existing flat files remain readable and writable. Enumeration recognises both
-forms and ignores temporary filenames. A regression writes through the registry
-and reads through the runtime, then repeats with a legacy flat file.
+Both stores now use one path resolver and one layout, the registry's. Nothing
+has shipped yet, so there's no flat-file cache in the wild to keep reading.
+Enumeration ignores temporary filenames. A regression writes through the
+registry and reads through the runtime.
 
 That exposed a second assumption: rootfs generation IDs hashed each layer's
 filename. Every registry layer's filename is `data`, so replacing a layer could
-reuse the previous rootfs generation. We now extract the digest from its parent
-for that layout. The same ordered digests produce the same generation in both
-layouts, and changed digests produce a new generation without touching a running
-container's files. The tests exercise those properties directly.
+reuse the previous rootfs generation. We now take the digest from the parent
+directory's name instead. Changed digests produce a new generation without
+touching a running container's files. The tests exercise that property
+directly.
 
 Digest pins also contain a colon (`sha256:...`), as do registries with explicit
 ports. That character separates lower layers in overlayfs mount options. We
@@ -611,799 +615,233 @@ encode it as `%3A` in rootfs directory components while preserving the original
 OCI reference for registry requests. A path regression covers both a pinned
 digest and a registry port; ordinary tag paths keep their existing layout.
 
-### An upload location is not permission to forward credentials
-
-The registry starts an upload by returning a `Location` header. Our catalogue
-client used to accept any absolute URL there, then reuse its authenticated HTTP
-client for PATCH and PUT. A response naming a different server could therefore
-send the administrator's bearer to that server. Disabling automatic redirects
-doesn't fix an explicit request made by our own code.
-
-We now resolve both relative and absolute upload locations with `url::Url`, then
-compare their origins. An origin includes the scheme, host and effective port:
-changing any of those refuses the next request. Credentials embedded in the URL
-and fragments are refused too. Query strings remain valid because registries can
-use them to identify an upload session. POST and PATCH error responses stop the
-upload before any location from that response is used.
-
-The regression runs two HTTP servers. The first supplies a location on the
-second; the second records whether it received an Authorization header. Before
-the fix it did. After the fix, the client reports an origin violation without
-contacting it. Separate cases cover protocol-relative URLs, TLS downgrades,
-changed ports, and valid relative and same-origin absolute locations.
-
-
-### Give a busy registry room to recover
-
-A privileged CI run reached the public registry successfully, then lost its
-pinned BusyBox pull to a `Rate exceeded` response. The other 42 runtime checks
-passed. A laptop making its first pull can hit the same path.
-
-External manifest/config reads and layer downloads retry recognised rate-limit
-and temporary gateway/service errors. They also retry interrupted requests and
-response streams, as described below. Each operation makes at most
-four attempts, with roughly one, two and four seconds between them and a small
-random delay to spread simultaneous nodes. One deadline covers every attempt:
-30 seconds for manifest/config retrieval and 120 seconds per layer. A stalled
-request cannot reset that budget. Authentication failures, missing images,
-malformed responses and digest mismatches still fail.
-
-The retry helper accepts a closure which creates a fresh future for each
-attempt. In Rust, `FnMut() -> F` means a callable that may update captured state
-and returns a value of type `F`; the `Future` bound says that value represents
-asynchronous work. Each layer attempt creates a new byte buffer, so a failed
-transfer's prefix cannot contaminate the next attempt. Only a complete,
-digest-verified layer reaches the atomic cache publication step.
-
-The pinned OCI client exposes structured error codes but discards response
-headers on this path. Our backoff therefore doesn't claim to honour a server's
-`Retry-After` value. Hermetic registry tests exercise transient recovery,
-permanent denial and attempt limits; a stalled-response test advances time
-only after the real HTTP request reaches the fixture. The external registry
-qualification remains a separate check.
-
-
-### Keep failed upload cleanup on the list
-
-An upload times out. The reaper forgets its session, tries to remove the
-partial file, and ignores the filesystem error. Who retries tomorrow? Nobody.
-The next sweep has no record of that file.
-
-Upload sessions now have two explicit states: `Active` and `Retiring`. Expiry,
-a failed request body or a finalisation attempt fences future writers before
-cleanup starts. An existing writer retains its semaphore permit until its own
-operation ends. The reaper selects only retired or expired sessions whose
-writer has exited. It forgets each session after file removal and directory
-sync succeed; errors keep the owner available for another pass.
-
-The reaper visits every selected session, collecting failures instead of
-stopping at the first one. The HTTP test replaces one upload file with a
-directory, which makes deletion fail even when the test runs as root. That
-upload stays fenced while another expired upload disappears. Restore the file
-and the next pass finishes both physical cleanup and ownership retirement.
-The unit regression demonstrates the original loss: the second sweep returns
-nothing before the fix. Upload recovery after process death needs a separate
-startup owner because these session records live in memory.
-
-
-### Recover uploads only after acquiring their directory
-
-Killing Bun destroys its upload-session map but leaves partial files on disk.
-The real restart test proves the gap: an upload accepts a chunk, Bun receives
-SIGKILL, and its replacement serves requests while the partial file remains.
-
-Before starting any registry or replication writer, Bun now acquires an
-exclusive file lock for the configured image store. The kernel releases it
-when the process exits, including an ungraceful exit. A second Bun using that
-same writable store refuses startup; it cannot sweep the first Bun's uploads.
-Self-upgrade closes the old descriptor during `exec`, so the replacement can
-acquire ownership again. The lock file itself remains in place.
-
-The owner reclaims regular temporary files whose names match our generated
-upload IDs, then syncs the upload directory before startup continues. Clients
-must restart interrupted uploads; we don't pretend to recover their lost
-session metadata. Unexpected names, non-regular entries, a redirected upload
-directory or an I/O error refuse startup. Recovery never follows a directory
-symlink to remove someone else's files.
-
-`UploadDirectoryOwner` keeps the open lock file alive. Its `#[must_use]`
-attribute asks the compiler to warn when a caller discards the guard; Bun holds
-it until registry shutdown. The blocking pool handles directory traversal,
-locking and sync operations, keeping those calls off the async executor.
-Tests cover competing owners, replacement, unknown entries, directory symlinks,
-and the actual Bun SIGKILL path. The separate live upgrade suite checks that
-rolling replacement and rollback can reacquire ownership.
-
-
-### A dropped connection has no HTTP status
-
-The rootless runtime CI gate failed while fetching an Alpine configuration blob:
-the connection failed before a complete response arrived. Our retry branch only
-looked for an HTTP status, so this failure escaped the retry policy altogether.
-
-Registry reads now also recognise request, timeout and response-stream errors.
-Reqwest labels interrupted byte streams as decode errors; the OCI client parses
-manifests separately, and ImageStore verifies layer digests. These errors are
-different from a complete malformed manifest or corrupt layer. The same four-attempt limit and original deadline apply.
-Retries preserve authentication and TLS verification and start layer buffers
-from empty.
-
-The local registry fixture sends part of a successful response, then breaks its
-body stream. The failing-first regression repeats that interruption for the
-manifest, configuration and layer paths and verifies the final unpacked bytes.
-A separate case sends complete malformed manifests or corrupt layers and requires immediate refusal;
-existing cases still check denied access, persistent rate limits and a stalled
-response. Passing those fixtures doesn't establish Docker Hub availability,
-so the real cold-image runtime gate remains part of qualification.
-
-
-The configuration-content case exposed a separate integrity gap: this path
-fetched but ignored the configuration bytes without verifying their descriptor
-digest. Inspecting the upstream client also showed that pinned manifest bytes
-need explicit verification, including each link through an image index. C56
-tracks that work; the transport retry change does not close it.
-
-
-### A digest header isn't proof
-
-Ask a registry for `image@sha256:...`. It can reply with different, perfectly
-valid JSON and repeat the requested digest in `Docker-Content-Digest`. Parsing
-that JSON proves nothing about its identity. Our first regression accepted the
-changed configuration; the pull-through regression accepted a changed index.
-Both responses carried plausible headers.
-
-ImageStore and Pickle now use one verified fetch path. It hashes the exact root
-bytes before parsing a pinned reference. If the root is an image index, the
-existing platform resolver selects a descriptor, and we verify the selected
-manifest's raw bytes against that descriptor's digest and size. Finally, we
-check the configuration bytes against the manifest's descriptor. Tag-based pulls
-compute their root digest locally too; a mutable tag itself isn't an immutable
-identity guarantee.
-
-`VerifiedImageManifest` owns the parsed manifest and its original `Vec<u8>`
-bytes. Keeping both avoids serialising JSON again, which can change whitespace
-or field ordering and therefore the digest. Pickle publishes those verified
-bytes directly instead of fetching the manifest a second time. There is no gap
-where metadata from one response can be paired with another response's bytes.
-
-Integrity failures use a terminal OCI error, so they don't enter the transient
-transport retry branch. The complete manifest/index/config fetch stays inside
-the caller's deadline. We still verify downloaded layers before publishing them.
-This proves content identity; it doesn't establish who built the image or make a
-mutable tag trustworthy.
-
-The HTTP fixtures exercise both consumers with changed root manifests, changed
-indices, changed selected manifests, wrong configuration bytes and incorrect
-descriptor sizes. Another case resolves an intact index and checks both the
-unpacked file and Pickle's exact manifest/configuration hashes. Complete corrupt
-configuration responses now join malformed manifests and corrupt layers in the
-no-retry regression. Actual upstream runtime tests remain a separate check of
-registry interoperability.
-
-
-### Valid bytes can still describe an invalid size
-
-A manifest can have the correct digest and still declare a layer size of `-1`.
-Our upstream adapter cast that signed number to `u64`, making it enormous, then
-passed the value to `Vec::with_capacity`. The regression reaches a capacity
-overflow panic before fetching the blob. Another manifest uses three large
-positive sizes whose sum cannot fit the cache's accounting field.
-
-We now validate every layer size and their sum before publishing upstream
-metadata. `u64::try_from` returns an error for a negative value; the old `as`
-cast silently changed its meaning. `checked_add` returns `None` if the sum would
-overflow, which becomes an ordinary pull error. The public blob-fetch method
-also checks that its unsigned descriptor fits OCI's signed size field.
-
-The receive buffer starts with `Vec::new()`, so a descriptor cannot demand an
-up-front allocation. It grows as bytes arrive; this change does not introduce a
-new maximum image size or convert the download path into a streaming disk writer.
-After transfer, the byte length must match the descriptor. Direct pulls make the
-same check for an existing cached blob before reusing it. SHA-256 verification
-remains a separate requirement.
-
-The fixtures sign no content and trust no digest header. They compute valid
-manifest digests over deliberately invalid size metadata, so identity checks
-cannot hide the size defect. Cold and warm cache cases verify the actual layer
-request count, and both direct and pull-through consumers refuse a length
-mismatch.
-
-### Give the cache the same deadline as a direct pull
-
-A node could retry a throttled direct pull successfully, then fail on the same
-response when Pickle fetched it for the cluster. The two consumers shared digest
-verification but only ImageStore used the retry helper. Pickle's freshness HEAD
-and layer fetch also lacked a deadline.
-
-Both now call the same crate-private helper in `grill::oci_pull`. Each HEAD and
-manifest/configuration read gets 30 seconds; each layer gets 120 seconds. Four
-attempts fit inside that original budget, including backoff. Integrity and
-authorisation errors remain terminal. A blob attempt owns a new empty buffer,
-so bytes from an interrupted response cannot prefix the next complete response.
-
-The tests exercise actual HTTP requests through the upstream adapter. They
-count throttled attempts, interrupt a response body, and stall each read type
-before advancing Tokio's clock past its budget. Separate denial and incorrect
-length cases prove that retries don't turn permanent failures into repeated
-downloads. This establishes the cache's read behaviour without depending on
-a public registry's availability.
-
-### One image, two repository owners
-
-Push the same image to `production/app:latest` and `rbtest-copy/app:latest`.
-The bytes have the same digest. The repositories still have different owners.
-Our catalogue used to keep only one manifest row per digest, so the second push
-inherited the first repository's metadata. Deleting the test tag could also
-remove `latest` from the production row's tag set. That is a poor foundation
-for automatic test cleanup.
-
-The catalogue now identifies a metadata row by both repository and digest.
-Tags point to content within that repository. Moving a tag updates its
-repository's tag sets but preserves the previous digest for a pull that has
-already verified and pinned it. Explicitly deleting the last tag removes only
-that repository's row. Blob storage and holder locations remain keyed by content
-digest; the registry does not write a second copy of identical bytes. Garbage
-collection considers references from every remaining repository before allowing
-a shared blob to be deleted.
-
-The Rust lookup uses `.find(...)` with a closure that checks both fields. A
-closure is an unnamed function; its `|...|` parameters receive each candidate.
-The deletion path uses `.retain(...)`, which keeps entries for which its
-predicate returns `true`. Checking the repository in that predicate is the
-part that prevents one owner's cleanup from retiring somebody else's metadata.
-Signatures attest the digest, so attaching one updates every repository copy
-and later copies preserve it. Scheduler and peer pulls select the repository
-when looking up a pinned digest too.
-
-The first regression pushes identical metadata into two repositories and fails
-because only one row survives. Further checks move a tag, preserve signatures
-through disk reload, restore a Raft snapshot and push the actual same bytes over
-HTTP. They then delete the test reference and verify that the ordinary reference
-and its shared content remain available. Durable state advances to generation
-11; fresh pre-release clusters avoid interpreting an older collapsed catalogue
-as complete ownership evidence. Repository leases and upload retirement are the
-next, separate boundary.
-
-### A test volume needs an owner before it exists
-
-Suppose a test creates a 32 MiB volume and Bun dies just after mounting its
-backing image. The test client has disappeared too. Deleting an application row
-won't unmount that filesystem. Deleting the directory underneath it is worse:
-we might remove the data while the mount is still live.
-
-For reserved test namespaces, `VolumeManager::prepare_test_storage` first writes
-a private ownership checkpoint under `.test-storage`. Each managed path records
-its backend and whether provisioning finished. We synchronise the checkpoint and
-its directory before creating the subvolume or image. An interrupted preparation
-stays incomplete on disk. Recovery refuses to format it again; lease retirement
-can inspect and remove what that attempt actually created. Reopening a completed
-volume preserves its data and verifies its backend. An existing directory without
-an ownership checkpoint is an error, not an invitation to adopt someone else's data.
-
-The checkpoint also owns the application's generated configuration directory.
-Host-source volumes remain outside that ownership. We reject symlinked parents,
-symlinked configuration files, overlapping volume/artifact paths, duplicate JSON
-keys and invalid identities. The `unique_volumes` deserialiser implements Serde's
-`Visitor<'de>` trait: `'de` is the lifetime of the input being decoded, and
-`visit_map` consumes entries one at a time. This lets us reject a duplicate before
-a `BTreeMap` silently replaces the earlier value. `#[serde(deserialize_with =
-"unique_volumes")]` selects that function when reading the journal; normal
-serialisation still produces a JSON object.
-
-Stopping an application is not permission to delete its storage. Scale-down,
-rescheduling and ordinary Stop all preserve it. The lease reaper sends a separate
-`RetireTestResources` command, which first confirms runtime retirement and only
-then retires storage. The checkpoint enters a retiring state before deletion.
-A loop volume must match its recorded image and unmount normally; a busy mount
-keeps the checkpoint and lease pending. Btrfs subvolumes use `btrfs subvolume
-delete`. Plain directories are removed only after checking for unexpected mounts.
-We delete the checkpoint last and synchronise the directory again. A retry can
-finish an interrupted deletion without treating missing files as lost ownership.
-
-Linux reports mounts through `/proc/self/mountinfo`. macOS uses
-[`getfsstat`](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/getfsstat.2.html).
-The latter fills a caller-provided array. `MaybeUninit<statfs>` reserves correctly
-aligned storage without pretending it contains valid Rust values. We inspect
-only the records the syscall says it initialised. The `unsafe` blocks document
-that boundary; the rest of the cleanup path remains ordinary checked Rust.
-Filesystem commands run on `spawn_blocking` threads with deadlines. On Linux,
-parent-death signalling also prevents a provisioning helper from continuing after
-its Bun owner dies.
-
-For 0.1.0, disposable test volumes do not support snapshots. Manual mutation
-refuses and automatic snapshot discovery excludes their namespace. Unexpected
-snapshot storage keeps cleanup pending so an operator can investigate. Ordinary
-application snapshots keep their existing behaviour. Storage ownership doesn't
-solve the separate problem of recovering a runtime that died before its first
-adoption record; that remains part of the release's runtime recovery work.
-
-### A successful push must survive a catalogue write failure
-
-Imagine `catalog.json` has become unwritable. The original registry handler
-updated its in-memory catalogue, printed the persistence error and still returned
-`201 Created`. The image appeared until Bun restarted. That is not a successful
-push.
-
-Manifest commits now acquire an owned Tokio write guard, build the next
-catalogue, persist it and only then publish it in memory. `write_owned()` differs
-from borrowing a guard with `write()`: the guard owns an `Arc` reference to the
-lock, so we can move it into `spawn_blocking`. If the HTTP caller disappears,
-the blocking task still owns the guard until its filesystem transaction finishes.
-Another request cannot persist an older snapshot over it. The catalogue uses a
-private temporary file, atomic replacement and checked file/directory syncs.
-Persistence errors reach the caller and the pull-through cache.
-
-Garbage collection uses the same guard through persistence and physical blob
-deletion. A manifest handler also rechecks its required blobs after acquiring
-the guard. Why twice? Its initial HTTP validation might have happened before a
-queued collector removed an unreferenced layer. Publishing after that deletion
-would acknowledge an image we could no longer run. If a push commits first,
-collection's fresh reference check preserves its blobs. If collection wins,
-the push must refuse and the client must upload the missing bytes again.
-
-The tests drive both orderings through the real handlers. One queues collection,
-waits until a push has validated and stored its raw manifest, then lets collection
-finish before publication. Another submits a stale collection report after the
-manifest commit. Four simultaneous pushes must all survive reopening the on-disk
-catalogue. A failed GC catalogue write must delete no bytes, and repair followed
-by retry must finish collection. Authoritative cluster acceptance remains a
-separate Raft decision; an unconfirmed cluster commit returns a retryable error.
-
-### A collection decision must survive a failed deletion
-
-Suppose two nodes hold an unreferenced layer. Raft approves node A's deletion
-and removes A from the holder set, then its filesystem refuses the unlink.
-On retry, the catalogue lists only B. That does not make A's leftover bytes the
-last copy: B is still the protected holder. The old collector confused those
-cases and retained A's extra copy indefinitely.
-
-Nomination now protects a sole holder only when it names the local node.
-Arbitration can approve A again while another advertised holder remains, even
-if A was already removed from the set. It still checks every manifest reference
-on every attempt. A push between the first approval and retry protects the layer,
-and B cannot delete the last advertised copy. Three failing-first tests exercise
-reloaded approval, nomination and an actual failed file deletion followed by
-repair. All 243 Pickle and 82 Raft state-machine tests pass on macOS/Linux, with
-strict Clippy on both. The ownership decision is unchanged in shape; no new
-state format is needed.
-
-### The node receiving a push might not lead the catalogue
-
-A client can reach a perfectly healthy registry on a follower. Saving the blobs
-there does not make its manifest visible in Raft. The receiving node now sends
-its proposal directly to the advertised leader when the local council cannot
-commit it. A worker without a council uses the same path. If the leader is
-unavailable, the client gets a retryable error and the stored bytes remain
-available for its next attempt.
-
-The internal request contains a `RegistryMutation` enum with two alternatives:
-a manifest commit or a garbage-collection proposal. It cannot carry an arbitrary
-Raft command. The larger manifest lives in `Box<ManifestCommit>`: `Box` owns a
-heap allocation, so the small GC alternative does not reserve space for every
-manifest field. Serialisation still produces the same manifest fields on the
-wire; this is a Rust memory-layout choice.
-
-The leader requires both the internal service credential and the node certificate
-presented on that TLS connection. It checks current revocations and derives the
-allowed holder ID from the certificate. A request body cannot nominate another
-node's holdings for deletion. If an operator retires the writer while a proposal
-is in flight, the Raft state machine refuses it too. Checking only before the
-write would leave an ordering gap.
-
-The client refuses redirects, bounds the response and includes streaming in its
-deadline. The server bounds the request body and places its deadline outside JSON
-extraction, so a sender cannot hold the handler indefinitely by trickling JSON.
-A timed-out proposal remains uncertain: it might have committed after the caller
-stopped waiting. Retrying is how the client establishes acceptance.
-
-The tests push through a worker and a follower using real TLS, then inspect the
-leader's catalogue. A three-node Raft fixture isolates its old leader, elects a
-replacement and updates the advertised route. Forwarding succeeds through the
-new leader and refuses after the remaining quorum is lost. Separate tests cover
-wrong credentials, forged holdings, certificate revocation and bounded streams.
-Repository lease ownership and cleanup still need their own conditional commits;
-forwarding alone cannot establish those obligations.
-
-### An upload belongs to its creator
-
-Two deploy tokens can publish into the same repository. That doesn't make them
-interchangeable halfway through an upload. Previously Pickle checked the role
-on every chunk but discarded the authenticated identity. Anyone with another
-deploy token and the upload URL could append bytes or complete the upload.
-
-Authentication now returns `Option<AuthContext>`. `Some(context)` retains the
-exact credential fingerprint and its scope; `None` represents the explicitly
-open standalone bootstrap mode. Upload metadata stores that fingerprint, never
-the bearer secret or just its human-readable name. A replacement credential
-with the same name doesn't inherit the old session. The internal service
-principal doesn't inherit it either.
-
-The session's existing writer guard checks repository, identity and lifecycle
-before body consumption. Every request still authenticates against the current
-token store, so revocation takes effect even if the session remains within its
-TTL. A refused outsider cannot mutate or discard the creator's temporary file.
-The TTL reaper remains responsible for abandoned sessions. The regression uses
-two credentials with the same name, attempts PATCH and completion with the
-wrong credential and the service principal, revokes the owner, then verifies
-that the restored owner can finish its unchanged bytes.
-
-### Keeping the writer receipt until cleanup finishes
-
-A repository can receive uploads on two nodes before either publishes a
-manifest. A catalogue of completed images can't tell us who owns those partial
-files. The lease therefore records each repository and every node which may
-have accepted a writer. The receipt comes before the bytes.
-
-The record uses `BTreeMap<String, BTreeSet<u64>>`: an ordered map from repository
-names to ordered sets of node identities. The type arguments inside `<...>`
-select what each generic collection stores. Ordering makes serialisation
-stable; a set makes a repeated writer claim idempotent. We retain a repository
-entry even after its final node acknowledges retirement, because the global
-catalogue still needs that repository name for its final cleanup.
-
-Publication is a separate conditional Raft operation. It checks the active
-lease, the repository namespace and the publishing node's receipt when the
-entry is applied. Moving the lease to Cleaning fences a proposal admitted
-before cleanup but committed afterwards. Ordinary manifest commits cannot
-bypass the reserved `rbtest-.../` repository namespace.
-
-The cleanup barrier has two stages. First, desired workloads disappear and
-all former placement owners confirm runtime retirement. Only then does Raft
-record `workloads_retired`. Registry acknowledgements before that point refuse.
-The lease remains until every registered writer confirms local retirement.
-Finishing removes all of the repository's metadata, including untagged rows,
-while preserving ordinary repositories and shared digests. Only exclusive,
-unreferenced digests lose their location records; normal GC can then reclaim
-the orphan bytes instead of retaining a useless last copy forever.
-
-Operator decommission records how many registry obligations it clears, alongside
-the existing placement audit. It doesn't grant the old identity a way back in.
-Snapshot restoration preserves the remaining owners and the original audit.
-The standalone lease store uses the same durable receipts and refuses early
-completion; its runtime reaper records the workload barrier only after the
-agent confirms cleanup.
-
-These are the durable state transitions. They don't, by themselves, wire OCI
-request admission, replication and local upload/catalogue deletion into the
-protocol. Those callers must acquire the receipt before writing and retain
-transaction ownership until their mutation finishes. We track that integration
-separately rather than counting the schema as a finished cleanup feature.
-
-### Keeping repository names intact between peers
-
-`rbtest-run1/team/web` must keep that name when a node copies its layers.
-An old workaround replaced slashes with hyphens because the original HTTP
-router accepted only one path segment. The router has supported nested
-repositories for some time, but the workaround remained. That would move a
-leased upload outside the namespace which owns it.
-
-Peer HEAD, GET and upload requests now preserve the full repository path. The
-regression serves only the exact nested path: upload used to receive 404, and
-now upload, inventory and verified download all succeed. Content-addressed blob
-storage stays shared; it doesn't excuse losing the request's repository identity.
-
-### Asking the current owner before deleting
-
-A worker knows which uploads it received. It cannot infer that the applications
-using those images have stopped. It asks the leader for its own outstanding
-repository receipts, and the leader returns them only after the committed
-workload-retirement barrier. The response includes the lease generation as well
-as the repository name; a cleanup retry must not target a later owner.
-
-`RegistryQuery` is an enum with two variants: `Lease { repository }` and
-`Retirements`. Matching the enum forces the server to handle both questions.
-The result is another enum, so a caller expecting a receipt inventory cannot
-silently reinterpret an owner lookup. A service bearer alone is insufficient:
-the TLS leaf identifies the actual node, and a quorum-backed security read
-checks revocation before answering. An isolated old leader refuses even if its
-local catalogue looks plausible.
-
-The integration test drives active, Cleaning, workload-retired and acknowledged
-states, checking the returned inventory at each step. Real TLS tests replace
-the leader and remove quorum. Request limits include a stalled body, since a
-deadline around just the handler would start too late. These queries provide
-the cleanup worker's evidence; they do not themselves remove any files.
-
-### A repository name is not an ownership record
-
-Suppose a node receives an upload, crashes, and later sees a cleanup request for
-that repository. The name alone is insufficient. The local catalogue now keeps
-`repository_owners: BTreeMap<String, String>`, mapping each reserved repository
-to its exact lease generation before bytes may be accepted. `BTreeMap` stores
-keys in sorted order, giving deterministic serialisation; both strings are owned
-by the catalogue rather than borrowing a request buffer.
-
-Claiming the same generation is idempotent. A different generation refuses.
-Existing reserved metadata with no recorded owner also refuses, because adopting
-it would invent evidence. Retirement checks the generation before removing rows,
-tags and the owner entry. Repeating an already-completed retirement is harmless,
-but repeating it after a later owner has claimed the repository refuses. Shared
-content still follows the ordinary reference-aware garbage collector.
-
-The reload regression failed because serde ignored the previously unknown owner
-field. It now survives atomic persistence. Other tests cover conflicting claims,
-stale retirement, unowned legacy metadata and catalogue copies across snapshots.
-The durable-state generation advances to 14; development clusters still start
-fresh. HTTP integration must persist this record before accepting upload bytes.
-
-### Connecting the ownership record to an upload
-
-A lease owner sends `x-reliaburger-test-lease` on every request that writes under
-its `rbtest-…/` namespace. Authentication preserves the exact credential identity.
-Another deploy token with the same display name cannot use the lease. The
-receiving node first records its writer receipt in Raft (or the standalone lease
-store), then persists the local repository generation. Only then can it create
-an upload file. Internal peer uploads may discover an existing active owner;
-they cannot create a repository or publish a user's manifest.
-
-The local exclusion primitive is `RwLock<()>`. Here `()` is Rust's unit type,
-a value carrying no data: we need the lock's ownership, not a protected boolean.
-Writers hold read guards; retirement takes the exclusive write guard. Raft still
-makes the admission decision, so releasing the lock after cleanup cannot revive
-a Cleaning lease. `Arc<OwnedRwLockReadGuard<()>>` lets the request share the same
-guard with its blocking filesystem transaction. Cancelling the request drops
-one reference; it does not release the transaction's ownership.
-
-Creating a temporary file and registering its upload session also runs in an
-owned task. Otherwise cancellation between those two awaits leaves a file that
-the cleanup worker cannot find. The test pauses session registration, observes
-the newly created file, cancels the request and proves retirement still waits.
-Once registration resumes, cleanup removes the file and acknowledges the receipt.
-
-A manifest's final publication checks lease activity again. Standalone publication
-holds the lease operation guard through persistence; clustered publication uses
-the conditional Raft request. The cleanup worker queries only its own receipts,
-waits for writers, deletes partial uploads, persists metadata removal and finally
-acknowledges the exact lease/repository/node tuple. Failed deletion or persistence
-leaves that receipt pending. A blocked repository does not starve later receipts.
-The tests cover late writes, cancelled admission, both filesystem failures and
-shared blobs still referenced by an ordinary repository. A real TLS worker also
-exercises the claim, publication, workload barrier and final confirmation through
-the leader. This integrates HTTP writers; P2P pulls and workload image-reference
-admission still need the same ownership contract.
-
-### A disposable image cannot become an ordinary dependency
-
-Consider an ordinary application using `rbtest-run1/web:latest`. If run1 finishes,
-removing its repository would also remove the application's future source image.
-The registry cannot safely infer that dependency from running containers. We
-refuse it at admission: only an active application lease may use its own already
-registered repositories. Another lease, an ordinary app or a job must use an
-ordinary image instead. Init-container images count too.
-
-`AppSpec::image_references` returns `impl Iterator<Item = &str>`. The caller sees
-the iterator contract rather than the concrete chain/filter types, and the
-borrowed strings remain owned by the configuration. Omitted init images inherit
-the already-checked main image. The shared check accepts an iterator whose items
-have lifetime `'a`; it examines those borrowed strings without retaining them.
-Its optional `(lease, observed_time)` pair makes the time part of the committed
-decision instead of reading a different wall clock during Raft replay.
-
-HTTP checks every image before enqueueing a job or committing any part of a mixed
-manifest. Raft repeats the application check at apply time. The failing-first
-tests cover ordinary main/init images and jobs; the positive cases retain access
-for the same active lease, while missing repositories, another lease, expiry and
-Cleaning refuse. A hostname or digest reference cannot hide the repository name.
-
-### Shared bytes do not preserve a retired repository
-
-Two repositories can point at the same manifest bytes. Retiring one must leave
-those bytes for the other, but it must not leave the retired name usable through
-an exact digest URL. Both tag and digest reads therefore resolve the requested
-repository's metadata before opening the shared blob. The HTTP regression first
-returned 200 for the retired repository; it now returns 404 while the ordinary
-repository still returns 200. The disk read runs on a blocking worker so it cannot
-stall the asynchronous request executor.
-
-### A fresh worker needs a current catalogue
-
-Push an image through one node, then ask a fresh worker to run it. The bytes may
-already be cached, yet a worker's empty local catalogue used to report that the
-image did not exist. An uninitialised follower had the same problem. Both now
-query the advertised leader over authenticated node TLS before resolving the
-repository. Tags, digest reads and pull-through decisions use that same view.
-
-The query returns only that repository's metadata and the locations of its
-referenced blobs. A separate usage query returns two numbers for configured
-quotas. Copying the whole catalogue merely to count bytes would waste bandwidth.
-No leader or no quorum produces an error, never an empty registry. Responses
-exceeding the control-message ceiling also refuse. These new enum variants change
-the wire contract, so the explicit protocol generation advances to 11; the disk
-format remains generation 14.
-
-The regression starts with a successfully committed image and an empty local
-catalogue, then checks actual TLS worker/follower resolution and quota refusal.
-Other tests exercise missing authority, lost quorum, repository projection and
-oversized responses. The public image-list endpoint and safe publication of peer
-copy receipts are separate work; a successful read alone proves neither.
-
-### The image list must agree with image pulls
-
-The public `/v1/images` endpoint had its own copy of the stale-read problem. It
-looked only at a node-local catalogue, so even a leader could return an empty list
-while Raft contained a successfully pushed image. It now reads the same current
-authority as pulls. Production startup attaches the node's existing authenticated
-registry transport to the API router before serving requests.
-
-`Option<Extension<RegistryReadAuthority>>` is an optional axum extractor: the
-router supplies its typed routing context, and embedded standalone routers may
-omit it. A clustered router without usable authority returns 503. A standalone
-router continues to read its local catalogue. The query returns typed public
-image summaries, leaving internal writer receipts and lease ownership out of the
-response. This adds protocol generation 12 without changing durable state 14.
-
-The failing-first test checks a committed image without a local projection.
-Worker/follower reads, a lost leader route and missing user authentication are
-also exercised. The authentication fixture seeds a user token, because an empty
-user-token store intentionally retains the local bootstrap window.
-
-### A cancelled peer download still needs an owner
-
-A peer pull created a temporary file and waited for more bytes. Cancelling its
-caller dropped the future, leaving that file outside the upload-session tracker.
-The failing-first regression pauses the HTTP body after its first chunk and
-checks ownership before cancelling the caller.
-
-Node pulls now run as owned Tokio tasks. The caller awaits a join handle; dropping
-that handle detaches the task, so the task still finishes its bounded network
-operation and cleanup. Before accepting bytes it records the repository's writer
-receipt and local lease generation, creates a tracked upload, and obtains the
-session's writer permit. It verifies the digest and syncs the final file before
-releasing ownership. Failed removal leaves a retiring session for the reaper.
-Stalled bodies, corrupt digests and failed final renames all take that same path.
-A node restart still uses the exclusive upload-directory recovery sweep.
-
-A whole-image pull shares its existing repository read guard with child pulls.
-Tokio's `RwLock` is fair: once a cleanup writer queues, a new reader waits behind
-it. Reacquiring a reader while retaining the old one could therefore deadlock.
-Sharing the guard also lets an already-admitted transfer finish after cleanup
-begins; cleanup waits for it and then removes its payload. Fresh transfers must
-still obtain active ownership, even when their bytes are cached locally.
-
-Runtime P2P fetches and the healer both use this path. Cached blobs are reverified
-on blocking workers. The queued-cleanup regression, cancelled caller, stalled
-body, corrupt data, failed publication and retained-deletion tests cover those
-boundaries. Publishing storage locations still needs its own conditional,
-GC-fenced confirmation; owning a transfer does not make an old holder set safe.
-
-### A late publication must not undo collection
-
-Suppose a node checks its uploaded blobs and proposes a manifest, but the
-proposal times out. Collection then runs. The old proposal can still reach Raft
-later, so a local mutex alone cannot prove that the advertised bytes survived.
-Each storage node now has a durable GC generation. Every approval that might
-delete bytes advances it before changing catalogue holdings; an exhausted counter
-refuses the entire operation. A refused deletion leaves the generation unchanged.
-
-The publisher queries its current generation while holding the local catalogue
-guard, checks that its verified blobs remain present, persists local metadata and
-keeps the guard through the authoritative proposal. Raft compares the attached
-generation with its current record before publishing either an ordinary or leased
-manifest. A stale publication gets a typed retry result, surfaced as 503, so the
-next attempt obtains a fresh generation and checks its bytes again.
-
-Both publication and GC run as owned tasks. GC acquires the same local guard
-before asking for approval and retains it through physical deletion. Cancelling
-a caller does not release a transaction that still owns work. If a GC proposal
-times out, it deletes nothing; a later committed generation still invalidates
-older publication attempts. This is why the generation belongs in the replicated
-state as well as the network request.
-
-The tests first reproduced a stale manifest being accepted and an exhausted
-counter still approving collection. They also exercise snapshot restoration,
-unchanged generations for refused deletions, ownership across caller cancellation
-and actual TLS publication after a worker collects an orphan. The state format
-advances to 15 and the protocol to 13. Development clusters still need fresh
-state. Peer-copy confirmation will use this same fence; its old full-holder-set
-operation remains the next piece to replace.
-
-### Let the storage node speak for itself
-
-A healer used to read a holder list, send some bytes and write back its updated
-list. Meanwhile, another node could collect a copy. The healer would then put
-that absent copy back in the catalogue. The failing regression exercises exactly
-that obsolete whole-list operation; Raft now refuses it.
-
-The replacement is `ImageCopyConfirmation`. It names one existing repository,
-one immutable manifest and one storage node. The receiver acquires repository
-ownership, reads current metadata and its GC generation, then hashes every
-referenced local file with a fixed-size buffer while retaining the catalogue
-guard. It proposes only its own identity. Raft checks the generation again and
-unions that node into the current holders, without replaying tags or another
-node's holdings. Reserved repositories also require their exact active lease and
-writer receipt. Cleanup, missing metadata and retired identities refuse.
-
-The internal confirmation endpoint requires the service credential. Explicit
-anonymous standalone bootstrap permits ordinary local repositories; it does not
-permit clustered or leased confirmation. Replication asks the receiver to confirm
-even when HEAD skipped all uploads. Receipts must match the requested node,
-repository and digest, and their complete bodies share a size limit and deadline.
-Direct peer consumers use the same local proof before using downloaded layers.
-
-An owned asynchronous task survives cancellation of its caller. Its blocking
-hashing closure returns a tuple containing the catalogue guard, repository access
-and optional local lease operation. Binding that tuple keeps all three alive
-until the authoritative reply. These are ordinary Rust values with destructors: a
-leading underscore suppresses an unused-variable warning, but does not drop a
-bound value early. That distinction matters when a value owns a lock.
-
-Tests cover corrupt and missing cached files, durable standalone confirmation,
-service-only admission, cancelled callers, wrong or stalled receipts, lease
-expiry/cleanup, GC generations and node retirement. The actual TLS fixture gives
-a fresh receiver its own certificate and proves that its confirmed holdings
-appear at the leader without filling its local catalogue with stale remote tags.
-The new replicated operation advances protocol/state compatibility to 14/16.
-
-### The client is a Mac; the container is still Linux
-
-Our upstream integrity fixture used to advertise the same child image for both
-Linux and Darwin. That let a platform bug hide in plain sight: the OCI library's
-current-platform resolver chose the client's operating system. A Mac asking for
-a normal Linux container index therefore found no usable image. Replacing the
-fixture with a Linux-only index made the existing end-to-end pull test fail.
-
-The verified puller now chooses Linux explicitly, normalising Rust's `x86_64` and
-`aarch64` names to OCI's `amd64` and `arm64`. Normal node pulls use the node's
-architecture. A catalogue client can instead select the container host's reported
-architecture before staging its runnable fixture. Missing or unsupported targets
-refuse; they cannot silently select another platform. The pinned root index,
-selected child and configuration retain the same digest and size verification.
-
-The target-architecture test supplies an amd64-only index. Both amd64 spellings
-succeed, an ARM64 request fails and an unknown architecture refuses before
-network access. The complete image-integrity suite still checks altered indexes,
-child manifests, configurations, length metadata and interrupted reads.
-
-### Pending retirement is an ordinary state
-
-The runnable registry acceptance found a misleading failure in cleanup. All
-workloads had stopped, but storage workers had not yet acknowledged their
-repositories. The coordinator immediately proposed final lease deletion, and
-Raft correctly refused. Turning that refusal into HTTP 500 made the test runner
-report failed cleanup even though normal asynchronous retirement was in progress.
-
-After recording the workload-retired barrier, the coordinator now checks the
-remaining writer receipts. Any outstanding receipt returns the existing
-`CleanupPending` result, which the API exposes as 202. The caller keeps polling;
-only confirmed removal finishes the lease. This follows the same rule as pending
-placements. Once cleanup starts, no new writer can attach, so those outstanding
-sets can only shrink. Final Raft checks still protect against concurrent changes.
-
-The regression records two writers, begins cleanup and receives Pending after
-zero and one confirmations. Only the second confirmation permits completion.
-Before the fix it received a consensus error and recorded a spurious cleanup
-failure. Actual transport or storage errors continue to retain their evidence.
-
-### Kill the owner, then stop helping
-
-A cancelled request is useful coverage, but it leaves Bun alive. The physical
-recovery test launches the actual binary with TLS and a durable single-node
-council. It pushes identical content into an ordinary repository and a leased
-one, then leaves another leased upload incomplete. Before killing Bun, it checks
-both the committed writer receipt and the local catalogue's exact lease owner.
-
-The test sends SIGKILL and waits for that child to exit. It drops the writing
-clients, starts a replacement against the same data and observes the original
-lease deadline. It never renews or releases the lease. Recovery must discover the
-pending ownership itself. Only a missing lease, missing disposable manifest and
-empty upload directory count as complete retirement. The ordinary manifest,
-configuration and layer must still return exactly their original bytes.
-
-This runs on macOS and Linux. It proves recovery after the storage owner dies;
-a single-node council cannot prove recovery through a different elected leader.
-That remains a separate multi-node qualification.
-
-The companion test enrols two more actual Bun processes through signed join
-requests with a pinned root fingerprint. All three must agree on the current
-leader and observe three voters before the test starts writing. The selected
-leader is the only storage owner. The fixture kills it, then waits for the two
-survivors to elect a replacement and start cleaning the expired lease. Both must
-still report the disconnected writer's receipt. After the old owner restarts,
-all three APIs must report the lease absent, with the same shared-content checks.
-
-One fixture mistake mattered here: our single-node port helper chose unrelated
-random ports. Peer Raft discovery uses a uniform offset from the gossip port;
-the three-node fixture now reserves a complete TCP/UDP transport block for each
-node. It also selects the observed leader instead of assuming that the bootstrap
-node wins every later election. These checks exercise the real cluster protocol
-without replacing it with an in-memory network.
+## Trust nothing that comes over the wire
+
+Pickle's pull-through cache and Grill's direct pulls both talk to registries we
+don't control. Docker Hub is mostly well behaved. "Mostly" isn't a security
+property, and a laptop test found just how many assumptions we'd made about the
+other end.
+
+Start with the header everyone trusts. Ask a registry for
+`alpine@sha256:...`, and it can reply with different, perfectly valid JSON while
+repeating the requested digest in `Docker-Content-Digest`. Parsing that JSON
+proves nothing about its identity. Our first regression accepted a changed
+configuration; the pull-through version accepted a changed index. Both came with
+plausible headers.
+
+So Grill and Pickle now share one verified fetch path. It hashes the exact bytes
+of the root manifest before parsing them. If the root is an image index, it picks
+the Linux entry for the node's architecture (explicitly Linux: the OCI library
+used to pick the *client's* operating system, so a Mac asking for a Linux image
+found nothing) and verifies that child manifest's bytes against the index's
+descriptor. Then it checks the configuration bytes against the manifest. Every
+check goes through one small function:
+
+```rust
+fn verify(bytes: &[u8], expected: &str, size: Option<i64>) -> Result<(), OciDistributionError> {
+    let actual = format!("sha256:{:x}", Sha256::digest(bytes));
+    if actual != expected {
+        return Err(invalid(format!(
+            "upstream content digest mismatch: expected {expected}, received {actual}"
+        )));
+    }
+    if let Some(size) = size
+        && u64::try_from(size).ok() != Some(bytes.len() as u64)
+    {
+        return Err(invalid(format!(
+            "upstream descriptor size mismatch for {expected}: expected {size}, received {}",
+            bytes.len()
+        )));
+    }
+    Ok(())
+}
+```
+
+`{:x}` formats the hash as lowercase hex. The second `if` is a *let chain*, new
+in Rust 2024: `if let Some(size) = size && ...` runs the block only when the
+pattern matches *and* the condition holds, with `size` already bound in the
+condition. OCI stores sizes as signed integers, so `u64::try_from(size)`
+refuses a negative one, and `.ok()` turns that `Result` into an `Option` we can
+compare. A size of `-1` therefore can't equal any real length. The old code used
+`size as u64`, which quietly turned `-1` into 18 quintillion and passed it to
+`Vec::with_capacity`. It panicked before fetching a single byte.
+
+We keep the verified bytes alongside the parsed manifest
+(`VerifiedImageManifest`) and publish those exact bytes into Pickle. Serialising
+the parsed struct again would change whitespace or field order, and with it the
+digest. Layers are still hashed before they reach the cache.
+
+Two more lessons from the same fixtures. First, a registry's upload `Location`
+header isn't permission to follow it with credentials. The peer-replication
+fix above constrained redirects; the catalogue client had the same hole and
+would have sent an administrator's bearer to whatever server the header named.
+Both now resolve the location with `url::Url` and refuse any change of scheme,
+host or port. Second, public registries rate-limit and drop connections. A
+privileged CI run lost its BusyBox pull to `Rate exceeded` after 42 other checks
+passed. Reads now retry rate limits, temporary gateway errors and interrupted
+streams, at most four attempts with jittered backoff, all inside *one* deadline
+(30 seconds for metadata, 120 per layer), so a stalled request can't reset the
+clock. Each attempt starts from an empty buffer, so a half-received body never
+prefixes the next one. Authentication failures, missing images and integrity
+failures don't retry: asking again won't change the answer.
+
+## Who owns these bytes?
+
+Content addressing answers "are these the right bytes?". It says nothing about
+who may publish them, who may delete them, or whether a push really happened.
+Those questions kept coming back, so let's take them in the order a push meets
+them.
+
+**The push has to be real.** Imagine `catalog.json` has become unwritable. The
+original handler updated its in-memory catalogue, logged the error and returned
+`201 Created`. The image existed until Bun restarted. Now a manifest commit takes
+the catalogue's write lock, persists the next catalogue and only then publishes it
+in memory. It takes the lock with `write_owned()` rather than `write()`: an owned
+guard holds an `Arc` to the lock instead of borrowing it, so we can move it into
+`spawn_blocking` and the file write keeps the lock even if the HTTP client hangs
+up halfway through. A client can also reach a perfectly healthy follower.
+Storing the blobs there doesn't make the manifest visible in Raft, so the
+follower forwards a `RegistryMutation` to the leader over node TLS. It's an enum
+of the few registry operations a node may ask for, not an arbitrary Raft command,
+and the leader derives the node's identity from its certificate, so a request
+body can't speak for another node's storage.
+
+**Repositories own metadata; content is shared.** Push the same image to
+`production/app` and `rbtest-run1/app` and the bytes have one digest. The
+catalogue used to keep one row per digest, so deleting the test tag could strip
+`latest` from production. Rows are now keyed by repository *and* digest, while
+blob files stay shared and garbage collection counts references from every
+repository. Uploads belong to the credential that started them too: Pickle
+records a fingerprint of the token, so another deploy token with the upload URL
+can't append to someone else's half-finished push.
+
+**Late publications mustn't undo collection.** Here's the race that took longest
+to see. A node checks that its blobs exist and proposes a manifest, but the
+proposal times out. Garbage collection then deletes one of those blobs. The old
+proposal is still in flight and can reach Raft later, advertising bytes that are
+gone. A local mutex can't help, because the two events happen on different sides
+of the network. So every storage node has a *GC generation*, a counter in the
+replicated state that goes up whenever Raft approves a deletion on that node. A
+publication carries the generation its author observed, and the state machine
+checks it when the entry is applied:
+
+```rust
+fn registry_publication_is_current(
+    &self,
+    commit: &crate::pickle::types::ManifestCommit,
+) -> bool {
+    commit.holder_nodes.iter().all(|node| {
+        self.state
+            .registry_gc_generations
+            .get(node)
+            .copied()
+            .unwrap_or(0)
+            == commit.observed_gc_generation
+    })
+}
+```
+
+`iter().all(...)` returns `true` only if the closure is true for every holder,
+like Python's `all()`. `get` returns an `Option<&u64>` (a reference into the
+map), `.copied()` turns it into an `Option<u64>`, and `unwrap_or(0)` supplies a
+default for a node that has never collected anything. Unlike `unwrap`,
+`unwrap_or` can't panic. A stale publication gets `RegistryPublicationStale`,
+which the client sees as a retryable 503; its next attempt reads a fresh
+generation and checks its blobs again. The GC side increments the counter with
+`checked_add(1)` and refuses the whole deletion on overflow rather than wrapping
+round to an old value. And because the publisher persisted its local catalogue
+*before* proposing, an explicit refusal now restores the previous local
+catalogue. A timeout doesn't: the council may have committed after all, so the
+local state waits for a retry to settle the question.
+
+The replication healer had the same shape of bug. It read a holder list, copied
+some bytes and wrote the whole list back, resurrecting any copy that GC had
+removed in the meantime. Raft now refuses whole-list updates. Instead, the node
+that *received* the copy hashes its local files and confirms only its own
+holding (`ImageCopyConfirmation`), checked against the same GC generation. The
+storage node speaks for itself.
+
+**Test images have to disappear completely.** `relish test` (Chapter 15) pushes
+throwaway images into repositories under a reserved `rbtest-<run>/` namespace,
+held by a lease. Cleaning those up is harder than it sounds, because partial
+uploads may sit on nodes that never published anything. So before a node accepts
+a single byte for a leased repository, it records a *writer receipt* in Raft:
+"node N may hold data for repository R under lease L". Cleanup then runs in two
+stages. First, every workload using the lease must be confirmed retired. Then
+each node with a receipt deletes its partial uploads and metadata and confirms,
+and only when the last receipt is gone does the lease disappear. Until then the
+API answers 202 `CleanupPending`, which is an ordinary state, not a failure. An
+ordinary app can't reference an `rbtest-` image at all, so a finished test can't
+pull the rug from under production. Test volumes follow the same pattern: an
+ownership checkpoint on disk before the loop image or subvolume exists, and a
+normal (never lazy) unmount before anything is deleted.
+
+Whose clock decides that a lease has expired? At first, each storage node
+stamped its own time on its requests, so a node running a minute slow could keep
+writing for a minute after its lease ended. The state machine can't read the
+clock itself: every council member replays `apply` and must reach the same
+answer. So the leader stamps its own time as it turns a mutation into a Raft
+entry. One clock decides for everyone.
+
+Finally, uploads that die with Bun. A crashed Bun leaves partial files but no
+session map. On startup Bun takes an exclusive file lock on the image store (so
+two Buns can't sweep each other's uploads), removes regular files whose names
+match our generated upload IDs, and refuses to start if it finds anything
+unexpected. It never follows a symlink out of the upload directory.
+
+The test that ties this together launches the real binary, pushes the same
+content into an ordinary and a leased repository, leaves another upload half
+finished, and sends SIGKILL. A replacement Bun must retire the lease on its own,
+with no renewals, while the ordinary image still returns exactly its original
+bytes. A three-node variant kills the storage-owning leader and checks that the
+survivors carry its receipts forward until it returns and cleans up.
+
+## Tests
+
+Pickle is almost entirely testable in-process. A blob store is a directory, the OCI API is an axum router, and the catalog is a `Vec` — none of that needs the internet or another node. So the default suite spins up a Pickle server in the test, pushes a manifest and its blobs, then pulls them back, all without leaving the process.
+
+### Unit tests — the registry without the network
+
+The 104 tests in `src/pickle/` cover:
+
+- **Digest and manifest** — `Digest::new` accepts well-formed digests and rejects everything else; manifests round-trip through serde unchanged.
+- **Blob store** — write/read, upload sessions, and the digest-mismatch rejection path (`PickleError::DigestMismatch`).
+- **OCI API** — `full_push_pull_round_trip` drives the real `/v2/` handlers end to end against an in-process server; plus the not-found paths (`blob_head_not_found`, `manifest_get_not_found`) that must return the right status codes. The manifest-validation contract gets a rejection matrix: invalid JSON, missing or unknown media type, size mismatch, malformed descriptor digest, missing referenced blob, and a happy path asserting the GET returns byte-identical bytes.
+- **Garbage collection** — the safety rails get a test each: `gc_protects_sole_copy`, `gc_protects_active_deployment_images`, `gc_protects_tagged_manifest_layers`, `gc_protects_within_retention_window`, and the positive case `gc_collects_unreferenced_blob`. These are the tests that let you trust GC won't eat your last copy of a layer. `gc_never_nominates_a_catalogued_manifests_own_blob` pins the REG1 fix, and `tests/suite/pickle_integrity.rs` runs the full push → GC → peer-pull acceptance sequence against real in-process registries.
+
+### Hermetic protocol tests, provisioned runtime tests
+
+The image-pull protocol belongs in the portable suite. An in-process registry serves a
+digest-pinned synthetic image over loopback, so manifest fetching, blob digest validation,
+unpacking and cache reuse don't depend on Docker Hub or a mutable tag.
+
+Real runtimes are different. runc needs Linux and kernel capabilities; Apple Container
+needs Apple silicon and nested virtualisation. Those tests compile with a reasoned
+`#[ignore]` and run through named targets:
+
+```sh
+sudo make test-linux  # runc plus the other provisioned Linux/kernel suites
+make test-apple       # manual Apple Container check
+```
+
+An explicitly requested suite asserts its prerequisites and fails if they are missing. It
+never returns early and appears green without running. Chapter 15 explains the distinction
+between `#[cfg]`, `#[ignore]` and an executed test in detail.
+
+For an end-to-end smoke test of a real push and pull through Pickle on macOS:
+
+```sh
+make pickle-test-macos    # push/pull a real Docker image through Pickle (needs Docker Desktop)
+```
+
+### Running them
+
+The default path needs nothing special:
+
+```sh
+cargo test --lib pickle       # the whole registry, in-process
+```
+
+Reach for the gated commands only when you want to exercise real images or real runtimes. The full env-var table lives in `docs/README.md`.
+
+Phase 5 adds 72 tests, bringing the total to 867.

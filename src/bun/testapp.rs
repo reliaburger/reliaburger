@@ -18,9 +18,14 @@
 /// - `GET /env/NAME` — the value of an environment variable, or 404. This is
 ///   how a test proves a secret was decrypted inside the workload rather
 ///   than trusting the API's word for it.
+///
+/// `GET /metrics` answers too, with Prometheus text: `http_requests_total`
+/// and an `http_request_duration_seconds` histogram over the requests the
+/// mode answered. It's what lets a laptop demo show `relish metrics` and the
+/// dashboard's request and latency charts without a real app.
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -108,6 +113,71 @@ pub fn special_route_response(path: &str) -> Option<String> {
     None
 }
 
+/// Upper bounds (seconds) of the latency histogram's buckets.
+const LATENCY_BUCKETS: [f64; 8] = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0];
+
+/// Request count and latency histogram behind `GET /metrics`.
+///
+/// Atomics rather than a mutex: every connection task records into the
+/// same counters, and a relaxed increment is all a counter needs.
+#[derive(Debug, Default)]
+struct RequestMetrics {
+    /// Cumulative count per bucket in `LATENCY_BUCKETS`, as Prometheus
+    /// histograms are: a 20 ms request lands in every bucket from 25 ms up.
+    buckets: [AtomicU64; LATENCY_BUCKETS.len()],
+    count: AtomicU64,
+    sum_micros: AtomicU64,
+}
+
+impl RequestMetrics {
+    fn observe(&self, elapsed: Duration) {
+        let seconds = elapsed.as_secs_f64();
+        for (bound, bucket) in LATENCY_BUCKETS.iter().zip(&self.buckets) {
+            if seconds <= *bound {
+                bucket.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        self.count.fetch_add(1, Ordering::Relaxed);
+        let micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        self.sum_micros.fetch_add(micros, Ordering::Relaxed);
+    }
+
+    /// The Prometheus text exposition of these metrics.
+    fn render(&self) -> String {
+        let count = self.count.load(Ordering::Relaxed);
+        let mut body = String::from(
+            "# HELP http_requests_total Requests the test app answered.\n\
+             # TYPE http_requests_total counter\n",
+        );
+        body.push_str(&format!("http_requests_total {count}\n"));
+        body.push_str(
+            "# HELP http_request_duration_seconds Time to answer a request.\n\
+             # TYPE http_request_duration_seconds histogram\n",
+        );
+        for (bound, bucket) in LATENCY_BUCKETS.iter().zip(&self.buckets) {
+            body.push_str(&format!(
+                "http_request_duration_seconds_bucket{{le=\"{bound}\"}} {}\n",
+                bucket.load(Ordering::Relaxed)
+            ));
+        }
+        body.push_str(&format!(
+            "http_request_duration_seconds_bucket{{le=\"+Inf\"}} {count}\n"
+        ));
+        let sum = self.sum_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0;
+        body.push_str(&format!("http_request_duration_seconds_sum {sum}\n"));
+        body.push_str(&format!("http_request_duration_seconds_count {count}\n"));
+        body
+    }
+
+    fn response(&self) -> String {
+        let body = self.render();
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+}
+
 /// A test HTTP server for integration tests.
 pub struct TestApp {
     port: u16,
@@ -132,6 +202,7 @@ impl TestApp {
         let shutdown = CancellationToken::new();
         let token = shutdown.clone();
         let request_count = Arc::new(AtomicU32::new(0));
+        let request_metrics = Arc::new(RequestMetrics::default());
 
         // Hold the ballast for the lifetime of the server task. Written to
         // once so the pages are actually resident — an untouched allocation
@@ -153,8 +224,10 @@ impl TestApp {
                                 let count = request_count.fetch_add(1, Ordering::SeqCst);
                                 let mode = mode.clone();
                                 let token = token.clone();
+                                let request_metrics = Arc::clone(&request_metrics);
 
                                 tokio::spawn(async move {
+                                    let started = Instant::now();
                                     // Read the request (must consume it before responding)
                                     let mut buf = vec![0u8; 4096];
                                     let n = socket.read(&mut buf).await.unwrap_or(0);
@@ -170,11 +243,16 @@ impl TestApp {
                                     // `Hang` hangs on everything — the mode is
                                     // the app's identity, and an app that
                                     // answers /payload isn't hanging.
-                                    if !matches!(mode, TestAppMode::Hang)
-                                        && let Some(response) = special_route_response(path)
-                                    {
-                                        let _ = socket.write_all(response.as_bytes()).await;
-                                        return;
+                                    if !matches!(mode, TestAppMode::Hang) {
+                                        let special = if path == "/metrics" {
+                                            Some(request_metrics.response())
+                                        } else {
+                                            special_route_response(path)
+                                        };
+                                        if let Some(response) = special {
+                                            let _ = socket.write_all(response.as_bytes()).await;
+                                            return;
+                                        }
                                     }
 
                                     let response = match &mode {
@@ -217,6 +295,7 @@ impl TestApp {
                                     };
 
                                     let _ = socket.write_all(response.as_bytes()).await;
+                                    request_metrics.observe(started.elapsed());
                                 });
                             }
                             Err(_) => break,
@@ -327,6 +406,67 @@ mod tests {
         assert!(special_route_response("/health").is_none());
         // A near-miss must not be captured by the payload route.
         assert!(special_route_response("/payloadish").is_none());
+    }
+
+    #[test]
+    fn request_metrics_render_a_counter_and_a_cumulative_histogram() {
+        let metrics = RequestMetrics::default();
+        metrics.observe(Duration::from_millis(3));
+        metrics.observe(Duration::from_millis(40));
+        metrics.observe(Duration::from_secs(2));
+        let body = metrics.render();
+        // The scraper reads what it wrote: one parser, both directions.
+        let parsed = crate::mayo::scrape::parse_prometheus_text(&body);
+        let value = |name: &str, le: Option<&str>| {
+            parsed
+                .iter()
+                .find(|m| {
+                    m.key.name.as_str() == name && m.key.labels.get("le").map(String::as_str) == le
+                })
+                .map(|m| m.value)
+        };
+        assert_eq!(value("http_requests_total", None), Some(3.0));
+        assert_eq!(
+            value("http_request_duration_seconds_bucket", Some("0.005")),
+            Some(1.0)
+        );
+        assert_eq!(
+            value("http_request_duration_seconds_bucket", Some("0.05")),
+            Some(2.0)
+        );
+        assert_eq!(
+            value("http_request_duration_seconds_bucket", Some("1")),
+            Some(2.0)
+        );
+        assert_eq!(
+            value("http_request_duration_seconds_bucket", Some("+Inf")),
+            Some(3.0)
+        );
+        assert_eq!(
+            value("http_request_duration_seconds_count", None),
+            Some(3.0)
+        );
+        let sum = value("http_request_duration_seconds_sum", None).unwrap();
+        assert!((sum - 2.043).abs() < 1e-6, "{sum}");
+    }
+
+    #[tokio::test]
+    async fn a_running_app_counts_the_requests_it_answers_on_metrics() {
+        let app = TestApp::start(TestAppMode::Healthy).await.unwrap();
+        let address = format!("127.0.0.1:{}", app.port());
+        fetch(&address, "/").await;
+        fetch(&address, "/healthz").await;
+        // Recording happens after the write; give the task a moment.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let body = fetch(&address, "/metrics").await;
+            if body.contains("http_requests_total 2\n") {
+                break;
+            }
+            assert!(Instant::now() < deadline, "{body}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        app.shutdown();
     }
 
     #[test]

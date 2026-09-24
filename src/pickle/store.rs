@@ -209,20 +209,28 @@ impl BlobStore {
     /// path calls this before trusting a locally-cached blob. Returns `true`
     /// when the blob is present and its content hashes to `digest`.
     ///
-    /// Hashing runs on the caller's thread; whole-blob callers on the async
-    /// runtime should wrap this in `spawn_blocking`.
-    pub fn revalidate_blob(&self, digest: &Digest) -> bool {
+    /// Returns `Ok(false)` for a missing or corrupt blob and an error when the
+    /// file exists but can't be read: an I/O failure says nothing about the
+    /// bytes, so it must not look like a cache miss.
+    ///
+    /// The file is hashed in fixed-size chunks, so a multi-gigabyte layer
+    /// never sits in memory. Hashing runs on the caller's thread; callers on
+    /// the async runtime should wrap this in `spawn_blocking`.
+    pub fn revalidate_blob(&self, digest: &Digest) -> Result<bool, PickleError> {
         let path = self.blob_path(digest);
-        let Ok(data) = std::fs::read(&path) else {
-            return false;
+        let actual = match sha256_file(&path) {
+            Ok(actual) => actual,
+            Err(PickleError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
         };
-        if compute_sha256(&data).as_str() == digest.as_str() {
-            true
-        } else {
-            // Corrupt: remove it so the next pull refetches clean bytes.
-            let _ = std::fs::remove_file(&path);
-            false
+        if actual == *digest {
+            return Ok(true);
         }
+        // Corrupt: remove it so the next pull refetches clean bytes.
+        std::fs::remove_file(&path)?;
+        Ok(false)
     }
 
     /// Delete a blob.
@@ -427,6 +435,22 @@ impl BlobStore {
     pub fn base_dir(&self) -> &Path {
         &self.base_dir
     }
+}
+
+/// Stream a file through SHA-256 in 64 KiB chunks.
+pub(crate) fn sha256_file(path: &Path) -> Result<Digest, PickleError> {
+    use std::io::Read as _;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(Digest::from_sha256_hex(&hex::encode(hasher.finalize())))
 }
 
 /// Compute the SHA-256 digest of data.
@@ -742,19 +766,56 @@ mod tests {
         let data = b"honest layer bytes";
         let digest = compute_sha256(data);
         store.write_blob(data, &digest).unwrap();
-        assert!(store.revalidate_blob(&digest));
+        assert!(store.revalidate_blob(&digest).unwrap());
 
         // Corrupt the on-disk bytes behind the store's back.
         std::fs::write(store.blob_path(&digest), b"tampered").unwrap();
-        assert!(!store.revalidate_blob(&digest), "corrupt blob accepted");
+        assert!(
+            !store.revalidate_blob(&digest).unwrap(),
+            "corrupt blob accepted"
+        );
         assert!(!store.has_blob(&digest), "corrupt blob was not removed");
+    }
+
+    /// A blob larger than one read buffer hashes correctly across chunks,
+    /// and a change in its last byte is still caught.
+    #[test]
+    fn multi_chunk_blob_revalidates_and_a_late_mismatch_is_caught() {
+        let (store, _dir) = test_store();
+        let data: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+        let digest = compute_sha256(&data);
+        store.write_blob(&data, &digest).unwrap();
+        assert!(store.revalidate_blob(&digest).unwrap());
+
+        let mut tampered = data.clone();
+        *tampered.last_mut().unwrap() ^= 1;
+        std::fs::write(store.blob_path(&digest), &tampered).unwrap();
+        assert!(!store.revalidate_blob(&digest).unwrap());
+        assert!(!store.has_blob(&digest));
+    }
+
+    /// An I/O failure says nothing about the bytes: it must surface as an
+    /// error, not look like "not cached" and trigger a pointless refetch
+    /// over a blob that may be perfectly good.
+    #[test]
+    fn unreadable_blob_is_an_error_not_a_cache_miss() {
+        let (store, _dir) = test_store();
+        let digest = compute_sha256(b"layer behind a broken disk");
+        // A directory where the blob file should be: opening it for reading
+        // fails with a real I/O error on every platform, even as root.
+        std::fs::create_dir_all(store.blob_path(&digest)).unwrap();
+        assert!(store.revalidate_blob(&digest).is_err());
+        assert!(
+            store.blob_path(&digest).exists(),
+            "an unreadable blob must not be deleted as if it were corrupt"
+        );
     }
 
     #[test]
     fn revalidate_missing_blob_is_false() {
         let (store, _dir) = test_store();
         let digest = compute_sha256(b"never stored");
-        assert!(!store.revalidate_blob(&digest));
+        assert!(!store.revalidate_blob(&digest).unwrap());
     }
 
     #[test]

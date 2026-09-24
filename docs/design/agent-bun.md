@@ -86,6 +86,88 @@ port map and network namespace, but does not delete the shared lower. A real
 rootful-runc suite covers two-replica isolation, restart persistence, failed
 create rollback, process-death adoption and absence of leaked mountpoints.
 
+### 1.2 Image config and the container user
+
+Runc resolves each container's process against the image's verified config
+blob, with Kubernetes rules: app `command` replaces `Entrypoint` (and drops
+`Cmd`), app `args` replaces `Cmd`, image `Env` sits under the app's env (the
+app wins), and image `WorkingDir` and `User` apply unless the app sets
+`working_dir` or `run_as_user`/`run_as_group`. A named user or group is looked
+up in the image's own `/etc/passwd` and `/etc/group`, following symlinks inside
+the image only. The spec generator records the app's wishes in
+`OciProcess::overrides`; runc consumes that field after the pull, so
+`config.json` stays pure OCI. Process workloads and the Apple runtime ignore it
+and run `command` followed by `args`.
+
+Every rootful runc container runs in a user namespace (decision D1 of the
+zero-to-cluster plan). Container ids `0..65536` map onto the node's range
+`2000000000..2000065536`, so image root is an unprivileged host uid. The one
+range is shared by every container on the node, like Docker's
+`userns-remap`, which keeps the unpacked image cache shareable:
+
+- `ImageStore::with_owner_shift` unpacks each layer entry with its uid and gid
+  plus the base (restoring set-id bits `chown` clears), and gives directories
+  the unpacker creates to container root. Shifted trees live in their own
+  `gen-{hash}-owner-{base}` generation.
+- The private overlay's upper directory copies the image root's owner and
+  mode, since the overlay's `/` takes them from the upper.
+- The container gets Docker's default capability set, which only acts on what
+  the namespace owns.
+- `/sys` is a read-only bind of the host's: a user namespace may not mount a
+  fresh sysfs in a network namespace it doesn't own.
+- The node-created network namespace sets
+  `net.ipv4.ip_unprivileged_port_start=0` and an open `ping_group_range`, so
+  container root can bind port 80 without `CAP_NET_BIND_SERVICE` over it.
+- The workload identity directory is handed to the container user's host uid
+  at create time, and Bun writes rotated identity files with the directory's
+  owner.
+
+Operators must keep `2000000000..2000065536` out of `/etc/subuid` and any
+directory service. Rootless runc maps a single id, so every image user runs
+as its container root there.
+
+**Volume ownership.** A bind mount keeps host ownership, and a user-namespaced
+process can only write what its mapped ids own. Before creating the container,
+Bun resolves the process user (image `USER`, or `run_as_user`/`run_as_group`),
+maps it into the node range and prepares every read-write volume:
+
+- **Managed volumes** (those with a `*.volume.json` provisioning sidecar,
+  whatever the backend: plain directory, loop-mounted ext4 or Btrfs subvolume)
+  are handed to that user. The sidecar records who the volume was last handed
+  to, and the plan follows from it:
+
+  | Recorded owner | Volume root owner | Action |
+  |---|---|---|
+  | none (first mount) | anything | `lchown` the whole tree to the user, root mode `0755` |
+  | same user | inside the container range | nothing |
+  | different user | inside the container range | move files owned by (or grouped to) the old user to the new one; leave the rest |
+  | anything | outside the container range | whole tree again (a snapshot restored from before the first mount, a host-side `chown`) |
+
+  The owner is recorded only after the walk finishes, so an interrupted
+  hand-over repeats. "Same user, do nothing" is the important row: Redis's
+  entrypoint starts as root, `chown`s `/data` to `redis` (999) and drops to
+  it. Re-chowning to root on every start would fight that, and walking a
+  populated volume on every restart costs time proportional to its size. An
+  image `USER` change is the one case that rewrites a populated volume, and
+  it moves only what the previous user owned, so files the container gave to
+  other users stay theirs. Btrfs snapshots and restores carry ownership with
+  the data; the sidecar sits beside the subvolume and survives a restore.
+- **Host-path volumes** (`source = ...`) belong to the operator and are never
+  chowned. The host directory must be owned by the container user's host id
+  (container uid `u` is host uid `2000000000 + u`), group-writable by its
+  host gid, or world-writable. When the mode bits say the process can't write,
+  Bun logs a warning naming the directory, its owner and the host uid to
+  `chown` it to, then starts the container anyway: a read-mostly mount is
+  legitimate.
+- **Rootless runc** skips all of this: the volume was created by the user
+  whose id is the container's only mapped id (container root).
+
+There is no `fs_group`. Kubernetes needs `fsGroup` because a pod's volume is
+shared by containers running as different users; a Reliaburger app has one
+process user, and images that switch users do so from root, which can
+`chown` inside the namespace once the volume is its own. The Kubernetes
+importer drops `securityContext.fsGroup` with a warning.
+
 Rootless runc has no host privilege with which to mount OverlayFS, and the
 project does not yet own a FUSE snapshotter. It therefore accepts a shared image
 generation only when `root.readonly = true`. A writable rootless image fails
@@ -834,7 +916,7 @@ pub struct UpgradeConfig {
 - `WorkloadStateReport` -- periodic batch of workload states (instance ID, state, health, resource usage)
 - `EventStream` -- real-time events (starts, stops, health changes, OOMs)
 - `SchedulingDirective` -- from parent to Bun: start/stop/update workloads
-- `NodeReadinessReport` -- an additive, independently expiring lease carrying
+- `NodeReadinessReport` -- an independently expiring lease carrying
   the live `Starting`, `Ready`, `Degraded` or `Stopped` state of every critical
   long-lived subsystem, with transition and last-error times
 
@@ -869,9 +951,9 @@ Readiness and local capability inputs are direct reads from a process-wide
 evidence tracker, so a dead agent command loop cannot make the endpoint hang or
 fabricate a healthy answer.
 
-The reporting worker sends readiness in its own extension frame. The leader
+The reporting worker sends readiness in its own frame. The leader
 leases it by aggregator receive time and leadership epoch, independently of
-ordinary state, DNS and egress frames. A missing or stale readiness lease makes
+ordinary state and capability frames. A missing or stale readiness lease makes
 the scheduler mark the node unready. One healthy heartbeat cannot keep another
 dead subsystem looking alive.
 

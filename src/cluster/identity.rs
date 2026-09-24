@@ -19,12 +19,9 @@ use crate::mustard::membership::MembershipSnapshot;
 /// `DefaultHasher` (fixed in `reporting::assignment`), not here: djb2 is
 /// pure pinned arithmetic, identical on every toolchain, and the test below
 /// pins its outputs. Its known weakness is poor avalanche on similar short
-/// names (a collision risk), but swapping the function was judged riskier
-/// than living with it: every node derives every PEER's id from its name, so
-/// old and new binaries in one cluster would disagree about identities
-/// mid-upgrade, and durable Raft logs/membership are keyed by the old ids.
-/// A migration would need a cluster-wide flag day plus durable-state
-/// rewriting; deferred until an id scheme change is worth that cost.
+/// names (a collision risk). Every node derives every peer's id from its
+/// name, and Raft logs and membership are keyed by these ids, so changing
+/// the function is a protocol and state generation change.
 pub fn raft_id_from_name(name: &str) -> u64 {
     let hash = name.bytes().fold(5381u64, |acc, b| {
         acc.wrapping_mul(33).wrapping_add(b as u64)

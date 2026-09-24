@@ -59,12 +59,17 @@ impl RenewalMonitor {
     }
 }
 
+/// Pause after a failed renewal attempt before the next one.
+pub const RETRY_DELAY: Duration = Duration::from_secs(5);
+
 /// One renewal owner for one durable identity. The HTTP client refuses redirects
 /// and uses a fresh TLS connection for each attempt, with the current live leaf.
 pub struct NodeRenewalWorker {
     identity: LiveNodeIdentity,
     http: reqwest::Client,
     state: watch::Sender<RenewalState>,
+    /// Pause after a failed attempt before the next one.
+    retry_delay: Duration,
 }
 
 impl NodeRenewalWorker {
@@ -95,9 +100,17 @@ impl NodeRenewalWorker {
                 identity,
                 http,
                 state,
+                retry_delay: RETRY_DELAY,
             },
             RenewalMonitor(monitor),
         ))
+    }
+
+    /// Replace the production [`RETRY_DELAY`] between failed attempts. Tests
+    /// that drive several failures use a short delay instead of waiting it out.
+    pub fn with_retry_delay(mut self, retry_delay: Duration) -> Self {
+        self.retry_delay = retry_delay;
+        self
     }
 
     /// Renew at the signed lifetime midpoint, retrying failed attempts after five
@@ -165,7 +178,7 @@ impl NodeRenewalWorker {
                         eprintln!("node identity renewal failed; retrying: {error}");
                         last_error = Some(error);
                     }
-                    retry_at = tokio::time::Instant::now() + Duration::from_secs(5);
+                    retry_at = tokio::time::Instant::now() + self.retry_delay;
                 }
             }
         }

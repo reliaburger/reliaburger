@@ -233,6 +233,7 @@ pub async fn start(
         GossipConfig::default(),
         transport,
     );
+    node.set_node_gate(node_gate.clone());
     node.set_seeds(params.seeds.clone());
 
     let (membership_tx, membership_rx) = watch::channel::<Vec<MembershipSnapshot>>(Vec::new());
@@ -966,27 +967,6 @@ impl Default for CouncilReconcilerConfig {
             op_timeout: RECONCILE_OP_TIMEOUT,
         }
     }
-}
-
-/// Spawn the council reconciler with production timing. See
-/// [`spawn_council_reconciler_with_config`].
-pub fn spawn_council_reconciler(
-    council: Arc<CouncilNode>,
-    membership_rx: watch::Receiver<Vec<MembershipSnapshot>>,
-    port_offset: i32,
-    self_id: u64,
-    self_info: CouncilNodeInfo,
-    shutdown: CancellationToken,
-) {
-    spawn_council_reconciler_with_config(
-        council,
-        membership_rx,
-        port_offset,
-        self_id,
-        self_info,
-        CouncilReconcilerConfig::default(),
-        shutdown,
-    );
 }
 
 /// Spawn the council reconciler: on the leader, each tick re-plans the Raft

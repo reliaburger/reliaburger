@@ -16,7 +16,6 @@ pub struct NodeCapabilities {
     /// Kernel hooks and runtime support for pre-start egress allowlists.
     pub egress: crate::sesame::egress::EgressEnforcementCapability,
     /// Ready resolver transports and workload reachability.
-    #[serde(skip)]
     pub dns: crate::onion::dns::DnsCapability,
 }
 

@@ -2,7 +2,7 @@
 #![cfg(target_os = "linux")]
 
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use reliaburger::config::Config;
@@ -38,8 +38,14 @@ impl Node {
         if root.join("cluster").exists() {
             command.arg("--cluster");
         }
-        if !root.join("production").exists() {
-            command.arg("--experimental-owned-runc");
+        if let Ok(cgroup) = std::fs::read_to_string(root.join("service-cgroup")) {
+            let procs = std::path::PathBuf::from(cgroup.trim()).join("cgroup.procs");
+            // SAFETY: the closure runs in the forked child before exec and only
+            // performs open/write/close syscalls through std's File API on a
+            // path allocated before the fork; it takes no locks.
+            unsafe {
+                command.pre_exec(move || std::fs::write(&procs, "0"));
+            }
         }
         let mut child = command
             .arg("--config")
@@ -113,6 +119,307 @@ impl Node {
     }
 }
 
+/// Tears down everything a test started under its root when it goes out of
+/// scope, including while a failed assertion unwinds.
+///
+/// Bun dies with its `Child`, but the owners it launched lead process groups
+/// of their own and the containers they supervise outlive both. Leaked, they
+/// hold host-wide cgroups and addresses that break every later run, and their
+/// pinned eBPF programs make every connect() on the host fail. Deleting the
+/// containers doesn't free their networks either: each namespace's bind mount
+/// keeps its veth pair and /32 host route, and the next test's first
+/// container gets the same address and fails with "File exists". Drop can't
+/// await or return errors, so the teardown is synchronous and best-effort:
+/// nothing in it may panic, since a second panic during unwinding aborts the
+/// test binary and hides the first.
+struct RootCleanup(PathBuf);
+
+impl Drop for RootCleanup {
+    fn drop(&mut self) {
+        // The kernel ownership lock is released only once Bun has exited, and
+        // SIGKILL doesn't wait for that.
+        wait_for_exit(&kill_root_processes(&self.0));
+        for node in node_roots(&self.0) {
+            delete_runc_containers(&node.join("data/instances/runc/state"));
+            #[cfg(feature = "ebpf")]
+            retire_leaked_kernel(&node);
+        }
+        let suffix = root_suffix(&self.0);
+        if suffix.is_empty() {
+            return;
+        }
+        remove_leaked_cgroups(&suffix);
+        remove_leaked_networks(&suffix);
+    }
+}
+
+/// SIGKILL every process whose command line names a path under the root:
+/// Bun, its detached owners and the Runc commands they were running.
+/// Returns the processes it signalled.
+fn kill_root_processes(root: &Path) -> Vec<nix::unistd::Pid> {
+    use nix::sys::signal::{Signal, kill, killpg};
+    use nix::unistd::{Pid, getpgid, getpgrp};
+    use std::os::unix::ffi::OsStrExt;
+    // The trailing separator stops one root matching another it prefixes.
+    let mut needle = root.as_os_str().as_bytes().to_vec();
+    needle.push(b'/');
+    let mut killed = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return killed;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        let Ok(command) = std::fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        if !command.windows(needle.len()).any(|part| part == needle) {
+            continue;
+        }
+        let pid = Pid::from_raw(pid);
+        // An owner leads its own group, so killing the group takes the Runc
+        // child it is waiting on too. Bun shares the test's group, and
+        // signalling that group would kill the test binary itself.
+        match getpgid(Some(pid)) {
+            Ok(group) if group != getpgrp() => {
+                let _ = killpg(group, Signal::SIGKILL);
+            }
+            _ => {
+                let _ = kill(pid, Signal::SIGKILL);
+            }
+        }
+        killed.push(pid);
+    }
+    killed
+}
+
+/// Wait up to ten seconds for every process to exit. A zombie counts: it
+/// has already closed its files and released its locks, and Bun stays one
+/// until the test's runtime reaps it.
+fn wait_for_exit(processes: &[nix::unistd::Pid]) {
+    let exited = |pid: &nix::unistd::Pid| {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return true;
+        };
+        // The state follows the command name, which may itself hold ") ".
+        stat.rsplit_once(") ")
+            .is_none_or(|(_, rest)| rest.starts_with('Z'))
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !processes.iter().all(exited) {
+        if std::time::Instant::now() >= deadline {
+            eprintln!("test cleanup: processes still running after SIGKILL");
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Kill and remove the cgroups of this root's apps: their instance cgroups
+/// under /sys/fs/cgroup/reliaburger/<namespace>/, and the service cgroup the
+/// cgroup-kill test makes at /sys/fs/cgroup/reliaburger-<app>. Every test
+/// names its apps through `root_app_name`, so the root's suffix finds them.
+fn remove_leaked_cgroups(suffix: &str) {
+    let ours = |path: &Path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(&format!("-{suffix}")))
+    };
+    let namespaces = std::fs::read_dir("/sys/fs/cgroup/reliaburger")
+        .into_iter()
+        .flatten()
+        .flatten();
+    for namespace in namespaces {
+        for app in std::fs::read_dir(namespace.path())
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            if ours(&app.path()) {
+                remove_cgroup(&app.path());
+            }
+        }
+    }
+    for service in std::fs::read_dir("/sys/fs/cgroup")
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let path = service.path();
+        let is_service = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("reliaburger-"));
+        if is_service && ours(&path) {
+            remove_cgroup(&path);
+        }
+    }
+}
+
+/// Kill every process in a cgroup subtree, then remove it bottom-up. A
+/// cgroup refuses removal (EBUSY) until its killed processes have exited.
+fn remove_cgroup(path: &Path) {
+    if !path.join("cgroup.procs").exists() {
+        return;
+    }
+    let _ = std::fs::write(path.join("cgroup.kill"), "1");
+    for child in std::fs::read_dir(path).into_iter().flatten().flatten() {
+        if child.file_type().is_ok_and(|kind| kind.is_dir()) {
+            remove_cgroup(&child.path());
+        }
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match std::fs::remove_dir(path) {
+            Ok(()) => return,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error)
+                if error.raw_os_error() == Some(nix::libc::EBUSY)
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => {
+                eprintln!("test cleanup: cannot remove {}: {error}", path.display());
+                return;
+            }
+        }
+    }
+}
+
+/// Delete the network namespace, host veth and port forwards of each of this
+/// root's instances. Deleting the host end of a veth pair deletes both ends
+/// and the /32 route to the container address with them.
+fn remove_leaked_networks(suffix: &str) {
+    use reliaburger::grill::{InstanceId, netns};
+    let marker = format!("-{suffix}-");
+    let placeholder = netns::namespace_path(&InstanceId(String::new()));
+    let Some(directory) = placeholder.parent() else {
+        return;
+    };
+    for entry in std::fs::read_dir(directory).into_iter().flatten().flatten() {
+        let namespace = entry.file_name().to_string_lossy().into_owned();
+        let Some(instance) = namespace.strip_prefix("rb-") else {
+            continue;
+        };
+        if !instance.contains(&marker) {
+            continue;
+        }
+        let veth = netns::host_veth_name(&InstanceId(instance.to_owned()));
+        for address in routed_addresses(&veth) {
+            remove_port_forwards(address);
+        }
+        let _ = std::process::Command::new("ip")
+            .args(["link", "del", &veth])
+            .output();
+        let _ = std::process::Command::new("ip")
+            .args(["netns", "del", &namespace])
+            .output();
+    }
+}
+
+/// The container addresses the host routes through a veth.
+fn routed_addresses(veth: &str) -> Vec<std::net::Ipv4Addr> {
+    let Ok(output) = std::process::Command::new("ip")
+        .args(["-o", "-4", "route", "show", "dev", veth])
+        .output()
+    else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .filter_map(|destination| destination.split('/').next()?.parse().ok())
+        .collect()
+}
+
+/// Delete the nftables port-map elements that forward to an address.
+fn remove_port_forwards(address: std::net::Ipv4Addr) {
+    use reliaburger::grill::portmap;
+    let Ok(listing) = std::process::Command::new("nft")
+        .args(["-j", "list", "ruleset"])
+        .output()
+    else {
+        return;
+    };
+    for port in portmap::ports_for_address(&listing.stdout, address).unwrap_or_default() {
+        let _ = std::process::Command::new("nft")
+            .args(portmap::element_delete(port))
+            .output();
+    }
+}
+
+/// The root itself and any per-node subdirectory with its own data directory.
+fn node_roots(root: &Path) -> Vec<PathBuf> {
+    let mut nodes = vec![root.to_path_buf()];
+    if let Ok(entries) = std::fs::read_dir(root) {
+        nodes.extend(
+            entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.join("data").is_dir()),
+        );
+    }
+    nodes
+}
+
+/// Kill and delete every container Runc records in one state root.
+fn delete_runc_containers(state: &Path) {
+    if !state.is_dir() {
+        return;
+    }
+    let Ok(listed) = std::process::Command::new("runc")
+        .arg("--root")
+        .arg(state)
+        .args(["list", "--quiet"])
+        .output()
+    else {
+        return;
+    };
+    for id in String::from_utf8_lossy(&listed.stdout).lines() {
+        let _ = std::process::Command::new("runc")
+            .arg("--root")
+            .arg(state)
+            .args(["delete", "--force", id])
+            .output();
+    }
+}
+
+/// Unpin and detach the eBPF programs a node left behind, unless the test
+/// already retired them.
+#[cfg(feature = "ebpf")]
+fn retire_leaked_kernel(node: &Path) {
+    let policy = node.join("data/kernel-policy");
+    let Ok(bytes) = std::fs::read(policy.join("owner.json")) else {
+        return;
+    };
+    let Ok(owner) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return;
+    };
+    let (Some(cgroup), Some(pins)) = (
+        owner["cgroup_path"].as_str(),
+        owner["pin_directory"].as_str(),
+    ) else {
+        return;
+    };
+    if !Path::new(pins).exists() {
+        return;
+    }
+    if let Err(error) = reliaburger::onion::ebpf::loader::OnionEbpf::retire_owned_state(
+        Path::new(cgroup),
+        &policy,
+        Path::new(pins),
+    ) {
+        eprintln!("test cleanup: cannot retire {}: {error}", node.display());
+    }
+    let _ = std::fs::remove_dir(pins);
+}
+
 fn runtime(root: &Path) -> RuncGrill {
     let directory = root.join("data/instances/runc");
     RuncGrill::new(
@@ -120,8 +427,8 @@ fn runtime(root: &Path) -> RuncGrill {
         ImageStore::new(root.join("images")),
         false,
         directory.join("state"),
+        env!("CARGO_BIN_EXE_bun").into(),
     )
-    .with_owner(env!("CARGO_BIN_EXE_bun").into())
     .unwrap()
 }
 
@@ -232,6 +539,26 @@ async fn wait_file(path: &Path) {
     .unwrap_or_else(|_| panic!("fixture never reached {}", path.display()));
 }
 
+/// An app name unique to this test root.
+///
+/// Instance cgroups live at a host-wide path built from the namespace, app
+/// and ordinal. A fixed name shares that path with every earlier run, so one
+/// leaked workload makes Runc refuse the next run's first container ("cgroup
+/// is not empty") and the deploy rolls to a new generation instead.
+fn root_app_name(prefix: &str, root: &Path) -> String {
+    format!("{prefix}-{}", root_suffix(root))
+}
+
+/// The part of an app name `root_app_name` takes from the root, which
+/// `RootCleanup` uses to find what the root's apps left on the host.
+fn root_suffix(root: &Path) -> String {
+    root.file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .trim_start_matches('.')
+        .to_ascii_lowercase()
+}
+
 #[tokio::test]
 #[ignore = "requires isolated Linux root, real runc/ip/nft and static BusyBox"]
 async fn actual_bun_sigkill_and_cancelled_caller_preserve_oci_init_and_retry_ownership() {
@@ -246,16 +573,9 @@ async fn actual_bun_sigkill_and_cancelled_caller_preserve_oci_init_and_retry_own
         "retry",
     ] {
         let root = tempfile::tempdir().unwrap().keep();
+        let _cleanup = RootCleanup(root.clone());
         println!("qualifying {phase}: {}", root.as_path().display());
-        let name = format!(
-            "oci-crash-{}",
-            root.file_name()
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .trim_start_matches('.')
-                .to_ascii_lowercase()
-        );
+        let name = root_app_name("oci-crash", &root);
         install_wrappers(root.as_path());
         std::fs::write(root.as_path().join("phase"), phase).unwrap();
         std::fs::write(root.as_path().join("armed"), "armed").unwrap();
@@ -436,6 +756,7 @@ fn retire_kernel(root: &Path) {
 #[ignore = "requires isolated Linux root, bpffs, real runc/ip/nft and static BusyBox"]
 async fn normal_standalone_bun_recovers_durable_kernel_and_discovery() {
     let root = tempfile::tempdir().unwrap().keep();
+    let _cleanup = RootCleanup(root.clone());
     durable_fixture(&root);
     let mut node = Node::start(&root).await;
     let activated =
@@ -447,15 +768,7 @@ async fn normal_standalone_bun_recovers_durable_kernel_and_discovery() {
         activated,
         "normal standalone startup did not activate durable ownership"
     );
-    let name = format!(
-        "durable-{}",
-        root.file_name()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .trim_start_matches('.')
-            .to_ascii_lowercase()
-    );
+    let name = root_app_name("durable", &root);
     node.client.apply(&durable_app(&name)).await.unwrap();
     wait_file(&root.join("shared/main")).await;
     let original = kernel_manifest(&root);
@@ -494,14 +807,67 @@ async fn normal_standalone_bun_recovers_durable_kernel_and_discovery() {
     retire_kernel(&root);
 }
 
+/// systemd's `KillMode=mixed`/`control-group` stop: everything left in the
+/// unit's cgroup dies at once, including detached owners and Runc launchers.
+/// Containers survive because Runc gives them cgroups of their own.
+#[cfg(feature = "ebpf")]
+#[tokio::test]
+#[ignore = "requires isolated Linux root, cgroup v2, bpffs, real runc/ip/nft and static BusyBox"]
+async fn service_cgroup_kill_of_bun_and_owners_retires_the_launch_and_redeploys() {
+    let root = tempfile::tempdir().unwrap().keep();
+    let _cleanup = RootCleanup(root.clone());
+    durable_fixture(&root);
+    let name = root_app_name("cgkill", &root);
+    let cgroup = Path::new("/sys/fs/cgroup").join(format!("reliaburger-{name}"));
+    std::fs::create_dir(&cgroup).unwrap();
+    std::fs::write(root.join("service-cgroup"), cgroup.to_str().unwrap()).unwrap();
+    let mut node = Node::start(&root).await;
+    node.client.apply(&durable_app(&name)).await.unwrap();
+    wait_file(&root.join("shared/main")).await;
+    std::fs::write(cgroup.join("cgroup.kill"), "1").unwrap();
+    node.child.wait().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !std::fs::read_to_string(cgroup.join("cgroup.procs"))
+            .unwrap()
+            .trim()
+            .is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let mut recovered = Node::start(&root).await;
+    // The launcher that supervised the container died with its owner, so Bun
+    // can't adopt it. It must retire the launch and clean up rather than wedge
+    // on the dead owners' records, and the same app must deploy again.
+    assert!(recovered.client.status().await.unwrap().is_empty());
+    std::fs::remove_file(root.join("shared/main")).unwrap();
+    recovered.client.apply(&durable_app(&name)).await.unwrap();
+    wait_file(&root.join("shared/main")).await;
+    let running = recovered.client.status().await.unwrap();
+    assert!(
+        running
+            .iter()
+            .any(|instance| instance.app_name == name && instance.state == "running"),
+        "{running:?}"
+    );
+    recovered.client.stop(&name, "default").await.unwrap();
+    recovered.crash().await;
+    std::fs::remove_dir(&cgroup).unwrap();
+    retire_kernel(&root);
+}
+
 #[cfg(feature = "ebpf")]
 #[tokio::test]
 #[ignore = "requires isolated Linux root, bpffs, real runc/ip/nft and static BusyBox"]
 async fn automatic_restart_bun_death_before_adoption_retires_the_unrecorded_successor() {
     let root = tempfile::tempdir().unwrap().keep();
+    let _cleanup = RootCleanup(root.clone());
     println!("qualifying automatic restart: {}", root.display());
     durable_fixture(&root);
-    let name = "restart-crash";
+    let name = root_app_name("restart-crash", &root);
+    let name = name.as_str();
     let mut config = durable_app(name);
     config.app.get_mut(name).unwrap().command = vec![
         "/bin/busybox".into(), "sh".into(), "-c".into(),
@@ -510,11 +876,11 @@ async fn automatic_restart_bun_death_before_adoption_retires_the_unrecorded_succ
     let mut node = Node::start(&root).await;
     node.client.apply(&config).await.unwrap();
     wait_file(&root.join("shared/main")).await;
-    let record = root.join("data/instances/default__restart-crash-0.json");
+    let id = reliaburger::grill::InstanceId(format!("default__{name}-0"));
+    let record = root.join(format!("data/instances/{}.json", id.0));
     assert!(record.exists());
     let original_kernel = kernel_manifest(&root);
     let original = runtime(&root).launch_inventory().await.unwrap().unwrap();
-    let id = reliaburger::grill::InstanceId("default__restart-crash-0".into());
     let original = original
         .iter()
         .find(|launch| launch.instance_id == id)
@@ -704,19 +1070,18 @@ async fn upgrade_and_rollback(root: &Path, node: &Node, key: &[u8]) {
 #[ignore = "requires isolated Linux root, bpffs, real runc/ip/nft and static BusyBox"]
 async fn normal_owned_bun_upgrade_and_rollback_preserve_runtime_and_kernel() {
     let root = tempfile::tempdir().unwrap().keep();
+    let _cleanup = RootCleanup(root.clone());
     durable_fixture(&root);
     let key = upgrade_fixture(&root);
+    let name = root_app_name("upgrade-owned", &root);
     let mut node = Node::start(&root).await;
-    node.client
-        .apply(&durable_app("upgrade-owned"))
-        .await
-        .unwrap();
+    node.client.apply(&durable_app(&name)).await.unwrap();
     wait_file(&root.join("shared/main")).await;
     let original = kernel_manifest(&root);
     upgrade_and_rollback(&root, &node, &key).await;
     failed_owned_upgrade_reverts(&root, &mut node, &key).await;
     assert_eq!(kernel_manifest(&root), original);
-    node.client.stop("upgrade-owned", "default").await.unwrap();
+    node.client.stop(&name, "default").await.unwrap();
     node.crash().await;
     let journal =
         reliaburger::bun::discovery_owners::DiscoveryJournal::open(&root.join("data/discovery"))
@@ -732,6 +1097,7 @@ async fn normal_owned_bun_upgrade_and_rollback_preserve_runtime_and_kernel() {
 async fn normal_rootless_bun_recovers_owned_forward_and_discovery() {
     assert!(!nix::unistd::geteuid().is_root());
     let root = tempfile::tempdir().unwrap().keep();
+    let _cleanup = RootCleanup(root.clone());
     durable_fixture(&root);
     let config = std::fs::read_to_string(root.join("node.toml")).unwrap();
     std::fs::write(
@@ -750,8 +1116,9 @@ async fn normal_rootless_bun_recovers_owned_forward_and_discovery() {
         "normal rootless startup did not activate durable discovery"
     );
     assert!(!root.join("data/kernel-policy").exists());
-    let mut app = durable_app("rootless-owned");
-    app.app.get_mut("rootless-owned").unwrap().command = vec![
+    let name = root_app_name("rootless-owned", &root);
+    let mut app = durable_app(&name);
+    app.app.get_mut(&name).unwrap().command = vec![
         "/bin/busybox".into(), "sh".into(), "-c".into(),
         "printf 'main\n' >> /work/main; printf owned > /work/index.html; exec /bin/busybox httpd -f -p 8080 -h /work".into(),
     ];
@@ -782,11 +1149,7 @@ async fn normal_rootless_bun_recovers_owned_forward_and_discovery() {
         reqwest::get(&url).await.unwrap().text().await.unwrap(),
         "owned"
     );
-    recovered
-        .client
-        .stop("rootless-owned", "default")
-        .await
-        .unwrap();
+    recovered.client.stop(&name, "default").await.unwrap();
     recovered.crash().await;
     let journal =
         reliaburger::bun::discovery_owners::DiscoveryJournal::open(&root.join("data/discovery"))
@@ -802,6 +1165,7 @@ async fn normal_clustered_bun_recovers_enrolled_consumer_before_adoption() {
     use reliaburger::config::node::NodeConfig;
     use sha2::{Digest, Sha256};
     let root = tempfile::tempdir().unwrap().keep();
+    let _cleanup = RootCleanup(root.clone());
     durable_fixture(&root);
     reliaburger::relish::commands::init(&root, "activation", "activation-node").unwrap();
     let base = NodeConfig::from_file(&root.join("node.toml")).unwrap();
@@ -826,6 +1190,7 @@ async fn normal_clustered_bun_recovers_enrolled_consumer_before_adoption() {
         node_id: reliaburger::meat::NodeId::new("activation-node"),
         cluster_identity: Sha256::digest(&identity.root_ca_der).into(),
     };
+    let name = root_app_name("cluster-owned", &root);
     let mut node = Node::start(&root).await;
     let active = root.join("data/discovery/discovery.json").exists();
     if !active {
@@ -835,14 +1200,22 @@ async fn normal_clustered_bun_recovers_enrolled_consumer_before_adoption() {
         active,
         "normal clustered startup did not activate consumer ownership"
     );
-    node.client
-        .apply(&durable_app("cluster-owned"))
-        .await
-        .unwrap();
+    node.client.apply(&durable_app(&name)).await.unwrap();
     wait_file(&root.join("shared/main")).await;
-    wait_cluster_publication(&node.client).await;
+    wait_cluster_publication(&node.client, &name).await;
+    // Publication precedes the deploy's terminal event. A crash before the
+    // reconciler records the placement as applied leaves it pending, and
+    // recovery then rightly redeploys instead of adopting the original.
+    wait_placement_applied(&root, &name).await;
     let original = node.client.status().await.unwrap().remove(0);
     node.crash().await;
+    // A failed first launch rolls to a new generation and would still pass
+    // the rest of this test, hiding whatever made the first one fail.
+    assert_eq!(
+        original.id,
+        format!("default__{name}-0"),
+        "first deploy did not start"
+    );
     let journal =
         reliaburger::bun::discovery_owners::DiscoveryJournal::open(&root.join("data/discovery"))
             .unwrap();
@@ -852,7 +1225,7 @@ async fn normal_clustered_bun_recovers_enrolled_consumer_before_adoption() {
     );
     drop(journal);
     let mut recovered = Node::start(&root).await;
-    wait_cluster_publication(&recovered.client).await;
+    wait_cluster_publication(&recovered.client, &name).await;
     let adopted = recovered.client.status().await.unwrap().remove(0);
     assert_eq!(adopted.pid, original.pid);
     assert_eq!(adopted.host_port, original.host_port);
@@ -860,11 +1233,7 @@ async fn normal_clustered_bun_recovers_enrolled_consumer_before_adoption() {
         std::fs::read_to_string(root.join("shared/main")).unwrap(),
         "main\n"
     );
-    recovered
-        .client
-        .stop("cluster-owned", "default")
-        .await
-        .unwrap();
+    recovered.client.stop(&name, "default").await.unwrap();
     tokio::time::timeout(Duration::from_secs(45), async {
         loop {
             let checkpoint: serde_json::Value = serde_json::from_slice(
@@ -904,10 +1273,35 @@ async fn normal_clustered_bun_recovers_enrolled_consumer_before_adoption() {
 }
 
 #[cfg(feature = "ebpf")]
-async fn wait_cluster_publication(client: &BunClient) {
+async fn wait_placement_applied(root: &Path, name: &str) {
+    let checkpoint = root.join("data/applied-placements.json");
     tokio::time::timeout(Duration::from_secs(45), async {
         loop {
-            if let Ok(service) = client.resolve("cluster-owned").await
+            if std::fs::read(&checkpoint)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .is_some_and(|value| {
+                    value["entries"].as_array().is_some_and(|entries| {
+                        entries.iter().any(|entry| {
+                            entry["name"] == name && entry["assignment"]["state"] == "applied"
+                        })
+                    })
+                })
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the reconciler never recorded the placement as applied");
+}
+
+#[cfg(feature = "ebpf")]
+async fn wait_cluster_publication(client: &BunClient, name: &str) {
+    tokio::time::timeout(Duration::from_secs(45), async {
+        loop {
+            if let Ok(service) = client.resolve(name).await
                 && service.healthy_backends == 1
             {
                 break;
@@ -1018,6 +1412,7 @@ async fn enrolled_upgrade_fixture(
 #[ignore = "requires isolated Linux root, bpffs, real runc/ip/nft and static BusyBox"]
 async fn three_enrolled_oci_nodes_preserve_ownership_through_upgrade_and_rollback() {
     let root = tempfile::tempdir().unwrap().keep();
+    let _cleanup = RootCleanup(root.clone());
     let roots: Vec<_> = (0..3)
         .map(|i| {
             let path = root.join(format!("node{i}"));
@@ -1068,15 +1463,15 @@ async fn three_enrolled_oci_nodes_preserve_ownership_through_upgrade_and_rollbac
     })
     .await
     .unwrap_or_else(|_| panic!("three enrolled voters did not converge: {last_views:?}"));
-    let mut app = durable_app("cluster-owned");
-    app.app.get_mut("cluster-owned").unwrap().placement =
-        Some(reliaburger::config::app::PlacementSpec {
-            required: vec!["fixture=rolling-0".into()],
-            preferred: vec![],
-        });
+    let name = root_app_name("cluster-owned", &root);
+    let mut app = durable_app(&name);
+    app.app.get_mut(&name).unwrap().placement = Some(reliaburger::config::app::PlacementSpec {
+        required: vec!["fixture=rolling-0".into()],
+        preferred: vec![],
+    });
     nodes[0].client.apply(&app).await.unwrap();
     for node in &nodes {
-        wait_cluster_publication(&node.client).await;
+        wait_cluster_publication(&node.client, &name).await;
     }
     let original = nodes[0].client.status().await.unwrap().remove(0);
     let manifests: Vec<_> = roots.iter().map(|root| kernel_manifest(root)).collect();
@@ -1108,7 +1503,7 @@ async fn three_enrolled_oci_nodes_preserve_ownership_through_upgrade_and_rollbac
             .await
             .expect("clustered owned upgrade did not settle");
             for node in &nodes {
-                wait_cluster_publication(&node.client).await;
+                wait_cluster_publication(&node.client, &name).await;
             }
             let current = nodes[0].client.status().await.unwrap().remove(0);
             assert_eq!(current.id, original.id);
@@ -1123,11 +1518,7 @@ async fn three_enrolled_oci_nodes_preserve_ownership_through_upgrade_and_rollbac
             }
         }
     }
-    nodes[0]
-        .client
-        .stop("cluster-owned", "default")
-        .await
-        .unwrap();
+    nodes[0].client.stop(&name, "default").await.unwrap();
     tokio::time::timeout(Duration::from_secs(60), async {
         loop {
             let mut cleared = true;
@@ -1214,9 +1605,12 @@ async fn assert_startup_refused(root: &Path, expected: &str) {
 #[tokio::test]
 #[ignore = "run through scripts/release/qualify-discovery-reboot.sh on a disposable VM"]
 async fn actual_bun_kernel_discovery_host_reboot() {
-    let Ok(directory) = std::env::var("RELIABURGER_DISCOVERY_REBOOT_DIRECTORY") else {
-        return;
-    };
+    // A missing variable means an automated driver picked this up by
+    // mistake. Passing would claim reboot evidence nobody collected.
+    let directory = std::env::var("RELIABURGER_DISCOVERY_REBOOT_DIRECTORY").expect(
+        "RELIABURGER_DISCOVERY_REBOOT_DIRECTORY unset: run this only through \
+         scripts/release/qualify-discovery-reboot.sh, which power-cycles the VM",
+    );
     let root = Path::new(&directory);
     let name = format!(
         "reboot-{}",

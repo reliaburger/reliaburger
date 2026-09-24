@@ -344,9 +344,7 @@ An axum router on port 9117:
 | GET | `/v1/cluster/nodes` | Gossip membership |
 | GET | `/v1/cluster/council` | Raft council status |
 | POST | `/v1/cluster/join` | Join a cluster |
-| POST | `/v1/chaos/partition` | Inject network partition |
-| POST | `/v1/chaos/heal` | Heal partitions |
-| GET | `/v1/chaos/status` | Chaos injection status |
+| GET | `/v1/chaos/status` | Node-experiment reservation |
 
 Handlers are thin. They construct an `AgentCommand`, send it over the `mpsc` channel, and await the `oneshot` response.
 

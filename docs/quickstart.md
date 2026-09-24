@@ -8,17 +8,26 @@ not a measured guarantee.
 ## Install and boot
 
 ```sh
-curl -fsSL https://reliaburger.com/install.sh | bash
-export PATH="$HOME/.reliaburger/bin:$PATH"
+curl -fsSL https://reliaburger.com/install.sh | sh
 relish nodes
 relish status
 relish logs hello
 relish dashboard             # Ctrl-C stops the browser connection
 ```
 
+The installer keeps `relish` in `~/.reliaburger/bin`. If `~/.local/bin` is
+already on your `PATH`, it links `~/.local/bin/relish` there and you're done.
+Otherwise it prints the one line to add for your shell (`~/.zshrc`,
+`~/.bash_profile` on macOS, `~/.bashrc` on Linux, `fish_add_path` for fish)
+and asks, on the terminal, whether to add it for you. It never edits a file
+without a yes. Pass `--no-modify-path` (`sh -s -- --no-modify-path`) or set
+`RELIABURGER_NO_MODIFY_PATH=1` to keep everything inside `~/.reliaburger`.
+Until you open a new terminal, setup prints next steps with the full path.
+
 The default is three Linux VMs, running real OCI containers with runc. Relish
-installs Lima in your user directory, downloads a pinned Ubuntu image and
-signed Linux binaries, creates the cluster's credentials, then enrols each
+installs Lima in your user directory, downloads the release's guest image (Ubuntu
+24.04 with runc and the node's other packages already installed) and signed
+Linux binaries, creates the cluster's credentials, then enrols each
 node. It checks the authenticated APIs, the three-member council and a sample
 container through the host ingress port. Open `http://localhost:18080/` to see
 the sample app. Your first application config is saved under
@@ -34,14 +43,14 @@ There is no Rust build and no repository checkout in the published path.
 Native macOS uses Apple's Virtualization.framework through Lima. Linux needs
 QEMU, KVM access and Lima's host prerequisites already installed. Allow at
 least 8 GiB of available memory and 15 GiB of free disk for the default cluster;
-image download time also depends on your connection. Guest package setup uses
-Ubuntu's repositories. No host directories are mounted into the VMs. Managed Lima state lives under
+image download time also depends on your connection. The VMs don't install
+anything at first boot, so setup doesn't depend on Ubuntu's package mirrors. No host directories are mounted into the VMs. Managed Lima state lives under
 `~/.reliaburger/lima`, isolated from your normal Lima configuration.
 
 For a smaller single-node cluster:
 
 ```sh
-curl -fsSL https://reliaburger.com/install.sh | bash -s -- --nodes 1
+curl -fsSL https://reliaburger.com/install.sh | sh -s -- --nodes 1
 ```
 
 To install only the CLI, pass `--install-only`. Then start it separately:
@@ -54,8 +63,9 @@ Use `/install.sh`: GitHub Pages serves the same static page to browsers and
 curl, so the site's root is HTML. The bootstrap downloads a complete,
 version-specific installer over HTTPS before running it. That installer pins
 the native CLI's SHA-256; Relish separately requires the compiled-in release
-signing key for guest binaries. Guest images and Lima archives have fixed
-checksums. The initial shell bootstrap trusts HTTPS.
+signing key for guest binaries and for the guest image's checksum. Lima archives
+have fixed checksums. The initial shell bootstrap trusts HTTPS. Both scripts are plain POSIX sh,
+so any `sh` runs them; pass installer options after `sh -s --`.
 
 ## Resume, stop and remove
 
@@ -66,9 +76,36 @@ relish local start
 relish local destroy --yes
 ```
 
-Setup saves ownership and credentials before creating VMs. If it fails or
-hits its five-minute deadline, rerun the same command. It reuses verified
-cached assets, the original CA and the owned VMs. A retry won't silently
+`stop` and `start` also take one node, by the name `relish nodes` shows, its
+number or `node-N`, so losing a machine is one command:
+
+```sh
+relish local stop node-3     # the other two keep the council's quorum
+relish local start node-3    # boots it and waits for its API
+```
+
+Two stops ask for `--yes` first. Node 1 carries every host forward (the CLI
+endpoint, the ingress on `localhost:18080` and the registry), so while it's
+down the cluster keeps running but `relish` can't reach it. And stopping a
+node that would leave fewer than two of three running costs the council its
+quorum. Both are fair experiments; neither should happen by accident.
+
+Setup shows a line per step as it goes: each download with its size and
+speed, each VM boot, and each node's install, enrolment and start. It ends with
+a short summary of where the time went. Add `--timings` to also print every
+step's duration. Each run, successful or not, saves the same data as JSON in
+`~/.reliaburger/clusters/laptop/timings.json`. On an M2 Max, a three-node
+cluster took about 3¼ minutes with an empty cache (1½ of them downloading)
+and under two minutes with cached downloads; the
+[measurements](qualification/2026-09-23-quickstart-timings.md) have the detail.
+
+Setup saves ownership and credentials before creating VMs. Building the
+cluster, from the first VM boot to the demo app, has a five-minute deadline.
+Downloads don't count towards it, because their speed is your network's: a
+download fails only if no data arrives for 30 seconds (or after 30 minutes in
+total), and an interrupted download resumes from where it stopped. If setup
+fails or runs out of time, rerun the same command. It reuses verified cached
+assets, the original CA and the owned VMs. A retry won't silently
 change the version, topology or ports, or replace a previously running VM
 that disappeared. The error tells you where the checkpoint lives.
 
@@ -81,6 +118,19 @@ observations. A saved provisioning checkpoint is not a live health check.
 cluster's saved record, along with its credentials and checkpoints. It keeps
 the downloaded tool and image cache for future clusters. `--name NAME` selects
 a different saved cluster; setup currently supports one active CLI context.
+
+To remove Reliaburger from the laptop afterwards, destroy each cluster, then:
+
+```sh
+relish uninstall            # asks first; --yes skips the question
+```
+
+It removes the CLI, its `~/.local/bin` link, the private Lima tools, the
+download cache and the managed Lima home. It refuses while a quickstart cluster
+or managed VM still exists and names the `relish local destroy` command to run.
+Anything else under `~/.reliaburger` stays, and it lists what it kept. It
+doesn't edit your shell's rc file; if you added the `PATH` line, it reminds
+you to remove it.
 
 The API forwards bind loopback ports 19117–19119. The first node's HTTP ingress
 uses 18080, and its authenticated HTTPS Pickle registry uses 15050. Change these
@@ -110,7 +160,7 @@ A release candidate can use an explicit HTTPS mirror of its unchanged assets:
 relish setup --quickstart --release-mirror https://YOUR_HOST/candidate
 ```
 
-This keeps guest-image checksums and embedded binary signatures enabled. It
+This keeps guest-image and binary signatures enabled. It
 cannot be combined with development binaries. Repeat the mirror option when
 resuming. The [release guide](releasing.md#qualifying-a-staged-candidate) covers
 candidate verification and the matching installer environment variable.
@@ -126,8 +176,11 @@ RELIABURGER_HOME=/absolute/path/to/isolated-state \
   --development-binaries /absolute/path/to/linux-binaries
 ```
 
-This bypasses release downloads for those two operator-supplied binaries. It
-still verifies the pinned upstream guest image and Lima archive. It prints a
+This bypasses release downloads for those two operator-supplied binaries. With
+no release to take the built guest image from, it boots the stock Ubuntu cloud
+image that image is built from, checked against its pinned SHA-256, and each VM
+installs the node packages from Ubuntu's mirrors at first boot: expect each
+boot to take 15–40 s longer. It still verifies the Lima archive. It prints a
 notice and does not count as qualification of a signed, downloadable release.
 Use the same `RELIABURGER_HOME` for subsequent CLI and lifecycle commands.
 

@@ -1,6 +1,7 @@
 //! Retain runtime addresses, host ports and original records until committed remote release.
 
 use super::{BunAgent, BunError, DiscoveryOwnership, Grill, InstanceId};
+use crate::cluster::producer::ProducerRelease;
 use crate::onion::producer::ProducerReleaseConfirmation;
 
 impl<G: Grill + Clone + 'static> BunAgent<G> {
@@ -10,11 +11,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         client: crate::cluster::producer::ProducerReleaseClient,
     ) {
         self.producer_release_client = Some(client);
+        // Requests in flight belong to the previous transport.
+        self.producer_releases.clear();
     }
 
     /// Call only after observed runtime exit and local request drainage.
     pub(super) async fn confirm_producer_release(
-        &self,
+        &mut self,
         id: &InstanceId,
     ) -> Result<Option<ProducerReleaseConfirmation>, BunError> {
         if matches!(self.discovery_ownership, DiscoveryOwnership::Disabled)
@@ -37,13 +40,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         {
             return Ok(None);
         }
-        let launches = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            self.supervisor.grill().launch_inventory(),
-        )
-        .await
-        .map_err(|_| refuse("producer runtime inventory timed out".into()))??
-        .ok_or_else(|| refuse("producer runtime inventory is unavailable".into()))?;
+        let launches = self
+            .complete_runtime_inventory(super::LOOP_RUNTIME_INVENTORY_TIMEOUT, |reason| {
+                refuse(format!("producer {reason}"))
+            })
+            .await?;
         let mut originals = launches.iter().filter(|launch| launch.instance_id == *id);
         let original = originals
             .next()
@@ -90,10 +91,56 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .ok_or_else(|| refuse("producer cluster identity is unavailable".into()))?
             .local_node_id
             .0;
-        let confirmation = tokio::select! {
-            _ = self.shutdown.cancelled() => return Err(refuse("producer release interrupted; ownership retained".into())),
-            result = client.confirm(node_id, &execution) => result.map_err(|error| refuse(error.to_string()))?,
+        // The request runs as its own task, so a slow or unreachable leader
+        // can't hold the agent loop for the client's whole timeout. Callers
+        // treat the refusal as "retry later"; the next attempt collects the
+        // answer instead of asking again.
+        let requested = self.producer_releases.contains_key(&execution);
+        let pending = self
+            .producer_releases
+            .entry(execution.clone())
+            .or_insert_with(|| {
+                let client = client.clone();
+                let node_id = node_id.clone();
+                let execution = execution.clone();
+                tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+                    client
+                        .confirm(&node_id, &execution)
+                        .await
+                        .map_err(|error| error.to_string())
+                }))
+            });
+        let awaiting = |reason| BunError::ProducerReleasePending {
+            instance_id: id.clone(),
+            reason,
         };
-        Ok(Some(confirmation))
+        // Only a fresh request waits; a retry just collects a finished answer.
+        if requested && !pending.is_finished() {
+            return Err(awaiting("producer release awaits leader confirmation"));
+        }
+        let outcome = tokio::select! {
+            _ = self.shutdown.cancelled() => {
+                return Err(refuse("producer release interrupted; ownership retained".into()));
+            }
+            outcome = tokio::time::timeout(PRODUCER_RELEASE_WAIT, &mut *pending) => outcome,
+        };
+        let Ok(joined) = outcome else {
+            return Err(awaiting("producer release awaits leader confirmation"));
+        };
+        self.producer_releases.remove(&execution);
+        match joined
+            .map_err(|error| refuse(error.to_string()))?
+            .map_err(refuse)?
+        {
+            ProducerRelease::Confirmed(confirmation) => Ok(Some(confirmation)),
+            ProducerRelease::Pending => Err(awaiting(
+                "other nodes have not yet confirmed the endpoint's withdrawal",
+            )),
+        }
     }
 }
+
+/// How long a caller waits for the leader before retiring on a later attempt.
+/// A healthy leader answers well within it; a slow one no longer stalls the
+/// single agent loop for every pending retirement.
+const PRODUCER_RELEASE_WAIT: std::time::Duration = std::time::Duration::from_secs(1);

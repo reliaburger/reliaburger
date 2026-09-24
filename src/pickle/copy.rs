@@ -112,20 +112,8 @@ impl PickleState {
         // The blocking closure returns the guards, retaining them through the
         // subsequent authoritative response even if the original caller leaves.
         let (_local, _access, _operation) = tokio::task::spawn_blocking(move || {
-            use sha2::{Digest as _, Sha256};
-            use std::io::Read;
             for digest in digests {
-                let mut file = std::fs::File::open(store.blob_path(&digest))?;
-                let mut hash = Sha256::new();
-                let mut buffer = [0u8; 64 * 1024];
-                loop {
-                    let count = file.read(&mut buffer)?;
-                    if count == 0 {
-                        break;
-                    }
-                    hash.update(&buffer[..count]);
-                }
-                let actual = Digest::new(&format!("sha256:{}", hex::encode(hash.finalize())))?;
+                let actual = super::store::sha256_file(&store.blob_path(&digest))?;
                 if actual != digest {
                     return Err(PickleError::DigestMismatch {
                         expected: digest,

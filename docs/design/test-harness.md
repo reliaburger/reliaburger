@@ -52,28 +52,46 @@ be visible until we remove its race.
 
 | Command | Contract | Automation |
 |---|---|---|
-| `make lint` | Clippy for every target and feature available on the host | Linux and hosted macOS |
+| `make lint` | Clippy for every target, with all features and with none, so the build without default features stays healthy | Linux and hosted macOS |
 | `make test` | Portable unit, component and integration correctness via nextest | Linux and hosted macOS |
-| `make test-no-default` | The same portable contract without default features | Linux |
 | `make test-doc` | Rust documentation examples | Linux and hosted macOS |
-| `make test-slow` | Required wall-clock health and retry acceptance | Linux |
-| `make test-linux` | runc, namespaces, eBPF, Btrfs, Buildah and root-only tmpfs | Privileged Linux |
-| `make test-cluster` | Gossip, placement, failover, healing, recovery and chaos | Linux, serial resource group |
-| `make test-upgrade-node` | Real single-node binary replacement | Linux |
-| `make test-upgrade-cluster` | Real rolling cluster replacement | Linux |
+| `make test-slow` | Required wall-clock health and retry acceptance | Linux; PRs into `main`, `main` and nightly |
+| `make test-linux` | runc, namespaces, eBPF, Btrfs, Buildah and root-only tmpfs | Privileged Linux; PRs into `main`, `main` and nightly |
+| `make test-cluster` | Gossip, placement, failover, healing, recovery and chaos | Linux, serial resource group; PRs into `main`, `main` and nightly |
+| `make test-upgrade-node` | Real single-node binary replacement | Linux; PRs into `main`, `main` and nightly |
+| `make test-upgrade-cluster` | Real rolling cluster replacement | Linux; PRs into `main`, `main` and nightly |
 | `make test-apple` | Deferred Apple adapter | Manual Apple-silicon development check, outside 0.1.0 |
-| `make bench` | Criterion transport and 5–250-node measurements | Pull requests |
-| `make bench-large` | Criterion 500- and 1,000-node measurements | Pull requests |
-| `make bench-10k` | Deterministic 10,000-member per-node scale acceptance | Pull requests |
-| `make coverage` | Combined default and no-default portable line coverage | Pull requests |
+| `make bench` | Criterion transport and 5–250-node measurements | `main`, nightly, and PRs touching gossip |
+| `make bench-large` | Criterion 500- and 1,000-node measurements | `main`, nightly, and PRs touching gossip |
+| `make coverage` | The portable suite, run once under line coverage; this is the Linux test gate too | Linux |
 | `make audit` | Current RustSec database, with new vulnerabilities and maintenance warnings denied | Pull requests, release gate and weekly schedule |
-| `make examples` | Every checked-in workload config parses, validates and plans through Relish without deployment | Linux pull requests |
+| `tests/examples.rs` (part of `make test`) | Every checked-in workload config parses, validates and plans through Relish without deployment | Linux and hosted macOS |
 
 Direct Apple Container is disabled for 0.1.0. Its manual development tests remain
 separate because hosted macOS runners cannot provide its nested virtualisation.
 The supported runtime gates run on pull requests, and release tags must pass the
 same reusable validation workflow before publication. Managed macOS laptop
 acceptance uses Linux VMs (see V04 in the release checklist).
+
+Pull requests stacked on another branch skip the acceptance suites (wall-clock,
+cluster, upgrade and privileged Linux) unless labelled `full-ci`; they run once the
+PR targets `main`. Documentation-only pull requests skip the Rust jobs entirely,
+except for the manual and the snippets `documentation_first_run` checks.
+
+### Tests no CI job runs
+
+These need hardware, credentials or a reboot that hosted runners can't provide. They
+are `#[ignore]`d with the reason, and each has a named way to run it:
+
+| Test | Needs | How to run |
+|---|---|---|
+| `grill::apple::tests::*` | Apple silicon with Apple Container | `make test-apple` |
+| `bun::gpu::tests::nvidia_detector_finds_hardware` | An NVIDIA GPU and `nvidia-smi` | `RELIABURGER_GPU_TESTS=1 cargo nextest run --run-ignored=only -E 'test(nvidia_detector_finds_hardware)'` |
+| `ketchup::export::tests::export_to_real_s3_manual` | AWS credentials and a bucket | `RELIABURGER_TEST_S3_URL=s3://bucket/prefix cargo nextest run --run-ignored=only -E 'test(export_to_real_s3_manual)'` |
+| `owned_runc::actual_host_reboot_*`, `oci_crash::actual_bun_kernel_discovery_host_reboot` | A Linux VM that can be rebooted mid-test | `scripts/release/qualify-oci-reboot.sh`, `scripts/release/qualify-discovery-reboot.sh` |
+
+A gated test must be `#[ignore]`d. One that returns early when its variable is unset
+reports a pass without testing anything.
 
 The dependency audit refreshes its database on every run. It denies new
 vulnerabilities, unsoundness, yanked packages and unmaintained-package notices.
@@ -140,8 +158,9 @@ one runner needs 100 million records and confuses distributed scale with single-
 capacity. Criterion data is uploaded from CI, but we will not set a regression threshold
 until runs are stable on consistent hardware.
 
-`cargo-llvm-cov` combines the portable default and `--no-default-features` runs into LCOV
-and HTML artefacts. The measured Linux CI line baseline is 79.65%, so CI starts at 78.65%,
+`cargo-llvm-cov` runs the portable suite once, instrumented, and writes LCOV and HTML
+artefacts. On Linux that run is also the test gate and the JUnit source, so the suite isn't
+compiled and run a second time uninstrumented. The measured Linux CI line baseline is 79.65%, so CI starts at 78.65%,
 one percentage point lower. Raise it when coverage improves; do not lower it to land
 unrelated work.
 
@@ -152,3 +171,18 @@ observation, and choose exactly one suite. Prefer a black-box test when the prom
 to `bun` or `relish`. Use snapshots for structured rendering, properties for large algorithm
 spaces and Criterion for measurements. A test that can pass without executing its promised
 behaviour is worse than no test: it gives us confidence we didn't earn.
+
+A new portable integration test goes in `tests/suite/` as a module: add the file and a
+`mod` line in `tests/suite/main.rs`. Every file directly under `tests/` is a separate crate
+that links the whole library, so each one costs a link step and hundreds of megabytes of
+debug executable. Merging 45 small files into `suite` took the test binaries from 77 to
+33 and their size from 9.1 GB to 4.0 GB. Its tests are named `<module>::<test>`, so filter them with
+`test(/^module::/)`, not `binary(module)`. Add a new top-level binary only when the tests
+need gating by a Makefile target, their own nextest group or override (selected with
+`binary(...)`), or process isolation that nextest doesn't already give, such as a fixture
+that re-executes the test binary by name. Shared helpers under `tests/support/` are
+included once at the suite root and reached through `crate::`.
+
+Multi-node tests start their clusters through `tests/support/cluster.rs`: the fully wired
+`bun --cluster` node, the in-memory five-node council, `local`, `wait_until` and the leader
+waits all live there, so include it rather than copying another start-up helper.

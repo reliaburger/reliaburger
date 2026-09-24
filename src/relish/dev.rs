@@ -26,11 +26,6 @@ fn agent_launch_cmd(runtime: &str) -> String {
     )
 }
 
-/// The runtime a dev cluster uses when its state file predates the field.
-fn default_runtime() -> String {
-    "runc".to_string()
-}
-
 fn invalid_input(reason: impl Into<String>) -> RelishError {
     RelishError::LimaError {
         command: "validate development cluster".into(),
@@ -450,7 +445,6 @@ pub struct DevCluster {
     pub nodes: Vec<DevNode>,
     /// The container runtime every node runs (`runc` or `process`). Persisted
     /// so `start` relaunches with the same runtime `create` chose.
-    #[serde(default = "default_runtime")]
     pub runtime: String,
 }
 
@@ -1278,15 +1272,6 @@ mod tests {
         assert_eq!(decoded.nodes.len(), 2);
         assert_eq!(decoded.nodes[0].ip.as_deref(), Some("192.168.105.2"));
         assert_eq!(decoded.runtime, "process");
-    }
-
-    /// A state file written before the runtime field existed still loads,
-    /// defaulting to runc.
-    #[test]
-    fn cluster_state_without_runtime_defaults_to_runc() {
-        let legacy = r#"{"name":"old","nodes":[]}"#;
-        let decoded: DevCluster = serde_json::from_str(legacy).unwrap();
-        assert_eq!(decoded.runtime, "runc");
     }
 
     #[test]

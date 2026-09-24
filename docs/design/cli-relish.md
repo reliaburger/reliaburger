@@ -626,6 +626,7 @@ relish --help                       # Print help and exit
 # Core operations
 relish status                       # Per-instance status table (app, state, PID, restarts)
 relish apply <path>                 # Apply a TOML config file or directory
+relish apply -f <path-or-https-url> # Same; also takes Kubernetes YAML (imported in memory)
 relish apply <path> --dry-run       # Print the plan, contact no agent (always exits 0)
 relish deploy <path>                # Health-gated rolling deploy from a config file
 relish deploy <path> --dry-run      # Print the plan without deploying
@@ -659,6 +660,7 @@ relish top                          # Workload table: state, PID, restarts (no l
 relish wtf                          # Correlated cluster health diagnosis
 relish wtf --app <app>              # Scope to one app
 relish wtf --watch                  # Re-run every 30s until Ctrl-C
+relish wtf --watch --interval 5     # Re-run every 5s instead
 
 # Forensics
 relish history <app>                # Deploy history for an app
@@ -826,10 +828,10 @@ contract does not need another migration when the TC data path lands. Today the
 server rejects both: the loaded cgroup connect hook can refuse a connection but
 cannot sleep or pace packets. Service partition is different. Bun resolves the
 named source app to its live cgroup ids, writes exact source/VIP/port keys into
-the connect map, and refuses the request when eBPF is unavailable. The numeric
-cgroup id in the wire type is server-owned and clients must leave it as zero.
-`memory oom` is also refused because a kill cannot be reversed; use a Kill
-fault when the experiment needs to exercise restart after abrupt termination.
+the connect map, and refuses the request when eBPF is unavailable. Clients can't
+name a cgroup id at all. There's no `memory oom` form because a kill can't be
+reversed; use a Kill fault when the experiment needs to exercise restart after
+abrupt termination.
 
 ### Detailed Command Behaviour
 
@@ -858,6 +860,14 @@ confirmation prompt and no `--yes` flag. Exits 0 on success, 1 on failure.
 With `--dry-run`, it prints the apply plan and contacts no agent — always
 exiting 0, even when no agent is running. The plan uses `ApplyPlan`'s display
 (see `relish deploy` below for the format).
+
+The manifest can be given positionally or with `-f`/`--file` (the kubectl
+spelling), as a local path or an `https://` URL. Plain `http://` is refused.
+Downloads are limited to 1 MiB and 30 seconds, and redirects must stay on
+HTTPS. A document with top-level `apiVersion:` and `kind:` lines is Kubernetes
+YAML: `relish apply` runs the `relish import` conversion in memory, prints the
+migration report to stderr, validates the result and applies it. Anything else
+is parsed as Reliaburger TOML.
 
 **`relish deploy <path>`**
 
@@ -960,24 +970,27 @@ dashboard), not as a CLI command. There is no `relish events` subcommand or its
 `--app` / `--node` / `--type` / `--since` / `--until` / `--severity` filters.
 Use `relish history <app>` for an app's audit trail.
 
-**`relish trace <app> --to <app|host>`**
+**`relish trace <app> --to <app|host> [--count N]`**
 
 End-to-end connectivity diagnosis. Relish finds a running source instance and
 calls `POST /v1/trace` on that node. Bun runs only fixed probe scripts; request
 values become positional arguments and never shell syntax. The source image
 must provide a POSIX `sh`, `nslookup` and `nc` for every observation to run.
-The response contains four steps:
+The response (schema version 2) contains five steps:
 
-1. **DNS query:** Runs `nslookup` inside the source workload. For an internal service it queries `<app>.<namespace>.internal` and checks that the answer contains the live VIP.
-2. **Service and eBPF state:** Reads the userspace service map. On Linux with Onion attached, it also reads the live `backend_map` and requires a healthy kernel backend. Otherwise the userspace result is explicitly `inferred`.
+1. **DNS query:** Runs `nslookup` inside the source workload. For an internal service it queries `<app>.<namespace>.internal` and checks that the answer contains the live VIP. The details keep only the answer and resolver (or the lines explaining a failure).
+2. **Service and eBPF state:** Reads the userspace service map, lists the backends and names the one the VIP sends connects to (or says it round-robins over several). On Linux with Onion attached, it also reads the live `backend_map`, lists the kernel's backends and requires a healthy one. Otherwise the userspace result is explicitly `inferred`.
 3. **Firewall state:** On Linux with the firewall hooks attached, resolves the source PID to its cgroup and evaluates the live namespace and firewall maps using the same rule as the connect hook. Without those maps the result is `Unknown`, never an invented pass.
-4. **TCP probe:** Runs `nc` inside the source workload against the service VIP and selected port and reports observed latency.
+4. **Active faults:** The `relish fault` experiments on this node that act on this source's calls to this destination (destination-wide, or `--from` this source), with id, parameters and time left, plus live evidence where readable: the `fault_connect_map` entries for (VIP, port, source cgroup) and (VIP, port, 0), and the netem delay on the source's `eth0`. Partition, NXDOMAIN and 100% drop fail; delay and partial drop are `Degraded`.
+5. **TCP probe:** Runs `nc -z` inside the source workload against the service VIP and port, `--count` times (1-10), and times each connect inside the container (`date +%s%N`, falling back to `/proc/uptime` at 10 ms when `date` lacks nanoseconds). All succeeding passes, some is `Degraded`, none fails. `latency_ms` is the median successful connect.
 
 Every step labels its evidence `observed`, `inferred` or `unavailable` and its
-verdict `Pass`, `Fail` or `Unknown`. `Fail` wins the overall result; incomplete
-evidence cannot become green. Exit statuses are 0, 1 and 2 respectively.
+verdict `Pass`, `Fail`, `Degraded` or `Unknown`. `Fail` wins the overall
+result, then `Degraded`, then `Unknown`; incomplete evidence cannot become
+green. Exit statuses are 0 for Pass, 1 for Fail and 2 for Degraded or Unknown.
 Workload probes run on a spawned, bounded task so an eight-second probe timeout
-can't stall Bun's command loop. Bun permits at most eight concurrent traces per
+(longer for a counted TCP probe, and the API waits up to 45 seconds) can't
+stall Bun's command loop. Bun permits at most eight concurrent traces per
 node and returns HTTP 429 for the ninth instead of accumulating an unbounded
 queue of workload processes. Agent shutdown cancels in-flight probes and
 releases their permits immediately.
@@ -1331,8 +1344,8 @@ server-owned workload lease, and records every injected fault by exact
 target-local id, owning node and direct client. Teardown clears those exact
 faults newest first, then releases the workload lease. It takes the same path
 after failure, timeout or panic; any unconfirmed reversal makes cleanup
-`Unknown`. Blanket `fault clear` and `chaos heal` aren't used as ownership
-substitutes.
+`Unknown`. Blanket `fault clear` isn't used as an ownership
+substitute.
 
 Node drain and kill use an Admin with the server's `alter_node_state` grant
 and explicit acknowledgement to withdraw scheduler readiness or
@@ -1454,10 +1467,13 @@ Each correlated group becomes one `[app.*]` block. Uncorrelated resources are co
 |---|---|
 | `spec.replicas` | `replicas` |
 | `spec.template.spec.containers[0].image` | `image` |
-| `spec.template.spec.containers[0].ports[0].containerPort` | `port` |
+| `containers[0].command` / `containers[0].args` | `command` / `args` (kept separate; Kubernetes rules at run time) |
+| `containers[0].workingDir` | `working_dir` |
+| `securityContext.runAsUser` / `runAsGroup` (container, else pod) | `run_as_user` / `run_as_group` |
+| Service `targetPort` (named or numeric), else `containers[0].ports[0].containerPort` | `port`; a differing Service `port`, extra Service ports and unrouted container ports are **warned** |
 | `resources.requests.cpu` / `resources.limits.cpu` | `cpu = "request-limit"` |
 | `resources.requests.memory` / `resources.limits.memory` | `memory = "request-limit"` |
-| `readinessProbe.httpGet.path` | `[app.*.health] path` |
+| `readinessProbe.httpGet` | `[app.*.health] path` (and `port` when it isn't the app's); `exec`/`tcpSocket`/`grpc` probes are **warned** |
 | `env[]` and `envFrom[]` | `[app.*.env]` |
 | `nodeSelector` | `[app.*.placement] required` |
 | `tolerations` | **Warning** (no equivalent) |

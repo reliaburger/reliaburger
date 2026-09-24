@@ -1,6 +1,6 @@
 # Phase 15 follow-up plan — review of PR #151 (`codex/phase15-correctness-2026-07-28`)
 
-> Historical checklist. The [17 September completion plan](2026-09-17-codebase-completion-plan.md#reconciliation-with-the-earlier-plans)
+> Historical checklist. The [17 September completion plan](archive/2026-09-17-codebase-completion-plan.md#reconciliation-with-the-earlier-plans)
 > reconciles every section with the current code and tracks the remaining work.
 > Do not interpret the unchecked boxes below as a current implementation count.
 

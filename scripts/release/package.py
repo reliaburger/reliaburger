@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sign release binaries and emit the existing schema-1 metadata format.
+"""Sign release binaries and guest images, and emit the schema-1 metadata.
 
 OpenSSL 3 performs Ed25519 operations. The private key is PKCS#8 DER, matching
 `relish dev keygen`. This script never creates or rotates the release identity.
@@ -18,6 +18,7 @@ PLATFORMS = {
     "bun": ("linux-aarch64", "linux-x86_64"),
     "relish": ("linux-aarch64", "linux-x86_64", "macos-aarch64", "macos-x86_64"),
 }
+GUEST_METADATA = "guest-image-metadata.json"
 # SubjectPublicKeyInfo header for a 32-byte Ed25519 public key (RFC 8410).
 ED25519_SPKI = bytes.fromhex("302a300506032b6570032100")
 
@@ -37,7 +38,40 @@ def sha256(path):
     return digest.hexdigest()
 
 
-def package_release(directory, version, repository, key, trusted_keys):
+def guest_image_statement(version, arch, asset, digest, source_digest):
+    """The text the release key signs for a guest image; see artifacts.rs."""
+    return (f"reliaburger guest image v1\nversion {version}\narch {arch}\nasset {asset}\n"
+            f"sha256 {digest}\nsource-sha256 {source_digest}\n").encode()
+
+
+def sign_bytes(key, data):
+    """Ed25519 over bytes that aren't a file yet."""
+    with tempfile.TemporaryDirectory(prefix="reliaburger-statement-") as temporary:
+        path = Path(temporary) / "statement"
+        path.write_bytes(data)
+        signature = openssl("pkeyutl", "-sign", "-rawin", "-keyform", "DER", "-inkey", key, "-in", path)
+    if len(signature) != 64:
+        raise ValueError("unexpected Ed25519 signature length")
+    return base64.b64encode(signature).decode("ascii")
+
+
+def guest_image_metadata(directory, version, key, pins):
+    """Sign each built guest image's digest, binding it to its pinned source."""
+    images = {}
+    for arch, pin in sorted(pins["images"].items()):
+        path = directory / pin["asset"]
+        digest = sha256(path)
+        source = pin["source"]
+        statement = guest_image_statement(version, arch, pin["asset"], digest, source["sha256"])
+        images[arch] = {
+            "asset": pin["asset"], "sha256": digest, "size": path.stat().st_size,
+            "signature": sign_bytes(key, statement),
+            "source": {"url": source["url"], "sha256": source["sha256"]},
+        }
+    return {"schema": 1, "version": version, "images": images}
+
+
+def package_release(directory, version, repository, key, trusted_keys, pins):
     if not re.fullmatch(r"v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?", version):
         raise ValueError("release tag must be a version prefixed with v")
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
@@ -47,6 +81,10 @@ def package_release(directory, version, repository, key, trusted_keys):
             path = directory / f"{binary}-{platform}"
             if not path.is_file() or path.is_symlink() or path.stat().st_size == 0:
                 raise ValueError(f"missing or invalid release binary: {path.name}")
+    for image in pins["images"].values():
+        path = directory / image["asset"]
+        if not path.is_file() or path.is_symlink() or path.stat().st_size == 0:
+            raise ValueError(f"missing or invalid guest image: {path.name}")
 
     public = openssl("pkey", "-inform", "DER", "-in", key, "-pubout", "-outform", "DER")
     if len(public) != 44 or not public.startswith(ED25519_SPKI):
@@ -79,6 +117,9 @@ def package_release(directory, version, repository, key, trusted_keys):
             checksums.append(f"{digest}  {path.name}\n")
         name = "metadata.json" if binary == "bun" else "cli-metadata.json"
         outputs[name] = {"schema": 1, "latest": version, "releases": [{"version": version, "platforms": artifacts}]}
+    outputs[GUEST_METADATA] = guest_image_metadata(directory, version, key, pins)
+    for image in outputs[GUEST_METADATA]["images"].values():
+        checksums.append(f"{image['sha256']}  {image['asset']}\n")
 
     # No metadata is written until every expected artefact has been signed.
     for name, document in outputs.items():
@@ -111,7 +152,8 @@ def main():
         with key.open("xb") as stream:
             os.chmod(key, 0o600)
             stream.write(base64.b64decode(encoded_key, validate=True))
-        package_release(args.directory, args.version, args.repository, key, trusted)
+        pins = json.loads(Path(__file__).with_name("guest-images.json").read_text())
+        package_release(args.directory, args.version, args.repository, key, trusted, pins)
 
 
 if __name__ == "__main__":

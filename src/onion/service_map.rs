@@ -365,7 +365,8 @@ impl ServiceMap {
 }
 
 /// Separate successive executions even when they share a node and host port.
-/// Unknown execution evidence retains the legacy key and is not retirement proof.
+/// Without execution evidence the key is the bare endpoint, which is not
+/// retirement proof.
 fn catalog_instance_id(backend: &super::catalog::CatalogBackend) -> String {
     let endpoint = format!(
         "{}:{}:{}",

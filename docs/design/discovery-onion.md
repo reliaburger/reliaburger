@@ -363,7 +363,7 @@ pub struct BackendInstance {
 The live rootful-runc path is:
 
 1. Bun derives the node-side veth gateway, binds UDP and TCP port 53 there with `IP_FREEBIND`, and only then reports DNS ready.
-2. Runc creates a per-instance `resolv.conf` naming that gateway and bind-mounts it read-only at `/etc/resolv.conf`. It never edits the shared image rootfs.
+2. Runc creates a per-instance `resolv.conf` naming that gateway and bind-mounts it read-only at `/etc/resolv.conf`. It never edits the shared image rootfs. The file carries `search <namespace>.internal internal` and `options ndots:2`, so Kubernetes-style `redis` (the caller's namespace) and `redis.default` resolve. Names under `.internal` with more labels than `<app>.<namespace>` get NXDOMAIN, not REFUSED, so resolvers keep walking the search list.
 3. The C library sends its query to the gateway. Bun answers `.internal` from the latest service-map snapshot and forwards other private-source queries to the configured upstream resolver.
 4. Unknown internal names stay local as NXDOMAIN. Public sources receive REFUSED for every name, so the responder can't become an open recursive resolver.
 5. If either startup bind fails, Bun doesn't start the agent. If the serving task later exits, its supervisor cancels Bun and the reporting lease withdraws readiness.

@@ -7,7 +7,7 @@
 //! nodes; this test exercises the per-node 10,000-member invariant through the
 //! real message handler and dissemination queue.
 //!
-//! Run it with `make bench-10k`.
+//! It runs in about a second in a debug build, so it is part of `make test`.
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -34,7 +34,6 @@ async fn seeded_simulation_converges_without_a_sentinel_result() {
 }
 
 #[tokio::test]
-#[ignore = "10,000-member scale acceptance test; run with make bench-10k"]
 async fn one_node_handles_10k_member_protocol_state() {
     let cluster_size = 10_000;
     let network = InMemoryNetwork::new();
@@ -52,7 +51,6 @@ async fn one_node_handles_10k_member_protocol_state() {
             address: address(index),
             state: NodeState::Alive,
             incarnation: 1,
-            lamport: index as u64,
         })
         .collect();
 

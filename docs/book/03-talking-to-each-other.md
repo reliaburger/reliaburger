@@ -74,6 +74,7 @@ The sequence:
 5. Bring everything up
 6. Set the default route inside the namespace to point at the gateway
 7. Enable IP forwarding on the host
+8. Accept the containers' traffic in the host's iptables FORWARD chain, because Docker and ufw set its policy to DROP (chapter 9 has the story)
 
 The `rb-` prefix on namespace names avoids collisions with other tools that might create network namespaces.
 
@@ -118,6 +119,16 @@ pub fn node_index_from_id(node_id: &str) -> u16 {
 The `|acc, b|` syntax is a closure (Rust's lambdas). The pipes delimit the parameter list, like parentheses in `def f(acc, b):` in Python or `func(acc, b int)` in Go. The body follows directly. Short closures can be a single expression with no braces; longer ones get `{ }` just like a function. Rust infers the parameter types from context, so we don't need to annotate them.
 
 The `fold` method is Rust's version of a reduce. We start with an accumulator (5381, the traditional djb2 seed) and combine each byte of the node ID into the running hash. djb2 isn't cryptographic, but we don't need it to be. We just need reasonable distribution across 32k buckets so that different nodes don't collide. In production, the council assigns sequential node indices on join, but the hash gives us a sensible default before the cluster is formed.
+
+### Handing out addresses you can take back
+
+Where does `container_index` come from? The first version incremented a `u16`. A /23 has 510 usable addresses and the gateway takes one, so a node has 509 container slots, and a counter knows nothing about that. Keep deploying and it walks onto the broadcast address, then into the next node's subnet. Restart Bun and it starts from zero, straight onto addresses live containers are still using.
+
+So indices come from a small journal, `.network-leases.json`, next to the runtime state. Bun records an instance's index *before* running any network command, writes the file the careful way (temporary file, `fsync`, atomic rename, `fsync` of the directory) and reloads it under a file lock on every change. A full pool refuses the deploy before it creates anything. A lease goes back only after cleanup has checked the kernel and found the namespace, the host veth and any port forwards gone; if teardown can't prove that, the address stays reserved.
+
+The other half of "whose address is this" is routing. Our first cut gave every host-side veth the node's whole /23 as a connected network. With one container that works. Add a second and Linux has two interfaces claiming the same subnet, so the host's packets for container two go out through container one's veth. Now each endpoint gets a `/32` address, the host installs an explicit route to each container through its own veth, and each container gets a route to its gateway plus a default route through it. The /23 is still the *allocation* pool; it just isn't a network anybody claims to be directly attached to.
+
+These `ip` commands run through the same owned command executor as the runtime itself (Chapter 1), for a reason we found by killing Bun at the worst moment: with an `ip link add` still waiting to run, a new Bun looked for the veth, didn't find it, and treated the slot as clean. Then the old command woke up and created it. Recovery now retires the old generation's commands before it inspects the kernel, and only then does absence mean anything.
 
 ### Port mapping: two strategies
 
@@ -212,40 +223,14 @@ When `path` is `Some`, runc joins the pre-created namespace (where our veth is a
 For rootless containers, we use `slirp4netns`, the same tool Podman uses. It implements a userspace TCP/IP stack via a TAP device inside the user namespace:
 
 1. Runc creates a new network namespace (we no longer strip it from the spec)
-2. Grill starts `runc run` and polls `runc state` for the container init PID
-3. We spawn: `slirp4netns --configure --mtu=65520 --disable-host-loopback --api-socket {socket} {pid} tap0`
+2. A `createRuntime` OCI hook (Bun's own binary, in a hidden mode) receives the container's init PID and holds creation until the network is ready, so the payload never starts without one
+3. Bun starts `slirp4netns --configure --mtu=65520 --disable-host-loopback --api-socket {socket} ... tap0` against that namespace
 4. The container gets IP `10.0.2.100` with gateway `10.0.2.2`
 5. Port forwarding uses slirp4netns's API socket — we send JSON commands to map ports
-6. The instance record stores the socket, mapping and owner PID/start time. A
-   replacement Bun either reclaims that exact process or recreates it before
-   declaring adoption successful.
 
 The `--disable-host-loopback` flag is important: it prevents the container from reaching services on the host's loopback. Without it, a compromised container could probe the host's `localhost`-only services.
 
-#### One userspace network needs one process owner
-
-Starting networking twice for an instance used to overwrite its `slirp4netns`
-handle in a map. The previous helper kept running. Dropping a Tokio `Child`
-doesn't kill its process, and we deliberately need that behaviour during Bun
-replacement. A plain map insertion cannot distinguish a handoff from a leak.
-
-Replacement now holds the async ownership lock while retiring the old helper,
-waiting for exit and installing its successor. Adoption of the same PID and
-start time keeps the existing handle; conflicting metadata is refused. When a
-different surviving helper takes over, retirement preserves its API socket.
-Otherwise the old owner's cleanup could unlink the new owner's socket.
-
-Startup has a stricter lifetime. `PendingSlirp` owns an `Option<Child>` and its
-`Drop` implementation requests termination if the future is cancelled. `take()`
-moves the child out only after socket readiness and host forwarding succeed.
-The published handle can then survive an intentional Bun handoff. This is why
-we don't set `kill_on_drop` on every helper indiscriminately.
-
-Socket checks use asynchronous filesystem calls, and one two-second deadline
-bounds both readiness and the forwarding handshake. Regression tests cancel a
-real helper during startup, stall its forwarding response, replace a failed
-network and adopt the same surviving process repeatedly. They check process
-exit and socket ownership, not just the number of handles in the map.
+The helper is a process, not kernel state, so it needs an owner that outlives any one Bun. It runs as another role of the same durable runtime record as the container's launcher (Chapter 1 builds that owned lifecycle). Before it execs `slirp4netns`, the helper opens the container's user and network namespaces through `/proc/<pid>` and hands slirp those file descriptors rather than a PID. A PID can be recycled between the check and the use; an open namespace descriptor can't change what it points at. When a replacement Bun adopts the container, it asks the surviving helper for its forwarding table and refuses anything that differs from the original port mapping instead of "fixing" it.
 
 ### Apple Container: the easy case
 
@@ -505,9 +490,9 @@ RaftRequest::PublishEndpoints {
 }
 ```
 
-Applying it checks the observed generation, records withdrawals and replaces `DesiredState.endpoint_catalog` — a wholesale swap, so the leader is the single source of truth and a follower never merges half a view. Because it lives in `DesiredState`, it rides the same replication and snapshot machinery as every other cluster fact, and it survives a leader change for free: the new leader inherits the last catalogue and republishes from its own reports on the next tick. The leader only writes when the catalogue actually changed, so a steady cluster isn't churning the log every couple of seconds.
+`expected_generation` is a compare-and-swap: the state machine refuses the write unless the catalogue's publication counter still matches the value the scheduler read, so a scheduler working from a stale view can't overwrite a newer decision. Applying it records which endpoints disappeared and replaces `DesiredState.endpoint_catalog` — a wholesale swap, so the leader is the single source of truth and a follower never merges half a view. Because it lives in `DesiredState`, it rides the same replication and snapshot machinery as every other cluster fact, and it survives a leader change for free: the new leader inherits the last catalogue and republishes from its own reports on the next tick. The leader only writes when the catalogue actually changed, so a steady cluster isn't churning the log every couple of seconds.
 
-The last hop is getting the catalogue *into* each node's resolution path. Every node's reconciler polls the leader's `/v1/placements/{node}` endpoint every couple of seconds to learn its assignments. We piggyback the catalogue on that response, after registering the consumer in Raft. Council voters also hold the replicated `DesiredState`, but use the same reconciler to install routing. Explicit protocol and state compatibility must match; a serde default is not permission to mix incompatible binaries. The reconciler hands the catalogue to its Bun agent, which overlays it onto the local service map:
+The last hop is getting the catalogue *into* each node's resolution path. Every node's reconciler polls the leader's `/v1/placements/{node}` endpoint every couple of seconds to learn its assignments. We piggyback the catalogue on that response (after recording the poller in Raft as a consumer of it, for reasons we'll get to at the end of the chapter). Council voters also hold the replicated `DesiredState`, but they install routing through the same reconciler so there's one path to test. The reconciler hands the catalogue to its Bun agent, which overlays it onto the local service map:
 
 ```rust
 let merged = self.service_map.with_cluster_catalog(&self.cluster_catalog);
@@ -539,37 +524,7 @@ Names are namespace-qualified: `<app>.<namespace>.internal`. A query for
 `api.payments.internal` resolves the `api` service in `payments`, and
 `api.default.internal` resolves the other `api`, each to its own VIP.
 
-A short name needs a caller identity. Using the node's default namespace seems
-convenient until two tenants both run Redis. The responder now looks up the
-packet's source address in a snapshot owned by RuncGrill. Runc publishes an
-address/namespace binding when it creates the isolated network, before starting
-the workload. That includes jobs, init containers and apps without a service
-port. Removing a network withdraws the binding before teardown.
-
-The snapshot travels over a `watch` channel. `send_replace` keeps the latest
-value even before DNS subscribes; a receiver's `borrow` reads one consistent
-snapshot without contending with the runtime's network lock. Duplicate source
-addresses with conflicting namespaces resolve to no identity. Unknown sources
-get `REFUSED` for short names on both UDP and TCP. Host tools can use qualified
-names, and no internal query gets forwarded upstream.
-
-Adoption must restore this ownership too. Bun verifies that the recorded network
-namespace and the live container's namespace have the same filesystem identity,
-then reads the actual IPv4 address from the kernel. It restores the runtime's
-network owner, claims that address in the durable reservation journal, and
-republishes the DNS binding. Guessing the address from a restarted counter would let a new
-container inherit an old container's namespace identity.
-
-Fault lookup uses the same complete `ServiceId`. A fault authorised for
-`payments/redis` cannot affect `default/redis`; overlapping experiments retain
-independent ownership until clear or expiry, as Chapter 8 explains.
-
-Tests send real UDP and TCP queries while changing, removing and conflicting a
-source binding. Two real runc workloads in different namespaces resolve the same short name to
-different VIPs. A privileged adoption test checks the binding before start,
-after Bun replacement and after teardown. The old `dns.default_namespace`
-configuration field is rejected: an operator preference cannot establish which
-workload sent a packet.
+What about a bare `redis.internal`? Our first answer was "the node's default namespace", which is convenient right up until two tenants on one node both run Redis. A short name only means something if we know who asked. So the responder looks up the packet's source address in a table that Runc maintains: it binds each container address to its namespace when it creates the network, before the workload starts, and withdraws the binding before teardown. The table travels to the DNS task over a `watch` channel, the same trick we'll use for the service map below. An unknown or ambiguous source gets `REFUSED` for a short name; qualified names work for everyone, and no `.internal` query is ever forwarded upstream. The old `dns.default_namespace` setting is now a config error, because an operator's preference can't tell us which workload sent a packet.
 
 The cost is ~50 microseconds per DNS lookup (localhost UDP round trip). That's 10x faster than CoreDNS over the pod network, but it's not zero. Most applications cache DNS results anyway, so this hit happens once per connection lifetime, not per request.
 
@@ -625,9 +580,32 @@ The hardened version fixes each in turn. Receive errors log and `continue` — t
 
 The responder is now properly authoritative for `.internal`: unknown names get NXDOMAIN locally and are never forwarded, AAAA on a known name gets an empty NOERROR ("the name exists, it just has no IPv6"), and unsupported types get NOTIMP. Not one internal byte reaches the upstream.
 
+A later audit sent a question with the last byte of its class field missing. We answered it anyway. The hand-rolled decoder read the name and type, trusted the header's counts, and assumed the rest was fine. Rather than patch our own parser one hole at a time, we swapped it for Hickory's protocol codec (just the wire format, with no resolver or DNSSEC engine attached) and kept only the policy on our side:
+
+```rust
+let mut decoder = BinDecoder::new(packet);
+let message = Message::read(&mut decoder).ok()?;
+if !decoder.is_empty()
+    || message.metadata.op_code != OpCode::Query
+    || message.queries.len() != 1
+    // ... more admission checks ...
+```
+
+`&mut decoder` lends the decoder exclusively to `Message::read`, which advances its cursor as it parses. `.ok()` turns the `Result` into an `Option`, dropping the error, and `?` on an `Option` returns `None` from `decode_query` early. Here `None` means "drop this packet", never "answer with nothing". After parsing we insist the decoder consumed every byte (`is_empty()`), so trailing junk is an error rather than something we politely ignore. The test corpus includes every truncation of a valid query, a compression loop, overlong names and a literal dot inside a label, and each case must be followed by a valid query that still succeeds.
+
 The Rust-flavoured part is how the responder reads the service map. The agent *owns* its `ServiceMap` — it mutates it freely inside its event loop, no locks. Sharing it with the DNS task via `Arc<RwLock<…>>` would have meant threading lock acquisitions through dozens of agent call sites. Instead the agent publishes a *snapshot* on a `tokio::sync::watch` channel every time the map changes (the same moment it rebuilds the routing table). A watch channel holds exactly one value — the latest — and the responder reads it with `borrow()`, no await, no contention. The cost is a clone of the map per change; deploys are rare and maps are small, so that's a bargain for keeping the agent lock-free. Go programmers will recognise the shape: don't share memory, communicate — except here the borrow checker enforces it.
 
 Containers find the responder through an old-fashioned mechanism: `/etc/resolv.conf`. Runc writes a per-instance file in the OCI bundle and bind-mounts it read-only at `/etc/resolv.conf`; it never edits the shared unpacked image rootfs. The file names the node-side veth gateway, not host loopback. `resolv.conf` has no port syntax, so only port 53 is valid.
+
+Kubernetes manifests don't say `redis.internal`, though. They say `redis:6379`, or `redis.default` to cross a namespace, because a pod's `resolv.conf` carries a search list. Ours does too now, for a container in `payments`:
+
+```text
+nameserver 10.0.2.1
+search payments.internal internal
+options ndots:2
+```
+
+A resolver appends each search suffix in turn to any name with fewer than `ndots` dots, before trying it as written. So `redis` becomes `redis.payments.internal` (the caller's own namespace), and `redis.default` becomes `redis.default.payments.internal` and then `redis.default.internal`. That first attempt can't exist, and the responder has to say so with NXDOMAIN. It used to answer REFUSED, and glibc and musl both treat REFUSED as "stop searching", so `redis.default` quietly failed. Why `ndots:2` rather than Kubernetes' 5? With 1, `redis.default` would go upstream as written before the search list, leaking an internal name to the public resolver. With 5, `api.stripe.com` would pay three local misses before its real lookup. Two covers both short forms and costs a two-label external name like `example.com` two node-local NXDOMAINs.
 
 Rootful runc is the supported transparent DNS path today. Rootless runc now has supervised slirp networking and published ports, but it still has no route to the node's port-53 responder or resolver injection. ProcessGrill doesn't install a resolver into the host, and Apple Container has no DNS injection in its adapter. Enabling `[dns]` with any of those runtimes fails before adoption or workload creation. The live node capability records readiness, IPv4/IPv6 support and workload reachability; a DNS-enabled scheduling pass excludes nodes that can't prove all three.
 
@@ -715,20 +693,7 @@ One surprise: returning 0 from a `cgroup/connect4` hook gives `EPERM`, not `ECON
 
 The name `cgroup/connect4` gives it away: this hook only sees IPv4 `connect()` calls. IPv6 connects go through a separate hook, `cgroup/connect6`, and for a long time we simply didn't attach one. For the VIP rewrite that's fine — VIPs live in `127.128.0.0/16` and are v4 by construction. For the egress policy that later grew inside this same program (Chapter 10), it was a hole you could drive a truck through: any dual-stack workload could bypass its entire allowlist by connecting over IPv6. Phase 12b added `onion_connect6` to the same object file and attaches it right next to connect4. It does no rewriting (there are no v6 VIPs to rewrite), it's pure policy.
 
-Each health tick checks those live hooks and the enforcement map. The result
-drives both workload fencing and the readiness capability published for that
-tick. Previously readiness immediately repeated the same probe, paying for
-another map read and potentially describing a different observation. The
-enforcement method now returns its capability value after handling affected
-workloads; readiness consumes that value directly.
-
-This isn't a cache across ticks or requests. The next tick observes the kernel
-again, and a separate cluster report also gets fresh evidence. Repairing a
-missing enforcement flag still requires a second map read to verify the repair.
-That read proves a change took effect; removing it would weaken the boundary.
-The regression counts observation calls rather than relying on a benchmark's
-timing. A real eBPF test detaches the hooks and requires both workload stop and
-withdrawn readiness capability within the existing four-second bound.
+Every health tick checks that both hooks are still attached and the enforcement map is intact. One observation drives two decisions: stopping workloads that need enforcement the kernel no longer provides, and the readiness the node advertises for that tick. Using a single reading for both means the scheduler never hears "enforcing" from a node that has just stopped its workloads for not enforcing.
 
 One wrinkle worth knowing about: a dual-stack socket reaching an IPv4 server goes through *connect6* with a "v4-mapped" address, `::ffff:a.b.c.d`. The connect6 hook has to spot that pattern and judge the connection against the IPv4 policy, or the mapped form becomes yet another bypass. The kernel also insists that `user_ip6` is read in 32-bit chunks — the verifier rejects byte-wise loads from that context field.
 
@@ -798,9 +763,9 @@ A reverse proxy solves all three. External clients talk to `myapp.com:443`, and 
 
 ### Architecture
 
-Wrapper runs inside Bun as a set of async tasks — not a separate process. But it runs on its own tokio runtime with its own thread pool. This is the key design decision: if someone points a botnet at port 80, the flood of connections saturates Wrapper's threads but can't starve the gossip protocol, the Raft consensus, the health checker, or the scheduler. Resource isolation through separate runtimes.
+Wrapper runs inside Bun as a set of async tasks — not a separate process, and not a separate runtime either. We originally planned to give it its own tokio runtime with its own thread pool, so a flood on port 80 couldn't starve gossip, Raft or the health checker. The config even had a `worker_threads` knob for it. Nothing ever read the knob, and a setting that pretends to bound resources is worse than no setting, so it's gone. Wrapper shares Bun's one runtime (the project rule: never create a second one), and its protection comes from bounding the work instead.
 
-On top of that, a concurrent connection limit (default 10,000) rejects new connections with 503 once the cap is hit. So a DDoS attacker faces: per-IP rate limiting, a global connection ceiling, and runtime isolation that protects the rest of the system.
+A concurrent connection limit (default 10,000) rejects new connections with 503 once the cap is hit. So a DDoS attacker faces per-IP rate limiting, a global connection ceiling and bounded TLS handshakes, which together cap how much of the runtime a flood can occupy.
 
 ### The routing table
 
@@ -1024,6 +989,26 @@ The `101`-then-splice tests are the ones that pin this down. It's not enough to 
 
 TLS handshakes got the same "bound the resource" treatment from the other side. Spawning a task per handshake (the fix from a couple of sections ago) stops one slow handshaker blocking the accept loop, but it doesn't stop *ten thousand* slow handshakers spawning ten thousand tasks. So the accept loop now grabs a handshake permit from a second semaphore before it spends any work, and wraps the handshake itself in a `tokio::time::timeout`. A peer that opens a socket and never sends a ClientHello is dropped on the deadline, and its permit returns to the pool. Bounded concurrency plus a deadline: a flood costs a fixed amount of memory and clears itself.
 
+### Count the request before you hide the route
+
+The permit fixed WebSockets that started *during* a drain. It said nothing about a slow request that reached its backend a second *before* the drain began. The tracker had never counted it, so the drain reported "complete" while the request was still waiting for its answer, and Bun stopped the container underneath it. A gated test server that acknowledges a request and then waits to be released made this easy to reproduce.
+
+Now the handler takes the routing table's read lock, picks its candidate backends and records a drain guard for all of them before letting go. Withdrawing a route needs the write lock, so Bun can't slip a withdrawal between "this handler copied an endpoint" and "this handler is counted against it". While no backend has answered, the guard holds every failover candidate, because any of them might still get the request.
+
+Once one answers, the others are spectators. We first kept them captured for the whole response, and a review spotted what that does to a rolling deploy: a long server-sent-events stream served by healthy backend A also held failover candidate B. B's drain couldn't finish, and at B's deadline the cancellation meant for B tore down A's perfectly good stream. So the proxy narrows its ownership the moment a response arrives from candidate `idx`:
+
+```rust
+let mut drain_guard = drain_guard;
+if let Some(guard) = &mut drain_guard {
+    guard.keep_only(idx);
+}
+let terminate: Vec<_> = terminate.into_iter().nth(idx).into_iter().collect();
+```
+
+`if let Some(guard) = &mut drain_guard` borrows the guard mutably *inside* the `Option` without taking it out, so `keep_only` can edit it in place. `keep_only` moves the unused instance ids into a throwaway `DrainGuard` and drops it at once; its `Drop` releases them exactly as a finished request would, so there's one release path, not two. The last line keeps only the serving backend's cancellation token: `into_iter()` consumes the vector, `nth(idx)` yields an `Option` holding that one token, and `into_iter().collect()` turns the `Option` back into a zero- or one-element `Vec`.
+
+One more distinction took a couple of rounds to get right. A drain deadline *cancels* work; it doesn't prove the work stopped. The tracker reports completion only after the guards have actually been dropped, and a response body that was cut short by cancellation ends with a `ConnectionAborted` error rather than a clean end-of-stream, so the client can tell it got half a response. Completion of cleanup and successful delivery are different facts, and each gets reported honestly.
+
 ### Streaming, not photocopying, the body (post-audit fix)
 
 The "translator not photocopier" section was about headers. The bodies had their own version of the same sin. The proxy buffered the whole request body (up to a hardcoded 10 MiB) and collected the *entire* backend response into memory before sending a byte to the client. For a server-sent-events stream or a gRPC call or a large file download, that's not a proxy, it's a bucket — the first byte reaches the client only after the last byte arrives, and a big response pins its whole size in RAM.
@@ -1100,1471 +1085,117 @@ local instances. Removing that route without changing any endpoints must remove
 it from the routing table too. A healthy container is only half the story; the
 request still has to reach it.
 
+## An address is only free when everyone has let go
 
-### A finite subnet needs durable ownership
-
-A /23 provides 510 usable addresses. The gateway takes one, so the rootful
-runtime has 509 container slots. Incrementing a `u16` counter does not enforce
-that boundary: it eventually chooses a broadcast address, spills into another
-subnet and wraps onto an occupied slot. Restarting the counter makes matters
-worse.
-
-`NetworkLeases` records each instance's index before any network command runs.
-The private `.network-leases.json` file also identifies its node subnet and
-format. Updates use a unique temporary file, file sync, atomic rename and
-directory sync. Every transaction reloads the journal under a process lock;
-corrupt data, duplicate indices, symlinks and a changed subnet refuse allocation.
-A full pool refuses before creating the instance's bundle. The low-level network
-setup function independently rejects indices outside the declared subnet.
-
-The transaction runs in `spawn_blocking`, which moves filesystem work off the
-async executor. It owns an `OwnedMutexGuard`, so cancelling the waiting future
-does not release that guard while the file write is still running. The OS file
-lock also needs explicit release in `Drop`: a concurrent fork can briefly inherit
-its file descriptor before exec, so closing only our descriptor can leave the
-lock busy. A guard's destructor is a useful place to express that ownership.
-
-Each instance also has a lifecycle mutex. Create, adoption, exit observation
-and teardown cannot race for that instance, while different instances can
-progress concurrently. The lock map stores `Weak` references: unlike `Arc`, a
-`Weak` does not keep the lock alive. `upgrade()` returns `Some(Arc<_>)` only while
-an owner still exists, and unused map entries can be discarded.
-
-Failed or cancelled setup leaves its reservation intact until cleanup confirms
-that the named namespace, host veth and owned host-port forwarding entries have
-disappeared. It inspects the actual nftables map, so a cancellation between
-installing a mapping and publishing its handle cannot hide a stale entry. Cleanup can
-reconstruct this plan from the journal even if Bun died before publishing an
-in-memory network handle. It retains the address on uncertain teardown. A new
-Bun adopts verified live kernel addresses into the same journal; a conflicting
-owner refuses. Operators must retain this journal with the runtime state and
-must not delete it to bypass exhaustion. Cancelled, unadopted plans can consume
-capacity until the runtime explicitly retires their owner; there is no expiry
-that silently reuses a possibly live address.
-
-Tests fill all 509 slots, reload the pool, retire one slot and reuse exactly
-that slot. Concurrent reservations remain distinct. Real rootful tests cancel
-a creation while its registry request is stalled, replace the runtime object,
-and show that the address is unavailable until recovered teardown succeeds.
-They also cover duplicate-create refusal, adoption, failed bundle preparation
-and reuse after namespace removal.
-
-
-### Configuration needs a consumer
-
-Wrapper uses unweighted round-robin across routable backends. Its old public
-`lb_strategy` field offered `LeastConnections`, but neither backend selector read
-it. We remove that field and enum for 0.1.0. A future strategy needs connection
-accounting and selection tests before it earns a setting.
-
-We also remove `WrapperConfig::worker_threads`. Wrapper runs on Bun's existing
-Tokio runtime; it doesn't create a separate four-thread runtime. Keeping an unused
-field would let callers believe they had configured a resource boundary. Neither
-field was part of the node TOML or a serialised routing record, so this changes
-only the unreleased Rust library API. Existing routing and proxy tests still
-exercise the supported behaviour.
-
-
-The helper inventory also removes the unused `run_proxy` convenience wrapper.
-Bun uses `bind_proxy` and `BoundProxy::serve`: binding is a fallible startup step,
-and serving is the owned long-lived task. DNS keeps its standalone
-`run_dns_responder` wrapper because the DNS and eBPF integration tests exercise
-that public entry point. Its documentation now names that role and distinguishes
-it from Bun's readiness-aware binding path.
-
-
-### Give the DNS codec the whole packet
-
-Send a question whose QCLASS is missing its last byte. Our old decoder still
-answered it. It read the name and QTYPE, then assumed the rest of the packet
-was sound. It also trusted header counts and joined labels without preserving
-the difference between a separator and a literal dot inside one label.
-
-The replacement uses Hickory's protocol codec, with its standard-library
-feature and no resolver or DNSSEC engine. The codec checks names, compression
-and record boundaries. We require the decoder to consume the complete packet;
-unclaimed trailing bytes are an error. Onion then admits one normal IN-class
-question, checks the source identity and applies the existing namespace rules.
-Unsupported operations, malformed records and unsupported name forms are
-refused before either an internal answer or upstream forwarding.
-
-`Message::read(&mut decoder).ok()?` deserves a look. `&mut` lends the decoder
-exclusively while the codec advances its cursor. `.ok()` turns a decoding error
-into `None`, and `?` returns that absence to the caller. Here absence means the
-network task drops the malformed request. It never means an empty successful
-answer. This parser doesn't use an `unwrap()` on network data.
-
-The same library encodes responses. That removes our separate walk to find
-the end of a question, which would need its own compression handling. Internal
-answers still have zero TTL, A records resolve to the service VIP, and known
-names queried for AAAA still receive an empty successful response. EDNS0
-queries receive an OPT response advertising our bounded UDP payload size.
-This doesn't implement DNSSEC, general authoritative hosting or TCP recursion.
-
-The wire corpus includes every truncation of a valid query, wrong counts,
-response/opcode misuse, non-IN classes, overlong names, a compression loop,
-unclaimed bytes, missing additional records and a literal dot inside a label.
-A valid request sent immediately afterwards must still succeed. A TCP case
-checks that malformed input closes only that connection. The existing live
-namespace, fault, forwarding and TCP/UDP tests retain their original assertions.
-
-### Port zero reserves one transport at a time
-
-Coverage CI caught a DNS startup failure despite asking the kernel for a free
-port. UDP and TCP have separate port allocators. The UDP socket selected a port
-that an unrelated TCP listener already owned. Binding the TCP half then failed.
-
-When the requested port is zero, the responder now retries that collision up to
-16 times. Each attempt keeps its UDP socket until TCP binds, or drops it before
-trying again. Explicit ports still fail on conflict; Bun cannot silently move a
-configured DNS service elsewhere. The wire tests also hold 64 successful pairs,
-check that both transports stay reserved, and verify that dropping a pair
-releases both sockets.
-
-### A test backend must honour HTTP too
-
-The request-ID regression used a tiny TCP echo server that read once, advertised
-HTTP/1.1 keep-alive and closed after one response. The proxy could reuse that
-connection before noticing its close, so the second assertion sometimes saw an
-empty error response. A full native suite reproduced the failure. The fixture
-now uses axum to parse requests and manage keep-alive, and joins its proxy and
-backend tasks. The production forwarding code hasn't changed.
-
-
-### Retire the command before reusing the address
-
-A namespace already exists. The next `ip link add` invocation is waiting to
-create its veth pair. Now kill Bun. Looking only for the veth tells the new Bun
-that it is absent, but the old command can still create it. Our physical
-regression stops at exactly this point.
-
-Namespace creation, forwarding installation, forwarding inspection and teardown
-now accept a `RuntimeCommandExecutor`. There are two concrete implementations:
-a direct executor for standalone callers and a claimed executor attached to the
-durable generation described in chapter 1. The network operations construct the
-same argument arrays in either case. The trait changes who owns execution, not
-what command the network operation asks to run.
-
-The claimed executor shares a Tokio mutex containing `Option<IntentCommands>`.
-`Some` holds the live claim. An execution error leaves `None`, forcing recovery
-from durable evidence rather than allowing a second operation to assume the
-first completed. A spawned worker retains the mutex through the operation and
-restores the claim on success even when the requesting future is cancelled.
-A clone made before sealing keeps normal admission authority only; it cannot
-act as a cleanup handle after the generation enters Retiring. Its refusal also
-preserves the legitimate cleanup handle.
-
-The real Linux test creates a namespace, pauses the veth command, and sends
-SIGKILL to the caller process. Recovery claims the original generation, fences
-new work and positively retires the waiting command. Only then does it delete
-the namespace and inspect kernel absence. Opening the old gate afterwards
-produces no veth. A second physical test runs namespace setup and nftables port
-publication to completion, then verifies owned forwarding and network teardown.
-Both tests run in the provisioned Linux suite and share its host-network test
-group. They use private intent directories and distinct namespace names.
-
-A completed deletion command can return non-zero because its target is already
-absent. Teardown therefore inspects the kernel after command completion. A
-command execution error is different: it now refuses teardown before that
-inspection can be mistaken for final retirement. The owned network path is
-qualified independently; production Runc still needs to carry these handles
-alongside its durable launcher and rootless-helper records.
-
-### Two containers need two routes
-
-One container could reach its gateway. Adding a second broke host access to
-that second address. Both host veth interfaces advertised the node's whole
-`/23` allocation as a directly connected network, so Linux sent packets for the
-second container through the first container's interface. The regression creates
-two real network namespaces and exchanges packets from the host and from each
-peer before removing both namespaces.
-
-Keep the `/23` as an allocation pool, but give each endpoint a `/32` address.
-The host installs an explicit route to each container through its own veth. Each
-container has a direct route to the gateway and a default route through it; it
-must not try to ARP for a peer behind another veth. Removing a veth also removes
-its routes. These setup commands use the same generation-bound executor as the
-other network mutations, so interrupted setup retains its cleanup obligation.
-
-Adoption now requires the `/32` endpoint shape. Durable state 26 refuses older
-development networks instead of assuming their connected routes are safe.
-
-
-## Don't ask membership who you are
-
-A worker retires a local endpoint. Before the next report reaches the leader,
-the worker receives a catalogue that still advertises its old host port. If it
-merges that entry back into its routing table, retirement has just undone itself.
-
-Our merger already excluded entries from the local node. The mistake was asking
-Raft membership for that node's name. A worker can lack council metrics, and a
-joining node can have metrics before membership includes it. Neither changes its
-configured identity. `ClusterHandle` now carries a `NodeId` directly from cluster
-startup; the merger borrows its name regardless of the current membership view.
-The existing `Option` still represents whether this is a clustered agent at all.
-
-The integration test sends a delayed catalogue through the agent's command
-channel without any council metrics. It checks the resolve response, the snapshot
-used by DNS and the ingress backend pool: the remote endpoint survives and both
-stale local endpoints disappear. This closes local self-restoration. It does not
-prove another node has received a withdrawal; that needs separate acknowledgement
-before an address can safely be reused.
-
-
-## A stopped container can still own an address
-
-The container exits normally. Runc tears down its namespace, and our address pool
-makes its IP available again. Now freeze an old service's backend map before
-that happens, and start an unrelated container. The old VIP returns HTTP 200
-with the new container's identity. This is the natural-exit regression, using
-real Runc, a real kernel map and HTTP responses from both workloads.
-
-Stopping execution and releasing an address are separate facts. The opt-in owned
-Runc adapter now records a `NetworkReference` before a service workload starts.
-It contains the instance identity, runtime generation and original allocation.
-The original intent keeps that reference in either `Held` or `Released` state.
-`Option<NetworkReferenceState>` also distinguishes workloads that never held a
-discovery reference. These are data-bearing enum variants: Rust makes each
-variant carry the exact reference whose state it describes.
-
-Natural exit still seals command admission, drains accepted commands and removes
-host network resources. It can report that execution stopped. While discovery
-holds the address, the durable runtime intent remains Retiring and the address
-reservation remains occupied. A matching release first persists Released, then
-lets resource retirement finish. A retry reads that receipt; a request from an
-older generation cannot release its successor's reservation.
-
-The agent captures the reference before startup. During retirement it confirms
-backend withdrawal and policy cleanup before releasing the reference. It checks
-the kernel even when userspace no longer lists that backend: a failed earlier
-rewrite may have left it installed. It also avoids recreating a backend-map key
-whose absence is already confirmed.
-
-This does not turn missing service metadata into evidence. If a recovered runtime
-still holds a reference but the agent lacks its original discovery ownership,
-cleanup refuses rather than freeing the address. Complete service reconstruction,
-remote catalogue acknowledgements and in-flight proxy requests remain separate
-work before selecting this adapter in production. State format 27 and OCI intent
-version 4 reject older development state that lacks this distinction.
-
-
-## A routing test needs its own router
-
-The host can ping each container, but one container cannot ping its neighbour.
-Our explicit /32 routes are correct. A DROP policy on the host's forwarding
-chain can produce exactly this result: host-originated traffic does not pass
-through the same chain as traffic travelling between the two interfaces.
-
-The route regression now runs its host and both container namespaces inside a
-private outer network namespace. It also gets a private mount tree and `/run`,
-so its named namespace mounts cannot escape into the real host. The original
-host-to-container and bidirectional peer probes are unchanged. Running the test
-inside another namespace with a DROP policy must pass while leaving that outer
-policy untouched.
-
-This isolates the routing claim. It does not promise that Bun overrides an
-operator's firewall. Direct Linux installations must permit the required
-forwarding; the managed VM path gives us a dedicated host configuration.
-
-
-## Stop unsafe execution even when cleanup refuses
-
-Now combine two failures. Remove a running container's egress enforcement flag
-and freeze that map so the repair fails. Also freeze the service backend map.
-The old agent tries to withdraw the backend before stopping the container,
-receives an error and leaves the payload running without its required policy.
-The real-container regression observes that it never stops within 15 seconds.
-
-The retained address gives us another option. After ordinary cleanup fails,
-the agent fences execution separately. For a published container address, it
-first checks that the runtime still holds the original address reference. It
-disables automatic restart, retires initialisers and force-stops the payload,
-requiring positive exit evidence. Every affected replica gets an attempt even
-if another replica refuses.
-
-Nothing here confirms discovery cleanup. The service key, address reference,
-policy ownership and adoption record stay in place. An explicit Stop still
-returns an error while the backend map refuses withdrawal. The regression also
-starts an unrelated container, proves it serves its own HTTP identity, and
-checks that it neither reuses the retained address nor answers through the old
-VIP. This is the opt-in owned runtime contract; complete recovery and production
-selection remain separate work.
-
-
-## Recover the allocation, not just the name
-
-Two service names can hash to the same VIP. The second registration probes for
-another address. Re-register those services in reverse order after a crash and
-the assignments change. Existing kernel routes and grants still refer to the
-original allocations. Our recovery regression finds two real colliding names,
-reverses their saved inventory and demonstrates that ordinary registration loses
-those original identities.
-
-`ServiceMap::from_snapshot` restores each exact VIP, destination identity, port,
-backend list and firewall configuration. It rebuilds the address reservations
-from those entries. Invalid labels, mismatched identities, duplicate service or
-VIP owners, invalid endpoints and duplicate or excessive backends reject the
-whole inventory. Construction happens in a new local map; an error drops it
-without publishing a partial result.
-
-The argument `&[ServiceEntry]` is a borrowed slice: the function can inspect the
-caller's entries without taking ownership. It clones validated entries into the
-returned map. The typed error's `&'static str` reason refers to a fixed string
-literal whose lifetime covers the whole programme.
-
-This is a recovery primitive, not permission to route traffic. Saved health is
-historical evidence. Bun must still load a durable checkpoint, correlate the
-original runtime and kernel ownership, and reconcile live backends before
-publishing DNS, ingress or kernel routes. That integration remains unfinished.
-
-
-## Keep cleanup permission across the next crash
-
-A container has exited, but its old VIP may still lead to its address. We must
-retain that address until discovery has withdrawn it. Now suppose Bun crashes
-between withdrawing the route and releasing the runtime reservation. Where does
-the permission to finish cleanup live?
-
-`DiscoveryJournal` saves a complete inventory in a private directory. Service
-owners retain their exact allocated entries. Reference owners tie a service to
-its original instance, runtime generation and network allocation. `Held` means
-that discovery still owes withdrawal. `ReleaseAuthorised` records permission to
-ask the runtime to release the address. The caller records that permission first,
-performs the release, then forgets the completed reference. Recovery can replay
-the permission against the same runtime generation.
-
-These phases are Rust enums, so a transition has a named state rather than a
-collection of flags. The journal rejects changing a retained allocation,
-forgetting a held reference, or moving an authorised reference back to `Held`.
-Services have a similar `Owned` to `Withdrawn` transition. The store cannot prove
-that a kernel deletion, remote acknowledgement or runtime release happened.
-Its caller must establish those facts before advancing the corresponding phase.
-
-An owned `File` keeps the exclusive filesystem claim alive. Dropping the journal
-closes the descriptor and releases the claim. JSON contains a schema number and
-all owners together; `#[serde(deny_unknown_fields)]` on the envelope and owner
-records makes unexpected fields an error rather than silently dropping them.
-The loader also validates exact service allocations and original runtime
-references. Only a newly created directory may initialise a claim. An existing
-directory with a missing claim keeps refusing, even on repeated recovery attempts;
-otherwise the first failed open could create the evidence that the next open trusts. It bounds reads at 16 MiB and refuses missing established state,
-corrupt data, conflicting owners and redirected or non-private files.
-
-Saving writes and syncs a temporary file, atomically replaces the checkpoint,
-then syncs its directory. What if the last sync fails? The rename might already
-have happened. The journal retains its previous in-memory obligations and refuses
-further writes until recovery reopens the complete durable state. The failure
-test forces replacement to fail, restores the original file and checks that the
-same writer still refuses. Merely fixing the filesystem must not silently clear
-its uncertainty.
-
-This API performs blocking filesystem work. A future async caller must move the
-journal into a blocking worker that retains its claim until the entire operation
-finishes, even if the waiting future is cancelled. Bun does not use this store
-yet. Publication gates, runtime correlation, remote withdrawal acknowledgements
-and recovery qualification remain separate work. Passing storage tests does not
-prove a recovered route is safe to publish.
-
-
-### Move the journal, keep the claim
-
-An async function can still block its executor. Calling the synchronous journal
-write inside `async fn` does exactly that when storage stalls. Our regression
-pauses a write and checks that the single-thread async runtime can still send a
-heartbeat. A second test cancels the waiting caller, verifies another writer
-cannot take the filesystem claim, then resumes storage and recovers the saved
-obligation. Both tests fail with an inline write.
-
-`open_async` and `persist` run filesystem work through `spawn_blocking`.
-`persist(self, next)` consumes the journal: its `self` argument transfers ownership
-instead of borrowing with `&mut self`. The `move` closure then owns the journal,
-including its open claim file, until the write finishes. Cancelling the awaiting
-future does not cancel that already-running blocking operation or release its
-claim early. A successful awaited result returns the journal to the caller.
-Failure or cancellation requires reopening and reconciling durable state; the
-caller cannot continue using the moved value. Rust makes that last rule concrete.
-
-Bun integration must distinguish an unopened journal from a consumed journal
-whose write was never acknowledged. Treating both as permission to initialise
-empty ownership would defeat the guarantee. These worker methods provide the
-ownership boundary; wiring every publication and recovery path remains separate.
-
-
-## Health changed; did routing change too?
-
-An HTTP probe returns 503 while the kernel backend map refuses updates. Previously,
-Bun marked its local backend unhealthy, printed the kernel error and advanced the
-instance to Pending for restart. The kernel still routed to that instance. The
-real regression observes restart count one even though withdrawal never succeeded.
-A separate portable regression shows that successful health changes were not
-published to the DNS/ingress snapshot either.
-
-Now Bun builds a candidate health view and checks kernel publication before
-replacing the service map and publishing the userspace snapshot. It records the
-observed lifecycle health truth even when publication fails, but it does not
-advance the restart state machine. The runtime and its cleanup evidence stay owned.
-
-Every subsequent probe retries publication. Waiting for another lifecycle
-transition would lose the retry: an already-Unhealthy instance remains Unhealthy
-on the next failing probe. Once publication succeeds, that later probe may initiate
-the bounded restart policy. A focused test first refuses publication without its
-original allocation, restores that same allocation, then verifies the next probe
-publishes withdrawal before increasing the restart count. Portless workloads do
-not need a backend update.
-
-This confirms the local health update. Remote withdrawal acknowledgements and
-requests that already captured an ingress backend remain separate cleanup proofs.
-
-
-## A replacement does not need another slot
-
-A service already has 32 backends. Updating one instance's address, port or health
-still leaves 32 backends, but the old insertion path checked capacity before
-looking for that instance and rejected the update. The regression fills the map,
-replaces one endpoint and then attempts a genuinely new endpoint.
-
-The map now looks for an existing instance first. Rust's mutable iterator yields
-a mutable reference to its endpoint; assigning through that reference replaces
-its fields in place, then returns success. Only insertion checks the capacity.
-The test verifies the updated endpoint, unchanged count, and that overflow refusal
-leaves the entire retained entry unchanged.
-
-
-### The first reader may arrive later
-
-Deploy an app before attaching a discovery subscriber. Tokio's watch `send`
-refuses the update when there are no receivers, leaving the channel's original
-empty map in place. A later subscriber therefore misses a completed deployment.
-The regression exercises exactly that ordering.
-
-Publication now uses `send_replace`, which retains the latest value whether or
-not anyone is listening. The first reader receives the current service and its
-backend immediately. The existing health-transition and retry tests also run
-against this publication path.
-
-### Notification backpressure must not hold the drain lock
-
-Fill the drain-completion channel, then let another backend finish. An awaited
-send used to hold the shared tracker lock until the receiver made space. Request
-guards need that same lock to release their counts. A notification consumer
-could therefore stop unrelated request cleanup.
-
-`try_send` returns immediately. Its `TrySendError` enum distinguishes a full
-queue from a closed receiver. With a full queue we retain the pending completion
-and retry on the next sweep; with a closed receiver, polling callers can still
-observe completion. The regression fills a one-slot queue, checks that the sweep
-returns and the entry remains, consumes the old notification, then verifies that
-the next sweep delivers the retained one. No notification is silently lost to
-backpressure. Capturing requests before drain starts and confirming their actual
-release after deadline cancellation are separate requirements.
-
-
-### Capture the request before withdrawing the route
-
-A slow request reaches its backend. Then a deployment starts draining that
-backend. Counting only requests that arrive *during* the drain misses this one
-entirely. The live regression uses a gated HTTP server: it acknowledges receipt,
-waits while the test starts draining, then answers only when released. A second
-case reaches that server through failover. Both previously reported completion
-while the request was still waiting.
-
-Wrapper now takes the routing read lock, chooses its candidates and records a
-request guard for all of them before releasing the lock. Bun's route withdrawal
-needs the write lock, so it cannot pass a handler that has copied an endpoint
-without recording its ownership. Normal requests create active entries; starting
-a drain adds a deadline without resetting their counts. The guard conservatively
-holds every captured failover candidate until the request finishes. WebSockets
-capture just their single target because their handshake has no failover.
-
-A deadline cancels work. It doesn't prove the work stopped. HTTP body reads,
-upstream connection/header waits, response streaming and WebSocket handshakes
-and splices all observe cancellation. `FuturesUnordered` polls the cancellation
-futures for the captured candidates; the first one that resolves stops the
-request. The tracker reports completion only after the guard releases both
-connection counts. A cancelled task therefore keeps its ownership until its
-cleanup actually runs.
-
-Response streaming needs another detail. If a client stops reading, Hyper may
-stop polling its response body. A cancellation check inside that body cannot
-then run. A small spawned pump reads the upstream into a one-item channel and
-races both reads and sends against cancellation. Dropping the response aborts
-the pump through `AbortOnDropHandle`, an owning wrapper around the task handle.
-That uses tokio-util's `rt` feature. The connection permit stays with the response;
-the upstream guard stays with the pump. Buffered bytes need no backend address.
-The stalled-consumer regression deliberately never polls the response and still
-requires drain completion after cancellation. A live WebSocket regression also
-requires the splice to close before completion.
-
-This proves the local Wrapper ownership boundary used by deployment drains.
-Durable discovery recovery and remote catalogue acknowledgement still need their
-own proof before an allocator can reuse an old address.
-
-### A cancelled response must fail at the client
-
-The client has received seven bytes of a promised 100-byte response. A drain
-then cancels its upstream. If the pump simply closes its channel, the response
-stream sees ordinary EOF (end of file), and Hyper can finish the downstream
-response successfully. Our live proxy regression catches exactly that: the
-client accepts an incomplete response without an error.
-
-The pump now returns a `Result<(), std::io::Error>`. Once its chunk channel closes,
-the response stream checks that result before choosing successful EOF. A drain
-cancellation becomes `ConnectionAborted`; a failed pump task becomes an error
-too. Upstream read errors also retain their failure through the response body.
-The stream emits a terminal error once, then ends. Normal complete responses
-still end cleanly, covered by the large-response case.
-
-This does not move backend ownership back into a possibly stalled downstream
-reader. The pump releases its request guard when it finishes; the response owns
-the pump's final result until the client can observe it. Completion of cleanup
-and successful delivery are different facts, and both need honest reporting.
-
-### Put the journal before publication
-
-The checkpoint store cannot protect a publication nobody records. Bun now has an
-opt-in fresh-agent integration: before acknowledging a backend snapshot, it
-persists the exact service allocation and attempted backends, then writes the
-kernel map. DNS and Wrapper still receive only the confirmed candidate. A storage
-failure therefore stops initial deployment before runtime creation; the agent
-refuses later publication even if somebody repairs the path underneath it.
-
-The owner is an enum with three states: Disabled, Ready and Uncertain. Starting a
-write uses `std::mem::replace` to move the Ready journal into its blocking worker
-and leave Uncertain in the agent. Only acknowledged success returns Ready. This
-makes cancellation fail closed without losing the worker's exclusive claim.
-Disappearing from a new snapshot does not prove retirement: the next checkpoint
-retains earlier service allocations until a separate confirmed cleanup can remove
-them. Tests reopen the store after agent drop, reject a broken checkpoint before
-launch, and retain an old service through publication of a different one.
-
-Integrating the journal also exposed a useful Rust distinction. `Send` means a
-value can move between threads; `Sync` means threads can safely share references
-to it. Bun's async methods can hold `&self` across an await, so its fields must
-support that sharing. Our test-only std mpsc receiver did not. A Tokio one-shot
-receiver keeps the same pause/resume test but is safe to share; its blocking wait
-still runs only in the blocking writer. The original responsiveness and cancelled
-waiter tests remain part of qualification.
-
-This entry point accepts a fresh journal only. Existing ownership, instance
-records or runtime launches require full reconciliation before adoption. The
-fresh-only recovery gate refuses those inputs before adopting, killing or deleting
-runtime evidence. Production selection, original runtime-reference correlation,
-withdrawal authorisation and remote acknowledgements remain unfinished. Enabling
-this publication producer is not permission to claim those recovery guarantees.
-
-### Journal the runtime's original address reference
-
-An owned runtime can stop execution while retaining its container address for
-old discovery consumers. Bun must remember *which* generation and allocation it
-holds. Keeping that reference only in a HashMap loses the link when Bun dies.
-The new regression starts a workload, drops the agent and reopens the discovery
-checkpoint. Before the fix, its service existed but its runtime reference did not.
-
-Bun now persists the exact reference after the runtime retains it and before
-Start. The record includes the service, instance, original generation and
-container index, with phase Held. A checkpoint failure leaves the runtime's hold
-intact and refuses Start. Another regression blocks runtime creation, breaks the
-checkpoint after initial service publication, then resumes creation. Previously,
-Start still happened and only final backend publication failed.
-
-The publication and reference operations use one update helper. It moves the
-journal into its blocking writer and restores Ready only on acknowledgement.
-The store's existing transition validation rejects replacement of an original
-held generation. Bun also rejects a runtime returning another instance's reference.
-Release requires an exact ReleaseAuthorised journal entry; a locally empty route
-cannot manufacture that permission. Authorisation and recovery reconciliation
-remain the next steps, so this opt-in profile stays outside production selection.
-
-The physical Linux case uses an owned Runc container and a real eBPF VIP. After
-controller-task loss it reopens the journal and compares the saved reference with
-the runtime's original hold. The fixture then confirms that natural exit leaves
-the old address unavailable to a successor while the retained backend exists.
-This is controller-task loss, not the later required actual Bun SIGKILL gate.
-
-### Permission must precede physical release
-
-For an agent without cluster membership, successful local withdrawal and request
-release supply the discovery proof. Before handing an address back to the runtime,
-Bun checks the original service's VIP and port, confirms its backend is absent,
-and persists ReleaseAuthorised for the exact original reference. Only then does
-it call the runtime. After acknowledgement it removes the reference from the
-checkpoint and its in-memory inventory. A failure between those writes leaves a
-replayable permission, rather than an ambiguous missing owner.
-
-The ordering test pauses the runtime's release method and reads the checkpoint.
-It must already contain ReleaseAuthorised, while the runtime still holds the
-address. Resuming release must remove the reference from both inventories. A
-broken permission checkpoint must prevent the runtime call entirely. Clustered
-agents refuse this local authorisation: they need remote withdrawal evidence,
-even when this node's own routing is empty.
-
-A physical owned-Runc/eBPF case then retires an application, observes the cleared
-runtime/checkpoint reference, starts a successor on the same address and checks
-that the predecessor's VIP cannot reach it. Service-allocation retirement and
-recovery replay are separate remaining steps; these address permissions do not
-silently forget the service's original VIP.
-
-### Retire the service allocation as well
-
-Stopping the last backend is not the same as retiring its service VIP. The
-checkpoint used to retain an Owned allocation after a successful Stop, while the
-in-memory allocator made that address available again. A subsequent allocation
-could then disagree with the original durable owner.
-
-Stop now checks the exact original VIP and port, requires an empty live backend
-set and no remaining runtime references, and confirms release of any historical
-ingress candidates. Its caller has already withdrawn the kernel service and
-its destination grants. For a standalone agent, Bun first persists Withdrawn
-with no backends, then persists removal of that owner. Only after both writes
-succeed does it unregister the VIP. A failed write retains the allocation and
-fences further journal mutations. A crash after Withdrawn leaves an explicit
-retirement stage for recovery to finish.
-
-Three failing-first tests cover successful removal, checkpoint failure and a
-clustered agent without runtime references. That last case still refuses local
-retirement: the absence of a runtime hold says nothing about remote consumers.
-The original conservative-publication test now injects lost private metadata
-without calling Stop, so it continues to prove that absence is not retirement.
-The real Linux address-reuse case also checks that confirmed service retirement
-leaves no service owner in the journal. Full recovery remains separate.
-
-### A retry retires the old address, not the workload identity
-
-An application can keep the same instance name across automatic restarts, but its
-new runtime has a different generation. Previously the specialised retry cleanup
-removed the old execution record and policy while leaving its network reference
-held. The owned runtime correctly refused to create a successor over that owner.
-
-After routing withdrawal, request release and confirmed runtime exit, retry now
-clears the old policy and releases its exact address reference through the same
-durable permission path as Stop. Only then does it remove execution evidence and
-create the successor. Its identity bundle and mount remain: this is still the
-same logical workload. A failed permission write prevents successor creation.
-The successor's pre-start path records its new generation before allowing Start.
-
-Two failing-first contracts exercise ordering and failed persistence. The real
-Linux case kills a running owned container, waits for Bun's ordinary automatic
-restart, checks that the journal contains the replacement generation and proves
-the original VIP serves it. It then retires the service and checks safe address
-reuse. This exercises a workload crash; actual Bun death during retry remains a
-separate recovery gate.
-
-### Correlate the two original inventories
-
-Consider a crash after Runc records an address hold but before Bun acknowledges
-its discovery checkpoint. The service allocation exists in one journal and the
-runtime generation exists in the other. Recovery needs both. The runtime launch
-inventory now includes its saved Held or Released reference alongside the
-original OCI specification; a Process runtime reports no container address.
-
-The discovery journal can validate that complete inventory and return a proposed
-reconciled snapshot. Existing references must match the exact generation and
-allocation. A runtime release requires prior ReleaseAuthorised permission. An
-unacknowledged hold can be recovered only by matching its original cgroup and
-container port to an existing Owned service allocation. Duplicate identities,
-missing originals and published backends without holds refuse the entire result.
-No routes, runtime calls or checkpoint writes happen during this correlation.
-
-Why use the cgroup? `api-g5-0` can describe ordinal zero of app `api-g5`, or a
-replacement of app `api` in generation five. The original OCI cgroup names the
-structured owner. Parsing the runtime name and hoping is not enough. Likewise,
-a released receipt stays paired with its discovery permission until a later
-physical acknowledgement completes the operation. Correlation is evidence for
-the recovery transaction, not permission to publish historical healthy backends.
-
-The tests cover the gap between writes, absent and changed originals, premature
-release, duplicate identities and ambiguous names. The real Runc recovery test
-also checks that its complete inventory exposes the original held reference and
-its eventual released receipt. Restoring allocations, withdrawing historical
-routing and adopting only validated runtimes are the next integration steps.
-
-### A failed lookup does not prove absence
-
-A permission error reading the kernel backend map used to become `Ok(None)`.
-The culprit was `.ok()`: it converts any `Result<T, E>` into `Option<T>`, dropping
-the error. Cleanup could therefore treat an unreadable entry as already absent.
-An explicit `match` now returns None only for Aya's KeyNotFound variant and
-propagates every other failure. The regression first proves an absent key can be
-read normally, then denies BPF syscalls in an isolated subprocess using seccomp
-(a Linux syscall filter). Before the fix, that real denied lookup still reported
-absence. The subprocess confines the filter so it cannot affect later tests.
-
-### Recover before allowing adoption to mutate ownership
-
-The standalone startup entry point now opens the original journal, requires a
-complete runtime inventory and persists the correlated result. It reserves each
-original VIP and port without publishing old backends. With kernel networking,
-every existing backend key must belong to that inventory; an unknown key refuses
-recovery before withdrawal. Bun then removes the original routes and destination
-grants. The agent stays fenced until every withdrawal succeeds.
-
-A Recovered journal state records that startup reconciliation happened and keeps
-that distinction through later consuming writes. Before adoption changes runtime
-state, Bun validates the original inventory again, restores policy and replays
-pending release permissions. The normal runtime reconciliation can then retire
-launches that never acquired an adoption record. Their original address hold is
-now available to cleanup even though they have no supervisor entry.
-
-After positive adoption, Bun obtains current container addresses and publishes
-checked backend snapshots using the reserved allocations. A workload with a
-health check starts in HealthWait with an unhealthy backend. Saved healthy status
-is history. Empty services retire through the confirmed withdrawal checkpoints.
-
-The entry point requires startup without concurrent runtime registration and
-with all prior node consumers stopped. It refuses clustered recovery until remote
-acknowledgements exist. Unit cases cover live adoption, unrecorded cleanup,
-pending release, changed runtime evidence and historical health. The physical
-Linux case loses the controller task, refuses an unknown kernel owner, then
-recovers the same generation and proves VIP routing and later safe reuse.
-Actual Bun process death, host reboot and production selection remain separate
-qualification gates.
-
-### A new report must not move an existing VIP
-
-Two services can hash to the same natural VIP. Rebuilding allocations from a
-sorted list on every update was deterministic, but it wasn't stable: adding an
-earlier-sorting service could move an existing one, and removing the first owner
-could move a collision-resolved service back to the natural address. Neither
-change has anything to do with that service's runtime.
-
-Catalogue reconciliation now reserves all retained allocations before assigning
-new ones. It validates the original inventory and refuses duplicates, invalid
-identities and exhausted address space. Fresh rebuild also returns Result;
-exhaustion no longer silently shares a VIP. The leader uses the committed
-catalogue as its starting point and includes every declared port-bearing service,
-even when reports contain no backends. Allocation failure preserves the last
-published catalogue while ordinary scheduling continues.
-
-Four failing-first tests cover colliding arrivals, departures, conflicting saved
-allocations and exhaustion. These stable active allocations are a prerequisite
-for remote retirement evidence. They do not authorise reuse after service deletion;
-retiring deleted allocations still needs the acknowledgement ledger.
-
-### A successful write is not a permanent receipt
-
-Suppose this scheduler publishes a catalogue, loses leadership, and later takes
-charge again. Another leader may have changed the catalogue in between. Comparing
-against a local copy of our last write can leave the wrong committed catalogue in
-place indefinitely. A Raft request can also commit successfully while its state
-machine returns `CouncilResponse::Refused`; transport success isn't application
-success.
-
-The scheduler now compares each candidate against the current committed catalogue.
-It accepts only `CouncilResponse::Applied` as a successful publication and logs
-other replies. No local success cache suppresses future retries. The integration
-test uses a real single-node council: replace a previously published catalogue,
-require the running scheduler to restore it, then check that unchanged state
-produces no extra log entries. This is publication convergence, not proof that
-remote consumers have withdrawn an endpoint.
-
-
-### Remembering consumers that stop answering
-
-A worker can disappear from gossip while still holding an old routing table.
-Dropping it from the cleanup list would turn loss of contact into permission to
-reuse somebody else's address. We now register each catalogue consumer in Raft
-before returning its first placement response. The registration survives snapshots
-and has no heartbeat expiry. Repeated polls don't append another registration.
-
-`BTreeSet<String>` stores each node name once, in deterministic order. Unlike a
-map, a set has no separate value; membership itself is the fact we need here.
-The registration limit refuses new consumers without evicting existing ones.
-Where credentials are configured, the internal service credential is required.
-The existing credential-free development profile still registers every consumer;
-this only adds an obligation and cannot discharge one. With TLS, the peer's validated node
-identity must also match the requested node; the deliberately plaintext profile
-trusts the cluster service credential. Neither an ordinary API user nor an invalid
-certificate can create consumer records.
-
-Operator decommission removes the fenced identity from this census and records
-that fact in the immutable retirement result. A repeat returns the same result;
-the retired name cannot register again. This follows the existing requirement to
-stop or isolate workloads before decommissioning. Gossip suspicion and elapsed
-time cannot substitute for that action.
-
-Protocol 15/state 28 introduce the replicated consumer set and registration
-request. Fresh development clusters are required. This census establishes who
-must be accounted for; generation-specific withdrawal receipts and the gate that
-checks them before releasing addresses are still separate work.
-
-### Distinguishing successive executions without publishing their secrets
-
-`default__api-0` can stop and restart under the same name. Its next execution is
-a different owner, even if it happens to receive the same host port. A delayed
-receipt for the first execution must never free the second one's address.
-
-The runtime inventory now carries `RuntimeGeneration`, an opaque public
-fingerprint of the original private execution record. ProcessGrill derives it
-from the owner token, and owned Runc derives it from its original intent
-generation. SHA-256 uses a different fixed prefix for each runtime, so identical
-input bytes in different runtimes don't represent the same identity. The process
-owner token authenticates its control socket. Publishing it directly would turn
-a diagnostic identifier into permission to control the workload.
-
-The newtype wraps a private String and exposes only its fingerprint through
-`as_str()`. Reopening the runtime reproduces the same value; recreating the same
-instance gets a new value. Discovery recovery also checks that this fingerprint
-matches the original Runc address reference before accepting the inventory.
-This change is in-memory runtime evidence only. Carrying it through reports and
-catalogues, and requiring generation-specific retirement receipts, comes next.
-
-
-### Keeping the original execution identity through the reporting path
-
-The worker used to report only a replica ordinal. That loses deployment names
-and runtime generations, so two executions using the same node and host port
-look identical to remote routing. Reports and catalogue backends now also carry
-the canonical instance name and its non-secret execution fingerprint.
-
-Bun reads the original runtime inventory within a bounded deadline. It attaches
-an identity only when the instance and complete original specification match.
-Duplicate inventory entries, unavailable evidence and changed specifications
-produce an unknown identity; resource commitments still appear in the report.
-We don't invent an owner from an ordinal or a port number.
-
-The reporting worker preserves this evidence, the leader includes it in the
-catalogue, and remote routing includes the fingerprint in its backend key. A
-replacement execution therefore has a different key even if it reuses the same
-address. Unknown identities retain the older routing key and cannot serve as
-retirement proof. Withdrawal acknowledgements remain separate work.
-
-`TryFrom<String>` checks deserialised fingerprints before constructing the
-newtype: exactly 64 lowercase hexadecimal characters. Its Result either contains
-a valid identity or a short error, without echoing an accidentally supplied
-private token. Protocol 16/state 29 describe the changed reporting wire and
-replicated catalogue. Fresh pre-release clusters are required.
-
-
-### A report timeout must not start another filesystem reader
-
-A slow disk can outlast Bun's one-second inventory deadline. Tokio cannot cancel
-an already-running blocking filesystem operation merely because its caller stops
-waiting. Repeating that report could otherwise accumulate readers.
-
-ProcessControl and owned Runc now share one inventory permit across their clones.
-The reader acquires an `OwnedSemaphorePermit`, a token that keeps its semaphore
-alive without borrowing the caller. An `async move` task takes ownership of that
-token and keeps it until the read actually ends. Dropping the caller's join handle
-detaches the task; it doesn't release the permit. A caller cancelled while queued
-never starts its read. An I/O error releases the permit so the next report can retry.
-
-Runc constructs a new intent journal for each read, so putting the semaphore in
-that temporary journal would achieve nothing. It belongs to the shared runtime
-ownership instead. The regression aborts one caller, times out a second, releases
-the original operation, and verifies that the cancelled queued read never runs.
-A separate case checks recovery after a failed read.
-
-### Removing an endpoint creates an obligation
-
-Suppose a worker disappears while another node still routes requests to its old
-host port. Replacing the leader's catalogue doesn't erase that remote node's
-copy. Reusing the port at this point could send a request to a different workload.
-
-Council now commits withdrawal obligations alongside catalogue replacement. A
-monotonic publication number identifies the outgoing catalogue. Each withdrawal
-retains the original service allocation, removed backend execution identities
-and the durable consumer identities that may still hold them. Later publications
-and Raft snapshots retain those obligations. Nodes registering after a withdrawal
-don't inherit it: registration must happen before a node can read a catalogue.
-
-We compare destination ownership separately from health. A health change or a
-reordered report doesn't create a new execution, and a partial replacement
-shouldn't drain backends that remain in use. A HashSet indexes the node, address,
-port and execution identity; deriving `Hash` for the execution newtypes lets Rust
-hash those fields together. The stored withdrawal still carries the original
-values, including the service port, for eventual kernel and routing removal.
-
-The ledger bounds retained generations, service/backend exposures and outstanding
-consumer confirmations. Hitting a limit refuses the publication without evicting
-old evidence. `plan_publication` constructs a candidate value; Council installs
-it only after all checks pass. `checked_add` returns None on sequence overflow,
-so a new publication can never wrap around and reuse an old number.
-
-Decommissioning follows the same rule. After the operator fences a node, Council
-discharges that consumer's obligations. If the node also produced endpoints,
-Council records their withdrawal for the remaining consumers before committing
-any placement, lease or retirement changes. A failed ledger transition therefore
-cannot leave a partially decommissioned node.
-
-This is the replicated record, not permission to reuse an address. Consumers
-still need durable local withdrawal and authenticated receipts, and producers
-must require the committed result before release. The next integration also
-reserves retired VIPs in the allocator. State format 30 records the new ledger;
-protocol 16 is unchanged in this checkpoint, and pre-release clusters need fresh
-state.
-
-### A withdrawal keeps its VIP reserved
-
-A durable withdrawal record is useful only if allocation honours it. The leader
-now reserves both the current catalogue's addresses and older withdrawn VIPs
-before allocating new services. This covers a service that disappears in the very
-update that introduces a colliding newcomer. Existing active services keep their
-allocations; a recreated service probes for another address while its previous
-allocation still has remote consumers.
-
-Council checks the same rule at publication. It validates service identities,
-ports and unique in-range addresses, then rejects collisions with both retained
-withdrawals and the withdrawals produced by this update. Refusal leaves the
-committed catalogue and history unchanged. A candidate prepared from an older
-view therefore cannot bypass reservations simply by proposing its own VIP.
-
-`reserved_vips()` returns `impl Iterator<Item = VirtualIP> + '_`. The caller sees
-an iterator of copied addresses, while `'_` ties its borrowed traversal to the
-ledger's lifetime. The compiler prevents retaining that traversal after its
-ledger disappears. Only withdrawn service allocations reserve VIPs; replacing a
-backend does not move an otherwise active service.
-
-These checks protect virtual address assignment. Consumer receipts and the
-producer's physical address/host-port release decision remain separate work.
-
-
-### Refusing a catalogue prepared against an older generation
-
-The scheduler reads generation 12 and starts preparing a catalogue. Meanwhile,
-another committed operation removes a node's endpoints and advances publication
-to generation 13. The first scheduler mustn't overwrite that newer decision.
-
-`PublishEndpoints` now carries `expected_generation` alongside its candidate.
-Council compares it with committed state before checking or changing any
-publication data. A mismatch returns Refused and leaves the catalogue and
-withdrawal history untouched. This comparison and the eventual update happen
-inside one Raft state-machine transition, so another writer cannot slip between
-them. The scheduler sends the generation from the same desired-state snapshot
-used to build its candidate; after refusal, its next tick reads current state.
-
-Even an identical catalogue needs current evidence. A repeated old request may
-have lost its reply, but that doesn't make its old generation current again. A
-freshly read identical candidate is still a no-op and doesn't advance the
-publication number. Snapshot recovery and endpoint removal during decommission
-preserve this rule. The live scheduler regression also submits a stale writer
-before checking that the scheduler converges without repeated unchanged writes.
-
-This changes both the cluster request and stored Raft log representation, so the
-compatibility boundary advances to protocol 17/state 31. Missing generations
-cannot silently default to zero. Fresh pre-release clusters are required.
-
-
-### Tell each consumer which original routes to withdraw
-
-A worker saw generation 1, disconnected, and returned after two backend changes.
-Sending only the latest catalogue loses the identities of the routes it may still
-own. Its placement response now includes the current publication generation and
-all outstanding withdrawal instructions for that worker. Each instruction retains
-the original generation, service allocation, removed backends and whether the VIP
-itself is retiring. A worker enrolled after a withdrawal doesn't inherit it.
-
-The API builds the catalogue, generation and instructions from one cloned committed
-state. It filters the ledger by the requesting node's registered identity and
-copies only that consumer's instructions, without exposing the list of other
-consumers. Registration and the existing system/TLS identity checks still precede
-this response. Reading an instruction neither acknowledges it nor modifies Raft.
-
-The Rust response uses a `Vec<EndpointWithdrawalInstruction>` for the ordered
-instructions and each instruction uses a `BTreeMap<String, ServiceWithdrawal>`
-for its original services. Both types own their values, so serialisation can't
-observe a subsequent change to committed state. We deliberately omit
-`#[serde(default)]` from the catalogue, publication generation and instruction
-list: a missing field is an incompatible response, not evidence of no cleanup.
-An explicitly empty instruction list remains valid. The HTTP contract advances
-to protocol 18; durable state remains 31 because this adds no stored field.
-
-The regression runs the real placement handler against Raft. Two original readers
-retain both old generations, while a reader registered later receives only the
-withdrawal it owes. Serialisation preserves original execution fingerprints and
-repeated reads leave obligations unchanged. Durable consumer processing and
-authenticated receipts are the next pieces; receiving instructions alone cannot
-authorise the producer to reuse an address.
-
-
-### A cleanup receipt belongs to one node and one generation
-
-Worker A has withdrawn generation 12. Worker B is offline, and generation 13 has
-also left the catalogue. A's receipt mustn't erase B's work or acknowledge 13.
-Council removes A only from generation 12's consumer set. The withdrawal record
-can disappear when that set becomes empty; the durable consumer registration
-stays, so future publications still account for A.
-
-`POST /v1/discovery/withdrawn` requires system credentials and a current node TLS
-certificate. The request contains compatibility metadata and the original
-generation, but no node name. The handler derives identity from the certificate
-after a quorum-backed security read. A caller cannot nominate another consumer,
-and a follower cannot forward the request under its own certificate. Missing,
-foreign and revoked credentials refuse without modifying the ledger. Plaintext
-development registration alone cannot authorise cleanup.
-
-The handler returns success only for a committed `Applied` response. A refused
-write, unavailable leader or timeout leaves the caller uncertain. A timeout may
-still be followed by a commit, so retries must be safe: an already absent
-historical obligation is a no-op. Zero and current/future generations refuse.
-Generation numbers never repeat, so a delayed receipt cannot discharge a newer
-withdrawal. Raft also rejects unregistered and permanently retired identities.
-
-Removing a consumer first borrows its record with `get_mut`. Once the code has
-finished using that borrow, Rust allows removing the now-empty record from the
-map. The compiler tracks the last use of the borrow, rather than requiring it to
-last to the end of the enclosing block. This lets us express the transition
-without cloning the entire ledger or introducing a lock inside the state machine.
-
-Tests exercise the HTTP handler with real signed certificates and a running Raft
-node; the fixture supplies the same certificate extension as the TLS listener.
-They verify that delayed receipts, late registrations and invalid credentials
-leave unrelated obligations intact. A separate snapshot test proves that one
-consumer's recorded receipt survives restoration and replay. These tests do not
-claim that the consumer has durably withdrawn its local routes yet: wiring that
-proof to this endpoint and gating physical producer release remain separate work.
-
-The new Raft command advances compatibility to protocol 19/state 32. Pre-release
-clusters must start fresh rather than replay an unknown durable command.
-
-
-### Queueing a catalogue is not publishing it
-
-The leader sends a new remote backend together with an invalid ingress rate limit.
-Previously Bun replaced its catalogue, rebuilt only the valid ingress routes,
-logged the error and refreshed DNS anyway. Meanwhile, the placement reconciler
-had already treated sending the command as success. Different readers could see
-different updates, with no useful failure result for the caller.
-
-The cluster path now validates allocations and builds a separate candidate
-routing table. An error discards that candidate and keeps the confirmed catalogue,
-DNS snapshot and ingress configuration. After validation, Bun takes the routing
-write lock and replaces the views without an intervening await. Identical updates
-remain no-ops. The ordinary routing-table builder still reports invalid routes;
-the cluster publisher chooses when to install its result.
-
-`SyncClusterCatalog` now carries a `oneshot::Sender<Result<(), BunError>>`. The
-sender carries a single reply, whose inner Result distinguishes successful
-publication from a refusal. The receiving future can itself fail when its sender
-is dropped, so a lost reply is not success either. The placement loop puts one
-deadline around both queueing and confirmation, and honours shutdown while it
-waits. It retries refusals, lost replies and timeouts before performing the next
-placement work.
-
-The regressions first reproduce a changed catalogue after routing refusal, an
-invalid VIP accepted into the views, and a deployment queued before the publisher
-replies. They also verify a corrected retry and distinguish an explicit refusal,
-a lost reply and a positive confirmation. Existing fake agents must now send the
-confirmation too; otherwise a test would accidentally model a stalled publisher.
-
-This is an in-process contract, so protocol 19/state 32 remain unchanged. It is
-also only publication confirmation. A request captured before the table swap may
-still own an old backend. Durable consumer records, confirmed draining and receipt
-submission are the next steps; this reply alone cannot authorise address reuse.
-
-
-### Remembering what a consumer might have published
-
-A consumer can die after installing a route but before reporting success. On
-restart, the latest catalogue might already omit that backend. We therefore need
-the original attempted publication, including its execution fingerprint, alongside
-the exact merged local and remote service view. Saving only the latest desired
-catalogue would lose the evidence needed to withdraw the old route.
-
-The discovery journal now accepts a consumer identity and an ordered history of
-publication attempts. The identity binds the enrolled node to a fingerprint of
-its cluster trust identity; rotating leaf certificates must not change that
-binding. Each attempt keeps its committed generation and original catalogue.
-`Option<ConsumerOwnership>` lets standalone inventories express the absence of a
-cluster consumer explicitly. Generation zero is valid only for an empty catalogue.
-
-Validation reconstructs each effective service map, checks allocation uniqueness,
-and requires every remote catalogue backend to appear with its original VIP and
-port. Additional local entries remain part of the recorded exposure. Adjacent
-attempts may share a generation when only the local view changes, but they cannot
-rewrite the catalogue or move backwards. Rust's slice `starts_with` method checks
-that an update preserves the whole previous history. Derived `PartialEq` and `Eq`
-compare the nested records by value, including backend health and execution IDs.
-
-This foundation deliberately refuses history removal. It caps retained attempts
-at 1,024 and combined service/backend records at 65,536, in addition to the
-journal's 16 MiB limit. Reaching a limit refuses a write; it never evicts uncertain
-ownership. Confirmed-withdrawal phases and safe compaction still need implementing.
-
-The existing journal provides exclusive ownership and cancellation-safe blocking
-writes. If the async caller disappears, the worker retains its claim until the
-write completes. A failed write fences that writer until reopening and recovery.
-Tests interrupt both paths and compare the recovered original evidence. Other
-tests reject lost history, changed enrolment identity and conflicting effective
-views without changing the checkpoint. Standalone recovery and fresh enablement
-refuse consumer evidence they cannot reconcile.
-
-The checkpoint schema advances to 2 and durable state to 33; protocol remains 19.
-Publication does not yet call this storage path. Connecting it before publication,
-recovering original exposures, confirming drainage and sending receipts remain
-separate work. A saved attempt alone grants no permission to reuse an address.
-
-### Keeping delayed catalogue replies behind the current generation
-
-A consumer installs catalogue generation four, then receives a delayed reply for
-three. The server already protects against stale catalogue writers, but that
-protection does not order replies received by Bun. Previously the reconciler
-threw away the response's generation when it sent the catalogue to the agent.
-An old response could therefore restore a withdrawn backend.
-
-`SyncClusterCatalog` now carries the committed generation. Bun remembers the last
-confirmed generation as `Option<u64>`: `None` means it has not confirmed a cluster
-publication in this process, while `Some(0)` represents a confirmed empty initial
-catalogue. Those are different states. The `is_some_and` method runs a predicate
-only when the option contains a value; the closure receives that value and returns
-whether the incoming update conflicts with it.
-
-Bun refuses lower generations and a changed catalogue claiming the same generation.
-Zero requires an empty catalogue. Validation or routing failure does not advance
-the fence, so a corrected update can retry. An identical catalogue at a higher
-generation still advances it: equality of contents does not make the intermediate
-publication history disappear. Ingress configuration has its own desired-state
-changes, so an unchanged catalogue may still update ingress at the same catalogue
-generation. This fence does not order those independent ingress changes.
-
-The publisher also validates the effective merged service map before changing any
-view, including the otherwise identical-update path. A valid remote catalogue
-can collide with a local allocation after merging. In that case Bun keeps the
-previous publication and refuses the update; it does not silently move a VIP
-that another owner may still use. Regressions check catalogue, DNS and ingress
-retention, corrected retries, identical-generation advancement and merged-view
-conflicts. A real HTTP polling test checks that the response generation reaches
-the agent command.
-
-This fence is in memory. Restoring it from the durable consumer journal before
-new publication remains part of cluster recovery integration. It neither proves
-that old requests have drained nor authorises an address release. The command is
-internal, so protocol 19/state 33 remain unchanged.
-
-### Retiring an execution before reusing its address
-
-Suppose a worker stops an application and frees port 30001. An old health report
-then arrives at the leader. Without an execution fence, the leader can advertise
-the old application at an address that now belongs to its successor. Waiting for
-an empty catalogue once does not solve that race.
-
-Producer retirement now creates a permanent, node-scoped fence for the original
-runtime generation. In one Raft transaction it removes fenced backends and records
-the original consumer withdrawal obligations. The returned result distinguishes a
-committed fence with pending consumers from confirmed release. A retry checks all
-historical exposures for that execution, not only the latest catalogue. Unknown
-generation evidence from an already-fenced producer cannot revive an endpoint;
-its original withdrawals conservatively block release until consumers finish.
-
-The scheduler filters fenced reports, and Raft checks the proposed catalogue again.
-Both checks are necessary: a scheduler may have read state before retirement
-committed. A later execution can use the same instance name and address because
-its durable runtime fingerprint differs. Snapshot recovery retains the fence,
-including when an execution was retired before its first report ever arrived.
-
-The fence map uses nested `BTreeMap` values: node identity, then runtime generation,
-then original instance identity. Ordered maps make snapshots deterministic and
-avoid scanning every retired execution for each backend. The 65,536-entry bound
-refuses additional retirements rather than deleting history. Retirement computes
-new catalogue and withdrawal state before mutating the committed state, so a
-capacity or generation-overflow refusal leaves every original obligation intact.
-
-The producer still has to prove local runtime exit and request drainage. A server
-confirmation establishes remote withdrawal only. The HTTP boundary authenticates
-the producer, and the agent must obtain that confirmation before returning its
-host port or runtime address. The Raft request/response and durable fence advance
-compatibility to protocol 20/state 34; old development clusters require fresh state.
-
-### Turning a remote release result into local permission
-
-The producer calls `/v1/discovery/retire` directly on the leader. The handler
-requires system authority, current protocol/state formats and a node certificate
-validated against a quorum-backed security read. It derives the producer identity
-from that certificate; a request cannot nominate another node. A committed fence
-with outstanding consumers returns 202. Confirmed release returns the exact node
-and execution in a bounded JSON response. Missing quorum and unknown outcomes do
-not authorise cleanup.
-
-Bun's durable discovery path now reads the original runtime inventory before
-retirement and correlates it with the owned instance, specification and host port.
-It asks the leader to retire that exact generation. The client requires HTTPS,
-limits response size and total request duration, and checks the returned node and
-execution. Pending, malformed, redirected and mismatched replies preserve the
-allocation. Dropping the wait cannot grant permission; a later attempt sends the
-same original execution and obtains a fresh committed result.
-
-The agent performs this check before deleting records or releasing an allocation,
-including the automatic-restart path. For Runc, the returned generation must also
-match the original network reference, and durable local release permission still
-precedes the runtime release call. Process host ports remain allocated until
-retirement bookkeeping completes. Standalone release keeps its existing local
-proof requirements. Portless workloads with no network reference need no remote
-address release.
-
-The production binary supplies the enrolled client and live leader watches. The
-gate is enabled by the opt-in durable discovery profile; selecting that profile
-for production still waits for complete consumer recovery. Service VIP retirement
-also remains separate from releasing one producer execution's physical address.
-
-Producer validation returns `ProducerRetirementError`, with distinct variants for
-invalid node identity, invalid execution identity, conflicting original ownership
-and exhausted capacity. `thiserror` supplies the human-readable error from each
-variant's `#[error(...)]` attribute. The Raft boundary converts it to a refusal
-message; the library keeps the reason typed until that boundary.
-
-
-### Rebooting the kernel owner
-
-Suppose Bun dies while a container is still serving requests. Its pinned maps
-and cgroup links must stay alive until the next Bun recovers them. Now suppose
-the whole machine loses power. Those same objects disappear with the kernel.
-An empty pin directory means different things in these two cases.
-
-The kernel manifest records the Linux boot UUID before creating maps or links.
-On the same boot we require the original cgroup identity and complete active
-inventory. Missing pins are an error. On a different, positively identified
-boot we require an empty pin directory and unchanged ownership paths. Any live
-pin refuses recovery: the old manifest cannot authorise changing a new kernel's
-objects. We write the new boot and `Preparing` phase before rebuilding. A second
-crash can then resume that preparation. `Retiring` and `Retired` remain terminal
-for loading, even across a reboot.
-
-The comparison uses Rust's exhaustive `matches!` expression for the two phases
-that allow reconstruction. The manifest's `String` boot identity is required by
-Serde, so missing or malformed evidence cannot silently become permission.
-This is kernel absence evidence only. Durable discovery and remote withdrawal
-obligations live on disk and must still be reconciled before publication or
-address reuse. A reboot doesn't erase another node's open request.
-
-
-Normal standalone rootful Runc startup now joins these pieces when eBPF is
-enabled. Bun selects the command owner before runtime recovery, takes the kernel
-claim, verifies every hook, and opens the discovery journal before adopting any
-instance. The journal initially reserves old VIPs without publishing old health.
-Only a positively adopted runtime can regain a backend. A stopped runtime must
-complete its recorded withdrawal before its address can be released.
-
-We derive the private bpffs directory from the canonical data path using SHA-256.
-That gives restart and self-upgrade the same pin location without sharing another
-node's claim. An existing ownership directory also prevents switching off eBPF or
-changing runtime mode to bypass recovery. A failed load stops startup; it cannot
-fall back to an unprotected agent. The actual Bun regression deploys a container,
-kills Bun, adopts the same execution, then confirms service retirement. It also
-checks that lost discovery evidence and disabled enforcement refuse readiness.
-
-Cluster consumers need an additional recovery step: restoring their original
-remote exposures and sending durable withdrawal receipts. Standalone activation
-doesn't enable that unfinished path.
-
-
-`scripts/release/qualify-discovery-reboot.sh --vm DISPOSABLE_LIMA_VM` tests the
-whole standalone startup path across an abrupt VM stop. It leaves a real Bun and
-published container alive, records the kernel manifest and original discovery
-reference, and verifies the same Bun/test binary checksums after boot. Recovery
-must observe a different boot UUID and absent pins, preserve the on-disk
-obligations, retire the interrupted execution with unknown outcome, and clear its
-old service before readiness. An explicit redeployment runs once; the earlier
-release reference cannot free the successor's address. We then restart Bun once
-more to prove same-boot adoption still works after reboot recovery.
-
-The fixture reads the atomic discovery checkpoint rather than competing with
-Bun's runtime polling. Its isolated network namespace also needs a fresh
-`/run/netns` mount point after boot. These are test prerequisites, not recovery
-permissions. The driver retains checksums, phase logs and original ownership
-proofs under `/var/tmp` in the guest.
-
-
-There is another way to lose exclusive ownership: recreate a missing lock file.
-The original process still holds a lock on the old inode, while the replacement
-locks a new inode at the same pathname. Both believe they are the only writer.
-Our physical regression reproduced this with a live loader. A second regression
-removed a retired owner's manifest and watched the old loader recreate it as a
-fresh active owner.
-
-Kernel ownership now creates a lock and manifest only when it created the private
-state directory itself. Existing directories require both original files. Fresh
-ownership syncs the lock, directory and parent before creating kernel objects.
-We check bpffs, cgroup and boot prerequisites before establishing that directory,
-so an unmounted bpffs doesn't leave a misleading partial claim. Losing established
-authority refuses recovery on every boot; a new boot proves old kernel absence,
-not permission to invent a replacement journal.
-
-### Remembering the reader's cleanup work
-
-A node can stop publishing an endpoint while an HTTP request still holds the old
-backend. It can also send a withdrawal receipt and crash before recording the
-leader's reply. Neither case is permission to forget the original exposure.
-
-The consumer journal has four phases: `Publishing`, `Active`, `Withdrawing` and
-`Withdrawn`. Only the last permits compacting publication history. The latest
-catalogue generation survives that compaction, so an old assignment cannot become
-new just because earlier records disappeared. Each withdrawal instruction also
-has `Pending` or `Ready` receipt state. Pending means local cleanup still owes
-proof. Ready means sending is safe, but the instruction remains until the leader
-acknowledges it. A lost response causes an idempotent retry.
-
-Rust enums make these permissions explicit. A `match` over the old and new phases
-checks allowed transitions before the journal writes anything. The `BTreeMap`
-keys receipts by their original generation; deterministic ordering makes snapshots
-and tests easier to inspect. Tests first reproduce premature receipt removal and
-refusal to compact even after withdrawal, then exercise the permission boundaries.
-
-The agent now uses those permissions. It journals the proposed merged catalogue,
-local service view and ingress configuration before publishing any of them. A
-replacement first hides DNS/ingress, removes original kernel entries and destination
-grants, and cancels requests captured under the old routing-table lock. The request
-counters still have to reach zero. Only then does the agent record `Withdrawn`,
-make eligible receipts ready, compact history and publish the replacement.
-
-Local lifecycle changes cannot bypass this sequence. They invalidate the consumer
-view and retain their own runtime/discovery records; only the consumer reconciler
-may publish the merged view again. Local backends need the committed catalogue's
-allocation and matching original runtime generation. This prevents a prepared or
-retiring local instance from inventing a public endpoint outside the journal.
-
-Recovery binds the journal to both node name and enrolled cluster fingerprint.
-It inspects local and consumer kernel entries together, correlates local runtime
-holds, withdraws the old view and starts with no historical health in DNS or
-Wrapper. A ready receipt survives this process. The latest catalogue generation
-also survives, even after all but the latest publication have been compacted.
-The regression captures both an HTTP request and a WebSocket, confirms that
-cancellation alone sends no receipt, releases their guards independently, then
-reopens the journal and retries the exact original receipt.
-
-### Delivering the receipt
-
-Suppose a consumer has removed generation 17, but its reply to the leader gets
-lost. Repeating the receipt is safe. Guessing that the leader received it isn't.
-The local journal keeps the original instruction in `Ready` until an authenticated
-request to `/v1/discovery/withdrawn` returns 204. Redirects, 200, 202, failures and
-timeouts keep it queued. The cluster client disables redirects so a peer cannot
-forward node authority elsewhere. The next placement poll resolves the current
-leader again; no leader address becomes part of the durable permission.
-
-The reconciler sends small rotating batches, with a deadline and shutdown check
-for each request. It then sends `ConfirmConsumerReceipt` back to the agent. That
-second message removes the local journal entry. A crash between these two steps
-just repeats the receipt. Already completed withdrawals can still make progress
-when the new publication is refused, for example because its inventory is full.
-
-In Rust, the HTTP result and the agent reply are separate `Result` values. Neither
-channel acceptance nor an HTTP success category proves both operations happened.
-The code checks the exact acknowledgement before requesting the second durable
-write. This is the same ownership rule we've used throughout: retain evidence
-until the next owner has positively accepted responsibility.
-
-We test this boundary in two places. The privileged Linux tests publish into an
-actual backend map, freeze that map to make deletion fail, then restart recovery.
-The pending receipt and both publication attempts must survive; recovery must
-refuse to claim success. The positive control removes the map entry and recovers
-its ready receipt without republishing the old view. A separate mTLS test runs the
-real agent and placement reconciler against two HTTPS leaders. It loses the first
-HTTP reply, changes the leader, then loses the first local confirmation. Only the
-successful retry removes the journal entry. A timeout is a reason to try again,
-not permission to forget.
-
-### Replaying a release grant
-
-Bun can crash after saving `ReleaseAuthorised` but before the runtime acknowledges
-release. On restart, the leader might be unavailable. We can still replay the
-exact saved permission: it already records the successful remote confirmation and
-local withdrawal. We compare the entire original reference, including execution
-generation and allocation. A different or still-held reference must obtain its
-own confirmation. The regression recovers an enrolled consumer with no leader
-transport and checks that only its already-authorised reference is released.
-
-### Local reservations and global addresses
-
-A worker must reserve the VIP the council assigned, including collision resolution.
-Hashing the name independently can pick a different address. Clustered registration
-therefore reads the last durable catalogue, checks the declared port and restores
-that exact allocation through the same snapshot validator used during recovery.
-An uncommitted service cannot start publishing an invented address.
-
-Removing a worker's empty local reservation does not free the cluster's VIP. The
-worker first releases its original runtime references, withdraws its complete
-consumer view and waits for captured requests. It then records local withdrawal
-before forgetting that reservation. The council continues reserving the global
-address until every registered consumer has confirmed. A remaining remote replica
-can still publish the original service after this worker removes its local copy.
-The regression holds a remote request guard across local retirement and proves
-both the refusal and the subsequent successful remote publication.
-
-### Rootless execution evidence
-
-A rootless container forwards a host port through its userspace network helper.
-It has no address lease in the rootful bridge pool. Requiring that kind of lease
-would make every rootless recovery fail; accepting an instance name alone could
-mistake a replacement for the original execution. We persist the original runtime
-generation for these published backends instead. Recovery compares the generation,
-service identity and both ports with the original runtime intent. Missing or
-replaced intent refuses recovery. The optional `BTreeMap<String, RuntimeGeneration>`
-uses sorted instance keys, keeping serialised evidence deterministic. An existing
-publication cannot replace its witness without withdrawing that backend first.
-
-### Let recovery serve its own confirmations
-
-A stopped producer can still own an address used by another node's old view.
-Waiting for that node before starting our own API creates a cycle: neither side
-can receive the confirmation it needs. We keep the original execution in a
-`VecDeque` (a double-ended queue), reserve its host port and start the control
-plane with workload readiness held closed. Each health tick retries one original
-retirement. Failed entries move to the back so another producer can progress.
-New deployments remain refused until the queue and local service cleanup finish.
-A missing or changed execution is an error, never permission to free its port.
-
-Rootless recovery has a different address proof: the owned network helper must
-confirm the original host/container port pair. Only then can adoption restore a
-loopback backend without a container IP. The regression deliberately removes the
-container address; an absent or mismatched helper still refuses adoption.
-
-### A rollout must keep listening
-
-A rolling replacement can wait for the local consumer's withdrawal receipt.
-If placement polling waits for the rollout to finish, the receipt never arrives.
-The reconciler now polls discovery while waiting for the terminal deployment
-event. `tokio::pin!` keeps that same pending future in place across selections;
-we don't restart its deadline or submit a second deployment on each tick.
-Catalogue polls still require positive agent acknowledgement, and receipt retries
-still resolve the current leader and require authenticated HTTPS. A socket test
-holds the deployment open while the next consumer update arrives. The real mTLS
-fixture also holds it open through a lost receipt response, leader replacement
-and lost local confirmation before proving the durable receipt was forgotten.
-
-### Select ownership before starting consumers
-
-Normal Linux Runc startup now selects durable discovery for rootful nodes with
-eBPF enabled, including enrolled clusters, and for standalone rootless nodes.
-Kernel ownership is a separate condition: rootless forwarding has no kernel hooks
-to claim. Existing kernel state cannot be bypassed by switching to rootless mode.
-Clustered recovery requires both an enrolled node identity and the shared service
-authority. We fingerprint the root CA, which stays stable when a node leaf renews,
-and recover the consumer before adopting runtimes or starting DNS and ingress.
-
-The real-process regressions first show missing discovery journals on both startup
-paths. The rootless case then proves the original process and host forward survive
-Bun death and that confirmed stop clears publication. The cluster case verifies
-normal enrolled startup and restart. A complete clustered workload retirement and
-upgrade matrix is a separate qualification step.
-
-### Retry the remaining obligation
-
-The real clustered retirement test found an easy trap: the first attempt removes
-a local backend, but another consumer still holds the address. On retry, asking
-the service map to remove that same backend returns “not found”. That error would
-block cleanup forever. We now invalidate the consumer view on every attempt and
-remove the local entry only while it is present. Absence is not release permission;
-the original remote confirmations and durable runtime hold still govern release.
-The physical regression publishes an OCI workload through the council, kills Bun,
-adopts the same execution, deletes the desired app and waits until service,
-address and receipt obligations are all cleared.
-
-
-### Keep rootless clusters outside the release boundary
-
-A surviving rootless execution proves who owns its local host port. It doesn't
-prove that every remote consumer has stopped sending traffic to the old address.
-Until we carry the original publication generation through remote withdrawal and
-port release, recovering that execution alone cannot make clustered reuse safe.
-
-For 0.1.0, rootless Runc supports standalone host-port forwarding. Bun rejects
-`--cluster` immediately after selecting a rootless Runc runtime, before owner
-recovery, workload adoption or networking starts. We check the selected runtime,
-so `--runtime auto` and the experimental ownership flag cannot bypass the refusal.
-Rootful Linux Runc/eBPF remains the container cluster profile; the macOS quickstart
-provides it inside the managed Linux VM.
-
-The regression launches the actual Bun binary as an unprivileged Linux user for
-both explicit and automatic selection, with and without the experimental flag.
-Every attempt must fail promptly with migration guidance and leave runtime,
-discovery and kernel ownership unopened. The existing standalone recovery test
-continues to prove that supported rootless workloads survive upgrades and rollback.
+Here's an experiment that should worry you, run against our first version. A container exits normally. Runc tears down its namespace, and the lease journal marks its IP free. Meanwhile an old entry in the kernel's backend map still points a service VIP at that IP (we froze the map in the test, but a failed update or a slow remote node does the same thing). Now start an unrelated container. It gets the recycled address, and the old VIP answers HTTP 200 *with the new container's identity*. Nothing crashed. Traffic just went to the wrong workload.
+
+Stopping a process and releasing its address are two separate facts, and everything in this section follows from keeping them apart. An address stays reserved while anything might still route to it: this node's kernel map, a request Wrapper captured, or another node's copy of the catalogue. Only when every one of those has positively let go does the address go back into the pool. When we can't tell, we keep it. Running out of addresses is an outage you can see; routing to the wrong container is one you can't.
+
+### Writing it down before doing it
+
+A node's half of this lives in a small discovery journal on disk. It records every service allocation Bun has published or tried to publish (exact VIP, port and backends), and every container address a runtime is holding on discovery's behalf. The rule is the same one the lease journal follows: write the journal *before* touching the kernel map, DNS or Wrapper. Then, after a crash, the saved state is always at least as large as what might actually be exposed, and recovery can clean up from it.
+
+Each held address goes through two phases:
+
+```rust
+pub enum ReferencePhase {
+    /// At least one publication obligation still retains this address.
+    Held,
+    /// Withdrawal was confirmed; runtime release may be performed or replayed.
+    ReleaseAuthorised,
+}
+```
+
+(In the code's vocabulary, an *obligation* is simply cleanup somebody still owes.) To release an address, Bun checks that the backend really is gone from the live service map, writes `ReleaseAuthorised` to disk, *then* asks the runtime to release it, and only after the runtime acknowledges does it forget the entry. Crash anywhere in that sequence and the next Bun finds either a `Held` entry (it hasn't released yet, and must prove withdrawal again) or a `ReleaseAuthorised` one (it can replay the release, even if the leader is unreachable). There's no state where the address is free but nobody remembers why.
+
+Saving is synchronous file I/O, which must not run on the async executor, and it must not be abandoned halfway if the caller gives up waiting. The journal handles both by giving itself away:
+
+```rust
+pub async fn persist(mut self, next: DiscoveryInventory) -> io::Result<Self> {
+    tokio::task::spawn_blocking(move || {
+        self.save(next)?;
+        Ok(self)
+    })
+    .await
+    .map_err(io::Error::other)?
+}
+```
+
+Look at the first parameter. Most methods take `&self` or `&mut self`, a borrow. This one takes `self`, so calling it *moves* the journal into the function and the caller no longer has it. The `move` closure then takes the journal (including its open lock file) into the blocking thread, and only a successful save hands it back as `Ok(self)`. If the awaiting future is cancelled, the blocking write keeps running and keeps the lock until it finishes. If the save fails, the caller doesn't get the journal back at all. Rust turns "you may not keep writing after an uncertain save" from a comment into a compile error.
+
+The agent has to hold *something* while the journal is away. It keeps an enum:
+
+```rust
+let (DiscoveryOwnership::Ready(journal) | DiscoveryOwnership::Recovered(journal)) =
+    std::mem::replace(&mut self.discovery_ownership, DiscoveryOwnership::Uncertain)
+else {
+    return Err(failure("discovery ownership changed during update".into()));
+};
+match journal.persist(next).await {
+    Ok(journal) => { /* put Ready or Recovered back */ }
+    Err(error) => { /* stay Uncertain; reopen from disk later */ }
+}
+```
+
+`std::mem::replace` swaps a new value into a place and hands you the old one, which is how you move a value out of a struct field you only have `&mut` access to. The `let PATTERN = value else { ... };` form is a *let-else*: if the pattern matches, its bindings (here `journal`) stay in scope after the statement; if not, the `else` block runs and must leave the function. The `|` inside the pattern accepts either variant, as long as both bind the same names. So while a write is in flight the agent is `Uncertain`, and anything that tries to publish or release meanwhile gets refused.
+
+Our first version had a nasty flaw here. It failed closed, but nothing ever reopened the door: one failed write (a full disk for a second, say) left the agent `Uncertain` until someone restarted Bun, publishing nothing while its health check said all was well. Now the agent remembers which directory it owned and, on every tick, reopens the journal from disk and adopts whichever checkpoint is durable. Because the journal is always written before the change it describes, either the old checkpoint or the new one is a safe description. While it's stuck, a critical readiness subsystem called `discovery:journal` reports the failure, so the scheduler stops sending work to a node that can't publish it.
+
+### Recovering after Bun dies, or the machine does
+
+On startup Bun reopens the journal, compares it against the runtime's own inventory of original launches, and reserves every old VIP *without* republishing the old backends. Saved health is history, not evidence. A workload that survived gets its backend back only after positive adoption, and it starts unhealthy until its health check passes again.
+
+The kernel side has its own twist. If Bun dies but the machine doesn't, the pinned eBPF maps and cgroup links are still live and must be adopted. If the whole machine loses power, they're gone. An empty pin directory means completely different things in those two cases, so the kernel ownership record stores the Linux boot ID. Same boot: every pin must be present. Different boot: every pin must be absent, and we rebuild. Anything in between refuses to start. So does a missing lock or manifest file; quietly recreating one would give two processes an "exclusive" claim each.
+
+### Other nodes hold copies too
+
+Everything so far is local. But the endpoint catalogue went to every node, and a node on the far side of a partition may still route to an address long after this one withdrew it. The leader replacing its catalogue doesn't erase anybody else's copy.
+
+So the council keeps a ledger of withdrawals. Every node that polls for placements over mTLS is recorded in Raft as a *consumer* before it receives its first catalogue. When a publication removes endpoints, the leader records which backends left and which consumers might still have them:
+
+```rust
+pub struct EndpointWithdrawal {
+    /// Qualified service identities with their original destinations.
+    pub services: BTreeMap<String, ServiceWithdrawal>,
+    /// Durable node identities; absence from gossip does not discharge them.
+    pub consumers: BTreeSet<String>,
+}
+
+pub struct EndpointWithdrawals {
+    /// Generation of the active catalogue, starting at zero before publication.
+    pub generation: u64,
+    /// Original publication generations, retained until every consumer confirms.
+    pub pending: BTreeMap<u64, EndpointWithdrawal>,
+}
+```
+
+A `BTreeSet` is a sorted set: each node name appears once, in a deterministic order, which keeps Raft snapshots reproducible. Each consumer finds its outstanding withdrawals in the next placements response, removes those routes locally (journal first, as above) and then posts a *receipt* to `/v1/discovery/withdrawn`: an authenticated "I've removed everything from generation 12". The server takes the node's identity from its TLS certificate, never from the request body, so one node can't answer for another. The consumer keeps the receipt queued until it gets exactly a 204; a timeout or a lost reply just means sending it again, which is harmless. When a generation's consumer set is empty, its entry disappears.
+
+Withdrawn VIPs stay reserved while their entry is pending:
+
+```rust
+pub fn reserved_vips(&self) -> impl Iterator<Item = super::vip::VirtualIP> + '_ {
+    self.pending
+        .values()
+        .flat_map(|withdrawal| withdrawal.services.values())
+        .filter_map(|removed| removed.retire_vip.then_some(removed.service.vip))
+}
+```
+
+The return type says "some iterator yielding `VirtualIP`s" without naming the concrete type (`impl Trait` in return position), and `+ '_` says that iterator borrows from `self`, so the compiler won't let you keep it after the ledger is gone. `bool::then_some(x)` turns `true` into `Some(x)` and `false` into `None`, which is exactly what `filter_map` wants. Publication generations only ever go up, and the planner advances them with `checked_add(1)`, which returns `None` on overflow instead of wrapping, so an old receipt can never match a new generation.
+
+The producer's side mirrors this. Before a node frees the host port or container address of a stopped instance, it asks the leader to *retire* that exact execution at `/v1/discovery/retire`. The leader records a permanent retirement (the code calls it a *fence*: any late report from that execution is ignored from then on, rather than put back in the catalogue) and answers "confirmed" only once every consumer has sent its receipt. Executions are identified by a runtime generation, an opaque SHA-256 fingerprint of the original launch record. A restart gets a new fingerprint even if it reuses the same name and port, so a delayed receipt for the old execution can't free the new one. The request runs as its own task with a one-second wait, so an unreachable leader makes retirement slow, not the whole agent.
+
+Why not just expire an entry when a node has been silent for a while? Because a partitioned node that's still alive may still be serving old routes, and handing its addresses to someone else is worse than asking an operator to confirm it's really gone. Decommissioning the node discharges what it owed. To make this visible before the ledger fills, the leader degrades a `discovery:withdrawal-backlog` readiness subsystem at 75% occupancy and exports `discovery_withdrawal_ledger_occupancy_ratio` for alerting.
+
+### What went wrong on the way
+
+This design took several attempts, and the mistakes are worth more than the final shape.
+
+The first consumer registration included plaintext development clusters. But a receipt has to come from a TLS identity, so a plaintext node could never pay off what it owed. After about a thousand deploys the ledger filled and the whole cluster stopped publishing catalogue updates. Plaintext clusters now skip the ledger entirely and get the weaker behaviour, which is fine on a laptop and one more reason not to run one on a shared network.
+
+The first way of replacing a view was painfully correct: hide DNS and ingress, empty the kernel map, cancel every captured request, wait for zero, publish the new view. The catalogue generation changes whenever anything deploys anywhere, so a single rolling deploy made every node drop every in-flight request for every service. No test noticed, because none kept traffic flowing while the catalogue changed. Now the journal keeps a short list of views that *might* still be exposed, Bun updates the kernel map in place, drains only the backends that actually left, and marks a receipt ready once no remaining view contains the withdrawn endpoint. The full withdraw-and-wait sequence survives only for the first publication after a restart, when we genuinely can't know what the previous process had captured.
+
+And a small one with a big effect: reading a kernel map entry used `.ok()`, which turns *any* error into `None`. A permission error therefore looked exactly like "the entry is absent", and cleanup would have treated an unreadable route as already gone. The lookup now matches Aya's `KeyNotFound` explicitly and propagates everything else. A failed lookup is not proof of absence.
+
+Finally, a limit. Rootless Runc can prove who owns its local host port, but nothing yet carries that proof through remote withdrawal. So for 0.1.0 rootless Runc is standalone only: Bun refuses `--cluster` as soon as it selects a rootless runtime, before it touches any state. Container clusters are rootful Linux Runc with eBPF, which is what the macOS quickstart runs inside its Linux VM.

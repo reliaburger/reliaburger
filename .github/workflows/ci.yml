@@ -5,7 +5,13 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main, "codex/**"]
+    # fix/** covers review PRs stacked on each other rather than on main.
+    branches: [main, "codex/**", "fix/**"]
+    # labeled lets a `full-ci` label start the heavy suites on a stacked PR.
+    types: [opened, synchronize, reopened, labeled]
+  schedule:
+    # Nightly full run on main, including the benchmarks.
+    - cron: "17 3 * * *"
 
 # PR updates supersede earlier checks. Main/tag runs each retain their own group.
 # Fixed prefixes also keep reusable source CI separate from its release caller.
@@ -16,11 +22,37 @@ concurrency:
 permissions:
   contents: read
 
+# Caches: GitHub keeps 10 GB per repository. Jobs that build the same profile
+# share one key, and only pushes to main save, even when tests fail. PRs,
+# stacked or not, restore main's cache instead of evicting each other's.
+
 env:
   CARGO_TERM_COLOR: always
   NEXTEST_PROFILE: ci
 
 jobs:
+  changes:
+    # Which job groups this run needs; see scripts/ci/select-jobs.sh.
+    name: select jobs
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.select.outputs.code }}
+      gossip: ${{ steps.select.outputs.gossip }}
+      heavy: ${{ steps.select.outputs.heavy }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: select
+        env:
+          EVENT: ${{ github.event_name }}
+          # The PR event names the branch it targets; github.base_ref reported
+          # main for a PR stacked on another branch (run 35921062344).
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          FULL_CI: ${{ contains(github.event.pull_request.labels.*.name, 'full-ci') }}
+        run: scripts/ci/select-jobs.sh
+
   dependency-audit:
     name: dependency advisory audit
     runs-on: ubuntu-latest
@@ -29,19 +61,50 @@ jobs:
       - uses: taiki-e/install-action@cargo-audit
       - run: make audit
 
+  lint:
+    # Formatting and Clippy report on their own, a few minutes in, instead of
+    # waiting behind the test suite.
+    name: lint
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: lint
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
+      - name: Prepare portable build host
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang libbpf-dev llvm
+      - name: Format
+        run: make fmt-check
+      - name: Lint every target, with all features and with none
+        run: make lint
+
   minimum-rust:
+    # The declared minimum compiler must build every target with and without
+    # default features. The stable jobs run the tests, so running them again
+    # on 1.97 would only repeat the same suite.
     name: minimum Rust 1.97.0
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.0
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-nextest@0.9.145
       - uses: Swatinem/rust-cache@v2
         with:
-          key: minimum-rust-1.97.0
+          shared-key: minimum-rust
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
       - name: Prepare portable build host
         run: |
           sudo apt-get update -qq
@@ -49,44 +112,41 @@ jobs:
           sudo apt-get install -y -qq clang libbpf-dev llvm
       - name: Check every target and feature with the locked graph
         run: cargo check --locked --all-targets --all-features
-      - name: Test the minimum compiler with default features
-        run: cargo nextest run --locked --profile ci --no-tests=fail
-      - name: Test the minimum compiler without default features
-        run: cargo nextest run --locked --profile ci --no-tests=fail --no-default-features
+      - name: Check every target without default features
+        run: cargo check --locked --all-targets --no-default-features
 
   portable:
+    # The Linux portable suite runs once, instrumented: the same run is the
+    # test gate, the coverage gate and the JUnit source.
     name: portable Linux
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.98.0
         with:
-          components: rustfmt, clippy
+          components: llvm-tools-preview
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-nextest@0.9.145
+          tool: cargo-nextest@0.9.145,cargo-llvm-cov
       - uses: Swatinem/rust-cache@v2
         with:
-          key: portable
+          shared-key: portable
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
       - name: Prepare portable build host
         run: |
           sudo apt-get update -qq
           sudo apt-get remove -y -qq buildah
           sudo apt-get install -y -qq clang libbpf-dev llvm
-      - name: Format
-        run: make fmt-check
-      - name: Lint every target and feature
-        run: make lint
-      - name: Portable tests
-        run: make test
+      - name: Portable tests with line coverage
+        run: make coverage
       - name: Verify JUnit output
         run: test -s target/nextest/ci/junit.xml
-      - name: No-default-feature tests
-        run: make test-no-default
       - name: Doctests
         run: make test-doc
-      - name: Executable examples
-        run: make examples
       - name: Upload JUnit
         if: always()
         uses: actions/upload-artifact@v4
@@ -94,26 +154,20 @@ jobs:
           name: junit-portable
           path: target/nextest/ci/junit.xml
           if-no-files-found: warn
-
-  slow:
-    name: wall-clock acceptance
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.98.0
-      - uses: taiki-e/install-action@v2
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          tool: cargo-nextest@0.9.145
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: slow
-      - run: make test-slow
+          name: coverage
+          path: target/coverage
+          if-no-files-found: warn
 
   linux:
     name: privileged Linux
+    needs: changes
+    if: needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.98.0
@@ -122,7 +176,9 @@ jobs:
           tool: cargo-nextest@0.9.145
       - uses: Swatinem/rust-cache@v2
         with:
-          key: linux-privileged
+          shared-key: linux-privileged
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
       - name: Install runtime and kernel test dependencies
         run: |
           sudo apt-get update -qq
@@ -146,55 +202,91 @@ jobs:
           path: /var/tmp/reliaburger-oci-interruptions.*/
           if-no-files-found: ignore
       - name: Run only provisioned Linux tests
-        run: sudo -E env PATH="$PATH" NEXTEST_PROFILE=ci make test-linux
+        # The qualification step above already ran owned_runc and owned_network
+        # in a private namespace.
+        run: >-
+          sudo -E env PATH="$PATH" NEXTEST_PROFILE=ci make test-linux
+          LINUX_EXCLUDE='& not binary(owned_runc) & not binary(owned_network)'
+
+  build-tests:
+    # Compile the portable test binaries once. The acceptance jobs download
+    # this nextest archive instead of each rebuilding every test binary.
+    # Runners check out to the same path, so the archive's compiled-in binary
+    # paths still resolve after extraction.
+    name: build tests
+    needs: changes
+    if: needs.changes.outputs.heavy == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.145
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux-debug
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
+      - run: cargo nextest archive --locked --archive-file tests.tar.zst
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nextest-archive
+          path: tests.tar.zst
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
 
   cluster:
     name: multi-node cluster
+    needs: [changes, build-tests]
+    if: needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      ARCHIVED: cargo nextest run --archive-file tests.tar.zst --extract-to . --extract-overwrite --workspace-remap . --profile ci --no-tests=fail
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.98.0
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.145
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v4
         with:
-          key: cluster
-      - run: make test-cluster
+          name: nextest-archive
+      - run: make test-cluster NEXTEST="$ARCHIVED"
 
-  upgrade-node:
-    name: single-node upgrade
+  acceptance:
+    # Wall-clock, single-node upgrade and cluster upgrade suites: 13 tests
+    # that each used to pay for their own full test build.
+    name: acceptance
+    needs: [changes, build-tests]
+    if: needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 40
+    env:
+      ARCHIVED: cargo nextest run --archive-file tests.tar.zst --extract-to . --extract-overwrite --workspace-remap . --profile ci --no-tests=fail
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.98.0
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.145
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v4
         with:
-          key: upgrade-node
-      - run: make test-upgrade-node
-
-  upgrade-cluster:
-    name: cluster upgrade
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.98.0
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-nextest@0.9.145
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: upgrade-cluster
-      - run: make test-upgrade-cluster
+          name: nextest-archive
+      - name: Wall-clock acceptance
+        run: make test-slow NEXTEST="$ARCHIVED"
+      - name: Single-node upgrade
+        if: ${{ !cancelled() }}
+        run: make test-upgrade-node NEXTEST="$ARCHIVED"
+      - name: Cluster upgrade
+        if: ${{ !cancelled() }}
+        run: make test-upgrade-cluster NEXTEST="$ARCHIVED"
 
   macos:
     name: portable macOS
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
@@ -206,78 +298,34 @@ jobs:
           tool: cargo-nextest@0.9.145
       - uses: Swatinem/rust-cache@v2
         with:
-          key: macos-portable
-      - name: Lint every target and feature
+          shared-key: macos
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
+      - name: Lint every target, with all features and with none
         run: make lint
       - run: make test
       - run: make test-doc
 
-  coverage:
-    name: coverage
+  benchmarks:
+    # Criterion output is uploaded, not gated, so pull requests only pay for
+    # the release build when they touch the gossip protocol or its benches.
+    name: benchmarks
+    needs: changes
+    if: needs.changes.outputs.gossip == 'true'
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.98.0
-        with:
-          components: llvm-tools-preview
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-nextest@0.9.145
-      - uses: taiki-e/install-action@cargo-llvm-cov
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: coverage
-      - name: Remove provisioned container builder
-        run: sudo apt-get remove -y -qq buildah
-      - run: make coverage
-      - uses: actions/upload-artifact@v4
-        with:
-          name: coverage
-          path: target/coverage
-          if-no-files-found: error
-
-  benchmark-fast:
-    name: fast benchmarks
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.98.0
       - uses: Swatinem/rust-cache@v2
         with:
-          key: benchmark-fast
+          shared-key: bench
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
       - run: make bench
-      - uses: actions/upload-artifact@v4
-        with:
-          name: criterion-fast
-          path: target/criterion
-          if-no-files-found: error
-
-  benchmark-large:
-    name: large benchmarks
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.98.0
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: benchmark-large
       - run: make bench-large
       - uses: actions/upload-artifact@v4
         with:
-          name: criterion-large
+          name: criterion
           path: target/criterion
           if-no-files-found: error
-
-  scale-10k:
-    name: 10k-member scale acceptance
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.98.0
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: scale-10k
-      - run: make bench-10k

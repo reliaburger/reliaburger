@@ -362,8 +362,7 @@ pub fn check_join_token(
         return Err(JoinError::TokenExpired);
     }
     // The token is bound to one node id: the request must ask for exactly that
-    // id (M4). A legacy token loads with an empty id and so matches no real
-    // node id — it is refused here, failing closed.
+    // id (M4).
     if join_token.node_id != requested_node_id {
         return Err(JoinError::NodeIdMismatch);
     }
@@ -439,20 +438,6 @@ pub fn sign_join_csr(
         root_ca_der,
         node_ca_der,
     })
-}
-
-/// Generate a new join token and add it to the security state.
-///
-/// Returns the plaintext token (for the admin). The hash is stored
-/// in the security state.
-pub fn generate_new_join_token(
-    state: &mut SecurityState,
-    ttl: Duration,
-    node_id: &str,
-) -> Result<String, JoinError> {
-    let (plaintext, join_token) = create_join_token(ttl, node_id)?;
-    state.join_tokens.push(join_token);
-    Ok(plaintext)
 }
 
 /// Create a join token without storing its plaintext.

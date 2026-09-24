@@ -409,10 +409,9 @@ reliaburger-1        192.168.105.2:9443   alive      yes      yes
 reliaburger-2        192.168.105.3:9443   alive      yes      -
 reliaburger-3        192.168.105.4:9443   alive      yes      -
 
-$ relish --agent http://192.168.105.2:9117 chaos council-partition
-CHAOS  Council Partition
+$ relish --agent http://192.168.105.2:9117 test --chaos --yes --filter minority_partition_degrades_and_heals
   ...
-  PASSED  council partition recovery in 12.1s
+  PASSED  minority_partition_degrades_and_heals
 
 $ relish dev destroy
 ```

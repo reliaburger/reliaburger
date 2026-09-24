@@ -300,8 +300,18 @@ fn capability_identity(report: Option<&ClusterCapabilityReport>) -> (String, boo
     )
 }
 
+/// A client for one node's per-node reads, routed through the entry node.
+///
+/// The CLI often can't dial a node's advertised address: on a laptop the
+/// guests sit behind Lima's user-mode network and only node 1's API is
+/// forwarded to the host. The entry node can reach every peer, so every
+/// per-node read goes through its relay, which carries the caller's own
+/// credential. One path for every topology beats guessing which addresses
+/// happen to be reachable.
 pub(crate) fn node_client(entry: &BunClient, node: &NodeStatus) -> Result<BunClient, String> {
-    entry.for_node(node).map_err(|error| error.to_string())
+    entry
+        .via_node(&node.node_id)
+        .map_err(|error| error.to_string())
 }
 
 fn leader_client<'a>(
@@ -907,19 +917,23 @@ mod tests {
     }
 
     #[test]
-    fn node_client_reuses_auth_and_scheme_with_each_ipv4_or_ipv6_api_port() {
-        let entry = BunClient::new_with_token("https://127.0.0.1:9443", Some("secret"));
+    fn node_clients_go_through_the_entry_node_never_the_advertised_address() {
+        let entry = BunClient::new_with_token("https://127.0.0.1:19117", Some("secret"));
 
-        let mut v4_node = node("10.0.0.8:7946");
-        v4_node.api_address = Some("10.0.0.8:19443".parse().unwrap());
-        let mut v6_node = node("[2001:db8::8]:7946");
-        v6_node.api_address = Some("[2001:db8::8]:29443".parse().unwrap());
-        let ipv4 = node_client(&entry, &v4_node).unwrap();
-        let ipv6 = node_client(&entry, &v6_node).unwrap();
+        let mut guest = node("192.168.104.3:7946");
+        guest.node_id = "rb-0123456789ab-2".to_string();
+        guest.api_address = Some("192.168.104.3:9117".parse().unwrap());
+        let relayed = node_client(&entry, &guest).unwrap();
+        assert_eq!(
+            relayed.base_url(),
+            "https://127.0.0.1:19117/v1/nodes/rb-0123456789ab-2/relay"
+        );
+        // A node with no advertised API address is still reachable.
+        assert!(node_client(&entry, &node("10.0.0.8:7946")).is_ok());
 
-        assert_eq!(ipv4.base_url(), "https://10.0.0.8:19443");
-        assert_eq!(ipv6.base_url(), "https://[2001:db8::8]:29443");
-        assert!(node_client(&entry, &node("10.0.0.8:7946")).is_err());
+        let mut hostile = node("10.0.0.9:7946");
+        hostile.node_id = "../v1/token/create?".to_string();
+        assert!(node_client(&entry, &hostile).is_err());
     }
 
     #[test]

@@ -1,0 +1,9 @@
+---
+source: src/relish/metrics_cmd.rs
+expression: "render_overview(\"default\", \"web\", \"15m\", &summaries)"
+---
+METRIC                         TYPE       SERIES  INSTANCES  VALUE
+http_request_duration_seconds  histogram       2          2  mean 11.9ms
+http_requests_total            counter         4          2  8.40/s
+process_memory_bytes           gauge           2          2  104.9M
+up                             gauge           2          2  2

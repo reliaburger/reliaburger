@@ -69,6 +69,27 @@ struct DrainGuard {
     websocket: bool,
 }
 
+impl DrainGuard {
+    /// Keep ownership of only the candidate at `index` and release the rest
+    /// now. Called once a backend has answered: the unused failover
+    /// candidates must not hold their drains open, or be able to cancel this
+    /// response, for as long as it streams.
+    fn keep_only(&mut self, index: usize) {
+        if index >= self.instance_ids.len() {
+            return;
+        }
+        let kept = self.instance_ids.remove(index);
+        let released = std::mem::replace(&mut self.instance_ids, vec![kept]);
+        // Dropping a guard for the others releases them exactly as a finished
+        // request would.
+        drop(DrainGuard {
+            drains: self.drains.clone(),
+            instance_ids: released,
+            websocket: self.websocket,
+        });
+    }
+}
+
 impl Drop for DrainGuard {
     fn drop(&mut self) {
         let drains = self.drains.clone();
@@ -629,7 +650,13 @@ async fn do_proxy(
                 //
                 // The response owns its permit; a bounded upstream pump owns
                 // the drain guard and observes cancellation even when the
-                // client stops polling its body (ING2/DEP5/§5.5).
+                // client stops polling its body (ING2/DEP5/§5.5). Only this
+                // backend's drain may hold or cancel the stream (T1.7).
+                let mut drain_guard = drain_guard;
+                if let Some(guard) = &mut drain_guard {
+                    guard.keep_only(idx);
+                }
+                let terminate: Vec<_> = terminate.into_iter().nth(idx).into_iter().collect();
                 let stream =
                     guarded_body_stream(resp.bytes_stream(), permit, drain_guard, terminate);
                 return response
@@ -1934,6 +1961,144 @@ mod tests {
             .await
             .expect("an unpolled response body prevented backend cleanup");
         drop(body);
+    }
+
+    /// T1.7: a stream served by A must not be owned by B, the unused failover
+    /// candidate. Draining B during a rolling deploy used to cancel A's
+    /// healthy stream at B's deadline, and B's drain could not finish early
+    /// because the stream still counted against it.
+    #[tokio::test]
+    async fn draining_an_unused_failover_candidate_leaves_the_stream_alone() {
+        use crate::onion::types::BackendInstance;
+        use crate::wrapper::draining::{DrainCommand, DrainTracker, SharedDrains};
+        use std::net::Ipv4Addr;
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Two identical streaming backends: each sends headers and a first
+        // chunk, reports that it is serving, then waits to finish the body.
+        let (serving_tx, mut serving_rx) = tokio::sync::mpsc::channel::<String>(2);
+        let finish = Arc::new(tokio::sync::Notify::new());
+        let mut service_map = crate::onion::service_map::ServiceMap::new();
+        service_map
+            .register_app("web", "default", 80, None)
+            .unwrap();
+        for id in ["default__web-a", "default__web-b"] {
+            let backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = backend.local_addr().unwrap().port();
+            let serving = serving_tx.clone();
+            let finish = Arc::clone(&finish);
+            tokio::spawn(async move {
+                if let Ok((mut sock, _)) = backend.accept().await {
+                    let mut buf = [0u8; 1024];
+                    let _ = sock.read(&mut buf).await;
+                    let _ = sock
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nfirst")
+                        .await;
+                    let _ = serving.send(id.to_string()).await;
+                    finish.notified().await;
+                    let _ = sock.write_all(b"-last").await;
+                }
+            });
+            service_map
+                .add_backend(
+                    &crate::onion::service_id::ServiceId::new("default", "web"),
+                    BackendInstance {
+                        instance_id: id.to_string(),
+                        node_ip: Ipv4Addr::LOCALHOST,
+                        host_port: port,
+                        healthy: true,
+                    },
+                )
+                .unwrap();
+        }
+        let mut ingress = std::collections::HashMap::new();
+        ingress.insert(
+            ("default".to_string(), "web".to_string()),
+            crate::config::app::IngressSpec {
+                host: "web.test".to_string(),
+                path: None,
+                tls: None,
+                websocket: None,
+                rate_limit_rps: None,
+                rate_limit_burst: None,
+            },
+        );
+        let mut table = RoutingTable::new();
+        table.rebuild(&service_map, &ingress).unwrap();
+        let routing_table = Arc::new(RwLock::new(table));
+
+        let drains = SharedDrains::new(DrainTracker::new(tokio::sync::mpsc::channel(8).0));
+        let shutdown = CancellationToken::new();
+        let bound = bind_proxy_with_drains(
+            WrapperConfig {
+                http_port: 0,
+                https_port: 0,
+                ..WrapperConfig::default()
+            },
+            routing_table,
+            Some(drains.clone()),
+            shutdown.clone(),
+        )
+        .await
+        .unwrap();
+        let http_port = bound.http_addr.port();
+        tokio::spawn(async move {
+            bound.serve().await.ok();
+        });
+
+        let response = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{http_port}/"))
+            .header("host", "web.test")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let serving = tokio::time::timeout(Duration::from_secs(2), serving_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let unused = if serving == "default__web-a" {
+            "default__web-b"
+        } else {
+            "default__web-a"
+        };
+
+        // Retire the candidate the stream never used, with a short deadline.
+        drains
+            .start_drain(&DrainCommand {
+                app_name: "web".to_string(),
+                instance_id: unused.to_string(),
+                timeout: Duration::from_millis(600),
+            })
+            .await;
+        // Its drain has nothing in flight, so it finishes within a few sweeps
+        // (the release runs on a spawned task), well before its deadline.
+        let mut completed = Vec::new();
+        for _ in 0..30 {
+            completed = drains.check_completions().await;
+            if !completed.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            completed,
+            vec![unused.to_string()],
+            "an unused failover candidate's drain waited on another backend's stream"
+        );
+
+        // Past that deadline, the healthy stream still completes in full.
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert!(drains.check_completions().await.is_empty());
+        finish.notify_waiters();
+        let body = tokio::time::timeout(Duration::from_secs(2), response.bytes())
+            .await
+            .unwrap()
+            .expect("the unused candidate's drain aborted a healthy stream");
+        assert_eq!(&body[..], b"first-last");
+
+        shutdown.cancel();
     }
 
     /// DEP5: the live proxy counts a request to a draining backend against

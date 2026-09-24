@@ -936,7 +936,7 @@ The `relish` CLI uses the age public key to encrypt. No cluster access required.
 2. Store the new keypair in Raft, marking the old keypair as `read_only = true`. Starting a second rotation while one is un-finalised is refused (idempotent retries of the same rotation, deduped on the generation number, are accepted).
 3. The cluster now accepts ciphertexts encrypted with either key; new encryption always uses the newest non-read-only generation.
 4. The operator (or CI) re-encrypts all secrets with the new public key and commits to git. Each applied `AppSpec` records which generation seals its encrypted values (`SecurityState.secret_seals`, keyed `namespace/app/ENV_KEY`) — age ciphertext does not disclose its recipient, so write time is the only moment this is knowable.
-5. Once all `ENC[AGE:...]` values use the new key, the operator runs `relish secret rotate --finalize` to delete the old keypair. Finalise verifies the seal records first: any secret still sealed under an older generation — or with no record at all (legacy state) — refuses the retirement and is named in the error, so the key that can decrypt it is never deleted early.
+5. Once all `ENC[AGE:...]` values use the new key, the operator runs `relish secret rotate --finalize` to delete the old keypair. Finalise verifies the seal records first: any secret still sealed under an older generation — or with no record at all — refuses the retirement and is named in the error, so the key that can decrypt it is never deleted early.
 
 ### 5.6 Raft Log Encryption
 

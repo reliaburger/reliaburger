@@ -53,10 +53,23 @@ enum Command {
         #[arg(long)]
         no_open: bool,
     },
-    /// Apply configuration from a file or directory.
+    /// Apply a Reliaburger TOML or Kubernetes YAML manifest.
+    ///
+    /// Kubernetes YAML (a document with `apiVersion` and `kind`) is imported
+    /// in memory; its migration report goes to stderr.
+    #[command(group(clap::ArgGroup::new("manifest").required(true)))]
     Apply {
-        /// Path to a TOML config file or directory.
-        path: PathBuf,
+        /// Manifest path or https:// URL.
+        #[arg(group = "manifest", value_name = "PATH_OR_URL")]
+        path: Option<String>,
+        /// Manifest path or https:// URL (the kubectl spelling).
+        #[arg(
+            short = 'f',
+            long = "file",
+            group = "manifest",
+            value_name = "PATH_OR_URL"
+        )]
+        file: Option<String>,
         /// Show the plan without deploying (exits 0 even with no agent).
         #[arg(long)]
         dry_run: bool,
@@ -111,8 +124,26 @@ enum Command {
         /// SQL query against the `logs` table.
         sql: String,
     },
-    /// Show the status (state, PID, restarts) of all running workloads.
+    /// Show every workload on every node, with its latest CPU and memory.
     Top,
+    /// Show an app's own Prometheus metrics, scraped by the nodes running it.
+    ///
+    /// Without --name, lists every metric with one number: a gauge's value,
+    /// a counter's rate, a histogram's mean. With --name, one line per
+    /// instance with a sparkline.
+    Metrics {
+        /// App name.
+        app: String,
+        /// Namespace the app lives in.
+        #[arg(long, default_value = "default")]
+        namespace: String,
+        /// One metric to show per instance (a histogram by its base name).
+        #[arg(long)]
+        name: Option<String>,
+        /// How far back to look (e.g. "90s", "15m", "1h").
+        #[arg(long, default_value = "15m")]
+        since: String,
+    },
     /// Execute a command inside a running container.
     Exec {
         /// App name.
@@ -207,14 +238,6 @@ enum Command {
     },
     /// Show ingress routing table.
     Routes,
-    /// Show legacy chaos status (mutations retired; use test --chaos).
-    Chaos {
-        /// Action: status. Old mutation actions return a migration error.
-        action: String,
-        /// Confirm that a partition action is intentional.
-        #[arg(long)]
-        acknowledge: bool,
-    },
     /// Inject faults for chaos testing (Smoker).
     Fault {
         #[command(subcommand)]
@@ -371,6 +394,9 @@ enum Command {
         /// Port for --web (0 picks an ephemeral port).
         #[arg(long, default_value_t = 8642)]
         port: u16,
+        /// Open this chapter, e.g. `tour` or `chaos`.
+        #[arg(conflicts_with = "web")]
+        chapter: Option<String>,
         #[command(subcommand)]
         action: Option<ManualAction>,
     },
@@ -379,13 +405,23 @@ enum Command {
         /// Open with this search query pre-seeded (e.g. "ebpf").
         query: Option<String>,
     },
+    /// Remove the CLI, its PATH link, the managed Lima tools and the image cache.
+    Uninstall {
+        /// Don't ask for confirmation (required without a terminal).
+        #[arg(long)]
+        yes: bool,
+    },
     /// Manage a laptop cluster created by setup --quickstart.
     Local {
         #[arg(value_enum)]
         action: LocalAction,
+        /// One node to start or stop: its name as `relish nodes` shows it,
+        /// its number (1, 2, 3) or `node-N`. Omit to act on every node.
+        node: Option<String>,
         #[arg(long, default_value = "laptop")]
         name: String,
-        /// Confirm permanent deletion of the owned VMs and their data.
+        /// Confirm destroying the cluster, stopping node 1 (which carries the
+        /// CLI endpoint and ingress) or stopping a node the quorum needs.
         #[arg(long)]
         yes: bool,
     },
@@ -411,6 +447,9 @@ enum Command {
         /// HTTPS directory containing unchanged signed release candidate assets.
         #[arg(long, requires = "quickstart", conflicts_with = "development_binaries")]
         release_mirror: Option<String>,
+        /// Also print every setup step's timing (always saved as timings.json).
+        #[arg(long, requires = "quickstart")]
+        timings: bool,
 
         /// Accept the default answer to every question (non-interactive).
         #[arg(long)]
@@ -473,9 +512,12 @@ enum Command {
         /// Scope application checks and log correlation to one app.
         #[arg(long)]
         app: Option<String>,
-        /// Re-run diagnosis every 30 seconds until Ctrl-C.
+        /// Re-run diagnosis every `--interval` seconds until Ctrl-C.
         #[arg(long)]
         watch: bool,
+        /// Seconds between `--watch` collections.
+        #[arg(long, default_value_t = 30, requires = "watch", value_parser = clap::value_parser!(u64).range(1..))]
+        interval: u64,
     },
     /// Trace DNS, service-map, firewall and TCP evidence from a workload.
     Trace {
@@ -493,6 +535,10 @@ enum Command {
         /// Destination port. Internal services derive it when omitted.
         #[arg(long)]
         port: Option<u16>,
+        /// Repeat the TCP connect this many times (1-10) and report how many
+        /// succeeded and how long they took.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=10))]
+        count: u32,
     },
 }
 
@@ -839,6 +885,9 @@ enum FaultAction {
         /// Jitter (e.g. "50ms").
         #[arg(long)]
         jitter: Option<String>,
+        /// Only delay traffic from this app (in the target's namespace).
+        #[arg(long)]
+        from: Option<String>,
         /// Fault duration (default: 10m).
         #[arg(long)]
         duration: Option<String>,
@@ -913,7 +962,7 @@ enum FaultAction {
     Memory {
         /// Target service name.
         target: String,
-        /// Memory fill percentage or "oom" (e.g. "90%", "oom").
+        /// Memory fill percentage (e.g. "90%").
         value: String,
         /// Fault duration (default: 10m).
         #[arg(long)]
@@ -1070,6 +1119,11 @@ enum FaultAction {
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
+    // Parse, then stop: tests/suite/website.rs checks the documented tour
+    // commands against this exact parser without running any of them.
+    if std::env::var_os("RELISH_PARSE_ONLY").is_some() {
+        return ExitCode::SUCCESS;
+    }
 
     // Record the global connection overrides before any client is built.
     reliaburger::relish::client::set_cli_token(cli.token.clone());
@@ -1088,15 +1142,17 @@ async fn main() -> ExitCode {
         Command::Tui => reliaburger::relish::tui::run().await,
         Command::Apply {
             ref path,
+            ref file,
             dry_run,
             rerun_jobs,
-        } => {
-            if rerun_jobs {
-                commands::rerun_jobs(path).await
-            } else {
-                commands::apply(path, cli.output, dry_run).await
-            }
-        }
+        } => match reliaburger::relish::manifest::ManifestSource::parse(
+            // The ArgGroup makes exactly one of the two present.
+            path.as_deref().or(file.as_deref()).unwrap_or_default(),
+        ) {
+            Err(error) => Err(error),
+            Ok(source) if rerun_jobs => commands::rerun_jobs(&source).await,
+            Ok(source) => commands::apply(&source, cli.output, dry_run).await,
+        },
         Command::Status => commands::status(cli.output).await,
         Command::Dashboard { port, no_open } => {
             reliaburger::relish::dashboard::run(port, no_open).await
@@ -1131,6 +1187,21 @@ async fn main() -> ExitCode {
             ref sql,
         } => commands::logs_search(source, sql).await,
         Command::Top => commands::top(cli.output).await,
+        Command::Metrics {
+            ref app,
+            ref namespace,
+            ref name,
+            ref since,
+        } => {
+            reliaburger::relish::metrics_cmd::metrics(
+                app,
+                namespace,
+                name.as_deref(),
+                since,
+                cli.output,
+            )
+            .await
+        }
         Command::Exec {
             ref app,
             ref command,
@@ -1205,10 +1276,6 @@ async fn main() -> ExitCode {
         }
         Command::Resolve { ref name } => commands::resolve(name).await,
         Command::Routes => commands::routes().await,
-        Command::Chaos {
-            ref action,
-            acknowledge,
-        } => commands::chaos(action, acknowledge).await,
         Command::Snapshot { ref action } => match action {
             SnapshotAction::Create {
                 app,
@@ -1237,6 +1304,7 @@ async fn main() -> ExitCode {
                 target,
                 delay,
                 jitter,
+                from,
                 duration,
                 targeting,
             } => {
@@ -1244,6 +1312,7 @@ async fn main() -> ExitCode {
                     target,
                     delay,
                     jitter.as_deref(),
+                    from.as_deref(),
                     duration,
                     targeting,
                 )
@@ -1556,14 +1625,21 @@ async fn main() -> ExitCode {
         Command::Manual {
             web,
             port,
+            ref chapter,
             ref action,
         } => match action {
             Some(ManualAction::Examples { dir }) => reliaburger::relish::manual::examples(dir),
             None if web => reliaburger::relish::manual::web::serve(port).await,
-            None => reliaburger::relish::manual::run().await,
+            None => reliaburger::relish::manual::run(chapter.as_deref()).await,
         },
         Command::Source { query } => reliaburger::relish::source::run(query).await,
-        Command::Local { action, name, yes } => {
+        Command::Uninstall { yes } => reliaburger::relish::uninstall::run(yes).map_err(Into::into),
+        Command::Local {
+            action,
+            node,
+            name,
+            yes,
+        } => {
             use reliaburger::relish::quickstart::lifecycle::{self, Action};
             let action = match action {
                 LocalAction::Status => Action::Status,
@@ -1571,7 +1647,7 @@ async fn main() -> ExitCode {
                 LocalAction::Stop => Action::Stop,
                 LocalAction::Destroy => Action::Destroy,
             };
-            lifecycle::run(action, &name, yes)
+            lifecycle::run(action, &name, node.as_deref(), yes)
                 .await
                 .map_err(|error| reliaburger::relish::RelishError::InitFailed(format!("{error:#}")))
         }
@@ -1584,6 +1660,7 @@ async fn main() -> ExitCode {
             registry_port,
             development_binaries,
             release_mirror,
+            timings,
             yes,
             ref dir,
             ref release_url,
@@ -1599,6 +1676,7 @@ async fn main() -> ExitCode {
                         registry_port: registry_port.unwrap_or(15050),
                         development_binaries,
                         release_mirror,
+                        timings,
                     },
                 )
                 .await
@@ -1657,11 +1735,16 @@ async fn main() -> ExitCode {
                 .await,
             );
         }
-        Command::Wtf { app, watch } => {
+        Command::Wtf {
+            app,
+            watch,
+            interval,
+        } => {
             return finish_outcome(
                 reliaburger::relish::wtf_cmd::run(reliaburger::relish::wtf_cmd::WtfArgs {
                     app,
                     watch,
+                    interval: std::time::Duration::from_secs(interval),
                     output: cli.output,
                 })
                 .await,
@@ -1673,6 +1756,7 @@ async fn main() -> ExitCode {
             to,
             to_namespace,
             port,
+            count,
         } => {
             return finish_outcome(
                 reliaburger::relish::trace_cmd::run(reliaburger::relish::trace_cmd::TraceArgs {
@@ -1681,6 +1765,7 @@ async fn main() -> ExitCode {
                     destination: to,
                     destination_namespace: to_namespace,
                     port,
+                    count,
                     output: cli.output,
                 })
                 .await,
@@ -1975,7 +2060,8 @@ mod tests {
             bare.command,
             Command::Wtf {
                 app: None,
-                watch: false
+                watch: false,
+                interval: 30
             }
         ));
 
@@ -1988,9 +2074,22 @@ mod tests {
             scoped.command,
             Command::Wtf {
                 app: Some(ref app),
-                watch: true
+                watch: true,
+                interval: 30
             } if app == "payments"
         ));
+
+        let fast = parse(&["relish", "wtf", "--watch", "--interval", "5"]).unwrap();
+        assert!(matches!(
+            fast.command,
+            Command::Wtf {
+                watch: true,
+                interval: 5,
+                ..
+            }
+        ));
+        assert!(parse(&["relish", "wtf", "--interval", "5"]).is_err());
+        assert!(parse(&["relish", "wtf", "--watch", "--interval", "0"]).is_err());
     }
 
     #[test]
@@ -2020,11 +2119,33 @@ mod tests {
                 to,
                 to_namespace,
                 port: Some(5432),
+                count: 1,
             } if source == "api"
                 && namespace == "frontend"
                 && to == "db"
                 && to_namespace == "storage"
         ));
+    }
+
+    #[test]
+    fn trace_count_repeats_the_connect_up_to_ten_times() {
+        let parsed = parse(&[
+            "relish", "trace", "frontend", "--to", "redis", "--count", "10",
+        ])
+        .unwrap();
+        assert!(matches!(parsed.command, Command::Trace { count: 10, .. }));
+        assert!(
+            parse(&[
+                "relish", "trace", "frontend", "--to", "redis", "--count", "0"
+            ])
+            .is_err()
+        );
+        assert!(
+            parse(&[
+                "relish", "trace", "frontend", "--to", "redis", "--count", "11"
+            ])
+            .is_err()
+        );
     }
 
     #[test]
@@ -2045,7 +2166,32 @@ mod tests {
     fn parse_apply_command() {
         let cli = parse(&["relish", "apply", "config.toml"]).unwrap();
         assert!(
-            matches!(cli.command, Command::Apply { ref path, dry_run: false, rerun_jobs: false } if path.to_str() == Some("config.toml"))
+            matches!(cli.command, Command::Apply { ref path, file: None, dry_run: false, rerun_jobs: false } if path.as_deref() == Some("config.toml"))
+        );
+    }
+
+    /// Z1.4: `-f` takes a path or URL, the kubectl way; the positional
+    /// form keeps working, and exactly one of them is required.
+    #[test]
+    fn parse_apply_file_flag_and_url() {
+        for flag in ["-f", "--file"] {
+            let cli = parse(&["relish", "apply", flag, "app.yaml"]).unwrap();
+            assert!(
+                matches!(cli.command, Command::Apply { path: None, ref file, .. } if file.as_deref() == Some("app.yaml"))
+            );
+        }
+        let url = "https://reliaburger.com/demo/podinfo.yaml";
+        let cli = parse(&["relish", "apply", "-f", url, "--dry-run"]).unwrap();
+        assert!(
+            matches!(cli.command, Command::Apply { ref file, dry_run: true, .. } if file.as_deref() == Some(url))
+        );
+        assert!(
+            parse(&["relish", "apply"]).is_err(),
+            "a manifest is required"
+        );
+        assert!(
+            parse(&["relish", "apply", "a.toml", "-f", "b.yaml"]).is_err(),
+            "one manifest at a time"
         );
     }
 
@@ -2253,7 +2399,20 @@ mod tests {
     #[test]
     fn parse_managed_quickstart_and_explicit_destroy() {
         assert!(parse(&["relish", "setup", "--quickstart", "--nodes", "3"]).is_ok());
+        assert!(parse(&["relish", "setup", "--quickstart", "--timings"]).is_ok());
+        assert!(parse(&["relish", "setup", "--timings"]).is_err());
         assert!(parse(&["relish", "local", "status"]).is_ok());
+        let cli = parse(&["relish", "local", "stop", "node-3"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Local { node: Some(ref node), yes: false, .. } if node == "node-3"
+        ));
+        let cli = parse(&["relish", "local", "start", "2", "--name", "demo"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Local { node: Some(ref node), ref name, .. } if node == "2" && name == "demo"
+        ));
+        assert!(parse(&["relish", "local", "stop", "1", "--yes"]).is_ok());
         assert!(parse(&["relish", "local", "destroy", "--name", "laptop", "--yes"]).is_ok());
         assert!(parse(&["relish", "setup", "--nodes", "3"]).is_err());
     }
@@ -2483,6 +2642,33 @@ mod tests {
     }
 
     #[test]
+    fn parse_metrics_command_defaults_and_flags() {
+        let cli = parse(&["relish", "metrics", "web"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Metrics { ref app, ref namespace, name: None, ref since }
+                if app == "web" && namespace == "default" && since == "15m"
+        ));
+        let cli = parse(&[
+            "relish",
+            "metrics",
+            "web",
+            "--namespace",
+            "shop",
+            "--name",
+            "http_requests_total",
+            "--since",
+            "1h",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Metrics { ref namespace, name: Some(ref name), ref since, .. }
+                if namespace == "shop" && name == "http_requests_total" && since == "1h"
+        ));
+    }
+
+    #[test]
     fn parse_logs_with_grep() {
         let cli = parse(&["relish", "logs", "web", "--grep", "ERROR"]).unwrap();
         match cli.command {
@@ -2613,6 +2799,20 @@ mod tests {
                 assert_eq!(target, "redis");
                 assert_eq!(delay, "200ms");
             }
+            _ => panic!("expected Fault Delay"),
+        }
+    }
+
+    #[test]
+    fn parse_fault_delay_from_one_source() {
+        let cli = parse(&[
+            "relish", "fault", "delay", "redis", "300ms", "--from", "frontend",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Fault {
+                action: FaultAction::Delay { from, .. },
+            } => assert_eq!(from.as_deref(), Some("frontend")),
             _ => panic!("expected Fault Delay"),
         }
     }
@@ -2968,10 +3168,12 @@ mod tests {
             Command::Manual {
                 web,
                 port,
+                ref chapter,
                 ref action,
             } => {
                 assert!(!web);
                 assert_eq!(port, 8642);
+                assert!(chapter.is_none());
                 assert!(action.is_none());
             }
             _ => panic!("expected Manual command"),
@@ -2986,7 +3188,26 @@ mod tests {
             Command::Manual {
                 web: true,
                 port: 0,
+                chapter: None,
                 action: None,
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_manual_chapter_and_keep_examples_a_subcommand() {
+        let cli = parse(&["relish", "manual", "tour"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Manual { chapter: Some(ref chapter), action: None, .. } if chapter == "tour"
+        ));
+        let cli = parse(&["relish", "manual", "examples"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Manual {
+                chapter: None,
+                action: Some(ManualAction::Examples { .. }),
+                ..
             }
         ));
     }

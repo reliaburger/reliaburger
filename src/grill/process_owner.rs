@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -53,9 +53,8 @@ pub enum OwnerPhase {
 pub struct OwnerRecord {
     /// Owner record format, independent of agent adoption records.
     pub schema: u32,
-    /// Linux kernel boot that admitted this execution; never inferred from PIDs.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub boot_id: Option<String>,
+    /// Kernel boot that admitted this execution; never inferred from PIDs.
+    pub boot_id: String,
     /// Unpredictable generation capability used by the control socket.
     pub nonce: String,
     /// Foreground executable followed by its arguments.
@@ -64,9 +63,8 @@ pub struct OwnerRecord {
     pub environment: BTreeMap<String, String>,
     /// Last durably confirmed execution phase.
     pub phase: OwnerPhase,
-    /// Production runtime intent, persisted before starting any owner helper.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub launch: Option<ProcessLaunch>,
+    /// Runtime intent, persisted before starting any owner helper.
+    pub launch: ProcessLaunch,
 }
 
 /// Workload identity and complete runtime input for discovery before adoption.
@@ -80,36 +78,22 @@ pub struct ProcessLaunch {
 }
 
 /// Short private socket location independent of the node's data path length.
-pub(crate) fn socket_path(directory: &Path, record: &OwnerRecord) -> PathBuf {
-    if record.launch.is_some() {
-        PathBuf::from(format!(
-            "/tmp/rbp-{}-{}",
-            nix::unistd::geteuid(),
-            record.nonce
-        ))
-        .join("control.sock")
-    } else {
-        directory.join("control.sock")
-    }
+pub fn socket_path(record: &OwnerRecord) -> PathBuf {
+    PathBuf::from(format!(
+        "/tmp/rbp-{}-{}",
+        nix::unistd::geteuid(),
+        record.nonce
+    ))
+    .join("control.sock")
 }
 
 pub(crate) fn load(directory: &Path) -> io::Result<OwnerRecord> {
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
-        .open(directory.join("owner.json"))?;
-    if !file.metadata()?.is_file() || file.metadata()?.len() > RECORD_LIMIT {
-        return Err(io::Error::other("invalid process owner record file"));
-    }
-    let mut bytes = Vec::new();
-    file.take(RECORD_LIMIT + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > RECORD_LIMIT {
-        return Err(io::Error::other("process owner record exceeds size limit"));
-    }
-    let record: OwnerRecord = serde_json::from_slice(&bytes)?;
-    if !matches!(record.schema, 1..=3)
-        || record.nonce.is_empty()
-        || record.nonce.len() > 128
+    let record: OwnerRecord = crate::durable::read_json(
+        &directory.join("owner.json"),
+        RECORD_LIMIT,
+        crate::durable::Access::Regular,
+    )?;
+    if record.schema != 3
         || record
             .command
             .first()
@@ -117,35 +101,58 @@ pub(crate) fn load(directory: &Path) -> io::Result<OwnerRecord> {
     {
         return Err(io::Error::other("invalid process owner record"));
     }
-    if (record.schema >= 2) != record.launch.is_some()
-        || (record.schema >= 2
-            && (record.nonce.len() != 32
-                || !record.nonce.bytes().all(|byte| byte.is_ascii_hexdigit())))
-    {
+    if record.nonce.len() != 32 || !record.nonce.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(io::Error::other("invalid process launch generation"));
     }
     validate_boot(&record)?;
     Ok(record)
 }
 
-/// Read a positive Linux kernel identity. Unsupported hosts cannot infer reboot.
-pub(crate) fn current_boot_id() -> io::Result<Option<String>> {
+/// Read the identity of the running kernel boot, in lowercase UUID form.
+///
+/// Linux publishes a random `boot_id`; macOS publishes `kern.bootsessionuuid`.
+/// Both change on every boot, so a record naming another boot cannot have a
+/// live owner or child.
+pub fn current_boot_id() -> io::Result<Option<String>> {
     #[cfg(target_os = "linux")]
-    {
+    let boot = {
         let mut bytes = String::new();
         File::open("/proc/sys/kernel/random/boot_id")?
             .take(64)
             .read_to_string(&mut bytes)?;
-        let boot = bytes.trim();
-        if !valid_boot_id(boot) {
-            return Err(io::Error::other("invalid kernel boot identity"));
+        bytes
+    };
+    #[cfg(target_os = "macos")]
+    let boot = {
+        let mut bytes = [0u8; 64];
+        let mut length = bytes.len();
+        // SAFETY: the name is a NUL-terminated literal; the output buffer is
+        // writable for `length` bytes and the kernel writes at most that many,
+        // updating `length`. No new value is supplied, so nothing is changed.
+        let result = unsafe {
+            nix::libc::sysctlbyname(
+                c"kern.bootsessionuuid".as_ptr(),
+                bytes.as_mut_ptr().cast(),
+                &mut length,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
         }
-        Ok(Some(boot.to_owned()))
+        let value = bytes
+            .get(..length)
+            .ok_or_else(|| io::Error::other("invalid kernel boot identity length"))?;
+        String::from_utf8_lossy(value)
+            .trim_end_matches('\0')
+            .to_owned()
+    };
+    let boot = boot.trim().to_ascii_lowercase();
+    if !valid_boot_id(&boot) {
+        return Err(io::Error::other("invalid kernel boot identity"));
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        Ok(None)
-    }
+    Ok(Some(boot))
 }
 
 pub(crate) fn valid_boot_id(value: &str) -> bool {
@@ -160,12 +167,7 @@ pub(crate) fn valid_boot_id(value: &str) -> bool {
 }
 
 fn validate_boot(record: &OwnerRecord) -> io::Result<()> {
-    if record
-        .boot_id
-        .as_deref()
-        .is_some_and(|boot| !valid_boot_id(boot))
-        || (cfg!(target_os = "linux") && record.schema == 3 && record.boot_id.is_none())
-    {
+    if !valid_boot_id(&record.boot_id) {
         return Err(io::Error::other("invalid process owner boot identity"));
     }
     Ok(())
@@ -173,10 +175,7 @@ fn validate_boot(record: &OwnerRecord) -> io::Result<()> {
 
 pub(crate) fn from_previous_boot(record: &OwnerRecord) -> io::Result<bool> {
     validate_boot(record)?;
-    match (&record.boot_id, current_boot_id()?) {
-        (Some(original), Some(current)) => Ok(*original != current),
-        _ => Ok(false),
-    }
+    Ok(current_boot_id()?.is_some_and(|current| record.boot_id != current))
 }
 
 pub(crate) fn persist(directory: &Path, record: &OwnerRecord) -> io::Result<()> {
@@ -220,20 +219,15 @@ pub fn launch_detached_owner(directory: &Path, generation: &str) -> io::Result<(
 
 /// Run the internal owner on a single thread, before constructing any runtime.
 ///
-/// The directory must already contain its private launch record. A duplicate
-/// helper refuses the live lock or a non-prepared generation before launching.
-pub fn run_owner(directory: &Path) -> io::Result<()> {
-    run_owner_generation(directory, None)
-}
-
-/// Run only the generation selected by the launching runtime. Delayed helpers
+/// The directory must already contain its private launch record. Only the
+/// generation selected by the launching runtime runs, so delayed helpers
 /// cannot accidentally activate a replacement after cancellation or restart.
-pub fn run_owner_generation(directory: &Path, generation: Option<&str>) -> io::Result<()> {
+/// A duplicate helper refuses the live lock or a non-prepared generation
+/// before launching.
+pub fn run_owner_generation(directory: &Path, generation: &str) -> io::Result<()> {
     let lock = lock_owner(directory)?;
     let mut record = load(directory)?;
-    if generation.is_some_and(|generation| generation != record.nonce)
-        || (record.schema >= 2 && generation.is_none())
-    {
+    if generation != record.nonce {
         return Err(io::Error::other("process owner generation mismatch"));
     }
     if from_previous_boot(&record)? {
@@ -270,22 +264,19 @@ fn run_locked_owner(directory: &Path, record: &mut OwnerRecord, _lock: File) -> 
     }
     become_subreaper()?;
     exec::install_cancellation_handler()?;
-    let socket_path = socket_path(directory, record);
-    if record.launch.is_some() {
-        use std::os::unix::fs::DirBuilderExt;
-        let parent = socket_path
-            .parent()
-            .ok_or_else(|| io::Error::other("invalid socket path"))?;
-        // A previous owner that died before activation may leave this socket.
-        // The exclusive lock and Prepared phase fence all delayed launchers.
-        match std::fs::DirBuilder::new().mode(0o700).create(parent) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                validate_socket_directory(parent)?;
-                remove_socket(&socket_path)?;
-            }
-            Err(error) => return Err(error),
+    let socket_path = socket_path(record);
+    let parent = socket_path
+        .parent()
+        .ok_or_else(|| io::Error::other("invalid socket path"))?;
+    // A previous owner that died before activation may leave this socket.
+    // The exclusive lock and Prepared phase fence all delayed launchers.
+    match std::fs::DirBuilder::new().mode(0o700).create(parent) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            validate_socket_directory(parent)?;
+            remove_socket(&socket_path)?;
         }
+        Err(error) => return Err(error),
     }
     let listener = UnixListener::bind(&socket_path)?;
     listener.set_nonblocking(true)?;
@@ -337,6 +328,7 @@ fn run_locked_owner(directory: &Path, record: &mut OwnerRecord, _lock: File) -> 
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
             Err(error) => return Err(error),
         }
+        reap_orphans(owned.child.id(), &executions)?;
         if exit_code.is_none() {
             exit_code = observe_exit(owned.child.id())?;
         }
@@ -355,25 +347,37 @@ fn run_locked_owner(directory: &Path, record: &mut OwnerRecord, _lock: File) -> 
     }
 }
 
+/// Whether no process remains in the execution gate's process group.
+///
+/// The gate leads its own group, so its PID is also the group ID. This sends
+/// the null signal, which only asks the kernel whether the group exists, so it
+/// can never disturb a process that later reuses the ID. A reused group, or a
+/// zombie awaiting its reaper, reads as present; the caller just retries.
+pub(crate) fn process_group_absent(leader: u32) -> io::Result<bool> {
+    let group =
+        i32::try_from(leader).map_err(|_| io::Error::other("invalid recorded process group"))?;
+    match nix::sys::signal::killpg(Pid::from_raw(group), None) {
+        Ok(()) | Err(nix::errno::Errno::EPERM) => Ok(false),
+        Err(nix::errno::Errno::ESRCH) => Ok(true),
+        Err(error) => Err(io::Error::from(error)),
+    }
+}
+
 pub(crate) fn complete_retirement(directory: &Path, record: &mut OwnerRecord) -> io::Result<()> {
     let OwnerPhase::Retiring { exit_code } = record.phase else {
         return Err(io::Error::other("process retirement has no absence proof"));
     };
-    let socket = socket_path(directory, record);
-    if record.launch.is_some() {
-        let parent = socket
-            .parent()
-            .ok_or_else(|| io::Error::other("invalid socket path"))?;
-        match validate_socket_directory(parent) {
-            Ok(()) => {
-                remove_socket(&socket)?;
-                std::fs::remove_dir(parent)?;
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
+    let socket = socket_path(record);
+    let parent = socket
+        .parent()
+        .ok_or_else(|| io::Error::other("invalid socket path"))?;
+    match validate_socket_directory(parent) {
+        Ok(()) => {
+            remove_socket(&socket)?;
+            std::fs::remove_dir(parent)?;
         }
-    } else {
-        remove_socket(&socket)?;
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
     }
     record.phase = OwnerPhase::Retired { exit_code };
     persist(directory, record)
@@ -580,6 +584,47 @@ fn become_subreaper() -> io::Result<()> {
     Ok(())
 }
 
+/// Reap exited orphans that the subreaper adopted while the workload runs.
+///
+/// A double-forking workload hands its grandchildren to this owner. Without
+/// reaping, each one stays a zombie until the whole generation retires. The
+/// root child and exec helpers are left alone: `observe_exit` and each
+/// execution still need their exit statuses, and reaping would discard them.
+#[cfg(target_os = "linux")]
+fn reap_orphans(root: u32, executions: &[exec::Execution]) -> io::Result<()> {
+    use nix::sys::wait::{Id, WaitPidFlag, waitid, waitpid};
+    loop {
+        // WNOWAIT only peeks, so a tracked child's status stays in place.
+        let flags = WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT;
+        let pid = match waitid(Id::All, flags) {
+            Ok(status) => status.pid(),
+            Err(nix::errno::Errno::ECHILD) => None,
+            Err(error) => return Err(error.into()),
+        };
+        let Some(pid) = pid else {
+            return Ok(());
+        };
+        let raw = pid.as_raw() as u32;
+        if raw == root
+            || executions
+                .iter()
+                .any(|execution| execution.child_id() == Some(raw))
+        {
+            // Its own waiter collects it this tick; orphans wait for the next.
+            return Ok(());
+        }
+        // Only this single-threaded owner reaps, so the peeked PID is still
+        // that exited orphan.
+        waitpid(pid, Some(WaitPidFlag::WNOHANG))?;
+    }
+}
+
+/// macOS has no subreaper, so launchd adopts and reaps orphaned descendants.
+#[cfg(target_os = "macos")]
+fn reap_orphans(_root: u32, _executions: &[exec::Execution]) -> io::Result<()> {
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 fn retire_children(owner: &mut OwnedChild) -> io::Result<bool> {
     use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
@@ -673,5 +718,64 @@ fn retire_children(owner: &mut OwnedChild) -> io::Result<bool> {
         owner.child.wait()?;
         owner.reaped = true;
         return Ok(true);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(boot_id: String) -> OwnerRecord {
+        use super::super::oci::{OciLinux, OciProcess, OciRoot, OciSpec, OciUser};
+        OwnerRecord {
+            schema: 3,
+            boot_id,
+            nonce: "0".repeat(32),
+            command: vec!["true".into()],
+            environment: BTreeMap::new(),
+            phase: OwnerPhase::Prepared,
+            launch: ProcessLaunch {
+                instance_id: super::super::InstanceId("default__web-0".into()),
+                spec: OciSpec {
+                    root: OciRoot {
+                        path: "/".into(),
+                        readonly: false,
+                    },
+                    process: OciProcess {
+                        args: vec!["true".into()],
+                        env: vec![],
+                        cwd: "/".into(),
+                        user: OciUser { uid: 0, gid: 0 },
+                        capabilities: None,
+                        overrides: None,
+                    },
+                    mounts: vec![],
+                    linux: OciLinux {
+                        namespaces: vec![],
+                        resources: None,
+                        cgroups_path: None,
+                        uid_mappings: None,
+                        gid_mappings: None,
+                    },
+                    port_mapping: None,
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn host_has_a_stable_valid_boot_identity() {
+        let first = current_boot_id().unwrap().expect("host exposes no boot id");
+        assert!(valid_boot_id(&first), "{first}");
+        assert_eq!(first, first.to_ascii_lowercase());
+        assert_eq!(current_boot_id().unwrap(), Some(first));
+    }
+
+    #[test]
+    fn record_from_another_boot_is_from_a_previous_boot() {
+        let current = current_boot_id().unwrap().unwrap();
+        assert!(!from_previous_boot(&record(current)).unwrap());
+        let other = "00000000-0000-4000-8000-000000000000".to_owned();
+        assert!(from_previous_boot(&record(other)).unwrap());
     }
 }

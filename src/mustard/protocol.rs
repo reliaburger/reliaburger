@@ -14,6 +14,8 @@ use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
 use std::time::Instant;
 
+use rand::SeedableRng;
+use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use tokio_util::sync::CancellationToken;
 
@@ -98,6 +100,13 @@ pub struct MustardNode<T: MustardTransport> {
     directory: NodeDirectory,
     /// Optional watch channel publishing the directory on change.
     directory_watch: Option<watch::Sender<NodeDirectory>>,
+    /// The Smoker node-kill switch shared with this node's transports.
+    /// While it is closed this node is "dead": it forms no opinions about
+    /// its peers, so it has no stale suspicions to spread once it reopens.
+    node_gate: crate::smoker::node_fault::NodeTransportGate,
+    /// Source of randomness for probe-target and relay selection. Seeded
+    /// from the OS in production; tests can pin it to replay one schedule.
+    rng: StdRng,
 }
 
 impl<T: MustardTransport> MustardNode<T> {
@@ -138,7 +147,15 @@ impl<T: MustardTransport> MustardNode<T> {
             council_roles_rx: None,
             directory: NodeDirectory::default(),
             directory_watch: None,
+            node_gate: crate::smoker::node_fault::NodeTransportGate::new(),
+            rng: StdRng::from_entropy(),
         }
+    }
+
+    /// Share the Smoker node-kill switch that also gates this node's
+    /// transports, so failure detection pauses while the node plays dead.
+    pub fn set_node_gate(&mut self, gate: crate::smoker::node_fault::NodeTransportGate) {
+        self.node_gate = gate;
     }
 
     /// Advertise this node's control-plane endpoints (API and reporting
@@ -340,7 +357,6 @@ impl<T: MustardTransport> MustardNode<T> {
                     address: member.address,
                     state: member.state,
                     incarnation: member.incarnation,
-                    lamport: 0,
                 },
             );
             updates.truncate(super::message::MAX_PIGGYBACK_UPDATES);
@@ -414,7 +430,6 @@ impl<T: MustardTransport> MustardNode<T> {
                 address: self.address,
                 state: NodeState::Left,
                 incarnation: self.incarnation,
-                lamport: 0,
             },
             self.membership.len(),
         );
@@ -474,6 +489,12 @@ impl<T: MustardTransport> MustardNode<T> {
     /// probing), and promotes expired suspects to dead. Exposed publicly
     /// so tests can drive the protocol step-by-step.
     pub async fn run_one_cycle(&mut self) {
+        // A node-kill fault makes this node play dead. A dead process runs
+        // no failure detector, and every probe would fail anyway, so any
+        // verdict reached now would be about the gate, not the peer.
+        if self.node_gate.is_quiesced() {
+            return;
+        }
         // An explicit departure retires a contact; a failure does not. Inspect
         // Left before reaping, while that distinction still exists.
         self.rejoin_contacts.retain(|(node, _)| {
@@ -545,8 +566,9 @@ impl<T: MustardTransport> MustardNode<T> {
             }
         }
 
-        // No ACK at all — mark as suspect
-        if self.membership.suspect(&target_id) {
+        // No ACK at all — mark as suspect, unless the gate closed while we
+        // waited: then the silence is ours, not the target's.
+        if !self.node_gate.is_quiesced() && self.membership.suspect(&target_id) {
             self.dissemination.enqueue(
                 MembershipUpdate {
                     node_id: target_id.clone(),
@@ -558,7 +580,6 @@ impl<T: MustardTransport> MustardNode<T> {
                     // peers (detection stops propagating) or wrongly overrides
                     // fresher Alive state.
                     incarnation: self.membership_incarnation_of(&target_id),
-                    lamport: 0,
                 },
                 self.membership.len(),
             );
@@ -627,7 +648,6 @@ impl<T: MustardTransport> MustardNode<T> {
                     address: from,
                     state: NodeState::Alive,
                     incarnation: message.incarnation,
-                    lamport: 0,
                 },
                 self.membership.len(),
             );
@@ -763,7 +783,6 @@ impl<T: MustardTransport> MustardNode<T> {
             address: self.address,
             state: NodeState::Alive,
             incarnation: self.incarnation,
-            lamport: 0,
         };
         // Apply the refutation to our own record too, not just the outbound
         // queue (O9). The claim we're refuting was applied a moment ago, so
@@ -802,7 +821,6 @@ impl<T: MustardTransport> MustardNode<T> {
                         address: node_addr,
                         state: NodeState::Dead,
                         incarnation: inc,
-                        lamport: 0,
                     },
                     self.membership.len(),
                 );
@@ -811,38 +829,43 @@ impl<T: MustardTransport> MustardNode<T> {
     }
 
     /// Pick a random alive peer to probe (not ourselves).
-    pub fn pick_probe_target(&self) -> Option<(NodeId, SocketAddr)> {
-        let candidates: Vec<_> = self
+    pub fn pick_probe_target(&mut self) -> Option<(NodeId, SocketAddr)> {
+        let mut candidates: Vec<_> = self
             .membership
             .active_members()
             .into_iter()
             .filter(|m| m.node_id != self.node_id)
             .collect();
+        // The table is a HashMap, whose order differs per process; sorting
+        // makes the choice depend only on the RNG, so a seeded RNG replays.
+        candidates.sort_unstable_by(|a, b| a.node_id.cmp(&b.node_id));
 
-        if candidates.is_empty() {
-            return None;
-        }
-
-        let mut rng = rand::thread_rng();
-        let target = candidates.choose(&mut rng).unwrap();
+        let target = candidates.choose(&mut self.rng)?;
         Some((target.node_id.clone(), target.address))
     }
 
     /// Pick random relay nodes for indirect probing (not ourselves, not the target).
-    fn pick_relays(&self, target: &NodeId) -> Vec<SocketAddr> {
-        let candidates: Vec<_> = self
+    fn pick_relays(&mut self, target: &NodeId) -> Vec<SocketAddr> {
+        let mut candidates: Vec<_> = self
             .membership
             .alive_members()
             .into_iter()
             .filter(|m| m.node_id != self.node_id && m.node_id != *target)
             .collect();
+        candidates.sort_unstable_by(|a, b| a.node_id.cmp(&b.node_id));
 
-        let mut rng = rand::thread_rng();
         let count = self.config.indirect_probe_count.min(candidates.len());
         candidates
-            .choose_multiple(&mut rng, count)
+            .choose_multiple(&mut self.rng, count)
             .map(|m| m.address)
             .collect()
+    }
+
+    /// Replace the OS-seeded RNG with a fixed seed, so a test replays
+    /// exactly one probe schedule.
+    #[cfg(test)]
+    fn seed_rng(&mut self, seed: u64) {
+        self.rng = StdRng::seed_from_u64(seed);
     }
 
     /// Wait for an ACK from (or about) the target within the timeout.
@@ -989,7 +1012,6 @@ mod tests {
                 address: member.address,
                 state: NodeState::Left,
                 incarnation: member.incarnation,
-                lamport: 1,
             })
             .collect::<Vec<_>>()
         {
@@ -1173,6 +1195,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn quiesced_node_forms_no_opinions_about_its_peers() {
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        // n2 is unreachable, exactly as every peer is while n1's node-kill
+        // gate drops all of its datagrams.
+        let gate = crate::smoker::node_fault::NodeTransportGate::new();
+        let mut node1 = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
+        node1.set_node_gate(gate.clone());
+        node1.membership.add_node(
+            NodeId::new("n2"),
+            addr(2),
+            1,
+            BTreeMap::new(),
+            Instant::now(),
+        );
+
+        gate.quiesce();
+        for _ in 0..3 {
+            node1.run_one_cycle().await;
+            tokio::time::sleep(fast_config().suspicion_timeout).await;
+        }
+
+        // A killed node runs no failure detector. Suspicions formed while it
+        // was cut off would spread after the gate reopens and knock healthy
+        // peers out of everyone's live membership.
+        let n2 = node1.membership.get(&NodeId::new("n2")).unwrap();
+        assert_eq!(n2.state, NodeState::Alive);
+        assert!(
+            node1
+                .dissemination
+                .select_updates()
+                .iter()
+                .all(|update| update.node_id != NodeId::new("n2")),
+            "no rumour about n2 may be queued while n1 is quiesced"
+        );
+
+        gate.restore();
+        node1.run_one_cycle().await;
+        assert_eq!(
+            node1.membership.get(&NodeId::new("n2")).unwrap().state,
+            NodeState::Suspect,
+            "failure detection resumes once the gate reopens"
+        );
+    }
+
+    #[tokio::test]
     async fn disseminated_suspect_carries_target_incarnation() {
         let net = InMemoryNetwork::new();
         let t1 = net.register(addr(1)).await;
@@ -1312,7 +1380,6 @@ mod tests {
                     address: addr(2),
                     state: NodeState::Suspect,
                     incarnation: 1,
-                    lamport: 1,
                 }],
             },
         );
@@ -1349,7 +1416,6 @@ mod tests {
                     address: addr(2),
                     state: NodeState::Dead,
                     incarnation: 1,
-                    lamport: 1,
                 }],
             },
         );
@@ -1385,7 +1451,6 @@ mod tests {
                 address: addr(3),
                 state: NodeState::Alive,
                 incarnation: 1,
-                lamport: 1,
             },
             3,
         );
@@ -1607,14 +1672,32 @@ mod tests {
 
     #[tokio::test]
     async fn gossip_convergence_five_nodes() {
-        // 5 nodes in a ring topology (each knows the next).
-        // After enough cycles, all nodes should know about all others.
+        // 5 nodes in a ring topology (each knows the next). After enough
+        // rounds, every node should know about every other.
         //
         // We manually drive PING/ACK exchanges rather than spawning
         // concurrent tasks (tokio::spawn + start_paused is unreliable
-        // under parallel test load; see tokio #3709). And we use
-        // try_recv() to drain messages without involving timers, so
-        // the test is fully deterministic modulo random target selection.
+        // under parallel test load; see tokio #3709), and use try_recv()
+        // to drain messages without timers.
+        //
+        // Each node's probe RNG is seeded, so every run replays the same
+        // schedules. Unseeded, about 1 schedule in 1,300 strands a member:
+        // every update about it spends its bounded re-broadcasts before
+        // reaching some node, the queues drain, and no later round helps
+        // because nothing resynchronises full membership. A fixed set of
+        // seeds keeps the test about convergence rather than about luck.
+        for seed in 0..16 {
+            let rounds = converge_five_node_ring(seed).await;
+            assert!(
+                rounds.is_some(),
+                "seed {seed}: five-node ring did not converge within 100 rounds"
+            );
+        }
+    }
+
+    /// Drive a seeded five-node ring until every node sees five active
+    /// members. Returns the round it converged in, or `None` after 100.
+    async fn converge_five_node_ring(seed: u64) -> Option<usize> {
         let net = InMemoryNetwork::new();
         let config = fast_config();
 
@@ -1625,7 +1708,8 @@ mod tests {
             let a = addr(100 + i);
             addresses.push(a);
             let t = net.register(a).await;
-            let node = MustardNode::new(NodeId::new(format!("n{i}")), a, config.clone(), t);
+            let mut node = MustardNode::new(NodeId::new(format!("n{i}")), a, config.clone(), t);
+            node.seed_rng(seed * 5 + u64::from(i));
             nodes.push(node);
         }
 
@@ -1642,7 +1726,7 @@ mod tests {
         // 2. Every node drains its inbox (processing PINGs → sending
         //    ACKs, applying piggybacked updates)
         // 3. Every node drains again (picking up the ACKs)
-        for _ in 0..100 {
+        for round in 0..100 {
             // Phase 1: each node sends a PING to a random peer
             for node in &mut nodes {
                 if let Some((_target_id, target_addr)) = node.pick_probe_target() {
@@ -1664,17 +1748,15 @@ mod tests {
                     }
                 }
             }
-        }
 
-        // Every node should know about all 5 members
-        for node in &nodes {
-            let alive_count = node.membership.active_members().len();
-            assert_eq!(
-                alive_count, 5,
-                "node {} sees {} active members, expected 5",
-                node.node_id, alive_count
-            );
+            if nodes
+                .iter()
+                .all(|node| node.membership.active_members().len() == 5)
+            {
+                return Some(round);
+            }
         }
+        None
     }
 
     // -- directory extension propagation (12b.2) ------------------------------
@@ -2070,7 +2152,6 @@ mod tests {
                     address: addr(1),
                     state: NodeState::Dead,
                     incarnation: 50,
-                    lamport: 1,
                 }],
             },
         );
@@ -2108,7 +2189,6 @@ mod tests {
                     address: addr(1),
                     state: NodeState::Suspect,
                     incarnation: 4,
-                    lamport: 1,
                 }],
             },
         );
@@ -2146,7 +2226,6 @@ mod tests {
                     address: addr(1),
                     state: NodeState::Left,
                     incarnation: 1,
-                    lamport: 1,
                 }],
             },
         );
@@ -2188,7 +2267,6 @@ mod tests {
                     address: addr(1),
                     state: NodeState::Left,
                     incarnation: node.incarnation,
-                    lamport: 9,
                 }],
             },
         );

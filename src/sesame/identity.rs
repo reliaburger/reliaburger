@@ -13,6 +13,7 @@ use rcgen::{
 };
 use serde::{Deserialize, Serialize};
 
+use super::ca::CLOCK_SKEW_BACKDATE;
 use super::cert;
 use super::types::{SerialNumber, SpiffeUri, WorkloadIdentity};
 
@@ -24,11 +25,6 @@ pub const ROTATION_INTERVAL: Duration = Duration::from_secs(1800);
 
 /// Maximum grace period extension when council is unreachable: 4 hours.
 pub const GRACE_PERIOD_EXTENSION: Duration = Duration::from_secs(4 * 3600);
-
-/// How far a workload certificate's `not_before` is backdated, so a signer
-/// and verifier whose clocks disagree by a few minutes still accept a
-/// freshly issued certificate.
-pub const CLOCK_SKEW_BACKDATE: Duration = Duration::from_secs(300);
 
 /// Errors from workload identity operations.
 #[derive(Debug, thiserror::Error)]
@@ -425,8 +421,8 @@ pub fn write_identity_files(
 /// Load a workload identity back from its per-instance directory.
 ///
 /// Returns `Ok(None)` when no identity has been written there (no
-/// `meta.json`) — a legacy app-scoped directory or a not-yet-provisioned
-/// instance. Used at adoption so a restarted Bun keeps each workload's
+/// `meta.json`, which is written last) — a not-yet-provisioned instance or
+/// an interrupted write. Used at adoption so a restarted Bun keeps each workload's
 /// identity and rotation schedule instead of `identity: None` (D9).
 pub fn load_identity(dir: &Path) -> Result<Option<WorkloadIdentity>, IdentityError> {
     let meta_path = dir.join(IDENTITY_META_FILE);
@@ -1035,13 +1031,13 @@ mod tests {
         assert!(!loaded.grace_extended);
     }
 
-    /// A directory without `meta.json` (legacy app-scoped layout, or a
-    /// not-yet-provisioned instance) loads as `None`, never an error.
+    /// A directory without `meta.json` (a not-yet-provisioned instance or
+    /// an interrupted write) loads as `None`, never an error.
     #[test]
     fn load_identity_returns_none_without_metadata() {
         let dir = tempfile::tempdir().unwrap();
         assert!(load_identity(dir.path()).unwrap().is_none());
-        // A legacy-style dir with stray files but no sidecar: still None.
+        // Stray files from an interrupted write but no sidecar: still None.
         std::fs::write(dir.path().join("cert.pem"), b"stale").unwrap();
         assert!(load_identity(dir.path()).unwrap().is_none());
     }

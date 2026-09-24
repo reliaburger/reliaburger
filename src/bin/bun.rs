@@ -15,7 +15,7 @@ use reliaburger::bun::agent::BunAgent;
 use reliaburger::bun::api;
 use reliaburger::config::node::NodeConfig;
 use reliaburger::grill::port::PortAllocator;
-use reliaburger::grill::{AnyGrill, ProcessGrill, detect_runtime};
+use reliaburger::grill::{AnyGrill, DetectedRuntime, ProcessGrill, detect_runtime};
 use reliaburger::ketchup::log_store::LogStore;
 use reliaburger::mayo::alert::AlertEvaluator;
 use reliaburger::mayo::collector::SystemCollector;
@@ -44,10 +44,6 @@ struct Cli {
     #[arg(long, default_value = "auto")]
     runtime: String,
 
-    /// Standalone qualification of durable OCI ownership; not production activation.
-    #[arg(long, hide = true)]
-    experimental_owned_runc: bool,
-
     /// Join/form a cluster using the `[cluster]` config (gossip membership).
     /// Without this flag, bun runs as a single node, as before.
     /// Container clusters require rootful Linux Runc; rootless Runc is standalone only.
@@ -69,9 +65,9 @@ enum Command {
         directory: PathBuf,
         /// Exact generation selected before launching the helper.
         #[arg(long)]
-        generation: Option<String>,
+        generation: String,
         /// Reparent the durable owner before acknowledging the launcher.
-        #[arg(long, requires = "generation")]
+        #[arg(long)]
         detach: bool,
     },
     /// Internal workload activation gate; never executes before durable ownership.
@@ -620,19 +616,13 @@ fn main() -> anyhow::Result<()> {
             detach,
         }) => {
             if *detach {
-                let generation = generation
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("detached owner requires a generation"))?;
                 return reliaburger::grill::process_owner::launch_detached_owner(
                     directory, generation,
                 )
                 .map_err(Into::into);
             }
-            return reliaburger::grill::process_owner::run_owner_generation(
-                directory,
-                generation.as_deref(),
-            )
-            .map_err(Into::into);
+            return reliaburger::grill::process_owner::run_owner_generation(directory, generation)
+                .map_err(Into::into);
         }
         Some(Command::ProcessExecutionGate { directory }) => {
             return reliaburger::grill::process_owner::run_execution_gate(directory)
@@ -944,20 +934,6 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             "durable ownership requires its original runtime and enforcement mode; refusing a mode change"
         );
     }
-    let runtime = if cli.experimental_owned_runc || durable_discovery {
-        if cli.experimental_owned_runc && cli.cluster && !durable_discovery {
-            anyhow::bail!("owned Runc qualification requires a supported durable cluster profile");
-        }
-        match runtime {
-            #[cfg(target_os = "linux")]
-            AnyGrill::Runc(runtime) => {
-                AnyGrill::Runc(runtime.with_owner(std::env::current_exe()?)?)
-            }
-            _ => anyhow::bail!("owned Runc qualification requires the Linux runc runtime"),
-        }
-    } else {
-        runtime
-    };
     // DNS is a workload capability, not a best-effort side task. Select the
     // runtime first so we can derive its reachable resolver address, then bind
     // both sockets before starting the agent, reporting readiness or adopting
@@ -1188,6 +1164,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         config.security.bootstrap_peers.clone(),
     );
     agent.set_smoker_config(config.smoker.to_smoker_config());
+    agent.set_stop_confirmation_timeout(config.runtime.stop_confirmation_timeout());
     let node_pressure_available = agent.configure_node_pressure(
         reliaburger::smoker::node_pressure::NodePressureLimits {
             max_cpu_percentage: config.testing.max_node_pressure_cpu_percent,
@@ -1361,6 +1338,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                 aggregated_rx,
                 config.dns.enabled,
                 config.reconstruction.clone(),
+                Some(readiness.clone()),
                 shutdown.clone(),
             ));
             // L3: leader-only autoscale loop, feeding on the same rollup
@@ -1738,6 +1716,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     let collection_interval = config.metrics.collection_interval_secs.max(1);
     let collection_shutdown = shutdown.clone();
     let collection_cmd_tx = cmd_tx.clone();
+    let collection_node = node_name.clone();
     feeder_handles.push(tokio::spawn(async move {
         let mut collector = SystemCollector::new();
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(collection_interval));
@@ -1762,11 +1741,19 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                         .is_ok()
                         && let Ok(statuses) = status_rx.await
                     {
-                        let instances: Vec<(Option<u32>, &str, &str)> = statuses
-                            .iter()
-                            .map(|s| (s.pid, s.namespace.as_str(), s.app_name.as_str()))
-                            .collect();
-                        samples.extend(collector.collect_instance_metrics(&instances));
+                        let instances: Vec<reliaburger::mayo::collector::InstanceProcess<'_>> =
+                            statuses
+                                .iter()
+                                .map(|s| reliaburger::mayo::collector::InstanceProcess {
+                                    pid: s.pid,
+                                    namespace: &s.namespace,
+                                    app: &s.app_name,
+                                    instance: &s.id,
+                                })
+                                .collect();
+                        samples.extend(
+                            collector.collect_instance_metrics(&instances, &collection_node),
+                        );
                     }
 
                     // Ingress metrics (E): fold the wrapper's process-global
@@ -1785,6 +1772,16 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                         samples.push(reliaburger::mayo::collector::CollectedMetric {
                             key: reliaburger::mayo::types::MetricKey::simple(name),
                             value: value as f64,
+                        });
+                    }
+
+                    // The leader's withdrawal ledger (zero on followers).
+                    for (name, value) in
+                        reliaburger::cluster::orchestrate::withdrawal_ledger_gauge().samples()
+                    {
+                        samples.push(reliaburger::mayo::collector::CollectedMetric {
+                            key: reliaburger::mayo::types::MetricKey::simple(name),
+                            value,
                         });
                     }
 
@@ -1809,6 +1806,59 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             }
         }
     }));
+
+    // Scrape this node's own instances of apps that declare `metrics` (Z6.5).
+    // The loop asks the agent for targets over the command channel and does
+    // the HTTP work itself, so a slow or hung app never stalls the agent.
+    // Each request is bounded by half the interval (at most 5 s), so a sweep
+    // finishes before the next one is due.
+    {
+        let scrape_mayo = Arc::clone(&mayo_store);
+        let interval =
+            std::time::Duration::from_secs(config.metrics.app_scrape_interval_secs.max(1));
+        let timeout = (interval / 2).clamp(
+            std::time::Duration::from_millis(500),
+            std::time::Duration::from_secs(5),
+        );
+        let scrape_shutdown = shutdown.clone();
+        let scrape_cmd_tx = cmd_tx.clone();
+        let scrape_node = node_name.clone();
+        feeder_handles.push(tokio::spawn(async move {
+            let client = reqwest::Client::builder()
+                .timeout(timeout)
+                .build()
+                .unwrap_or_default();
+            let mut tick = tokio::time::interval(interval);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = scrape_shutdown.cancelled() => break,
+                    _ = tick.tick() => {
+                        let (response, targets) = tokio::sync::oneshot::channel();
+                        if scrape_cmd_tx
+                            .send(reliaburger::bun::agent::AgentCommand::ScrapeTargets { response })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        let Ok(targets) = targets.await else { continue };
+                        if targets.is_empty() {
+                            continue;
+                        }
+                        reliaburger::mayo::scrape::scrape_app_targets(
+                            &scrape_mayo,
+                            &client,
+                            &targets,
+                            &scrape_node,
+                            timeout,
+                        )
+                        .await;
+                    }
+                }
+            }
+        }));
+    }
 
     // Spawn Prometheus scrape task (E). Only when targets are configured —
     // an empty list means scraping is disabled and no loop is spawned.
@@ -3012,22 +3062,19 @@ async fn select_runtime(
     let _ = image_directory;
     match name {
         "auto" => {
-            let runtime = detect_runtime().await;
-            // The process fallback uses durable owners so launches remain
+            // Both runtimes use durable owners, so launches remain
             // discoverable even before agent adoption is recorded.
-            let runtime = match runtime {
-                AnyGrill::Process(_) => AnyGrill::Process(ProcessGrill::with_owner(
+            let runtime = match detect_runtime().await {
+                DetectedRuntime::Process => AnyGrill::Process(ProcessGrill::with_owner(
                     instances_dir.to_path_buf(),
                     std::env::current_exe()?,
                 )),
                 #[cfg(target_os = "linux")]
-                AnyGrill::Runc(detected) => AnyGrill::Runc(create_runc_runtime(
+                DetectedRuntime::Runc { rootless } => AnyGrill::Runc(create_runc_runtime(
                     instances_dir,
                     image_directory,
-                    detected.is_rootless(),
-                )),
-                #[cfg(target_os = "macos")]
-                AnyGrill::Apple(_) => anyhow::bail!(APPLE_RUNTIME_DEFERRED),
+                    rootless,
+                )?),
             };
             let kind = match &runtime {
                 AnyGrill::Process(_) => "process",
@@ -3052,7 +3099,7 @@ async fn select_runtime(
             let mode = if is_rootless { "rootless" } else { "root" };
             println!("bun: using runc runtime ({mode})");
 
-            let grill = create_runc_runtime(instances_dir, image_directory, is_rootless);
+            let grill = create_runc_runtime(instances_dir, image_directory, is_rootless)?;
             Ok(AnyGrill::Runc(grill))
         }
         "apple" => anyhow::bail!(APPLE_RUNTIME_DEFERRED),
@@ -3065,16 +3112,17 @@ fn create_runc_runtime(
     instances_dir: &std::path::Path,
     image_directory: &std::path::Path,
     rootless: bool,
-) -> reliaburger::grill::runc::RuncGrill {
+) -> anyhow::Result<reliaburger::grill::runc::RuncGrill> {
     // Runtime ownership must follow the node's actual storage directories,
     // including configured paths and explicit storage fallback selection.
     let runtime_directory = instances_dir.join("runc");
-    reliaburger::grill::runc::RuncGrill::new(
+    Ok(reliaburger::grill::runc::RuncGrill::new(
         runtime_directory.join("bundles"),
         reliaburger::grill::ImageStore::new(image_directory.to_path_buf()),
         rootless,
         runtime_directory.join("state"),
-    )
+        std::env::current_exe()?,
+    )?)
 }
 
 async fn runtime_version(runtime: &str) -> Option<String> {
@@ -3289,7 +3337,8 @@ mod tests {
         for node in ["first", "second"] {
             let instances = root.path().join(node).join("instances");
             let runtime =
-                create_runc_runtime(&instances, &root.path().join(node).join("images"), true);
+                create_runc_runtime(&instances, &root.path().join(node).join("images"), true)
+                    .unwrap();
             let spec: reliaburger::grill::oci::OciSpec = serde_json::from_value(serde_json::json!({
                 "root": {"path": "/", "readonly": true},
                 "process": {"args": [node], "env": [], "cwd": "/", "user": {"uid": 0, "gid": 0}},
@@ -3378,7 +3427,9 @@ mod tests {
             reliaburger::grill::ImageStore::new(temp.path().join("images")),
             false,
             temp.path().join("state"),
-        );
+            std::env::current_exe().unwrap(),
+        )
+        .unwrap();
         let expected = grill.dns_gateway_address().unwrap();
 
         let (_, nameserver, freebind) =
@@ -3397,7 +3448,9 @@ mod tests {
             reliaburger::grill::ImageStore::new(temp.path().join("images")),
             false,
             temp.path().join("state"),
-        );
+            std::env::current_exe().unwrap(),
+        )
+        .unwrap();
 
         let error = configure_workload_dns(AnyGrill::Runc(grill), "127.0.0.53:53".parse().unwrap())
             .err()

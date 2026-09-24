@@ -224,10 +224,7 @@ impl VolumeManager {
 
     /// The recorded backend of a provisioned volume, if any.
     pub fn backend_of(&self, host_path: &Path) -> Option<super::btrfs::VolumeBackend> {
-        let bytes = std::fs::read(Self::sidecar_path(host_path)).ok()?;
-        serde_json::from_slice::<VolumeSidecar>(&bytes)
-            .ok()
-            .map(|s| s.backend)
+        read_sidecar(host_path).map(|sidecar| sidecar.backend)
     }
 
     fn write_backend(
@@ -235,13 +232,14 @@ impl VolumeManager {
         host_path: &Path,
         backend: super::btrfs::VolumeBackend,
     ) -> Result<(), VolumeError> {
-        let sidecar = VolumeSidecar { schema: 1, backend };
-        let json = serde_json::to_vec_pretty(&sidecar).map_err(|e| VolumeError::CreateFailed {
-            path: host_path.display().to_string(),
-            reason: format!("sidecar serialise: {e}"),
-        })?;
-        std::fs::write(Self::sidecar_path(host_path), json)?;
-        Ok(())
+        write_sidecar(
+            host_path,
+            &VolumeSidecar {
+                schema: 1,
+                backend,
+                owner: None,
+            },
+        )
     }
 
     /// Sidecar sibling of the volume directory:
@@ -351,6 +349,252 @@ impl VolumeManager {
 struct VolumeSidecar {
     schema: u32,
     backend: super::btrfs::VolumeBackend,
+    /// Who the volume was last handed to; `None` until its first mount.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner: Option<VolumeOwner>,
+}
+
+fn read_sidecar(host_path: &Path) -> Option<VolumeSidecar> {
+    let bytes = std::fs::read(VolumeManager::sidecar_path(host_path)).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Replace the sidecar atomically: a torn sidecar reads as "never
+/// provisioned", and provisioning again would stack loop mounts.
+fn write_sidecar(host_path: &Path, sidecar: &VolumeSidecar) -> Result<(), VolumeError> {
+    let json = serde_json::to_vec_pretty(sidecar).map_err(|e| VolumeError::CreateFailed {
+        path: host_path.display().to_string(),
+        reason: format!("sidecar serialise: {e}"),
+    })?;
+    let path = VolumeManager::sidecar_path(host_path);
+    let staged = path.with_extension("json.tmp");
+    std::fs::write(&staged, json)?;
+    std::fs::rename(&staged, &path)?;
+    Ok(())
+}
+
+/// A host uid and gid: who a container process runs as, or who owns a file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct VolumeOwner {
+    pub uid: u32,
+    pub gid: u32,
+}
+
+impl std::fmt::Display for VolumeOwner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.uid, self.gid)
+    }
+}
+
+/// What happens to a managed volume's ownership before a container mounts it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnershipPlan {
+    /// Already handed to this user. Nothing changes, so whatever the
+    /// container did with its files (an entrypoint handing them to a
+    /// service user, say) survives the restart.
+    Keep,
+    /// Never handed over, or its root belongs to an id outside the
+    /// container range: the whole tree becomes the container user's.
+    HandOver,
+    /// Handed to a different user before (the image's `USER` or the app's
+    /// `run_as_user` changed): files still owned by that user, or in its
+    /// group, move to the new one. Everything else stays put.
+    Rehome { from: VolumeOwner },
+}
+
+/// Decide how a managed volume's ownership changes for a container user.
+///
+/// `recorded` is who the volume was last handed to, `root` who owns its
+/// top directory now, `wanted` the container process's host ids. Only a
+/// first mount, a changed user, or a root nobody in the container range
+/// owns (a snapshot restored from before the first mount, a host-side
+/// `chown`) walks the tree. An unchanged user costs nothing, however much
+/// data the volume holds.
+pub fn plan_ownership(
+    recorded: Option<VolumeOwner>,
+    root: VolumeOwner,
+    wanted: VolumeOwner,
+) -> OwnershipPlan {
+    let root_mapped = super::userns::container_id(root.uid).is_some()
+        && super::userns::container_id(root.gid).is_some();
+    match recorded {
+        _ if !root_mapped => OwnershipPlan::HandOver,
+        None => OwnershipPlan::HandOver,
+        Some(previous) if previous == wanted => OwnershipPlan::Keep,
+        Some(previous) => OwnershipPlan::Rehome { from: previous },
+    }
+}
+
+/// Mode a handed-over volume's root gets: the owner writes, others read.
+/// Entrypoints that want it tighter (Postgres wants 0700) `chmod` it
+/// themselves, which they can, because they own it.
+const HANDED_OVER_MODE: u32 = 0o755;
+
+/// Give a managed volume to the container user about to mount it.
+///
+/// Returns `Ok(None)` when `host_path` has no provisioning sidecar, i.e.
+/// it isn't a volume Bun manages: host directories are never chowned.
+/// The new owner is recorded only after the walk finishes, so an
+/// interrupted hand-over runs again on the next start.
+pub fn hand_to_container_user(
+    host_path: &Path,
+    wanted: VolumeOwner,
+) -> Result<Option<OwnershipPlan>, VolumeError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let Some(mut sidecar) = read_sidecar(host_path) else {
+        return Ok(None);
+    };
+    let metadata = std::fs::symlink_metadata(host_path)?;
+    if !metadata.is_dir() {
+        return Err(VolumeError::CreateFailed {
+            path: host_path.display().to_string(),
+            reason: "managed volume is not a directory".to_string(),
+        });
+    }
+    let root = VolumeOwner {
+        uid: metadata.uid(),
+        gid: metadata.gid(),
+    };
+    let plan = plan_ownership(sidecar.owner, root, wanted);
+    match plan {
+        OwnershipPlan::Keep => return Ok(Some(plan)),
+        OwnershipPlan::HandOver => {
+            chown_tree(host_path, &|_| Some(wanted))?;
+            std::fs::set_permissions(host_path, std::fs::Permissions::from_mode(HANDED_OVER_MODE))?;
+        }
+        OwnershipPlan::Rehome { from } => {
+            chown_tree(host_path, &|current| {
+                let moved = VolumeOwner {
+                    uid: if current.uid == from.uid {
+                        wanted.uid
+                    } else {
+                        current.uid
+                    },
+                    gid: if current.gid == from.gid {
+                        wanted.gid
+                    } else {
+                        current.gid
+                    },
+                };
+                (moved != current).then_some(moved)
+            })?;
+        }
+    }
+    sidecar.owner = Some(wanted);
+    write_sidecar(host_path, &sidecar)?;
+    Ok(Some(plan))
+}
+
+/// Change the owner of `root` and everything under it to whatever
+/// `new_owner` says (`None` leaves an entry alone).
+///
+/// A container of the same app may still be running on this volume (a
+/// rolling update), so it can swap a directory for a symlink to `/etc`
+/// mid-walk. Every step therefore goes through the parent directory's
+/// descriptor with "don't follow symlinks" flags: the walk can't be
+/// steered out of the volume by a path it looked at a moment ago. It uses
+/// an explicit stack, not recursion, so a maliciously deep tree fails
+/// with an error rather than overflowing Bun's stack.
+fn chown_tree(
+    root: &Path,
+    new_owner: &dyn Fn(VolumeOwner) -> Option<VolumeOwner>,
+) -> Result<(), VolumeError> {
+    use nix::dir::Dir;
+    use nix::errno::Errno;
+    use nix::fcntl::{AtFlags, OFlag};
+    use nix::sys::stat::{Mode, SFlag, fstat, fstatat};
+    use nix::unistd::{Gid, Uid, fchown, fchownat};
+    use std::os::fd::AsRawFd;
+    use std::rc::Rc;
+
+    let directory_flags =
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+    let owner_of = |stat: &nix::sys::stat::FileStat| VolumeOwner {
+        uid: stat.st_uid,
+        gid: stat.st_gid,
+    };
+    let is_directory = |stat: &nix::sys::stat::FileStat| {
+        SFlag::from_bits_truncate(stat.st_mode) & SFlag::S_IFMT == SFlag::S_IFDIR
+    };
+    // Names under an open directory, which later `*at` calls resolve
+    // against. `Rc` (a reference-counted pointer) lets every child share
+    // its parent's descriptor, which closes when the last child is done.
+    let children = |mut directory: Dir| -> Result<Vec<(Rc<Dir>, std::ffi::CString)>, Errno> {
+        let mut names = Vec::new();
+        for entry in directory.iter() {
+            let name = entry?.file_name().to_owned();
+            if name.as_bytes() != b"." && name.as_bytes() != b".." {
+                names.push(name);
+            }
+        }
+        let directory = Rc::new(directory);
+        Ok(names
+            .into_iter()
+            .map(|name| (Rc::clone(&directory), name))
+            .collect())
+    };
+    let io = |errno: Errno| VolumeError::Io(std::io::Error::from(errno));
+
+    let top = Dir::open(root, directory_flags, Mode::empty()).map_err(io)?;
+    let stat = fstat(top.as_raw_fd()).map_err(io)?;
+    if let Some(owner) = new_owner(owner_of(&stat)) {
+        fchown(
+            top.as_raw_fd(),
+            Some(Uid::from_raw(owner.uid)),
+            Some(Gid::from_raw(owner.gid)),
+        )
+        .map_err(io)?;
+    }
+    let mut pending = children(top).map_err(io)?;
+    while let Some((parent, name)) = pending.pop() {
+        let parent_fd = Some(parent.as_raw_fd());
+        let stat = match fstatat(parent_fd, name.as_c_str(), AtFlags::AT_SYMLINK_NOFOLLOW) {
+            Ok(stat) => stat,
+            // Deleted by the running container since we listed it.
+            Err(Errno::ENOENT) => continue,
+            Err(errno) => return Err(io(errno)),
+        };
+        if let Some(owner) = new_owner(owner_of(&stat)) {
+            match fchownat(
+                parent_fd,
+                name.as_c_str(),
+                Some(Uid::from_raw(owner.uid)),
+                Some(Gid::from_raw(owner.gid)),
+                AtFlags::AT_SYMLINK_NOFOLLOW,
+            ) {
+                Ok(()) | Err(Errno::ENOENT) => {}
+                Err(errno) => return Err(io(errno)),
+            }
+        }
+        if !is_directory(&stat) {
+            continue;
+        }
+        match Dir::openat(parent_fd, name.as_c_str(), directory_flags, Mode::empty()) {
+            Ok(directory) => pending.extend(children(directory).map_err(io)?),
+            // Swapped for a symlink or a file, or removed: not ours to walk.
+            Err(Errno::ELOOP | Errno::ENOTDIR | Errno::ENOENT) => continue,
+            Err(errno) => return Err(io(errno)),
+        }
+    }
+    Ok(())
+}
+
+/// Whether a container process running as `user` (host ids) can write
+/// into a directory owned by `directory` with permission bits `mode`.
+///
+/// Judged from the mode bits alone (no ACLs, no supplementary groups), so
+/// it's a hint for a warning, not a guarantee. Container root holds
+/// `CAP_DAC_OVERRIDE`, but inside a user namespace that only reaches
+/// files whose owner and group the namespace maps.
+pub fn container_can_write(directory: VolumeOwner, mode: u32, user: VolumeOwner) -> bool {
+    let container_root = super::userns::container_id(user.uid) == Some(0);
+    let directory_mapped = super::userns::container_id(directory.uid).is_some()
+        && super::userns::container_id(directory.gid).is_some();
+    (container_root && directory_mapped)
+        || (directory.uid == user.uid && mode & 0o200 != 0)
+        || (directory.gid == user.gid && mode & 0o020 != 0)
+        || mode & 0o002 != 0
 }
 
 /// Check if the current process is running as root.
@@ -480,6 +724,144 @@ mod tests {
         assert!(path.exists());
     }
 
+    fn mapped(container: u32) -> VolumeOwner {
+        let host = crate::grill::userns::host_id(container).unwrap();
+        VolumeOwner {
+            uid: host,
+            gid: host,
+        }
+    }
+
+    const HOST_ROOT: VolumeOwner = VolumeOwner { uid: 0, gid: 0 };
+
+    #[test]
+    fn a_fresh_volume_is_handed_to_the_container_user() {
+        // Just provisioned: owned by the node's root, never handed over.
+        assert_eq!(
+            plan_ownership(None, HOST_ROOT, mapped(999)),
+            OwnershipPlan::HandOver
+        );
+    }
+
+    #[test]
+    fn a_populated_volume_of_the_same_user_is_left_alone() {
+        // Redis: handed to image root, whose entrypoint then chowned /data
+        // to redis (999). Re-chowning to root on every start would fight it.
+        assert_eq!(
+            plan_ownership(Some(mapped(0)), mapped(999), mapped(0)),
+            OwnershipPlan::Keep
+        );
+        assert_eq!(
+            plan_ownership(Some(mapped(999)), mapped(999), mapped(999)),
+            OwnershipPlan::Keep
+        );
+    }
+
+    #[test]
+    fn a_changed_container_user_rehomes_the_previous_users_files() {
+        assert_eq!(
+            plan_ownership(Some(mapped(1000)), mapped(1000), mapped(2000)),
+            OwnershipPlan::Rehome { from: mapped(1000) }
+        );
+    }
+
+    #[test]
+    fn a_root_outside_the_container_range_is_handed_over_again() {
+        // A snapshot restored from before the first mount, or a host-side
+        // chown: the recorded owner no longer describes the tree.
+        assert_eq!(
+            plan_ownership(Some(mapped(999)), HOST_ROOT, mapped(999)),
+            OwnershipPlan::HandOver
+        );
+        let half_mapped = VolumeOwner {
+            uid: mapped(999).uid,
+            gid: 0,
+        };
+        assert_eq!(
+            plan_ownership(Some(mapped(999)), half_mapped, mapped(999)),
+            OwnershipPlan::HandOver
+        );
+    }
+
+    #[test]
+    fn host_directories_are_never_chowned() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::set_permissions(&data, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+
+        let plan = hand_to_container_user(&data, mapped(999)).unwrap();
+
+        assert_eq!(plan, None, "no sidecar, so not a managed volume");
+        let mode = std::os::unix::fs::PermissionsExt::mode(
+            &std::fs::metadata(&data).unwrap().permissions(),
+        );
+        assert_eq!(mode & 0o777, 0o700);
+    }
+
+    #[test]
+    fn handing_over_records_the_owner_and_opens_the_root() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let vm = VolumeManager::new(dir.path());
+        let path = vm
+            .create_managed_volume("default", "redis", Path::new("/data"), None)
+            .unwrap();
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        std::fs::create_dir(path.join("nested")).unwrap();
+        std::fs::write(path.join("nested/file"), b"x").unwrap();
+        // Without root the only owner we can hand to is ourselves. That
+        // still runs the whole hand-over, because our uid is outside the
+        // container range.
+        let me = std::fs::metadata(&path).unwrap();
+        let me = VolumeOwner {
+            uid: me.uid(),
+            gid: me.gid(),
+        };
+
+        let plan = hand_to_container_user(&path, me).unwrap();
+
+        assert_eq!(plan, Some(OwnershipPlan::HandOver));
+        assert_eq!(read_sidecar(&path).unwrap().owner, Some(me));
+        let mode = std::os::unix::fs::PermissionsExt::mode(
+            &std::fs::metadata(&path).unwrap().permissions(),
+        );
+        assert_eq!(mode & 0o777, 0o755);
+        assert_eq!(std::fs::read(path.join("nested/file")).unwrap(), b"x");
+        // Provisioning again (every instance start) keeps the record.
+        vm.create_managed_volume("default", "redis", Path::new("/data"), None)
+            .unwrap();
+        assert_eq!(read_sidecar(&path).unwrap().owner, Some(me));
+        assert_eq!(
+            vm.backend_of(&path),
+            Some(crate::grill::btrfs::VolumeBackend::Plain)
+        );
+    }
+
+    #[test]
+    fn container_writes_need_ownership_group_or_world_write() {
+        let redis = mapped(999);
+        // Host root's 0755 directory: nobody in the container can write.
+        assert!(!container_can_write(HOST_ROOT, 0o755, redis));
+        assert!(!container_can_write(HOST_ROOT, 0o755, mapped(0)));
+        assert!(container_can_write(redis, 0o755, redis));
+        assert!(!container_can_write(redis, 0o555, redis));
+        assert!(container_can_write(
+            VolumeOwner {
+                uid: 0,
+                gid: redis.gid
+            },
+            0o775,
+            redis
+        ));
+        assert!(container_can_write(HOST_ROOT, 0o1777, redis));
+        // Container root overrides permissions on files the namespace maps.
+        assert!(container_can_write(redis, 0o700, mapped(0)));
+    }
+
     #[test]
     fn check_usage_empty_dir() {
         let dir = tempfile::tempdir().unwrap();
@@ -517,6 +899,140 @@ mod tests {
             .status()
             .unwrap_or_else(|e| panic!("{program} failed to run: {e}"));
         assert!(status.success(), "{program} {args:?} failed");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn owner_of(path: &Path) -> VolumeOwner {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::symlink_metadata(path).unwrap();
+        VolumeOwner {
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+        }
+    }
+
+    /// A changed container user takes over only what the previous one
+    /// owned, and a symlink the container planted is never followed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires Linux root"]
+    fn rehoming_moves_only_the_previous_users_files_and_never_follows_symlinks() {
+        assert!(is_root(), "chowning into the container range needs root");
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::write(&outside, b"host file").unwrap();
+        let vm = VolumeManager::new(dir.path().join("volumes"));
+        let path = vm
+            .create_managed_volume("default", "app", Path::new("/data"), None)
+            .unwrap();
+        std::fs::create_dir(path.join("sub")).unwrap();
+        std::fs::write(path.join("sub/mine"), b"x").unwrap();
+
+        let plan = hand_to_container_user(&path, mapped(0)).unwrap();
+        assert_eq!(plan, Some(OwnershipPlan::HandOver));
+        assert_eq!(owner_of(&path.join("sub/mine")), mapped(0));
+        // What the entrypoint would do: give a file to a service user,
+        // and plant links out of the volume.
+        let container_made = |name: &str, owner: VolumeOwner| {
+            std::os::unix::fs::lchown(path.join(name), Some(owner.uid), Some(owner.gid)).unwrap();
+        };
+        std::fs::write(path.join("service"), b"y").unwrap();
+        container_made(
+            "service",
+            VolumeOwner {
+                uid: mapped(999).uid,
+                gid: mapped(0).gid,
+            },
+        );
+        std::os::unix::fs::symlink(&outside, path.join("link")).unwrap();
+        container_made("link", mapped(0));
+        std::os::unix::fs::symlink(dir.path(), path.join("dirlink")).unwrap();
+        container_made("dirlink", mapped(0));
+
+        assert_eq!(
+            hand_to_container_user(&path, mapped(0)).unwrap(),
+            Some(OwnershipPlan::Keep)
+        );
+        assert_eq!(owner_of(&path.join("service")).uid, mapped(999).uid);
+
+        let plan = hand_to_container_user(&path, mapped(1000)).unwrap();
+        assert_eq!(plan, Some(OwnershipPlan::Rehome { from: mapped(0) }));
+        assert_eq!(owner_of(&path), mapped(1000));
+        assert_eq!(owner_of(&path.join("sub/mine")), mapped(1000));
+        assert_eq!(
+            owner_of(&path.join("service")),
+            VolumeOwner {
+                uid: mapped(999).uid,
+                gid: mapped(1000).gid
+            },
+            "the service user's file keeps its user"
+        );
+        assert_eq!(owner_of(&path.join("link")), mapped(1000));
+        assert_eq!(owner_of(&outside), HOST_ROOT, "symlink target untouched");
+        assert_eq!(
+            owner_of(dir.path()),
+            HOST_ROOT,
+            "linked directory untouched"
+        );
+        assert_eq!(read_sidecar(&path).unwrap().owner, Some(mapped(1000)));
+    }
+
+    /// Btrfs snapshots carry ownership with the data, and the sidecar
+    /// survives a restore, so a restored volume needs no second hand-over.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires Linux root, Btrfs tools, and RELIABURGER_BTRFS_TESTS=1"]
+    fn a_restored_btrfs_volume_keeps_its_container_ownership() {
+        assert!(
+            std::env::var("RELIABURGER_BTRFS_TESTS").is_ok(),
+            "set RELIABURGER_BTRFS_TESTS=1 after provisioning Btrfs tools and root access"
+        );
+        let scratch = tempfile::tempdir().unwrap();
+        let img = scratch.path().join("btrfs.img");
+        let mount = scratch.path().join("mnt");
+        std::fs::create_dir_all(&mount).unwrap();
+        run_cmd("truncate", &["-s", "1G", img.to_str().unwrap()]);
+        run_cmd("mkfs.btrfs", &["-q", img.to_str().unwrap()]);
+        run_cmd(
+            "mount",
+            &["-o", "loop", img.to_str().unwrap(), mount.to_str().unwrap()],
+        );
+
+        let body = || -> Result<(), String> {
+            let vm = VolumeManager::new(&mount);
+            let live = vm
+                .create_managed_volume("default", "db", Path::new("/data"), None)
+                .map_err(|e| format!("create: {e}"))?;
+            if vm.backend_of(&live) != Some(crate::grill::btrfs::VolumeBackend::BtrfsSubvolume) {
+                return Err("expected the btrfs subvolume backend".to_string());
+            }
+            hand_to_container_user(&live, mapped(0)).map_err(|e| e.to_string())?;
+            std::fs::write(live.join("state"), b"v1").map_err(|e| e.to_string())?;
+            std::os::unix::fs::lchown(live.join("state"), Some(mapped(999).uid), None)
+                .map_err(|e| e.to_string())?;
+            let snapshots = crate::grill::snapshot::SnapshotManager::new(&mount);
+            let meta = snapshots
+                .create("default", "db", "/data", None, std::time::SystemTime::now())
+                .map_err(|e| format!("snapshot: {e}"))?;
+            std::fs::write(live.join("state"), b"garbage").map_err(|e| e.to_string())?;
+            snapshots
+                .restore("default", "db", &meta.name)
+                .map_err(|e| format!("restore: {e}"))?;
+
+            let plan = hand_to_container_user(&live, mapped(0)).map_err(|e| e.to_string())?;
+            if plan != Some(OwnershipPlan::Keep) {
+                return Err(format!("restored volume re-planned as {plan:?}"));
+            }
+            if owner_of(&live) != mapped(0) || owner_of(&live.join("state")).uid != mapped(999).uid
+            {
+                return Err("restore lost the container ownership".to_string());
+            }
+            Ok(())
+        };
+        let result = body();
+
+        let _ = std::process::Command::new("umount").arg(&mount).status();
+        result.unwrap();
     }
 
     /// Roadmap (Phase 12): writing beyond a Btrfs qgroup quota fails.

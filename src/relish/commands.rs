@@ -23,14 +23,32 @@ use crate::bun::agent::CouncilStatus;
 /// Without `--dry-run`, an unreachable agent is an error: the plan is
 /// still printed for reference, but the exit code is non-zero so
 /// scripts and CI cannot mistake "nothing happened" for a deploy.
-pub async fn apply(path: &Path, output: OutputFormat, dry_run: bool) -> Result<(), RelishError> {
-    apply_with_client(path, output, dry_run, &BunClient::default_local()).await
+///
+/// The manifest is Reliaburger TOML or Kubernetes YAML, from a file or an
+/// `https://` URL. Kubernetes YAML is imported in memory and its migration
+/// report printed to stderr before anything is applied.
+pub async fn apply(
+    source: &super::manifest::ManifestSource,
+    output: OutputFormat,
+    dry_run: bool,
+) -> Result<(), RelishError> {
+    apply_with_client(source, output, dry_run, &BunClient::default_local()).await
+}
+
+/// Read a manifest for `apply`, printing any migration report to stderr.
+async fn load_manifest(source: &super::manifest::ManifestSource) -> Result<Config, RelishError> {
+    let loaded = super::manifest::load(source).await?;
+    if let Some(report) = &loaded.migration_report {
+        eprint!("{report}");
+        eprintln!();
+    }
+    loaded.config.validate()?;
+    Ok(loaded.config)
 }
 
 /// Explicitly rerun a node-local job manifest, including unknown prior outcomes.
-pub async fn rerun_jobs(path: &Path) -> Result<(), RelishError> {
-    let config = Config::from_file(path)?;
-    config.validate()?;
+pub async fn rerun_jobs(source: &super::manifest::ManifestSource) -> Result<(), RelishError> {
+    let config = load_manifest(source).await?;
     let result = BunClient::default_local()
         .apply_rerunning_jobs(&config)
         .await?;
@@ -42,14 +60,26 @@ pub async fn rerun_jobs(path: &Path) -> Result<(), RelishError> {
     Ok(())
 }
 
+/// The last line of `relish apply`. A single node starts the instances
+/// before it answers and names them; a cluster commits the apps and lets
+/// the scheduler place them, so there are no instances to name yet.
+fn apply_summary(created: usize, instances: &[String]) -> String {
+    if instances.is_empty() {
+        format!(
+            "applied {created} app(s); the scheduler places them now (watch with `relish status`)"
+        )
+    } else {
+        format!("deployed {created} instance(s): {}", instances.join(", "))
+    }
+}
+
 async fn apply_with_client(
-    path: &Path,
+    source: &super::manifest::ManifestSource,
     output: OutputFormat,
     dry_run: bool,
     client: &BunClient,
 ) -> Result<(), RelishError> {
-    let config = Config::from_file(path)?;
-    config.validate()?;
+    let config = load_manifest(source).await?;
 
     if dry_run {
         // Diff against the live agent's current state when one answers, so
@@ -74,11 +104,7 @@ async fn apply_with_client(
         Ok(()) => {
             // Agent is alive — send the config (progress streams to stderr)
             let result = client.apply(&config).await?;
-            println!(
-                "deployed {} instance(s): {}",
-                result.created,
-                result.instances.join(", ")
-            );
+            println!("{}", apply_summary(result.created, &result.instances));
             Ok(())
         }
         Err(_) => {
@@ -705,29 +731,6 @@ async fn nodes_with_client(output: OutputFormat, client: &BunClient) -> Result<(
     }
 
     Ok(())
-}
-
-/// Run a chaos testing scenario or action.
-pub async fn chaos(action: &str, acknowledged: bool) -> Result<(), RelishError> {
-    let client = BunClient::default_local();
-    match action {
-        "council-partition" => super::chaos::council_partition(&client, acknowledged).await,
-        "worker-isolation" => super::chaos::worker_isolation(&client, acknowledged).await,
-        "status" => super::chaos::status(&client).await,
-        "heal" => super::chaos::heal(&client).await,
-        other => {
-            eprintln!("unknown chaos action: {other}");
-            eprintln!();
-            eprintln!("available actions:");
-            eprintln!("  use relish test --chaos for guarded recovery scenarios");
-            eprintln!("  status              show active fault injections");
-            eprintln!("  mutations and blanket heal are retired");
-            Err(RelishError::ApiError {
-                status: 0,
-                body: format!("unknown chaos action: {other}"),
-            })
-        }
-    }
 }
 
 /// Join an existing cluster: fetch a certificate from a member and persist it.
@@ -1382,48 +1385,86 @@ pub fn export_k8s(file: &Path) -> Result<(), RelishError> {
     Ok(())
 }
 
-/// Show the status of all running workloads — state, PID, restart count.
-///
-/// Named `top` by analogy, but it does not (yet) report live CPU/memory usage;
-/// the title and help say what it actually shows rather than promising resource
-/// figures it doesn't print (O19).
+/// Show every workload in the cluster with its node, state and latest CPU and
+/// memory. The figures are the last samples the node's metrics collector took
+/// (every few seconds), not a live meter; `-` means no sample yet.
 pub async fn top(output: OutputFormat) -> Result<(), RelishError> {
     let client = BunClient::default_local();
-    let statuses = client.status().await?;
+    let top = client.cluster_top().await?;
+    for warning in &top.warnings {
+        eprintln!("warning: {warning}");
+    }
 
     match output {
-        OutputFormat::Human => {
-            if statuses.is_empty() {
-                println!("no workloads running");
-                return Ok(());
-            }
-            println!(
-                "{:<20} {:<12} {:<10} {:<10} {:<10}",
-                "APP", "NAMESPACE", "STATE", "PID", "RESTARTS"
-            );
-            for s in &statuses {
-                let pid = s
-                    .pid
-                    .map(|p| p.to_string())
-                    .unwrap_or_else(|| "-".to_string());
-                println!(
-                    "{:<20} {:<12} {:<10} {:<10} {:<10}",
-                    s.app_name, s.namespace, s.state, pid, s.restart_count
-                );
-            }
-        }
+        OutputFormat::Human => print!("{}", render_top(&top.rows)),
         OutputFormat::Json => {
             let json =
-                serde_json::to_string_pretty(&statuses).map_err(RelishError::SerialiseJson)?;
+                serde_json::to_string_pretty(&top.rows).map_err(RelishError::SerialiseJson)?;
             println!("{json}");
         }
         OutputFormat::Yaml => {
-            let yaml = serde_yaml::to_string(&statuses).map_err(RelishError::SerialiseYaml)?;
+            let yaml = serde_yaml::to_string(&top.rows).map_err(RelishError::SerialiseYaml)?;
             print!("{yaml}");
         }
     }
 
     Ok(())
+}
+
+/// The `relish top` table.
+fn render_top(rows: &[crate::bun::top::TopRow]) -> String {
+    use std::fmt::Write as _;
+
+    if rows.is_empty() {
+        return "no workloads running\n".to_string();
+    }
+    let mut output = format!(
+        "{:<18} {:<20} {:<12} {:<10} {:<8} {:<9} {:>7} {:>10}\n",
+        "NODE", "APP", "NAMESPACE", "STATE", "PID", "RESTARTS", "CPU", "MEMORY"
+    );
+    for row in rows {
+        let pid = row
+            .instance
+            .pid
+            .map(|pid| pid.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let cpu = row
+            .cpu_percent
+            .map(|cpu| format!("{cpu:.1}%"))
+            .unwrap_or_else(|| "-".to_string());
+        let memory = row
+            .memory_bytes
+            .map(format_memory)
+            .unwrap_or_else(|| "-".to_string());
+        let _ = writeln!(
+            output,
+            "{:<18} {:<20} {:<12} {:<10} {:<8} {:<9} {:>7} {:>10}",
+            row.node,
+            row.instance.app_name,
+            row.instance.namespace,
+            row.instance.state,
+            pid,
+            row.instance.restart_count,
+            cpu,
+            memory
+        );
+    }
+    output
+}
+
+/// Bytes in binary units, one decimal place above a KiB.
+fn format_memory(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["KiB", "MiB", "GiB", "TiB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64 / 1024.0;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.1} {}", UNITS[unit])
 }
 
 /// List images in the local Pickle registry.
@@ -2028,6 +2069,78 @@ mod tests {
     use super::*;
     use std::io::Write as _;
 
+    /// Z6.7: applying podinfo to the laptop cluster ended with
+    /// "deployed 4 instance(s):" and nothing after the colon.
+    #[test]
+    fn a_cluster_apply_says_the_apps_are_being_placed() {
+        assert_eq!(
+            apply_summary(4, &[]),
+            "applied 4 app(s); the scheduler places them now (watch with `relish status`)"
+        );
+        assert_eq!(
+            apply_summary(2, &["default__web-0".into(), "default__web-1".into()]),
+            "deployed 2 instance(s): default__web-0, default__web-1"
+        );
+    }
+
+    fn top_row(
+        node: &str,
+        id: &str,
+        pid: Option<u32>,
+        cpu: Option<f64>,
+        memory: Option<u64>,
+    ) -> crate::bun::top::TopRow {
+        crate::bun::top::TopRow {
+            node: node.to_string(),
+            instance: crate::bun::agent::InstanceStatus {
+                id: id.to_string(),
+                app_name: "podinfo".to_string(),
+                namespace: "default".to_string(),
+                state: "running".to_string(),
+                restart_count: u32::from(node == "rb-3"),
+                host_port: None,
+                exit_code: None,
+                pid,
+            },
+            cpu_percent: cpu,
+            memory_bytes: memory,
+        }
+    }
+
+    #[test]
+    fn top_lists_every_node_with_cpu_and_memory() {
+        insta::assert_snapshot!(render_top(&[
+            top_row(
+                "rb-0123456789ab-1",
+                "default__podinfo-0",
+                Some(2311),
+                Some(3.4),
+                Some(24_117_248)
+            ),
+            top_row(
+                "rb-2",
+                "default__podinfo-0",
+                Some(2290),
+                Some(0.0),
+                Some(900)
+            ),
+            top_row("rb-3", "default__podinfo-0", None, None, None),
+        ]));
+    }
+
+    #[test]
+    fn top_says_so_when_nothing_runs() {
+        assert_eq!(render_top(&[]), "no workloads running\n");
+    }
+
+    #[test]
+    fn memory_uses_binary_units() {
+        assert_eq!(format_memory(512), "512 B");
+        assert_eq!(format_memory(1536), "1.5 KiB");
+        assert_eq!(format_memory(24_117_248), "23.0 MiB");
+        assert_eq!(format_memory(3 * 1024 * 1024 * 1024), "3.0 GiB");
+    }
+
     #[tokio::test]
     async fn join_token_file_rejects_exposed_empty_and_oversized_credentials() {
         let dir = tempfile::tempdir().unwrap();
@@ -2092,6 +2205,38 @@ mod tests {
         f
     }
 
+    fn source(path: &Path) -> crate::relish::manifest::ManifestSource {
+        crate::relish::manifest::ManifestSource::File(path.to_path_buf())
+    }
+
+    /// Z1.4: Kubernetes YAML applies directly, through the importer.
+    #[cfg(feature = "kubernetes")]
+    #[tokio::test]
+    async fn apply_dry_run_accepts_kubernetes_yaml() {
+        let f = write_temp_config(
+            r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  template:
+    spec:
+      containers:
+      - name: web
+        image: nginx:1
+"#,
+        );
+        apply_with_client(
+            &source(f.path()),
+            OutputFormat::Human,
+            true,
+            &bogus_client(),
+        )
+        .await
+        .unwrap();
+    }
+
     /// X5 regression: an unreachable agent used to fall back to a
     /// dry-run plan and exit 0, making dead-agent deploys look green.
     #[tokio::test]
@@ -2103,9 +2248,14 @@ mod tests {
             port = 8080
         "#,
         );
-        let err = apply_with_client(f.path(), OutputFormat::Human, false, &bogus_client())
-            .await
-            .unwrap_err();
+        let err = apply_with_client(
+            &source(f.path()),
+            OutputFormat::Human,
+            false,
+            &bogus_client(),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, RelishError::AgentUnreachable), "got: {err:?}");
     }
 
@@ -2119,16 +2269,21 @@ mod tests {
         "#,
         );
         assert!(
-            apply_with_client(f.path(), OutputFormat::Human, true, &bogus_client())
-                .await
-                .is_ok()
+            apply_with_client(
+                &source(f.path()),
+                OutputFormat::Human,
+                true,
+                &bogus_client()
+            )
+            .await
+            .is_ok()
         );
     }
 
     #[tokio::test]
     async fn apply_with_missing_file_errors() {
         let result = apply_with_client(
-            Path::new("/nonexistent/config.toml"),
+            &source(Path::new("/nonexistent/config.toml")),
             OutputFormat::Human,
             false,
             &bogus_client(),
@@ -2145,7 +2300,13 @@ mod tests {
     #[tokio::test]
     async fn apply_with_invalid_toml_errors() {
         let f = write_temp_config("this is not valid toml [[[");
-        let result = apply_with_client(f.path(), OutputFormat::Human, false, &bogus_client()).await;
+        let result = apply_with_client(
+            &source(f.path()),
+            OutputFormat::Human,
+            false,
+            &bogus_client(),
+        )
+        .await;
         assert!(result.is_err());
     }
 
@@ -2157,7 +2318,13 @@ mod tests {
             replicas = 3
         "#,
         );
-        let result = apply_with_client(f.path(), OutputFormat::Human, false, &bogus_client()).await;
+        let result = apply_with_client(
+            &source(f.path()),
+            OutputFormat::Human,
+            false,
+            &bogus_client(),
+        )
+        .await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(

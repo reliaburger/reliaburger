@@ -348,6 +348,7 @@ pub fn router_with_upgrade(
         .route("/v1/ws/events", get(ws_events_handler))
         .route("/v1/ws/logs/{app}/{namespace}", get(ws_logs_handler))
         .route("/v1/status/{app}/{namespace}", get(status_app_handler))
+        .route("/v1/top", get(top_handler))
         .route("/v1/stop/{app}/{namespace}", post(stop_handler))
         .route("/v1/logs/{app}/{namespace}", get(logs_handler))
         .route(
@@ -393,6 +394,12 @@ pub fn router_with_upgrade(
             axum::routing::delete(test_lease_release_handler),
         )
         .route("/v1/cluster/nodes", get(nodes_handler))
+        .route(
+            "/v1/nodes/{node}/relay/{*path}",
+            get(node_relay_handler).post(node_relay_handler).layer(
+                axum::extract::DefaultBodyLimit::max(MAX_RELAY_REQUEST_BYTES),
+            ),
+        )
         .route("/v1/cluster/council", get(council_handler))
         .route("/v1/upgrade/apply", post(upgrade_apply_handler))
         .route("/v1/upgrade/status", get(upgrade_status_handler))
@@ -405,10 +412,8 @@ pub fn router_with_upgrade(
             post(upgrade_cluster_rollback_handler),
         )
         .route("/v1/cluster/elect", post(cluster_elect_handler))
-        .route("/v1/chaos/partition", post(chaos_partition_handler))
         .route("/v1/chaos/reserve", post(node_fault_reserve_handler))
         .route("/v1/chaos/fence", post(node_fault_fence_handler))
-        .route("/v1/chaos/heal", post(chaos_heal_handler))
         .route("/v1/chaos/status", get(chaos_status_handler))
         .route(
             "/v1/snapshots/{namespace}/{app}",
@@ -441,6 +446,10 @@ pub fn router_with_upgrade(
         .route(
             "/v1/metrics/app/{app}/{namespace}",
             get(metrics_app_handler),
+        )
+        .route(
+            "/v1/metrics/app/{app}/{namespace}/chart",
+            get(metrics_app_chart_handler),
         )
         .route("/v1/alerts", get(alerts_handler))
         .route("/v1/logs/sql", get(logs_sql_handler))
@@ -886,6 +895,19 @@ async fn trace_handler(
         )
             .into_response();
     }
+    if request
+        .count
+        .is_some_and(|count| count == 0 || count > crate::onion::trace::MAX_TRACE_CONNECTS)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!(
+                "trace count must be between 1 and {}",
+                crate::onion::trace::MAX_TRACE_CONNECTS
+            )})),
+        )
+            .into_response();
+    }
     if !valid_trace_label(&request.source) || !valid_trace_label(&request.source_namespace) {
         return (
             StatusCode::BAD_REQUEST,
@@ -999,7 +1021,8 @@ async fn trace_handler(
     {
         return (StatusCode::SERVICE_UNAVAILABLE, "agent unavailable").into_response();
     }
-    match tokio::time::timeout(std::time::Duration::from_secs(20), receiver).await {
+    // DNS (8s) plus up to ten connects at three seconds each.
+    match tokio::time::timeout(std::time::Duration::from_secs(45), receiver).await {
         Ok(Ok(Ok(result))) => Json(result).into_response(),
         Ok(Ok(Err(crate::bun::BunError::AppNotFound { .. }))) => (
             StatusCode::NOT_FOUND,
@@ -1015,7 +1038,7 @@ async fn trace_handler(
         Ok(Err(_)) => (StatusCode::SERVICE_UNAVAILABLE, "agent dropped response").into_response(),
         Err(_) => (
             StatusCode::GATEWAY_TIMEOUT,
-            "trace timed out after 20 seconds",
+            "trace timed out after 45 seconds",
         )
             .into_response(),
     }
@@ -1660,19 +1683,12 @@ async fn upgrade_apply_handler(
         }
     };
 
-    let (tx, rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(AgentCommand::UpgradeApply {
-            directive,
-            response: tx,
-        })
-        .await
-        .is_err()
+    match ask_agent(&state.cmd_tx, |response| AgentCommand::UpgradeApply {
+        directive,
+        response,
+    })
+    .await
     {
-        return agent_unavailable();
-    }
-    match rx.await {
         Ok(Ok(())) => (
             StatusCode::ACCEPTED,
             Json(serde_json::json!({ "status": "upgrading" })),
@@ -1697,16 +1713,11 @@ async fn upgrade_status_handler(
     {
         return resp;
     }
-    let (tx, rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(AgentCommand::UpgradeStatus { response: tx })
-        .await
-        .is_err()
+    match ask_agent(&state.cmd_tx, |response| AgentCommand::UpgradeStatus {
+        response,
+    })
+    .await
     {
-        return agent_unavailable();
-    }
-    match rx.await {
         Ok(Ok(status)) => Json(status).into_response(),
         Ok(Err(e)) => (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1748,19 +1759,12 @@ async fn upgrade_rollback_handler(
         }
     };
 
-    let (tx, rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(AgentCommand::UpgradeRollback {
-            version: request.version,
-            response: tx,
-        })
-        .await
-        .is_err()
+    match ask_agent(&state.cmd_tx, |response| AgentCommand::UpgradeRollback {
+        version: request.version,
+        response,
+    })
+    .await
     {
-        return agent_unavailable();
-    }
-    match rx.await {
         Ok(Ok(())) => (
             StatusCode::ACCEPTED,
             Json(serde_json::json!({ "status": "rolling back" })),
@@ -1773,6 +1777,35 @@ async fn upgrade_rollback_handler(
             .into_response(),
         Err(_) => agent_unavailable(),
     }
+}
+
+/// Send one command to the agent loop and wait for its reply.
+///
+/// `build` receives the reply half of a fresh oneshot channel and returns the
+/// command that carries it. If the agent loop has gone away, either before it
+/// accepts the command or before it answers, the error is the 500 response the
+/// handlers return for that case.
+// `Response` is large, but it is the reply the handler sends as-is.
+#[allow(clippy::result_large_err)]
+async fn ask_agent<T>(
+    cmd_tx: &mpsc::Sender<AgentCommand>,
+    build: impl FnOnce(oneshot::Sender<T>) -> AgentCommand,
+) -> Result<T, Response> {
+    let (response, reply) = oneshot::channel();
+    if cmd_tx.send(build(response)).await.is_err() {
+        return Err(internal_error("agent unavailable"));
+    }
+    reply
+        .await
+        .map_err(|_| internal_error("agent dropped response"))
+}
+
+fn internal_error(message: &str) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({ "error": message })),
+    )
+        .into_response()
 }
 
 fn agent_unavailable() -> Response {
@@ -3032,12 +3065,21 @@ async fn refuse_retired_tls_peer(
             .extensions()
             .get::<crate::sesame::renewal::TlsPeerCertificate>(),
     ) {
-        let security = council.security_state().await;
-        let retired = crate::sesame::cert::subject_uri_sans(&peer.0).is_ok_and(|uris| {
-            uris.iter()
-                .filter_map(|uri| crate::sesame::ca::node_id_from_spiffe_uri(uri))
-                .any(|node| security.crl.retired_nodes.contains_key(node))
-        });
+        // An identity we can't read might belong to a retired node, so refuse it.
+        let Ok(uris) = crate::sesame::cert::subject_uri_sans(&peer.0) else {
+            return (
+                StatusCode::FORBIDDEN,
+                "peer certificate identity is unreadable",
+            )
+                .into_response();
+        };
+        let mut retired = false;
+        for node in uris
+            .iter()
+            .filter_map(|uri| crate::sesame::ca::node_id_from_spiffe_uri(uri))
+        {
+            retired |= council.is_node_retired(node).await;
+        }
         if retired {
             return (
                 StatusCode::FORBIDDEN,
@@ -3230,6 +3272,9 @@ async fn placements_handler(
             .into_response();
     }
     let mut desired = council.desired_state().await;
+    // Receipts must come from this same TLS identity. A plaintext consumer
+    // could never send one, so registering it would only freeze discovery.
+    let authenticated_consumer = peer.is_some();
     if let Some(peer) = peer {
         match crate::sesame::renewal::validate_peer(&peer, &desired.security_state) {
             Ok(identity) if identity == node_id => {}
@@ -3262,7 +3307,7 @@ async fn placements_handler(
     }
     // Registration precedes every first exposure. Once committed, an offline
     // consumer stays accountable until the operator permanently fences it.
-    if !desired.endpoint_consumers.contains(&node_id) {
+    if authenticated_consumer && !desired.endpoint_consumers.contains(&node_id) {
         let registration = tokio::time::timeout(
             std::time::Duration::from_secs(10),
             council.write(crate::council::RaftRequest::RegisterEndpointConsumer {
@@ -3379,13 +3424,10 @@ async fn current_apps_handler(State(state): State<ApiState>) -> Response {
     let mut resources: std::collections::BTreeMap<String, Option<String>> =
         std::collections::BTreeMap::new();
 
-    let (resp_tx, resp_rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(AgentCommand::CurrentResources { response: resp_tx })
-        .await
-        .is_ok()
-        && let Ok(local) = resp_rx.await
+    if let Ok(local) = ask_agent(&state.cmd_tx, |response| AgentCommand::CurrentResources {
+        response,
+    })
+    .await
     {
         for entry in local {
             resources.insert(entry.resource, entry.image);
@@ -3437,31 +3479,49 @@ async fn local_statuses(state: &ApiState) -> Result<Vec<InstanceStatus>, String>
 async fn status_handler(
     State(state): State<ApiState>,
     Query(query): Query<StatusQuery>,
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
 ) -> Response {
+    let auth = auth.as_deref();
+    let visible = |app: &str, namespace: &str| {
+        crate::sesame::auth::authorize_scoped(auth, app, namespace).is_ok()
+    };
     if !query.cluster {
         return match local_statuses(&state).await {
-            Ok(statuses) => Json(statuses).into_response(),
-            Err(error) => (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({"error": error})),
-            )
-                .into_response(),
+            Ok(mut statuses) => {
+                statuses.retain(|status| visible(&status.app_name, &status.namespace));
+                Json(statuses).into_response()
+            }
+            Err(error) => unavailable_response(error),
         };
     }
+    // Peers answer the fan-out under this node's service token, which sees
+    // everything, so the caller's scope has to be applied here.
     match cluster_statuses(&state).await {
-        Ok(statuses) => Json(statuses).into_response(),
-        Err(error) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"error": error})),
-        )
-            .into_response(),
+        Ok(mut statuses) => {
+            statuses
+                .retain(|status| visible(&status.instance.app_name, &status.instance.namespace));
+            Json(statuses).into_response()
+        }
+        Err(error) => unavailable_response(error),
     }
 }
 
 async fn cluster_statuses(
     state: &ApiState,
 ) -> Result<Vec<super::agent::ClusterInstanceStatus>, String> {
-    let local_name = state
+    let (statuses, failures) = collect_cluster_statuses(state, CLUSTER_STATUS_TIMEOUT).await?;
+    match failures.into_iter().next() {
+        Some(failure) => Err(format!("status incomplete: {failure}")),
+        None => Ok(statuses),
+    }
+}
+
+/// How long one peer may take to answer a cluster status fan-out.
+const CLUSTER_STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// This node's cluster name, or `local` for a standalone agent.
+fn local_node_name(state: &ApiState) -> String {
+    state
         .node_name
         .clone()
         .or_else(|| {
@@ -3475,7 +3535,17 @@ async fn cluster_statuses(
                     .map(|node| node.name.clone())
             })
         })
-        .unwrap_or_else(|| "local".to_string());
+        .unwrap_or_else(|| "local".to_string())
+}
+
+/// Every node's workload statuses, plus one message per peer that didn't
+/// answer. Only this node's own status failing is an error: callers decide
+/// whether a partial cluster view is good enough.
+async fn collect_cluster_statuses(
+    state: &ApiState,
+    peer_timeout: std::time::Duration,
+) -> Result<(Vec<super::agent::ClusterInstanceStatus>, Vec<String>), String> {
+    let local_name = local_node_name(state);
     let mut statuses: Vec<_> = local_statuses(state)
         .await?
         .into_iter()
@@ -3494,7 +3564,7 @@ async fn cluster_statuses(
             .filter(|member| member.node_id.0 != local_name)
             .map(|member| async move {
                 let name = member.node_id.0;
-                let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let result = tokio::time::timeout(peer_timeout, async {
                     let url = state
                         .cluster_http
                         .url(&member.address.to_string(), "/v1/status");
@@ -3518,16 +3588,21 @@ async fn cluster_statuses(
                             instance,
                         })
                         .collect::<Vec<_>>()),
-                    Ok(Err(error)) => Err(format!("status incomplete: node {name}: {error}")),
-                    Err(_) => Err(format!("status incomplete: node {name} timed out")),
+                    Ok(Err(error)) => Err(format!("node {name}: {error}")),
+                    Err(_) => Err(format!("node {name} timed out")),
                 }
             }),
     )
     .buffer_unordered(8);
     tokio::pin!(requests);
+    let mut failures = Vec::new();
     while let Some(result) = requests.next().await {
-        statuses.extend(result?);
+        match result {
+            Ok(instances) => statuses.extend(instances),
+            Err(failure) => failures.push(failure),
+        }
     }
+    failures.sort();
     statuses.sort_by(|left, right| {
         (&left.node, &left.instance.namespace, &left.instance.id).cmp(&(
             &right.node,
@@ -3535,23 +3610,133 @@ async fn cluster_statuses(
             &right.instance.id,
         ))
     });
-    Ok(statuses)
+    Ok((statuses, failures))
+}
+
+/// `GET /v1/top[?cluster=true]`: workloads with their latest CPU and memory.
+///
+/// Without `cluster` a node answers for itself. With it, the node merges its
+/// own rows with every peer's; a peer that doesn't answer becomes a warning
+/// rather than failing the whole view, so `relish top` still works while a
+/// node is down.
+async fn top_handler(
+    State(state): State<ApiState>,
+    Query(query): Query<StatusQuery>,
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+) -> Response {
+    let auth = auth.as_deref();
+    let visible = |row: &crate::bun::top::TopRow| {
+        crate::sesame::auth::authorize_scoped(auth, &row.instance.app_name, &row.instance.namespace)
+            .is_ok()
+    };
+    let mut rows = match local_top_rows(&state).await {
+        Ok(rows) => rows,
+        Err(error) => return unavailable_response(error),
+    };
+    if !query.cluster {
+        rows.retain(visible);
+        return Json(rows).into_response();
+    }
+    let mut warnings = Vec::new();
+    let local_name = local_node_name(&state);
+    let members = match &state.membership {
+        Some(membership) => membership.read().await.clone(),
+        None => Vec::new(),
+    };
+    let requests = futures_util::stream::iter(
+        members
+            .into_iter()
+            .filter(|member| member.node_id.0 != local_name)
+            .map(|member| {
+                let state = &state;
+                async move {
+                    let name = member.node_id.0;
+                    let result = tokio::time::timeout(CLUSTER_STATUS_TIMEOUT, async {
+                        let url = state
+                            .cluster_http
+                            .url(&member.address.to_string(), "/v1/top");
+                        let mut request = state.cluster_http.client().get(url);
+                        if let Some(token) = &state.service_token {
+                            request = request.bearer_auth(token);
+                        }
+                        request
+                            .send()
+                            .await?
+                            .error_for_status()?
+                            .json::<Vec<crate::bun::top::TopRow>>()
+                            .await
+                    })
+                    .await;
+                    match result {
+                        Ok(Ok(rows)) => Ok(rows),
+                        Ok(Err(error)) => Err(format!("node {name}: {error}")),
+                        Err(_) => Err(format!("node {name} timed out")),
+                    }
+                }
+            }),
+    )
+    .buffer_unordered(8);
+    tokio::pin!(requests);
+    while let Some(result) = requests.next().await {
+        match result {
+            Ok(peer_rows) => rows.extend(peer_rows),
+            Err(warning) => warnings.push(warning),
+        }
+    }
+    // Peers answered with the node's service token, which sees everything,
+    // so the caller's scope applies here.
+    rows.retain(visible);
+    rows.sort_by(|left, right| {
+        (&left.node, &left.instance.namespace, &left.instance.id).cmp(&(
+            &right.node,
+            &right.instance.namespace,
+            &right.instance.id,
+        ))
+    });
+    warnings.sort();
+    Json(crate::bun::top::ClusterTop { rows, warnings }).into_response()
+}
+
+/// This node's workloads joined to their latest samples in its own store.
+async fn local_top_rows(state: &ApiState) -> Result<Vec<crate::bun::top::TopRow>, String> {
+    use crate::bun::top::{CPU_METRIC, MEMORY_METRIC, USAGE_WINDOW_SECS};
+
+    let statuses = local_statuses(state).await?;
+    let usage = match &state.mayo {
+        Some(mayo) => {
+            let since = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                .saturating_sub(USAGE_WINDOW_SECS);
+            let sql = format!(
+                "SELECT timestamp, metric_name, labels, value FROM metrics \
+                 WHERE metric_name IN ('{CPU_METRIC}', '{MEMORY_METRIC}') \
+                 AND timestamp >= {since} ORDER BY timestamp"
+            );
+            // Missing samples leave the columns empty; they don't hide the
+            // workloads themselves.
+            match mayo.read().await.query_sql(&sql).await {
+                Ok(samples) => crate::bun::top::latest_usage(&samples),
+                Err(_) => std::collections::HashMap::new(),
+            }
+        }
+        None => std::collections::HashMap::new(),
+    };
+    Ok(crate::bun::top::node_rows(
+        &local_node_name(state),
+        statuses,
+        &usage,
+    ))
 }
 
 /// List all run-to-completion workload instances.
 async fn jobs_handler(State(state): State<ApiState>) -> Response {
-    let (response_tx, response_rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(AgentCommand::JobStatus {
-            response: response_tx,
-        })
-        .await
-        .is_err()
+    match ask_agent(&state.cmd_tx, |response| AgentCommand::JobStatus {
+        response,
+    })
+    .await
     {
-        return agent_unavailable();
-    }
-    match response_rx.await {
         Ok(statuses) => Json(statuses).into_response(),
         Err(_) => agent_unavailable(),
     }
@@ -3637,21 +3822,7 @@ async fn status_app_handler(
     if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
         return resp;
     }
-    let (resp_tx, resp_rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(AgentCommand::Status { response: resp_tx })
-        .await
-        .is_err()
-    {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent unavailable" })),
-        )
-            .into_response();
-    }
-
-    match resp_rx.await {
+    match ask_agent(&state.cmd_tx, |response| AgentCommand::Status { response }).await {
         Ok(statuses) => {
             let filtered: Vec<&InstanceStatus> = statuses
                 .iter()
@@ -3667,11 +3838,7 @@ async fn status_app_handler(
                 Json(serde_json::json!(filtered)).into_response()
             }
         }
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent dropped response" })),
-        )
-            .into_response(),
+        Err(response) => response,
     }
 }
 
@@ -3775,41 +3942,25 @@ async fn cluster_stop(
     // The desired state is gone; stop the local replica if we have one.
     // A missing local instance is expected on a leader that holds no
     // replica, so it is not an error here.
-    let (resp_tx, resp_rx) = oneshot::channel();
-    let _ = state
-        .cmd_tx
-        .send(AgentCommand::Stop {
-            app_name: app,
-            namespace,
-            response: resp_tx,
-        })
-        .await;
-    let _ = resp_rx.await;
+    let _ = ask_agent(&state.cmd_tx, |response| AgentCommand::Stop {
+        app_name: app,
+        namespace,
+        response,
+    })
+    .await;
 
     Json(serde_json::json!({ "status": "stopped" })).into_response()
 }
 
 /// Stop an app on this node only (standalone mode).
 async fn stop_local(state: &ApiState, app: String, namespace: String) -> Response {
-    let (resp_tx, resp_rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(AgentCommand::Stop {
-            app_name: app,
-            namespace,
-            response: resp_tx,
-        })
-        .await
-        .is_err()
+    match ask_agent(&state.cmd_tx, |response| AgentCommand::Stop {
+        app_name: app,
+        namespace,
+        response,
+    })
+    .await
     {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent unavailable" })),
-        )
-            .into_response();
-    }
-
-    match resp_rx.await {
         Ok(Ok(())) => Json(serde_json::json!({ "status": "stopped" })).into_response(),
         Ok(Err(error)) => {
             let status = match error {
@@ -3823,11 +3974,7 @@ async fn stop_local(state: &ApiState, app: String, namespace: String) -> Respons
             )
                 .into_response()
         }
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent dropped response" })),
-        )
-            .into_response(),
+        Err(response) => response,
     }
 }
 
@@ -3839,6 +3986,11 @@ struct LogsQuery {
     start: Option<u64>,
     end: Option<u64>,
     grep: Option<String>,
+    /// Follow only this node's instances. Set on the internal per-node
+    /// streams of a cluster-wide follow, so a peer never fans out again.
+    local: Option<bool>,
+    /// Prefix each followed line with `[node instance]`.
+    label: Option<bool>,
 }
 
 /// Get logs for an app.
@@ -3857,62 +4009,327 @@ async fn logs_handler(
     let follow = query.follow.unwrap_or(false);
 
     if follow {
-        let (lines_tx, lines_rx) = mpsc::channel::<String>(64);
-        if state
-            .cmd_tx
-            .send(AgentCommand::FollowLogs {
-                app_name: app,
-                namespace,
-                tail: query.tail,
-                lines: lines_tx,
-            })
-            .await
-            .is_err()
+        // A cluster member follows every node that runs the app; the
+        // per-node streams it opens come back here with `local=true`.
+        if !query.local.unwrap_or(false)
+            && let (Some(council), Some(membership), Some(self_name)) =
+                (&state.council, &state.membership, &state.node_name)
         {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": "agent unavailable" })),
-            )
+            let (events_tx, events_rx) = mpsc::channel::<Event>(256);
+            tokio::spawn(follow_cluster_logs(
+                state.clone(),
+                Arc::clone(council),
+                Arc::clone(membership),
+                self_name.clone(),
+                app,
+                namespace,
+                query.tail,
+                events_tx,
+            ));
+            let stream = ReceiverStream::new(events_rx).map(Ok::<_, std::convert::Infallible>);
+            return Sse::new(stream)
+                .keep_alive(axum::response::sse::KeepAlive::default())
                 .into_response();
         }
-
+        let label = query
+            .label
+            .unwrap_or(false)
+            .then(|| state.node_name.clone())
+            .flatten();
+        let lines_rx = match follow_local_logs(&state, app, namespace, query.tail, label).await {
+            Ok(lines_rx) => lines_rx,
+            Err(response) => return response,
+        };
         let stream = ReceiverStream::new(lines_rx)
             .map(|line| Ok::<_, std::convert::Infallible>(Event::default().data(line)));
         return Sse::new(stream).into_response();
     }
 
-    let (resp_tx, resp_rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(AgentCommand::Logs {
-            app_name: app,
-            namespace,
-            tail: query.tail,
-            response: resp_tx,
-        })
-        .await
-        .is_err()
+    match ask_agent(&state.cmd_tx, |response| AgentCommand::Logs {
+        app_name: app,
+        namespace,
+        tail: query.tail,
+        response,
+    })
+    .await
     {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent unavailable" })),
-        )
-            .into_response();
-    }
-
-    match resp_rx.await {
         Ok(Ok(logs)) => Json(serde_json::json!({ "logs": logs })).into_response(),
         Ok(Err(e)) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "error": e.to_string() })),
         )
             .into_response(),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent dropped response" })),
-        )
-            .into_response(),
+        Err(response) => response,
     }
+}
+
+/// Start following this node's instances of an app.
+// `Response` is large but it IS the HTTP reply to send on failure;
+// boxing it would tax every call site for a value that lives one frame.
+#[allow(clippy::result_large_err)]
+async fn follow_local_logs(
+    state: &ApiState,
+    app: String,
+    namespace: String,
+    tail: Option<usize>,
+    label: Option<String>,
+) -> Result<mpsc::Receiver<String>, Response> {
+    let (lines_tx, lines_rx) = mpsc::channel::<String>(64);
+    state
+        .cmd_tx
+        .send(AgentCommand::FollowLogs {
+            app_name: app,
+            namespace,
+            tail,
+            label,
+            lines: lines_tx,
+        })
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "agent unavailable" })),
+            )
+                .into_response()
+        })?;
+    Ok(lines_rx)
+}
+
+/// How often a cluster-wide follow re-reads placements, to pick up replicas
+/// scheduled onto new nodes and to notice nodes that left.
+const LOG_FOLLOW_REFRESH: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Why one node's part of a cluster-wide follow stopped.
+struct LogSourceEnded {
+    node: String,
+    /// `None` when the stream ended cleanly, say because its replica
+    /// restarted; the next refresh reconnects without a warning.
+    error: Option<String>,
+}
+
+/// Merge the log streams of every node that runs an app into `events`.
+///
+/// Every [`LOG_FOLLOW_REFRESH`] it re-reads the app's placements and the live
+/// membership: it opens a stream to each placed node it isn't following yet
+/// and drops the streams of nodes that left. A node that goes away produces a
+/// `warning` event and the follow carries on with the rest. It returns when
+/// the client disconnects.
+#[allow(clippy::too_many_arguments)]
+async fn follow_cluster_logs(
+    state: ApiState,
+    council: Arc<crate::council::CouncilNode>,
+    membership: Arc<RwLock<Vec<NodeMembershipInfo>>>,
+    self_name: String,
+    app: String,
+    namespace: String,
+    tail: Option<usize>,
+    events: mpsc::Sender<Event>,
+) {
+    let app_id = crate::meat::types::AppId::new(&app, &namespace);
+    let mut sources: std::collections::HashMap<String, tokio::task::AbortHandle> =
+        std::collections::HashMap::new();
+    let mut connected_before: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut departed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // When each node's last stream ended, so a node with nothing to stream
+    // yet is retried once per refresh rather than in a tight loop.
+    let mut ended_at: std::collections::HashMap<String, tokio::time::Instant> =
+        std::collections::HashMap::new();
+    let (ended_tx, mut ended_rx) = mpsc::channel::<LogSourceEnded>(16);
+    loop {
+        let placed: std::collections::BTreeSet<crate::meat::NodeId> = council
+            .desired_state()
+            .await
+            .scheduling
+            .get(&app_id)
+            .map(|placements| placements.iter().map(|p| p.node_id.clone()).collect())
+            .unwrap_or_default();
+        let members = membership.read().await.clone();
+
+        // A node we followed that dropped out of the live membership gets
+        // one warning, whether its stream broke, ended cleanly (a graceful
+        // shutdown) or is still hanging on a dead connection.
+        let alive = |node: &str| members.iter().any(|member| member.node_id.0 == node);
+        departed.retain(|node| !alive(node));
+        let newly_departed: Vec<String> = connected_before
+            .iter()
+            .filter(|node| **node != self_name && !alive(node) && !departed.contains(*node))
+            .cloned()
+            .collect();
+        for node in newly_departed {
+            if let Some(source) = sources.remove(&node) {
+                source.abort();
+            }
+            let warning = format!("node {node} left the cluster; no longer following its logs");
+            if !send_log_warning(&events, warning).await {
+                return;
+            }
+            departed.insert(node);
+        }
+
+        for node in placed {
+            let cooling = ended_at
+                .get(&node.0)
+                .is_some_and(|at| at.elapsed() < LOG_FOLLOW_REFRESH);
+            if sources.contains_key(&node.0) || cooling {
+                continue;
+            }
+            // Only the first connection replays the tail; a reconnect after
+            // a replica restart carries on from new lines.
+            let tail = if connected_before.insert(node.0.clone()) {
+                tail
+            } else {
+                None
+            };
+            let source = if node.0 == self_name {
+                spawn_local_log_source(
+                    &state,
+                    &app,
+                    &namespace,
+                    tail,
+                    &self_name,
+                    events.clone(),
+                    ended_tx.clone(),
+                )
+                .await
+            } else {
+                let Some(member) = members.iter().find(|member| member.node_id == node) else {
+                    continue;
+                };
+                let url = state.cluster_http.url(
+                    &member.address.to_string(),
+                    &format!("/v1/logs/{app}/{namespace}"),
+                );
+                Some(spawn_peer_log_source(
+                    &state,
+                    node.0.clone(),
+                    url,
+                    tail,
+                    events.clone(),
+                    ended_tx.clone(),
+                ))
+            };
+            if let Some(source) = source {
+                sources.insert(node.0, source);
+            }
+        }
+
+        tokio::select! {
+            () = events.closed() => break,
+            Some(ended) = ended_rx.recv() => {
+                sources.remove(&ended.node);
+                ended_at.insert(ended.node.clone(), tokio::time::Instant::now());
+                if let Some(error) = ended.error
+                    && !send_log_warning(&events, format!("node {}: {error}", ended.node)).await
+                {
+                    break;
+                }
+            }
+            () = tokio::time::sleep(LOG_FOLLOW_REFRESH) => {}
+        }
+    }
+    for source in sources.into_values() {
+        source.abort();
+    }
+}
+
+async fn send_log_warning(events: &mpsc::Sender<Event>, warning: String) -> bool {
+    events
+        .send(
+            Event::default()
+                .event(crate::ketchup::sse::WARNING_EVENT)
+                .data(warning),
+        )
+        .await
+        .is_ok()
+}
+
+/// Follow this node's own instances as one source of a cluster-wide follow.
+async fn spawn_local_log_source(
+    state: &ApiState,
+    app: &str,
+    namespace: &str,
+    tail: Option<usize>,
+    self_name: &str,
+    events: mpsc::Sender<Event>,
+    ended: mpsc::Sender<LogSourceEnded>,
+) -> Option<tokio::task::AbortHandle> {
+    let mut lines = follow_local_logs(
+        state,
+        app.to_string(),
+        namespace.to_string(),
+        tail,
+        Some(self_name.to_string()),
+    )
+    .await
+    .ok()?;
+    let node = self_name.to_string();
+    Some(
+        tokio::spawn(async move {
+            while let Some(line) = lines.recv().await {
+                if events.send(Event::default().data(line)).await.is_err() {
+                    return;
+                }
+            }
+            let _ = ended.send(LogSourceEnded { node, error: None }).await;
+        })
+        .abort_handle(),
+    )
+}
+
+/// Stream one peer's labelled log lines into `events`, and report how the
+/// stream ended.
+fn spawn_peer_log_source(
+    state: &ApiState,
+    node: String,
+    url: String,
+    tail: Option<usize>,
+    events: mpsc::Sender<Event>,
+    ended: mpsc::Sender<LogSourceEnded>,
+) -> tokio::task::AbortHandle {
+    let mut request = state.cluster_http.client().get(url).query(&[
+        ("follow", "true"),
+        ("local", "true"),
+        ("label", "true"),
+    ]);
+    if let Some(tail) = tail {
+        request = request.query(&[("tail", tail)]);
+    }
+    if let Some(token) = &state.service_token {
+        request = request.bearer_auth(token);
+    }
+    tokio::spawn(async move {
+        let error = relay_peer_log_stream(request, &events).await.err();
+        let _ = ended.send(LogSourceEnded { node, error }).await;
+    })
+    .abort_handle()
+}
+
+async fn relay_peer_log_stream(
+    request: reqwest::RequestBuilder,
+    events: &mpsc::Sender<Event>,
+) -> Result<(), String> {
+    let response = tokio::time::timeout(std::time::Duration::from_secs(5), request.send())
+        .await
+        .map_err(|_| "log stream did not start within 5s".to_string())?
+        .map_err(|error| format!("log stream failed: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!("log stream refused: {}", response.status()));
+    }
+    let mut decoder = crate::ketchup::sse::SseDecoder::default();
+    let mut body = response.bytes_stream();
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk.map_err(|error| format!("log stream broke: {error}"))?;
+        for event in decoder.push(&chunk) {
+            let mut forwarded = Event::default().data(event.data);
+            if let Some(kind) = event.event {
+                forwarded = forwarded.event(kind);
+            }
+            if events.send(forwarded).await.is_err() {
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Upgrade an authenticated request to a live log stream.
@@ -3946,6 +4363,7 @@ async fn ws_logs_session(
             app_name: app,
             namespace,
             tail,
+            label: None,
             lines: lines_tx,
         })
         .await
@@ -4182,57 +4600,27 @@ async fn exec_handler(
     {
         return resp;
     }
-    let (resp_tx, resp_rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(AgentCommand::Exec {
-            app_name: app,
-            namespace,
-            command: body.command,
-            response: resp_tx,
-        })
-        .await
-        .is_err()
+    match ask_agent(&state.cmd_tx, |response| AgentCommand::Exec {
+        app_name: app,
+        namespace,
+        command: body.command,
+        response,
+    })
+    .await
     {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent unavailable" })),
-        )
-            .into_response();
-    }
-
-    match resp_rx.await {
         Ok(Ok(output)) => Json(serde_json::json!({ "output": output })).into_response(),
         Ok(Err(e)) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "error": e.to_string() })),
         )
             .into_response(),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent dropped response" })),
-        )
-            .into_response(),
+        Err(response) => response,
     }
 }
 
 /// List cluster nodes.
 async fn nodes_handler(State(state): State<ApiState>) -> Response {
-    let (resp_tx, resp_rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(AgentCommand::Nodes { response: resp_tx })
-        .await
-        .is_err()
-    {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent unavailable" })),
-        )
-            .into_response();
-    }
-
-    match resp_rx.await {
+    match ask_agent(&state.cmd_tx, |response| AgentCommand::Nodes { response }).await {
         Ok(mut nodes) => {
             if let Some(membership) = &state.membership {
                 let members = membership.read().await;
@@ -4245,37 +4633,142 @@ async fn nodes_handler(State(state): State<ApiState>) -> Response {
             }
             Json(nodes).into_response()
         }
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent dropped response" })),
-        )
-            .into_response(),
+        Err(response) => response,
     }
+}
+
+/// Largest request body the node relay forwards (a trace request is tiny).
+const MAX_RELAY_REQUEST_BYTES: usize = 64 * 1024;
+/// Largest response the node relay passes back (an events page is the biggest).
+const MAX_RELAY_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+/// A trace probes for up to 25 seconds on the target; allow for the hop.
+const RELAY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The per-node reads `relish wtf` and `relish trace` make, and nothing else.
+/// The relay is a reachability aid, not a general proxy.
+fn relay_allows(method: &axum::http::Method, path: &str) -> bool {
+    const READS: &[&str] = &[
+        "v1/health",
+        "v1/status",
+        "v1/diagnostics",
+        "v1/diagnostics/apps",
+        "v1/events",
+        "v1/deploys/operations",
+        "v1/alerts",
+        "v1/fault",
+        "v1/cluster/council",
+        "v1/capabilities",
+    ];
+    match *method {
+        axum::http::Method::GET => READS.contains(&path),
+        axum::http::Method::POST => path == "v1/trace",
+        _ => false,
+    }
+}
+
+/// `GET|POST /v1/nodes/{node}/relay/{path}`: send one of a few per-node
+/// diagnostic requests to a named node and return its answer.
+///
+/// A laptop host can reach node 1's forwarded port but not the guests' own
+/// addresses, so `relish wtf` and `relish trace` reach every other node
+/// through this. The caller's own credential travels with the request and the
+/// target repeats every authentication and authorisation check; the relay
+/// never adds the node's service identity.
+async fn node_relay_handler(
+    State(state): State<ApiState>,
+    Path((node, path)): Path<(String, String)>,
+    method: axum::http::Method,
+    uri: axum::http::Uri,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    if !relay_allows(&method, &path) {
+        return (
+            StatusCode::NOT_FOUND,
+            format!("the node relay does not forward {method} /{path}"),
+        )
+            .into_response();
+    }
+    let mut url = match target_node_api_url(&state, &node, &format!("/{path}")).await {
+        Ok(url) => url,
+        Err(response) => return response,
+    };
+    if let Some(query) = uri.query() {
+        url.push('?');
+        url.push_str(query);
+    }
+    let mut request = state.cluster_http.client().request(method.clone(), url);
+    if method == axum::http::Method::POST {
+        request = request
+            .header(
+                axum::http::header::CONTENT_TYPE.as_str(),
+                "application/json",
+            )
+            .body(body);
+    }
+    let request = copy_forwarded_auth(request, &headers);
+    let response = match tokio::time::timeout(RELAY_TIMEOUT, request.send()).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("node {node} did not answer: {error}"),
+            )
+                .into_response();
+        }
+        Err(_) => {
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                format!(
+                    "node {node} did not answer within {}s",
+                    RELAY_TIMEOUT.as_secs()
+                ),
+            )
+                .into_response();
+        }
+    };
+    let status =
+        StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let Ok(chunk) = chunk else {
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("node {node} broke off its answer"),
+            )
+                .into_response();
+        };
+        if bytes.len() + chunk.len() > MAX_RELAY_RESPONSE_BYTES {
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("node {node} answered with more than the relay's 8 MiB limit"),
+            )
+                .into_response();
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let mut relayed = (status, bytes).into_response();
+    if let Some(content_type) = content_type
+        && let Ok(value) = axum::http::HeaderValue::from_str(&content_type)
+    {
+        relayed
+            .headers_mut()
+            .insert(axum::http::header::CONTENT_TYPE, value);
+    }
+    relayed
 }
 
 /// Show council (Raft) status.
 async fn council_handler(State(state): State<ApiState>) -> Response {
-    let (resp_tx, resp_rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(AgentCommand::Council { response: resp_tx })
-        .await
-        .is_err()
-    {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent unavailable" })),
-        )
-            .into_response();
-    }
-
-    match resp_rx.await {
+    match ask_agent(&state.cmd_tx, |response| AgentCommand::Council { response }).await {
         Ok(council) => Json(serde_json::json!(council)).into_response(),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent dropped response" })),
-        )
-            .into_response(),
+        Err(response) => response,
     }
 }
 
@@ -4517,7 +5010,7 @@ async fn registry_proposal_handler(
             .map_err(|error| (StatusCode::FORBIDDEN, error.to_string()))?;
         let request = proposal
             .mutation
-            .request_for_node(&node_id)
+            .request_for_node(&node_id, crate::testkit::lease::now_unix_millis())
             .map_err(|error| (StatusCode::FORBIDDEN, error.to_string()))?;
         council
             .write(request)
@@ -4619,37 +5112,21 @@ async fn join_handler(
                 .into_response();
         }
     };
-    let (resp_tx, resp_rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(AgentCommand::JoinIssue {
-            token: body.token,
-            node_id: body.node_id,
-            csr_der,
-            response: resp_tx,
-        })
-        .await
-        .is_err()
+    match ask_agent(&state.cmd_tx, |response| AgentCommand::JoinIssue {
+        token: body.token,
+        node_id: body.node_id,
+        csr_der,
+        response,
+    })
+    .await
     {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent unavailable" })),
-        )
-            .into_response();
-    }
-
-    match resp_rx.await {
         Ok(Ok(bundle)) => Json(bundle).into_response(),
         Ok(Err(e)) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": e.to_string() })),
         )
             .into_response(),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent dropped response" })),
-        )
-            .into_response(),
+        Err(response) => response,
     }
 }
 
@@ -4657,237 +5134,21 @@ async fn join_handler(
 // Chaos testing endpoints
 // ---------------------------------------------------------------------------
 
-/// Request body for partition injection.
-#[derive(Deserialize)]
-struct ChaosPartitionRequest {
-    peers: Vec<String>,
-    duration_secs: u64,
-    #[serde(default)]
-    acknowledged: bool,
-}
-
-/// Inject a network partition.
-async fn chaos_partition_handler(
-    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
-    State(state): State<ApiState>,
-    Json(body): Json<ChaosPartitionRequest>,
-) -> Response {
-    // AUTH4: fault injection is an operator action, not a node-to-node one.
-    if let Err(resp) =
-        crate::sesame::auth::authorize_user(auth.as_deref(), crate::sesame::types::ApiRole::Admin)
-    {
-        return resp;
-    }
-    let (principal, role) = auth
-        .as_deref()
-        .map(|auth| (auth.principal_id.as_str(), auth.role))
-        .unwrap_or(("local-bootstrap", crate::sesame::types::ApiRole::Admin));
-    if let Err(error) = state.static_capabilities.test_policy.authorise(
-        crate::testkit::safety::OperationPermission::AlterNodeState,
-        &crate::testkit::safety::OperationAuthorisation {
-            principal,
-            role,
-            acknowledged: body.acknowledged,
-        },
-    ) {
-        return (StatusCode::FORBIDDEN, error.to_string()).into_response();
-    }
-    let audit_peers = body.peers.clone();
-    let audit_duration_seconds = body.duration_secs;
-    let injected_by = auth
-        .as_deref()
-        .map(|auth| auth.token_name.clone())
-        .unwrap_or_else(|| "local-bootstrap".to_string());
-    let Some(target_node) = state.node_name.clone() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "node fault safety requires a cluster identity",
-        )
-            .into_response();
-    };
-    let request = crate::smoker::types::FaultRequest {
-        fault_type: crate::smoker::types::FaultType::CouncilPartition,
-        target_service: body.peers.join(","),
-        namespace: None,
-        target_instance: None,
-        target_node: Some(target_node),
-        duration: std::time::Duration::from_secs(body.duration_secs),
-        injected_by: injected_by.clone(),
-        reason: Some("legacy chaos partition".into()),
-        include_leader: true,
-        override_safety: false,
-        acknowledged: body.acknowledged,
-    };
-    let reservation = match prepare_and_reserve_node_fault(&state, request).await {
-        Ok(grant) => grant,
-        Err(response) => return *response,
-    };
-    let duration_secs = reservation.request.duration.as_secs();
-    let (resp_tx, resp_rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(AgentCommand::InjectPartition {
-            reservation: Some(reservation),
-            peers: body.peers,
-            duration_secs,
-            injected_by,
-            response: resp_tx,
-        })
-        .await
-        .is_err()
-    {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent unavailable" })),
-        )
-            .into_response();
-    }
-
-    match resp_rx.await {
-        Ok(Ok((msg, summary))) => {
-            record_fault_audit(
-                &state,
-                FaultAudit {
-                    action: "fault.injected",
-                    principal,
-                    severity: crate::bun::events::EventSeverity::Warning,
-                    app: None,
-                    node: None,
-                    details: std::collections::BTreeMap::from([
-                        ("fault_type".to_string(), "CouncilPartition".to_string()),
-                        (
-                            "duration_seconds".to_string(),
-                            audit_duration_seconds.to_string(),
-                        ),
-                        ("peers".to_string(), audit_peers.join(",")),
-                        ("fault_id".to_string(), summary.id.to_string()),
-                    ]),
-                    message: format!("{msg} by principal {principal}"),
-                },
-            )
-            .await;
-            Json(serde_json::json!({ "message": msg, "fault": summary })).into_response()
-        }
-        Ok(Err(e)) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": e.to_string() })),
-        )
-            .into_response(),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent dropped response" })),
-        )
-            .into_response(),
-    }
-}
-
-/// Remove all network partitions.
-async fn chaos_heal_handler(
-    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
-    State(state): State<ApiState>,
-) -> Response {
-    if let Err(resp) =
-        crate::sesame::auth::authorize_user(auth.as_deref(), crate::sesame::types::ApiRole::Admin)
-    {
-        return resp;
-    }
-    let (principal, role) = auth
-        .as_deref()
-        .map(|auth| (auth.principal_id.as_str(), auth.role))
-        .unwrap_or(("local-bootstrap", crate::sesame::types::ApiRole::Admin));
-    if let Err(error) = state.static_capabilities.test_policy.authorise_reversal(
-        crate::testkit::safety::OperationPermission::AlterNodeState,
-        &crate::testkit::safety::OperationAuthorisation {
-            principal,
-            role,
-            acknowledged: false,
-        },
-    ) {
-        return (StatusCode::FORBIDDEN, error.to_string()).into_response();
-    }
-    let (resp_tx, resp_rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(AgentCommand::HealPartition { response: resp_tx })
-        .await
-        .is_err()
-    {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent unavailable" })),
-        )
-            .into_response();
-    }
-
-    match resp_rx.await {
-        Ok(Ok(msg)) => {
-            record_fault_audit(
-                &state,
-                FaultAudit {
-                    action: "fault.cleared-council-partition",
-                    principal,
-                    severity: crate::bun::events::EventSeverity::Info,
-                    app: None,
-                    node: None,
-                    details: std::collections::BTreeMap::new(),
-                    message: format!("{msg} by principal {principal}"),
-                },
-            )
-            .await;
-            Json(serde_json::json!({ "message": msg })).into_response()
-        }
-        Ok(Err(e)) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": e.to_string() })),
-        )
-            .into_response(),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent dropped response" })),
-        )
-            .into_response(),
-    }
-}
-
-/// Query chaos status.
+/// Show the locally replicated node-experiment reservation, if any.
 async fn chaos_status_handler(State(state): State<ApiState>) -> Response {
-    let (resp_tx, resp_rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(AgentCommand::ChaosStatus { response: resp_tx })
-        .await
-        .is_err()
-    {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent unavailable" })),
-        )
-            .into_response();
-    }
-
-    match resp_rx.await {
-        Ok(status) => {
-            let reservation = match &state.council {
-                Some(council) => council.desired_state().await.node_fault_reservations.active,
-                None => None,
-            };
-            Json(serde_json::json!({
-                "active_partition": status.active_partition,
-                "node_fault_reservation": reservation.map(|grant| serde_json::json!({
-                    "sequence": grant.sequence,
-                    "target_node": grant.request.target_node,
-                    "fault_type": grant.request.fault_type,
-                    "cleanup_after_unix_ms": grant.cleanup_after_unix_ms,
-                })),
-            }))
-            .into_response()
-        }
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent dropped response" })),
-        )
-            .into_response(),
-    }
+    let reservation = match &state.council {
+        Some(council) => council.desired_state().await.node_fault_reservations.active,
+        None => None,
+    };
+    Json(serde_json::json!({
+        "node_fault_reservation": reservation.map(|grant| serde_json::json!({
+            "sequence": grant.sequence,
+            "target_node": grant.request.target_node,
+            "fault_type": grant.request.fault_type,
+            "cleanup_after_unix_ms": grant.cleanup_after_unix_ms,
+        })),
+    }))
+    .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -4944,33 +5205,18 @@ async fn snapshot_create_handler(
         return resp;
     }
     let Json(body) = body.unwrap_or_default();
-    let (resp_tx, resp_rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(AgentCommand::SnapshotCreate {
-            namespace,
-            app_name: app,
-            volume: body.volume,
-            name: body.name,
-            response: resp_tx,
-        })
-        .await
-        .is_err()
+    match ask_agent(&state.cmd_tx, |response| AgentCommand::SnapshotCreate {
+        namespace,
+        app_name: app,
+        volume: body.volume,
+        name: body.name,
+        response,
+    })
+    .await
     {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent unavailable" })),
-        )
-            .into_response();
-    }
-    match resp_rx.await {
         Ok(Ok(metas)) => (StatusCode::CREATED, Json(serde_json::json!(metas))).into_response(),
         Ok(Err(e)) => snapshot_error_response(&e),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent dropped response" })),
-        )
-            .into_response(),
+        Err(response) => response,
     }
 }
 
@@ -4982,31 +5228,16 @@ async fn snapshot_list_handler(
     if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
         return resp;
     }
-    let (resp_tx, resp_rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(AgentCommand::SnapshotList {
-            namespace,
-            app_name: app,
-            response: resp_tx,
-        })
-        .await
-        .is_err()
+    match ask_agent(&state.cmd_tx, |response| AgentCommand::SnapshotList {
+        namespace,
+        app_name: app,
+        response,
+    })
+    .await
     {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent unavailable" })),
-        )
-            .into_response();
-    }
-    match resp_rx.await {
         Ok(Ok(metas)) => Json(serde_json::json!(metas)).into_response(),
         Ok(Err(e)) => snapshot_error_response(&e),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent dropped response" })),
-        )
-            .into_response(),
+        Err(response) => response,
     }
 }
 
@@ -5024,32 +5255,17 @@ async fn snapshot_restore_handler(
     if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
         return resp;
     }
-    let (resp_tx, resp_rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(AgentCommand::SnapshotRestore {
-            namespace,
-            app_name: app,
-            name: body.name,
-            response: resp_tx,
-        })
-        .await
-        .is_err()
+    match ask_agent(&state.cmd_tx, |response| AgentCommand::SnapshotRestore {
+        namespace,
+        app_name: app,
+        name: body.name,
+        response,
+    })
+    .await
     {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent unavailable" })),
-        )
-            .into_response();
-    }
-    match resp_rx.await {
         Ok(Ok(())) => Json(serde_json::json!({ "restored": true })).into_response(),
         Ok(Err(e)) => snapshot_error_response(&e),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent dropped response" })),
-        )
-            .into_response(),
+        Err(response) => response,
     }
 }
 
@@ -5066,32 +5282,17 @@ async fn snapshot_delete_handler(
     if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
         return resp;
     }
-    let (resp_tx, resp_rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(AgentCommand::SnapshotDelete {
-            namespace,
-            app_name: app,
-            name,
-            response: resp_tx,
-        })
-        .await
-        .is_err()
+    match ask_agent(&state.cmd_tx, |response| AgentCommand::SnapshotDelete {
+        namespace,
+        app_name: app,
+        name,
+        response,
+    })
+    .await
     {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent unavailable" })),
-        )
-            .into_response();
-    }
-    match resp_rx.await {
         Ok(Ok(())) => Json(serde_json::json!({ "deleted": true })).into_response(),
         Ok(Err(e)) => snapshot_error_response(&e),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent dropped response" })),
-        )
-            .into_response(),
+        Err(response) => response,
     }
 }
 
@@ -5189,6 +5390,16 @@ async fn fault_inject_handler(
         ) {
             return (StatusCode::FORBIDDEN, response.to_string()).into_response();
         }
+        // Workload faults act on processes, so they have to reach the node
+        // that runs them. A cluster member routes every one, including those
+        // it keeps for itself, so the replica rail always sees the whole
+        // service.
+        if let Some(self_name) = state.node_name.clone()
+            && state.membership.is_some()
+        {
+            return route_workload_fault(&state, auth.as_deref(), &headers, request, &self_name)
+                .await;
+        }
     }
 
     // The caller controls the JSON body, so it cannot be the audit identity.
@@ -5208,8 +5419,30 @@ async fn fault_inject_handler(
     } else {
         None
     };
+    match apply_fault_locally(&state, auth.as_deref(), request, reservation, None).await {
+        Ok(summary) => Json(summary).into_response(),
+        Err(response) => response,
+    }
+}
+
+/// Apply a fault on this node and record its audit event.
+///
+/// `replica_evidence` carries the cluster-wide replica counts a routed
+/// workload fault was judged against; `None` keeps the agent's local view.
+// `Response` is large but it IS the HTTP reply to send on failure;
+// boxing it would tax every call site for a value that lives one frame.
+#[allow(clippy::result_large_err)]
+async fn apply_fault_locally(
+    state: &ApiState,
+    auth: Option<&crate::sesame::auth::AuthContext>,
+    mut request: crate::smoker::types::FaultRequest,
+    reservation: Option<crate::smoker::reservation::NodeFaultReservation>,
+    replica_evidence: Option<crate::smoker::types::ReplicaEvidence>,
+) -> Result<crate::smoker::types::FaultSummary, Response> {
+    request.injected_by = auth
+        .map(|auth| auth.token_name.clone())
+        .unwrap_or_else(|| "local-bootstrap".to_string());
     let audit_principal = auth
-        .as_deref()
         .map(|auth| auth.principal_id.clone())
         .unwrap_or_else(|| "local-bootstrap".to_string());
     let audit_target_node = request.target_node.clone();
@@ -5221,25 +5454,14 @@ async fn fault_inject_handler(
         .unwrap_or_else(|| request.fault_type.to_string());
     let audit_duration_seconds = request.duration.as_secs();
     let audit_reason = request.reason.clone();
-    let (resp_tx, resp_rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(AgentCommand::InjectFault {
-            reservation,
-            request,
-            response: resp_tx,
-        })
-        .await
-        .is_err()
+    match ask_agent(&state.cmd_tx, |response| AgentCommand::InjectFault {
+        reservation: reservation.map(Box::new),
+        request,
+        replica_evidence,
+        response,
+    })
+    .await
     {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent unavailable" })),
-        )
-            .into_response();
-    }
-
-    match resp_rx.await {
         Ok(Ok(summary)) => {
             if let Some(events) = &state.events {
                 let timestamp = std::time::SystemTime::now()
@@ -5279,18 +5501,14 @@ async fn fault_inject_handler(
                         ),
                     });
             }
-            Json(serde_json::json!(summary)).into_response()
+            Ok(summary)
         }
-        Ok(Err(e)) => (
+        Ok(Err(e)) => Err((
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": e.to_string() })),
         )
-            .into_response(),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent dropped response" })),
-        )
-            .into_response(),
+            .into_response()),
+        Err(response) => Err(response),
     }
 }
 
@@ -5741,6 +5959,330 @@ async fn forward_node_fault(
     .await
 }
 
+/// How long a peer may take to report its instances or faults while a
+/// workload fault is being routed. It stays well under the 5-second deadline
+/// a forwarding node gives the owner, which gathers the same evidence again.
+const FAULT_EVIDENCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Route a workload fault to the nodes that run its targets.
+///
+/// The node that receives the request plans one request per owner from live
+/// cluster status, checks the replica rail against cluster-wide counts, then
+/// applies its own share and forwards the rest under the caller's credential.
+/// An owner receiving a forwarded share (its `target_node` names the owner)
+/// repeats the same steps, so its own server policy and its own view of the
+/// replica rail decide before anything happens there.
+async fn route_workload_fault(
+    state: &ApiState,
+    auth: Option<&crate::sesame::auth::AuthContext>,
+    headers: &HeaderMap,
+    request: crate::smoker::types::FaultRequest,
+    self_name: &str,
+) -> Response {
+    use crate::smoker::routing::{WorkloadInstance, plan_workload_fault, replica_evidence};
+
+    if request.fault_type.acts_on_callers() {
+        return route_network_fault(state, auth, headers, request, self_name).await;
+    }
+    let namespace = request.namespace.clone().unwrap_or_default();
+    let (statuses, faults) = tokio::join!(
+        collect_cluster_statuses(state, FAULT_EVIDENCE_TIMEOUT),
+        collect_cluster_faults(state, FAULT_EVIDENCE_TIMEOUT),
+    );
+    // A peer that didn't answer contributes no replicas, which only makes the
+    // replica rail stricter.
+    let statuses = match statuses {
+        Ok((statuses, _unreachable)) => statuses,
+        Err(error) => return unavailable_response(error),
+    };
+    let instances: Vec<WorkloadInstance> = statuses
+        .into_iter()
+        .filter(|status| {
+            status.instance.app_name == request.target_service
+                && status.instance.namespace == namespace
+        })
+        .map(|status| WorkloadInstance {
+            running: status.instance.state == "running",
+            node: status.node,
+            instance_id: status.instance.id,
+        })
+        .collect();
+    let evidence = replica_evidence(&request, &instances, &faults.0);
+
+    let context = crate::smoker::types::SafetyContext {
+        // Workload faults only meet the replica rail; zeroed cluster fields
+        // make the node rails stand aside, as they do in standalone mode.
+        council_size: 0,
+        council_nodes_with_active_faults: 0,
+        leader_node_id: String::new(),
+        total_nodes: 0,
+        nodes_with_active_faults: 0,
+        target_service_replicas: evidence.replicas,
+        target_service_faulted_replicas: evidence.faulted_replicas,
+    };
+    let check = crate::smoker::safety::evaluate_safety(&request, &context);
+    if !check.approved {
+        let reason = check
+            .violation
+            .map(|violation| violation.to_string())
+            .unwrap_or_else(|| "safety check failed".to_string());
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": reason })),
+        )
+            .into_response();
+    }
+
+    let plan = match plan_workload_fault(&request, &instances) {
+        Ok(plan) => plan,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": error.to_string() })),
+            )
+                .into_response();
+        }
+    };
+
+    send_routed_faults(state, auth, headers, plan, self_name, Some(evidence)).await
+}
+
+/// Route a network fault to the nodes that run its callers.
+///
+/// Network faults act where a connection starts, so a destination-wide fault
+/// goes to every live node and a `--from` fault to the nodes that run the
+/// source app in the fault's namespace. No replica rail applies: nothing is
+/// stopped, only traffic towards the target changes.
+async fn route_network_fault(
+    state: &ApiState,
+    auth: Option<&crate::sesame::auth::AuthContext>,
+    headers: &HeaderMap,
+    request: crate::smoker::types::FaultRequest,
+    self_name: &str,
+) -> Response {
+    use crate::smoker::routing::{WorkloadInstance, plan_network_fault};
+
+    let namespace = request.namespace.clone().unwrap_or_default();
+    let mut nodes: Vec<String> = match &state.membership {
+        Some(membership) => membership
+            .read()
+            .await
+            .iter()
+            .map(|member| member.node_id.0.clone())
+            .collect(),
+        None => Vec::new(),
+    };
+    nodes.push(self_name.to_string());
+    let sources: Vec<WorkloadInstance> = match request.fault_type.source_app() {
+        Some(source) => match collect_cluster_statuses(state, FAULT_EVIDENCE_TIMEOUT).await {
+            Ok((statuses, _unreachable)) => statuses
+                .into_iter()
+                .filter(|status| {
+                    status.instance.app_name == source && status.instance.namespace == namespace
+                })
+                .map(|status| WorkloadInstance {
+                    running: status.instance.state == "running",
+                    node: status.node,
+                    instance_id: status.instance.id,
+                })
+                .collect(),
+            Err(error) => return unavailable_response(error),
+        },
+        None => Vec::new(),
+    };
+    let plan = match plan_network_fault(&request, &nodes, &sources) {
+        Ok(plan) => plan,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": error.to_string() })),
+            )
+                .into_response();
+        }
+    };
+    send_routed_faults(state, auth, headers, plan, self_name, None).await
+}
+
+/// Apply this node's share of a routed fault and forward every other share,
+/// returning one summary whose `routed` lists the rest.
+async fn send_routed_faults(
+    state: &ApiState,
+    auth: Option<&crate::sesame::auth::AuthContext>,
+    headers: &HeaderMap,
+    plan: Vec<crate::smoker::routing::RoutedFault>,
+    self_name: &str,
+    evidence: Option<crate::smoker::types::ReplicaEvidence>,
+) -> Response {
+    let mut applied: Vec<crate::smoker::types::FaultSummary> = Vec::new();
+    for routed in plan {
+        let result = if routed.node == self_name {
+            apply_fault_locally(state, auth, routed.request, None, evidence).await
+        } else {
+            forward_workload_fault(state, &routed.node, headers, &routed.request).await
+        };
+        match result {
+            Ok(mut summary) => {
+                summary.node = Some(routed.node);
+                applied.push(summary);
+            }
+            Err(response) if applied.is_empty() => return response,
+            Err(response) => {
+                return partial_fault_response(&routed.node, response, applied).await;
+            }
+        }
+    }
+    let mut applied = applied.into_iter();
+    let Some(mut first) = applied.next() else {
+        return (StatusCode::BAD_REQUEST, "fault matched no instances").into_response();
+    };
+    first.routed = applied.collect();
+    Json(first).into_response()
+}
+
+/// Forward one owner's share of a workload fault and read back its summary.
+// `Response` is large but it IS the HTTP reply to send on failure;
+// boxing it would tax every call site for a value that lives one frame.
+#[allow(clippy::result_large_err)]
+async fn forward_workload_fault(
+    state: &ApiState,
+    node: &str,
+    headers: &HeaderMap,
+    request: &crate::smoker::types::FaultRequest,
+) -> Result<crate::smoker::types::FaultSummary, Response> {
+    let response = forward_node_fault(state, node, headers, request).await;
+    if !response.status().is_success() {
+        return Err(response);
+    }
+    let body = axum::body::to_bytes(response.into_body(), MAX_FAULT_FORWARD_RESPONSE_BYTES)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("failed to read fault response from {node}: {error}"),
+            )
+                .into_response()
+        })?;
+    serde_json::from_slice(&body).map_err(|error| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("node {node} returned an unreadable fault summary: {error}"),
+        )
+            .into_response()
+    })
+}
+
+/// A routed fault took effect on some owners and failed on another. Report
+/// both, so the operator can clear what did land.
+async fn partial_fault_response(
+    failed_node: &str,
+    failure: Response,
+    applied: Vec<crate::smoker::types::FaultSummary>,
+) -> Response {
+    let status = failure.status();
+    let body = axum::body::to_bytes(failure.into_body(), MAX_FAULT_FORWARD_RESPONSE_BYTES)
+        .await
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_default();
+    let landed: Vec<String> = applied
+        .iter()
+        .map(|summary| {
+            format!(
+                "{} on {}",
+                summary.id,
+                summary.node.as_deref().unwrap_or("?")
+            )
+        })
+        .collect();
+    (
+        status,
+        Json(serde_json::json!({
+            "error": format!(
+                "fault failed on {failed_node} ({body}) after it took effect as {}",
+                landed.join(", ")
+            ),
+            "applied": applied,
+        })),
+    )
+        .into_response()
+}
+
+/// Every node's active faults, each tagged with the node that holds it, plus
+/// one message per peer that didn't answer.
+async fn collect_cluster_faults(
+    state: &ApiState,
+    peer_timeout: std::time::Duration,
+) -> (Vec<crate::smoker::types::FaultSummary>, Vec<String>) {
+    let local_name = local_node_name(state);
+    let mut failures = Vec::new();
+    let mut faults: Vec<_> = match ask_agent(&state.cmd_tx, |response| AgentCommand::ListFaults {
+        response,
+    })
+    .await
+    {
+        Ok(local) => local
+            .into_iter()
+            .map(|mut fault| {
+                fault.node = Some(local_name.clone());
+                fault
+            })
+            .collect(),
+        Err(_) => {
+            failures.push(format!("node {local_name}: agent unavailable"));
+            Vec::new()
+        }
+    };
+    let members = match &state.membership {
+        Some(membership) => membership.read().await.clone(),
+        None => Vec::new(),
+    };
+    let requests = futures_util::stream::iter(
+        members
+            .into_iter()
+            .filter(|member| member.node_id.0 != local_name)
+            .map(|member| async move {
+                let name = member.node_id.0;
+                let result = tokio::time::timeout(peer_timeout, async {
+                    let url = state
+                        .cluster_http
+                        .url(&member.address.to_string(), "/v1/fault");
+                    let mut request = state.cluster_http.client().get(url);
+                    if let Some(token) = &state.service_token {
+                        request = request.bearer_auth(token);
+                    }
+                    request
+                        .send()
+                        .await?
+                        .error_for_status()?
+                        .json::<Vec<crate::smoker::types::FaultSummary>>()
+                        .await
+                })
+                .await;
+                match result {
+                    Ok(Ok(faults)) => Ok(faults
+                        .into_iter()
+                        .map(|mut fault| {
+                            fault.node = Some(name.clone());
+                            fault
+                        })
+                        .collect::<Vec<_>>()),
+                    Ok(Err(error)) => Err(format!("node {name}: {error}")),
+                    Err(_) => Err(format!("node {name} timed out")),
+                }
+            }),
+    )
+    .buffer_unordered(8);
+    tokio::pin!(requests);
+    while let Some(result) = requests.next().await {
+        match result {
+            Ok(node_faults) => faults.extend(node_faults),
+            Err(failure) => failures.push(failure),
+        }
+    }
+    failures.sort();
+    faults.sort_by(|left, right| (&left.node, left.id).cmp(&(&right.node, right.id)));
+    (faults, failures)
+}
+
 /// Resolve a live cluster member to one of its API URLs.
 // `Response` is large but it IS the HTTP reply to send on failure —
 // boxing it would tax every call site for a value that lives one frame.
@@ -5948,28 +6490,30 @@ async fn fault_clear_handler(
         )
             .into_response();
     }
-    let (resp_tx, resp_rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(AgentCommand::ClearFault {
-            fault_id: id,
-            allow_workload_fault,
-            allow_node_fault,
-            allow_node_pressure,
-            response: resp_tx,
-        })
-        .await
-        .is_err()
+    match ask_agent(&state.cmd_tx, |response| AgentCommand::ClearFault {
+        fault_id: id,
+        allow_workload_fault,
+        allow_node_fault,
+        allow_node_pressure,
+        response,
+    })
+    .await
     {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent unavailable" })),
-        )
-            .into_response();
-    }
-
-    match resp_rx.await {
-        Ok(Ok(msg)) => {
+        Ok(Ok(clearance)) => {
+            if let Some(sequence) = clearance.reservation
+                && !wait_for_node_fault_release(&state, sequence).await
+            {
+                return (
+                    StatusCode::GATEWAY_TIMEOUT,
+                    Json(serde_json::json!({
+                        "error": format!(
+                            "fault {id} is reversed on this node, but the cluster has not yet \
+                             released its reservation; retry the clear before injecting again"
+                        )
+                    })),
+                )
+                    .into_response();
+            }
             record_fault_audit(
                 &state,
                 FaultAudit {
@@ -5986,18 +6530,48 @@ async fn fault_clear_handler(
                 },
             )
             .await;
-            Json(serde_json::json!({ "message": msg })).into_response()
+            Json(serde_json::json!({ "message": clearance.message })).into_response()
         }
         Ok(Err(e)) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": e.to_string() })),
         )
             .into_response(),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent dropped response" })),
-        )
-            .into_response(),
+        Err(response) => response,
+    }
+}
+
+/// How long a clear waits for the council to release a node fault's
+/// reservation. It stays under the 5-second deadline a forwarding node gives
+/// the owning node, so a forwarded clear reports this node's own verdict.
+const NODE_FAULT_RELEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// Wait until the council no longer holds the reservation a cleared node fault
+/// owned, or the deadline passes. Returns whether it was released.
+///
+/// The leader's reaper releases a reservation only after it has fenced the
+/// target node through its own live membership view. So once this returns
+/// `true`, the leader that will judge the next node fault has already seen
+/// this node back, and the single experiment slot is free again.
+async fn wait_for_node_fault_release(state: &ApiState, sequence: u64) -> bool {
+    let Some(council) = &state.council else {
+        return true;
+    };
+    let deadline = tokio::time::Instant::now() + NODE_FAULT_RELEASE_TIMEOUT;
+    loop {
+        let released = council
+            .desired_state()
+            .await
+            .node_fault_reservations
+            .active
+            .is_none_or(|grant| grant.sequence != sequence);
+        if released {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 }
 
@@ -6030,6 +6604,7 @@ async fn forward_node_fault_clear(
 async fn fault_clear_all_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
+    headers: HeaderMap,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     if let Err(resp) = crate::sesame::auth::authorize_user(
@@ -6052,13 +6627,12 @@ async fn fault_clear_all_handler(
     ) {
         return (StatusCode::FORBIDDEN, error.to_string()).into_response();
     }
-    let (resp_tx, resp_rx) = oneshot::channel();
     // `?service=NAME` clears only that service's faults; no query clears all
     // workload faults. An *empty* `?service=` is neither: every node-class
     // fault carries an empty `target_service`, so it would match them all —
     // reject it rather than let this Deployer-authorised path reverse Admin
     // faults by omission.
-    let command = match params.get("service") {
+    let target = match params.get("service") {
         Some(service) if service.is_empty() => {
             return (
                 StatusCode::BAD_REQUEST,
@@ -6078,11 +6652,7 @@ async fn fault_clear_all_handler(
                 {
                     return response;
                 }
-                AgentCommand::ClearFaultsByService {
-                    service: service.clone(),
-                    namespace: Some(namespace.clone()),
-                    response: resp_tx,
-                }
+                Some((service.clone(), Some(namespace.clone())))
             }
             // Cross-namespace clear: reversing a service's faults in every
             // namespace is a cluster-wide action, so a scoped token is refused
@@ -6091,25 +6661,31 @@ async fn fault_clear_all_handler(
                 if let Err(response) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
                     return response;
                 }
-                AgentCommand::ClearFaultsByService {
-                    service: service.clone(),
-                    namespace: None,
-                    response: resp_tx,
-                }
+                Some((service.clone(), None))
             }
         },
-        None => AgentCommand::ClearAllFaults { response: resp_tx },
+        None => None,
     };
-    if state.cmd_tx.send(command).await.is_err() {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent unavailable" })),
-        )
-            .into_response();
-    }
-
-    match resp_rx.await {
+    let command = |response| match target {
+        Some((service, namespace)) => AgentCommand::ClearFaultsByService {
+            service,
+            namespace,
+            response,
+        },
+        None => AgentCommand::ClearAllFaults { response },
+    };
+    match ask_agent(&state.cmd_tx, command).await {
         Ok(Ok(msg)) => {
+            // Workload faults are routed to the nodes that run their targets,
+            // so a clear has to reach those nodes too. Peers get `local=true`
+            // and the caller's own credential, so each repeats every check.
+            let msg = if params.get("local").is_some_and(|local| local == "true") {
+                msg
+            } else {
+                let mut messages = vec![msg];
+                messages.extend(clear_faults_on_peers(&state, &headers, &params).await);
+                messages.join("; ")
+            };
             let service = params.get("service").cloned();
             let mut details = std::collections::BTreeMap::new();
             let action = if let Some(service) = &service {
@@ -6138,123 +6714,128 @@ async fn fault_clear_all_handler(
             Json(serde_json::json!({ "error": e.to_string() })),
         )
             .into_response(),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent dropped response" })),
-        )
-            .into_response(),
+        Err(response) => response,
     }
 }
 
-/// List all active faults.
-async fn fault_list_handler(State(state): State<ApiState>) -> Response {
-    let (resp_tx, resp_rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(AgentCommand::ListFaults { response: resp_tx })
-        .await
-        .is_err()
+/// Send a clear-all or clear-by-service to every other live member and
+/// describe each answer. A peer that can't be reached is reported, not fatal:
+/// its faults still expire on their own.
+async fn clear_faults_on_peers(
+    state: &ApiState,
+    headers: &HeaderMap,
+    params: &std::collections::HashMap<String, String>,
+) -> Vec<String> {
+    let local_name = local_node_name(state);
+    let members = match &state.membership {
+        Some(membership) => membership.read().await.clone(),
+        None => return Vec::new(),
+    };
+    let mut query: Vec<(&str, &str)> = params
+        .iter()
+        .filter(|(key, _)| matches!(key.as_str(), "service" | "namespace"))
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    query.push(("local", "true"));
+    let mut messages = Vec::new();
+    for member in members
+        .into_iter()
+        .filter(|member| member.node_id.0 != local_name)
     {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent unavailable" })),
-        )
-            .into_response();
+        let node = member.node_id.0;
+        let url = state
+            .cluster_http
+            .url(&member.address.to_string(), "/v1/fault");
+        let request = state.cluster_http.client().delete(url).query(&query);
+        let response =
+            send_node_request(&node, copy_forwarded_auth(request, headers), "fault clear").await;
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), MAX_FAULT_FORWARD_RESPONSE_BYTES)
+            .await
+            .unwrap_or_default();
+        let text = serde_json::from_slice::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|value| value["message"].as_str().map(str::to_string))
+            .unwrap_or_else(|| String::from_utf8_lossy(&body).into_owned());
+        messages.push(if status.is_success() {
+            format!("{node}: {text}")
+        } else {
+            format!("{node}: not cleared ({status}): {text}")
+        });
     }
+    messages
+}
 
-    match resp_rx.await {
+#[derive(Debug, Default, Deserialize)]
+struct FaultListQuery {
+    #[serde(default)]
+    cluster: bool,
+}
+
+/// Every node's active faults, as `GET /v1/fault?cluster=true` returns them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClusterFaultList {
+    /// Active faults, each tagged with the node that holds it.
+    pub faults: Vec<crate::smoker::types::FaultSummary>,
+    /// One message per node whose faults couldn't be read.
+    pub warnings: Vec<String>,
+}
+
+/// List active faults: this node's by default, every node's with
+/// `?cluster=true`.
+async fn fault_list_handler(
+    State(state): State<ApiState>,
+    Query(query): Query<FaultListQuery>,
+) -> Response {
+    if query.cluster {
+        let (faults, warnings) = collect_cluster_faults(&state, CLUSTER_STATUS_TIMEOUT).await;
+        return Json(ClusterFaultList { faults, warnings }).into_response();
+    }
+    match ask_agent(&state.cmd_tx, |response| AgentCommand::ListFaults {
+        response,
+    })
+    .await
+    {
         Ok(summaries) => Json(serde_json::json!(summaries)).into_response(),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent dropped response" })),
-        )
-            .into_response(),
+        Err(response) => response,
     }
 }
 
 /// Resolve a service name to its VIP and backends.
 async fn resolve_handler(State(state): State<ApiState>, Path(name): Path<String>) -> Response {
-    let (resp_tx, resp_rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(AgentCommand::Resolve {
-            app_name: name.clone(),
-            response: resp_tx,
-        })
-        .await
-        .is_err()
+    match ask_agent(&state.cmd_tx, |response| AgentCommand::Resolve {
+        app_name: name.clone(),
+        response,
+    })
+    .await
     {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent unavailable" })),
-        )
-            .into_response();
-    }
-
-    match resp_rx.await {
         Ok(Some(info)) => Json(serde_json::json!(info)).into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "error": format!("service {name:?} not found") })),
         )
             .into_response(),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent dropped response" })),
-        )
-            .into_response(),
+        Err(response) => response,
     }
 }
 
 /// List all registered services.
 async fn resolve_all_handler(State(state): State<ApiState>) -> Response {
-    let (resp_tx, resp_rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(AgentCommand::ResolveAll { response: resp_tx })
-        .await
-        .is_err()
+    match ask_agent(&state.cmd_tx, |response| AgentCommand::ResolveAll {
+        response,
+    })
+    .await
     {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent unavailable" })),
-        )
-            .into_response();
-    }
-
-    match resp_rx.await {
         Ok(entries) => Json(serde_json::json!(entries)).into_response(),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent dropped response" })),
-        )
-            .into_response(),
+        Err(response) => response,
     }
 }
 
 /// List all ingress routes.
 async fn routes_handler(State(state): State<ApiState>) -> Response {
-    let (resp_tx, resp_rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(AgentCommand::Routes { response: resp_tx })
-        .await
-        .is_err()
-    {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent unavailable" })),
-        )
-            .into_response();
-    }
-
-    match resp_rx.await {
+    match ask_agent(&state.cmd_tx, |response| AgentCommand::Routes { response }).await {
         Ok(routes) => Json(serde_json::json!(routes)).into_response(),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent dropped response" })),
-        )
-            .into_response(),
+        Err(response) => response,
     }
 }
 
@@ -6272,7 +6853,15 @@ struct MetricsQueryParams {
     /// node answers with only that app's local data; absent for node-wide
     /// dashboard queries.
     app: Option<String>,
+    /// Keep only the newest N samples of each series (per-app queries).
+    per_series: Option<u32>,
 }
+
+/// Window the per-app endpoint reads when the caller gives no `start`.
+///
+/// Callers want "what's happening now"; reading from the epoch made every
+/// unbounded query scan (and cap) the whole retention period.
+const APP_METRICS_DEFAULT_WINDOW_SECS: u64 = 15 * 60;
 
 /// `GET /v1/metrics?name=X&start=S&end=E` — query time-series data.
 ///
@@ -6303,25 +6892,11 @@ async fn metrics_query_handler(
     // cross-node fan-out: answer with only that app's local samples. Every
     // caller-supplied string reaches the SQL literal, so escape each (OBS1).
     if let Some(app) = &params.app {
-        let app_filter = crate::mayo::store::escape_sql_literal(app);
-        let sql = if name == "*" {
-            format!(
-                "SELECT timestamp, metric_name, labels, value FROM metrics \
-                 WHERE labels LIKE '%\"{app_filter}\"%' \
-                 AND timestamp >= {start} AND timestamp <= {end} \
-                 ORDER BY timestamp LIMIT 10000"
-            )
-        } else {
-            let name = crate::mayo::store::escape_sql_literal(name);
-            format!(
-                "SELECT timestamp, metric_name, labels, value FROM metrics \
-                 WHERE metric_name = '{name}' \
-                 AND labels LIKE '%\"{app_filter}\"%' \
-                 AND timestamp >= {start} AND timestamp <= {end} \
-                 ORDER BY timestamp LIMIT 10000"
-            )
-        };
-        return match store.query_sql(&sql).await {
+        let name = (name != "*").then_some(name);
+        return match store
+            .query_app(app, name, start, end, params.per_series)
+            .await
+        {
             Ok(results) => {
                 let data: Vec<serde_json::Value> = results
                     .iter()
@@ -6409,12 +6984,9 @@ async fn metrics_summary_handler(
 
 /// Gather instance statuses from the agent.
 async fn gather_statuses(state: &ApiState) -> Vec<InstanceStatus> {
-    let (tx, rx) = oneshot::channel();
-    let _ = state
-        .cmd_tx
-        .send(AgentCommand::Status { response: tx })
-        .await;
-    rx.await.unwrap_or_default()
+    ask_agent(&state.cmd_tx, |response| AgentCommand::Status { response })
+        .await
+        .unwrap_or_default()
 }
 
 /// Build dashboard app rows from instance statuses.
@@ -6555,6 +7127,24 @@ async fn dashboard_handler(State(state): State<ApiState>) -> Response {
     }
 }
 
+/// Names of the metrics an app's instances reported in the last five
+/// minutes, for choosing its page's charts. Empty if the query fails or
+/// takes more than three seconds: the page renders without those charts
+/// rather than waiting on a slow node.
+async fn scraped_metric_names(state: &ApiState, app: &str, namespace: &str) -> Vec<String> {
+    let start = crate::mayo::types::Sample::now(0.0)
+        .timestamp
+        .saturating_sub(300);
+    let query = app_metric_rows(state, app, namespace, None, start, i64::MAX as u64, Some(1));
+    let Ok(Ok(result)) = tokio::time::timeout(std::time::Duration::from_secs(3), query).await
+    else {
+        return Vec::new();
+    };
+    let names: std::collections::BTreeSet<String> =
+        result.data.into_iter().map(|row| row.metric_name).collect();
+    names.into_iter().collect()
+}
+
 /// `GET /ui/app/{app}/{namespace}` — app detail page.
 async fn app_detail_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
@@ -6625,22 +7215,11 @@ async fn app_detail_handler(
         vec![]
     };
 
-    let charts = vec![
-        ChartConfig {
-            endpoint: format!("/v1/metrics/app/{app}/{namespace}?name=process_cpu_percent"),
-            title: "CPU Usage".to_string(),
-            y_label: "%".to_string(),
-            refresh_secs: 10,
-            range_secs: 3600,
-        },
-        ChartConfig {
-            endpoint: format!("/v1/metrics/app/{app}/{namespace}?name=process_memory_bytes"),
-            title: "Memory Usage".to_string(),
-            y_label: "bytes".to_string(),
-            refresh_secs: 10,
-            range_secs: 3600,
-        },
-    ];
+    let charts = crate::brioche::app_detail::app_charts(
+        &app,
+        &namespace,
+        &scraped_metric_names(&state, &app, &namespace).await,
+    );
 
     let data = AppDetailData {
         app_name: app,
@@ -6788,17 +7367,13 @@ async fn app_env_handler(
     if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
         return resp;
     }
-    let (tx, rx) = oneshot::channel();
-    let _ = state
-        .cmd_tx
-        .send(AgentCommand::AppConfig {
-            app_name: app,
-            namespace,
-            response: tx,
-        })
-        .await;
-
-    match rx.await {
+    match ask_agent(&state.cmd_tx, |response| AgentCommand::AppConfig {
+        app_name: app,
+        namespace,
+        response,
+    })
+    .await
+    {
         Ok(Some(spec)) => Json(safe_env(&spec.env)).into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,
@@ -7102,6 +7677,7 @@ async fn metrics_cluster_handler(
             start,
             end,
             app: None,
+            per_series: None,
         };
         let timeout = std::time::Duration::from_secs(10);
         let result = crate::mayo::query_fanout::fan_out_cluster_query(
@@ -7143,34 +7719,28 @@ async fn metrics_cluster_handler(
     }
 }
 
-/// `GET /v1/metrics/app/{app}/{namespace}?name=X&start=S&end=E` — single-app query.
+/// One app's metric rows, wherever its instances run.
 ///
 /// When the placement map is visible (council + membership), fans out to the
 /// nodes running the app, hitting each one's app-filtered `/v1/metrics` leaf
 /// and merge-sorting the per-instance rows. Falls back to the local metrics
 /// store otherwise (single-node, or no placement info) — which is the same as
-/// fanning out to just this node.
-async fn metrics_app_handler(
-    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
-    State(state): State<ApiState>,
-    Path((app, namespace)): Path<(String, String)>,
-    Query(params): Query<MetricsQueryParams>,
-) -> Response {
-    if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
-        return resp;
-    }
-    let start = params.start.unwrap_or(0);
-    // Clamped below u64::MAX: DataFusion 45's interval analysis
-    // overflows (debug-build panic) computing the cardinality of a
-    // full-domain unsigned range like `timestamp <= u64::MAX`.
-    let end = params.end.unwrap_or(i64::MAX as u64).min(i64::MAX as u64);
-
+/// fanning out to just this node. `Err` carries a store failure message.
+async fn app_metric_rows(
+    state: &ApiState,
+    app: &str,
+    namespace: &str,
+    name: Option<&str>,
+    start: u64,
+    end: u64,
+    per_series: Option<u32>,
+) -> Result<MetricsQueryResult, String> {
     // Cross-node fan-out: each node keeps only its own instances' samples, so
     // reading just this node's store misses instances scheduled elsewhere.
     if let (Some(council), Some(membership)) = (&state.council, &state.membership) {
         use crate::meat::types::AppId;
         let desired = council.desired_state().await;
-        let app_id = AppId::new(&app, &namespace);
+        let app_id = AppId::new(app, namespace);
         let node_ids: Vec<crate::meat::NodeId> = desired
             .scheduling
             .get(&app_id)
@@ -7188,83 +7758,180 @@ async fn metrics_app_handler(
 
             if !urls.is_empty() {
                 let query = MetricsQuery {
-                    metric_name: params.name.clone(),
+                    metric_name: name.map(str::to_string),
                     start,
                     end,
                     // The leaf filters on the `app` label, stored as `namespace/app`.
                     app: Some(format!("{namespace}/{app}")),
+                    per_series,
                 };
                 let timeout = std::time::Duration::from_secs(10);
-                let result = crate::mayo::query_fanout::fan_out_app_query(
+                return Ok(crate::mayo::query_fanout::fan_out_app_query(
                     &query,
                     &urls,
                     state.cluster_http.client(),
                     timeout,
                     state.service_token.as_deref(),
                 )
-                .await;
-                return Json(result).into_response();
+                .await);
             }
         }
     }
 
     let Some(mayo) = &state.mayo else {
-        return Json(MetricsQueryResult {
+        return Ok(MetricsQueryResult {
             data: vec![],
             warnings: vec![],
-        })
-        .into_response();
+        });
     };
-
-    let store = mayo.read().await;
 
     // Filter by app label in the local store. Both the app/namespace path
-    // segments and the caller-supplied `name` reach the SQL literal, so escape
-    // every one (OBS1): without this a crafted `?name=x' OR '1'='1` or an app
-    // name carrying a quote would break out of the literal and drop the
-    // tenant/time predicate, leaking other apps' metrics.
-    let app_filter = crate::mayo::store::escape_sql_literal(&format!("{namespace}/{app}"));
-    let sql = match &params.name {
-        Some(name) => {
-            let name = crate::mayo::store::escape_sql_literal(name);
-            format!(
-                "SELECT timestamp, metric_name, labels, value FROM metrics \
-                 WHERE metric_name = '{name}' \
-                 AND labels LIKE '%\"{app_filter}\"%' \
-                 AND timestamp >= {start} AND timestamp <= {end} \
-                 ORDER BY timestamp LIMIT 10000"
-            )
-        }
-        None => format!(
-            "SELECT timestamp, metric_name, labels, value FROM metrics \
-             WHERE labels LIKE '%\"{app_filter}\"%' \
-             AND timestamp >= {start} AND timestamp <= {end} \
-             ORDER BY timestamp LIMIT 10000"
-        ),
-    };
-
-    match store.query_sql(&sql).await {
-        Ok(rows) => {
-            let data: Vec<MetricsQueryRow> = rows
-                .into_iter()
-                .map(|(ts, name, labels, val)| MetricsQueryRow {
-                    timestamp: ts,
-                    metric_name: name,
-                    labels,
-                    value: val,
-                })
-                .collect();
-            Json(MetricsQueryResult {
-                data,
-                warnings: vec![],
+    // segments and the caller-supplied `name` reach the SQL literal, which
+    // `query_app` escapes (OBS1): without that a crafted `?name=x' OR '1'='1`
+    // or an app name carrying a quote would break out of the literal and drop
+    // the tenant/time predicate, leaking other apps' metrics.
+    let rows = mayo
+        .read()
+        .await
+        .query_app(&format!("{namespace}/{app}"), name, start, end, per_series)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(MetricsQueryResult {
+        data: rows
+            .into_iter()
+            .map(|(timestamp, metric_name, labels, value)| MetricsQueryRow {
+                timestamp,
+                metric_name,
+                labels,
+                value,
             })
-            .into_response()
+            .collect(),
+        warnings: vec![],
+    })
+}
+
+/// The query window a per-app request names: `start` defaults to fifteen
+/// minutes ago, `end` to now.
+fn app_query_window(start: Option<u64>, end: Option<u64>) -> (u64, u64) {
+    let start = start.unwrap_or_else(|| {
+        crate::mayo::types::Sample::now(0.0)
+            .timestamp
+            .saturating_sub(APP_METRICS_DEFAULT_WINDOW_SECS)
+    });
+    // Clamped below u64::MAX: DataFusion 45's interval analysis
+    // overflows (debug-build panic) computing the cardinality of a
+    // full-domain unsigned range like `timestamp <= u64::MAX`.
+    let end = end.unwrap_or(i64::MAX as u64).min(i64::MAX as u64);
+    (start, end)
+}
+
+fn metrics_error_response(error: String) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({ "error": error })),
+    )
+        .into_response()
+}
+
+/// `GET /v1/metrics/app/{app}/{namespace}?name=X&start=S&end=E&per_series=N`
+/// — one app's raw metric rows, across every node running it.
+async fn metrics_app_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+    Path((app, namespace)): Path<(String, String)>,
+    Query(params): Query<MetricsQueryParams>,
+) -> Response {
+    if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
+        return resp;
+    }
+    let (start, end) = app_query_window(params.start, params.end);
+    match app_metric_rows(
+        &state,
+        &app,
+        &namespace,
+        params.name.as_deref(),
+        start,
+        end,
+        params.per_series,
+    )
+    .await
+    {
+        Ok(result) => Json(result).into_response(),
+        Err(error) => metrics_error_response(error),
+    }
+}
+
+#[derive(Deserialize)]
+struct AppChartParams {
+    /// Metric to draw; a histogram's base name for `kind=mean`.
+    name: String,
+    /// How rows become lines.
+    kind: crate::mayo::series::ChartKind,
+    start: Option<u64>,
+    end: Option<u64>,
+}
+
+/// What the dashboard's chart script draws: series lined up on one time
+/// axis, plus any fan-out warnings.
+#[derive(Debug, Serialize, Deserialize)]
+struct AppChartResponse {
+    #[serde(flatten)]
+    chart: crate::mayo::series::ChartData,
+    warnings: Vec<crate::mayo::rollup::QueryWarning>,
+}
+
+/// `GET /v1/metrics/app/{app}/{namespace}/chart?name=X&kind=gauge|rate|mean`
+/// — one metric as one line per instance, ready to draw.
+///
+/// `gauge` draws values, `rate` draws a counter's per-second rate, and
+/// `mean` draws `rate(X_sum) / rate(X_count)`, a histogram's mean.
+async fn metrics_app_chart_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+    Path((app, namespace)): Path<(String, String)>,
+    Query(params): Query<AppChartParams>,
+) -> Response {
+    use crate::mayo::series::{self, ChartKind};
+
+    if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
+        return resp;
+    }
+    let (start, end) = app_query_window(params.start, params.end);
+    let fetch = |name: String| {
+        let state = &state;
+        let app = &app;
+        let namespace = &namespace;
+        async move { app_metric_rows(state, app, namespace, Some(&name), start, end, None).await }
+    };
+    let response = match params.kind {
+        ChartKind::Gauge | ChartKind::Rate => {
+            fetch(params.name.clone())
+                .await
+                .map(|result| AppChartResponse {
+                    chart: series::instance_chart(params.kind, &result.data),
+                    warnings: result.warnings,
+                })
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
-            .into_response(),
+        ChartKind::Mean => {
+            match tokio::try_join!(
+                fetch(format!("{}_sum", params.name)),
+                fetch(format!("{}_count", params.name))
+            ) {
+                Ok((sum, count)) => {
+                    let mut warnings = sum.warnings;
+                    warnings.extend(count.warnings);
+                    Ok(AppChartResponse {
+                        chart: series::mean_chart(&sum.data, &count.data),
+                        warnings,
+                    })
+                }
+                Err(error) => Err(error),
+            }
+        }
+    };
+    match response {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => metrics_error_response(error),
     }
 }
 
@@ -7754,16 +8421,12 @@ async fn identity_sign_handler(
         }
     };
 
-    let (tx, rx) = oneshot::channel();
-    let _ = state
-        .cmd_tx
-        .send(AgentCommand::SignImage {
-            manifest_digest: req.digest,
-            response: tx,
-        })
-        .await;
-
-    match rx.await {
+    match ask_agent(&state.cmd_tx, |response| AgentCommand::SignImage {
+        manifest_digest: req.digest,
+        response,
+    })
+    .await
+    {
         Ok(Ok(msg)) => Json(serde_json::json!({ "message": msg })).into_response(),
         Ok(Err(e)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -8549,6 +9212,19 @@ mod tests {
     async fn test_setup_with_metrics(
         samples: &[(&str, &str, f64)],
     ) -> (Router, CancellationToken, tempfile::TempDir) {
+        let now = crate::mayo::types::Sample::now(0.0).timestamp;
+        let timed: Vec<(&str, &str, &str, u64, f64)> = samples
+            .iter()
+            .map(|(name, app, value)| (*name, *app, "instance-0", now, *value))
+            .collect();
+        test_setup_with_timed_metrics(&timed).await
+    }
+
+    /// Like [`test_setup_with_metrics`], with an explicit instance label
+    /// and timestamp per sample: `(name, app label, instance, time, value)`.
+    async fn test_setup_with_timed_metrics(
+        samples: &[(&str, &str, &str, u64, f64)],
+    ) -> (Router, CancellationToken, tempfile::TempDir) {
         use crate::mayo::types::{MetricKey, Sample};
 
         let (cmd_tx, cmd_rx) = mpsc::channel(32);
@@ -8562,11 +9238,12 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let mut store = MayoStore::new(dir.path().to_path_buf());
-        for (name, app_filter, value) in samples {
+        for (name, app_filter, instance, timestamp, value) in samples {
             let mut labels = std::collections::BTreeMap::new();
             labels.insert("app".to_string(), app_filter.to_string());
+            labels.insert("instance".to_string(), instance.to_string());
             let key = MetricKey::with_labels(*name, labels);
-            store.insert(&key, Sample::at(1000, *value));
+            store.insert(&key, Sample::at(*timestamp, *value));
         }
         store.flush().await.unwrap();
         let mayo = Some(Arc::new(RwLock::new(store)));
@@ -9000,12 +9677,22 @@ mod tests {
     }
 
     fn council_partition_body(acknowledged: bool) -> String {
-        serde_json::json!({
-            "peers": ["node-b"],
-            "duration_secs": 30,
-            "acknowledged": acknowledged,
+        serde_json::to_string(&crate::smoker::types::FaultRequest {
+            fault_type: crate::smoker::types::FaultType::CouncilPartition {
+                peers: vec!["node-b".to_string()],
+            },
+            target_service: String::new(),
+            namespace: None,
+            target_instance: None,
+            target_node: Some("node-a".to_string()),
+            duration: std::time::Duration::from_secs(30),
+            injected_by: "untrusted-client-value".to_string(),
+            reason: Some("api policy test".to_string()),
+            include_leader: true,
+            override_safety: false,
+            acknowledged,
         })
-        .to_string()
+        .unwrap()
     }
 
     fn node_kill_body(acknowledged: bool) -> String {
@@ -9065,7 +9752,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_partition_route_does_not_bypass_the_admin_role() {
+    async fn deployer_cannot_partition_a_council_member() {
         let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::Deployer);
         let (app, shutdown) = setup_with_auth_readiness_and_leases(
             vec![token],
@@ -9076,21 +9763,13 @@ mod tests {
         )
         .await;
 
-        assert_eq!(
-            post_status(
-                app,
-                "/v1/chaos/partition",
-                &plaintext,
-                &council_partition_body(true),
-            )
-            .await,
-            StatusCode::FORBIDDEN
-        );
+        let status = post_status(app, "/v1/fault", &plaintext, &council_partition_body(true)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
         shutdown.cancel();
     }
 
     #[tokio::test]
-    async fn legacy_partition_route_requires_explicit_acknowledgement() {
+    async fn council_partition_requires_explicit_acknowledgement() {
         let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::Admin);
         let (app, shutdown) = setup_with_auth_readiness_and_leases(
             vec![token],
@@ -9103,7 +9782,7 @@ mod tests {
 
         let (status, body) = post_authenticated(
             app,
-            "/v1/chaos/partition",
+            "/v1/fault",
             &plaintext,
             &council_partition_body(false),
             None,
@@ -9111,31 +9790,6 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert!(String::from_utf8_lossy(&body).contains("acknowledgement"));
-        shutdown.cancel();
-    }
-
-    #[tokio::test]
-    async fn legacy_partition_requires_cluster_reservation_evidence() {
-        let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::Admin);
-        let (app, shutdown) = setup_with_auth_readiness_and_leases(
-            vec![token],
-            None,
-            crate::bun::readiness::ReadinessTracker::new(),
-            node_fault_static_capabilities(),
-            None,
-        )
-        .await;
-
-        let (status, body) = post_authenticated(
-            app,
-            "/v1/chaos/partition",
-            &plaintext,
-            &council_partition_body(true),
-            None,
-        )
-        .await;
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert!(String::from_utf8_lossy(&body).contains("cluster identity"));
         shutdown.cancel();
     }
 
@@ -10003,7 +10657,7 @@ schedule = "* * * * *"
     }
 
     #[tokio::test]
-    async fn credential_free_placements_still_record_consumers_but_a_service_token_requires_authentication()
+    async fn credential_free_placements_serve_discovery_but_a_service_token_requires_authentication()
      {
         let council = seeded_council("endpoint-consumer-development").await;
         for service in [None, Some("internal".to_string())] {
@@ -10031,13 +10685,13 @@ schedule = "* * * * *"
                     StatusCode::OK
                 }
             );
-            assert_eq!(
-                council
+            // Neither poll carries a TLS identity, so neither may owe receipts.
+            assert!(
+                !council
                     .desired_state()
                     .await
                     .endpoint_consumers
-                    .contains(node),
-                !protected
+                    .contains(node)
             );
             shutdown.cancel();
         }
@@ -10061,7 +10715,14 @@ schedule = "* * * * *"
             Some(council.clone()),
         )
         .await;
+        // Only TLS-authenticated polls register consumers, so enrol directly.
         for consumer in ["worker", "other-worker"] {
+            council
+                .write(RaftRequest::RegisterEndpointConsumer {
+                    node_id: consumer.into(),
+                })
+                .await
+                .unwrap();
             assert_eq!(
                 get_authenticated(
                     app.clone(),
@@ -10104,6 +10765,12 @@ schedule = "* * * * *"
             ));
             originals.push(serde_json::to_value(&catalog.services["default__web"]).unwrap());
             if generation == 2 {
+                council
+                    .write(RaftRequest::RegisterEndpointConsumer {
+                        node_id: "late-worker".into(),
+                    })
+                    .await
+                    .unwrap();
                 let (status, bytes) =
                     get_authenticated(app.clone(), "/v1/placements/late-worker", "internal").await;
                 assert_eq!(status, StatusCode::OK);
@@ -10191,7 +10858,33 @@ schedule = "* * * * *"
     }
 
     #[tokio::test]
-    async fn placements_register_the_consumer_before_serving_discovery() {
+    async fn unparseable_peer_identity_is_refused_before_any_route() {
+        let council = seeded_council("unparseable-peer").await;
+        let (app, shutdown) = setup_with_auth_leases_events_and_council(
+            vec![],
+            Some("internal".into()),
+            crate::bun::readiness::ReadinessTracker::new(),
+            lease_static_capabilities(),
+            None,
+            None,
+            Some(council.clone()),
+        )
+        .await;
+        // The handshake verifier normally rejects this first; if anything
+        // slips past it, the retirement check must not wave it through.
+        let app = app.layer(axum::Extension(crate::sesame::renewal::TlsPeerCertificate(
+            Vec::from(b"not a certificate".as_slice()).into(),
+        )));
+        assert_eq!(
+            get_status(app, "/v1/health", None).await,
+            StatusCode::FORBIDDEN
+        );
+        shutdown.cancel();
+        council.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn placements_serve_plaintext_discovery_without_registering_a_consumer() {
         let council = seeded_council("endpoint-consumer").await;
         let (token, user_key) = a_user_token(crate::sesame::types::ApiRole::Admin);
         let (app, shutdown) = setup_with_auth_leases_events_and_council(
@@ -10214,12 +10907,11 @@ schedule = "* * * * *"
             get_authenticated(app.clone(), path, "internal").await.0,
             StatusCode::OK
         );
+        // Receipts need a TLS identity; tests/suite/endpoint_withdrawal.rs covers
+        // registration for authenticated consumers.
         assert!(
-            council
-                .desired_state()
-                .await
-                .endpoint_consumers
-                .contains("worker")
+            council.desired_state().await.endpoint_consumers.is_empty(),
+            "a plaintext poll registered an obligation nobody can discharge"
         );
         let invalid_peer =
             app.clone()
@@ -12720,6 +13412,11 @@ schedule = "* * * * *"
             9117,
             None,
         );
+        // The per-member deadline is a Tokio timer, so paused time reaches
+        // it as soon as the request is idle on the silent socket instead of
+        // waiting five real seconds. The 7 s guard still fires later, so a
+        // missing deadline fails rather than passes.
+        tokio::time::pause();
         let response = tokio::time::timeout(
             std::time::Duration::from_secs(7),
             app.oneshot(
@@ -12738,6 +13435,93 @@ schedule = "* * * * *"
         assert!(json["error"].as_str().unwrap().contains("unresponsive"));
         worker.await.unwrap();
         drop(listener);
+    }
+
+    /// The cluster fan-out authenticates to peers with the node's own service
+    /// token, which sees everything. What comes back must still be trimmed
+    /// to the *caller's* scope, locally and cluster-wide (T1.9).
+    #[tokio::test]
+    async fn namespace_scoped_token_sees_only_its_namespace_in_status() {
+        let status = |id: &str, namespace: &str| -> InstanceStatus {
+            serde_json::from_value(serde_json::json!({
+                "id": id, "app_name": "web", "namespace": namespace, "state": "running",
+                "restart_count": 0, "host_port": null, "pid": null
+            }))
+            .unwrap()
+        };
+        let peer_statuses = vec![status("peer-a", "team-a"), status("peer-b", "team-b")];
+        let peer = Router::new().route(
+            "/v1/status",
+            axum::routing::get(move || {
+                let statuses = peer_statuses.clone();
+                async move { Json(statuses) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_address = listener.local_addr().unwrap();
+        let peer_server = tokio::spawn(async move {
+            axum::serve(listener, peer).await.unwrap();
+        });
+
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(4);
+        let local_statuses = vec![status("local-a", "team-a"), status("local-b", "team-b")];
+        let worker = tokio::spawn(async move {
+            while let Some(command) = cmd_rx.recv().await {
+                if let AgentCommand::Status { response } = command {
+                    let _ = response.send(local_statuses.clone());
+                }
+            }
+        });
+        let created = crate::sesame::token::create_token(
+            "tenant-a-reader",
+            crate::sesame::types::ApiRole::ReadOnly,
+            crate::sesame::types::TokenScope {
+                apps: None,
+                namespaces: Some(vec!["team-a".to_string()]),
+            },
+            None,
+        )
+        .unwrap();
+        let store = crate::sesame::auth::new_token_store();
+        store.write().await.push(created.token);
+        let members = Arc::new(RwLock::new(vec![NodeMembershipInfo {
+            node_id: crate::meat::NodeId::new("peer"),
+            address: peer_address,
+        }]));
+        let app = router(
+            cmd_tx,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(store),
+            None,
+            None,
+            Some(members),
+            None,
+            9117,
+            None,
+        );
+
+        let (code, body) = get_authenticated(app.clone(), "/v1/status", &created.plaintext).await;
+        assert_eq!(code, StatusCode::OK);
+        let local: Vec<InstanceStatus> = serde_json::from_slice(&body).unwrap();
+        let local_ids: Vec<_> = local.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(local_ids, ["local-a"]);
+
+        let (code, body) =
+            get_authenticated(app, "/v1/status?cluster=true", &created.plaintext).await;
+        assert_eq!(code, StatusCode::OK);
+        let cluster: Vec<crate::bun::agent::ClusterInstanceStatus> =
+            serde_json::from_slice(&body).unwrap();
+        let mut cluster_ids: Vec<_> = cluster.iter().map(|s| s.instance.id.as_str()).collect();
+        cluster_ids.sort_unstable();
+        assert_eq!(cluster_ids, ["local-a", "peer-a"]);
+
+        peer_server.abort();
+        worker.abort();
     }
 
     #[test]
@@ -13667,6 +14451,176 @@ schedule = "* * * * *"
         shutdown2.cancel();
     }
 
+    /// With no `start`, the per-app endpoint reads the last fifteen minutes
+    /// rather than the whole retention period.
+    #[tokio::test]
+    async fn app_metrics_default_to_the_recent_window() {
+        let now = crate::mayo::types::Sample::now(0.0).timestamp;
+        let (app, shutdown, _dir) = test_setup_with_timed_metrics(&[
+            ("requests_total", "default/web", "web-0", now - 3600, 1.0),
+            ("requests_total", "default/web", "web-0", now - 30, 2.0),
+        ])
+        .await;
+        let (status, body) = get(app.clone(), "/v1/metrics/app/web/default").await;
+        assert_eq!(status, StatusCode::OK);
+        let parsed: MetricsQueryResult = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed.data.len(), 1, "{:?}", parsed.data);
+        assert_eq!(parsed.data[0].value, 2.0);
+
+        // An explicit start still reaches back.
+        let (_, body) = get(
+            app,
+            &format!("/v1/metrics/app/web/default?start={}", now - 7200),
+        )
+        .await;
+        let parsed: MetricsQueryResult = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed.data.len(), 2);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn app_metrics_per_series_returns_only_the_latest_samples() {
+        let now = crate::mayo::types::Sample::now(0.0).timestamp;
+        let (app, shutdown, _dir) = test_setup_with_timed_metrics(&[
+            ("requests_total", "default/web", "web-0", now - 30, 1.0),
+            ("requests_total", "default/web", "web-0", now - 20, 2.0),
+            ("requests_total", "default/web", "web-0", now - 10, 3.0),
+            ("up", "default/web", "web-0", now - 10, 1.0),
+        ])
+        .await;
+        let (status, body) = get(app, "/v1/metrics/app/web/default?per_series=1").await;
+        assert_eq!(status, StatusCode::OK);
+        let parsed: MetricsQueryResult = serde_json::from_slice(&body).unwrap();
+        let mut latest: Vec<(String, f64)> = parsed
+            .data
+            .iter()
+            .map(|row| (row.metric_name.clone(), row.value))
+            .collect();
+        latest.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            latest,
+            vec![("requests_total".to_string(), 3.0), ("up".to_string(), 1.0)]
+        );
+        shutdown.cancel();
+    }
+
+    /// The dashboard's chart script reads `{timestamps, series: [{label,
+    /// values}]}` with one series per instance and `values` aligned to
+    /// `timestamps` (brioche.js `toChart`). Counters arrive as rates.
+    #[tokio::test]
+    async fn the_chart_endpoint_answers_one_rate_line_per_instance() {
+        let now = crate::mayo::types::Sample::now(0.0).timestamp;
+        let (app, shutdown, _dir) = test_setup_with_timed_metrics(&[
+            (
+                "http_requests_total",
+                "default/web",
+                "web-0",
+                now - 20,
+                100.0,
+            ),
+            (
+                "http_requests_total",
+                "default/web",
+                "web-0",
+                now - 10,
+                150.0,
+            ),
+            (
+                "http_requests_total",
+                "default/web",
+                "web-1",
+                now - 18,
+                10.0,
+            ),
+            ("http_requests_total", "default/web", "web-1", now - 8, 30.0),
+            (
+                "http_requests_total",
+                "default/other",
+                "other-0",
+                now - 8,
+                999.0,
+            ),
+        ])
+        .await;
+        let (status, body) = get(
+            app,
+            "/v1/metrics/app/web/default/chart?name=http_requests_total&kind=rate",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let chart: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            chart["timestamps"],
+            serde_json::json!([now - 10, now - 8]),
+            "{chart}"
+        );
+        assert_eq!(
+            chart["series"],
+            serde_json::json!([
+                {"label": "web-0", "values": [5.0, null]},
+                {"label": "web-1", "values": [null, 2.0]},
+            ]),
+            "{chart}"
+        );
+        assert_eq!(chart["warnings"], serde_json::json!([]));
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn the_chart_endpoint_draws_a_histogram_as_mean_latency() {
+        let now = crate::mayo::types::Sample::now(0.0).timestamp;
+        let (app, shutdown, _dir) = test_setup_with_timed_metrics(&[
+            ("latency_seconds_sum", "default/web", "web-0", now - 20, 1.0),
+            ("latency_seconds_sum", "default/web", "web-0", now - 10, 3.0),
+            (
+                "latency_seconds_count",
+                "default/web",
+                "web-0",
+                now - 20,
+                10.0,
+            ),
+            (
+                "latency_seconds_count",
+                "default/web",
+                "web-0",
+                now - 10,
+                50.0,
+            ),
+        ])
+        .await;
+        let (status, body) = get(
+            app,
+            "/v1/metrics/app/web/default/chart?name=latency_seconds&kind=mean",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let chart: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(chart["timestamps"], serde_json::json!([now - 10]));
+        assert_eq!(chart["series"][0]["values"], serde_json::json!([0.05]));
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn the_app_page_charts_what_the_app_exposes() {
+        let (app, shutdown, _dir) = test_setup_with_metrics(&[
+            ("http_requests_total", "default/web", 1.0),
+            ("http_request_duration_seconds_sum", "default/web", 1.0),
+            ("http_request_duration_seconds_count", "default/web", 1.0),
+        ])
+        .await;
+        let (status, body) = get(app, "/ui/app/web/default").await;
+        assert_eq!(status, StatusCode::OK);
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        for endpoint in [
+            "chart?name=process_cpu_percent&amp;kind=gauge",
+            "chart?name=http_requests_total&amp;kind=rate",
+            "chart?name=http_request_duration_seconds&amp;kind=mean",
+        ] {
+            assert!(html.contains(endpoint), "{endpoint} missing from {html}");
+        }
+        shutdown.cancel();
+    }
+
     #[tokio::test]
     async fn per_app_process_metric_is_queryable() {
         // OBS3: per-app (app-labelled) process metrics must be collectible and
@@ -13687,5 +14641,672 @@ schedule = "* * * * *"
         assert_eq!(parsed.data[0].metric_name, "process_cpu_percent");
 
         shutdown.cancel();
+    }
+}
+
+/// Multi-node API tests: several real routers on loopback listeners, each
+/// with a scripted agent, sharing one membership table. They exercise the
+/// cross-node routing paths without starting gossip or Raft.
+#[cfg(test)]
+mod cluster_routing_tests {
+    use super::*;
+    use crate::smoker::types::{FaultRequest, FaultSummary, FaultType, ReplicaEvidence};
+    use tokio_util::sync::CancellationToken;
+
+    const SERVICE_TOKEN: &str = "cluster-routing-internal";
+
+    type Injected = Arc<tokio::sync::Mutex<Vec<(FaultRequest, Option<ReplicaEvidence>)>>>;
+
+    struct FakeNode {
+        url: String,
+        injected: Injected,
+    }
+
+    struct FakeCluster {
+        nodes: Vec<FakeNode>,
+        membership: Arc<RwLock<Vec<NodeMembershipInfo>>>,
+        operator: String,
+        /// A read-only token confined to the `api` app.
+        api_reader: String,
+        stop: CancellationToken,
+    }
+
+    impl FakeCluster {
+        /// List a member whose address has nothing listening, like a node
+        /// that died before gossip noticed.
+        async fn add_unreachable_member(&self, name: &str) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            drop(listener);
+            self.membership.write().await.push(NodeMembershipInfo {
+                node_id: crate::meat::NodeId::new(name),
+                address,
+            });
+        }
+
+        async fn get_json<T: serde::de::DeserializeOwned>(&self, entry: usize, path: &str) -> T {
+            reqwest::Client::new()
+                .get(format!("{}{path}", self.nodes[entry].url))
+                .bearer_auth(&self.operator)
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap()
+        }
+    }
+
+    impl Drop for FakeCluster {
+        fn drop(&mut self) {
+            self.stop.cancel();
+        }
+    }
+
+    fn instance(id: &str, app: &str, state: &str) -> InstanceStatus {
+        InstanceStatus {
+            id: id.to_string(),
+            app_name: app.to_string(),
+            namespace: "default".to_string(),
+            state: state.to_string(),
+            restart_count: 0,
+            host_port: None,
+            exit_code: None,
+            pid: Some(4242),
+        }
+    }
+
+    fn summary_of(id: u64, request: &FaultRequest) -> FaultSummary {
+        FaultSummary {
+            id,
+            fault_type: request.fault_type.to_string(),
+            target_service: request.target_service.clone(),
+            target_instance: request.target_instance.clone(),
+            target_node: request.target_node.clone(),
+            remaining_secs: 60,
+            injected_by: request.injected_by.clone(),
+            node: None,
+            routed: Vec::new(),
+        }
+    }
+
+    /// Answer the agent commands the routing paths use from a fixed script.
+    fn spawn_fake_agent(
+        name: String,
+        instances: Vec<InstanceStatus>,
+        injected: Injected,
+        mut commands: mpsc::Receiver<AgentCommand>,
+        stop: CancellationToken,
+    ) {
+        tokio::spawn(async move {
+            loop {
+                let command = tokio::select! {
+                    () = stop.cancelled() => return,
+                    command = commands.recv() => match command {
+                        Some(command) => command,
+                        None => return,
+                    },
+                };
+                match command {
+                    AgentCommand::Status { response } => {
+                        let _ = response.send(instances.clone());
+                    }
+                    AgentCommand::ListFaults { response } => {
+                        let faults = injected
+                            .lock()
+                            .await
+                            .iter()
+                            .enumerate()
+                            .map(|(index, (request, _))| summary_of(index as u64 + 1, request))
+                            .collect();
+                        let _ = response.send(faults);
+                    }
+                    AgentCommand::InjectFault {
+                        request,
+                        replica_evidence,
+                        response,
+                        ..
+                    } => {
+                        let mut injected = injected.lock().await;
+                        let summary = summary_of(injected.len() as u64 + 1, &request);
+                        injected.push((request, replica_evidence));
+                        let _ = response.send(Ok(summary));
+                    }
+                    AgentCommand::ClearAllFaults { response } => {
+                        let count = injected.lock().await.drain(..).count();
+                        let _ = response.send(Ok(format!("{name} cleared {count}")));
+                    }
+                    _ => {}
+                }
+            }
+        });
+    }
+
+    /// Start one router per `(name, instances)` pair, all sharing a
+    /// membership table, a service token and one operator token.
+    async fn start_cluster(layout: Vec<(&str, Vec<InstanceStatus>)>) -> FakeCluster {
+        let created = crate::sesame::token::create_token(
+            "operator",
+            crate::sesame::types::ApiRole::Admin,
+            crate::sesame::types::TokenScope::default(),
+            None,
+        )
+        .unwrap();
+        let api_reader = crate::sesame::token::create_token(
+            "api-reader",
+            crate::sesame::types::ApiRole::ReadOnly,
+            crate::sesame::types::TokenScope {
+                apps: Some(vec!["api".to_string()]),
+                namespaces: None,
+            },
+            None,
+        )
+        .unwrap();
+        let stop = CancellationToken::new();
+        let mut listeners = Vec::new();
+        let mut membership = Vec::new();
+        for (name, _) in &layout {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            membership.push(NodeMembershipInfo {
+                node_id: crate::meat::NodeId::new(*name),
+                address: listener.local_addr().unwrap(),
+            });
+            listeners.push(listener);
+        }
+        let membership = Arc::new(RwLock::new(membership));
+        let mut nodes = Vec::new();
+        for ((name, instances), listener) in layout.into_iter().zip(listeners) {
+            let (cmd_tx, cmd_rx) = mpsc::channel(32);
+            let injected: Injected = Arc::default();
+            spawn_fake_agent(
+                name.to_string(),
+                instances,
+                Arc::clone(&injected),
+                cmd_rx,
+                stop.clone(),
+            );
+            let store = crate::sesame::auth::new_token_store();
+            *store.write().await = vec![created.token.clone(), api_reader.token.clone()];
+            let static_capabilities = crate::bun::capabilities::StaticCapabilities {
+                test_policy: crate::testkit::safety::ClusterTestPolicy {
+                    safety_class: crate::testkit::safety::ClusterSafetyClass::Development,
+                    allowed_operations: std::collections::BTreeSet::from([
+                        crate::testkit::safety::OperationPermission::InjectWorkloadFaults,
+                    ]),
+                    ..crate::testkit::safety::ClusterTestPolicy::default()
+                },
+                ..crate::bun::capabilities::StaticCapabilities::default()
+            };
+            let app = router_with_upgrade(
+                cmd_tx,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(store),
+                Some(SERVICE_TOKEN.to_string()),
+                None,
+                Some(Arc::clone(&membership)),
+                None,
+                None,
+                listener.local_addr().unwrap().port(),
+                None,
+                None,
+                None,
+                "default".to_string(),
+                Some(name.to_string()),
+                900,
+                crate::cluster::ClusterHttp::plaintext(),
+                5050,
+                "http",
+                256 * 1024 * 1024,
+                false,
+                static_capabilities,
+                super::super::readiness::ReadinessTracker::new(),
+                None,
+                None,
+            );
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let cancelled = stop.clone();
+            tokio::spawn(async move {
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(async move { cancelled.cancelled().await })
+                    .await
+                    .ok();
+            });
+            nodes.push(FakeNode { url, injected });
+        }
+        FakeCluster {
+            nodes,
+            membership,
+            operator: created.plaintext,
+            api_reader: api_reader.plaintext,
+            stop,
+        }
+    }
+
+    fn kill(count: u32) -> FaultRequest {
+        FaultRequest {
+            fault_type: FaultType::Kill { count },
+            target_service: "web".to_string(),
+            namespace: None,
+            target_instance: None,
+            target_node: None,
+            duration: std::time::Duration::from_secs(0),
+            injected_by: String::new(),
+            reason: None,
+            include_leader: false,
+            override_safety: false,
+            acknowledged: true,
+        }
+    }
+
+    async fn inject(
+        cluster: &FakeCluster,
+        entry: usize,
+        request: &FaultRequest,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = reqwest::Client::new()
+            .post(format!("{}/v1/fault", cluster.nodes[entry].url))
+            .bearer_auth(&cluster.operator)
+            .json(request)
+            .send()
+            .await
+            .unwrap();
+        let status = StatusCode::from_u16(response.status().as_u16()).unwrap();
+        let text = response.text().await.unwrap();
+        let body = serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text));
+        (status, body)
+    }
+
+    async fn injected_count(cluster: &FakeCluster) -> usize {
+        let mut total = 0;
+        for node in &cluster.nodes {
+            total += node.injected.lock().await.len();
+        }
+        total
+    }
+
+    #[tokio::test]
+    async fn a_workload_fault_reaches_the_node_that_runs_its_target() {
+        let cluster = start_cluster(vec![
+            ("node-1", vec![]),
+            (
+                "node-2",
+                vec![
+                    instance("default/web-0", "web", "running"),
+                    instance("default/web-1", "web", "running"),
+                ],
+            ),
+        ])
+        .await;
+
+        let (status, body) = inject(&cluster, 0, &kill(1)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let summary: FaultSummary = serde_json::from_value(body).unwrap();
+        assert_eq!(summary.node.as_deref(), Some("node-2"));
+        assert_eq!(summary.target_node.as_deref(), Some("node-2"));
+
+        assert!(cluster.nodes[0].injected.lock().await.is_empty());
+        let owner = cluster.nodes[1].injected.lock().await;
+        assert_eq!(owner.len(), 1);
+        let (request, evidence) = &owner[0];
+        assert_eq!(request.fault_type, FaultType::Kill { count: 1 });
+        // The owner recorded the caller's token, not a node identity.
+        assert_eq!(request.injected_by, "operator");
+        assert_eq!(
+            *evidence,
+            Some(ReplicaEvidence {
+                replicas: 2,
+                faulted_replicas: 0,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn the_replica_rail_counts_replicas_on_every_node() {
+        // One replica on each node: killing both leaves nothing, even though
+        // each node alone would think it was only losing its own copy.
+        let cluster = start_cluster(vec![
+            ("node-1", vec![instance("default/web-0", "web", "running")]),
+            ("node-2", vec![instance("default/web-0", "web", "running")]),
+        ])
+        .await;
+
+        let (status, body) = inject(&cluster, 0, &kill(2)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.to_string().contains("replica"), "{body}");
+        assert_eq!(injected_count(&cluster).await, 0);
+
+        let (status, body) = inject(&cluster, 0, &kill(1)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(injected_count(&cluster).await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_fault_on_several_owners_reports_every_fault_it_created() {
+        let cluster = start_cluster(vec![
+            ("node-1", vec![instance("default/web-0", "web", "running")]),
+            ("node-2", vec![instance("default/web-0", "web", "running")]),
+            ("node-3", vec![instance("default/web-0", "web", "running")]),
+        ])
+        .await;
+
+        let (status, body) = inject(&cluster, 1, &kill(2)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let summary: FaultSummary = serde_json::from_value(body).unwrap();
+        let mut nodes: Vec<_> = std::iter::once(&summary)
+            .chain(&summary.routed)
+            .map(|fault| fault.node.clone().unwrap())
+            .collect();
+        nodes.sort();
+        assert_eq!(nodes, vec!["node-1", "node-2"]);
+        assert!(cluster.nodes[2].injected.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_fault_with_no_running_target_is_refused_before_anything_runs() {
+        let cluster = start_cluster(vec![
+            ("node-1", vec![]),
+            ("node-2", vec![instance("default/web-0", "web", "stopped")]),
+        ])
+        .await;
+        let (status, body) = inject(&cluster, 0, &kill(1)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.to_string().contains("no running instances"), "{body}");
+        assert_eq!(injected_count(&cluster).await, 0);
+    }
+
+    fn network(fault_type: FaultType) -> FaultRequest {
+        FaultRequest {
+            fault_type,
+            duration: std::time::Duration::from_secs(60),
+            ..kill(0)
+        }
+    }
+
+    async fn nodes_that_got_a_fault(cluster: &FakeCluster) -> Vec<usize> {
+        let mut nodes = Vec::new();
+        for (index, node) in cluster.nodes.iter().enumerate() {
+            if !node.injected.lock().await.is_empty() {
+                nodes.push(index);
+            }
+        }
+        nodes
+    }
+
+    #[tokio::test]
+    async fn a_network_fault_on_every_caller_lands_on_every_node() {
+        // The target runs on node-2 only, but its callers could be anywhere:
+        // the connect hook and the DNS responder act on the caller's node.
+        let cluster = start_cluster(vec![
+            ("node-1", vec![]),
+            ("node-2", vec![instance("default/web-0", "web", "running")]),
+            ("node-3", vec![]),
+        ])
+        .await;
+
+        let (status, body) = inject(&cluster, 0, &network(FaultType::DnsNxdomain)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let summary: FaultSummary = serde_json::from_value(body).unwrap();
+        let mut holders: Vec<_> = std::iter::once(&summary)
+            .chain(&summary.routed)
+            .map(|fault| fault.node.clone().unwrap())
+            .collect();
+        holders.sort();
+        assert_eq!(holders, vec!["node-1", "node-2", "node-3"]);
+        assert_eq!(nodes_that_got_a_fault(&cluster).await, vec![0, 1, 2]);
+        for node in &cluster.nodes {
+            let injected = node.injected.lock().await;
+            // Each node's share names that node, and the owner re-plans it
+            // as a network fault rather than a target-owner fault.
+            assert_eq!(injected[0].0.fault_type, FaultType::DnsNxdomain);
+            assert_eq!(injected[0].1, None, "no replica evidence for traffic");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_network_fault_from_one_source_lands_only_where_that_source_runs() {
+        let mut other_tenant = instance("team-b/frontend-0", "frontend", "running");
+        other_tenant.namespace = "team-b".to_string();
+        let cluster = start_cluster(vec![
+            ("node-1", vec![instance("default/web-0", "web", "running")]),
+            ("node-2", vec![other_tenant]),
+            (
+                "node-3",
+                vec![instance("default/frontend-0", "frontend", "running")],
+            ),
+        ])
+        .await;
+
+        let partition = network(FaultType::Partition {
+            source_app: Some("frontend".to_string()),
+        });
+        let (status, body) = inject(&cluster, 0, &partition).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(nodes_that_got_a_fault(&cluster).await, vec![2]);
+
+        // A source with no running instance anywhere is refused up front.
+        let nowhere = network(FaultType::Delay {
+            delay_ns: 300_000_000,
+            jitter_ns: 0,
+            source_app: Some("worker".to_string()),
+        });
+        let (status, body) = inject(&cluster, 0, &nowhere).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.to_string().contains("worker"), "{body}");
+        assert_eq!(injected_count(&cluster).await, 1);
+    }
+
+    #[tokio::test]
+    async fn the_cluster_fault_list_and_clear_reach_every_node() {
+        let cluster = start_cluster(vec![
+            ("node-1", vec![]),
+            (
+                "node-2",
+                vec![
+                    instance("default/web-0", "web", "running"),
+                    instance("default/web-1", "web", "running"),
+                ],
+            ),
+        ])
+        .await;
+        assert_eq!(inject(&cluster, 0, &kill(1)).await.0, StatusCode::OK);
+
+        let client = reqwest::Client::new();
+        let listing: ClusterFaultList = client
+            .get(format!("{}/v1/fault?cluster=true", cluster.nodes[0].url))
+            .bearer_auth(&cluster.operator)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(listing.warnings.is_empty(), "{:?}", listing.warnings);
+        assert_eq!(listing.faults.len(), 1);
+        assert_eq!(listing.faults[0].node.as_deref(), Some("node-2"));
+
+        let response = client
+            .delete(format!("{}/v1/fault", cluster.nodes[0].url))
+            .bearer_auth(&cluster.operator)
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        let message = response.text().await.unwrap();
+        assert!(message.contains("node-2: node-2 cleared 1"), "{message}");
+        assert!(cluster.nodes[1].injected.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn top_merges_every_node_and_warns_about_the_missing_one() {
+        let cluster = start_cluster(vec![
+            ("node-1", vec![instance("default/web-0", "web", "running")]),
+            (
+                "node-2",
+                vec![
+                    instance("default/web-0", "web", "running"),
+                    instance("default/api-0", "api", "running"),
+                ],
+            ),
+        ])
+        .await;
+        cluster.add_unreachable_member("node-3").await;
+
+        let top: crate::bun::top::ClusterTop = cluster.get_json(0, "/v1/top?cluster=true").await;
+        let rows: Vec<_> = top
+            .rows
+            .iter()
+            .map(|row| (row.node.as_str(), row.instance.app_name.as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![("node-1", "web"), ("node-2", "api"), ("node-2", "web")]
+        );
+        assert_eq!(top.warnings.len(), 1, "{:?}", top.warnings);
+        assert!(
+            top.warnings[0].starts_with("node node-3"),
+            "{:?}",
+            top.warnings
+        );
+
+        // Without `cluster`, a node answers for itself only.
+        let local: Vec<crate::bun::top::TopRow> = cluster.get_json(1, "/v1/top").await;
+        assert!(local.iter().all(|row| row.node == "node-2"));
+        assert_eq!(local.len(), 2);
+    }
+
+    async fn relay(
+        cluster: &FakeCluster,
+        method: reqwest::Method,
+        path: &str,
+        token: Option<&str>,
+    ) -> (StatusCode, String) {
+        let mut request =
+            reqwest::Client::new().request(method, format!("{}{path}", cluster.nodes[0].url));
+        if let Some(token) = token {
+            request = request.bearer_auth(token);
+        }
+        let response = request.send().await.unwrap();
+        let status = StatusCode::from_u16(response.status().as_u16()).unwrap();
+        (status, response.text().await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn the_relay_reaches_a_peer_with_the_callers_own_credential() {
+        let cluster = start_cluster(vec![
+            ("node-1", vec![]),
+            (
+                "node-2",
+                vec![
+                    instance("default/web-0", "web", "running"),
+                    instance("default/api-0", "api", "running"),
+                ],
+            ),
+        ])
+        .await;
+        let operator = Some(cluster.operator.as_str());
+
+        let (status, body) = relay(
+            &cluster,
+            reqwest::Method::GET,
+            "/v1/nodes/node-2/relay/v1/status",
+            operator,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let statuses: Vec<InstanceStatus> = serde_json::from_str(&body).unwrap();
+        assert_eq!(statuses.len(), 2);
+
+        // A scoped caller stays scoped on the far side: the peer filtered with
+        // the caller's token, not a node identity that sees everything.
+        let (status, body) = relay(
+            &cluster,
+            reqwest::Method::GET,
+            "/v1/nodes/node-2/relay/v1/status",
+            Some(&cluster.api_reader),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let statuses: Vec<InstanceStatus> = serde_json::from_str(&body).unwrap();
+        let apps: Vec<_> = statuses.iter().map(|s| s.app_name.as_str()).collect();
+        assert_eq!(apps, vec!["api"]);
+
+        // No credential, no relay.
+        let (status, _) = relay(
+            &cluster,
+            reqwest::Method::GET,
+            "/v1/nodes/node-2/relay/v1/status",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn the_relay_forwards_only_the_diagnostic_reads() {
+        let cluster = start_cluster(vec![
+            ("node-1", vec![]),
+            ("node-2", vec![instance("default/web-0", "web", "running")]),
+        ])
+        .await;
+        let operator = Some(cluster.operator.as_str());
+        for (method, path) in [
+            (reqwest::Method::POST, "/v1/nodes/node-2/relay/v1/fault"),
+            (reqwest::Method::GET, "/v1/nodes/node-2/relay/v1/token/list"),
+            (reqwest::Method::DELETE, "/v1/nodes/node-2/relay/v1/fault"),
+            (
+                reqwest::Method::GET,
+                "/v1/nodes/node-2/relay/v1/nodes/node-1/relay/v1/status",
+            ),
+        ] {
+            let (status, body) = relay(&cluster, method.clone(), path, operator).await;
+            assert!(
+                status == StatusCode::NOT_FOUND || status == StatusCode::METHOD_NOT_ALLOWED,
+                "{method} {path} was relayed: {status} {body}"
+            );
+        }
+        assert_eq!(injected_count(&cluster).await, 0);
+
+        let (status, body) = relay(
+            &cluster,
+            reqwest::Method::GET,
+            "/v1/nodes/node-9/relay/v1/status",
+            operator,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert!(body.contains("node-9"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn the_relay_keeps_the_query_string() {
+        let cluster = start_cluster(vec![
+            ("node-1", vec![]),
+            (
+                "node-2",
+                vec![
+                    instance("default/web-0", "web", "running"),
+                    instance("default/web-1", "web", "running"),
+                ],
+            ),
+        ])
+        .await;
+        assert_eq!(inject(&cluster, 1, &kill(1)).await.0, StatusCode::OK);
+        let (status, body) = relay(
+            &cluster,
+            reqwest::Method::GET,
+            "/v1/nodes/node-2/relay/v1/fault?cluster=true",
+            Some(&cluster.operator),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let listing: ClusterFaultList = serde_json::from_str(&body).unwrap();
+        assert_eq!(listing.faults.len(), 1);
     }
 }

@@ -1,5 +1,6 @@
 use ratatui::text::Line;
 
+use crate::relish::output::sparkline;
 use crate::relish::tui::app::{DetailTab, TuiApp, View};
 
 use super::widgets;
@@ -172,18 +173,4 @@ pub fn lines(app: &TuiApp, height: usize) -> Vec<Line<'static>> {
         }
     }
     lines
-}
-
-fn sparkline(values: &[f64]) -> String {
-    const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-    let min = values.iter().copied().fold(f64::INFINITY, f64::min);
-    let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    let range = (max - min).max(f64::EPSILON);
-    values
-        .iter()
-        .map(|value| {
-            let index = (((value - min) / range) * (BARS.len() - 1) as f64).round() as usize;
-            BARS[index.min(BARS.len() - 1)]
-        })
-        .collect()
 }

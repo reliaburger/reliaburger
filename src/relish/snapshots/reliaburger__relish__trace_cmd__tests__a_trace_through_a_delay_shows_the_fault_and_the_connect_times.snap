@@ -1,0 +1,23 @@
+---
+source: src/relish/trace_cmd.rs
+expression: render_human(&result)
+---
+Trace default/frontend -> default/redis:6379 from node node-1
+  1. DNS query [PASS; observed]
+     redis.default.internal -> 127.128.202.174 (resolver 10.202.142.1)
+  2. Service and eBPF state [PASS; observed]
+     userspace service map: VIP 127.128.202.174, 1 of 1 backends healthy
+       backend default__redis-0 at 10.202.142.7:6379 (healthy)
+     the VIP sends every connect to default__redis-0 at 10.202.142.7:6379
+     live backend_map: 1 entries, 1 healthy
+       kernel backend 10.202.142.7:6379 (healthy)
+  3. Firewall state [PASS; observed]
+     live maps: source cgroup 4242, source namespace Some(7), destination namespace 7, action None
+  4. Active faults [DEGRADED; observed]
+     fault 3: delay 300ms from frontend (571s left)
+     live netem on the source's eth0: delay 300ms
+     reason: fault 3 (delay 300ms from frontend) is active on this path
+  5. TCP probe [PASS; observed]
+     10/10 connects to 127.128.202.174:6379 succeeded (connect time min 300.9 ms, median 301.6 ms)
+Overall: DEGRADED (10/10 connects, median connect 301.6 ms)
+  because fault 3 (delay 300ms from frontend) is active on this path

@@ -38,18 +38,21 @@ jobs:
       CANDIDATE_RUN: ${{ inputs.candidate_run }}
       QUALIFIED_DIGEST: ${{ inputs.qualified_digest }}
     steps:
+      # Scripts come from main (the workflow's own ref), never from the tag:
+      # this job holds a write token, and anyone who can push a tag could
+      # otherwise put their own candidate.py in front of it.
       - uses: actions/checkout@v4
-        with:
-          ref: refs/tags/${{ inputs.tag }}
       - name: Check version and capture the tagged source commit
         run: |
-          python3 - <<'PYCODE'
-          import os, tomllib
-          with open("Cargo.toml", "rb") as source:
-              expected = "v" + tomllib.load(source)["package"]["version"]
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] \
+            || { echo "tag must look like v1.2.3: $RELEASE_TAG" >&2; exit 1; }
+          git fetch --no-tags origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          git show "refs/tags/$RELEASE_TAG:Cargo.toml" | python3 -c '
+          import os, sys, tomllib
+          expected = "v" + tomllib.load(sys.stdin.buffer)["package"]["version"]
           assert os.environ["RELEASE_TAG"] == expected, f"tag must match {expected}"
-          PYCODE
-          printf 'CANDIDATE_COMMIT=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          '
+          printf 'CANDIDATE_COMMIT=%s\n' "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" >> "$GITHUB_ENV"
       - name: Download and verify the qualified candidate
         run: |
           python3 scripts/release/candidate.py fetch --directory dist \

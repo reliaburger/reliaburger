@@ -36,13 +36,13 @@ use super::report::{
 const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Resource ownership mode. Production command wiring always requires server
-/// leases; the legacy variant exists only for runner unit tests whose tiny
-/// mock servers predate the lease API.
+/// leases; the unleased variant exists only for runner unit tests whose tiny
+/// mock servers don't implement the lease API.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum LeaseOwnership {
     Required,
     #[cfg(test)]
-    LegacyNamespaceCleanup,
+    UnleasedForUnitTests,
 }
 
 /// Everything a run needs beyond the cases themselves.
@@ -439,7 +439,7 @@ async fn run_one(
             }
         }
         #[cfg(test)]
-        LeaseOwnership::LegacyNamespaceCleanup => (namespace, None),
+        LeaseOwnership::UnleasedForUnitTests => (namespace, None),
     };
 
     let context = TestContext {
@@ -617,7 +617,7 @@ mod tests {
             chaos: false,
             profile: TestProfile::Development,
             fixed_namespace: None,
-            lease_ownership: LeaseOwnership::LegacyNamespaceCleanup,
+            lease_ownership: LeaseOwnership::UnleasedForUnitTests,
         }
     }
 
@@ -1053,6 +1053,8 @@ mod tests {
             target_node: request.target_node,
             remaining_secs: request.duration.as_secs(),
             injected_by: "runner-test".to_string(),
+            node: None,
+            routed: Vec::new(),
         })
     }
 

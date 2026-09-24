@@ -22,6 +22,8 @@ fn spec(script: &str) -> OciSpec {
             env: vec!["OWNER_TEST=preserved".into()],
             cwd: "/".into(),
             user: OciUser { uid: 0, gid: 0 },
+            capabilities: None,
+            overrides: None,
         },
         mounts: vec![],
         linux: OciLinux {
@@ -160,6 +162,34 @@ async fn recovered_preparation_can_be_cancelled_before_execution() {
 }
 
 #[tokio::test]
+async fn generation_from_a_previous_boot_never_runs() {
+    let directory = tempfile::tempdir().unwrap();
+    let marker = directory.path().join("ran");
+    let id = InstanceId("default__rebooted-0".into());
+    let grill = runtime(directory.path());
+    grill
+        .create(&id, &spec(&format!("touch '{}'", marker.display())))
+        .await
+        .unwrap();
+    // Simulate a reboot between preparation and start: the durable record
+    // names a kernel boot that is no longer running.
+    let path = directory
+        .path()
+        .join("process-owners")
+        .join(&id.0)
+        .join("owner.json");
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert!(record["boot_id"].is_string(), "{record}");
+    record["boot_id"] = "00000000-0000-4000-8000-000000000000".into();
+    std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+    let recovered = runtime(directory.path());
+    assert_eq!(recovered.state(&id).await.unwrap(), ContainerState::Stopped);
+    assert!(recovered.start(&id).await.is_err());
+    assert!(!marker.exists());
+}
+
+#[tokio::test]
 async fn long_data_paths_and_repeated_generations_preserve_control() {
     let root = tempfile::tempdir().unwrap();
     let directory = root.path().join("a".repeat(100)).join("b".repeat(100));
@@ -209,7 +239,7 @@ async fn delayed_helper_cannot_start_a_replacement_generation() {
 }
 
 #[tokio::test]
-async fn owner_loss_preserves_uncertainty_and_never_signals_recorded_pid() {
+async fn owner_loss_retires_only_after_the_workload_process_group_is_gone() {
     let directory = tempfile::tempdir().unwrap();
     let marker = directory.path().join("owner-killed");
     let release = directory.path().join("release");
@@ -245,14 +275,14 @@ async fn owner_loss_preserves_uncertainty_and_never_signals_recorded_pid() {
     })
     .await
     .unwrap();
-    assert!(status.is_err(), "missing owner must not imply absence");
-    assert!(kill.is_err(), "cannot signal a PID recovered from disk");
     assert!(
-        recovered.state(&id).await.is_err(),
-        "natural exit is still unobserved by the owner"
+        status.is_err(),
+        "a live workload without its owner is not absent"
     );
-    // The test has positively observed its workload finish; remove only this
-    // fixture's abandoned control socket so it does not litter the host.
+    assert!(kill.is_err(), "cannot signal a PID recovered from disk");
+    // Once nothing in the workload's process group remains, the dead owner's
+    // generation retires with an unknown exit code instead of wedging.
+    stopped(&recovered, &id).await;
     let record: serde_json::Value = serde_json::from_slice(
         &std::fs::read(
             directory
@@ -264,13 +294,17 @@ async fn owner_loss_preserves_uncertainty_and_never_signals_recorded_pid() {
         .unwrap(),
     )
     .unwrap();
+    assert_eq!(record["phase"]["state"], "retired", "{record}");
+    assert!(record["phase"]["exit_code"].is_null(), "{record}");
     let socket_directory = std::path::PathBuf::from(format!(
         "/tmp/rbp-{}-{}",
         nix::unistd::geteuid(),
         record["nonce"].as_str().unwrap()
     ));
-    std::fs::remove_file(socket_directory.join("control.sock")).unwrap();
-    std::fs::remove_dir(socket_directory).unwrap();
+    assert!(
+        !socket_directory.exists(),
+        "retirement left the control socket"
+    );
     assert!(diagnostic_logs.unwrap().contains("diagnostic-output"));
 }
 
@@ -757,18 +791,19 @@ async fn cancelled_queued_mutation_preserves_successor(mutation: QueuedMutation)
     persist_record(&record);
     let expected = serde_json::to_value(&record).unwrap();
     drop(lock);
-    // Cover the owner's bounded startup interval too, including cold debug
-    // executable loading. The broken implementation changes the record first.
-    let changed = tokio::time::timeout(Duration::from_secs(20), async {
-        loop {
-            if serde_json::to_value(read_record()).unwrap() != expected || marker.exists() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+    // Wait for the cancelled caller's blocking work to finish instead of
+    // watching a fixed window. A queued mutation holds its in-flight count
+    // until it returns, and the broken implementation changes the record
+    // (start waits for its owner to run) before returning. The ceiling only
+    // turns a wedged operation into a failure.
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while grill.owner_operations_in_flight() > 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .is_ok();
+    .expect("the cancelled caller's queued work never finished");
+    let changed = serde_json::to_value(read_record()).unwrap() != expected || marker.exists();
     grill.kill(&id).await.unwrap();
     stopped(&grill, &id).await;
     assert!(

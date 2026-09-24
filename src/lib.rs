@@ -12,6 +12,7 @@ pub mod cluster;
 pub mod compatibility;
 pub mod config;
 pub mod council;
+pub(crate) mod durable;
 pub mod firewall;
 pub mod grill;
 pub mod ketchup;

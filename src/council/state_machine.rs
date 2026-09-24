@@ -99,9 +99,8 @@ impl std::fmt::Debug for StateMachineInner {
 }
 
 /// Write the latest snapshot (data + index + version + checksum) to redb,
-/// fsyncing on commit. A legacy (pre-envelope) store is upgraded in place:
-/// the version and checksum keys land in the same write transaction as the
-/// payload they describe.
+/// fsyncing on commit. The version and checksum keys land in the same write
+/// transaction as the payload they describe.
 // `redb::Error` is large but dictated by the crate; boxing it here buys nothing.
 #[allow(clippy::result_large_err)]
 fn persist_snapshot(db: &Database, data: &[u8], index: u64) -> Result<(), redb::Error> {
@@ -145,7 +144,7 @@ fn snapshot_checksum(data: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-/// Read the stored format version, `None` for a legacy pre-envelope store.
+/// Read the stored format version, `None` when the store has no version key.
 // `SnapshotStoreError` is large but dictated by the errors it wraps.
 #[allow(clippy::result_large_err)]
 fn read_snapshot_version(
@@ -741,8 +740,8 @@ impl StateMachineInner {
                 // Verify before retiring (PKI8): every stored secret in the
                 // scope must be sealed under the newest generation, or the
                 // retirement would brick it. Secrets without a recorded
-                // seal (legacy state) count as "unknown generation" and
-                // block finalise until re-encrypted.
+                // seal count as "unknown generation" and block finalise
+                // until re-encrypted.
                 let newest = self
                     .state
                     .security_state
@@ -1772,8 +1771,8 @@ impl StateMachineInner {
     }
 
     /// Every stored secret in `scope` still sealed under a generation
-    /// older than `newest` — including secrets with no recorded seal
-    /// (legacy state written before seals existed). Sorted, as
+    /// older than `newest`, including secrets with no recorded seal.
+    /// Sorted, as
     /// `namespace/app/ENV_KEY` names, for deterministic error messages.
     fn stale_sealed_secrets(&self, scope: &AgeKeyScope, newest: u64) -> Vec<String> {
         let mut stale = Vec::new();
@@ -1966,6 +1965,11 @@ impl CouncilStateMachine {
     /// Read the current desired state.
     pub async fn desired_state(&self) -> DesiredState {
         self.inner.read().await.state.clone()
+    }
+
+    /// Read part of the desired state under the lock, without cloning all of it.
+    pub async fn read_desired<T>(&self, read: impl FnOnce(&DesiredState) -> T) -> T {
+        read(&self.inner.read().await.state)
     }
 
     /// Log id the loaded snapshot covers up to, `None` when no snapshot is
@@ -2481,20 +2485,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_snapshot_without_envelope_is_refused_and_preserved() {
+    async fn unversioned_snapshot_is_refused_and_preserved() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("legacy.redb");
+        let path = dir.path().join("unversioned.redb");
         let app_id = AppId::new("web", "prod");
-        let mut legacy_state = DesiredState::default();
-        legacy_state.apps.insert(
+        let mut unversioned_state = DesiredState::default();
+        unversioned_state.apps.insert(
             app_id.clone(),
             AppSpec {
-                image: Some("legacy:v1".to_string()),
+                image: Some("unversioned:v1".to_string()),
                 ..default_spec()
             },
         );
-        legacy_state.last_applied_log = Some(log_id(1, 3));
-        let payload = serde_json::to_vec(&legacy_state).unwrap();
+        unversioned_state.last_applied_log = Some(log_id(1, 3));
+        let payload = serde_json::to_vec(&unversioned_state).unwrap();
         {
             let db = Database::create(&path).unwrap();
             let wtx = db.begin_write().unwrap();
@@ -4567,35 +4571,19 @@ mod tests {
         );
     }
 
-    /// PKI8 fixture: security state persisted before `secret_seals`
-    /// existed loads fine (self-describing JSON, `#[serde(default)]`),
-    /// and its secrets — with no recorded generation — block finalize
-    /// until re-encrypted.
+    /// PKI8: an encrypted secret with no recorded seal has an unknown
+    /// generation, so it blocks finalize until re-encrypted.
     #[test]
-    fn legacy_secret_without_generation_metadata_blocks_finalize() {
+    fn secret_without_a_recorded_seal_blocks_finalize() {
         use crate::sesame::types::AgeKeyScope;
 
-        // A legacy SecurityState JSON with no `secret_seals` field.
-        let legacy_json = r#"{
-            "certificate_authorities": [],
-            "age_keypairs": [],
-            "api_tokens": [],
-            "join_tokens": [],
-            "next_serial": 6
-        }"#;
-        let legacy: crate::sesame::types::SecurityState =
-            serde_json::from_str(legacy_json).unwrap();
-        assert!(legacy.secret_seals.is_empty(), "missing field defaults");
-
         let mut inner = StateMachineInner::default();
-        inner.state.security_state = legacy;
         inner
             .state
             .security_state
             .age_keypairs
             .push(test_age_keypair(AgeKeyScope::ClusterWide, 0, false));
-        // The app predates seal recording: insert it directly, the way a
-        // pre-upgrade snapshot would restore it — no seal entry.
+        // Insert the app directly so no seal entry is recorded.
         inner.state.apps.insert(
             crate::meat::types::AppId::new("web", "default"),
             spec_with_encrypted_env(),
@@ -4982,22 +4970,6 @@ mod tests {
         }
         assert_eq!(inner.state.upgrade_history.len(), 20);
         assert_eq!(inner.state.upgrade_history[0].upgrade_id, "up-5");
-    }
-
-    #[test]
-    fn old_snapshot_without_upgrade_fields_still_loads() {
-        // Serialise a current DesiredState, strip the Phase 14 fields to
-        // fake a snapshot written by an older binary, and reload. This is
-        // the serde(default) compatibility rule made executable.
-        let state = DesiredState::default();
-        let mut value = serde_json::to_value(&state).unwrap();
-        let object = value.as_object_mut().unwrap();
-        object.remove("active_upgrade");
-        object.remove("upgrade_history");
-
-        let reloaded: DesiredState = serde_json::from_value(value).unwrap();
-        assert!(reloaded.active_upgrade.is_none());
-        assert!(reloaded.upgrade_history.is_empty());
     }
 
     #[test]
@@ -6621,62 +6593,6 @@ mod tests {
         let state = sm.desired_state().await;
         assert!(state.test_leases.is_empty());
         assert!(!state.apps.contains_key(&app_id));
-    }
-
-    /// The 12b.2 compatibility rule made executable: a snapshot written
-    /// before the batch/build tracker fields existed must load cleanly,
-    /// with both trackers defaulting to empty and counters at 1.
-    #[test]
-    fn pre_12b2_snapshot_without_tracker_fields_still_loads() {
-        let state = DesiredState::default();
-        let mut value = serde_json::to_value(&state).unwrap();
-        let object = value.as_object_mut().unwrap();
-        assert!(object.remove("batch_state").is_some());
-        assert!(object.remove("build_state").is_some());
-        assert!(object.remove("test_leases").is_some());
-
-        let reloaded: DesiredState = serde_json::from_value(value).unwrap();
-        assert_eq!(reloaded.batch_state.next_batch_id, 1);
-        assert!(reloaded.batch_state.batches.is_empty());
-        assert_eq!(reloaded.build_state.next_build_id, 1);
-        assert!(reloaded.build_state.builds.is_empty());
-        assert!(reloaded.test_leases.is_empty());
-    }
-
-    /// Missing tracker fields do not authorise migration of development state.
-    #[tokio::test]
-    async fn pre_12b2_persisted_snapshot_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("pre12b2.redb");
-        let app_id = AppId::new("web", "prod");
-
-        // Fake the exact bytes an older binary persisted: current state
-        // serialised, tracker fields stripped, stored without envelope.
-        let mut legacy_state = DesiredState::default();
-        legacy_state.apps.insert(app_id.clone(), default_spec());
-        let mut value = serde_json::to_value(&legacy_state).unwrap();
-        let object = value.as_object_mut().unwrap();
-        object.remove("batch_state");
-        object.remove("build_state");
-        object.remove("test_leases");
-        let payload = serde_json::to_vec(&value).unwrap();
-        {
-            let db = Database::create(&path).unwrap();
-            let wtx = db.begin_write().unwrap();
-            {
-                let mut t = wtx.open_table(SNAPSHOT).unwrap();
-                t.insert(SNAP_DATA_KEY, payload.as_slice()).unwrap();
-                t.insert(SNAP_INDEX_KEY, 1u64.to_le_bytes().as_slice())
-                    .unwrap();
-            }
-            wtx.commit().unwrap();
-        }
-
-        let db = std::sync::Arc::new(Database::create(&path).unwrap());
-        assert!(matches!(
-            CouncilStateMachine::with_store(db),
-            Err(SnapshotStoreError::UnsupportedVersion { found: 0, .. })
-        ));
     }
 
     /// O5: the CRL is replicated in every snapshot and scanned on every TLS

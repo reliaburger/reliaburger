@@ -30,12 +30,10 @@ $ cargo --version
 cargo 1.85.0 (d73d2caf9 2024-12-20)
 ```
 
-Those example version strings show the compiler that introduced the 2024 edition.
-The current repository requires Rust 1.97 or later because language editions and
-compiler/library requirements are separate contracts. `Cargo.toml` declares
-`rust-version = "1.97"`, and CI tests the committed dependency graph on 1.97.0.
-Release builds pin 1.98.0; use `cargo +1.98.0 build --locked --bins` after installing
-that toolchain if you want the release compiler locally.
+That's the release that introduced the 2024 edition. The edition isn't the whole
+story, though: our dependencies need a newer compiler, so `Cargo.toml` declares
+`rust-version = "1.97"`. Release builds pin 1.98.0; install it and run
+`cargo +1.98.0 build --locked --bins` if you want exactly the release compiler.
 
 ### Platform prerequisites
 
@@ -628,6 +626,8 @@ impl Config {
 
 Parse, then validate. Two steps, clean errors, no confusion.
 
+Names deserve validation too, and we learnt that the hard way. An app called `Bad` used to deploy happily as `default__Bad-0`, and an empty name got through as well. Names end up in DNS names, instance IDs and filesystem paths, so validation now insists that app, job and namespace names are lowercase DNS labels: 1 to 63 ASCII letters, digits or hyphens, starting and ending with a letter or digit. We reject bad names rather than lowercasing them, because normalising could quietly merge two names you meant to keep apart. Bun runs the same check when it admits a command, so an API call can't sneak past what the config file couldn't.
+
 ## Tests first
 
 We haven't written a single line of implementation code without a test to drive it. Here's what the testing process looks like.
@@ -820,12 +820,14 @@ pub async fn allocate(&self) -> Result<u16, PortError> {
     }
 
     let mut rng = rand::thread_rng();
-    loop {
-        let port = rng.gen_range(self.range_start..self.range_end);
+    let first = rng.gen_range(0..self.total_ports());
+    for offset in 0..self.total_ports() {
+        let port = self.range_start + ((first + offset) % self.total_ports()) as u16;
         if allocated.insert(port) {
             return Ok(port);
         }
     }
+    Err(PortError::Exhausted { ... })
 }
 ```
 
@@ -835,7 +837,9 @@ pub async fn allocate(&self) -> Result<u16, PortError> {
 
 Why random port selection instead of sequential? Two reasons. Sequential assignment is predictable, which is a minor security concern (an attacker who knows your allocation pattern can guess which ports are in use). And sequential assignment creates hot-spots when containers are frequently created and destroyed — you'd keep reusing the same low ports while the rest of the range sits idle.
 
-`rand::thread_rng()` creates a thread-local random number generator. `rng.gen_range(start..end)` picks a random number in the half-open range `[start, end)`. These come from the `rand` crate, which we added to our dependencies. `allocated.insert(port)` tries to add the port to the set. If it's already there (collision), `insert` returns `false` and we try again. If it succeeds, `insert` returns `true` and we return the port.
+`rand::thread_rng()` creates a thread-local random number generator. `rng.gen_range(start..end)` picks a random number in the half-open range `[start, end)`. These come from the `rand` crate, which we added to our dependencies. `allocated.insert(port)` tries to add the port to the set. If it's already there (collision), `insert` returns `false` and we move on. If it succeeds, `insert` returns `true` and we return the port.
+
+Only the starting point is random. From there we walk the range once, wrapping around with `%`. Our first version kept guessing at random, capped at a thousand attempts. That's fine in an empty range and wrong in a nearly full one: with one free port in 64,000, a thousand guesses almost always miss it and report exhaustion that isn't there. Walking the range can't miss, and the regression test proves it by reserving 63,999 ports and asking for the last one, over and over.
 
 ## Speaking cgroup v2
 
@@ -1967,12 +1971,17 @@ ProcessGrill is a cheat — it spawns processes, not containers. For Phase 1 tha
 
 ```rust
 pub struct RuncGrill {
+    /// Base directory for OCI bundles.
     bundle_base: PathBuf,
-    entries: Arc<Mutex<HashMap<InstanceId, RuncEntry>>>,
+    /// Independent owners that run every Runc command and outlive Bun.
+    ownership: owned::Ownership,
+    /// Runc state directory (`--root` flag).
+    state_dir: PathBuf,
+    // ... image store, networks, port mappings, address reservations
 }
 ```
 
-The implementation is straightforward shell-out:
+Ignore `ownership` for now. It's how Bun survives its own crashes, and we'll get to it in [Surviving our own crash](#surviving-our-own-crash). At heart, the implementation is a shell-out:
 
 ```rust
 async fn runc_command(
@@ -1991,7 +2000,7 @@ async fn runc_command(
 }
 ```
 
-Creating a container means writing the OCI spec to disk and calling `runc create`:
+Creating a container means preparing its bundle: write the OCI spec to disk and set up the root filesystem:
 
 ```rust
 // Write the OCI spec as config.json
@@ -2000,10 +2009,9 @@ tokio::fs::write(bundle_dir.join("config.json"), spec_json).await?;
 
 // Create rootfs directory
 tokio::fs::create_dir_all(bundle_dir.join("rootfs")).await?;
-
-// Call runc create
-self.runc_command(&["create", "--bundle", &bundle_str, &instance.0], instance).await?;
 ```
+
+Starting it runs `runc --root <state> run --bundle <bundle> <id>` in the foreground. `runc run` stays alive for as long as the container does, which matters later: that long-lived process is something Bun has to keep track of.
 
 Querying state parses the JSON that `runc state` returns:
 
@@ -2035,6 +2043,8 @@ Apple shipped a `container` CLI tool that runs Linux containers in lightweight V
 - `spec.mounts` become `--volume host:container` flags
 
 The state query parses `container inspect` JSON, similar to runc. Like RuncGrill, it's platform-gated (`#[cfg(target_os = "macos")]`) and its tests are behind `RELIABURGER_APPLE_CONTAINER_TESTS=1`.
+
+The adapter works, but it doesn't ship in 0.1.0. If Bun crashes halfway through a `container create`, the Apple daemon may carry on creating the container, and a dead CLI process proves nothing about what the daemon did next. Runc gets a full answer to that problem later in this chapter; Apple Container doesn't have one yet. So for the first release, macOS runs containers inside managed Linux VMs using the same runc path as Linux, and `--runtime apple` refuses with a pointer to `relish setup --quickstart`.
 
 ### The AnyGrill dispatch pattern
 
@@ -2070,22 +2080,18 @@ Every method is just a match-and-delegate. Mechanical, repetitive, but dead simp
 Runtime detection happens at startup:
 
 ```rust
-pub async fn detect_runtime() -> AnyGrill {
-    #[cfg(target_os = "macos")]
-    if which_exists("container").await {
-        return AnyGrill::Apple(AppleContainerGrill::new());
-    }
-
+pub async fn detect_runtime() -> DetectedRuntime {
     #[cfg(target_os = "linux")]
     if which_exists("runc").await {
-        return AnyGrill::Runc(RuncGrill::new(/* ... */));
+        return DetectedRuntime::Runc {
+            rootless: rootless::is_rootless(),
+        };
     }
-
-    AnyGrill::Process(ProcessGrill::new())
+    DetectedRuntime::Process
 }
 ```
 
-Check for the platform-native runtime. If it's there, use it. Otherwise, fall back to processes. A `--runtime` CLI flag lets you override this.
+If runc is installed, use it. Otherwise, fall back to processes. Detection only says *what* it found; Bun then builds the runtime itself, because constructing a `RuncGrill` needs the node's configured storage directories, and those live in Bun's config, not here. `DetectedRuntime::Runc { rootless: bool }` is an enum variant with a named field, just like a struct. A `--runtime` CLI flag lets you override detection.
 
 ## Probing for health
 
@@ -2476,6 +2482,22 @@ async fn status_handler(
 
 Create a oneshot channel. Send the command with the sender half. Await the receiver half. Return the result as JSON. The handler doesn't know how the agent processes commands — it just sends and waits. This separation means we can test the API layer independently from the agent logic.
 
+Write that dance thirty times and it stops being a pattern and starts being noise. So the API now has one helper that does it:
+
+```rust
+async fn ask_agent<T>(
+    cmd_tx: &mpsc::Sender<AgentCommand>,
+    build: impl FnOnce(oneshot::Sender<T>) -> AgentCommand,
+) -> Result<T, Response> { /* channel, send, await, 500 on failure */ }
+
+match ask_agent(&state.cmd_tx, |response| AgentCommand::Status { response }).await {
+    Ok(statuses) => Json(statuses).into_response(),
+    Err(response) => response,
+}
+```
+
+Two Rust features make this work. `T` is a generic type parameter, so one function serves every command, whatever it replies with. The `build` argument is a closure, the `|response| ...` part, which is Rust's lambda syntax. `impl FnOnce(oneshot::Sender<T>) -> AgentCommand` says "any closure that takes the sender and returns a command, called at most once". Why `FnOnce`? Because the closure *moves* its captured values (an app name, a request body) into the command, and you can only move something once. The compiler infers `T` from the variant the closure builds, so the call site never names a type.
+
 The `apply` handler does a bit more work: it parses the TOML body and validates the config before sending the command, returning 400 for invalid input:
 
 ```rust
@@ -2786,6 +2808,75 @@ if looks_like_image_ref(&spec.root.path) {
 
 The `detect_runtime()` function now auto-detects rootless mode and configures paths accordingly. Non-root users get `~/.local/share/reliaburger/` for images and bundles; root uses `/var/lib/reliaburger/`.
 
+### Doing what the image says
+
+For a long time we pulled the layers and threw the config blob away. Every container ran the app's `command`, with the app's `env`, in `/`, as uid 65534. That works for a test image you built yourself. Now try the official Redis image. Its config says:
+
+```json
+{"Entrypoint": ["docker-entrypoint.sh"], "Cmd": ["redis-server"],
+ "Env": ["PATH=...", "REDIS_VERSION=8.8.0"], "WorkingDir": "/data"}
+```
+
+With no `command`, runc had nothing to run. With one, the entrypoint script never ran, `REDIS_VERSION` was missing, and the process couldn't write to `/data`. Podinfo's image says `"User": "app", "WorkingDir": "/home/app", "Cmd": ["./podinfo"]`, a relative path that only works from the right directory. Almost every public image leans on at least one of these fields, so a Kubernetes manifest that runs fine on a real cluster fell over on ours.
+
+The fix is to do what Kubernetes does. The app's `command` replaces the image's `Entrypoint` (and drops its `Cmd`); the app's `args` replaces `Cmd`; the image's `Env` goes underneath the app's, so the app wins a clash; the image's `WorkingDir` and `User` apply unless the app sets `working_dir` or `run_as_user`. The rule for the argv is small enough to read at a glance:
+
+```rust
+process.args = if overrides.command.is_empty() {
+    let cmd = if overrides.args.is_empty() { &image.cmd } else { &overrides.args };
+    image.entrypoint.iter().chain(cmd).cloned().collect()
+} else {
+    overrides.command.iter().chain(&overrides.args).cloned().collect()
+};
+```
+
+`if` is an expression in Rust, so both branches produce the new argument vector and we assign it once. `.iter().chain(other)` walks one sequence and then the next without building an intermediate vector (think `itertools.chain` in Python). `.cloned()` turns the borrowed `&String`s into owned `String`s, and `.collect()` gathers them into whatever type the left-hand side needs, here a `Vec<String>`.
+
+Where does `overrides` come from? Only runc unpacks images itself, so only runc can read the config. The spec generator can't resolve anything yet: it doesn't have the image. So it records what the app asked for in a field the OCI spec doesn't have, `OciProcess::overrides`, and runc resolves it after the pull:
+
+```rust
+let Some(overrides) = process.overrides.take() else {
+    return Ok(());
+};
+```
+
+`Option::take()` moves the value out and leaves `None` behind. That does two jobs at once: we own the overrides without cloning them, and the field is empty by the time we write `config.json`, so runc sees a pure OCI document. A `None` means the process is already final, which is how our hand-built test specs keep working.
+
+The config blob decides what runs, and as whom, so it has to be the bytes we verified. The direct pull path already checks the config against the digest in the manifest before it fetches a single layer; `pull_and_unpack` now returns that parsed config alongside the rootfs in a `PulledImage`. The cluster path (Pickle and its peers) hands back the config blob's path and digest, and we hash the file again before parsing it. It's a few kilobytes. We'd rather pay for the hash than trust a file on disk.
+
+The `User` field needs one more step. `"app"` is a name, and names live in the image's `/etc/passwd`. We read that file from the unpacked image, but the image controls its own symlinks: `/etc/passwd -> /etc/shadow` must mean the image's shadow file, not the host's. So `resolve_in_root` walks the path one component at a time, restarts absolute link targets from the image root, and never lets `..` climb above it, the way the kernel would inside the container.
+
+### Root, but not really
+
+Honouring `User` raises an awkward question. Neither Redis nor nginx sets a user, which means root. Their entrypoints rely on it: Redis `chown`s `/data` and then drops to the `redis` user with `gosu`; nginx binds port 80 as root and starts its workers as `nginx`. Keep running everything as 65534 and a large slice of the Kubernetes ecosystem won't start. Run them as real root and a container escape owns the node.
+
+The answer is a user namespace. We already met one for rootless mode, where it maps your uid to root inside the container. Rootful containers now get one too, with a bigger mapping: container ids 0 to 65,535 map onto host ids 2,000,000,000 to 2,000,065,535. Inside, Redis is root and can `chown` and `setuid`. Outside, it's uid two billion, which owns nothing on the node.
+
+```rust
+pub const HOST_ID_BASE: u32 = 2_000_000_000;
+pub const CONTAINER_ID_COUNT: u32 = 65_536;
+```
+
+The underscores are just digit separators, like `2_000_000_000` in Python. We picked two billion because it sits above systemd's container range and below its dynamic ranges near 2^31, so it collides with neither `/etc/subuid` allocations nor systemd-nspawn.
+
+With the namespace comes Docker's default capability set: `CAP_CHOWN`, `CAP_SETUID`, `CAP_NET_BIND_SERVICE` and a handful more. Inside a user namespace a capability only acts on what the namespace owns, so these let an entrypoint manage its own files and processes without any say over the host's.
+
+Three details make it actually work. First, the files. Container root is host uid 2,000,000,000, and the unpacked image was owned by host root, which the namespace doesn't map at all. So the image store shifts ownership once, at unpack time: a file owned by uid 999 in the layer is owned by 2,000,000,999 on disk, and any directory the unpacker invents goes to container root. `chown` quietly clears set-uid bits, so we put the mode back afterwards. Every container on a node shares this one range (like Docker's `userns-remap`), which is what keeps the unpacked image cache shareable. Per-container ranges would need idmapped mounts for every rootfs, and we don't need that yet.
+
+Second, `/sys`. The kernel only lets a user namespace mount a fresh `sysfs` if it also owns the network namespace, and ours was created by the node beforehand. Rootless mode already had the answer, a read-only bind of the host's `/sys`, so both paths share it now.
+
+Third, port 80. For the same ownership reason, container root has no `CAP_NET_BIND_SERVICE` over its network namespace. When we create the namespace we set `net.ipv4.ip_unprivileged_port_start=0` inside it, as Docker does. The namespace holds one container, so there's nobody to impersonate on a low port.
+
+The destructuring assignment in the user resolution is worth a glance, because it's newer Rust:
+
+```rust
+if let Some(run_as_user) = overrides.user {
+    (uid, gid, home) = by_id(run_as_user)?;
+}
+```
+
+`by_id` is a closure that returns a `Result` of a three-element tuple. Assigning a tuple to existing `mut` variables in one go works the way it does in Python or Go (`uid, gid, home = ...`). Rust only allowed it on plain assignment, not just in `let`, from version 1.59.
+
 ### Testing image pulling
 
 The unit tests for `ImageReference::parse` and layer unpacking run unconditionally. They create synthetic gzipped tarballs in temp directories and verify that whiteouts, symlinks, and multi-layer ordering work correctly.
@@ -2795,6 +2886,108 @@ The fixture serves a small synthetic manifest, config and compressed layer over 
 the tests can verify manifest fetching, digest checks, unpacking and cache reuse without a
 mutable Docker Hub tag or network access. The real runc acceptance remains a separate
 provisioned Linux suite because its promise is runtime execution, not registry protocol.
+
+The image-config rules are pure functions over a parsed config and a scratch rootfs, so
+`image_config`'s unit tests cover every combination of `command`, `args`, env, working
+directory and the `User` forms (`app`, `100`, `100:50`, `app:staff`, an unknown name, a
+passwd symlink that points at the host) on any machine. The user namespace mapping is
+unit-tested the same way. Two provisioned-Linux tests then run the real thing, pinned by
+digest: Redis with no `command` must reach "Ready to accept connections", show
+`REDIS_VERSION`, run in `/data`, drop `redis-server` to uid 999 and map container root to
+2,000,000,000; nginx must answer on port 80 while every one of its processes has a host uid
+of at least two billion.
+
+## Surviving our own crash
+
+Run `relish apply`, then `kill -9` Bun halfway through. What's left on the machine? Maybe a network namespace. Maybe a half-written bundle. Maybe a `runc run` that's still busy starting your container. When Bun comes back, it has to answer two questions: what did I leave behind, and is any of it still moving?
+
+A PID written to a file answers neither. The process might have exited, and Linux might have handed the same number to your database. Our first Runc implementation spawned `runc` as Bun's own child and wrote the PID down afterwards, so every crash window lived in the gap between those two steps. We patched a few windows one at a time before admitting the shape was wrong. Now every Runc container goes through the same *owned* lifecycle, built from three ideas.
+
+**Write the intent down first.** Before Bun touches the kernel, it records the original request (the OCI spec as the user gave it, before image and network preparation rewrite it) together with the runtime configuration that gives it meaning: bundle directory, runc state directory, image cache, rootless or not. Each attempt gets a random *generation* ID, so two attempts that reuse the instance name `default__web-0` can't be mistaken for each other. The record lands in a private staging directory, gets synced, and only then is renamed into place. Its lifecycle is a small enum:
+
+```rust
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum IntentPhase {
+    /// Preparation or execution may have created resources; absence is unproven.
+    Owned,
+    /// New workload mutations are fenced while commands and resources retire.
+    Retiring,
+    /// The runtime confirmed every command and resource retired.
+    Retired {
+        /// Actual workload exit code, when known independently of cleanup.
+        exit_code: Option<i32>,
+    },
+}
+```
+
+Like `DetectedRuntime::Runc` earlier, `Retired { exit_code: Option<i32> }` carries a named field, a tiny struct living inside the enum. C would need a tagged union and discipline; here the compiler won't let you read `exit_code` unless you've matched `Retired`. The serde attribute `tag = "state"` picks the JSON shape, `{"state": "retired", "exit_code": 0}`, rather than serde's default of nesting the variant name as an object key. `deny_unknown_fields` makes a record with a typo or an extra field fail to load instead of loading half-understood.
+
+Read the phases as: `Owned` means cleanup is still owed, `Retiring` means cleanup has started and nothing new may begin, and `Retired` means Bun has proof everything is gone. Only a `Retired` generation may be replaced. Recovery refuses a live intent whose recorded configuration differs from the current one (a changed runc binary or state directory would make a surviving container look absent), and the error names the instance so you know what to stop first. We originally applied that check to retired records too, which meant that changing the DNS resolver stopped Bun from starting once any container had ever run. A retired generation owns nothing, so it's exempt now.
+
+**Hold a lock for as long as you act.** A Tokio mutex coordinates tasks inside one Bun. It can't coordinate the Bun that died with the one that replaced it. So each instance has a lock file, and anyone who wants to act on a generation must first *claim* it: take an exclusive lock on that file, then re-read the journal and check that the generation is still the one they expected. The lock lives inside the claim and is released by `Drop`:
+
+```rust
+// Never unlink or replace a lock file: another process may already hold it.
+#[derive(Debug)]
+struct LifecycleLock(File);
+
+impl Drop for LifecycleLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+```
+
+`Drop` is Rust's destructor trait. The compiler calls `drop` when the value goes out of scope, including when a `?` returns early with an error, so no path out of a function can forget to unlock. Go would need a `defer`; C would need discipline again. We never delete the lock file, because a second process could then lock a fresh file under the same name while the first still holds the old one.
+
+The methods that write to the journal take the claim by value and hand it back: `pub async fn retire(mut self, exit_code: Option<i32>) -> io::Result<Self>`. Taking `self` rather than `&self` *moves* the claim into the function, and from there into the `spawn_blocking` worker doing the write. If the async caller is cancelled mid-write, the worker still owns the lock until the write finishes. Ownership, not convention, keeps the lock alive.
+
+**Let something else own the process.** Every command Runc runs, from the long-lived `runc run` launcher to a two-second `ip link add`, starts under an independent *process owner*: a small Bun helper process that outlives Bun. The owner records the child's identity on disk before opening an execution gate that lets the command actually start. It holds its own lock file for its whole life, makes itself the subreaper so orphaned grandchildren come back to it, and is the only thing that ever reaps or signals the child. Bun talks to it over a private Unix socket. If Bun can take an owner's lock, the owner is gone, and an owner that vanished without recording a result is an error, never "probably finished". A timed-out wait means "still running", and the command stays on the books until its owner confirms it has retired.
+
+With those three pieces, restart becomes a matter of reading and checking. For each instance, Bun finds its *adoption record* (its own note of what it was running: spec, PID, process start time, log location). `owned_adopt` claims the generation and cross-checks everything:
+
+```rust
+let intent = context.intent().await?;
+if intent.spec != adoption.oci_spec /* || ...runtime and container ID... */ {
+    return Err(io::Error::other("runtime intent conflicts with adoption record"));
+}
+if matches!(intent.phase, IntentPhase::Retired { .. }) {
+    return Ok(false);
+}
+let Some(CommandState::Running { pid: launcher_pid }) =
+    context.role_state(RuntimeRole::Launcher).await?
+else {
+    runtime.owned_cleanup(&id, &context).await?;
+    return Ok(false);
+};
+```
+
+`matches!` is a macro that returns `true` if a value fits a pattern; `{ .. }` means "ignore the fields". `let Some(...) = ... else { ... }` is *let-else*: if the pattern matches, its bindings (`launcher_pid` here) stay available for the rest of the function; if not, the `else` block runs and must leave the function. A launcher that isn't running gets cleaned up rather than adopted. After this excerpt, the launcher's PID and start time must agree with the adoption record to within two seconds. Linux reports process start times relative to boot and converts them using the boot time, which moves when NTP steps the clock. An exact comparison refused a healthy container after a one-second correction.
+
+One question remains: did the *machine* restart? Kill Bun and the container can keep running. Reboot Linux and it can't. Every intent and owner record stores the kernel's boot ID from `/proc/sys/kernel/random/boot_id`, a random UUID that changes on every boot. A different boot ID proves that every process from the old record is dead, so recovery records the execution as interrupted with no exit code and removes the stale runc state directly. It never passes the old PID to `runc delete --force`; that number might belong to something else by now.
+
+For a while this owned path was opt-in, and rootful Runc without eBPF quietly took the old spawn-and-record path with all of the crash windows above still open. Nothing had been released, so nobody depended on it, and we deleted it (about 1,900 lines). `RuncGrill::new` now takes the owner executable as a plain argument:
+
+```rust
+pub fn new(
+    bundle_base: PathBuf,
+    image_store: ImageStore,
+    rootless: bool,
+    state_dir: PathBuf,
+    owner_executable: PathBuf,
+) -> std::io::Result<Self>
+```
+
+An `Option` field set by a builder method would make every method ask "is it there?", and a forgotten check is a silent second code path. A required argument means the question never comes up.
+
+### Testing the awkward moments
+
+Unit tests can edit records to exercise each decision, but that's not the same as a crash. `tests/oci_crash.rs` starts the real Bun binary with real runc, and wraps `ip` and `runc` in small scripts that pause at a known step (preparation, launch, namespace removal) while still running the real tool. Then it kills Bun with SIGKILL. Recovery must retire whatever wasn't adopted before serving a new apply, an already-adopted workload must survive with exactly one execution, and an explicit retry must run the payload once more. One window is too narrow to hit by pausing a script, so the fixture compiles a small `LD_PRELOAD` shim that pauses the file open for the intent lock itself. The shim exists only in the test; production code contains no injected waits.
+
+The reboot test taught us something about green ticks. It power-cycles a disposable Lima VM between two phases, and a driver script tells it where its state lives through an environment variable. Our first version said `let Ok(directory) = std::env::var(...) else { return; };`, and returning early made the test *pass*. The Linux suite runs every ignored test in the binary, so CI reported a green reboot test that had never rebooted anything. Now it calls `.expect("...")` (an `unwrap()` with our own panic message), the automated suites skip it, and a pass can only come from the driver that actually restarts the VM.
+
+Real runc also caught a mistake that inspecting our generated JSON never would. We put the host path `/sys/fs/cgroup/reliaburger/default/web/0` into the OCI `cgroupsPath`. Runc accepted it and created the container under `/sys/fs/cgroup/sys/fs/cgroup/reliaburger/...`, because OCI treats absolute cgroup paths as relative to the cgroup mount. Our resource policy guarded an empty cgroup while the container ran somewhere else. The spec now carries `/reliaburger/default/web/0`, and the regression has the container print `/proc/self/cgroup` from the inside. Checking the JSON we generated would only have repeated our own wrong assumption.
 
 ## What we built
 
@@ -2915,607 +3108,3 @@ valid intermediate state. Our wall-clock acceptance test now waits for both a
 positive restart count and a live post-restart state within its existing
 deadline. Looking at the counter alone raced that transition and falsely called
 a scheduled restart stuck. A workload which really stays pending still fails.
-
-### Duration input must survive arithmetic and Unicode
-
-`relish logs --since 18446744073709551615d` used to overflow when converting
-days to seconds. We now use `checked_mul`, which returns `None` when the result
-cannot fit, and turn that into the existing CLI flag error. Parsing the final
-unit uses a Unicode character boundary rather than subtracting one byte from
-the string length. Invalid non-ASCII units therefore return an error too, rather
-than panicking while slicing a UTF-8 string. The regression covers overflowing
-minutes, hours and days as well as multibyte units; ordinary durations retain
-their existing saturating subtraction from the current epoch time.
-
-### Find the free port before declaring exhaustion
-
-If only one port is free in a large range, a thousand random guesses will usually
-miss it. That is not exhaustion. The allocator now chooses a random starting
-point and visits each candidate once, wrapping around the configured range.
-Its existing Tokio mutex covers the entire selection, so concurrent callers
-cannot receive the same reservation. Adopted ports outside the range still do
-not consume its capacity. A regression reserves 63,999 of 64,000 candidates and
-repeatedly allocates and releases the final free port; the concurrent allocation
-tests check uniqueness too.
-
-
-### Check names before creating their resources
-
-The deployment regression submits an app named `Bad`. Before the repair, Bun
-creates `default__Bad-0` and reports success. Configuration also accepts an empty
-name. That's a problem because the names become parts of DNS names, instance IDs
-and filesystem paths; our identity format already assumes lowercase DNS labels.
-
-Admission now enforces that assumption for app names, job names, their namespaces
-and namespace declarations. Each label contains 1–63 ASCII bytes, starts and ends
-with a lowercase letter or digit, and contains only those characters or hyphens.
-An explicit empty namespace is invalid; omitting it still selects `default`.
-We reject invalid labels rather than normalising them, which could merge two
-names that the caller intended to keep separate.
-
-The shared predicate borrows a `&str` and calls `as_bytes()`. This gives us a
-borrowed byte slice without allocating another string. A small closure checks
-letters and digits; the interior permits `b'-'`, Rust's byte literal for a
-hyphen. Checking length before indexing relies on `&&` short-circuiting: an
-empty slice never reaches either endpoint lookup. Trace already used these
-rules and now calls the same predicate.
-
-Both configuration entry points and Bun's command admission use the check.
-The tests cover separators, traversal-shaped strings, uppercase, whitespace,
-Unicode and length boundaries. The runtime regression uses harmless invalid
-labels and asserts that the mock receives no create call. Stored ownership
-records still need their own recovery validation; accepting a new configuration
-and interpreting old on-disk ownership are different entry points.
-
-### A command is still a process
-
-Suppose Bun runs `ip link add`, then disappears before collecting the result.
-Inspecting the network a moment later is not enough: the old command might
-still be about to create the link. The same problem applies to `runc run` and
-slirp4netns. Resource ownership needs to include the commands that can change
-those resources.
-
-The `OwnedCommands` adapter reuses the foreground owner's launch record and
-execution gate. It gives each command an unpredictable `CommandId`, persists
-its declared executable, arguments and environment, and only then permits
-activation. The identifier is a newtype: its tuple field is private, so callers
-cannot accidentally pass an application ID where a command ID belongs. Serde's
-`#[serde(transparent)]` stores the inner identifier directly rather than adding
-another JSON object around it. That allows a runtime's journal to retain the
-reference before it starts the command.
-
-Preparation and execution are separate calls for a reason. A crash after
-preparation leaves a discoverable, unactivated attempt. A crash after activation
-leaves an independent owner. Neither depends on the caller remembering the PID.
-`CommandState` distinguishes Prepared, Cancelled, Running and Retired. A missing
-owner returns an error; it is never another spelling of Retired.
-
-Waiting has a bounded deadline. When it expires, the command can still be
-running. The caller must retain its resource obligation and explicitly retire
-the command before confirming cleanup. Output is available only after confirmed
-retirement and is bounded to 1 MiB across both streams. Exceeding that bound
-makes output retrieval fail without losing the separate evidence that execution
-finished. Invalid paths, NUL bytes and malformed environment keys refuse before
-any intent is published.
-
-The collection belongs to one runtime generation. Its caller must hold that
-runtime's lifecycle guard while registering commands and collecting retirement
-evidence. Listing the current commands does not prevent a concurrent caller
-from registering another one. The adapter is a foundation; routing Runc and
-network operations through it, preserving the original OCI specification, and
-keeping their guards through cancellation are separate integration steps in the
-[OCI ownership plan](../plans/2026-09-20-oci-launch-ownership.md).
-
-
-### Runtime files belong to the configured node
-
-Give two nodes different storage directories. You expect their prepared OCI
-bundles to be different files. Before the correction, Bun selected Runc with
-hard-coded defaults even when its own storage configuration pointed elsewhere.
-The registry used the configured images directory while Runc could pull into a
-second cache under the user's home directory. The read-only regression prints
-that unexpected cache path before failing.
-
-Bun now passes the actual selected images directory into runtime construction
-and keeps Runc bundles and state below the node's instance directory. Automatic
-detection uses the same construction path as explicit `--runtime runc`.
-A preparation test gives two node directories the same instance ID and different
-commands, then checks that writing the second bundle leaves the first unchanged.
-This establishes filesystem ownership; it does not claim that two nodes can
-share the same host network without additional isolation.
-
-State format 20 rejects older development state, whose runtime files could live
-outside that node's data directory. Silently switching directories would make a
-surviving old container look absent. Fresh development clusters follow the
-release's existing compatibility policy.
-
-
-### Refuse duplicates before touching their bundles
-
-Create a rootless container twice with the same instance ID. The second call
-used to rewrite `config.json` and replace the in-memory entry. Rootful creation
-already checked for existing network resources, but rootless preparation had no
-equivalent check. An OCI state directory left by a previous Bun could also be
-overlooked.
-
-Runc now checks both its current entry and the instance's OCI state directory
-before preparing anything. An entry permits replacement only after confirmed
-retirement has marked it Stopped. The refusal returns before rollback, because
-rolling back a duplicate request could delete the first request's resources.
-The tests keep the original bundle bytes, attempt a replacement, and check that
-the refusal preserves them. A separate successful replacement after retirement
-ensures this guard does not prevent ordinary reuse.
-
-This check protects the ownership evidence currently available to the adapter.
-It does not recover an interrupted preparation or exclude a delayed launcher
-from another Bun. Those require the durable intent and command ownership
-described above.
-
-
-### Remember the request before preparing it
-
-Bun can disappear after creating a network namespace but before writing its
-application adoption record. On restart, that record cannot tell us what was
-being prepared. Nor can `config.json`: preparation rewrites image references,
-root filesystem paths and network settings. We need the original request.
-
-`IntentJournal` stores that request alongside the runtime configuration and an
-unpredictable generation identifier. The generation distinguishes two attempts
-that reuse the same instance name. Owned means cleanup is still owed. Retiring fences new workload mutations
-while cleanup proceeds. Retired preserves an optional independently observed
-workload exit code. Publishing a replacement requires Retired. Merely dropping the Rust value
-that represents a claim does not retire any resources.
-
-A Tokio mutex can coordinate clones of one adapter. It cannot coordinate two
-adapters constructed separately after recovery. Each intent therefore has a
-stable filesystem lock. We never remove or replace its file: doing so would let
-two callers lock different inodes behind the same name. The caller first observes
-a generation, then claims that exact generation. The claim checks again after
-locking, so a queued operation cannot acquire authority over a successor.
-
-The claim owns the file descriptor. Its `Drop` implementation explicitly unlocks
-it, including when an error returns early. Publication and retirement take
-`self` by value and return the claim on success. That transfers the whole claim
-into the blocking worker. If the async caller disappears during a filesystem
-write, the worker still holds the lock until the write completes. Other runtime
-effects must retain that same claim through their own completion; this API does
-not make arbitrary detached work safe automatically.
-
-First publication writes a private staging directory, syncs its complete record,
-then atomically renames the directory and syncs its parent. No resource mutation
-is permitted before that succeeds. Recovery ignores abandoned staging
-directories, but refuses published directories with missing, oversized, invalid
-or redirected records. It also refuses a different bundle directory, state
-root, image cache, executable, rootless setting or node subnet. Guessing those
-values could make surviving resources look absent.
-
-The journal is separate from the command owner. The journal says what the
-runtime owes; the command owner establishes whether a particular command
-finished. Before connecting either to the agent's complete launch inventory,
-Runc must restore its launcher and helper obligations and demonstrate retirement.
-The tests for this journal establish persistence, exclusion and generation
-fencing, not physical container-crash recovery.
-
-
-### Close command admission before inspecting absence
-
-Imagine a network command waiting for a lock. Its caller times out, cleanup
-checks that the interface is absent, and a replacement reuses the address. The
-old command then creates the interface. Inspecting absence was real; treating
-that observation as final was the mistake.
-
-`IntentCommands` connects a generation claim to its durable short-command
-collection. `run` moves the claim into a spawned worker. Cancelling the caller
-drops its join handle, but Tokio keeps the worker running, and the worker keeps
-the claim until command registration and the bounded wait complete. A separate
-adapter cannot take that claim in the meantime. The cancellation regression
-blocks a real shell command, drops its caller, and verifies this exclusion before
-letting the command finish.
-
-A wait timeout leaves the command discoverable. Further normal commands refuse
-until earlier commands have positively retired. Cleanup first persists Retiring,
-then seals normal admission and drains the entire command collection. A drain
-error or deadline leaves Retiring on disk. Recovery must drain again; a fresh
-`IntentCommands` value never inherits an unverified in-memory success flag.
-
-Only the drained collection may run cleanup commands. Those commands have the
-same durable ownership and retirement checks. The runtime must then verify its
-OCI state, mounts and network resources absent before calling `finish`, which
-rechecks every command while it still owns the generation claim. The wrapper
-cannot inspect those runtime resources itself. Long-running launchers and
-network helpers need their separate role records; this collection covers short
-mutations.
-
-The process-death regression kills the actual caller after its command reaches
-a controlled wait. A new adapter claims the surviving generation, seals and
-drains it, and only then opens the old command's gate. No late mutation occurs.
-This exercises the ordering with real processes; wiring the same ordering into
-Runc's actual namespace and forwarding operations remains the integration step.
-
-### Give the launcher a durable role
-
-A foreground `runc run` can outlive Bun. So can the network helper that connects
-its rootless container. A recovered PID tells us neither which command we
-permitted nor whether its owner has finished collecting descendants. We need a
-record of the permission itself.
-
-Each runtime generation now has separate command collections for its launcher,
-rootless network helper and short mutations. `RuntimeRole` is a Rust enum: its
-`Launcher` and `RootlessNetwork` variants name the two long-lived responsibilities.
-A `match` selects the corresponding collection and binding; adding another
-variant makes the compiler demand that we handle it in each selection.
-
-Starting a role has three steps. Prepare an immutable command, persist its exact
-command ID in the original-intent record, then ask its independent owner to
-activate it. The generation claim stays in the worker throughout. A crash
-between the first two steps leaves an unbound Prepared command. Recovery may
-cancel it, because it never received permission to execute. An unbound command
-that has executed is inconsistent evidence, so recovery refuses it.
-
-The persisted `RuntimeRoles` struct groups the two current `Option<CommandId>`
-bindings and the identities of retired network helpers. `None` means no command
-was authorised for that role. Each bound ID must exist in the complete command
-inventory. A missing binding, an unbound executed command or a reference into
-another generation prevents cleanup. The journal format is version 3, so an
-older record cannot silently stand in for the helper replacement history.
-This format is still awaiting production Runc integration.
-
-Long-running roles don't block short state observations. They do block confirmed
-retirement. Sealing first refuses further admission, validates both bindings,
-then retires every role and short command through their owners. Only afterwards
-may the runtime inspect kernel resources and release its address reservation.
-A short launcher that has already exited keeps its actual exit code and original
-log files across adapter reconstruction. A cleanup signal never manufactures a
-successful workload result.
-
-The role tests exercise a launcher exiting with code 7, two surviving roles,
-preparation interrupted before binding, corrupt bindings, and actual caller
-SIGKILL while both roles remain alive. Recovery retires both before opening their
-old mutation gate; neither can act afterwards. Shared handles also prove that a
-clone from before sealing cannot start a helper or discard cleanup authority.
-These tests establish the command protocol. Actual Runc, slirp, mount and agent recovery still need the
-integration and physical qualification described in the OCI ownership plan.
-
-### Don't let exec hold up retirement
-
-An operator starts a long `runc exec`, then asks Bun to stop the container.
-Holding the adapter mutex until exec returns would make cleanup wait behind the
-very command it needs to interrupt. Instead, we capture the role's immutable
-owner capability under the mutex, release the mutex, and wait through the owner's
-existing auxiliary-command protocol.
-
-The captured value contains an owned-command collection and its exact command
-ID. It grants no permission to prepare another role. The independent owner
-checks whether its main command is still running before accepting exec, retains
-each accepted child owner, and waits for all of them during retirement. A request
-captured before sealing cannot target a successor generation. Its old owner
-must either refuse it or account for it before completing retirement.
-
-We deliberately keep the exec socket future in the caller. Cancelling that
-future closes the connection, which tells the owner to retire its auxiliary
-command. Spawning an unobserved background task here would discard that useful
-cancellation signal. This differs from short mutations, whose worker retains
-the generation claim until it finishes.
-
-Two regressions exercise concurrent cleanup and cancellation using actual child
-commands. One requires sealing to finish while a long exec is still waiting;
-the other opens a delayed mutation gate only after retirement and checks that
-nothing happens. Actual container exec qualification follows when Runc uses
-this adapter path.
-
-### Keep polling from filling the disk
-
-Twelve successful runtime queries used to leave twelve command records. A node
-polling for weeks would keep every one. The failing regression counts those
-records through the public inventory API, then requires the repeated-query path
-to retain only the latest completed command.
-
-Before admitting another short command, the generation owner proves all earlier
-short commands terminal and prunes them. Prepared or running records remain in
-the inventory. So do records whose owner disappeared without retirement proof.
-Launcher and network-helper collections keep their outcomes and logs; polling
-never prunes those roles.
-
-Deletion needs its own ordering. Removing files directly from an active command
-directory could leave a missing `owner.json` after a crash, making the next
-inventory rightly refuse the incomplete evidence. Instead, we take the command's
-operation and owner locks, recheck its generation and terminal state, then rename
-the whole directory into a private `retired-commands` directory. We sync both
-parents before deleting its contents. A later pass may finish an interrupted
-deletion there, even if the record file has already gone.
-
-Why is it safe to remove the lock files too? Command IDs are random and never
-reused. A delayed start either reaches the terminal record before pruning, or
-reloads its original path after that path disappears. Both refuse execution.
-This operation therefore belongs only to command collections. Ordinary workload
-instance names can be reused and must keep their existing generation protocol.
-
-The tests retain prepared and running commands, preserve uncertain owner
-metadata, reject a redirected garbage directory, and resume a partially deleted
-tombstone. The polling regression then checks the bound through actual commands,
-including their successful exits.
-
-### Connect ownership to the OCI adapter
-
-A container can finish before Bun saves its adoption record. The runtime still
-needs to distinguish a successful short job from an unstarted preparation. The
-durable Runc adapter reads the original-intent journal first and gets execution
-evidence from the bound launcher owner. Agent adoption metadata supplements
-that evidence; it doesn't create ownership after the fact.
-
-The opt-in rootful path now retains a generation claim through namespace setup,
-image preparation, rootfs work, launcher activation and cleanup. Each lifecycle
-operation runs in a worker that owns the runtime clone and its lifecycle guard.
-Dropping the caller cannot release that guard while a blocking rootfs operation
-continues. A queued operation also carries the generation it observed before
-waiting, so it cannot quietly act on a replacement with the same instance name.
-
-The common operation helper accepts `FnOnce`, a closure Rust permits us to call
-once. That lets the closure consume its captured values when it constructs the
-async operation. `Future<Output = io::Result<T>>` describes the result of that
-operation: `T` may be a state, an exit code or another return value. The helper
-applies the same claim and cancellation rules to each of those operations.
-
-Cleanup seals command admission and retires the foreground launcher and its
-auxiliary exec owners before inspecting OCI state. It then uses owned commands
-to delete stale runtime state and forwarding, removes mounts and namespaces,
-withdraws its local DNS bindings, and finally releases the address reservation.
-Any failure leaves the original intent available for another attempt. A missing
-agent PID record is never the proof that permits cleanup.
-
-The first physical fixtures use a static BusyBox binary in an otherwise empty
-rootfs, so an image registry doesn't influence the result. They cover abandoned
-preparation, a short job's exit and output, and actual caller death during
-container exec. Rootless helpers, production Bun selection and discovery/egress
-reconciliation remain separate qualification steps before release.
-
-Adoption checks both the original specification and the saved log identity. The
-log path contains the immutable launcher command and runtime generation; matching
-specifications alone could accept metadata left by an earlier identical launch.
-The live launcher PID and start time must also agree, but cleanup never signals a
-PID taken from that adoption record.
-
-A completed log reader uncovered another lifetime problem. Its output channel
-could stall while it held the exclusive claim, blocking a replacement container.
-The regression reproduces that failure with a one-line channel. Retired log
-files are immutable, so the reader now captures their paths and releases the
-claim before waiting on its reader. Active streams keep the shared source for
-their original generation, drain final output, and never switch to a successor
-with the same instance name.
-
-### Replace a network helper without repeating the workload
-
-The network helper exits, but the container keeps running. Restarting the
-container would repeat its application command. We only need a new helper.
-
-The role journal now keeps the current helper binding and every earlier helper
-that positively retired. Replacement records the new binding before activation
-and retains the old command as evidence. Missing history or a duplicate identity
-makes validation refuse. The workload launcher keeps its original one-attempt
-rule; this recovery path cannot rerun an ordinary job.
-
-A crash can leave a prepared replacement without its binding. That command never
-received activation permission. Recovery cancels such preparations under their
-owner locks and confirms their terminal state before preparing another helper.
-An unbound command that executed remains inconsistent evidence and blocks both
-replacement and retirement. We don't explain it away as an interrupted write.
-
-The validation set borrows command identities from the journal using
-`HashSet<&CommandId>`. The ampersand means the set holds references, so it doesn't
-copy their strings. The claim keeps the record alive and immutable throughout
-validation; the later binding update happens after those borrows end.
-
-### Give rootless networking the right namespace
-
-Suppose Bun records container PID 1234, then dies before starting its network
-helper. By the time the next Bun reads that record, Linux might have reused 1234.
-Checking a timestamp and then asking slirp4netns to open `/proc/1234/ns/net` still
-leaves a gap between those two operations.
-
-The owned helper opens the process's `/proc` directory first. A file descriptor
-is an open kernel reference, rather than another pathname to look up later.
-Reading `status` and opening `ns/user` and `ns/net` through that descriptor keeps
-all three observations tied to the same process. If that process exits during
-inspection, the operation fails or retains its old namespaces. It cannot silently
-switch to a new occupant of the PID.
-
-We then ask the launcher's independent owner to confirm its running root through
-its authenticated control socket. The container must be a namespace init whose
-parent is that root. The launcher owner retains the root's waitable identity
-until its descendants retire, so the parent PID cannot be recycled underneath
-this check. We also refuse the helper's own user and network namespaces.
-
-`File` closes its descriptor when it leaves scope. Calling `as_raw_fd()` borrows
-the underlying descriptor number without transferring ownership. We clear
-`FD_CLOEXEC` only on the two namespace files: this flag normally closes a file
-when `exec` replaces the process image. Slirp receives `/proc/self/fd/...` paths
-for those retained files. It never has to look up the container PID again.
-`CommandExt::exec()` replaces the helper with slirp in the same process, keeping
-the durable owner's root identity intact.
-
-There is a separate startup race. A job can execute its first network request
-before Bun has configured slirp. We add a runtime-specific `createRuntime` hook
-to the prepared OCI JSON. The original user specification stays unchanged in
-the intent journal. The hook reports its init PID and waits behind a bounded
-readiness gate. Bun binds the network role, starts the verified helper, inspects
-its forwarding API and opens the gate. Only then may Runc execute the payload.
-The hook and init remain descendants of the owned foreground launcher throughout.
-See the [OCI hook contract](https://github.com/opencontainers/runtime-spec/blob/main/config.md#createruntime-hooks)
-and [slirp API protocol](https://github.com/rootless-containers/slirp4netns/blob/master/slirp4netns.1.md#api-socket).
-
-The slirp API needs a write-half shutdown after each JSON request. We bound the
-whole exchange and parse the response structurally, including the exact host
-and guest ports. A socket file alone proves very little. Once a helper has
-positively retired, recovery can replace it and restore forwarding while the
-same launcher continues running. An unavailable owner remains an error.
-
-The Linux acceptance cases use a local static BusyBox fixture, so an image
-registry outage cannot masquerade as a lifecycle failure. They exercise a short
-job's first network instruction, published-port recovery, helper replacement
-without repeating the workload, long data-directory paths and actual caller
-SIGKILL before any agent adoption record exists. Passing those cases qualifies
-this adapter; production selection and the broader release gates remain separate.
-
-
-### Retire the old execution before preparing the next
-
-An application exits and Bun prepares its replacement. What happens if Bun dies
-inside the next `create` call? If the old adoption record still exists, recovery
-sees a new runtime generation alongside metadata describing its predecessor.
-Neither record is necessarily corrupt. Their combination is wrong.
-
-The restart driver now confirms runtime retirement, removes the old kernel
-policy, removes the adoption record durably, and prunes the policy's retirement
-marker before calling `create`. A removal error keeps the application Pending.
-The next tick can retry; no successor has started in the meantime.
-
-The execution changes, but the logical workload identity stays the same. Its
-certificate files and mount source survive automatic restart. We validate that
-source before creation; explicit workload retirement still removes it. Deleting
-and recreating credentials on every process exit would introduce an unnecessary
-empty-identity interval into normal crash recovery.
-
-One regression holds `create` at a gate and checks that the predecessor record
-has already disappeared while identity material remains. Another replaces the
-record file with a directory, making removal fail, and proves that Bun never
-calls `create` until the obstruction is repaired. These tests target the ordering
-boundary directly. Physical Bun and container recovery exercise the wider
-contract separately.
-
-
-### A cgroup path has two roots
-
-Bun prepares `/sys/fs/cgroup/reliaburger/default/web/0` before startup and installs
-policy against that directory's kernel identity. We originally put the same
-string into OCI's `cgroupsPath`. Runc accepted it, then put the container below
-`/sys/fs/cgroup/sys/fs/cgroup/reliaburger/default/web/0`. The policy protected an
-empty cgroup. The container ran elsewhere.
-
-[OCI defines absolute cgroup paths relative to the cgroup mount](https://github.com/opencontainers/runtime-spec/blob/main/config-linux.md#cgroups-path).
-The JSON therefore needs `/reliaburger/default/web/0`. Application, job and init
-specifications now make that conversion when they are generated. Recovery uses
-`host_cgroup_path()` for the inverse conversion. It refuses relative paths,
-parent traversal, the hierarchy root and legacy host-prefixed values rather
-than guessing what a stored path meant. State generation 21 makes this change
-an explicit fresh-cluster boundary.
-
-The regression uses actual Runc and a local static BusyBox image. It creates the
-host cgroup before startup, records its kernel identity, and has the container's
-first command report `/proc/self/cgroup`. We compare the reported path and the
-original directory identity, then positively retire the runtime. Checking only
-the generated JSON would have repeated the original mistaken assumption.
-
-
-### A failed poll isn't a failed command
-
-The command-output regression passed in isolation, then failed under concurrent
-load. Its diagnostic was a broken pipe while asking the independent owner for
-status. The command hadn't supplied an invalid result; the client had lost one
-observation. Returning that transport error immediately made a bounded `wait`
-less useful precisely when the machine was busy.
-
-The wait now retries transient socket errors within its original deadline. An
-empty response is classified as `UnexpectedEof`, distinguishing a closed peer
-from a non-empty malformed message. Corrupt ownership, mismatched generations
-and malformed responses still refuse. The retry path never sends the command
-again, and never treats a connection failure as proof that it has stopped.
-
-Our deterministic tests temporarily redirect the private control socket while
-the real owner and workload stay alive. Closing a connection mid-request forces
-a failed observation; restoring the socket lets the same wait obtain positive
-retirement and the original output. Leaving the socket unreachable instead
-exhausts the deadline and preserves the original Running record. The fixture's
-`Drop` implementation restores the socket even when unwinding through a failed
-assertion. Rust runs that cleanup when the guard leaves scope.
-
-
-## One container path for the first release
-
-You install the Apple Container CLI, then run Bun with automatic runtime
-selection. Previously, installing that extra binary changed which adapter Bun
-used. For 0.1.0, native macOS Bun always chooses foreground processes. Containers
-run inside the managed Linux VMs, through the same runc path used on Linux.
-Explicit `--runtime apple` selection refuses and points to
-`relish setup --quickstart`.
-
-Why keep the Apple adapter in the source tree? Its ordinary lifecycle already
-works, but a Bun crash can interrupt a CLI invocation whose daemon operation is
-still running. A dead client doesn't prove the daemon stopped creating a
-container. We need durable intent and confirmed reconciliation before claiming
-recovery. That work is deferred; the adapter is unavailable in the release CLI.
-
-The regression installs a fake `container` executable in a temporary directory
-and gives a child test process its own `PATH`. Rust's `Command::env` changes the
-child's environment without changing the parent's. That matters when other
-asynchronous tests run concurrently: changing the whole process environment
-would change their runtime discovery too. The child must still select
-ProcessGrill, and explicit Apple selection must explain the supported VM path.
-
-### The owner survived Bun. Did it survive the kernel?
-
-Kill Bun and a container can keep running. Reboot Linux and it cannot. Recovery
-needs to tell those situations apart before it can release anything.
-
-Each new command record now stores Linux's kernel boot UUID before the owner may
-execute it. A different, valid UUID is positive evidence that the old kernel and
-all of its processes are gone. Recovery takes the exclusive owner lock, reloads
-the same generation, then cancels unstarted work or records an interrupted
-execution with no exit code. It never signals the saved PID. That number might
-already belong to your database.
-
-`Option<String>` makes the platform boundary explicit: `Some(uuid)` carries Linux
-evidence; `None` on other hosts grants no reboot recovery authority. The `?`
-operator propagates failed reads instead of turning missing evidence into an
-empty identifier. An invalid UUID or an unreachable owner on the same boot still
-blocks cleanup. Existing confirmed exit codes survive reboot unchanged.
-
-This proves process absence, not discovery withdrawal. A retained container
-address still needs its original consumer confirmations, and persisted OCI and
-kernel resources need their own recovery checks. The unit-style regressions edit
-records to exercise these decisions; they are not evidence of an actual reboot.
-
-OCI metadata needs a separate check. Runc's state directory may survive reboot,
-including a saved PID. We bind the original runtime intent to the boot too. On a
-later boot, recovery first refuses any matching namespace, veth or cgroup that
-exists in the new kernel. Under the original exclusive claim, it seals and drains
-all admitted commands, then removes the stale private OCI metadata directly.
-Passing that old PID to `runc delete --force` would give stale state too much power.
-
-The two-phase `qualify-oci-reboot.sh` test uses a disposable Lima VM. It starts a
-real container, holds its address, leaves another launch prepared, and force-stops
-the VM. After restart it requires a different kernel boot UUID and absent original
-kernel objects. It checks that the unknown outcome stays unknown, the prepared
-payload never runs, and the held address cannot be reused until explicit release.
-Finally it runs a replacement and refuses a delayed release from the old generation.
-The driver preserves both logs and the test binary's checksum across the reboot.
-
-### Kill the agent at the awkward moments
-
-`tests/oci_crash.rs` starts the actual Bun binary and actual Runc containers. Small
-`ip` and `runc` wrappers pause preparation, launch or namespace retirement at a
-known boundary; they still execute the real tools. Two more cases kill Bun while
-an initialiser runs and after the main workload has an adoption record. Dropping
-the in-flight HTTP apply request exercises caller cancellation before SIGKILL.
-
-Recovery must retire unadopted execution before serving a fresh apply. Neither the
-second initialiser nor the main payload may sneak through the interrupted chain.
-An already adopted main workload must survive with exactly one execution. Each
-case then performs an explicit retry and checks that the main payload runs once
-more. The fixture keeps its private logs, uses separate workload names and gives
-the non-root OCI user write access to its test bind mount.
-
-The hidden `--experimental-owned-runc` option selects the durable adapter for this
-standalone qualification. It refuses other runtimes and cluster mode. This is
-not production activation: durable consumer discovery recovery and pinned kernel
-recovery still have to meet their own contracts before the normal startup path
-can select them.
-
-One gap is too small to hit reliably by polling. Bun can register an initialiser
-and die before Runc publishes its intent. The Linux qualification fixture compiles
-a small `LD_PRELOAD` shim that pauses the real file-open operation for that intent's
-lock. It checks that the intent directory does not yet exist, then kills Bun. The
-shim belongs to the test only; the production Rust path contains no injected wait.
-A final case starts a successful application first, then repeats the crash during
-its subsequent explicit deployment. This catches accidental reliance on fresh
-storage. The interruption driver also reruns the lower-level caller-cancellation,
-launcher, exec and network-mutation contracts in private Linux namespaces.

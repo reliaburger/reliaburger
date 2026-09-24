@@ -140,13 +140,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         catalog.validate_allocations().map_err(failure)?;
         // Cluster allocation is authoritative. Locally prepared or retiring
         // allocations remain reserved internally, but cannot invent a public VIP.
-        let launches = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            self.supervisor.grill().launch_inventory(),
-        )
-        .await
-        .map_err(|_| failure("consumer runtime inventory timed out"))??
-        .ok_or_else(|| failure("consumer publication requires complete runtime inventory"))?;
+        let launches = self
+            .complete_runtime_inventory(super::RUNTIME_INVENTORY_TIMEOUT, |reason| {
+                failure(format!("consumer {reason}"))
+            })
+            .await?;
         let local: Vec<_> = self
             .service_map
             .resolve_all()
@@ -235,11 +233,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .consumer_owner()
             .cloned()
             .ok_or_else(|| failure("consumer ownership is uncertain"))?;
-        let mut changed = false;
-        if owner.publications.last() != Some(&publication) {
-            owner.publications.push(publication.clone());
-            changed = true;
-        }
         let mut seen = std::collections::HashSet::new();
         for withdrawal in withdrawals {
             if !seen.insert(withdrawal.generation) {
@@ -258,71 +251,200 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                             phase: ReceiptPhase::Pending,
                         },
                     );
-                    changed = true;
                 }
             }
         }
         if owner.receipts.values().any(|receipt| {
-            receipt.phase == ReceiptPhase::Ready
-                && publication_intersects(&publication, &receipt.withdrawal)
+            receipt.phase == ReceiptPhase::Ready && publication.intersects(&receipt.withdrawal)
         }) {
             return Err(failure(
                 "publication would resurrect a confirmed withdrawal",
             ));
         }
-        if changed || owner.phase != ConsumerPhase::Active {
-            owner.phase = ConsumerPhase::Withdrawing;
-            self.save_consumer(owner).await?;
-            if !self.withdraw_consumer_view().await? {
-                return Ok(self.consumer_update(false));
-            }
-            let mut owner = self
-                .consumer_owner()
-                .cloned()
-                .ok_or_else(|| failure("consumer ownership is missing"))?;
-            for receipt in owner.receipts.values_mut() {
-                if !publication_intersects(&publication, &receipt.withdrawal) {
-                    receipt.phase = ReceiptPhase::Ready;
-                } else if receipt.phase == ReceiptPhase::Ready {
-                    return Err(failure(
-                        "publication would resurrect a confirmed withdrawal",
-                    ));
-                }
-            }
-            self.save_consumer(owner.clone()).await?;
-            owner.publications = vec![publication.clone()];
+        if owner.phase != ConsumerPhase::Active {
+            return self.republish_after_withdrawal(owner, publication).await;
+        }
+        if owner.publications.last() != Some(&publication) {
+            owner.publications.push(publication.clone());
             owner.phase = ConsumerPhase::Publishing;
             self.save_consumer(owner.clone()).await?;
-            let services =
-                ServiceMap::from_snapshot(&publication.effective_services).map_err(failure)?;
-            let routes = publication
-                .ingress
-                .iter()
-                .map(|route| {
-                    (
-                        (route.namespace.clone(), route.name.clone()),
-                        route.config.clone(),
-                    )
-                })
-                .collect();
-            let mut table = crate::wrapper::routing::RoutingTable::new();
-            table.rebuild(&services, &routes).map_err(failure)?;
-            for entry in &publication.effective_services {
-                self.publish_backend_kernel(
-                    &ServiceId::new(&entry.namespace, &entry.app_name),
-                    &services,
-                )
-                .await?;
-            }
-            *self.routing_table.write().await = table;
-            self.service_map_tx.send_replace(services);
-            self.cluster_catalog = publication.catalog;
-            self.cluster_catalog_generation = Some(generation);
+            self.apply_consumer_publication(&publication).await?;
             owner.phase = ConsumerPhase::Active;
-            self.save_consumer(owner).await?;
-            self.sync_firewall_ebpf().await;
         }
+        if Some(&owner) != self.consumer_owner() {
+            self.save_consumer(owner).await?;
+        }
+        self.compact_consumer_publications().await?;
         Ok(self.consumer_update(true))
+    }
+
+    /// Recovery path: nothing from an earlier view may remain exposed before
+    /// the new one publishes, so withdraw everything and wait for release.
+    async fn republish_after_withdrawal(
+        &mut self,
+        mut owner: ConsumerOwnership,
+        publication: ConsumerPublication,
+    ) -> Result<ConsumerUpdate, BunError> {
+        if owner.publications.last() != Some(&publication) {
+            owner.publications.push(publication.clone());
+        }
+        owner.phase = ConsumerPhase::Withdrawing;
+        self.save_consumer(owner).await?;
+        if !self.withdraw_consumer_view().await? {
+            return Ok(self.consumer_update(false));
+        }
+        let mut owner = self
+            .consumer_owner()
+            .cloned()
+            .ok_or_else(|| failure("consumer ownership is missing"))?;
+        for receipt in owner.receipts.values_mut() {
+            if !publication.intersects(&receipt.withdrawal) {
+                receipt.phase = ReceiptPhase::Ready;
+            } else if receipt.phase == ReceiptPhase::Ready {
+                return Err(failure(
+                    "publication would resurrect a confirmed withdrawal",
+                ));
+            }
+        }
+        self.save_consumer(owner.clone()).await?;
+        owner.publications = vec![publication.clone()];
+        owner.phase = ConsumerPhase::Publishing;
+        self.save_consumer(owner.clone()).await?;
+        self.apply_consumer_publication(&publication).await?;
+        owner.phase = ConsumerPhase::Active;
+        self.save_consumer(owner).await?;
+        Ok(self.consumer_update(true))
+    }
+
+    /// Replace the kernel and userspace view in place. Unchanged services keep
+    /// their entries throughout; only services absent from the new view leave
+    /// the kernel, after DNS and ingress have stopped offering them.
+    async fn apply_consumer_publication(
+        &mut self,
+        publication: &ConsumerPublication,
+    ) -> Result<(), BunError> {
+        let services =
+            ServiceMap::from_snapshot(&publication.effective_services).map_err(failure)?;
+        let routes = publication
+            .ingress
+            .iter()
+            .map(|route| {
+                (
+                    (route.namespace.clone(), route.name.clone()),
+                    route.config.clone(),
+                )
+            })
+            .collect();
+        let mut table = crate::wrapper::routing::RoutingTable::new();
+        table.rebuild(&services, &routes).map_err(failure)?;
+        for entry in &publication.effective_services {
+            self.publish_backend_kernel(
+                &ServiceId::new(&entry.namespace, &entry.app_name),
+                &services,
+            )
+            .await?;
+        }
+        let previous = self
+            .service_map_tx
+            .borrow()
+            .resolve_all()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        *self.routing_table.write().await = table;
+        self.service_map_tx.send_replace(services);
+        self.cluster_catalog = publication.catalog.clone();
+        self.cluster_catalog_generation = Some(publication.generation);
+        for entry in previous.iter().filter(|entry| {
+            !publication
+                .effective_services
+                .iter()
+                .any(|current| current.vip == entry.vip && current.port == entry.port)
+        }) {
+            self.withdraw_discovery_entry(entry).await?;
+        }
+        self.sync_firewall_ebpf().await;
+        Ok(())
+    }
+
+    /// Forget earlier views once requests that captured their removed backends
+    /// have released, then mark receipts no remaining view contradicts.
+    async fn compact_consumer_publications(&mut self) -> Result<(), BunError> {
+        let Some(mut owner) = self.consumer_owner().cloned() else {
+            return Ok(());
+        };
+        let Some(current) = owner.publications.last().cloned() else {
+            return Ok(());
+        };
+        if owner.phase != ConsumerPhase::Active {
+            return Ok(());
+        }
+        let published: std::collections::HashSet<&str> = current
+            .effective_services
+            .iter()
+            .flat_map(|entry| {
+                entry
+                    .backends
+                    .iter()
+                    .map(|backend| backend.instance_id.as_str())
+            })
+            .collect();
+        let mut retiring = std::collections::BTreeMap::new();
+        for publication in &owner.publications[..owner.publications.len() - 1] {
+            for entry in &publication.effective_services {
+                for backend in &entry.backends {
+                    if !published.contains(backend.instance_id.as_str()) {
+                        retiring.insert(backend.instance_id.clone(), entry.app_name.clone());
+                    }
+                }
+            }
+        }
+        let retiring: Vec<_> = retiring
+            .into_iter()
+            .map(
+                |(instance_id, app_name)| crate::wrapper::draining::DrainCommand {
+                    app_name,
+                    instance_id,
+                    timeout: CONSUMER_DRAIN_TIMEOUT,
+                },
+            )
+            .collect();
+        if !self.drains.drain_all(&retiring).await {
+            return Ok(());
+        }
+        owner.publications = vec![current];
+        for receipt in owner.receipts.values_mut() {
+            if !owner.publications[0].intersects(&receipt.withdrawal) {
+                receipt.phase = ReceiptPhase::Ready;
+            }
+        }
+        if Some(&owner) != self.consumer_owner() {
+            self.save_consumer(owner).await?;
+        }
+        Ok(())
+    }
+
+    /// Rebuild the published view from the last committed catalogue after a
+    /// local change, such as a health transition or a replaced instance.
+    pub(super) async fn refresh_consumer_view(&mut self) -> Result<(), BunError> {
+        if !self.consumer_view_stale {
+            return Ok(());
+        }
+        // Before the first synchronisation after recovery, the next committed
+        // catalogue rebuilds the view from current local state anyway.
+        let Some(last) = self
+            .consumer_owner()
+            .filter(|owner| owner.phase == ConsumerPhase::Active)
+            .and_then(|owner| owner.publications.last())
+            .cloned()
+        else {
+            self.consumer_view_stale = false;
+            return Ok(());
+        };
+        self.synchronise_consumer(last.generation, last.catalog, last.ingress, vec![])
+            .await?;
+        self.consumer_view_stale = false;
+        Ok(())
     }
 
     pub(super) fn consumer_update(&self, published: bool) -> ConsumerUpdate {
@@ -362,18 +484,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.save_consumer(owner).await
     }
 
-    /// Fence local view changes until the consumer journals and publishes their merged view.
-    pub(super) async fn invalidate_consumer_view(&mut self) -> Result<(), BunError> {
-        let Some(mut owner) = self.consumer_owner().cloned() else {
-            return if self.consumer_controls_views() {
-                Err(failure("consumer ownership is uncertain"))
-            } else {
-                Ok(())
-            };
-        };
-        owner.phase = ConsumerPhase::Withdrawing;
-        self.save_consumer(owner).await?;
-        self.clear_consumer_userspace().await;
+    /// Mark the published view out of date after a local change. The agent
+    /// loop republishes it in place; until then the previous view keeps serving.
+    pub(super) fn mark_consumer_view_stale(&mut self) -> Result<(), BunError> {
+        if self.consumer_owner().is_none() {
+            return Err(failure("consumer ownership is uncertain"));
+        }
+        self.consumer_view_stale = true;
         Ok(())
     }
 
@@ -439,29 +556,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 }
 
+/// Matches the default deploy drain: long enough for ordinary requests to
+/// finish, short enough that withdrawal receipts still make progress.
+const CONSUMER_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 fn failure(error: impl std::fmt::Display) -> BunError {
     BunError::ClusterPublication(error.to_string())
-}
-
-fn publication_intersects(
-    publication: &ConsumerPublication,
-    withdrawal: &EndpointWithdrawalInstruction,
-) -> bool {
-    withdrawal.services.values().any(|removed| {
-        publication
-            .effective_services
-            .iter()
-            .any(|entry| removed.retire_vip && entry.vip == removed.service.vip)
-            || publication.catalog.services.values().any(|service| {
-                service.backends.iter().any(|candidate| {
-                    removed.service.backends.iter().any(|original| {
-                        candidate.node_id == original.node_id
-                            && candidate.node_ip == original.node_ip
-                            && candidate.host_port == original.host_port
-                            && (original.execution.is_none()
-                                || candidate.execution == original.execution)
-                    })
-                })
-            })
-    })
 }

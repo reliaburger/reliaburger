@@ -32,8 +32,10 @@ impl fmt::Display for FaultId {
 
 /// The type of fault being injected.
 ///
-/// Packet-level network faults (Delay, Drop, Partition, Bandwidth)
-/// require eBPF on Linux. DnsNxdomain is a network fault too, but it
+/// Connect-time network faults (Drop, Partition) require eBPF on Linux.
+/// Delay is a netem qdisc on each caller container's interface, so it needs
+/// Linux traffic control and runc's per-container network namespaces;
+/// Bandwidth is not implemented yet. DnsNxdomain is a network fault too, but it
 /// acts in the userspace DNS responder (Onion's `.internal` resolver),
 /// not the kernel, so it works wherever the responder runs. Resource
 /// faults (CpuStress, MemoryPressure, DiskIoThrottle) require cgroups on
@@ -43,12 +45,16 @@ impl fmt::Display for FaultId {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum FaultType {
-    /// Add latency to connections to the target service.
+    /// Add latency to traffic towards the target service.
     Delay {
         /// Delay in nanoseconds.
         delay_ns: u64,
         /// Jitter range in nanoseconds (+/- random).
         jitter_ns: u64,
+        /// Source app whose traffic is delayed (in the fault's namespace);
+        /// `None` delays every caller.
+        #[serde(default)]
+        source_app: Option<String>,
     },
 
     /// Fail a percentage of connections with EPERM.
@@ -62,19 +68,20 @@ pub enum FaultType {
 
     /// Block traffic from a specific source service to the target.
     Partition {
-        /// Source app name (the caller that gets blocked).
+        /// Source app name (the caller that gets blocked). Bun resolves its
+        /// cgroups itself; `None` blocks every caller.
         source_app: Option<String>,
-        /// Legacy wire field. Bun resolves source cgroups server-side; API
-        /// requests must leave this as zero.
-        #[serde(default)]
-        source_cgroup_id: u64,
     },
 
-    /// Legacy gossip/Raft transport partition used by `relish chaos`.
+    /// Cut the target node off from named peers on the gossip and Raft
+    /// transports.
     ///
     /// This is distinct from a service-to-service eBPF partition: only this
     /// variant can remove a council voter from quorum.
-    CouncilPartition,
+    CouncilPartition {
+        /// Node names the target stops talking to.
+        peers: Vec<String>,
+    },
 
     /// Throttle bandwidth to the target service.
     Bandwidth {
@@ -94,9 +101,6 @@ pub enum FaultType {
     MemoryPressure {
         /// How full to push memory (0-100).
         percentage: u8,
-        /// If true, trigger an immediate OOM kill instead.
-        #[serde(default)]
-        oom: bool,
     },
 
     /// Throttle disk I/O via blkio cgroup.
@@ -153,7 +157,7 @@ impl FaultType {
     pub fn is_node_operation(&self) -> bool {
         matches!(
             self,
-            Self::NodeDrain | Self::NodeKill { .. } | Self::CouncilPartition
+            Self::NodeDrain | Self::NodeKill { .. } | Self::CouncilPartition { .. }
         )
     }
 
@@ -167,11 +171,43 @@ impl FaultType {
         self.is_node_operation() || matches!(self, Self::NodePressure { .. })
     }
 
+    /// Whether the fault acts on the *callers* of its target rather than on
+    /// the target's own processes.
+    ///
+    /// Network faults take effect where a connection starts: the eBPF connect
+    /// hook, the traffic-control qdisc and the DNS responder all run on the
+    /// caller's node. So these faults are installed on the nodes that run the
+    /// callers, not on the nodes that run the target.
+    pub fn acts_on_callers(&self) -> bool {
+        matches!(
+            self,
+            Self::Delay { .. }
+                | Self::Drop { .. }
+                | Self::DnsNxdomain
+                | Self::Partition { .. }
+                | Self::Bandwidth { .. }
+        )
+    }
+
+    /// The one caller app a network fault is limited to, if any. `None`
+    /// means every caller of the target.
+    pub fn source_app(&self) -> Option<&str> {
+        match self {
+            Self::Delay { source_app, .. } | Self::Partition { source_app } => {
+                source_app.as_deref()
+            }
+            _ => None,
+        }
+    }
+
     /// Whether the fault must be routed to a named node.
     pub fn is_node_targeted(&self) -> bool {
         matches!(
             self,
-            Self::NodeDrain | Self::NodeKill { .. } | Self::NodePressure { .. }
+            Self::NodeDrain
+                | Self::NodeKill { .. }
+                | Self::NodePressure { .. }
+                | Self::CouncilPartition { .. }
         )
     }
 }
@@ -182,13 +218,17 @@ impl fmt::Display for FaultType {
             Self::Delay {
                 delay_ns,
                 jitter_ns,
+                source_app,
             } => {
                 let delay_ms = *delay_ns / 1_000_000;
+                write!(f, "delay {delay_ms}ms")?;
                 if *jitter_ns > 0 {
                     let jitter_ms = *jitter_ns / 1_000_000;
-                    write!(f, "delay {delay_ms}ms +/-{jitter_ms}ms")
-                } else {
-                    write!(f, "delay {delay_ms}ms")
+                    write!(f, " +/-{jitter_ms}ms")?;
+                }
+                match source_app {
+                    Some(source) => write!(f, " from {source}"),
+                    None => Ok(()),
                 }
             }
             Self::Drop { probability } => write!(f, "drop {probability}%"),
@@ -200,7 +240,9 @@ impl fmt::Display for FaultType {
                     write!(f, "partition (all callers)")
                 }
             }
-            Self::CouncilPartition => write!(f, "council-partition"),
+            Self::CouncilPartition { peers } => {
+                write!(f, "council-partition from {}", peers.join(","))
+            }
             Self::Bandwidth { bytes_per_sec } => {
                 // The parser reads megabits/s (`1mbps` = 125_000 bytes/s), so
                 // invert that here rather than dividing by 1024² — otherwise
@@ -215,13 +257,7 @@ impl fmt::Display for FaultType {
                     write!(f, "cpu {percentage}%")
                 }
             }
-            Self::MemoryPressure { percentage, oom } => {
-                if *oom {
-                    write!(f, "memory oom")
-                } else {
-                    write!(f, "memory {percentage}%")
-                }
-            }
+            Self::MemoryPressure { percentage } => write!(f, "memory {percentage}%"),
             Self::DiskIoThrottle {
                 bytes_per_sec,
                 write_only,
@@ -271,13 +307,13 @@ impl FaultType {
     /// never loaded), so the fault takes effect there and needs no eBPF. It
     /// used to be listed, which made it look implemented while it silently did
     /// nothing (the 12b.6 gate caught this).
+    ///
+    /// `Delay` isn't here either: it is a netem qdisc on each caller's
+    /// interface, which needs traffic control, not the connect hook.
     pub fn requires_ebpf(&self) -> bool {
         matches!(
             self,
-            Self::Delay { .. }
-                | Self::Drop { .. }
-                | Self::Partition { .. }
-                | Self::Bandwidth { .. }
+            Self::Drop { .. } | Self::Partition { .. } | Self::Bandwidth { .. }
         )
     }
 
@@ -299,7 +335,8 @@ impl FaultType {
 /// State captured when a persistent fault is applied, so clearing or expiring
 /// it can put the target back exactly as it was.
 ///
-/// eBPF service faults record their exact map keys. Process Kill has nothing
+/// Network faults record nothing here: the agent converges their kernel state
+/// on the active fault set (see `smoker::network`). Process Kill has nothing
 /// to undo, so it carries `None`. Resource faults and Pause, which leave a
 /// durable change on the target instance's cgroup or process, record what to
 /// restore here. The field is runtime-only: it never crosses the wire
@@ -325,10 +362,6 @@ pub enum FaultReversal {
     /// Stored as peer node ids (resolved to addresses at reversal time so a
     /// peer that changed address is still cleared correctly).
     Partition { peers: Vec<String> },
-    /// Exact eBPF connect-map keys installed for a service network fault.
-    ///
-    /// Tuple fields are `(virtual IP, network-order port, source cgroup id)`.
-    BpfConnectKeys(Vec<(u32, u16, u64)>),
     /// A scheduler drain: restore readiness when the final drain owner clears.
     NodeDrain,
     /// A simulated node failure: reopen gossip, Raft and reporting transports.
@@ -352,10 +385,8 @@ pub struct FaultRule {
     pub fault_type: FaultType,
     /// Target service name (e.g. "redis", "api", "payment-service").
     pub target_service: String,
-    /// Namespace of the target service, when the fault is namespace-qualified.
-    /// `None` keeps the legacy behaviour of matching the service in every
-    /// namespace; the workload-fault API always sets it (defaulting to
-    /// `default`) so injected faults hit only the intended tenant.
+    /// Namespace of the target service. Every workload fault carries one;
+    /// node faults, which have no service, carry `None`.
     pub namespace: Option<String>,
     /// Optional: target a specific instance by name (e.g. "redis-1").
     pub target_instance: Option<String>,
@@ -414,14 +445,11 @@ impl FaultRule {
 
     /// Whether an instance in `namespace` is in scope for this fault.
     ///
-    /// A namespace-qualified fault (the API path) matches only its own
-    /// namespace, so a fault on `web` in `team-a` never touches `team-b`'s
-    /// `web`. A legacy fault with no namespace (`None`) matches any namespace,
-    /// preserving the historical behaviour for internal/test callers.
+    /// A fault matches only its own namespace, so a fault on `web` in
+    /// `team-a` never touches `team-b`'s `web`. A fault with no namespace
+    /// (a node fault) matches no workload at all.
     pub fn matches_namespace(&self, namespace: &str) -> bool {
-        self.namespace
-            .as_deref()
-            .is_none_or(|target| target == namespace)
+        self.namespace.as_deref() == Some(namespace)
     }
 
     /// How long until this fault expires (zero if already expired).
@@ -487,11 +515,11 @@ pub struct FaultRequest {
     pub fault_type: FaultType,
     /// Target service name.
     pub target_service: String,
-    /// Namespace of the target service. `None` on node-targeted faults (which
-    /// have no service) and on legacy callers; the workload-fault API defaults
-    /// it to `default` and enforces the caller's token scope against it, so a
-    /// scoped Deployer cannot fault another tenant's same-named service.
-    #[serde(default)]
+    /// Namespace of the target service. `None` on node-targeted faults, which
+    /// have no service. The workload-fault API fills in `default` when a
+    /// caller omits it and enforces the caller's token scope against it, so a
+    /// scoped Deployer cannot fault another tenant's same-named service. The
+    /// agent refuses a workload fault that reaches it without one.
     pub namespace: Option<String>,
     /// Optional: target a specific instance.
     pub target_instance: Option<String>,
@@ -612,6 +640,20 @@ pub struct SafetyContext {
     pub target_service_faulted_replicas: u32,
 }
 
+/// Cluster-wide replica counts for a workload fault's target service.
+///
+/// The API gathers these from every node's live status and fault list, so the
+/// replica-minimum rail judges the whole service. Without them an agent only
+/// sees its own replicas and would refuse to kill the one copy it holds even
+/// when two more run elsewhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplicaEvidence {
+    /// Running replicas of the target service across the cluster.
+    pub replicas: u32,
+    /// Active faults against the target service across the cluster.
+    pub faulted_replicas: u32,
+}
+
 // ---------------------------------------------------------------------------
 // ScriptedScenario
 // ---------------------------------------------------------------------------
@@ -635,7 +677,7 @@ pub struct ScenarioStep {
     pub fault: String,
     /// Target service name.
     pub target: String,
-    /// Fault value (e.g. "200ms", "10%", "90%", "oom", "nxdomain").
+    /// Fault value (e.g. "200ms", "10%", "90%", "nxdomain").
     pub value: String,
     /// Optional jitter (e.g. "50ms").
     pub jitter: Option<String>,
@@ -661,12 +703,19 @@ pub struct FaultSummary {
     /// Target instance, if scoped.
     pub target_instance: Option<String>,
     /// Target node, for routed node faults.
-    #[serde(default)]
     pub target_node: Option<String>,
     /// Seconds remaining before auto-expiry.
     pub remaining_secs: u64,
     /// Who injected it.
     pub injected_by: String,
+    /// Node that holds the fault. Set by cluster-wide listings and by a
+    /// routed injection, so `relish fault clear ID` can find the owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
+    /// Further faults the same request created on other nodes. A workload
+    /// fault whose targets span several nodes becomes one fault per owner.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub routed: Vec<FaultSummary>,
 }
 
 impl From<&FaultRule> for FaultSummary {
@@ -679,6 +728,8 @@ impl From<&FaultRule> for FaultSummary {
             target_node: rule.target_node.clone(),
             remaining_secs: rule.remaining().as_secs(),
             injected_by: rule.injected_by.clone(),
+            node: None,
+            routed: Vec::new(),
         }
     }
 }
@@ -697,7 +748,7 @@ mod tests {
     }
 
     #[test]
-    fn matches_namespace_confines_qualified_faults_but_not_legacy_ones() {
+    fn matches_namespace_confines_a_fault_to_its_own_namespace() {
         let mut rule = FaultRule::new(
             FaultId(1),
             FaultType::Pause,
@@ -705,10 +756,9 @@ mod tests {
             Duration::from_secs(1),
             "tester".to_string(),
         );
-        // No namespace = legacy behaviour: matches every namespace.
-        assert!(rule.matches_namespace("team-a"));
-        assert!(rule.matches_namespace("team-b"));
-        // Qualified = matches only its own namespace.
+        // No namespace (a node fault) matches no workload.
+        assert!(!rule.matches_namespace("team-a"));
+        assert!(!rule.matches_namespace("default"));
         rule.namespace = Some("team-a".to_string());
         assert!(rule.matches_namespace("team-a"));
         assert!(!rule.matches_namespace("team-b"));
@@ -719,6 +769,7 @@ mod tests {
         let ft = FaultType::Delay {
             delay_ns: 200_000_000,
             jitter_ns: 0,
+            source_app: None,
         };
         assert_eq!(ft.to_string(), "delay 200ms");
     }
@@ -728,6 +779,7 @@ mod tests {
         let ft = FaultType::Delay {
             delay_ns: 200_000_000,
             jitter_ns: 50_000_000,
+            source_app: None,
         };
         assert_eq!(ft.to_string(), "delay 200ms +/-50ms");
     }
@@ -747,7 +799,6 @@ mod tests {
     fn fault_type_partition_display() {
         let ft = FaultType::Partition {
             source_app: Some("web".into()),
-            source_cgroup_id: 0,
         };
         assert_eq!(ft.to_string(), "partition from web");
     }
@@ -778,9 +829,10 @@ mod tests {
     #[test]
     fn fault_type_requires_ebpf() {
         assert!(
-            FaultType::Delay {
+            !FaultType::Delay {
                 delay_ns: 1,
-                jitter_ns: 0
+                jitter_ns: 0,
+                source_app: None
             }
             .requires_ebpf()
         );
@@ -801,13 +853,7 @@ mod tests {
             }
             .requires_cgroups()
         );
-        assert!(
-            FaultType::MemoryPressure {
-                percentage: 90,
-                oom: false
-            }
-            .requires_cgroups()
-        );
+        assert!(FaultType::MemoryPressure { percentage: 90 }.requires_cgroups());
         assert!(
             FaultType::DiskIoThrottle {
                 bytes_per_sec: 1024,
@@ -819,7 +865,8 @@ mod tests {
         assert!(
             !FaultType::Delay {
                 delay_ns: 1,
-                jitter_ns: 0
+                jitter_ns: 0,
+                source_app: None
             }
             .requires_cgroups()
         );
@@ -835,7 +882,11 @@ mod tests {
         assert!(!pressure.is_node_operation());
         assert!(FaultType::NodeDrain.is_node_targeted());
         assert!(FaultType::NodeDrain.is_node_operation());
-        assert!(FaultType::CouncilPartition.is_node_operation());
+        let partition = FaultType::CouncilPartition {
+            peers: vec!["node-2".into()],
+        };
+        assert!(partition.is_node_targeted());
+        assert!(partition.is_node_operation());
     }
 
     #[test]
@@ -844,14 +895,16 @@ mod tests {
             FaultType::Delay {
                 delay_ns: 200_000_000,
                 jitter_ns: 50_000_000,
+                source_app: None,
             },
             FaultType::Drop { probability: 10 },
             FaultType::DnsNxdomain,
             FaultType::Partition {
                 source_app: Some("web".into()),
-                source_cgroup_id: 123,
             },
-            FaultType::CouncilPartition,
+            FaultType::CouncilPartition {
+                peers: vec!["node-2".into(), "node-3".into()],
+            },
             FaultType::Bandwidth {
                 bytes_per_sec: 1_000_000,
             },
@@ -859,10 +912,7 @@ mod tests {
                 percentage: 50,
                 cores: Some(2),
             },
-            FaultType::MemoryPressure {
-                percentage: 90,
-                oom: false,
-            },
+            FaultType::MemoryPressure { percentage: 90 },
             FaultType::DiskIoThrottle {
                 bytes_per_sec: 10_000_000,
                 write_only: true,
@@ -1033,6 +1083,7 @@ mod tests {
             fault_type: FaultType::Delay {
                 delay_ns: 200_000_000,
                 jitter_ns: 0,
+                source_app: None,
             },
             target_service: "redis".into(),
             namespace: None,

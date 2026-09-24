@@ -157,6 +157,8 @@ The evaluation logic above — `compute_desired`, the hysteresis, the cooldown �
 
 Wiring it revealed a small design mismatch worth explaining. `run_autoscale_loop` took a *synchronous* `app_provider` closure — `Fn() -> Vec<(AppId, ...)>` — to list the apps to consider. But the apps live in the Raft desired state, which you read with an `async` call, and the metrics live in the rollup store, also async. A sync closure can't `await`. Rather than contort a shared cache to feed the sync closure, the leader task drives the same *pure* functions directly: `AutoscaleConfig::from_spec`, `evaluate`, and the `AutoscaleTracker`. The tested logic is reused; only the plumbing around it is new. When a library's shape doesn't fit the wiring, reach for its tested internals rather than bending the wiring to the shape.
 
+We later deleted `run_autoscale_loop` outright. Nothing called it, and it started the cooldown before knowing whether the Raft write had succeeded (the first bug below). `cluster::orchestrate::spawn_autoscaler` is now the only loop.
+
 The loop lives where every leader-only loop in Reliaburger lives — spawned once, checking leadership each tick, no start/stop dance. Each cycle: read the desired apps, keep only those with an `[autoscale]` section, query the rollup store for each app's recent metric, run `evaluate`, and on a decision commit an `AutoscaleOverride` to Raft.
 
 That last word is the whole trick. The autoscaler doesn't deploy anything or talk to nodes. It writes one number to Raft — the desired replica count — and stops. The scheduler from Chapter 2 already watches desired state; it now reads the *effective* replica count (the override if one exists, else the spec's) and re-places accordingly, and the per-node reconcilers converge. Scaling is just another edit to desired state, flowing through the exact machinery a manual `relish apply` uses. No parallel path, no special case. The integration test drives it end to end: deploy a one-replica app, feed a sustained 95% CPU metric into the rollup stores, and watch the cluster grow the app to its `max` of three — purely because a number changed in Raft.
@@ -562,11 +564,12 @@ A Kubernetes Deployment becomes an `AppSpec`. The mapping isn't one-to-one, but 
 
 - `spec.replicas` → `replicas`
 - `spec.template.spec.containers[0].image` → `image`
-- `containers[0].command` + `containers[0].args` → `command` (concatenated — K8s splits the argv into two fields, we keep one)
+- `containers[0].command` → `command`, `containers[0].args` → `args` (kept apart, so the runtime can apply them to the image's `Entrypoint` and `Cmd` exactly as Kubernetes does)
+- `containers[0].workingDir` → `working_dir`; `securityContext.runAsUser`/`runAsGroup` → `run_as_user`/`run_as_group`
 - `metadata.namespace` → `namespace`
-- `containers[0].ports[0].containerPort` → `port`
+- the Service's `targetPort` (named or numeric), else `containers[0].ports[0].containerPort` → `port`
 - `env[].value` → `env` (plain values)
-- `readinessProbe.httpGet.path` → `health.path`
+- `readinessProbe.httpGet` → `health` (path, and the port when it isn't the app's)
 - `strategy.rollingUpdate.maxSurge` → `deploy.max_surge`
 - `terminationGracePeriodSeconds` → `deploy.drain_timeout`
 - `nodeSelector` → `placement.required`
@@ -575,6 +578,10 @@ A Kubernetes Deployment becomes an `AppSpec`. The mapping isn't one-to-one, but 
 DaemonSets become `replicas = "*"`. StatefulSets produce a warning because Reliaburger doesn't have ordered startup or stable network IDs. Jobs and CronJobs map directly. The whole mapping above runs through one shared `pod_spec_to_app` helper, whatever the workload kind — that wasn't always true, and the section below explains what it cost while it wasn't.
 
 Three of those rows have a history: `command`, `namespace`, and env values used to be silently dropped. A Deployment running `python -m worker.main` would import as an app running the image's default entrypoint. No error, no warning — the config just did something different from the original. Silent data loss during migration is the worst kind, because you only discover it when the workload misbehaves in production.
+
+`args` has a history of its own. For a long time the importer glued `command` and `args` into one vector, which was harmless while runc ignored the image's config anyway. Once runc started honouring `Entrypoint` and `Cmd` (Chapter 1), gluing became a bug: a manifest with only `args` would have replaced the image's entrypoint with its arguments. So they're separate fields now, on both sides.
+
+Ports are the other place where a quiet mapping would lie. A Kubernetes Service can listen on port 80 and forward to container port 9898, and it can expose several ports. A Reliaburger app has one port, and `frontend:9898` reaches it on the same number. The importer follows the Service's `targetPort` (resolving names like `http` against the container's ports) to pick the app's port, and then says what it couldn't keep: the Service port that clients used to dial, any further Service ports, container ports nothing routes to, a readiness probe that runs a command or opens a TCP socket, and a Service with no workload of the same name.
 
 Env vars that use `valueFrom` (secret refs, configmap refs, field refs) still can't map automatically — there's no way to reach into another cluster's secret store. But now they land in the migration report as warnings naming each variable, instead of vanishing. The rule the importer follows: convert what you can, warn about what you can't, drop nothing silently.
 
@@ -597,6 +604,63 @@ Dropped (no Reliaburger equivalent):
 ```
 
 CRDs, ServiceAccounts, PodDisruptionBudgets, RBAC — these either have no equivalent or are handled automatically by Reliaburger (SPIFFE replaces ServiceAccounts, deploy config replaces PDBs). The report tells you exactly what to review.
+
+### Skipping the TOML
+
+Import-then-apply is two commands and a file you didn't want. So `relish apply` takes Kubernetes YAML directly, from a path or an `https://` URL:
+
+```sh
+relish apply -f https://reliaburger.com/demo/podinfo.yaml
+```
+
+How does it know? A top-level `apiVersion:` line isn't valid TOML, so a document with `apiVersion:` and `kind:` at the start of a line can only be Kubernetes. That document goes through the same importer in memory, its migration report still lands on stderr (applying mustn't hide what it approximated), and the resulting `Config` is validated and applied like any TOML file.
+
+The download is where a convenience turns into an attack surface, so it's deliberately narrow: HTTPS only (redirects too, via reqwest's `https_only`), a 30-second timeout and a 1 MiB cap enforced while reading, not just from the `Content-Length` header a server can lie about. The CLI accepts the manifest positionally or with `-f`, and clap's `ArgGroup` makes exactly one of them required:
+
+```rust
+#[command(group(clap::ArgGroup::new("manifest").required(true)))]
+Apply {
+    #[arg(group = "manifest")]
+    path: Option<String>,
+    #[arg(short = 'f', long = "file", group = "manifest")]
+    file: Option<String>,
+    // ...
+}
+```
+
+A group is clap's way of saying "these arguments are alternatives": `required(true)` demands one, and membership in the group makes any two of them a usage error. The compiler can't express "exactly one of two `Option`s is `Some`" in the type, so clap checks it at parse time and the handler can rely on it.
+
+### A demo that has to keep working
+
+A migration story needs a real application to migrate, not a toy we wrote to pass. We picked podinfo in its three-tier shape: a frontend that calls a backend through `--backend-url=http://backend:9898/echo` and caches in redis through `--cache-server=tcp://redis:6379`. It's a widely used Kubernetes demo, and it leans on everything this chapter and the first one promise: the podinfo image runs `./podinfo` as user `app` from `/home/app`, the official Redis image needs its entrypoint to run as root and drop privileges, and both talk to each other by short Kubernetes names.
+
+`examples/kubernetes/podinfo.yaml` keeps as close to upstream as we could and lists every edit in its header: images pinned by digest (redis from the ECR mirror to dodge Docker Hub rate limits), no `webapp` namespace or service account, HTTP probes instead of `exec: podcli check http`, three frontend replicas, redis's config file turned into arguments, and an ingress on `podinfo.localhost`. The import report still lists what it can't keep, and that's the point.
+
+One edit isn't a migration at all. An idle demo gives the tour's metrics nothing to count and its faults nothing to hurt, so the manifest adds a `loadgen` Deployment: BusyBox, pinned by digest, running a shell loop.
+
+```yaml
+command:
+  - /bin/sh
+  - -c
+  - |
+    while true; do
+      wget -q -T 5 -O /dev/null http://frontend:9898/
+      wget -q -T 5 -O /dev/null --post-data loadgen http://frontend:9898/api/echo
+      wget -q -T 5 -O /dev/null --post-data "$(date)" http://frontend:9898/cache/loadgen
+      wget -q -T 5 -O /dev/null http://frontend:9898/cache/loadgen
+      sleep 0.5
+    done
+```
+
+It calls the frontend by its short service name, the way any other client in the cluster would. The echo goes on to the backend and the two `/cache` calls go through to redis. Why four calls and not three? The first version had three, and the VIP hands connections to the three frontends in turn, so every home-page request landed on one replica and every cache read on another. The latency chart then showed one frontend that never touched redis, which is accurate and useless. Four calls per loop rotate each kind of request across all three. There's no `set -e`, so a failed request (and during a fault, plenty fail) just moves the loop on. `-T 5` caps each one, so a black-holed connection costs five seconds rather than forever. Why not a proper load tester? Because the job is "some traffic, always", not "measure throughput", and BusyBox is already the image our own tests pin.
+
+Two tests hold it in place. A portable one imports the file and checks the four apps it should produce. A provisioned-Linux one starts a real Bun with runc, eBPF, the DNS responder and ingress, runs `relish apply -f` on the file, and then goes through the ingress by host name: the home page must answer, `POST /api/echo` must come back as the backend's list of responses, and a value written to `/cache/demo` must read back from redis, and so must whatever the load generator wrote to `/cache/loadgen`.
+
+It paid for itself on its first run. Every image the node's Pickle cache served failed with `digest mismatch for layer sha256:8d0c5e505441...: expected sha256:8d0c5e505441..., got sha256:8d0c5e5054411ef2...`. The two digests were the same; one of them had been printed. The cluster image source passed the config blob's digest along with `to_string()`, and `Digest`'s `Display` impl abbreviates to twelve hex digits for humans. In Rust, `Display` is the trait behind `{}` and `to_string()`, and nothing stops a type from making it lossy. The fix was `as_str()`, and the pickle suite now re-hashes the config blob against the digest it returns. Unit tests of the pull path never noticed, because they went round the cluster source rather than through it.
+
+It paid again on its first CI run, less politely. It passed in our VM and failed on GitHub's runner with `frontend never reached the backend by name`, followed by Bun's startup log and nothing else. Were the containers even running? The test couldn't say, so the first fix was to the test: a failure now prints the last answer it got through the ingress, every instance's state, each app's logs, every runtime command's stderr, `runc list`, the kernel, runc version and user-namespace sysctls, and the host's FORWARD chain.
+
+The frontend answering while the backend stayed out of reach was already a hint. Container to container traffic leaves one veth and enters another, so the host *forwards* it, and GitHub's runner has Docker installed. Docker sets the iptables FORWARD policy to DROP (so does ufw). Setting `iptables -P FORWARD DROP` in the VM reproduced the failure, and this time the test explained itself: all five containers running, the frontend's log saying `dial tcp 127.128.202.174:6379: i/o timeout`. Name resolution worked. The packets died between two containers. We couldn't fix it in our own nftables table, because netfilter doesn't work that way: an accept in one table just hands the packet to the next table on the same hook, and a drop anywhere is final. So `setup_container_network` now makes sure iptables' own FORWARD chain accepts what our `veth-…` interfaces send, and replies or DNATed published-port traffic towards them, ahead of whatever policy the host has. Every Ubuntu box with Docker or ufw would have hit this on day one. Better it was a CI runner.
 
 ### Export: the reverse direction
 
@@ -778,11 +842,31 @@ ownership, private bootstrap files and damaged bundles.
 
 The installer needs a guest image and prebuilt binaries. A partial download
 mustn't become tomorrow's cached executable. The downloader streams each body
-to a randomly named private file beside its destination, checks a running
+to a private `<name>.partial` file beside its destination, checks a running
 SHA-256 digest, flushes it, and renames it into place. A bad checksum leaves an
 existing file untouched. Cached files get checked again before reuse.
 
-Request deadlines include the response body. Size limits apply both to the
+Our first downloader gave each request 180 seconds, body included. That sounds
+generous until you do the arithmetic: the Ubuntu image is about 600 MB, so any
+link slower than about 27 Mbit/s failed every time, and each retry started from
+zero. A time limit on the whole transfer can't tell a slow link from a dead one.
+What we actually want to detect is a transfer that has stopped. So each chunk
+now has 30 seconds to arrive (`tokio::time::timeout` around `response.chunk()`),
+and there's no limit on a transfer that keeps moving.
+
+When a transfer does stop, or you press Ctrl-C, the partial file stays. The
+next run hashes what's there, asks for the rest with an HTTP `Range:
+bytes=N-` header, and appends. If the server answers `206 Partial Content`
+starting at exactly our offset, we carry on; if it ignores the range and sends
+the whole file with `200`, we truncate and start again. Either way the digest
+covers every byte of the final file, so a resumed download is trusted exactly
+as much as a fresh one. A partial whose final digest is wrong gets deleted,
+because retrying from the same bytes can never succeed. We mark that case with
+a tiny `thiserror` type, `Unrecoverable`, and check for it with anyhow's
+`downcast_ref`, which asks an `anyhow::Error` whether it wraps a particular
+concrete error type. It's Rust's rough equivalent of Go's `errors.As`.
+
+Size limits apply both to the
 advertised length and the bytes actually received, so chunked responses don't
 bypass them. Redirects must keep using HTTPS, and URLs can't contain credentials.
 Loopback HTTP is allowed only in test builds for the local fixture server.
@@ -798,29 +882,80 @@ leaving Ubuntu's loopback resolver alone. Systemd owns the agent process and
 its journal instead of a detached shell process with an uncertain lifetime.
 
 A join token can now come from `relish join --token-file`. It must be a small,
-nonempty, owner-only file. This lets provisioning copy the token into a private
-guest directory without exposing it in the host or guest process arguments.
+nonempty, owner-only file. This lets provisioning hand the token to the guest
+without exposing it in the host or guest process arguments.
 The existing `--token` option remains available for manual use. Clap enforces
 that you supply exactly one source; both routes use the same pinned-CA join.
 
 ### Put the steps together
 
-`setup --quickstart` wraps the whole operation in one five-minute deadline.
-Each completed external step gets a durable checkpoint. The first VM boots
-alone: Lima creates its shared SSH identity during this step, and concurrent
-first boots race that initialisation. The remaining VM boots run through
-`FuturesUnordered`, a collection of futures polled concurrently that yields
-results as they finish. A future is Rust's suspended asynchronous computation;
-putting several in this stream lets one VM boot while another waits for package
-installation. We persist each result before moving on. Dropping a timed-out
+`setup --quickstart` used to wrap the whole operation in one five-minute
+deadline. That deadline guards against a setup that hangs, but downloads made
+it a guard against slow networks too: at 20 Mbit/s the image alone takes four
+minutes. Now the five minutes cover what we control, from the first VM boot to
+the ingress probe. Downloads get the stall detection above and a separate
+30-minute backstop, and since partial files survive, running out of time costs
+nothing but the wait. Each completed external step gets a durable checkpoint. Our first version
+booted VM 1 alone, because concurrent first boots corrupted Lima's shared SSH
+key, and only then started the others. That cost a whole boot, 40 seconds or
+more. Reading Lima 2.1.0's source showed why: `limactl start` checks whether
+`_config/user` exists, and only afterwards takes a lock and runs `ssh-keygen`.
+It never checks again under the lock, so two first starts both generate a key
+and the second overwrites the first. Lima's `user-v2` network daemon has the
+same check-then-lock shape.
+
+So we remove the race instead of serialising around it. Before any VM starts,
+`Lima::ensure_user_key` runs the same `ssh-keygen -t ed25519 -N "" -C lima`
+into a private staging directory and renames the public half into place first,
+because Lima treats the private file as proof that both exist. Then the first
+`limactl start` launches the network daemon, and the others start as soon as
+its PID is alive and its socket exists, a second or two later rather than a
+whole boot later. All boots run through `FuturesUnordered`, a collection of
+futures polled concurrently that yields results as they finish. A future is
+Rust's suspended asynchronous computation; putting several in this stream lets
+one VM boot while another waits for package installation. `tokio::select!`
+waits for whichever comes first, the network daemon or the first boot itself
+(which also covers resuming a cluster whose first VM is already running). We
+persist each result before moving on. Dropping a timed-out
 Lima command kills its direct child; VMs already created remain recorded for
 resume or explicit cleanup.
 
 The first node receives the saved bootstrap identity. Subsequent nodes generate
 their own keys through the ordinary pinned-CA join protocol, using short-lived,
-node-bound tokens. The host never invents a second CA on a retry. Guest file
-replacement uses a staging file and rename, which also permits recovery when
-a previous attempt already started the executable being installed.
+node-bound tokens. The host never invents a second CA on a retry.
+
+Getting files into a guest used to take five `limactl` calls per file: make a
+private directory, copy, `install` with a mode, rename, clean up. Each call is a
+fresh SSH session, and with binaries, config, key, unit file and seven identity
+files that came to about 140 calls, one node after another. Now the host writes
+every file for a node into one tar stream, with root ownership and each file's
+final mode in its header, and pipes it into a single `sudo sh -c` on the
+guest. The `tar` crate's `Builder` writes the archive; `tempfile::tempfile()`
+gives us an anonymous file to hold it, which disappears when the last handle
+closes, so there's nothing to clean up on the host. The guest script unpacks
+into a private staging directory, then renames each file into place in the
+order we listed them. A rename is atomic, so a reader sees the old file or the
+new one, never half of each; it also works when a previous attempt already
+started the executable we're replacing. The identity's commit marker goes
+last, as before.
+
+Because those paths end up inside a shell script, `GuestFile` accepts only
+absolute paths made of plain letters, digits, dots, dashes and underscores.
+We test that the script refuses `..` and quoting tricks, and we run the real
+script with `/bin/sh` against a temporary directory to check modes, order and
+cleanup. The join token takes the same route: it travels on standard input into
+an owner-only file that a shell `trap` removes when `relish join` finishes.
+
+With one copy per node, the nodes themselves can go in parallel. The first
+node must be ready before the others, because they enrol through it. After
+that, nodes 2 and 3 install, enrol and start concurrently. They share the
+operation's checkpoint file, so each future borrows the `Operation` through a
+`tokio::sync::Mutex<&mut Operation>`. This is worth a second look if you're
+coming from Go. The mutex doesn't own the operation; it holds a mutable
+*borrow* of it. The futures aren't spawned, they're polled by a
+`FuturesUnordered` inside our function, so they can borrow local variables and
+the compiler proves the borrow ends before we use `operation` again. Only the
+checkpoint writes take the lock; the slow work doesn't.
 
 API readiness alone isn't the finish line. We check the running binary version,
 all owned nodes, council membership and leader, then deploy a digest-pinned
@@ -831,12 +966,12 @@ having demonstrated a usable cluster. Real-VM qualification still has to prove
 these steps work together, and a published candidate with empty caches must
 meet the timing target before we advertise it.
 
-The release mirrors the dated Ubuntu images named in `guest-images.json`.
-Ubuntu can retire older dated downloads; keeping the verified bytes with the
-release preserves reproducibility. The native CLI embeds the same manifest.
-A developer can explicitly supply local Linux binaries for testing before a
-release exists, but that path prints a notice and cannot qualify the signed
-installer. `RELIABURGER_HOME` isolates its state from a normal installation.
+The release carries its own guest images, built from the dated Ubuntu images
+named in `guest-images.json` (more on that in a moment). Ubuntu can retire
+older dated downloads; keeping the verified bytes with the release preserves
+reproducibility. A developer can explicitly supply local Linux binaries for
+testing before a release exists, but that path prints a notice and cannot
+qualify the signed installer. `RELIABURGER_HOME` isolates its state from a normal installation.
 
 Lifecycle commands hold the operation lock and use only its saved VM names.
 Stopping preserves disks. Destroying requires `--yes`, removes the owned VMs,
@@ -844,6 +979,217 @@ and removes the active context only if its owner matches. We preserve the lock
 file's inode: deleting it while holding the lock would let another process
 create a new file at the same path and acquire a different lock.
 
+
+### Progress you can trust
+
+For a long time quickstart printed five lines in four minutes. "Preparing
+verified Linux image and tooling", then nothing for two minutes while 600 MB
+arrived. Is it downloading? Stuck? Would Ctrl-C lose everything? You couldn't
+tell, and neither could we when we measured it.
+
+Now every step gets a line: each download with bytes, total and speed, each VM
+boot, each node's install, enrolment and start, then quorum and the demo. On a
+terminal the lines redraw in place, with a status, the elapsed time and any
+note such as `cached` or `already running`. In a CI log or a pipe, where
+cursor movement would be garbage, each step prints once when it starts and
+once when it ends. At the end comes a short "where the time went" table.
+
+The interesting part is how a download on one Tokio task tells the display
+about its bytes without anyone taking a lock. A step is an `Arc<StepState>`;
+`Arc` is a reference-counted pointer that several threads can hold at once
+(Go programmers get this for free from the garbage collector). Inside it the
+byte counter is an `AtomicU64`, which the downloader bumps with `fetch_add` and
+the display reads with `load`. Things that are set exactly once, like the total
+size, a note or the finish time, live in `std::sync::OnceLock`, a cell that
+can be written once and then read by anyone without locking. Rust's type
+system is doing real work here. `Arc<T>` only lets you share `&T`, a shared
+reference, so we *can't* mutate a plain `u64` through it. The compiler forces
+us to pick a type that is safe to change through a shared reference.
+
+The display itself runs on a plain `std::thread`, not a Tokio task. Writing to
+a terminal can block, and a blocked write on a Tokio worker would stall
+whatever else that worker was polling. Steps reach the thread through a
+`std::sync::mpsc` channel; the thread wakes every 125 ms, drains the channel
+and redraws. When setup ends it marks anything still running as `stop` rather
+than leaving it spinning, and hands back every step so we can total the times.
+
+The summary groups steps by stage and reports each stage's wall-clock span,
+from its first start to its last finish. Adding up the three VM boots would
+say we spent three minutes booting when we spent one; they overlap, and the
+point of the summary is to say where the minutes actually went.
+
+### Measure it, then believe it
+
+We said quickstart took about four minutes, and that was true of one run. So
+we added `--timings`, which prints every step's duration and start offset, and
+made every run save the same data as `timings.json` in the cluster directory,
+failed runs included. Then we ran it over and over on one M2 Max, before and
+after the changes above. The numbers are in `docs/qualification/`; here's what
+they taught us.
+
+The first lesson came before the first VM. The memory preflight refused to
+start three VMs on a 32 GiB Mac because it saw half a GiB available. The
+`sysinfo` crate computes macOS "available" memory as free plus inactive pages,
+*minus* the pages the compressor occupies. Compressed pages never counted as
+free in the first place, so on a busy Mac with ten GiB compressed the result
+is nearly zero while `memory_pressure` reports 60% free. We now ask the kernel
+for that same figure, `kern.memorystatus_level`, and keep `sysinfo` on Linux,
+where `MemAvailable` means what it says.
+
+The second lesson was about variance. Two warm runs out of four had one VM
+boot 90 seconds late. The journal showed why: our own provisioning script
+restarts `systemd-logind`, and sometimes logind spins in `stop-sigterm` until
+systemd's 90-second stop timeout kills it. Lima's "user session is ready"
+check waits with it. A plain restart had been the fix for an earlier SSH
+stall, so we kept the restart and made it brutal: kill logind first, then
+start it. That's the state systemd reached anyway, 90 seconds sooner.
+
+The third was the nastiest. Now and then a VM started and never booted:
+Lima said "running", the serial console stayed completely empty, and SSH
+never answered. We reproduced it with plain `limactl start` and a bare
+Ubuntu image, no Reliaburger code at all, so it lives somewhere between Lima
+and Apple's Virtualization.framework. We can't fix that, but we can notice
+it. A healthy guest prints its login prompt within seconds, so
+`start_watched` races the start command against a 60-second watchdog with
+`tokio::select!`. If the console is still silent when the watchdog fires,
+the `select!` drops the start future, which kills `limactl` (we built its
+`Command` with `kill_on_drop(true)`), then forces the VM off and starts it
+once more. Dropping a future is how you cancel it in Rust; there's no
+`cancel()` method, and no context object to thread through as in Go. A resumed
+setup applies the same test to a VM left "running" by an earlier attempt.
+
+### Bake the image, don't install at boot
+
+The measurements had one more thing to say. The kernel reached a login prompt
+in 8 seconds, and then every VM sat in cloud-init for another half a minute.
+Doing what? Our provisioning script ran `apt-get update` and installed runc,
+uidmap and friends from Ubuntu's mirrors. That's 42 MB of package indexes per
+VM, three VMs at once, on every fresh cluster, before a single container runs.
+And a laptop with a flaky connection or an Ubuntu mirror having a bad day
+turned into a failed setup.
+
+The fix is old-fashioned: install the packages once, when we build the
+release, and ship a disk image that already has them. We call it baking the
+image (decision D4 in the plan). `scripts/release/build_guest_image.sh` takes
+the pinned Ubuntu cloud image, checks its SHA-256, converts it to a raw file
+and loop-mounts it. Then it `chroot`s in and runs `apt-get install`, the same
+command the VM used to run at first boot. Two details keep the result small
+and honest. The package indexes and downloaded `.deb` files live on a tmpfs
+mounted over `/var/lib/apt/lists` and `/var/cache/apt`, so 500 MB of apt state
+never touches the image. (Our first build forgot this, deleted the files
+afterwards and still shipped a 796 MiB image, because ext4 doesn't hand
+deleted blocks back until its journal commits, and the compressor happily
+compressed the ghosts.) And before compressing, the script seals the image:
+an empty `/etc/machine-id`, `cloud-init clean`, no SSH host keys. A baked
+image that kept those would give three VMs the same identity, which is the
+kind of bug that surfaces months later as two nodes fighting over a DHCP
+lease.
+
+We build natively on each architecture, arm64 on GitHub's arm runner and
+x86-64 on the ordinary one. `virt-customize` from libguestfs is the
+textbook tool, but it boots a small helper VM and wants `/dev/kvm` to do it
+quickly, and a cross-architecture chroot would need `qemu-user-static` to
+emulate every package script. A native chroot needs neither, and the aarch64
+build takes about two minutes.
+
+What format do we ship? Lima 2.1.0 turns a qcow2 image into the raw disk
+Apple's Virtualization.framework needs, but it reads only zlib-compressed
+qcow2 clusters, not zstd ones. It can decompress a `.zst` file too, but by
+running a `zstd` command, and macOS doesn't have one. So we ship exactly what
+Ubuntu ships, a zlib qcow2: 604 MiB, 13 MiB more than the stock image. The
+download barely changes, and on the M2 Max a VM went from `limactl start` to
+ready in 14–18 s instead of 31–53 s.
+
+Here's the part that took some thought. The CLI used to have the image's
+SHA-256 compiled in, from `guest-images.json`. A baked image can't work that
+way. CI builds it in the same run as the CLI, and no two builds produce the
+same bytes (file times and journal contents differ). So instead of pinning
+the digest, we sign it. `package.py` signs a short statement per
+architecture with the release key:
+
+```text
+reliaburger guest image v1
+version v0.1.0
+arch aarch64
+asset reliaburger-guest-ubuntu-24.04-20260911-aarch64.qcow2
+sha256 …
+source-sha256 7b682958…
+```
+
+The CLI downloads `guest-image-metadata.json`, rebuilds that text itself and
+checks the signature before it believes a single digest in the file:
+
+```rust
+impl GuestImageMetadata {
+    pub fn verified(
+        mut self,
+        version: &BinaryVersion,
+        arch: &str,
+        pin: &GuestImage,
+        release_keys: &[PublicKey],
+    ) -> Result<BuiltGuestImage> {
+        // schema, version, asset name and upstream digest checks...
+        let statement = guest_image_statement(
+            &version, arch, &image.asset, &image.sha256, &image.source.sha256,
+        );
+        // ...then the Ed25519 check, reusing the binary verifier
+        verify_binary(statement.as_bytes(), &envelope, release_keys, None, false)
+            .context("release guest image signature is not valid")?;
+        Ok(image)
+    }
+}
+```
+
+`verified` takes `mut self`, not `&self`. It consumes the metadata: once
+you've asked for a verified image, the unverified document is gone, moved into
+the method, and the caller can't accidentally read a digest from it
+afterwards. (`mut` lets the method take the image out of its own map with
+`remove` instead of cloning it.) Go has no equivalent; there, the caller would
+still hold the struct and nothing would stop them using it. The statement
+carries the version, so an old release's genuine metadata can't be replayed
+against a new CLI, and the upstream digest, so the image provably started from
+the Ubuntu build we pinned. The signature covers a few hundred bytes rather
+than the 604 MiB image, so the CLI never has to read the whole image into
+memory to check it; the ordinary streaming SHA-256 of the download does that.
+
+Development runs have no release to take a baked image from, so they still
+boot the stock Ubuntu image. One provisioning script serves both. It counts
+the installed packages and runs apt only when the count is short:
+
+```rust
+Ok(format!(
+    "installed=$(dpkg-query -W -f='${{db:Status-Abbrev}}\\n' {list} 2>/dev/null \
+     | grep -c '^ii' || true)\n\
+     if [ \"$installed\" -ne {count} ]; then ...",
+    count = packages.len()
+))
+```
+
+In `format!`, `{list}` is a placeholder filled from a local variable, so a
+literal brace has to be doubled: `${{db:Status-Abbrev}}` comes out as the
+`${db:Status-Abbrev}` that `dpkg-query` expects. Why count instead of looking
+for a missing package? `dpkg-query` prints nothing at all for a package it
+has never heard of, so "is any line not `ii`?" would answer no. The package
+names come from `guest-images.json`, and since they end up in a shell script
+we refuse anything that isn't a plain Debian package name, even though we
+wrote the file ourselves.
+
+The test for that script doesn't grep it for strings. It runs it, with
+`bash`, against a directory of stub commands put first on `PATH`: a fake
+`dpkg-query` that reports every package installed except one, and a fake
+`apt-get` that writes its arguments to a log. A baked image must produce an
+empty log; a stock one must produce `update` and then `install` with the
+whole list. `#[cfg(unix)]` on those tests compiles them only on Unix hosts,
+the same attribute family as `#[cfg(test)]`, because the stubs are shell
+scripts.
+
+We didn't pre-pull the demo's container images into the guest image, though
+the plan suggested it. Bun always fetches an image's manifest from the
+registry, even when every layer is cached, and it trusts a cached layer by its
+size alone once the file exists. Seeding its cache from outside would mean a
+new, offline, verify-everything path through the most security-sensitive code
+in the image store, to save a 1.9 MB BusyBox layer. The manifest round trips
+to the registry, which Bun makes either way, would stay.
 
 ### Keep the host predictable
 
@@ -870,6 +1216,8 @@ for quickstart. Changing the registry does not mean changing the workload:
 the digest stays fixed, and the normal OCI client still resolves the host
 architecture and checks downloaded content. This remains a network dependency,
 so the signed cold-install gate must exercise it too.
+
+The context also records the other loopback forwards, HTTP ingress on 18080 and the authenticated registry on 15050, so tools don't have to guess guest ports. And the guest's systemd unit mounts bpffs at `/sys/fs/bpf` in an `ExecStartPre` step if the base image didn't, so Bun never starts without the filesystem that holds its eBPF pins.
 
 ### Status from any node
 
@@ -925,162 +1273,120 @@ Cargo features select optional crate behaviour at compile time; here both debug
 and release builds carry their assets. A development binary should exercise the
 same standalone packaging contract as the release.
 
+### Scripts read exit codes, not sentences
 
-### A status command must fail when the cluster is unhealthy
+A script that runs `relish local status` can't read our intentions. It sees an exit code. The first version printed "Missing" or "API not ready" and still exited 0. Now every owned VM gets a condition:
 
-A script that runs `relish local status` cannot read our intentions. It sees an
-exit code. The first implementation printed “Missing” or “API not ready” and
-still returned success. We now collect a `NodeStatus` for every owned VM, with a
-`NodeCondition` enum distinguishing ready, missing, stopped, API failure and
-unknown evidence. Only a complete ready set returns exit 0; all other outcomes
-return exit 1 after showing the observations.
+```rust
+pub enum NodeCondition {
+    Ready,
+    Missing,
+    NotRunning { vm_state: String },
+    ApiNotReady { reason: String },
+    Unknown { reason: String },
+}
+```
 
-The real CLI regression supplies a private saved operation and a tiny Lima
-fixture that answers only read-only list requests. It checks missing and stopped
-VMs, then holds a TCP listener open without answering TLS to model an
-unresponsive API. All three must fail without changing any VM. Existing
-readiness tests separately prove that liveness without ready critical subsystems
-cannot pass.
+Unlike a C enum, a Rust variant can carry its own fields, so "not running" arrives with the state Lima reported. The command prints every node and exits 1 unless all are `Ready`. `Unknown` counts as unhealthy: if we couldn't look, we can't claim it's fine. The older `relish dev` commands likewise validate their saved state file (cluster name, node list, VM ownership) before touching Lima, because parsing JSON proves we have Rust values, not that they describe *our* cluster.
 
+The tutorial's "lose a node" step used to mean typing a `limactl` path and a
+generated VM name. Now it's `relish local stop node-3`. `select_node` accepts
+the name `relish nodes` prints (which is the VM name), a number from 1 or
+`node-N`, and an unknown selector lists the valid ones. Stopping one node goes
+through a pure function first, `stop_consequences`, which returns a sentence
+for each reason the stop deserves a second thought: node 1 carries every host
+port forward, and a stop that leaves fewer than a majority running takes the
+council's quorum with it. Any reason means `--yes`. We didn't refuse outright;
+killing the node the CLI talks to is a perfectly good experiment, just not one
+you want to run by typing the wrong digit. The tests drive a fake `limactl`, a
+five-line shell script that logs its arguments and answers `list --json` from
+a file, so they can assert exactly which VM was stopped and that a refused
+stop touched nothing.
 
-### Validate a saved development cluster before touching Lima
+Numbers are the other trap. `relish fault --duration 5m` must fit the request's seconds field:
 
-Suppose a truncated state file says a cluster has no nodes. Indexing its first
-node panics. Worse, a saved node name that belongs to another cluster could send
-`dev destroy` to the wrong VM. Parsing JSON only establishes that we have Rust
-values; it does not prove that those values describe our cluster.
+```rust
+let seconds = mins.checked_mul(60).ok_or_else(|| RelishError::ApiError {
+    status: 0,
+    body: format!("duration {s} exceeds the supported seconds range"),
+})?;
+```
 
-The older `relish dev` commands now check the requested cluster name, complete
-node list, ownership names, runtime, resources and IP addresses before any VM
-operation. Start, stop and destroy confirm that every owned VM exists before
-mutating one. Errors preserve the state file so the operator can diagnose it.
-This development backend discovers IPv4 addresses; it refuses incomplete saved
-addresses instead of substituting loopback.
+Rust integer overflow panics in debug builds and silently wraps in release builds. `checked_mul` returns `Some(product)` when the result fits and `None` when it doesn't, and `ok_or_else` turns `None` into our error. Delays convert to nanoseconds with `u64::try_from(duration.as_nanos())` for the same reason: `as_nanos()` returns a `u128`, and an `as u64` cast would quietly drop the high bits and inject a different delay.
 
-Paths need the same care. Rust's `Path` can contain bytes that are not UTF-8,
-while a Lima command string needs text. `Path::to_str` therefore returns an
-`Option<&str>`: `Some` contains valid text and `None` means conversion is not
-possible. We turn `None` into an actionable error before creating or recreating
-VMs. Shell commands quote valid paths and test filters as single arguments, so
-spaces, apostrophes and dollar signs keep their literal meaning.
+### Ship the bytes you tested
 
-The CLI regressions use a private home directory and fake Lima executable.
-They prove that malformed ownership, missing addresses and unsupported runtimes
-never invoke Lima, that a missing owned VM permits only a listing, and that an
-invalid checkout is refused before `--recreate`. A shell fixture passes a path
-containing quotes and command substitution plus a semicolon-bearing test filter;
-only the intended argument reaches Cargo. No real VM is involved.
+If a laptop test passes with one binary and the release tag then builds it again, we've tested one executable and published another. So the candidate workflow builds and signs once, from a commit on `main`, and records every asset's SHA-256 in `candidate.json`. Promotion checks the saved candidate against the digest kept at qualification time and publishes those exact bytes, with no compiler or signing key involved. It does hold a token that can write releases, so it runs only from `main` with `main`'s scripts and treats the tag strictly as data. Our first version ran the tagged tree's `candidate.py`, which let anyone who could push a tag hand that token a script of their own.
 
+### `| sh`, not `| bash`
 
-The managed context also records service forwards. HTTP ingress defaults to
-localhost port 18080 and the authenticated HTTPS registry to 15050. The latter is
-selected with `relish setup --quickstart --registry-port PORT`. Setup checks that
-it doesn't overlap an API or ingress port, and Lima exposes it only on loopback.
-The context lets the test catalogue use the host address rather than guessing a
-guest port from the API URL. Chapter 15 follows that distinction through IPv6,
-TLS server names and credential-free workload probes.
+The homepage tells you to pipe the installer to `sh`. Our first installer said `bash` on its first line and used `[[ … =~ … ]]` to validate the version and the mirror URL, so `curl … | sh` failed on Ubuntu and Debian, where `sh` is dash, and in any container image with busybox. Bash's features were convenient. They weren't necessary.
 
+Both scripts are now plain POSIX sh. A regular expression becomes a `case` pattern: `https:///*|*[?#@\\[:space:]]*` rejects an empty host and any credentials, query, fragment, backslash or whitespace, and `https://?*` accepts the rest. The version check first rejects every character outside `[A-Za-z0-9.-]`, which includes newlines, so the `grep -E` that checks its shape sees exactly one line and can't be fooled by a second.
 
-For 0.1.0, we delete that obsolete loop. It had no callers or tests, and it
-advanced the tracker before learning whether a decision had reached Raft. The
-wired `cluster::orchestrate::spawn_autoscaler` remains the sole long-lived loop;
-its pure decision functions and existing tests stay in `meat::autoscaler`.
-Leaving an unused alternative around would give the next reader two conflicting
-answers to the same lifecycle question.
+`set -o pipefail` isn't POSIX either. Without it a pipeline's status is its last command's, so a failed `sha256sum | awk` looks like success with empty output. We don't rely on the status: the result is compared with the pinned digest, and an empty string never matches. That's the pattern throughout: every pipeline ends in a check that fails closed.
 
+The body sits in a `main` function called on the last line. A piped shell executes the script as it arrives, so a download cut off halfway through would otherwise run half an installer. With the function, a truncated script defines nothing and runs nothing.
 
-### Keep duration units inside their destination type
+The packaging tests run both scripts under every POSIX shell they find, with a fake `curl` that serves fixtures, and under `shellcheck -s sh` when it's installed. On a Mac, `sh` is bash pretending to be POSIX, and it forgives things dash won't, so the tests run `dash` too when it's there (it ships with macOS).
 
-A fault duration written in minutes must fit in the seconds field we send.
-A delay must fit in a narrower nanosecond field. Those are separate limits.
-`u64::MAX` seconds is representable as a Rust `Duration`, but multiplying it by
-one billion doesn't fit in a `u64` nanosecond counter.
+### Getting onto `PATH` without editing your files behind your back
 
-`checked_mul` returns `Some(product)` when multiplication fits and `None` when
-it doesn't. We turn `None` into a CLI error before submitting the request.
-`u64::try_from(duration.as_nanos())` checks the separate conversion from Rust's
-`u128` nanosecond total. An `as u64` cast would truncate the high bits and submit
-a different delay. Tests exercise the largest accepted value and its immediate
-successor for minutes, hours and milliseconds converted to nanoseconds. The
-original code panics on the multiplication in a debug build and silently
-truncates the delay; both failures reproduce before the repair.
+An installer that ends with "now add this directory to PATH" has handed you homework, and the next command in the tutorial fails until you do it. But an installer that quietly appends to your `.zshrc` has edited a file you care about without asking. We wanted neither.
 
+The binary always lives in one place we own, `~/.reliaburger/bin`. Then there are three cases. If that directory is already on `PATH`, there's nothing to do. If `~/.local/bin` is on `PATH` (most Linux desktops, and plenty of Macs), we put a symbolic link to the binary there. Otherwise we print the one line your shell needs, choosing the file by `$SHELL`: `~/.zshrc` for zsh, `~/.bash_profile` for bash on macOS (Terminal starts login shells, which don't read `.bashrc`), `~/.bashrc` on Linux, and `fish_add_path` for fish. Then we ask whether to add it.
 
-### Similar duration strings can mean different things
+Why a link rather than a second copy? One real file means one checksum to verify, one atomic rename on upgrade, and an uninstaller that can tell our link from someone else's `relish`: it only removes a link that points into the store. For the same reason the installer never replaces anything already at `~/.local/bin/relish` unless it's our own link.
 
-`relish fault --duration 60` means sixty seconds. `relish logs --since 60`
-means epoch second sixty. The log filter also accepts `1d`; the fault/test
-parser does not. Combining these parsers would change the CLI contract.
+Asking has a catch. With `curl … | sh`, the shell's standard input *is* the script, so `read` would swallow the next line of the installer instead of your answer. We ask on `/dev/tty`, the controlling terminal, and only if the subshell `(exec </dev/tty)` can open it; in CI or over a pipe with no terminal, we print the line and move on. The default answer is no, the line is added at most once, and `--no-modify-path` keeps everything inside `~/.reliaburger`. The tests give the installer a pseudo-terminal as its controlling terminal and type the answer, which is the only honest way to exercise that prompt.
 
-We evaluated humantime 2.3.0 against a twelve-input corpus. It rejects a bare
-`60` and accepts compound, fractional and extra-unit forms that our commands
-currently reject. Keeping today's syntax would still require our own admission
-wrapper and the same checked conversion to nanoseconds. For 0.1.0 we retain the
-small duration parsers. Their compatibility table, numeric boundary tests and
-arbitrary-text property test make that decision executable. Hickory replaces
-the DNS codec because complete wire decoding removes a second parser's worth
-of boundary and compression handling; the duration evaluation doesn't show
-the same benefit.
+The last step is the quickstart's own "next:" message. Straight after installation your current shell still has the old `PATH`, so `relish status` would fail. `relish::install::invocation()` looks up `relish` on `PATH` the way a shell would, canonicalises both paths (resolving the link), and prints `relish` only if the lookup lands on the running executable. Otherwise it prints the full path, quoted for the shell if it contains a space.
 
-### Build once, qualify those bytes, publish those bytes
+### `relish uninstall`
 
-Suppose our laptop test passes with one binary, then pushing a release tag
-builds it again. The source is unchanged. The compiler, linker or build input
-might not be. We've tested one executable and published another.
+A one-line install deserves a one-line way out. `relish local destroy` already removes a cluster; `relish uninstall` removes the rest: the CLI, its `~/.local/bin` link, the private Lima distribution in `tools/`, the guest images and binaries in `cache/`, and the managed Lima home.
 
-The candidate workflow now builds and signs on a manually selected main commit,
-after source CI passes. It records every asset's size and SHA-256 in
-`candidate.json`, together with the source commit and workflow run/attempt.
-The qualification report keeps that record's digest. A later promotion downloads
-the saved candidate and checks it against the report before creating a draft.
-It also compares GitHub's uploaded asset digests before making the draft public.
-No compiler or signing key participates in promotion.
+The hard part is deciding what *not* to remove. `~/.reliaburger` is also where a server install keeps node data, and a saved context holds an administrator credential for a cluster that might still be running somewhere. So the module works from an allow-list: a handful of names the installer and the quickstart create, plus a link in `~/.local/bin` only if `read_link` says it points at our binary. Everything else under the home directory goes into the plan's `keep` list and gets printed, so you can see what stayed and why. `plan()` is a pure function of the directory tree, which makes it easy to test against a temporary home; `execute()` does the deleting.
 
-The Python helper is deliberately separate from Rust's runtime upgrade verifier.
-It coordinates release files and GitHub provenance; the agent still verifies
-Ed25519 signatures before executing a replacement. A SHA-256 copied from an
-untrusted download is not an approval. Here the independently retained digest
-binds promotion to the bytes the operator qualified.
+Order matters too. While `clusters/` has a saved cluster, or the Lima home has a VM directory (Lima keeps `_config` and `_networks` beside one directory per VM), removing `tools/` would strand a running VM with no `limactl` to stop it. Uninstall refuses and names `relish local destroy`.
 
-Tests change each asset, remove it, add unexpected files and substitute a source
-commit, version, repository or run. They also reject failed/PR build provenance,
-symlinks, incomplete matrices, changed guest images and mismatched uploaded
-assets. A passing round trip preserves every original byte. This gives us a
-repeatable publication gate, not evidence that the first public installation
-has already passed; that still needs the real candidate and empty caches.
+Two small Rust details. `std::fs::remove_dir_all` doesn't follow a symbolic link at the top level, so if someone made `cache` a link to a directory they care about, we remove the link and not their files; a test proves it. And the binary deletes itself. On Unix that's fine: unlinking removes the name from the directory, and the kernel keeps the file's contents alive until the running process closes it.
 
-### Test the final installer before its final URL exists
+The shape of the errors follows the rest of the crate: a `thiserror` enum, `UninstallError`, whose messages say what to do next, and a `#[from]` conversion into `RelishError` so the binary's `?` just works. `#[from]` generates the `From` impl that the `?` operator calls to convert one error type into another.
 
-Our candidate contains metadata pointing at `v0.1.0` on GitHub. Those URLs won't
-exist until publication. Rewriting metadata for a test server would change the
-file set we just promised to preserve.
+### The tour, twice
 
-Instead, the installer accepts `RELIABURGER_RELEASE_BASE_URL`, an explicit HTTPS
-directory of unchanged candidate files. It downloads the same checksum-pinned
-CLI and passes that directory to `setup --quickstart --release-mirror`. The
-managed downloader translates only this version's Reliaburger asset URLs. Lima
-still comes from its pinned upstream URL. Every transferred binary and guest
-image keeps the existing checksum or signature verification.
+The homepage has a "Try it in five minutes" section, and the CLI has the same tour as a manual chapter, `docs/manual/08_five-minute-tour.md`. Why both? Because the quickstart ends in a terminal, and "now go back to the website" is exactly the kind of context switch that loses people. Setup's last lines now say `relish manual tour`, with the full path to `relish` if your shell can't find it yet.
 
-The optional mirror is a transport choice for one setup command, not a new
-cluster identity or a weaker development mode. Repeat it when resuming. We
-validate the directory before creating setup state, reject credentials/query
-strings/fragments, and refuse combining it with development binaries. Tests
-run both shell entry points with a captured download transport, then exercise
-metadata and binary downloads through a real local HTTP fixture. The fixture's
-HTTP exception exists only in test builds; distributed CLIs require HTTPS.
+`relish manual` had no way to open one chapter, so it gained an optional positional argument. Clap already had a subcommand in that position (`relish manual examples`); it tries subcommand names first, so `examples` still means the subcommand and anything else becomes the chapter. A parser test pins that down, because it's the sort of precedence rule that changes quietly in a refactor.
 
-The candidate record can also be verified locally before staging, without
-creating a release tag. None of these tests claims that the first signed
-candidate has completed the cold-host matrix. They make that test possible.
+`find_chapter` takes what you typed and tries, in order: an exact short name (`chaos`), a part of exactly one short name (`tour`), and a part of exactly one title. Ambiguity is an error that lists every short name rather than a guess. The short name comes from the file name, with `split_once('_')` dropping the number: `split_once` returns an `Option` of the two halves around the first match, and `map_or(stem, |(_, rest)| rest)` means "the part after the underscore, or the whole stem if there isn't one". The reader gained `open_document`, which selects the chapter and gives the content pane the keyboard, so the arrow keys scroll the tour straight away.
 
-### Establish the kernel filesystem before starting Bun
+### A tutorial that can't lie
 
-Durable kernel recovery needs bpffs mounted at `/sys/fs/bpf`. A managed guest
-cannot assume the base image mounted it. Its systemd service now runs a short
-pre-start command: retain an existing mount, otherwise mount bpffs, and let any
-failure prevent Bun from starting. The loader still verifies ownership and refuses
-invalid pins. A physical regression starts in a private mount namespace, removes
-the inherited mount, runs the actual generated preflight twice and checks the
-filesystem type after each run. This covers first boot and repeat startup without
-unmounting the host's policy inventory.
+A tutorial is documentation that people copy and paste, so every stale flag in it becomes someone's first error message. The homepage tour runs about a dozen `relish` commands, and nothing stopped us renaming one of them next month.
+
+So each command on the page carries a `data-tour` attribute, and `tests/suite/website.rs` pulls them out (the chapter's ```` ```sh ```` blocks too) and runs each one through the real command-line parser. Not a copy of the parser: the compiled `relish` binary, started with `RELISH_PARSE_ONLY=1`, which makes `main` return straight after `Cli::parse()`. That's a two-line hook, and it means the test exercises exactly what users run, including clap's global options and value parsers. We could have moved the `Cli` struct into the library so a test could call `Cli::try_parse_from`, but that would mean reshuffling a 3,000-line file several people are editing at once, for no extra coverage.
+
+The same test checks that the page and the chapter list the same commands, that `relish manual tour` resolves to the tour chapter, and that the Pages workflow publishes the demo manifest from `examples/kubernetes/`, the file CI imports, rather than a second copy that could drift.
+
+Some tour commands describe features still being built: `relish apply -f` for Kubernetes YAML and `relish local stop NODE`. They sit in a `PENDING` list, and the test requires them to *fail* to parse. The day one starts parsing, the test fails and says to delete its entry. An exemption that turns itself into a failure can't quietly outlive its reason, which is the whole point of the exercise.
+
+CI skips the Rust jobs for documentation-only changes, and until now the website counted as documentation. `scripts/ci/select-jobs.sh` now treats `docs/website/index.html` as code, for the same reason it already treats the manual as code: a test reads it.
+
+### Running the tour for real
+
+A parse test proves the commands exist. It doesn't prove they do what the sentence next to them claims. So before the homepage changed to lead with tracing, metrics and a latency fault, we ran every step on a real three-node cluster on an Apple-silicon laptop, timed it, and kept the output (`docs/qualification/2026-09-24-tour-transcript.md`). The first attempt didn't get past step three.
+
+Here's what a real run found that thousands of unit and integration tests hadn't:
+
+- **Status timed out while an image pulled.** runc holds an instance's lifecycle lock for its whole create, and the agent loop asked it for the PID of every instance, including ones still pulling. Two nodes stopped answering for 35 seconds, their reports went stale, and the leader moved all three frontends to the one node that already had the image. The loop no longer asks the runtime about an instance in `Pending` or `Preparing`: it has no process yet.
+- **A rolling deploy never finished.** The leader answers a producer release with 202 until every node confirms the old endpoint's withdrawal. The deploy worker took the 202 as a failure, and the orchestrator retried with a whole new generation of replacements. The frontend passed generation 30. Now a 202 is a typed `ProducerRelease::Pending` and the worker asks again for up to 30 seconds.
+- **Some withdrawals could never be confirmed.** That still didn't converge, because a new instance's first catalogue entry has no runtime execution yet, and the ledger recorded the entry's replacement (the same address, now with an execution) as a withdrawal. A withdrawal with no execution matches every execution at that address, so no node could ever confirm it while the address stayed published, and every release on that node waited forever. Learning a backend's execution is now not a withdrawal.
+- **Three replicas looked like one.** Every node numbers its own replicas from 0, so the frontends were all `default__frontend-0`. `relish metrics` grouped by instance and reported one replica whose counter jumped between three. The key is now instance *and* node.
+- **Losing one node moved all three frontends.** The leader re-planned the whole app, and a new leader that hadn't heard from node-2 yet counted its replica as lost too. Placements that still hold now stay put, and a live node the leader hasn't heard from yet keeps its replicas.
+- **`wtf` said all was well with a node missing**, because a stopped node leaves the membership list. A council with quorum but a missing member is now a warning.
+
+Every one of those has its own test now. The deeper lesson is about where the bugs were: not in any one component, but between them. The lock was correct, and so was the agent loop. So were the ledger and the catalogue, each on its own terms. Only a whole cluster, with real images, real timings and a leader that dies, puts them in the same room.
+
+Two things still aren't pretty. While a node is down, nothing can release an address it might still route to, so a survivor that gains a replica keeps retrying its rolling replacement until the node returns (traffic is fine; the survivor already runs the new replicas). And a replica-count change is still a rolling redeploy on that node rather than "start one more". Both are honest behaviour, not wrong answers, and both are on the list.
