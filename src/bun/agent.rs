@@ -7637,19 +7637,25 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     ) {
         self.health_inflight.remove(&instance_id);
         let now = Instant::now();
-        if !self
-            .supervisor
-            .get_instance(&instance_id)
-            .is_some_and(|instance| {
-                instance.created_at == created_at
-                    && matches!(
-                        instance.state,
-                        ContainerState::HealthWait
-                            | ContainerState::Running
-                            | ContainerState::Unhealthy
-                    )
-            })
-        {
+        let Some(instance) = self.supervisor.get_instance(&instance_id) else {
+            return;
+        };
+        // A newer registration owns the cadence of a replaced instance.
+        if instance.created_at != created_at {
+            return;
+        }
+        if !matches!(
+            instance.state,
+            ContainerState::HealthWait | ContainerState::Running | ContainerState::Unhealthy
+        ) {
+            // The instance left the probed states while this probe was in
+            // flight (killed, restarting). Discard the result but keep its
+            // cadence, as `run_health_checks` does for a skipped check: a
+            // restart reuses this registration, so dropping it here would
+            // leave the restarted instance in HealthWait with no probes.
+            self.supervisor
+                .health_checker_mut()
+                .schedule_next(instance_id, now);
             return;
         }
         let status = match status {
@@ -14433,6 +14439,43 @@ mod tests {
             )
             .await;
         assert!(view.borrow().resolve(&service).unwrap().backends[0].healthy);
+        agent.retire_workload("web", "default").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_probe_that_lands_after_a_kill_keeps_the_restarted_instance_probed() {
+        let (mut agent, _commands, _shutdown) = test_agent();
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        let id = InstanceId("default__web-0".into());
+        let health = super::super::health::HealthCheckConfig::from_spec(
+            config_with_health().app["web"].health.as_ref().unwrap(),
+            8080,
+        );
+        let now = Instant::now();
+        agent.supervisor.register_health(id.clone(), health, now);
+        // The check is taken off the queue for a probe, as run_health_checks does.
+        let far = now + std::time::Duration::from_secs(3600);
+        while agent.supervisor.health_checker_mut().pop_due(far).is_some() {}
+        // The process is killed while the probe is in flight.
+        let instance = agent.supervisor.get_instance_mut(&id).unwrap();
+        instance.state = ContainerState::Pending;
+        let created_at = instance.created_at;
+        agent
+            .complete_health_probe(
+                id.clone(),
+                created_at,
+                Ok(super::super::health::HealthStatus::Unhealthy),
+            )
+            .await;
+        assert_eq!(
+            agent
+                .supervisor
+                .health_checker_mut()
+                .pop_due(far)
+                .map(|(due, _)| due),
+            Some(id.clone()),
+            "the late probe dropped the check, so the restart would never be probed"
+        );
         agent.retire_workload("web", "default").await.unwrap();
     }
 
