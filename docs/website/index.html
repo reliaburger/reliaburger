@@ -68,6 +68,24 @@
               signed release is out, the install line stops with a release-not-published message.
               You’ll need macOS, or Linux with QEMU and KVM, plus about 8 GiB of free memory and
               15 GiB of disk.</p>
+            <!-- The page's only script: assets/tour-player.js loads the vendored asciinema
+                 player (assets/asciinema/) and the recording from this site when the tour opens. -->
+            <figure id="tour-recording" class="recording" data-cast="./assets/tour.cast" data-poster="npt:1:12">
+              <div class="recording-screen"></div>
+              <noscript><p class="recording-fallback">The recording plays with JavaScript. Without it,
+                <a href="./assets/tour.cast">download the recording</a> and play it in a terminal with
+                <code>asciinema play tour.cast</code>, or follow the steps below.</p></noscript>
+              <figcaption>
+                <span>The whole tour on a real laptop cluster, run by
+                  <a href="https://github.com/reliaburger/reliaburger/blob/main/scripts/demo/tour.sh">scripts/demo/tour.sh</a>.
+                  Setup plays four times faster and idle time is cut to two seconds; every wait
+                  says how long it really took.</span>
+                <span class="recording-speed" role="group" aria-label="Playback speed" hidden>speed
+                  <button type="button" data-speed="1" aria-pressed="true">1×</button>
+                  <button type="button" data-speed="2" aria-pressed="false">2×</button>
+                  <button type="button" data-speed="4" aria-pressed="false">4×</button></span>
+              </figcaption>
+            </figure>
             <ol class="tour-steps">
               <li>
                 <pre><code data-tour>curl -fsSL https://reliaburger.com/install.sh | sh</code></pre>
@@ -268,8 +286,10 @@ target/debug/relish</code></pre>
     <footer>
       <span>Reliaburger · by Miko Pawlikowski</span>
       <a href="https://github.com/reliaburger/reliaburger/blob/main/LICENSE">Apache 2.0</a>
-      <span class="footer-note">Plain HTML and CSS. No tracking, no third-party requests.</span>
+      <span class="footer-note">HTML and CSS. The one script plays the tour’s recording with a copy
+        of the asciinema player served from this site. No tracking, no third-party requests.</span>
     </footer>
   </div>
+  <script src="./assets/tour-player.js" defer></script>
 </body>
 </html>

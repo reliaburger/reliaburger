@@ -193,7 +193,7 @@ tutorial, because a tutorial over a broken path is a lie.
 - [ ] **Z5.2 The same tutorial in the product.** `relish manual` gets a
   "Five-minute tour" chapter generated from the same source, and the quickstart's
   final message points at it.
-- [ ] **Z5.3 A recording.** A scripted, reproducible run of the tutorial
+- [x] **Z5.3 A recording.** A scripted, reproducible run of the tutorial
   (`scripts/demo/tour.sh`) recorded with asciinema and embedded on the homepage with the
   vendored asciinema player (D2); the site README and footer say where JavaScript
   is used and why.
