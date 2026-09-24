@@ -72,7 +72,7 @@ const OWNED: &[&str] = &["tools", "cache", "lima", "setup.lock"];
 /// Work out what to remove from `root`, plus the link in `local_bin` if it
 /// points at our binary. Refuses while clusters or managed VMs exist.
 pub fn plan(root: &Path, local_bin: Option<&Path>) -> Result<Plan, UninstallError> {
-    let clusters = directory_names(&root.join("clusters"))?;
+    let clusters = live_cluster_names(&root.join("clusters"))?;
     if !clusters.is_empty() {
         return Err(UninstallError::ClustersExist { names: clusters });
     }
@@ -250,6 +250,23 @@ fn entries(directory: &Path) -> Result<Vec<PathBuf>, UninstallError> {
 }
 
 /// Names of the subdirectories of `directory`, sorted.
+/// Cluster directories holding anything but the operation lock. `relish local
+/// destroy` keeps the lock's inode so a concurrent setup can't lock a
+/// different file, so a destroyed cluster leaves exactly that behind.
+fn live_cluster_names(directory: &Path) -> Result<Vec<String>, UninstallError> {
+    let mut live = Vec::new();
+    for name in directory_names(directory)? {
+        let contents = entries(&directory.join(&name))?;
+        if contents
+            .iter()
+            .any(|path| path.file_name().is_none_or(|file| file != "operation.lock"))
+        {
+            live.push(name);
+        }
+    }
+    Ok(live)
+}
+
 fn directory_names(directory: &Path) -> Result<Vec<String>, UninstallError> {
     let mut names: Vec<String> = entries(directory)?
         .into_iter()
@@ -343,12 +360,23 @@ mod tests {
     fn refuses_while_a_quickstart_cluster_exists() {
         let (_temp, root, local_bin) = installed_home();
         std::fs::create_dir_all(root.join("clusters/laptop")).unwrap();
+        std::fs::write(root.join("clusters/laptop/operation.lock"), "").unwrap();
+        std::fs::write(root.join("clusters/laptop/state.json"), "{}").unwrap();
         let error = plan(&root, Some(&local_bin)).unwrap_err();
         assert!(
             matches!(error, UninstallError::ClustersExist { ref names } if names == &["laptop"])
         );
         assert!(error.to_string().contains("relish local destroy"));
         assert!(root.join("bin/relish").exists());
+    }
+
+    #[test]
+    fn proceeds_after_destroy_leaves_only_the_operation_lock() {
+        let (_temp, root, local_bin) = installed_home();
+        std::fs::create_dir_all(root.join("clusters/laptop")).unwrap();
+        std::fs::write(root.join("clusters/laptop/operation.lock"), "").unwrap();
+        let plan = plan(&root, Some(&local_bin)).unwrap();
+        assert!(plan.remove.contains(&root.join("clusters")));
     }
 
     #[test]
