@@ -166,7 +166,7 @@ Tuple matching like this is why Rust people keep banging on about exhaustiveness
 
 ```rust
 pub const EMBEDDED_RELEASE_KEYS: &[&str] =
-    &["ed25519:NCfgKCWG8/h7N57f3EEtle0NS/nJPr6QxBOtMnfvHDI="];
+    &["ed25519:zSUgsFfmv0WohbjRJE7FJf/xgLIgMuK7AbnDgOdduRM="];
 ```
 
 Public keys are public; committing one is fine and pinning it in the binary is the point — a config file must never be able to widen what a production binary trusts. The *private* key lives outside the repository (generated with `relish dev keygen`, which chmods it 0600 and prints a warning to that effect).
