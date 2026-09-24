@@ -990,6 +990,120 @@ async fn start_spread_web_cluster(
     [n1, n2, n3]
 }
 
+/// Z6.7: losing the leader node of three must bring the app back to three
+/// replicas on the survivors, without moving the replica on the survivor that
+/// doesn't need a second one and without churning generations of
+/// replacements. `relish wtf` flags the gap while it lasts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
+async fn losing_the_leader_node_places_only_its_replica_on_the_survivors() {
+    let shutdown = CancellationToken::new();
+    let nodes = start_spread_web_cluster("nl", 19941, &shutdown).await;
+    let entry = &nodes[0];
+    // Lose the leader when it isn't the entry node, as the tour's node-3 was;
+    // otherwise any other node, so the test never loses its own client.
+    let doomed = nodes[1..]
+        .iter()
+        .find(|node| *node.thinks_leader.borrow())
+        .unwrap_or(&nodes[2]);
+    let survivors: Vec<&Node> = nodes
+        .iter()
+        .filter(|node| node.name != doomed.name)
+        .collect();
+    let mut before = std::collections::HashMap::new();
+    for node in &survivors {
+        before.insert(node.name.clone(), web_process(node).await.unwrap().0);
+    }
+
+    doomed._wired.shutdown.cancel();
+
+    // wtf sees the gap before the scheduler has closed it.
+    let flagged = async {
+        loop {
+            if let Ok(inputs) = reliaburger::relish::wtf::collect(&entry.client, None).await {
+                let report = reliaburger::relish::wtf::diagnose(&inputs);
+                if report
+                    .warnings
+                    .iter()
+                    .any(|finding| finding.id == "under-replicated")
+                {
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    };
+    assert!(
+        tokio::time::timeout(Duration::from_secs(30), flagged)
+            .await
+            .is_ok(),
+        "wtf never noticed that web ran fewer replicas than it wanted"
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    while live_web_instances(&survivors).await < 3 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "web never got back to three replicas on the survivors"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    // Hold still: no more replacements start once three run.
+    let settled = std::collections::BTreeSet::from_iter(web_instance_ids(&survivors).await);
+    tokio::time::sleep(Duration::from_secs(15)).await;
+    let later = std::collections::BTreeSet::from_iter(web_instance_ids(&survivors).await);
+    assert!(
+        later.is_subset(&settled),
+        "new replicas kept starting after three ran: {settled:?} then {later:?}"
+    );
+    assert_eq!(live_web_instances(&survivors).await, 3);
+    // Every survivor still runs web, and one of them didn't restart at all:
+    // only the missing replica was placed.
+    let mut untouched = 0;
+    for node in &survivors {
+        let (pid, _) = web_process(node)
+            .await
+            .unwrap_or_else(|| panic!("{} lost its replica", node.name));
+        if before[&node.name] == pid {
+            untouched += 1;
+        }
+    }
+    assert!(untouched >= 1, "every survivor's replica was replaced");
+    let report = reliaburger::relish::wtf::diagnose(
+        &reliaburger::relish::wtf::collect(&entry.client, None)
+            .await
+            .unwrap(),
+    );
+    assert!(
+        !report
+            .warnings
+            .iter()
+            .any(|finding| finding.id == "under-replicated"),
+        "{:?}",
+        report.warnings
+    );
+    shutdown.cancel();
+}
+
+/// The ids of every live `web` instance on `nodes`.
+async fn web_instance_ids(nodes: &[&Node]) -> Vec<String> {
+    let mut ids = Vec::new();
+    for node in nodes {
+        if let Ok(statuses) = node.client.status().await {
+            ids.extend(
+                statuses
+                    .into_iter()
+                    .filter(|s| {
+                        s.app_name == "web"
+                            && !matches!(s.state.as_str(), "stopped" | "stopping" | "failed")
+                    })
+                    .map(|s| format!("{}/{}", node.name, s.id)),
+            );
+        }
+    }
+    ids
+}
+
 /// The pid and restart count of `node`'s `web` replica.
 async fn web_process(node: &Node) -> Option<(u32, u32)> {
     node.client
