@@ -41,6 +41,36 @@ candidate and new checksums; never replace an existing release's binaries.
 The compiler pin does not promise identical bytes across different linkers or
 host operating systems.
 
+## Release profile and binary size
+
+`[profile.release]` sets `strip = true` and `codegen-units = 1`. Release builds
+never carried debug info (Cargo drops it by default); the 0.1.0 candidate's
+binaries were big because of the symbol table and because sixteen codegen units
+per crate each kept their own copies of generic code. The two settings halve
+every binary:
+
+| Asset | Staged candidate | Now |
+| --- | ---: | ---: |
+| `relish-macos-aarch64` | 177.8 MB | 90.5 MB |
+| `relish-linux-aarch64` | 201.8 MB | 94.6 MB |
+| `bun-linux-aarch64` | 230.4 MB | 104.9 MB |
+
+A cold quickstart on Apple silicon downloads 320 MB less (961 MB instead of
+1,281 MB, most of what's left being the guest image). The price is a
+rebuild of the `reliaburger` crate that's two to three times slower, because
+that crate no longer compiles in parallel pieces; expect the "Build locked
+release binaries" step to grow from 5–11 minutes to roughly 12–30, which is
+still off the candidate workflow's critical path. Fat LTO saved only 3 MB more
+and took 23 minutes even warm, and thin LTO made the code bigger, so neither
+is on.
+
+Panics still print their message and `file:line`, but `RUST_BACKTRACE=1`
+shows no function names in a released binary. Ask for the panic line in bug
+reports; for function names, build from source with
+`CARGO_PROFILE_RELEASE_STRIP=none`. Nothing reads symbols at runtime. The
+measurements, including build times and the backtrace check, are in
+[qualification/2026-09-24-binary-size.md](qualification/2026-09-24-binary-size.md).
+
 ## Cluster compatibility
 
 0.1.0 requires fresh clusters. Preserve pre-release development data separately;

@@ -903,6 +903,33 @@ byte 7, stall after byte 12, ignore the range, answer 503. The retry count
 shows up in the progress line, so a flaky download now reads `resumed at 113.1
 MiB (retry 2)` instead of `[FAIL]`.
 
+The other half of the fix was downloading less. The candidate's `relish` for
+macOS weighed 178 MB, and we assumed debug info. Wrong: since Rust 1.77 a
+release build already strips it. The binary itself told us where the bytes
+were. A quarter was the symbol table (function names, kept so a
+`RUST_BACKTRACE` trace can print them), and more than half was machine code,
+bloated by Cargo's default of sixteen *codegen units* per crate: LLVM
+optimises each unit separately, so every unit keeps its own copy of the
+generic functions it instantiates. Rust generics are monomorphised (compiled
+once per concrete type, like C++ templates rather than Go's shared
+implementation), so a crate as generic-heavy as ours pays for that many times
+over. Two lines in `Cargo.toml` fix both:
+
+```toml
+[profile.release]
+strip = true
+codegen-units = 1
+```
+
+The binaries halved (relish for macOS went to 90 MB, bun for Linux from 230 MB
+to 105 MB), and a cold quickstart now downloads 320 MB less. The cost is a
+slower release build, since one codegen unit means one thread per crate, and
+backtraces without function names. Panics still print where they happened,
+because Rust bakes the panic's file and line into the call site, not into the
+symbol table. We also tried link-time optimisation. Thin LTO made the code
+*bigger*, and fat LTO saved another 3 MB for a build three times slower again.
+Measure before you reach for the famous flag.
+
 Size limits apply both to the
 advertised length and the bytes actually received, so chunked responses don't
 bypass them. Redirects must keep using HTTPS, and URLs can't contain credentials.
