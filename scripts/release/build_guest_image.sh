@@ -111,7 +111,8 @@ in_guest apt-get -o Acquire::Retries=3 update -qq >&2
 # shellcheck disable=SC2086
 in_guest apt-get -o Acquire::Retries=3 install -y -qq $packages >&2
 
-# shellcheck disable=SC2086
+# SC2016: ${Package} is dpkg-query's format syntax, not a shell expansion.
+# shellcheck disable=SC2086,SC2016
 versions=$(in_guest dpkg-query -W -f='${Package}=${Version}\n' $packages)
 mkdir -p "$root/usr/share/reliaburger"
 python3 - "$arch" "$source_sha256" "$versions" >"$root/usr/share/reliaburger/guest-image.json" <<'PYCODE'
