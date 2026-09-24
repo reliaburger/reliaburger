@@ -1373,3 +1373,20 @@ The same test checks that the page and the chapter list the same commands, that 
 Some tour commands describe features still being built: `relish apply -f` for Kubernetes YAML and `relish local stop NODE`. They sit in a `PENDING` list, and the test requires them to *fail* to parse. The day one starts parsing, the test fails and says to delete its entry. An exemption that turns itself into a failure can't quietly outlive its reason, which is the whole point of the exercise.
 
 CI skips the Rust jobs for documentation-only changes, and until now the website counted as documentation. `scripts/ci/select-jobs.sh` now treats `docs/website/index.html` as code, for the same reason it already treats the manual as code: a test reads it.
+
+### Running the tour for real
+
+A parse test proves the commands exist. It doesn't prove they do what the sentence next to them claims. So before the homepage changed to lead with tracing, metrics and a latency fault, we ran every step on a real three-node cluster on an Apple-silicon laptop, timed it, and kept the output (`docs/qualification/2026-09-24-tour-transcript.md`). The first attempt didn't get past step three.
+
+Here's what a real run found that thousands of unit and integration tests hadn't:
+
+- **Status timed out while an image pulled.** runc holds an instance's lifecycle lock for its whole create, and the agent loop asked it for the PID of every instance, including ones still pulling. Two nodes stopped answering for 35 seconds, their reports went stale, and the leader moved all three frontends to the one node that already had the image. The loop no longer asks the runtime about an instance in `Pending` or `Preparing`: it has no process yet.
+- **A rolling deploy never finished.** The leader answers a producer release with 202 until every node confirms the old endpoint's withdrawal. The deploy worker took the 202 as a failure, and the orchestrator retried with a whole new generation of replacements. The frontend passed generation 30. Now a 202 is a typed `ProducerRelease::Pending` and the worker asks again for up to 30 seconds.
+- **Some withdrawals could never be confirmed.** That still didn't converge, because a new instance's first catalogue entry has no runtime execution yet, and the ledger recorded the entry's replacement (the same address, now with an execution) as a withdrawal. A withdrawal with no execution matches every execution at that address, so no node could ever confirm it while the address stayed published, and every release on that node waited forever. Learning a backend's execution is now not a withdrawal.
+- **Three replicas looked like one.** Every node numbers its own replicas from 0, so the frontends were all `default__frontend-0`. `relish metrics` grouped by instance and reported one replica whose counter jumped between three. The key is now instance *and* node.
+- **Losing one node moved all three frontends.** The leader re-planned the whole app, and a new leader that hadn't heard from node-2 yet counted its replica as lost too. Placements that still hold now stay put, and a live node the leader hasn't heard from yet keeps its replicas.
+- **`wtf` said all was well with a node missing**, because a stopped node leaves the membership list. A council with quorum but a missing member is now a warning.
+
+Every one of those has its own test now. The deeper lesson is about where the bugs were: not in any one component, but between them. The lock was correct, and so was the agent loop. So were the ledger and the catalogue, each on its own terms. Only a whole cluster, with real images, real timings and a leader that dies, puts them in the same room.
+
+Two things still aren't pretty. While a node is down, nothing can release an address it might still route to, so a survivor that gains a replica keeps retrying its rolling replacement until the node returns (traffic is fine; the survivor already runs the new replicas). And a replica-count change is still a rolling redeploy on that node rather than "start one more". Both are honest behaviour, not wrong answers, and both are on the list.

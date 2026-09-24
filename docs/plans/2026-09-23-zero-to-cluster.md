@@ -240,13 +240,16 @@ beat needs product work first:
 - [x] **Z6.6 Charts that draw.** Fix the dashboard's empty app charts, draw one
   series per instance, show counters as rates, and add a requests-per-second
   and latency chart for apps with scraped metrics.
-- [ ] **Z6.7 Traffic and the new tour.** The demo manifest gains a tiny load
+- [x] **Z6.7 Traffic and the new tour.** The demo manifest gains a tiny load
   generator that calls the frontend by service name, so there's always traffic
   for metrics and faults to act on. The tour becomes: install, apply, status,
   open, **trace frontend → redis**, **metrics frontend**, **delay redis for the
   frontend**, trace again (the fault is on the path), metrics again (latency
   jumps), dashboard, kill a replica, lose a node, `wtf`. Checked end to end on a
-  real laptop cluster before the homepage copy changes.
+  real laptop cluster before the homepage copy changes. Done 24 September: the
+  run, its timings (4 min 34 s from `setup --quickstart` to `wtf` with warm
+  downloads) and the eight bugs it found are in
+  `docs/qualification/2026-09-24-tour-transcript.md`.
 
 ## Decisions
 

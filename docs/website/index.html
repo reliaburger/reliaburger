@@ -77,49 +77,71 @@
               </li>
               <li>
                 <pre><code data-tour>relish apply -f https://reliaburger.com/demo/podinfo.yaml</code></pre>
-                <p>A real Kubernetes app: podinfo’s frontend, backend and Redis cache. Relish converts
-                  the YAML as it applies it and prints a report of anything it had to change.</p>
+                <p>A real Kubernetes app: podinfo’s frontend, backend and Redis cache, plus a small
+                  load generator so there’s always traffic. Relish converts the YAML as it applies it
+                  and tells you what it had to change.</p>
               </li>
               <li>
                 <pre><code data-tour>relish status</code></pre>
-                <p>Three frontend replicas, spread over three nodes. The scheduler did that, not you.</p>
+                <p>Give it half a minute. Three frontend replicas, one on each node. The scheduler
+                  spread them, not you.</p>
               </li>
               <li>
                 <pre><code>open http://podinfo.localhost:18080</code></pre>
-                <p>Or paste the address into a browser. The request comes in through the built-in
-                  ingress, and the page shows which replica answered.</p>
+                <p>Or paste the address into a browser. It comes in through the built-in ingress;
+                  reload and the hostname changes as each replica answers.</p>
               </li>
               <li>
-                <pre><code data-tour>relish logs frontend --since 1m</code></pre>
-                <p>Logs from every replica on every node, in one stream. No log shipper to install.</p>
+                <pre><code data-tour>relish trace frontend --to redis</code></pre>
+                <p>Every hop from a frontend to Redis: DNS, the virtual IP, the eBPF service map in
+                  the kernel, the firewall, any active faults, then a real TCP connect from inside the
+                  frontend. On Kubernetes you’d piece that together from five tools and a debug pod.</p>
+              </li>
+              <li>
+                <pre><code data-tour>relish metrics frontend</code></pre>
+                <p>podinfo’s own Prometheus metrics, from every replica. Each node read the manifest’s
+                  <code>prometheus.io</code> annotations and scrapes its own replicas. There’s no
+                  Prometheus to install.</p>
+              </li>
+              <li>
+                <pre><code data-tour>relish fault delay redis 300ms --from frontend --duration 2m --acknowledge</code></pre>
+                <p>Now make Redis slow, but only for the frontends. Every packet they send it waits
+                  300 ms; anything else calling Redis doesn’t notice. It lifts itself after two
+                  minutes. No chaos tooling to install either.</p>
+              </li>
+              <li>
+                <pre><code data-tour>relish trace frontend --to redis --count 3</code></pre>
+                <p>The same path, now DEGRADED. The trace names the fault, shows the delay it found on
+                  the frontend’s network interface, and every connect takes 300 ms.</p>
+              </li>
+              <li>
+                <pre><code data-tour>relish metrics frontend --name http_request_duration_seconds</code></pre>
+                <p>Wait twenty seconds, then look at latency per replica. It was under a millisecond;
+                  now it’s in the hundreds, and a cache read through the ingress takes almost a
+                  second.</p>
               </li>
               <li>
                 <pre><code data-tour>relish dashboard</code></pre>
-                <p>Live CPU and memory charts in your browser, over the CLI’s own authenticated
-                  connection. Ctrl-C closes it; the cluster keeps running.</p>
+                <p>The same thing as live charts in your browser: CPU, memory, requests per second and
+                  latency, one line per replica. Ctrl-C closes it; the cluster keeps running.</p>
               </li>
               <li>
-                <pre><code data-tour>relish fault kill frontend --count 1 --acknowledge</code></pre>
-                <p>Break it on purpose. Fault injection is built in, and on a laptop cluster it’s
-                  switched on.</p>
+                <pre><code data-tour>relish fault kill frontend --count 1 --acknowledge</code>
+<code data-tour>relish status</code></pre>
+                <p>Kill a frontend. Run <code>status</code> again a few seconds later and it’s back,
+                  with a restart counted: the node agent restarts what should be running.</p>
               </li>
               <li>
-                <pre><code data-tour>relish status</code></pre>
-                <p>Run it again. The killed replica is back, because the node agent restarts what
-                  should be running.</p>
-              </li>
-              <li>
-                <pre><code data-tour>relish local stop <var>NODE</var></code></pre>
-                <p>Now lose a whole machine. Use the name of the third node from <code>relish status</code>.</p>
-              </li>
-              <li>
-                <pre><code data-tour>relish status</code></pre>
-                <p>The replicas that lived there come back on the two survivors.</p>
+                <pre><code data-tour>relish local stop node-3</code>
+<code data-tour>relish status</code></pre>
+                <p>Now lose a whole machine. Within a minute there are three frontends again, all on
+                  the two survivors. Nobody had to notice first.</p>
               </li>
               <li>
                 <pre><code data-tour>relish wtf</code></pre>
-                <p>One screen on what just happened and what still needs attention. It’s what you’d
-                  run first in a real incident.</p>
+                <p>One screen on what’s wrong and what to do about it. Here: a council member is
+                  missing, and one more failure would lose quorum. It’s what you’d run first in a
+                  real incident.</p>
               </li>
             </ol>
             <p>Finished? Remove the cluster, then Relish itself:</p>
