@@ -129,10 +129,18 @@ tutorial, because a tutorial over a broken path is a lie.
 
 ### Phase 3: get the cluster up in about three minutes (quickstart)
 
-- [ ] **Z3.1 A pre-baked guest image.** A release asset built in CI from the
+- [x] **Z3.1 A pre-baked guest image.** A release asset built in CI from the
   pinned Ubuntu image with runc, uidmap, btrfs-progs, nftables and iproute2
   already installed, compressed (`qcow2` + zstd), and the podinfo and busybox
-  images pre-pulled. No `apt-get` on first boot. See D4.
+  images pre-pulled. No `apt-get` on first boot. See D4. Done, with two
+  changes: zlib qcow2, because Lima 2.1.0 can't read zstd qcow2 clusters and
+  macOS has no `zstd` command; and no pre-pulled images, because Bun can't
+  adopt a seeded cache without a new offline verification path, to save one
+  1.9 MB layer. CI builds both architectures natively; the release signs each
+  image's digest (`guest-image-metadata.json`), which the CLI verifies. A
+  bare VM boots in 14–18 s instead of 31–53 s
+  ([measurements](../qualification/2026-09-24-guest-image.md)); a timed
+  quickstart awaits a signed candidate.
 - [x] **Z3.2 Boot every VM at once.** Generate Lima's SSH key in our `LIMA_HOME`
   before the first boot, then start all VMs in parallel. Done: peers start as
   soon as Lima's network daemon runs (about 0.5 s after VM 1), and a 60 s

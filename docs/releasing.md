@@ -17,6 +17,11 @@ requests, main and manual candidate builds:
 | `relish-linux-aarch64` | Ubuntu 22.04 arm64 | Linux CLI |
 | `relish-macos-aarch64` | macOS 15 Apple silicon | Laptop CLI |
 | `relish-macos-x86_64` | macOS 15 Intel | CLI build; cold-install qualification still required |
+| `reliaburger-guest-ubuntu-24.04-…-aarch64.qcow2` | Ubuntu 24.04 arm64 | Quickstart VM image |
+| `reliaburger-guest-ubuntu-24.04-…-x86_64.qcow2` | Ubuntu 24.04 x86_64 | Quickstart VM image |
+
+Pull requests build the guest images only when `build_guest_image.sh`,
+`guest-images.json` or the workflow changes.
 
 Native runners avoid depending on tools installed outside a cross-build
 container. Runner labels follow GitHub's
@@ -93,8 +98,8 @@ gh workflow run build.yml --ref main
 ```
 
 This reruns source CI and builds the native matrix and PDFs at one main commit.
-Only after those checks pass does it mirror the pinned guest images, sign all
-six binaries and upload `candidate-<commit>-<attempt>` as an Actions artefact.
+Only after those checks pass does it collect the two built guest images, sign
+all six binaries and both images' digests, and upload `candidate-<commit>-<attempt>` as an Actions artefact.
 It creates no Git tag or GitHub release. PR and ordinary main builds never use
 the release signing secret.
 
@@ -186,7 +191,7 @@ Repeat the same command to resume an interrupted setup.
 
 Only that version's Reliaburger release URLs are redirected to the directory.
 The pinned Lima tooling URLs stay unchanged. HTTPS, bounded requests, guest-image
-hashes and embedded binary signatures remain enforced. Credentials in URLs,
+signatures and embedded binary signatures remain enforced. Credentials in URLs,
 query strings and fragments are refused. This cannot be combined with
 `--development-binaries`. As with the default bootstrap, HTTPS authenticates the
 selected installer host; the independently retained candidate digest establishes
@@ -199,11 +204,65 @@ has been created by this code change.
 
 ## Guest images and bootstrap installer
 
-The candidate job mirrors the two dated Ubuntu images in
-`scripts/release/guest-images.json`, verifying SHA-256 before publication. The
-CLI embeds that same manifest and verifies its downloaded image. Update the
-manifest deliberately when changing the guest baseline; don't introduce an
-unpinned `current` fallback.
+Each quickstart VM boots from a guest image the release builds itself: the
+dated Ubuntu 24.04 cloud image named in `scripts/release/guest-images.json`
+with that file's `packages` (runc, uidmap, btrfs-progs, nftables, iptables,
+iproute2) already installed. Without them baked in, every VM spent 15–40 s of
+its first boot in `apt-get update` and `install`, against Ubuntu's live mirrors
+([measurements](qualification/2026-09-24-guest-image.md)).
+
+`scripts/release/build_guest_image.sh` builds one image, for the host's own
+architecture:
+
+```sh
+sudo apt-get install -y qemu-utils
+sudo scripts/release/build_guest_image.sh --output guest > guest-record.json
+```
+
+It downloads the upstream image (or takes `--source FILE`) and refuses it unless
+its SHA-256 matches the pin. It converts it to a sparse raw file, loop-mounts
+the root and boot partitions, and runs `apt-get install` in a chroot, with
+package indexes and downloads on a tmpfs so they never reach the image and with
+service starts blocked. Then it seals the image: an empty `/etc/machine-id`,
+`cloud-init clean`, no SSH host keys, random seed, logs or temporary files, so
+every VM still generates its own identity at first boot. `fstrim` returns freed
+blocks to the sparse file, and `qemu-img convert -c` writes a zlib-compressed
+qcow2. The installed package versions go into `/usr/share/reliaburger/guest-image.json`
+inside the image and into the JSON record the script prints.
+
+Why these choices:
+
+- **Native builds, chroot, no emulation.** The package scripts run in the
+  chroot, so the build host's CPU must match. GitHub's `ubuntu-24.04-arm`
+  runner builds aarch64 and `ubuntu-24.04` builds x86_64, at native speed and
+  without `/dev/kvm`, which libguestfs (`virt-customize`) would want, and
+  without the `qemu-user-static` a cross-architecture chroot would need.
+- **qcow2 with zlib, not zstd or raw.** Lima 2.1.0 converts qcow2 itself, but
+  registers no zstd decompressor for qcow2 clusters, and it decompresses a
+  `.zst` or `.xz` file by running the `zstd` or `xz` command, which macOS
+  doesn't ship. zlib qcow2 is what Ubuntu itself publishes, so the quickstart
+  treats the built image exactly like the stock one.
+- **Live archive, not a snapshot.** `snapshot.ubuntu.com` doesn't serve
+  `ubuntu-ports` (arm64) anonymously, so the build installs the current
+  packages and records their versions.
+
+A rebuild never produces the same bytes: file times and the ext4 journal
+differ. So the CLI can't have the image's digest compiled in, the way it had
+the upstream image's. Instead `package.py` signs a statement per architecture
+(version, architecture, asset name, image SHA-256 and upstream SHA-256) with
+the release key and publishes `guest-image-metadata.json`. The CLI downloads
+that, requires a valid signature from an embedded release key, the pinned asset
+name and the pinned upstream digest, and only then downloads the image and
+checks its SHA-256. `candidate.py` checks that the metadata names both images
+with their actual digests and the pinned source, and records every byte in
+`candidate.json` as usual.
+
+Update `guest-images.json` deliberately when changing the guest baseline (new
+upstream image date or package list); don't introduce an unpinned `current`
+fallback. Development runs (`--development-binaries`) have no release to take a
+built image from, so they boot the pinned upstream image and install the
+packages at first boot. The VM's provisioning script skips `apt` whenever every
+package is already present, so both paths use the same script.
 
 Packaging generates `install.sh` with the exact native CLI checksums. The
 static `docs/website/install.sh` fetches that versioned installer over HTTPS.

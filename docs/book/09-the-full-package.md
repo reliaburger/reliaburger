@@ -944,12 +944,12 @@ having demonstrated a usable cluster. Real-VM qualification still has to prove
 these steps work together, and a published candidate with empty caches must
 meet the timing target before we advertise it.
 
-The release mirrors the dated Ubuntu images named in `guest-images.json`.
-Ubuntu can retire older dated downloads; keeping the verified bytes with the
-release preserves reproducibility. The native CLI embeds the same manifest.
-A developer can explicitly supply local Linux binaries for testing before a
-release exists, but that path prints a notice and cannot qualify the signed
-installer. `RELIABURGER_HOME` isolates its state from a normal installation.
+The release carries its own guest images, built from the dated Ubuntu images
+named in `guest-images.json` (more on that in a moment). Ubuntu can retire
+older dated downloads; keeping the verified bytes with the release preserves
+reproducibility. A developer can explicitly supply local Linux binaries for
+testing before a release exists, but that path prints a notice and cannot
+qualify the signed installer. `RELIABURGER_HOME` isolates its state from a normal installation.
 
 Lifecycle commands hold the operation lock and use only its saved VM names.
 Stopping preserves disks. Destroying requires `--yes`, removes the owned VMs,
@@ -1035,6 +1035,139 @@ the `select!` drops the start future, which kills `limactl` (we built its
 once more. Dropping a future is how you cancel it in Rust; there's no
 `cancel()` method, and no context object to thread through as in Go. A resumed
 setup applies the same test to a VM left "running" by an earlier attempt.
+
+### Bake the image, don't install at boot
+
+The measurements had one more thing to say. The kernel reached a login prompt
+in 8 seconds, and then every VM sat in cloud-init for another half a minute.
+Doing what? Our provisioning script ran `apt-get update` and installed runc,
+uidmap and friends from Ubuntu's mirrors. That's 42 MB of package indexes per
+VM, three VMs at once, on every fresh cluster, before a single container runs.
+And a laptop with a flaky connection or an Ubuntu mirror having a bad day
+turned into a failed setup.
+
+The fix is old-fashioned: install the packages once, when we build the
+release, and ship a disk image that already has them. We call it baking the
+image (decision D4 in the plan). `scripts/release/build_guest_image.sh` takes
+the pinned Ubuntu cloud image, checks its SHA-256, converts it to a raw file
+and loop-mounts it. Then it `chroot`s in and runs `apt-get install`, the same
+command the VM used to run at first boot. Two details keep the result small
+and honest. The package indexes and downloaded `.deb` files live on a tmpfs
+mounted over `/var/lib/apt/lists` and `/var/cache/apt`, so 500 MB of apt state
+never touches the image. (Our first build forgot this, deleted the files
+afterwards and still shipped a 796 MiB image, because ext4 doesn't hand
+deleted blocks back until its journal commits, and the compressor happily
+compressed the ghosts.) And before compressing, the script seals the image:
+an empty `/etc/machine-id`, `cloud-init clean`, no SSH host keys. A baked
+image that kept those would give three VMs the same identity, which is the
+kind of bug that surfaces months later as two nodes fighting over a DHCP
+lease.
+
+We build natively on each architecture, arm64 on GitHub's arm runner and
+x86-64 on the ordinary one. `virt-customize` from libguestfs is the
+textbook tool, but it boots a small helper VM and wants `/dev/kvm` to do it
+quickly, and a cross-architecture chroot would need `qemu-user-static` to
+emulate every package script. A native chroot needs neither, and the aarch64
+build takes about two minutes.
+
+What format do we ship? Lima 2.1.0 turns a qcow2 image into the raw disk
+Apple's Virtualization.framework needs, but it reads only zlib-compressed
+qcow2 clusters, not zstd ones. It can decompress a `.zst` file too, but by
+running a `zstd` command, and macOS doesn't have one. So we ship exactly what
+Ubuntu ships, a zlib qcow2: 604 MiB, 13 MiB more than the stock image. The
+download barely changes, and on the M2 Max a VM went from `limactl start` to
+ready in 14–18 s instead of 31–53 s.
+
+Here's the part that took some thought. The CLI used to have the image's
+SHA-256 compiled in, from `guest-images.json`. A baked image can't work that
+way. CI builds it in the same run as the CLI, and no two builds produce the
+same bytes (file times and journal contents differ). So instead of pinning
+the digest, we sign it. `package.py` signs a short statement per
+architecture with the release key:
+
+```text
+reliaburger guest image v1
+version v0.1.0
+arch aarch64
+asset reliaburger-guest-ubuntu-24.04-20260911-aarch64.qcow2
+sha256 …
+source-sha256 7b682958…
+```
+
+The CLI downloads `guest-image-metadata.json`, rebuilds that text itself and
+checks the signature before it believes a single digest in the file:
+
+```rust
+impl GuestImageMetadata {
+    pub fn verified(
+        mut self,
+        version: &BinaryVersion,
+        arch: &str,
+        pin: &GuestImage,
+        release_keys: &[PublicKey],
+    ) -> Result<BuiltGuestImage> {
+        // schema, version, asset name and upstream digest checks...
+        let statement = guest_image_statement(
+            &version, arch, &image.asset, &image.sha256, &image.source.sha256,
+        );
+        // ...then the Ed25519 check, reusing the binary verifier
+        verify_binary(statement.as_bytes(), &envelope, release_keys, None, false)
+            .context("release guest image signature is not valid")?;
+        Ok(image)
+    }
+}
+```
+
+`verified` takes `mut self`, not `&self`. It consumes the metadata: once
+you've asked for a verified image, the unverified document is gone, moved into
+the method, and the caller can't accidentally read a digest from it
+afterwards. (`mut` lets the method take the image out of its own map with
+`remove` instead of cloning it.) Go has no equivalent; there, the caller would
+still hold the struct and nothing would stop them using it. The statement
+carries the version, so an old release's genuine metadata can't be replayed
+against a new CLI, and the upstream digest, so the image provably started from
+the Ubuntu build we pinned. The signature covers a few hundred bytes rather
+than the 604 MiB image, so the CLI never has to read the whole image into
+memory to check it; the ordinary streaming SHA-256 of the download does that.
+
+Development runs have no release to take a baked image from, so they still
+boot the stock Ubuntu image. One provisioning script serves both. It counts
+the installed packages and runs apt only when the count is short:
+
+```rust
+Ok(format!(
+    "installed=$(dpkg-query -W -f='${{db:Status-Abbrev}}\\n' {list} 2>/dev/null \
+     | grep -c '^ii' || true)\n\
+     if [ \"$installed\" -ne {count} ]; then ...",
+    count = packages.len()
+))
+```
+
+In `format!`, `{list}` is a placeholder filled from a local variable, so a
+literal brace has to be doubled: `${{db:Status-Abbrev}}` comes out as the
+`${db:Status-Abbrev}` that `dpkg-query` expects. Why count instead of looking
+for a missing package? `dpkg-query` prints nothing at all for a package it
+has never heard of, so "is any line not `ii`?" would answer no. The package
+names come from `guest-images.json`, and since they end up in a shell script
+we refuse anything that isn't a plain Debian package name, even though we
+wrote the file ourselves.
+
+The test for that script doesn't grep it for strings. It runs it, with
+`bash`, against a directory of stub commands put first on `PATH`: a fake
+`dpkg-query` that reports every package installed except one, and a fake
+`apt-get` that writes its arguments to a log. A baked image must produce an
+empty log; a stock one must produce `update` and then `install` with the
+whole list. `#[cfg(unix)]` on those tests compiles them only on Unix hosts,
+the same attribute family as `#[cfg(test)]`, because the stubs are shell
+scripts.
+
+We didn't pre-pull the demo's container images into the guest image, though
+the plan suggested it. Bun always fetches an image's manifest from the
+registry, even when every layer is cached, and it trusts a cached layer by its
+size alone once the file exists. Seeding its cache from outside would mean a
+new, offline, verify-everything path through the most security-sensitive code
+in the image store, to save a 1.9 MB BusyBox layer. The manifest round trips
+to the registry, which Bun makes either way, would stay.
 
 ### Keep the host predictable
 

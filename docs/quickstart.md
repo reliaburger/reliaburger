@@ -25,8 +25,9 @@ without a yes. Pass `--no-modify-path` (`sh -s -- --no-modify-path`) or set
 Until you open a new terminal, setup prints next steps with the full path.
 
 The default is three Linux VMs, running real OCI containers with runc. Relish
-installs Lima in your user directory, downloads a pinned Ubuntu image and
-signed Linux binaries, creates the cluster's credentials, then enrols each
+installs Lima in your user directory, downloads the release's guest image (Ubuntu
+24.04 with runc and the node's other packages already installed) and signed
+Linux binaries, creates the cluster's credentials, then enrols each
 node. It checks the authenticated APIs, the three-member council and a sample
 container through the host ingress port. Open `http://localhost:18080/` to see
 the sample app. Your first application config is saved under
@@ -42,8 +43,8 @@ There is no Rust build and no repository checkout in the published path.
 Native macOS uses Apple's Virtualization.framework through Lima. Linux needs
 QEMU, KVM access and Lima's host prerequisites already installed. Allow at
 least 8 GiB of available memory and 15 GiB of free disk for the default cluster;
-image download time also depends on your connection. Guest package setup uses
-Ubuntu's repositories. No host directories are mounted into the VMs. Managed Lima state lives under
+image download time also depends on your connection. The VMs don't install
+anything at first boot, so setup doesn't depend on Ubuntu's package mirrors. No host directories are mounted into the VMs. Managed Lima state lives under
 `~/.reliaburger/lima`, isolated from your normal Lima configuration.
 
 For a smaller single-node cluster:
@@ -62,8 +63,8 @@ Use `/install.sh`: GitHub Pages serves the same static page to browsers and
 curl, so the site's root is HTML. The bootstrap downloads a complete,
 version-specific installer over HTTPS before running it. That installer pins
 the native CLI's SHA-256; Relish separately requires the compiled-in release
-signing key for guest binaries. Guest images and Lima archives have fixed
-checksums. The initial shell bootstrap trusts HTTPS. Both scripts are plain POSIX sh,
+signing key for guest binaries and for the guest image's checksum. Lima archives
+have fixed checksums. The initial shell bootstrap trusts HTTPS. Both scripts are plain POSIX sh,
 so any `sh` runs them; pass installer options after `sh -s --`.
 
 ## Resume, stop and remove
@@ -159,7 +160,7 @@ A release candidate can use an explicit HTTPS mirror of its unchanged assets:
 relish setup --quickstart --release-mirror https://YOUR_HOST/candidate
 ```
 
-This keeps guest-image checksums and embedded binary signatures enabled. It
+This keeps guest-image and binary signatures enabled. It
 cannot be combined with development binaries. Repeat the mirror option when
 resuming. The [release guide](releasing.md#qualifying-a-staged-candidate) covers
 candidate verification and the matching installer environment variable.
@@ -175,8 +176,11 @@ RELIABURGER_HOME=/absolute/path/to/isolated-state \
   --development-binaries /absolute/path/to/linux-binaries
 ```
 
-This bypasses release downloads for those two operator-supplied binaries. It
-still verifies the pinned upstream guest image and Lima archive. It prints a
+This bypasses release downloads for those two operator-supplied binaries. With
+no release to take the built guest image from, it boots the stock Ubuntu cloud
+image that image is built from, checked against its pinned SHA-256, and each VM
+installs the node packages from Ubuntu's mirrors at first boot: expect each
+boot to take 15–40 s longer. It still verifies the Lima archive. It prints a
 notice and does not count as qualification of a signed, downloadable release.
 Use the same `RELIABURGER_HOME` for subsequent CLI and lifecycle commands.
 
