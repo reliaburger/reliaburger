@@ -475,7 +475,10 @@ async fn reserve_api_socket(listen: &str) -> anyhow::Result<tokio::net::TcpSocke
         } else {
             tokio::net::TcpSocket::new_v6()?
         };
-        socket.set_reuseaddr(true)?;
+        // Reuse lets a restart rebind a fixed port past TIME_WAIT. With port
+        // zero it also lets Linux pick an ephemeral port another reuse socket
+        // holds, and the later listen() fails with EADDRINUSE.
+        socket.set_reuseaddr(address.port() != 0)?;
         match socket.bind(address) {
             Ok(()) => return Ok(socket),
             Err(error) => last_error = error,
@@ -3304,6 +3307,27 @@ fn configure_workload_dns(
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[tokio::test]
+    async fn ephemeral_api_port_is_reserved_without_address_reuse() {
+        let socket = reserve_api_socket("127.0.0.1:0").await.unwrap();
+        assert!(!socket.reuseaddr().unwrap());
+        assert_ne!(socket.local_addr().unwrap().port(), 0);
+        socket.listen(1).unwrap();
+    }
+
+    #[tokio::test]
+    async fn fixed_api_port_is_reserved_with_address_reuse_for_restarts() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let socket = reserve_api_socket(&format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
+        assert!(socket.reuseaddr().unwrap());
+    }
 
     #[tokio::test]
     async fn apple_selection_explains_the_linux_vm_release_profile() {
