@@ -32,14 +32,14 @@ relish status                        # three frontends, spread across the nodes
 open http://podinfo.localhost:18080  # through the built-in ingress
 
 # See every hop from frontend to Redis: DNS, VIP, eBPF map, firewall, TCP
-relish trace frontend --to redis
+relish path frontend --to redis
 
 # podinfo's own Prometheus metrics, scraped from its pod annotations
 relish metrics frontend
 
 # Make Redis slow, but only for the frontends, for two minutes
 relish fault delay redis 300ms --from frontend --duration 2m --acknowledge
-relish trace frontend --to redis --count 3
+relish path frontend --to redis --count 3
 relish dashboard                     # live charts in the browser
 
 # Break things and watch the cluster recover
@@ -113,7 +113,7 @@ reverts itself. Network upgrades need two Ed25519 signatures: the release's
 and your own.
 
 **Diagnostics built for incidents.** `relish wtf` correlates cluster health into
-one screen of problems and next steps. `relish trace` walks the network path
+one screen of problems and next steps. `relish path` walks the network path
 between two apps and labels each step observed, inferred or unavailable.
 `relish test` runs a live-cluster test catalogue, and `relish bench` measures
 the data plane.
