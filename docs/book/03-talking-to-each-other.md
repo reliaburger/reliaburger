@@ -74,6 +74,7 @@ The sequence:
 5. Bring everything up
 6. Set the default route inside the namespace to point at the gateway
 7. Enable IP forwarding on the host
+8. Accept the containers' traffic in the host's iptables FORWARD chain, because Docker and ufw set its policy to DROP (chapter 9 has the story)
 
 The `rb-` prefix on namespace names avoids collisions with other tools that might create network namespaces.
 

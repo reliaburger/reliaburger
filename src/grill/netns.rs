@@ -469,6 +469,14 @@ pub async fn setup_container_network_with_commands(
     )
     .await?;
 
+    // 11. Let that forwarded traffic past a host firewall's FORWARD policy
+    allow_container_forwarding()
+        .await
+        .map_err(|reason| NetnsError::SetupFailed {
+            instance: instance_id.0.clone(),
+            reason,
+        })?;
+
     Ok(ContainerNetwork {
         namespace_path: ns_path,
         container_ip: c_ip,
@@ -726,6 +734,69 @@ pub async fn teardown_container_network_with_commands(
                 });
             }
         }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Host firewall
+// ---------------------------------------------------------------------------
+
+/// The iptables FORWARD rules that let container traffic through a host
+/// whose FORWARD policy is DROP. Every host veth is named `veth-…`, and
+/// `veth-+` is iptables' prefix match for them.
+///
+/// Anything a container sends is accepted: to another container on this
+/// node, or out through the masquerade. Traffic towards a container is
+/// accepted only as a reply, or when a published port's DNAT sent it there,
+/// so the rest of the network can't route into container addresses.
+const FORWARD_ACCEPT_RULES: [&[&str]; 2] = [
+    &["-i", "veth-+", "-j", "ACCEPT"],
+    &[
+        "-o",
+        "veth-+",
+        "-m",
+        "conntrack",
+        "--ctstate",
+        "RELATED,ESTABLISHED,DNAT",
+        "-j",
+        "ACCEPT",
+    ],
+];
+
+/// Make sure the host's iptables FORWARD chain accepts container traffic.
+///
+/// Docker and ufw both set the FORWARD policy to DROP. Our nftables tables
+/// can't overrule that: an accept in one table only passes the packet on to
+/// the next table at the same hook, while a drop anywhere is final. So the
+/// accept has to sit in the chain that drops, ahead of its policy. Hosts
+/// without iptables have no such chain, and nothing to do.
+///
+/// The rules are node-wide, idempotent and harmless with no containers
+/// running, so they're checked on every setup (a firewall reload may have
+/// removed them) and never retired. That's also why they run outside the
+/// instance's own command journal.
+async fn allow_container_forwarding() -> Result<(), String> {
+    for rule in FORWARD_ACCEPT_RULES {
+        let mut check = vec!["-w", "-C", "FORWARD"];
+        check.extend_from_slice(rule);
+        let present = match DirectCommandExecutor.output("iptables", &check).await {
+            Ok(output) => output.exit_code == Some(0),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(format!("check iptables FORWARD rules: {error}")),
+        };
+        if present {
+            continue;
+        }
+        let mut insert = vec!["-w", "-I", "FORWARD", "1"];
+        insert.extend_from_slice(rule);
+        run_cmd_raw_with(
+            &DirectCommandExecutor,
+            "iptables",
+            &insert,
+            "accept container traffic in the iptables FORWARD chain",
+        )
+        .await?;
     }
     Ok(())
 }
@@ -1182,6 +1253,55 @@ mod tests {
         assert!(ping.status.success(), "container cannot ping gateway");
 
         // Clean up
+        teardown_container_network(&network)
+            .await
+            .expect("failed to tear down");
+    }
+
+    /// Docker and ufw set the iptables FORWARD policy to DROP. Container to
+    /// container traffic crosses that hook, so the node must accept its own
+    /// veths' traffic there, or every call between apps times out.
+    #[tokio::test]
+    #[ignore = "requires Linux root and RELIABURGER_NETNS_TESTS=1"]
+    async fn container_network_accepts_its_forwarded_traffic_in_iptables() {
+        assert!(
+            netns_tests_enabled(),
+            "set RELIABURGER_NETNS_TESTS=1 after provisioning Linux network tools and root access"
+        );
+
+        let id = InstanceId("netns-forward-0".to_string());
+        let _ = run_cmd_raw(
+            "ip",
+            &["link", "del", &host_veth_name(&id)],
+            "pre-cleanup veth",
+        )
+        .await;
+        let _ = run_cmd_raw(
+            "ip",
+            &["netns", "del", "rb-netns-forward-0"],
+            "pre-cleanup netns",
+        )
+        .await;
+
+        let network = setup_container_network(&id, 97, 0, false)
+            .await
+            .expect("failed to set up container network");
+
+        for rule in FORWARD_ACCEPT_RULES {
+            let mut check = vec!["-w", "-C", "FORWARD"];
+            check.extend_from_slice(rule);
+            let present = tokio::process::Command::new("iptables")
+                .args(&check)
+                .output()
+                .await
+                .expect("iptables runs");
+            assert!(
+                present.status.success(),
+                "missing FORWARD rule {rule:?}: {}",
+                String::from_utf8_lossy(&present.stderr)
+            );
+        }
+
         teardown_container_network(&network)
             .await
             .expect("failed to tear down");
