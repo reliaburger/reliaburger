@@ -167,6 +167,23 @@ fn homepage_and_manual_show_the_same_tour() {
     );
 }
 
+/// The recording's script (`scripts/demo/tour.sh`) reads its commands from
+/// the page, and knows how to run and wait for each one. A command added to
+/// the tour must be taught to the script too, or the recording drifts.
+#[test]
+fn the_recording_script_knows_every_tour_command() {
+    let output = Command::new("bash")
+        .arg(repository().join("scripts/demo/tour.sh"))
+        .arg("--check")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 fn manual_tour_opens_the_tour_chapter() {
     use reliaburger::relish::manual::{assets, find_chapter};
