@@ -354,6 +354,7 @@ that used to fail passes.
 | `mustard::protocol::tests::gossip_convergence_five_nodes` | 22 Sep | Unseeded RNG; exposed missing anti-entropy (C6.5) | Fixed: push-pull anti-entropy (C6.5); unseeded again |
 | `ebpf::standalone_discovery_recovery_preserves_original_routing_and_cleanup` | 22 Sep | Product: 2 s force-kill deadline too short under load | Fixed (C3.3) |
 | `registry_recovery::new_leader_retains_registry_cleanup_until_the_killed_writer_returns` | 23 Sep | Harness: treated the retryable lease-leader 503 as fatal | Fixed |
+| `owned_rootless::rootless_port_and_launcher_survive_recovery_and_helper_replacement` | 22 Sep | The replacement slirp4netns helper sometimes exits before readiness after the test kills the old one, and `state()` reports it as an error mid-recovery | Open: decide whether recovery retries the helper or reports the error |
 
 ## Current release checklist
 
