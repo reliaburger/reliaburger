@@ -519,8 +519,11 @@ enum Command {
         #[arg(long, default_value_t = 30, requires = "watch", value_parser = clap::value_parser!(u64).range(1..))]
         interval: u64,
     },
-    /// Trace DNS, service-map, firewall and TCP evidence from a workload.
-    Trace {
+    /// Walk the network path from a workload to a destination, hop by hop.
+    ///
+    /// Checks DNS, the service VIP, the eBPF service map, the firewall, active
+    /// faults and a real TCP connect from inside the source workload.
+    Path {
         /// Source application name.
         source: String,
         /// Source namespace.
@@ -1750,7 +1753,7 @@ async fn main() -> ExitCode {
                 .await,
             );
         }
-        Command::Trace {
+        Command::Path {
             source,
             namespace,
             to,
@@ -1759,7 +1762,7 @@ async fn main() -> ExitCode {
             count,
         } => {
             return finish_outcome(
-                reliaburger::relish::trace_cmd::run(reliaburger::relish::trace_cmd::TraceArgs {
+                reliaburger::relish::path_cmd::run(reliaburger::relish::path_cmd::PathArgs {
                     source,
                     source_namespace: namespace,
                     destination: to,
@@ -2093,12 +2096,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_trace_namespaces_port_and_machine_output() {
+    fn parse_path_namespaces_port_and_machine_output() {
         let parsed = parse(&[
             "relish",
             "--output",
             "yaml",
-            "trace",
+            "path",
             "api",
             "--namespace",
             "frontend",
@@ -2113,7 +2116,7 @@ mod tests {
         assert_eq!(parsed.output, OutputFormat::Yaml);
         assert!(matches!(
             parsed.command,
-            Command::Trace {
+            Command::Path {
                 source,
                 namespace,
                 to,
@@ -2128,24 +2131,29 @@ mod tests {
     }
 
     #[test]
-    fn trace_count_repeats_the_connect_up_to_ten_times() {
+    fn path_count_repeats_the_connect_up_to_ten_times() {
         let parsed = parse(&[
-            "relish", "trace", "frontend", "--to", "redis", "--count", "10",
+            "relish", "path", "frontend", "--to", "redis", "--count", "10",
         ])
         .unwrap();
-        assert!(matches!(parsed.command, Command::Trace { count: 10, .. }));
+        assert!(matches!(parsed.command, Command::Path { count: 10, .. }));
         assert!(
             parse(&[
-                "relish", "trace", "frontend", "--to", "redis", "--count", "0"
+                "relish", "path", "frontend", "--to", "redis", "--count", "0"
             ])
             .is_err()
         );
         assert!(
             parse(&[
-                "relish", "trace", "frontend", "--to", "redis", "--count", "11"
+                "relish", "path", "frontend", "--to", "redis", "--count", "11"
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn trace_is_not_a_subcommand() {
+        assert!(parse(&["relish", "trace", "frontend", "--to", "redis"]).is_err());
     }
 
     #[test]

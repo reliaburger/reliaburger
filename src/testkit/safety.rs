@@ -102,7 +102,7 @@ pub struct ClusterTestPolicy {
     /// Zero disables memory pressure. The 90% hard ceiling preserves a
     /// control-plane and kernel headroom band.
     pub max_node_pressure_memory_percent: u8,
-    /// Destinations trace may probe when the caller also has permission.
+    /// Destinations `relish path` may probe when the caller also has permission.
     pub external_probe_allowlist: Vec<String>,
 }
 
@@ -177,7 +177,7 @@ impl ClusterTestPolicy {
         Ok(())
     }
 
-    /// Whether an external trace destination is explicitly allowlisted.
+    /// Whether an external `relish path` destination is explicitly allowlisted.
     /// Matching is exact and includes the port; there are no wildcards or DNS
     /// suffix rules that could silently expand probe authority.
     pub fn permits_external_probe(&self, host: &str, port: u16) -> bool {

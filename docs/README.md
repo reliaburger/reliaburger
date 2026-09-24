@@ -645,7 +645,7 @@ Commands:
 | `logs-search <dir> <sql>` | Run SQL over an exported Parquet log archive |
 | `inspect <name>` | Detailed info about an app (bare app name) |
 | `wtf [--app <app>] [--watch [--interval <secs>]]` | Correlated cluster-health diagnosis (exit 0 OK / 1 criticals / 2 warnings-only) |
-| `trace <src> --to <dst>` | Probe DNS, service-map, firewall and TCP from a workload (exit 0/1/2) |
+| `path <src> --to <dst>` | Walk the network path from a workload: DNS, service map, firewall, faults and TCP (exit 0/1/2) |
 | `exec <app> <cmd...>` | Execute a command inside a running instance |
 | `stop <app>` | Stop all instances of an app |
 | `init [dir]` | Generate PKI and an mTLS-required starter config (`--development-plaintext` is an explicit local-only exception) |
@@ -1132,7 +1132,7 @@ The bun agent exposes a local HTTP API on port 9117:
 | `GET` | `/v1/capabilities/cluster` | Bounded authenticated capability evidence from every expected node |
 | `GET` | `/v1/diagnostics` | Bounded local disk, cgroup throttling and public certificate evidence |
 | `GET` | `/v1/diagnostics/apps` | Desired replicas, scheduled replicas and service exposure used by diagnostics |
-| `POST` | `/v1/trace` | Run fixed DNS and TCP probes from a local source workload and return live service/firewall evidence |
+| `POST` | `/v1/path` | Run fixed DNS and TCP probes from a local source workload and return live service/firewall evidence |
 | `POST` | `/v1/test/leases` | Create a policy-authorised, server-owned Phase 15 app lease |
 | `GET` | `/v1/test/leases/{id}` | Inspect an owned lease (or inspect any lease as unscoped Admin) |
 | `POST` | `/v1/test/leases/{id}/renew` | Renew an active owned lease within the server TTL ceiling |
@@ -1264,14 +1264,16 @@ and 2 means warnings or unknown evidence. Bounded in-memory restart and deploy
 history is deliberately reported as degraded, not silently accepted as a
 complete historical record.
 
-`relish trace <source> --to <destination>` finds a running source instance,
-then asks that node to run fixed `nslookup` and TCP-connect probes inside the
+`relish path <source> --to <destination>` walks the network path from a source
+workload to a destination, hop by hop. It finds a running source instance, then
+asks that node to run fixed `nslookup` and TCP-connect probes inside the
 source workload. Internal destinations derive their port from the live service
-map; use `--namespace`, `--to-namespace` and `--port` when needed. The four
+map; use `--namespace`, `--to-namespace` and `--port` when needed. The five
 steps cover the actual DNS answer, live userspace and attached eBPF service
-state, live attached firewall state, and the TCP result. Each step is labelled
-`observed`, `inferred` or `unavailable`. A failure exits 1; missing evidence or
-missing probe tools exits 2 rather than pretending the path is healthy.
+state, live attached firewall state, the faults active on the path, and the TCP
+result. Each step is labelled `observed`, `inferred` or `unavailable`. A
+failure exits 1; missing evidence or missing probe tools exits 2 rather than
+pretending the path is healthy.
 
 External probes are denied by default. They require an Admin credential,
 `probe_external_destination` in `[testing].allowed_operations`, the protected

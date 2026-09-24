@@ -116,7 +116,7 @@ pub fn node_config(
 /// (kill, pause, CPU, memory, network) and node faults (`node-kill`,
 /// `node-drain`), which the quorum and leader rails still guard and which
 /// expire on their own. It leaves out node pressure, which could starve a
-/// 2 GiB VM's own control plane, external trace probes, and isolated test
+/// 2 GiB VM's own control plane, external path probes, and isolated test
 /// workloads. Server installs keep the protected default: a missing
 /// `[testing]` section still means `unknown`, which allows nothing.
 pub fn laptop_test_policy() -> crate::testkit::safety::ClusterTestPolicy {

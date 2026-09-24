@@ -1,8 +1,8 @@
 ---
-source: src/relish/trace_cmd.rs
+source: src/relish/path_cmd.rs
 expression: render_human(&result)
 ---
-Trace default/frontend -> default/redis:6379 from node node-1
+Path default/frontend -> default/redis:6379 from node node-1
   1. DNS query [PASS; observed]
      redis.default.internal -> 127.128.202.174 (resolver 10.202.142.1)
   2. Service and eBPF state [PASS; observed]

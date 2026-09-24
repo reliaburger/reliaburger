@@ -124,8 +124,8 @@
                   reload and the hostname changes as each replica answers.</p>
               </li>
               <li>
-                <pre><code data-tour>relish trace frontend --to redis</code></pre>
-                <p>Every hop from a frontend to Redis: DNS, the virtual IP, the eBPF service map in
+                <pre><code data-tour>relish path frontend --to redis</code></pre>
+                <p>Walk the path from a frontend to Redis, hop by hop: DNS, the virtual IP, the eBPF service map in
                   the kernel, the firewall, any active faults, then a real TCP connect from inside the
                   frontend. On Kubernetes you’d piece that together from five tools and a debug pod.</p>
               </li>
@@ -142,8 +142,8 @@
                   minutes. No chaos tooling to install either.</p>
               </li>
               <li>
-                <pre><code data-tour>relish trace frontend --to redis --count 3</code></pre>
-                <p>The same path, now DEGRADED. The trace names the fault, shows the delay it found on
+                <pre><code data-tour>relish path frontend --to redis --count 3</code></pre>
+                <p>The same path, now DEGRADED. It names the fault, shows the delay it found on
                   the frontend’s network interface, and every connect takes 300 ms.</p>
               </li>
               <li>

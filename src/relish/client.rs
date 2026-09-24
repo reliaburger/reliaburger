@@ -424,7 +424,7 @@ impl BunClient {
     ///
     /// The entry node reaches its peers on the cluster network even when the
     /// caller can't, as on a laptop behind Lima's user-mode network. The
-    /// relay forwards only the per-node reads `wtf` and `trace` need, and the
+    /// relay forwards only the per-node reads `wtf` and `path` need, and the
     /// target repeats every check against the caller's own credential.
     pub fn via_node(&self, node_id: &str) -> Result<Self, RelishError> {
         let valid = !node_id.is_empty()
@@ -888,15 +888,15 @@ impl BunClient {
         .await
     }
 
-    /// Run the fixed server-side connectivity trace on the node hosting the
-    /// source workload.
-    pub async fn trace(
+    /// Run the fixed server-side path probe on the node hosting the source
+    /// workload.
+    pub async fn probe_path(
         &self,
         request: &crate::onion::trace::TraceRequest,
     ) -> Result<crate::onion::trace::TraceResult, RelishError> {
         let response = self
             .http()?
-            .post(format!("{}/v1/trace", self.base_url))
+            .post(format!("{}/v1/path", self.base_url))
             .json(request)
             .send()
             .await

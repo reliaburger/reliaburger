@@ -1376,7 +1376,7 @@ join = ["10.0.1.5:9443"]
 | `[process_workloads]` | `allow_globs` | `false` | bool | Allow glob patterns in `allowed_binaries`. |
 | `[upgrades]` | `external_signing_key` | (none) | `"ed25519:..."` | External signing key for dual-signature verification. Required for network upgrades. |
 | `[upgrades]` | `retain_versions` | `3` | 1-10 | Number of previous binary versions to keep on disk. |
-| `[testing]` | `external_probe_allowlist` | `[]` | exact `host:port` strings | External destinations `relish trace` may probe after its independent Admin, operation and protected-cluster checks; an empty list permits none. Wildcards and CIDRs do not match. |
+| `[testing]` | `external_probe_allowlist` | `[]` | exact `host:port` strings | External destinations `relish path` may probe after its independent Admin, operation and protected-cluster checks; an empty list permits none. Wildcards and CIDRs do not match. |
 
 ---
 

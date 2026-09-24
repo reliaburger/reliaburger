@@ -699,11 +699,11 @@ files under `tests/`):
 - `relish bench` produces valid benchmark report with all metrics
 - `relish bench --compare` detects regression (> 10% metric degradation)
 - `relish wtf` detects and diagnoses known failure patterns
-- `relish trace <app> --to <app>` traces connectivity through eBPF, firewall, and network layers
+- `relish path <app> --to <app>` walks the network path hop by hop through eBPF, firewall, and network layers
 
 Current test locations: runner and comparison regressions live in
-`src/testkit/runner.rs` and `src/testkit/bench/compare.rs`; diagnostic and trace
-regressions live under `src/relish/wtf/` and in `src/relish/trace_cmd.rs`.
+`src/testkit/runner.rs` and `src/testkit/bench/compare.rs`; diagnostic and path
+regressions live under `src/relish/wtf/` and in `src/relish/path_cmd.rs`.
 `tests/suite/wtf_watch.rs` exercises the real CLI process. Live cases live under
 `src/testkit/cases/` and `src/testkit/chaos/`; their complete three-node run is a
 release gate, not something the unit-test count establishes.
@@ -717,7 +717,7 @@ release gate, not something the unit-test count establishes.
    prerequisites fail rather than becoming green skips.
 3. **`relish bench`.** Benchmark harness (scheduler throughput, eBPF latency, network throughput, deploy speed, state reconstruction), regression detection via `--compare`.
 4. **`relish wtf`.** Automated cluster health diagnosis with root cause correlation.
-5. **`relish trace`.** End-to-end connectivity debugging through eBPF, firewall, and network layers.
+5. **`relish path`.** End-to-end connectivity debugging through eBPF, firewall, and network layers.
 6. **Run all tests green.**
 
 Design docs: [cli-relish.md](design/cli-relish.md), [agent-bun.md](design/agent-bun.md), [chaos-smoker.md](design/chaos-smoker.md)

@@ -1,4 +1,4 @@
-//! `relish trace` source-node selection, rendering and exit contract.
+//! `relish path` source-node selection, rendering and exit contract.
 
 use std::fmt::Write as _;
 use std::time::Duration;
@@ -11,9 +11,9 @@ use super::{CommandOutcome, OutputFormat, RelishError};
 
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Arguments accepted by the trace command body.
+/// Arguments accepted by the path command body.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TraceArgs {
+pub struct PathArgs {
     /// Source application.
     pub source: String,
     /// Source namespace.
@@ -30,14 +30,14 @@ pub struct TraceArgs {
     pub output: OutputFormat,
 }
 
-/// Run `relish trace` against the configured cluster.
-pub async fn run(args: TraceArgs) -> Result<CommandOutcome, RelishError> {
+/// Run `relish path` against the configured cluster.
+pub async fn run(args: PathArgs) -> Result<CommandOutcome, RelishError> {
     run_with_client(args, &BunClient::default_local()).await
 }
 
 /// Run with an explicit entry client for tests and embedded callers.
 pub async fn run_with_client(
-    args: TraceArgs,
+    args: PathArgs,
     entry: &BunClient,
 ) -> Result<CommandOutcome, RelishError> {
     let request = TraceRequest {
@@ -48,16 +48,19 @@ pub async fn run_with_client(
         port: args.port,
         count: Some(args.count),
     };
-    let result = trace(&request, entry).await?;
+    let result = probe_path(&request, entry).await?;
     println!("{}", render_result(&result, args.output)?);
     Ok(outcome(&result.overall_result))
 }
 
-/// Run a trace on a node that runs the source workload, reached through the
+/// Probe the path from a node that runs the source workload, reached through the
 /// entry node's relay.
-pub async fn trace(request: &TraceRequest, entry: &BunClient) -> Result<TraceResult, RelishError> {
+pub async fn probe_path(
+    request: &TraceRequest,
+    entry: &BunClient,
+) -> Result<TraceResult, RelishError> {
     let source = find_source_client(entry, &request.source, &request.source_namespace).await?;
-    tokio::time::timeout(Duration::from_secs(50), source.trace(request))
+    tokio::time::timeout(Duration::from_secs(50), source.probe_path(request))
         .await
         .map_err(|_| RelishError::RequestTimeout)?
 }
@@ -135,7 +138,7 @@ fn render_result(result: &TraceResult, output: OutputFormat) -> Result<String, R
 
 fn render_human(result: &TraceResult) -> String {
     let mut output = format!(
-        "Trace {} -> {}:{} from node {}\n",
+        "Path {} -> {}:{} from node {}\n",
         result.source, result.destination, result.destination_port, result.source_node
     );
     for step in &result.steps {
@@ -254,11 +257,11 @@ mod tests {
         assert_eq!(outcome(&result.overall_result), CommandOutcome::Warnings);
     }
 
-    /// The tour's `relish trace frontend --to redis --count 10` under a
+    /// The tour's `relish path frontend --to redis --count 10` under a
     /// delay: the fault is named, with its live evidence, and the connect
     /// figures come from inside the container.
     #[test]
-    fn a_trace_through_a_delay_shows_the_fault_and_the_connect_times() {
+    fn a_path_through_a_delay_shows_the_fault_and_the_connect_times() {
         use crate::onion::trace::{ConnectSummary, TraceStep};
         let step = |number: u32, name: &str, details: &[&str], verdict: TraceVerdict| TraceStep {
             step_number: number,
@@ -335,7 +338,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_trace_maps_to_exit_one() {
+    fn failed_path_maps_to_exit_one() {
         let result = result(TraceVerdict::Fail {
             reason: "firewall denied".to_string(),
         });

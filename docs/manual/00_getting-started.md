@@ -73,5 +73,5 @@ arguments for the terminal one.
 - The five-minute tour: `relish manual tour`
 - Deploy and manage an app: `deploy-an-app`
 - Form a real cluster: `cluster-basics`
-- Diagnose a broken cluster (`wtf`, `trace`, `bench`): `diagnostics`
+- Diagnose a broken cluster (`wtf`, `path`, `bench`): `diagnostics`
 - Press `/` in this manual to search; `q` quits.
