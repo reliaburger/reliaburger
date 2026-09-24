@@ -13,7 +13,8 @@ cluster plan asked for before the homepage copy changed.
   as in a release.
 - Binaries: Linux aarch64 `bun` and `relish` built `--release --features ebpf`
   in the `reliaburger-test` Lima VM; the host `relish` a debug build of the same
-  tree (`fix/z2c-tour` at the tour-copy commit).
+  tree (`fix/z2c-tour` at `d87d0d4`; the load generator's CPU limit changed
+  after this run).
 - The manifest was applied from `examples/kubernetes/podinfo.yaml`, the file the
   Pages workflow publishes as `https://reliaburger.com/demo/podinfo.yaml`. The
   URL path itself is covered by `relish apply`'s own tests.
