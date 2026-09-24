@@ -8,6 +8,10 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
+use std::collections::BTreeMap;
+
+use oci_distribution::manifest::OciDescriptor;
+
 use super::oci_pull::retry_registry_read;
 
 /// A parsed OCI image reference.
@@ -138,6 +142,89 @@ fn split_name_tag(s: &str) -> (&str, String) {
     }
 }
 
+/// Whether plain HTTP may reach `registry`. Remote registries stay on HTTPS;
+/// local development registries and test fixtures on the same host don't need
+/// a certificate merely to move bytes that are verified by digest anyway.
+pub(crate) fn is_loopback_registry(registry: &str) -> bool {
+    registry.starts_with("127.0.0.1:") || registry.starts_with("localhost:")
+}
+
+/// Registries that serve digest-pinned images on behalf of an upstream host,
+/// e.g. `public.ecr.aws` → `mirror.internal:5000`.
+///
+/// A digest names exact bytes and every pull verifies the whole digest chain,
+/// so a mirror can make a pull faster or fail it, but can never substitute
+/// content. Tag references always go to their own registry: a mirror could
+/// answer a mutable tag with a different image.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(
+    try_from = "BTreeMap<String, String>",
+    into = "BTreeMap<String, String>"
+)]
+pub struct ImageMirrors(BTreeMap<String, String>);
+
+impl TryFrom<BTreeMap<String, String>> for ImageMirrors {
+    type Error = ImageError;
+
+    fn try_from(mirrors: BTreeMap<String, String>) -> Result<Self, Self::Error> {
+        Self::new(mirrors)
+    }
+}
+
+impl From<ImageMirrors> for BTreeMap<String, String> {
+    fn from(mirrors: ImageMirrors) -> Self {
+        mirrors.0
+    }
+}
+
+impl ImageMirrors {
+    /// Validate `upstream host → mirror host[:port]` pairs.
+    pub fn new(mirrors: BTreeMap<String, String>) -> Result<Self, ImageError> {
+        for (upstream, mirror) in &mirrors {
+            for host in [upstream, mirror] {
+                let valid = !host.is_empty()
+                    && !host.contains(['/', '@', '?', '#'])
+                    && !host.chars().any(char::is_whitespace);
+                if !valid {
+                    return Err(ImageError::InvalidReference(format!(
+                        "image mirror {upstream:?} = {mirror:?} must map one registry \
+                         host[:port] to another, without a scheme or path"
+                    )));
+                }
+            }
+        }
+        Ok(Self(mirrors))
+    }
+
+    /// The same repository and digest on `image`'s mirror, if it has one
+    /// and `image` is pinned by digest.
+    pub fn mirror_for(&self, image: &ImageReference) -> Option<ImageReference> {
+        if !image.tag.starts_with("sha256:") {
+            return None;
+        }
+        let mirror = self.0.get(&image.registry)?;
+        Some(ImageReference {
+            registry: mirror.clone(),
+            repository: image.repository.clone(),
+            tag: image.tag.clone(),
+        })
+    }
+
+    /// Mirrors reached over plain HTTP (see [`is_loopback_registry`]).
+    pub(crate) fn loopback_hosts(&self) -> Vec<String> {
+        self.0
+            .values()
+            .filter(|mirror| is_loopback_registry(mirror))
+            .cloned()
+            .collect()
+    }
+
+    /// The configured `upstream → mirror` pairs.
+    pub fn as_map(&self) -> &BTreeMap<String, String> {
+        &self.0
+    }
+}
+
 /// An image's blobs, materialised in local storage.
 #[derive(Debug, Clone)]
 pub struct LocalImageBlobs {
@@ -223,6 +310,8 @@ pub struct ImageStore {
     /// own ownership (see `grill::userns`). `None` keeps the unpacking
     /// user as owner.
     owner_shift: Option<u32>,
+    /// Registries tried before the origin for digest-pinned images.
+    mirrors: ImageMirrors,
 }
 
 /// The path of a blob in the storage shared by the registry and the runtime.
@@ -238,7 +327,14 @@ impl ImageStore {
             cluster_source: std::sync::Arc::new(std::sync::OnceLock::new()),
             unpack_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             owner_shift: None,
+            mirrors: ImageMirrors::default(),
         }
+    }
+
+    /// Try `mirrors` before an image's own registry for digest-pinned pulls.
+    pub fn with_mirrors(mut self, mirrors: ImageMirrors) -> Self {
+        self.mirrors = mirrors;
+        self
     }
 
     /// Unpack images with each file owned by `base` plus its uid and gid
@@ -361,7 +457,9 @@ impl ImageStore {
     /// manifests on disk; subsequent pulls of the same image are fast.
     pub async fn pull_and_unpack(&self, image: &str) -> Result<PulledImage, ImageError> {
         let image_ref = ImageReference::parse(image)?;
-        let oci_ref = image_ref.to_oci_reference()?;
+        // Refuse a reference the registry client can't express before any
+        // cluster or cache lookup acts on it.
+        image_ref.to_oci_reference()?;
 
         let rootfs = self.rootfs_path(&image_ref);
 
@@ -406,13 +504,45 @@ impl ImageStore {
             }
         }
 
+        // A digest-pinned image may come from a configured mirror first. The
+        // digest chain is verified either way, so a failing or dishonest
+        // mirror costs time, never integrity.
+        let (layers, config) = match self.mirrors.mirror_for(&image_ref) {
+            Some(mirror) => match self.fetch_external(&image_ref, &mirror).await {
+                Ok(fetched) => fetched,
+                Err(reason) => {
+                    eprintln!(
+                        "warning: mirror {} failed for {image}: {reason} — \
+                         falling back to {}",
+                        mirror.registry, image_ref.registry
+                    );
+                    self.fetch_external(&image_ref, &image_ref).await?
+                }
+            },
+            None => self.fetch_external(&image_ref, &image_ref).await?,
+        };
+        // Unpack layers into an immutable content-addressed generation
+        // (REG5), not the shared tag directory — a re-pull after a tag move
+        // gets a fresh generation and can't clobber a running container.
+        // Tar extraction is CPU-bound, so it runs on a blocking task.
+        let layer_paths: Vec<PathBuf> = layers.iter().map(|l| self.blob_path(&l.digest)).collect();
+        let rootfs = self.unpack_to(layer_paths, rootfs).await?;
+        Ok(PulledImage { rootfs, config })
+    }
+
+    /// Fetch `image`'s verified manifest, config and layer blobs from
+    /// `source`, which is either the image's own registry or its mirror.
+    /// Cache entries stay keyed by `image`, so both sources fill one cache.
+    async fn fetch_external(
+        &self,
+        image_ref: &ImageReference,
+        source: &ImageReference,
+    ) -> Result<(Vec<OciDescriptor>, super::image_config::ImageConfig), ImageError> {
         // Keep remote registries on HTTPS. Loopback is the one exception:
         // local development registries and the hermetic test fixture do not
         // need a certificate merely to move bytes within the same host.
-        let protocol = if image_ref.registry.starts_with("127.0.0.1:")
-            || image_ref.registry.starts_with("localhost:")
-        {
-            oci_distribution::client::ClientProtocol::HttpsExcept(vec![image_ref.registry.clone()])
+        let protocol = if is_loopback_registry(&source.registry) {
+            oci_distribution::client::ClientProtocol::HttpsExcept(vec![source.registry.clone()])
         } else {
             oci_distribution::client::ClientProtocol::Https
         };
@@ -426,13 +556,15 @@ impl ImageStore {
         let client = oci_distribution::Client::new(client_config);
         let auth = oci_distribution::secrets::RegistryAuth::Anonymous;
 
+        let oci_ref = source.to_oci_reference()?;
+
         // Verify the raw digest chain before publishing any cache metadata.
         let verified = retry_registry_read(super::oci_pull::METADATA_READ, || {
             super::oci_pull::pull_verified_manifest(&client, &oci_ref, &auth)
         })
         .await
         .map_err(|e| ImageError::ManifestPull {
-            image: image_ref.full_reference(),
+            image: source.full_reference(),
             reason: e.to_string(),
         })?;
 
@@ -440,7 +572,7 @@ impl ImageStore {
         let config = parse_config(&verified.config_bytes, &manifest.config.digest)?;
 
         // Save the manifest for cache validation
-        let manifest_path = self.manifest_path(&image_ref);
+        let manifest_path = self.manifest_path(image_ref);
         if let Some(parent) = manifest_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -513,18 +645,7 @@ impl ImageStore {
             tokio::fs::write(&tmp, &blob_data).await?;
             tokio::fs::rename(&tmp, &blob_path).await?;
         }
-
-        // Unpack layers into an immutable content-addressed generation
-        // (REG5), not the shared tag directory — a re-pull after a tag move
-        // gets a fresh generation and can't clobber a running container.
-        // Tar extraction is CPU-bound, so it runs on a blocking task.
-        let layer_paths: Vec<PathBuf> = manifest
-            .layers
-            .iter()
-            .map(|l| self.blob_path(&l.digest))
-            .collect();
-        let rootfs = self.unpack_to(layer_paths, rootfs).await?;
-        Ok(PulledImage { rootfs, config })
+        Ok((manifest.layers, config))
     }
 
     /// Unpack blobs the cluster already holds, re-checking the config
@@ -2263,5 +2384,169 @@ mod tests {
 
         let result = store.pull_and_unpack(&missing).await;
         assert!(result.is_err());
+    }
+
+    /// A loopback address nothing listens on: any request to it is refused.
+    fn unreachable_registry() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().to_string()
+    }
+
+    /// `fixture`'s image under another registry host, and a mirror map
+    /// sending that host to `mirror`.
+    fn mirrored(fixture: &RegistryFixture, origin: &str, mirror: &str) -> (String, ImageMirrors) {
+        let (_, path) = fixture.reference.split_once('/').unwrap();
+        let mirrors =
+            ImageMirrors::new(BTreeMap::from([(origin.to_owned(), mirror.to_owned())])).unwrap();
+        (format!("{origin}/{path}"), mirrors)
+    }
+
+    fn registry_host(fixture: &RegistryFixture) -> &str {
+        fixture.reference.split_once('/').unwrap().0
+    }
+
+    #[test]
+    fn mirrors_apply_only_to_digest_pinned_references() {
+        let mirrors = ImageMirrors::new(BTreeMap::from([(
+            "public.ecr.aws".to_owned(),
+            "127.0.0.1:5099".to_owned(),
+        )]))
+        .unwrap();
+        let pinned = ImageReference::parse(&format!(
+            "public.ecr.aws/docker/library/busybox@sha256:{}",
+            "a".repeat(64)
+        ))
+        .unwrap();
+        let mirror = mirrors.mirror_for(&pinned).unwrap();
+        assert_eq!(mirror.registry, "127.0.0.1:5099");
+        assert_eq!(mirror.repository, pinned.repository);
+        assert_eq!(mirror.tag, pinned.tag);
+        let tagged = ImageReference::parse("public.ecr.aws/docker/library/busybox:1.37").unwrap();
+        assert_eq!(mirrors.mirror_for(&tagged), None);
+        let elsewhere =
+            ImageReference::parse(&format!("ghcr.io/org/app@sha256:{}", "a".repeat(64))).unwrap();
+        assert_eq!(mirrors.mirror_for(&elsewhere), None);
+        assert_eq!(mirrors.loopback_hosts(), ["127.0.0.1:5099"]);
+    }
+
+    #[test]
+    fn mirrors_refuse_schemes_paths_and_empty_hosts() {
+        for (upstream, mirror) in [
+            ("public.ecr.aws", "http://127.0.0.1:5099"),
+            ("public.ecr.aws", "mirror.internal/ecr"),
+            ("public.ecr.aws", ""),
+            ("", "mirror.internal"),
+            ("public.ecr.aws", "user@mirror.internal"),
+            ("public.ecr.aws", "mirror internal"),
+        ] {
+            let map = BTreeMap::from([(upstream.to_owned(), mirror.to_owned())]);
+            assert!(
+                ImageMirrors::new(map).is_err(),
+                "accepted {upstream:?} = {mirror:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_mirror_serves_digest_pinned_pulls_without_the_origin() {
+        let mirror = start_registry_fixture().await;
+        let (reference, mirrors) =
+            mirrored(&mirror, &unreachable_registry(), registry_host(&mirror));
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(tmp.path().to_path_buf()).with_mirrors(mirrors);
+        let rootfs = store.pull_and_unpack(&reference).await.unwrap().rootfs;
+        assert_eq!(
+            std::fs::read(rootfs.join("bin/sh")).unwrap(),
+            b"fixture shell"
+        );
+        assert_eq!(mirror.layer_requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_denying_or_dishonest_mirror_falls_back_to_the_verified_origin() {
+        for case in ["denied", "changed manifest", "changed configuration"] {
+            let mirror = match case {
+                "denied" => {
+                    start_registry_fixture_with_fault(Some(registry_fault(
+                        false,
+                        StatusCode::FORBIDDEN,
+                        "DENIED",
+                        usize::MAX,
+                    )))
+                    .await
+                }
+                "changed manifest" => {
+                    start_registry_fixture_with_options(
+                        None,
+                        Some(RegistryIntegrityCase::ChangedManifest),
+                    )
+                    .await
+                }
+                _ => {
+                    start_registry_fixture_with_options(
+                        None,
+                        Some(RegistryIntegrityCase::ChangedConfiguration),
+                    )
+                    .await
+                }
+            };
+            let origin = start_registry_fixture().await;
+            let (reference, mirrors) =
+                mirrored(&origin, registry_host(&origin), registry_host(&mirror));
+            assert_eq!(reference, origin.reference, "{case}");
+            let tmp = tempfile::tempdir().unwrap();
+            let store = ImageStore::new(tmp.path().to_path_buf()).with_mirrors(mirrors);
+            let pulled = store.pull_and_unpack(&reference).await.unwrap();
+            assert_eq!(
+                std::fs::read(pulled.rootfs.join("bin/sh")).unwrap(),
+                b"fixture shell",
+                "{case}"
+            );
+            assert_eq!(pulled.config.env, ["FIXTURE=1"], "{case}");
+            assert_eq!(mirror.manifest_requests.load(Ordering::SeqCst), 1, "{case}");
+            assert_eq!(mirror.layer_requests.load(Ordering::SeqCst), 0, "{case}");
+            assert_eq!(origin.manifest_requests.load(Ordering::SeqCst), 1, "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn pull_through_reads_digest_pinned_images_from_a_loopback_mirror() {
+        use crate::pickle::upstream::{OciUpstream, UpstreamRegistry};
+        let mirror = start_registry_fixture().await;
+        let (reference, mirrors) =
+            mirrored(&mirror, &unreachable_registry(), registry_host(&mirror));
+        // The HTTPS client still reaches a loopback mirror over plain HTTP.
+        let upstream = OciUpstream::new(Default::default()).with_mirrors(mirrors);
+        let reference = ImageReference::parse(&reference).unwrap();
+        let manifest = upstream.fetch_manifest(&reference).await.unwrap();
+        let bytes = upstream
+            .fetch_blob(&reference, &manifest.layers[0])
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::pickle::store::compute_sha256(&bytes),
+            manifest.layers[0].digest
+        );
+        assert_eq!(mirror.layer_requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn pull_through_falls_back_to_the_origin_when_the_mirror_lies() {
+        use crate::pickle::upstream::{OciUpstream, UpstreamRegistry};
+        let mirror =
+            start_registry_fixture_with_options(None, Some(RegistryIntegrityCase::ChangedManifest))
+                .await;
+        let origin = start_registry_fixture().await;
+        let (reference, mirrors) =
+            mirrored(&origin, registry_host(&origin), registry_host(&mirror));
+        let upstream = OciUpstream::insecure_http(Default::default()).with_mirrors(mirrors);
+        let reference = ImageReference::parse(&reference).unwrap();
+        let manifest = upstream.fetch_manifest(&reference).await.unwrap();
+        assert_eq!(
+            crate::pickle::store::compute_sha256(&manifest.manifest_bytes),
+            manifest.digest
+        );
+        assert_eq!(mirror.manifest_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(origin.manifest_requests.load(Ordering::SeqCst), 1);
     }
 }

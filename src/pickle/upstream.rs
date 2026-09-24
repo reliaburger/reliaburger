@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
-use crate::grill::image::ImageReference;
+use crate::grill::image::{ImageMirrors, ImageReference};
 use crate::grill::oci_pull::{
     LAYER_READ, METADATA_READ, pull_verified_manifest_for_architecture, retry_registry_read,
 };
@@ -159,6 +159,10 @@ pub struct OciUpstream {
     client: oci_distribution::Client,
     /// host → (username, password); anonymous when absent.
     credentials: HashMap<String, (String, String)>,
+    /// Tried before the origin for digest-pinned images.
+    mirrors: ImageMirrors,
+    /// Every registry is plain HTTP (integration fixtures only).
+    plain_http: bool,
 }
 
 impl OciUpstream {
@@ -178,14 +182,30 @@ impl OciUpstream {
         protocol: oci_distribution::client::ClientProtocol,
     ) -> Self {
         let config = oci_distribution::client::ClientConfig {
-            protocol,
+            protocol: protocol.clone(),
             ..Default::default()
         };
         Self {
             architecture: std::env::consts::ARCH.into(),
             client: oci_distribution::Client::new(config),
             credentials,
+            mirrors: ImageMirrors::default(),
+            plain_http: matches!(protocol, oci_distribution::client::ClientProtocol::Http),
         }
+    }
+
+    /// Try `mirrors` before an image's own registry for digest-pinned reads.
+    /// Loopback mirrors use plain HTTP, like the runtime's direct pulls.
+    pub fn with_mirrors(mut self, mirrors: ImageMirrors) -> Self {
+        let loopback = mirrors.loopback_hosts();
+        if !self.plain_http && !loopback.is_empty() {
+            self.client = oci_distribution::Client::new(oci_distribution::client::ClientConfig {
+                protocol: oci_distribution::client::ClientProtocol::HttpsExcept(loopback),
+                ..Default::default()
+            });
+        }
+        self.mirrors = mirrors;
+        self
     }
 
     /// Select Linux images for the container node rather than the harness host.
@@ -238,59 +258,13 @@ impl UpstreamRegistry for OciUpstream {
         image: &'a ImageReference,
     ) -> UpstreamFuture<'a, UpstreamManifest> {
         Box::pin(async move {
-            let reference = Self::oci_reference(image)?;
-            let auth = self.auth_for(&image.registry);
-            let verified = retry_registry_read(METADATA_READ, || {
-                pull_verified_manifest_for_architecture(
-                    &self.client,
-                    &reference,
-                    &auth,
-                    &self.architecture,
-                )
-            })
-            .await
-            .map_err(|e| {
-                PickleError::ReplicationFailed(format!(
-                    "upstream manifest {} failed: {e}",
-                    image.full_reference()
-                ))
-            })?;
-            let manifest = verified.manifest;
-            let digest = verified.digest;
-            let config_bytes = verified.config_bytes;
-            let manifest_bytes = verified.manifest_bytes;
-            let config = LayerDescriptor {
-                digest: Digest::new(&manifest.config.digest).map_err(|e| {
-                    PickleError::ReplicationFailed(format!("upstream config digest: {e}"))
-                })?,
-                size: config_bytes.len() as u64,
-                media_type: manifest.config.media_type.clone(),
-            };
-            let layers = manifest
-                .layers
-                .iter()
-                .map(|layer| {
-                    Ok(LayerDescriptor {
-                        digest: Digest::new(&layer.digest).map_err(|e| {
-                            PickleError::ReplicationFailed(format!("upstream layer digest: {e}"))
-                        })?,
-                        size: layer.size as u64,
-                        media_type: layer.media_type.clone(),
-                    })
-                })
-                .collect::<Result<Vec<_>, PickleError>>()?;
-
-            let digest = Digest::new(&digest).map_err(|e| {
-                PickleError::ReplicationFailed(format!("upstream manifest digest: {e}"))
-            })?;
-
-            Ok(UpstreamManifest {
-                digest,
-                manifest_bytes,
-                config,
-                config_bytes,
-                layers,
-            })
+            if let Some(mirror) = self.mirrors.mirror_for(image) {
+                match self.fetch_manifest_from(&mirror).await {
+                    Ok(manifest) => return Ok(manifest),
+                    Err(error) => report_mirror_failure(image, &mirror, &error),
+                }
+            }
+            self.fetch_manifest_from(image).await
         })
     }
 
@@ -300,45 +274,128 @@ impl UpstreamRegistry for OciUpstream {
         layer: &'a LayerDescriptor,
     ) -> UpstreamFuture<'a, Vec<u8>> {
         Box::pin(async move {
-            let reference = Self::oci_reference(image)?;
-            let size = i64::try_from(layer.size).map_err(|_| {
-                PickleError::ReplicationFailed(format!(
-                    "upstream layer size is out of range for {}",
-                    layer.digest
-                ))
-            })?;
-            let descriptor = oci_distribution::manifest::OciDescriptor {
-                digest: layer.digest.as_str().to_string(),
-                media_type: layer.media_type.clone(),
-                size,
-                ..Default::default()
-            };
-            let bytes = retry_registry_read(LAYER_READ, || async {
-                // Each attempt owns an empty buffer; partial responses cannot leak
-                // into the next attempt. Metadata is not an allocation budget.
-                let mut bytes = Vec::new();
-                self.client
-                    .pull_blob(&reference, &descriptor, &mut bytes)
-                    .await?;
-                Ok(bytes)
-            })
-            .await
-            .map_err(|e| {
-                PickleError::ReplicationFailed(format!(
-                    "upstream blob {} failed: {e}",
-                    layer.digest
-                ))
-            })?;
-            if bytes.len() as u64 != layer.size {
-                return Err(PickleError::ReplicationFailed(format!(
-                    "upstream layer size mismatch for {}: expected {}, received {}",
-                    layer.digest,
-                    layer.size,
-                    bytes.len(),
-                )));
+            if let Some(mirror) = self.mirrors.mirror_for(image) {
+                match self.fetch_blob_from(&mirror, layer).await {
+                    Ok(bytes) => return Ok(bytes),
+                    Err(error) => report_mirror_failure(image, &mirror, &error),
+                }
             }
+            self.fetch_blob_from(image, layer).await
+        })
+    }
+}
+
+fn report_mirror_failure(image: &ImageReference, mirror: &ImageReference, error: &PickleError) {
+    eprintln!(
+        "warning: mirror {} failed for {}: {error}; falling back to {}",
+        mirror.registry,
+        image.full_reference(),
+        image.registry
+    );
+}
+
+impl OciUpstream {
+    /// Read and verify `image`'s platform manifest and config from its registry.
+    async fn fetch_manifest_from(
+        &self,
+        image: &ImageReference,
+    ) -> Result<UpstreamManifest, PickleError> {
+        let reference = Self::oci_reference(image)?;
+        let auth = self.auth_for(&image.registry);
+        let verified = retry_registry_read(METADATA_READ, || {
+            pull_verified_manifest_for_architecture(
+                &self.client,
+                &reference,
+                &auth,
+                &self.architecture,
+            )
+        })
+        .await
+        .map_err(|e| {
+            PickleError::ReplicationFailed(format!(
+                "upstream manifest {} failed: {e}",
+                image.full_reference()
+            ))
+        })?;
+        let manifest = verified.manifest;
+        let digest = verified.digest;
+        let config_bytes = verified.config_bytes;
+        let manifest_bytes = verified.manifest_bytes;
+        let config = LayerDescriptor {
+            digest: Digest::new(&manifest.config.digest).map_err(|e| {
+                PickleError::ReplicationFailed(format!("upstream config digest: {e}"))
+            })?,
+            size: config_bytes.len() as u64,
+            media_type: manifest.config.media_type.clone(),
+        };
+        let layers = manifest
+            .layers
+            .iter()
+            .map(|layer| {
+                Ok(LayerDescriptor {
+                    digest: Digest::new(&layer.digest).map_err(|e| {
+                        PickleError::ReplicationFailed(format!("upstream layer digest: {e}"))
+                    })?,
+                    size: layer.size as u64,
+                    media_type: layer.media_type.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, PickleError>>()?;
+
+        let digest = Digest::new(&digest).map_err(|e| {
+            PickleError::ReplicationFailed(format!("upstream manifest digest: {e}"))
+        })?;
+
+        Ok(UpstreamManifest {
+            digest,
+            manifest_bytes,
+            config,
+            config_bytes,
+            layers,
+        })
+    }
+
+    /// Read one layer from `image`'s registry, checking its advertised size.
+    async fn fetch_blob_from(
+        &self,
+        image: &ImageReference,
+        layer: &LayerDescriptor,
+    ) -> Result<Vec<u8>, PickleError> {
+        let reference = Self::oci_reference(image)?;
+        let size = i64::try_from(layer.size).map_err(|_| {
+            PickleError::ReplicationFailed(format!(
+                "upstream layer size is out of range for {}",
+                layer.digest
+            ))
+        })?;
+        let descriptor = oci_distribution::manifest::OciDescriptor {
+            digest: layer.digest.as_str().to_string(),
+            media_type: layer.media_type.clone(),
+            size,
+            ..Default::default()
+        };
+        let bytes = retry_registry_read(LAYER_READ, || async {
+            // Each attempt owns an empty buffer; partial responses cannot leak
+            // into the next attempt. Metadata is not an allocation budget.
+            let mut bytes = Vec::new();
+            self.client
+                .pull_blob(&reference, &descriptor, &mut bytes)
+                .await?;
             Ok(bytes)
         })
+        .await
+        .map_err(|e| {
+            PickleError::ReplicationFailed(format!("upstream blob {} failed: {e}", layer.digest))
+        })?;
+        if bytes.len() as u64 != layer.size {
+            return Err(PickleError::ReplicationFailed(format!(
+                "upstream layer size mismatch for {}: expected {}, received {}",
+                layer.digest,
+                layer.size,
+                bytes.len(),
+            )));
+        }
+        Ok(bytes)
     }
 }
 

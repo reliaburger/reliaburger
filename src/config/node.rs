@@ -682,6 +682,13 @@ pub struct ImagesSection {
     pub max_context_bytes: u64,
     /// Image trust policy (signature requirements).
     pub trust_policy: TrustPolicySection,
+    /// Registries that serve digest-pinned images on behalf of an upstream
+    /// host, e.g. `{ "public.ecr.aws" = "mirror.internal:5000" }`. Bun and
+    /// the pull-through cache try the mirror first and fall back to the
+    /// upstream if it fails. Every pull verifies the digest chain, so a
+    /// mirror can't substitute content; tag references never use it.
+    /// Loopback mirrors (`127.0.0.1:…`, `localhost:…`) speak plain HTTP.
+    pub mirrors: crate::grill::image::ImageMirrors,
 }
 
 /// Credentials for one upstream registry host.
@@ -739,6 +746,7 @@ impl Default for ImagesSection {
             build_timeout_secs: 900,
             max_context_bytes: 256 * 1024 * 1024,
             trust_policy: TrustPolicySection::default(),
+            mirrors: crate::grill::image::ImageMirrors::default(),
         }
     }
 }
@@ -907,6 +915,33 @@ pub struct AlertDestination {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_mirrors_parse_and_refuse_urls() {
+        let config =
+            NodeConfig::parse("[images]\nmirrors = { 'public.ecr.aws' = '127.0.0.1:5099' }\n")
+                .unwrap();
+        assert_eq!(
+            config.images.mirrors.as_map().get("public.ecr.aws"),
+            Some(&"127.0.0.1:5099".to_string())
+        );
+        assert!(
+            NodeConfig::parse("")
+                .unwrap()
+                .images
+                .mirrors
+                .as_map()
+                .is_empty()
+        );
+        let error = NodeConfig::parse(
+            "[images]\nmirrors = { 'public.ecr.aws' = 'https://mirror.internal' }\n",
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("without a scheme or path"),
+            "{error}"
+        );
+    }
 
     #[test]
     fn node_config_rejects_ignored_release_endpoint() {

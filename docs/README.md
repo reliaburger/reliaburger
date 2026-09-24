@@ -996,11 +996,21 @@ p2p_concurrency = 4          # parallel layer fetches per image pull
 build_timeout_secs = 900     # ceiling per buildah stage
 max_context_bytes = 268435456 # 256 MiB cap on an extracted build context
 
+# Digest-pinned images try a mirror first and fall back to the upstream.
+# Tag references never use a mirror; loopback mirrors speak plain HTTP.
+mirrors = { "public.ecr.aws" = "mirror.internal:5000", "ghcr.io" = "mirror.internal:5000" }
+
 [[images.external_registries]]
 host = "ghcr.io"
 username = "bot"
 password_secret = "GHCR_TOKEN"   # environment variable, read at startup
 ```
+
+A mirror only ever serves an image named by its `@sha256:` digest, and Bun
+verifies the whole digest chain whichever registry answers, so a stale or
+hostile mirror can make a pull slower but never change what runs. Authenticated
+`GET /v1/capabilities` reports the configured mirrors, and `relish test` stages
+its pinned fixture image through them.
 
 ### Volume snapshots and scheduled backups (Phase 12)
 

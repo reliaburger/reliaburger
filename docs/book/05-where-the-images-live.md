@@ -715,6 +715,48 @@ list too. The unit tests drive it with `#[tokio::test(start_paused = true)]` and
 `std::future::pending()`, a future that never completes, so "the registry hung
 for 30 seconds" takes no real time at all.
 
+Retries help when the internet is slow. They can't help when it's gone, and
+some clusters never had it: air-gapped sites, or a CI job that shouldn't depend
+on a CDN's mood. So digest-pinned images can come from a mirror:
+
+```toml
+[images]
+mirrors = { "public.ecr.aws" = "mirror.internal:5000" }
+```
+
+Why only digest-pinned ones? Because a digest makes the mirror harmless. When a
+deployment asks for `busybox@sha256:9532…`, Bun hashes the index, the platform
+manifest, the config and every layer it receives, whoever sent them. A mirror
+that serves anything else fails verification, and Bun falls back to the real
+registry. A tag is different. `busybox:1.37` means whatever the registry says
+today, so a mirror answering it would be choosing the image for us. Tags always
+go home.
+
+Validation happens while the config parses, not when the first pull fails:
+
+```rust
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "BTreeMap<String, String>", into = "BTreeMap<String, String>")]
+pub struct ImageMirrors(BTreeMap<String, String>);
+
+impl TryFrom<BTreeMap<String, String>> for ImageMirrors {
+    type Error = ImageError;
+
+    fn try_from(mirrors: BTreeMap<String, String>) -> Result<Self, Self::Error> {
+        Self::new(mirrors)
+    }
+}
+```
+
+`TryFrom` is the standard library's trait for fallible conversions, and `type
+Error = ImageError;` is an *associated type*: each implementation names its own
+error type, where Go would return a bare `error` interface. The `try_from`
+attribute tells serde to deserialise a plain map first, then run it through our
+conversion. There's no way to build an `ImageMirrors` holding `https://…` or a
+path, so the pull code never has to check again. Loopback mirrors use plain
+HTTP, like the loopback registries the tests already use; everything else stays
+on HTTPS.
+
 ## Who owns these bytes?
 
 Content addressing answers "are these the right bytes?". It says nothing about

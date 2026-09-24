@@ -649,7 +649,15 @@ When an image reference includes a registry hostname (e.g., `docker.io/redis:7-a
 
 2. **Subsequent requests.** Other nodes resolve the image from Raft state and pull layers from peers. The upstream registry is never contacted again until the cached manifest expires or is explicitly refreshed.
 
-3. **Tag re-resolution.** For mutable tags (e.g., `redis:7-alpine`), Pickle periodically re-checks the upstream registry for manifest changes (configurable interval, default 1 hour). If the upstream digest has changed, the new manifest and any new layers are pulled and cached.
+3. **Digest mirrors.** `[images] mirrors` maps an upstream host to a mirror
+   (`{ "public.ecr.aws" = "mirror.internal:5000" }`). For a digest-pinned
+   reference, the pull-through cache and Bun's direct pull read from the mirror
+   first and fall back to the upstream on any failure. The digest chain is
+   verified either way, so the mirror is untrusted. Tag references always go to
+   their own registry, because a mirror could answer a mutable tag with a
+   different image. Loopback mirrors use plain HTTP.
+
+4. **Tag re-resolution.** For mutable tags (e.g., `redis:7-alpine`), Pickle periodically re-checks the upstream registry for manifest changes (configurable interval, default 1 hour). If the upstream digest has changed, the new manifest and any new layers are pulled and cached.
 
 ```rust
 /// Pull-through cache resolution for an external image reference.
@@ -897,6 +905,9 @@ external_registries = [
   { host = "docker.io", username = "myorg", password_secret = "DOCKERHUB_TOKEN" },
 ]
 
+# Mirrors for digest-pinned images (§5.4). Tried first, upstream on failure.
+mirrors = { "public.ecr.aws" = "mirror.internal:5000" }
+
 # Image trust policy. Require all Pickle-hosted images to be signed before
 # Meat will schedule them. Unsigned images are accepted into Pickle but
 # remain unschedulable. Default: false.
@@ -935,7 +946,7 @@ pub struct PickleConfig {
     pub trust_policy: TrustPolicySection,
     // Note: the shipped `ImagesSection` also carries registry_port,
     // registry_bind, p2p_concurrency, pull_through, cache_recheck_secs,
-    // build_timeout_secs, and max_context_bytes. There is no push_sync,
+    // build_timeout_secs, max_context_bytes and mirrors. There is no push_sync,
     // pre_pull, or gc_retain_tags field.
 }
 

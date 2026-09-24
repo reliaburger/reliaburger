@@ -1354,6 +1354,7 @@ join = ["10.0.1.5:9443"]
 | `[images]` | `gc_retain_days` | `30` | 1-365 | Keep images accessed within this many days. |
 | `[images]` | `pre_pull` | `true` | bool | Pre-pull images referenced by scheduled workloads. |
 | `[images]` | `external_registries` | `[]` | list of registry objects | External OCI registries for pulling images not in Pickle. |
+| `[images]` | `mirrors` | `{}` | map of upstream host to mirror `host[:port]` | Registries tried first for digest-pinned images; the upstream is the fallback. |
 | `[logs]` | `retention_days` | `7` | 1-365 | Days to retain uncompressed logs. |
 | `[logs]` | `compressed_retention_days` | `30` | 1-3650 | Days to retain compressed logs. |
 | `[logs]` | `max_storage` | `"20Gi"` | resource string (bytes) | Maximum disk space for logs. |

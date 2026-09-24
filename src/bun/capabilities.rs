@@ -86,6 +86,8 @@ pub struct StaticCapabilities {
     pub node_pressure: bool,
     /// Registry image policy requires trusted signatures.
     pub registry_signatures_required: bool,
+    /// Configured `[images] mirrors` for digest-pinned images.
+    pub image_mirrors: crate::grill::ImageMirrors,
     /// Authenticated diagnostics facts and server-side storage paths. Paths
     /// are never copied into the public capability or diagnostic response.
     pub diagnostics: crate::bun::diagnostics::DiagnosticStaticEvidence,
@@ -193,6 +195,10 @@ pub struct ClusterCapabilities {
     /// Actual listeners; a managed client substitutes its explicit host forwards.
     #[serde(default)]
     pub service_endpoints: ServiceEndpoints,
+    /// Registries this node tries first for digest-pinned images, so a test
+    /// harness can stage fixtures from the same place the node pulls them.
+    #[serde(default)]
+    pub image_mirrors: crate::grill::ImageMirrors,
     /// Wire schema version.
     pub schema_version: u32,
     /// Stable identity of the node which assembled this report.
@@ -392,6 +398,7 @@ impl ClusterCapabilities {
         let operations = operation_policy(&statics.test_policy);
         let mut report = Self {
             service_endpoints: statics.service_endpoints.clone(),
+            image_mirrors: statics.image_mirrors.clone(),
             schema_version: CAPABILITY_SCHEMA_VERSION,
             node_id: statics.node_id.clone(),
             cluster_name: statics.cluster_name.clone(),

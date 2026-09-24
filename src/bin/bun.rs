@@ -909,7 +909,13 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     }
 
     // Select runtime
-    let runtime = select_runtime(&cli.runtime, &instances_dir, &pickle_dir).await?;
+    let runtime = select_runtime(
+        &cli.runtime,
+        &instances_dir,
+        &pickle_dir,
+        &config.images.mirrors,
+    )
+    .await?;
     #[cfg(target_os = "linux")]
     let (durable_discovery, durable_kernel) = match &runtime {
         AnyGrill::Runc(runtime) if runtime.is_rootless() => {
@@ -2368,6 +2374,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         },
         node_pressure: node_pressure_available,
         registry_signatures_required: config.images.trust_policy.require_signatures,
+        image_mirrors: config.images.mirrors.clone(),
         diagnostics: reliaburger::bun::diagnostics::DiagnosticStaticEvidence {
             storage_paths: diagnostic_storage_paths,
             node_certificate: None,
@@ -2683,7 +2690,8 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                 concurrency: config.images.p2p_concurrency,
                 client: registry_client.clone(),
                 upstream: Some(std::sync::Arc::new(
-                    reliaburger::pickle::upstream::OciUpstream::new(credentials),
+                    reliaburger::pickle::upstream::OciUpstream::new(credentials)
+                        .with_mirrors(config.images.mirrors.clone()),
                 )),
                 pull_through: config.images.pull_through,
                 cache_recheck_secs: config.images.cache_recheck_secs,
@@ -3058,9 +3066,10 @@ async fn select_runtime(
     name: &str,
     instances_dir: &std::path::Path,
     image_directory: &std::path::Path,
+    mirrors: &reliaburger::grill::ImageMirrors,
 ) -> anyhow::Result<AnyGrill> {
     #[cfg(not(target_os = "linux"))]
-    let _ = image_directory;
+    let _ = (image_directory, mirrors);
     match name {
         "auto" => {
             // Both runtimes use durable owners, so launches remain
@@ -3075,6 +3084,7 @@ async fn select_runtime(
                     instances_dir,
                     image_directory,
                     rootless,
+                    mirrors,
                 )?),
             };
             let kind = match &runtime {
@@ -3100,7 +3110,7 @@ async fn select_runtime(
             let mode = if is_rootless { "rootless" } else { "root" };
             println!("bun: using runc runtime ({mode})");
 
-            let grill = create_runc_runtime(instances_dir, image_directory, is_rootless)?;
+            let grill = create_runc_runtime(instances_dir, image_directory, is_rootless, mirrors)?;
             Ok(AnyGrill::Runc(grill))
         }
         "apple" => anyhow::bail!(APPLE_RUNTIME_DEFERRED),
@@ -3113,13 +3123,15 @@ fn create_runc_runtime(
     instances_dir: &std::path::Path,
     image_directory: &std::path::Path,
     rootless: bool,
+    mirrors: &reliaburger::grill::ImageMirrors,
 ) -> anyhow::Result<reliaburger::grill::runc::RuncGrill> {
     // Runtime ownership must follow the node's actual storage directories,
     // including configured paths and explicit storage fallback selection.
     let runtime_directory = instances_dir.join("runc");
     Ok(reliaburger::grill::runc::RuncGrill::new(
         runtime_directory.join("bundles"),
-        reliaburger::grill::ImageStore::new(image_directory.to_path_buf()),
+        reliaburger::grill::ImageStore::new(image_directory.to_path_buf())
+            .with_mirrors(mirrors.clone()),
         rootless,
         runtime_directory.join("state"),
         std::env::current_exe()?,
@@ -3296,7 +3308,7 @@ mod tests {
     #[tokio::test]
     async fn apple_selection_explains_the_linux_vm_release_profile() {
         let root = tempfile::tempdir().unwrap();
-        let error = select_runtime("apple", root.path(), root.path())
+        let error = select_runtime("apple", root.path(), root.path(), &Default::default())
             .await
             .err()
             .expect("direct Apple Container must be unavailable for 0.1.0");
@@ -3314,6 +3326,7 @@ mod tests {
             "runc",
             &root.path().join("instances"),
             &root.path().join("custom-images"),
+            &Default::default(),
         )
         .await
         .unwrap();
@@ -3337,9 +3350,13 @@ mod tests {
         let mut paths = Vec::new();
         for node in ["first", "second"] {
             let instances = root.path().join(node).join("instances");
-            let runtime =
-                create_runc_runtime(&instances, &root.path().join(node).join("images"), true)
-                    .unwrap();
+            let runtime = create_runc_runtime(
+                &instances,
+                &root.path().join(node).join("images"),
+                true,
+                &Default::default(),
+            )
+            .unwrap();
             let spec: reliaburger::grill::oci::OciSpec = serde_json::from_value(serde_json::json!({
                 "root": {"path": "/", "readonly": true},
                 "process": {"args": [node], "env": [], "cwd": "/", "user": {"uid": 0, "gid": 0}},
