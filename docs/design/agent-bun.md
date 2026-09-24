@@ -123,10 +123,50 @@ range is shared by every container on the node, like Docker's
   owner.
 
 Operators must keep `2000000000..2000065536` out of `/etc/subuid` and any
-directory service. Managed and host-path volumes are bind-mounted with their
-host ownership; a container that needs to write one must own it (planned:
-hand managed volumes to the container user at first mount). Rootless runc
-maps a single id, so every image user runs as its container root there.
+directory service. Rootless runc maps a single id, so every image user runs
+as its container root there.
+
+**Volume ownership.** A bind mount keeps host ownership, and a user-namespaced
+process can only write what its mapped ids own. Before creating the container,
+Bun resolves the process user (image `USER`, or `run_as_user`/`run_as_group`),
+maps it into the node range and prepares every read-write volume:
+
+- **Managed volumes** (those with a `*.volume.json` provisioning sidecar,
+  whatever the backend: plain directory, loop-mounted ext4 or Btrfs subvolume)
+  are handed to that user. The sidecar records who the volume was last handed
+  to, and the plan follows from it:
+
+  | Recorded owner | Volume root owner | Action |
+  |---|---|---|
+  | none (first mount) | anything | `lchown` the whole tree to the user, root mode `0755` |
+  | same user | inside the container range | nothing |
+  | different user | inside the container range | move files owned by (or grouped to) the old user to the new one; leave the rest |
+  | anything | outside the container range | whole tree again (a snapshot restored from before the first mount, a host-side `chown`) |
+
+  The owner is recorded only after the walk finishes, so an interrupted
+  hand-over repeats. "Same user, do nothing" is the important row: Redis's
+  entrypoint starts as root, `chown`s `/data` to `redis` (999) and drops to
+  it. Re-chowning to root on every start would fight that, and walking a
+  populated volume on every restart costs time proportional to its size. An
+  image `USER` change is the one case that rewrites a populated volume, and
+  it moves only what the previous user owned, so files the container gave to
+  other users stay theirs. Btrfs snapshots and restores carry ownership with
+  the data; the sidecar sits beside the subvolume and survives a restore.
+- **Host-path volumes** (`source = ...`) belong to the operator and are never
+  chowned. The host directory must be owned by the container user's host id
+  (container uid `u` is host uid `2000000000 + u`), group-writable by its
+  host gid, or world-writable. When the mode bits say the process can't write,
+  Bun logs a warning naming the directory, its owner and the host uid to
+  `chown` it to, then starts the container anyway: a read-mostly mount is
+  legitimate.
+- **Rootless runc** skips all of this: the volume was created by the user
+  whose id is the container's only mapped id (container root).
+
+There is no `fs_group`. Kubernetes needs `fsGroup` because a pod's volume is
+shared by containers running as different users; a Reliaburger app has one
+process user, and images that switch users do so from root, which can
+`chown` inside the namespace once the volume is its own. The Kubernetes
+importer drops `securityContext.fsGroup` with a warning.
 
 Rootless runc has no host privilege with which to mount OverlayFS, and the
 project does not yet own a FUSE snapshotter. It therefore accepts a shared image

@@ -1047,6 +1047,19 @@ args = ["--maxmemory", "64mb"]      # replaces the image's Cmd, keeps its Entryp
 
 The image's `Env` is merged under the app's `env` (the app wins on a clash). Every rootful runc container runs in a user namespace: container uid 0 is host uid 2,000,000,000, so an image that runs as root (Redis, nginx) can `chown` its files and bind port 80 without being root on the node. Keep host ids `2000000000`–`2000065535` out of `/etc/subuid` and your directory service.
 
+Volumes follow the container's user:
+
+```toml
+[[app.cache.volumes]]
+path = "/data"                      # managed: handed to the container user on first mount
+
+[[app.cache.volumes]]
+path = "/import"
+source = "/srv/import"              # host path: never chowned by Bun
+```
+
+A managed volume is `chown`ed to the container process's host uid and gid (container uid `u` is host uid `2000000000 + u`) the first time it's mounted, and left alone after that, so an entrypoint that hands `/data` to a service user keeps it that way across restarts. If the image's `USER` (or `run_as_user`) changes, files the previous user owned move to the new one. A host-path directory stays as you made it: own it by the mapped uid (`sudo chown 2000000999:2000000999 /srv/import` for container uid 999) or make it world-writable, otherwise Bun logs a warning at start and the container can only read it. There is no `fs_group`; `relish import` drops Kubernetes `fsGroup` with a warning.
+
 An app that serves Prometheus metrics declares where, and every node scrapes its own instances of it (no Prometheus install needed):
 
 ```toml

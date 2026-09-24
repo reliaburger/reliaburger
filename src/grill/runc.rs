@@ -304,6 +304,9 @@ impl RuncGrill {
                 .map_err(GrillError::ImagePull)?;
             let lower = pulled.rootfs;
             self.apply_image_config(instance, &mut spec, &pulled.config, &lower)?;
+            if !self.rootless {
+                prepare_volumes(instance, &spec).await?;
+            }
 
             if spec.root.readonly {
                 // A read-only OCI root cannot mutate the shared generation, so
@@ -445,6 +448,84 @@ impl RuncGrill {
 
 /// Where the workload identity directory appears inside a container.
 const IDENTITY_MOUNT: &str = "/run/reliaburger/identity";
+
+/// Make every read-write volume usable by the user-namespaced process.
+///
+/// Managed volumes (the ones with a provisioning sidecar) are handed to
+/// the container user. Host directories are the operator's and are never
+/// chowned: when the mode bits say the container user can't write to one,
+/// Bun warns and starts the container anyway, since it may only read.
+/// Rootless containers need none of this: their single mapped id is the
+/// user that created the volume.
+async fn prepare_volumes(instance: &InstanceId, spec: &OciSpec) -> Result<(), GrillError> {
+    let user = &spec.process.user;
+    let (Some(uid), Some(gid)) = (
+        super::userns::host_id(user.uid),
+        super::userns::host_id(user.gid),
+    ) else {
+        // userns::apply already refused ids outside the range.
+        return Ok(());
+    };
+    let wanted = super::volume::VolumeOwner { uid, gid };
+    let sources: Vec<PathBuf> = spec
+        .mounts
+        .iter()
+        .filter(|mount| mount.options.iter().any(|option| option == "rw"))
+        .filter(|mount| mount.options.iter().any(|option| option == "bind"))
+        .filter_map(|mount| mount.source.clone())
+        .collect();
+    let container_user = format!("{}:{}", user.uid, user.gid);
+    let prepared = tokio::task::spawn_blocking(move || {
+        for source in sources {
+            prepare_volume(&source, wanted, &container_user)?;
+        }
+        Ok::<(), String>(())
+    })
+    .await
+    .map_err(|e| e.to_string())
+    .and_then(|result| result);
+    prepared.map_err(|reason| GrillError::StartFailed {
+        instance: instance.clone(),
+        reason,
+    })
+}
+
+/// Hand one managed volume over, or check one host directory.
+fn prepare_volume(
+    source: &std::path::Path,
+    wanted: super::volume::VolumeOwner,
+    container_user: &str,
+) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let handed = super::volume::hand_to_container_user(source, wanted).map_err(|e| {
+        format!(
+            "failed to hand volume {} to container user {container_user} (host {wanted}): {e}",
+            source.display()
+        )
+    })?;
+    if handed.is_some() {
+        return Ok(());
+    }
+    // A host path that doesn't exist yet is runc's to report.
+    let Ok(metadata) = std::fs::metadata(source) else {
+        return Ok(());
+    };
+    let owner = super::volume::VolumeOwner {
+        uid: metadata.uid(),
+        gid: metadata.gid(),
+    };
+    if metadata.is_dir() && !super::volume::container_can_write(owner, metadata.mode(), wanted) {
+        eprintln!(
+            "warning: host path volume {} is owned by {owner} with mode {:o}; container user \
+             {container_user} runs as host {wanted} and can't write to it. Bun never chowns \
+             host directories: chown it to {wanted} or make it writable by that user",
+            source.display(),
+            metadata.mode() & 0o7777,
+        );
+    }
+    Ok(())
+}
 
 impl super::Grill for RuncGrill {
     async fn create(&self, instance: &InstanceId, spec: &OciSpec) -> Result<(), GrillError> {
@@ -1720,5 +1801,110 @@ mod tests {
         }
 
         grill.kill(&id).await.unwrap();
+    }
+
+    /// Run redis (append-only persistence) over the managed `/data` volume
+    /// as instance `id` and wait until it serves.
+    async fn start_redis_on_volume(
+        tmp: &std::path::Path,
+        id: &InstanceId,
+        user: &str,
+    ) -> RuncGrill {
+        let (grill, spec) = image_app(
+            tmp,
+            id,
+            &format!(
+                "image = \"{REDIS_IMAGE}\"\nargs = [\"--appendonly\", \"yes\"]\n{user}\n\
+                 [[volumes]]\npath = \"/data\"\n"
+            ),
+        );
+        grill.create(id, &spec).await.unwrap();
+        grill.start(id).await.unwrap();
+        wait_for_log(&grill, id, "Ready to accept connections").await;
+        grill
+    }
+
+    async fn redis_cli(grill: &RuncGrill, id: &InstanceId, command: &[&str]) -> String {
+        let mut argv = vec!["redis-cli".to_string()];
+        argv.extend(command.iter().map(|part| part.to_string()));
+        grill.exec(id, &argv).await.unwrap().trim().to_string()
+    }
+
+    /// Z1.1: user-namespaced redis writes to a managed volume and finds its
+    /// data again after a restart, first as the image's `redis` user
+    /// directly (no entrypoint chown to help), then as image root after a
+    /// user change.
+    #[tokio::test]
+    #[ignore = "requires rootful runc, network access to public.ecr.aws, and RELIABURGER_RUNC_TESTS=1"]
+    async fn runc_redis_persists_to_a_managed_volume_across_restarts() {
+        use std::os::unix::fs::MetadataExt;
+
+        assert!(runc_tests_enabled(), "set RELIABURGER_RUNC_TESTS=1");
+        assert!(nix::unistd::geteuid().is_root(), "rootful runc needs root");
+        let tmp = tempfile::tempdir().unwrap();
+        let ids: Vec<InstanceId> = (0..3)
+            .map(|index| InstanceId(format!("default__redis-data-{index}")))
+            .collect();
+        for id in &ids {
+            remove_test_network(id);
+        }
+        let _network_cleanup = TestNetworkCleanup(ids.clone());
+        // Bun provisions the volume before creating the container.
+        let volume = crate::grill::volume::VolumeManager::new(tmp.path().join("volumes"))
+            .create_managed_volume("default", "redis-data", std::path::Path::new("/data"), None)
+            .unwrap();
+        assert_eq!(std::fs::metadata(&volume).unwrap().uid(), 0);
+        let redis_host_uid = crate::grill::userns::host_id(999).unwrap();
+        let as_redis = "run_as_user = 999\nrun_as_group = 999";
+
+        // First start: redis-server runs as 999 from the first instruction,
+        // so only the hand-over can make /data writable.
+        let grill = start_redis_on_volume(tmp.path(), &ids[0], as_redis).await;
+        assert_eq!(
+            redis_cli(&grill, &ids[0], &["SET", "burger", "cheese"]).await,
+            "OK"
+        );
+        let root = std::fs::metadata(&volume).unwrap();
+        assert_eq!((root.uid(), root.gid()), (redis_host_uid, redis_host_uid));
+        assert!(
+            volume.join("appendonlydir").is_dir(),
+            "redis should persist into the volume"
+        );
+        grill.kill(&ids[0]).await.unwrap();
+
+        // Restart as the same user: the data is back, ownership untouched.
+        let grill = start_redis_on_volume(tmp.path(), &ids[1], as_redis).await;
+        assert_eq!(
+            redis_cli(&grill, &ids[1], &["GET", "burger"]).await,
+            "cheese"
+        );
+        assert_eq!(
+            redis_cli(&grill, &ids[1], &["SET", "bun", "sesame"]).await,
+            "OK"
+        );
+        grill.kill(&ids[1]).await.unwrap();
+
+        // Restart as image root: the volume moves to container root, and
+        // docker-entrypoint.sh chowns /data to redis and drops to it.
+        let grill = start_redis_on_volume(tmp.path(), &ids[2], "").await;
+        assert_eq!(
+            redis_cli(&grill, &ids[2], &["GET", "burger"]).await,
+            "cheese"
+        );
+        assert_eq!(redis_cli(&grill, &ids[2], &["GET", "bun"]).await, "sesame");
+        assert_eq!(
+            redis_cli(&grill, &ids[2], &["SET", "pickle", "yes"]).await,
+            "OK"
+        );
+        let sidecar: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(volume.with_file_name("data.volume.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            sidecar["owner"]["uid"],
+            crate::grill::userns::HOST_ID_BASE,
+            "the volume was last handed to container root: {sidecar}"
+        );
+        grill.kill(&ids[2]).await.unwrap();
     }
 }

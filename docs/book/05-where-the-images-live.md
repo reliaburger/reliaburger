@@ -208,6 +208,48 @@ On Linux, managed volumes with a size limit get a loop-mounted ext4 filesystem. 
 
 On macOS, there's no loop mount. Reliaburger creates a plain directory and logs a warning. Size limits are soft-only on macOS. This is a development convenience, not a production limitation — production clusters run Linux.
 
+## Whose volume is it?
+
+Chapter 1 put every Runc container in a user namespace: container uid 999 is host uid 2,000,000,999, and container root is nobody special on the node. That fixed a lot, and broke volumes on the spot. Bun creates `/var/lib/reliaburger/volumes/default/redis/data` as root, bind-mounts it at `/data`, and Redis's entrypoint tries to `chown` it to the `redis` user. Inside a user namespace, `CAP_CHOWN` only works on files whose owner the namespace maps. Host root isn't mapped. `chown: Operation not permitted`, and Redis never starts.
+
+Docker's `userns-remap` answers this by chowning a new volume into the remapped range. Kubernetes answers with `fsGroup`, which makes a volume group-owned by a chosen gid and adds that gid to every container in the pod. We copied Docker. A Reliaburger app has one process user, and images that switch users (Redis, Postgres) start as root and hand their data directory over themselves, which works as soon as container root owns the directory. So there's no `fs_group` field, and `relish import` warns that it dropped one.
+
+The interesting part is *when* to chown. Every start? Redis's entrypoint gives `/data` to uid 999; Bun giving it back to root on the next start would fight it, and a recursive `chown` of a 200 GB volume on every restart is a long way to wait. Only when the volume is empty? A loop-mounted ext4 volume is born with `lost+found` in it. So the provisioning sidecar next to the volume (the one that already records its backend) now also records who we handed it to, and a small pure function decides:
+
+```rust
+pub fn plan_ownership(
+    recorded: Option<VolumeOwner>,
+    root: VolumeOwner,
+    wanted: VolumeOwner,
+) -> OwnershipPlan {
+    let root_mapped = super::userns::container_id(root.uid).is_some()
+        && super::userns::container_id(root.gid).is_some();
+    match recorded {
+        _ if !root_mapped => OwnershipPlan::HandOver,
+        None => OwnershipPlan::HandOver,
+        Some(previous) if previous == wanted => OwnershipPlan::Keep,
+        Some(previous) => OwnershipPlan::Rehome { from: previous },
+    }
+}
+```
+
+The `if` after a pattern is a *match guard*: the arm only matches when the condition holds too, and the arms are tried top to bottom. `_ if !root_mapped` matches any `recorded` value, so it catches a root that nothing in the container range owns (a snapshot restored from before the first mount, say) before the other arms get a look. Because `OwnershipPlan` is an enum, the caller's `match` on the result must handle `Keep`, `HandOver` and `Rehome`, and the compiler says so if a fourth variant ever turns up.
+
+`Rehome` is the image-`USER`-changed case. It moves only what the previous user owned, using the same tree walk as `HandOver` with a different rule:
+
+```rust
+fn chown_tree(
+    root: &Path,
+    new_owner: &dyn Fn(VolumeOwner) -> Option<VolumeOwner>,
+) -> Result<(), VolumeError>
+```
+
+`&dyn Fn(...)` is a borrowed *trait object*: any closure with that signature, called through a pointer, much like passing a function pointer plus a context in C. `HandOver` passes `&|_| Some(wanted)` (everything goes to the new user), `Rehome` passes a closure that returns `None` for files the old user never owned. The walk uses `symlink_metadata` and `lchown`, so a symlink the container planted pointing at `/etc/shadow` gets its own ownership changed, not its target's.
+
+Host-path volumes (`source = "/srv/import"`) get none of this. They're the operator's directories, and silently chowning `/srv/import` to uid 2,000,000,999 is exactly the kind of surprise an orchestrator shouldn't spring. Bun checks the mode bits instead and, if the container's user plainly can't write, logs which host uid to `chown` the directory to. It still starts the container, because plenty of host mounts are only ever read.
+
+The proof is a gated test that runs the real Redis image with `--appendonly yes` over a managed volume: first as uid 999 directly (so no entrypoint `chown` can paper over a missing hand-over), writes a key, restarts, reads it back, then restarts as image root and reads it again.
+
 ## Under the hood: key patterns
 
 ### Validate at construction, not at use

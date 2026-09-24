@@ -62,6 +62,12 @@ pub fn host_id(id: u32) -> Option<u32> {
     (id < CONTAINER_ID_COUNT).then(|| HOST_ID_BASE + id)
 }
 
+/// The container id host uid or gid `id` stands for, if the range maps it.
+pub fn container_id(id: u32) -> Option<u32> {
+    id.checked_sub(HOST_ID_BASE)
+        .filter(|offset| *offset < CONTAINER_ID_COUNT)
+}
+
 /// Put a rootful container in the node's user namespace.
 ///
 /// Adds the `user` namespace and its id mappings, grants Docker's default
@@ -185,6 +191,9 @@ mod tests {
         assert_eq!(host_id(999), Some(2_000_000_999));
         assert_eq!(host_id(65_535), Some(2_000_065_535));
         assert_eq!(host_id(65_536), None);
+        assert_eq!(container_id(2_000_000_999), Some(999));
+        assert_eq!(container_id(2_000_065_536), None);
+        assert_eq!(container_id(0), None, "host root is no container id");
         // The whole range stays below 2^31, so no signed-int tool
         // mistakes a container uid for a negative number.
         assert!(u64::from(HOST_ID_BASE) + u64::from(CONTAINER_ID_COUNT) < 1 << 31);
