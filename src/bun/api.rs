@@ -849,6 +849,16 @@ async fn gather_desired_apps(
                     scheduled_replicas: desired.scheduling.get(app_id).map_or(0, |placements| {
                         placements.len().try_into().unwrap_or(u32::MAX)
                     }),
+                    placements: desired.scheduling.get(app_id).map_or_else(
+                        Default::default,
+                        |placements| {
+                            let mut per_node = std::collections::BTreeMap::new();
+                            for placement in placements {
+                                *per_node.entry(placement.node_id.0.clone()).or_insert(0u32) += 1;
+                            }
+                            per_node
+                        },
+                    ),
                     service_port: spec.port,
                 },
             )
@@ -9102,6 +9112,7 @@ mod tests {
             namespace: namespace.to_string(),
             desired_replicas: 1,
             scheduled_replicas: 1,
+            placements: Default::default(),
             service_port: Some(8080),
         };
 
@@ -13561,6 +13572,7 @@ schedule = "* * * * *"
                 namespace: "default".into(),
                 desired_replicas: 3,
                 scheduled_replicas: 2,
+                placements: Default::default(),
                 service_port: None,
             },
             crate::bun::diagnostics::DesiredAppEvidence {
@@ -13568,6 +13580,7 @@ schedule = "* * * * *"
                 namespace: "default".into(),
                 desired_replicas: 2,
                 scheduled_replicas: 0,
+                placements: Default::default(),
                 service_port: None,
             },
         ];

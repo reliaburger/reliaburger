@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 /// Evidence collected from one diagnostic source.
@@ -173,6 +175,23 @@ pub struct ServiceObservation {
     pub total_backends: usize,
 }
 
+/// Desired and running replicas of one app, and where the scheduler put them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicaObservation {
+    /// Application name.
+    pub app: String,
+    /// Application namespace.
+    pub namespace: String,
+    /// Desired replicas after resolving fixed versus daemon mode.
+    pub desired_replicas: u32,
+    /// Replicas the scheduler has placed, per node.
+    pub placed: BTreeMap<String, u32>,
+    /// Running instances, per node that answered.
+    pub running: BTreeMap<String, u32>,
+    /// Nodes whose instances could not be read.
+    pub unanswered: Vec<String>,
+}
+
 /// One active Smoker fault.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FaultObservation {
@@ -307,6 +326,8 @@ pub struct ApplicationEvidence {
     pub deploys: Evidence<Vec<DeployObservation>>,
     /// Desired replicas and observed service backends.
     pub services: Evidence<Vec<ServiceObservation>>,
+    /// Desired, placed and running replicas per app.
+    pub replicas: Evidence<Vec<ReplicaObservation>>,
     /// Currently firing alerts.
     pub alerts: Evidence<Vec<AlertObservation>>,
     /// Actual cgroup throttled-time deltas.

@@ -4200,6 +4200,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                                 .count()
                                 .try_into()
                                 .unwrap_or(u32::MAX),
+                            placements: Default::default(),
                             service_port: spec.port,
                         },
                     )
