@@ -422,6 +422,7 @@ mod tests {
                 node_ip: Ipv4Addr::new(10, 0, 1, 1),
                 host_port: 30000,
                 healthy: true,
+                local: false,
             }],
             firewall_allow_from: allow_from,
         }

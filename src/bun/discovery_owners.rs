@@ -1017,6 +1017,7 @@ mod tests {
                 node_ip: "127.0.0.1".parse().unwrap(),
                 host_port: 20000,
                 healthy: true,
+                local: false,
             });
         owner
             .executions
@@ -1138,6 +1139,7 @@ mod tests {
                 node_ip: "10.0.0.4".parse().unwrap(),
                 host_port: 8080,
                 healthy: true,
+                local: false,
             });
         journal.save(saved).unwrap();
         let mut launch = runtime_launch(NetworkReferenceState::Held(original));

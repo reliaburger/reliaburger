@@ -4,10 +4,11 @@
  *
  * When a process calls connect() with a destination in the VIP range
  * (127.128.0.0/16), this program:
- * 1. Refuses the connect if this node's cluster view lease has lapsed
+ * 1. Notes whether this node's cluster view lease has lapsed
  * 2. Looks up the backend list in backend_map
  * 3. Checks firewall rules (namespace isolation + per-app allow_from)
- * 4. Selects a healthy backend via round-robin
+ * 4. Selects a healthy backend via round-robin, only among backends on
+ *    this node once the lease has lapsed
  * 5. Rewrites the destination address and port
  *
  * Non-VIP connections pass through untouched.
@@ -235,17 +236,20 @@ int onion_connect(struct bpf_sock_addr *ctx)
         return 1;  /* pass through (no enforcement or allowed) */
     }
 
-    /* --- View lease: a lapsed cluster view routes nothing --- */
+    /* --- View lease: a lapsed cluster view routes only to this node --- */
+    int local_only = 0;
     {
         __u32 lease_key = VIEW_LEASE_KEY;
         struct view_lease_value *lease =
             bpf_map_lookup_elem(&view_lease_map, &lease_key);
-        /* The leader may have released and reused any address this view
-         * names, so deny rather than guess. CLOCK_BOOTTIME keeps counting
-         * while a machine is suspended, so sleeping doesn't stretch it. */
+        /* The leader may have released and reused any remote address this
+         * view names. A local backend's address can only be reused by this
+         * node's own Bun, which withdraws it here first, so those stay
+         * routable. CLOCK_BOOTTIME keeps counting while a machine is
+         * suspended, so sleeping doesn't stretch the lease. */
         if (lease && lease->enforced == 1 &&
             bpf_ktime_get_boot_ns() >= lease->expires_ns)
-            return 0;  /* deny -> EPERM: view lease lapsed */
+            local_only = 1;
     }
 
     /* --- Smoker fault check (before normal path) --- */
@@ -328,7 +332,8 @@ no_fault:
             return 0;  /* deny -> EPERM: cross-namespace denied */
     }
 
-    /* --- Backend selection: round-robin among healthy --- */
+    /* --- Backend selection: round-robin among healthy (and, once the
+     * lease has lapsed, local) backends --- */
     __u32 selected_idx = 0;
     int found = 0;
 
@@ -346,7 +351,8 @@ no_fault:
 
         __u32 idx = (rr + i) % val->count;
 
-        if (idx < MAX_BACKENDS && val->backends[idx].healthy == 1) {
+        if (idx < MAX_BACKENDS && val->backends[idx].healthy == 1 &&
+            (!local_only || val->backends[idx].local == 1)) {
             selected_idx = idx;
             found = 1;
             val->rr_index = rr + i + 1;
@@ -355,7 +361,7 @@ no_fault:
     }
 
     if (!found)
-        return 0;  /* deny -> EPERM: no healthy backends */
+        return 0;  /* deny -> EPERM: no healthy (or, lapsed, local) backends */
 
     /* Rewrite destination to the selected backend */
     struct backend_endpoint *be = &val->backends[selected_idx];

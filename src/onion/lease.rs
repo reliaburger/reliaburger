@@ -11,9 +11,10 @@
 //! - [`ViewLease`] lives on the consumer. Each time the leader answers a
 //!   placement poll and the node publishes that answer, the lease runs for
 //!   [`CONSUMER_VIEW_LEASE`] from the moment the request was *sent*. When it
-//!   runs out, the node stops routing cluster services: Bun withdraws its view,
-//!   Wrapper refuses cluster routes and the kernel's connect hook refuses
-//!   virtual addresses, even if Bun itself has died.
+//!   runs out, the node stops routing to other nodes: Bun shrinks its view to
+//!   its own backends, Wrapper serves only those, and the kernel's connect
+//!   hook refuses every remote backend, even if Bun itself has died. Local
+//!   backends keep serving, because only this node can reuse their addresses.
 //! - [`ConsumerContacts`] lives on the leader. It remembers when it last served
 //!   each consumer. Only a consumer that has been silent for longer than the
 //!   lease plus [`CONSUMER_DISCHARGE_MARGIN`], and that gossip doesn't report
@@ -21,7 +22,8 @@
 //!
 //! The consumer's lease starts before the leader's clock does and is shorter
 //! than the leader's wait, so by the time the leader stops waiting for a node,
-//! that node has already stopped routing. Neither side compares wall clocks.
+//! that node has already stopped routing to other nodes. Neither side compares
+//! wall clocks.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

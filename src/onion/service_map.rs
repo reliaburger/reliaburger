@@ -318,6 +318,7 @@ impl ServiceMap {
                             node_ip: backend.node_ip,
                             host_port: backend.host_port,
                             healthy: backend.healthy,
+                            local: false,
                         });
                     }
                 }
@@ -341,6 +342,7 @@ impl ServiceMap {
                                 node_ip: b.node_ip,
                                 host_port: b.host_port,
                                 healthy: b.healthy,
+                                local: false,
                             })
                             .collect(),
                         firewall_allow_from: None,
@@ -402,6 +404,7 @@ mod tests {
             node_ip: Ipv4Addr::from(ip),
             host_port: port,
             healthy: true,
+            local: false,
         }
     }
 
@@ -1022,6 +1025,7 @@ mod tests {
                     node_ip: Ipv4Addr::new(10, 0, 0, 1),
                     host_port: 30001,
                     healthy: true,
+                    local: false,
                 },
             )
             .unwrap();
