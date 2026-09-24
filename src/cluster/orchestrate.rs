@@ -550,22 +550,14 @@ fn plan_scheduling_pass_with_dns(
         } else {
             effective_replicas(spec, override_replicas, alive.len())
         };
-        let requires_egress = spec.egress.as_ref().is_some_and(|e| !e.allow.is_empty());
         let converged = desired
             .scheduling
             .get(app_id)
             .map(|placements| {
                 placements.len() == want
-                    && placements.iter().all(|p| {
-                        alive.contains(&p.node_id)
-                            && cache.get_node(&p.node_id).is_some_and(|node| {
-                                node.ready
-                                    && (!requires_egress
-                                        || node.capabilities.egress.can_enforce_allowlist())
-                                    && (!dns_required
-                                        || node.capabilities.dns.can_resolve_internal())
-                            })
-                    })
+                    && placements
+                        .iter()
+                        .all(|p| placement_holds(p, spec, cache, alive, dns_required))
             })
             .unwrap_or(false);
         planned.push((app_id, spec, override_replicas, want, converged));
@@ -614,6 +606,36 @@ fn plan_scheduling_pass_with_dns(
         if let Some(n) = override_replicas {
             effective_spec.replicas = Replicas::Fixed(n);
         }
+        // A fixed-size app keeps the placements that still hold and only
+        // places the rest. Losing one node of three must not move the
+        // replicas on the other two: they're serving, and replacing them
+        // would restart them for nothing.
+        let kept: Vec<crate::meat::types::Placement> = match effective_spec.replicas {
+            Replicas::Fixed(_) => desired
+                .scheduling
+                .get(app_id)
+                .map(|placements| {
+                    placements
+                        .iter()
+                        .filter(|p| placement_holds(p, spec, cache, alive, dns_required))
+                        .take(want)
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default(),
+            Replicas::DaemonSet => Vec::new(),
+        };
+        if !kept.is_empty() {
+            let missing = want - kept.len();
+            if missing == 0 {
+                decisions.push(crate::meat::types::SchedulingDecision {
+                    app_id: app_id.clone(),
+                    placements: kept,
+                });
+                continue;
+            }
+            effective_spec.replicas = Replicas::Fixed(missing as u32);
+        }
         // The scheduler owns its cache, so hand it the shared one and take
         // it back afterwards (Rust move semantics — no shared &mut alias).
         // Snapshot first: a partially-placed fixed-replica app reserves some
@@ -626,8 +648,12 @@ fn plan_scheduling_pass_with_dns(
         let mut scheduler = Scheduler::new(std::mem::take(cache)).with_dns_required(dns_required);
         let result = scheduler.schedule_app(app_id, &effective_spec);
         match result {
-            Ok(decision) => {
+            Ok(mut decision) => {
                 *cache = scheduler.cluster;
+                if !kept.is_empty() {
+                    let added = std::mem::take(&mut decision.placements);
+                    decision.placements = kept.into_iter().chain(added).collect();
+                }
                 decisions.push(decision);
             }
             Err(e) => {
@@ -637,6 +663,34 @@ fn plan_scheduling_pass_with_dns(
         }
     }
     decisions
+}
+
+/// Whether an existing placement can stay where it is: its node is alive and
+/// ready and can enforce what the spec needs.
+///
+/// A live node that hasn't reported to this leader yet keeps its placements.
+/// A new leader hears from nodes over several seconds, and a node whose
+/// report went to a council member that just died can take longer still;
+/// "not heard from yet" is not evidence of trouble, and moving its replicas
+/// would restart healthy workloads. A node that reported and went stale, or
+/// reported not ready, does lose them.
+fn placement_holds(
+    placement: &crate::meat::types::Placement,
+    spec: &AppSpec,
+    cache: &ClusterStateCache,
+    alive: &HashSet<NodeId>,
+    dns_required: bool,
+) -> bool {
+    if !alive.contains(&placement.node_id) {
+        return false;
+    }
+    let Some(node) = cache.get_node(&placement.node_id) else {
+        return true;
+    };
+    let requires_egress = spec.egress.as_ref().is_some_and(|e| !e.allow.is_empty());
+    node.ready
+        && (!requires_egress || node.capabilities.egress.can_enforce_allowlist())
+        && (!dns_required || node.capabilities.dns.can_resolve_internal())
 }
 
 /// The number of nodes a daemon set of `spec` can currently be placed on
@@ -2866,6 +2920,99 @@ image = "busybox:latest"
             "second app must not double-book: {decisions:?}"
         );
         assert_eq!(decisions[0].app_id, a);
+    }
+
+    fn placed_on(names: &[&str]) -> Vec<crate::meat::types::Placement> {
+        names
+            .iter()
+            .map(|name| crate::meat::types::Placement {
+                node_id: NodeId::new(*name),
+                resources: Resources::new(100, 0, 0),
+            })
+            .collect()
+    }
+
+    fn nodes_of(decision: &crate::meat::types::SchedulingDecision) -> Vec<&str> {
+        decision
+            .placements
+            .iter()
+            .map(|p| p.node_id.0.as_str())
+            .collect()
+    }
+
+    /// Z6.7: stopping one laptop node moved all three frontends onto a single
+    /// survivor, restarting the two that were serving fine.
+    #[test]
+    fn losing_a_node_replaces_only_its_replicas() {
+        let app = AppId::new("frontend", "default");
+        let mut desired = DesiredState::default();
+        desired.apps.insert(app.clone(), app_spec(100, 3));
+        desired
+            .scheduling
+            .insert(app.clone(), placed_on(&["n1", "n2", "n3"]));
+        let mut cache = ClusterStateCache::new();
+        cache.set_node(sched_node("n1", 4000, BTreeMap::new()));
+        cache.set_node(sched_node("n2", 4000, BTreeMap::new()));
+        let alive = HashSet::from([NodeId::new("n1"), NodeId::new("n2")]);
+
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+
+        assert_eq!(decisions.len(), 1);
+        let nodes = nodes_of(&decisions[0]);
+        assert_eq!(nodes.len(), 3);
+        assert_eq!(nodes[..2], ["n1", "n2"], "survivors keep their replicas");
+        assert!(["n1", "n2"].contains(&nodes[2]), "{nodes:?}");
+    }
+
+    /// A new leader that hasn't heard from a live node yet leaves that
+    /// node's replicas alone.
+    #[test]
+    fn a_live_node_that_has_not_reported_yet_keeps_its_replicas() {
+        let app = AppId::new("frontend", "default");
+        let mut desired = DesiredState::default();
+        desired.apps.insert(app.clone(), app_spec(100, 3));
+        desired
+            .scheduling
+            .insert(app.clone(), placed_on(&["n1", "n2", "n3"]));
+        let mut cache = ClusterStateCache::new();
+        cache.set_node(sched_node("n1", 4000, BTreeMap::new()));
+        let alive = HashSet::from([NodeId::new("n1"), NodeId::new("n2")]);
+
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+
+        assert_eq!(nodes_of(&decisions[0]), ["n1", "n2", "n1"]);
+
+        // Reporting not ready is evidence; that node's replica moves.
+        let mut cache = ClusterStateCache::new();
+        cache.set_node(sched_node("n1", 4000, BTreeMap::new()));
+        let mut unready = sched_node("n2", 4000, BTreeMap::new());
+        unready.ready = false;
+        cache.set_node(unready);
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+        assert_eq!(nodes_of(&decisions[0]), ["n1", "n1", "n1"]);
+    }
+
+    #[test]
+    fn scaling_down_keeps_the_first_placements() {
+        let app = AppId::new("frontend", "default");
+        let mut desired = DesiredState::default();
+        desired.apps.insert(app.clone(), app_spec(100, 2));
+        desired
+            .scheduling
+            .insert(app.clone(), placed_on(&["n1", "n2", "n3"]));
+        let mut cache = ClusterStateCache::new();
+        for name in ["n1", "n2", "n3"] {
+            cache.set_node(sched_node(name, 4000, BTreeMap::new()));
+        }
+        let alive = HashSet::from([NodeId::new("n1"), NodeId::new("n2"), NodeId::new("n3")]);
+
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+
+        assert_eq!(nodes_of(&decisions[0]), ["n1", "n2"]);
     }
 
     /// A cordoned (upgrade) node receives nothing.
