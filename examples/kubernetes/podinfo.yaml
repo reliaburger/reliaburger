@@ -27,8 +27,10 @@
 #  7. A `loadgen` Deployment (not in upstream) keeps traffic flowing so the
 #     metrics and faults in the tour have something to act on. It's a
 #     BusyBox shell loop, pinned by digest like the rest, that calls the
-#     frontend by service name about six times a second: the home page, then
-#     a write and a read of /cache/loadgen, which go through to redis. A
+#     frontend by service name several times a second: the home page, an
+#     echo the frontend forwards to the backend, then a write and a read of
+#     /cache/loadgen, which go through to redis. Four calls per loop, not
+#     three, so the three frontends take turns at every kind of request. A
 #     failed request is ignored and the loop carries on, so it keeps going
 #     through every fault you inject.
 #
@@ -309,6 +311,7 @@ spec:
             - |
               while true; do
                 wget -q -T 5 -O /dev/null http://frontend:9898/
+                wget -q -T 5 -O /dev/null --post-data loadgen http://frontend:9898/api/echo
                 wget -q -T 5 -O /dev/null --post-data "$(date)" http://frontend:9898/cache/loadgen
                 wget -q -T 5 -O /dev/null http://frontend:9898/cache/loadgen
                 sleep 0.5

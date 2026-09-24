@@ -645,13 +645,14 @@ command:
   - |
     while true; do
       wget -q -T 5 -O /dev/null http://frontend:9898/
+      wget -q -T 5 -O /dev/null --post-data loadgen http://frontend:9898/api/echo
       wget -q -T 5 -O /dev/null --post-data "$(date)" http://frontend:9898/cache/loadgen
       wget -q -T 5 -O /dev/null http://frontend:9898/cache/loadgen
       sleep 0.5
     done
 ```
 
-It calls the frontend by its short service name, the way any other client in the cluster would, and the two `/cache` calls go through to redis. There's no `set -e`, so a failed request (and during a fault, plenty fail) just moves the loop on. `-T 5` caps each one, so a black-holed connection costs five seconds rather than forever. Why not a proper load tester? Because the job is "some traffic, always", not "measure throughput", and BusyBox is already the image our own tests pin.
+It calls the frontend by its short service name, the way any other client in the cluster would. The echo goes on to the backend and the two `/cache` calls go through to redis. Why four calls and not three? The first version had three, and the VIP hands connections to the three frontends in turn, so every home-page request landed on one replica and every cache read on another. The latency chart then showed one frontend that never touched redis, which is accurate and useless. Four calls per loop rotate each kind of request across all three. There's no `set -e`, so a failed request (and during a fault, plenty fail) just moves the loop on. `-T 5` caps each one, so a black-holed connection costs five seconds rather than forever. Why not a proper load tester? Because the job is "some traffic, always", not "measure throughput", and BusyBox is already the image our own tests pin.
 
 Two tests hold it in place. A portable one imports the file and checks the four apps it should produce. A provisioned-Linux one starts a real Bun with runc, eBPF, the DNS responder and ingress, runs `relish apply -f` on the file, and then goes through the ingress by host name: the home page must answer, `POST /api/echo` must come back as the backend's list of responses, and a value written to `/cache/demo` must read back from redis, and so must whatever the load generator wrote to `/cache/loadgen`.
 
