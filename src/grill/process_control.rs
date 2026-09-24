@@ -855,10 +855,14 @@ mod tests {
         drop(UnixListener::bind(&socket).unwrap());
         let owner = {
             let socket = socket.clone();
+            let listening = root.path().join("listening.sock");
             std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_millis(50));
-                std::fs::remove_file(&socket).unwrap();
-                let listener = UnixListener::bind(&socket).unwrap();
+                // Swap the live socket in with one rename: removing the dead
+                // file first opened a window where connect saw NotFound, which
+                // correctly means "no owner" and is never retried.
+                let listener = UnixListener::bind(&listening).unwrap();
+                std::fs::rename(&listening, &socket).unwrap();
                 let (connection, _) = listener.accept().unwrap();
                 let mut line = String::new();
                 std::io::BufReader::new(&connection)
