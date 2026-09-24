@@ -333,6 +333,10 @@ impl RuncGrill {
                     Err(error) => return Err(error),
                 }
             }
+            // The OCI hook writes init.json atomically. One killed before its
+            // rename leaves a temporary behind, and removing the directory then
+            // failed with "Directory not empty" on every retry.
+            crate::sesame::identity::remove_abandoned_atomic_writes(&directory)?;
             std::fs::remove_dir(directory)
         })
         .await
