@@ -15,8 +15,9 @@ use std::time::Instant;
 
 use reliaburger::meat::NodeId;
 use reliaburger::mustard::{
-    GossipConfig, GossipMessage, GossipPayload, InMemoryNetwork, MAX_PIGGYBACK_UPDATES,
-    MembershipUpdate, MustardNode, NodeState,
+    GossipConfig, GossipMessage, GossipPayload, InMemoryNetwork, InMemoryTransport,
+    MAX_PIGGYBACK_UPDATES, MAX_SYNC_DATAGRAMS, MAX_SYNC_ENTRIES, MembershipUpdate, MustardNode,
+    NodeState,
 };
 
 #[path = "../benches/support/gossip.rs"]
@@ -33,10 +34,12 @@ async fn seeded_simulation_converges_without_a_sentinel_result() {
     assert!(rounds > 0);
 }
 
-#[tokio::test]
-async fn one_node_handles_10k_member_protocol_state() {
-    let cluster_size = 10_000;
-    let network = InMemoryNetwork::new();
+/// One node holding a 10,000-member table, learnt through the real message
+/// handler from datagrams sent by `n1` at `address(1)`.
+async fn observer_with_members(
+    network: &InMemoryNetwork,
+    cluster_size: usize,
+) -> MustardNode<InMemoryTransport> {
     let transport = network.register(address(0)).await;
     let mut observer = MustardNode::new(
         NodeId::new("n0"),
@@ -54,7 +57,6 @@ async fn one_node_handles_10k_member_protocol_state() {
         })
         .collect();
 
-    let ingest_started = Instant::now();
     for chunk in updates.chunks(MAX_PIGGYBACK_UPDATES) {
         observer
             .handle_message(
@@ -69,6 +71,16 @@ async fn one_node_handles_10k_member_protocol_state() {
             )
             .await;
     }
+    observer
+}
+
+#[tokio::test]
+async fn one_node_handles_10k_member_protocol_state() {
+    let cluster_size = 10_000;
+    let network = InMemoryNetwork::new();
+
+    let ingest_started = Instant::now();
+    let mut observer = observer_with_members(&network, cluster_size).await;
     let ingest_elapsed = ingest_started.elapsed();
 
     assert_eq!(observer.membership.len(), cluster_size);
@@ -96,4 +108,60 @@ async fn one_node_handles_10k_member_protocol_state() {
         "one node ingested {cluster_size} members in {ingest_elapsed:.1?}; first dissemination of every update took {:.1?} across {batches} batches",
         dissemination_started.elapsed()
     );
+}
+
+/// Anti-entropy must not undo the per-node bound: however large the table,
+/// one push-pull reply is at most `MAX_SYNC_DATAGRAMS` datagrams of at most
+/// `MAX_PIGGYBACK_UPDATES` entries, and successive exchanges rotate through
+/// the table so every member still goes out.
+#[tokio::test]
+async fn push_pull_with_10k_members_is_bounded_and_sweeps_the_table() {
+    let cluster_size = 10_000;
+    let network = InMemoryNetwork::new();
+    let requester = network.register(address(1)).await;
+    let mut observer = observer_with_members(&network, cluster_size).await;
+    // Discard the ACKs to the ingest PINGs.
+    while requester.try_recv().is_some() {}
+
+    let most_exchanges = cluster_size.div_ceil(MAX_SYNC_ENTRIES);
+    let mut seen = HashSet::with_capacity(cluster_size);
+    let mut exchanges = 0;
+    while seen.len() < cluster_size {
+        observer
+            .handle_message(
+                address(1),
+                GossipMessage::new(
+                    NodeId::new("n1"),
+                    1,
+                    GossipPayload::Sync {
+                        entries: vec![],
+                        wants_reply: true,
+                    },
+                ),
+            )
+            .await;
+        let mut datagrams = 0;
+        while let Some((_, reply)) = requester.try_recv() {
+            assert!(reply.payload.updates().len() <= MAX_PIGGYBACK_UPDATES);
+            seen.extend(
+                reply
+                    .payload
+                    .updates()
+                    .iter()
+                    .map(|update| update.node_id.clone()),
+            );
+            datagrams += 1;
+        }
+        assert!(
+            (1..=MAX_SYNC_DATAGRAMS).contains(&datagrams),
+            "one exchange sent {datagrams} datagrams"
+        );
+        exchanges += 1;
+        assert!(
+            exchanges <= most_exchanges,
+            "{exchanges} exchanges covered only {} of {cluster_size} members",
+            seen.len()
+        );
+    }
+    eprintln!("{exchanges} bounded push-pull replies swept all {cluster_size} members");
 }

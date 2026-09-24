@@ -17,6 +17,21 @@ use super::state::NodeState;
 /// Bounded to keep message size constant (~512 bytes total).
 pub const MAX_PIGGYBACK_UPDATES: usize = 8;
 
+/// Most datagrams one side sends in a single anti-entropy exchange.
+///
+/// Each [`GossipPayload::Sync`] datagram carries at most
+/// [`MAX_PIGGYBACK_UPDATES`] entries and no directory extension, which keeps
+/// it under the 1400-byte UDP budget even with 63-byte (DNS-label-length)
+/// node names and IPv6 addresses. Capping the datagram count caps the
+/// exchange too: a node sends at most [`MAX_SYNC_ENTRIES`] membership
+/// entries per exchange however large the cluster, and a larger table goes
+/// out as a rotating window.
+pub const MAX_SYNC_DATAGRAMS: usize = 8;
+
+/// Most membership entries one side sends in a single anti-entropy exchange.
+/// A table this size or smaller is exchanged whole every time.
+pub const MAX_SYNC_ENTRIES: usize = MAX_PIGGYBACK_UPDATES * MAX_SYNC_DATAGRAMS;
+
 /// Most label keys a directory extension will carry. Labels ride every
 /// gossip datagram, so an unbounded set would blow past the UDP budget;
 /// past this many keys we drop the rest (deterministically — `BTreeMap`
@@ -135,6 +150,20 @@ pub enum GossipPayload {
         /// sender's address from it (M13).
         relayed: bool,
     },
+    /// Anti-entropy push-pull: part of the sender's full membership table.
+    ///
+    /// An exchange is a burst of these datagrams, each carrying at most
+    /// [`MAX_PIGGYBACK_UPDATES`] entries. The receiver merges every entry
+    /// under the normal SWIM precedence (incarnation, then state), exactly as
+    /// it would a piggybacked update. Only the first datagram of a request
+    /// sets `wants_reply`, and a reply never does, so an exchange is one
+    /// push and one pull rather than a ping-pong.
+    Sync {
+        /// Membership entries from the sender's table, in any state.
+        entries: Vec<MembershipUpdate>,
+        /// Whether the receiver should answer with its own table.
+        wants_reply: bool,
+    },
 }
 
 impl GossipPayload {
@@ -143,7 +172,10 @@ impl GossipPayload {
         match self {
             GossipPayload::Ping { updates }
             | GossipPayload::PingReq { updates, .. }
-            | GossipPayload::Ack { updates, .. } => updates,
+            | GossipPayload::Ack { updates, .. }
+            | GossipPayload::Sync {
+                entries: updates, ..
+            } => updates,
         }
     }
 }
@@ -491,6 +523,76 @@ mod tests {
             relayed: false,
         };
         assert!(payload.updates().is_empty());
+    }
+
+    fn a_sync_message(wants_reply: bool) -> GossipMessage {
+        let entries = (0..MAX_PIGGYBACK_UPDATES)
+            .map(|i| MembershipUpdate {
+                node_id: NodeId::new(format!("node-{i}")),
+                address: test_addr(),
+                state: NodeState::Dead,
+                incarnation: i as u64,
+            })
+            .collect();
+        GossipMessage::new(
+            NodeId::new("sender"),
+            3,
+            GossipPayload::Sync {
+                entries,
+                wants_reply,
+            },
+        )
+    }
+
+    #[test]
+    fn sync_datagram_round_trips_with_its_entries_and_reply_flag() {
+        let msg = a_sync_message(true);
+        let decoded = decode_datagram(&encode_datagram(&msg).unwrap()).unwrap();
+        assert_eq!(decoded.payload.updates(), msg.payload.updates());
+        assert!(matches!(
+            decoded.payload,
+            GossipPayload::Sync {
+                wants_reply: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn sync_entries_are_covered_by_the_message_hmac() {
+        let key = crate::sesame::mtls::gossip_hmac::derive_gossip_key(&[3u8; 32]);
+        let mut signed = a_sync_message(false).signed(&key).unwrap();
+        assert!(signed.verify_hmac(&key));
+        // A forged resurrection inside a signed sync must not verify.
+        if let GossipPayload::Sync { entries, .. } = &mut signed.payload {
+            entries[0].state = NodeState::Alive;
+            entries[0].incarnation = u64::MAX;
+        }
+        assert!(!signed.verify_hmac(&key));
+    }
+
+    #[test]
+    fn a_full_sync_datagram_fits_the_udp_budget() {
+        // 63-byte names (the longest DNS label) and IPv6 addresses for the
+        // sender and every entry: the worst case a sync datagram carries.
+        // Sync goes out without a directory extension, so this is all of it.
+        let long_name = |i: u64| NodeId::new(format!("{}{i}", "n".repeat(62)));
+        let mut msg = a_sync_message(true);
+        msg.sender = long_name(9);
+        msg.incarnation = u64::MAX;
+        if let GossipPayload::Sync { entries, .. } = &mut msg.payload {
+            for entry in entries.iter_mut() {
+                entry.node_id = long_name(entry.incarnation);
+                entry.address = "[fd00::1]:9443".parse().unwrap();
+                entry.incarnation = u64::MAX;
+            }
+        }
+        let datagram = encode_datagram(&msg).unwrap();
+        assert!(
+            datagram.len() < 1400,
+            "full sync datagram too large: {} bytes",
+            datagram.len()
+        );
     }
 
     #[test]

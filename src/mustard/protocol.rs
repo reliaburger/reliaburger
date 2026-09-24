@@ -8,6 +8,10 @@
 /// 5. If still no ACK, marks the target as Suspect.
 /// 6. Promotes expired suspects to Dead.
 ///
+/// Every `push_pull_interval` (and on the first cycle, so a joining node
+/// syncs straight away) it also exchanges its membership table with one
+/// random live peer: anti-entropy for whatever piggybacking missed.
+///
 /// The `MustardNode` struct owns the membership table, dissemination
 /// queue, and transport, and drives the protocol as an async task.
 use std::collections::{BTreeMap, VecDeque};
@@ -28,7 +32,8 @@ use super::directory::NodeDirectory;
 use super::dissemination::DisseminationQueue;
 use super::membership::{MembershipSnapshot, MembershipTable};
 use super::message::{
-    DirectoryExtension, GossipMessage, GossipPayload, LeaderHint, MembershipUpdate,
+    DirectoryExtension, GossipMessage, GossipPayload, LeaderHint, MAX_PIGGYBACK_UPDATES,
+    MAX_SYNC_ENTRIES, MembershipUpdate,
 };
 use super::state::NodeState;
 use super::transport::MustardTransport;
@@ -107,6 +112,12 @@ pub struct MustardNode<T: MustardTransport> {
     /// Source of randomness for probe-target and relay selection. Seeded
     /// from the OS in production; tests can pin it to replay one schedule.
     rng: StdRng,
+    /// When the next anti-entropy push-pull is due. Starts at creation, so
+    /// the first cycle with a live peer syncs: that is the join sync.
+    next_push_pull: Instant,
+    /// Where the next outgoing window of the membership table starts, for
+    /// tables larger than one exchange carries (`MAX_SYNC_ENTRIES`).
+    sync_cursor: usize,
 }
 
 impl<T: MustardTransport> MustardNode<T> {
@@ -149,6 +160,8 @@ impl<T: MustardTransport> MustardNode<T> {
             directory_watch: None,
             node_gate: crate::smoker::node_fault::NodeTransportGate::new(),
             rng: StdRng::from_entropy(),
+            next_push_pull: Instant::now(),
+            sync_cursor: 0,
         }
     }
 
@@ -512,6 +525,12 @@ impl<T: MustardTransport> MustardNode<T> {
         }
         self.ping_rejoin_contact().await;
 
+        // An isolated node stays due, so it syncs with the first peer it
+        // finds rather than a whole interval later.
+        if now >= self.next_push_pull && self.push_pull().await {
+            self.next_push_pull = now + self.config.push_pull_interval;
+        }
+
         let target = self.pick_probe_target();
         let Some((target_id, target_addr)) = target else {
             // Bootstrap may have no configured seeds. Remembered direct
@@ -747,6 +766,14 @@ impl<T: MustardTransport> MustardNode<T> {
                     }
                 }
             }
+            GossipPayload::Sync { wants_reply, .. } => {
+                // The entries were merged above like any piggybacked update.
+                // Answer a request with our own table; never answer a reply,
+                // or two nodes would bounce their tables back and forth.
+                if *wants_reply {
+                    self.send_membership(from, false).await;
+                }
+            }
             GossipPayload::Ack { relayed, .. } => {
                 if !relayed
                     && message.sender != self.node_id
@@ -791,6 +818,82 @@ impl<T: MustardTransport> MustardNode<T> {
         // still holds it Suspect, Dead or Left.
         self.membership.apply_update(&update, Instant::now());
         self.dissemination.enqueue(update, self.membership.len());
+    }
+
+    /// Start an anti-entropy exchange with one random live peer.
+    ///
+    /// Pushes our membership table (or the next window of it, see
+    /// `membership_window`) and asks the peer to push its own back.
+    /// Both sides merge under the ordinary SWIM precedence, so a stale entry
+    /// can't resurrect a dead node or undo a refutation. Returns `false` when
+    /// there is no live peer to sync with.
+    pub async fn push_pull(&mut self) -> bool {
+        let mut candidates: Vec<_> = self
+            .membership
+            .alive_members()
+            .into_iter()
+            .filter(|m| m.node_id != self.node_id)
+            .map(|m| (m.node_id.clone(), m.address))
+            .collect();
+        candidates.sort_unstable();
+        let Some((_, address)) = candidates.choose(&mut self.rng).cloned() else {
+            return false;
+        };
+        self.send_membership(address, true).await;
+        true
+    }
+
+    /// Send our membership table to `target` as a burst of `Sync` datagrams.
+    /// Only the first datagram carries `wants_reply`, so the peer answers once.
+    ///
+    /// Sync datagrams go out unstamped: the directory extension can take
+    /// ~700 bytes with a full label set, and every probe already carries it,
+    /// so the whole UDP budget goes to membership entries instead.
+    async fn send_membership(&mut self, target: SocketAddr, wants_reply: bool) {
+        let window = self.membership_window();
+        for (index, entries) in window.chunks(MAX_PIGGYBACK_UPDATES).enumerate() {
+            let sync = GossipMessage::new(
+                self.node_id.clone(),
+                self.incarnation,
+                GossipPayload::Sync {
+                    entries: entries.to_vec(),
+                    wants_reply: wants_reply && index == 0,
+                },
+            );
+            let _ = self.transport.send(target, &sync).await;
+        }
+    }
+
+    /// The membership entries for one exchange: the whole table when it fits
+    /// in [`MAX_SYNC_ENTRIES`], otherwise the next window of that many,
+    /// rotating through the table (sorted by node id) one exchange at a time.
+    ///
+    /// Every entry goes, whatever its state. A peer that missed a `Dead` or
+    /// `Left` needs to hear it as much as one that missed a join.
+    fn membership_window(&mut self) -> Vec<MembershipUpdate> {
+        let mut entries: Vec<MembershipUpdate> = self
+            .membership
+            .iter()
+            .map(|m| MembershipUpdate {
+                node_id: m.node_id.clone(),
+                address: m.address,
+                state: m.state,
+                incarnation: m.incarnation,
+            })
+            .collect();
+        if entries.len() <= MAX_SYNC_ENTRIES {
+            return entries;
+        }
+        entries.sort_unstable_by(|a, b| a.node_id.cmp(&b.node_id));
+        let start = self.sync_cursor % entries.len();
+        self.sync_cursor = start + MAX_SYNC_ENTRIES;
+        entries
+            .iter()
+            .cycle()
+            .skip(start)
+            .take(MAX_SYNC_ENTRIES)
+            .cloned()
+            .collect()
     }
 
     /// Promote suspects whose suspicion timeout has expired to Dead.
@@ -969,7 +1072,7 @@ impl<T: MustardTransport> MustardNode<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mustard::transport::InMemoryNetwork;
+    use crate::mustard::transport::{InMemoryNetwork, InMemoryTransport};
     use std::time::Duration;
 
     fn addr(port: u16) -> SocketAddr {
@@ -983,6 +1086,7 @@ mod tests {
             suspicion_timeout: Duration::from_millis(100),
             indirect_probe_count: 2,
             cleanup_timeout: Duration::from_millis(200),
+            push_pull_interval: Duration::from_millis(500),
         }
     }
 
@@ -1670,6 +1774,10 @@ mod tests {
         );
     }
 
+    /// Rounds between anti-entropy exchanges in the manual simulations: the
+    /// default 10 s `push_pull_interval` over the default 500 ms probe period.
+    const PUSH_PULL_EVERY_ROUNDS: usize = 20;
+
     #[tokio::test]
     async fn gossip_convergence_five_nodes() {
         // 5 nodes in a ring topology (each knows the next). After enough
@@ -1680,24 +1788,51 @@ mod tests {
         // under parallel test load; see tokio #3709), and use try_recv()
         // to drain messages without timers.
         //
-        // Each node's probe RNG is seeded, so every run replays the same
-        // schedules. Unseeded, about 1 schedule in 1,300 strands a member:
-        // every update about it spends its bounded re-broadcasts before
-        // reaching some node, the queues drain, and no later round helps
-        // because nothing resynchronises full membership. A fixed set of
-        // seeds keeps the test about convergence rather than about luck.
-        for seed in 0..16 {
-            let rounds = converge_five_node_ring(seed).await;
+        // Before anti-entropy, 73 schedules in 100,000 stranded a member for
+        // good: every update about it spent its bounded re-broadcasts before
+        // reaching some node, the queues drained, and no later round helped.
+        // With push-pull all 100,000 converged by round 23, three rounds
+        // after the first exchange. So this runs 2,000 fresh schedules every
+        // time, from an OS-random base, and allows two exchanges' worth of
+        // rounds; a failure prints the seed that replays it.
+        let base: u64 = rand::random();
+        for offset in 0..2_000u64 {
+            let seed = base.wrapping_add(offset);
+            let rounds = converge_five_node_ring(seed, Some(PUSH_PULL_EVERY_ROUNDS)).await;
             assert!(
-                rounds.is_some(),
-                "seed {seed}: five-node ring did not converge within 100 rounds"
+                rounds.is_some_and(|round| round < 2 * PUSH_PULL_EVERY_ROUNDS),
+                "seed {seed}: five-node ring took {rounds:?} rounds to converge"
             );
         }
     }
 
+    #[tokio::test]
+    async fn a_stranding_schedule_is_rescued_by_push_pull() {
+        // Seed 830 is the first of the 73 schedules in 0..100,000 that
+        // stranded a member permanently with piggybacking alone. The
+        // simulation leaves the first exchange until round 20, so up to then
+        // this replays the stranding schedule exactly, and push-pull has to
+        // do the rescue.
+        assert_eq!(
+            converge_five_node_ring(830, None).await,
+            None,
+            "seed 830 no longer strands without anti-entropy; pick another stranding seed"
+        );
+        let rounds = converge_five_node_ring(830, Some(PUSH_PULL_EVERY_ROUNDS)).await;
+        assert!(
+            rounds.is_some_and(|round| round >= PUSH_PULL_EVERY_ROUNDS),
+            "push-pull did not rescue the stranded member: {rounds:?}"
+        );
+    }
+
     /// Drive a seeded five-node ring until every node sees five active
     /// members. Returns the round it converged in, or `None` after 100.
-    async fn converge_five_node_ring(seed: u64) -> Option<usize> {
+    ///
+    /// With `push_pull_every = Some(n)`, every node also starts an
+    /// anti-entropy exchange on rounds n, 2n, 3n, … Round 0 is left to
+    /// piggybacking so a schedule replays identically up to the first
+    /// exchange, whichever way it is run.
+    async fn converge_five_node_ring(seed: u64, push_pull_every: Option<usize>) -> Option<usize> {
         let net = InMemoryNetwork::new();
         let config = fast_config();
 
@@ -1709,7 +1844,7 @@ mod tests {
             addresses.push(a);
             let t = net.register(a).await;
             let mut node = MustardNode::new(NodeId::new(format!("n{i}")), a, config.clone(), t);
-            node.seed_rng(seed * 5 + u64::from(i));
+            node.seed_rng(seed.wrapping_mul(5).wrapping_add(u64::from(i)));
             nodes.push(node);
         }
 
@@ -1722,12 +1857,14 @@ mod tests {
         }
 
         // Simulate gossip rounds. Each round:
-        // 1. Every node picks a random peer and sends a PING
+        // 1. Every node picks a random peer and sends a PING (and, when an
+        //    exchange is due, a push-pull request to another random peer)
         // 2. Every node drains its inbox (processing PINGs → sending
-        //    ACKs, applying piggybacked updates)
-        // 3. Every node drains again (picking up the ACKs)
+        //    ACKs, sync requests → sending its table, applying entries)
+        // 3. Every node drains again (picking up the ACKs and sync replies)
         for round in 0..100 {
-            // Phase 1: each node sends a PING to a random peer
+            let push_pull_due =
+                push_pull_every.is_some_and(|every| round > 0 && round % every == 0);
             for node in &mut nodes {
                 if let Some((_target_id, target_addr)) = node.pick_probe_target() {
                     let updates = node.dissemination.select_updates();
@@ -1738,9 +1875,11 @@ mod tests {
                     );
                     let _ = node.transport.send(target_addr, &ping).await;
                 }
+                if push_pull_due {
+                    node.push_pull().await;
+                }
             }
 
-            // Phase 2+3: drain messages twice (PINGs then ACKs)
             for _ in 0..2 {
                 for node in &mut nodes {
                     while let Some((from, msg)) = node.transport.try_recv() {
@@ -1757,6 +1896,235 @@ mod tests {
             }
         }
         None
+    }
+
+    // -- anti-entropy push-pull (C6.5) ----------------------------------------
+
+    fn entry(node: &str, port: u16, state: NodeState, incarnation: u64) -> MembershipUpdate {
+        MembershipUpdate {
+            node_id: NodeId::new(node),
+            address: addr(port),
+            state,
+            incarnation,
+        }
+    }
+
+    fn sync_from(sender: &str, entries: Vec<MembershipUpdate>, wants_reply: bool) -> GossipMessage {
+        GossipMessage::new(
+            NodeId::new(sender),
+            1,
+            GossipPayload::Sync {
+                entries,
+                wants_reply,
+            },
+        )
+    }
+
+    fn state_of<T: MustardTransport>(node: &MustardNode<T>, id: &str) -> Option<(NodeState, u64)> {
+        node.membership
+            .get(&NodeId::new(id))
+            .map(|member| (member.state, member.incarnation))
+    }
+
+    /// Answer everything that reaches `node` for `duration`. Returns how many
+    /// push-pull requests arrived.
+    async fn serve(node: &mut MustardNode<InMemoryTransport>, duration: Duration) -> usize {
+        let deadline = tokio::time::Instant::now() + duration;
+        let mut requests = 0;
+        while tokio::time::Instant::now() < deadline {
+            let Some((from, message)) = node.transport.try_recv() else {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                continue;
+            };
+            if matches!(
+                message.payload,
+                GossipPayload::Sync {
+                    wants_reply: true,
+                    ..
+                }
+            ) {
+                requests += 1;
+            }
+            node.handle_message(from, message).await;
+        }
+        requests
+    }
+
+    #[tokio::test]
+    async fn push_pull_cannot_resurrect_a_dead_node() {
+        let net = InMemoryNetwork::new();
+        let t = net.register(addr(1)).await;
+        let mut node = MustardNode::new(NodeId::new("observer"), addr(1), fast_config(), t);
+        node.membership.add_node(
+            NodeId::new("m"),
+            addr(3),
+            3,
+            BTreeMap::new(),
+            Instant::now(),
+        );
+        node.membership.declare_dead(&NodeId::new("m"));
+
+        // A peer that never heard of the death still holds m Alive, at the
+        // same or an older incarnation. Neither may bring m back.
+        let stale = vec![
+            entry("m", 3, NodeState::Alive, 3),
+            entry("m", 3, NodeState::Alive, 2),
+        ];
+        node.handle_message(addr(2), sync_from("peer", stale, false))
+            .await;
+
+        assert_eq!(state_of(&node, "m"), Some((NodeState::Dead, 3)));
+    }
+
+    #[tokio::test]
+    async fn push_pull_cannot_override_a_refutation() {
+        let net = InMemoryNetwork::new();
+        let t = net.register(addr(1)).await;
+        let mut node = MustardNode::new(NodeId::new("observer"), addr(1), fast_config(), t);
+        // m refuted a suspicion by moving to incarnation 5.
+        node.membership.add_node(
+            NodeId::new("m"),
+            addr(3),
+            5,
+            BTreeMap::new(),
+            Instant::now(),
+        );
+
+        let stale = vec![
+            entry("m", 3, NodeState::Suspect, 4),
+            entry("m", 3, NodeState::Dead, 4),
+        ];
+        node.handle_message(addr(2), sync_from("peer", stale, false))
+            .await;
+
+        assert_eq!(state_of(&node, "m"), Some((NodeState::Alive, 5)));
+    }
+
+    #[tokio::test]
+    async fn push_pull_does_not_introduce_a_member_we_only_hear_is_down() {
+        let net = InMemoryNetwork::new();
+        let t = net.register(addr(1)).await;
+        let mut node = MustardNode::new(NodeId::new("observer"), addr(1), fast_config(), t);
+
+        let down = vec![
+            entry("gone", 3, NodeState::Dead, 1),
+            entry("left", 4, NodeState::Left, 1),
+        ];
+        node.handle_message(addr(2), sync_from("peer", down, false))
+            .await;
+
+        assert_eq!(state_of(&node, "gone"), None);
+        assert_eq!(state_of(&node, "left"), None);
+    }
+
+    #[tokio::test]
+    async fn push_pull_claim_about_ourselves_is_refuted() {
+        let net = InMemoryNetwork::new();
+        let t = net.register(addr(1)).await;
+        let mut node = MustardNode::new(NodeId::new("observer"), addr(1), fast_config(), t);
+
+        let claim = vec![entry("observer", 1, NodeState::Suspect, 1)];
+        node.handle_message(addr(2), sync_from("peer", claim, false))
+            .await;
+
+        assert_eq!(node.incarnation, 2);
+        assert_eq!(state_of(&node, "observer"), Some((NodeState::Alive, 2)));
+    }
+
+    #[tokio::test]
+    async fn push_pull_request_is_answered_once_with_the_whole_table() {
+        let net = InMemoryNetwork::new();
+        let t = net.register(addr(1)).await;
+        let requester = net.register(addr(2)).await;
+        let mut node = MustardNode::new(NodeId::new("observer"), addr(1), fast_config(), t);
+        // Twenty others plus the observer and requester: three datagrams.
+        for i in 0..20u16 {
+            node.membership.add_node(
+                NodeId::new(format!("m{i}")),
+                addr(10 + i),
+                1,
+                BTreeMap::new(),
+                Instant::now(),
+            );
+        }
+
+        node.handle_message(addr(2), sync_from("requester", vec![], true))
+            .await;
+
+        let mut datagrams = 0;
+        let mut seen = std::collections::HashSet::new();
+        while let Some((_, reply)) = requester.try_recv() {
+            let GossipPayload::Sync {
+                entries,
+                wants_reply,
+            } = reply.payload
+            else {
+                panic!("expected only sync datagrams, got {:?}", reply.payload);
+            };
+            assert!(!wants_reply, "a reply must never ask for a reply");
+            assert!(entries.len() <= MAX_PIGGYBACK_UPDATES);
+            datagrams += 1;
+            seen.extend(entries.into_iter().map(|entry| entry.node_id));
+        }
+        assert_eq!(datagrams, 3);
+        assert_eq!(seen.len(), node.membership.len());
+
+        // A reply is merged, never answered, or two nodes would bounce
+        // their tables back and forth forever.
+        node.handle_message(addr(2), sync_from("requester", vec![], false))
+            .await;
+        assert!(requester.try_recv().is_none());
+    }
+
+    #[tokio::test]
+    async fn joining_node_learns_the_whole_cluster_on_its_first_cycle() {
+        let net = InMemoryNetwork::new();
+        let joiner_transport = net.register(addr(1)).await;
+        let seed_transport = net.register(addr(2)).await;
+        let mut seed =
+            MustardNode::new(NodeId::new("seed"), addr(2), fast_config(), seed_transport);
+        // The seed learnt these long ago: its dissemination queue has
+        // nothing left to say about them, so only a full sync can teach
+        // the joiner.
+        for (i, name) in ["a", "b", "c"].into_iter().enumerate() {
+            seed.membership.add_node(
+                NodeId::new(name),
+                addr(10 + i as u16),
+                1,
+                BTreeMap::new(),
+                Instant::now(),
+            );
+        }
+        assert!(seed.dissemination.is_empty());
+
+        let mut joiner = MustardNode::new(
+            NodeId::new("joiner"),
+            addr(1),
+            fast_config(),
+            joiner_transport,
+        );
+        joiner.add_seed(NodeId::new("seed"), addr(2));
+
+        let ((), requests) = tokio::join!(
+            joiner.run_one_cycle(),
+            serve(&mut seed, Duration::from_millis(100))
+        );
+        assert_eq!(requests, 1, "the first cycle must start a push-pull");
+        for name in ["seed", "a", "b", "c"] {
+            assert_eq!(
+                state_of(&joiner, name).map(|(state, _)| state),
+                Some(NodeState::Alive),
+                "joiner did not learn {name} from the join sync"
+            );
+        }
+        assert!(state_of(&seed, "joiner").is_some());
+
+        // The next exchange waits for `push_pull_interval`.
+        let ((), requests) = tokio::join!(
+            joiner.run_one_cycle(),
+            serve(&mut seed, Duration::from_millis(100))
+        );
+        assert_eq!(requests, 0, "push-pull ran again before its interval");
     }
 
     // -- directory extension propagation (12b.2) ------------------------------
