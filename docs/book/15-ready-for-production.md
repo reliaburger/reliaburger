@@ -1697,6 +1697,16 @@ again. Using the cluster service token here would be convenient, but it would
 also turn any compromised follower into the owner of every test lease.
 Convenience doesn't get a vote on authority.
 
+A forwarded create has one more wrinkle. The leader answers once a quorum
+has committed the lease, and that quorum doesn't have to include the follower
+that forwarded it. The caller's very next request is an apply under the new
+lease, usually sent to the same follower, which checks the lease against its
+own replica before forwarding. A multi-node CI run caught it answering "lease
+not found" for a lease it had handed out a millisecond earlier. So the
+follower now holds the `201 Created` until its own replica has applied the
+lease, for up to five seconds: read-your-writes for anyone who stays on the
+same node.
+
 The runner now creates one lease after capability gating and before it runs a
 case. It asks for the case budget plus the fixed cleanup budget; if the server's
 maximum can't cover both, the case becomes `Unknown` without touching the

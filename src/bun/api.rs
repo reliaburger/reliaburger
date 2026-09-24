@@ -1177,7 +1177,7 @@ async fn test_lease_create_handler(
         && request.scope == LeaseScope::Applications
         && !council.is_leader().await
     {
-        return forward_test_lease_request(
+        let created = forward_test_lease_request(
             &state,
             council,
             reqwest::Method::POST,
@@ -1186,6 +1186,7 @@ async fn test_lease_create_handler(
             Some(&request),
         )
         .await;
+        return await_forwarded_lease_replica(council, created).await;
     }
     let mut random = [0u8; 16];
     if ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut random).is_err() {
@@ -1255,6 +1256,54 @@ async fn test_lease_create_handler(
         return lease_error_response(error);
     }
     (StatusCode::CREATED, Json(lease)).into_response()
+}
+
+/// How long a follower holds a forwarded lease creation for its own replica.
+const FORWARDED_LEASE_REPLICA_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Hold a follower's forwarded lease creation until its own replica has it.
+///
+/// The leader answers once a quorum has committed the lease, and that quorum
+/// need not include this follower. The caller's next request, an apply that
+/// carries the lease, usually comes back to this node, which checks the lease
+/// against its local replica before forwarding the apply. Answering early let
+/// that check report "lease not found" for a lease the caller had just been
+/// given. A replica still behind at the deadline gets the lease returned
+/// anyway: it exists, and a later request will find it.
+async fn await_forwarded_lease_replica(
+    council: &crate::council::CouncilNode,
+    created: Response,
+) -> Response {
+    if created.status() != StatusCode::CREATED {
+        return created;
+    }
+    let (parts, body) = created.into_parts();
+    let Ok(bytes) = axum::body::to_bytes(body, MAX_LEASE_FORWARD_RESPONSE_BYTES).await else {
+        return (
+            StatusCode::BAD_GATEWAY,
+            "failed to read leader lease response",
+        )
+            .into_response();
+    };
+    if let Ok(lease) = serde_json::from_slice::<crate::testkit::lease::TestLease>(&bytes) {
+        // Subscribe before the first look, so an entry applied between the
+        // look and the wait still wakes it.
+        let mut applied = council.metrics();
+        let _ = tokio::time::timeout(FORWARDED_LEASE_REPLICA_WAIT, async {
+            while !council
+                .desired_state()
+                .await
+                .test_leases
+                .contains_key(&lease.lease_id)
+            {
+                if applied.changed().await.is_err() {
+                    break;
+                }
+            }
+        })
+        .await;
+    }
+    Response::from_parts(parts, axum::body::Body::from(bytes))
 }
 
 async fn test_lease_get_handler(
@@ -10602,6 +10651,151 @@ schedule = "* * * * *"
                 .0,
             StatusCode::SERVICE_UNAVAILABLE
         );
+        for stop in stops {
+            stop.cancel();
+        }
+        for node in nodes {
+            node.shutdown().await.unwrap();
+        }
+        for server in servers {
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn lease_created_through_a_lagging_follower_is_in_its_replica_when_returned() {
+        use crate::council::CouncilNode;
+        use crate::council::log_store::MemLogStore;
+        use crate::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
+        use crate::council::state_machine::CouncilStateMachine;
+        use crate::council::types::{CouncilConfig, CouncilNodeInfo};
+        let network = InMemoryRaftRouter::new();
+        let mut nodes = Vec::new();
+        let mut listeners = Vec::new();
+        let mut members = std::collections::BTreeMap::new();
+        for id in 1..=3 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            members.insert(
+                id,
+                CouncilNodeInfo {
+                    addr: std::net::SocketAddr::new(address.ip(), address.port() - 3),
+                    name: format!("node-{id}"),
+                },
+            );
+            listeners.push(listener);
+            let node = Arc::new(
+                CouncilNode::new(
+                    id,
+                    CouncilConfig::default(),
+                    InMemoryRaftNetworkFactory::new(id, network.clone()),
+                    MemLogStore::new(),
+                    CouncilStateMachine::new(),
+                    None,
+                )
+                .await
+                .unwrap(),
+            );
+            network.register(id, node.raft().clone()).await;
+            nodes.push(node);
+        }
+        nodes[0].initialize(members).await.unwrap();
+        let leader_port = listeners[0].local_addr().unwrap().port();
+        let (owner, owner_key) = a_user_token(crate::sesame::types::ApiRole::Deployer);
+        let mut routers = Vec::new();
+        let mut stops = Vec::new();
+        let mut servers = Vec::new();
+        for (node, listener) in nodes.iter().zip(listeners) {
+            let (commands, _receiver) = mpsc::channel(4);
+            let store = crate::sesame::auth::new_token_store();
+            *store.write().await = vec![owner.clone()];
+            let router = router_with_upgrade(
+                commands,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(node.clone()),
+                Some(store),
+                None,
+                None,
+                None,
+                None,
+                None,
+                leader_port,
+                None,
+                None,
+                None,
+                "default".to_string(),
+                None,
+                900,
+                crate::cluster::ClusterHttp::plaintext(),
+                5050,
+                "http",
+                256 * 1024 * 1024,
+                false,
+                lease_static_capabilities(),
+                crate::bun::readiness::ReadinessTracker::new(),
+                None,
+                None,
+            );
+            let stop = CancellationToken::new();
+            routers.push(router.clone());
+            let cancelled = stop.clone();
+            servers.push(tokio::spawn(async move {
+                axum::serve(listener, router)
+                    .with_graceful_shutdown(async move { cancelled.cancelled().await })
+                    .await
+                    .unwrap();
+            }));
+            stops.push(stop);
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !nodes[0].is_leader().await || nodes[2].current_leader().await != Some(1) {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        // Node 3 misses replication for well under an election timeout, so
+        // the leader and node 2 commit the lease without it.
+        network.partition(1, 3).await;
+        let healer = {
+            let network = network.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                network.heal().await;
+            })
+        };
+        let (status, body) = post_authenticated(
+            routers[2].clone(),
+            "/v1/test/leases",
+            &owner_key,
+            r#"{"ttl_seconds":60}"#,
+            None,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        let lease: crate::testkit::lease::TestLease = serde_json::from_slice(&body).unwrap();
+        // The caller's next request, an apply under this lease, checks node
+        // 3's own replica before it forwards.
+        assert!(
+            nodes[2]
+                .desired_state()
+                .await
+                .test_leases
+                .contains_key(&lease.lease_id),
+            "node 3 returned a lease its own replica did not hold yet"
+        );
+
+        healer.await.unwrap();
         for stop in stops {
             stop.cancel();
         }
