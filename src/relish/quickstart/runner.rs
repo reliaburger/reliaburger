@@ -41,7 +41,8 @@ pub struct Options {
     pub timings: bool,
 }
 
-/// How long a download may go without receiving a byte before it fails.
+/// How long a download attempt may go without receiving a byte before it is
+/// dropped and retried from where it got to.
 const DOWNLOAD_STALL: Duration = Duration::from_secs(30);
 
 /// Backstop for all downloads together. A transfer that keeps making progress

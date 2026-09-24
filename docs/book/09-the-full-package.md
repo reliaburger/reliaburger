@@ -866,6 +866,70 @@ a tiny `thiserror` type, `Unrecoverable`, and check for it with anyhow's
 `downcast_ref`, which asks an `anyhow::Error` whether it wraps a particular
 concrete error type. It's Rust's rough equivalent of Go's `errors.As`.
 
+That design had one flaw, and a release candidate found it. On a perfectly
+healthy 50 Mbit/s link, four cold setups in a row died in the download phase:
+the connection to GitHub's CDN dropped mid-body (`end of file before message
+length reached`) or went quiet for 30 seconds, and setup stopped and told the
+user to run it again. Resuming across runs is nice. Making the user be the retry
+loop isn't. Plain `curl` fetched the same assets fine, because a single dropped
+connection is weather, not failure.
+
+So the downloader now retries inside the run. Each attempt reconnects with
+`Range: bytes=<what we have>-` and appends, with the same 206 check and the
+same clean restart on a 200. The attempts sit in a loop with exponential
+backoff (1 s, 2 s, 4 s and so on, capped at 30 s), and the budget is ten
+attempts *in a row without progress*: any attempt that gets further than the
+last one refills it, so a link that drops every minute still finishes. Progress
+means beating the furthest point reached so far, not just receiving bytes;
+otherwise a server that ignores ranges and drops at the same byte every time
+would loop until the 30-minute backstop.
+
+Which errors deserve a retry? A second marker type answers that. `Transient`
+wraps an `anyhow::Error` with `#[error(transparent)]`, which tells `thiserror`
+to forward both the message and the source to the wrapped error, so the user
+sees the original text. Stalls, connection errors, 5xx, 429 and 408 get
+wrapped; a 404, a size limit, a digest mismatch or a full disk don't, and fail
+at once. The loop is then one `downcast_ref::<Transient>()` away from its
+decision. Every attempt also starts from the original URL rather than wherever
+the last one was redirected. GitHub sends release assets to signed CDN URLs
+that expire, and one test serves redirects that each work exactly once to
+prove the retry asks for a fresh one.
+
+The tests needed a server that misbehaves precisely. axum is too well-behaved
+for that (it won't send a `Content-Length` and then hang up early), so the tests
+use a small HTTP/1.1 server on a raw `TcpListener`, driven by a closure
+that picks each reply from the request number, path and range: cut the body at
+byte 7, stall after byte 12, ignore the range, answer 503. The retry count
+shows up in the progress line, so a flaky download now reads `resumed at 113.1
+MiB (retry 2)` instead of `[FAIL]`.
+
+The other half of the fix was downloading less. The candidate's `relish` for
+macOS weighed 178 MB, and we assumed debug info. Wrong: since Rust 1.77 a
+release build already strips it. The binary itself told us where the bytes
+were. A quarter was the symbol table (function names, kept so a
+`RUST_BACKTRACE` trace can print them), and more than half was machine code,
+bloated by Cargo's default of sixteen *codegen units* per crate: LLVM
+optimises each unit separately, so every unit keeps its own copy of the
+generic functions it instantiates. Rust generics are monomorphised (compiled
+once per concrete type, like C++ templates rather than Go's shared
+implementation), so a crate as generic-heavy as ours pays for that many times
+over. Two lines in `Cargo.toml` fix both:
+
+```toml
+[profile.release]
+strip = true
+codegen-units = 1
+```
+
+The binaries halved (relish for macOS went to 90 MB, bun for Linux from 230 MB
+to 105 MB), and a cold quickstart now downloads 320 MB less. The cost is a
+slower release build, since one codegen unit means one thread per crate, and
+backtraces without function names. Panics still print where they happened,
+because Rust bakes the panic's file and line into the call site, not into the
+symbol table. We also tried link-time optimisation. Thin LTO made the code
+*bigger*, and fat LTO saved another 3 MB for a build three times slower again.
+Measure before you reach for the famous flag.
+
 Size limits apply both to the
 advertised length and the bytes actually received, so chunked responses don't
 bypass them. Redirects must keep using HTTPS, and URLs can't contain credentials.

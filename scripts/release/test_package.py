@@ -207,6 +207,80 @@ exit 1
                     self.assertNotEqual(result.returncode, 0, invalid)
                     self.assertIn(b"invalid RELIABURGER_VERSION", result.stderr)
 
+    def flaky_tools(self, name, chunk):
+        """Fake `curl` that delivers `chunk` more bytes per call and fails
+        with exit 18 (partial file) until the whole fixture has arrived. Each
+        call must ask to continue, or it never gets past the first chunk.
+        The installer script itself always arrives in three pieces.
+        `sleep` is a no-op, so retries don't slow the test down."""
+        tools = self.root / name
+        tools.mkdir()
+        (tools / "uname").write_text('#!/bin/sh\ncase "$1" in -s) echo Darwin;; -m) echo arm64;; esac\n')
+        (tools / "sleep").write_text("#!/bin/sh\n")
+        (tools / "curl").write_text(f"""#!/bin/sh
+resume=false
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --continue-at) resume=true; shift ;;
+    -o) output=$2; shift ;;
+    https://*) url=$1 ;;
+  esac
+  shift
+done
+printf '%s\\n' "$url" >> "$URLS"
+# The installer itself arrives in three pieces, the binary in `chunk`s.
+case "$url" in
+  */install.sh) source=$INSTALLER; piece=$(($(wc -c < "$INSTALLER") / 3 + 1)) ;;
+  *) source=$FIXTURE; piece={chunk} ;;
+esac
+[ "$resume" = true ] && [ -f "$output" ] || : > "$output"
+have=$(wc -c < "$output")
+tail -c +$((have + 1)) "$source" | head -c "$piece" >> "$output"
+[ "$(wc -c < "$output")" -eq "$(wc -c < "$source")" ] || exit 18
+""")
+        for tool in tools.iterdir():
+            tool.chmod(0o755)
+        return tools
+
+    def test_installers_resume_a_dropped_download(self):
+        import os
+        self.package()
+        genuine = (self.assets / "relish-macos-aarch64").read_bytes()
+        tools = self.flaky_tools("flaky-tools", 12)
+        urls = self.root / "urls"
+        home = self.root / "flaky-home"
+        home.mkdir()
+        env = dict(os.environ, HOME=str(home), PATH=str(tools) + os.pathsep + os.environ["PATH"],
+                   URLS=str(urls), FIXTURE=str(self.assets / "relish-macos-aarch64"),
+                   INSTALLER=str(self.assets / "install.sh"), RELIABURGER_RELEASE_BASE_URL="https://example.com/r")
+        for shell, script in [(shell, script) for shell in POSIX_SHELLS for script in [self.assets / "install.sh", BOOTSTRAP]]:
+            with self.subTest(shell=shell, script=script):
+                urls.unlink(missing_ok=True)
+                result = subprocess.run([shell, str(script), "--install-only"], env=env, capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual((home / ".reliaburger/bin/relish").read_bytes(), genuine)
+                self.assertIn(b"resuming, attempt 2 of 5", result.stderr)
+                # The binary arrives in 12-byte pieces; every retry asks for the original URL.
+                pieces = -(-len(genuine) // 12)
+                self.assertEqual(urls.read_text().splitlines().count("https://example.com/r/relish-macos-aarch64"), pieces)
+
+    def test_installer_gives_up_on_a_download_that_never_finishes(self):
+        import os
+        self.package()
+        tools = self.flaky_tools("stuck-tools", 1)
+        home = self.root / "stuck-home"
+        home.mkdir()
+        env = dict(os.environ, HOME=str(home), PATH=str(tools) + os.pathsep + os.environ["PATH"],
+                   URLS=str(self.root / "urls"), FIXTURE=str(self.assets / "relish-macos-aarch64"),
+                   INSTALLER=str(self.assets / "install.sh"))
+        for shell in POSIX_SHELLS:
+            with self.subTest(shell=shell):
+                result = subprocess.run([shell, str(self.assets / "install.sh"), "--install-only"], env=env, capture_output=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(b"attempt 5 of 5", result.stderr)
+                self.assertIn(b"could not download", result.stderr)
+                self.assertFalse((home / ".reliaburger/bin/relish").exists())
+
     def test_installers_are_posix_sh(self):
         self.package()
         scripts = [self.assets / "install.sh", BOOTSTRAP]

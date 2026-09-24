@@ -20,6 +20,31 @@ checksum() {
   fi
 }
 
+# Fetch $1 into $2, resuming rather than restarting when the connection
+# drops. Our own loop instead of curl's --retry: --retry-all-errors needs curl
+# 7.71 (Ubuntu 20.04 ships 7.68), and a fresh curl per attempt picks up where
+# the file ends with --continue-at on every version. Each attempt also goes
+# back to the original URL, so a release asset's short-lived signed redirect
+# is issued anew. No --max-time: a slow link is fine as long as bytes keep
+# coming, and --speed-time drops one that has stalled for 30 seconds.
+download() {
+  attempt=1
+  while :; do
+    status=0
+    curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+      --tlsv1.2 --connect-timeout 15 --speed-limit 1 --speed-time 30 \
+      --continue-at - "$1" -o "$2" || status=$?
+    [ "$status" -ne 0 ] || return 0
+    # 33: the server can't resume, so the next attempt starts from scratch.
+    [ "$status" -ne 33 ] || rm -f "$2"
+    [ "$attempt" -lt 5 ] || return "$status"
+    attempt=$((attempt + 1))
+    printf 'reliaburger: download interrupted (curl exit %s); resuming, attempt %s of 5\n' \
+      "$status" "$attempt" >&2
+    sleep 2
+  done
+}
+
 on_path() {
   case ":${PATH:-}:" in
     *":$1:"*) return 0 ;;
@@ -146,10 +171,12 @@ main() {
   trap 'exit 130' INT
   trap 'exit 143' TERM HUP
   url="$release_base/relish-$platform"
-  curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
-    --tlsv1.2 --connect-timeout 15 --max-time 180 --retry 2 "$url" -o "$staging/relish" \
-    || fail "could not download $url"
-  actual=$(checksum "$staging/relish") || actual=
+  downloaded=true
+  download "$url" "$staging/relish" || downloaded=false
+  actual=$(checksum "$staging/relish" 2>/dev/null) || actual=
+  # A last attempt can fail with 416 on a file that is already complete, so
+  # the checksum, not curl's exit status, decides.
+  [ "$downloaded" = true ] || [ "$actual" = "$expected" ] || fail "could not download $url"
   [ "$actual" = "$expected" ] || fail 'CLI checksum mismatch; existing installation was not changed'
   chmod 755 "$staging/relish"
   # Same directory, so the rename is atomic: a reader sees the old binary or the new one.

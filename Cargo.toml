@@ -100,6 +100,19 @@ insta = { version = "1", features = ["json"] }
 proptest = "1"
 tower = { version = "0.5", features = ["util"] }
 
+# Every quickstart downloads two or three of these binaries, and every
+# self-upgrade ships Bun through the registry. Release builds already carry
+# no debug info; the symbol table was a quarter of each file, and one
+# codegen unit per crate lets LLVM deduplicate and inline across what used
+# to be sixteen pieces, a third of the machine code. Together they halve
+# the binaries. Panics still print their message and `file:line`, but a
+# `RUST_BACKTRACE` trace has no function names. Fat LTO saved little more
+# and made warm builds three times slower again. Measurements:
+# docs/qualification/2026-09-24-binary-size.md.
+[profile.release]
+strip = true
+codegen-units = 1
+
 [profile.dev]
 debug = "line-tables-only"
 
