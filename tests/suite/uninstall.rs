@@ -50,10 +50,30 @@ fn uninstall_yes_removes_the_installation() {
 fn uninstall_refuses_while_a_quickstart_cluster_exists() {
     let home = tempfile::tempdir().unwrap();
     installed(home.path());
-    std::fs::create_dir_all(home.path().join(".reliaburger/clusters/laptop")).unwrap();
+    let cluster = home.path().join(".reliaburger/clusters/laptop");
+    std::fs::create_dir_all(&cluster).unwrap();
+    std::fs::write(cluster.join("operation.lock"), "").unwrap();
+    std::fs::write(cluster.join("state.json"), "{}").unwrap();
     let output = uninstall(home.path(), &["--yes"]);
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("laptop") && stderr.contains("relish local destroy"));
     assert!(home.path().join(".reliaburger/tools").exists());
+}
+
+#[test]
+fn uninstall_succeeds_after_destroy_leaves_only_the_operation_lock() {
+    let home = tempfile::tempdir().unwrap();
+    installed(home.path());
+    let cluster = home.path().join(".reliaburger/clusters/laptop");
+    std::fs::create_dir_all(&cluster).unwrap();
+    std::fs::write(cluster.join("operation.lock"), "").unwrap();
+    let output = uninstall(home.path(), &["--yes"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!home.path().join(".reliaburger/clusters").exists());
+    assert!(!home.path().join(".reliaburger/tools").exists());
 }
