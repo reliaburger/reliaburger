@@ -14,6 +14,7 @@
 #[path = "support/bun_process.rs"]
 mod bun_process;
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -84,6 +85,11 @@ impl Demo {
 
     fn client(&self) -> BunClient {
         BunClient::new(&format!("http://{}", self.api))
+    }
+
+    /// Everything a failed demo run needs to explain itself.
+    async fn diagnostics(&self) -> String {
+        diagnostics(&self.root, self.api, "").await
     }
 
     /// `relish trace frontend --to redis --count 5`, printed for the record.
@@ -270,30 +276,43 @@ https_port = {https}
         .build()
         .unwrap();
     let base = format!("http://podinfo.localhost:{ingress}");
+    // The last answer each wait saw, so a timeout says what went wrong.
+    let last = RefCell::new(String::new());
     let home = eventually(Duration::from_secs(180), || async {
-        let response = http.get(&base).send().await.ok()?;
-        let body = response.text().await.ok()?;
+        let outcome = get_text(http.get(&base)).await;
+        let body = remember(&last, outcome)?;
         body.contains("podinfo").then_some(body)
     })
-    .await
-    .unwrap_or_else(|| panic!("the frontend never answered through ingress:\n{}", log()));
+    .await;
+    let Some(home) = home else {
+        let last = last.borrow().clone();
+        panic!(
+            "the frontend never answered through ingress\n{}",
+            diagnostics(&root, api, &last).await
+        );
+    };
     assert!(home.contains("\"hostname\""), "{home}");
 
     // The frontend forwards /api/echo to --backend-url=http://backend:9898,
     // and answers with the list of backend responses.
     let echoed = eventually(Duration::from_secs(60), || async {
-        let response = http
-            .post(format!("{base}/api/echo"))
-            .body("reliaburger-demo")
-            .send()
-            .await
-            .ok()?;
-        let body = response.text().await.ok()?;
+        let outcome = get_text(
+            http.post(format!("{base}/api/echo"))
+                .body("reliaburger-demo"),
+        )
+        .await;
+        let body = remember(&last, outcome)?;
         let parsed: serde_json::Value = serde_json::from_str(&body).ok()?;
         parsed.is_array().then_some(body)
     })
-    .await
-    .unwrap_or_else(|| panic!("frontend never reached the backend by name:\n{}", log()));
+    .await;
+    let Some(echoed) = echoed else {
+        let last = last.borrow().clone();
+        panic!(
+            "frontend never reached the backend by name\n{}",
+            diagnostics(&root, api, &last).await
+        );
+    };
     assert!(echoed.contains("reliaburger-demo"), "{echoed}");
 
     let demo = Demo {
@@ -306,14 +325,17 @@ https_port = {https}
     };
     // The frontend's /cache API stores in --cache-server=tcp://redis:6379.
     let cached = eventually(Duration::from_secs(60), || async {
-        demo.cache_round_trip("kept-in-redis").await.ok()
+        let outcome = demo.cache_round_trip("kept-in-redis").await;
+        remember(&last, outcome)
     })
     .await;
-    assert!(
-        cached.is_some(),
-        "frontend never reached redis by name:\n{}",
-        demo.log()
-    );
+    if cached.is_none() {
+        let last = last.borrow().clone();
+        panic!(
+            "frontend never reached redis by name\n{}",
+            diagnostics(&demo.root, demo.api, &last).await
+        );
+    }
     demo
 }
 
@@ -417,7 +439,9 @@ allowed_operations = ["inject_workload_faults"]
         demo.cache_round_trip("after-the-partition").await.ok()
     })
     .await;
-    assert!(healed.is_some(), "redis never came back:\n{}", demo.log());
+    if healed.is_none() {
+        panic!("redis never came back\n{}", demo.diagnostics().await);
+    }
 
     // Z6.3: a 300ms delay from the frontend to redis. Reading a key is two
     // redis commands (EXISTS, then GET), each held back 300ms on the way
@@ -549,6 +573,207 @@ async fn frontend_restarts(client: &BunClient, instance: &str) -> u32 {
         .find(|status| status.id == instance && status.state == "running")
         .map(|status| status.restart_count)
         .unwrap_or_default()
+}
+
+/// Send a request and read its body. A non-2xx answer is an error that
+/// keeps its status and body.
+async fn get_text(request: reqwest::RequestBuilder) -> Result<String, String> {
+    let response = request.send().await.map_err(|error| format!("{error:?}"))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|error| format!("{status}, body unreadable: {error}"))?;
+    if status.is_success() {
+        Ok(body)
+    } else {
+        Err(format!("{status} {body}"))
+    }
+}
+
+/// Record the latest outcome of a polled request in `last`, and pass the
+/// body on when there is one.
+fn remember(last: &RefCell<String>, outcome: Result<String, String>) -> Option<String> {
+    let text = match &outcome {
+        Ok(body) => format!("ok: {body}"),
+        Err(error) => format!("error: {error}"),
+    };
+    *last.borrow_mut() = bounded(&text, 2000);
+    outcome.ok()
+}
+
+/// At most `limit` bytes of `text`, cut on a character boundary.
+fn bounded(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.to_string();
+    }
+    let mut end = limit;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}... ({} bytes more)", &text[..end], text.len() - end)
+}
+
+/// The last `lines` lines of `text`.
+fn tail(text: &str, lines: usize) -> String {
+    let all: Vec<&str> = text.lines().collect();
+    all[all.len().saturating_sub(lines)..].join("\n")
+}
+
+/// A command's stdout and stderr, cut to its last `lines` lines, or why it
+/// didn't run.
+fn command_output(program: &str, args: &[&str], lines: usize) -> String {
+    match std::process::Command::new(program).args(args).output() {
+        Ok(output) => {
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            tail(text.trim_end(), lines)
+        }
+        Err(error) => format!("(cannot run {program}: {error})"),
+    }
+}
+
+/// Every file under `directory` ending in `.stdout` or `.stderr`: the
+/// containers' captured output.
+fn captured_output_files(directory: &Path, found: &mut Vec<PathBuf>) {
+    for entry in std::fs::read_dir(directory).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            captured_output_files(&path, found);
+        } else if path
+            .extension()
+            .is_some_and(|extension| extension == "stdout" || extension == "stderr")
+        {
+            found.push(path);
+        }
+    }
+}
+
+/// What a failed demo prints: the last answer the test saw, the host
+/// (kernel, runc, user-namespace and forwarding settings), every instance's
+/// state and output, runc's own view and the tail of Bun's log. Bounded, so
+/// a CI log stays readable.
+async fn diagnostics(root: &Path, api: std::net::SocketAddr, last: &str) -> String {
+    let mut report = String::new();
+    let mut section = |title: &str, body: &str| {
+        report.push_str(&format!("\n=== {title} ===\n{}\n", body.trim_end()));
+    };
+    section("last answer", last);
+
+    let sysctls = [
+        "kernel.apparmor_restrict_unprivileged_userns",
+        "kernel.unprivileged_userns_clone",
+        "user.max_user_namespaces",
+        "net.ipv4.ip_forward",
+    ]
+    .iter()
+    .map(|name| {
+        let path = Path::new("/proc/sys").join(name.replace('.', "/"));
+        let value = std::fs::read_to_string(path).unwrap_or_else(|_| "(absent)".to_string());
+        format!("{name} = {}", value.trim())
+    })
+    .collect::<Vec<_>>()
+    .join("\n");
+    let subuid = std::fs::read_to_string("/etc/subuid").unwrap_or_default();
+    section(
+        "host",
+        &format!(
+            "kernel: {}\nrunc: {}\n{sysctls}\n/etc/subuid:\n{}\ndemo root filesystem: {}",
+            command_output("uname", &["-r"], 1),
+            command_output("sh", &["-c", "runc --version | head -1"], 1),
+            tail(&subuid, 10),
+            command_output("stat", &["-f", "-c", "%T", &root.display().to_string()], 1),
+        ),
+    );
+    // Container-to-container traffic crosses the host's forward hook, where
+    // a DROP policy (Docker's, ufw's) cuts the frontend off from its peers.
+    section(
+        "forwarding",
+        &format!(
+            "iptables -S FORWARD:\n{}\nnft forward chains:\n{}",
+            command_output("iptables", &["-S", "FORWARD"], 30),
+            command_output(
+                "sh",
+                &["-c", "nft list chains | grep -B2 'hook forward'"],
+                30
+            ),
+        ),
+    );
+
+    let client = BunClient::new(&format!("http://{api}"));
+    let statuses = match tokio::time::timeout(Duration::from_secs(10), client.status()).await {
+        Ok(Ok(statuses)) => statuses
+            .iter()
+            .map(|status| {
+                format!(
+                    "{} {} restarts={} exit={:?} pid={:?}",
+                    status.id, status.state, status.restart_count, status.exit_code, status.pid
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Ok(Err(error)) => format!("(status failed: {error})"),
+        Err(_) => "(status timed out)".to_string(),
+    };
+    section("instances", &statuses);
+    for app in APPS {
+        let options = reliaburger::relish::client::LogOptions {
+            tail: Some(15),
+            follow: false,
+            grep: None,
+            start: None,
+            json_field: None,
+        };
+        let logs = match tokio::time::timeout(
+            Duration::from_secs(10),
+            client.logs(app, "default", &options),
+        )
+        .await
+        {
+            Ok(Ok(logs)) => logs,
+            Ok(Err(error)) => format!("(logs failed: {error})"),
+            Err(_) => "(logs timed out)".to_string(),
+        };
+        section(&format!("{app} logs"), &bounded(&logs, 4000));
+    }
+
+    // The containers' own output (in case the log API is what broke) and
+    // every runtime command's stderr, where runc explains a failed create.
+    // Runtime commands' stdout is runc's state JSON, which says nothing new.
+    let mut files = Vec::new();
+    captured_output_files(&root.join("data"), &mut files);
+    files.retain(|file| {
+        file.extension()
+            .is_some_and(|extension| extension == "stderr")
+            || file.components().any(|part| part.as_os_str() == "launcher")
+    });
+    files.sort();
+    for file in files.iter().take(24) {
+        let text = std::fs::read_to_string(file).unwrap_or_default();
+        if !text.trim().is_empty() {
+            let name = file.strip_prefix(root).unwrap_or(file);
+            section(
+                &name.display().to_string(),
+                &bounded(&tail(&text, 10), 2000),
+            );
+        }
+    }
+
+    let state = root.join("data/instances/runc/state");
+    section(
+        "runc list",
+        &command_output(
+            "runc",
+            &["--root", &state.display().to_string(), "list"],
+            20,
+        ),
+    );
+    let log = std::fs::read_to_string(root.join("bun.log")).unwrap_or_default();
+    section("bun log (tail)", &tail(&log, 80));
+    report
 }
 
 /// Poll `check` until it returns `Some`, for at most `limit`.
