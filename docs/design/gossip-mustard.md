@@ -96,7 +96,8 @@ Node A                    Node B                    Node C
   │                         │──── ACK ──────────────>│
   │<──── ACK (indirect) ────────────────────────────│
   │                         │                         │
-  │  [If neither direct nor indirect ACK:]            │
+  │  [If no ACK, direct or indirect, within a second  │
+  │   probe_timeout (waited even with no relays):]    │
   │                         │                         │
   │  Mark B as SUSPECT      │                         │
   │  Disseminate SUSPECT    │                         │

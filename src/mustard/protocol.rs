@@ -4,8 +4,9 @@
 /// 1. Picks a random alive peer to probe.
 /// 2. Sends a PING (with piggybacked membership updates).
 /// 3. Waits for an ACK within `probe_timeout`.
-/// 4. If no ACK, sends PING-REQ to `indirect_probe_count` random peers.
-/// 5. If still no ACK, marks the target as Suspect.
+/// 4. If no ACK, sends PING-REQ to up to `indirect_probe_count` random peers.
+/// 5. Waits one more `probe_timeout` for a relayed or late direct ACK
+///    (even when no relay exists), then marks the target as Suspect.
 /// 6. Promotes expired suspects to Dead.
 ///
 /// Every `push_pull_interval` (and on the first cycle, so a joining node
@@ -575,14 +576,16 @@ impl<T: MustardTransport> MustardNode<T> {
                 .await;
         }
 
-        // Wait for indirect ACK
-        if !relays.is_empty() {
-            let got_indirect = self
-                .wait_for_ack(&target_id, self.config.probe_timeout)
-                .await;
-            if got_indirect {
-                return;
-            }
+        // Wait for an indirect ACK, or a late direct one. Wait even with no
+        // relays: in a three-node cluster that has lost one member, the lost
+        // member is the only possible relay, and suspecting the healthy peer
+        // after a single `probe_timeout` would halve the evidence every other
+        // probe gets. One slow ACK on a loaded host was enough.
+        let got_late_or_indirect = self
+            .wait_for_ack(&target_id, self.config.probe_timeout)
+            .await;
+        if got_late_or_indirect {
+            return;
         }
 
         // No ACK at all — mark as suspect, unless the gate closed while we
@@ -1772,6 +1775,40 @@ mod tests {
             NodeState::Alive,
             "B should be Alive thanks to indirect probe via C, but was {b_state}"
         );
+    }
+
+    /// Probe `b` from `a` once, with `b` answering the PING after `delay`.
+    /// Neither node has a relay for the other, like a three-node cluster
+    /// that has already lost one member. Paused time and no spawned task
+    /// make the ACK's lateness exact.
+    async fn probe_without_relays(delay: Duration) -> NodeState {
+        let net = InMemoryNetwork::new();
+        let ta = net.register(addr(1)).await;
+        let tb = net.register(addr(2)).await;
+        let mut a = MustardNode::new(NodeId::new("a"), addr(1), fast_config(), ta);
+        let mut b = MustardNode::new(NodeId::new("b"), addr(2), fast_config(), tb);
+        a.add_seed(NodeId::new("b"), addr(2));
+        a.next_push_pull = Instant::now() + Duration::from_secs(3600);
+
+        let b_answers = async {
+            let (from, ping) = b.transport.recv().await.expect("a pings b");
+            tokio::time::sleep(delay).await;
+            b.handle_message(from, ping).await;
+        };
+        tokio::join!(a.run_one_cycle(), b_answers);
+        a.membership.get(&NodeId::new("b")).unwrap().state
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn late_ack_without_relays_keeps_the_target_alive() {
+        let late = fast_config().probe_timeout * 3 / 2;
+        assert_eq!(probe_without_relays(late).await, NodeState::Alive);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silence_past_both_probe_windows_without_relays_suspects_the_target() {
+        let too_late = fast_config().probe_timeout * 5 / 2;
+        assert_eq!(probe_without_relays(too_late).await, NodeState::Suspect);
     }
 
     /// Rounds between anti-entropy exchanges in the manual simulations: the
