@@ -427,7 +427,7 @@ impl ImageStore {
         let auth = oci_distribution::secrets::RegistryAuth::Anonymous;
 
         // Verify the raw digest chain before publishing any cache metadata.
-        let verified = retry_registry_read(std::time::Duration::from_secs(30), || {
+        let verified = retry_registry_read(super::oci_pull::METADATA_READ, || {
             super::oci_pull::pull_verified_manifest(&client, &oci_ref, &auth)
         })
         .await
@@ -479,7 +479,7 @@ impl ImageStore {
                 tokio::fs::create_dir_all(parent).await?;
             }
 
-            let blob_data = retry_registry_read(std::time::Duration::from_secs(120), || async {
+            let blob_data = retry_registry_read(super::oci_pull::LAYER_READ, || async {
                 // A failed transfer may have written a prefix. Each attempt
                 // owns a fresh buffer; no partial bytes reach the cache.
                 let mut blob_data = Vec::new();
@@ -1936,8 +1936,25 @@ mod tests {
         assert_eq!(fixture.layer_requests.load(Ordering::SeqCst), 2);
     }
 
+    /// Let one stalled request hit its per-attempt ceiling in simulated time,
+    /// then return to real time so the retry reaches the real HTTP fixture.
+    async fn expire_stalled_attempt(
+        received: &tokio::sync::Notify,
+        budget: super::super::oci_pull::RegistryReadBudget,
+    ) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), received.notified())
+            .await
+            .unwrap();
+        // Pause only after the real HTTP server receives the request, so
+        // simulated time cannot race socket readiness during setup.
+        tokio::time::pause();
+        tokio::time::advance(budget.attempt + std::time::Duration::from_secs(1)).await;
+        tokio::time::resume();
+    }
+
     #[tokio::test]
-    async fn pull_through_registry_reads_keep_their_original_deadline() {
+    async fn pull_through_registry_retries_a_stalled_read() {
+        use super::super::oci_pull::{LAYER_READ, METADATA_READ};
         use crate::pickle::upstream::UpstreamRegistry;
         for mode in ["head", "manifest", "layer"] {
             let mut fault = registry_fault(
@@ -1956,7 +1973,7 @@ mod tests {
             } else {
                 None
             };
-            let mut read = tokio::spawn(async move {
+            let read = tokio::spawn(async move {
                 match mode {
                     "head" => upstream.head_manifest_digest(&reference).await.map(|_| ()),
                     "manifest" => upstream.fetch_manifest(&reference).await.map(|_| ()),
@@ -1966,29 +1983,23 @@ mod tests {
                         .map(|_| ()),
                 }
             });
-            tokio::time::timeout(std::time::Duration::from_secs(5), received.notified())
-                .await
-                .unwrap();
-            tokio::time::pause();
-            tokio::time::advance(std::time::Duration::from_secs(if mode == "layer" {
-                121
+            let budget = if mode == "layer" {
+                LAYER_READ
             } else {
-                31
-            }))
-            .await;
-            let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), &mut read).await;
-            tokio::time::resume();
-            if outcome.is_err() {
-                read.abort();
-            }
-            let error = outcome
-                .expect("upstream read exceeded its original budget")
+                METADATA_READ
+            };
+            expire_stalled_attempt(&received, budget).await;
+            tokio::time::timeout(std::time::Duration::from_secs(10), read)
+                .await
+                .expect("the retry never completed")
                 .unwrap()
-                .unwrap_err();
-            assert!(
-                error.to_string().contains("deadline exceeded"),
-                "{mode}: {error}"
-            );
+                .unwrap_or_else(|error| panic!("{mode}: {error}"));
+            let requests = if mode == "layer" {
+                &fixture.layer_requests
+            } else {
+                &fixture.manifest_requests
+            };
+            assert_eq!(requests.load(Ordering::SeqCst), 2, "{mode}");
         }
     }
 
@@ -2168,28 +2179,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registry_stalled_manifest_exhausts_the_original_deadline() {
-        let mut fault = registry_fault(false, StatusCode::SERVICE_UNAVAILABLE, "UNAVAILABLE", 1);
-        fault.delay = std::time::Duration::from_secs(60);
-        let received = fault.received.clone();
-        let fixture = start_registry_fixture_with_fault(Some(fault)).await;
-        let tmp = tempfile::tempdir().unwrap();
-        let store = ImageStore::new(tmp.path().to_path_buf());
-        let reference = fixture.reference.clone();
-        let pull = tokio::spawn(async move { store.pull_and_unpack(&reference).await });
-        tokio::time::timeout(std::time::Duration::from_secs(5), received.notified())
-            .await
-            .unwrap();
-        // Pause only after the real HTTP server receives the request, so
-        // simulated time cannot race socket readiness during setup.
-        tokio::time::pause();
-        tokio::time::advance(std::time::Duration::from_secs(30)).await;
-        let result = pull.await.unwrap();
-        tokio::time::resume();
-        assert!(
-            matches!(result, Err(ImageError::ManifestPull { reason, .. }) if reason.contains("deadline exceeded"))
-        );
-        assert_eq!(fixture.manifest_requests.load(Ordering::SeqCst), 1);
+    async fn registry_stalled_manifest_and_layer_reads_are_retried() {
+        use super::super::oci_pull::{LAYER_READ, METADATA_READ};
+        for target in [RegistryFaultTarget::Manifest, RegistryFaultTarget::Layer] {
+            let layer = matches!(target, RegistryFaultTarget::Layer);
+            let mut fault =
+                registry_fault(layer, StatusCode::SERVICE_UNAVAILABLE, "UNAVAILABLE", 1);
+            fault.delay = std::time::Duration::from_secs(3600);
+            let received = fault.received.clone();
+            let fixture = start_registry_fixture_with_fault(Some(fault)).await;
+            let tmp = tempfile::tempdir().unwrap();
+            let store = ImageStore::new(tmp.path().to_path_buf());
+            let reference = fixture.reference.clone();
+            let pull = tokio::spawn(async move { store.pull_and_unpack(&reference).await });
+            expire_stalled_attempt(&received, if layer { LAYER_READ } else { METADATA_READ }).await;
+            let rootfs = tokio::time::timeout(std::time::Duration::from_secs(10), pull)
+                .await
+                .expect("the retry never completed")
+                .unwrap()
+                .unwrap()
+                .rootfs;
+            assert_eq!(
+                std::fs::read(rootfs.join("bin/sh")).unwrap(),
+                b"fixture shell"
+            );
+            let (manifests, layers) = if layer { (1, 2) } else { (2, 1) };
+            assert_eq!(fixture.manifest_requests.load(Ordering::SeqCst), manifests);
+            assert_eq!(fixture.layer_requests.load(Ordering::SeqCst), layers);
+        }
     }
 
     #[tokio::test]

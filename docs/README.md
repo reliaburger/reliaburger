@@ -969,8 +969,9 @@ cache by default: the first pull fetches from upstream and commits under a
 `cache/<host>/<repo>` catalog entry; later pulls anywhere in the cluster are
 served peer-to-peer. Cluster-pushed images download from multiple peers in
 parallel (rarest layer first). Direct external pulls and Pickle upstream reads retry recognised rate-limit
-and temporary gateway/service errors up to four attempts. Retries share a
-30-second HEAD/manifest/config budget or a 120-second budget per layer; authentication,
+and temporary gateway/service/server errors, refused or interrupted connections and
+stalled reads up to four attempts. Each HEAD/manifest/config attempt may take 30 seconds
+within a 2-minute total, and each layer attempt 120 seconds within 6 minutes; authentication,
 malformed responses and digest failures still fail. Operational constraints:
 
 - **`registry_port` must be uniform across the cluster** — peers derive each

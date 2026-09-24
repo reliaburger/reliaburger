@@ -11,7 +11,9 @@ use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
 use crate::grill::image::ImageReference;
-use crate::grill::oci_pull::{pull_verified_manifest_for_architecture, retry_registry_read};
+use crate::grill::oci_pull::{
+    LAYER_READ, METADATA_READ, pull_verified_manifest_for_architecture, retry_registry_read,
+};
 
 use super::types::{Digest, LayerDescriptor, ManifestCatalog, PickleError};
 
@@ -216,7 +218,7 @@ impl UpstreamRegistry for OciUpstream {
         Box::pin(async move {
             let reference = Self::oci_reference(image)?;
             let auth = self.auth_for(&image.registry);
-            let digest = retry_registry_read(Duration::from_secs(30), || {
+            let digest = retry_registry_read(METADATA_READ, || {
                 self.client.fetch_manifest_digest(&reference, &auth)
             })
             .await
@@ -238,7 +240,7 @@ impl UpstreamRegistry for OciUpstream {
         Box::pin(async move {
             let reference = Self::oci_reference(image)?;
             let auth = self.auth_for(&image.registry);
-            let verified = retry_registry_read(Duration::from_secs(30), || {
+            let verified = retry_registry_read(METADATA_READ, || {
                 pull_verified_manifest_for_architecture(
                     &self.client,
                     &reference,
@@ -311,7 +313,7 @@ impl UpstreamRegistry for OciUpstream {
                 size,
                 ..Default::default()
             };
-            let bytes = retry_registry_read(Duration::from_secs(120), || async {
+            let bytes = retry_registry_read(LAYER_READ, || async {
                 // Each attempt owns an empty buffer; partial responses cannot leak
                 // into the next attempt. Metadata is not an allocation budget.
                 let mut bytes = Vec::new();
