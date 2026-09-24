@@ -225,6 +225,21 @@ fn removed_exposures(
                         )
                     })
                     .collect();
+                // A backend first published before its node knew the runtime
+                // execution, then again with it, is the same destination
+                // learning who owns it, not a withdrawal. A withdrawal with no
+                // execution matches every execution at that address, so no
+                // consumer could ever confirm it while the address stays in
+                // the catalogue, and the leader would refuse every producer
+                // release on that node for good.
+                let refined = |backend: &crate::onion::catalog::CatalogBackend| {
+                    backend.execution.is_none()
+                        && service.backends.iter().any(|candidate| {
+                            candidate.node_id == backend.node_id
+                                && candidate.node_ip == backend.node_ip
+                                && candidate.host_port == backend.host_port
+                        })
+                };
                 original
                     .backends
                     .iter()
@@ -234,7 +249,7 @@ fn removed_exposures(
                             backend.node_ip,
                             backend.host_port,
                             &backend.execution,
-                        ))
+                        )) && !refined(backend)
                     })
                     .cloned()
                     .collect()
@@ -344,6 +359,45 @@ mod tests {
                 .unwrap()
                 .pending
                 .is_empty()
+        );
+    }
+
+    /// Z6.7: every new instance's first report reached the catalogue without
+    /// its runtime execution. The next catalogue named the execution, the
+    /// ledger recorded a withdrawal of the execution-less entry, and on the
+    /// laptop cluster no producer release on that node ever succeeded again.
+    #[test]
+    fn learning_a_backends_execution_is_not_a_withdrawal() {
+        let consumers = BTreeSet::from(["reader".into()]);
+        let known = catalogue('a');
+        let mut unknown = known.clone();
+        let backend = &mut unknown.services.get_mut("default__api").unwrap().backends[0];
+        backend.execution = None;
+        backend.healthy = false;
+        let ledger = EndpointWithdrawals::default()
+            .plan_publication(&EndpointCatalog::default(), &unknown, &consumers)
+            .unwrap();
+        let learned = ledger
+            .plan_publication(&unknown, &known, &consumers)
+            .unwrap();
+        assert_eq!(learned.generation, 2);
+        assert!(learned.pending.is_empty(), "{:?}", learned.pending);
+
+        // The same address gone from the catalogue is still a withdrawal.
+        let removed = ledger
+            .plan_publication(&unknown, &EndpointCatalog::default(), &consumers)
+            .unwrap();
+        assert_eq!(removed.pending.len(), 1);
+        // So is an execution-less entry replaced at a different port.
+        let mut moved = known.clone();
+        moved.services.get_mut("default__api").unwrap().backends[0].host_port = 30002;
+        assert_eq!(
+            ledger
+                .plan_publication(&unknown, &moved, &consumers)
+                .unwrap()
+                .pending
+                .len(),
+            1
         );
     }
 
