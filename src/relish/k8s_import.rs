@@ -746,6 +746,16 @@ fn import_security_context(
 ) {
     let pod = pod_spec.and_then(|ps| ps.security_context.as_ref());
     let own = container.and_then(|c| c.security_context.as_ref());
+    if let Some(fs_group) = pod.and_then(|sc| sc.fs_group) {
+        report.warnings.push(MigrationWarning {
+            resource: resource.to_string(),
+            message: format!(
+                "securityContext.fsGroup {fs_group} dropped: managed volumes are handed to \
+                 the container's user on first mount, and host path volumes keep their \
+                 host ownership"
+            ),
+        });
+    }
     let user = own
         .and_then(|sc| sc.run_as_user)
         .or_else(|| pod.and_then(|sc| sc.run_as_user));
@@ -2599,6 +2609,34 @@ spec:
         // Pod-level runAsUser, container-level runAsGroup.
         assert_eq!(app.run_as_user, Some(100));
         assert_eq!(app.run_as_group, Some(101));
+    }
+
+    #[test]
+    fn fs_group_is_dropped_with_a_warning() {
+        let yaml = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: db
+spec:
+  template:
+    spec:
+      securityContext:
+        runAsUser: 999
+        fsGroup: 999
+      containers:
+      - name: db
+        image: postgres:17
+"#;
+        let result = import_from_yaml(yaml).unwrap();
+        assert_eq!(result.config.app["db"].run_as_user, Some(999));
+        let warnings = warnings_of(&result);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.starts_with("Deployment/db") && w.contains("fsGroup 999 dropped")),
+            "{warnings:?}"
+        );
     }
 
     #[test]
