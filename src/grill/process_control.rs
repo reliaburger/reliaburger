@@ -504,7 +504,7 @@ impl ProcessControl {
 
     /// Run through the durable owner; dropping this future cancels its socket.
     pub(crate) async fn exec(&self, id: &InstanceId, command: &[String]) -> io::Result<String> {
-        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt};
         let record = self.record(id).await?;
         if !matches!(record.phase, OwnerPhase::Running { .. }) {
             return Err(io::Error::other("instance is not running"));
@@ -520,8 +520,7 @@ impl ProcessControl {
         // Keep this socket in the caller's async future. Cancellation or Bun
         // death closes it, allowing the independent owner to retire execution.
         tokio::time::timeout(Duration::from_secs(300), async {
-            let mut socket = tokio::net::UnixStream::connect(path).await?;
-            socket.write_all(request.as_bytes()).await?;
+            let socket = deliver_exec_request(&path, &request).await?;
             let mut bytes = Vec::new();
             tokio::io::BufReader::new(socket)
                 .take(process_owner::exec::RESPONSE_LIMIT + 1)
@@ -681,6 +680,35 @@ fn dropped_connection(error: &io::Error) -> bool {
     )
 }
 
+/// Connect to a live owner and hand it an exec request, asking again when the
+/// owner drops the connection before the request reaches it.
+///
+/// The owner serves one client at a time and hangs up on one whose request
+/// hasn't arrived within its read timeout. A Bun starved between `connect`
+/// and `write` on a loaded host got "Broken pipe" and failed the exec. The
+/// owner can't have started a command it never read, so sending again is
+/// safe. A failure after the request is sent is never retried: by then the
+/// command may be running.
+async fn deliver_exec_request(path: &Path, request: &str) -> io::Result<tokio::net::UnixStream> {
+    use tokio::io::AsyncWriteExt;
+    let mut attempt = 1;
+    loop {
+        let delivered = async {
+            let mut socket = tokio::net::UnixStream::connect(path).await?;
+            socket.write_all(request.as_bytes()).await?;
+            Ok(socket)
+        }
+        .await;
+        match delivered {
+            Err(error) if dropped_connection(&error) && attempt < OWNER_REQUEST_ATTEMPTS => {
+                attempt += 1;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            delivered => return delivered,
+        }
+    }
+}
+
 fn request(record: &OwnerRecord, action: &str) -> io::Result<serde_json::Value> {
     let path = process_owner::socket_path(record);
     process_owner::validate_socket_directory(
@@ -816,6 +844,40 @@ mod tests {
         let _owner = ImpatientOwner::start(&control, &id, 3).await;
         let record = control.status(&id).await.unwrap();
         assert!(matches!(record.phase, OwnerPhase::Running { .. }));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn exec_request_is_sent_again_until_the_owner_listens() {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("control.sock");
+        // A socket file nobody listens on refuses connections, the way an
+        // owner's socket does while it is busy dropping a slow client.
+        drop(UnixListener::bind(&socket).unwrap());
+        let owner = {
+            let socket = socket.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                std::fs::remove_file(&socket).unwrap();
+                let listener = UnixListener::bind(&socket).unwrap();
+                let (connection, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                std::io::BufReader::new(&connection)
+                    .read_line(&mut line)
+                    .unwrap();
+                line
+            })
+        };
+        deliver_exec_request(&socket, "exec\n").await.unwrap();
+        assert_eq!(owner.join().unwrap(), "exec\n");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn exec_request_gives_up_on_an_owner_that_never_listens() {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("control.sock");
+        drop(UnixListener::bind(&socket).unwrap());
+        let error = deliver_exec_request(&socket, "exec\n").await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
     }
 
     #[tokio::test(flavor = "multi_thread")]
