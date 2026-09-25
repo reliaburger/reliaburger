@@ -103,7 +103,7 @@ startup instead of being ignored.
 | `[node]` | `name`, `labels` (matched by `placement`) |
 | `[cluster]` | `name`, `join`, ports, `[cluster.backup]` (see `operations`) |
 | `[storage]` | data directories, `[storage.snapshots]` (see `images-and-volumes`) |
-| `[resources]` | CPU and memory held back for the node itself (`500m`, `512Mi`) |
+| `[resources]` | CPU and memory held back for the node itself (`500m` or `0.5` cores, `512Mi`) |
 | `[network]` | `advertise_address`, host `port_range` |
 | `[security]` | master key, bootstrap and identity paths, `require_mtls` |
 | `[ebpf]`, `[dns]`, `[ingress]` | the data plane (see `networking`) |

@@ -165,14 +165,14 @@ pub fn check_quota(
 /// pass — `Config::validate` already rejects a malformed budget at apply
 /// time, so a bad value can't reach here in practice.
 pub fn quota_from_spec(name: &str, spec: &crate::config::NamespaceSpec) -> NamespaceQuota {
-    let parse = |s: &Option<String>| {
-        s.as_ref()
-            .and_then(|v| crate::config::types::parse_resource_value(v).ok())
-    };
+    use crate::config::types::{parse_byte_size, parse_cpu_millicores};
     NamespaceQuota {
         namespace: name.to_string(),
-        max_cpu_millicores: parse(&spec.cpu),
-        max_memory_bytes: parse(&spec.memory),
+        max_cpu_millicores: spec
+            .cpu
+            .as_deref()
+            .and_then(|v| parse_cpu_millicores(v).ok()),
+        max_memory_bytes: spec.memory.as_deref().and_then(|v| parse_byte_size(v).ok()),
         max_gpus: spec.gpu,
         max_apps: spec.max_apps,
         max_replicas: spec.max_replicas,
@@ -416,6 +416,21 @@ mod tests {
         assert_eq!(quota.max_gpus, Some(2));
         assert_eq!(quota.max_apps, Some(50));
         assert_eq!(quota.max_replicas, Some(200));
+    }
+
+    #[test]
+    fn quota_from_spec_reads_bare_cpu_as_cores() {
+        let spec = crate::config::NamespaceSpec {
+            cpu: Some("4".to_string()),
+            memory: None,
+            gpu: None,
+            max_apps: None,
+            max_replicas: None,
+        };
+        assert_eq!(
+            quota_from_spec("team", &spec).max_cpu_millicores,
+            Some(4000)
+        );
     }
 
     #[test]

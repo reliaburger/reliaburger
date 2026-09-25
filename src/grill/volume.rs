@@ -8,7 +8,7 @@ mod owned;
 
 use std::path::{Path, PathBuf};
 
-use crate::config::types::parse_resource_value;
+use crate::config::types::parse_byte_size;
 
 /// Errors from volume operations.
 #[derive(Debug, thiserror::Error)]
@@ -105,9 +105,7 @@ impl VolumeManager {
         }
 
         let size_bytes = size_limit
-            .map(|s| {
-                parse_resource_value(s).map_err(|e| VolumeError::InvalidSize(format!("{s}: {e}")))
-            })
+            .map(|s| parse_byte_size(s).map_err(|e| VolumeError::InvalidSize(format!("{s}: {e}"))))
             .transpose()?;
 
         let backend = super::btrfs::select_backend(
@@ -611,7 +609,7 @@ fn is_root() -> bool {
 
 /// Parse a volume size string (e.g. "10Gi") into bytes.
 pub fn parse_volume_size(s: &str) -> Result<u64, VolumeError> {
-    parse_resource_value(s).map_err(|e| VolumeError::InvalidSize(e.to_string()))
+    parse_byte_size(s).map_err(|e| VolumeError::InvalidSize(e.to_string()))
 }
 
 #[cfg(test)]

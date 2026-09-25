@@ -369,7 +369,7 @@ The command-line interface that humans interact with.
 
 - `app.rs` — `AppSpec`: image, command, replicas, port, health check config, cpu/memory/gpu ranges, placement constraints, deploy strategy.
 - `job.rs` — `JobSpec`: one-shot tasks.
-- `types.rs` — `Replicas` enum (`Fixed(u32)` or `DaemonSet`), `ResourceRange` (request + limit), `VolumeSpec`, `parse_resource_value()` for human-readable strings like "512Mi".
+- `types.rs` — `Replicas` enum (`Fixed(u32)` or `DaemonSet`), `ResourceRange` (request + limit), `VolumeSpec`, `parse_byte_size()` and `parse_cpu_millicores()` for human-readable strings like "512Mi" and "0.5".
 - `node.rs` — `NodeConfig`: the node-level config file with sections for node identity, cluster settings, storage, resources, networking, reporting tree, and reconstruction.
 - `namespace.rs` — Namespace-level quota configuration.
 - `validate.rs` — Config validation logic.

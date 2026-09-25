@@ -56,10 +56,18 @@ pub struct AppSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub health: Option<HealthSpec>,
     /// Memory request-limit range, e.g. "128Mi-512Mi".
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        with = "super::types::memory_range",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub memory: Option<ResourceRange>,
-    /// CPU request-limit range, e.g. "100m-500m".
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// CPU request-limit range, e.g. "100m-500m" or "0.5-2" (bare numbers are cores).
+    #[serde(
+        default,
+        with = "super::types::cpu_range",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub cpu: Option<ResourceRange>,
     /// Number of GPUs required.
     #[serde(skip_serializing_if = "Option::is_none")]

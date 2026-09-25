@@ -939,7 +939,13 @@ unsupported rather than silently falling back to broken host DNS.
 
 ## Configuration
 
-Workloads are defined in TOML. See [`examples/`](../examples/) for ready-to-apply configs:
+Workloads are defined in TOML. Resources follow the Kubernetes units: `cpu`
+takes cores (`"2"`, `"0.5"`) or millicores (`"250m"`), `memory` takes bytes or
+`Ki`/`Mi`/`Gi`/`Ti`, and either can be a `request-limit` range such as
+`cpu = "0.5-2"` or `memory = "256Mi-512Mi"`. The same CPU units apply to a
+namespace `cpu` budget and to the node's `[resources] reserved_cpu`.
+
+See [`examples/`](../examples/) for ready-to-apply configs:
 
 | Example | Demonstrates |
 |---------|-------------|

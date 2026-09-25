@@ -967,10 +967,11 @@ fn statefulset_to_app(name: &str, ss: &StatefulSet, report: &mut MigrationReport
 /// Parse a Kubernetes CPU quantity into millicores.
 ///
 /// K8s CPU is denominated in *cores*: `"1"` is one core (1000m), `"0.5"` is
-/// 500m, `"500m"` is 500 millicores. The old code fed these strings to
-/// `ResourceRange::parse`, where a bare integer means *millicores* — so
-/// `cpu: "1"` imported as one millicore, a 1000× under-read, and `"0.5"`
-/// failed to parse and vanished.
+/// 500m, `"500m"` is 500 millicores. Reliaburger's own CPU parser now
+/// follows the same convention, but this one stays separate because K8s
+/// quantities allow forms (scientific notation, sub-millicore values that
+/// round) that an app TOML deliberately rejects. The result goes straight
+/// into a `ResourceRange` in millicores, so nothing converts it twice.
 fn parse_k8s_cpu_millicores(quantity: &str) -> Option<u64> {
     let s = quantity.trim();
     if let Some(millis) = s.strip_suffix('m') {
@@ -2212,7 +2213,7 @@ spec:
     }
 
     /// K8s CPU is denominated in cores; the old code read `cpu: "1"` through
-    /// Reliaburger's own parser, where a bare integer means millicores — a
+    /// Reliaburger's own parser, where a bare integer then meant millicores — a
     /// 1000× under-read. And requests-only manifests (the common case)
     /// imported with no resources at all because only `limits` was read.
     #[test]
@@ -2244,6 +2245,37 @@ spec:
         assert_eq!(cpu.limit, 1000, "a missing limit takes the request value");
         let memory = app.memory.expect("requests-only memory must import");
         assert_eq!(memory.request, 512_000_000, "512M is decimal megabytes");
+    }
+
+    /// `relish import` writes the imported config out as TOML. The CPU
+    /// value must survive that trip: bare numbers in TOML are cores, so
+    /// writing 1000 millicores as `"1000"` would re-read as 1000 cores.
+    #[test]
+    fn imported_cpu_survives_the_toml_round_trip() {
+        let yaml = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 1
+  template:
+    spec:
+      containers:
+      - name: web
+        image: web:v1
+        resources:
+          requests:
+            cpu: "0.5"
+          limits:
+            cpu: "2"
+"#;
+        let result = import_from_yaml(yaml).unwrap();
+        let toml = toml::to_string_pretty(&result.config).unwrap();
+        assert!(toml.contains(r#"cpu = "500m-2000m""#), "{toml}");
+        let reparsed: crate::config::Config = toml::from_str(&toml).unwrap();
+        let cpu = reparsed.app["web"].cpu.unwrap();
+        assert_eq!((cpu.request, cpu.limit), (500, 2000));
     }
 
     #[test]

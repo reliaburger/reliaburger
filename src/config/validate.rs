@@ -6,7 +6,7 @@ use super::Config;
 /// meaningful context.
 use super::error::ConfigError;
 use super::node::NodeConfig;
-use super::types::parse_resource_value;
+use super::types::{parse_byte_size, parse_cpu_millicores};
 
 /// Whether a workload or namespace is a non-empty lowercase DNS label.
 pub(crate) fn valid_workload_label(value: &str) -> bool {
@@ -134,14 +134,14 @@ fn validate_namespace(name: &str, ns: &super::namespace::NamespaceSpec) -> Resul
     // Resource budgets must parse as non-negative resource values. A
     // negative or overflowing CPU/memory budget is a typo, not a quota.
     if let Some(cpu) = &ns.cpu {
-        parse_resource_value(cpu).map_err(|_| ConfigError::Validation {
+        parse_cpu_millicores(cpu).map_err(|_| ConfigError::Validation {
             field: "cpu".to_string(),
             context: format!("namespace {name:?}"),
             reason: format!("invalid resource value {cpu:?}"),
         })?;
     }
     if let Some(memory) = &ns.memory {
-        parse_resource_value(memory).map_err(|_| ConfigError::Validation {
+        parse_byte_size(memory).map_err(|_| ConfigError::Validation {
             field: "memory".to_string(),
             context: format!("namespace {name:?}"),
             reason: format!("invalid resource value {memory:?}"),
@@ -538,29 +538,27 @@ impl NodeConfig {
         }
 
         // Reserved resources must parse
-        parse_resource_value(&self.resources.reserved_cpu).map_err(|_| {
+        parse_cpu_millicores(&self.resources.reserved_cpu).map_err(|_| {
             ConfigError::Validation {
                 field: "resources.reserved_cpu".to_string(),
                 context: "node config".to_string(),
                 reason: format!("invalid resource value {:?}", self.resources.reserved_cpu),
             }
         })?;
-        parse_resource_value(&self.resources.reserved_memory).map_err(|_| {
-            ConfigError::Validation {
-                field: "resources.reserved_memory".to_string(),
-                context: "node config".to_string(),
-                reason: format!(
-                    "invalid resource value {:?}",
-                    self.resources.reserved_memory
-                ),
-            }
+        parse_byte_size(&self.resources.reserved_memory).map_err(|_| ConfigError::Validation {
+            field: "resources.reserved_memory".to_string(),
+            context: "node config".to_string(),
+            reason: format!(
+                "invalid resource value {:?}",
+                self.resources.reserved_memory
+            ),
         })?;
 
         // The registry storage cap must parse (M23): the binary reads it with
         // `unwrap_or(0)`, and 0 means "unlimited", so a typo like "10GBB" would
         // silently disable the cap. Fail here instead. `0` (explicit unlimited)
         // parses fine.
-        parse_resource_value(&self.images.max_storage).map_err(|_| ConfigError::Validation {
+        parse_byte_size(&self.images.max_storage).map_err(|_| ConfigError::Validation {
             field: "images.max_storage".to_string(),
             context: "node config".to_string(),
             reason: format!("invalid resource value {:?}", self.images.max_storage),
