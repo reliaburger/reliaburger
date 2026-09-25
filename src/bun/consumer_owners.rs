@@ -42,21 +42,29 @@ impl ConsumerPublication {
         &self,
         withdrawal: &crate::onion::withdrawal::EndpointWithdrawalInstruction,
     ) -> bool {
+        // The withdrawal's generation is the last catalogue that exposed the
+        // removed backends. A catalogue newer than that which lists one of them
+        // again means the leader deliberately published it again (a node's
+        // report that went missing during a leader change, say), so it's live,
+        // not an exposure this view still owes a withdrawal for. Counting it
+        // left a node that rejoined after the churn unable ever to confirm.
+        let republished = self.generation > withdrawal.generation;
         withdrawal.services.values().any(|removed| {
             self.effective_services
                 .iter()
                 .any(|entry| removed.retire_vip && entry.vip == removed.service.vip)
-                || self.catalog.services.values().any(|service| {
-                    service.backends.iter().any(|candidate| {
-                        removed.service.backends.iter().any(|original| {
-                            candidate.node_id == original.node_id
-                                && candidate.node_ip == original.node_ip
-                                && candidate.host_port == original.host_port
-                                && (original.execution.is_none()
-                                    || candidate.execution == original.execution)
+                || !republished
+                    && self.catalog.services.values().any(|service| {
+                        service.backends.iter().any(|candidate| {
+                            removed.service.backends.iter().any(|original| {
+                                candidate.node_id == original.node_id
+                                    && candidate.node_ip == original.node_ip
+                                    && candidate.host_port == original.host_port
+                                    && (original.execution.is_none()
+                                        || candidate.execution == original.execution)
+                            })
                         })
                     })
-                })
         })
     }
 }
@@ -444,6 +452,20 @@ mod tests {
         let mut acknowledged = compacted.clone();
         acknowledged.receipts.clear();
         assert!(validate_transition(Some(&compacted), Some(&acknowledged)).is_ok());
+    }
+
+    #[test]
+    fn a_backend_the_leader_publishes_again_no_longer_blocks_its_old_withdrawal() {
+        // V02 soak: a leader change briefly dropped node 1's backends and
+        // withdrew them; they came straight back unchanged. A node that
+        // rejoined afterwards only ever saw the newer catalogue.
+        let mut view = owner().publications[1].clone();
+        view.catalog = serde_json::from_value(web_catalog()).unwrap();
+        view.generation = 3;
+        assert!(!view.intersects(&withdrawal(2)));
+        // A view from the withdrawn catalogue itself still exposes it.
+        view.generation = 2;
+        assert!(view.intersects(&withdrawal(2)));
     }
 
     #[test]
