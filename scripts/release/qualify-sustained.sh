@@ -1078,7 +1078,9 @@ run_cycle() {
     current_slot=
 }
 
-# Hours 12, 24, ...: graceful stop/start; 20 and 40: quorum loss; 36: all off.
+# Specials scale with the run: graceful stop/start at each half, quorum loss
+# at 40% and 85% of the hours, every VM off at 70%. A 12 h run gets graceful
+# at 6 and 12, quorum loss at 5 and 10, all off at 8.
 # The compressed schedule runs one of each on cycles 1-3 instead.
 special_for_cycle() {
     local index=$1 hour
@@ -1091,8 +1093,13 @@ special_for_cycle() {
         return 0
     fi
     hour=$(( index + 1 ))
-    if [ $(( hour % 12 )) -eq 0 ]; then special_graceful; fi
-    case $hour in 20|40) special_quorum_loss ;; 36) special_all_off ;; esac
+    local hours=$(( duration / 3600 )) half
+    half=$(( hours / 2 )); [ "$half" -ge 1 ] || half=1
+    if [ $(( hour % half )) -eq 0 ]; then special_graceful; fi
+    if [ "$hour" -eq $(( (hours * 40 + 50) / 100 )) ] || [ "$hour" -eq $(( (hours * 85 + 50) / 100 )) ]; then
+        special_quorum_loss
+    fi
+    if [ "$hour" -eq $(( (hours * 70 + 50) / 100 )) ]; then special_all_off; fi
 }
 
 # --- teardown and record -----------------------------------------------------
