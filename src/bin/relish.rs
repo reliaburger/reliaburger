@@ -161,12 +161,20 @@ enum Command {
         /// Resource name.
         name: String,
     },
-    /// Stop all instances of an app.
+    /// Scale an app to zero, keeping its configuration; `relish apply` starts it again.
     Stop {
         /// App name.
         app: String,
         /// Namespace the app lives in (as derived by `compile` from its
         /// directory). Defaults to "default".
+        #[arg(long, default_value = "default")]
+        namespace: String,
+    },
+    /// Remove an app from the cluster and stop all its instances.
+    Delete {
+        /// App name.
+        app: String,
+        /// Namespace the app lives in. Defaults to "default".
         #[arg(long, default_value = "default")]
         namespace: String,
     },
@@ -1253,6 +1261,10 @@ async fn main() -> ExitCode {
             ref app,
             ref namespace,
         } => commands::stop(app, namespace).await,
+        Command::Delete {
+            ref app,
+            ref namespace,
+        } => commands::delete(app, namespace).await,
         Command::Init {
             ref dir,
             ref cluster_name,
@@ -2310,6 +2322,15 @@ mod tests {
     fn parse_status_command() {
         let cli = parse(&["relish", "status"]).unwrap();
         assert!(matches!(cli.command, Command::Status));
+    }
+
+    #[test]
+    fn delete_parses_app_and_namespace() {
+        let cli = parse(&["relish", "delete", "web", "--namespace", "team-a"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Delete { ref app, ref namespace } if app == "web" && namespace == "team-a"
+        ));
     }
 
     #[test]

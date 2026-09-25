@@ -350,6 +350,7 @@ pub fn router_with_upgrade(
         .route("/v1/status/{app}/{namespace}", get(status_app_handler))
         .route("/v1/top", get(top_handler))
         .route("/v1/stop/{app}/{namespace}", post(stop_handler))
+        .route("/v1/delete/{app}/{namespace}", post(delete_handler))
         .route("/v1/logs/{app}/{namespace}", get(logs_handler))
         .route(
             "/v1/logs/entries/{app}/{namespace}",
@@ -4130,22 +4131,80 @@ async fn stop_handler(
     }
 
     if let Some(council) = state.council.clone() {
-        return cluster_stop(state, council, app, namespace).await;
+        return cluster_app_change(state, council, app, namespace, AppChange::Stop).await;
     }
 
     stop_local(&state, app, namespace).await
 }
 
-/// Stop an app in cluster mode: clear its desired state through Raft, then
-/// best-effort stop the local instances.
-async fn cluster_stop(
+/// `POST /v1/delete/{app}/{namespace}` — remove an app from the cluster.
+///
+/// In cluster mode the app leaves desired state and every node retires its
+/// instances. A standalone node has no desired state beyond its running
+/// instances, so deleting is the same as stopping there.
+async fn delete_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+    Path((app, namespace)): Path<(String, String)>,
+) -> Response {
+    if let Err(resp) =
+        crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::Deployer)
+    {
+        return resp;
+    }
+    if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
+        return resp;
+    }
+    if let Err(resp) = enforce_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Deploy,
+        &app,
+        &namespace,
+    )
+    .await
+    {
+        return resp;
+    }
+
+    if let Some(council) = state.council.clone() {
+        return cluster_app_change(state, council, app, namespace, AppChange::Delete).await;
+    }
+
+    stop_local(&state, app, namespace).await
+}
+
+/// Whether `relish stop` or `relish delete` is changing an app.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppChange {
+    /// Scale to zero, keeping the specification, until the next apply.
+    Stop,
+    /// Remove the app from desired state.
+    Delete,
+}
+
+impl AppChange {
+    fn verb(self) -> &'static str {
+        match self {
+            AppChange::Stop => "stop",
+            AppChange::Delete => "delete",
+        }
+    }
+}
+
+/// Stop or delete an app in cluster mode through Raft. Nodes' reconcilers
+/// then retire its instances, the leader's own included. Stopping the local
+/// replica directly used to leave the reconciler believing it still ran, so
+/// an apply straight afterwards never brought it back.
+async fn cluster_app_change(
     state: ApiState,
     council: Arc<crate::council::CouncilNode>,
     app: String,
     namespace: String,
+    change: AppChange,
 ) -> Response {
     // Followers can't write to Raft (openraft does not forward client
-    // writes), so forward the whole stop to the leader's API.
+    // writes), so forward the whole request to the leader's API.
     if !council.is_leader().await {
         let Some(leader_url) = leader_api_url(&state, &council).await else {
             return (
@@ -4156,7 +4215,7 @@ async fn cluster_stop(
             )
                 .into_response();
         };
-        let url = format!("{leader_url}/v1/stop/{app}/{namespace}");
+        let url = format!("{leader_url}/v1/{}/{app}/{namespace}", change.verb());
         let mut request = state.cluster_http.client().post(url);
         if let Some(token) = &state.service_token {
             request = request.bearer_auth(token);
@@ -4171,7 +4230,7 @@ async fn cluster_stop(
             Err(e) => (
                 StatusCode::BAD_GATEWAY,
                 Json(serde_json::json!({
-                    "error": format!("failed to forward stop to the leader: {e}")
+                    "error": format!("failed to forward {} to the leader: {e}", change.verb())
                 })),
             )
                 .into_response(),
@@ -4179,30 +4238,31 @@ async fn cluster_stop(
     }
 
     let app_id = crate::meat::AppId::new(&app, &namespace);
-    if let Err(e) = council
-        .write(crate::council::types::RaftRequest::AppDelete { app_id })
-        .await
-    {
-        return (
+    let request = match change {
+        AppChange::Stop => crate::council::types::RaftRequest::AppStop { app_id },
+        AppChange::Delete => crate::council::types::RaftRequest::AppDelete { app_id },
+    };
+    match council.write(request).await {
+        Ok(crate::council::CouncilResponse::Refused { reason }) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": reason })),
+        )
+            .into_response(),
+        Ok(_) => {
+            let status = match change {
+                AppChange::Stop => "stopped",
+                AppChange::Delete => "deleted",
+            };
+            Json(serde_json::json!({ "status": status })).into_response()
+        }
+        Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
-                "error": format!("failed to clear desired state: {e}")
+                "error": format!("failed to update desired state: {e}")
             })),
         )
-            .into_response();
+            .into_response(),
     }
-
-    // The desired state is gone; stop the local replica if we have one.
-    // A missing local instance is expected on a leader that holds no
-    // replica, so it is not an error here.
-    let _ = ask_agent(&state.cmd_tx, |response| AgentCommand::Stop {
-        app_name: app,
-        namespace,
-        response,
-    })
-    .await;
-
-    Json(serde_json::json!({ "status": "stopped" })).into_response()
 }
 
 /// Stop an app on this node only (standalone mode).

@@ -1005,6 +1005,12 @@ pub(super) enum JobPhase {
 
 `relish apply` refuses to start a job whose previous outcome is unknown, and says why: `previous outcome is unknown; use apply --rerun-jobs for an explicit rerun`. `--rerun-jobs` is the human saying "I've checked, run it again". The API accepts it only from a user with the Deployer role, and only for a file containing nothing but non-scheduled jobs. GitOps and the reconciler never set it. Cron jobs are the one exception: once bun has confirmed the old run's container is gone, the next scheduled occurrence runs normally. That's a new occurrence, not a replay of the uncertain one. Chapter 8 covers the retry budget and the crash tests behind this.
 
+## Stop means stop, delete means delete
+
+For most of the project `relish stop web` in a cluster did two things: it deleted `web` from desired state through Raft, and it stopped the leader's own replica on the spot. Both sound reasonable. Together they made a trap. The leader's placement reconciler still had `web` recorded as converged, so when the V02 soak ran `relish stop` and then applied the same file a few seconds later, the reconciler saw the same specification come back and skipped it. The app stayed down. And there was no way at all to remove an app, short of GitOps.
+
+Now there are two commands with two meanings. `relish stop` writes `AppStop`, which keeps the specification and puts the app in `stopped_apps`; the scheduler treats a stopped app as an override of zero replicas, and every node's reconciler retires its instances the ordinary way, the leader's included. Applying the app clears the mark. `relish delete` writes `AppDelete`, which removes it altogether. Neither reaches past a reconciler to stop a container itself, so the bookkeeping that decides what to redeploy is never out of step with what runs.
+
 ## Two seconds is too eager
 
 Each node's placement reconciler polls the leader every couple of seconds and deploys whatever its share of the placements says. If a deploy failed, the next poll simply tried again. Kubernetes has `CrashLoopBackOff` for exactly this; we had a supervisor back-off for instances that crash after starting, but a deploy that never produces a running instance never reaches the supervisor. The V02 soak found the result: an app whose binary had been truncated by a power cut reached generation `g170` in eight minutes, every attempt a fresh container, a fresh journal entry and a fresh log line.

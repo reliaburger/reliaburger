@@ -440,7 +440,22 @@ async fn stop_with_client(
     client: &BunClient,
 ) -> Result<(), RelishError> {
     client.stop(app, namespace).await?;
-    println!("stopped {app}");
+    println!("stopped {app}; `relish apply` starts it again");
+    Ok(())
+}
+
+/// Remove an app from the cluster.
+pub async fn delete(app: &str, namespace: &str) -> Result<(), RelishError> {
+    delete_with_client(app, namespace, &BunClient::default_local()).await
+}
+
+async fn delete_with_client(
+    app: &str,
+    namespace: &str,
+    client: &BunClient,
+) -> Result<(), RelishError> {
+    client.delete(app, namespace).await?;
+    println!("deleted {app}");
     Ok(())
 }
 
