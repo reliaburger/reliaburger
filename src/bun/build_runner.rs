@@ -667,9 +667,9 @@ pub async fn transfer_context_to_builder(
 /// Upload a buildah-exported OCI image layout to the local registry, presenting
 /// `bearer` (the internal service token) as the write credential (B1).
 ///
-/// `buildah push` cannot authenticate against Pickle — Pickle takes the
-/// service token as a *bearer* and buildah only offers HTTP Basic `--creds`,
-/// which Pickle never accepts and never challenges for. So the push writes a
+/// `buildah push` could only present the service token as HTTP Basic
+/// `--creds`, which Pickle refuses over plaintext and which would expose the
+/// token in buildah's command line over TLS. So the push writes a
 /// local OCI layout and this function uploads it: every blob under
 /// `blobs/sha256/` goes up as a monolithic blob (covering the config, the
 /// layers, and — for a multi-platform build — the sub-manifests), then the top
