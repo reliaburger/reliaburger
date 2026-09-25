@@ -12,6 +12,12 @@ use crate::council::{CouncilNode, CouncilResponse, RaftRequest};
 #[derive(Debug, Clone)]
 pub struct TlsPeerCertificate(pub rustls::pki_types::CertificateDer<'static>);
 
+/// The node leaf lifetime this member signs renewals with, installed by Bun as
+/// a router extension from `[security] leaf_lifetime_override_secs`. Absent,
+/// the member signs with [`ca::NODE_LEAF_LIFETIME`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodeLeafLifetime(pub std::time::Duration);
+
 /// A node asks to replace its leaf while retaining its authenticated node identity.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -39,10 +45,12 @@ pub enum RenewalError {
 /// Issue a replacement after fresh quorum-backed identity validation and serial
 /// allocation. A follower never forwards a peer identity through its own TLS
 /// connection; the requesting node must retry directly against the leader.
+/// The leaf lives for `lifetime`, the signing leader's configured value.
 pub async fn issue_renewal(
     council: &CouncilNode,
     peer: &TlsPeerCertificate,
     request: &RenewalRequest,
+    lifetime: std::time::Duration,
 ) -> Result<join::JoinBundle, RenewalError> {
     use base64::Engine as _;
     request
@@ -97,7 +105,7 @@ pub async fn issue_renewal(
         .map_err(|error| RenewalError::Unavailable(error.to_string()))?;
     validate_peer(peer, &state)?;
     let result = tokio::task::spawn_blocking(move || {
-        join::sign_join_csr(&csr, &node_id, serial, &state, &wrapping_ikm)
+        join::sign_join_csr(&csr, &node_id, serial, lifetime, &state, &wrapping_ikm)
     })
     .await
     .map_err(|error| RenewalError::Unavailable(error.to_string()))?

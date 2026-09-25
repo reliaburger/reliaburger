@@ -38,6 +38,18 @@ const INTERMEDIATE_CA_LIFETIME: Duration = Duration::from_secs(5 * 365 * 24 * 36
 /// freshly issued certificate.
 pub const CLOCK_SKEW_BACKDATE: Duration = Duration::from_secs(300);
 
+/// Default lifetime of a node leaf certificate. Renewal replaces it at its
+/// midpoint, so a healthy node rotates roughly every six months.
+pub const NODE_LEAF_LIFETIME: Duration = Duration::from_secs(365 * 24 * 3600);
+
+/// Default lifetime of a cluster-issued ingress leaf (`tls = "cluster"`).
+pub const INGRESS_LEAF_LIFETIME: Duration = Duration::from_secs(90 * 24 * 3600);
+
+/// Shortest leaf lifetime `[security] leaf_lifetime_override_secs` accepts.
+/// Anything shorter would leave a node only a few minutes of slack to renew
+/// through a leader election or a brief partition.
+pub const MIN_LEAF_LIFETIME_OVERRIDE: Duration = Duration::from_secs(600);
+
 /// The result of generating a CA: the CA struct for storage, plus
 /// the raw private key DER (for the caller to use before wrapping).
 pub struct GeneratedCa {
@@ -355,7 +367,7 @@ pub fn issue_node_cert(
     let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
         .map_err(|e| CaError::KeyGenFailed(e.to_string()))?;
     let private_key_der = key_pair.serialize_der();
-    let mut params = node_cert_params(node_id, serial)?;
+    let mut params = node_cert_params(node_id, serial, NODE_LEAF_LIFETIME)?;
     bound_leaf_validity(&mut params, ca_params)?;
 
     let ca_cert = ca_params
@@ -377,11 +389,17 @@ pub fn issue_node_cert(
 /// other field, the node-id URI SAN in particular, is rebuilt server-side from
 /// `node_id`, so a CSR that smuggles extra SANs never gets them signed.
 ///
+/// `lifetime` is the issuing member's node leaf lifetime: normally
+/// [`NODE_LEAF_LIFETIME`], shorter when that member carries
+/// `[security] leaf_lifetime_override_secs`. The issuer's CA validity still
+/// clamps it.
+///
 /// Returns `(certificate_der, serial)`.
 pub fn sign_node_csr(
     csr_der: &[u8],
     node_id: &str,
     serial: SerialNumber,
+    lifetime: Duration,
     ca_keypair: &KeyPair,
     ca_params: &CertificateParams,
 ) -> Result<(Vec<u8>, SerialNumber), CaError> {
@@ -390,7 +408,7 @@ pub fn sign_node_csr(
     let csr_params = rcgen::CertificateSigningRequestParams::from_der(&csr_der_ref)
         .map_err(|e| CaError::SignFailed(format!("failed to parse node CSR: {e}")))?;
 
-    let mut params = node_cert_params(node_id, serial)?;
+    let mut params = node_cert_params(node_id, serial, lifetime)?;
     bound_leaf_validity(&mut params, ca_params)?;
     let ca_cert = ca_params
         .clone()
@@ -422,9 +440,11 @@ fn bound_leaf_validity(
 
 /// Build the certificate params for a node certificate (shared by the
 /// self-issued and CSR-signed paths).
-fn node_cert_params(node_id: &str, serial: SerialNumber) -> Result<CertificateParams, CaError> {
-    let lifetime = Duration::from_secs(365 * 24 * 3600); // 1 year
-
+fn node_cert_params(
+    node_id: &str,
+    serial: SerialNumber,
+    lifetime: Duration,
+) -> Result<CertificateParams, CaError> {
     let mut params = CertificateParams::default();
     let mut dn = DistinguishedName::new();
     dn.push(DnType::CommonName, node_id);
@@ -831,6 +851,7 @@ mod tests {
             &csr_der,
             "node-02",
             SerialNumber(11),
+            NODE_LEAF_LIFETIME,
             &hierarchy.node.signing_keypair,
             &hierarchy.node.certificate_params,
         )
@@ -968,6 +989,7 @@ mod tests {
             &csr_der,
             "node-good",
             SerialNumber(11),
+            NODE_LEAF_LIFETIME,
             &hierarchy.node.signing_keypair,
             &hierarchy.node.certificate_params,
         )
@@ -997,5 +1019,67 @@ mod tests {
             None
         );
         assert_eq!(node_id_from_spiffe_uri("https://example"), None);
+    }
+
+    fn signed_window_secs(der: &[u8]) -> i64 {
+        let (_, cert) = x509_parser::parse_x509_certificate(der).unwrap();
+        cert.validity().not_after.timestamp() - cert.validity().not_before.timestamp()
+    }
+
+    #[test]
+    fn node_leaves_default_to_one_year() {
+        let hierarchy = generate_ca_hierarchy("test", b"ikm").unwrap();
+        let (issued, _, _) = issue_node_cert(
+            "node-01",
+            SerialNumber(10),
+            &hierarchy.node.signing_keypair,
+            &hierarchy.node.certificate_params,
+        )
+        .unwrap();
+        let (csr_der, _) = create_node_csr("node-02").unwrap();
+        let (signed, _) = sign_node_csr(
+            &csr_der,
+            "node-02",
+            SerialNumber(11),
+            NODE_LEAF_LIFETIME,
+            &hierarchy.node.signing_keypair,
+            &hierarchy.node.certificate_params,
+        )
+        .unwrap();
+        // The backdated start may be clamped to the Node CA's own start; the
+        // end is still one year from issue.
+        let year = NODE_LEAF_LIFETIME.as_secs() as i64;
+        for der in [&issued, &signed] {
+            let window = signed_window_secs(der);
+            assert!(
+                (year..=year + CLOCK_SKEW_BACKDATE.as_secs() as i64).contains(&window),
+                "{window}"
+            );
+        }
+    }
+
+    #[test]
+    fn signed_node_csr_honours_a_shortened_lifetime() {
+        let hierarchy = generate_ca_hierarchy("test", b"ikm").unwrap();
+        let (csr_der, _) = create_node_csr("node-02").unwrap();
+        let (signed, _) = sign_node_csr(
+            &csr_der,
+            "node-02",
+            SerialNumber(11),
+            Duration::from_secs(3600),
+            &hierarchy.node.signing_keypair,
+            &hierarchy.node.certificate_params,
+        )
+        .unwrap();
+        let (_, cert) = x509_parser::parse_x509_certificate(&signed).unwrap();
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let not_after = cert.validity().not_after.timestamp();
+        assert!(
+            (now + 3595..=now + 3600).contains(&not_after),
+            "an hour-long override must end an hour from issue: {not_after} vs {now}"
+        );
     }
 }

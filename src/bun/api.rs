@@ -4997,10 +4997,14 @@ async fn cluster_ca_handler(State(state): State<ApiState>) -> Response {
 async fn node_renewal_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     peer: Option<axum::Extension<crate::sesame::renewal::TlsPeerCertificate>>,
+    lifetime: Option<axum::Extension<crate::sesame::renewal::NodeLeafLifetime>>,
     State(state): State<ApiState>,
     Json(request): Json<crate::sesame::renewal::RenewalRequest>,
 ) -> Response {
     use crate::sesame::renewal::{RenewalError, issue_renewal};
+    let lifetime = lifetime.map_or(crate::sesame::ca::NODE_LEAF_LIFETIME, |lifetime| {
+        lifetime.0.0
+    });
     if let Err(response) = crate::sesame::auth::require_system(auth.as_deref()) {
         return response;
     }
@@ -5016,7 +5020,7 @@ async fn node_renewal_handler(
     };
     match tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        issue_renewal(council, &peer, &request),
+        issue_renewal(council, &peer, &request, lifetime),
     )
     .await
     {

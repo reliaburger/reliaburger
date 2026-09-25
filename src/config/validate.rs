@@ -427,6 +427,37 @@ fn validate_job(name: &str, job: &super::job::JobSpec) -> Result<(), ConfigError
 }
 
 impl NodeConfig {
+    /// `[security] leaf_lifetime_override_secs` exists to qualify renewal in a
+    /// soak run. It must never reach a cluster whose class is production or
+    /// undeclared, and it may only shorten both leaf classes it touches.
+    fn validate_leaf_lifetime_override(&self) -> Result<(), ConfigError> {
+        use crate::sesame::ca::{INGRESS_LEAF_LIFETIME, MIN_LEAF_LIFETIME_OVERRIDE};
+        use crate::testkit::safety::ClusterSafetyClass;
+        let Some(seconds) = self.security.leaf_lifetime_override_secs else {
+            return Ok(());
+        };
+        let refuse = |reason: String| ConfigError::Validation {
+            field: "security.leaf_lifetime_override_secs".to_string(),
+            context: "node config".to_string(),
+            reason,
+        };
+        if self.testing.safety_class != ClusterSafetyClass::Development {
+            return Err(refuse(
+                "is a development-only soak setting; it requires \
+                 [testing] safety_class = \"development\""
+                    .to_string(),
+            ));
+        }
+        let minimum = MIN_LEAF_LIFETIME_OVERRIDE.as_secs();
+        let maximum = INGRESS_LEAF_LIFETIME.as_secs();
+        if !(minimum..=maximum).contains(&seconds) {
+            return Err(refuse(format!(
+                "must be between {minimum} and {maximum} seconds, got {seconds}"
+            )));
+        }
+        Ok(())
+    }
+
     /// Validate the parsed node configuration.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.reporting_tree.max_events_per_report
@@ -512,6 +543,8 @@ impl NodeConfig {
                 reason: "must be greater than zero".into(),
             });
         }
+
+        self.validate_leaf_lifetime_override()?;
 
         self.testing
             .validate()
@@ -1014,6 +1047,109 @@ mod tests {
         );
         config.reporting_tree.max_events_per_report = 100;
         assert!(config.validate().is_ok());
+    }
+
+    fn development_with_leaf_override(seconds: u64) -> NodeConfig {
+        let mut config = NodeConfig::default();
+        config.testing.safety_class = crate::testkit::safety::ClusterSafetyClass::Development;
+        config.security.leaf_lifetime_override_secs = Some(seconds);
+        config
+    }
+
+    fn assert_leaf_override_refused(config: &NodeConfig, reason_contains: &str) {
+        let error = config.validate().unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                ConfigError::Validation { field, reason, .. }
+                    if field == "security.leaf_lifetime_override_secs"
+                        && reason.contains(reason_contains)
+            ),
+            "{error:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("security.leaf_lifetime_override_secs")
+        );
+    }
+
+    #[test]
+    fn leaf_lifetime_override_is_accepted_on_a_development_node() {
+        let config = development_with_leaf_override(3600);
+        config.validate().unwrap();
+        assert_eq!(
+            config.security.node_leaf_lifetime(),
+            std::time::Duration::from_secs(3600)
+        );
+        assert_eq!(
+            config.security.ingress_leaf_lifetime(),
+            std::time::Duration::from_secs(3600)
+        );
+        development_with_leaf_override(600).validate().unwrap();
+        development_with_leaf_override(90 * 24 * 3600)
+            .validate()
+            .unwrap();
+    }
+
+    #[test]
+    fn leaf_lifetime_override_below_ten_minutes_is_refused() {
+        assert_leaf_override_refused(&development_with_leaf_override(599), "between 600");
+        assert_leaf_override_refused(&development_with_leaf_override(0), "between 600");
+    }
+
+    #[test]
+    fn leaf_lifetime_override_above_the_ingress_default_is_refused() {
+        // The knob shortens both leaf classes, so it can't exceed the shorter
+        // (90-day ingress) default: that would lengthen ingress leaves.
+        assert_leaf_override_refused(
+            &development_with_leaf_override(90 * 24 * 3600 + 1),
+            "and 7776000 seconds",
+        );
+        assert_leaf_override_refused(
+            &development_with_leaf_override(365 * 24 * 3600),
+            "and 7776000 seconds",
+        );
+    }
+
+    #[test]
+    fn leaf_lifetime_override_is_refused_outside_development() {
+        use crate::testkit::safety::ClusterSafetyClass;
+        for class in [
+            ClusterSafetyClass::Unknown,
+            ClusterSafetyClass::Staging,
+            ClusterSafetyClass::Production,
+        ] {
+            let mut config = development_with_leaf_override(3600);
+            config.testing.safety_class = class;
+            assert_leaf_override_refused(&config, "development-only");
+        }
+        // An absent `[testing]` section is Unknown, never development.
+        let parsed = NodeConfig::parse("[security]\nleaf_lifetime_override_secs = 3600\n").unwrap();
+        assert_leaf_override_refused(&parsed, "safety_class = \"development\"");
+    }
+
+    #[test]
+    fn absent_leaf_lifetime_override_keeps_the_compiled_defaults() {
+        let config = NodeConfig::parse("").unwrap();
+        assert_eq!(config.security.leaf_lifetime_override_secs, None);
+        config.validate().unwrap();
+        assert_eq!(
+            config.security.node_leaf_lifetime(),
+            crate::sesame::ca::NODE_LEAF_LIFETIME
+        );
+        assert_eq!(
+            config.security.ingress_leaf_lifetime(),
+            crate::sesame::ca::INGRESS_LEAF_LIFETIME
+        );
+        assert_eq!(
+            crate::sesame::ca::NODE_LEAF_LIFETIME,
+            std::time::Duration::from_secs(365 * 24 * 3600)
+        );
+        assert_eq!(
+            crate::sesame::ca::INGRESS_LEAF_LIFETIME,
+            std::time::Duration::from_secs(90 * 24 * 3600)
+        );
     }
 
     #[test]

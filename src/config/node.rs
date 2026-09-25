@@ -327,6 +327,35 @@ pub struct SecuritySection {
     /// don't need it; `relish init --development-plaintext` and `relish dev`
     /// set it for their deliberately-insecure local clusters.
     pub allow_insecure_cluster: bool,
+
+    /// Development-only: shorten the node leaf and cluster-issued ingress leaf
+    /// lifetimes to this many seconds, so a soak run sees many renewals a day
+    /// instead of one every six months. Accepted only with
+    /// `[testing] safety_class = "development"`, and only between 600 seconds
+    /// and the 90-day ingress default. It applies where the leaf is signed:
+    /// the council leader for node renewals, the signing member for joins,
+    /// each node for its own ingress leaves.
+    pub leaf_lifetime_override_secs: Option<u64>,
+}
+
+impl SecuritySection {
+    /// Lifetime of node leaves this member signs (joins and renewals).
+    pub fn node_leaf_lifetime(&self) -> std::time::Duration {
+        self.shortened(crate::sesame::ca::NODE_LEAF_LIFETIME)
+    }
+
+    /// Lifetime of the cluster-issued ingress leaves this node mints.
+    pub fn ingress_leaf_lifetime(&self) -> std::time::Duration {
+        self.shortened(crate::sesame::ca::INGRESS_LEAF_LIFETIME)
+    }
+
+    /// The override never lengthens a compiled default, even if validation
+    /// was skipped.
+    fn shortened(&self, default: std::time::Duration) -> std::time::Duration {
+        self.leaf_lifetime_override_secs.map_or(default, |secs| {
+            default.min(std::time::Duration::from_secs(secs))
+        })
+    }
 }
 
 /// Self-upgrade configuration (Phase 14).

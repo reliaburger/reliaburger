@@ -113,8 +113,11 @@ image past `require_signatures`.
 
 ## Between nodes
 
-`relish init` generates the root, node, workload and ingress CAs. Nodes renew
-their certificates at the midpoint of their validity without restarting, and a
+`relish init` generates the root, node, workload and ingress CAs. Node
+certificates last a year and cluster-issued ingress certificates 90 days. Nodes
+renew their certificates at the midpoint of their validity without restarting
+(a development cluster can shorten both lifetimes for soak testing, see
+`[security] leaf_lifetime_override_secs` in the reference), and a
 new node joins with a single-use token and a certificate signing request, so
 its private key never leaves it. Every node needs the cluster's master key
 (`*-master.key` from `init`): it unwraps the CA keys and the secret keys, and

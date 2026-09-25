@@ -36,7 +36,7 @@ Sesame is not a separate binary or sidecar. It is compiled into the single `reli
 | **Meat** (scheduler) | Provides the scheduling state that council uses to validate CSRs -- a worker node can only obtain a certificate for a workload that Meat has scheduled onto that node. |
 | **Mustard** (gossip) | Propagates the `cluster_nodes` IP set used by nftables perimeter rules. Membership changes trigger Bun to reconcile firewall state. |
 | **Onion** (eBPF service discovery) | Hosts the `connect()` interception point where eBPF firewall checks are enforced. The `firewall_map` BPF map is loaded alongside Onion's existing service map. |
-| **Wrapper** (ingress) | Reconstructs Ingress CA material on council-enabled ingress nodes and issues per-SNI leaves for `tls = "cluster"` routes. Automatic renewal remains follow-up work. |
+| **Wrapper** (ingress) | Reconstructs Ingress CA material on council-enabled ingress nodes and issues per-SNI leaves for `tls = "cluster"` routes (90 days by default). A cached leaf is reissued on the first handshake after its midpoint, measured from the issuing instant. |
 | **Lettuce** (GitOps) | Delivers app configurations containing `ENC[AGE:...]` secret values and `firewall`/`egress` blocks to Bun for processing. |
 
 ---
@@ -287,7 +287,7 @@ pub struct NodeCertificate {
 
     /// Certificate validity period.
     pub not_before: SystemTime,
-    pub not_after: SystemTime,  // default: 1 year from issuance
+    pub not_after: SystemTime,  // default: 1 year from issuance (see §6.1.1)
 
     /// The Node CA generation that signed this certificate.
     pub ca_generation: u64,
@@ -1054,6 +1054,65 @@ intermediate_ca_lifetime = "5y"
 # Default: "ecdsa-p256".
 ca_algorithm = "ecdsa-p256"
 ```
+
+The block above is the design sketch. What ships in 0.1.0 is narrower: the
+lifetimes are compiled constants in `src/sesame/ca.rs` (`NODE_LEAF_LIFETIME`
+one year, `INGRESS_LEAF_LIFETIME` 90 days, workload identity one hour in
+`src/sesame/identity.rs`, root CA 10 years, intermediates 5 years), and the
+only node-config knob is a development-only override for the two leaf classes.
+
+#### 6.1.1 Soak override: `leaf_lifetime_override_secs`
+
+```toml
+[testing]
+safety_class = "development"
+
+[security]
+leaf_lifetime_override_secs = 3600
+```
+
+**Why it exists.** A node leaf renews at six months, so a 24-hour soak would
+exercise node renewal zero times. Qualifying renewal under restarts, leader
+changes and power cuts needs dozens of renewals per node per day. The override
+shortens the node leaf and the cluster-issued ingress leaf to the given number
+of seconds; at 3600 a node renews roughly every 27 minutes (half of the
+3,900-second signed window, which includes the 300-second backdate).
+
+**Why development only.** A short leaf turns every leader outage longer than
+half the lifetime into a fleet-wide expiry, which then needs operator
+re-enrolment. That's the right trade in a soak and the wrong one anywhere else,
+so `NodeConfig::validate` refuses the key unless `[testing] safety_class` is
+`development` (an absent section is `unknown`, which is refused). The value
+must be between 600 seconds (`MIN_LEAF_LIFETIME_OVERRIDE`) and 90 days: it
+shortens both leaf classes, so it can't exceed the shorter default without
+lengthening ingress leaves. Workload identity and the CA lifetimes aren't
+affected. Bun refuses to start on a violation, naming the key.
+
+**Where it takes effect.** The lifetime is decided where the leaf is signed:
+
+| Leaf | Signed by | Whose value applies |
+|------|-----------|---------------------|
+| Node leaf, renewal | council leader (`POST /v1/cluster/renew`, `issue_renewal`) | the leader's |
+| Node leaf, join | the member handling the join (`handle_join_issue`) | that member's |
+| Node leaf, `relish init` | `relish` on the operator's machine | always one year |
+| Ingress leaf | each ingress node for itself (`IngressCertResolver`) | that node's |
+
+**When nodes disagree.** The issuer's value always sets the signed lifetime;
+operators should give every node the same value. The renewal worker also treats
+its own override as a ceiling (`NodeRenewalWorker::with_leaf_lifetime_ceiling`):
+it renews no later than the midpoint of a ceiling-length leaf (for 3600,
+1,650 seconds after issue), whatever the signed lifetime. That covers the two
+awkward cases:
+
+- A node that gains the override while holding a one-year leaf (including the
+  first node's `relish init` leaf) renews within half the override instead of
+  in six months, and gets a short leaf from a leader that also carries it.
+- A node with the override behind a leader without it gets a one-year leaf
+  back. It renews again half a ceiling later, not on the next one-second tick,
+  so a mismatch costs one extra renewal per half-override and never a loop.
+
+A node without the override behind a leader with it simply receives short
+leaves and renews at their midpoint as usual.
 
 ### 6.2 Node Authentication
 

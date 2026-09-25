@@ -74,7 +74,14 @@ fn issue_for(
     state.next_serial += 1;
 
     let (csr_der, _key) = ca::create_node_csr(node_id).unwrap();
-    join::sign_join_csr(&csr_der, node_id, serial, state, ikm)
+    join::sign_join_csr(
+        &csr_der,
+        node_id,
+        serial,
+        ca::NODE_LEAF_LIFETIME,
+        state,
+        ikm,
+    )
 }
 
 #[test]
@@ -298,7 +305,14 @@ async fn spawn_issuer(
             jt.consumed = true;
             let serial = reliaburger::sesame::types::SerialNumber(state.next_serial);
             state.next_serial += 1;
-            join::sign_join_csr(&csr_der, node_id, serial, &state, &issuer.ikm)
+            join::sign_join_csr(
+                &csr_der,
+                node_id,
+                serial,
+                ca::NODE_LEAF_LIFETIME,
+                &state,
+                &issuer.ikm,
+            )
         })();
 
         match issued {
