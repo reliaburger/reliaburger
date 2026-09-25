@@ -684,7 +684,7 @@ Commands:
 | `token create --name <name>` | Create an API token (`--role`, `--apps`, `--namespaces`, `--ttl-days`) |
 | `token list` | List all API tokens |
 | `token revoke <name>` | Revoke an API token by name |
-| `fault delay <target> <delay>` | Reserved contract; currently refused until the TC packet path ships |
+| `fault delay <target> <delay>` | Delays traffic to the target with a `tc` netem qdisc on each caller container (runc only); `--from APP` limits it to one caller |
 | `fault drop <target> <pct> --acknowledge` | Fail a percentage of connections (ECONNREFUSED) |
 | `fault dns <target> nxdomain --acknowledge` | Return NXDOMAIN for DNS resolution |
 | `fault partition <target> [--from <app>] --acknowledge` | Block connect() from one source app (or all callers) to a service; requires Linux eBPF |
