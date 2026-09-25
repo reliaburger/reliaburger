@@ -336,8 +336,10 @@ in repository Actions. Signed candidate qualification is still V03.
   - [x] Preserve a complete signed candidate with source/run identity and per-file hashes; promote only the qualified bytes without rebuilding.
   - [x] Add explicit HTTPS candidate mirrors to both installers and managed setup without bypassing checksums or signatures.
   - [x] Stage a verified candidate as a pre-release that promotion refuses, and script the real `curl | sh` qualification against it ([runbook](releasing.md#staging-a-candidate)).
-  - [ ] Qualify hosted candidate creation, staged HTTPS delivery and actual signed installation before promotion.
+  - [x] Qualify hosted candidate creation, staged HTTPS delivery and actual signed installation before promotion ([Apple silicon, 25 Sep](qualification/2026-09-25-staged-install-apple-silicon.md): candidate run 36078958881, two cold installs passed).
 - [ ] **V04** (gate) Measure repeated cold installs on the advertised host matrix.
+  - [x] Apple silicon: two cold installs, 125–126 s from the first `curl` to a ready three-node cluster ([record](qualification/2026-09-25-staged-install-apple-silicon.md)).
+  - [ ] Intel macOS, Linux x86_64 and Linux arm64.
 - [x] **V05** Review all dependency exceptions against the current RustSec database and [record their reachability and migration dispositions](qualification/2026-09-18-dependency-exceptions.md). `make audit` also refuses an active rkyv graph.
 
 ### Known flakes
