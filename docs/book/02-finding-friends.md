@@ -110,6 +110,8 @@ impl NodeCapacity {
 
 Labels are stored in a `BTreeMap` rather than a `HashMap` because we need deterministic serialisation. When the scheduler evaluates placement constraints like `region = "us-east"`, it needs to iterate labels in a consistent order across all nodes.
 
+Labels travel in each node's gossip extension, not in membership updates, and every node copies what it hears onto the sender's membership record. The snapshot the scheduler and `relish nodes` read, though, is only republished when a digest of the membership changes, and that digest held each member's id, state, incarnation and roles. The V02 soak restarted a node with a new label. It came back quickly enough that nobody suspected it, so its state and incarnation didn't move, the digest didn't move, and the new label never left the internal record: the app pinned to it could never be scheduled. The digest now includes labels and addresses. A snapshot is cheap; a change the scheduler can't see isn't.
+
 ## The SWIM gossip protocol
 
 Now for the interesting part. How do 10,000 nodes discover each other, detect failures, and propagate information — without a central registry?
