@@ -100,7 +100,13 @@ impl VolumeManager {
             .join(app_name)
             .join(relative_path);
 
-        if self.backend_of(&host_path).is_some() {
+        if let Some(backend) = self.backend_of(&host_path) {
+            // A loop mount doesn't survive a reboot. Without this the app
+            // would write into the bare mountpoint on the root filesystem,
+            // unbounded, while its real data sat unmounted in the image.
+            if backend == super::btrfs::VolumeBackend::LoopMount {
+                self.remount_loop(&host_path)?;
+            }
             return Ok(host_path); // already provisioned
         }
 
@@ -316,6 +322,50 @@ impl VolumeManager {
     /// No-op on non-Linux platforms.
     #[cfg(not(target_os = "linux"))]
     fn setup_loop_mount(&self, _path: &Path, _size_bytes: u64) -> Result<(), VolumeError> {
+        Ok(())
+    }
+
+    /// Mount a provisioned loop volume's image again if it isn't mounted.
+    #[cfg(target_os = "linux")]
+    fn remount_loop(&self, path: &Path) -> Result<(), VolumeError> {
+        if super::rootfs::is_mountpoint(path) {
+            return Ok(());
+        }
+        let img_path = path.with_extension("img");
+        let failed = |reason: String| VolumeError::CreateFailed {
+            path: path.display().to_string(),
+            reason,
+        };
+        if !img_path.is_file() {
+            return Err(failed(format!(
+                "loop volume image {} is missing",
+                img_path.display()
+            )));
+        }
+        // Anything written to the bare mountpoint while the image was
+        // unmounted would be hidden by the mount. Refuse rather than hide it.
+        if std::fs::read_dir(path)?.next().is_some() {
+            return Err(failed(
+                "loop volume mountpoint holds files written while its image was unmounted; \
+                 move them into the mounted volume first"
+                    .to_string(),
+            ));
+        }
+        let status = std::process::Command::new("mount")
+            .args(["-o", "loop"])
+            .arg(&img_path)
+            .arg(path)
+            .status()
+            .map_err(|e| failed(format!("mount: {e}")))?;
+        if !status.success() {
+            return Err(failed("loop remount failed (requires root)".to_string()));
+        }
+        Ok(())
+    }
+
+    /// No-op on non-Linux platforms.
+    #[cfg(not(target_os = "linux"))]
+    fn remount_loop(&self, _path: &Path) -> Result<(), VolumeError> {
         Ok(())
     }
 
@@ -1036,6 +1086,33 @@ mod tests {
     /// Roadmap (Phase 12): writing beyond a Btrfs qgroup quota fails.
     /// The test provisions its own loopback btrfs filesystem — no
     /// assumptions about the host's disks.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires Linux root with mkfs.ext4 and loop devices"]
+    fn loop_volume_is_mounted_again_after_a_reboot() {
+        assert!(nix::unistd::geteuid().is_root());
+        let scratch = tempfile::tempdir().unwrap();
+        let vm = VolumeManager::new(scratch.path());
+        let path = vm
+            .create_managed_volume("default", "db", Path::new("/data"), Some("16Mi"))
+            .unwrap();
+        assert_eq!(
+            vm.backend_of(&path),
+            Some(crate::grill::btrfs::VolumeBackend::LoopMount)
+        );
+        std::fs::write(path.join("acknowledged"), b"36318").unwrap();
+        // What a reboot leaves behind: the image, unmounted.
+        run_cmd("umount", &[path.to_str().unwrap()]);
+        assert!(!path.join("acknowledged").exists());
+
+        let again = vm
+            .create_managed_volume("default", "db", Path::new("/data"), Some("16Mi"))
+            .unwrap();
+        let data = std::fs::read(again.join("acknowledged"));
+        let _ = std::process::Command::new("umount").arg(&again).status();
+        assert_eq!(data.unwrap(), b"36318");
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "requires Linux root, Btrfs tools, and RELIABURGER_BTRFS_TESTS=1"]
