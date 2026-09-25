@@ -163,6 +163,16 @@ pub enum RelishError {
     #[error("{0}")]
     Io(#[from] std::io::Error),
 
+    /// `relish sign` was given an image the Pickle registry doesn't hold.
+    #[error(
+        "{image} is not in the cluster's Pickle registry (push it first; relish sign signs Pickle-hosted images only)"
+    )]
+    ImageNotInRegistry { image: String },
+
+    /// Image signing key error (generation, parsing, signing).
+    #[error("{0}")]
+    ImageSigning(#[from] crate::pickle::signing::SigningError),
+
     /// Upgrade tooling error (key generation, signing).
     #[error("{0}")]
     Upgrade(#[from] crate::upgrade::error::UpgradeError),

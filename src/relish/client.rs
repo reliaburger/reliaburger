@@ -2116,13 +2116,16 @@ impl BunClient {
             .to_string())
     }
 
-    /// Sign an image manifest and attach the signature via Raft.
-    pub async fn sign_image(&self, image: &str) -> Result<String, RelishError> {
+    /// Submit a locally made image signature for the cluster to attach.
+    pub async fn sign_image(
+        &self,
+        submission: &crate::pickle::signing::SignatureSubmission,
+    ) -> Result<String, RelishError> {
         let url = format!("{}/v1/identity/sign", self.base_url);
         let response = self
             .http()?
             .post(&url)
-            .json(&serde_json::json!({ "digest": image }))
+            .json(submission)
             .send()
             .await
             .map_err(classify_error)?;

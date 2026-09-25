@@ -371,10 +371,24 @@ enum Command {
         #[command(subcommand)]
         action: JoinTokenAction,
     },
-    /// Sign an image in the Pickle registry and attach the signature.
+    /// Sign a Pickle-hosted image with your own key so `require_signatures`
+    /// admits it.
+    ///
+    /// The image's tag is resolved to its manifest digest and the digest is
+    /// signed on this machine; only the signature and public key go to the
+    /// cluster. Nodes admit the image when their `[images.trust_policy] keys`
+    /// lists the public key. Create a key with `relish sign keygen --out PATH`.
+    #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
     Sign {
-        /// Image reference or manifest digest (e.g. "myapp:v1" or "sha256:abc...").
-        image: String,
+        #[command(subcommand)]
+        action: Option<SignAction>,
+        /// Image in the Pickle registry: a tag ("myapp:v1"), a pinned
+        /// reference ("myapp@sha256:…") or a manifest digest ("sha256:…").
+        #[arg(required = true)]
+        image: Option<String>,
+        /// ECDSA P-256 private key (PKCS#8 PEM) to sign with.
+        #[arg(long, required = true)]
+        key: Option<PathBuf>,
     },
     /// Manage a local dev cluster (Lima VMs).
     Dev {
@@ -677,6 +691,18 @@ enum TokenAction {
     Revoke {
         /// Token name to revoke.
         name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum SignAction {
+    /// Generate an image signing key and print the public key line for
+    /// `[images.trust_policy] keys`.
+    Keygen {
+        /// Where to write the private key (PKCS#8 PEM, mode 0600). Refuses
+        /// to overwrite an existing file.
+        #[arg(long)]
+        out: PathBuf,
     },
 }
 
@@ -1547,7 +1573,19 @@ async fn main() -> ExitCode {
                 commands::join_token_create(node_id, *ttl).await
             }
         },
-        Command::Sign { ref image } => commands::sign(image).await,
+        Command::Sign {
+            ref action,
+            ref image,
+            ref key,
+        } => match (action, image, key) {
+            (Some(SignAction::Keygen { out }), _, _) => commands::sign_keygen(out),
+            (None, Some(image), Some(key)) => commands::sign(image, key).await,
+            // clap enforces IMAGE and --key whenever no subcommand is given.
+            (None, _, _) => Err(reliaburger::relish::RelishError::InvalidFlag {
+                flag: "key".to_string(),
+                reason: "relish sign needs IMAGE and --key PATH".to_string(),
+            }),
+        },
         Command::Dev { action } => match &action {
             DevAction::Create {
                 nodes,
@@ -2365,6 +2403,32 @@ mod tests {
                 development_plaintext: true,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn parse_sign_takes_an_image_and_a_key() {
+        let cli = parse(&["relish", "sign", "myapp:v1", "--key", "ci.pem"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Sign { action: None, image: Some(ref image), key: Some(ref key) }
+                if image == "myapp:v1" && key == &PathBuf::from("ci.pem")
+        ));
+    }
+
+    #[test]
+    fn parse_sign_requires_a_key() {
+        assert!(parse(&["relish", "sign", "myapp:v1"]).is_err());
+        assert!(parse(&["relish", "sign", "--key", "ci.pem"]).is_err());
+    }
+
+    #[test]
+    fn parse_sign_keygen_needs_no_image() {
+        let cli = parse(&["relish", "sign", "keygen", "--out", "ci.pem"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Sign { action: Some(SignAction::Keygen { ref out }), .. }
+                if out == &PathBuf::from("ci.pem")
         ));
     }
 

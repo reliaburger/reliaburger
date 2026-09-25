@@ -609,7 +609,7 @@ Phases 2–11 built the cluster subsystems but the `bun` binary always ran singl
 - [x] SecurityState in Raft (prerequisite for the wiring items below)
 - [x] Wire agent-to-council CSR flow during deploy
 - [x] Wire automatic keyless signing after build job push
-- [x] `relish sign` CLI command
+- [x] `relish sign` CLI command (operator-held P-256 key: `relish sign IMAGE --key PATH` resolves the tag to its digest and signs locally; `relish sign keygen` prints the `trust_policy.keys` line)
 - [x] `/v1/identity/jwks` and `/v1/identity/sign` API endpoints
 - [x] CRL distribution, egress DNS resolution
 - TPM sealing — deferred to v2 (requires hardware)

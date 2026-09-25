@@ -267,7 +267,7 @@ pub fn check_image_schedulable(
 /// Split an image name into `(name, tag)`, defaulting the tag to
 /// `latest`. Only a colon *after* the last `/` starts a tag, so a
 /// registry port (`localhost:5050/myapp`) is not mistaken for one.
-fn split_repo_tag(name: &str) -> (&str, &str) {
+pub(crate) fn split_repo_tag(name: &str) -> (&str, &str) {
     let tail_start = name.rfind('/').map(|i| i + 1).unwrap_or(0);
     match name[tail_start..].rfind(':') {
         Some(i) => (&name[..tail_start + i], &name[tail_start + i + 1..]),
@@ -282,7 +282,7 @@ fn split_repo_tag(name: &str) -> (&str, &str) {
 /// Basename stripping was the IMG1 bug: `team/app` collapsed to `app`
 /// and missed its own policy, while an unrelated `docker.io/library/
 /// app` matched a check meant for the local `app`.
-fn canonical_repository(name: &str) -> &str {
+pub(crate) fn canonical_repository(name: &str) -> &str {
     match name.split_once('/') {
         Some((first, rest))
             if first.contains('.') || first.contains(':') || first == "localhost" =>

@@ -555,9 +555,10 @@ pub enum AgentCommand {
     ListFaults {
         response: oneshot::Sender<Vec<crate::smoker::types::FaultSummary>>,
     },
-    /// Sign an image manifest digest and attach the signature via Raft.
+    /// Verify an operator's detached image signature (made by `relish sign`
+    /// with a key the cluster never sees) and attach it via Raft.
     SignImage {
-        manifest_digest: String,
+        submission: crate::pickle::signing::SignatureSubmission,
         response: oneshot::Sender<Result<String, BunError>>,
     },
     /// Get the deployed AppSpec for a specific app (for safe env display).
@@ -4714,10 +4715,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 let _ = response.send(table.list_routes());
             }
             AgentCommand::SignImage {
-                manifest_digest,
+                submission,
                 response,
             } => {
-                let result = self.handle_sign_image(&manifest_digest).await;
+                let result = self.handle_sign_image(submission).await;
                 let _ = response.send(result);
             }
             AgentCommand::AppConfig {
@@ -9237,58 +9238,64 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         Ok(crate::sesame::join::JoinBundle::from_result(&join_result))
     }
 
-    /// Handle a SignImage command: sign a manifest digest and attach via Raft.
-    async fn handle_sign_image(&self, manifest_digest: &str) -> Result<String, BunError> {
-        let cluster = self
+    /// Handle a SignImage command: verify an operator's detached signature
+    /// and attach it to the manifest via Raft.
+    ///
+    /// The node never holds the signing key, so it can't mint trust: it only
+    /// checks that the signature verifies under the public key it came with.
+    /// Whether that key is trusted is decided at deploy time against
+    /// `[images.trust_policy] keys`. The reply warns when this node's policy
+    /// doesn't list the key, because deploys here would still refuse it.
+    async fn handle_sign_image(
+        &self,
+        submission: crate::pickle::signing::SignatureSubmission,
+    ) -> Result<String, BunError> {
+        let council = self
             .cluster
             .as_ref()
+            .and_then(|cluster| cluster.council.as_ref())
             .ok_or_else(|| BunError::SecurityError {
-                reason: "no cluster available for signing".to_string(),
-            })?;
-        let council = cluster
-            .council
-            .as_ref()
-            .ok_or_else(|| BunError::SecurityError {
-                reason: "no council available for signing".to_string(),
+                reason: "image signatures live in the cluster catalogue; this node has no council"
+                    .to_string(),
             })?;
 
-        let digest = crate::pickle::types::Digest::new(manifest_digest).map_err(|e| {
-            BunError::SecurityError {
-                reason: format!("invalid digest: {e}"),
-            }
-        })?;
-
-        // Generate an ephemeral signing keypair
-        let rng = ring::rand::SystemRandom::new();
-        let pkcs8 = ring::signature::EcdsaKeyPair::generate_pkcs8(
-            &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
-            &rng,
-        )
-        .map_err(|_| BunError::SecurityError {
-            reason: "failed to generate signing keypair".to_string(),
-        })?;
-
-        let sig = crate::pickle::signing::create_external_key_signature(
-            &digest,
-            pkcs8.as_ref(),
-            "local-agent",
-        )
-        .map_err(|e| BunError::SecurityError {
-            reason: format!("signing failed: {e}"),
-        })?;
+        let public_key = submission.public_key.clone();
+        let (digest, signature) =
+            submission
+                .into_verified()
+                .map_err(|e| BunError::SecurityError {
+                    reason: format!("signature rejected: {e}"),
+                })?;
+        let fingerprint = match &signature.method {
+            crate::pickle::types::SigningMethod::ExternalKey { key_id } => key_id.clone(),
+            crate::pickle::types::SigningMethod::Keyless { identity, .. } => identity.clone(),
+        };
 
         let attach = crate::pickle::types::AttachSignature {
-            manifest_digest: digest,
-            signature: sig,
+            manifest_digest: digest.clone(),
+            signature,
         };
-        council
+        let response = council
             .write(crate::council::RaftRequest::AttachSignature(attach))
             .await
             .map_err(|e| BunError::SecurityError {
                 reason: format!("failed to attach signature: {e}"),
             })?;
+        // An unknown digest comes back as a refusal, not an error; reporting
+        // success there would claim a signature that attached to nothing.
+        if let crate::council::types::CouncilResponse::Refused { reason } = response {
+            return Err(BunError::SecurityError {
+                reason: format!("signature attach refused: {reason}"),
+            });
+        }
 
-        Ok(format!("signature attached to {manifest_digest}"))
+        let mut message = format!("signed {} with key {fingerprint}", digest.as_str());
+        if !self.trust_policy.keys.contains(&public_key) {
+            message.push_str(
+                "\nwarning: this node's [images.trust_policy] keys does not list this key, so deploys here will refuse the image until it does",
+            );
+        }
+        Ok(message)
     }
 
     /// Check identity rotation for all instances, and (rate-limited)
@@ -15697,6 +15704,208 @@ mod tests {
         // even with require_signatures on and no council.
         let spec: AppSpec = toml::from_str(r#"command = ["echo", "hi"]"#).unwrap();
         assert!(agent.enforce_image_signature(&spec).await.is_ok());
+    }
+
+    // --- relish sign, end to end (operator key → attach → deploy gate) ---
+
+    /// A single-node leader council, enough to hold a manifest catalogue.
+    async fn catalogue_council(raft_port: u16) -> Arc<CouncilNode> {
+        use crate::council::log_store::MemLogStore;
+        use crate::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
+        use crate::council::state_machine::CouncilStateMachine;
+        use crate::council::types::CouncilConfig;
+
+        let router = InMemoryRaftRouter::new();
+        let network = InMemoryRaftNetworkFactory::new(1, router.clone());
+        let node = CouncilNode::new(
+            1,
+            CouncilConfig::default(),
+            network,
+            MemLogStore::new(),
+            CouncilStateMachine::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        router.register(1, node.raft().clone()).await;
+        let address = std::net::SocketAddr::from(([127, 0, 0, 1], raft_port));
+        node.initialize(std::collections::BTreeMap::from([(
+            1u64,
+            CouncilNodeInfo::new(address, "node-1".to_string()),
+        )]))
+        .await
+        .unwrap();
+        for _ in 0..40 {
+            if node.is_leader().await {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        Arc::new(node)
+    }
+
+    /// Push (commit) an unsigned manifest `repository:tag` with `digest_hex`.
+    async fn push_manifest(council: &CouncilNode, repository: &str, tag: &str, digest_hex: &str) {
+        use crate::pickle::types::{Digest, ImageManifest, LayerDescriptor, ManifestCommit};
+        let commit = ManifestCommit {
+            observed_gc_generation: 0,
+            manifest: ImageManifest {
+                digest: Digest::from_sha256_hex(digest_hex),
+                config: LayerDescriptor {
+                    digest: Digest::from_sha256_hex(&"c".repeat(64)),
+                    size: 100,
+                    media_type: "application/vnd.oci.image.config.v1+json".to_string(),
+                },
+                layers: vec![],
+                repository: repository.to_string(),
+                tags: std::collections::BTreeSet::new(),
+                total_size: 100,
+                pushed_at: std::time::SystemTime::UNIX_EPOCH,
+                pushed_by: 1,
+                signature: None,
+            },
+            tag: tag.to_string(),
+            holder_nodes: std::collections::BTreeSet::from([1]),
+        };
+        let response = council
+            .write(crate::council::RaftRequest::ManifestCommit(commit))
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                response,
+                crate::council::types::CouncilResponse::Applied { .. }
+            ),
+            "manifest commit: {response:?}"
+        );
+    }
+
+    fn agent_with_council(council: Arc<CouncilNode>) -> BunAgent<MockGrill> {
+        let (_membership_tx, membership_rx) = tokio::sync::watch::channel(Vec::new());
+        let (_snapshot_tx, snapshot_rx) = mpsc::channel(1);
+        let (_command_tx, command_rx) = mpsc::channel(8);
+        let cluster = ClusterHandle {
+            local_node_id: crate::meat::NodeId::new("node-1"),
+            membership_rx,
+            raft_metrics_rx: None,
+            council: Some(council),
+            snapshot_rx,
+            wrapping_ikm: None,
+            partition_blocklists: PartitionBlocklists::default(),
+            crl_handle: Default::default(),
+        };
+        BunAgent::with_cluster(
+            MockGrill::new(),
+            PortAllocator::new(30000, 31000),
+            command_rx,
+            CancellationToken::new(),
+            cluster,
+            "test".to_string(),
+        )
+    }
+
+    /// Do what `relish sign IMAGE --key KEY` does against this council:
+    /// resolve the reference through the image listing, sign the digest
+    /// locally, and hand the submission to the node.
+    async fn relish_sign(
+        agent: &BunAgent<MockGrill>,
+        council: &CouncilNode,
+        image: &str,
+        key: &crate::pickle::signing::SigningKey,
+    ) -> Result<String, BunError> {
+        let images = council.manifest_catalog().await.images();
+        let digest = crate::relish::commands::resolve_image_digest(image, &images).unwrap();
+        agent.handle_sign_image(key.sign(&digest).unwrap()).await
+    }
+
+    fn app(image: &str) -> AppSpec {
+        toml::from_str(&format!("image = {image:?}")).unwrap()
+    }
+
+    #[tokio::test]
+    async fn relish_signed_image_is_admitted_only_under_a_policy_trusting_its_key() {
+        let council = catalogue_council(9301).await;
+        let signed = "1".repeat(64);
+        push_manifest(&council, "myapp", "v1", &signed).await;
+        push_manifest(&council, "unsigned", "v1", &"2".repeat(64)).await;
+        push_manifest(&council, "stranger", "v1", &"3".repeat(64)).await;
+        let mut agent = agent_with_council(council.clone());
+
+        let operator = crate::pickle::signing::SigningKey::generate().unwrap();
+        let stranger = crate::pickle::signing::SigningKey::generate().unwrap();
+        let message = relish_sign(&agent, &council, "myapp:v1", &operator)
+            .await
+            .unwrap();
+        assert!(message.contains(&format!("sha256:{signed}")), "{message}");
+        assert!(
+            message.contains("does not list this key"),
+            "an untrusted key must be called out: {message}"
+        );
+        relish_sign(&agent, &council, "stranger:v1", &stranger)
+            .await
+            .unwrap();
+
+        agent.set_trust_policy(crate::config::node::TrustPolicySection {
+            require_signatures: true,
+            keys: vec![operator.public_key_base64()],
+        });
+
+        // Signed with the trusted key: admitted, pinned to the signed digest.
+        let pinned = agent.enforce_image_signature(&app("myapp:v1")).await;
+        assert_eq!(pinned, Ok(Some(format!("myapp@sha256:{signed}"))));
+        // Never signed: refused.
+        let unsigned = agent.enforce_image_signature(&app("unsigned:v1")).await;
+        assert!(unsigned.is_err(), "unsigned image admitted: {unsigned:?}");
+        // Signed, but by a key the policy doesn't list: refused.
+        let untrusted = agent.enforce_image_signature(&app("stranger:v1")).await;
+        assert!(
+            untrusted
+                .as_ref()
+                .is_err_and(|reason| reason.contains("not in trust policy")),
+            "other-key image admitted: {untrusted:?}"
+        );
+
+        // With the trusted key listed, signing reports no warning.
+        let message = relish_sign(&agent, &council, "myapp:v1", &operator)
+            .await
+            .unwrap();
+        assert!(!message.contains("warning"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn moving_a_tag_after_signing_leaves_the_new_digest_unsigned() {
+        let council = catalogue_council(9302).await;
+        push_manifest(&council, "myapp", "v1", &"1".repeat(64)).await;
+        let mut agent = agent_with_council(council.clone());
+        let operator = crate::pickle::signing::SigningKey::generate().unwrap();
+        relish_sign(&agent, &council, "myapp:v1", &operator)
+            .await
+            .unwrap();
+        agent.set_trust_policy(crate::config::node::TrustPolicySection {
+            require_signatures: true,
+            keys: vec![operator.public_key_base64()],
+        });
+
+        // Someone re-pushes v1 with different bytes: the signature covered
+        // the old digest, not the tag, so the new content is refused.
+        push_manifest(&council, "myapp", "v1", &"4".repeat(64)).await;
+        let result = agent.enforce_image_signature(&app("myapp:v1")).await;
+        assert!(result.is_err(), "re-tagged content admitted: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn signing_a_digest_the_catalogue_does_not_hold_is_refused() {
+        let council = catalogue_council(9303).await;
+        let agent = agent_with_council(council);
+        let operator = crate::pickle::signing::SigningKey::generate().unwrap();
+        let digest = crate::pickle::types::Digest::from_sha256_hex(&"5".repeat(64));
+        let result = agent
+            .handle_sign_image(operator.sign(&digest).unwrap())
+            .await;
+        assert!(
+            matches!(&result, Err(BunError::SecurityError { reason }) if reason.contains("refused")),
+            "got: {result:?}"
+        );
     }
 
     #[tokio::test]

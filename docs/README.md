@@ -672,7 +672,8 @@ Commands:
 | `build <path>` | Build OCI images from `[build.*]` sections and push to Pickle (async: submits, then polls; `--timeout` bounds the wait) |
 | `batch <path>` | Submit `[job.*]` sections as a high-throughput batch across the cluster |
 | `batch-status <id>` | Show a submitted batch's progress (`--wait --timeout` polls to a terminal state) |
-| `sign <image>` | Sign an image in the Pickle registry and attach the signature |
+| `sign <image> --key <path>` | Sign a Pickle image's manifest digest with your ECDSA P-256 key (tags resolve to digests; nodes admit it when `[images.trust_policy] keys` lists the key) |
+| `sign keygen --out <path>` | Generate an image signing key and print the public key for `trust_policy.keys` |
 | `import -f <file>` | Convert Kubernetes YAML to Reliaburger TOML (`kubernetes` build feature; `-f` repeatable, `--strict`) |
 | `export -f <file>` | Convert Reliaburger TOML to Kubernetes YAML (`kubernetes` build feature) |
 | `snapshot create <app>` | Snapshot an app's managed volumes (Btrfs-backed; `--volume` for one, `--name` to label) |

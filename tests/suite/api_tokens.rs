@@ -341,7 +341,7 @@ async fn scoped_admin_cannot_mint_unscoped_credentials_or_use_global_management(
             (
                 "POST",
                 "/v1/identity/sign",
-                r#"{"digest":"sha256:example"}"#,
+                r#"{"digest":"sha256:example","public_key":"","signature":""}"#,
             ),
         ] {
             let mut request = Request::builder()

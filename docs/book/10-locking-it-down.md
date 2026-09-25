@@ -255,7 +255,7 @@ We support two approaches because different teams have different workflows.
 
 **Keyless signing** uses the build job's workload identity. The build job already has an ECDSA P-256 keypair (from its SPIFFE certificate). After pushing the image, it signs the manifest digest with that key and attaches the certificate chain. Verification follows the chain back to the cluster's root CA. No signing keys to manage, rotate, or protect. The keypair is ephemeral -- it exists only for the lifetime of the build job.
 
-**External key signing** works like cosign. Your CI system signs with a long-lived ECDSA P-256 key. You register the public key in the cluster's trust policy. The scheduler verifies incoming signatures against those registered keys.
+**External key signing** is for images you build elsewhere. You (or your CI system) sign with a long-lived ECDSA P-256 key via `relish sign`. You register the public key in each node's trust policy, and the deploy gate verifies signatures against those registered keys. It's the same idea as cosign, but not cosign's format: the signed message is the digest string itself. (The first version of `relish sign` got this badly wrong; see "Whose key is it, anyway?" below.)
 
 ```rust
 pub enum SigningMethod {
@@ -1148,6 +1148,68 @@ The identity is `spiffe://…/job/build-signer`, stable across builds, and its l
 
 The build-failure gate stayed exactly as it was. When `require_signatures` is on and signing can't produce a policy-trusted signature (no council, no Workload CA, no signer), the build *fails*. It doesn't report success with an unsigned image. A build that can't be trusted isn't a build that's done.
 
+### Whose key is it, anyway?
+
+Fixing the build signer left one embarrassing sibling behind: `relish sign`. Its help text promised `relish sign myapp:v1`. The agent accepted only a `sha256:` digest. And once you'd dug the digest out of `relish images` and handed it over, the agent did exactly what the build runner used to do: generated a fresh keypair, signed, attached, and threw the private key away. The signature verified. Nothing trusted it. `[images.trust_policy] keys` can only list keys you know in advance, and nobody could know a key that existed for one function call. On a cluster with `require_signatures` on, `relish sign` couldn't get a single image past the gate. It was the ephemeral-key bug again, with a CLI in front.
+
+So who should hold the key? We had two honest options.
+
+The cluster could hold it. We already have a trusted signer (the build signer), so `relish sign` could ask the agent to sign with it, and the policy would accept the result without configuration. That's less code. It also means anyone holding an Admin API token can make any image trusted, because the key sits behind the same API the token opens. Steal a token, bless your backdoored image, deploy it.
+
+The operator could hold it. `relish sign` signs on your machine with your key, and each node trusts that key because its public half is in the node's config file. Now blessing an image takes the private key *and* the right to write node config. A stolen API token gets you nowhere. That's the separation `trust_policy.keys` was designed for, and the verifier already knew how to check it. Only the signing side was missing. We went with the operator.
+
+The flow is three steps, and the private key never crosses the network:
+
+```bash
+$ relish sign keygen --out ci-signing.pem
+wrote image signing key to ci-signing.pem
+public key: BCAURFV8gG6r1LDO...
+
+$ relish sign myapp:v1 --key ci-signing.pem
+signed sha256:3f1a… with key sha256:9c2e41d07b5a3f18
+```
+
+`relish sign` resolves `myapp:v1` to its manifest digest through `GET /v1/images`, using the same registry-host stripping the deploy-time check uses, signs the *digest* (a tag can move, a digest can't), and posts a `SignatureSubmission`: digest, public key, signature. The agent checks that the signature verifies under the key it came with, attaches it through Raft, and refuses outright if the catalogue doesn't hold that digest. It deliberately doesn't refuse a key its own policy doesn't list (you might sign before rolling the key out to every node). It warns instead, because a deploy on that node would still say no.
+
+We kept ECDSA P-256 rather than the Ed25519 the release signer (Chapter 14) uses. The verifier and the `keys` format already spoke P-256, and one algorithm per trust root is plenty. P-256 keys are also what `openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256` makes, so a team with its own key tooling can skip `keygen` entirely.
+
+The key type is a plain struct that owns the PKCS#8 bytes and the parsed `ring` key pair:
+
+```rust
+pub struct SigningKey {
+    pkcs8: Vec<u8>,
+    key_pair: EcdsaKeyPair,
+}
+
+impl std::fmt::Debug for SigningKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SigningKey")
+            .field("public_key", &self.public_key_base64())
+            .finish_non_exhaustive()
+    }
+}
+```
+
+Almost every struct in this book gets `#[derive(Debug)]`, which prints every field. That's exactly wrong for a private key: one `{:?}` in an error message or a panic and the key is in your logs. So we write the `Debug` implementation by hand. `impl Trait for Type` is how Rust attaches a trait's methods to a type (Go gets there implicitly by method set; Rust makes you say it). Our version prints only the public key, and `finish_non_exhaustive()` renders a trailing `..` so the output admits fields are missing. A test asserts the private bytes never show up.
+
+Writing the key file needed one platform-specific line:
+
+```rust
+let mut options = fs::OpenOptions::new();
+options.write(true).create_new(true);
+#[cfg(unix)]
+{
+    use std::os::unix::fs::OpenOptionsExt as _;
+    options.mode(0o600);
+}
+```
+
+`create_new(true)` is `O_EXCL`: the open fails if the file exists, so `keygen` can't clobber a key you already trust. `#[cfg(unix)]` compiles the block only on Unix targets, the way `#ifdef` would in C, except the compiler still parses and type-checks everything around it. `OpenOptionsExt` is an *extension trait*: the standard library adds Unix-only methods such as `mode` to the portable `OpenOptions` type, and they only become callable once you import the trait. `as _` imports it without binding a name, since we want its methods, not the name.
+
+The CLI shape needed a small clap trick. We wanted both `relish sign IMAGE --key PATH` and `relish sign keygen --out PATH`, a positional argument and a subcommand on the same command. `#[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]` tells clap to try the subcommand first and, when it matches, to stop demanding `IMAGE` and `--key`.
+
+The test that matters is the one the old code could never have passed. `relish_signed_image_is_admitted_only_under_a_policy_trusting_its_key` stands up a single-node council, pushes three manifests, and does what `relish sign` does: resolve through the image listing, sign locally, submit. Then it turns on `require_signatures` with the operator's key and asks the real deploy gate about each image. The operator-signed one comes back pinned to its signed digest. The never-signed one is refused. The one signed by a different key is refused as "not in trust policy". A companion test re-pushes `myapp:v1` with new bytes after signing and checks the new content is refused, because the signature covered the old digest, not the tag. And an `openssl`-generated test key pins the documented `openssl pkey … | tail -c 65 | base64` pipeline to the exact string `keys` expects, so the manual can't drift from the code.
+
 ## What we deferred
 
 **TPM sealing** binds the master secret to specific hardware via the TPM chip's Platform Configuration Registers. If someone steals a disk, the master key is useless on different hardware. This is important for production hardening, but requires a TPM 2.0 device and the `tss-esapi` crate (Linux only). We've deferred it to v2.
@@ -1158,7 +1220,7 @@ Phase 10 adds a complete security layer on top of the Phase 4 PKI foundation:
 
 - Every workload instance gets a SPIFFE X.509 certificate and OIDC JWT automatically, with exact validity windows and server-rebuilt SANs
 - Identity lives in a per-instance directory (tmpfs-backed on Linux root), created before start, removed with the instance, and restored — schedule and all — across agent restarts
-- Images are signed (keyless or cosign-compatible) and verified by the scheduler
+- Images are signed (keyless by the build signer, or with an operator key via `relish sign`) and verified before they deploy
 - SecurityState (CAs, tokens, keypairs, CRL, secret seals) is replicated through Raft
 - The agent provisions identity during deploy and rotates certificates every 30 minutes
 - API tokens are managed via `relish token list/revoke`

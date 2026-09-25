@@ -109,10 +109,35 @@ keys = []                 # extra trusted ECDSA P-256 public keys, base64
 
 Images that `relish build` pushes are signed by the cluster's build signer,
 which the policy trusts without a key. Images from external registries and the
-pull-through cache aren't checked, so pin those by digest. `relish sign`
-attaches a signature to an image already in the registry, but only takes a
-`sha256:` digest, and it signs with a key `keys` can't list, so it won't get an
-image past `require_signatures`.
+pull-through cache aren't checked, so pin those by digest.
+
+For images you build elsewhere and push to the registry, sign them with your
+own key. Make one, and put the public key it prints in every node's `keys`:
+
+```bash
+relish sign keygen --out ci-signing.pem   # private key, mode 0600; keep it secret
+```
+
+Then sign each image you push, by tag, pinned reference or digest:
+
+```bash
+relish sign myapp:v1 --key ci-signing.pem
+```
+
+`relish sign` looks the tag up in the registry and signs the manifest digest it
+points at, on your machine; only the signature and public key reach the
+cluster, and signing needs an unscoped Admin token. Re-pushing the tag with new
+content leaves the new digest unsigned, so sign again after every push. The
+agent warns if its own `keys` doesn't list your key yet, since deploys there
+will refuse the image until it does.
+
+Already have key tooling? Any unencrypted PKCS#8 P-256 key works, and this
+prints its public key in the form `keys` wants:
+
+```bash
+openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out ci-signing.pem
+openssl pkey -in ci-signing.pem -pubout -outform DER | tail -c 65 | base64
+```
 
 ## Between nodes
 

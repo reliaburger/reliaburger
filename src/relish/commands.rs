@@ -1467,7 +1467,6 @@ fn format_memory(bytes: u64) -> String {
     format!("{value:.1} {}", UNITS[unit])
 }
 
-/// List images in the local Pickle registry.
 /// Rotate or finalise the cluster's secret encryption key.
 pub async fn secret_rotate(finalize: bool) -> Result<(), RelishError> {
     let client = BunClient::default_local();
@@ -1476,12 +1475,97 @@ pub async fn secret_rotate(finalize: bool) -> Result<(), RelishError> {
     Ok(())
 }
 
-/// Sign an image in the Pickle registry and attach the signature via Raft.
-pub async fn sign(image: &str) -> Result<(), RelishError> {
+/// Sign a Pickle-hosted image with the operator's key and attach the
+/// signature. A tag is resolved to its manifest digest first, and the
+/// digest is what gets signed: a tag can move, a digest can't.
+pub async fn sign(image: &str, key_path: &Path) -> Result<(), RelishError> {
+    let key_text = fs::read_to_string(key_path)?;
+    let key = crate::pickle::signing::SigningKey::from_pem(&key_text)?;
+
     let client = BunClient::default_local();
-    let result = client.sign_image(image).await?;
+    let listing = client.images().await?;
+    let images: Vec<crate::pickle::types::ImageSummary> =
+        serde_json::from_value(listing["images"].clone()).map_err(|e| RelishError::ApiError {
+            status: 0,
+            body: format!("failed to parse images response: {e}"),
+        })?;
+    let digest = resolve_image_digest(image, &images)?;
+
+    let submission = key.sign(&digest)?;
+    let result = client.sign_image(&submission).await?;
     println!("{result}");
     Ok(())
+}
+
+/// Generate an image signing key at `out` (PKCS#8 PEM, owner-only
+/// permissions) and print the public key in the form
+/// `[images.trust_policy] keys` expects.
+pub fn sign_keygen(out: &Path) -> Result<(), RelishError> {
+    let key = crate::pickle::signing::SigningKey::generate()?;
+    write_private_key(out, &key.to_pem())?;
+    let public_key = key.public_key_base64();
+    println!("wrote image signing key to {}", out.display());
+    println!("public key: {public_key}");
+    println!();
+    println!("Trust it by adding this to every node's config:");
+    println!();
+    println!("[images.trust_policy]");
+    println!("require_signatures = true");
+    println!("keys = [\"{public_key}\"]");
+    Ok(())
+}
+
+/// Write a private key, refusing to overwrite and keeping it owner-only.
+fn write_private_key(path: &Path, pem: &str) -> Result<(), RelishError> {
+    use std::io::Write as _;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).map_err(|e| match e.kind() {
+        std::io::ErrorKind::AlreadyExists => RelishError::FileExists {
+            path: path.display().to_string(),
+        },
+        _ => RelishError::Io(e),
+    })?;
+    file.write_all(pem.as_bytes())?;
+    Ok(())
+}
+
+/// Resolve the image `relish sign` was given to the manifest digest to sign.
+///
+/// Accepts a tag reference (`myapp:v1`, `localhost:5050/team/app:v2`), a
+/// pinned reference (`myapp@sha256:…`) or a bare digest. The registry host
+/// is stripped the same way the deploy-time trust check strips it, so the
+/// digest signed here is the one a deploy of the same reference verifies.
+pub fn resolve_image_digest(
+    image: &str,
+    images: &[crate::pickle::types::ImageSummary],
+) -> Result<crate::pickle::types::Digest, RelishError> {
+    use crate::meat::scheduler::{canonical_repository, split_repo_tag};
+
+    let not_found = || RelishError::ImageNotInRegistry {
+        image: image.to_string(),
+    };
+    let found = if image.starts_with("sha256:") {
+        images.iter().find(|summary| summary.digest == image)
+    } else if let Some((name, digest)) = image.split_once('@') {
+        let repository = canonical_repository(name);
+        images
+            .iter()
+            .find(|summary| summary.repository == repository && summary.digest == digest)
+    } else {
+        let (name, tag) = split_repo_tag(image);
+        let repository = canonical_repository(name);
+        images
+            .iter()
+            .find(|summary| summary.repository == repository && summary.tags.contains(tag))
+    };
+    let summary = found.ok_or_else(not_found)?;
+    crate::pickle::types::Digest::new(&summary.digest).map_err(|_| not_found())
 }
 
 pub async fn images(output: OutputFormat) -> Result<(), RelishError> {
@@ -2759,5 +2843,107 @@ spec:
     fn lint_missing_file() {
         let result = lint(Path::new("/nonexistent/config.toml"));
         assert!(result.is_err());
+    }
+
+    // --- relish sign ---
+
+    const MYAPP_V1: &str =
+        "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+    const MYAPP_V2: &str =
+        "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+    const TEAM_APP: &str =
+        "sha256:3333333333333333333333333333333333333333333333333333333333333333";
+
+    fn summary(
+        repository: &str,
+        digest: &str,
+        tags: &[&str],
+    ) -> crate::pickle::types::ImageSummary {
+        crate::pickle::types::ImageSummary {
+            repository: repository.to_string(),
+            digest: digest.to_string(),
+            tags: tags.iter().map(|t| t.to_string()).collect(),
+            layers: 1,
+            total_size: 100,
+        }
+    }
+
+    fn registry_listing() -> Vec<crate::pickle::types::ImageSummary> {
+        vec![
+            summary("myapp", MYAPP_V1, &["v1"]),
+            summary("myapp", MYAPP_V2, &["v2", "latest"]),
+            summary("team/app", TEAM_APP, &["v1"]),
+        ]
+    }
+
+    #[test]
+    fn sign_resolves_a_tag_to_its_manifest_digest() {
+        let digest = resolve_image_digest("myapp:v1", &registry_listing()).unwrap();
+        assert_eq!(digest.as_str(), MYAPP_V1);
+    }
+
+    #[test]
+    fn sign_resolves_an_untagged_reference_to_latest() {
+        let digest = resolve_image_digest("myapp", &registry_listing()).unwrap();
+        assert_eq!(digest.as_str(), MYAPP_V2);
+    }
+
+    #[test]
+    fn sign_strips_the_registry_host_like_the_deploy_check_does() {
+        let digest =
+            resolve_image_digest("localhost:5050/team/app:v1", &registry_listing()).unwrap();
+        assert_eq!(digest.as_str(), TEAM_APP);
+    }
+
+    #[test]
+    fn sign_accepts_a_pinned_reference_and_a_bare_digest() {
+        let pinned = format!("myapp@{MYAPP_V1}");
+        assert_eq!(
+            resolve_image_digest(&pinned, &registry_listing())
+                .unwrap()
+                .as_str(),
+            MYAPP_V1
+        );
+        assert_eq!(
+            resolve_image_digest(MYAPP_V2, &registry_listing())
+                .unwrap()
+                .as_str(),
+            MYAPP_V2
+        );
+    }
+
+    #[test]
+    fn sign_refuses_an_image_the_registry_does_not_hold() {
+        for image in [
+            "myapp:v9",
+            "nginx:latest",
+            "team/app@sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        ] {
+            let result = resolve_image_digest(image, &registry_listing());
+            assert!(
+                matches!(result, Err(RelishError::ImageNotInRegistry { .. })),
+                "{image}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sign_keygen_writes_an_owner_only_key_and_refuses_to_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("image-signing.pem");
+        sign_keygen(&path).unwrap();
+
+        let key = crate::pickle::signing::SigningKey::from_pem(&fs::read_to_string(&path).unwrap());
+        assert!(key.is_ok(), "the written key must load back: {key:?}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        assert!(matches!(
+            sign_keygen(&path),
+            Err(RelishError::FileExists { .. })
+        ));
     }
 }

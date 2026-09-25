@@ -8574,7 +8574,9 @@ async fn identity_jwks_handler(State(state): State<ApiState>) -> Response {
     Json(crate::sesame::oidc::jwks_response(oidc_config)).into_response()
 }
 
-/// Sign an image manifest digest and attach the signature via Raft.
+/// Attach an operator's detached image signature (from `relish sign`) to a
+/// manifest via Raft. The body is a [`crate::pickle::signing::SignatureSubmission`];
+/// the private key never reaches the cluster.
 async fn identity_sign_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
@@ -8590,12 +8592,8 @@ async fn identity_sign_handler(
     if let Err(response) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
         return response;
     }
-    #[derive(serde::Deserialize)]
-    struct SignRequest {
-        digest: String,
-    }
-
-    let req: SignRequest = match serde_json::from_str(&body) {
+    let submission: crate::pickle::signing::SignatureSubmission = match serde_json::from_str(&body)
+    {
         Ok(r) => r,
         Err(e) => {
             return (
@@ -8607,7 +8605,7 @@ async fn identity_sign_handler(
     };
 
     match ask_agent(&state.cmd_tx, |response| AgentCommand::SignImage {
-        manifest_digest: req.digest,
+        submission,
         response,
     })
     .await
