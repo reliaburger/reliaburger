@@ -56,13 +56,13 @@ repo = "https://deploy-bot:TOKEN@git.example.com/org/infra.git"
 branch = "main"                  # default
 path = "/"                       # default
 poll_interval_secs = 30          # default
-recursive = true                 # it always recurses; false only earns a warning
 require_signed_commits = true
 trusted_signing_keys = ["<GPG or SSH key fingerprint>"]
 webhook_secret = "a-long-random-string"
 ```
 
-Credentials go in the URL; Bun strips them out of the process arguments and
+The sync always reads every `.toml` file under `path`, subdirectories
+included. Credentials go in the URL; Bun strips them out of the process arguments and
 Git's config. With `require_signed_commits`, a commit that doesn't verify
 against `trusted_signing_keys` isn't applied, and an empty key list refuses
 everything. There's no `relish gitops` command: the web dashboard's GitOps

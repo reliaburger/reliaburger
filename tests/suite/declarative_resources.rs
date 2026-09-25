@@ -196,7 +196,6 @@ async fn manual_apply_and_gitops_converge_identically() {
         require_signed_commits: false,
         trusted_signing_keys: vec![],
         webhook_secret: None,
-        recursive: false,
         webhook_rate_limit: 10,
     };
     spawn_gitops_sync(

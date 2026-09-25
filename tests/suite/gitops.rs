@@ -86,7 +86,6 @@ fn repo_config(repo: &str, poll_interval_secs: u64) -> GitOpsConfig {
         require_signed_commits: false,
         trusted_signing_keys: vec![],
         webhook_secret: None,
-        recursive: false,
         webhook_rate_limit: 10,
     }
 }
