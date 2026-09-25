@@ -336,7 +336,8 @@ in repository Actions. Signed candidate qualification is still V03.
   - [x] Add power-cut fixtures for the exporter checkpoint/lock (C03) and `LocalLeaseStore` (C11), driven by `scripts/release/qualify-storage-power-cut.sh` on a disposable VM, and the `v02-loops` Actions lane ([record](qualification/2026-09-25-v02-power-cut.md)).
   - [x] Sync local-destination exports before the checkpoint acknowledges them; the C03 power-cut fixture found every recent export empty after a cut, with most sources already pruned.
   - [x] Open every object store (exports, metrics, snapshot upload, council backups) through one helper that syncs `file://` writes, and add a council-backup power-cut fixture (every retained backup was empty after a cut before the fix).
-  - [ ] Qualify the snapshot uploader under power cuts (needs Btrfs volumes); its `uploaded` metadata is also written without a sync.
+  - [x] Write the snapshot uploader's `uploaded` metadata atomically and durably (it used a plain `std::fs::write`).
+  - [ ] Qualify the snapshot uploader under power cuts (needs Btrfs volumes).
   - [ ] Run the `v02-loops` Actions lane and record its bounds.
 - [ ] **V03** (gate) Publish and install the exact signed candidate.
   - [x] Preserve a complete signed candidate with source/run identity and per-file hashes; promote only the qualified bytes without rebuilding.

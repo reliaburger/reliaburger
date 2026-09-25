@@ -333,7 +333,10 @@ impl SnapshotManager {
         let json = serde_json::to_vec_pretty(meta).map_err(|e| {
             SnapshotError::Btrfs(format!("meta serialise: {e}")) // unreachable in practice
         })?;
-        std::fs::write(Self::meta_path(snapshot_path), json)?;
+        // The `uploaded` flag is the upload checkpoint. A torn or lost file
+        // after a power cut would hide the snapshot from listing, so replace
+        // it atomically and durably.
+        crate::sesame::identity::atomic_write(&Self::meta_path(snapshot_path), &json)?;
         Ok(())
     }
 
@@ -451,6 +454,46 @@ mod tests {
         let json = serde_json::to_string(&meta).unwrap();
         let back: SnapshotMeta = serde_json::from_str(&json).unwrap();
         assert_eq!(back, meta);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_meta_replaces_the_file_atomically() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = dir.path().join("1752000000");
+        let manager = SnapshotManager::new(dir.path());
+        let mut meta = SnapshotMeta {
+            schema: 1,
+            namespace: "default".to_string(),
+            app: "db".to_string(),
+            volume_path: "/data".to_string(),
+            name: "1752000000".to_string(),
+            created_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_752_000_000),
+            size_bytes: 4096,
+            uploaded: false,
+        };
+        manager.write_meta(&snapshot, &meta).unwrap();
+        let path = SnapshotManager::meta_path(&snapshot);
+        let before = std::fs::metadata(&path).unwrap().ino();
+        meta.uploaded = true;
+        manager.write_meta(&snapshot, &meta).unwrap();
+        // A rename installs a new inode; an in-place write would keep it.
+        assert_ne!(std::fs::metadata(&path).unwrap().ino(), before);
+        let back: SnapshotMeta = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(back.uploaded);
+        let leftovers = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".reliaburger-")
+            })
+            .count();
+        assert_eq!(leftovers, 0);
     }
 
     // -- behaviour on non-btrfs volumes ------------------------------------
