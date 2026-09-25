@@ -75,7 +75,8 @@ Everything the installer and the quickstart write lives in `~/.reliaburger`
 
 `relish local destroy --yes` removes a cluster's VMs, credentials and state
 and keeps the cache. `relish uninstall` then removes the CLI, the tools, the
-cache and the Lima home, and leaves anything else under `~/.reliaburger`.
+cache and the Lima home (plus `context.lock` when no `context.json` is left),
+and leaves anything else under `~/.reliaburger`.
 
 ## Files on a node
 

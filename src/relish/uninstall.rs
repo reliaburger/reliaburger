@@ -4,9 +4,11 @@
 //! That is the CLI in `<RELIABURGER_HOME>/bin`, the `~/.local/bin/relish`
 //! link if it points there, the private Lima distribution (`tools/`), the
 //! downloaded guest images and binaries (`cache/`) and the managed Lima home
-//! (`lima/`). Anything else under `RELIABURGER_HOME` (node data from a server
-//! install, a saved context) stays, and nothing outside it is touched apart
-//! from our own link. Clusters come first: while a quickstart cluster or a
+//! (`lima/`). The context lock (`context.lock`) goes too once no saved
+//! context (`context.json`) is left for it to guard. Anything else under
+//! `RELIABURGER_HOME` (node data from a server install, a saved context and
+//! its lock) stays, and nothing outside it is touched apart from our own
+//! link. Clusters come first: while a quickstart cluster or a
 //! managed VM exists, uninstall refuses and names the command that removes it.
 //!
 //! Deleting the running executable is fine on Unix: the directory entry goes,
@@ -69,6 +71,11 @@ pub struct Plan {
 /// and the quickstart create.
 const OWNED: &[&str] = &["tools", "cache", "lima", "setup.lock"];
 
+/// The saved managed-cluster context, kept by uninstall.
+const CONTEXT: &str = "context.json";
+/// The lock guarding [`CONTEXT`], removed only when no context is left.
+const CONTEXT_LOCK: &str = "context.lock";
+
 /// Work out what to remove from `root`, plus the link in `local_bin` if it
 /// points at our binary. Refuses while clusters or managed VMs exist.
 pub fn plan(root: &Path, local_bin: Option<&Path>) -> Result<Plan, UninstallError> {
@@ -109,6 +116,11 @@ pub fn plan(root: &Path, local_bin: Option<&Path>) -> Result<Plan, UninstallErro
     if exists(&clusters) {
         remove.push(clusters);
     }
+    // The lock only guards the context file; with no context it's litter.
+    let context_lock = root.join(CONTEXT_LOCK);
+    if exists(&context_lock) && !exists(&root.join(CONTEXT)) {
+        remove.push(context_lock);
+    }
 
     let mut keep = Vec::new();
     for entry in entries(root)? {
@@ -134,6 +146,17 @@ pub fn plan(root: &Path, local_bin: Option<&Path>) -> Result<Plan, UninstallErro
 /// nothing else is left in them.
 pub fn execute(plan: &Plan) -> Result<(), UninstallError> {
     for path in &plan.remove {
+        if *path == plan.root.join(CONTEXT_LOCK) {
+            // Unlink under the lock, re-checking that no context appeared,
+            // so a concurrent `relish setup` can't be left on a stale file.
+            crate::relish::local_context::remove_unused_lock(&plan.root.join(CONTEXT)).map_err(
+                |error| UninstallError::Remove {
+                    path: path.clone(),
+                    source: std::io::Error::other(error.to_string()),
+                },
+            )?;
+            continue;
+        }
         let removal = match std::fs::symlink_metadata(path) {
             // `remove_dir_all` never follows a link, so a `tools` symlink
             // loses the link, not its target.
@@ -333,10 +356,37 @@ mod tests {
     }
 
     #[test]
+    fn removes_the_context_lock_once_no_context_is_left() {
+        let (_temp, root, local_bin) = installed_home();
+        // What `relish local destroy` leaves: the lock, not the context.
+        std::fs::write(root.join("context.lock"), "").unwrap();
+        let plan = plan(&root, Some(&local_bin)).unwrap();
+        assert!(plan.remove.contains(&root.join("context.lock")));
+        assert!(plan.keep.is_empty());
+        execute(&plan).unwrap();
+        assert!(!root.exists(), "the lock no longer keeps the home alive");
+    }
+
+    #[test]
+    fn a_context_lock_held_by_another_process_stops_uninstall() {
+        let (_temp, root, local_bin) = installed_home();
+        std::fs::write(root.join("context.lock"), "").unwrap();
+        let plan = plan(&root, Some(&local_bin)).unwrap();
+        let held = std::fs::File::open(root.join("context.lock")).unwrap();
+        held.try_lock().unwrap();
+        let error = execute(&plan).unwrap_err();
+        assert!(
+            matches!(error, UninstallError::Remove { ref path, .. } if path.ends_with("context.lock"))
+        );
+        assert!(root.join("context.lock").exists());
+    }
+
+    #[test]
     fn keeps_everything_the_installer_did_not_create() {
         let (_temp, root, local_bin) = installed_home();
         std::fs::write(root.join("bin/bun"), "node agent").unwrap();
         std::fs::write(root.join("context.json"), "{}").unwrap();
+        std::fs::write(root.join("context.lock"), "").unwrap();
         std::fs::create_dir_all(root.join("images")).unwrap();
 
         let plan = plan(&root, Some(&local_bin)).unwrap();
@@ -345,12 +395,14 @@ mod tests {
             vec![
                 root.join("bin/bun"),
                 root.join("context.json"),
+                root.join("context.lock"),
                 root.join("images")
             ]
         );
         execute(&plan).unwrap();
         assert!(root.join("bin/bun").is_file());
         assert!(root.join("context.json").is_file());
+        assert!(root.join("context.lock").is_file());
         assert!(root.join("images").is_dir());
         assert!(!root.join("bin/relish").exists());
         assert!(!root.join("tools").exists());
