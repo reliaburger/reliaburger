@@ -861,7 +861,8 @@ slot_chaos() {
     say "fault: chaos $kind"
     open_window "chaos-$kind"
     case $kind in
-        kill) rel fault kill soak-identity --acknowledge --reason v02 > "$output" 2>&1 || result=$? ;;
+        # One of three frontends: the replica-minimum rail refuses a kill that leaves none.
+        kill) rel fault kill frontend --count 1 --acknowledge --reason v02 > "$output" 2>&1 || result=$? ;;
         delay) rel fault delay frontend 200ms --duration 60s --acknowledge --reason v02 > "$output" 2>&1 || result=$? ;;
         partition) rel fault partition soak-redis --from soak-redis-client --duration 60s --acknowledge --reason v02 > "$output" 2>&1 || result=$? ;;
         pause) rel fault pause soak-spammer --duration 60s --acknowledge --reason v02 > "$output" 2>&1 || result=$? ;;
