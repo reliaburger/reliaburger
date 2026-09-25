@@ -26,13 +26,27 @@ pub struct ProcessWorkloadsConfig {
     ///
     /// When enabled, process workloads run in a separate mount namespace
     /// and cannot see `/var/lib/reliaburger` or other workloads' volumes.
+    #[serde(skip_serializing_if = "is_default_mount_isolation")]
     pub mount_isolation: bool,
 
     /// Directory for temporary script files.
     ///
     /// Inline scripts are written here, made executable, and cleaned up
     /// after execution. Must not be inside any workload-visible path.
+    #[serde(skip_serializing_if = "is_default_script_dir")]
     pub script_dir: PathBuf,
+}
+
+// Both defaults depend on the machine that reads the file. When relish on a
+// Mac writes a Linux guest's node.toml, writing them out would pin the Mac's
+// temp directory and its "no mount isolation" onto the guest. Leaving them
+// out lets each node compute its own.
+fn is_default_mount_isolation(value: &bool) -> bool {
+    *value == ProcessWorkloadsConfig::default().mount_isolation
+}
+
+fn is_default_script_dir(value: &std::path::Path) -> bool {
+    value == ProcessWorkloadsConfig::default().script_dir
 }
 
 impl Default for ProcessWorkloadsConfig {
@@ -111,6 +125,22 @@ mod tests {
     fn parses_empty_toml() {
         let config: ProcessWorkloadsConfig = toml::from_str("").unwrap();
         assert!(config.allowed_binaries.is_empty());
+    }
+
+    #[test]
+    fn host_dependent_defaults_are_left_for_the_reading_node() {
+        let written = toml::to_string(&ProcessWorkloadsConfig::default()).unwrap();
+        assert!(!written.contains("script_dir"), "{written}");
+        assert!(!written.contains("mount_isolation"), "{written}");
+        let explicit = ProcessWorkloadsConfig {
+            script_dir: PathBuf::from("/srv/scripts"),
+            mount_isolation: !ProcessWorkloadsConfig::default().mount_isolation,
+            ..Default::default()
+        };
+        let written = toml::to_string(&explicit).unwrap();
+        let back: ProcessWorkloadsConfig = toml::from_str(&written).unwrap();
+        assert_eq!(back.script_dir, PathBuf::from("/srv/scripts"));
+        assert_eq!(back.mount_isolation, explicit.mount_isolation);
     }
 
     #[test]
