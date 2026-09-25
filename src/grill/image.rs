@@ -384,14 +384,20 @@ impl ImageStore {
         let target = generation.clone();
         let owner_shift = self.owner_shift;
         tokio::task::spawn_blocking(move || {
-            unpack_layers_with_owner(&layer_paths, &target, owner_shift)
+            unpack_layers_with_owner(&layer_paths, &target, owner_shift)?;
+            // The marker is the only thing a later pull checks. Flush the
+            // unpacked tree before writing it: after a power cut the V02 soak
+            // found `.complete` present and `redis-server` empty, and every
+            // redeploy failed with "exec format error".
+            sync_filesystem(&target)?;
+            crate::sesame::identity::atomic_write(&complete, b"complete\n")?;
+            Ok::<(), ImageError>(())
         })
         .await
         .map_err(|e| ImageError::UnpackFailed {
             digest: "join".to_string(),
             reason: e.to_string(),
         })??;
-        tokio::fs::write(&complete, b"complete\n").await?;
         Ok(generation)
     }
 
@@ -641,9 +647,17 @@ impl ImageStore {
             // valid cache hit (M3) — the `exists()` check above never
             // re-verifies a cached file. The digest was verified above, so a
             // completed rename only ever publishes a good blob.
-            let tmp = blob_path.with_extension("tmp");
-            tokio::fs::write(&tmp, &blob_data).await?;
-            tokio::fs::rename(&tmp, &blob_path).await?;
+            // The temp file is synced before the rename and the directory
+            // after it, so a power cut can't publish an empty blob either.
+            let published = blob_path.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::sesame::identity::atomic_write(&published, &blob_data)
+            })
+            .await
+            .map_err(|e| ImageError::UnpackFailed {
+                digest: digest.clone(),
+                reason: e.to_string(),
+            })??;
         }
         Ok((manifest.layers, config))
     }
@@ -668,6 +682,22 @@ impl ImageStore {
         let rootfs = self.unpack_to(blobs.layers, rootfs).await?;
         Ok(PulledImage { rootfs, config })
     }
+}
+
+/// Flush every dirty page of the filesystem holding `path` to disk.
+#[cfg(target_os = "linux")]
+fn sync_filesystem(path: &Path) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    let directory = std::fs::File::open(path)?;
+    // `directory` stays open for the whole call, so the descriptor is valid.
+    nix::unistd::syncfs(directory.as_raw_fd()).map_err(std::io::Error::from)
+}
+
+/// Flush every dirty page to disk. macOS has no per-filesystem sync.
+#[cfg(not(target_os = "linux"))]
+fn sync_filesystem(_path: &Path) -> std::io::Result<()> {
+    nix::unistd::sync();
+    Ok(())
 }
 
 /// Parse a digest-verified config blob.
