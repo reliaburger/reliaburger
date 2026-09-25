@@ -635,6 +635,94 @@ async fn retained_addresses_survive_exit_and_recovery_until_the_original_referen
     assert_eq!(successor_still_held, Some(successor));
 }
 
+/// V02 soak: a stopped instance waiting for its address release left its
+/// intent `retiring`. Every later Bun (restart, SIGKILL, host reboot) refused
+/// to adopt it and exited, so systemd restarted it forever.
+#[tokio::test]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft"]
+async fn restart_recovers_a_retiring_generation_that_still_holds_its_address() {
+    use reliaburger::grill::records::{InstanceRecord, RuntimeKind};
+    use reliaburger::grill::runc_intent::NetworkReferenceState;
+    assert!(nix::unistd::geteuid().is_root());
+    let root = tempfile::tempdir().unwrap();
+    let id = instance(root.path());
+    let specification = spec(root.path(), "exec /bin/busybox sleep 60");
+    let first = runtime(root.path());
+    first.create(&id, &specification).await.unwrap();
+    install_fixture(root.path(), &id);
+    let original = first.retain_network_reference(&id).await.unwrap().unwrap();
+    first.start(&id).await.unwrap();
+    let pid = first.pid(&id).await.unwrap();
+    let record = InstanceRecord {
+        schema: 2,
+        instance_id: id.0.clone(),
+        namespace: "default".into(),
+        app_name: "owned-runc".into(),
+        replica_index: 0,
+        is_job: false,
+        image: "/empty-fixture".into(),
+        runtime: RuntimeKind::Runc,
+        pid,
+        pid_started_at: reliaburger::grill::records::process_start_time(pid).unwrap(),
+        runc_container_id: Some(id.0.clone()),
+        log_stem: first.log_stem(&id).await,
+        host_port: None,
+        app_spec: None,
+        oci_spec: specification,
+        rootless_network: None,
+    };
+    // A rollout stops the instance; discovery still holds its address.
+    first.kill(&id).await.unwrap();
+    drop(first);
+
+    let restarted = runtime(root.path());
+    let after_restart = restarted.adopt(&id, &record).await;
+    drop(restarted);
+
+    // The same state after a reboot: the intent names an older kernel.
+    let path = root
+        .path()
+        .join("bundles/.intents/records")
+        .join(&id.0)
+        .join("intent.json");
+    let mut intent: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    intent["boot_id"] = "00000000-0000-4000-8000-000000000001".into();
+    std::fs::write(&path, serde_json::to_vec(&intent).unwrap()).unwrap();
+    let rebooted = runtime(root.path());
+    let after_reboot = rebooted.adopt(&id, &record).await;
+    let held = rebooted
+        .launch_inventory()
+        .await
+        .unwrap()
+        .unwrap()
+        .into_iter()
+        .find(|launch| launch.instance_id == id)
+        .unwrap()
+        .network_reference;
+    let refused_replacement = rebooted
+        .create(&id, &spec(root.path(), "exit 0"))
+        .await
+        .is_err();
+    rebooted.release_network_reference(&original).await.unwrap();
+    assert_eq!(rebooted.state(&id).await.unwrap(), ContainerState::Stopped);
+    assert_absent(root.path(), &id);
+
+    assert!(
+        matches!(after_restart, Ok(false)),
+        "restart refused a retiring generation: {after_restart:?}"
+    );
+    assert!(
+        matches!(after_reboot, Ok(false)),
+        "reboot refused a retiring generation: {after_reboot:?}"
+    );
+    assert_eq!(held, Some(NetworkReferenceState::Held(original)));
+    assert!(
+        refused_replacement,
+        "a held address was handed to a replacement"
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft"]
 async fn previous_boot_intent_cannot_start_or_remove_conflicting_live_resources() {
