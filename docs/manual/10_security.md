@@ -24,7 +24,7 @@ in the clear.
 
 ```sh
 relish token create --name ci-deploy --role deployer --namespaces shop --ttl-days 90
-relish token list
+relish token list      # name, role, created and expiry times (UTC)
 relish token revoke ci-deploy
 ```
 
@@ -59,16 +59,16 @@ image = "ghcr.io/example/api:1.4.2"
 env = { DB_PASSWORD = "ENC[AGE:YWdlLWVuY3J5cHRpb24...]" }
 ```
 
-Encrypt a value with the cluster's public key. `relish secret pubkey` reads it
-from the directory `relish init` wrote; anyone with a token can fetch the
-current one from the API instead:
+Encrypt a value with the cluster's public key. `relish secret pubkey` asks the
+cluster for its current key, using the same endpoint, token and CA as every
+other command, so it works straight after `relish setup --quickstart`. Give it
+the directory `relish init` wrote to read the key from disk instead, with no
+cluster running:
 
 ```sh
-relish secret pubkey cluster
-curl --fail --cacert "$RELIABURGER_CA_CERT" \
-  -H "Authorization: Bearer $RELIABURGER_TOKEN" \
-  https://127.0.0.1:9117/v1/secret/public-key
-relish secret encrypt --pubkey 'age1...' 'the plaintext'
+relish secret pubkey                  # ask the cluster
+relish secret pubkey cluster          # offline, from `relish init` output
+relish secret encrypt --pubkey "$(relish secret pubkey)" 'the plaintext'
 ```
 
 Encryption is local: `secret encrypt` never contacts the cluster. The node
@@ -79,9 +79,9 @@ through.
 To rotate the key: `relish secret rotate` makes a new keypair and prints its
 public key, while the old one keeps decrypting. Re-encrypt your values with the
 new key, re-apply, then run `relish secret rotate --finalize`. It refuses, and
-names the offenders, while any stored secret still needs the old key. `secret
-pubkey` reads the file from `init`, so after a rotation use the key that
-`rotate` printed or the API.
+names the offenders, while any stored secret still needs the old key. Plain
+`secret pubkey` follows the rotation; the offline form reads the file from
+`init`, which still holds the original key.
 
 ## Workload identity
 

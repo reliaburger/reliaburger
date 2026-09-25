@@ -32,7 +32,8 @@ pub struct DeployRequest {
 /// Deploy configuration parsed from `DeploySpec`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DeployConfig {
-    /// Rolling or blue-green (only rolling implemented in Phase 7).
+    /// Rolling (replace a few at a time) or blue-green (stand up the whole
+    /// new fleet, then swap); the agent dispatches its redeploy on this.
     pub strategy: DeployStrategy,
     /// Max instances above target during rollout.
     pub max_surge: u32,
@@ -188,7 +189,7 @@ pub fn plan_rolling_step(
     }
 }
 
-/// Deploy strategy.
+/// Deploy strategy, from `[app.NAME.deploy] strategy` (`"rolling"` or `"blue-green"`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeployStrategy {
     Rolling,

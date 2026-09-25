@@ -678,11 +678,11 @@ Commands:
 | `snapshot list <app>` | List an app's snapshots, newest first |
 | `snapshot restore <app> <name>` | Restore a snapshot over the live volume (stop the app first) |
 | `snapshot delete <app> <name>` | Delete a snapshot |
-| `secret pubkey [dir]` | Print the age public key from a local cluster directory |
+| `secret pubkey [dir]` | Print the cluster's age public key (from the API, or offline from a `relish init` directory) |
 | `secret encrypt --pubkey <key> <value>` | Encrypt a value for use in app configs |
 | `secret rotate [--finalize]` | Start (or finalise) secret encryption-key rotation |
 | `token create --name <name>` | Create an API token (`--role`, `--apps`, `--namespaces`, `--ttl-days`) |
-| `token list` | List all API tokens |
+| `token list` | List API tokens with role, creation time and expiry (UTC) |
 | `token revoke <name>` | Revoke an API token by name |
 | `fault delay <target> <delay>` | Delays traffic to the target with a `tc` netem qdisc on each caller container (runc only); `--from APP` limits it to one caller |
 | `fault drop <target> <pct> --acknowledge` | Fail a percentage of connections (ECONNREFUSED) |
@@ -939,7 +939,13 @@ unsupported rather than silently falling back to broken host DNS.
 
 ## Configuration
 
-Workloads are defined in TOML. See [`examples/`](../examples/) for ready-to-apply configs:
+Workloads are defined in TOML. Resources follow the Kubernetes units: `cpu`
+takes cores (`"2"`, `"0.5"`) or millicores (`"250m"`), `memory` takes bytes or
+`Ki`/`Mi`/`Gi`/`Ti`, and either can be a `request-limit` range such as
+`cpu = "0.5-2"` or `memory = "256Mi-512Mi"`. The same CPU units apply to a
+namespace `cpu` budget and to the node's `[resources] reserved_cpu`.
+
+See [`examples/`](../examples/) for ready-to-apply configs:
 
 | Example | Demonstrates |
 |---------|-------------|
@@ -1380,11 +1386,11 @@ Authenticated clients can fetch the public age recipient with
 `generation`, never private key material. Scoped read-only credentials may
 fetch it; deployments still require their normal permissions.
 
+`relish secret pubkey` (with no directory) makes that request for you, with the
+configured endpoint, token and CA:
+
 ```sh
-curl --fail --cacert cluster/identity/root-ca.crt \
-  -H "Authorization: Bearer $RELIABURGER_TOKEN" \
-  https://127.0.0.1:9117/v1/secret/public-key
-relish secret encrypt --pubkey '<public_key from the response>' 'value'
+relish secret encrypt --pubkey "$(relish secret pubkey)" 'value'
 ```
 
 Use the resulting `ENC[AGE:...]` string in an app environment variable. A

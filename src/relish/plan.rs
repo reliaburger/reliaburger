@@ -114,10 +114,10 @@ pub fn generate_plan(config: &Config, current: Option<&[CurrentResource]>) -> Ap
             summary.push(("health".to_string(), health.path.clone()));
         }
         if let Some(ref memory) = app.memory {
-            summary.push(("memory".to_string(), memory.to_string()));
+            summary.push(("memory".to_string(), memory.to_memory_string()));
         }
         if let Some(ref cpu) = app.cpu {
-            summary.push(("cpu".to_string(), cpu.to_string()));
+            summary.push(("cpu".to_string(), cpu.to_cpu_string()));
         }
         if let Some(ref namespace) = app.namespace {
             summary.push(("namespace".to_string(), namespace.clone()));
@@ -577,7 +577,7 @@ mod tests {
         let plan = generate_plan(&config, None);
         let summary = &plan.entries[0].summary;
         assert!(summary.iter().any(|(k, _)| k == "memory"));
-        assert!(summary.iter().any(|(k, _)| k == "cpu"));
+        assert!(summary.iter().any(|(k, v)| k == "cpu" && v == "100m-500m"));
     }
 
     // -- Diff-based plan tests ------------------------------------------------

@@ -255,7 +255,7 @@ pub(super) fn prepare(
             .size
             .as_deref()
             .map(|size| {
-                crate::config::types::parse_resource_value(size)
+                crate::config::types::parse_byte_size(size)
                     .map_err(|error| VolumeError::InvalidSize(error.to_string()))
             })
             .transpose()?;

@@ -3,10 +3,11 @@
 # Init containers run sequentially before the main app starts.
 # If any init container fails, the app transitions to Failed.
 # Here, the init runs "echo" (succeeds), then nginx starts.
-# Requires a real container runtime (runc or Apple Container).
+# Requires runc on Linux (on macOS, use the managed Linux VM from
+# `relish setup --quickstart`).
 #
 # Deploy with:
-#   cargo run --bin bun -- --runtime apple   # or --runtime runc
+#   cargo run --bin bun -- --runtime runc
 #   cargo run --bin relish -- apply examples/phase-1/container-init-container.toml
 #   cargo run --bin relish -- status
 

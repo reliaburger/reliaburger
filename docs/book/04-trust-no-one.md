@@ -453,7 +453,7 @@ In your app config:
 DATABASE_URL = "ENC[AGE:YWdlLWVuY3J5cH...]"
 ```
 
-You don't need the cluster's key files on your laptop to encrypt a value. `GET /v1/secret/public-key` returns the active public recipient and its generation to any authenticated caller, including read-only ones. A public recipient can encrypt but can't decrypt, so the endpoint returns a two-field `SecretPublicKey` struct rather than serialising the stored keypair, which also holds wrapped private material.
+You don't need the cluster's key files on your laptop to encrypt a value. `GET /v1/secret/public-key` returns the active public recipient and its generation to any authenticated caller, including read-only ones. A public recipient can encrypt but can't decrypt, so the endpoint returns a two-field `SecretPublicKey` struct rather than serialising the stored keypair, which also holds wrapped private material. `relish secret pubkey` is a thin wrapper around that request. It used to read only the bootstrap file `relish init` leaves behind, which a quickstart user never sees and which goes stale after a rotation, so the CLI now asks the cluster by default and keeps the file as the offline option (`relish secret pubkey cluster/`).
 
 At container startup, Bun decrypts `ENC[AGE:...]` values and injects the plaintext as environment variables. The decrypted value never touches disk — it goes straight from memory into the container's process environment.
 

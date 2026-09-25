@@ -113,7 +113,7 @@ never syncs the wrong repository.
 
 Lettuce parses TOML files in a defined order to handle cross-references:
 
-1. **Discovery.** Walk all `.toml` files under `path` (non-recursive by default; `recursive = true` in config enables subdirectory scanning).
+1. **Discovery.** Walk all `.toml` files under `path`, subdirectories included (`git ls-tree -r`). There is no shallow mode and no `recursive` key.
 2. **Namespace resolution.** Files can declare `[namespace]` blocks. If a file doesn't declare a namespace, it inherits the namespace from its parent directory name, or falls back to `default`.
 3. **Parse and validate.** Each file is parsed with the `toml` crate. Validation checks:
    - Required fields present (`image` or `exec`/`script` for apps/jobs)
@@ -175,9 +175,6 @@ pub struct GitOpsConfig {
     /// HMAC-SHA256 secret for webhook payload validation. If None, the webhook
     /// endpoint is disabled.
     pub webhook_secret: Option<String>,
-
-    /// Whether to recurse into subdirectories under `path`. Default: false.
-    pub recursive: bool,
 
     /// Maximum webhook triggers processed per minute. Default: 10.
     pub webhook_rate_limit: u32,
@@ -723,9 +720,6 @@ trusted_signing_keys = [
 # HMAC-SHA256 secret for webhook validation. If omitted, webhook endpoint is
 # disabled and only polling is used.
 webhook_secret = "whsec_super_secret_value"
-
-# Recurse into subdirectories under `path`. Default: false.
-recursive = true
 
 # Maximum webhook triggers per minute. Default: 10.
 webhook_rate_limit = 10

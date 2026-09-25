@@ -50,6 +50,11 @@ preferred = ["ssd=true"]
 path = "/data"            # a managed volume; see `images-and-volumes`
 ```
 
+CPU follows Kubernetes: a bare number is cores (`cpu = "2"`, `cpu = "0.5-2"`)
+and the `m` suffix is millicores (`"250m"` is a quarter of a core). Memory takes
+`Ki`/`Mi`/`Gi`/`Ti`, and a bare number is bytes. A single value sets the request
+and the limit to the same thing.
+
 Names (apps, jobs, namespaces) are lowercase DNS labels. Secrets go in `env`
 encrypted; see `security`. Ingress, firewall and egress rules are in
 `networking`, metrics scraping in `observability`.

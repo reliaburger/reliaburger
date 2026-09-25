@@ -510,10 +510,10 @@ This pattern — enum type, custom visitor, `deserialize_any` — is the standar
 
 Resources like CPU and memory use a range format: `"128Mi-512Mi"` means "request 128 mebibytes, limit 512 mebibytes". A single value like `"256Mi"` means request and limit are equal.
 
-The `parse_resource_value` function handles the suffixes:
+The `parse_byte_size` function handles the memory suffixes:
 
 ```rust
-pub fn parse_resource_value(s: &str) -> Result<u64, ConfigError> {
+pub fn parse_byte_size(s: &str) -> Result<u64, ConfigError> {
     if let Some(num) = s.strip_suffix("Gi") {
         return parse_num(num, 1024 * 1024 * 1024, s);
     }
@@ -523,14 +523,17 @@ pub fn parse_resource_value(s: &str) -> Result<u64, ConfigError> {
     if let Some(num) = s.strip_suffix("Ki") {
         return parse_num(num, 1024, s);
     }
-    if let Some(num) = s.strip_suffix('m') {
-        return parse_num(num, 1, s); // millicores
-    }
     s.parse::<u64>().map_err(/* ... */)
 }
 ```
 
-`Ki`, `Mi`, `Gi`, `Ti` are binary prefixes (powers of 1024), used for memory. The `m` suffix is millicores for CPU — 500m means half a CPU core. Bare numbers are passed through as-is.
+`Ki`, `Mi`, `Gi`, `Ti` are binary prefixes (powers of 1024). A bare number is bytes, the same as Kubernetes.
+
+CPU gets its own parser, `parse_cpu_millicores`, and here we follow Kubernetes too: a bare number is *cores*. `cpu = "2"` is two cores (2000 millicores), `"0.5"` is half a core, and the `m` suffix is millicores, so `"250m"` is a quarter of a core. Everything inside Reliaburger counts millicores, so that's what the parser returns.
+
+It didn't start out that way. The first version had one parser for both resources, where a bare number was "base units": bytes for memory, millicores for CPU. So `cpu = "2"` quietly asked for two *thousandths* of a core. Anyone arriving from Kubernetes, where `cpu: 2` means two cores, got a workload that crawled and no error to explain why. Splitting the parser is what makes the unit visible at the type level: nothing can accidentally read a CPU string as bytes any more.
+
+The fractional part is parsed by hand rather than through `f64`, because `0.1` has no exact binary floating-point representation and we don't want `"0.1"` turning into 99 millicores. Anything finer than a millicore (`"0.0005"`) is an error rather than a silent rounding.
 
 Two pieces of Rust syntax here deserve a closer look, because they'll appear constantly from now on.
 
@@ -542,7 +545,16 @@ Two pieces of Rust syntax here deserve a closer look, because they'll appear con
 
 `parse` returns `Result<u64, ParseIntError>`, which is Rust's other "might fail" type. Where `Option` is "value or nothing," `Result` is "value or error." `.map_err(...)` transforms the error variant: it takes the `ParseIntError` from the standard library and converts it into our `ConfigError` type, keeping the success value untouched. This kind of chaining — calling a method, then mapping the error — is idiomatic Rust. You'll see `.map()`, `.map_err()`, `.and_then()`, and `?` used together to build pipelines that handle errors without nested `if` statements.
 
-`ResourceRange` uses a custom `Deserialize` that reads the string, splits on `-`, and parses both halves. If there's no `-`, request and limit are the same value.
+`ResourceRange` splits the string on `-` and parses both halves. If there's no `-`, request and limit are the same value. The struct itself is just two `u64`s, and it doesn't know whether they're millicores or bytes, so the unit has to come from the field. Serde lets a field pick its own (de)serialisation functions:
+
+```rust
+#[serde(default, with = "super::types::cpu_range", skip_serializing_if = "Option::is_none")]
+pub cpu: Option<ResourceRange>,
+```
+
+`with = "cpu_range"` points serde at a module containing a `serialize` and a `deserialize` function, used instead of the type's own implementation. `cpu_range` reads the string with the CPU parser and writes it back with an `m` suffix; `memory_range` does the same with bytes. The suffix on the way out matters: without it, 500 millicores would serialise as `"500"`, and the next read would see 500 cores. `default` is needed because a `with` field loses serde's built-in "missing `Option` means `None`" behaviour.
+
+Inside the module, `Option::<String>::deserialize(deserializer)?` reads an optional string, `.map(...)` parses it if present, and `.transpose()` turns the resulting `Option<Result<T, E>>` inside out into `Result<Option<T>, E>` so the `?`-style error handling works. `ResourceRange::parse_cpu` and `parse_memory` share one private helper that takes the value parser as an argument of type `fn(&str) -> Result<u64, ConfigError>`: a plain function pointer, like a C function pointer, with no closure capture and no allocation.
 
 ### EnvValue and encrypted secrets
 
@@ -664,7 +676,7 @@ fn replicas_deserialise_zero_rejected() {
 
 #[test]
 fn parse_resource_range_request_exceeds_limit_rejected() {
-    assert!(ResourceRange::parse("500m-100m").is_err());
+    assert!(ResourceRange::parse_cpu("500m-100m").is_err());
 }
 ```
 

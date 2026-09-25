@@ -144,8 +144,7 @@ pub fn default_path() -> Result<PathBuf, RelishError> {
 }
 
 fn lock_context(path: &Path) -> Result<std::fs::File, RelishError> {
-    // Keep the lock inode in place: deleting it would let a concurrent
-    // writer lock a different inode for the same context path.
+    let lock_path = path.with_extension("lock");
     let mut options = std::fs::OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
     #[cfg(unix)]
@@ -153,10 +152,55 @@ fn lock_context(path: &Path) -> Result<std::fs::File, RelishError> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let lock = options.open(path.with_extension("lock"))?;
+    let lock = options.open(&lock_path)?;
     lock.try_lock()
         .map_err(|error| RelishError::InitFailed(format!("local context is busy: {error}")))?;
+    // `relish uninstall` deletes the lock file (under the lock) once no
+    // context is left. A writer that opened the file just before that
+    // unlink now holds a lock nobody else can see, while a newer writer
+    // could lock a fresh file at the same path. Refuse unless the file we
+    // locked is still the one the path names.
+    if !still_linked(&lock, &lock_path)? {
+        return Err(RelishError::InitFailed(
+            "local context is busy: its lock file was removed; retry".to_string(),
+        ));
+    }
     Ok(lock)
+}
+
+#[cfg(unix)]
+fn still_linked(lock: &std::fs::File, lock_path: &Path) -> Result<bool, RelishError> {
+    use std::os::unix::fs::MetadataExt;
+    let held = lock.metadata()?;
+    match std::fs::symlink_metadata(lock_path) {
+        Ok(current) => Ok(current.dev() == held.dev() && current.ino() == held.ino()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(not(unix))]
+fn still_linked(_lock: &std::fs::File, _lock_path: &Path) -> Result<bool, RelishError> {
+    Ok(true)
+}
+
+/// Delete the context's lock file once no context remains beside it.
+///
+/// Returns `true` if the lock file was removed. The unlink happens while
+/// holding the lock, and every locker re-checks that its file is still
+/// linked, so no two writers can end up on different lock files. Leaves
+/// everything alone (and returns `false`) while a context file exists.
+pub fn remove_unused_lock(path: &Path) -> Result<bool, RelishError> {
+    let lock_path = path.with_extension("lock");
+    if std::fs::symlink_metadata(&lock_path).is_err() {
+        return Ok(false);
+    }
+    let _lock = lock_context(path)?;
+    if std::fs::symlink_metadata(path).is_ok() {
+        return Ok(false);
+    }
+    std::fs::remove_file(&lock_path)?;
+    Ok(true)
 }
 
 /// Managed local state root; an explicit override must be an absolute path.
@@ -191,6 +235,49 @@ mod tests {
         LocalContext::remove_owned(&path, "one").unwrap();
         assert!(!path.exists());
         LocalContext::remove_owned(&path, "one").unwrap();
+    }
+
+    #[test]
+    fn unused_lock_is_removed_but_a_live_context_keeps_it() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("context.json");
+        let lock = root.path().join("context.lock");
+        context(root.path(), "one").save(&path).unwrap();
+        assert!(lock.exists(), "saving creates the lock beside the context");
+
+        assert!(!remove_unused_lock(&path).unwrap());
+        assert!(lock.exists(), "a saved context keeps its lock");
+
+        LocalContext::remove_owned(&path, "one").unwrap();
+        assert!(remove_unused_lock(&path).unwrap());
+        assert!(!lock.exists());
+        assert!(!remove_unused_lock(&path).unwrap(), "already gone");
+    }
+
+    #[test]
+    fn unused_lock_is_left_while_another_process_holds_it() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("context.json");
+        let _held = lock_context(&path).unwrap();
+        assert!(remove_unused_lock(&path).is_err());
+        assert!(root.path().join("context.lock").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_lock_file_unlinked_or_replaced_is_detected() {
+        let root = tempfile::tempdir().unwrap();
+        let lock_path = root.path().join("context.lock");
+        // A writer that opened the lock file before uninstall unlinked it.
+        std::fs::write(&lock_path, "").unwrap();
+        let stale = std::fs::File::open(&lock_path).unwrap();
+        std::fs::remove_file(&lock_path).unwrap();
+        assert!(!still_linked(&stale, &lock_path).unwrap());
+        // A fresh file at the same path is a different inode.
+        std::fs::write(&lock_path, "").unwrap();
+        assert!(!still_linked(&stale, &lock_path).unwrap());
+        let fresh = std::fs::File::open(&lock_path).unwrap();
+        assert!(still_linked(&fresh, &lock_path).unwrap());
     }
 
     fn context(root: &std::path::Path, owner: &str) -> LocalContext {

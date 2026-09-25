@@ -2197,8 +2197,8 @@ work, not by `M1`.
     and an app recreated under the same name inherited the dead one's history
   - [x] **Honesty:** `[gitops] recursive` isn't ignored so much as redundant — `git ls-tree -r`
     always descends — which makes `recursive = false` the misleading case, promising a shallow
-    sync and delivering a deep one. Documented, and `GitOpsConfig::warnings()` says so at
-    startup rather than correcting behaviour behind the operator's back. `SyncState::history`
+    sync and delivering a deep one. (Since removed outright: `recursive` is no longer a
+    `[gitops]` key, so `deny_unknown_fields` rejects it at parse time.) `SyncState::history`
     (never written by the runner) and `coordinator_node_id` (informational — leadership is what
     gates syncing) are documented at the fields, so the next reader doesn't trust them
   - [x] **Deleted:** `smoker/node.rs` — `DrainPlan`/`KillPlan` had only self-tests and no

@@ -1625,8 +1625,9 @@ mod tests {
             dns: Default::default(),
         });
         let mut spec = basic_app_spec(None);
-        spec.memory =
-            Some(crate::config::types::ResourceRange::parse("128Mi-512Mi").expect("valid range"));
+        spec.memory = Some(
+            crate::config::types::ResourceRange::parse_memory("128Mi-512Mi").expect("valid range"),
+        );
         let err = sup
             .deploy_app("limited", "default", &spec, Instant::now())
             .await
@@ -1645,7 +1646,8 @@ mod tests {
         // process runtime kind.
         let mut sup = test_supervisor();
         let mut spec = basic_app_spec(None);
-        spec.memory = Some(crate::config::types::ResourceRange::parse("128Mi-512Mi").unwrap());
+        spec.memory =
+            Some(crate::config::types::ResourceRange::parse_memory("128Mi-512Mi").unwrap());
         let err = sup
             .deploy_app("limited", "default", &spec, Instant::now())
             .await
@@ -1662,7 +1664,8 @@ mod tests {
         let port_allocator = PortAllocator::new(30000, 31000);
         let mut sup = WorkloadSupervisor::new(grill, port_allocator);
         let mut spec = basic_app_spec(None);
-        spec.memory = Some(crate::config::types::ResourceRange::parse("128Mi-512Mi").unwrap());
+        spec.memory =
+            Some(crate::config::types::ResourceRange::parse_memory("128Mi-512Mi").unwrap());
         let ids = sup
             .deploy_app("limited", "default", &spec, Instant::now())
             .await

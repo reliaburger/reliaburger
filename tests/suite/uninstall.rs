@@ -77,3 +77,36 @@ fn uninstall_succeeds_after_destroy_leaves_only_the_operation_lock() {
     assert!(!home.path().join(".reliaburger/clusters").exists());
     assert!(!home.path().join(".reliaburger/tools").exists());
 }
+
+#[test]
+fn uninstall_removes_the_context_lock_left_after_destroy() {
+    let home = tempfile::tempdir().unwrap();
+    installed(home.path());
+    // `relish local destroy` removes context.json but leaves its lock.
+    std::fs::write(home.path().join(".reliaburger/context.lock"), "").unwrap();
+    let output = uninstall(home.path(), &["--yes"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!home.path().join(".reliaburger").exists());
+}
+
+#[test]
+fn uninstall_keeps_a_saved_context_and_its_lock() {
+    let home = tempfile::tempdir().unwrap();
+    installed(home.path());
+    let root = home.path().join(".reliaburger");
+    std::fs::write(root.join("context.json"), "{}").unwrap();
+    std::fs::write(root.join("context.lock"), "").unwrap();
+    let output = uninstall(home.path(), &["--yes"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(root.join("context.json").exists());
+    assert!(root.join("context.lock").exists());
+    assert!(!root.join("tools").exists());
+}

@@ -365,7 +365,7 @@ async fn unschedulable_jobs_appear_in_the_batch() {
                         "command": ["echo", "never"],
                         // More millicores than the fallback capacity
                         // (u64::MAX / 2) can ever satisfy.
-                        "cpu": "9999999999999999999",
+                        "cpu": "9999999999999999999m",
                     },
                 },
             ],

@@ -15,6 +15,19 @@ use crate::config::Config;
 
 use super::RelishError;
 
+/// One API token as `GET /v1/token/list` describes it; never the secret.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct TokenSummary {
+    /// Token name, as given to `relish token create`.
+    pub name: String,
+    /// Role the token grants.
+    pub role: String,
+    /// Creation time, Unix seconds.
+    pub created_at: u64,
+    /// Expiry, Unix seconds; `None` for a token that never expires.
+    pub expires_at: Option<u64>,
+}
+
 /// Client for the Bun agent HTTP API.
 #[derive(Clone)]
 pub struct BunClient {
@@ -1922,26 +1935,16 @@ impl BunClient {
         response.json().await.map_err(classify_error)
     }
 
-    /// List API tokens from SecurityState.
-    pub async fn token_list(&self) -> Result<serde_json::Value, RelishError> {
-        let url = format!("{}/v1/token/list", self.base_url);
-        let response = self
-            .http()?
-            .get(&url)
-            .send()
-            .await
-            .map_err(classify_error)?;
-
-        let status = response.status().as_u16();
-        if !response.status().is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(RelishError::ApiError { status, body });
+    /// List API tokens from SecurityState (names, roles and times only).
+    pub async fn token_list(&self) -> Result<Vec<TokenSummary>, RelishError> {
+        #[derive(serde::Deserialize)]
+        struct TokenList {
+            tokens: Vec<TokenSummary>,
         }
-
-        response.json().await.map_err(|e| RelishError::ApiError {
-            status: 0,
-            body: format!("failed to parse token list: {e}"),
-        })
+        Ok(self
+            .get_typed_json::<TokenList>("/v1/token/list")
+            .await?
+            .tokens)
     }
 
     /// Create an API token via the agent (persisted in Raft). Returns the
