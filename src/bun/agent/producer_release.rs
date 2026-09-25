@@ -41,6 +41,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
     }
     /// Configure enrolled leader transport. Durable discovery enables the release gate.
+    /// Forward workload CSRs through the leader when this node isn't it.
+    pub fn set_workload_csr_client(
+        &mut self,
+        client: crate::cluster::workload_identity::WorkloadCsrClient,
+    ) {
+        self.workload_csr_client = Some(client);
+    }
+
     pub fn set_producer_release_client(
         &mut self,
         client: crate::cluster::producer::ProducerReleaseClient,

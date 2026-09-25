@@ -1731,6 +1731,8 @@ pub struct BunAgent<G: Grill> {
     discovery_ownership: DiscoveryOwnership,
     /// Enrolled transport used by the opt-in durable producer retirement gate.
     producer_release_client: Option<crate::cluster::producer::ProducerReleaseClient>,
+    /// Forwards workload CSRs to the leader when this node isn't it.
+    workload_csr_client: Option<crate::cluster::workload_identity::WorkloadCsrClient>,
     /// Producer release confirmations still waiting for the leader, keyed by
     /// the execution they would release. Dropping one aborts its request.
     producer_releases: std::collections::HashMap<
@@ -1940,6 +1942,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             service_map: crate::onion::service_map::ServiceMap::new(),
             discovery_ownership: DiscoveryOwnership::default(),
             producer_release_client: None,
+            workload_csr_client: None,
             producer_releases: std::collections::HashMap::new(),
             cluster_catalog: crate::onion::catalog::EndpointCatalog::new(),
             cluster_catalog_generation: None,
@@ -2051,6 +2054,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             service_map: crate::onion::service_map::ServiceMap::new(),
             discovery_ownership: DiscoveryOwnership::default(),
             producer_release_client: None,
+            workload_csr_client: None,
             producer_releases: std::collections::HashMap::new(),
             cluster_catalog: crate::onion::catalog::EndpointCatalog::new(),
             cluster_catalog_generation: None,
@@ -9081,17 +9085,35 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 }
             };
 
-        // Submit CSR to council
-        let result = council
-            .sign_workload_csr(
-                &csr_der,
-                &spiffe_uri,
-                crate::sesame::identity::CertUsage::Mtls,
-                &self.trust_domain,
-                "local",
-                &instance_id.0,
-            )
-            .await;
+        // Only the leader can sign. A follower used to call its own council,
+        // fail, and start the container with no identity at all.
+        let result = if council.is_leader().await {
+            council
+                .sign_workload_csr(
+                    &csr_der,
+                    &spiffe_uri,
+                    crate::sesame::identity::CertUsage::Mtls,
+                    &self.trust_domain,
+                    "local",
+                    &instance_id.0,
+                )
+                .await
+                .map(|signed| crate::cluster::workload_identity::SignedWorkload {
+                    cert_der: signed.cert_der,
+                    workload_ca_cert_der: signed.workload_ca_cert_der,
+                    root_ca_cert_der: signed.root_ca_cert_der,
+                    jwt_token: signed.jwt_token,
+                })
+                .map_err(|error| error.to_string())
+        } else {
+            match &self.workload_csr_client {
+                Some(client) => client
+                    .sign(&instance_id.0, workload_type, &csr_der)
+                    .await
+                    .map_err(|error| error.to_string()),
+                None => Err("no leader transport for workload signing".to_string()),
+            }
+        };
 
         match result {
             Ok(csr_result) => {
@@ -9146,7 +9168,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             Err(e) => {
                 let _ = events
                     .send(ApplyEvent::Progress {
-                        message: format!("identity: council CSR signing failed: {e}"),
+                        message: format!("identity: CSR signing failed: {e}"),
                     })
                     .await;
             }

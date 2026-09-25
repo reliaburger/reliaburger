@@ -466,6 +466,10 @@ pub fn router_with_upgrade(
         .route("/v1/placements/{node_id}", get(placements_handler))
         .route("/v1/discovery/retire", post(producer_retirement_handler))
         .route(
+            "/v1/cluster/workload-csr",
+            post(workload_csr_handler).layer(axum::extract::DefaultBodyLimit::max(16 * 1024)),
+        )
+        .route(
             "/v1/discovery/withdrawn",
             post(endpoint_withdrawal_receipt_handler),
         )
@@ -3304,6 +3308,86 @@ async fn endpoint_withdrawal_receipt_handler(
 }
 
 /// Producers contact the leader directly so forwarding cannot replace their TLS identity.
+/// `POST /v1/cluster/workload-csr` — sign a workload CSR for a follower.
+///
+/// Only the leader can sign (the CA read is linearised and the serial comes
+/// from Raft). The caller is identified by its node certificate, and the
+/// SPIFFE identity is derived from the instance id, which must belong to an
+/// app scheduled on that node.
+async fn workload_csr_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    peer: Option<axum::Extension<crate::sesame::renewal::TlsPeerCertificate>>,
+    State(state): State<ApiState>,
+    Json(request): Json<crate::cluster::workload_identity::WorkloadCsrRequest>,
+) -> Response {
+    use crate::cluster::workload_identity::{SignedWorkload, WorkloadCsrResponse, authorise};
+    use base64::Engine as _;
+    if let Err(response) = crate::sesame::auth::require_system(auth.as_deref()) {
+        return response;
+    }
+    if let Err(error) = request.compatibility.require_current() {
+        return (StatusCode::CONFLICT, error.to_string()).into_response();
+    }
+    let Some(peer) = peer else {
+        return (
+            StatusCode::FORBIDDEN,
+            "workload signing requires a TLS node certificate",
+        )
+            .into_response();
+    };
+    let Some(council) = &state.council else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no council available").into_response();
+    };
+    let Ok(csr_der) = base64::engine::general_purpose::STANDARD.decode(&request.csr_der) else {
+        return (StatusCode::BAD_REQUEST, "workload CSR is not base64").into_response();
+    };
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let security = council
+            .security_state_linearizable()
+            .await
+            .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?;
+        let node_id = crate::sesame::renewal::validate_peer(&peer, &security)
+            .map_err(|error| (StatusCode::FORBIDDEN, error.to_string()))?;
+        let desired = council.desired_state().await;
+        let (namespace, name) = authorise(
+            &desired,
+            &node_id,
+            &request.instance_id,
+            request.workload_type,
+        )
+        .map_err(|reason| (StatusCode::FORBIDDEN, reason))?;
+        let spiffe_uri = crate::bun::agent::workload_spiffe_uri(
+            &state.trust_domain,
+            &namespace,
+            &name,
+            request.workload_type,
+        );
+        council
+            .sign_workload_csr(
+                &csr_der,
+                &spiffe_uri,
+                crate::sesame::identity::CertUsage::Mtls,
+                &state.trust_domain,
+                &node_id,
+                &request.instance_id,
+            )
+            .await
+            .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error.to_string()))
+    })
+    .await;
+    match result {
+        Ok(Ok(signed)) => Json(WorkloadCsrResponse::encode(&SignedWorkload {
+            cert_der: signed.cert_der,
+            workload_ca_cert_der: signed.workload_ca_cert_der,
+            root_ca_cert_der: signed.root_ca_cert_der,
+            jwt_token: signed.jwt_token,
+        }))
+        .into_response(),
+        Ok(Err(error)) => error.into_response(),
+        Err(_) => (StatusCode::GATEWAY_TIMEOUT, "workload signing timed out").into_response(),
+    }
+}
+
 async fn producer_retirement_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     peer: Option<axum::Extension<crate::sesame::renewal::TlsPeerCertificate>>,
