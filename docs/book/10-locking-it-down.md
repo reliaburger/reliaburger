@@ -183,6 +183,12 @@ We didn't add a JWT crate for this. JWT is three base64url segments joined by do
 
 The JWT claims include the SPIFFE URI as the subject, the cluster name, namespace, node, and instance ID. External verifiers use the JWKS endpoint (which publishes the Ed25519 public key in RFC 8037 OKP format) to validate these tokens.
 
+### Only the leader signs
+
+Signing a workload certificate reads the CA from linearised state and takes a serial number from Raft, so it only works on the leader. For most of the project every node called its own council to sign, and every follower got an error back. The error went into a progress message, the container started anyway, and its `/run/reliaburger/identity/` stayed empty. The V02 soak's identity app ran on all three nodes for 76 minutes and only the leader's copy ever had a certificate.
+
+Followers now forward the CSR (never the key) to `POST /v1/cluster/workload-csr` on the leader, over the node's mTLS connection. The leader identifies the asking node by its certificate, derives the SPIFFE identity from the instance id rather than trusting the caller, and refuses an app that isn't scheduled on that node. A node can't talk the leader into a certificate for someone else's workload.
+
 ### Identity delivery
 
 The workload sees its identity at `/run/reliaburger/identity/`:

@@ -22,5 +22,6 @@ pub mod orchestrate;
 pub mod producer;
 pub mod retirement;
 pub mod runtime;
+pub mod workload_identity;
 
 pub use http::ClusterHttp;
