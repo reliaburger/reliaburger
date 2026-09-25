@@ -333,6 +333,9 @@ in repository Actions. Signed candidate qualification is still V03.
   - [x] Wait for the retry workload's own counter write before injecting Bun death in the job crash fixture.
   - [x] Keep the ordinary application running in the initialiser-identity regression.
   - [x] Isolate the physical peer-route fixture from host forwarding policy.
+  - [x] Add power-cut fixtures for the exporter checkpoint/lock (C03) and `LocalLeaseStore` (C11), driven by `scripts/release/qualify-storage-power-cut.sh` on a disposable VM, and the `v02-loops` Actions lane ([record](qualification/2026-09-25-v02-power-cut.md)).
+  - [x] Sync local-destination exports before the checkpoint acknowledges them; the C03 power-cut fixture found every recent export empty after a cut, with most sources already pruned.
+  - [ ] Run the `v02-loops` Actions lane and record its bounds.
 - [ ] **V03** (gate) Publish and install the exact signed candidate.
   - [x] Preserve a complete signed candidate with source/run identity and per-file hashes; promote only the qualified bytes without rebuilding.
   - [x] Add explicit HTTPS candidate mirrors to both installers and managed setup without bypassing checksums or signatures.
