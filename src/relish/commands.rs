@@ -419,7 +419,10 @@ async fn exec_with_client(
     command: &[String],
     client: &BunClient,
 ) -> Result<(), RelishError> {
-    let output = client.exec(app, namespace, command).await?;
+    // The entry node only runs its own instances; exec on the node that
+    // runs this app (through the entry node's relay on a laptop cluster).
+    let target = super::path_cmd::find_source_client(client, app, namespace).await?;
+    let output = target.exec(app, namespace, command).await?;
     if !output.is_empty() {
         print!("{output}");
     }

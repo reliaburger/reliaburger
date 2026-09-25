@@ -2345,7 +2345,9 @@ client builds a relayed client with `BunClient::via_node`, whose base URL is
 formats its path onto the base URL.
 
 The relay on the server is deliberately not a proxy. It forwards ten `GET`
-paths and one `POST` (`/v1/path`), refuses everything else with a 404,
+paths and two kinds of `POST` (`/v1/path`, and `/v1/exec/{app}/{namespace}`
+since the V02 triage found `relish exec` could only reach instances on the
+entry node), refuses everything else with a 404,
 forwards the caller's own `Authorization` header and never the node's service
 token. So a relayed request can't do anything the caller couldn't do by
 dialling the node directly. A test proves it: a token scoped to one app asks a
