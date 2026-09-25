@@ -6,7 +6,8 @@
 //! - the log/metrics exporter (its `_export_checkpoint.json`, the
 //!   cross-process `_export_checkpoint.lock`, and export-then-prune);
 //! - the standalone `LocalLeaseStore` (private unique temporaries plus file
-//!   and directory syncs).
+//!   and directory syncs);
+//! - council backups, which upload a new backup and then prune older ones.
 //!
 //! `prepare` starts worker processes (re-executions of this test binary) that
 //! keep mutating durable state. Every operation they finish is appended to an
@@ -24,6 +25,9 @@ use std::time::Duration;
 
 use rand::Rng;
 use reliaburger::bun::disk_pressure::check_and_relieve;
+use reliaburger::council::backup::{
+    BackupConfig, BackupStore, decode_backup, encode_backup, seal_snapshot, unseal_snapshot,
+};
 use reliaburger::ketchup::export::{CHECKPOINT_FILENAME, ExportCheckpoint, export_logs};
 use reliaburger::ketchup::log_store::LogStore;
 use reliaburger::ketchup::remote_query::query_remote;
@@ -869,6 +873,212 @@ async fn actual_power_cut_preserves_acknowledged_lease_operations() {
     match phase().as_str() {
         "prepare" => prepare_leases(&root).await,
         "verify" => verify_leases(&root).await,
+        other => panic!("invalid power-cut phase {other}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Council backups: upload, then prune older backups
+// ---------------------------------------------------------------------------
+
+const BACKUP_TEST: &str = "actual_power_cut_preserves_acknowledged_council_backups";
+const BACKUP_KEY: [u8; 32] = [7; 32];
+/// Small, so pruning deletes an older backup on almost every tick.
+const BACKUP_RETAIN: usize = 3;
+/// Backup keys are millisecond timestamps; a fixed base keeps them unique.
+const BACKUP_EPOCH_MS: u64 = 1_790_000_000_000;
+
+fn backup_directory(root: &Path) -> PathBuf {
+    root.join("backups")
+}
+
+fn backup_url(root: &Path) -> String {
+    format!("file://{}", backup_directory(root).display())
+}
+
+fn backup_time(sequence: u64) -> std::time::SystemTime {
+    std::time::UNIX_EPOCH + Duration::from_millis(BACKUP_EPOCH_MS + sequence)
+}
+
+fn backup_payload(sequence: u64) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({"sequence": sequence})).unwrap()
+}
+
+/// Seal a fresh backup, upload it, then prune, the way the leader's backup
+/// tick does, recording each step in the ledger once it has returned.
+async fn run_backup_worker(root: &Path) {
+    let store = BackupStore::from_url(&backup_url(root)).unwrap();
+    let mut ledger = Ledger::open(&root.join("ledgers/backup.ledger"));
+    let mut sequence = 0u64;
+    loop {
+        let sealed = seal_snapshot(
+            &BACKUP_KEY,
+            &backup_payload(sequence),
+            &BackupConfig::default(),
+        )
+        .unwrap();
+        let bytes = encode_backup(&sealed).unwrap();
+        ledger.record(&format!("begin {sequence}"));
+        store.put(&sealed, backup_time(sequence)).await.unwrap();
+        ledger.record(&format!("put {sequence} {}", sha256(&bytes)));
+        store.prune(BACKUP_RETAIN).await.unwrap();
+        ledger.record(&format!("prune {sequence}"));
+        sequence += 1;
+        let pause = rand::thread_rng().gen_range(2..30);
+        tokio::time::sleep(Duration::from_millis(pause)).await;
+    }
+}
+
+/// Acknowledged uploads (sequence → SHA-256) and the upload in flight, if any.
+fn acknowledged_backups(root: &Path) -> (BTreeMap<u64, String>, Option<u64>) {
+    let mut uploads = BTreeMap::new();
+    let mut in_flight = None;
+    for line in ledger_lines(&root.join("ledgers/backup.ledger")) {
+        let fields: Vec<&str> = line.split(' ').collect();
+        match fields.as_slice() {
+            ["begin", sequence] => in_flight = Some(sequence.parse().unwrap()),
+            ["put", sequence, sha] => {
+                let sequence: u64 = sequence.parse().unwrap();
+                assert_eq!(in_flight.take(), Some(sequence), "put without begin");
+                uploads.insert(sequence, sha.to_string());
+            }
+            ["prune", _] => {}
+            _ => panic!("unexpected backup ledger line {line:?}"),
+        }
+    }
+    (uploads, in_flight)
+}
+
+/// Every backup object at the destination, by sequence, plus leftover
+/// staging files from uploads the cut interrupted.
+fn stored_backups(root: &Path) -> (BTreeMap<u64, Vec<u8>>, usize) {
+    let mut backups = BTreeMap::new();
+    let mut staged = 0;
+    for entry in std::fs::read_dir(backup_directory(root)).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(millis) = name
+            .strip_prefix("council-")
+            .and_then(|rest| rest.strip_suffix(".backup"))
+        else {
+            staged += 1;
+            continue;
+        };
+        let sequence = millis.parse::<u64>().unwrap() - BACKUP_EPOCH_MS;
+        backups.insert(sequence, std::fs::read(entry.path()).unwrap());
+    }
+    (backups, staged)
+}
+
+fn assert_backup_intact(sequence: u64, bytes: &[u8]) {
+    let sealed = decode_backup(bytes).unwrap_or_else(|error| {
+        panic!("backup {sequence} is torn ({} bytes): {error}", bytes.len())
+    });
+    let payload = unseal_snapshot(&BACKUP_KEY, &sealed)
+        .unwrap_or_else(|error| panic!("backup {sequence} does not unseal: {error}"));
+    assert_eq!(
+        payload,
+        backup_payload(sequence),
+        "backup {sequence} holds another state"
+    );
+}
+
+async fn prepare_backups(root: &Path) {
+    begin_prepare(root);
+    std::fs::create_dir_all(backup_directory(root)).unwrap();
+    std::fs::create_dir_all(root.join("ledgers")).unwrap();
+    sync_directory(root);
+    spawn_worker(BACKUP_TEST, root, "backup");
+    wait_until("acknowledged backups", || {
+        acknowledged_backups(root).0.len() > BACKUP_RETAIN + 2
+    })
+    .await;
+    finish_prepare(root);
+}
+
+async fn verify_backups(root: &Path) {
+    let boot = assert_rebooted(root);
+    let (uploads, in_flight) = acknowledged_backups(root);
+    let (stored, staged) = stored_backups(root);
+
+    // Nothing at the destination is torn, and each acknowledged backup holds
+    // exactly the bytes that were uploaded.
+    for (sequence, bytes) in &stored {
+        assert_backup_intact(*sequence, bytes);
+        match uploads.get(sequence) {
+            Some(sha) => assert_eq!(&sha256(bytes), sha, "backup {sequence} changed"),
+            None => assert_eq!(
+                Some(*sequence),
+                in_flight,
+                "backup {sequence} was never uploaded"
+            ),
+        }
+    }
+
+    // Pruning keeps the newest backups. An upload that landed without its
+    // acknowledgement may have pruned one more acknowledged backup, no more.
+    let newest = *uploads.keys().last().unwrap();
+    let unacknowledged = stored.keys().filter(|sequence| **sequence > newest).count();
+    for sequence in uploads.keys().rev().take(BACKUP_RETAIN - unacknowledged) {
+        assert!(
+            stored.contains_key(sequence),
+            "acknowledged backup {sequence} is missing, though pruning must keep it"
+        );
+    }
+
+    // Recovery reads the newest backup, and the store keeps working.
+    let store = BackupStore::from_url(&backup_url(root)).unwrap();
+    let latest = store
+        .latest()
+        .await
+        .expect("newest backup is unreadable after the power cut")
+        .expect("no backup survived the power cut");
+    let newest_stored = *stored.keys().last().unwrap();
+    assert_eq!(
+        unseal_snapshot(&BACKUP_KEY, &latest).unwrap(),
+        backup_payload(newest_stored)
+    );
+    let fresh = newest_stored + 1_000;
+    let sealed = seal_snapshot(
+        &BACKUP_KEY,
+        &backup_payload(fresh),
+        &BackupConfig::default(),
+    )
+    .unwrap();
+    store.put(&sealed, backup_time(fresh)).await.unwrap();
+    store.prune(BACKUP_RETAIN).await.unwrap();
+    let latest = store.latest().await.unwrap().unwrap();
+    assert_eq!(
+        unseal_snapshot(&BACKUP_KEY, &latest).unwrap(),
+        backup_payload(fresh)
+    );
+
+    finish_verify(
+        root,
+        &boot,
+        serde_json::json!({
+            "fixture": "backups",
+            "acknowledged": uploads.len(),
+            "present": stored.len(),
+            "in_flight_landed": unacknowledged,
+            "staged_leftovers": staged,
+        }),
+    );
+}
+
+/// Two-phase fixture: the driver must actually cut the disposable VM's power.
+#[tokio::test]
+#[ignore = "run only through scripts/release/qualify-storage-power-cut.sh on a disposable VM"]
+async fn actual_power_cut_preserves_acknowledged_council_backups() {
+    let root = fixture_directory();
+    if let Ok(role) = std::env::var(ROLE) {
+        assert_eq!(role, "backup", "unknown backup worker role");
+        run_backup_worker(&root).await;
+        return;
+    }
+    match phase().as_str() {
+        "prepare" => prepare_backups(&root).await,
+        "verify" => verify_backups(&root).await,
         other => panic!("invalid power-cut phase {other}"),
     }
 }

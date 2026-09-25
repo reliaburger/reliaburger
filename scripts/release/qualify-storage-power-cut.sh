@@ -8,7 +8,7 @@
 set -euo pipefail
 
 usage() {
-    echo "usage: $0 --vm DISPOSABLE_LIMA_VM --fixture exporter|leases [--iterations N] [--record FILE.md]" >&2
+    echo "usage: $0 --vm DISPOSABLE_LIMA_VM --fixture exporter|leases|backups [--iterations N] [--record FILE.md]" >&2
     exit 2
 }
 
@@ -32,6 +32,7 @@ done
 case $fixture in
     exporter) test=actual_power_cut_preserves_acknowledged_log_exports ;;
     leases) test=actual_power_cut_preserves_acknowledged_lease_operations ;;
+    backups) test=actual_power_cut_preserves_acknowledged_council_backups ;;
     *) usage ;;
 esac
 # The shared development VM carries other people's builds and clusters.

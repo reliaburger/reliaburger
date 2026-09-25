@@ -2781,19 +2781,48 @@ backend doesn't `fsync` what it writes unless you ask
 checkpoint that promises "this is safely elsewhere" is a licence to prune, so
 the promise has to be at least as durable as the licence.
 
-The fix is four lines in `parse_destination`: for a `file` URL, build the
-store ourselves with `with_fsync(true)`. The regression test is less satisfying
-than we'd like. Nothing a unit test can observe changes when an `fsync` is
-missing, so `local_destinations_sync_uploads_before_acknowledging` checks the
-store's `Debug` output for `fsync: true`, and the power-cut fixture carries the
-real proof. With the fix, it passes. The
+The exporter wasn't the only caller. Metrics, volume-snapshot upload and
+council backups all opened their destinations with the same `parse_url`, and
+each of them acts on a write once it returns. So the fix isn't four lines in
+the exporter. It's one function that everybody goes through:
+
+```rust
+pub(crate) fn open(url: &url::Url) -> Result<(Box<dyn ObjectStore>, Path), object_store::Error> {
+    let (store, prefix) = object_store::parse_url(url)?;
+    if url.scheme() == "file" {
+        return Ok((Box::new(LocalFileSystem::new().with_fsync(true)), prefix));
+    }
+    Ok((store, prefix))
+}
+```
+
+`Box<dyn ObjectStore>` is Rust's spelling of "some type that implements the
+`ObjectStore` trait, decided at run time". `dyn` marks a trait object (roughly
+a Go interface value), and the `Box` puts it on the heap, because the compiler
+can't know how big an unknown type is. That's why we can hand back either the
+`parse_url` result or our own `LocalFileSystem`: both fit behind the same
+pointer. Cloud schemes pass through untouched, because S3 and GCS don't
+acknowledge a write until they've stored it.
+
+The regression tests are less satisfying than we'd like. Nothing a unit test
+can observe changes when an `fsync` is missing, so each caller's test checks
+the store's `Debug` output for `fsync: true`, and the power-cut fixtures carry
+the real proof.
+
+Council backups got a fixture of their own, because they have the same shape:
+upload a new backup, then delete everything but the newest three. Before the
+fix, three runs out of three ended the same way. Three backup files survived,
+all empty, and retention had deleted every older, intact one. The cluster had
+been told, every few milliseconds, that it had a backup. After a power cut it
+had nothing to restore from. With the shared helper, the fixture passes. The
 [qualification record](../qualification/2026-09-25-v02-power-cut.md) has both
 sets of runs.
 
-Could an ordinary test have caught this? Not honestly. Both files were fine
+Could an ordinary test have caught this? Not honestly. Every file was fine
 until the kernel went away, and no amount of killing processes reproduces
-that. The snapshot uploader and council backups build their stores the same
-way, so they're next in line for a fixture of their own.
+that. The snapshot uploader still needs its own fixture: it needs Btrfs
+volumes, and the metadata that marks a snapshot as uploaded is itself written
+without a sync.
 
 ## Lessons learned: audit the evidence too
 
