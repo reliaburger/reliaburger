@@ -45,6 +45,11 @@ network namespace. Each step is labelled `observed`, `inferred` or
 `unavailable`; incomplete evidence can't turn green. It isn't request tracing:
 it follows one connection's route, not a request through your services.
 
+Right after `relish apply`, a destination may not have a healthy backend in
+the source node's view yet. `path` waits up to 30 s for one and says so on
+stderr, then reports whatever it finds. A destination that has no instances
+anywhere after a few seconds is treated as a wrong name and fails at once.
+
 ```sh
 relish path web --to redis                     # internal service, port derived
 relish path frontend --to redis --count 10     # ten connects: success rate, timing

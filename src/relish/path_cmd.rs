@@ -60,9 +60,77 @@ pub async fn probe_path(
     entry: &BunClient,
 ) -> Result<TraceResult, RelishError> {
     let source = find_source_client(entry, &request.source, &request.source_namespace).await?;
-    tokio::time::timeout(Duration::from_secs(50), source.probe_path(request))
-        .await
-        .map_err(|_| RelishError::RequestTimeout)?
+    let started = tokio::time::Instant::now();
+    let deadline = started + BACKEND_WAIT;
+    let mut announced = false;
+    loop {
+        let probed = tokio::time::timeout(Duration::from_secs(50), source.probe_path(request))
+            .await
+            .map_err(|_| RelishError::RequestTimeout)?;
+        // Right after `relish apply` a destination can be missing from this
+        // node's view, or present with no healthy backend yet. Give it a
+        // moment instead of reporting a broken path. A just-applied app has
+        // no instances while the scheduler places it, so a destination with
+        // none anywhere is only taken for a typo after a short grace.
+        let waiting = match &probed {
+            Ok(result) => awaiting_backends(result),
+            Err(error) => {
+                absent_from_view(error)
+                    && (started.elapsed() < SCHEDULING_GRACE
+                        || destination_has_instances(entry, request).await)
+            }
+        };
+        if !waiting || tokio::time::Instant::now() >= deadline {
+            return probed;
+        }
+        if !announced {
+            eprintln!(
+                "waiting up to {} s for {} to have a healthy backend in the service map",
+                BACKEND_WAIT.as_secs(),
+                request.destination
+            );
+            announced = true;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+/// The agent's refusal for a destination its service map doesn't hold yet.
+fn absent_from_view(error: &RelishError) -> bool {
+    matches!(error, RelishError::ApiError { status: 404, body } if body.contains("absent from the live service map"))
+}
+
+/// Whether the cluster runs, or is starting, any instance of the destination.
+async fn destination_has_instances(entry: &BunClient, request: &TraceRequest) -> bool {
+    match tokio::time::timeout(DISCOVERY_TIMEOUT, entry.status()).await {
+        Ok(Ok(instances)) => instances.iter().any(|instance| {
+            instance.app_name == request.destination
+                && instance.namespace == request.destination_namespace
+        }),
+        _ => false,
+    }
+}
+
+/// How long `relish path` waits for a destination that has no healthy backend yet.
+const BACKEND_WAIT: Duration = Duration::from_secs(30);
+
+/// How long an unknown destination may take to show instances before
+/// `relish path` treats it as a name that doesn't exist.
+const SCHEDULING_GRACE: Duration = Duration::from_secs(6);
+
+/// Whether the only thing wrong is that the destination has no healthy
+/// backend in the source node's service map yet.
+fn awaiting_backends(result: &TraceResult) -> bool {
+    use crate::onion::trace::TraceVerdict;
+    let service_step_failed = result
+        .steps
+        .iter()
+        .any(|step| step.step_number == 2 && matches!(step.verdict, TraceVerdict::Fail { .. }));
+    let dns_failed = result
+        .steps
+        .iter()
+        .any(|step| step.step_number == 1 && matches!(step.verdict, TraceVerdict::Fail { .. }));
+    service_step_failed && !dns_failed
 }
 
 async fn find_source_client(
@@ -231,6 +299,48 @@ mod tests {
             latency_ms: None,
             connects: None,
         }
+    }
+
+    fn two_steps(dns: TraceVerdict, service: TraceVerdict) -> TraceResult {
+        let mut result = result(dns);
+        result.steps.push(TraceStep {
+            step_number: 2,
+            name: "Service and eBPF state".to_string(),
+            evidence: TraceEvidence::Observed,
+            details: vec!["userspace service map: VIP 127.128.0.2, 0 of 0 backends healthy".into()],
+            verdict: service,
+        });
+        result
+    }
+
+    #[test]
+    fn only_the_agents_absent_destination_refusal_counts_as_not_yet_published() {
+        assert!(absent_from_view(&RelishError::ApiError {
+            status: 404,
+            body: r#"{"error":"internal destination is absent from the live service map"}"#.into(),
+        }));
+        assert!(!absent_from_view(&RelishError::ApiError {
+            status: 404,
+            body: r#"{"error":"source app not found"}"#.into(),
+        }));
+        assert!(!absent_from_view(&RelishError::RequestTimeout));
+    }
+
+    #[test]
+    fn a_resolvable_destination_without_healthy_backends_is_waited_for() {
+        let fail = TraceVerdict::Fail {
+            reason: "live service state has no healthy backend".to_string(),
+        };
+        assert!(awaiting_backends(&two_steps(
+            TraceVerdict::Pass,
+            fail.clone()
+        )));
+        // A name that doesn't resolve is more likely a typo: report at once.
+        assert!(!awaiting_backends(&two_steps(fail.clone(), fail)));
+        assert!(!awaiting_backends(&two_steps(
+            TraceVerdict::Pass,
+            TraceVerdict::Pass
+        )));
     }
 
     #[test]
