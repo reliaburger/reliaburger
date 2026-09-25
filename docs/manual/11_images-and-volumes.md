@@ -134,6 +134,7 @@ relish snapshot list db
 relish stop db
 relish snapshot restore db before-upgrade
 relish snapshot delete db before-upgrade
+relish apply db.toml     # start it again
 ```
 
 Restore overwrites the live volume, so stop the app first. On other

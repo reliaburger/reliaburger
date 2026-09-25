@@ -648,7 +648,8 @@ Commands:
 | `wtf [--app <app>] [--watch [--interval <secs>]]` | Correlated cluster-health diagnosis (exit 0 OK / 1 criticals / 2 warnings-only) |
 | `path <src> --to <dst>` | Walk the network path from a workload: DNS, service map, firewall, faults and TCP (exit 0/1/2) |
 | `exec <app> <cmd...>` | Execute a command inside a running instance |
-| `stop <app>` | Stop all instances of an app |
+| `stop <app>` | Scale an app to zero, keeping its configuration; `apply` starts it again |
+| `delete <app>` | Remove an app from the cluster and stop its instances |
 | `init [dir]` | Generate PKI and an mTLS-required starter config (`--development-plaintext` is an explicit local-only exception) |
 | `nodes` | List cluster nodes and their gossip state |
 | `council` | Show council (Raft) composition and status |

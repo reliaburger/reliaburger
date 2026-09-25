@@ -554,11 +554,16 @@ fn plan_scheduling_pass_with_dns(
         let Some(spec) = desired.apps.get(app_id) else {
             continue;
         };
-        let override_replicas = desired
-            .autoscale_overrides
-            .iter()
-            .find(|(k, _)| k == &app_id.to_string())
-            .map(|(_, n)| *n);
+        // `relish stop` pins an app at zero until it is applied again.
+        let override_replicas = if desired.stopped_apps.contains(app_id) {
+            Some(0)
+        } else {
+            desired
+                .autoscale_overrides
+                .iter()
+                .find(|(k, _)| k == &app_id.to_string())
+                .map(|(_, n)| *n)
+        };
         // A daemon set targets every *eligible* node, so its convergence count
         // is the eligible-node count, not every alive node (M25).
         let want = if override_replicas.is_none() && matches!(spec.replicas, Replicas::DaemonSet) {
@@ -3127,6 +3132,28 @@ image = "busybox:latest"
             .iter()
             .map(|p| p.node_id.0.as_str())
             .collect()
+    }
+
+    /// `relish stop` keeps the spec but schedules nothing until the next apply.
+    #[test]
+    fn a_stopped_app_is_scheduled_at_zero_replicas() {
+        let app = AppId::new("frontend", "default");
+        let mut desired = DesiredState::default();
+        desired.apps.insert(app.clone(), app_spec(100, 2));
+        desired
+            .scheduling
+            .insert(app.clone(), placed_on(&["n1", "n2"]));
+        desired.stopped_apps.insert(app.clone());
+        let mut cache = ClusterStateCache::new();
+        cache.set_node(sched_node("n1", 4000, BTreeMap::new()));
+        cache.set_node(sched_node("n2", 4000, BTreeMap::new()));
+        let alive = HashSet::from([NodeId::new("n1"), NodeId::new("n2")]);
+
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+
+        assert_eq!(decisions.len(), 1);
+        assert!(nodes_of(&decisions[0]).is_empty(), "{decisions:?}");
     }
 
     /// Z6.7: stopping one laptop node moved all three frontends onto a single

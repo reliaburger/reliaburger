@@ -303,8 +303,17 @@ impl StateMachineInner {
                 }
                 self.apply_app_spec(app_id, spec);
             }
+            RaftRequest::AppStop { app_id } => {
+                if !self.state.apps.contains_key(app_id) {
+                    return Some(CouncilResponse::Refused {
+                        reason: format!("app {app_id} is not deployed"),
+                    });
+                }
+                self.state.stopped_apps.insert(app_id.clone());
+            }
             RaftRequest::AppDelete { app_id } => {
                 self.state.apps.remove(app_id);
+                self.state.stopped_apps.remove(app_id);
                 self.state.scheduling.remove(app_id);
                 // A deleted app leaves no baseline for an override to sit
                 // above; drop it so a re-created app of the same name starts
@@ -1720,6 +1729,8 @@ impl StateMachineInner {
             self.state.autoscale_overrides.retain(|(k, _)| k != &key);
         }
         self.state.apps.insert(app_id.clone(), spec.clone());
+        // Applying an app is how it starts again after `relish stop`.
+        self.state.stopped_apps.remove(app_id);
         // Applying a spec is when encrypted values were re-sealed.
         self.record_secret_seals(app_id, spec);
     }
@@ -2325,6 +2336,57 @@ mod tests {
 
         let state = sm.desired_state().await;
         assert_eq!(state.apps.get(&app_id).unwrap().image, spec.image);
+    }
+
+    #[tokio::test]
+    async fn stop_keeps_the_spec_until_the_next_apply_and_delete_forgets_both() {
+        let mut sm = CouncilStateMachine::new();
+        let app_id = AppId::new("web", "prod");
+        let spec = AppSpec {
+            image: Some("myapp:v2".to_string()),
+            ..default_spec()
+        };
+        let upsert = |index| {
+            normal_entry(
+                1,
+                index,
+                RaftRequest::AppSpec {
+                    app_id: app_id.clone(),
+                    spec: Box::new(spec.clone()),
+                },
+            )
+        };
+        let stop = |index| {
+            normal_entry(
+                1,
+                index,
+                RaftRequest::AppStop {
+                    app_id: app_id.clone(),
+                },
+            )
+        };
+        let refused = sm.apply(vec![stop(1)]).await.unwrap();
+        assert!(matches!(refused[0], CouncilResponse::Refused { .. }));
+
+        sm.apply(vec![upsert(2), stop(3)]).await.unwrap();
+        let state = sm.desired_state().await;
+        assert!(state.apps.contains_key(&app_id));
+        assert!(state.stopped_apps.contains(&app_id));
+
+        sm.apply(vec![upsert(4)]).await.unwrap();
+        assert!(!sm.desired_state().await.stopped_apps.contains(&app_id));
+
+        let delete = normal_entry(
+            1,
+            6,
+            RaftRequest::AppDelete {
+                app_id: app_id.clone(),
+            },
+        );
+        sm.apply(vec![stop(5), delete]).await.unwrap();
+        let state = sm.desired_state().await;
+        assert!(!state.apps.contains_key(&app_id));
+        assert!(!state.stopped_apps.contains(&app_id));
     }
 
     #[tokio::test]

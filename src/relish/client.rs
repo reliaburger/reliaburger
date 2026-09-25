@@ -1290,6 +1290,25 @@ impl BunClient {
         Ok(())
     }
 
+    /// Remove an app from the cluster (`POST /v1/delete/{app}/{namespace}`).
+    pub async fn delete(&self, app: &str, namespace: &str) -> Result<(), RelishError> {
+        let url = format!("{}/v1/delete/{}/{}", self.base_url, app, namespace);
+        let response = self
+            .http()?
+            .post(&url)
+            .send()
+            .await
+            .map_err(classify_error)?;
+
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(RelishError::ApiError { status, body });
+        }
+
+        Ok(())
+    }
+
     /// Snapshot an app's managed volumes; returns the created
     /// snapshots' metadata.
     pub async fn snapshot_create(

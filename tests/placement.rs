@@ -307,7 +307,7 @@ async fn live_web_instances(nodes: &[&Node]) -> usize {
 /// it on the next tick.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 #[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
-async fn cluster_stop_clears_desired_state_and_does_not_resurrect() {
+async fn cluster_stop_scales_to_zero_until_apply_and_delete_removes_the_app() {
     let shutdown = CancellationToken::new();
 
     let n1 = start_node("s1", 18461, vec![], &shutdown).await;
@@ -375,20 +375,15 @@ async fn cluster_stop_clears_desired_state_and_does_not_resurrect() {
     }
     assert!(cleared, "the stopped app was not torn down");
 
-    // The desired-state map must not contain the app on any council.
+    // Stop keeps the spec, marked stopped, and nothing resurrects it.
     tokio::time::sleep(Duration::from_secs(6)).await;
+    let app = reliaburger::meat::AppId::new("web", "default");
     for n in &nodes {
         if let Some(council) = &n.handle.council {
             let ds = council.desired_state().await;
-            let app = reliaburger::meat::AppId::new("web", "default");
             assert!(
-                !ds.apps.contains_key(&app),
-                "node {}: desired state still holds the stopped app",
-                n.name
-            );
-            assert!(
-                !ds.scheduling.contains_key(&app),
-                "node {}: scheduling still holds the stopped app",
+                ds.apps.contains_key(&app) && ds.stopped_apps.contains(&app),
+                "node {}: stop should keep the spec and mark the app stopped",
                 n.name
             );
         }
@@ -397,6 +392,49 @@ async fn cluster_stop_clears_desired_state_and_does_not_resurrect() {
         live_web_instances(&nodes).await,
         0,
         "a reconciler resurrected the stopped app"
+    );
+
+    // Applying the same config straight away brings it back.
+    tokio::time::timeout(Duration::from_secs(15), stopper.client.apply(&config))
+        .await
+        .expect("apply did not hang")
+        .expect("apply succeeded");
+    let back_by = tokio::time::Instant::now() + Duration::from_secs(30);
+    while tokio::time::Instant::now() < back_by && live_web_instances(&nodes).await == 0 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(
+        live_web_instances(&nodes).await >= 1,
+        "apply after stop did not start the app again"
+    );
+
+    // Delete removes it from desired state for good.
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        stopper.client.delete("web", "default"),
+    )
+    .await
+    .expect("delete did not hang")
+    .expect("delete succeeded");
+    let gone_by = tokio::time::Instant::now() + Duration::from_secs(20);
+    while tokio::time::Instant::now() < gone_by && live_web_instances(&nodes).await > 0 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    for n in &nodes {
+        if let Some(council) = &n.handle.council {
+            let ds = council.desired_state().await;
+            assert!(
+                !ds.apps.contains_key(&app) && !ds.stopped_apps.contains(&app),
+                "node {}: desired state still holds the deleted app",
+                n.name
+            );
+        }
+    }
+    assert_eq!(
+        live_web_instances(&nodes).await,
+        0,
+        "the deleted app still runs"
     );
 
     shutdown.cancel();

@@ -46,7 +46,7 @@ impl Drop for Cleanup {
                             for app in APPS {
                                 let _ = tokio::time::timeout(
                                     Duration::from_secs(30),
-                                    client.stop(app, "default"),
+                                    client.delete(app, "default"),
                                 )
                                 .await;
                             }

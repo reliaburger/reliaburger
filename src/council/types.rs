@@ -98,6 +98,9 @@ pub enum RaftRequest {
     AppSpec { app_id: AppId, spec: Box<AppSpec> },
     /// Remove an application.
     AppDelete { app_id: AppId },
+    /// Scale an application to zero, keeping its specification, until it is
+    /// applied again.
+    AppStop { app_id: AppId },
     /// Record where replicas of an app should run.
     SchedulingDecision(SchedulingDecision),
     /// Set a cluster-wide configuration key.
@@ -400,6 +403,10 @@ pub struct DesiredState {
     pub registry_gc_generations: std::collections::BTreeMap<u64, u64>,
     /// Autoscale replica overrides (runtime adjustments above/below baseline).
     pub autoscale_overrides: Vec<(String, u32)>,
+    /// Apps stopped with `relish stop`: scheduled at zero replicas until the
+    /// next apply of the app clears them.
+    #[serde(default)]
+    pub stopped_apps: std::collections::BTreeSet<AppId>,
     /// GitOps sync state.
     pub gitops_sync_state: Option<crate::lettuce::types::SyncState>,
     /// GitOps coordinator election.
