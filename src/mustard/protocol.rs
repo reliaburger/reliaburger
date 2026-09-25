@@ -39,6 +39,17 @@ use super::message::{
 use super::state::NodeState;
 use super::transport::MustardTransport;
 
+/// What a published membership snapshot is compared by.
+type MembershipDigest = (
+    NodeId,
+    NodeState,
+    u64,
+    bool,
+    bool,
+    SocketAddr,
+    BTreeMap<String, String>,
+);
+
 /// A participant in the Mustard gossip protocol.
 ///
 /// Owns the membership table, dissemination queue, and transport.
@@ -66,7 +77,7 @@ pub struct MustardNode<T: MustardTransport> {
     rejoin_watch: Option<watch::Sender<bool>>,
     /// Digest of the last-published membership. Used to publish on any content
     /// change (state/incarnation/council/leader), not just a count change.
-    last_published_digest: Vec<(NodeId, NodeState, u64, bool, bool)>,
+    last_published_digest: Vec<MembershipDigest>,
     /// Whether this node has announced its own departure.
     ///
     /// Once it has, a `Left` about us echoing back off a peer is our own
@@ -396,7 +407,10 @@ impl<T: MustardTransport> MustardNode<T> {
             self.membership.set_roles(&roles);
         }
         let snapshot = self.membership.snapshot();
-        let digest: Vec<(NodeId, NodeState, u64, bool, bool)> = snapshot
+        // Labels and addresses change without a state or incarnation change
+        // (a node restarted with a new `[node.labels]`), so they're part of
+        // the digest too; otherwise that change is never published.
+        let digest: Vec<MembershipDigest> = snapshot
             .iter()
             .map(|m| {
                 (
@@ -405,6 +419,8 @@ impl<T: MustardTransport> MustardNode<T> {
                     m.incarnation,
                     m.is_council,
                     m.is_leader,
+                    m.address,
+                    m.labels.clone(),
                 )
             })
             .collect();
@@ -2382,6 +2398,50 @@ mod tests {
                 .and_then(|l| l.get("zone"))
                 .map(String::as_str),
             Some("us-east")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_relabelled_member_is_republished_without_a_state_change() {
+        // V02 soak bug 5: a node restarted with new labels (same state,
+        // same incarnation) and `relish nodes` kept its old ones for good,
+        // because the snapshot digest ignored labels.
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        let t2 = net.register(addr(2)).await;
+        let mut node1 = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
+        let mut node2 = MustardNode::new(NodeId::new("n2"), addr(2), fast_config(), t2);
+        let (tx, rx) = watch::channel(Vec::new());
+        node1.set_membership_watch(tx);
+        let zone = |labels: BTreeMap<String, String>| {
+            BTreeMap::from([("zone".to_string(), labels["zone"].clone())])
+        };
+        node2.set_advertised_endpoints(
+            9117,
+            9445,
+            zone(BTreeMap::from([("zone".into(), "us-east".into())])),
+        );
+        node1.add_seed(NodeId::new("n2"), addr(2));
+        probe_answered_by(&mut node1, answer(&mut node2)).await;
+        node1.publish_membership();
+
+        node2.set_advertised_endpoints(
+            9117,
+            9445,
+            zone(BTreeMap::from([("zone".into(), "us-west".into())])),
+        );
+        probe_answered_by(&mut node1, answer(&mut node2)).await;
+        node1.publish_membership();
+
+        let published = rx.borrow().clone();
+        let n2 = published
+            .iter()
+            .find(|member| member.node_id == NodeId::new("n2"))
+            .expect("n2 published");
+        assert_eq!(
+            n2.labels.get("zone").map(String::as_str),
+            Some("us-west"),
+            "the snapshot kept n2's old labels"
         );
     }
 
