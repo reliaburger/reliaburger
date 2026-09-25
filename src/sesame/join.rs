@@ -381,11 +381,14 @@ pub fn check_join_token(
 /// actually in the trust store.
 ///
 /// The `wrapping_ikm` is needed to unwrap the Node CA private key from Raft
-/// storage.
+/// storage. `lifetime` is the signing member's node leaf lifetime
+/// ([`ca::NODE_LEAF_LIFETIME`] unless that member's node config shortens it),
+/// so the member that signs decides how long the leaf lives.
 pub fn sign_join_csr(
     csr_der: &[u8],
     node_id: &str,
     serial: SerialNumber,
+    lifetime: Duration,
     state: &SecurityState,
     wrapping_ikm: &[u8],
 ) -> Result<JoinResult, JoinError> {
@@ -428,7 +431,8 @@ pub fn sign_join_csr(
         time::OffsetDateTime::from_unix_timestamp(issuer.validity().not_after.timestamp())
             .map_err(|e| JoinError::CertIssueFailed(format!("invalid Node CA validity: {e}")))?;
 
-    let (cert_der, serial) = ca::sign_node_csr(csr_der, node_id, serial, &ca_keypair, &ca_params)?;
+    let (cert_der, serial) =
+        ca::sign_node_csr(csr_der, node_id, serial, lifetime, &ca_keypair, &ca_params)?;
 
     Ok(JoinResult {
         node_id: node_id.to_string(),
@@ -542,8 +546,41 @@ mod tests {
     ) -> Result<(JoinResult, Vec<u8>), JoinError> {
         check_join_token(token, node_id, state)?;
         let (csr_der, key_der) = ca::create_node_csr(node_id).unwrap();
-        let result = sign_join_csr(&csr_der, node_id, serial, state, master_secret)?;
+        let result = sign_join_csr(
+            &csr_der,
+            node_id,
+            serial,
+            ca::NODE_LEAF_LIFETIME,
+            state,
+            master_secret,
+        )?;
         Ok((result, key_der))
+    }
+
+    #[test]
+    fn join_signing_uses_the_signing_members_leaf_lifetime() {
+        let (state, token, master_secret) = setup_with_known_key();
+        check_join_token(&token, "node-02", &state).unwrap();
+        let (csr_der, _key) = ca::create_node_csr("node-02").unwrap();
+        let result = sign_join_csr(
+            &csr_der,
+            "node-02",
+            SerialNumber(6),
+            Duration::from_secs(3600),
+            &state,
+            &master_secret,
+        )
+        .unwrap();
+        let (_, leaf) = x509_parser::parse_x509_certificate(&result.certificate_der).unwrap();
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let not_after = leaf.validity().not_after.timestamp();
+        assert!(
+            (now + 3595..=now + 3600).contains(&not_after),
+            "{not_after} vs {now}"
+        );
     }
 
     #[test]

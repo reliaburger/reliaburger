@@ -481,9 +481,14 @@ fn refuse_open_non_loopback_bind(listen: &str) -> anyhow::Result<()> {
 /// Ingress CA or the wrapping IKM is unavailable, or reconstruction fails. A
 /// warning is logged so the operator knows `tls = "cluster"` routes are not
 /// yet cluster-signed.
+///
+/// `lifetime` is this node's ingress leaf lifetime: 90 days unless
+/// `[security] leaf_lifetime_override_secs` shortens it. Each node mints its
+/// own ingress leaves, so its own config decides.
 async fn build_ingress_cert_resolver(
     council: &std::sync::Arc<reliaburger::council::CouncilNode>,
     routing_table: std::sync::Arc<tokio::sync::RwLock<reliaburger::wrapper::routing::RoutingTable>>,
+    lifetime: std::time::Duration,
 ) -> Option<std::sync::Arc<dyn rustls::server::ResolvesServerCert>> {
     use reliaburger::sesame::types::CaRole;
 
@@ -502,7 +507,6 @@ async fn build_ingress_cert_resolver(
     };
     let (default_cert, default_key) =
         reliaburger::wrapper::tls::generate_self_signed_cert().ok()?;
-    let lifetime = std::time::Duration::from_secs(90 * 24 * 3600);
     match reliaburger::wrapper::tls::IngressCertResolver::new(
         keypair,
         params,
@@ -1114,6 +1118,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         config.security.bootstrap_peers.clone(),
     );
     agent.set_smoker_config(config.smoker.to_smoker_config());
+    agent.set_node_leaf_lifetime(config.security.node_leaf_lifetime());
     agent.set_stop_confirmation_timeout(config.runtime.stop_confirmation_timeout());
     let node_pressure_available = agent.configure_node_pressure(
         reliaburger::smoker::node_pressure::NodePressureLimits {
@@ -1562,7 +1567,14 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         // wrapping IKM to unwrap the Ingress CA key). A disk cert still wins.
         let ingress_resolver: Option<std::sync::Arc<dyn rustls::server::ResolvesServerCert>> =
             match &api_council {
-                Some(council) => build_ingress_cert_resolver(council, routing_table.clone()).await,
+                Some(council) => {
+                    build_ingress_cert_resolver(
+                        council,
+                        routing_table.clone(),
+                        config.security.ingress_leaf_lifetime(),
+                    )
+                    .await
+                }
                 None => None,
             };
         ingress_cluster_tls_ready = ingress_resolver.is_some();
@@ -2399,6 +2411,10 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         Some(identity) => app.layer(axum::Extension(identity.clone())),
         None => app,
     };
+    // The leader signs renewals with its own configured lifetime.
+    let app = app.layer(axum::Extension(
+        reliaburger::sesame::renewal::NodeLeafLifetime(config.security.node_leaf_lifetime()),
+    ));
     let app = match (
         &api_identity,
         &api_council,
@@ -2412,6 +2428,12 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                 token,
             )
             .map_err(|error| anyhow::anyhow!("failed to prepare node renewal: {error}"))?;
+            let worker = match config.security.leaf_lifetime_override_secs {
+                Some(seconds) => {
+                    worker.with_leaf_lifetime_ceiling(std::time::Duration::from_secs(seconds))
+                }
+                None => worker,
+            };
             let mut local_api = listener.local_addr()?;
             if local_api.ip().is_unspecified() {
                 local_api.set_ip(if local_api.is_ipv6() {

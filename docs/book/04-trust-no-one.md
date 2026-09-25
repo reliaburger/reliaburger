@@ -399,6 +399,28 @@ pub fn state(&self) -> RenewalState {
 
 The ingress proxy's certificates for your domains follow the same rules with shorter loops. Their serials are 20 random bytes with the top bits fixed (`(serial[0] & 0x3f) | 0x40` keeps the six low bits and sets the next, giving a positive number of full length), because a per-process counter gave two ingress nodes restarting on the same CA identical serials. The handshake sends the leaf *and* its intermediate, since a client that trusts only the root can't connect the two otherwise; a unit test proved the signature correct, and a real client still said `UnknownIssuer`. Cached leaves renew at mid-life, operator-supplied files hot-reload only once the certificate and key match, and API, registry and ingress TLS connections get a one-hour maximum lifetime, so even a WebSocket eventually reconnects to the current certificate.
 
+**How do you test a six-month timer?** A node leaf lives a year and renews at six months. Our unit tests fake the clock by signing certificates whose windows are already half over, but that doesn't tell you what happens to a real cluster when renewal collides with a leader election, a SIGKILL or a power cut. For that we run a multi-day soak, and a soak that renews each node zero times proves nothing. So there's exactly one knob, and it's deliberately awkward to reach:
+
+```toml
+[testing]
+safety_class = "development"
+
+[security]
+leaf_lifetime_override_secs = 3600
+```
+
+It shortens the node leaf and the cluster-issued ingress leaf, and nothing else: workload identity already lives an hour, and the CAs stay put. `NodeConfig::validate` refuses it unless the node declares itself a development cluster (a missing `[testing]` section is `unknown`, which counts as protected), and only accepts 600 seconds up to the 90-day ingress default. Why so strict? A cluster of hour-long leaves turns any leader outage longer than half an hour into every node's identity expiring, and an expired identity needs an operator to re-enrol it. That's a fine thing to provoke in a soak and a terrible thing to find in production because someone copied a config file.
+
+The interesting question is *whose* value counts. The member that signs decides: the leader for renewals, whoever handles a join, and each node for its own ingress leaves. But what if you add the setting to a running cluster, where every node already holds a leaf that won't be due for six months? Or the leader didn't get the new config and keeps handing out year-long leaves? The renewal worker treats its own override as a ceiling on how long it waits:
+
+```rust
+let lifetime = self.lifetime_ceiling.map_or(signed, |ceiling| {
+    signed.min(ceiling.saturating_add(super::ca::CLOCK_SKEW_BACKDATE))
+});
+```
+
+`lifetime_ceiling` is an `Option<Duration>`. `map_or(default, f)` returns `default` for `None` and `f(value)` for `Some(value)`, so the common case (no override) keeps the signed lifetime untouched. The closure receives the unwrapped value. `saturating_add` clamps at the largest representable `Duration` instead of overflowing; C would silently wrap, and `Duration`'s plain `+` would panic. The ceiling gets the 300-second backdate added because every issued leaf's window includes it; without that, a perfectly normal hour-long leaf would look "too long" and renew early. The midpoint is then taken over whichever window is shorter. A node holding a year-long leaf renews about 27 minutes after it was issued, and a node whose leader ignores the override renews once per half-hour instead of on every one-second tick. We had a test prove that second part, because the obvious version ("renew now if the leaf is longer than the ceiling") would hammer the leader with a serial allocation every second for as long as the configs disagreed.
+
 ## Gossip HMAC
 
 Gossip uses UDP, which can't do TLS. Instead, we authenticate gossip messages with HMAC-SHA256. The HMAC key is derived from the cluster master secret (which members hold, but outsiders don't). Deriving it from the public Root CA certificate would prove nothing. This proves the sender holds cluster key material without the overhead of TLS on every UDP datagram.

@@ -1679,6 +1679,9 @@ pub struct BunAgent<G: Grill> {
     network_faults: InstalledNetworkFaults,
     /// Smoker duration limits (`[smoker]`): default + maximum fault lifetime.
     smoker_config: crate::smoker::config::SmokerConfig,
+    /// Node leaf lifetime this member signs joining nodes' certificates with
+    /// (`[security] leaf_lifetime_override_secs`, else the one-year default).
+    node_leaf_lifetime: std::time::Duration,
     /// Reference-counted node drains, independent from binary-upgrade drains.
     node_fault_fence: crate::smoker::reservation::NodeFaultFence,
     node_drain_gate: crate::smoker::node_fault::NodeDrainGate,
@@ -1909,6 +1912,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             fault_registry: crate::smoker::registry::FaultRegistry::new(),
             network_faults: InstalledNetworkFaults::default(),
             smoker_config: crate::smoker::config::SmokerConfig::default(),
+            node_leaf_lifetime: crate::sesame::ca::NODE_LEAF_LIFETIME,
             stop_confirmation_timeout: crate::config::node::RuntimeSection::default()
                 .stop_confirmation_timeout(),
             node_fault_fence: crate::smoker::reservation::NodeFaultFence::default(),
@@ -2019,6 +2023,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             fault_registry: crate::smoker::registry::FaultRegistry::new(),
             network_faults: InstalledNetworkFaults::default(),
             smoker_config: crate::smoker::config::SmokerConfig::default(),
+            node_leaf_lifetime: crate::sesame::ca::NODE_LEAF_LIFETIME,
             stop_confirmation_timeout: crate::config::node::RuntimeSection::default()
                 .stop_confirmation_timeout(),
             node_fault_fence: crate::smoker::reservation::NodeFaultFence::default(),
@@ -2242,6 +2247,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// by config rather than only the hardcoded 24h backstop.
     pub fn set_smoker_config(&mut self, config: crate::smoker::config::SmokerConfig) {
         self.smoker_config = config;
+    }
+
+    /// Set the node leaf lifetime this member signs joining nodes with.
+    pub fn set_node_leaf_lifetime(&mut self, lifetime: std::time::Duration) {
+        self.node_leaf_lifetime = lifetime;
     }
 
     /// Thread `[runtime] stop_confirmation_timeout_secs` in: how long each
@@ -9212,11 +9222,17 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .map_err(|error| BunError::SecurityError {
                 reason: error.to_string(),
             })?;
-        let join_result =
-            crate::sesame::join::sign_join_csr(csr_der, node_id, serial, &security_state, ikm)
-                .map_err(|e| BunError::SecurityError {
-                    reason: format!("join signing failed: {e}"),
-                })?;
+        let join_result = crate::sesame::join::sign_join_csr(
+            csr_der,
+            node_id,
+            serial,
+            self.node_leaf_lifetime,
+            &security_state,
+            ikm,
+        )
+        .map_err(|e| BunError::SecurityError {
+            reason: format!("join signing failed: {e}"),
+        })?;
 
         Ok(crate::sesame::join::JoinBundle::from_result(&join_result))
     }

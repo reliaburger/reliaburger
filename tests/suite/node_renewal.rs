@@ -155,8 +155,8 @@ async fn renewal_allocates_distinct_committed_serials_and_keeps_the_requesters_k
     let (first, first_key) = request("node");
     let (second, second_key) = request("node");
     let (one, two) = tokio::join!(
-        renewal::issue_renewal(&council, &peer, &first),
-        renewal::issue_renewal(&council, &peer, &second)
+        renewal::issue_renewal(&council, &peer, &first, ca::NODE_LEAF_LIFETIME),
+        renewal::issue_renewal(&council, &peer, &second, ca::NODE_LEAF_LIFETIME)
     );
     let one = one.unwrap();
     let two = two.unwrap();
@@ -179,13 +179,13 @@ async fn renewal_refuses_mismatched_csr_and_foreign_or_revoked_peer_before_alloc
     let valid = peer(&hierarchy, 10);
     let (wrong, _) = request("different-node");
     assert!(matches!(
-        renewal::issue_renewal(&council, &valid, &wrong).await,
+        renewal::issue_renewal(&council, &valid, &wrong, ca::NODE_LEAF_LIFETIME).await,
         Err(RenewalError::Request(_))
     ));
     let (request, _) = request("node");
     let foreign = peer(&ca::generate_ca_hierarchy("foreign", &IKM).unwrap(), 10);
     assert!(matches!(
-        renewal::issue_renewal(&council, &foreign, &request).await,
+        renewal::issue_renewal(&council, &foreign, &request, ca::NODE_LEAF_LIFETIME).await,
         Err(RenewalError::Identity(_))
     ));
     council
@@ -199,7 +199,7 @@ async fn renewal_refuses_mismatched_csr_and_foreign_or_revoked_peer_before_alloc
         .await
         .unwrap();
     assert!(matches!(
-        renewal::issue_renewal(&council, &valid, &request).await,
+        renewal::issue_renewal(&council, &valid, &request, ca::NODE_LEAF_LIFETIME).await,
         Err(RenewalError::Identity(_))
     ));
     assert_eq!(council.security_state().await.next_serial, 100);
@@ -259,7 +259,12 @@ async fn renewal_refuses_a_member_without_current_quorum_authority() {
     let (request, _) = request("node");
     let result = tokio::time::timeout(
         Duration::from_secs(5),
-        renewal::issue_renewal(&council, &peer(&hierarchy, 10), &request),
+        renewal::issue_renewal(
+            &council,
+            &peer(&hierarchy, 10),
+            &request,
+            ca::NODE_LEAF_LIFETIME,
+        ),
     )
     .await
     .unwrap();
@@ -293,7 +298,7 @@ async fn renewal_rejects_an_expired_leaf_even_when_the_connection_used_to_be_val
     let (request, _) = request("node");
     let peer = TlsPeerCertificate(leaf.der().clone());
     assert!(matches!(
-        renewal::issue_renewal(&council, &peer, &request).await,
+        renewal::issue_renewal(&council, &peer, &request, ca::NODE_LEAF_LIFETIME).await,
         Err(RenewalError::Identity(_))
     ));
     assert_eq!(council.security_state().await.next_serial, 100);
@@ -315,7 +320,7 @@ async fn renewal_refuses_malformed_or_incompatible_requests_without_spending_ser
             csr_b64,
         };
         assert!(matches!(
-            renewal::issue_renewal(&council, &valid, &malformed).await,
+            renewal::issue_renewal(&council, &valid, &malformed, ca::NODE_LEAF_LIFETIME).await,
             Err(RenewalError::Request(_))
         ));
     }
@@ -323,7 +328,7 @@ async fn renewal_refuses_malformed_or_incompatible_requests_without_spending_ser
     let mut old_protocol = request.clone();
     old_protocol.compatibility.protocol = 0;
     assert!(matches!(
-        renewal::issue_renewal(&council, &valid, &old_protocol).await,
+        renewal::issue_renewal(&council, &valid, &old_protocol, ca::NODE_LEAF_LIFETIME).await,
         Err(RenewalError::Request(_))
     ));
     let mut incompatible = serde_json::to_value(&request).unwrap();
@@ -367,7 +372,13 @@ async fn renewal_refuses_revoked_node_and_root_issuers() {
             .unwrap();
         let (request, _) = request("node");
         assert!(matches!(
-            renewal::issue_renewal(&council, &peer(&hierarchy, 10), &request).await,
+            renewal::issue_renewal(
+                &council,
+                &peer(&hierarchy, 10),
+                &request,
+                ca::NODE_LEAF_LIFETIME
+            )
+            .await,
             Err(RenewalError::Identity(_))
         ));
         assert_eq!(council.security_state().await.next_serial, 100);
@@ -380,7 +391,28 @@ fn worker_identity(
     serial: u64,
     due: bool,
 ) -> reliaburger::sesame::identity_store::NodeIdentity {
-    let (certificate_der, private_key_der) = if due {
+    if due {
+        return windowed_identity(hierarchy, serial, -300, 120);
+    }
+    let (certificate_der, private_key_der, _) = ca::issue_node_cert(
+        "node",
+        SerialNumber(serial),
+        &hierarchy.node.signing_keypair,
+        &hierarchy.node.certificate_params,
+    )
+    .unwrap();
+    identity_from(hierarchy, serial, certificate_der, private_key_der)
+}
+
+/// A leaf whose signed window runs from `not_before_secs` to `not_after_secs`
+/// relative to now, so a test can place the renewal midpoint precisely.
+fn windowed_identity(
+    hierarchy: &ca::CaHierarchy,
+    serial: u64,
+    not_before_secs: i64,
+    not_after_secs: i64,
+) -> reliaburger::sesame::identity_store::NodeIdentity {
+    let (certificate_der, private_key_der) = {
         let key = rcgen::KeyPair::generate().unwrap();
         let mut params = rcgen::CertificateParams::default();
         params.subject_alt_names = vec![rcgen::SanType::URI(
@@ -392,8 +424,8 @@ fn worker_identity(
         ];
         params.serial_number = Some(serial.into());
         let now = time::OffsetDateTime::now_utc();
-        params.not_before = now - time::Duration::seconds(300);
-        params.not_after = now + time::Duration::seconds(120);
+        params.not_before = now + time::Duration::seconds(not_before_secs);
+        params.not_after = now + time::Duration::seconds(not_after_secs);
         let issuer = hierarchy
             .node
             .certificate_params
@@ -408,16 +440,16 @@ fn worker_identity(
                 .to_vec(),
             key.serialize_der(),
         )
-    } else {
-        let (cert, key, _) = ca::issue_node_cert(
-            "node",
-            SerialNumber(serial),
-            &hierarchy.node.signing_keypair,
-            &hierarchy.node.certificate_params,
-        )
-        .unwrap();
-        (cert, key)
     };
+    identity_from(hierarchy, serial, certificate_der, private_key_der)
+}
+
+fn identity_from(
+    hierarchy: &ca::CaHierarchy,
+    serial: u64,
+    certificate_der: Vec<u8>,
+    private_key_der: Vec<u8>,
+) -> reliaburger::sesame::identity_store::NodeIdentity {
     reliaburger::sesame::identity_store::NodeIdentity {
         node_id: "node".into(),
         certificate_der,
@@ -451,6 +483,15 @@ impl Drop for WorkerFixture {
 
 impl WorkerFixture {
     async fn new(hierarchy: &ca::CaHierarchy, due: bool) -> Self {
+        Self::with_leader_lifetime(hierarchy, due, None).await
+    }
+
+    /// `leader_lifetime` mirrors the leader's `leaf_lifetime_override_secs`.
+    async fn with_leader_lifetime(
+        hierarchy: &ca::CaHierarchy,
+        due: bool,
+        leader_lifetime: Option<Duration>,
+    ) -> Self {
         use reliaburger::sesame::{credentials::LiveNodeIdentity, identity_store, mtls};
         use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
         let council = council(hierarchy, true).await;
@@ -461,7 +502,12 @@ impl WorkerFixture {
         let calls = Arc::new(AtomicUsize::new(0));
         let route_mode = mode.clone();
         let route_calls = calls.clone();
-        let app = router(council.clone(), None).layer(axum::middleware::from_fn(
+        let app = match leader_lifetime {
+            Some(lifetime) => router(council.clone(), None)
+                .layer(axum::Extension(renewal::NodeLeafLifetime(lifetime))),
+            None => router(council.clone(), None),
+        };
+        let app = app.layer(axum::middleware::from_fn(
             move |request: axum::extract::Request, next: axum::middleware::Next| {
                 let mode = route_mode.clone();
                 let calls = route_calls.clone();
@@ -533,12 +579,24 @@ impl WorkerFixture {
     }
 
     fn start(&mut self) -> reliaburger::sesame::renewal_worker::RenewalMonitor {
+        self.start_with_ceiling(None)
+    }
+
+    /// `ceiling` mirrors this node's own `leaf_lifetime_override_secs`.
+    fn start_with_ceiling(
+        &mut self,
+        ceiling: Option<Duration>,
+    ) -> reliaburger::sesame::renewal_worker::RenewalMonitor {
         let (worker, monitor) = reliaburger::sesame::renewal_worker::NodeRenewalWorker::new(
             self.live.clone(),
             reliaburger::sesame::mtls::CrlHandle::default(),
             "internal-token",
         )
         .unwrap();
+        let worker = match ceiling {
+            Some(ceiling) => worker.with_leaf_lifetime_ceiling(ceiling),
+            None => worker,
+        };
         // Several tests drive two or three failures in a row. None asserts the
         // spacing, so the production five-second pause only adds wall time.
         let worker = worker.with_retry_delay(Duration::from_millis(200));
@@ -609,6 +667,144 @@ async fn worker_waits_until_midpoint_then_retries_failed_persistence_without_pub
     );
     fixture.shutdown.cancel();
     wait_for_condition(|| monitor.state() == RenewalState::Stopped).await;
+    fixture.council.shutdown().await.unwrap();
+}
+
+const YEAR_SECS: i64 = 365 * 24 * 3600;
+
+/// Signed window of the live leaf: the configured lifetime plus the backdate.
+fn live_window(fixture: &WorkerFixture) -> Duration {
+    let current = fixture.live.snapshot();
+    current
+        .not_after
+        .duration_since(current.not_before)
+        .unwrap()
+}
+
+#[tokio::test]
+async fn renewal_endpoint_signs_with_the_leaders_configured_lifetime() {
+    let hierarchy = ca::generate_ca_hierarchy("renewal", &IKM).unwrap();
+    let council = council(&hierarchy, true).await;
+    let (request, key) = request("node");
+    let app = router(council.clone(), Some(peer(&hierarchy, 10))).layer(axum::Extension(
+        renewal::NodeLeafLifetime(Duration::from_secs(3600)),
+    ));
+    let response = post(app, &request, Some("internal-token")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 65536)
+        .await
+        .unwrap();
+    let bundle: reliaburger::sesame::join::JoinBundle = serde_json::from_slice(&body).unwrap();
+    let identity = bundle.into_identity(key).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    reliaburger::sesame::identity_store::save(directory.path(), &identity).unwrap();
+    let saved = reliaburger::sesame::identity_store::load(directory.path())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        saved.not_after.duration_since(saved.not_before).unwrap(),
+        Duration::from_secs(3600) + ca::CLOCK_SKEW_BACKDATE
+    );
+    council.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn worker_renews_a_short_override_leaf_at_its_midpoint() {
+    use reliaburger::sesame::renewal_worker::RenewalState;
+    use std::sync::atomic::Ordering;
+    let hierarchy = ca::generate_ca_hierarchy("renewal", &IKM).unwrap();
+    let override_lifetime = Duration::from_secs(600);
+    let mut fixture =
+        WorkerFixture::with_leader_lifetime(&hierarchy, false, Some(override_lifetime)).await;
+    // Exactly the window a 600 s override signs (600 s plus the 300 s
+    // backdate), issued long enough ago that its midpoint is 3 s away.
+    fixture
+        .live
+        .replace(windowed_identity(&hierarchy, 20, -447, 453))
+        .await
+        .unwrap();
+    let monitor = fixture.start_with_ceiling(Some(override_lifetime));
+    wait_for_condition(|| monitor.state() == RenewalState::Valid).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        fixture.calls.load(Ordering::SeqCst),
+        0,
+        "renewed before the midpoint"
+    );
+    assert_eq!(fixture.live.snapshot().serial, SerialNumber(20));
+    wait_for_condition(|| {
+        fixture.live.snapshot().serial.0 >= 100 && monitor.state() == RenewalState::Valid
+    })
+    .await;
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    // The leader signed the replacement with its override, so the next
+    // midpoint is 150 s away and the worker goes quiet again.
+    assert_eq!(
+        live_window(&fixture),
+        override_lifetime + ca::CLOCK_SKEW_BACKDATE
+    );
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(monitor.state(), RenewalState::Valid);
+    fixture.shutdown.cancel();
+    fixture.council.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn worker_replaces_a_year_long_leaf_once_half_its_ceiling_has_passed() {
+    use reliaburger::sesame::renewal_worker::RenewalState;
+    use std::sync::atomic::Ordering;
+    let hierarchy = ca::generate_ca_hierarchy("renewal", &IKM).unwrap();
+    let override_lifetime = Duration::from_secs(3600);
+    // A node that already holds a one-year leaf when the override is added
+    // must not wait six months for its first short renewal. This one was
+    // issued 2,000 s ago, past the 1,950 s midpoint of an hour-long leaf.
+    let mut fixture =
+        WorkerFixture::with_leader_lifetime(&hierarchy, false, Some(override_lifetime)).await;
+    fixture
+        .live
+        .replace(windowed_identity(&hierarchy, 20, -2000, YEAR_SECS))
+        .await
+        .unwrap();
+    let monitor = fixture.start_with_ceiling(Some(override_lifetime));
+    wait_for_condition(|| {
+        fixture.live.snapshot().serial.0 >= 100 && monitor.state() == RenewalState::Valid
+    })
+    .await;
+    assert_eq!(
+        live_window(&fixture),
+        override_lifetime + ca::CLOCK_SKEW_BACKDATE
+    );
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    fixture.shutdown.cancel();
+    fixture.council.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn worker_does_not_spin_when_the_leader_signs_longer_than_its_ceiling() {
+    use reliaburger::sesame::renewal_worker::RenewalState;
+    use std::sync::atomic::Ordering;
+    let hierarchy = ca::generate_ca_hierarchy("renewal", &IKM).unwrap();
+    // Nodes disagree: this node carries the override, the leader doesn't.
+    let mut fixture = WorkerFixture::with_leader_lifetime(&hierarchy, false, None).await;
+    fixture
+        .live
+        .replace(windowed_identity(&hierarchy, 20, -2000, YEAR_SECS))
+        .await
+        .unwrap();
+    let monitor = fixture.start_with_ceiling(Some(Duration::from_secs(3600)));
+    wait_for_condition(|| {
+        fixture.live.snapshot().serial.0 >= 100 && monitor.state() == RenewalState::Valid
+    })
+    .await;
+    // The leader's one-year leaf wins, and the node's next renewal is half
+    // its own ceiling away, not the next one-second tick.
+    assert!(live_window(&fixture) > Duration::from_secs(364 * 24 * 3600));
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(monitor.state(), RenewalState::Valid);
+    fixture.shutdown.cancel();
     fixture.council.shutdown().await.unwrap();
 }
 
@@ -767,7 +963,7 @@ async fn decommission_rejects_existing_connections_and_requires_fresh_enrolment(
         StatusCode::FORBIDDEN
     );
     assert!(matches!(
-        renewal::issue_renewal(&council, &peer, &old_request).await,
+        renewal::issue_renewal(&council, &peer, &old_request, ca::NODE_LEAF_LIFETIME).await,
         Err(RenewalError::Identity(_))
     ));
     assert_eq!(council.security_state().await.next_serial, serial);
@@ -778,6 +974,7 @@ async fn decommission_rejects_existing_connections_and_requires_fresh_enrolment(
             &old_csr,
             "old-worker",
             SerialNumber(serial),
+            ca::NODE_LEAF_LIFETIME,
             &state,
             &IKM
         ),
@@ -810,6 +1007,7 @@ async fn decommission_rejects_existing_connections_and_requires_fresh_enrolment(
         &csr,
         "replacement-worker",
         SerialNumber(issued_serial),
+        ca::NODE_LEAF_LIFETIME,
         &state,
         &IKM,
     )

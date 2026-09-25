@@ -53,14 +53,22 @@ fn issue_all(hierarchy: &ca::CaHierarchy) -> Vec<Result<Vec<u8>, String>> {
             &csr,
             "node",
             SerialNumber(11),
+            ca::NODE_LEAF_LIFETIME,
             &hierarchy.node.signing_keypair,
             &hierarchy.node.certificate_params,
         )
         .map(|(cert, _)| cert)
         .map_err(|error| error.to_string()),
-        join::sign_join_csr(&csr, "node", SerialNumber(12), &state, b"test-ikm")
-            .map(|result| result.certificate_der)
-            .map_err(|error| error.to_string()),
+        join::sign_join_csr(
+            &csr,
+            "node",
+            SerialNumber(12),
+            ca::NODE_LEAF_LIFETIME,
+            &state,
+            b"test-ikm",
+        )
+        .map(|result| result.certificate_der)
+        .map_err(|error| error.to_string()),
     ]
 }
 

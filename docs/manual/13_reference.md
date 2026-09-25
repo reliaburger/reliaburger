@@ -106,7 +106,7 @@ startup instead of being ignored.
 | `[storage]` | data directories, `[storage.snapshots]` (see `images-and-volumes`) |
 | `[resources]` | CPU and memory held back for the node itself (`500m` or `0.5` cores, `512Mi`) |
 | `[network]` | `advertise_address`, host `port_range` |
-| `[security]` | master key, bootstrap and identity paths, `require_mtls` |
+| `[security]` | master key, bootstrap and identity paths, `require_mtls`, `leaf_lifetime_override_secs` (development only, see below) |
 | `[ebpf]`, `[dns]`, `[ingress]` | the data plane (see `networking`) |
 | `[images]` | registry, pull-through cache, mirrors, trust policy |
 | `[metrics]`, `[logs]`, `[alerts]` | observability (see `observability`) |
@@ -114,6 +114,36 @@ startup instead of being ignored.
 | `[smoker]`, `[testing]` | fault durations and the fault and test policy (see `chaos`) |
 | `[process_workloads]` | `allowed_binaries` for `exec` workloads (empty: none) |
 | `[runtime]` | `stop_confirmation_timeout_secs` |
+
+### Shorter certificates for soak runs
+
+`[security] leaf_lifetime_override_secs` shortens two certificate lifetimes so
+a long test run can watch renewal happen many times a day:
+
+| Certificate | Default | With the override |
+|-------------|---------|-------------------|
+| Node leaf (mTLS between nodes) | 1 year, renewed at 6 months | the override, renewed at half of it |
+| Cluster-issued ingress leaf (`tls = "cluster"`) | 90 days, renewed at 45 | the override, renewed at half of it |
+
+Workload identity (1 hour) and the CA certificates don't change. Bun refuses
+to start unless the node also sets `[testing] safety_class = "development"`,
+and the value must be between `600` (10 minutes) and `7776000` (90 days):
+
+```toml
+[testing]
+safety_class = "development"
+
+[security]
+leaf_lifetime_override_secs = 3600
+```
+
+The member that signs a certificate decides its lifetime: the council leader
+for node renewals, the member that handles a join for a new node, and each
+node for its own ingress leaves. Give every node the same value. A node with
+the override also renews no later than half the override after its leaf was
+issued, so a node holding a year-long leaf when you add the setting renews
+within half the override rather than in six months, and a node whose leader
+lacks the setting renews once per half-override instead of spinning.
 
 ## Exit codes
 
