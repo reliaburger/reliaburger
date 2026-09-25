@@ -20,6 +20,7 @@ pub mod lettuce;
 pub mod mayo;
 pub mod meat;
 pub mod mustard;
+pub(crate) mod object_storage;
 pub mod onion;
 pub mod pickle;
 pub mod reconstruction;

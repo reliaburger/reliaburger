@@ -49,7 +49,7 @@ fn parse_object_store(
         url::Url::from_file_path(&absolute)
             .map_err(|_| MayoError::ObjectStore("could not build file:// url".to_string()))?
     };
-    let (store, prefix) = object_store::parse_url(&url)
+    let (store, prefix) = crate::object_storage::open(&url)
         .map_err(|e| MayoError::ObjectStore(format!("unsupported object_store_url: {e}")))?;
     Ok((Arc::from(store), prefix))
 }
@@ -1555,5 +1555,19 @@ mod tests {
         // No data for an unknown app in the window → None.
         let none = store.query_avg("cpu", "ghost", 60).await.unwrap();
         assert_eq!(none, None);
+    }
+
+    /// A flushed metrics file is the only copy once the buffer is cleared,
+    /// so a local object store must sync it.
+    #[test]
+    fn local_metrics_object_store_syncs_its_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let bare = dir.path().to_str().unwrap().to_string();
+        let url = format!("file://{bare}");
+        for destination in [bare, url] {
+            let (store, _) = parse_object_store(&destination).unwrap();
+            let store = format!("{store:?}");
+            assert!(store.contains("fsync: true"), "{destination}: {store}");
+        }
     }
 }

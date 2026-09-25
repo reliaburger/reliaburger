@@ -125,19 +125,13 @@ fn parse_destination(
     destination: &str,
 ) -> Result<(Box<dyn object_store::ObjectStore>, object_store::path::Path), KetchupError> {
     let url = destination_url(destination)?;
-    let (store, prefix) = object_store::parse_url(&url).map_err(|e| {
+    // The checkpoint licenses pruning the source, so an upload must be durable
+    // before it's acknowledged; `object_storage::open` syncs local writes.
+    crate::object_storage::open(&url).map_err(|e| {
         KetchupError::Io(std::io::Error::other(format!(
             "unsupported destination: {e}"
         )))
-    })?;
-    // The checkpoint licenses pruning the source, so an upload must be durable
-    // before it's acknowledged. `parse_url` leaves local fsync off; a power cut
-    // then left every recent export as an empty file (V02 power-cut record).
-    if url.scheme() == "file" {
-        let local = object_store::local::LocalFileSystem::new().with_fsync(true);
-        return Ok((Box::new(local), prefix));
-    }
-    Ok((store, prefix))
+    })
 }
 
 fn export_scope(destination: &str, node_id: &str) -> Result<String, KetchupError> {
@@ -151,7 +145,7 @@ fn export_scope(destination: &str, node_id: &str) -> Result<String, KetchupError
 
 fn destination_url(destination: &str) -> Result<url::Url, KetchupError> {
     // A bare filesystem path has no scheme; normalise it to a file:// URL so
-    // `object_store::parse_url` picks the LocalFileSystem backend. Existing
+    // `object_storage::open` picks the LocalFileSystem backend. Existing
     // configs and tests pass plain temp-dir paths, so this stays compatible.
     let url = if destination.contains("://") {
         url::Url::parse(destination)
