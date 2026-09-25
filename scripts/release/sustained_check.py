@@ -14,6 +14,7 @@ Subcommands:
   window EVIDENCE open|close [LABEL]    faults in progress; outages are allowed while open
   baseline EVIDENCE SNAPSHOT            record each node's leak inventory as the baseline
   evaluate EVIDENCE SNAPSHOT            findings; exit 1 on a new failure, 3 when not yet settled
+  seen EVIDENCE KEY                     exit 0 if a harness failure KEY was bundled in the last half hour
   ingress-expect EVIDENCE NODE SERIAL   the serial a node must serve after a successful reload
   count EVIDENCE NAME [N]               add to a named counter in the record
   toml-set FILE SECTION.KEY=VALUE...    set keys in a TOML file in place (VALUE is a TOML literal)
@@ -889,6 +890,9 @@ def main(argv=None):
         sub = commands.add_parser(name)
         sub.add_argument("evidence")
         sub.add_argument("snapshot")
+    seen = commands.add_parser("seen")
+    seen.add_argument("evidence")
+    seen.add_argument("key")
     ingress = commands.add_parser("ingress-expect")
     ingress.add_argument("evidence")
     ingress.add_argument("node")
@@ -944,6 +948,16 @@ def main(argv=None):
         return 0
     if args.command == "evaluate":
         return evaluate(args.evidence, args.snapshot)
+    if args.command == "seen":
+        # A harness-detected failure already bundled in the last half hour is a repeat.
+        state = load_state(args.evidence)
+        reported = state.setdefault("harness_reported", {})
+        now = int(time.time())
+        if now - reported.get(args.key, -REPEAT_WINDOW) < REPEAT_WINDOW:
+            return 0
+        reported[args.key] = now
+        save_state(args.evidence, state)
+        return 1
     if args.command == "ingress-expect":
         state = load_state(args.evidence)
         state.setdefault("ingress_expected", {})[args.node] = {"serial": normalise_serial(args.serial), "since": int(time.time())}

@@ -250,9 +250,12 @@ api_node() {
     for i in 1 2 3; do [ "${down[i]}" = 1 ] || { echo "$i"; return; }; done
     echo 1
 }
+# Relish gets 330 s (exec's own limit is 300 s); `relish test` runs set
+# rel_budget for the call.
+rel_budget=330
 rel_on() {
     local node=$1; shift
-    RELIABURGER_TOKEN=$(cat "$evidence/.token") with_timeout 330 "$relish" \
+    RELIABURGER_TOKEN=$(cat "$evidence/.token") with_timeout "$rel_budget" "$relish" \
         --endpoint "https://127.0.0.1:$(( api_port + node - 1 ))" --ca-cert "$ca" "$@"
 }
 rel() { rel_on "$(api_node)" "$@"; }
@@ -368,7 +371,7 @@ rotate_ingress() {
                 event --phase "tls:invalid-$kind" --target "${vm[node]}" --verdict ok --detail "refused; still serving $served"
             else
                 event --phase "tls:invalid-$kind" --target "${vm[node]}" --verdict fail --detail "served ${served:-nothing}, expected $previous"
-                record_failure "ingress-invalid-pair" "${vm[node]} served ${served:-nothing} after a $kind pair; expected the last good $previous"
+                record_failure "ingress-invalid-pair" "${vm[node]} served ${served:-nothing} after a $kind pair; expected the last good $previous" '' "ingress-invalid-pair|${vm[node]}"
             fi
         done
     fi
@@ -392,7 +395,7 @@ rotate_ingress() {
             event --phase tls:reload --target "${vm[node]}" --verdict ok --duration "$elapsed" --detail "serving $serial"
         else
             event --phase tls:reload --target "${vm[node]}" --verdict fail --duration "$elapsed" --detail "served ${served:-nothing}"
-            record_failure "ingress-reload" "${vm[node]} served ${served:-nothing} ${elapsed} s after the $serial pair landed"
+            record_failure "ingress-reload" "${vm[node]} served ${served:-nothing} ${elapsed} s after the $serial pair landed" '' "ingress-reload|${vm[node]}"
         fi
     done
     rm -rf "$tls/current"
@@ -683,7 +686,12 @@ registry() {
 
 failure_count=0
 record_failure() {
-    local check_name=$1 detail=$2 snapshot=${3:-} directory node
+    local check_name=$1 detail=$2 snapshot=${3:-} key=${4:-} directory node
+    # A keyed failure that keeps recurring gets one bundle per half hour.
+    if [ -n "$key" ] && check seen "$evidence" "$key"; then
+        event --phase failure --target "$check_name" --verdict repeat --detail "$detail"
+        return 0
+    fi
     failure_count=$(( $(find "$evidence/failures" -mindepth 1 -maxdepth 1 -type d | wc -l) + 1 ))
     directory=$evidence/failures/$failure_count
     mkdir -p "$directory"
@@ -860,8 +868,8 @@ slot_chaos() {
         drop) rel fault drop frontend 10% --duration 60s --acknowledge --reason v02 > "$output" 2>&1 || result=$? ;;
         dns) rel fault dns soak-redis nxdomain --duration 60s --acknowledge --reason v02 > "$output" 2>&1 || result=$? ;;
         scenario)
-            rel --output json test --chaos --yes --filter dead_worker_node_has_workloads_rescheduled --timeout 600s \
-                > "$output" 2>&1 || result=$? ;;
+            rel_budget=900 rel --output json test --chaos --yes --filter dead_worker_node_has_workloads_rescheduled \
+                --timeout 600s > "$output" 2>&1 || result=$? ;;
     esac
     event --phase "fault:chaos-$kind" --exit "$result" --command "$kind" --verdict "$([ "$result" -eq 0 ] && echo ok || echo fail)"
     [ "$result" -eq 0 ] || record_failure "chaos-$kind" "$(tail -n 3 "$output" | tr '\n' ' ')"
@@ -876,7 +884,8 @@ catalogue_pulse() {
     output=$evidence/snapshots/pulse-$(date +%s).json
     say 'catalogue pulse'
     open_window pulse
-    rel --output json test --profile full-runc --filter volumes,image-registry,workload-identity,ingress,deployments \
+    # Five groups, four at a time, 300 s each at most.
+    rel_budget=1800 rel --output json test --profile full-runc --filter volumes,image-registry,workload-identity,ingress,deployments \
         --timeout 300s > "$output" 2>"$output.err" || result=$?
     event --phase pulse --exit "$result" --verdict "$([ "$result" -eq 0 ] && echo ok || echo fail)" --detail "${output##*/}"
     [ "$result" -eq 0 ] || record_failure pulse "relish test exited $result; see ${output##*/}"

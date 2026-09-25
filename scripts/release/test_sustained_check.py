@@ -299,6 +299,11 @@ class Recovery(Evidence):
         self.assertEqual([item["severity"] for item in again["findings"]], ["repeat"])
         self.assertEqual(self.failures(later), ["ingress-http"])
 
+    def test_a_harness_failure_key_is_new_once_then_a_repeat(self):
+        self.assertEqual(checker.main(["seen", str(self.evidence), "ingress-reload|rb-a-3"]), 1)
+        self.assertEqual(checker.main(["seen", str(self.evidence), "ingress-reload|rb-a-3"]), 0)
+        self.assertEqual(checker.main(["seen", str(self.evidence), "ingress-reload|rb-a-2"]), 1)
+
     def test_ingress_errors_outside_a_fault_window_fail(self):
         _, verdict = self.evaluate(self.snapshot(kind="light", **{"http_txt": "502 0.10\n"}))
         self.assertEqual(self.failures(verdict), ["ingress-http"])
