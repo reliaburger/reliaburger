@@ -1420,6 +1420,16 @@ machines.
   same for the complete standalone path, carrying discovery ownership through
   a power cut and then checking retirement, explicit redeployment and same-boot
   adoption.
+- `scripts/release/qualify-storage-power-cut.sh --vm DISPOSABLE_LIMA_VM
+  --fixture exporter|leases --iterations N` cuts the VM's power at a random
+  moment while worker processes export Parquet files (three exporters sharing
+  one checkpoint and lock) or mutate lease stores, each logging finished
+  operations to a synced ledger. After the reboot it checks that every
+  acknowledged export is at the destination byte for byte, that nothing was
+  pruned before it was exported, that every acknowledged lease operation
+  survived, and that the lock and stores are reusable. It writes a Markdown
+  record with a rule-of-three bound. It refuses the shared `reliaburger-test`
+  VM.
 
 Passing them doesn't close the release gates in the
 [remaining-work table](plans/2026-09-22-v0.1.0-remaining-work.md).

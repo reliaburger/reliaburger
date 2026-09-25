@@ -135,3 +135,17 @@ slow-timeout = { period = "60s", terminate-after = 4 }
 filter = 'binary(oci_crash)'
 test-group = "crash-recovery"
 slow-timeout = { period = "60s", terminate-after = 4 }
+
+# Power-cut fixtures run only through scripts/release/qualify-storage-power-cut.sh,
+# which drives each phase on a disposable VM. They are ignored, and no Make
+# target selects their binary; should a runner pick them up anyway, keep them
+# in the serial crash-recovery group, because prepare starts worker processes.
+[[profile.default.overrides]]
+filter = 'binary(power_cut)'
+test-group = "crash-recovery"
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+[[profile.ci.overrides]]
+filter = 'binary(power_cut)'
+test-group = "crash-recovery"
+slow-timeout = { period = "60s", terminate-after = 5 }
