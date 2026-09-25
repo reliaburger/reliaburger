@@ -486,6 +486,42 @@ configure_nodes() {
     check ingress-expect "$evidence" "${vm[2]}" "$(cat "$tls/current/serial")"
     check ingress-expect "$evidence" "${vm[3]}" "$(cat "$tls/current/serial")"
     next_rotation=$(( $(date +%s) + rotation ))
+    wait_labels
+}
+
+# The pinned volume apps can't be placed until the cluster sees the labels.
+# On the 0.1.0 candidate a restarted node sometimes never republishes its
+# node.toml labels; that is a failure row, and one more restart is tried.
+# Print the nodes (2, 3) whose soak-volume label the cluster doesn't show yet.
+missing_labels() {
+    rel --output json nodes > "$evidence/.nodes.json" 2>/dev/null || { echo 2 3; return; }
+    python3 - "$evidence/.nodes.json" "${vm[2]}" "${vm[3]}" <<'PY'
+import json, sys
+labels = {node["node_id"]: node.get("labels", {}).get("soak-volume") for node in json.load(open(sys.argv[1]))}
+print(" ".join(index for index, name, want in (("2", sys.argv[2], "writer"), ("3", sys.argv[3], "redis"))
+               if labels.get(name) != want))
+PY
+}
+
+wait_labels() {
+    local attempt deadline node missing
+    for attempt in 1 2; do
+        deadline=$(( $(date +%s) + 120 ))
+        while [ "$(date +%s)" -lt "$deadline" ]; do
+            missing=$(missing_labels)
+            [ -n "$missing" ] || return 0
+            sleep 5
+        done
+        [ "$attempt" -eq 1 ] || setup_fail 'the soak-volume node labels never reached the cluster'
+        record_failure node-labels "node.toml labels not visible in relish nodes 120 s after the restart: $(tr -d '\n ' < "$evidence/.nodes.json" | head -c 400)"
+        for node in $missing; do
+            avoid=$node
+            kill_bun "$node"
+            wait_node_ready "$node" 180 || setup_fail "${vm[node]} not ready after a restart for its labels"
+            wait_cluster 300 || setup_fail "cluster not healthy after restarting ${vm[node]} for its labels"
+        done
+        avoid=0
+    done
 }
 
 # One leader, three live voters.
