@@ -31,7 +31,7 @@ impl SnapshotUploader {
     pub fn from_url(upload_url: &str) -> Result<Self, String> {
         let parsed = url::Url::parse(upload_url)
             .map_err(|e| format!("invalid upload_url {upload_url}: {e}"))?;
-        let (store, prefix) = object_store::parse_url(&parsed)
+        let (store, prefix) = crate::object_storage::open(&parsed)
             .map_err(|e| format!("unsupported upload_url {upload_url}: {e}"))?;
         Ok(Self { store, prefix })
     }
@@ -393,5 +393,16 @@ mod tests {
         assert_eq!(report.created, 0);
         assert_eq!(report.errors.len(), 1);
         assert!(report.errors[0].contains("not a btrfs subvolume"));
+    }
+
+    /// The `uploaded` flag stops later ticks re-uploading, so the archive must
+    /// be durable before the flag is written.
+    #[test]
+    fn local_upload_destination_syncs_before_the_checkpoint() {
+        let dest = tempfile::tempdir().unwrap();
+        let uploader =
+            SnapshotUploader::from_url(&format!("file://{}", dest.path().display())).unwrap();
+        let store = format!("{:?}", uploader.store);
+        assert!(store.contains("fsync: true"), "{store}");
     }
 }

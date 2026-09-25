@@ -125,7 +125,9 @@ fn parse_destination(
     destination: &str,
 ) -> Result<(Box<dyn object_store::ObjectStore>, object_store::path::Path), KetchupError> {
     let url = destination_url(destination)?;
-    object_store::parse_url(&url).map_err(|e| {
+    // The checkpoint licenses pruning the source, so an upload must be durable
+    // before it's acknowledged; `object_storage::open` syncs local writes.
+    crate::object_storage::open(&url).map_err(|e| {
         KetchupError::Io(std::io::Error::other(format!(
             "unsupported destination: {e}"
         )))
@@ -143,7 +145,7 @@ fn export_scope(destination: &str, node_id: &str) -> Result<String, KetchupError
 
 fn destination_url(destination: &str) -> Result<url::Url, KetchupError> {
     // A bare filesystem path has no scheme; normalise it to a file:// URL so
-    // `object_store::parse_url` picks the LocalFileSystem backend. Existing
+    // `object_storage::open` picks the LocalFileSystem backend. Existing
     // configs and tests pass plain temp-dir paths, so this stays compatible.
     let url = if destination.contains("://") {
         url::Url::parse(destination)
@@ -618,6 +620,24 @@ mod tests {
         assert_eq!(r2.files_exported, 1);
 
         assert_eq!(exported_files(dest.path()).len(), 2);
+    }
+
+    /// Pruning trusts the checkpoint, so a local destination must hold the
+    /// bytes durably before the checkpoint says so. `object_store` only syncs
+    /// local writes when asked, and the fsync itself can't be observed short of
+    /// a power cut (`tests/power_cut.rs` does that), so check the configuration.
+    #[test]
+    fn local_destinations_sync_uploads_before_acknowledging() {
+        let destination = tempfile::tempdir().unwrap();
+        let bare = destination.path().to_str().unwrap().to_string();
+        let url = format!("file://{bare}");
+        for destination in [bare, url] {
+            let (store, _) = parse_destination(&destination).unwrap();
+            assert!(
+                format!("{store:?}").contains("fsync: true"),
+                "{destination} acknowledges unsynced uploads: {store:?}"
+            );
+        }
     }
 
     #[test]

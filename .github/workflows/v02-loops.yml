@@ -1,0 +1,241 @@
+name: V02 loops
+
+# Release qualification lane D: loop the crash, lease and upgrade suites for
+# hours on hosted runners. Nothing else triggers it; push the v02-loops branch
+# or dispatch it by hand.
+on:
+  push:
+    branches: [v02-loops]
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: How long each time-boxed loop runs (nextest --stress-duration)
+        default: 5h30m
+      count:
+        description: Iterations for each counted loop (nextest --stress-count)
+        default: "200"
+
+concurrency:
+  group: v02-loops-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  NEXTEST_PROFILE: ci
+  LOOP_DURATION: ${{ inputs.duration || '5h30m' }}
+  LOOP_COUNT: ${{ inputs.count || '200' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build-tests:
+    # One nextest archive per platform. The loop jobs download it instead of
+    # rebuilding; runners check out to the same path, so compiled-in paths
+    # still resolve after extraction.
+    name: build tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.145
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # ubuntu-latest reuses the debug cache main already keeps for CI.
+          shared-key: ${{ matrix.os == 'ubuntu-latest' && 'linux-debug' || format('v02-{0}', matrix.os) }}
+          save-if: false
+      - run: cargo nextest archive --locked --archive-file tests.tar.zst
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nextest-archive-${{ matrix.os }}
+          path: tests.tar.zst
+          compression-level: 0
+          retention-days: 3
+          if-no-files-found: error
+
+  upgrade:
+    # C44 / item 263: real-binary upgrades, single node and rolling cluster,
+    # looped for the whole window on every supported runner architecture.
+    name: ${{ matrix.target }} loop (${{ matrix.os }})
+    needs: build-tests
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-15]
+        target: [test-upgrade-cluster, test-upgrade-node]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.145
+      - uses: actions/download-artifact@v4
+        with:
+          name: nextest-archive-${{ matrix.os }}
+      - name: Loop ${{ matrix.target }} for ${{ env.LOOP_DURATION }}
+        run: >-
+          make ${{ matrix.target }}
+          NEXTEST="cargo nextest run --archive-file tests.tar.zst --extract-to . --extract-overwrite --workspace-remap . --profile ci --no-tests=fail --stress-duration $LOOP_DURATION"
+          2>&1 | tee loop.log
+      - name: Summarise
+        if: ${{ !cancelled() }}
+        run: python3 scripts/release/loop_summary.py --lane "${{ matrix.target }} (${{ matrix.os }})" --junit target/nextest/ci/junit.xml --log loop.log --output summary.md
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: loop-${{ matrix.target }}-${{ matrix.os }}
+          path: |
+            target/nextest/ci/junit.xml
+            loop.log
+            summary.md
+            summary.json
+          if-no-files-found: warn
+
+  council:
+    # Council recovery and failover, looped for the whole window.
+    name: ${{ matrix.binary }} loop
+    needs: build-tests
+    strategy:
+      fail-fast: false
+      matrix:
+        binary: [council_disaster_recovery, cluster_failover]
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.145
+      - uses: actions/download-artifact@v4
+        with:
+          name: nextest-archive-ubuntu-latest
+      - name: Loop ${{ matrix.binary }} for ${{ env.LOOP_DURATION }}
+        env:
+          RELIABURGER_CLUSTER_TESTS: "1"
+        run: >-
+          cargo nextest run --archive-file tests.tar.zst --extract-to . --extract-overwrite
+          --workspace-remap . --profile ci --no-tests=fail --run-ignored=only
+          -E 'binary(${{ matrix.binary }})' --stress-duration "$LOOP_DURATION"
+          2>&1 | tee loop.log
+      - name: Summarise
+        if: ${{ !cancelled() }}
+        run: python3 scripts/release/loop_summary.py --lane "${{ matrix.binary }} (ubuntu-latest)" --junit target/nextest/ci/junit.xml --log loop.log --output summary.md
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: loop-${{ matrix.binary }}-ubuntu-latest
+          path: |
+            target/nextest/ci/junit.xml
+            loop.log
+            summary.md
+            summary.json
+          if-no-files-found: warn
+
+  leases:
+    # C11 lease recovery after owner death, and the C03 exporter lock and
+    # checkpoint, each repeated a fixed number of times per platform.
+    name: ${{ matrix.case }} x${{ inputs.count || '200' }} (${{ matrix.os }})
+    needs: build-tests
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-15]
+        case: [job-lease, registry-lease-expiry, registry-new-leader, export-lock-checkpoint]
+        include:
+          - case: job-lease
+            filter: binary(job_recovery) & test(=node_job_lease_reaps_a_surviving_process_after_bun_is_killed)
+          - case: registry-lease-expiry
+            filter: binary(registry_recovery) & test(=expired_registry_lease_recovers_after_bun_sigkill_and_preserves_shared_content)
+          - case: registry-new-leader
+            filter: binary(registry_recovery) & test(=new_leader_retains_registry_cleanup_until_the_killed_writer_returns)
+          - case: export-lock-checkpoint
+            filter: binary(suite) & (test(=log_export::active_export_lock_refuses_another_writer_without_uploading) | test(=log_export::export_persists_and_reloads_the_authoritative_checkpoint))
+          # Btrfs and loop devices need a privileged Linux host.
+          - os: ubuntu-latest
+            case: test-storage-owner-death
+            filter: binary(test_storage) & test(=lease_loop_storage_survives_owner_process_death)
+            privileged: true
+          - os: ubuntu-24.04-arm
+            case: test-storage-owner-death
+            filter: binary(test_storage) & test(=lease_loop_storage_survives_owner_process_death)
+            privileged: true
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.145
+      - uses: actions/download-artifact@v4
+        with:
+          name: nextest-archive-${{ matrix.os }}
+      - name: Install Btrfs and loop-device tools
+        if: ${{ matrix.privileged }}
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq btrfs-progs
+      - name: Loop ${{ matrix.case }} ${{ env.LOOP_COUNT }} times
+        if: ${{ !matrix.privileged }}
+        env:
+          FILTER: ${{ matrix.filter }}
+        run: >-
+          cargo nextest run --archive-file tests.tar.zst --extract-to . --extract-overwrite
+          --workspace-remap . --profile ci --no-tests=fail -E "$FILTER"
+          --stress-count "$LOOP_COUNT"
+          2>&1 | tee loop.log
+      - name: Loop ${{ matrix.case }} ${{ env.LOOP_COUNT }} times as root
+        if: ${{ matrix.privileged }}
+        env:
+          FILTER: ${{ matrix.filter }}
+          RELIABURGER_BTRFS_TESTS: "1"
+        run: >-
+          sudo -E env PATH="$PATH"
+          cargo nextest run --archive-file tests.tar.zst --extract-to . --extract-overwrite
+          --workspace-remap . --profile ci --no-tests=fail --run-ignored=only -E "$FILTER"
+          --stress-count "$LOOP_COUNT"
+          2>&1 | tee loop.log
+      - name: Summarise
+        if: ${{ !cancelled() }}
+        run: python3 scripts/release/loop_summary.py --lane "${{ matrix.case }} (${{ matrix.os }})" --junit target/nextest/ci/junit.xml --log loop.log --output summary.md
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: loop-${{ matrix.case }}-${{ matrix.os }}
+          path: |
+            target/nextest/ci/junit.xml
+            loop.log
+            summary.md
+            summary.json
+          if-no-files-found: warn
+
+  summary:
+    # One table for the qualification record: runs, failures and the
+    # rule-of-three bound for every lane.
+    name: summary
+    needs: [upgrade, council, leases]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: loop-*
+          path: loops
+      - run: python3 scripts/release/loop_summary.py --combine loops --output v02-loops-summary.md
+      - run: cat v02-loops-summary.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: v02-loops-summary
+          path: v02-loops-summary.md

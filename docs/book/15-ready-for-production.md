@@ -2710,6 +2710,120 @@ verification and Bun falls back to the real registry.
 The proof we wanted was blunt. Warm the cache, cut the VM's uplink, run the
 image-pulling suites. They pass.
 
+## Pulling the plug
+
+The exporter's checkpoint is written with the full ritual: a private temporary
+file, `sync_all`, an atomic rename, then a sync of the directory. The lease
+store does the same. Every unit test agrees. None of them proves anything about
+a power cut, because a process that dies still leaves the kernel's page cache
+behind, and the page cache is exactly what a power cut throws away.
+
+So the storage fixtures in `tests/power_cut.rs` copy the shape of the reboot
+fixture from Chapter 1: two phases, driven by
+`scripts/release/qualify-storage-power-cut.sh` against a disposable Lima VM.
+The prepare phase doesn't do the work itself. It starts workers, and the
+workers are the test binary again:
+
+```rust
+let child = Command::new(std::env::current_exe().unwrap())
+    .args(["--ignored", "--exact", test, "--nocapture", "--test-threads=1"])
+    .env(DIRECTORY, directory)
+    .env(ROLE, role)
+    .process_group(0)
+    .spawn()
+    .unwrap();
+```
+
+A Rust integration test compiles to an ordinary executable, and libtest accepts
+the name of one test to run. Re-executing ourselves with a `ROLE` variable gives
+us a worker that links the real library, with no extra binary to build or ship.
+The test function checks `ROLE` first and, if it's set, loops forever instead of
+running a phase. `process_group(0)` (from Chapter 12) detaches the worker from
+the shell session that ran prepare, so it keeps writing after prepare returns.
+
+For the exporter there are four workers. A generator flushes real Parquet
+through `LogStore` and publishes each file into the exported directory. Three
+exporters share one checkpoint and its cross-process lock: one behaves like
+`relish logs-export`, two like Bun's disk-pressure tick, which exports and then
+prunes. For leases there are three workers, each creating, renewing and
+releasing leases in its own store file, all in one directory.
+
+How does verify know what *should* have survived? Every worker keeps a ledger,
+and a ledger line is a promise:
+
+```rust
+fn record(&mut self, line: &str) {
+    self.0.write_all(format!("{line}\n").as_bytes()).unwrap();
+    self.0.sync_data().unwrap();
+}
+```
+
+`sync_data` is `fdatasync`: it flushes the bytes and the file size, and skips
+metadata such as timestamps that nobody will read. The worker records an
+operation only after the store said it was done, so every complete line names
+an operation the store acknowledged. The last line may be torn by the cut, and
+verify ignores anything after the final newline. A lease worker also writes a
+`begin` line before each operation, which lets verify accept exactly two
+outcomes: the state after every acknowledged operation, or that state plus the
+single operation that was in flight.
+
+The driver waits for prepare, sleeps a random 0–20 seconds and runs
+`limactl stop --force`. Verify first checks that the boot ID changed (a pass
+without a new kernel proves nothing), then works through the ledgers.
+
+The lease store passed. The exporter didn't, on its first run, or on the next
+three. Every export the workers had acknowledged was at the destination with
+the right name and zero bytes, and the pruners had already deleted most of the
+sources: 162 of 171 files gone for good in one run. The checkpoint was durable;
+the data it vouched for wasn't. The `object_store` crate's local filesystem
+backend doesn't `fsync` what it writes unless you ask
+(`LocalFileSystem::with_fsync`), and `object_store::parse_url` doesn't ask. A
+checkpoint that promises "this is safely elsewhere" is a licence to prune, so
+the promise has to be at least as durable as the licence.
+
+The exporter wasn't the only caller. Metrics, volume-snapshot upload and
+council backups all opened their destinations with the same `parse_url`, and
+each of them acts on a write once it returns. So the fix isn't four lines in
+the exporter. It's one function that everybody goes through:
+
+```rust
+pub(crate) fn open(url: &url::Url) -> Result<(Box<dyn ObjectStore>, Path), object_store::Error> {
+    let (store, prefix) = object_store::parse_url(url)?;
+    if url.scheme() == "file" {
+        return Ok((Box::new(LocalFileSystem::new().with_fsync(true)), prefix));
+    }
+    Ok((store, prefix))
+}
+```
+
+`Box<dyn ObjectStore>` is Rust's spelling of "some type that implements the
+`ObjectStore` trait, decided at run time". `dyn` marks a trait object (roughly
+a Go interface value), and the `Box` puts it on the heap, because the compiler
+can't know how big an unknown type is. That's why we can hand back either the
+`parse_url` result or our own `LocalFileSystem`: both fit behind the same
+pointer. Cloud schemes pass through untouched, because S3 and GCS don't
+acknowledge a write until they've stored it.
+
+The regression tests are less satisfying than we'd like. Nothing a unit test
+can observe changes when an `fsync` is missing, so each caller's test checks
+the store's `Debug` output for `fsync: true`, and the power-cut fixtures carry
+the real proof.
+
+Council backups got a fixture of their own, because they have the same shape:
+upload a new backup, then delete everything but the newest three. Before the
+fix, three runs out of three ended the same way. Three backup files survived,
+all empty, and retention had deleted every older, intact one. The cluster had
+been told, every few milliseconds, that it had a backup. After a power cut it
+had nothing to restore from. With the shared helper, the fixture passes. The
+[qualification record](../qualification/2026-09-25-v02-power-cut.md) has both
+sets of runs.
+
+Could an ordinary test have caught this? Not honestly. Every file was fine
+until the kernel went away, and no amount of killing processes reproduces
+that. The snapshot uploader still needs its own fixture: it needs Btrfs
+volumes, and the metadata that marks a snapshot as uploaded is itself written
+without a sync.
+
 ## Lessons learned: audit the evidence too
 
 Export a log file, replace it with new contents under the same name, then export
