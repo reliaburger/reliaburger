@@ -61,6 +61,38 @@ result by its bare name, as `api:v1.2.3`, and nodes find it in Pickle. Built
 images are signed by the cluster, which matters when `require_signatures` is
 on (see `security`).
 
+## Pushing with docker or crane
+
+Pickle speaks the standard registry API, so `docker push`, `crane` and other
+OCI clients work against a cluster whose nodes have mTLS identities (every
+`relish init` cluster and the quickstart). Log in with an API token of role
+`deployer` or above as the password; the username is ignored:
+
+```sh
+TOKEN="$(relish token create --name laptop-push --role deployer)"
+crane auth login NODE:5050 -u push -p "$TOKEN"
+crane push app.tar NODE:5050/api:v1
+```
+
+`docker login NODE:5050 -u push --password-stdin <<<"$TOKEN"` then
+`docker push NODE:5050/api:v1` works the same way. Apps refer to the image
+by its bare name, `api:v1`.
+
+The registry serves the node's certificate, which names the node rather than
+its address, so `NODE` has to be the node's name (`relish status` lists them)
+and your machine has to resolve it and trust the cluster's root CA. For the
+quickstart: add `127.0.0.1 NODE-1-NAME` to `/etc/hosts`, use port `15050`, and
+trust `~/.reliaburger/clusters/NAME/security/identity/root-ca.crt` (for docker,
+copy it to `/etc/docker/certs.d/NODE-1-NAME:15050/ca.crt`; on macOS, add it to
+the keychain for crane).
+
+Pickle only takes these credentials over TLS. A plaintext registry, which is
+what a node without an identity serves, refuses them even with a good token,
+because the password is your API token. There, use `relish build`, or push
+anonymously to a standalone node's loopback registry before its first API
+token exists. Pickle has no Docker token service, and it doesn't support
+deleting images through the registry API.
+
 ## Volumes
 
 ```toml

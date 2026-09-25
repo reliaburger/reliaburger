@@ -54,6 +54,7 @@ mod reconstruction;
 mod registry_authority;
 mod registry_capability;
 mod registry_routable_push;
+mod registry_standard_clients;
 mod registry_upload;
 mod relish_cli;
 mod reporting_tree;

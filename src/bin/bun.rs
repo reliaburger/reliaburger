@@ -314,65 +314,6 @@ fn load_node_identity(
         .transpose()
 }
 
-/// Serve an axum router over TLS, handshaking each connection in its own task
-/// (a slow handshaker never blocks the accept loop). Mirrors the wrapper's
-/// ingress TLS loop; runs until `shutdown` is cancelled.
-async fn serve_api_over_tls(
-    listener: tokio::net::TcpListener,
-    acceptor: tokio_rustls::TlsAcceptor,
-    router: axum::Router,
-    shutdown: tokio_util::sync::CancellationToken,
-) {
-    use tower::Service;
-    let mut make_service = router.into_make_service();
-    loop {
-        tokio::select! {
-            _ = shutdown.cancelled() => return,
-            accepted = listener.accept() => {
-                let Ok((tcp, _peer)) = accepted else { continue };
-                let acceptor = acceptor.clone();
-                let connection_shutdown = shutdown.clone();
-                let service = match make_service.call(()).await {
-                    Ok(service) => service,
-                    Err(infallible) => match infallible {},
-                };
-                tokio::spawn(async move {
-                    use reliaburger::sesame::connection::{
-                        LifetimeLimitedIo, MAX_TLS_CONNECTION_LIFETIME, TLS_CONNECTION_DRAIN_GRACE,
-                    };
-                    let Ok(Ok(tls)) = tokio::time::timeout(
-                        std::time::Duration::from_secs(10), acceptor.accept(tcp),
-                    ).await else { return };
-                    let service = match tls.get_ref().1.peer_certificates()
-                        .and_then(|certificates| certificates.first()) {
-                        Some(certificate) => service.layer(axum::Extension(
-                            reliaburger::sesame::renewal::TlsPeerCertificate(certificate.clone()),
-                        )),
-                        None => service,
-                    };
-                    let tls = LifetimeLimitedIo::new(tls, MAX_TLS_CONNECTION_LIFETIME);
-                    let hyper_service = hyper_util::service::TowerToHyperService::new(service);
-                    let builder = hyper_util::server::conn::auto::Builder::new(
-                        hyper_util::rt::TokioExecutor::new(),
-                    );
-                    let connection = builder.serve_connection_with_upgrades(
-                        hyper_util::rt::TokioIo::new(tls), hyper_service,
-                    );
-                    tokio::pin!(connection);
-                    let drain_after = MAX_TLS_CONNECTION_LIFETIME.saturating_sub(TLS_CONNECTION_DRAIN_GRACE);
-                    tokio::select! {
-                        _ = &mut connection => return,
-                        _ = connection_shutdown.cancelled() => {},
-                        _ = tokio::time::sleep(drain_after) => {},
-                    }
-                    connection.as_mut().graceful_shutdown();
-                    let _ = tokio::time::timeout(TLS_CONNECTION_DRAIN_GRACE, connection).await;
-                });
-            }
-        }
-    }
-}
-
 /// Enforce the `require_mtls` mode matrix before the cluster starts.
 ///
 /// With `require_mtls` set and no identity on disk, the node cannot speak the
@@ -2527,7 +2468,13 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
 
             match api_acceptor {
                 Some(acceptor) => {
-                    serve_api_over_tls(listener, acceptor, app, server_shutdown).await
+                    reliaburger::sesame::connection::serve_router_over_tls(
+                        listener,
+                        acceptor,
+                        app,
+                        server_shutdown,
+                    )
+                    .await
                 }
                 None => {
                     axum::serve(listener, app)
@@ -2835,7 +2782,13 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
 
             match pickle_acceptor {
                 Some(acceptor) => {
-                    serve_api_over_tls(pickle_listener, acceptor, pickle_app, pickle_shutdown).await
+                    reliaburger::sesame::connection::serve_router_over_tls(
+                        pickle_listener,
+                        acceptor,
+                        pickle_app,
+                        pickle_shutdown,
+                    )
+                    .await
                 }
                 None => {
                     axum::serve(pickle_listener, pickle_app)
@@ -3763,7 +3716,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let shutdown = tokio_util::sync::CancellationToken::new();
         let mut tasks = tokio::task::JoinSet::new();
-        tasks.spawn(serve_api_over_tls(
+        tasks.spawn(reliaburger::sesame::connection::serve_router_over_tls(
             listener,
             tokio_rustls::TlsAcceptor::from(config),
             router,
@@ -3870,7 +3823,7 @@ mod tests {
         let url = format!("https://{}/peer", listener.local_addr().unwrap());
         let shutdown = tokio_util::sync::CancellationToken::new();
         let mut tasks = tokio::task::JoinSet::new();
-        tasks.spawn(serve_api_over_tls(
+        tasks.spawn(reliaburger::sesame::connection::serve_router_over_tls(
             listener,
             tokio_rustls::TlsAcceptor::from(config),
             router,

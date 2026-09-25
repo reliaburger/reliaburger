@@ -44,7 +44,7 @@ If you try to construct a `Digest` with the wrong format, you get an error at th
 
 ## The OCI Distribution API
 
-`docker push` and `docker pull` speak a specific HTTP protocol: the OCI Distribution Spec. Pickle implements the subset that matters.
+`docker push` and `docker pull` speak a specific HTTP protocol: the OCI Distribution Spec. Pickle implements the subset that matters for pushing and pulling (no deletes, no cross-repository mounts).
 
 **Pushing an image** takes three steps:
 
@@ -180,11 +180,11 @@ Let's walk through what deploying an image looks like with Docker Hub versus Pic
 
 **Pickle workflow:**
 
-1. Build your image locally
-2. `docker push localhost:5000/myapp:v1` (Pickle's OCI API on the cluster)
+1. `docker login node-1:5050` once, with a Reliaburger API token as the password
+2. `docker push node-1:5050/myapp:v1` (Pickle's OCI API on any node), or skip docker entirely with `relish build`
 3. Done. Pickle replicates internally. Every node can pull from its peers.
 
-No login. No credentials to rotate. No rate limits. No outbound internet from worker nodes.
+One login, with a token the cluster already issues. No second account, no rate limits, no outbound internet from worker nodes. (How that login works, and why it only works over TLS, comes later in the chapter.)
 
 Now, Docker Hub does things Pickle doesn't try to do. It's a public registry with millions of images. You can browse, search, read READMEs, check vulnerability scans. Pickle is a private cluster registry, not a community marketplace. For public base images like `alpine` or `nginx`, you still reference Docker Hub in your config. The pull-through cache handles the rest.
 
@@ -868,6 +868,78 @@ with no renewals, while the ordinary image still returns exactly its original
 bytes. A three-node variant kills the storage-owning leader and checks that the
 survivors carry its receipts forward until it returns and cleans up.
 
+## Letting docker in
+
+The design doc said `docker push` and `crane push` work against Pickle. Then a comment in `pickle/build.rs` said Pickle never accepts HTTP Basic auth. Both were in the repository at the same time, and only one of them could be true. Which one?
+
+The comment was. Every credential check in the registry read `Authorization: Bearer …` and nothing else. That suits `relish` and peer replication, which send a bearer. It doesn't suit docker. `docker login` and `docker push` send `Authorization: Basic base64(user:password)`, and they only send it after the server asks. Docker's first request is an anonymous `GET /v2/`. If the answer is a 401 with `WWW-Authenticate: Basic realm="…"`, docker remembers the scheme and attaches its stored credential to everything after. If the 401 names no scheme, docker has nothing to go on. Pickle's 401s named nothing. So on any registry that wanted a principal, docker never offered its credential, and when crane offered one anyway, Pickle ignored it. The only stock push that worked was an anonymous one to a standalone node's loopback registry before anyone created an API token.
+
+There were two ways out. We could correct the docs and make `relish build` the only door. Or we could let standard clients in properly. The second turned out to be small, so we did that. Before writing any code, we decided what we would *not* do:
+
+- **No second credential.** The Basic password is an ordinary Reliaburger API token. The username is ignored: clients insist on sending one, but the token alone names the principal, and checking a field that carries no authority would only add a way to get it wrong.
+- **No Basic in the clear.** Basic is refused on a plaintext connection, even with a valid token and even for a read the loopback listener would serve to anyone. Accepting it would teach clients that sending the token in the clear works.
+- **No Docker token service.** The other challenge, `WWW-Authenticate: Bearer realm="https://…/token"`, has the client swap its credential for a short-lived token at a separate endpoint. Every client we care about speaks Basic, and a token service would mint a second kind of credential in exchange for the API token the client already holds. That's more moving parts and no extra security.
+
+### One authorisation path, two envelopes
+
+The tempting implementation threads "was this Basic?" through every handler. Blob upload, chunk, completion and manifest push each authorise separately, because they have different role requirements and quota checks. Five call sites means five chances to forget one. Instead, a single middleware sits at the router's edge and rewrites the envelope before any handler sees the request:
+
+```rust
+async fn standard_client_credentials(
+    mut request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let over_tls = request
+        .extensions()
+        .get::<crate::sesame::connection::TlsTransport>()
+        .is_some();
+    let credential = basic_credential(request.headers());
+    if !over_tls && !matches!(credential, BasicCredential::Absent) {
+        return oci_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED",
+            "HTTP Basic credentials are only accepted over TLS".to_string());
+    }
+    match credential {
+        BasicCredential::Absent => {}
+        BasicCredential::Token(token) => { /* replace the header with `Bearer {token}` */ }
+        BasicCredential::Malformed => return basic_challenge(malformed_basic()),
+    }
+    let response = next.run(request).await;
+    if over_tls && response.status() == StatusCode::UNAUTHORIZED {
+        return basic_challenge(response);
+    }
+    response
+}
+```
+
+`axum::middleware::from_fn(standard_client_credentials)` turns this plain `async fn` into a layer. `next.run(request).await` hands the request to everything inside the layer (the routes and their handlers) and gives back their response, so the function can act on the way in and the way out. On the way in, a Basic credential becomes the equivalent bearer. On the way out, any 401 from a TLS connection gets the `Basic` challenge that makes docker offer its credential. Every role, repository and lease check below the layer is byte-for-byte the bearer path. A ReadOnly token can pull and can't push, whichever envelope it arrives in.
+
+`BasicCredential` is an enum whose variants carry different data. `Token(String)` holds the password. `Absent` and `Malformed` hold nothing. A C programmer would reach for a struct with a status code and a nullable string. Here the string only exists in the variant where it means something, so the compiler won't let you read a token out of a malformed header. `matches!(value, Pattern)` is a macro that evaluates to `true` when the value fits the pattern, a one-line `match` for when all you want is a yes or no.
+
+### Ask the wire, not the config
+
+How does the middleware know the connection was TLS? The obvious answer is a `registry_over_tls: bool` from configuration, and it's wrong. Bun decides to serve TLS when the node has an identity. If building the TLS config then fails, it logs the error and serves plaintext. A flag set from configuration would still say "TLS" and would happily accept a password sent in the clear.
+
+So the evidence comes from the listener. The TLS accept loop (moved out of the `bun` binary into `sesame::connection::serve_router_over_tls` so tests can drive the real thing) attaches a marker to every request it serves:
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TlsTransport;
+
+let service = service.layer(axum::Extension(TlsTransport));
+```
+
+`TlsTransport` is a *unit struct*: a type with no fields and exactly one value, also written `TlsTransport`. It takes up zero bytes. It's useful because of its *type*. An HTTP request's extensions are a map keyed by type, and `request.extensions().get::<TlsTransport>()` asks "is there a value of this type in the map?". The `::<TlsTransport>` turbofish names the key. The plaintext listener, plain `axum::serve`, never inserts one, so the absence of the marker is the proof. A Go programmer would stash a sentinel in a `context.Context` under a private key type. This is the same idea, except the key *is* the type, so there's nothing to collide with.
+
+### What the real client found
+
+The unit tests drive the router with a fake TLS marker. `tests/suite/registry_standard_clients.rs` goes further: it serves the registry through the real `serve_router_over_tls` with a node certificate named `localhost`, then pushes an image with reqwest's `basic_auth`, verifying the certificate against the cluster root as docker would. It also has an ignored test that runs actual `crane`: `crane auth login`, `crane append` to push, `crane manifest` to pull back.
+
+That test failed on its first run, and not on authentication. crane asks `HEAD /v2/{name}/manifests/{tag}` before it pushes a manifest, and Pickle routed manifests for `GET` and `PUT` but not `HEAD`. The answer was 405, which crane treats as fatal. So "crane push works" had been false twice over: once for credentials and once for a missing verb. containerd asks the same question. The fix is a `manifest_head` that returns the `GET`'s status and headers, with the exact `Content-Length`, and no body.
+
+That's why the crane test exists at all. The spec says a registry "MUST" support manifest `HEAD`, and we could have read that sentence a dozen times and still missed that we didn't. A real client doesn't miss it.
+
+The honest limits for 0.1.0 are in the manual and design doc. Basic-auth clients need a TLS listener, which a cluster node with an identity has and a plaintext node doesn't. Node certificates name the node rather than an address, so a hostname-verifying client has to reach the registry by the node's name and trust the cluster root CA. And a loopback-only TLS listener answers docker's anonymous probe with 200, so docker never learns to send credentials there. Clustered listeners are routable, so that last one only bites hand-built setups.
+
 ## Tests
 
 Pickle is almost entirely testable in-process. A blob store is a directory, the OCI API is an axum router, and the catalog is a `Vec` — none of that needs the internet or another node. So the default suite spins up a Pickle server in the test, pushes a manifest and its blobs, then pulls them back, all without leaving the process.
@@ -879,6 +951,7 @@ The 104 tests in `src/pickle/` cover:
 - **Digest and manifest** — `Digest::new` accepts well-formed digests and rejects everything else; manifests round-trip through serde unchanged.
 - **Blob store** — write/read, upload sessions, and the digest-mismatch rejection path (`PickleError::DigestMismatch`).
 - **OCI API** — `full_push_pull_round_trip` drives the real `/v2/` handlers end to end against an in-process server; plus the not-found paths (`blob_head_not_found`, `manifest_get_not_found`) that must return the right status codes. The manifest-validation contract gets a rejection matrix: invalid JSON, missing or unknown media type, size mismatch, malformed descriptor digest, missing referenced blob, and a happy path asserting the GET returns byte-identical bytes.
+- **Standard clients** — a Deployer token as a Basic password over TLS pushes (`deployer_token_as_basic_password_over_tls_may_push`), a ReadOnly one is forbidden, an unknown one gets a 401 with a fresh `Basic` challenge, and a valid token over plaintext is still refused (`basic_credentials_over_plaintext_are_refused_even_with_a_valid_token`). `tests/suite/registry_standard_clients.rs` repeats the push through the real TLS listener, and its ignored `crane` test runs with `cargo nextest run --test suite --run-ignored=only -E 'test(crane)'` on a machine with crane installed.
 - **Garbage collection** — the safety rails get a test each: `gc_protects_sole_copy`, `gc_protects_active_deployment_images`, `gc_protects_tagged_manifest_layers`, `gc_protects_within_retention_window`, and the positive case `gc_collects_unreferenced_blob`. These are the tests that let you trust GC won't eat your last copy of a layer. `gc_never_nominates_a_catalogued_manifests_own_blob` pins the REG1 fix, and `tests/suite/pickle_integrity.rs` runs the full push → GC → peer-pull acceptance sequence against real in-process registries.
 
 ### Hermetic protocol tests, provisioned runtime tests

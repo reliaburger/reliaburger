@@ -257,12 +257,13 @@ fn buildah_push_args(local_tag: &str, tls_verify: bool) -> Vec<String> {
 /// image layout directory (`oci:{dir}:{tag}`) instead of pushing to a
 /// `docker://` registry (B1).
 ///
-/// Pickle authorises registry writes with the internal service token presented
-/// as a *bearer*; `buildah push` can only offer `--creds` (HTTP Basic), which
-/// Pickle does not accept and never challenges for — so a clustered `docker://`
-/// push simply 401s. The clustered runner uses this command to write a local
-/// layout, then uploads it to the registry through the bearer-carrying client.
-/// A local layout export needs no TLS and no credentials.
+/// Pickle authorises the runner's registry writes with the internal service
+/// token. `buildah push` can only offer it through `--creds` (HTTP Basic),
+/// which Pickle refuses on a plaintext listener and which would put the
+/// service token on buildah's command line, readable by anything that can list
+/// processes. So the clustered runner uses this command to write a local
+/// layout, then uploads it through the registry client that carries the token
+/// as a bearer header. A local layout export needs no TLS and no credentials.
 pub fn buildah_push_to_oci_args(local_tag: &str, oci_layout_dir: &str, tag: &str) -> Vec<String> {
     vec![
         "buildah".to_string(),
@@ -315,12 +316,12 @@ pub fn context_upload_url_at(scheme: &str, address: &str, digest: &str) -> Strin
 // ---------------------------------------------------------------------------
 // OCI image-layout upload (B1)
 //
-// A clustered `buildah push` to `docker://` cannot authenticate — Pickle
-// authorises writes by the internal service token as a *bearer*, and buildah
-// only offers `--creds` (HTTP Basic), which Pickle never accepts and never
-// challenges for. So the runner exports the image to a local OCI layout and
-// uploads it to the local registry through the bearer-carrying registry
-// client. These helpers build the registry URLs and read the layout's index.
+// A clustered `buildah push` to `docker://` could only authenticate with
+// `--creds` (HTTP Basic): refused on a plaintext registry, and over TLS it
+// would expose the service token in buildah's argv. So the runner exports the
+// image to a local OCI layout and uploads it to the local registry through
+// the bearer-carrying registry client. These helpers build the registry URLs
+// and read the layout's index.
 // ---------------------------------------------------------------------------
 
 /// The monolithic-blob upload URL for the local registry: a single `POST`

@@ -15,7 +15,7 @@ Core capabilities:
 - **Asynchronous, eventual replication.** A push stores the blobs locally, commits the manifest to Raft, and returns `201 Created` with an `oci-replication: pending` header. It does **not** block on replication. A leader-only heal loop (running roughly every 60s) then copies layers to peer nodes until the configured `redundancy` is met. `redundancy` counts the pushing node itself, so the default of 2 means two total copies — the pusher plus one peer. A freshly pushed image is therefore not guaranteed to survive the immediate loss of the pushing node until the heal loop has run at least once.
 - **P2P layer distribution.** OCI images are composed of content-addressed layers. Pickle downloads different layers from different peer nodes simultaneously (BitTorrent-like fan-out), bounding load on any single node and decreasing total deployment time as cluster size increases.
 - **Pull-through cache.** For images from external registries (Docker Hub, GHCR, ECR), Pickle acts as a transparent pull-through cache. The first node to need an external image pulls it from upstream; every subsequent node pulls from the peer cache.
-- **OCI Distribution API.** Any OCI-compatible tool works: `docker push`, `crane push`, `buildah push`, etc.
+- **OCI Distribution API.** Stock OCI clients push and pull over the standard `/v2/` API. What a client needs depends on the listener (see §1.2): `relish build` and peer replication send an API token as a bearer; `docker`, `crane` and other Basic-auth clients log in with an API token as the password, over TLS only.
 - **Integrated image signing.** Keyless signing via workload identity (Sigstore/cosign compatible), with optional enforcement that unsigned images are unschedulable.
 - **Build job integration.** Build jobs push directly to Pickle via the `pickle://` URI scheme through a scoped Unix socket, eliminating the need for Docker-in-Docker or external CI registries.
 
@@ -37,6 +37,45 @@ on loopback by default.
 state, redundancy target, active membership count and under-replicated layer count. Phase
 15 diagnostics must use those live fields. They must not infer redundancy from configuration
 or turn an impossible target into a green skip.
+
+### 1.2 Client authentication
+
+Pickle has one authorisation path: a Reliaburger API token (or, for peers, the internal
+service token), checked for at least the `Deployer` role on writes and for any valid token
+on routable reads. Clients reach it in one of two envelopes:
+
+- **Bearer.** `Authorization: Bearer <token>`. `relish`, the build runner and peer
+  replication use it. Accepted over TLS and plaintext.
+- **HTTP Basic.** `Authorization: Basic base64(<anything>:<token>)`, which is what
+  `docker login`/`docker push`, `crane`, `podman`, `skopeo` and `oras` send. The password
+  is the API token; the username is ignored. Accepted **only on a TLS connection**: the
+  TLS listener tags each request, and a Basic header on an untagged (plaintext) request is
+  refused with 401 even when the token is good. A Basic credential over TLS is rewritten
+  to the equivalent bearer before any handler runs, so role, repository and lease checks
+  are the bearer path's, unchanged.
+
+Every 401 from a TLS listener carries `WWW-Authenticate: Basic realm="reliaburger"`, which
+is what makes docker offer its stored credential. Plaintext 401s carry no challenge.
+Pickle does not implement the Docker token service (`WWW-Authenticate: Bearer realm=…`):
+every client above speaks Basic, and a token service would add a second credential type
+with nothing to gain over the API token it would be exchanged for.
+
+What works where, in 0.1.0:
+
+| Listener | Bearer clients (`relish build`) | Basic clients (docker, crane) |
+|----------|--------------------------------|-------------------------------|
+| Standalone, loopback, no API token yet | open (bootstrap window) | anonymous push works; Basic refused |
+| Standalone, loopback, tokens exist | token | refused: plaintext |
+| Cluster with node identity (TLS, routable) | token | `docker login` / `crane auth login` with a token |
+| Cluster without node identity (plaintext) | token | refused: plaintext |
+
+Node certificates name the node (its node id), not an IP address or `localhost`, so a
+client that verifies hostnames (docker, crane) must reach the registry by the node's name
+and trust the cluster root CA. On the laptop quickstart that means an `/etc/hosts` entry
+for node 1's name pointing at `127.0.0.1` and the port forward on `15050`. A loopback-only
+TLS listener answers anonymous `GET /v2/` with 200, so docker (which only offers
+credentials after a challenge on that probe) can't push to one; clustered listeners are
+routable, so this only affects hand-built configurations.
 
 ---
 
@@ -82,7 +121,7 @@ Push is a local, synchronous commit followed by asynchronous replication. The
 receiving node never blocks on peers.
 
 ```
-Client (docker push / crane push / build job)
+Client (docker push / crane push over TLS, relish build)
   │
   ▼
 [1] OCI Distribution API endpoint on receiving node (Bun HTTP server)
@@ -1268,7 +1307,7 @@ Traditional container registries (Docker Hub, GitHub Container Registry, Amazon 
 
 **Reference:** [OCI Distribution Spec](https://github.com/opencontainers/distribution-spec)
 
-Pickle implements the OCI Distribution Specification for API compatibility. Any tool that speaks this protocol (docker, crane, buildah, podman, skopeo, oras) works with Pickle without modification.
+Pickle implements the push and pull subset of the OCI Distribution Specification (blob `HEAD`/`GET`, monolithic and chunked uploads, manifest `HEAD`/`GET`/`PUT`, tag listing). Tools that speak it (docker, crane, buildah, podman, skopeo, oras) work without modification, subject to the authentication rules in §1.2: Basic-auth clients need a TLS listener and an API token. `crane` is exercised end to end by `tests/suite/registry_standard_clients.rs`. Not implemented: manifest and blob `DELETE`, cross-repository mounts (a `mount` request falls back to an ordinary upload, as the spec allows), the referrers API and the catalogue endpoint.
 
 ---
 

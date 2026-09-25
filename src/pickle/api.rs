@@ -560,7 +560,110 @@ pub fn router(state: PickleState) -> Router {
                 }
             },
         ))
+        .layer(axum::middleware::from_fn(standard_client_credentials))
         .with_state(state)
+}
+
+/// The challenge a TLS registry sends with every 401, so `docker login`,
+/// `docker push` and `crane` know to offer the credential they hold.
+const BASIC_CHALLENGE: &str = r#"Basic realm="reliaburger""#;
+
+/// What an `Authorization: Basic …` header carried, if it was one.
+enum BasicCredential {
+    /// No header, or a scheme other than Basic (a bearer is left alone).
+    Absent,
+    /// The password half of `username:password`: a Reliaburger API token.
+    Token(String),
+    /// A Basic header that doesn't decode to `username:password`.
+    Malformed,
+}
+
+/// Read an HTTP Basic credential. The username is ignored: stock clients
+/// insist on one, but the token alone identifies the principal, so it
+/// carries no authority and checking it would only add a way to get it wrong.
+fn basic_credential(headers: &HeaderMap) -> BasicCredential {
+    use base64::Engine;
+    let Some(value) = headers.get(axum::http::header::AUTHORIZATION) else {
+        return BasicCredential::Absent;
+    };
+    let Some((scheme, encoded)) = value.to_str().ok().and_then(|v| v.split_once(' ')) else {
+        return BasicCredential::Absent;
+    };
+    // RFC 9110 makes the scheme name case-insensitive.
+    if !scheme.eq_ignore_ascii_case("basic") {
+        return BasicCredential::Absent;
+    }
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded.trim())
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok());
+    match decoded.as_deref().and_then(|pair| pair.split_once(':')) {
+        Some((_username, password)) if !password.is_empty() => {
+            BasicCredential::Token(password.to_string())
+        }
+        _ => BasicCredential::Malformed,
+    }
+}
+
+/// Let stock OCI clients authenticate the way they know how (HTTP Basic),
+/// without giving the registry a second authorisation path.
+///
+/// Over TLS, a Basic credential whose password is an API token is rewritten
+/// to the equivalent `Bearer` header before any handler sees it, so every
+/// role, repository and lease check below runs exactly as it does for relish
+/// and peer replication. Over plaintext, Basic is refused outright, even with
+/// a good token and even where the read would be open: accepting it would
+/// teach clients that sending the token in the clear works. TLS 401s carry a
+/// `WWW-Authenticate: Basic` challenge; plaintext ones never do.
+async fn standard_client_credentials(
+    mut request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let over_tls = request
+        .extensions()
+        .get::<crate::sesame::connection::TlsTransport>()
+        .is_some();
+    let credential = basic_credential(request.headers());
+    if !over_tls && !matches!(credential, BasicCredential::Absent) {
+        return oci_error(
+            StatusCode::UNAUTHORIZED,
+            "UNAUTHORIZED",
+            "HTTP Basic credentials are only accepted over TLS".to_string(),
+        );
+    }
+    match credential {
+        BasicCredential::Absent => {}
+        BasicCredential::Token(token) => {
+            let Ok(bearer) = axum::http::HeaderValue::from_str(&format!("Bearer {token}")) else {
+                return basic_challenge(malformed_basic());
+            };
+            request
+                .headers_mut()
+                .insert(axum::http::header::AUTHORIZATION, bearer);
+        }
+        BasicCredential::Malformed => return basic_challenge(malformed_basic()),
+    }
+    let response = next.run(request).await;
+    if over_tls && response.status() == StatusCode::UNAUTHORIZED {
+        return basic_challenge(response);
+    }
+    response
+}
+
+fn malformed_basic() -> Response {
+    oci_error(
+        StatusCode::UNAUTHORIZED,
+        "UNAUTHORIZED",
+        "malformed HTTP Basic credentials".to_string(),
+    )
+}
+
+fn basic_challenge(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        axum::http::header::WWW_AUTHENTICATE,
+        axum::http::HeaderValue::from_static(BASIC_CHALLENGE),
+    );
+    response
 }
 
 /// The parsed shape of an OCI `/v2/{name}/…` request.
@@ -722,6 +825,9 @@ async fn dispatch_v2(
         }
         (Method::GET, V2Route::Manifest { name, reference }) => {
             manifest_get(&state, &name, &reference).await
+        }
+        (Method::HEAD, V2Route::Manifest { name, reference }) => {
+            manifest_head(&state, &name, &reference).await
         }
         (Method::GET, V2Route::Tags { name }) => tags_list(&state, &name).await,
         _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
@@ -1508,6 +1614,25 @@ async fn manifest_get(state: &PickleState, name: &str, reference: &str) -> Respo
         .header("docker-content-digest", digest.as_str())
         .body(axum::body::Body::from(data))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// `HEAD /v2/{name}/manifests/{reference}` — does a manifest exist?
+///
+/// The GET's status and headers with the body dropped. `crane` and
+/// containerd ask this before every manifest push and pull, and treat any
+/// answer but 200 or 404 as fatal, so a registry without it can't take a push
+/// from them at all.
+async fn manifest_head(state: &PickleState, name: &str, reference: &str) -> Response {
+    let (mut parts, body) = manifest_get(state, name, reference).await.into_parts();
+    if parts.status == StatusCode::OK
+        && let Some(length) = axum::body::HttpBody::size_hint(&body).exact()
+    {
+        parts.headers.insert(
+            axum::http::header::CONTENT_LENGTH,
+            axum::http::HeaderValue::from(length),
+        );
+    }
+    Response::from_parts(parts, axum::body::Body::empty())
 }
 
 /// Detect the correct content-type for a manifest blob.
@@ -3532,6 +3657,242 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
+    // --- Standard clients: HTTP Basic over TLS -----------------------------
+
+    /// A routable registry holding one Deployer and one ReadOnly token.
+    /// Returns `(state, dir, deployer, reader)`.
+    async fn standard_client_state() -> (PickleState, tempfile::TempDir, String, String) {
+        use crate::sesame::types::{ApiRole, TokenScope};
+        let (mut state, dir) = test_state();
+        let deployer = crate::sesame::token::create_token(
+            "ci",
+            ApiRole::Deployer,
+            TokenScope::default(),
+            None,
+        )
+        .unwrap();
+        let reader = crate::sesame::token::create_token(
+            "puller",
+            ApiRole::ReadOnly,
+            TokenScope::default(),
+            None,
+        )
+        .unwrap();
+        let tokens = crate::sesame::auth::new_token_store();
+        tokens.write().await.push(deployer.token);
+        tokens.write().await.push(reader.token);
+        state.auth = Some(crate::sesame::auth::AuthState::new(tokens, None));
+        state.require_read_auth = true;
+        state.allow_unauthenticated_bootstrap = false;
+        (state, dir, deployer.plaintext, reader.plaintext)
+    }
+
+    fn basic(username: &str, password: &str) -> String {
+        use base64::Engine;
+        let encoded =
+            base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"));
+        format!("Basic {encoded}")
+    }
+
+    /// Build a request, optionally as if it arrived on a TLS connection.
+    fn client_request(
+        method: &str,
+        uri: &str,
+        authorization: Option<&str>,
+        over_tls: bool,
+    ) -> axum::http::Request<Body> {
+        let mut builder = axum::http::Request::builder().method(method).uri(uri);
+        if let Some(value) = authorization {
+            builder = builder.header("authorization", value);
+        }
+        let mut request = builder.body(Body::empty()).unwrap();
+        if over_tls {
+            request
+                .extensions_mut()
+                .insert(crate::sesame::connection::TlsTransport);
+        }
+        request
+    }
+
+    fn challenge(response: &Response) -> Option<String> {
+        response
+            .headers()
+            .get("www-authenticate")
+            .map(|value| value.to_str().unwrap().to_string())
+    }
+
+    /// `docker login` probes `GET /v2/` with the stored credential; a
+    /// Deployer token as the Basic password must answer 200.
+    #[tokio::test]
+    async fn docker_login_probe_with_a_basic_token_over_tls_succeeds() {
+        let (state, _dir, deployer, _reader) = standard_client_state().await;
+        let app = test_router(state);
+        let auth = basic("anyone", &deployer);
+        let response = app
+            .oneshot(client_request("GET", "/v2/", Some(&auth), true))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// Without a challenge, docker never offers the credentials it holds.
+    /// An anonymous probe over TLS must say `Basic`.
+    #[tokio::test]
+    async fn anonymous_probe_over_tls_is_challenged_for_basic_credentials() {
+        let (state, _dir, _deployer, _reader) = standard_client_state().await;
+        let app = test_router(state);
+        let response = app
+            .oneshot(client_request("GET", "/v2/", None, true))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            challenge(&response).as_deref(),
+            Some(r#"Basic realm="reliaburger""#)
+        );
+    }
+
+    #[tokio::test]
+    async fn deployer_token_as_basic_password_over_tls_may_push() {
+        let (state, _dir, deployer, _reader) = standard_client_state().await;
+        let app = test_router(state);
+        let auth = basic("ci", &deployer);
+        let response = app
+            .oneshot(client_request(
+                "POST",
+                "/v2/team/api/blobs/uploads/",
+                Some(&auth),
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+
+    /// The role bar is the bearer path's, unchanged: a ReadOnly token may pull
+    /// but not push, whichever envelope it arrives in.
+    #[tokio::test]
+    async fn readonly_token_as_basic_password_is_forbidden_to_push() {
+        let (state, _dir, _deployer, reader) = standard_client_state().await;
+        let app = test_router(state);
+        let auth = basic("puller", &reader);
+        let response = app
+            .clone()
+            .oneshot(client_request(
+                "POST",
+                "/v2/team/api/blobs/uploads/",
+                Some(&auth),
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let response = app
+            .oneshot(client_request(
+                "GET",
+                "/v2/team/api/tags/list",
+                Some(&auth),
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_ne!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn unknown_token_as_basic_password_is_unauthorised_and_rechallenged() {
+        let (state, _dir, _deployer, _reader) = standard_client_state().await;
+        let app = test_router(state);
+        let auth = basic("ci", "rbrg_not_a_real_token");
+        let response = app
+            .oneshot(client_request(
+                "POST",
+                "/v2/team/api/blobs/uploads/",
+                Some(&auth),
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(challenge(&response).is_some_and(|value| value.starts_with("Basic ")));
+    }
+
+    #[tokio::test]
+    async fn malformed_basic_credentials_are_unauthorised() {
+        let (state, _dir, _deployer, _reader) = standard_client_state().await;
+        let app = test_router(state);
+        for header in ["Basic !!!not-base64", "Basic bm9jb2xvbg=="] {
+            let response = app
+                .clone()
+                .oneshot(client_request("GET", "/v2/", Some(header), true))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{header}");
+        }
+    }
+
+    /// Basic credentials in the clear are refused even when the token is
+    /// good, and even for a read the loopback listener would serve anyone.
+    #[tokio::test]
+    async fn basic_credentials_over_plaintext_are_refused_even_with_a_valid_token() {
+        let (mut state, _dir, deployer, _reader) = standard_client_state().await;
+        state.require_read_auth = false;
+        let app = test_router(state);
+        let auth = basic("ci", &deployer);
+        for (method, uri) in [("GET", "/v2/"), ("POST", "/v2/team/api/blobs/uploads/")] {
+            let response = app
+                .clone()
+                .oneshot(client_request(method, uri, Some(&auth), false))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {uri}"
+            );
+            assert!(challenge(&response).is_none(), "{method} {uri}");
+            let body = String::from_utf8(body_bytes(response).await).unwrap();
+            assert!(body.contains("only accepted over TLS"), "{body}");
+        }
+    }
+
+    /// A plaintext listener never invites Basic: advertising it would ask
+    /// clients to send their token in the clear.
+    #[tokio::test]
+    async fn plaintext_refusals_carry_no_basic_challenge() {
+        let (state, _dir, _deployer, _reader) = standard_client_state().await;
+        let app = test_router(state);
+        let response = app
+            .oneshot(client_request("GET", "/v2/", None, false))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(challenge(&response).is_none());
+    }
+
+    /// Bearer clients (relish, peer replication) are untouched by the
+    /// Basic support, over either transport.
+    #[tokio::test]
+    async fn bearer_tokens_keep_working_over_both_transports() {
+        let (state, _dir, deployer, _reader) = standard_client_state().await;
+        let app = test_router(state);
+        let auth = format!("Bearer {deployer}");
+        for over_tls in [false, true] {
+            let response = app
+                .clone()
+                .oneshot(client_request(
+                    "POST",
+                    "/v2/team/api/blobs/uploads/",
+                    Some(&auth),
+                    over_tls,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::ACCEPTED, "tls={over_tls}");
+        }
+    }
+
     async fn body_bytes(response: Response) -> Vec<u8> {
         response
             .into_body()
@@ -3707,8 +4068,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+        let manifest_digest = resp.headers()["docker-content-digest"].clone();
         let manifest_body = body_bytes(resp).await;
         assert!(!manifest_body.is_empty());
+
+        // `crane` and containerd HEAD a manifest before pushing or pulling
+        // it; a 405 here aborts the whole push.
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("HEAD")
+                    .uri("/v2/myapp/manifests/latest")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()["docker-content-digest"], manifest_digest);
+        assert_eq!(
+            resp.headers()["content-length"],
+            manifest_body.len().to_string().as_str()
+        );
+        assert!(body_bytes(resp).await.is_empty());
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("HEAD")
+                    .uri("/v2/myapp/manifests/missing")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
         // Pull layer blob back
         let resp = app
