@@ -316,6 +316,12 @@ impl VolumeManager {
             });
         }
 
+        // A fresh ext4 filesystem has `lost+found`, so the app would not see
+        // an empty volume. Redis's entrypoint then refuses to take its data
+        // directory over and Postgres's initdb refuses to run. e2fsck makes a
+        // new one if it ever needs it.
+        std::fs::remove_dir(path.join("lost+found"))?;
+
         Ok(())
     }
 
@@ -1100,6 +1106,8 @@ mod tests {
             vm.backend_of(&path),
             Some(crate::grill::btrfs::VolumeBackend::LoopMount)
         );
+        // Images like Redis and Postgres expect a new volume to be empty.
+        assert_eq!(std::fs::read_dir(&path).unwrap().count(), 0);
         std::fs::write(path.join("acknowledged"), b"36318").unwrap();
         // What a reboot leaves behind: the image, unmounted.
         run_cmd("umount", &[path.to_str().unwrap()]);

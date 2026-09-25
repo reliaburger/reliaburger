@@ -208,6 +208,8 @@ On Linux, managed volumes with a size limit get a loop-mounted ext4 filesystem. 
 
 A mount is kernel state, though, and kernel state doesn't survive a reboot. We only mounted the image when the volume was first created. The V02 soak stopped and started the whole cluster, and the writer app came back to an empty `/data`: its image sat unmounted beside a bare directory, the container wrote into that directory on the root filesystem (with no size limit at all), and 36,318 acknowledged lines were hidden rather than lost. Provisioning an existing loop volume now mounts its image again when it isn't mounted. If something already wrote into the bare mountpoint, it refuses and says so, because mounting over those files would hide them just as quietly.
 
+The same soak found a smaller trap in a new loop volume. `mkfs.ext4` leaves `lost+found` behind, so the app never sees an empty directory. The official Redis entrypoint only takes over its data directory when it holds nothing but `*.rdb` files and `appendonlydir`; anything else and it prints a notice, drops to the `redis` user and fails with "Permission denied". Postgres's `initdb` flatly refuses a non-empty directory. We remove `lost+found` right after mounting, so a new volume looks exactly like a Docker volume does. `e2fsck` makes a fresh one if it ever needs it.
+
 On macOS, there's no loop mount. Reliaburger creates a plain directory and logs a warning. Size limits are soft-only on macOS. This is a development convenience, not a production limitation — production clusters run Linux.
 
 ## Whose volume is it?

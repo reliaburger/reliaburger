@@ -91,7 +91,6 @@ pub async fn unmount_bundle(bundle: PathBuf) -> Result<(), RootfsError> {
 }
 
 /// Whether `path` is an exact mountpoint in the current mount namespace.
-#[cfg(test)]
 pub fn is_mountpoint(path: &Path) -> bool {
     let Ok(target) = std::fs::canonicalize(path) else {
         return false;
@@ -258,7 +257,6 @@ fn unmount_strict(path: &Path) -> Result<(), RootfsError> {
     }
 }
 
-#[cfg(test)]
 fn decode_mountinfo_path(encoded: &str) -> PathBuf {
     let bytes = encoded.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
