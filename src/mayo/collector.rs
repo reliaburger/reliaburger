@@ -157,6 +157,40 @@ impl SystemCollector {
         metrics
     }
 
+    /// Ask the agent which instances it runs and collect their per-process
+    /// metrics (see [`Self::collect_instance_metrics`]).
+    ///
+    /// This is the per-app half of Bun's collection loop, kept here so the
+    /// cluster tests drive the same code that feeds the autoscaler in
+    /// production. Returns an empty vec when the agent doesn't answer.
+    pub async fn collect_agent_instance_metrics(
+        &self,
+        agent: &tokio::sync::mpsc::Sender<crate::bun::agent::AgentCommand>,
+        node: &str,
+    ) -> Vec<CollectedMetric> {
+        let (response, statuses) = tokio::sync::oneshot::channel();
+        if agent
+            .send(crate::bun::agent::AgentCommand::Status { response })
+            .await
+            .is_err()
+        {
+            return Vec::new();
+        }
+        let Ok(statuses) = statuses.await else {
+            return Vec::new();
+        };
+        let instances: Vec<InstanceProcess<'_>> = statuses
+            .iter()
+            .map(|s| InstanceProcess {
+                pid: s.pid,
+                namespace: &s.namespace,
+                app: &s.app_name,
+                instance: &s.id,
+            })
+            .collect();
+        self.collect_instance_metrics(&instances, node)
+    }
+
     /// Collect per-process metrics for a given PID.
     ///
     /// Returns an empty vec if the process doesn't exist.

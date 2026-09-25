@@ -1743,28 +1743,13 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                     // with a PID, labelled `namespace/app`. Without this only
                     // node-level metrics existed, so the autoscaler and the
                     // per-app dashboards had no signal. The labelling itself
-                    // lives in `collect_instance_metrics` so it's unit-tested.
-                    let (status_tx, status_rx) = tokio::sync::oneshot::channel();
-                    if collection_cmd_tx
-                        .send(reliaburger::bun::agent::AgentCommand::Status { response: status_tx })
-                        .await
-                        .is_ok()
-                        && let Ok(statuses) = status_rx.await
-                    {
-                        let instances: Vec<reliaburger::mayo::collector::InstanceProcess<'_>> =
-                            statuses
-                                .iter()
-                                .map(|s| reliaburger::mayo::collector::InstanceProcess {
-                                    pid: s.pid,
-                                    namespace: &s.namespace,
-                                    app: &s.app_name,
-                                    instance: &s.id,
-                                })
-                                .collect();
-                        samples.extend(
-                            collector.collect_instance_metrics(&instances, &collection_node),
-                        );
-                    }
+                    // lives in `collect_instance_metrics` so it's unit-tested,
+                    // and the cluster tests drive this same call.
+                    samples.extend(
+                        collector
+                            .collect_agent_instance_metrics(&collection_cmd_tx, &collection_node)
+                            .await,
+                    );
 
                     // Ingress metrics (E): fold the wrapper's process-global
                     // request counters into the same time series.

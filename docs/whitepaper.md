@@ -218,7 +218,7 @@ metric = "cpu"
 target = "70%"
 ```
 
-The leader makes scaling decisions locally based on Mayo metrics. The Lettuce GitOps engine treats autoscaler adjustments as runtime overrides (see Section 14).
+`metric` is `"cpu"` or `"memory"`, and `target` is utilisation of each replica's request, the Kubernetes HPA convention (an app with no CPU request is measured against one core; memory scaling requires a memory request). The leader makes scaling decisions locally based on the per-instance CPU and memory Mayo records. The Lettuce GitOps engine treats autoscaler adjustments as runtime overrides (see Section 14).
 
 **Init containers:** Apps support init containers via an `[[app.web.init]]` block that runs before the main container starts, used for database migrations, config generation, or dependency checks.
 

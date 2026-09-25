@@ -1,22 +1,85 @@
 //! Autoscaling controller.
 //!
 //! Runs on the Raft leader, evaluates apps with `AutoscaleSpec` every
-//! evaluation interval. Queries Mayo for average metric utilisation,
-//! computes a desired replica count with hysteresis and cooldown, and
-//! writes `AutoscaleOverride` to persist the decision.
+//! evaluation interval. Queries Mayo for the average per-instance usage,
+//! turns it into utilisation of the app's resource request, computes a
+//! desired replica count with hysteresis and cooldown, and writes
+//! `AutoscaleOverride` to persist the decision.
+//!
+//! Utilisation follows the Kubernetes HPA convention: `target = "50%"`
+//! on `cpu` means "each replica uses, on average, half the CPU it
+//! requested". An app with no CPU request is measured against one whole
+//! core instead. Memory has no such natural unit, so scaling on memory
+//! without a memory request is refused at config validation.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::time::{Duration, Instant};
 
 use crate::config::app::AutoscaleSpec;
+use crate::config::types::ResourceRange;
 use crate::meat::types::AppId;
+
+/// One whole core in `process_cpu_percent` units: what CPU utilisation is
+/// measured against when the app declares no CPU request.
+pub const ONE_CORE_PERCENT: f64 = 100.0;
+
+/// The resource an `[autoscale]` block scales on.
+///
+/// Each variant maps to a per-instance series the node collector
+/// (`mayo::collector`) really records, labelled `app = "<namespace>/<app>"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoscaleMetric {
+    /// CPU, measured against the app's `cpu` request.
+    Cpu,
+    /// Resident memory, measured against the app's `memory` request.
+    Memory,
+}
+
+impl AutoscaleMetric {
+    /// Parse the `[autoscale] metric` value. Only `cpu` and `memory` are
+    /// supported; anything else would query a series nobody records.
+    pub fn parse(name: &str) -> Result<Self, AutoscaleConfigError> {
+        match name {
+            "cpu" => Ok(Self::Cpu),
+            "memory" => Ok(Self::Memory),
+            other => Err(AutoscaleConfigError::UnsupportedMetric {
+                metric: other.to_string(),
+            }),
+        }
+    }
+
+    /// The Mayo series the collector records for this resource.
+    ///
+    /// `process_cpu_percent` is percent of ONE core (a process saturating
+    /// two cores reads 200), and `process_memory_bytes` is resident bytes.
+    pub fn series_name(self) -> &'static str {
+        match self {
+            Self::Cpu => "process_cpu_percent",
+            Self::Memory => "process_memory_bytes",
+        }
+    }
+}
+
+impl fmt::Display for AutoscaleMetric {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Cpu => write!(f, "cpu"),
+            Self::Memory => write!(f, "memory"),
+        }
+    }
+}
 
 /// Parsed autoscale configuration with defaults applied.
 #[derive(Debug, Clone)]
 pub struct AutoscaleConfig {
-    /// Metric name (e.g. "cpu", "memory").
-    pub metric: String,
-    /// Target utilisation as a fraction (e.g. 0.70 for 70%).
+    /// Resource to scale on.
+    pub metric: AutoscaleMetric,
+    /// Per-replica request in the series' own unit (percent of one core
+    /// for CPU, bytes for memory). Always positive; one core
+    /// ([`ONE_CORE_PERCENT`]) when CPU scaling has no CPU request.
+    pub request: f64,
+    /// Target utilisation of the request as a fraction (0.70 for 70%).
     pub target: f64,
     /// Minimum replica count.
     pub min: u32,
@@ -48,14 +111,44 @@ pub enum AutoscaleConfigError {
     ZeroDuration { field: &'static str },
     #[error("autoscale scale_down_threshold ({value}) must be between 0 and 1")]
     InvalidThreshold { value: f64 },
+    #[error("autoscale metric {metric:?} is not supported; use \"cpu\" or \"memory\"")]
+    UnsupportedMetric { metric: String },
+    #[error(
+        "autoscale on memory needs a non-zero memory request on the app \
+         (e.g. memory = \"128Mi-512Mi\"): utilisation is measured against it"
+    )]
+    MissingMemoryRequest,
 }
 
 impl AutoscaleConfig {
-    /// Parse and validate from an `AutoscaleSpec`, applying defaults for
-    /// optional fields. Rejects `min > max`, a zero max, unparseable or
-    /// zero windows/cooldowns, and an out-of-range hysteresis threshold —
-    /// an invalid block is an error, never a silent clamp (DEP8).
-    pub fn from_spec(spec: &AutoscaleSpec) -> Result<Self, AutoscaleConfigError> {
+    /// Parse and validate from an `AutoscaleSpec` plus the app's `cpu` and
+    /// `memory` ranges, applying defaults for optional fields. Rejects an
+    /// unsupported metric, a missing or zero request for the chosen
+    /// metric, `min > max`, a zero max, unparseable or zero
+    /// windows/cooldowns, and an out-of-range hysteresis threshold. An
+    /// invalid block is an error, never a silent clamp or a silent no-op.
+    pub fn from_spec(
+        spec: &AutoscaleSpec,
+        cpu: Option<ResourceRange>,
+        memory: Option<ResourceRange>,
+    ) -> Result<Self, AutoscaleConfigError> {
+        let metric = AutoscaleMetric::parse(&spec.metric)?;
+        let request = match metric {
+            // Millicores to percent of one core: 1000m = 100%. With no CPU
+            // request, measure against one whole core. ProcessGrill and
+            // rootless nodes refuse apps that declare cpu at all (they can't
+            // enforce the limit), so refusing here would make CPU autoscaling
+            // impossible on them.
+            AutoscaleMetric::Cpu => cpu
+                .map(|range| range.request as f64 / 10.0)
+                .filter(|request| *request > 0.0)
+                .unwrap_or(ONE_CORE_PERCENT),
+            // Memory has no natural unit to fall back on, so it needs a request.
+            AutoscaleMetric::Memory => memory
+                .map(|range| range.request as f64)
+                .filter(|request| *request > 0.0)
+                .ok_or(AutoscaleConfigError::MissingMemoryRequest)?,
+        };
         let target =
             parse_percentage(&spec.target).ok_or_else(|| AutoscaleConfigError::InvalidTarget {
                 target: spec.target.clone(),
@@ -86,7 +179,8 @@ impl AutoscaleConfig {
             });
         }
         Ok(Self {
-            metric: spec.metric.clone(),
+            metric,
+            request,
             target,
             min: spec.min,
             max: spec.max,
@@ -94,6 +188,14 @@ impl AutoscaleConfig {
             cooldown,
             scale_down_threshold,
         })
+    }
+
+    /// Utilisation of the per-replica request, as a fraction, given the
+    /// average per-instance value of [`AutoscaleMetric::series_name`].
+    /// 1.0 means "using exactly what it asked for"; it can exceed 1.0
+    /// because a request isn't a limit.
+    pub fn utilisation(&self, series_value: f64) -> f64 {
+        series_value / self.request
     }
 }
 
@@ -285,9 +387,33 @@ fn parse_duration(s: &str) -> Option<Duration> {
 mod tests {
     use super::*;
 
+    /// 500 millicores: half a core.
+    const CPU_REQUEST: Option<ResourceRange> = Some(ResourceRange {
+        request: 500,
+        limit: 1000,
+    });
+    /// 256 MiB.
+    const MEMORY_REQUEST: Option<ResourceRange> = Some(ResourceRange {
+        request: 256 * 1024 * 1024,
+        limit: 512 * 1024 * 1024,
+    });
+
+    fn cpu_spec() -> AutoscaleSpec {
+        AutoscaleSpec {
+            metric: "cpu".to_string(),
+            target: "50%".to_string(),
+            min: 1,
+            max: 5,
+            evaluation_window: None,
+            cooldown: None,
+            scale_down_threshold: None,
+        }
+    }
+
     fn test_config() -> AutoscaleConfig {
         AutoscaleConfig {
-            metric: "cpu".to_string(),
+            metric: AutoscaleMetric::Cpu,
+            request: 50.0,
             target: 0.70,
             min: 2,
             max: 10,
@@ -486,7 +612,7 @@ mod tests {
             cooldown: None,
             scale_down_threshold: None,
         };
-        let config = AutoscaleConfig::from_spec(&spec).unwrap();
+        let config = AutoscaleConfig::from_spec(&spec, CPU_REQUEST, MEMORY_REQUEST).unwrap();
         assert_eq!(config.target, 0.70);
         assert_eq!(config.evaluation_window, Duration::from_secs(300));
         assert_eq!(config.cooldown, Duration::from_secs(180));
@@ -505,7 +631,7 @@ mod tests {
             scale_down_threshold: None,
         };
         assert_eq!(
-            AutoscaleConfig::from_spec(&spec).unwrap_err(),
+            AutoscaleConfig::from_spec(&spec, CPU_REQUEST, MEMORY_REQUEST).unwrap_err(),
             AutoscaleConfigError::MinExceedsMax { min: 10, max: 3 },
             "min>max must be a validation error, not a silent clamp"
         );
@@ -528,7 +654,7 @@ mod tests {
             ..base.clone()
         };
         assert_eq!(
-            AutoscaleConfig::from_spec(&zero_window).unwrap_err(),
+            AutoscaleConfig::from_spec(&zero_window, CPU_REQUEST, None).unwrap_err(),
             AutoscaleConfigError::ZeroDuration {
                 field: "evaluation_window"
             }
@@ -539,7 +665,9 @@ mod tests {
             ..base.clone()
         };
         assert_eq!(
-            AutoscaleConfig::from_spec(&zero_cooldown).unwrap().cooldown,
+            AutoscaleConfig::from_spec(&zero_cooldown, CPU_REQUEST, None)
+                .unwrap()
+                .cooldown,
             Duration::ZERO
         );
         let garbage = AutoscaleSpec {
@@ -547,7 +675,7 @@ mod tests {
             ..base.clone()
         };
         assert!(matches!(
-            AutoscaleConfig::from_spec(&garbage),
+            AutoscaleConfig::from_spec(&garbage, CPU_REQUEST, None),
             Err(AutoscaleConfigError::InvalidDuration {
                 field: "evaluation_window",
                 ..
@@ -567,7 +695,7 @@ mod tests {
             scale_down_threshold: None,
         };
         assert_eq!(
-            AutoscaleConfig::from_spec(&base).unwrap_err(),
+            AutoscaleConfig::from_spec(&base, CPU_REQUEST, None).unwrap_err(),
             AutoscaleConfigError::ZeroMax
         );
         let bad_threshold = AutoscaleSpec {
@@ -576,7 +704,7 @@ mod tests {
             ..base
         };
         assert!(matches!(
-            AutoscaleConfig::from_spec(&bad_threshold),
+            AutoscaleConfig::from_spec(&bad_threshold, CPU_REQUEST, None),
             Err(AutoscaleConfigError::InvalidThreshold { .. })
         ));
     }
@@ -592,9 +720,124 @@ mod tests {
             cooldown: Some("5m".to_string()),
             scale_down_threshold: Some(0.7),
         };
-        let config = AutoscaleConfig::from_spec(&spec).unwrap();
+        let config = AutoscaleConfig::from_spec(&spec, CPU_REQUEST, MEMORY_REQUEST).unwrap();
         assert_eq!(config.evaluation_window, Duration::from_secs(600));
         assert_eq!(config.cooldown, Duration::from_secs(300));
         assert_eq!(config.scale_down_threshold, 0.7);
+    }
+
+    #[test]
+    fn metric_names_map_to_the_collector_series() {
+        assert_eq!(AutoscaleMetric::Cpu.series_name(), "process_cpu_percent");
+        assert_eq!(
+            AutoscaleMetric::Memory.series_name(),
+            "process_memory_bytes"
+        );
+    }
+
+    #[test]
+    fn from_spec_rejects_an_unsupported_metric() {
+        let spec = AutoscaleSpec {
+            metric: "requests_per_second".to_string(),
+            ..cpu_spec()
+        };
+        assert_eq!(
+            AutoscaleConfig::from_spec(&spec, CPU_REQUEST, MEMORY_REQUEST).unwrap_err(),
+            AutoscaleConfigError::UnsupportedMetric {
+                metric: "requests_per_second".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn cpu_without_a_request_is_measured_against_one_core() {
+        // ProcessGrill and rootless nodes refuse apps that declare cpu, so
+        // CPU scaling must work without a request: 50% then means half a core.
+        let config = AutoscaleConfig::from_spec(&cpu_spec(), None, None).unwrap();
+        assert_eq!(config.request, ONE_CORE_PERCENT);
+        assert!((config.utilisation(50.0) - 0.5).abs() < 1e-9);
+        // A zero request is as good as none (utilisation of nothing is
+        // undefined), so it falls back the same way.
+        let zero = Some(ResourceRange {
+            request: 0,
+            limit: 500,
+        });
+        let config = AutoscaleConfig::from_spec(&cpu_spec(), zero, None).unwrap();
+        assert_eq!(config.request, ONE_CORE_PERCENT);
+    }
+
+    #[test]
+    fn from_spec_rejects_memory_scaling_without_a_memory_request() {
+        let spec = AutoscaleSpec {
+            metric: "memory".to_string(),
+            ..cpu_spec()
+        };
+        assert_eq!(
+            AutoscaleConfig::from_spec(&spec, CPU_REQUEST, None).unwrap_err(),
+            AutoscaleConfigError::MissingMemoryRequest
+        );
+        let zero = Some(ResourceRange {
+            request: 0,
+            limit: 1024,
+        });
+        assert_eq!(
+            AutoscaleConfig::from_spec(&spec, CPU_REQUEST, zero).unwrap_err(),
+            AutoscaleConfigError::MissingMemoryRequest
+        );
+    }
+
+    #[test]
+    fn cpu_utilisation_is_measured_against_the_cpu_request() {
+        // 500m requested = half a core. The collector reports percent of ONE
+        // core, so a process using a quarter of a core reads 25.0: half its
+        // request.
+        let config = AutoscaleConfig::from_spec(&cpu_spec(), CPU_REQUEST, None).unwrap();
+        assert!((config.utilisation(25.0) - 0.5).abs() < 1e-9);
+        // A full core against half a core requested is 200% utilisation.
+        assert!((config.utilisation(100.0) - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cpu_utilisation_handles_requests_above_one_core() {
+        // 2000m requested; 150% of one core used → 75% of the request.
+        let two_cores = Some(ResourceRange {
+            request: 2000,
+            limit: 2000,
+        });
+        let config = AutoscaleConfig::from_spec(&cpu_spec(), two_cores, None).unwrap();
+        assert!((config.utilisation(150.0) - 0.75).abs() < 1e-9);
+    }
+
+    #[test]
+    fn memory_utilisation_is_measured_against_the_memory_request() {
+        let spec = AutoscaleSpec {
+            metric: "memory".to_string(),
+            ..cpu_spec()
+        };
+        let config = AutoscaleConfig::from_spec(&spec, None, MEMORY_REQUEST).unwrap();
+        assert_eq!(config.metric, AutoscaleMetric::Memory);
+        let used = (128 * 1024 * 1024) as f64;
+        assert!((config.utilisation(used) - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_busy_replica_scales_up_through_the_real_units() {
+        // One replica burning a full core against a 500m request at a 50%
+        // target: utilisation 2.0, so ceil(1 * 2.0 / 0.5) = 4 replicas.
+        let config = AutoscaleConfig::from_spec(&cpu_spec(), CPU_REQUEST, None).unwrap();
+        let state = AutoscaleState {
+            baseline_replicas: 1,
+            current_replicas: 1,
+            last_scale_event: None,
+        };
+        let decision = evaluate(
+            &test_app(),
+            &config,
+            &state,
+            config.utilisation(100.0),
+            Instant::now(),
+        )
+        .expect("should scale up");
+        assert_eq!(decision.to, 4);
     }
 }

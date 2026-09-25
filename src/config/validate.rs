@@ -372,9 +372,11 @@ fn validate_app(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError
 
     // Autoscale block: bounds, windows and threshold are validated up front
     // so a bad `[autoscale]` fails the deploy instead of silently clamping
-    // at runtime (DEP8).
+    // at runtime (DEP8). An unsupported metric, or one the app has no request
+    // for, is refused here too: it would otherwise never scale.
     if let Some(autoscale) = &app.autoscale
-        && let Err(e) = crate::meat::autoscaler::AutoscaleConfig::from_spec(autoscale)
+        && let Err(e) =
+            crate::meat::autoscaler::AutoscaleConfig::from_spec(autoscale, app.cpu, app.memory)
     {
         return Err(ConfigError::Validation {
             field: "autoscale".to_string(),
@@ -909,6 +911,7 @@ mod tests {
         let app: AppSpec = toml::from_str(
             r#"
             image = "web:v1"
+            cpu = "100m-500m"
             [autoscale]
             metric = "cpu"
             target = "70%"
@@ -920,8 +923,62 @@ mod tests {
         let config = config_with_app("web", app);
         let err = config.validate().unwrap_err();
         assert!(
-            matches!(err, ConfigError::Validation { ref field, .. } if field == "autoscale"),
+            matches!(err, ConfigError::Validation { ref field, ref reason, .. }
+                if field == "autoscale" && reason.contains("must not exceed")),
             "min>max autoscale must be rejected at validation: {err:?}"
+        );
+    }
+
+    fn autoscaled_app(resources: &str, metric: &str) -> AppSpec {
+        toml::from_str(&format!(
+            r#"
+            image = "web:v1"
+            {resources}
+            [autoscale]
+            metric = "{metric}"
+            target = "50%"
+            min = 1
+            max = 5
+        "#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn validate_autoscale_accepts_cpu_and_memory_with_requests() {
+        let cpu = autoscaled_app(r#"cpu = "250m-1000m""#, "cpu");
+        config_with_app("web", cpu).validate().unwrap();
+        let memory = autoscaled_app(r#"memory = "128Mi-512Mi""#, "memory");
+        config_with_app("web", memory).validate().unwrap();
+    }
+
+    #[test]
+    fn validate_autoscale_rejects_an_unsupported_metric() {
+        let app = autoscaled_app(r#"cpu = "250m""#, "requests_per_second");
+        let err = config_with_app("web", app).validate().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Validation { ref field, ref reason, .. }
+                if field == "autoscale" && reason.contains("not supported")),
+            "an unknown metric must fail validation, not silently never scale: {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_autoscale_accepts_cpu_without_a_request() {
+        // Measured against one core; ProcessGrill apps can't declare cpu.
+        let app = autoscaled_app("", "cpu");
+        config_with_app("web", app).validate().unwrap();
+    }
+
+    #[test]
+    fn validate_autoscale_rejects_memory_without_a_memory_request() {
+        // CPU is requested, but the block scales on memory.
+        let app = autoscaled_app(r#"cpu = "250m""#, "memory");
+        let err = config_with_app("web", app).validate().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Validation { ref field, ref reason, .. }
+                if field == "autoscale" && reason.contains("needs a non-zero memory request")),
+            "{err:?}"
         );
     }
 
