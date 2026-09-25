@@ -1173,6 +1173,10 @@ pub struct EndpointWithdrawals {
 
 A `BTreeSet` is a sorted set: each node name appears once, in a deterministic order, which keeps Raft snapshots reproducible. Each consumer finds its outstanding withdrawals in the next placements response, removes those routes locally (journal first, as above) and then posts a *receipt* to `/v1/discovery/withdrawn`: an authenticated "I've removed everything from generation 12". The server takes the node's identity from its TLS certificate, never from the request body, so one node can't answer for another. The consumer keeps the receipt queued until it gets exactly a 204; a timeout or a lost reply just means sending it again, which is harmless. When a generation's consumer set is empty, its entry disappears.
 
+The V02 soak found a way to make a receipt impossible to send. Cut the power to the *leader* and the new one builds its first catalogue before every node has reported, so node 1's backends briefly vanish: a withdrawal is recorded, and a moment later node 1's report arrives and the same backends, same executions, are published again. Nodes 1 and 2 were polling throughout and confirmed. The node that had been cut came back to a catalogue that already listed those backends again, and a receipt is proven only when no view still exposes anything the withdrawal removed. It never would be. Worse, its own startup cleanup was queued behind that very withdrawal, so it refused every deploy, for good.
+
+The generation numbers say which reading is right. A withdrawal's generation is the last catalogue that exposed the removed backends, so a catalogue *newer* than that which lists one of them again means the leader deliberately published it again. It's live, not a leftover exposure. A view now only counts a backend match against a withdrawal when the view isn't newer than it. A producer that really retires an execution fences it first, so it can't come back, and any later removal gets a withdrawal of its own.
+
 Withdrawn VIPs stay reserved while their entry is pending:
 
 ```rust
