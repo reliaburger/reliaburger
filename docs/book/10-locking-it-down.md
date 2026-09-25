@@ -410,6 +410,8 @@ When a node needs to sign a workload CSR or issue a join certificate, it reads t
 
 API tokens live in `SecurityState.api_tokens` and are managed through Raft. `relish token create` generates a token (Argon2id-hashed before storage), `relish token list` shows active tokens via the `/v1/token/list` endpoint, and `relish token revoke` removes a token via `/v1/token/revoke`.
 
+`relish token list` used to print `created_at` exactly as the API sent it, Unix seconds, and ignored `expires_at` altogether, so the one thing you most want to know about a CI token (when does it stop working?) was missing. The client now deserialises the response into a typed `TokenSummary` with `expires_at: Option<u64>` instead of poking at a `serde_json::Value`, and the table shows UTC times plus `never`, `(in 30d)` or `(expired)`. The `time` crate, already a dependency for certificate validity windows, does the calendar arithmetic: `OffsetDateTime::from_unix_timestamp` returns a `Result`, because an `i64` of seconds can land outside the years it can represent. The rendering is a pure function of the token list and "now", so an `insta` inline snapshot pins the whole table, and a change in the output shows up as a diff in the test source rather than a vague assertion failure.
+
 Both list and revoke endpoints read from or write to the council's security state directly. The list endpoint formats each token's name, role, and creation timestamp. The revoke endpoint writes a `RevokeApiToken` command to Raft, which removes the token from all council replicas immediately.
 
 ## Enforcing what the tokens promise

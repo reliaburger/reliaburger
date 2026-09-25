@@ -1822,10 +1822,11 @@ fn print_batch_summary(batch_id: u64, summary: &serde_json::Value) {
     );
 }
 
-/// Create a new API token (local operation — no agent needed).
+/// Create a new API token through the agent.
 ///
-/// Generates a token, hashes it with Argon2id, and prints the plaintext
-/// to stdout (shown once, never stored).
+/// The agent mints the token, stores its Argon2id hash in Raft, and
+/// returns the plaintext once; this prints it to stdout and never stores
+/// it. Needs a reachable agent and an admin credential.
 pub async fn token_create(
     name: &str,
     role_str: &str,
@@ -1953,27 +1954,71 @@ pub fn secret_encrypt(pubkey: &str, value: &str) -> Result<(), RelishError> {
 
 /// List API tokens from SecurityState via the agent.
 pub async fn token_list() -> Result<(), RelishError> {
-    let client = BunClient::default_local();
-    let result = client.token_list().await?;
-    let tokens = result["tokens"].as_array();
-    match tokens {
-        Some(toks) if toks.is_empty() => {
-            println!("no tokens");
-        }
-        Some(toks) => {
-            println!("{:<20} {:<12} {:<20}", "NAME", "ROLE", "CREATED");
-            for t in toks {
-                let name = t["name"].as_str().unwrap_or("?");
-                let role = t["role"].as_str().unwrap_or("?");
-                let created = t["created_at"].as_u64().unwrap_or(0);
-                println!("{:<20} {:<12} {:<20}", name, role, created);
-            }
-        }
-        None => {
-            println!("no tokens");
-        }
-    }
+    let tokens = BunClient::default_local().token_list().await?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    print!("{}", render_token_list(&tokens, now));
     Ok(())
+}
+
+/// The `relish token list` table: UTC creation and expiry times, with how
+/// long a live token has left.
+fn render_token_list(tokens: &[super::client::TokenSummary], now: u64) -> String {
+    use std::fmt::Write as _;
+    if tokens.is_empty() {
+        return "no tokens\n".to_string();
+    }
+    let mut out = format!(
+        "{:<20} {:<12} {:<21} {}\n",
+        "NAME", "ROLE", "CREATED", "EXPIRES"
+    );
+    for token in tokens {
+        let expires = match token.expires_at {
+            None => "never".to_string(),
+            Some(at) if at <= now => format!("{} (expired)", format_utc(at)),
+            Some(at) => format!("{} (in {})", format_utc(at), format_duration(at - now)),
+        };
+        // Writing to a String can't fail.
+        let _ = writeln!(
+            out,
+            "{:<20} {:<12} {:<21} {}",
+            token.name,
+            token.role,
+            format_utc(token.created_at),
+            expires
+        );
+    }
+    out
+}
+
+/// Unix seconds as `YYYY-MM-DD HH:MM UTC`; the raw number if out of range.
+fn format_utc(unix_seconds: u64) -> String {
+    let Ok(at) = i64::try_from(unix_seconds)
+        .map_err(|_| ())
+        .and_then(|seconds| time::OffsetDateTime::from_unix_timestamp(seconds).map_err(|_| ()))
+    else {
+        return unix_seconds.to_string();
+    };
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02} UTC",
+        at.year(),
+        u8::from(at.month()),
+        at.day(),
+        at.hour(),
+        at.minute()
+    )
+}
+
+/// A coarse remaining time: the largest whole unit (`29d`, `5h`, `12m`, `40s`).
+fn format_duration(seconds: u64) -> String {
+    match seconds {
+        s if s >= 86_400 => format!("{}d", s / 86_400),
+        s if s >= 3_600 => format!("{}h", s / 3_600),
+        s if s >= 60 => format!("{}m", s / 60),
+        s => format!("{s}s"),
+    }
 }
 
 /// Revoke an API token by name via the agent.
@@ -2235,6 +2280,51 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let result = resolve_secret_pubkey(dir.path());
         assert!(result.is_err(), "missing bootstrap must error");
+    }
+
+    #[test]
+    fn token_list_renders_human_times_and_expiry() {
+        use super::super::client::TokenSummary;
+        // 2026-09-25 12:00:00 UTC.
+        let now = 1_790_337_600;
+        let tokens = vec![
+            TokenSummary {
+                name: "ci-bot".to_string(),
+                role: "deployer".to_string(),
+                created_at: now - 86_400,
+                expires_at: Some(now + 30 * 86_400),
+            },
+            TokenSummary {
+                name: "admin".to_string(),
+                role: "admin".to_string(),
+                created_at: now - 3 * 86_400,
+                expires_at: None,
+            },
+            TokenSummary {
+                name: "old-reader".to_string(),
+                role: "read-only".to_string(),
+                created_at: now - 90 * 86_400,
+                expires_at: Some(now - 3_600),
+            },
+            TokenSummary {
+                name: "short".to_string(),
+                role: "read-only".to_string(),
+                created_at: now,
+                expires_at: Some(now + 5_400),
+            },
+        ];
+        insta::assert_snapshot!(render_token_list(&tokens, now), @r"
+        NAME                 ROLE         CREATED               EXPIRES
+        ci-bot               deployer     2026-09-24 12:00 UTC  2026-10-25 12:00 UTC (in 30d)
+        admin                admin        2026-09-22 12:00 UTC  never
+        old-reader           read-only    2026-06-27 12:00 UTC  2026-09-25 11:00 UTC (expired)
+        short                read-only    2026-09-25 12:00 UTC  2026-09-25 13:30 UTC (in 1h)
+        ");
+    }
+
+    #[test]
+    fn token_list_says_so_when_empty() {
+        assert_eq!(render_token_list(&[], 0), "no tokens\n");
     }
 
     #[tokio::test]

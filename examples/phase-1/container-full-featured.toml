@@ -3,13 +3,13 @@
 # Demonstrates: image, port, health checks, environment variables,
 # volumes, init containers, resource limits, and replicas.
 #
-# This config is designed for real container runtimes (runc or Apple
-# Container). On ProcessGrill (the default), apps without a `command`
+# This config is designed for runc (on macOS, the managed Linux VM from
+# `relish setup --quickstart`). On ProcessGrill, apps without a `command`
 # field just sleep. See proc-full-featured.toml for a ProcessGrill version
 # that uses testapp.
 #
 # Deploy with a real runtime:
-#   cargo run --bin bun -- --runtime apple   # or --runtime runc
+#   cargo run --bin bun -- --runtime runc
 #   cargo run --bin relish -- apply examples/phase-1/container-full-featured.toml
 
 [app.myapp]

@@ -24,7 +24,7 @@ in the clear.
 
 ```sh
 relish token create --name ci-deploy --role deployer --namespaces shop --ttl-days 90
-relish token list
+relish token list      # name, role, created and expiry times (UTC)
 relish token revoke ci-deploy
 ```
 

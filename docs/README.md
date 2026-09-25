@@ -682,7 +682,7 @@ Commands:
 | `secret encrypt --pubkey <key> <value>` | Encrypt a value for use in app configs |
 | `secret rotate [--finalize]` | Start (or finalise) secret encryption-key rotation |
 | `token create --name <name>` | Create an API token (`--role`, `--apps`, `--namespaces`, `--ttl-days`) |
-| `token list` | List all API tokens |
+| `token list` | List API tokens with role, creation time and expiry (UTC) |
 | `token revoke <name>` | Revoke an API token by name |
 | `fault delay <target> <delay>` | Delays traffic to the target with a `tc` netem qdisc on each caller container (runc only); `--from APP` limits it to one caller |
 | `fault drop <target> <pct> --acknowledge` | Fail a percentage of connections (ECONNREFUSED) |
