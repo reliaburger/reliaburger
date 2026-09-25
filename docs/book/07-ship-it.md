@@ -1005,6 +1005,12 @@ pub(super) enum JobPhase {
 
 `relish apply` refuses to start a job whose previous outcome is unknown, and says why: `previous outcome is unknown; use apply --rerun-jobs for an explicit rerun`. `--rerun-jobs` is the human saying "I've checked, run it again". The API accepts it only from a user with the Deployer role, and only for a file containing nothing but non-scheduled jobs. GitOps and the reconciler never set it. Cron jobs are the one exception: once bun has confirmed the old run's container is gone, the next scheduled occurrence runs normally. That's a new occurrence, not a replay of the uncertain one. Chapter 8 covers the retry budget and the crash tests behind this.
 
+## Two seconds is too eager
+
+Each node's placement reconciler polls the leader every couple of seconds and deploys whatever its share of the placements says. If a deploy failed, the next poll simply tried again. Kubernetes has `CrashLoopBackOff` for exactly this; we had a supervisor back-off for instances that crash after starting, but a deploy that never produces a running instance never reaches the supervisor. The V02 soak found the result: an app whose binary had been truncated by a power cut reached generation `g170` in eight minutes, every attempt a fresh container, a fresh journal entry and a fresh log line.
+
+`DeployBackoff` remembers consecutive failures per placement and the specification they were for. The same specification waits 5 s, then 10, 20, 40, up to five minutes; a changed specification is new desired state and is tried at once, with the count reset. Success clears the record, and so does the leader withdrawing the placement. Eight minutes of a broken app is now a handful of attempts, and the journal says when the next one is due.
+
 ## What we deferred
 
 Blue-green deploys, autoscaling, the Lettuce GitOps engine, and Kubernetes migration tools are all Phase 9. The `DeployPhase` enum already carries the blue-green states (you'll have spotted `StartingGreen` and friends in the transition tests), and `execute` delegates to a separate blue-green path — but we'll cover that in Chapter 9. Rolling deploys with automatic rollback cover the vast majority of production deployment needs, and they're the foundation everything else builds on.
