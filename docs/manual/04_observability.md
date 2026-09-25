@@ -20,9 +20,16 @@ and instance, like `[rb-4f2a9c1e07b3-2 default__web-0] GET /healthz 200`. It
 picks up replicas scheduled onto new nodes as they appear. If a node goes
 away mid-stream, you get a `warning:` on stderr and the rest keep streaming.
 
-Retention and export are config (`[logs]`): old files age out after
-`retention_days`; `export_path` ships Parquet files to a local path or object
-store (`s3://`, `gs://`). Exported archives answer SQL:
+Retention and export are node config:
+
+```toml
+[logs]
+retention_days = 7                # default
+export_path = "s3://bucket/logs/" # optional: a local path, file://, s3:// or gs://
+export_interval_secs = 3600       # default
+```
+
+Exported Parquet archives answer SQL:
 
 ```sh
 relish logs-export --dest ./archive
@@ -36,13 +43,13 @@ and explains that a later export may repeat them.
 
 ## Metrics
 
-System, per-app and Prometheus-endpoint metrics are collected on every node:
-
+Every node collects its own system metrics and each workload's CPU and memory
+every 10 seconds, and keeps them for 7 days (`[metrics] retention_days`).
 The TUI and the web dashboard (Brioche) chart live CPU and memory. The CLI
 `relish top` is a one-shot table of every workload on every node: node, app,
 namespace, state, PID, restarts, and the latest CPU and memory sample each
-node's collector took (`process_cpu_percent`, `process_memory_bytes`, every
-few seconds). A `-` means no sample yet. A node that doesn't answer becomes a
+node's collector took (`process_cpu_percent`, `process_memory_bytes`). A `-`
+means no sample yet. A node that doesn't answer becomes a
 `warning:` line rather than an error:
 
 ```sh
@@ -86,9 +93,29 @@ sparkline; a histogram named by its base shows mean latency per instance.
 `up` is 1 while an instance's last scrape worked and 0 when it failed. The
 app's page in the web dashboard charts the same data, one line per instance.
 
-Alert rules evaluate in the agent; `[[alerts.destinations]]` webhooks (with
-optional HMAC signing) deliver them. Council members hold cluster-wide
-rollups so one node can answer for the fleet.
+There's no PromQL. You read metrics through `relish metrics`, the dashboards
+and the API. For something that isn't an app on the cluster, such as a node
+exporter, list fixed URLs as `[[metrics.scrape_targets]]` with a `job` and a
+`url`; they're scraped every 30 seconds.
+
+### Alerts
+
+Each node evaluates five built-in rules against its own metrics every 30
+seconds: CPU above 90% for 5 minutes and memory above 85% for 2 minutes
+(critical); memory above 70% for 10 minutes, disk above 80% for 5 minutes and
+CPU below 5% for 30 minutes (warning). You can't define your own rules yet.
+Webhooks deliver them, optionally signed with HMAC-SHA256:
+
+```toml
+[[alerts.destinations]]
+type = "webhook"
+url = "https://hooks.example.com/reliaburger"
+severity = ["critical"]           # empty: every severity
+secret = "shared-hmac-secret"     # optional
+```
+
+Council members hold cluster-wide rollups, so one node can answer for the
+fleet.
 
 ## Events and dashboards
 
@@ -97,6 +124,13 @@ relish                           # the terminal dashboard (TUI)
 relish dashboard                 # authenticated, read-only browser session
 ```
 
-The TUI shows apps, nodes, jobs, routes, live logs and events on WebSockets;
-press `?` inside for keys. The same data drives the web dashboard (Brioche)
-at <http://127.0.0.1:9117/>.
+The TUI shows apps, nodes, jobs, routes, live logs and events; press `?`
+inside for keys. It needs a terminal of at least 80×24.
+
+`relish dashboard` serves the web dashboard (Brioche) on a loopback port and
+opens a one-time link to it. It forwards read-only requests using the CLI's own
+token and CA, so you don't install a certificate in your browser or paste a
+token. Ctrl-C closes it; `--no-open` prints the link instead. You can also open
+a node's API address in a browser directly (<http://127.0.0.1:9117/> on a
+source build): once the cluster has tokens, it asks you to paste one and gives
+you a read-only session for 12 hours.

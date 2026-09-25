@@ -14,9 +14,15 @@ relish fault kill web --count 1 --acknowledge              # SIGKILL an instance
 relish fault pause web --acknowledge                       # SIGSTOP (freeze)
 relish fault cpu web 50% --acknowledge                     # burn CPU in the cgroup
 relish fault memory web 90% --acknowledge                  # push toward the limit
+relish fault disk-io web 10mbps --write-only --acknowledge # throttle disk I/O
+relish fault resume web --acknowledge                      # SIGCONT a paused app
 relish fault node-drain node-03 --acknowledge  # stop new scheduling
 relish fault node-kill node-03 --acknowledge   # bounded cluster-plane failure
+relish fault node-pressure node-03 --cpu 80% --memory 90% --acknowledge
 ```
+
+Workload faults take `--namespace` (default `default`), `--instance` to hit
+one instance, `--duration` and `--reason`, which is recorded with the fault.
 
 Every fault has a duration (default 10 minutes) and cleans up after itself:
 
@@ -32,15 +38,26 @@ as well as new ones (add `--from APP` to slow just one caller). `bandwidth` is
 accepted by the parser as a forward-compatible contract, but Bun refuses it for
 now. A rejected command hasn't injected a fault.
 
-Injection needs at least a Deployer credential, explicit `--acknowledge`, and
-`"inject_workload_faults"` in the server's
-`[testing].allowed_operations`. Admin doesn't override a disabled operation.
-Clearing remains possible with the same role and grant without a destructive
-acknowledgement. Bun gets audit identity from the authenticated credential,
-not `$USER` or the request body.
+Injection needs explicit `--acknowledge`, a credential with the right role
+and the operation in the server's `[testing].allowed_operations`:
 
-A server install writes no `[testing]` section, so its class is `unknown` and
-every fault is refused until an operator opts in. A laptop cluster from
+| Faults | Role | Grant |
+|--------|------|-------|
+| workload faults (`delay` to `resume`) | Deployer | `inject_workload_faults` |
+| `node-drain`, `node-kill` | Admin | `alter_node_state` |
+| `node-pressure` | Admin | `saturate_capacity` |
+
+Admin doesn't override a missing grant. `node-pressure` also needs
+`max_node_pressure_cpu_percent` or `max_node_pressure_memory_percent` above
+zero (both default to 0, and memory stops at 90%). Clearing needs the same role
+and grant, but no acknowledgement. Bun takes the audit identity from the
+authenticated credential, not `$USER` or the request body.
+
+`[testing] safety_class` is `development`, `staging`, `production` or, when
+unset, `unknown`. On `production` and `unknown` clusters every injection also
+needs `allow_protected_mutation = true`, a second switch you flip on purpose.
+A server install writes no `[testing]` section, so every fault is refused until
+an operator opts in. A laptop cluster from
 `relish setup --quickstart` is the exception: it's a throwaway development
 cluster, so each node's config says
 
@@ -63,7 +80,8 @@ node. A fault spread over several nodes becomes one fault per node, and the
 command prints each one. `relish fault list` shows every node's faults with a
 `NODE` column, and `relish fault clear <id>` finds the node that holds that
 id (pass `--node` if two nodes happen to use the same number). `relish fault
-clear` with no id, or with a service name, clears on every node.
+clear` with no id, or with a service name, clears on every node; clearing
+everything needs an unscoped token.
 
 Network faults (`delay`, `drop`, `dns`, `partition`) are the other way round.
 They change what happens when something *calls* the target, and that happens
@@ -112,14 +130,15 @@ The full catalogue needs at least three nodes, a digest-pinned BusyBox
 container workload, fresh node-kill and node-pressure evidence, and server
 grants for `provision_isolated_workloads`, `alter_node_state` and
 `saturate_capacity`. Missing destructive prerequisites refuse the suite. They
-don't turn into green skips. Rootless Linux and Apple Container can exercise
-the workload, but the full catalogue currently needs rootful Linux cgroup v2
-for node pressure. ProcessGrill remains a separate profile.
+don't turn into green skips. Node pressure needs rootful Linux runc with
+cgroup v2.
 
-An interactive run asks you to type exactly `yes`; CI uses:
+An interactive run asks you to type exactly `yes`; CI uses `--yes`. Pass
+`--filter` with a scenario name to run just that one:
 
 ```sh
 relish test --chaos --yes
+relish test --chaos --yes --filter minority_partition_degrades_and_heals
 ```
 
 `--yes` records consent. It doesn't grant permission and there is no
@@ -130,22 +149,32 @@ cleanup, the case is `Unknown`, not green.
 
 ## Scripted scenarios
 
-Describe a whole experiment in TOML — steps, durations, checks — and run it:
+A scenario file lists faults with their targets, values, start offsets and
+durations, and Relish injects each one when its time comes:
+
+```toml
+name = "Payment cascade failure"
+
+[[step]]
+description = "Database latency spike"
+fault = "delay"
+target = "pg"
+value = "500ms"
+duration = "2m"
+
+[[step]]
+description = "Database starts dropping connections"
+fault = "drop"
+target = "pg"
+value = "25%"
+start_after = "2m"
+duration = "3m"
+```
 
 ```sh
 relish fault scenario examples/phase-8/chaos-scenario.toml --dry-run
 relish fault scenario examples/phase-8/chaos-scenario.toml --acknowledge
-```
-
-## Cluster-level scenarios
-
-Partitions that cut a node off from the council, leader failure and node
-death run as guarded scenarios in the test catalogue. Each one records the exact
-fault it injected and reverses only that:
-
-```sh
-relish test --chaos --yes    # the whole catalogue
-relish test --chaos --yes --filter minority_partition_degrades_and_heals
+relish fault scenario examples/phase-8/chaos-scenario.toml --speed 2.0 --acknowledge
 ```
 
 Start small: one fault, one app, a hypothesis about what should happen. If

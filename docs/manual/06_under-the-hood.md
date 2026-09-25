@@ -6,7 +6,7 @@ design doc under `docs/design/`.
 
 | Component | What it does |
 |-----------|-------------|
-| **Grill** | Container runtime (runc, Apple Container, process fallback) |
+| **Grill** | Workload runtime (runc containers, ProcessGrill for plain processes) |
 | **Mustard** | SWIM gossip protocol for cluster membership |
 | **Council** | Raft consensus for leader election and state |
 | **Meat** | Bin-packing scheduler with labels, quotas, daemon mode |
@@ -30,7 +30,9 @@ src/
   config/              # TOML configuration parsing
   grill/               # Container runtime
   bun/                 # Node agent (event loop, API, health, supervisor)
+  cluster/             # Cluster runtime (council reconciler, orchestration)
   relish/              # CLI, TUI, manual, source reader
+  testkit/             # `relish test` and `relish bench` harness
   smoker/              # Fault injection
   mustard/             # SWIM gossip
   council/             # Raft consensus
@@ -57,15 +59,16 @@ docs/
 examples/              # Ready-to-apply workload configs
 ```
 
-You're reading an embedded copy of `docs/manual/`; the full source tree is
-in the binary too — try `relish source meat` to read the scheduler.
+You're reading an embedded copy of `docs/manual/`. The full source tree the
+binary was built from is in there too: try `relish source meat` to read the
+scheduler.
 
 ## Test suites
 
 ```sh
 make test              # portable nextest suite
 make test-cluster      # real multi-node failover/recovery acceptance
-sudo make test-linux   # runc, netns, eBPF, Btrfs suites
+sudo make test-linux   # runc, netns, eBPF, Btrfs and Buildah suites
 make test-upgrade      # real binary-replacement acceptance
 ```
 
