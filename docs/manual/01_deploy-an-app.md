@@ -66,7 +66,7 @@ relish apply app.toml            # deploy (or converge) everything in the file
 relish apply app.toml --dry-run  # preview; exits 0 even with no agent
 relish lint app.toml             # validate only
 relish logs web -f               # stream logs from every node (--tail 20 for the last 20)
-relish exec web env              # run a command inside an instance
+relish exec web env              # run a command inside an instance, on whichever node runs it
 relish top                       # every workload on every node, with CPU and memory
 relish inspect web               # full detail
 relish stop web                  # stop all instances

@@ -4914,9 +4914,23 @@ fn relay_allows(method: &axum::http::Method, path: &str) -> bool {
     ];
     match *method {
         axum::http::Method::GET => READS.contains(&path),
-        axum::http::Method::POST => path == "v1/path",
+        // `relish exec` reaches an instance on another node this way too;
+        // the target repeats the exec authorisation with the caller's token.
+        axum::http::Method::POST => path == "v1/path" || is_exec_path(path),
         _ => false,
     }
+}
+
+/// `v1/exec/{app}/{namespace}` and nothing longer.
+fn is_exec_path(path: &str) -> bool {
+    let mut segments = path.split('/');
+    segments.next() == Some("v1")
+        && segments.next() == Some("exec")
+        && segments.next().is_some_and(|app| !app.is_empty())
+        && segments
+            .next()
+            .is_some_and(|namespace| !namespace.is_empty())
+        && segments.next().is_none()
 }
 
 /// `GET|POST /v1/nodes/{node}/relay/{path}`: send one of a few per-node
@@ -15789,6 +15803,19 @@ mod cluster_routing_tests {
         )
         .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn the_relay_forwards_exec_to_one_app_and_nothing_nested() {
+        let post = axum::http::Method::POST;
+        assert!(relay_allows(&post, "v1/exec/web/default"));
+        assert!(!relay_allows(&post, "v1/exec/web/default/extra"));
+        assert!(!relay_allows(&post, "v1/exec/web"));
+        assert!(!relay_allows(&post, "v1/exec//default"));
+        assert!(!relay_allows(
+            &axum::http::Method::GET,
+            "v1/exec/web/default"
+        ));
     }
 
     #[tokio::test]

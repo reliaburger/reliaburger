@@ -133,7 +133,7 @@ fn awaiting_backends(result: &TraceResult) -> bool {
     service_step_failed && !dns_failed
 }
 
-async fn find_source_client(
+pub(crate) async fn find_source_client(
     entry: &BunClient,
     app: &str,
     namespace: &str,
