@@ -2395,6 +2395,8 @@ and Apple Container that means they run inside the selected workload. The
 image must contain a POSIX shell, `nslookup` and `nc`. If it doesn't, `relish path`
 says `Unknown`. A missing debugging tool isn't proof that the network failed.
 
+
+One more lesson came from qualifying the release. The staged-install script ran the homepage tour exactly as written: `relish apply`, `relish status`, `relish path frontend --to redis`. Two fresh clusters in six failed the last step with "0 of 0 backends healthy". Nothing was broken. Every instance said `running`, but Redis hadn't passed its first health check yet, or the new catalogue hadn't reached the frontend's node. A person typing the tour takes longer than a script does, but not always long enough. So `path` now waits up to 30 seconds when the only problem is a destination with no healthy backend in the source's view, and prints that it's waiting. A name that shows no instances anywhere after six seconds is almost certainly a typo, and fails straight away rather than making you wait the full half-minute.
 ## Don't stop the control plane to debug it
 
 A DNS query can wait. A TCP connect can wait too. Each workload operation has
