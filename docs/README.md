@@ -678,7 +678,7 @@ Commands:
 | `snapshot list <app>` | List an app's snapshots, newest first |
 | `snapshot restore <app> <name>` | Restore a snapshot over the live volume (stop the app first) |
 | `snapshot delete <app> <name>` | Delete a snapshot |
-| `secret pubkey [dir]` | Print the age public key from a local cluster directory |
+| `secret pubkey [dir]` | Print the cluster's age public key (from the API, or offline from a `relish init` directory) |
 | `secret encrypt --pubkey <key> <value>` | Encrypt a value for use in app configs |
 | `secret rotate [--finalize]` | Start (or finalise) secret encryption-key rotation |
 | `token create --name <name>` | Create an API token (`--role`, `--apps`, `--namespaces`, `--ttl-days`) |
@@ -1386,11 +1386,11 @@ Authenticated clients can fetch the public age recipient with
 `generation`, never private key material. Scoped read-only credentials may
 fetch it; deployments still require their normal permissions.
 
+`relish secret pubkey` (with no directory) makes that request for you, with the
+configured endpoint, token and CA:
+
 ```sh
-curl --fail --cacert cluster/identity/root-ca.crt \
-  -H "Authorization: Bearer $RELIABURGER_TOKEN" \
-  https://127.0.0.1:9117/v1/secret/public-key
-relish secret encrypt --pubkey '<public_key from the response>' 'value'
+relish secret encrypt --pubkey "$(relish secret pubkey)" 'value'
 ```
 
 Use the resulting `ENC[AGE:...]` string in an app environment variable. A

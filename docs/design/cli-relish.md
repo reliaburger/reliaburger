@@ -680,7 +680,7 @@ relish join --token <token> --node-id <id> <api-addr>  # Enrol a node identity
 relish join --token <t> --node-id <id> <addr> --ca-fingerprint sha256:... [--identity-dir <dir>]
 
 # Secrets
-relish secret pubkey [dir]          # Print the cluster age public key
+relish secret pubkey [dir]          # Print the cluster age public key (API, or offline from dir)
 relish secret encrypt --pubkey <key> <value> # Encrypt a value for ENC[AGE:...] fields
 relish secret rotate                # Start secret-key rotation
 relish secret rotate --finalize     # Finalise rotation (drop the old read-only keypair)

@@ -710,11 +710,15 @@ fn parse_join_token_ttl(value: &str) -> Result<u64, String> {
 
 #[derive(Subcommand)]
 enum SecretAction {
-    /// Print the cluster's age public key (for encrypting secrets offline).
+    /// Print the cluster's age public key (for `relish secret encrypt`).
+    ///
+    /// Asks the configured cluster for its active key, using the same
+    /// endpoint, token and CA as every other command. Pass the directory
+    /// `relish init` wrote to read the key from disk instead, with no
+    /// cluster running.
     Pubkey {
-        /// Directory containing the cluster config (from relish init).
-        #[arg(default_value = ".")]
-        dir: PathBuf,
+        /// Read the key offline from this `relish init` directory.
+        dir: Option<PathBuf>,
     },
     /// Encrypt a plaintext value for use in app config ENC[AGE:...] fields.
     Encrypt {
@@ -1506,7 +1510,7 @@ async fn main() -> ExitCode {
             commands::batch_status(id, wait, timeout).await
         }
         Command::Secret { action } => match &action {
-            SecretAction::Pubkey { dir } => commands::secret_pubkey(dir),
+            SecretAction::Pubkey { dir } => commands::secret_pubkey(dir.as_deref()).await,
             SecretAction::Encrypt { pubkey, value } => commands::secret_encrypt(pubkey, value),
             SecretAction::Rotate { finalize } => commands::secret_rotate(*finalize).await,
         },
@@ -1822,6 +1826,24 @@ mod tests {
             output: cli.output,
             token: cli.token,
         })
+    }
+
+    #[test]
+    fn secret_pubkey_asks_the_cluster_unless_given_an_init_directory() {
+        let cli = Cli::try_parse_from(["relish", "secret", "pubkey"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Secret {
+                action: SecretAction::Pubkey { dir: None }
+            })
+        ));
+        let cli = Cli::try_parse_from(["relish", "secret", "pubkey", "cluster"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Secret {
+                action: SecretAction::Pubkey { dir: Some(ref dir) }
+            }) if dir == std::path::Path::new("cluster")
+        ));
     }
 
     #[test]

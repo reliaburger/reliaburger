@@ -1880,14 +1880,25 @@ async fn token_create_with_client(
     Ok(())
 }
 
-/// Print the cluster's age public key from the init output directory.
+/// Print the cluster's age public key, for encrypting `ENC[AGE:...]` values.
 ///
-/// Reads the security bootstrap `relish init` wrote and extracts the
-/// cluster-wide age public key. This key can be used offline to encrypt
-/// secrets for `ENC[AGE:...]` config values.
-pub fn secret_pubkey(dir: &Path) -> Result<(), RelishError> {
-    println!("{}", resolve_secret_pubkey(dir)?);
+/// With no directory, asks the configured cluster (`GET
+/// /v1/secret/public-key`) for its active key, so a quickstart user, or
+/// anyone after a rotation, gets the key that will actually decrypt. With
+/// a directory, reads the security bootstrap `relish init` wrote there,
+/// which works offline.
+pub async fn secret_pubkey(dir: Option<&Path>) -> Result<(), RelishError> {
+    let key = match dir {
+        Some(dir) => resolve_secret_pubkey(dir)?,
+        None => fetch_secret_pubkey(&BunClient::default_local()).await?,
+    };
+    println!("{key}");
     Ok(())
+}
+
+/// Ask the cluster for its active age public key.
+async fn fetch_secret_pubkey(client: &BunClient) -> Result<String, RelishError> {
+    Ok(client.secret_public_key().await?.public_key)
 }
 
 /// Find the `*-security-bootstrap.json` in `dir` and return its cluster-wide
@@ -2183,6 +2194,40 @@ mod tests {
         let key = resolve_secret_pubkey(dir.path()).unwrap();
         assert_eq!(key, init.age_public_key);
         assert!(key.starts_with("age1"), "got {key}");
+    }
+
+    #[tokio::test]
+    async fn secret_pubkey_fetches_active_key_from_cluster() {
+        use axum::{Router, http::HeaderMap, routing::get};
+        let app = Router::new().route(
+            "/v1/secret/public-key",
+            get(|headers: HeaderMap| async move {
+                // The command must send the usual bearer token.
+                let authorised = headers.get("authorization").and_then(|v| v.to_str().ok())
+                    == Some("Bearer rbt_test");
+                if !authorised {
+                    return Err(axum::http::StatusCode::UNAUTHORIZED);
+                }
+                Ok(axum::Json(serde_json::json!({
+                    "public_key": "age1quickstartkey",
+                    "generation": 2,
+                })))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let base = format!("http://{address}");
+        let key = fetch_secret_pubkey(&BunClient::new_with_token(&base, Some("rbt_test"))).await;
+        let anonymous = fetch_secret_pubkey(&BunClient::new_with_token(&base, None)).await;
+        server.abort();
+        assert_eq!(key.unwrap(), "age1quickstartkey");
+        assert!(anonymous.is_err(), "an HTTP 401 must surface as an error");
+    }
+
+    #[tokio::test]
+    async fn secret_pubkey_errors_when_cluster_unreachable() {
+        assert!(fetch_secret_pubkey(&bogus_client()).await.is_err());
     }
 
     #[test]
