@@ -15,6 +15,7 @@
 pub mod applied;
 pub mod capacity;
 pub mod consumer;
+pub mod deploy_backoff;
 pub mod directory;
 pub mod http;
 pub mod identity;

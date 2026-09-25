@@ -2099,6 +2099,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failed_deploy_is_not_retried_on_the_next_poll() {
+        // V02 bug 3: a failing app was redeployed on every 2 s poll.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let assignments = NodeAssignments {
+            apps: vec![NodeAssignment {
+                name: "broken".into(),
+                namespace: "default".into(),
+                replicas: 1,
+                spec: spec_from_toml(
+                    r#"[app.broken]
+image = "proc-grill:image-ignored"
+command = ["false"]
+"#,
+                ),
+            }],
+            ..NodeAssignments::default()
+        };
+        let router = axum::Router::new().route(
+            "/v1/placements/worker",
+            axum::routing::get(move || {
+                let assignments = assignments.clone();
+                async move { axum::Json(assignments) }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let (_metrics, metrics_rx) = watch::channel(openraft::RaftMetrics::new_initial(1));
+        let (_directory, directory_rx) = watch::channel(crate::mustard::directory::NodeDirectory {
+            leader: Some(crate::mustard::message::LeaderHint {
+                node_id: NodeId::new("leader"),
+                term: 1,
+                api_address: address,
+                reporting_address: address,
+            }),
+            ..Default::default()
+        });
+        let root = tempfile::tempdir().unwrap();
+        let (commands, mut received) = mpsc::channel(8);
+        let shutdown = CancellationToken::new();
+        let reconciler = spawn_placement_reconciler(
+            "worker".into(),
+            metrics_rx,
+            directory_rx,
+            0,
+            None,
+            commands,
+            shutdown.clone(),
+            crate::cluster::ClusterHttp::plaintext(),
+            Some(root.path().to_path_buf()),
+        );
+        let mut deploys = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_millis(4500), async {
+            while let Some(command) = received.recv().await {
+                match command {
+                    AgentCommand::Status { response } => {
+                        let _ = response.send(vec![]);
+                    }
+                    AgentCommand::SyncClusterConsumer { response, .. } => {
+                        let _ = response.send(Ok(crate::bun::agent::ConsumerUpdate {
+                            published: true,
+                            receipts: vec![],
+                        }));
+                    }
+                    AgentCommand::Deploy { events, .. } => {
+                        deploys.push(std::time::Instant::now());
+                        let _ = events
+                            .send(ApplyEvent::Error {
+                                message: "replacement exited before its identity was recorded"
+                                    .into(),
+                            })
+                            .await;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await;
+        shutdown.cancel();
+        reconciler.await.unwrap();
+        server.abort();
+        assert_eq!(
+            deploys.len(),
+            1,
+            "a failed deploy was retried before its backoff elapsed"
+        );
+    }
+
+    #[tokio::test]
     async fn placement_ownership_is_durable_before_deployment_is_queued() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
