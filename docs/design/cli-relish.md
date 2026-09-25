@@ -704,7 +704,8 @@ relish snapshot delete <app> <name> [-n <ns>]
 # Image registry (Pickle)
 relish images                       # List images in the local registry
 relish build <path>                 # Build [build.*] images and push to Pickle
-relish sign <image>                 # Sign an image and attach the signature
+relish sign <image> --key <path>    # Sign an image's digest with your key
+relish sign keygen --out <path>     # Generate a signing key, print its public key
 
 # Jobs / batch
 relish batch <path>                 # Submit [job.*] sections as a batch

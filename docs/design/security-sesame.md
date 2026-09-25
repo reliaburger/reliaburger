@@ -1019,6 +1019,38 @@ When Bun processes an app's `[app.NAME.egress]` block:
 7. Every one-second agent tick verifies the live hooks and each protected cgroup's enforcement flag. It repairs a missing flag once and verifies the result. Hook loss, an unreadable map or failed repair stops the affected workload, records the affected app and makes the node unready until all four hooks recover. The slower kernel-truth sweep (`[ebpf] sweep_interval_secs`, default 60) still scrubs stale state and rebuilds all entries.
 8. `allow_franchise` remains unimplemented. Bun refuses it explicitly rather than starting a workload with unrestricted cross-cluster egress.
 
+### 5.10 Image Signing Trust Roots
+
+`[images.trust_policy] require_signatures` admits a Pickle-hosted image only
+when its attached signature verifies under one of two trust roots:
+
+- **The cluster root CA** (keyless). The per-namespace build signer
+  (`spiffe://…/job/build-signer`, a code-signing leaf from the Workload CA)
+  signs what `relish build` pushes. No configuration: the chain, validity,
+  code-signing EKU, SPIFFE identity and CRL are all checked against state the
+  council already holds.
+- **Operator keys** (`trust_policy.keys`). Base64 uncompressed ECDSA P-256
+  public keys in each node's config file. `relish sign IMAGE --key PATH`
+  resolves IMAGE to its manifest digest, signs the digest locally, and sends
+  `{digest, public_key, signature}` to `POST /v1/identity/sign` (unscoped
+  Admin). The agent checks only that the signature verifies under the key it
+  carries, then writes `AttachSignature`; trust is decided at deploy time.
+  `relish sign keygen --out PATH` makes a PKCS#8 PEM key (mode 0600, never
+  overwrites) and prints the public key line; any unencrypted PKCS#8 P-256
+  key from `openssl genpkey` works too.
+
+Why the operator holds the external key rather than the cluster: if the
+cluster held a signing key behind `/v1/identity/sign`, any Admin API token
+could make any image trusted. With the key on the operator's machine and the
+public half in node config, making an image trusted takes the private key and
+write access to node config; a stolen API token can only attach signatures
+nobody trusts. (The first `relish sign` signed with a key the agent generated
+per call and discarded, so no policy could ever list it; that path is gone.)
+
+The manifest carries a single signature slot, so a later `relish sign`
+replaces an earlier signature (including a build signer's). Signatures bind
+digests, never tags: re-pushing a tag leaves the new digest unsigned.
+
 ---
 
 ## 6. Configuration

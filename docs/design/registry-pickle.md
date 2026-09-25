@@ -769,22 +769,35 @@ There is no Fulcio-style ephemeral-key/OIDC exchange and no external signing key
 
 **External key signing:**
 
-For images pushed from external CI systems:
+For images pushed from external CI systems, signed with an operator-held
+key (not cosign: the signed message is the digest string, not cosign's
+simple-signing payload, and signatures live in the Raft catalogue rather
+than as OCI referrer artifacts):
 
 ```
-[1] Developer signs the image with their own cosign key:
-    cosign sign --key <private-key> mycluster:5000/myapp:v1.4.2
-
-[2] The signature is recorded against the manifest in the Raft
-    catalogue (not stored as a separate OCI referrer artifact).
-
-[3] On schedule, Meat verifies the signature against the ECDSA P-256
-    public keys registered in cluster configuration (base64-encoded):
+[1] Operator creates a key once and lists its public half on every node:
+    relish sign keygen --out ci-signing.pem
     [images.trust_policy]
-    keys = ["<base64 ECDSA P-256 public key>"]
+    keys = ["<base64 uncompressed ECDSA P-256 public key>"]
 
-[4] If verification succeeds, the image is schedulable.
+[2] After each push, relish resolves the tag to its manifest digest via
+    GET /v1/images and signs the digest locally:
+    relish sign mycluster:5050/myapp:v1.4.2 --key ci-signing.pem
+
+[3] relish POSTs {digest, public_key, signature} to /v1/identity/sign
+    (unscoped Admin). The agent checks the signature verifies under that
+    public key and writes AttachSignature; the state machine refuses a
+    digest the catalogue doesn't hold. The private key never leaves the
+    operator's machine.
+
+[4] At deploy, the gate verifies the signature and checks the public key
+    is in the node's trust_policy.keys, then pins the deploy to the
+    verified digest.
 ```
+
+Trust lives in node config rather than in the API on purpose: an Admin API
+token can attach a signature, but only a key listed in each node's config
+file makes it count. See Sesame §5.10.
 
 **Enforcement:**
 
