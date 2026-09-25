@@ -751,10 +751,13 @@ impl RuncGrill {
             if matches!(intent.phase, IntentPhase::Retired { .. }) {
                 return Ok(false);
             }
-            if intent.phase != IntentPhase::Owned {
-                return Err(io::Error::other(
-                    "runtime retirement requires recovery before adoption",
-                ));
+            if intent.phase == IntentPhase::Retiring {
+                // A sealed generation never runs again. Its host resources are
+                // gone or go now; a retained discovery address stays held until
+                // the caller's confirmed withdrawal releases it. Refusing here
+                // left the agent unable to start at all.
+                runtime.owned_cleanup(&id, &context).await?;
+                return Ok(false);
             }
             let Some(CommandState::Running { pid: launcher_pid }) =
                 context.role_state(RuntimeRole::Launcher).await?
