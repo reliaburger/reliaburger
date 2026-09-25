@@ -25,6 +25,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   NEXTEST_PROFILE: ci
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
   LOOP_DURATION: ${{ inputs.duration || '5h30m' }}
   LOOP_COUNT: ${{ inputs.count || '200' }}
 
