@@ -118,6 +118,14 @@ between two apps and labels each step observed, inferred or unavailable.
 `relish test` runs a live-cluster test catalogue, and `relish bench` measures
 the data plane.
 
+**Tested like it has to survive a bad day.** Beyond thousands of unit, property
+and snapshot tests, there are crash-recovery suites that kill the agent at every
+awkward moment, multi-node failover and council-loss tests, power-cut fixtures
+that pull the plug on a VM mid-write, a live-cluster test runner you can point
+at your own cluster (`relish test`), and a soak that installs the signed
+release the way you would and then breaks it for hours. CI never retries a
+failure. See [how Reliaburger is tested](docs/testing.md).
+
 **A terminal UI and a web dashboard.** Run `relish` with no arguments for the
 TUI; `relish dashboard` opens the web UI through your authenticated CLI session.
 
