@@ -1702,6 +1702,10 @@ async fn version_handler(State(state): State<ApiState>) -> impl IntoResponse {
     match &state.upgrade {
         Some(manager) => Json(serde_json::json!({
             "version": manager.running_version().to_string(),
+            // The version alone doesn't identify the bytes: the upgrade
+            // start gate and the orchestrator compare this digest with the
+            // candidate's so a same-version build can't pass as a swap.
+            "binary_sha256": manager.running_binary_sha256().await,
             "compatibility": crate::compatibility::CURRENT,
             "upgrade_in_flight": manager.upgrade_in_flight(),
             // Ids this node attempted and reverted — the orchestrator
@@ -1717,6 +1721,19 @@ async fn version_handler(State(state): State<ApiState>) -> impl IntoResponse {
     }
 }
 
+/// Admin with cluster-wide authority. Upgrades, rollbacks and elections act
+/// on every node and every tenant, so an Admin token scoped to some apps or
+/// namespaces is refused (403) like on the other cluster-wide routes. The
+/// service token (the orchestrator directing nodes) passes.
+// `Response` is large but it IS the HTTP reply to send on failure.
+#[allow(clippy::result_large_err)]
+fn authorize_cluster_admin(
+    auth: Option<&crate::sesame::auth::AuthContext>,
+) -> Result<(), Response> {
+    crate::sesame::auth::authorize(auth, crate::sesame::types::ApiRole::Admin)?;
+    crate::sesame::auth::require_unscoped(auth)
+}
+
 /// Apply a node-level upgrade directive (admin). Responds 202 once the
 /// binary is verified and staged; the process execs moments later.
 async fn upgrade_apply_handler(
@@ -1724,9 +1741,7 @@ async fn upgrade_apply_handler(
     State(state): State<ApiState>,
     body: String,
 ) -> Response {
-    if let Err(resp) =
-        crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::Admin)
-    {
+    if let Err(resp) = authorize_cluster_admin(auth.as_deref()) {
         return resp;
     }
     let directive: crate::upgrade::types::UpgradeDirective = match serde_json::from_str(&body) {
@@ -1749,6 +1764,16 @@ async fn upgrade_apply_handler(
         Ok(Ok(())) => (
             StatusCode::ACCEPTED,
             Json(serde_json::json!({ "status": "upgrading" })),
+        )
+            .into_response(),
+        Ok(Err(crate::bun::BunError::Upgrade(
+            error @ crate::upgrade::UpgradeError::AlreadyRunning { .. },
+        ))) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "already_running",
+                "detail": error.to_string(),
+            })),
         )
             .into_response(),
         Ok(Err(e)) => (
@@ -1791,9 +1816,7 @@ async fn upgrade_rollback_handler(
     State(state): State<ApiState>,
     body: String,
 ) -> Response {
-    if let Err(resp) =
-        crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::Admin)
-    {
+    if let Err(resp) = authorize_cluster_admin(auth.as_deref()) {
         return resp;
     }
     #[derive(serde::Deserialize, Default)]
@@ -1892,9 +1915,7 @@ async fn upgrade_start_handler(
     State(state): State<ApiState>,
     body: String,
 ) -> Response {
-    if let Err(resp) =
-        crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::Admin)
-    {
+    if let Err(resp) = authorize_cluster_admin(auth.as_deref()) {
         return resp;
     }
     #[derive(serde::Deserialize)]
@@ -1911,6 +1932,9 @@ async fn upgrade_start_handler(
         nodes: Vec<StartUpgradeNode>,
         #[serde(default)]
         direction: Option<crate::upgrade::types::UpgradeDirection>,
+        /// Allow a target older than what the nodes run.
+        #[serde(default)]
+        allow_downgrade: bool,
     }
     fn default_parallel() -> u32 {
         1
@@ -1980,6 +2004,39 @@ async fn upgrade_start_handler(
             .into_response();
     }
 
+    // Refuse same-version and unrequested downgrades before anything is
+    // recorded: once in Raft, a same-version run would "complete" without
+    // swapping a single byte.
+    let running = probe_running_binaries(&state, &derived_nodes).await;
+    match crate::upgrade::plan::check_target(
+        &request.target_version,
+        &request.binary_sha256,
+        request.allow_downgrade,
+        &running,
+    ) {
+        Ok(crate::upgrade::plan::TargetCheck::Proceed) => {}
+        Ok(crate::upgrade::plan::TargetCheck::AlreadyRunning) => {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": "already_running",
+                    "detail": format!(
+                        "every node already runs {} with this exact binary; nothing to do",
+                        request.target_version
+                    ),
+                })),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response();
+        }
+    }
+
     let upgrade_id = format!(
         "up-{}-{}",
         request.target_version,
@@ -2000,6 +2057,7 @@ async fn upgrade_start_handler(
             .unwrap_or(crate::upgrade::types::UpgradeDirection::Upgrade),
         phase: crate::upgrade::types::ClusterUpgradePhase::Preparing,
         registry_address: request.registry_address,
+        allow_downgrade: request.allow_downgrade,
         nodes: derived_nodes,
     };
 
@@ -2022,6 +2080,44 @@ async fn upgrade_start_handler(
         )
             .into_response(),
     }
+}
+
+/// Ask every planned node what it runs, for the start-time target gate.
+///
+/// Probes run concurrently, each bounded. An unreachable node is left out:
+/// the orchestrator re-checks every node as the walk reaches it.
+async fn probe_running_binaries(
+    state: &ApiState,
+    nodes: &[crate::upgrade::types::NodeUpgradeRecord],
+) -> Vec<crate::upgrade::plan::RunningBinary> {
+    use crate::upgrade::orchestrator::NodeControl as _;
+
+    let control = crate::upgrade::orchestrator::HttpNodeControl::with_http(
+        state.service_token.clone(),
+        state.cluster_http.clone(),
+    );
+    let probes = nodes.iter().map(|record| {
+        let control = &control;
+        async move {
+            let probe = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                control.probe(&record.address),
+            )
+            .await
+            .ok()
+            .flatten()?;
+            Some(crate::upgrade::plan::RunningBinary {
+                node: format!("node {}", record.node_id),
+                version: probe.version,
+                sha256: probe.binary_sha256,
+            })
+        }
+    });
+    futures_util::future::join_all(probes)
+        .await
+        .into_iter()
+        .flatten()
+        .collect()
 }
 
 /// Build the leader's authoritative view of every node for upgrade
@@ -2102,9 +2198,7 @@ async fn upgrade_resume_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
 ) -> Response {
-    if let Err(resp) =
-        crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::Admin)
-    {
+    if let Err(resp) = authorize_cluster_admin(auth.as_deref()) {
         return resp;
     }
     let Some(council) = &state.council else {
@@ -2160,9 +2254,7 @@ async fn upgrade_cluster_rollback_handler(
     State(state): State<ApiState>,
     body: String,
 ) -> Response {
-    if let Err(resp) =
-        crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::Admin)
-    {
+    if let Err(resp) = authorize_cluster_admin(auth.as_deref()) {
         return resp;
     }
     #[derive(serde::Deserialize)]
@@ -2244,6 +2336,7 @@ async fn upgrade_cluster_rollback_handler(
         direction: crate::upgrade::types::UpgradeDirection::Rollback,
         phase: crate::upgrade::types::ClusterUpgradePhase::Preparing,
         registry_address: String::new(),
+        allow_downgrade: false,
         nodes: derived_nodes,
     };
 
@@ -2272,9 +2365,7 @@ async fn cluster_elect_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
 ) -> Response {
-    if let Err(resp) =
-        crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::Admin)
-    {
+    if let Err(resp) = authorize_cluster_admin(auth.as_deref()) {
         return resp;
     }
     let Some(council) = &state.council else {
@@ -12234,6 +12325,13 @@ schedule = "* * * * *"
     /// Build a router whose store holds a Deployer token scoped to namespace
     /// `ns`, so AUTH1 scope enforcement can be exercised end-to-end.
     async fn setup_scoped_to_namespace(ns: &str) -> (Router, CancellationToken, String) {
+        setup_scoped_with_role(ns, crate::sesame::types::ApiRole::Deployer).await
+    }
+
+    async fn setup_scoped_with_role(
+        ns: &str,
+        role: crate::sesame::types::ApiRole,
+    ) -> (Router, CancellationToken, String) {
         let (cmd_tx, cmd_rx) = mpsc::channel(32);
         let shutdown = CancellationToken::new();
         let grill = MockGrill::new();
@@ -12246,13 +12344,7 @@ schedule = "* * * * *"
             apps: None,
             namespaces: Some(vec![ns.to_string()]),
         };
-        let created = crate::sesame::token::create_token(
-            "scoped",
-            crate::sesame::types::ApiRole::Deployer,
-            scope,
-            None,
-        )
-        .unwrap();
+        let created = crate::sesame::token::create_token("scoped", role, scope, None).unwrap();
         let store = crate::sesame::auth::new_token_store();
         store.write().await.push(created.token);
         let app = router(
@@ -12272,6 +12364,49 @@ schedule = "* * * * *"
             None,
         );
         (app, shutdown, created.plaintext)
+    }
+
+    /// Every route that upgrades, rolls back or re-elects the cluster.
+    const CLUSTER_ADMIN_ROUTES: [&str; 6] = [
+        "/v1/upgrade/apply",
+        "/v1/upgrade/rollback",
+        "/v1/upgrade/start",
+        "/v1/upgrade/resume",
+        "/v1/upgrade/cluster-rollback",
+        "/v1/cluster/elect",
+    ];
+
+    /// A namespace-scoped Admin clears the role gate, but these routes act on
+    /// every node and every tenant: it must not start a cluster-wide upgrade.
+    #[tokio::test]
+    async fn scoped_admin_is_refused_cluster_wide_upgrades_and_elections() {
+        for path in CLUSTER_ADMIN_ROUTES {
+            let (app, shutdown, tok) =
+                setup_scoped_with_role("team-a", crate::sesame::types::ApiRole::Admin).await;
+            let status = post_status(app, path, &tok, "{}").await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "scoped Admin allowed on {path}"
+            );
+            shutdown.cancel();
+        }
+    }
+
+    /// …while an unscoped Admin gets past authorisation (whatever the
+    /// handler then makes of an empty body).
+    #[tokio::test]
+    async fn unscoped_admin_passes_the_cluster_wide_gate() {
+        for path in CLUSTER_ADMIN_ROUTES {
+            let (app, shutdown, tok) =
+                setup_with_role("cluster-admin", crate::sesame::types::ApiRole::Admin).await;
+            let status = post_status(app, path, &tok, "{}").await;
+            assert!(
+                status != StatusCode::FORBIDDEN && status != StatusCode::UNAUTHORIZED,
+                "unscoped Admin refused on {path}: {status}"
+            );
+            shutdown.cancel();
+        }
     }
 
     #[tokio::test]

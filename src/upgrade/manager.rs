@@ -81,6 +81,9 @@ pub struct UpgradeManager {
     /// cost was *working at all* against a TLS-only registry, plus disclosing
     /// which build a node is moving to.
     cluster_http: crate::cluster::ClusterHttp,
+    /// Hex SHA-256 of the running binary, hashed once on first use (see
+    /// [`UpgradeManager::running_binary_sha256`]).
+    running_sha256: std::sync::Arc<tokio::sync::OnceCell<String>>,
 }
 
 /// Derive the store stem from the executable path bun was invoked as.
@@ -145,6 +148,7 @@ impl UpgradeManager {
             retain_versions: config.retain_versions,
             max_boot_attempts: config.max_boot_attempts,
             cluster_http: crate::cluster::ClusterHttp::plaintext(),
+            running_sha256: std::sync::Arc::new(tokio::sync::OnceCell::new()),
         })
     }
 
@@ -170,6 +174,29 @@ impl UpgradeManager {
     /// The version this process is running.
     pub fn running_version(&self) -> &BinaryVersion {
         &self.running_version
+    }
+
+    /// Hex SHA-256 of the binary this process runs, or `None` if it can't
+    /// be read.
+    ///
+    /// The store's file for the running version is the source (it is what
+    /// the entry symlink exec'd, and [`BinaryStore::stage`] refuses to put
+    /// different bytes under an existing version). A plain install with no
+    /// store file yet falls back to the executable itself. Hashing a whole
+    /// Bun binary is CPU work, so it runs on the blocking pool, once.
+    pub async fn running_binary_sha256(&self) -> Option<String> {
+        let stored = self.store.binary_path(&self.running_version);
+        self.running_sha256
+            .get_or_try_init(|| async move {
+                tokio::task::spawn_blocking(move || hash_running_binary(&stored))
+                    .await
+                    .ok()
+                    .flatten()
+                    .ok_or(())
+            })
+            .await
+            .ok()
+            .cloned()
     }
 
     /// Is an upgrade currently in flight on this node? (Cheap: one stat.)
@@ -235,6 +262,8 @@ impl UpgradeManager {
                 upgrade_id: directive.upgrade_id.clone(),
             });
         }
+
+        self.check_directive_target(directive).await?;
 
         let bytes = self.fetch_binary(directive).await?;
         let envelope = SignatureEnvelope {
@@ -602,6 +631,37 @@ impl UpgradeManager {
     // Internals
     // -----------------------------------------------------------------
 
+    /// Refuse a same-version or unrequested downgrade directive before
+    /// fetching anything. Identical bytes on the same version come back as
+    /// [`UpgradeError::AlreadyRunning`] so the caller can say "nothing to do".
+    async fn check_directive_target(
+        &self,
+        directive: &UpgradeDirective,
+    ) -> Result<(), UpgradeError> {
+        // Only a same-version directive needs the (hashed) running digest.
+        let sha256 = if directive.target_version == self.running_version {
+            self.running_binary_sha256().await
+        } else {
+            None
+        };
+        let running = super::plan::RunningBinary {
+            node: "this node".to_string(),
+            version: self.running_version.clone(),
+            sha256,
+        };
+        match super::plan::check_target(
+            &directive.target_version,
+            &directive.binary_sha256,
+            directive.allow_downgrade,
+            &[running],
+        )? {
+            super::plan::TargetCheck::Proceed => Ok(()),
+            super::plan::TargetCheck::AlreadyRunning => Err(UpgradeError::AlreadyRunning {
+                version: directive.target_version.clone(),
+            }),
+        }
+    }
+
     async fn fetch_binary(&self, directive: &UpgradeDirective) -> Result<Vec<u8>, UpgradeError> {
         match &directive.source {
             BinarySource::LocalFile { path } => Ok(tokio::fs::read(path).await?),
@@ -693,6 +753,25 @@ impl UpgradeManager {
         }
         entries
     }
+}
+
+/// Hash the running binary: the store's copy if present, else the
+/// executable this process was started from.
+fn hash_running_binary(stored: &Path) -> Option<String> {
+    let bytes = match std::fs::read(stored) {
+        Ok(bytes) => bytes,
+        Err(_) => std::fs::read(running_executable()?).ok()?,
+    };
+    Some(signing::sha256_hex(&bytes))
+}
+
+/// The executable this process runs. On Linux `/proc/self/exe` opens the
+/// exact inode even if the path was replaced since exec.
+fn running_executable() -> Option<PathBuf> {
+    if cfg!(target_os = "linux") {
+        return Some(PathBuf::from("/proc/self/exe"));
+    }
+    std::env::current_exe().ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -794,6 +873,7 @@ mod tests {
             external_signature: Some(sign(&fixture.external_pkcs8, bytes).unwrap()),
             source: BinarySource::LocalFile { path },
             network_provenance: false,
+            allow_downgrade: false,
         }
     }
 
@@ -822,6 +902,83 @@ mod tests {
             fixture.manager.store().current_target().unwrap(),
             v("0.1.0")
         );
+    }
+
+    #[tokio::test]
+    async fn running_binary_sha256_hashes_the_stored_running_version() {
+        let fixture = fixture();
+        assert_eq!(
+            fixture.manager.running_binary_sha256().await.as_deref(),
+            Some(sha256_hex(b"old binary").as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn same_version_directive_with_different_bytes_is_refused_untouched() {
+        let fixture = fixture();
+        let mut directive = directive_for(&fixture, b"rebuilt binary", "same-version");
+        directive.target_version = v("0.1.0");
+
+        let err = fixture
+            .manager
+            .prepare(&directive, vec![])
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, UpgradeError::SameVersionDifferentBinary { .. }),
+            "{err}"
+        );
+        assert!(!fixture.manager.upgrade_in_flight());
+        // The running version's bytes are still the original ones.
+        assert_eq!(
+            std::fs::read(fixture.manager.store().binary_path(&v("0.1.0"))).unwrap(),
+            b"old binary"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_version_directive_with_identical_bytes_reports_already_running() {
+        let fixture = fixture();
+        let mut directive = directive_for(&fixture, b"unused", "same-bytes");
+        directive.target_version = v("0.1.0");
+        directive.binary_sha256 = sha256_hex(b"old binary");
+
+        let err = fixture
+            .manager
+            .prepare(&directive, vec![])
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, UpgradeError::AlreadyRunning { .. }), "{err}");
+        assert!(!fixture.manager.upgrade_in_flight());
+    }
+
+    #[tokio::test]
+    async fn downgrade_directive_needs_allow_downgrade() {
+        let fixture = fixture();
+        let mut directive = directive_for(&fixture, b"soak build", "downgrade");
+        directive.target_version = v("0.1.0-soak.1");
+
+        let err = fixture
+            .manager
+            .prepare(&directive, vec![])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, UpgradeError::DowngradeRefused { .. }),
+            "{err}"
+        );
+        assert!(!fixture.manager.upgrade_in_flight());
+
+        directive.allow_downgrade = true;
+        let prepared = fixture
+            .manager
+            .prepare(&directive, vec![])
+            .await
+            .unwrap()
+            .expect("an allowed downgrade stages");
+        assert_eq!(prepared.target_version(), &v("0.1.0-soak.1"));
     }
 
     #[tokio::test]
@@ -1251,6 +1408,7 @@ mod tests {
             external_signature: None,
             source: BinarySource::LocalFile { path },
             network_provenance: false,
+            allow_downgrade: false,
         };
         manager.prepare(&directive, vec![]).await.unwrap().unwrap();
 
@@ -1280,6 +1438,7 @@ mod tests {
             external_signature: None,
             source: BinarySource::LocalFile { path: path.clone() },
             network_provenance: true,
+            allow_downgrade: false,
         };
         let err = fixture
             .manager
@@ -1324,6 +1483,7 @@ mod tests {
                 registry_address: "127.0.0.1:1".to_string(),
             },
             network_provenance: true,
+            allow_downgrade: false,
         };
 
         let plaintext = fixture.manager.fetch_binary(&directive).await;
@@ -1382,6 +1542,7 @@ mod tests {
                 registry_address: addr.to_string(),
             },
             network_provenance: true,
+            allow_downgrade: false,
         };
 
         // The 404 makes the fetch fail, but the request has already been sent.

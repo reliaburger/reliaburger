@@ -246,6 +246,7 @@ mod tests {
             direction: UpgradeDirection::Upgrade,
             phase: ClusterUpgradePhase::UpgradingWorkers,
             registry_address: String::new(),
+            allow_downgrade: false,
             nodes: vec![
                 record("n1", NodeUpgradePhase::Directed),
                 record("n2", NodeUpgradePhase::Pending),

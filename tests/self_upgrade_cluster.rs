@@ -600,6 +600,47 @@ retain_versions = 3
         }
     }
 
+    /// A relish client for `node`, authenticated as the cluster (the
+    /// registry refuses anonymous blob writes).
+    fn relish_client(&self, node: &ClusterNode) -> reliaburger::relish::client::BunClient {
+        reliaburger::relish::client::BunClient::new_with_token(
+            &format!("http://{}", node.api),
+            Some(&self.service_token),
+        )
+    }
+
+    /// Write `bytes` as `{dir}/bun-{version}` with a signed `.sig` envelope,
+    /// the shape `relish upgrade start --binary` expects.
+    fn signed_candidate(&self, dir: &Path, version: &str, bytes: &[u8]) -> PathBuf {
+        let path = dir.join(format!("bun-{version}"));
+        std::fs::write(&path, bytes).unwrap();
+        signing::SignatureEnvelope {
+            schema: 1,
+            sha256: signing::sha256_hex(bytes),
+            embedded: signing::sign(&self.release_pkcs8, bytes).unwrap(),
+            external: Some(signing::sign(&self.external_pkcs8, bytes).unwrap()),
+        }
+        .store(&dir.join(format!("bun-{version}.sig")))
+        .unwrap();
+        path
+    }
+
+    fn start_args(
+        binary: PathBuf,
+        allow_downgrade: bool,
+    ) -> reliaburger::relish::upgrade::StartArgs {
+        reliaburger::relish::upgrade::StartArgs {
+            version: None,
+            binary: Some(binary),
+            sig: None,
+            parallel: 1,
+            registry: None,
+            metadata_url: String::new(),
+            node_addresses: Vec::new(),
+            allow_downgrade,
+        }
+    }
+
     async fn shutdown(mut self) {
         for node in &mut self.nodes {
             let _ = node.stop_tx.send(true);
@@ -685,6 +726,128 @@ async fn rolling_upgrade_walks_workers_council_then_leader() {
         "old leader did not upgrade last: {healthy_order:?}"
     );
     harness.wait_for_leader().await;
+
+    harness.shutdown().await;
+}
+
+/// Forward exactly ONE TCP connection from a fresh loopback port to
+/// `target`, then stop listening. Plays a quickstart host forward that the
+/// nodes can't use: any later connection is refused.
+async fn one_shot_forward(target: String) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let Ok((mut inbound, _)) = listener.accept().await else {
+            return;
+        };
+        drop(listener);
+        let Ok(mut outbound) = tokio::net::TcpStream::connect(&target).await else {
+            return;
+        };
+        let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+    });
+    origin
+}
+
+#[tokio::test]
+#[ignore = "requires RELIABURGER_UPGRADE_TESTS=1 and a multi-core host"]
+async fn relish_pushes_through_a_forward_while_nodes_fetch_from_the_cluster_address() {
+    assert!(
+        upgrade_tests_enabled(),
+        "set RELIABURGER_UPGRADE_TESTS=1 on a provisioned multi-core host"
+    );
+    let _serial = SERIAL.lock().await;
+    let harness = ClusterHarness::start(4).await;
+    let leader = harness.wait_for_idle_leader().await;
+    let leader_node = harness.node(&leader);
+
+    // The quickstart shape: relish reaches the registry only through a
+    // host forward, which means nothing to the nodes. It closes after the
+    // push, so a node told to fetch from it would fail its download.
+    let forward = one_shot_forward(leader_node.registry.clone()).await;
+    let client = harness.relish_client(leader_node).with_service_endpoints(
+        reliaburger::bun::capabilities::ServiceEndpoints {
+            registry: Some(forward),
+            ..Default::default()
+        },
+    );
+    let staging = tempfile::tempdir().unwrap();
+    let bytes = std::fs::read(leader_node.bin_dir.join("bun-v0.2.0")).unwrap();
+    let candidate = harness.signed_candidate(staging.path(), "v0.2.0", &bytes);
+
+    reliaburger::relish::upgrade::start(&client, ClusterHarness::start_args(candidate, false))
+        .await
+        .expect("relish upgrade start");
+
+    let recorded = harness
+        .cluster_state()
+        .await
+        .expect("cluster upgrade state");
+    let active = &recorded["active"];
+    assert_eq!(
+        active["registry_address"], leader_node.registry,
+        "nodes must fetch from the leader's cluster registry address, not the forward"
+    );
+    let upgrade_id = active["upgrade_id"].as_str().unwrap().to_string();
+    let (_, phase) = harness.watch_upgrade(&upgrade_id, false).await;
+    assert_eq!(phase, "Completed");
+    harness.wait_for_versions("v0.2.0").await;
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires RELIABURGER_UPGRADE_TESTS=1 and a multi-core host"]
+async fn start_refuses_same_version_other_bytes_and_unrequested_downgrades() {
+    assert!(
+        upgrade_tests_enabled(),
+        "set RELIABURGER_UPGRADE_TESTS=1 on a provisioned multi-core host"
+    );
+    let _serial = SERIAL.lock().await;
+    let harness = ClusterHarness::start(4).await;
+    let leader = harness.wait_for_idle_leader().await;
+    let leader_node = harness.node(&leader);
+    let client = harness.relish_client(leader_node);
+    let staging = tempfile::tempdir().unwrap();
+    let running = std::fs::read(leader_node.bin_dir.join("bun-v0.1.0")).unwrap();
+
+    // Same version, different bytes: refused before anything is recorded.
+    let mut rebuilt = running.clone();
+    rebuilt.extend_from_slice(b"\n# a different build of v0.1.0\n");
+    let candidate = harness.signed_candidate(staging.path(), "v0.1.0", &rebuilt);
+    let err =
+        reliaburger::relish::upgrade::start(&client, ClusterHarness::start_args(candidate, false))
+            .await
+            .expect_err("a same-version candidate with other bytes must be refused");
+    assert!(
+        err.to_string().contains("different binary"),
+        "unexpected refusal: {err}"
+    );
+    assert!(harness.cluster_state().await.unwrap()["active"].is_null());
+
+    // Same version, same bytes: "already running", nothing recorded.
+    let same = tempfile::tempdir().unwrap();
+    let candidate = harness.signed_candidate(same.path(), "v0.1.0", &running);
+    reliaburger::relish::upgrade::start(&client, ClusterHarness::start_args(candidate, false))
+        .await
+        .expect("identical bytes report already running");
+    assert!(harness.cluster_state().await.unwrap()["active"].is_null());
+
+    // An older version needs --allow-downgrade.
+    let candidate = harness.signed_candidate(staging.path(), "v0.0.9", &running);
+    let err =
+        reliaburger::relish::upgrade::start(&client, ClusterHarness::start_args(candidate, false))
+            .await
+            .expect_err("a downgrade without the flag must be refused");
+    assert!(
+        err.to_string().contains("--allow-downgrade"),
+        "unexpected refusal: {err}"
+    );
+    assert!(harness.cluster_state().await.unwrap()["active"].is_null());
+    assert!(
+        harness.versions().await.values().all(|v| v == "v0.1.0"),
+        "no node may have moved"
+    );
 
     harness.shutdown().await;
 }

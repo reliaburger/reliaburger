@@ -722,3 +722,70 @@ let record: OwnerRecord = durable::read_json(&path, RECORD_LIMIT, Access::Regula
 Its signature is `read_json<T: DeserializeOwned>(...) -> io::Result<T>`. `DeserializeOwned` is serde's trait for types that can be built from bytes without borrowing from them, and the compiler picks `T` from the type annotation on the left: the same call returns an `OwnerRecord` here and a checkpoint somewhere else. `Access` says how private the file has to be. Startup also refuses records whose stored instance ID doesn't match their app, namespace and replica fields, rather than inventing a second name for a running workload and later failing to find it.
 
 Finally, the upgrade test suite runs all of this with real binaries and real runc. It signs a copied Bun with a throwaway test key, upgrades and rolls back through the real API, and requires the workload to keep its instance ID, PID and host port through both execs, with its main command running exactly once. A poisoned candidate must revert on its own. A three-node variant upgrades each node, leader last, rolls them all back, and checks that every node still sees the service afterwards. The throwaway key and the failure trigger are test-only; release binaries contain neither.
+
+
+## Two addresses and one version number
+
+Planning the 0.1.0 soak test meant reading `relish upgrade start` as an operator would, from a laptop, against a quickstart cluster. Two things didn't survive the read.
+
+### Where relish pushes isn't where nodes fetch
+
+The cluster flow used to take one registry address, `{api host}:5050`, and use it twice: relish pushed the binary there, and the same string went into the start request as the place every node should download from. On a quickstart cluster the API host from the Mac is `127.0.0.1`, so relish pushed to `127.0.0.1:5050`. Nothing listens there. The registry forward sits on host port 15050. Pass `--registry 127.0.0.1:15050` and the push works, but now every node is told to fetch from *its own* loopback port 15050, which is empty. The same bug bit anyone running relish on a node against `https://127.0.0.1:9117`: four nodes, each fetching from itself, three of them finding nothing.
+
+It's one address doing two jobs for two audiences. relish stands wherever the operator is; the nodes stand on the cluster network. So `start` now resolves a `RegistryRoute` with two fields:
+
+```rust
+pub struct RegistryRoute {
+    /// Origin relish pushes to, `scheme://host:port`.
+    pub push_origin: String,
+    /// `host:port` the nodes fetch from.
+    pub fetch_address: String,
+}
+```
+
+The fetch address comes from the node relish is connected to. relish asks it for its capability report, *as the node reports it* (a managed connection normally swaps in its host forwards, so there's a new `capabilities_as_reported` that doesn't), which gives the node's id and its real registry listener, typically `https://0.0.0.0:5050`. A wildcard listener says nothing about how peers reach it, so relish looks the node up in cluster membership and pairs its gossip IP with the listener's port. The push origin is the connection's declared registry forward when there is one (quickstart writes `https://127.0.0.1:15050` into the local context), and otherwise the API host with that same port. `--registry` still names one address for both jobs, for anyone who wants to decide.
+
+`resolve_registry_route` is a pure function from those facts to a route, so the unit tests read like a map of where relish might be standing: on the Mac through forwards, on a node through loopback, on a remote machine, and against a listener bound to a specific IPv6 address. The cluster suite adds `relish_pushes_through_a_forward_while_nodes_fetch_from_the_cluster_address`. It drives the real `relish::upgrade::start` through a one-shot TCP forward that closes after the push, so a node that tried to fetch through the forward would fail its download, and the walk would never complete.
+
+### An upgrade that swaps nothing
+
+The second gap is quieter. The orchestrator marks a node `Healthy` when `/v1/version` reports the target version, and the node's binary store names files by version. Now build a new bun without bumping the version and `relish upgrade start --binary` it. Every node already reports the target, so the walk marks them all `Healthy` on the first poll and reports success. Nothing was swapped. On a single node it was worse: `prepare` staged the new bytes over `bun-v0.1.0`, the very file the node was running and would revert to.
+
+The fix works at three layers, because each one can be reached without the others:
+
+- **The binary store** refuses to put different bytes under an existing version (`VersionContentConflict`). Identical bytes are accepted and left alone.
+- **Nodes report what they run.** `/v1/version` gains `binary_sha256`. Hashing a whole bun is CPU work, so the manager does it once, on the blocking pool, and caches it in a `tokio::sync::OnceCell`. `OnceCell::get_or_try_init` takes an async closure; the first caller runs it and everyone else awaits the same result. If the closure fails, the cell stays empty and the next caller tries again, which is what you want for an I/O error.
+- **One pure gate, `upgrade::plan::check_target`,** compares the target with what every node runs. Same version and different (or unknown) bytes: `SameVersionDifferentBinary`, which tells the operator to give the candidate a new version. Same version and identical bytes everywhere: `TargetCheck::AlreadyRunning`, and relish prints "nothing to do" and exits cleanly. The leader runs the gate in `/v1/upgrade/start` after probing every planned node, before anything goes into Raft. Each node runs it again in `prepare`. And the orchestrator re-checks the digest when a node reports the target version, so a node that changed underneath the walk fails the run instead of passing it.
+
+The API handler maps "already running" to a 200 rather than an error, with a match arm that binds and filters at once:
+
+```rust
+Ok(Err(crate::bun::BunError::Upgrade(
+    error @ crate::upgrade::UpgradeError::AlreadyRunning { .. },
+))) => ...
+```
+
+`name @ pattern` is a Rust binding: it matches only if the value fits the pattern on the right, and then gives you the whole matched value under `name`. Go and C have nothing like it; you'd match the variant and then re-borrow the value. Here it lets us render `error` into the response body without destructuring its fields.
+
+### Downgrades need asking for
+
+Nothing used to refuse moving to an *older* version with `upgrade start`. That matters because semver sorts pre-releases before their release: `0.1.0-soak.1 < 0.1.0`. The soak's private build is a downgrade by that ordering, and so is any accidentally older binary. We decided a downgrade through `start` should be deliberate, so it now needs `--allow-downgrade`. The flag rides in the start request, into the replicated `ClusterUpgradeState`, and into every node's directive, because each node checks for itself. Both new fields are `#[serde(default)]`, so state recorded by an older leader still reads back.
+
+`relish upgrade rollback VERSION` is unchanged and needs no flag. It returns to a binary that is already on every node's disk and was verified when it arrived, which is a different operation from installing a new one. So the soak runs `relish upgrade start --binary bun-v0.1.0-soak.1 --allow-downgrade` to move onto the soak build, and `relish upgrade rollback v0.1.0` to come back.
+
+The real-binary suites grew two more tests. `same_version_upgrade_never_swaps_silently` posts both kinds of same-version directive to a live node and checks the running file's bytes afterwards. `start_refuses_same_version_other_bytes_and_unrequested_downgrades` does the same through relish against the four-node cluster and asserts that no upgrade was ever recorded.
+
+### Scoped admins stay in their lane
+
+While we were in these handlers, a separate review of token scopes found that every mutating `/v1/upgrade/*` route checked for the Admin *role* and stopped there. An Admin token scoped to one namespace (`relish token create --namespaces team-a`) could therefore start a cluster-wide upgrade, which replaces the binary under every tenant. The upgrade handlers, and `/v1/cluster/elect` for the same reason, now go through one helper:
+
+```rust
+fn authorize_cluster_admin(
+    auth: Option<&crate::sesame::auth::AuthContext>,
+) -> Result<(), Response> {
+    crate::sesame::auth::authorize(auth, crate::sesame::types::ApiRole::Admin)?;
+    crate::sesame::auth::require_unscoped(auth)
+}
+```
+
+The `?` after the first call returns its error response early, so the function reads as the two rules it enforces, in order. The service token still passes, which matters: it's what the orchestrator presents when it directs each node. A unit test posts to all six routes with a scoped Admin and expects 403, another checks an unscoped Admin gets through, and a source-scanning test in `bun::authz` fails if any of those handlers stops calling the helper.

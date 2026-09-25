@@ -35,6 +35,8 @@ pub struct NodeProbe {
     pub upgrade_in_flight: bool,
     /// Upgrade ids the node attempted and reverted.
     pub failed_upgrade_ids: Vec<String>,
+    /// Hex SHA-256 of the binary the node runs, when it reports one.
+    pub binary_sha256: Option<String>,
 }
 
 /// Effects the orchestrator performs on nodes. Mocked in unit tests; the
@@ -202,6 +204,7 @@ async fn poll_and_drive_group<C: NodeControl>(
     let target = state.target_version.clone();
     let direction = state.direction;
     let state_upgrade_id = state.upgrade_id.clone();
+    let state_sha256 = state.binary_sha256.clone();
     let directive = build_directive(state);
     let budget = if role == NodeRole::Worker {
         state.parallel.max(1) as usize
@@ -261,6 +264,31 @@ async fn poll_and_drive_group<C: NodeControl>(
         }
 
         if probe.version == target && probe.healthy && !probe.upgrade_in_flight {
+            // The target *version* is not proof of the target *binary*: a
+            // node that already ran a same-numbered build with other bytes
+            // would otherwise be called Healthy without a swap. Start-time
+            // checks refuse that up front; this catches a node that changed
+            // underneath the walk.
+            if direction == UpgradeDirection::Upgrade
+                && !probe
+                    .binary_sha256
+                    .as_deref()
+                    .is_some_and(|sha| sha.eq_ignore_ascii_case(&state_sha256))
+            {
+                set_phase(
+                    record,
+                    NodeUpgradePhase::Failed {
+                        reason: format!(
+                            "node {} runs {target} but not this binary (sha256 {}); \
+                             a same-version upgrade cannot swap it",
+                            record.node_id,
+                            probe.binary_sha256.as_deref().unwrap_or("unknown")
+                        ),
+                    },
+                    context.now,
+                );
+                continue;
+            }
             // HTTP-healthy at the target is necessary but not sufficient: a
             // node that came back up but never rejoined the gossip mesh is
             // isolated (its workloads take no traffic, its votes don't
@@ -404,6 +432,7 @@ fn build_directive(state: &ClusterUpgradeState) -> UpgradeDirective {
             registry_address: state.registry_address.clone(),
         },
         network_provenance: true,
+        allow_downgrade: state.allow_downgrade,
     }
 }
 
@@ -545,11 +574,14 @@ impl NodeControl for HttpNodeControl {
             Ok(response) if response.status().is_success()
         );
 
+        let binary_sha256 = value["binary_sha256"].as_str().map(String::from);
+
         Some(NodeProbe {
             version,
             healthy,
             upgrade_in_flight,
             failed_upgrade_ids,
+            binary_sha256,
         })
     }
 
@@ -800,6 +832,7 @@ mod tests {
                     healthy,
                     upgrade_in_flight: in_flight,
                     failed_upgrade_ids: Vec::new(),
+                    binary_sha256: Some(fixture_sha256(version).to_string()),
                 },
             );
         }
@@ -812,6 +845,7 @@ mod tests {
                     healthy: true,
                     upgrade_in_flight: false,
                     failed_upgrade_ids: vec![failed_id.to_string()],
+                    binary_sha256: Some(fixture_sha256(version).to_string()),
                 },
             );
         }
@@ -867,8 +901,58 @@ mod tests {
             direction: UpgradeDirection::Upgrade,
             phase: ClusterUpgradePhase::UpgradingWorkers,
             registry_address: "leader:5050".to_string(),
+            allow_downgrade: false,
             nodes,
         }
+    }
+
+    /// The digest a mock node reports: the candidate's ("abc", see
+    /// `cluster_state`) on the target version, something else otherwise.
+    fn fixture_sha256(version: &str) -> &'static str {
+        if version == "0.2.0" { "abc" } else { "old" }
+    }
+
+    #[tokio::test]
+    async fn pending_node_on_the_target_version_with_other_bytes_fails_not_healthy() {
+        let control = MockControl::default();
+        control.set("addr-w1", "0.2.0", true, false);
+        control
+            .nodes
+            .lock()
+            .unwrap()
+            .get_mut("addr-w1")
+            .unwrap()
+            .binary_sha256 = Some("different".to_string());
+        let state = cluster_state(
+            vec![record("w1", NodeRole::Worker, NodeUpgradePhase::Pending)],
+            1,
+        );
+
+        let state = step(state, &control, &context()).await;
+
+        match &state.nodes[0].phase {
+            NodeUpgradePhase::Failed { reason } => {
+                assert!(reason.contains("not this binary"), "{reason}")
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert!(matches!(state.phase, ClusterUpgradePhase::Paused { .. }));
+        assert!(control.directives.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pending_node_already_on_the_exact_candidate_is_healthy_without_a_directive() {
+        let control = MockControl::default();
+        control.set("addr-w1", "0.2.0", true, false);
+        let state = cluster_state(
+            vec![record("w1", NodeRole::Worker, NodeUpgradePhase::Pending)],
+            1,
+        );
+
+        let state = step(state, &control, &context()).await;
+
+        assert_eq!(state.nodes[0].phase, NodeUpgradePhase::Healthy);
+        assert!(control.directives.lock().unwrap().is_empty());
     }
 
     /// A context in which every node the tests use is gossip-alive, so the

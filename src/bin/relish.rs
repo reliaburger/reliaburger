@@ -608,7 +608,10 @@ enum UpgradeAction {
         /// Worker upgrade parallelism.
         #[arg(long, default_value = "1")]
         parallel: u32,
-        /// The leader's Pickle registry nodes fetch from (host:port).
+        /// Registry (host:port) relish pushes the binary to AND nodes fetch
+        /// it from. By default relish pushes through this connection's
+        /// registry (a quickstart host forward, or the API host) and tells
+        /// nodes to fetch from the connected node's cluster address.
         #[arg(long)]
         registry: Option<String>,
         /// Release metadata URL.
@@ -617,6 +620,11 @@ enum UpgradeAction {
         /// Per-node API address override, node_id=host:port (repeatable).
         #[arg(long = "node-address")]
         node_addresses: Vec<String>,
+        /// Allow a target version older than what the nodes run. For
+        /// returning to a version you rolled forward from, prefer
+        /// `relish upgrade rollback`.
+        #[arg(long)]
+        allow_downgrade: bool,
     },
     /// Preview the rolling order and estimated duration.
     Plan {
@@ -1598,6 +1606,7 @@ async fn main() -> ExitCode {
                     registry,
                     url,
                     node_addresses,
+                    allow_downgrade,
                 } => {
                     reliaburger::relish::upgrade::start(
                         &client,
@@ -1609,6 +1618,7 @@ async fn main() -> ExitCode {
                             registry,
                             metadata_url: url,
                             node_addresses,
+                            allow_downgrade,
                         },
                     )
                     .await

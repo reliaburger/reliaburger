@@ -29,6 +29,11 @@ pub struct UpgradeDirective {
     /// upgrade and must require the operator's external signature. Verification
     /// treats the upgrade as network when this is set OR the source is network.
     pub network_provenance: bool,
+    /// The operator explicitly allowed a target older than the running
+    /// version (`relish upgrade start --allow-downgrade`). Without it the
+    /// node refuses a downgrade.
+    #[serde(default)]
+    pub allow_downgrade: bool,
 }
 
 /// Where the node obtains the binary bytes.
@@ -106,6 +111,10 @@ pub struct ClusterUpgradeState {
     /// Empty for rollbacks (the binary is already on every node's disk).
     #[serde(default)]
     pub registry_address: String,
+    /// Carried into every node's directive: the operator allowed a target
+    /// older than what the nodes run.
+    #[serde(default)]
+    pub allow_downgrade: bool,
     /// Fixed at start from gossip membership; the rolling order walks it.
     pub nodes: Vec<NodeUpgradeRecord>,
 }

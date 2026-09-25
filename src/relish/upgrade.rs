@@ -56,12 +56,14 @@ pub struct StartArgs {
     pub binary: Option<std::path::PathBuf>,
     pub sig: Option<std::path::PathBuf>,
     pub parallel: u32,
-    /// The leader's Pickle registry (`host:port`) that nodes fetch from.
-    /// Defaults to the API host with port 5050.
+    /// Registry (`host:port`) to push to and fetch from. `None` resolves
+    /// the two separately (see [`resolve_registry_route`]).
     pub registry: Option<String>,
     pub metadata_url: String,
     /// Per-node API address overrides, `node_id=host:port`.
     pub node_addresses: Vec<String>,
+    /// Allow a target older than the running version.
+    pub allow_downgrade: bool,
 }
 
 /// `relish upgrade start` — network or air-gapped.
@@ -130,13 +132,28 @@ pub async fn start(client: &BunClient, args: StartArgs) -> Result<(), RelishErro
             let nodes = client.nodes().await?;
             let overrides = parse_overrides(&args.node_addresses)?;
             let node_list = build_node_list(&nodes, &overrides)?;
-            // Cluster flow: push the blob to the leader's registry, then
-            // record the plan; the orchestrator walks the fleet.
-            let registry = args
-                .registry
-                .clone()
-                .unwrap_or_else(|| default_registry_for(client.base_url()));
-            push_blob(client, &registry, &bytes, &binary_sha256).await?;
+            // Cluster flow: push the blob to the connected node's registry,
+            // then record the plan; the orchestrator walks the fleet and
+            // every node fetches from that registry's cluster address.
+            let route = match &args.registry {
+                Some(explicit) => RegistryRoute::explicit(client.scheme(), explicit),
+                None => {
+                    let reported = client.capabilities_as_reported().await?;
+                    resolve_registry_route(
+                        client.scheme(),
+                        client.base_url(),
+                        client.declared_registry(),
+                        &reported.node_id,
+                        reported.service_endpoints.registry.as_deref(),
+                        &nodes,
+                    )?
+                }
+            };
+            eprintln!(
+                "pushing the binary via {}; nodes fetch it from {}",
+                route.push_origin, route.fetch_address
+            );
+            push_blob(client, &route.push_origin, &bytes, &binary_sha256).await?;
 
             let request = serde_json::json!({
                 "target_version": target_version,
@@ -144,10 +161,18 @@ pub async fn start(client: &BunClient, args: StartArgs) -> Result<(), RelishErro
                 "embedded_signature": embedded_signature,
                 "external_signature": external_signature,
                 "parallel": args.parallel,
-                "registry_address": registry,
+                "registry_address": route.fetch_address,
                 "nodes": node_list,
+                "allow_downgrade": args.allow_downgrade,
             });
             let response = client.upgrade_start(&request).await?;
+            if response["status"] == "already_running" {
+                println!(
+                    "{}",
+                    response["detail"].as_str().unwrap_or("already running")
+                );
+                return Ok(());
+            }
             println!(
                 "cluster upgrade to {target_version} started ({})",
                 response["upgrade_id"].as_str().unwrap_or("?")
@@ -178,8 +203,16 @@ pub async fn start(client: &BunClient, args: StartArgs) -> Result<(), RelishErro
                 // staged as a local file IS, so it still requires the external
                 // signature (M5).
                 network_provenance: args.binary.is_none(),
+                allow_downgrade: args.allow_downgrade,
             };
-            client.upgrade_apply(&directive).await?;
+            let response = client.upgrade_apply(&directive).await?;
+            if response["status"] == "already_running" {
+                println!(
+                    "{}",
+                    response["detail"].as_str().unwrap_or("already running")
+                );
+                return Ok(());
+            }
             println!("node upgrade to {target_version} started");
             println!("watch it with: relish upgrade status");
         }
@@ -445,16 +478,98 @@ fn version_from_file_name(path: &Path) -> Option<BinaryVersion> {
     format!("v{suffix}").parse().ok()
 }
 
-/// Derive the default registry (API host, port 5050) from a base URL like
-/// `http://10.0.1.5:9117`.
-fn default_registry_for(base_url: &str) -> String {
-    let host = base_url
-        .trim_start_matches("http://")
-        .trim_start_matches("https://")
-        .split(':')
-        .next()
-        .unwrap_or("127.0.0.1");
-    format!("{host}:5050")
+/// Where a cluster upgrade's binary travels: relish uploads it through
+/// `push_origin`, and every node downloads it from `fetch_address`.
+///
+/// These are two addresses because relish and the nodes stand in different
+/// places. On a quickstart laptop cluster relish reaches node 1's registry
+/// through a host forward (`https://127.0.0.1:15050`), which means nothing
+/// inside the VMs; the nodes need node 1's own cluster address. Sending the
+/// push address to the nodes (as relish once did) made every node fetch
+/// from its own loopback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistryRoute {
+    /// Origin relish pushes to, `scheme://host:port`.
+    pub push_origin: String,
+    /// `host:port` the nodes fetch from.
+    pub fetch_address: String,
+}
+
+impl RegistryRoute {
+    /// `--registry host:port`: the operator names one address for both.
+    fn explicit(scheme: &str, address: &str) -> Self {
+        Self {
+            push_origin: format!("{scheme}://{address}"),
+            fetch_address: address.to_string(),
+        }
+    }
+}
+
+/// Work out the [`RegistryRoute`] for the node this connection talks to.
+///
+/// - `listener` is that node's registry listener as it reports it
+///   (`https://0.0.0.0:5050`), `serving_node` its node id.
+/// - The fetch address is the listener if it is bound to a specific
+///   routable IP, otherwise the node's gossip IP with the listener's port.
+/// - The push origin is the connection's declared registry forward when it
+///   has one (quickstart), otherwise the API host with the listener's port.
+pub fn resolve_registry_route(
+    scheme: &str,
+    api_base_url: &str,
+    declared_forward: Option<&str>,
+    serving_node: &str,
+    listener: Option<&str>,
+    nodes: &[crate::bun::agent::NodeStatus],
+) -> Result<RegistryRoute, RelishError> {
+    let unresolved = |why: String| {
+        RelishError::FormatFailed(format!(
+            "{why}; pass --registry host:port to name the upgrade registry"
+        ))
+    };
+    let listener: std::net::SocketAddr = listener
+        .map(|origin| origin.rsplit("://").next().unwrap_or(origin))
+        .and_then(|address| address.trim_end_matches('/').parse().ok())
+        .ok_or_else(|| {
+            unresolved(format!(
+                "node {serving_node} reports no usable registry listener ({listener:?})"
+            ))
+        })?;
+
+    let fetch_address = if listener.ip().is_unspecified() || listener.ip().is_loopback() {
+        let member = nodes
+            .iter()
+            .find(|node| node.node_id == serving_node)
+            .ok_or_else(|| {
+                unresolved(format!(
+                    "node {serving_node} is not in the cluster membership"
+                ))
+            })?;
+        let gossip: std::net::SocketAddr = member.address.parse().map_err(|_| {
+            unresolved(format!(
+                "node {serving_node} has an unparseable cluster address {:?}",
+                member.address
+            ))
+        })?;
+        std::net::SocketAddr::new(gossip.ip(), listener.port()).to_string()
+    } else {
+        listener.to_string()
+    };
+
+    let push_origin = match declared_forward {
+        Some(forward) => forward.trim_end_matches('/').to_string(),
+        None => {
+            let host = reqwest::Url::parse(api_base_url)
+                .ok()
+                .and_then(|url| url.host_str().map(String::from))
+                .ok_or_else(|| unresolved(format!("cannot read a host from {api_base_url:?}")))?;
+            format!("{scheme}://{host}:{}", listener.port())
+        }
+    };
+
+    Ok(RegistryRoute {
+        push_origin,
+        fetch_address,
+    })
 }
 
 /// Download a URL into memory (shared with `relish setup`).
@@ -482,13 +597,12 @@ pub(crate) async fn download(url: &str) -> Result<Vec<u8>, RelishError> {
 /// reads. A bare `reqwest::Client` on a hardcoded `http://` failed both tests.
 async fn push_blob(
     client: &BunClient,
-    registry: &str,
+    origin: &str,
     bytes: &[u8],
     sha256: &str,
 ) -> Result<(), RelishError> {
     let url = format!(
-        "{}://{registry}/v2/{}/blobs/uploads/?digest=sha256:{sha256}",
-        client.scheme(),
+        "{origin}/v2/{}/blobs/uploads/?digest=sha256:{sha256}",
         crate::upgrade::BINARY_BLOB_REPO
     );
     let response = client
@@ -500,7 +614,7 @@ async fn push_blob(
         .map_err(|e| RelishError::FormatFailed(format!("blob push failed: {e}")))?;
     if !response.status().is_success() {
         return Err(RelishError::FormatFailed(format!(
-            "blob push to {registry} failed: status {}",
+            "blob push to {origin} failed: status {}",
             response.status()
         )));
     }
@@ -680,6 +794,118 @@ mod tests {
         assert_eq!(list[0]["role"], "Worker");
         assert_eq!(list[1]["address"], "[2001:db8::2]:19443"); // advertised
         assert_eq!(list[1]["role"], "Leader");
+    }
+
+    fn member(node_id: &str, gossip: &str) -> crate::bun::agent::NodeStatus {
+        crate::bun::agent::NodeStatus {
+            node_id: node_id.to_string(),
+            address: gossip.to_string(),
+            api_address: None,
+            state: "alive".to_string(),
+            incarnation: 1,
+            is_council: true,
+            is_leader: false,
+            labels: Default::default(),
+        }
+    }
+
+    #[test]
+    fn quickstart_pushes_through_the_host_forward_and_nodes_fetch_from_node_one() {
+        // relish on the Mac: API and registry are 127.0.0.1 host forwards;
+        // node 1 listens on the wildcard inside its VM.
+        let nodes = [
+            member("rb-1", "192.168.105.2:9443"),
+            member("rb-2", "192.168.105.3:9443"),
+        ];
+        let route = resolve_registry_route(
+            "https",
+            "https://127.0.0.1:19117",
+            Some("https://127.0.0.1:15050"),
+            "rb-1",
+            Some("https://0.0.0.0:5050"),
+            &nodes,
+        )
+        .unwrap();
+        assert_eq!(route.push_origin, "https://127.0.0.1:15050");
+        assert_eq!(route.fetch_address, "192.168.105.2:5050");
+    }
+
+    #[test]
+    fn plain_cluster_pushes_to_the_api_host_on_the_registry_port() {
+        let nodes = [member("n1", "10.0.0.5:9443")];
+        let route = resolve_registry_route(
+            "https",
+            "https://10.0.0.5:9117",
+            None,
+            "n1",
+            Some("https://0.0.0.0:5050"),
+            &nodes,
+        )
+        .unwrap();
+        assert_eq!(route.push_origin, "https://10.0.0.5:5050");
+        assert_eq!(route.fetch_address, "10.0.0.5:5050");
+    }
+
+    #[test]
+    fn relish_on_a_node_via_loopback_never_sends_loopback_to_the_fleet() {
+        // `relish` run on node 1 against https://127.0.0.1:9117 used to tell
+        // every node to fetch from 127.0.0.1:5050, i.e. its own registry.
+        let nodes = [member("n1", "10.0.0.5:9443")];
+        let route = resolve_registry_route(
+            "https",
+            "https://127.0.0.1:9117",
+            None,
+            "n1",
+            Some("https://0.0.0.0:5050"),
+            &nodes,
+        )
+        .unwrap();
+        assert_eq!(route.push_origin, "https://127.0.0.1:5050");
+        assert_eq!(route.fetch_address, "10.0.0.5:5050");
+    }
+
+    #[test]
+    fn a_listener_on_a_specific_address_is_fetched_from_directly() {
+        let route = resolve_registry_route(
+            "http",
+            "http://[2001:db8::5]:9117",
+            None,
+            "n1",
+            Some("http://[2001:db8::5]:15051"),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(route.push_origin, "http://[2001:db8::5]:15051");
+        assert_eq!(route.fetch_address, "[2001:db8::5]:15051");
+    }
+
+    #[test]
+    fn unresolvable_routes_point_at_the_registry_flag() {
+        let missing_listener =
+            resolve_registry_route("https", "https://10.0.0.5:9117", None, "n1", None, &[])
+                .unwrap_err();
+        assert!(missing_listener.to_string().contains("--registry"));
+
+        let unknown_node = resolve_registry_route(
+            "https",
+            "https://10.0.0.5:9117",
+            None,
+            "ghost",
+            Some("https://0.0.0.0:5050"),
+            &[member("n1", "10.0.0.5:9443")],
+        )
+        .unwrap_err();
+        assert!(
+            unknown_node.to_string().contains("--registry"),
+            "{unknown_node}"
+        );
+    }
+
+    #[test]
+    fn explicit_registry_is_both_push_and_fetch() {
+        let route = RegistryRoute::explicit("https", "10.0.0.9:5050");
+        assert_eq!(route.push_origin, "https://10.0.0.9:5050");
+        assert_eq!(route.fetch_address, "10.0.0.9:5050");
     }
 
     #[test]

@@ -988,6 +988,7 @@ fn owned_upgrade_directive(
         external_signature: None,
         source: BinarySource::LocalFile { path },
         network_provenance: false,
+        allow_downgrade: false,
     }
 }
 

@@ -477,7 +477,8 @@ authenticated cluster and create the first admin token before exposing the API
 on a non-loopback address.
 
 After bootstrap, cluster-wide token management, node join tokens, secret
-rotation and image signing require an **unscoped Admin** credential. An Admin
+rotation, image signing, self-upgrades (start, apply, rollback, resume) and
+leader elections require an **unscoped Admin** credential. An Admin
 restricted by `--apps` or `--namespaces` cannot use those global operations.
 Ordinary `[namespace]` quota and `[permission]` declarations also require an
 unscoped Admin; a Deployer can apply workloads within its scope and configured
@@ -718,6 +719,7 @@ Commands:
 | `upgrade check` | Check the release metadata for available updates |
 | `upgrade start <version>` | Start a rolling binary upgrade (network) |
 | `upgrade start --binary <path>` | Upgrade from a local signed binary (air-gapped) |
+| `upgrade start ... --allow-downgrade` | Allow a target older than the running version |
 | `upgrade plan <version>` | Preview the rolling order and estimated duration |
 | `upgrade status` | Show upgrade progress (cluster or node) |
 | `upgrade rollback [version]` | Roll back to a previous binary version |

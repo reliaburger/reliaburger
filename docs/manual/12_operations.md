@@ -37,6 +37,18 @@ For air-gapped clusters, `relish upgrade start --binary ./bun-v0.2.0` rolls a
 local binary instead. It needs only the release signature, in
 `bun-v0.2.0.sig` beside it (or `--sig`).
 
+relish pushes the binary to the registry of the node it's connected to and
+tells the other nodes to fetch it from that node's cluster address. From a
+laptop running a `relish local` cluster, the push goes through the registry
+forward and works without flags. `--registry host:port` names one address for
+both the push and the fetch.
+
+`start` refuses a candidate with the version the nodes already run but
+different bytes: build it with a new version instead. If the bytes are
+identical it reports that there's nothing to do. Moving to an older version
+needs `--allow-downgrade` (note that `v0.2.0-rc.1` is older than `v0.2.0`);
+`relish upgrade rollback` goes back to a retained version without it.
+
 Rolling upgrades need matching protocol and state formats; `bun --compatibility`
 prints what a binary supports. Development builds' state isn't migrated.
 
