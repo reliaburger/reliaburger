@@ -1200,13 +1200,17 @@ pub async fn build_submit_handler(
     // so a Deployer token scoped to namespace `a` cannot push an image into
     // namespace `b`'s repository. An unscoped token still pushes anywhere. This
     // runs before the council existence check so the scope gate applies in both
-    // single-node and clustered mode.
-    match crate::pickle::build::destination_scope(&request.spec) {
-        Ok((namespace, image)) => {
-            if let Err(resp) =
-                crate::sesame::auth::authorize_scoped(auth.as_deref(), &image, &namespace)
-            {
-                return resp;
+    // single-node and clustered mode. It is the registry's own repository
+    // rule, so `relish build` and `docker push` agree on what a scoped token
+    // may write (a bare name, which names no namespace, is refused to both).
+    match crate::pickle::build::destination_repository(&request.spec) {
+        Ok(repository) => {
+            if let Err(denied) = crate::pickle::registry_auth::check_repository_scope(
+                auth.as_deref(),
+                &repository,
+                crate::pickle::registry_auth::RepositoryAccess::WriteManifest,
+            ) {
+                return (StatusCode::FORBIDDEN, denied.to_string()).into_response();
             }
         }
         Err(e) => {

@@ -6,7 +6,9 @@
 //! guard registry requests. Reads stay open only on the loopback listener;
 //! routable reads require any valid principal. Writes require a principal
 //! with at least `Deployer` role, or the internal service token that
-//! node-to-node replication presents.
+//! node-to-node replication presents. A token scoped to apps or namespaces
+//! is further held to repositories named `<namespace>/<app>` inside its
+//! scope, for reads and writes alike ([`check_repository_scope`]).
 //!
 //! Two policy dimensions live here alongside the auth gate:
 //!
@@ -22,8 +24,8 @@ use std::time::{Duration, SystemTime};
 
 use tokio::sync::RwLock;
 
-use crate::sesame::auth::AuthState;
-use crate::sesame::types::ApiRole;
+use crate::sesame::auth::{AuthContext, AuthState};
+use crate::sesame::types::{ApiRole, TokenScope};
 
 /// How long a chunked upload session lives without activity before it's
 /// rejected and swept (REG8). Generous enough for a slow large-layer push,
@@ -192,21 +194,24 @@ pub async fn authenticate_writer(
 /// `PickleState::require_read_auth`); this function answers *who counts* when
 /// they do. The bar is deliberately lower than for writes: any valid token,
 /// no minimum role, because pulling is what read-only tokens are for.
-pub async fn authorise_read(auth: &AuthState, bearer: Option<&str>) -> Result<(), WriteDenied> {
+///
+/// Returns the authenticated principal so the caller can hold the read to
+/// the token's app/namespace scope ([`check_repository_scope`]).
+pub async fn authorise_read(
+    auth: &AuthState,
+    bearer: Option<&str>,
+) -> Result<AuthContext, WriteDenied> {
     if let (Some(bearer), Some(service)) = (bearer, auth.service_token.as_deref())
         && crate::sesame::auth::tokens_equal(bearer, service)
     {
-        return Ok(());
+        return Ok(crate::sesame::auth::system_context());
     }
 
     let Some(bearer) = bearer else {
         return Err(WriteDenied::Unauthenticated);
     };
     let tokens = { auth.tokens.read().await.clone() };
-    match crate::sesame::auth::authenticate(bearer, &tokens) {
-        Ok(_) => Ok(()),
-        Err(_) => Err(WriteDenied::Unauthenticated),
-    }
+    crate::sesame::auth::authenticate(bearer, &tokens).map_err(|_| WriteDenied::Unauthenticated)
 }
 
 /// Why a write was refused.
@@ -216,6 +221,117 @@ pub enum WriteDenied {
     Unauthenticated,
     /// Valid principal but insufficient role — 403.
     Forbidden,
+}
+
+/// What a registry request does to the repository it names, for the token
+/// scope decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepositoryAccess {
+    /// Pull a manifest, list tags, or fetch or probe a blob.
+    Read,
+    /// Start, continue or finish a blob upload.
+    WriteBlob,
+    /// Publish a manifest, and so move a tag.
+    WriteManifest,
+}
+
+/// Why a token's app/namespace scope refused a repository.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ScopeDenied {
+    /// The name doesn't follow the `<namespace>/<app>` convention, so a
+    /// scoped token has no namespace it could be held to.
+    #[error(
+        "repository {repository:?} is not named <namespace>/<app>; \
+         a scoped token may only use repositories in its own namespaces"
+    )]
+    OutsideConvention { repository: String },
+    /// The repository belongs to a namespace or app the token doesn't cover.
+    #[error("token scope does not allow app {app:?} in namespace {namespace:?}")]
+    OutOfScope { namespace: String, app: String },
+}
+
+/// The `(namespace, app)` a repository belongs to, or `None` when its name
+/// doesn't say.
+///
+/// The first path segment is the namespace and everything after the first
+/// `/` is the app: `team-a/web` is app `web` in `team-a`, and
+/// `team-a/web/debug` is app `web/debug` in `team-a`. This is the rule
+/// `/v1/build` applies to a `pickle://` destination. A bare name (`web`,
+/// `reliaburger-bun`, `_buildcontext`), a name with an empty, `.` or `..`
+/// segment, and the pull-through cache's reserved `cache/` prefix name no
+/// namespace, so they answer `None`.
+pub fn repository_namespace(repository: &str) -> Option<(&str, &str)> {
+    let (namespace, app) = repository.split_once('/')?;
+    let well_formed = repository
+        .split('/')
+        .all(|segment| !segment.is_empty() && segment != "." && segment != "..");
+    if !well_formed || namespace == "cache" {
+        return None;
+    }
+    Some((namespace, app))
+}
+
+/// Whether a principal is held to an app/namespace scope at all. The
+/// anonymous bootstrap, the internal system principal and unscoped tokens
+/// are not.
+pub fn is_scoped(principal: Option<&AuthContext>) -> bool {
+    principal.is_some_and(|principal| {
+        principal.token_name != crate::sesame::auth::SYSTEM_PRINCIPAL
+            && (principal.scoped_apps.is_some() || principal.scoped_namespaces.is_some())
+    })
+}
+
+/// Scratch repositories that only ever receive bare blobs from `relish`:
+/// `relish build` uploads the caller's source tarball to the first before
+/// `/v1/build` checks the scope of the image it will produce, and
+/// `relish upgrade` uploads the new binary to the second before
+/// `/v1/upgrade/start` checks for an admin.
+pub const BLOB_ONLY_REPOSITORIES: [&str; 2] = [
+    super::build::BUILD_CONTEXT_REPOSITORY,
+    crate::upgrade::BINARY_BLOB_REPO,
+];
+
+/// Hold a registry request to the caller's token scope.
+///
+/// Anyone [`is_scoped`] says isn't scoped passes: that keeps the standalone
+/// bootstrap, the system principal (replication, the build runner, upgrade
+/// fetches) and unscoped Admin/Deployer/ReadOnly tokens exactly where they
+/// were. A scoped token may use a repository only when
+/// [`repository_namespace`] places it in a namespace and app its scope
+/// allows; a name the convention can't place is refused rather than guessed.
+///
+/// One exception: a scoped token may upload *blobs* (never a manifest) to the
+/// two blob-only scratch repositories in [`BLOB_ONLY_REPOSITORIES`]. The API
+/// route that consumes each blob does its own authorisation, and a
+/// content-addressed blob with no manifest or tag grants nothing.
+pub fn check_repository_scope(
+    principal: Option<&AuthContext>,
+    repository: &str,
+    access: RepositoryAccess,
+) -> Result<(), ScopeDenied> {
+    let Some(principal) = principal.filter(|principal| is_scoped(Some(principal))) else {
+        return Ok(());
+    };
+    if access == RepositoryAccess::WriteBlob && BLOB_ONLY_REPOSITORIES.contains(&repository) {
+        return Ok(());
+    }
+    let Some((namespace, app)) = repository_namespace(repository) else {
+        return Err(ScopeDenied::OutsideConvention {
+            repository: repository.to_string(),
+        });
+    };
+    let scope = TokenScope {
+        apps: principal.scoped_apps.clone(),
+        namespaces: principal.scoped_namespaces.clone(),
+    };
+    if scope.allows(app, namespace) {
+        Ok(())
+    } else {
+        Err(ScopeDenied::OutOfScope {
+            namespace: namespace.to_string(),
+            app: app.to_string(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -569,6 +685,186 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    // --- token scope on repositories ---
+
+    fn principal(role: ApiRole, apps: Option<&[&str]>, namespaces: Option<&[&str]>) -> AuthContext {
+        let owned = |list: &[&str]| list.iter().map(|s| s.to_string()).collect();
+        AuthContext {
+            token_name: "ci".into(),
+            principal_id: "ci-1".into(),
+            role,
+            scoped_apps: apps.map(owned),
+            scoped_namespaces: namespaces.map(owned),
+        }
+    }
+
+    const EVERY_ACCESS: [RepositoryAccess; 3] = [
+        RepositoryAccess::Read,
+        RepositoryAccess::WriteBlob,
+        RepositoryAccess::WriteManifest,
+    ];
+
+    #[test]
+    fn repository_namespace_splits_on_the_first_slash() {
+        assert_eq!(repository_namespace("team-a/web"), Some(("team-a", "web")));
+        assert_eq!(
+            repository_namespace("team-a/web/debug"),
+            Some(("team-a", "web/debug"))
+        );
+        assert_eq!(
+            repository_namespace("library/redis"),
+            Some(("library", "redis"))
+        );
+    }
+
+    #[test]
+    fn repository_namespace_refuses_names_that_place_nothing() {
+        for name in [
+            "web",
+            "reliaburger-bun",
+            "_buildcontext",
+            "",
+            "/web",
+            "team-a/",
+            "team-a//web",
+            "./web",
+            "team-a/../team-b/web",
+            "cache/docker.io/library/redis",
+        ] {
+            assert_eq!(repository_namespace(name), None, "{name:?}");
+        }
+    }
+
+    #[test]
+    fn namespace_scoped_deployer_may_use_its_own_namespace() {
+        let ctx = principal(ApiRole::Deployer, None, Some(&["team-a"]));
+        for access in EVERY_ACCESS {
+            assert!(check_repository_scope(Some(&ctx), "team-a/web", access).is_ok());
+            assert!(check_repository_scope(Some(&ctx), "team-a/web/debug", access).is_ok());
+        }
+    }
+
+    #[test]
+    fn namespace_scoped_deployer_is_refused_other_namespaces() {
+        let ctx = principal(ApiRole::Deployer, None, Some(&["team-a"]));
+        for access in EVERY_ACCESS {
+            assert_eq!(
+                check_repository_scope(Some(&ctx), "team-b/web", access),
+                Err(ScopeDenied::OutOfScope {
+                    namespace: "team-b".into(),
+                    app: "web".into(),
+                })
+            );
+        }
+    }
+
+    /// A bare name carries no namespace, so a scoped token can't be held to
+    /// one there and is refused rather than guessed (even one scoped to
+    /// `default`).
+    #[test]
+    fn scoped_tokens_are_refused_names_outside_the_convention() {
+        let ctx = principal(ApiRole::Deployer, None, Some(&["default", "team-a"]));
+        for name in ["web", "api", "team-a//web", "cache/team-a/web"] {
+            for access in EVERY_ACCESS {
+                assert!(
+                    matches!(
+                        check_repository_scope(Some(&ctx), name, access),
+                        Err(ScopeDenied::OutsideConvention { .. })
+                    ),
+                    "{name:?} {access:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn app_scope_is_held_to_the_app_segment() {
+        let ctx = principal(ApiRole::Deployer, Some(&["web"]), Some(&["team-a"]));
+        assert!(
+            check_repository_scope(Some(&ctx), "team-a/web", RepositoryAccess::WriteBlob).is_ok()
+        );
+        assert!(
+            check_repository_scope(Some(&ctx), "team-a/api", RepositoryAccess::WriteBlob).is_err()
+        );
+        assert!(
+            check_repository_scope(Some(&ctx), "team-a/web/debug", RepositoryAccess::Read).is_err()
+        );
+    }
+
+    /// `relish build` uploads the caller's source tarball, and `relish
+    /// upgrade` the new binary, as bare blobs before the API route that uses
+    /// them checks the caller. Only blobs, though.
+    #[test]
+    fn scoped_tokens_may_upload_scratch_blobs_but_nothing_else_there() {
+        let ctx = principal(ApiRole::Admin, None, Some(&["team-a"]));
+        for scratch in ["_buildcontext", "reliaburger-bun"] {
+            assert!(BLOB_ONLY_REPOSITORIES.contains(&scratch));
+            assert!(
+                check_repository_scope(Some(&ctx), scratch, RepositoryAccess::WriteBlob).is_ok()
+            );
+            assert!(
+                check_repository_scope(Some(&ctx), scratch, RepositoryAccess::WriteManifest)
+                    .is_err()
+            );
+            assert!(check_repository_scope(Some(&ctx), scratch, RepositoryAccess::Read).is_err());
+        }
+    }
+
+    #[test]
+    fn unscoped_tokens_and_the_system_principal_are_unaffected() {
+        let unscoped = [
+            principal(ApiRole::Admin, None, None),
+            principal(ApiRole::Deployer, None, None),
+            principal(ApiRole::ReadOnly, None, None),
+            crate::sesame::auth::system_context(),
+        ];
+        for ctx in &unscoped {
+            assert!(!is_scoped(Some(ctx)));
+            for name in ["web", "team-b/web", "reliaburger-bun", "cache/x/y", ""] {
+                for access in EVERY_ACCESS {
+                    assert!(
+                        check_repository_scope(Some(ctx), name, access).is_ok(),
+                        "{} {name:?} {access:?}",
+                        ctx.token_name
+                    );
+                }
+            }
+        }
+        // The anonymous standalone bootstrap has no scope either.
+        assert!(check_repository_scope(None, "web", RepositoryAccess::WriteManifest).is_ok());
+    }
+
+    #[test]
+    fn a_scoped_admin_is_scoped_too() {
+        let ctx = principal(ApiRole::Admin, None, Some(&["team-a"]));
+        assert!(is_scoped(Some(&ctx)));
+        assert!(
+            check_repository_scope(Some(&ctx), "team-b/web", RepositoryAccess::WriteManifest)
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn authorised_reads_return_the_principal_for_scoping() {
+        let user = create_token(
+            "reader",
+            ApiRole::ReadOnly,
+            TokenScope {
+                apps: None,
+                namespaces: Some(vec!["team-a".into()]),
+            },
+            None,
+        )
+        .unwrap();
+        let store = new_token_store();
+        store.write().await.push(user.token);
+        let auth = AuthState::new(store, Some("rbrg_service".to_string()));
+        let reader = authorise_read(&auth, Some(&user.plaintext)).await.unwrap();
+        assert_eq!(reader.scoped_namespaces, Some(vec!["team-a".to_string()]));
+        let system = authorise_read(&auth, Some("rbrg_service")).await.unwrap();
+        assert!(!is_scoped(Some(&system)));
     }
 
     // --- upload session expiry (REG8) ---

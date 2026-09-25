@@ -34,7 +34,10 @@ relish token revoke ci-deploy
 | `deployer` | apply, deploy, stop and roll back workloads, inject workload faults |
 | `read-only` | status, logs, metrics and diagnostics (the default role) |
 
-`--apps` and `--namespaces` narrow a token to those apps and namespaces. Some
+`--apps` and `--namespaces` narrow a token to those apps and namespaces. In the
+image registry that means repositories named `<namespace>/<app>` inside the
+scope; a scoped token can't push or pull a bare name like `api` at all (see
+`images-and-volumes`). Some
 operations need cluster-wide authority, so only an *unscoped* admin can manage
 tokens and join tokens, rotate secrets, sign images, decommission nodes, clear
 every fault, or apply `[namespace]` and `[permission]` declarations.

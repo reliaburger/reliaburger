@@ -290,6 +290,7 @@ Smaller fixes that CI runs turned up along the way:
 - [x] **C57** Validate upstream layer sizes before cache accounting or allocation, and require downloaded bytes to match their descriptor length.
 - [x] **C58** Give Pickle's upstream reads the direct puller's bounded retry policy.
 - [x] **C59** Resolve OCI indexes for the Linux container target, independently of the client's operating system.
+- [x] **C60** Hold Pickle registry requests to the caller's token scope (found while landing PR #194). A namespace-scoped Deployer could push to any repository over Bearer and Basic alike. Every write (upload start, chunk, completion, manifest `PUT`, copy confirmation) and every routable read now requires a repository named `<namespace>/<app>` inside the scope; bare names, `cache/…` and malformed names are refused to scoped tokens, except blob-only uploads to `_buildcontext` and `reliaburger-bun`. A scoped reader's blob `GET` must be for a blob the named repository references. `/v1/build` destinations use the same rule (a bare destination no longer counts as `default`), and `/v1/images` lists only readable repositories. Unscoped tokens, the service token and the bootstrap window are unchanged.
 
 ### Engineering follow-ups
 
@@ -2319,7 +2320,7 @@ Post-12b user-experience work (not a roadmap phase). Plan:
 - [x] **Build-namespace scope check is a no-op** — `build_submit_handler` now
   binds every image push to the caller's namespace scope via `authorize_scoped`,
   using the *destination's* namespace (`destination_scope`, bare names → the
-  `default` namespace) rather than a self-declared build field. A Deployer token
+  `default` namespace; C60 later refused bare names to scoped tokens) rather than a self-declared build field. A Deployer token
   scoped to namespace `a` can no longer push into namespace `b`'s repository or
   to a bare-named repo; an unscoped token is unaffected. Runs in both single-node
   and clustered mode. Tests cover cross-namespace refusal, the bare-name bypass,

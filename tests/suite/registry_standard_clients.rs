@@ -52,6 +52,8 @@ struct Registry {
     plaintext_port: u16,
     deployer: String,
     reader: String,
+    /// A Deployer scoped to namespace `team`.
+    team_deployer: String,
     root_ca_der: Vec<u8>,
     shutdown: CancellationToken,
     _dir: tempfile::TempDir,
@@ -80,9 +82,20 @@ async fn start_registry() -> Registry {
         None,
     )
     .unwrap();
+    let team_deployer = reliaburger::sesame::token::create_token(
+        "team-ci",
+        ApiRole::Deployer,
+        TokenScope {
+            apps: None,
+            namespaces: Some(vec!["team".to_string()]),
+        },
+        None,
+    )
+    .unwrap();
     let tokens = new_token_store();
     tokens.write().await.push(deployer.token);
     tokens.write().await.push(reader.token);
+    tokens.write().await.push(team_deployer.token);
 
     let dir = tempfile::tempdir().unwrap();
     let state = PickleState {
@@ -135,6 +148,7 @@ async fn start_registry() -> Registry {
         plaintext_port,
         deployer: deployer.plaintext,
         reader: reader.plaintext,
+        team_deployer: team_deployer.plaintext,
         root_ca_der: hierarchy.root.ca.certificate_der.clone(),
         shutdown,
         _dir: dir,
@@ -262,6 +276,71 @@ async fn basic_credentials_are_refused_on_the_plaintext_listener() {
         .await
         .unwrap();
     assert_eq!(bearer.status().as_u16(), 200);
+
+    registry.shutdown.cancel();
+}
+
+/// A Deployer scoped to namespace `team` pushes `team/api` with Basic over
+/// TLS, as `docker push` would, and is refused every other repository: another
+/// namespace's and a bare name alike. Unscoped tokens are unaffected.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_namespace_scoped_token_pushes_only_into_its_namespace_over_tls() {
+    let registry = start_registry().await;
+    let client = tls_client(&registry.root_ca_der);
+    let config = br#"{"architecture":"arm64","os":"linux"}"#.to_vec();
+    let digest = digest_of(&config);
+    let manifest = serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "digest": digest,
+            "size": config.len(),
+        },
+        "layers": [],
+    }))
+    .unwrap();
+    let push = |repository: &'static str, username: &'static str, token: String| {
+        let client = client.clone();
+        let config = config.clone();
+        let manifest = manifest.clone();
+        let blob_url = oci_blob_upload_url("https", registry.tls_port, repository, &digest);
+        let manifest_url = oci_manifest_put_url("https", registry.tls_port, repository, "v1");
+        async move {
+            let blob = client
+                .post(&blob_url)
+                .basic_auth(username, Some(&token))
+                .body(config)
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16();
+            let manifest = client
+                .put(&manifest_url)
+                .basic_auth(username, Some(&token))
+                .header("content-type", "application/vnd.oci.image.manifest.v1+json")
+                .body(manifest)
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16();
+            (blob, manifest)
+        }
+    };
+
+    let team = registry.team_deployer.clone();
+    assert_eq!(push("team/api", "team-ci", team.clone()).await, (201, 201));
+    assert_eq!(push("other/api", "team-ci", team.clone()).await, (403, 403));
+    assert_eq!(push("api", "team-ci", team).await, (403, 403));
+    for repository in ["other/api", "api"] {
+        assert_eq!(
+            push(repository, "ci", registry.deployer.clone()).await,
+            (201, 201),
+            "{repository}"
+        );
+    }
 
     registry.shutdown.cancel();
 }

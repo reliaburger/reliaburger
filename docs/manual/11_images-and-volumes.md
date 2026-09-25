@@ -78,6 +78,17 @@ crane push app.tar NODE:5050/api:v1
 `docker push NODE:5050/api:v1` works the same way. Apps refer to the image
 by its bare name, `api:v1`.
 
+A token made with `--apps` or `--namespaces` is held to repositories named
+`<namespace>/<app>`, for pushes and pulls alike: the first path segment is the
+namespace, the rest is the app. A deployer scoped to `shop` may push
+`shop/api:v1` and `shop/api/worker:v1`, but not `billing/api:v1`, and not a
+bare `api:v1` or `library/redis` either, because those name no namespace it
+owns. The registry answers such a request with 403 `DENIED`, and the same rule
+applies to a `relish build` destination. From a routable registry a scoped
+token pulls only its own namespaces' images (a loopback registry serves reads
+to anyone on the node, token or not), and `relish images` lists only those.
+Unscoped tokens push and pull anything, as before.
+
 The registry serves the node's certificate, which names the node rather than
 its address, so `NODE` has to be the node's name (`relish status` lists them)
 and your machine has to resolve it and trust the cluster's root CA. For the

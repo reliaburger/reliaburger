@@ -514,6 +514,49 @@ statuses.retain(|status| visible(&status.instance.app_name, &status.instance.nam
 
 The deploy-history endpoint had a quieter version of the same bug. It filtered on the bare app name, and since instance identity gained namespaces (chapter 2), two apps called `web` can live in different namespaces quite happily. Filtering by name alone returned both. The namespace now rides in as a query parameter, and the handler filters and scope-checks on it.
 
+### The registry didn't know what a namespace was
+
+The route-matrix test only looks at the agent API. Pickle, the image registry from chapter 5, is a separate router on a separate port, and its authorisation stopped at the role: a Deployer may push, a ReadOnly token may pull. We found out what that meant while teaching the registry to accept `docker login` (chapter 5). A Deployer scoped to `team-a` could `docker push registry/team-b/web:v1` and overwrite another team's image, and it didn't matter whether the token came as a bearer or as a Basic password. The scope simply never came up.
+
+Checking it needs something the registry didn't have: a way to get from a repository name to a namespace. OCI names are just slash-separated paths, so we picked the convention `/v1/build` already used for `pickle://` destinations: the first segment is the namespace and everything after the first `/` is the app. `team-a/web` is app `web` in `team-a`, and `team-a/web/debug` is app `web/debug`.
+
+The interesting part is what to do with names that don't fit. `/v1/build` treated a bare `pickle://web:v1` as namespace `default`. That's a guess, and guessing is how scoped tokens end up with more than they were given: a token scoped to `default` would own every bare-named repository in the cluster, whoever pushed it. So for a scoped token, a name that doesn't place itself in a namespace is refused, and `/v1/build` now calls the same function, so the two ways of producing an image can't drift apart:
+
+```rust
+pub fn repository_namespace(repository: &str) -> Option<(&str, &str)> {
+    let (namespace, app) = repository.split_once('/')?;
+    let well_formed = repository
+        .split('/')
+        .all(|segment| !segment.is_empty() && segment != "." && segment != "..");
+    if !well_formed || namespace == "cache" {
+        return None;
+    }
+    Some((namespace, app))
+}
+```
+
+`split_once('/')` returns an `Option` holding the text either side of the first `/`, and the `?` after it works on `Option` exactly as it does on `Result`: no slash, and the function returns `None` on the spot. The return type `Option<(&str, &str)>` hands back two borrowed slices of the caller's string rather than two new `String`s. Rust's lifetime elision rules tie them to `repository`, the only borrowed input, so the compiler knows they can't outlive it. `cache/` is the pull-through cache's reserved prefix, and nobody should be able to claim it by being scoped to a namespace called `cache`.
+
+The decision itself is short. Anyone who isn't scoped passes (the anonymous standalone bootstrap, the service token that replication and the build runner use, and every unscoped token), so none of the internal callers had to change:
+
+```rust
+let Some(principal) = principal.filter(|principal| is_scoped(Some(principal))) else {
+    return Ok(());
+};
+if access == RepositoryAccess::WriteBlob && BLOB_ONLY_REPOSITORIES.contains(&repository) {
+    return Ok(());
+}
+let Some((namespace, app)) = repository_namespace(repository) else {
+    return Err(ScopeDenied::OutsideConvention { repository: repository.to_string() });
+};
+```
+
+`Option::filter` keeps the value only if the closure says yes, so `principal` survives the `let-else` only when there's a scope to enforce. The one exception, `BLOB_ONLY_REPOSITORIES`, exists because `relish` uploads two things before the API route that uses them checks the caller: `relish build` sends the source tarball to `_buildcontext`, and `relish upgrade` sends the new binary to `reliaburger-bun`. Those uploads are bare, content-addressed blobs. No manifest, no tag, so they grant nothing, and the exception is for `WriteBlob` only.
+
+Reads got the same rule, for the same reason `/v1/status` did: a token scoped to `team-a` shouldn't be able to pull `team-b`'s images any more than read its logs. Blobs made that harder than it looks. Pickle stores each blob once, by digest, and the blob routes never looked at the repository in the URL, so `GET /v2/team-a/web/blobs/<a team-b layer>` would have handed over the layer through an in-scope name. For a scoped reader the handler now checks that the named repository's catalogue actually references the digest. We left blob `HEAD` alone: a push asks it before every upload, and it only reveals whether a digest exists. `/v1/images` gets the `retain` treatment from the previous section.
+
+One case has no scope to apply. On the loopback listener reads are open to anyone, and a scoped token that gets refused could just be left off the request. We check it only where reads need a principal in the first place.
+
 ### Fail closed, not open
 
 A brand-new cluster has no tokens yet. The middleware treats an empty token store as a bootstrap window and lets everything through, because the operator needs *some* way to create the first token before any token exists. On loopback that's fine: you're the only one who can reach it. Bind that same token-less API to a routable address, though, and you've published an unauthenticated control plane to everyone who can route a packet to it.
