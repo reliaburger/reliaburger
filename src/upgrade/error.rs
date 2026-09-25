@@ -60,6 +60,53 @@ pub enum UpgradeError {
     #[error("upgrade {upgrade_id} already failed and was reverted on this node")]
     PreviouslyFailed { upgrade_id: String },
 
+    /// The node already runs the target version with exactly these bytes.
+    /// Nothing to do; callers report it rather than treat it as a failure.
+    #[error("{version} is already running with this exact binary; nothing to do")]
+    AlreadyRunning {
+        version: crate::upgrade::version::BinaryVersion,
+    },
+
+    /// The target version is already running but the candidate's bytes
+    /// differ. The store and the rolling walk are keyed by version, so a
+    /// same-version "upgrade" can never swap anything: refuse it loudly.
+    #[error(
+        "{node} already runs {version} but with a different binary \
+         (running sha256 {running}, candidate sha256 {candidate}); \
+         give the candidate a new version"
+    )]
+    SameVersionDifferentBinary {
+        /// `node n1` or `this node`.
+        node: String,
+        version: crate::upgrade::version::BinaryVersion,
+        running: String,
+        candidate: String,
+    },
+
+    /// The target version is older than what the node runs and the caller
+    /// did not ask for a downgrade.
+    #[error(
+        "{node} runs {running}, which is newer than {target}; \
+         pass --allow-downgrade to install an older version (or use `relish upgrade rollback`)"
+    )]
+    DowngradeRefused {
+        /// `node n1` or `this node`.
+        node: String,
+        running: crate::upgrade::version::BinaryVersion,
+        target: crate::upgrade::version::BinaryVersion,
+    },
+
+    /// The store already holds different bytes under this version's name.
+    #[error(
+        "the binary store already holds a different {version} \
+         (stored sha256 {stored}, incoming sha256 {incoming}); refusing to replace it"
+    )]
+    VersionContentConflict {
+        version: crate::upgrade::version::BinaryVersion,
+        stored: String,
+        incoming: String,
+    },
+
     /// No older version is installed to roll back to.
     #[error("no older version installed to roll back to")]
     NoRollbackTarget,

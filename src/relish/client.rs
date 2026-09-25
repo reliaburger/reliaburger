@@ -882,6 +882,20 @@ impl BunClient {
         Ok(report)
     }
 
+    /// The registry origin this managed connection declares (a quickstart
+    /// host forward such as `https://127.0.0.1:15050`), if any.
+    pub fn declared_registry(&self) -> Option<&str> {
+        self.service_endpoints.as_ref()?.registry.as_deref()
+    }
+
+    /// The node's own capability report, *without* substituting this
+    /// connection's declared forwards: the listeners as the node sees them.
+    pub async fn capabilities_as_reported(
+        &self,
+    ) -> Result<crate::bun::capabilities::ClusterCapabilities, RelishError> {
+        self.get_typed_json("/v1/capabilities").await
+    }
+
     /// Fetch an authenticated, bounded collection from current cluster peers.
     pub async fn cluster_capabilities(
         &self,
@@ -2202,13 +2216,15 @@ impl BunClient {
         self.get_json("/v1/upgrade/cluster").await
     }
 
-    /// Apply a node-level upgrade directive.
+    /// Apply a node-level upgrade directive. The response's `status` is
+    /// `upgrading`, or `already_running` when the node runs exactly this
+    /// binary already.
     pub async fn upgrade_apply(
         &self,
         directive: &crate::upgrade::types::UpgradeDirective,
-    ) -> Result<(), RelishError> {
+    ) -> Result<serde_json::Value, RelishError> {
         let body = serde_json::to_string(directive).map_err(RelishError::SerialiseJson)?;
-        self.post_json("/v1/upgrade/apply", body).await.map(|_| ())
+        self.post_json("/v1/upgrade/apply", body).await
     }
 
     /// Start a cluster-wide rolling upgrade (leader only).

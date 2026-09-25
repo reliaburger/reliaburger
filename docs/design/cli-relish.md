@@ -715,6 +715,8 @@ relish upgrade check                # Check for available updates
 relish upgrade start <version>      # Start rolling cluster upgrade
 relish upgrade start --binary <path> # Upgrade from local binary (air-gapped)
 relish upgrade start <version> --parallel <n> # Parallel worker upgrades
+relish upgrade start --binary <path> --allow-downgrade # Allow an older target
+relish upgrade start --binary <path> --registry <host:port> # Push/fetch registry override
 relish upgrade plan <version>       # Preview upgrade order and duration
 relish upgrade plan <version> --cluster-size <n> # Estimate for large clusters
 relish upgrade status               # Show upgrade progress

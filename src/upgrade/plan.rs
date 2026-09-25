@@ -15,7 +15,9 @@
 //! nodes to upgrade and how many workers at once; it does not get to invent
 //! *what those nodes are*.
 
+use super::error::UpgradeError;
 use super::types::{NodeRole, NodeUpgradePhase, NodeUpgradeRecord};
+use super::version::BinaryVersion;
 
 /// The leader's authoritative view of one node: what relish must match.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,6 +149,79 @@ where
     Ok(records)
 }
 
+/// What one node reports running, as input to [`check_target`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunningBinary {
+    /// How to name the node in an error: `node n1`, or `this node`.
+    pub node: String,
+    pub version: BinaryVersion,
+    /// Hex SHA-256 of the running executable. `None` when the node could
+    /// not (or does not) report it.
+    pub sha256: Option<String>,
+}
+
+/// Verdict of [`check_target`] when the upgrade may go ahead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetCheck {
+    /// At least one node needs the candidate.
+    Proceed,
+    /// Every node already runs exactly these bytes: nothing to do.
+    AlreadyRunning,
+}
+
+/// Gate an upgrade on what the nodes run *now*.
+///
+/// The rolling walk and the binary store are both keyed by version, so a
+/// candidate that shares the running version can't swap anything: the
+/// orchestrator would see the target version and call the node healthy.
+/// This makes that explicit:
+///
+/// - a node on the target version with different (or unknown) bytes:
+///   [`UpgradeError::SameVersionDifferentBinary`];
+/// - a node on a *newer* version, unless `allow_downgrade`:
+///   [`UpgradeError::DowngradeRefused`];
+/// - every node already on the target with identical bytes:
+///   [`TargetCheck::AlreadyRunning`].
+///
+/// Rollbacks don't come through here: they return to a binary that's
+/// already on disk and verified.
+pub fn check_target(
+    target: &BinaryVersion,
+    candidate_sha256: &str,
+    allow_downgrade: bool,
+    running: &[RunningBinary],
+) -> Result<TargetCheck, UpgradeError> {
+    let mut already_running = 0;
+    for node in running {
+        if node.version == *target {
+            let same_bytes = node
+                .sha256
+                .as_deref()
+                .is_some_and(|sha| sha.eq_ignore_ascii_case(candidate_sha256));
+            if !same_bytes {
+                return Err(UpgradeError::SameVersionDifferentBinary {
+                    node: node.node.clone(),
+                    version: target.clone(),
+                    running: node.sha256.clone().unwrap_or_else(|| "unknown".to_string()),
+                    candidate: candidate_sha256.to_string(),
+                });
+            }
+            already_running += 1;
+        } else if node.version > *target && !allow_downgrade {
+            return Err(UpgradeError::DowngradeRefused {
+                node: node.node.clone(),
+                running: node.version.clone(),
+                target: target.clone(),
+            });
+        }
+    }
+    if !running.is_empty() && already_running == running.len() {
+        Ok(TargetCheck::AlreadyRunning)
+    } else {
+        Ok(TargetCheck::Proceed)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -263,6 +338,106 @@ mod tests {
         assert_eq!(role_from_raft(9, Some(1), &voters), NodeRole::Worker);
         // No leader known yet: even a voter is Council, not Leader.
         assert_eq!(role_from_raft(1, None, &voters), NodeRole::Council);
+    }
+
+    fn running(node: &str, version: &str, sha256: Option<&str>) -> RunningBinary {
+        RunningBinary {
+            node: format!("node {node}"),
+            version: version.parse().unwrap(),
+            sha256: sha256.map(String::from),
+        }
+    }
+
+    #[test]
+    fn target_newer_than_every_node_proceeds() {
+        let nodes = [
+            running("a", "v0.1.0", Some("aa")),
+            running("b", "v0.1.0", None),
+        ];
+        let verdict = check_target(&"v0.2.0".parse().unwrap(), "bb", false, &nodes).unwrap();
+        assert_eq!(verdict, TargetCheck::Proceed);
+    }
+
+    #[test]
+    fn same_version_with_different_bytes_is_refused() {
+        let nodes = [
+            running("a", "v0.1.0", Some("aa")),
+            running("b", "v0.1.0", Some("aa")),
+        ];
+        let err = check_target(&"v0.1.0".parse().unwrap(), "bb", false, &nodes).unwrap_err();
+        assert!(
+            matches!(err, UpgradeError::SameVersionDifferentBinary { ref node, .. } if node == "node a"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("give the candidate a new version"));
+    }
+
+    #[test]
+    fn same_version_with_unknown_bytes_is_refused() {
+        let nodes = [running("a", "v0.1.0", None)];
+        let err = check_target(&"v0.1.0".parse().unwrap(), "bb", false, &nodes).unwrap_err();
+        assert!(matches!(
+            err,
+            UpgradeError::SameVersionDifferentBinary { .. }
+        ));
+    }
+
+    #[test]
+    fn same_version_with_identical_bytes_everywhere_is_already_running() {
+        let nodes = [
+            running("a", "v0.1.0", Some("AB")),
+            running("b", "v0.1.0", Some("ab")),
+        ];
+        let verdict = check_target(&"v0.1.0".parse().unwrap(), "ab", false, &nodes).unwrap();
+        assert_eq!(verdict, TargetCheck::AlreadyRunning);
+    }
+
+    #[test]
+    fn a_partly_upgraded_cluster_proceeds_for_the_rest() {
+        // Starting again after a partial walk: finished nodes are fine.
+        let nodes = [
+            running("a", "v0.2.0", Some("bb")),
+            running("b", "v0.1.0", Some("aa")),
+        ];
+        let verdict = check_target(&"v0.2.0".parse().unwrap(), "bb", false, &nodes).unwrap();
+        assert_eq!(verdict, TargetCheck::Proceed);
+    }
+
+    #[test]
+    fn downgrade_is_refused_without_the_flag() {
+        // 0.1.0-soak.1 sorts BEFORE 0.1.0 (semver pre-release rules).
+        let nodes = [running("a", "v0.1.0", Some("aa"))];
+        let target = "v0.1.0-soak.1".parse().unwrap();
+        let err = check_target(&target, "bb", false, &nodes).unwrap_err();
+        assert!(
+            matches!(err, UpgradeError::DowngradeRefused { .. }),
+            "{err}"
+        );
+        assert!(err.to_string().contains("--allow-downgrade"));
+    }
+
+    #[test]
+    fn downgrade_proceeds_with_the_flag() {
+        let nodes = [running("a", "v0.1.0", Some("aa"))];
+        let target = "v0.1.0-soak.1".parse().unwrap();
+        let verdict = check_target(&target, "bb", true, &nodes).unwrap();
+        assert_eq!(verdict, TargetCheck::Proceed);
+    }
+
+    #[test]
+    fn the_flag_does_not_excuse_same_version_different_bytes() {
+        let nodes = [running("a", "v0.1.0", Some("aa"))];
+        let err = check_target(&"v0.1.0".parse().unwrap(), "bb", true, &nodes).unwrap_err();
+        assert!(matches!(
+            err,
+            UpgradeError::SameVersionDifferentBinary { .. }
+        ));
+    }
+
+    #[test]
+    fn no_reachable_nodes_proceeds() {
+        let verdict = check_target(&"v0.2.0".parse().unwrap(), "bb", false, &[]).unwrap();
+        assert_eq!(verdict, TargetCheck::Proceed);
     }
 
     #[test]

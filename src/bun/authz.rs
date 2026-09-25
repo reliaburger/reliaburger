@@ -136,6 +136,8 @@ pub const ROUTE_MATRIX: &[Route] = &[
     route(Get, "/v1/nodes/{node}/relay/{*path}", AnyToken),
     route(Post, "/v1/nodes/{node}/relay/{*path}", AnyToken),
     route(Get, "/v1/cluster/council", AnyToken),
+    // Upgrades and elections act on the whole cluster: the handlers also
+    // refuse a scoped Admin (`authorize_cluster_admin`).
     route(Post, "/v1/upgrade/apply", Admin),
     route(Get, "/v1/upgrade/status", AnyToken),
     route(Post, "/v1/upgrade/rollback", Admin),
@@ -458,6 +460,27 @@ mod tests {
             body.contains("require_unscoped"),
             "/v1/logs/sql must refuse scoped tokens — it cannot filter arbitrary SQL by tenant"
         );
+    }
+
+    /// Upgrades, rollbacks and elections change every node, so a token
+    /// scoped to some apps or namespaces must not reach them.
+    #[test]
+    fn cluster_wide_upgrade_and_election_routes_refuse_scoped_tokens() {
+        let source = include_str!("api.rs");
+        for handler in [
+            "upgrade_apply_handler",
+            "upgrade_rollback_handler",
+            "upgrade_start_handler",
+            "upgrade_resume_handler",
+            "upgrade_cluster_rollback_handler",
+            "cluster_elect_handler",
+        ] {
+            let body = handler_body(source, handler).expect(handler);
+            assert!(
+                body.contains("authorize_cluster_admin"),
+                "{handler} must require an unscoped Admin"
+            );
+        }
     }
 
     /// Every route the router mounts must be present in the matrix. This

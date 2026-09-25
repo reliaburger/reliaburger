@@ -4969,6 +4969,7 @@ mod tests {
             direction: crate::upgrade::types::UpgradeDirection::Upgrade,
             phase: crate::upgrade::types::ClusterUpgradePhase::Preparing,
             registry_address: String::new(),
+            allow_downgrade: false,
             nodes: vec![],
         }
     }
