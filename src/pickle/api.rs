@@ -16,7 +16,7 @@ use serde::Deserialize;
 use tokio::sync::RwLock;
 
 use super::lease::{RegistryWriteAccess, RepositoryReadGuard};
-use super::registry_auth::{QuotaConfig, UploadSessions, WriteDenied};
+use super::registry_auth::{QuotaConfig, RepositoryAccess, UploadSessions, WriteDenied};
 use super::store::{BlobStore, compute_sha256};
 use super::types::{Digest, ImageManifest, LayerDescriptor, ManifestCatalog, ManifestCommit};
 use crate::sesame::auth::AuthState;
@@ -81,7 +81,8 @@ impl PickleState {
             .map(str::to_string)
     }
 
-    /// Authenticate a writer and preserve the identity used for upload ownership.
+    /// Authenticate a writer of `repository`, hold it to its token scope, and
+    /// preserve the identity used for upload ownership.
     /// `None` means anonymous standalone mode; errors carry the HTTP refusal.
     // `Response` is large but it IS the HTTP reply to send on failure —
     // boxing it would tax every call site for a value that lives one frame.
@@ -89,6 +90,8 @@ impl PickleState {
     async fn authorise_write(
         &self,
         headers: &HeaderMap,
+        repository: &str,
+        access: RepositoryAccess,
     ) -> Result<Option<crate::sesame::auth::AuthContext>, Response> {
         let Some(auth) = &self.auth else {
             return Ok(None);
@@ -101,7 +104,10 @@ impl PickleState {
         )
         .await
         {
-            Ok(principal) => Ok(principal),
+            Ok(principal) => {
+                scope_refusal(principal.as_ref(), repository, access)?;
+                Ok(principal)
+            }
             Err(WriteDenied::Unauthenticated) => Err(oci_error(
                 StatusCode::UNAUTHORIZED,
                 "UNAUTHORIZED",
@@ -139,20 +145,27 @@ impl PickleState {
     }
 
     /// Authorise a registry read (O1). A no-op unless the registry is bound
-    /// somewhere a stranger could reach it.
+    /// somewhere a stranger could reach it, and then the reader's principal,
+    /// for the caller to hold to its token scope.
+    ///
+    /// Where reads are open (loopback) there is no principal and no scope to
+    /// apply: a scoped token could simply be left off the request.
     // `Response` is large but it IS the HTTP reply to send on failure —
     // boxing it would tax every call site for a value that lives one frame.
     #[allow(clippy::result_large_err)]
-    async fn authorise_read(&self, headers: &HeaderMap) -> Result<(), Response> {
+    async fn authorise_read(
+        &self,
+        headers: &HeaderMap,
+    ) -> Result<Option<crate::sesame::auth::AuthContext>, Response> {
         if !self.require_read_auth {
-            return Ok(());
+            return Ok(None);
         }
         let Some(auth) = &self.auth else {
-            return Ok(());
+            return Ok(None);
         };
         let bearer = Self::bearer(headers);
         match super::registry_auth::authorise_read(auth, bearer.as_deref()).await {
-            Ok(()) => Ok(()),
+            Ok(principal) => Ok(Some(principal)),
             Err(_) => Err(oci_error(
                 StatusCode::UNAUTHORIZED,
                 "UNAUTHORIZED",
@@ -212,6 +225,18 @@ impl PickleState {
             )),
         }
     }
+}
+
+/// The 403 for a principal whose token scope doesn't cover `repository`.
+// `Response` is large but it IS the HTTP reply to send on failure.
+#[allow(clippy::result_large_err)]
+fn scope_refusal(
+    principal: Option<&crate::sesame::auth::AuthContext>,
+    repository: &str,
+    access: RepositoryAccess,
+) -> Result<(), Response> {
+    super::registry_auth::check_repository_scope(principal, repository, access)
+        .map_err(|denied| oci_error(StatusCode::FORBIDDEN, "DENIED", denied.to_string()))
 }
 
 /// Hash-and-store a blob off the async runtime (REG4).
@@ -756,14 +781,17 @@ async fn dispatch_v2(
     // O1: writes authorise per handler (they have different role bars and
     // quota checks); reads are uniform, so one gate covers every GET/HEAD.
     if matches!(method, Method::GET | Method::HEAD)
-        && let Err(response) = state.authorise_read(&headers).await
+        && let Err(response) = authorise_repository_read(&state, &method, &route, &headers).await
     {
         return response;
     }
 
     match (method, route) {
         (Method::POST, V2Route::Copy { name, digest }) => {
-            let principal = match state.authorise_write(&headers).await {
+            let principal = match state
+                .authorise_write(&headers, &name, RepositoryAccess::WriteManifest)
+                .await
+            {
                 Ok(principal) => principal,
                 Err(response) => return response,
             };
@@ -809,7 +837,11 @@ async fn dispatch_v2(
             blob_upload_complete(&state, &name, &upload_id, &digest, &headers, body).await
         }
         (Method::PUT, V2Route::Manifest { name, reference }) => {
-            if let Err(response) = state.authorise_write(&headers).await {
+            // Refuse before reading the body; `manifest_put` checks again.
+            if let Err(response) = state
+                .authorise_write(&headers, &name, RepositoryAccess::WriteManifest)
+                .await
+            {
                 return response;
             }
             match tokio::time::timeout(
@@ -834,6 +866,60 @@ async fn dispatch_v2(
     }
 }
 
+impl V2Route {
+    /// The repository the request names.
+    fn repository(&self) -> &str {
+        match self {
+            V2Route::Copy { name, .. }
+            | V2Route::Blob { name, .. }
+            | V2Route::UploadInitiate { name }
+            | V2Route::UploadSession { name, .. }
+            | V2Route::Manifest { name, .. }
+            | V2Route::Tags { name } => name,
+        }
+    }
+}
+
+/// Authenticate a GET/HEAD and hold it to the reader's token scope, the way
+/// `/v1/status` and the other API reads are.
+///
+/// A scoped reader may only name repositories in its scope. Blobs are stored
+/// once by digest and shared by every repository, so a scoped reader's blob
+/// GET must also be for a blob the named repository's catalogue references;
+/// otherwise `team-a/web/blobs/<team-b's layer digest>` would hand over
+/// another namespace's layer. A HEAD answers only "does this digest exist",
+/// which is what a push asks before uploading, so it skips that lookup.
+// `Response` is large but it IS the HTTP reply to send on failure.
+#[allow(clippy::result_large_err)]
+async fn authorise_repository_read(
+    state: &PickleState,
+    method: &axum::http::Method,
+    route: &V2Route,
+    headers: &HeaderMap,
+) -> Result<(), Response> {
+    let reader = state.authorise_read(headers).await?;
+    scope_refusal(reader.as_ref(), route.repository(), RepositoryAccess::Read)?;
+    let V2Route::Blob { name, digest } = route else {
+        return Ok(());
+    };
+    if method != axum::http::Method::GET || !super::registry_auth::is_scoped(reader.as_ref()) {
+        return Ok(());
+    }
+    let catalog = state
+        .catalog_snapshot(name)
+        .await
+        .map_err(registry_write_error)?;
+    if catalog.referenced_digest_set().contains(digest.as_str()) {
+        Ok(())
+    } else {
+        Err(oci_error(
+            StatusCode::NOT_FOUND,
+            "BLOB_UNKNOWN",
+            format!("repository {name} references no blob {digest}"),
+        ))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Version check
 // ---------------------------------------------------------------------------
@@ -841,7 +927,8 @@ async fn dispatch_v2(
 /// `GET /v2/` — OCI version check. Returns 200 OK.
 async fn v2_check(State(state): State<PickleState>, headers: HeaderMap) -> Response {
     // The OCI version probe is how a client discovers whether it needs
-    // credentials, so it answers 401 like every other read when it must.
+    // credentials, so it answers 401 like every other read when it must. It
+    // names no repository, so there's no scope to check.
     if let Err(response) = state.authorise_read(&headers).await {
         return response;
     }
@@ -938,7 +1025,10 @@ async fn blob_upload_initiate(
     body: axum::body::Body,
 ) -> Response {
     // Registry writes require a principal once auth is configured (REG4).
-    let principal = match state.authorise_write(headers_in).await {
+    let principal = match state
+        .authorise_write(headers_in, name, RepositoryAccess::WriteBlob)
+        .await
+    {
         Ok(principal) => principal,
         Err(response) => return response,
     };
@@ -997,7 +1087,10 @@ async fn blob_upload_patch(
     headers_in: &HeaderMap,
     body: axum::body::Body,
 ) -> Response {
-    let principal = match state.authorise_write(headers_in).await {
+    let principal = match state
+        .authorise_write(headers_in, name, RepositoryAccess::WriteBlob)
+        .await
+    {
         Ok(principal) => principal,
         Err(response) => return response,
     };
@@ -1132,7 +1225,10 @@ async fn blob_upload_complete(
     headers_in: &HeaderMap,
     body: axum::body::Body,
 ) -> Response {
-    let principal = match state.authorise_write(headers_in).await {
+    let principal = match state
+        .authorise_write(headers_in, name, RepositoryAccess::WriteBlob)
+        .await
+    {
         Ok(principal) => principal,
         Err(response) => return response,
     };
@@ -1368,7 +1464,10 @@ async fn manifest_put(
     headers: &HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    let principal = match state.authorise_write(headers).await {
+    let principal = match state
+        .authorise_write(headers, name, RepositoryAccess::WriteManifest)
+        .await
+    {
         Ok(principal) => principal,
         Err(response) => return response,
     };
@@ -2687,7 +2786,10 @@ mod tests {
         let headers = lease_request("POST", "/", &owner, Some("run1"), vec![])
             .headers()
             .clone();
-        let principal = state.authorise_write(&headers).await.unwrap();
+        let principal = state
+            .authorise_write(&headers, "rbtest-run1/web", RepositoryAccess::WriteManifest)
+            .await
+            .unwrap();
         let access = state
             .authorise_repository("rbtest-run1/web", &headers, principal.as_ref())
             .await
@@ -2723,7 +2825,10 @@ mod tests {
         let headers = lease_request("POST", "/", &owner, Some("run1"), vec![])
             .headers()
             .clone();
-        let principal = state.authorise_write(&headers).await.unwrap();
+        let principal = state
+            .authorise_write(&headers, "rbtest-run1/a", RepositoryAccess::WriteBlob)
+            .await
+            .unwrap();
         let busy = state
             .authorise_repository("rbtest-run1/a", &headers, principal.as_ref())
             .await
@@ -3890,6 +3995,345 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::ACCEPTED, "tls={over_tls}");
+        }
+    }
+
+    // --- Token scope on repositories ---------------------------------------
+
+    /// Plaintext tokens for [`scoped_state`].
+    struct ScopedTokens {
+        /// Deployer scoped to namespace `team-a`.
+        team_a_deployer: String,
+        /// Deployer with no scope.
+        deployer: String,
+        /// ReadOnly scoped to namespace `team-a`.
+        team_a_reader: String,
+        /// ReadOnly with no scope.
+        reader: String,
+    }
+
+    const SERVICE_TOKEN: &str = "rbrg_service_token_for_tests";
+
+    /// A routable registry with scoped and unscoped tokens and a service token.
+    async fn scoped_state() -> (PickleState, tempfile::TempDir, ScopedTokens) {
+        use crate::sesame::types::{ApiRole, TokenScope};
+        let (mut state, dir) = test_state();
+        let team_a = || TokenScope {
+            apps: None,
+            namespaces: Some(vec!["team-a".into()]),
+        };
+        let tokens = crate::sesame::auth::new_token_store();
+        let create = async |name: &str, role: ApiRole, scope: TokenScope| {
+            let created = crate::sesame::token::create_token(name, role, scope, None).unwrap();
+            tokens.write().await.push(created.token);
+            created.plaintext
+        };
+        let plaintext = ScopedTokens {
+            team_a_deployer: create("team-a-ci", ApiRole::Deployer, team_a()).await,
+            deployer: create("ci", ApiRole::Deployer, TokenScope::default()).await,
+            team_a_reader: create("team-a-puller", ApiRole::ReadOnly, team_a()).await,
+            reader: create("puller", ApiRole::ReadOnly, TokenScope::default()).await,
+        };
+        state.auth = Some(crate::sesame::auth::AuthState::new(
+            tokens,
+            Some(SERVICE_TOKEN.to_string()),
+        ));
+        state.require_read_auth = true;
+        state.allow_unauthenticated_bootstrap = false;
+        (state, dir, plaintext)
+    }
+
+    fn with_body(
+        mut request: axum::http::Request<Body>,
+        body: Vec<u8>,
+    ) -> axum::http::Request<Body> {
+        *request.body_mut() = Body::from(body);
+        request
+    }
+
+    /// Push `config` as a blob and a config-only manifest tagged `v1` into
+    /// `repository`, returning the manifest PUT's status.
+    async fn push_image(
+        app: &Router,
+        repository: &str,
+        authorization: &str,
+        over_tls: bool,
+        config: &[u8],
+    ) -> StatusCode {
+        let digest = compute_sha256(config);
+        let blob = app
+            .clone()
+            .oneshot(with_body(
+                client_request(
+                    "POST",
+                    &format!("/v2/{repository}/blobs/uploads/?digest={}", digest.as_str()),
+                    Some(authorization),
+                    over_tls,
+                ),
+                config.to_vec(),
+            ))
+            .await
+            .unwrap();
+        if !blob.status().is_success() {
+            return blob.status();
+        }
+        app.clone()
+            .oneshot(with_body(
+                client_request(
+                    "PUT",
+                    &format!("/v2/{repository}/manifests/v1"),
+                    Some(authorization),
+                    over_tls,
+                ),
+                manifest_body(&digest, config.len()),
+            ))
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// The bug: a Deployer scoped to one namespace could push to any
+    /// repository. Now it pushes only under `<its namespace>/…`, whichever
+    /// envelope carries the token.
+    #[tokio::test]
+    async fn namespace_scoped_deployer_pushes_only_into_its_namespace() {
+        let (state, _dir, tokens) = scoped_state().await;
+        let app = test_router(state);
+        let envelopes = [
+            (format!("Bearer {}", tokens.team_a_deployer), false),
+            (format!("Bearer {}", tokens.team_a_deployer), true),
+            (basic("team-a-ci", &tokens.team_a_deployer), true),
+        ];
+        for (index, (authorization, over_tls)) in envelopes.iter().enumerate() {
+            let config = format!("{{\"envelope\":{index}}}").into_bytes();
+            assert_eq!(
+                push_image(&app, "team-a/web", authorization, *over_tls, &config).await,
+                StatusCode::CREATED,
+                "own namespace, envelope {index}"
+            );
+            for elsewhere in ["team-b/web", "web", "library/redis", "team-a//web"] {
+                let response = app
+                    .clone()
+                    .oneshot(client_request(
+                        "POST",
+                        &format!("/v2/{elsewhere}/blobs/uploads/"),
+                        Some(authorization),
+                        *over_tls,
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    StatusCode::FORBIDDEN,
+                    "{elsewhere}, envelope {index}"
+                );
+                let body: serde_json::Value =
+                    serde_json::from_slice(&body_bytes(response).await).unwrap();
+                assert_eq!(body["errors"][0]["code"], "DENIED", "{body}");
+                assert_eq!(
+                    push_image(&app, elsewhere, authorization, *over_tls, &config).await,
+                    StatusCode::FORBIDDEN,
+                    "{elsewhere} manifest, envelope {index}"
+                );
+            }
+        }
+    }
+
+    /// A manifest PUT, PATCH and completion are each checked on their own,
+    /// not only the upload's first POST.
+    #[tokio::test]
+    async fn every_write_verb_is_held_to_the_scope() {
+        let (state, _dir, tokens) = scoped_state().await;
+        let app = test_router(state);
+        let authorization = format!("Bearer {}", tokens.team_a_deployer);
+        let config = b"{}".to_vec();
+        let digest = compute_sha256(&config);
+        for (method, uri) in [
+            (
+                "PATCH",
+                "/v2/team-b/web/blobs/uploads/some-upload".to_string(),
+            ),
+            (
+                "PUT",
+                format!(
+                    "/v2/team-b/web/blobs/uploads/some-upload?digest={}",
+                    digest.as_str()
+                ),
+            ),
+            ("PUT", "/v2/team-b/web/manifests/v1".to_string()),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(with_body(
+                    client_request(method, &uri, Some(&authorization), false),
+                    manifest_body(&digest, config.len()),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method} {uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn unscoped_deployer_still_pushes_anywhere() {
+        let (state, _dir, tokens) = scoped_state().await;
+        let app = test_router(state);
+        for (over_tls, authorization) in [
+            (false, format!("Bearer {}", tokens.deployer)),
+            (true, basic("ci", &tokens.deployer)),
+        ] {
+            for repository in ["team-b/web", "web", "library/redis"] {
+                let config = format!("{{\"tls\":{over_tls}}}").into_bytes();
+                assert_eq!(
+                    push_image(&app, repository, &authorization, over_tls, &config).await,
+                    StatusCode::CREATED,
+                    "{repository} tls={over_tls}"
+                );
+            }
+        }
+    }
+
+    /// Replication, the build runner and upgrade pushes present the service
+    /// token. It is the system principal, which no user scope applies to.
+    #[tokio::test]
+    async fn the_service_token_still_writes_every_repository() {
+        let (state, _dir, _tokens) = scoped_state().await;
+        let app = test_router(state);
+        let authorization = format!("Bearer {SERVICE_TOKEN}");
+        let bytes = b"the new bun binary".to_vec();
+        let digest = compute_sha256(&bytes);
+        for repository in [crate::upgrade::BINARY_BLOB_REPO, "team-b/web", "web"] {
+            let response = app
+                .clone()
+                .oneshot(with_body(
+                    client_request(
+                        "POST",
+                        &format!("/v2/{repository}/blobs/uploads/?digest={}", digest.as_str()),
+                        Some(&authorization),
+                        false,
+                    ),
+                    bytes.clone(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CREATED, "{repository}");
+        }
+    }
+
+    /// `relish build` uploads the caller's context before `/v1/build`
+    /// checks the destination, so a scoped Deployer must still get it in.
+    #[tokio::test]
+    async fn scoped_deployer_may_upload_a_build_context() {
+        let (state, _dir, tokens) = scoped_state().await;
+        let app = test_router(state);
+        let context = b"a tarred build context".to_vec();
+        let url = format!(
+            "/v2/{}/blobs/uploads/?digest={}",
+            super::super::build::BUILD_CONTEXT_REPOSITORY,
+            compute_sha256(&context).as_str()
+        );
+        let authorization = format!("Bearer {}", tokens.team_a_deployer);
+        let response = app
+            .oneshot(with_body(
+                client_request("POST", &url, Some(&authorization), false),
+                context,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    /// Pulls are held to the same scope as `/v1/status`: a scoped reader
+    /// sees its namespace's repositories and no one else's.
+    #[tokio::test]
+    async fn namespace_scoped_reader_pulls_only_its_namespace() {
+        let (state, _dir, tokens) = scoped_state().await;
+        let app = test_router(state);
+        let push = format!("Bearer {}", tokens.deployer);
+        let own = b"{\"own\":true}".to_vec();
+        let other = b"{\"own\":false}".to_vec();
+        assert_eq!(
+            push_image(&app, "team-a/web", &push, false, &own).await,
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            push_image(&app, "team-b/web", &push, false, &other).await,
+            StatusCode::CREATED
+        );
+
+        for authorization in [
+            format!("Bearer {}", tokens.team_a_reader),
+            basic("team-a-puller", &tokens.team_a_reader),
+        ] {
+            let get = |uri: String| {
+                let app = app.clone();
+                let authorization = authorization.clone();
+                async move {
+                    app.oneshot(client_request("GET", &uri, Some(&authorization), true))
+                        .await
+                        .unwrap()
+                        .status()
+                }
+            };
+            let own_blob = compute_sha256(&own);
+            let other_blob = compute_sha256(&other);
+            assert_eq!(get("/v2/".into()).await, StatusCode::OK);
+            assert_eq!(
+                get("/v2/team-a/web/manifests/v1".into()).await,
+                StatusCode::OK
+            );
+            assert_eq!(get("/v2/team-a/web/tags/list".into()).await, StatusCode::OK);
+            assert_eq!(
+                get(format!("/v2/team-a/web/blobs/{}", own_blob.as_str())).await,
+                StatusCode::OK
+            );
+            for uri in [
+                "/v2/team-b/web/manifests/v1".to_string(),
+                "/v2/team-b/web/tags/list".to_string(),
+                format!("/v2/team-b/web/blobs/{}", other_blob.as_str()),
+                "/v2/web/tags/list".to_string(),
+            ] {
+                assert_eq!(get(uri.clone()).await, StatusCode::FORBIDDEN, "{uri}");
+            }
+            // Blobs are shared by digest, so naming an in-scope repository
+            // must not unlock another namespace's layer.
+            assert_eq!(
+                get(format!("/v2/team-a/web/blobs/{}", other_blob.as_str())).await,
+                StatusCode::NOT_FOUND
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unscoped_reader_still_pulls_everything() {
+        let (state, _dir, tokens) = scoped_state().await;
+        let app = test_router(state);
+        let config = b"{\"bare\":true}".to_vec();
+        assert_eq!(
+            push_image(
+                &app,
+                "web",
+                &format!("Bearer {}", tokens.deployer),
+                false,
+                &config
+            )
+            .await,
+            StatusCode::CREATED
+        );
+        let authorization = format!("Bearer {}", tokens.reader);
+        for uri in [
+            "/v2/web/manifests/v1".to_string(),
+            format!(
+                "/v2/team-b/other/blobs/{}",
+                compute_sha256(&config).as_str()
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(client_request("GET", &uri, Some(&authorization), false))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
         }
     }
 

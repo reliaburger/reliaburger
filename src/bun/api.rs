@@ -8289,13 +8289,15 @@ async fn rollback_handler(
     Sse::new(stream).into_response()
 }
 
-/// `GET /v1/images` — list committed images using current cluster authority.
+/// `GET /v1/images` — list committed images using current cluster authority,
+/// trimmed to the repositories the caller's token scope may pull.
 async fn images_handler(
     State(state): State<ApiState>,
     authority: Option<axum::Extension<crate::pickle::authority::RegistryReadAuthority>>,
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
 ) -> Response {
     use crate::pickle::authority::{RegistryQuery, RegistryQueryResponse};
-    let images = if let Some(authority) = authority {
+    let mut images = if let Some(authority) = authority {
         match authority
             .forwarder
             .query(
@@ -8333,6 +8335,16 @@ async fn images_handler(
     } else {
         Vec::new()
     };
+    // The registry refuses a scoped token another namespace's repositories;
+    // listing them here would hand over their names, tags and digests anyway.
+    images.retain(|image| {
+        crate::pickle::registry_auth::check_repository_scope(
+            auth.as_deref(),
+            &image.repository,
+            crate::pickle::registry_auth::RepositoryAccess::Read,
+        )
+        .is_ok()
+    });
     Json(serde_json::json!({ "images": images })).into_response()
 }
 
@@ -13750,6 +13762,90 @@ schedule = "* * * * *"
 
         peer_server.abort();
         worker.abort();
+    }
+
+    /// The registry holds a scoped token to `<namespace>/<app>` repositories
+    /// in its scope; the image list follows the same rule.
+    #[tokio::test]
+    async fn namespace_scoped_token_lists_only_its_namespace_images() {
+        use crate::pickle::types::{Digest, ImageManifest, LayerDescriptor};
+        let mut catalog = ManifestCatalog::default();
+        for (index, repository) in ["team-a/web", "team-b/web", "web"].iter().enumerate() {
+            let digest = Digest::from_sha256_hex(&format!("{index:064x}"));
+            catalog.manifests.push((
+                digest.as_str().to_string(),
+                ImageManifest {
+                    digest: digest.clone(),
+                    config: LayerDescriptor {
+                        digest,
+                        size: 2,
+                        media_type: "application/vnd.oci.image.config.v1+json".into(),
+                    },
+                    layers: Vec::new(),
+                    repository: repository.to_string(),
+                    tags: ["v1".to_string()].into(),
+                    total_size: 2,
+                    pushed_at: std::time::SystemTime::UNIX_EPOCH,
+                    pushed_by: 1,
+                    signature: None,
+                },
+            ));
+        }
+        let scoped = crate::sesame::token::create_token(
+            "team-a-puller",
+            crate::sesame::types::ApiRole::ReadOnly,
+            crate::sesame::types::TokenScope {
+                apps: None,
+                namespaces: Some(vec!["team-a".into()]),
+            },
+            None,
+        )
+        .unwrap();
+        let unscoped = crate::sesame::token::create_token(
+            "puller",
+            crate::sesame::types::ApiRole::ReadOnly,
+            crate::sesame::types::TokenScope::default(),
+            None,
+        )
+        .unwrap();
+        let store = crate::sesame::auth::new_token_store();
+        store.write().await.push(scoped.token);
+        store.write().await.push(unscoped.token);
+        let (cmd_tx, _cmd_rx) = mpsc::channel(4);
+        let app = router(
+            cmd_tx,
+            None,
+            None,
+            None,
+            Some(Arc::new(RwLock::new(catalog))),
+            None,
+            None,
+            Some(store),
+            None,
+            None,
+            None,
+            None,
+            9117,
+            None,
+        );
+
+        let repositories = |body: Vec<u8>| -> Vec<String> {
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let mut names: Vec<String> = json["images"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|image| image["repository"].as_str().unwrap().to_string())
+                .collect();
+            names.sort_unstable();
+            names
+        };
+        let (code, body) = get_authenticated(app.clone(), "/v1/images", &scoped.plaintext).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(repositories(body), ["team-a/web"]);
+        let (code, body) = get_authenticated(app, "/v1/images", &unscoped.plaintext).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(repositories(body), ["team-a/web", "team-b/web", "web"]);
     }
 
     #[test]

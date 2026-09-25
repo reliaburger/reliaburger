@@ -878,6 +878,17 @@ A built-in default TTL (the "90 days" the config sketch mentions) is planned but
 not applied today, so a token created without `--ttl-days` is effectively
 permanent until explicitly revoked.
 
+**Scope enforcement (shipped):** `--apps` and `--namespaces` restrict a token
+on every route that names an app and namespace (`authorize_scoped`), filter
+cluster-wide listings such as `/v1/status` and `/v1/images` to the scope, and
+refuse routes that need cluster-wide authority (`require_unscoped`). The Pickle
+registry applies the same scope to repositories: a scoped token may push and
+(on a routable listener) pull only repositories named `<namespace>/<app>` whose
+namespace and app it covers, over Bearer and Basic alike; bare names such as
+`api` are refused to it, and `/v1/build` destinations meet the same rule. The
+internal service token and unscoped tokens are unaffected. See
+`registry-pickle.md` §1.2 for the exact rule.
+
 **Bootstrap boundary (shipped):** An empty user-token store leaves protected
 API routes open long enough to create the first cluster token. Bun contains
 that window to an IP-literal loopback listener (`127.0.0.0/8` or `::1`). It

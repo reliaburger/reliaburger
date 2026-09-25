@@ -940,6 +940,8 @@ That's why the crane test exists at all. The spec says a registry "MUST" support
 
 The honest limits for 0.1.0 are in the manual and design doc. Basic-auth clients need a TLS listener, which a cluster node with an identity has and a plaintext node doesn't. Node certificates name the node rather than an address, so a hostname-verifying client has to reach the registry by the node's name and trust the cluster root CA. And a loopback-only TLS listener answers docker's anonymous probe with 200, so docker never learns to send credentials there. Clustered listeners are routable, so that last one only bites hand-built setups.
 
+Opening the door to docker also showed us who else could walk through it. The Basic middleware makes every client take the bearer path, and the bearer path checked the token's role but never its scope, so a Deployer scoped to one namespace could push to any repository. Repositories now map to namespaces (`team-a/web` belongs to `team-a`), and a scoped token can only push and pull inside its own. Chapter 10 has the rule and the awkward cases, like what a bare `web` belongs to.
+
 ## Tests
 
 Pickle is almost entirely testable in-process. A blob store is a directory, the OCI API is an axum router, and the catalog is a `Vec` — none of that needs the internet or another node. So the default suite spins up a Pickle server in the test, pushes a manifest and its blobs, then pulls them back, all without leaving the process.

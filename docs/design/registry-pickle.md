@@ -60,6 +60,40 @@ Pickle does not implement the Docker token service (`WWW-Authenticate: Bearer re
 every client above speaks Basic, and a token service would add a second credential type
 with nothing to gain over the API token it would be exchanged for.
 
+**Token scope.** A token created with `--apps` or `--namespaces` is also held to its
+scope, on every write (blob upload start, chunk and completion, manifest `PUT`, and the
+internal copy confirmation) and on every routable read (manifest and blob `GET`/`HEAD`,
+tag listing), over Bearer and Basic alike. The rule
+(`pickle::registry_auth::check_repository_scope`):
+
+- A repository's namespace is its first path segment and its app is everything after
+  the first `/`: `team-a/web` is app `web` in `team-a`, `team-a/web/debug` is app
+  `web/debug`. The token's `TokenScope::allows(app, namespace)` must accept that pair.
+- Names that don't place a repository in a namespace are refused to scoped tokens with
+  403 `DENIED`: bare names (`web`, `reliaburger-bun`), names with an empty, `.` or `..`
+  segment, and the pull-through cache's reserved `cache/…`. `library/redis` is not special:
+  it is app `redis` in namespace `library`.
+- The one exception: a scoped token may upload *blobs* (never a manifest, never a read)
+  to the two blob-only scratch repositories. `relish build` sends the caller's source
+  tarball to `_buildcontext` before `/v1/build` checks the destination's scope, and
+  `relish upgrade` sends the new binary to `reliaburger-bun` before `/v1/upgrade/start`
+  checks for an admin. A content-addressed blob with no tag grants nothing.
+- Blobs are stored once and shared by digest, so a scoped reader's blob `GET` must also be
+  for a blob the named repository's catalogue references; `team-a/web/blobs/<digest of a
+  team-b layer>` answers 404. A blob `HEAD` (which a push sends before uploading) skips that
+  lookup and reveals only whether the digest exists.
+- Unscoped tokens (Admin, Deployer and ReadOnly), the internal service token (replication,
+  peer pulls, the build runner's push, upgrade binary fetches) and the standalone bootstrap
+  window are unaffected.
+- On the loopback listener reads are open to anyone, so no read scope applies there; a
+  scoped token could simply be left off.
+
+`/v1/build` applies the same function to a `pickle://` destination (the runner pushes with
+the service token, so the submit handler is the only gate), and `/v1/images` lists only
+the repositories the caller may read. Before this, a namespace-scoped Deployer could push
+to any repository through `docker push`, and a bare build destination counted as
+`default`.
+
 What works where, in 0.1.0:
 
 | Listener | Bearer clients (`relish build`) | Basic clients (docker, crane) |
