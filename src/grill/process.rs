@@ -1213,6 +1213,140 @@ mod tests {
         grill.kill(&id).await.unwrap();
     }
 
+    /// Read the first `count` lines `follow_logs` produces for `id`, as a
+    /// fresh forwarder would.
+    async fn followed_lines(
+        grill: &ProcessGrill,
+        id: &InstanceId,
+        count: usize,
+    ) -> Vec<crate::ketchup::types::CapturedLine> {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(64);
+        let follower = grill.clone();
+        let follow_id = id.clone();
+        let task = tokio::spawn(async move { follower.follow_logs(&follow_id, sender).await });
+        let mut lines = Vec::new();
+        while lines.len() < count {
+            let line = tokio::time::timeout(std::time::Duration::from_secs(5), receiver.recv())
+                .await
+                .expect("follow stalled")
+                .expect("follow ended early");
+            lines.push(line);
+        }
+        drop(receiver);
+        task.abort();
+        lines
+    }
+
+    fn client_record(
+        instance: &InstanceId,
+        captured: crate::ketchup::types::CapturedLine,
+    ) -> crate::ketchup::types::LogRecord {
+        crate::ketchup::types::LogRecord {
+            app: "client".to_string(),
+            namespace: "default".to_string(),
+            instance: instance.0.clone(),
+            stream: captured.stream,
+            line: captured.line,
+            position: captured.position,
+        }
+    }
+
+    async fn client_lines(store: &crate::ketchup::log_store::LogStore) -> Vec<String> {
+        store
+            .query("client", "default", None, None, None, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.line)
+            .collect()
+    }
+
+    fn printf_spec(output: &str) -> OciSpec {
+        spec_with_args(vec!["printf".to_string(), output.to_string()])
+    }
+
+    /// V02 soak follow-up: after a graceful whole-cluster stop and start, a
+    /// retired instance's capture file is still on disk next to its
+    /// replacement's. Re-following both after the restart must not store the
+    /// retired instance's lines again as the newest.
+    #[tokio::test]
+    async fn graceful_restart_does_not_reingest_a_retired_instances_capture_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_dir = tempfile::tempdir().unwrap();
+        let grill = ProcessGrill::with_log_dir(dir.path().to_path_buf());
+        let retired = InstanceId("client-old".to_string());
+        let current = InstanceId("client-new".to_string());
+        grill
+            .create(&retired, &printf_spec("INCR 1\\nINCR 2\\nINCR 3\\n"))
+            .await
+            .unwrap();
+        grill.start(&retired).await.unwrap();
+        let mut store = crate::ketchup::log_store::LogStore::new(store_dir.path().to_path_buf());
+        for line in followed_lines(&grill, &retired, 3).await {
+            assert!(store.ingest(&client_record(&retired, line)));
+        }
+        grill.kill(&retired).await.unwrap();
+        grill
+            .create(&current, &printf_spec("INCR 4\\n"))
+            .await
+            .unwrap();
+        grill.start(&current).await.unwrap();
+        for line in followed_lines(&grill, &current, 1).await {
+            assert!(store.ingest(&client_record(&current, line)));
+        }
+        let shared = std::sync::Arc::new(tokio::sync::RwLock::new(store));
+        crate::ketchup::log_store::flush_shared(&shared)
+            .await
+            .unwrap();
+        drop(shared);
+
+        // Bun comes back and follows every capture file it finds from byte 0.
+        let mut store = crate::ketchup::log_store::LogStore::new(store_dir.path().to_path_buf());
+        for (id, count) in [(&retired, 3), (&current, 1)] {
+            for line in followed_lines(&grill, id, count).await {
+                assert!(!store.ingest(&client_record(id, line)), "{id} re-ingested");
+            }
+        }
+        assert_eq!(
+            client_lines(&store).await,
+            vec!["INCR 1", "INCR 2", "INCR 3", "INCR 4"]
+        );
+        grill.kill(&current).await.unwrap();
+    }
+
+    /// A graceful stop between two periodic flushes: the lines exist only in
+    /// the buffer. The shutdown flush must persist them and their offsets, so
+    /// the restart neither loses nor duplicates them.
+    #[tokio::test]
+    async fn graceful_stop_keeps_lines_that_were_only_buffered() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_dir = tempfile::tempdir().unwrap();
+        let grill = ProcessGrill::with_log_dir(dir.path().to_path_buf());
+        let id = InstanceId("client-0".to_string());
+        grill
+            .create(&id, &printf_spec("INCR 1\\nINCR 2\\n"))
+            .await
+            .unwrap();
+        grill.start(&id).await.unwrap();
+        let mut store = crate::ketchup::log_store::LogStore::new(store_dir.path().to_path_buf());
+        for line in followed_lines(&grill, &id, 2).await {
+            store.ingest(&client_record(&id, line));
+        }
+        assert_eq!(store.buffer_len(), 2, "nothing flushed before the stop");
+        let shared = std::sync::Arc::new(tokio::sync::RwLock::new(store));
+        crate::ketchup::log_store::flush_shared(&shared)
+            .await
+            .unwrap();
+        drop(shared);
+
+        let mut store = crate::ketchup::log_store::LogStore::new(store_dir.path().to_path_buf());
+        for line in followed_lines(&grill, &id, 2).await {
+            assert!(!store.ingest(&client_record(&id, line)));
+        }
+        assert_eq!(client_lines(&store).await, vec!["INCR 1", "INCR 2"]);
+        grill.kill(&id).await.unwrap();
+    }
+
     #[tokio::test]
     async fn adopts_live_process_and_reports_running() {
         // A process spawned outside the grill entirely stands in for a

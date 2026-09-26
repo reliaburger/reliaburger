@@ -9,7 +9,7 @@ use crate::config::Config;
 use crate::relish::client::BunClient;
 use crate::smoker::types::{FaultRequest, FaultSummary, FaultType};
 use crate::testkit::TestContext;
-use crate::testkit::context::PINNED_TEST_WORKLOAD_IMAGE;
+use crate::testkit::context::{PINNED_TEST_WORKLOAD_IMAGE, container_http_script};
 use crate::testkit::registry::{TestCase, unknown};
 use crate::testkit::report::{CleanupOutcome, TestGroup};
 
@@ -23,15 +23,11 @@ fn fault_duration(timeout: Duration) -> Duration {
 
 fn container_spec(context: &TestContext, app: &str, replicas: u32, delayed: bool) -> String {
     let port = context.container_port(app);
-    let command = if delayed {
-        format!("[\"sh\", \"-c\", \"sleep 3; exec httpd -f -p {port} -h /etc\"]")
-    } else {
-        format!("[\"httpd\", \"-f\", \"-p\", \"{port}\", \"-h\", \"/etc\"]")
-    };
+    let script = container_http_script(port, if delayed { 3 } else { 0 });
     format!(
         "[app.{app}]\n\
          image = \"{PINNED_TEST_WORKLOAD_IMAGE}\"\n\
-         command = {command}\n\
+         command = [\"/bin/sh\", \"-c\", \"{script}\"]\n\
          port = {port}\n\
          replicas = {replicas}\n\
          namespace = \"{namespace}\"\n\
@@ -111,6 +107,7 @@ async fn wait_for_leader(
             && let Some(leader) = status.leader
             && different_from.is_none_or(|old| old != leader)
         {
+            context.wait_note.clear().await;
             return Ok(leader);
         }
         if context.deadline.remaining().is_zero() {
@@ -119,6 +116,11 @@ async fn wait_for_leader(
                 None => "no council leader was observed before deadline".to_string(),
             });
         }
+        let waiting = match different_from {
+            Some(old) => format!("waiting for a council leader other than {old}"),
+            None => "waiting for a council leader".to_string(),
+        };
+        context.wait_note.record(waiting).await;
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
@@ -137,6 +139,7 @@ async fn wait_for_node_state(
                 .find(|node| node.node_id == node_id)
                 .map(|node| node.state.clone());
             if last.as_deref().is_some_and(|state| wanted.contains(&state)) {
+                context.wait_note.clear().await;
                 return Ok(());
             }
         }
@@ -145,6 +148,12 @@ async fn wait_for_node_state(
                 "node {node_id} did not reach one of {wanted:?}; last state was {last:?}"
             ));
         }
+        context
+            .wait_note
+            .record(format!(
+                "waiting for node {node_id} to reach one of {wanted:?}; last state was {last:?}"
+            ))
+            .await;
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
@@ -682,6 +691,7 @@ mod tests {
             timeout,
             deadline: crate::testkit::deadline::Deadline::after(timeout).unwrap(),
             peer_route: crate::testkit::context::PeerRoute::Relay,
+            wait_note: Default::default(),
         };
         let relayed_worker = context.client.via_node("worker-2").unwrap();
 
@@ -710,6 +720,73 @@ mod tests {
                 "clear 7 worker-2".to_string()
             ]
         );
+    }
+
+    fn offline_context() -> TestContext {
+        let timeout = Duration::from_secs(5);
+        TestContext {
+            client: BunClient::new_with_token("http://127.0.0.1:9", None),
+            namespace: "rbtest-chaos-00".to_string(),
+            lease_id: None,
+            chaos_guard: crate::testkit::chaos::ChaosGuard::default(),
+            capabilities: crate::bun::capabilities::ClusterCapabilities::default(),
+            timeout,
+            deadline: crate::testkit::deadline::Deadline::after(timeout).unwrap(),
+            peer_route: crate::testkit::context::PeerRoute::Relay,
+            wait_note: Default::default(),
+        }
+    }
+
+    /// A workload answers its health check only from a file it wrote itself,
+    /// and names every external program by absolute path. The pinned BusyBox image
+    /// has no `/etc/hostname` and no `PATH`, so anything else never turns
+    /// healthy on a real container runtime.
+    fn assert_self_served(spec: &str, app: &str) {
+        let config = Config::parse(spec).unwrap();
+        let app_spec = &config.app[app];
+        let health = app_spec.health.as_ref().expect("a health check");
+        assert_eq!(
+            &app_spec.command[..2],
+            ["/bin/sh", "-c"],
+            "{:?}",
+            app_spec.command
+        );
+        let script = &app_spec.command[2];
+        let root = script
+            .rsplit(" -h ")
+            .next()
+            .expect("httpd serves a named directory")
+            .trim();
+        assert!(
+            script.contains(&format!("> {root}{}", health.path)),
+            "{script:?} never writes the {} it is health-checked on",
+            health.path
+        );
+        for step in script.split(';') {
+            let program = step
+                .split_whitespace()
+                .find(|word| *word != "exec")
+                .expect("no empty steps");
+            // `printf` is built into BusyBox's shell and needs no PATH.
+            assert!(
+                program.starts_with('/') || program == "printf",
+                "{program:?} relies on the image's PATH in {script:?}"
+            );
+        }
+    }
+
+    /// V02 soak: C2 waited all 600 s for three running replicas because its
+    /// httpd served `/etc`, which has no `hostname` in the pinned image.
+    #[test]
+    fn chaos_workloads_answer_their_health_check_without_image_defaults() {
+        let context = offline_context();
+        for delayed in [false, true] {
+            assert_self_served(
+                &container_spec(&context, "chaos-c2-reschedule", 3, delayed),
+                "chaos-c2-reschedule",
+            );
+        }
+        assert_self_served(&context.container_http_spec("web", 1), "web");
     }
 
     #[test]

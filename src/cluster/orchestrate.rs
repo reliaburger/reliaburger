@@ -154,6 +154,25 @@ pub struct IngressAssignment {
     pub config: crate::config::app::IngressSpec,
 }
 
+/// Every ingress route the cluster serves, for every node's routing table.
+///
+/// A stopped app keeps its spec, so the next apply restores it, but serves no
+/// traffic. It has no route, and the proxy answers 404 for its host.
+pub fn cluster_ingress(desired: &crate::council::types::DesiredState) -> Vec<IngressAssignment> {
+    desired
+        .apps
+        .iter()
+        .filter(|(id, _)| !desired.stopped_apps.contains(*id))
+        .filter_map(|(id, spec)| {
+            spec.ingress.clone().map(|config| IngressAssignment {
+                name: id.name.clone(),
+                namespace: id.namespace.clone(),
+                config,
+            })
+        })
+        .collect()
+}
+
 /// An exact lease generation whose runtime ownership must retire on one node.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -3287,6 +3306,28 @@ image = "busybox:latest"
 
         assert_eq!(decisions.len(), 1);
         assert!(nodes_of(&decisions[0]).is_empty(), "{decisions:?}");
+    }
+
+    /// #211 made `relish stop` keep the spec; the app's ingress route must
+    /// still go, or its host answers 503 instead of 404.
+    #[test]
+    fn a_stopped_app_has_no_cluster_ingress_route() {
+        let mut desired = DesiredState::default();
+        for name in ["kept", "stopped"] {
+            let mut spec = app_spec(100, 1);
+            spec.ingress = Some(toml::from_str(&format!("host = \"{name}.example\"")).unwrap());
+            desired.apps.insert(AppId::new(name, "default"), spec);
+        }
+        desired
+            .stopped_apps
+            .insert(AppId::new("stopped", "default"));
+
+        let hosts: Vec<_> = cluster_ingress(&desired)
+            .into_iter()
+            .map(|route| route.config.host)
+            .collect();
+
+        assert_eq!(hosts, ["kept.example"]);
     }
 
     /// Z6.7: stopping one laptop node moved all three frontends onto a single

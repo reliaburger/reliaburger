@@ -652,6 +652,58 @@ checkpoint, `fsync` the directory. `flush_replaces_the_checkpoint_atomically`
 checks that two flushes leave exactly one complete checkpoint and no temp
 files behind.
 
+### Ask everyone, not just the current home
+
+All of that shipped, and the next soak still caught a stale tail. Right
+after a graceful stop and start of the whole cluster, the Redis client's
+tail read `INCR 749 … 782`, counting in twos, while the counter was past
+2,500. Forty seconds later the tail was right again.
+
+We went looking for another re-ingestion bug and built tests for every way
+one could happen: a graceful restart with a retired instance's capture file
+still on disk, a graceful stop with lines only in the buffer. Both passed.
+The store was fine. The status snapshots told the real story. The client had
+started on node 1, moved to node 3 during a test run, then to node 2, where
+it spent half an hour. After the restart the scheduler put it back on node 1.
+
+And the cluster-wide query only asked the nodes where the app was placed
+*now*. Node 1's newest stored lines for the app were from the moment it left,
+thirty minutes earlier, during a rolling overlap (hence the twos). Node 2,
+which held everything since, was never asked. Nothing was out of order. We
+were just asking the wrong nodes.
+
+Lines live where they were produced, and they stay there when the app moves.
+Placement records where an app runs, not where it ran. So the fan-out now
+asks every live member, and a node that never ran the app answers with an
+empty list:
+
+```rust
+pub fn query_targets(placed: &[String], members: &[(String, String)]) -> QueryTargets {
+    QueryTargets {
+        reachable: members.to_vec(),
+        unreachable: placed
+            .iter()
+            .filter(|node| !members.iter().any(|(id, _)| id == *node))
+            .cloned()
+            .collect(),
+    }
+}
+```
+
+`members.to_vec()` copies the borrowed slice into an owned `Vec`, which needs
+the element type to be `Clone`; `(String, String)` is, because both halves
+are. Placement still matters for one thing: a placed node gossip no longer
+lists is certainly holding lines we want, so it comes back as a warning
+rather than silently shrinking the answer.
+
+Is asking every node expensive? Each node answers with only its own tail and
+the query is interactive, so on a laptop's three nodes it costs nothing. At
+the ten thousand nodes we design for it's a real cost, and one we'll watch.
+The alternative, recording
+every node an app ever ran on, is state the cluster would have to keep
+forever for the sake of a log query. `tail_after_an_app_moves_back_includes_the_nodes_it_ran_on_meanwhile`
+reproduces the soak with two stores and fails against the old node choice.
+
 ## When nothing looks like success
 
 Both hardening passes share a pattern, and later reviews kept finding more of it: a failure that comes back dressed as an empty, successful answer. A directory called `blocked.parquet` made the exporter and both retention loops report success. A peer that sent `200 OK` and then went quiet hung a log query. A node that answered `{}` convinced the diagnostic collector there were no alerts. None of these crash. They lie quietly, which is worse.

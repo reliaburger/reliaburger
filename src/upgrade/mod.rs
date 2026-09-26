@@ -30,3 +30,14 @@ pub use version::{BinaryVersion, resolve_running_version};
 /// Pickle repository name for distributing reliaburger binaries
 /// (single path segment — the registry routes require it).
 pub const BINARY_BLOB_REPO: &str = "reliaburger-bun";
+
+/// Does this HTTP status mean "not right now" rather than "no"?
+///
+/// Server errors, request timeouts and rate limits say nothing about the
+/// request itself, so repeating it later may well succeed. Every other
+/// non-success status is an answer about the request and won't change.
+pub(crate) fn is_transient_status(status: reqwest::StatusCode) -> bool {
+    status.is_server_error()
+        || status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+}

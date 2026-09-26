@@ -503,6 +503,14 @@ Our `make coverage` runs the portable suite once under instrumentation and emits
 HTML report. On Linux CI that same run is the test gate, so we don't pay for the suite twice. The first combined Linux CI measurement covered
 79.65% of lines, so CI starts at 78.65%, one percentage point lower, and can ratchet upwards.
 
+Instrumented programmes write their counters to a `.profraw` file as they exit. Our
+crash-recovery tests SIGKILL instrumented Bun processes on purpose, and one day a kill landed
+mid-write: all 4,708 tests passed, then `llvm-profdata` refused the truncated file and failed
+the whole report. The report steps now pass `--failure-mode all`, which skips an unreadable
+profile with a warning and only fails when none can be read. Skipping one killed process's
+partial counts can pull coverage down a hair. It can't push it up, so the floor still means
+what it says.
+
 Coverage finds unvisited code. It does not tell us whether an assertion is useful, whether a
 webhook test accidentally exercised startup, or whether a five-second performance limit is
 portable. The audit found all three in a suite with lots of coverage. Read the uncovered
@@ -1523,6 +1531,23 @@ shell into it to write and read a file. A firewall case runs `busybox httpd` as
 the target and `wget`s it from another container. An ingress case puts `httpd`
 behind the proxy and sends it an HTTP request with the right `Host` header.
 
+There's a catch with running `sleep` or `httpd` as a container's first
+process. PID 1 is special: the kernel drops any signal it has no handler for,
+and neither command installs one for SIGTERM. So every stop sat out bun's full
+ten-second grace before the SIGKILL. Bun stops workloads on its single command
+loop, so a node retiring several test apps couldn't even answer `/v1/status`,
+and the V02 soak's catalogue pulse reported six passing cases with cleanup
+"not confirmed within 30 s". The fixtures now run under a shell that traps the
+signal:
+
+```sh
+trap 'kill $! 2>/dev/null; exit 0' TERM; /bin/busybox sleep infinity & wait
+```
+
+The command runs in the background because a trapped signal interrupts `wait`
+but not a foreground child. `$!` is the background job's PID, so the trap takes
+it down too.
+
 A tag isn't an identity, though. `busybox:latest` can point at different bytes
 between two runs, which makes a failure impossible to reproduce and lets the
 runtime architectures drift apart. The catalogue uses BusyBox 1.37.0's OCI
@@ -2435,6 +2460,63 @@ it as `Option<axum::Extension<KnownMembers>>`, so a router built without it
 So the relay's allow-list grew by two reads: `GET /v1/cluster/nodes`, and
 `GET /v1/deploys/history/{app}` because the deployment cases compare each
 node's own history. One app segment, nothing nested, like the exec rule.
+
+The next soak ran the case again with all of that in place. It timed out
+again, at 600 s, and this time cleanup was confirmed. So was it the
+rescheduler? Rescheduling after a node dies is about as core a promise as an
+orchestrator makes, so we checked that first. A new cluster test,
+`a_killed_worker_has_its_replica_rescheduled_on_the_survivors`, kills a
+worker with the same fault the case uses (`NodeKill` with its containers) and
+waits for three running replicas on the two survivors. It gets them in about
+ten seconds.
+
+The soak's own evidence said the same thing, if you knew where to look. The
+status snapshots taken just before and just after the case show every
+workload on every node with the same process id. A node-kill with
+`kill_containers` would have changed all of them on its target. And the
+leader, which logs "cannot place" every two seconds while a node holding a
+pinned app is gone, logged nothing. The fault was never injected. The case
+never got past its first line of real work: waiting for its three replicas to
+run.
+
+They never could. The chaos scenarios built their workload with
+`httpd -f -p <port> -h /etc` and health-checked it on `/hostname`, expecting
+`/etc/hostname`. The pinned BusyBox image has no `/etc/hostname` (Docker
+bind-mounts one; we don't), and no `PATH` either. The ingress fixture learnt
+exactly this on 17 September and was fixed then; the chaos module had its own
+copy of the old spec and nobody ran it on a real runtime until the soak. The
+script now lives in one place, `container_http_script`, which both fixtures
+call: it writes its own `hostname` file, serves only that directory, and names
+BusyBox by absolute path. A unit test parses each chaos spec and checks that
+the file its health check asks for is one the script writes, and that every
+external program is an absolute path.
+
+Why did it take two soaks to see? Because the report said only "case
+exceeded its 600000 ms deadline". The case's own wait knew precisely what it
+was stuck on (three running replicas, and the states it last saw), but it
+gives up on the same deadline the runner enforces, and the runner won the
+race and cancelled it before the message came back. Now each poll helper also
+leaves a note on the context as it goes, a `WaitNote`, which is a newtype
+around `Arc<tokio::sync::Mutex<Option<String>>>` so every clone of the context
+shares one note. On a timeout the runner appends it:
+
+```rust
+if let (Some(note), TestOutcome::Unknown { reason, .. }) =
+    (context.wait_note.take().await, &mut outcome)
+{
+    reason.push_str("; it was still ");
+    reason.push_str(&note);
+}
+```
+
+That `if let` matches a *tuple* of two values at once, so the body runs only
+when there's a note *and* the outcome is the `Unknown` variant. The `..` skips
+the fields we don't need, and matching on `&mut outcome` binds `reason` as a
+mutable reference into the enum, so we can extend the string in place without
+rebuilding the variant. We didn't give the body a grace period to return its
+own message instead: an existing test insists that a timed-out body stops at
+its deadline, and a case that can keep acting after it would be a worse bug
+than a terse report.
 
 The registry cases failed faster: "blob upload POST failed … https://127.0.0.1:5050".
 They push to `ctx.registry_base()`, the registry origin from the capability

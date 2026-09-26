@@ -1216,6 +1216,105 @@ async fn losing_the_leader_node_places_only_its_replica_on_the_survivors() {
     shutdown.cancel();
 }
 
+/// V02 chaos C2: a node-kill fault on a worker (not the leader) that also
+/// kills its containers must bring the app back to three running replicas on
+/// the two survivors. The killed node's API stays open, so whatever it
+/// reports is observed but not counted: only the survivors carry the load.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
+async fn a_killed_worker_has_its_replica_rescheduled_on_the_survivors() {
+    use reliaburger::smoker::types::{FaultRequest, FaultType};
+
+    let shutdown = CancellationToken::new();
+    let nodes = start_spread_web_cluster("kw", 20441, &shutdown).await;
+    // The quorum rail admits one affected voter only once three vote.
+    let voters_ready = wait_until(Duration::from_secs(60), || {
+        nodes.iter().all(|node| {
+            node.handle.council.as_ref().is_some_and(|council| {
+                council
+                    .metrics()
+                    .borrow()
+                    .membership_config
+                    .membership()
+                    .voter_ids()
+                    .count()
+                    == 3
+            })
+        })
+    })
+    .await;
+    assert!(voters_ready, "council never grew to three voters");
+    let leader = nodes
+        .iter()
+        .find(|node| *node.thinks_leader.borrow())
+        .expect("a leader exists");
+    let entry = &nodes[0];
+    let target = nodes
+        .iter()
+        .find(|node| node.name != leader.name && node.name != entry.name)
+        .or_else(|| nodes.iter().find(|node| node.name != leader.name))
+        .expect("a worker exists");
+    let survivors: Vec<&Node> = nodes
+        .iter()
+        .filter(|node| node.name != target.name)
+        .collect();
+
+    entry
+        .client
+        .inject_fault(&FaultRequest {
+            fault_type: FaultType::NodeKill {
+                kill_containers: true,
+            },
+            target_service: String::new(),
+            namespace: None,
+            target_instance: None,
+            target_node: Some(target.name.clone()),
+            duration: Duration::from_secs(300),
+            injected_by: String::new(),
+            reason: Some("chaos C2 worker failure".to_string()),
+            include_leader: false,
+            override_safety: false,
+            acknowledged: true,
+        })
+        .await
+        .expect("a worker node kill is admitted");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        let running = running_web_instances(&survivors).await;
+        if running >= 3 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "web never got back to three running replicas on the survivors \
+             after {} was killed; survivors run {running}, the killed node reports {:?}",
+            target.name,
+            target.client.status().await.map(|statuses| statuses
+                .into_iter()
+                .filter(|s| s.app_name == "web")
+                .map(|s| s.state)
+                .collect::<Vec<_>>())
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    shutdown.cancel();
+}
+
+/// The number of `web` instances in the `running` state on `nodes`.
+async fn running_web_instances(nodes: &[&Node]) -> usize {
+    let mut count = 0;
+    for node in nodes {
+        if let Ok(statuses) = node.client.status().await {
+            count += statuses
+                .iter()
+                .filter(|s| s.app_name == "web" && s.state == "running")
+                .count();
+        }
+    }
+    count
+}
+
 /// The ids of every live `web` instance on `nodes`.
 async fn web_instance_ids(nodes: &[&Node]) -> Vec<String> {
     let mut ids = Vec::new();

@@ -630,6 +630,12 @@ The lesson is worth more than the feature: when a distributed primitive resists 
 
 `POST /v1/upgrade/start` (admin, leader): the plan — target version, hashes and signatures, `parallel`, the registry address nodes should fetch from, and the node list. The client names *which* nodes to upgrade, but it does **not** get to say what those nodes are. The leader rebuilds each node's role (from the Raft voter set and current leader) and address (from gossip membership) server-side and validates the request against its own view. Why bother? Because the roles decide the rolling order, and the leader-last invariant is load-bearing: a caller who could label a live leader "worker" (or a worker "leader") could make the real leader upgrade first-and-disruptively, or point directives at another host entirely. So a spoofed address, or any claim that crosses the leader boundary, is rejected; a harmless worker↔council relabel among non-leaders is quietly corrected to the authoritative role. Either way the plan the orchestrator walks is built from the leader's truth, never the client's claim. `GET /v1/upgrade/cluster` reads the replicated state from any node. `resume` and `cluster-rollback` do what they say — rollback runs the same walk with `direct_rollback` directives and no distribution step, since every node still has the previous binary on disk (§14.3's retention earning its keep).
 
+There's a catch in "the leader's truth", and a CI run found it for us. The rollback test upgrades a four-node cluster, then immediately asks the leader to roll it back. It got a 400: `address for node "n1" is "127.0.0.1:36685" but the cluster sees "127.0.0.1:45611"`. Port 45611 appeared nowhere in the logs. n1 had listened on 36685 before and after its upgrade. So where did 45611 come from?
+
+From arithmetic. The leader upgrades last, so it had just restarted, and a restarted node learns its peers in two steps. First, some member sends it a membership sync, which says "n1 is alive at gossip port 57888". Later, n1's own gossip arrives, stamped with the API address n1 advertises. Between the two, the membership table fills the gap by shifting the gossip port by the leader's *own* gossip-to-API offset: 57888 + (41165 − 53442) = 45611. That guess is right on a production fleet, where every node uses the same ports, and wrong on any host running several nodes with independently picked ports. The validation compared the client's correct address with the guess and called the client a liar.
+
+The fix keeps the guess where it's harmless and stops it being treated as an identity. `NodeMembershipInfo` now says whether its address was advertised, and the authoritative view carries `address: Option<String>`, built with `member.api_advertised.then(|| member.address.to_string())`. `derive_upgrade_nodes` refuses a node whose address it doesn't know yet with `PlanError::AddressNotAdvertised`, and `PlanError::is_transient` maps that to a 503 ("retry shortly") rather than a 400, because the request isn't wrong, only early. `/v1/cluster/nodes` stopped publishing guesses too, so relish reports "no advertised API endpoint" instead of quietly building a plan around one. Would accepting the client's address when we have nothing better have been simpler? Yes, and it would also undo the whole point of UPG2.
+
 `cargo test --lib upgrade::orchestrator`. Next: the operator's steering wheel — `relish upgrade`.
 
 ## 14.10 Driving it from relish
@@ -652,7 +658,7 @@ relish upgrade resume                  # carry on after a pause
 
 Notice what relish deliberately does **not** do: verify the signatures itself. It could — it embeds the same release keys — but the nodes *must* verify regardless (relish is outside their trust boundary), and a relish-side check would give integration tests signed with throwaway keys a false failure. One verification, in the place that matters.
 
-relish still assembles a node list for the start request, but it's no longer the source of truth. The leader rebuilds each node's API address from its own gossip membership table (which already carries the API port, derived once from the gossip port by a fixed offset) and its role from the Raft voter set, then validates relish's list against that. So a stale or hand-edited list can't upgrade a node under a false identity — the leader corrects what it safely can and rejects what it can't (see "What the API gained"). relish's job shrinks to *which* nodes and *how many workers at once*; the leader owns *what those nodes are*.
+relish still assembles a node list for the start request, but it's no longer the source of truth. The leader rebuilds each node's API address from its own gossip membership table (the address each node advertised over gossip, never a port-offset guess) and its role from the Raft voter set, then validates relish's list against that. So a stale or hand-edited list can't upgrade a node under a false identity — the leader corrects what it safely can and rejects what it can't (see "What the API gained"). relish's job shrinks to *which* nodes and *how many workers at once*; the leader owns *what those nodes are*.
 
 `plan` and `status` are the legibility half. Both are pure functions from data to a string, which makes them perfect **snapshot test** material — `insta::assert_snapshot!(render_plan("v0.2.0", 5, 2, 1, 2))` stores the rendered output in a `.snap` file under version control, and any change to the wording shows up as a reviewable diff instead of a broken `assert_eq` on a multi-line string literal. (First time we've used insta in this book: the workflow is run the test, eyeball the generated `.snap.new`, accept it. The eyeballing is the point — an earlier draft's single-node plan promised a "leadership transfer" with nobody to transfer to, and the snapshot diff caught it.)
 
@@ -879,3 +885,74 @@ Two small things changed on the way. The 409 for a start or rollback against a p
 The tests follow the layers. `plan::tests` covers the gate (no signature, empty signature, nodes that refuse), and `orchestrator::tests` checks that a `/v1/version` without the field probes as "can't accept". The same module covers abort on a clean pause, refusal for each of the three "moved" phases, refusal when not paused, supersede over a node that did move, and a `step` that leaves an aborted run alone. The cluster suite gets two real-binary tests. `start_refuses_when_a_node_cannot_verify_network_upgrades` boots two nodes, one without an external key, and checks that `relish upgrade start` fails naming that node with nothing recorded. `paused_upgrade_can_be_aborted_or_replaced_by_a_rollback` poisons a worker's binary so the run pauses, aborts it through relish, starts again (accepted, now that the slot is free), lets it pause a second time, and replaces that one with `relish upgrade rollback v0.1.0`, which completes.
 
 Running the whole upgrade suite twice in a row turned up a leak of our own. A single-node test deploys a workload on a fixed port, and workloads run under detached process owners precisely so they survive Bun's `exec`. They survived the test too. The next run found port 46071 already serving and its own instance never appeared. The harness now kills every process whose command line names its temporary directory, both in `shutdown` and in a `Drop` implementation. `Drop` is Rust's destructor: the compiler calls `drop(&mut self)` when a value goes out of scope, including while a panic unwinds the stack, so a failed assertion can't skip the cleanup the way it skips a `shutdown().await` at the end of the test.
+
+## One blip is not a refusal
+
+The V02 soak's next finding came from a chaos step, not a misconfiguration. Mid-walk, the harness SIGKILLed the leader's Bun. Node 3 had already upgraded. systemd brought the leader back three seconds later, and within the same second its orchestrator (the state lives in Raft, so the restart is just a resume) sent node 2 its directive. Node 2 asked the leader's Pickle registry for the binary. The registry wasn't listening yet: in the journal, "Pickle registry listening" comes eight lines *after* the pause. The fetch failed with "error sending request", node 2 answered 409 like any other refusal, and the orchestrator did what §14.9 told it to on a refusal. It paused. Ten minutes later the harness gave up and rolled back.
+
+Nothing was wrong with the binary, the signatures or node 2. The registry was simply three seconds late. So the question is: which failures mean "no", and which mean "not right now"?
+
+### Two kinds of failure, in the types
+
+"No" is anything that will give the same answer next time: a hash or signature that doesn't verify, a missing external key, a version the policy refuses, a registry that answers 404 because it doesn't hold the blob. "Not right now" is anything about reachability: a connection refused or reset, a body cut off halfway, a 5xx, a 408 or a 429. One helper, `upgrade::is_transient_status`, draws that line for HTTP statuses, and both sides of the directive use it.
+
+On the node, `fetch_binary` used to return `FetchFailed` for everything. It now has a sibling variant, `FetchUnavailable`, and `UpgradeError::is_transient()` is a one-line `matches!` over it. The node rides out an unavailable source itself for a short budget (10 s, backing off from 500 ms), because the fetch runs while the agent holds its command loop and the orchestrator is waiting on the HTTP answer. If the source is still down after that, the API answers **503** instead of 409.
+
+Holding the command loop also means a registry that *accepts* the connection and then says nothing is worse than one that refuses it. reqwest has no timeout by default, so the first version of the retry would have waited on that registry forever, with the whole agent stuck behind it. Each attempt now runs under `tokio::time::timeout`: 5 s to connect and get the response headers, 60 s for the whole attempt, body included (plenty for a ~100 MB binary on a LAN), and 75 s for the whole fetch, retries and backoff included. `timeout` wraps any future and returns `Err(Elapsed)` if the deadline passes first, dropping the inner future. In Rust, dropping a future cancels it, so the half-read connection is closed as well. A timeout counts as `FetchUnavailable`, because a registry that hangs is still a "not right now". A guard on a match arm does it:
+
+```rust
+Ok(Err(crate::bun::BunError::Upgrade(error))) if error.is_transient() => (
+    StatusCode::SERVICE_UNAVAILABLE,
+    Json(serde_json::json!({ "error": error.to_string() })),
+)
+    .into_response(),
+Ok(Err(e)) => (StatusCode::CONFLICT, /* … */).into_response(),
+```
+
+The `if` after the pattern is a *match guard*: the arm only matches when the pattern fits *and* the condition holds, otherwise matching falls through to the next arm. Order matters, so the more specific arm goes first.
+
+On the leader, `NodeControl::direct_upgrade` used to return `Result<(), String>`. A `String` can't tell you whether to retry without someone parsing it, which is exactly the stringly-typed API the project guide warns about. It now returns a two-variant error:
+
+```rust
+pub enum DirectiveError {
+    Transient(String),
+    Refused(String),
+}
+```
+
+A Go programmer would reach for a sentinel error and `errors.Is`. The Rust version is stronger in one specific way: the orchestrator `match`es on the result, and the compiler refuses to build it until both variants have an arm. Nobody can add a third kind of failure later and forget to decide what the walk does with it. A failure to reach the node at all is `Transient` too, since a node that is itself restarting looks just like that.
+
+### Retrying without losing your place
+
+A transient failure leaves the node `Pending` and fills in a new `directive_retry` field on its record: attempts so far, when the first one failed, when the last one did, and what it said. Because that record lives in Raft, a leader that changes mid-retry carries on with the same count and the same window rather than starting over. The orchestrator re-sends when the backoff has passed (3 s, doubling, capped at 30 s) and gives up after `DIRECTIVE_RETRY_WINDOW`, two minutes from the first failure. Only then does the node go `Failed`, with a reason that says how long it tried, and the run pauses as before. A refusal skips all of that and pauses on the spot.
+
+The subtle part is the concurrency budget. A council member waiting out its backoff still *holds its slot*. If it didn't, the next tick would see a free slot and direct the next council member, and the walk would quietly reorder itself around a node that is owed its turn. So pass 2 takes the slot before it even looks at the backoff:
+
+```rust
+slots -= 1;
+if record
+    .directive_retry
+    .as_ref()
+    .is_some_and(|retry| !retry_due(retry, context.now))
+{
+    continue;
+}
+```
+
+`as_ref()` turns an `&Option<DirectiveRetry>` into an `Option<&DirectiveRetry>`, so we can look inside without moving the value out of the record, and `is_some_and` is `false` for `None` and the closure's answer for `Some`. Writing this turned up an older bug in the same loop. A refused directive marked the node `Failed` but didn't use up its slot, so with `parallel = 2` the loop went on to direct the *next* worker in the same tick, past the failure that was about to pause the run. A refusal now ends pass 2, the same rule pass 1 already applied.
+
+`set_phase` clears `directive_retry` on every transition out of `Pending`, and `resume` clears it too, so a resumed run gets a fresh two minutes. The new field changes what the Raft log stores, and the 503 changes what a directive can answer, so `compatibility::CURRENT` moved to protocol 27 and state 43.
+
+### What we decided not to do
+
+We thought about letting a node fetch the blob from *any* Pickle node rather than the one address in the directive. It would have dodged this particular outage. It isn't simple, though. `relish upgrade start` pushes the binary to one registry, and nothing guarantees the other nodes hold that raw blob by the time the walk reaches them. A node would also need a list of peer registries it doesn't have today. The retry fixes the failure we actually saw, a registry that is late, and a registry that is *gone* is still a pause the operator should see.
+
+We also didn't make the orchestrator wait for its own registry after a restart. The registry in the directive needn't be the leader's, and a retry covers that case and every other kind of blip with one mechanism.
+
+### Tests
+
+`orchestrator::tests` scripts the mock node's answers. `transient_directive_failure_keeps_the_node_pending_and_retries` walks the clock through two transient failures, checks that no attempt happens inside a backoff and that the third one succeeds. `transient_failures_past_the_retry_window_pause_the_run` ticks every three seconds for two minutes (between four and ten attempts, never paused) and then checks the pause names the last error. `refused_directive_pauses_at_once_and_starts_no_sibling` pins the refusal path, including the sibling bug. `a_node_retrying_holds_its_place_in_the_rolling_order` checks the slot. Three more point the real `HttpNodeControl` at a canned 503, a canned 409 and a closed port.
+
+In `manager::tests`, `flaky_registry` is a tiny TCP server that follows a script (hang up, answer a status, or serve the blob) and counts requests. `prepare_rides_out_a_registry_that_is_briefly_unavailable` gets a hang-up, then a 503, then the blob, and stages it on the third request. A 404 fails after exactly one request and isn't transient. A registry that never comes back is reported transient with nothing staged. So is one that accepts and never answers, or stalls halfway through the body, and `a_hanging_registry_is_a_transient_failure_within_the_ceiling` checks that it gives up within the ceiling instead of hanging. Finally, and bytes that don't verify aren't transient even though they came over the network. An API test checks the 503/409 split end to end.
+
+The cluster suite gets `a_registry_outage_at_directive_time_does_not_pause_the_upgrade`. It puts a TCP proxy in front of the leader's registry that hangs up on everything for the first 25 seconds, longer than a node's own 10 s budget, so the orchestrator has to re-send. It points the upgrade at the proxy and requires the run to reach `Completed` with every node on v0.2.0, and requires that the outage actually turned fetches away. Otherwise the test would prove nothing.

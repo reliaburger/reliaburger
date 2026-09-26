@@ -47,7 +47,15 @@ use super::agent::{AgentCommand, ApplyEvent, InstanceStatus};
 #[derive(Debug, Clone)]
 pub struct NodeMembershipInfo {
     pub node_id: crate::meat::NodeId,
+    /// The node's API endpoint: the one it advertised over gossip, or a
+    /// port-offset guess until that advertisement arrives.
     pub address: std::net::SocketAddr,
+    /// `true` when `address` is the node's own advertisement. A guess is
+    /// fine for best-effort fan-out, but anything that compares or
+    /// publishes the address as the node's identity (upgrade plans, the
+    /// nodes listing) must wait for the real thing: nodes sharing a host
+    /// pick their ports independently, so one node's offset is not another's.
+    pub api_advertised: bool,
 }
 
 /// Every member gossip still knows (alive, suspect or dead, not left), with
@@ -1801,6 +1809,14 @@ async fn upgrade_apply_handler(
             })),
         )
             .into_response(),
+        // "Not right now" (the binary's registry is unreachable or
+        // restarting) is a 503, so the orchestrator re-sends the directive
+        // instead of pausing the whole run on one blip.
+        Ok(Err(crate::bun::BunError::Upgrade(error))) if error.is_transient() => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        )
+            .into_response(),
         Ok(Err(e)) => (
             StatusCode::CONFLICT,
             Json(serde_json::json!({ "error": e.to_string() })),
@@ -2012,13 +2028,7 @@ async fn upgrade_start_handler(
         authoritative.get(id).cloned()
     }) {
         Ok(nodes) => nodes,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": e.to_string() })),
-            )
-                .into_response();
-        }
+        Err(e) => return plan_error_response(&e),
     };
 
     if let Some(active) = council.desired_state().await.active_upgrade {
@@ -2219,6 +2229,22 @@ async fn archive_aborted_upgrade(
     Ok(())
 }
 
+/// Reply to a refused upgrade plan. A node whose endpoint the leader hasn't
+/// heard yet is a 503 (retry shortly); a claim that contradicts the cluster
+/// is the caller's fault, a 400.
+fn plan_error_response(error: &crate::upgrade::plan::PlanError) -> Response {
+    let status = if error.is_transient() {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    (
+        status,
+        Json(serde_json::json!({ "error": error.to_string() })),
+    )
+        .into_response()
+}
+
 /// Build the leader's authoritative view of every node for upgrade
 /// planning (UPG2): node id → its API address (from gossip membership) and
 /// role (from the Raft voter set + current leader). This is the source of
@@ -2259,7 +2285,7 @@ async fn build_authoritative_view(
         view.insert(
             name,
             AuthoritativeNode {
-                address: member.address.to_string(),
+                address: member.api_advertised.then(|| member.address.to_string()),
                 role,
             },
         );
@@ -2455,13 +2481,7 @@ async fn upgrade_cluster_rollback_handler(
         authoritative.get(id).cloned()
     }) {
         Ok(nodes) => nodes,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": e.to_string() })),
-            )
-                .into_response();
-        }
+        Err(e) => return plan_error_response(&e),
     };
 
     let upgrade_id = format!(
@@ -3795,19 +3815,7 @@ async fn placements_handler(
                 }
             })
             .collect(),
-        ingress: desired
-            .apps
-            .iter()
-            .filter_map(|(id, spec)| {
-                spec.ingress
-                    .clone()
-                    .map(|config| crate::cluster::orchestrate::IngressAssignment {
-                        name: id.name.clone(),
-                        namespace: id.namespace.clone(),
-                        config,
-                    })
-            })
-            .collect(),
+        ingress: crate::cluster::orchestrate::cluster_ingress(&desired),
     })
     .into_response()
 }
@@ -4884,9 +4892,9 @@ async fn logs_entries_handler(
 
 /// `GET /v1/logs/query/{app}/{namespace}?start=S&end=E&grep=G&tail=N`
 ///
-/// Cross-node log query. Looks up which nodes run the app from the
-/// council placement state, fans out the query to those nodes, and
-/// merge-sorts results by timestamp.
+/// Cross-node log query. Fans out to every live member (an app's lines stay
+/// on each node it ever ran on, see [`crate::ketchup::query::query_targets`])
+/// and merges the answers in ingest order.
 async fn logs_cross_node_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
@@ -4917,41 +4925,31 @@ async fn logs_cross_node_handler(
         let desired = council.desired_state().await;
         let app_id = AppId::new(&app, &namespace);
 
-        // Find which nodes run this app
-        let node_ids: Vec<crate::meat::NodeId> = desired
+        // Where the app runs now; its history may be on any live member.
+        let placed: Vec<String> = desired
             .scheduling
             .get(&app_id)
-            .map(|placements| placements.iter().map(|p| p.node_id.clone()).collect())
+            .map(|placements| placements.iter().map(|p| p.node_id.0.clone()).collect())
             .unwrap_or_default();
-
-        if node_ids.is_empty() {
-            return Json(LogQueryResult {
-                entries: vec![],
-                node_count: 0,
-                warnings: vec![],
+        let live: Vec<(String, String)> = membership
+            .read()
+            .await
+            .iter()
+            .map(|member| {
+                (
+                    member.node_id.0.clone(),
+                    state.cluster_http.url(&member.address.to_string(), ""),
+                )
             })
-            .into_response();
-        }
-
-        // Resolve NodeIds to HTTP URLs via membership table
-        let members = membership.read().await;
-        let mut nodes: Vec<(String, String)> = Vec::new();
-        let mut warnings = Vec::new();
-
-        for node_id in &node_ids {
-            if let Some(info) = members.iter().find(|m| m.node_id == *node_id) {
-                nodes.push((
-                    node_id.0.clone(),
-                    state.cluster_http.url(&info.address.to_string(), ""),
-                ));
-            } else {
-                // No membership entry — can't even reach it. A partial failure.
-                warnings.push(LogQueryWarning::NodeUnresponsive {
-                    node_id: node_id.0.clone(),
-                });
-            }
-        }
-        drop(members);
+            .collect();
+        let targets = crate::ketchup::query::query_targets(&placed, &live);
+        let nodes = targets.reachable;
+        // A placed node with no membership entry can't be reached at all.
+        let mut warnings: Vec<LogQueryWarning> = targets
+            .unreachable
+            .into_iter()
+            .map(|node_id| LogQueryWarning::NodeUnresponsive { node_id })
+            .collect();
 
         let node_count = nodes.len() + warnings.len();
 
@@ -5091,7 +5089,7 @@ async fn nodes_handler(State(state): State<ApiState>) -> Response {
                 for node in &mut nodes {
                     node.api_address = members
                         .iter()
-                        .find(|member| member.node_id.0 == node.node_id)
+                        .find(|member| member.node_id.0 == node.node_id && member.api_advertised)
                         .map(|member| member.address);
                 }
             }
@@ -12783,6 +12781,91 @@ schedule = "* * * * *"
         }
     }
 
+    /// The status a node answers an upgrade directive with when preparing
+    /// it fails with `error`, via a stand-in agent.
+    async fn upgrade_apply_status(error: crate::upgrade::UpgradeError) -> StatusCode {
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(4);
+        let mut error = Some(error);
+        tokio::spawn(async move {
+            while let Some(command) = cmd_rx.recv().await {
+                if let AgentCommand::UpgradeApply { response, .. } = command
+                    && let Some(error) = error.take()
+                {
+                    let _ = response.send(Err(crate::bun::BunError::Upgrade(error)));
+                }
+            }
+        });
+        let created = crate::sesame::token::create_token(
+            "cluster-admin",
+            crate::sesame::types::ApiRole::Admin,
+            crate::sesame::types::TokenScope::default(),
+            None,
+        )
+        .unwrap();
+        let store = crate::sesame::auth::new_token_store();
+        store.write().await.push(created.token);
+        let app = router(
+            cmd_tx,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(store),
+            None,
+            None,
+            None,
+            None,
+            9117,
+            None,
+        );
+        let directive = crate::upgrade::types::UpgradeDirective {
+            upgrade_id: "up-1".to_string(),
+            target_version: "v0.2.0".parse().unwrap(),
+            binary_sha256: "abc".to_string(),
+            embedded_signature: String::new(),
+            external_signature: None,
+            source: crate::upgrade::types::BinarySource::Pickle {
+                registry_address: "10.0.0.1:5050".to_string(),
+            },
+            network_provenance: true,
+            allow_downgrade: false,
+        };
+        post_status(
+            app,
+            "/v1/upgrade/apply",
+            &created.plaintext,
+            &serde_json::to_string(&directive).unwrap(),
+        )
+        .await
+    }
+
+    /// A registry that isn't serving is "not right now": 503, which the
+    /// orchestrator retries. A blob it doesn't hold, or bytes that don't
+    /// verify, are a refusal: 409, which pauses the run.
+    #[tokio::test]
+    async fn upgrade_apply_answers_503_only_when_the_binary_source_is_unavailable() {
+        use crate::upgrade::UpgradeError;
+        let unavailable = UpgradeError::FetchUnavailable {
+            url: "https://10.0.0.1:5050/v2/reliaburger-bun/blobs/sha256:abc".to_string(),
+            reason: "error sending request".to_string(),
+        };
+        assert_eq!(
+            upgrade_apply_status(unavailable).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let missing = UpgradeError::FetchFailed {
+            url: "https://10.0.0.1:5050/v2/reliaburger-bun/blobs/sha256:abc".to_string(),
+            reason: "status 404 Not Found".to_string(),
+        };
+        assert_eq!(upgrade_apply_status(missing).await, StatusCode::CONFLICT);
+        assert_eq!(
+            upgrade_apply_status(UpgradeError::EmbeddedSignatureInvalid).await,
+            StatusCode::CONFLICT
+        );
+    }
+
     #[tokio::test]
     async fn scoped_deployer_is_refused_stopping_outside_its_namespace() {
         // AUTH1: a Deployer scoped to `a` clears the role gate but is refused
@@ -13703,10 +13786,12 @@ schedule = "* * * * *"
             NodeMembershipInfo {
                 node_id: crate::meat::NodeId::new("node-alpha"),
                 address: "127.0.0.1:9101".parse().unwrap(),
+                api_advertised: true,
             },
             NodeMembershipInfo {
                 node_id: crate::meat::NodeId::new("node-beta"),
                 address: "127.0.0.1:9102".parse().unwrap(),
+                api_advertised: true,
             },
         ]));
         // No token store, so the request is open; membership at position 11.
@@ -14128,6 +14213,7 @@ schedule = "* * * * *"
         let members = Arc::new(RwLock::new(vec![NodeMembershipInfo {
             node_id: crate::meat::NodeId::new("unresponsive"),
             address,
+            api_advertised: true,
         }]));
         let app = router(
             cmd_tx,
@@ -14220,6 +14306,7 @@ schedule = "* * * * *"
         let members = Arc::new(RwLock::new(vec![NodeMembershipInfo {
             node_id: crate::meat::NodeId::new("peer"),
             address: peer_address,
+            api_advertised: true,
         }]));
         let app = router(
             cmd_tx,
@@ -14520,7 +14607,7 @@ schedule = "* * * * *"
             };
             response
                 .send(
-                    ["one", "unknown"]
+                    ["one", "guessed", "unknown"]
                         .into_iter()
                         .map(|id| super::super::agent::NodeStatus {
                             node_id: id.to_string(),
@@ -14536,10 +14623,20 @@ schedule = "* * * * *"
                 )
                 .unwrap();
         });
-        let membership = Arc::new(RwLock::new(vec![NodeMembershipInfo {
-            node_id: crate::meat::NodeId::new("one"),
-            address: "[::1]:19117".parse().unwrap(),
-        }]));
+        let membership = Arc::new(RwLock::new(vec![
+            NodeMembershipInfo {
+                node_id: crate::meat::NodeId::new("one"),
+                address: "[::1]:19117".parse().unwrap(),
+                api_advertised: true,
+            },
+            // Known to gossip, but its own directory extension hasn't
+            // arrived: the address is only a port-offset guess.
+            NodeMembershipInfo {
+                node_id: crate::meat::NodeId::new("guessed"),
+                address: "[::1]:19999".parse().unwrap(),
+                api_advertised: false,
+            },
+        ]));
         let app = router(
             tx,
             None,
@@ -14569,7 +14666,10 @@ schedule = "* * * * *"
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let nodes: Vec<crate::bun::agent::NodeStatus> = serde_json::from_slice(&body).unwrap();
         assert_eq!(nodes[0].api_address, Some("[::1]:19117".parse().unwrap()));
+        // A guess is not evidence: clients building an upgrade plan would
+        // hand it back as the node's address and be refused.
         assert_eq!(nodes[1].api_address, None);
+        assert_eq!(nodes[2].api_address, None);
         worker.await.unwrap();
     }
 
@@ -15500,6 +15600,7 @@ mod cluster_routing_tests {
             self.membership.write().await.push(NodeMembershipInfo {
                 node_id: crate::meat::NodeId::new(name),
                 address,
+                api_advertised: true,
             });
         }
 
@@ -15631,6 +15732,7 @@ mod cluster_routing_tests {
             membership.push(NodeMembershipInfo {
                 node_id: crate::meat::NodeId::new(*name),
                 address: listener.local_addr().unwrap(),
+                api_advertised: true,
             });
             listeners.push(listener);
         }

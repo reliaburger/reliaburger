@@ -1087,13 +1087,31 @@ slot_upgrade() {
             local node; node=$(random_between 2 3); power_off "$node"; sleep "$hold_min"; power_on "$node" || true
         fi
     fi
-    wait_versions "$target" 600 "$started" upgrade || true
+    # Every node reporting the target isn't the end of the run: the leader
+    # marks it Completed on a later tick, and a rollback before that is
+    # refused as "already in progress". A paused run needs no wait, since
+    # rollback replaces it.
+    if wait_versions "$target" 600 "$started" upgrade; then wait_upgrade_idle 120 || true; fi
     started=$(date +%s)
     gsh 1 "RELIABURGER_TOKEN=\$(cat /root/.soak-token) relish --endpoint https://127.0.0.1:9117 --ca-cert /etc/reliaburger/identity/root-ca.crt upgrade rollback v0.1.0" \
         > "$evidence/snapshots/upgrade-$upgrade_walks-rollback.log" 2>&1 || record_failure upgrade "upgrade rollback failed"
     wait_versions 0.1.0 600 "$started" rollback || true
     settle upgrade:settle 600 || true
     return 0
+}
+
+wait_upgrade_idle() {
+    local budget=$1 started status
+    started=$(date +%s)
+    while :; do
+        status=$(gsh 1 "RELIABURGER_TOKEN=\$(cat /root/.soak-token) relish --endpoint https://127.0.0.1:9117 --ca-cert /etc/reliaburger/identity/root-ca.crt upgrade status" 2>&1 || true)
+        case $status in *[Nn]'o upgrade in progress'*) return 0 ;; esac
+        if [ $(( $(date +%s) - started )) -ge "$budget" ]; then
+            record_failure upgrade-complete "run still in progress $budget s after every node reported the target: $(printf '%s' "$status" | head -n 3 | tr '\n' ' ')"
+            return 1
+        fi
+        sleep 5
+    done
 }
 
 wait_versions() {

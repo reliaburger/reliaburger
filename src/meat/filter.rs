@@ -235,6 +235,7 @@ mod tests {
             from_version: None,
             phase,
             since: None,
+            directive_retry: None,
         };
         let upgrade = ClusterUpgradeState {
             upgrade_id: "up-1".to_string(),
