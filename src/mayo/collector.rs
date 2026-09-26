@@ -43,6 +43,10 @@ impl SystemCollector {
     /// Create a new collector. Performs an initial refresh to establish
     /// baselines (CPU usage needs two measurements to compute deltas).
     pub fn new() -> Self {
+        // sysinfo keeps each tracked process's /proc stat file open to save
+        // syscalls, bounded only by RLIMIT_NOFILE, which Bun raises to about
+        // a million. Open and close them per refresh instead.
+        sysinfo::set_open_files_limit(0);
         let mut system = System::new_all();
         system.refresh_all();
         let networks = Networks::new_with_refreshed_list();
@@ -56,7 +60,13 @@ impl SystemCollector {
 
     /// Refresh all system data. Call this before collecting metrics.
     pub fn refresh(&mut self) {
-        self.system.refresh_all();
+        // `refresh_all` never forgets an exited process. On a node that
+        // starts short-lived processes all day, that grew Bun past 950 MB
+        // and 1,500 open files within half an hour in the V02 soak.
+        self.system.refresh_memory();
+        self.system.refresh_cpu_all();
+        self.system
+            .refresh_processes(sysinfo::ProcessesToUpdate::All, true);
         self.networks.refresh(true);
         self.disks.refresh(true);
     }
@@ -225,6 +235,38 @@ impl Default for SystemCollector {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn exited_processes_are_forgotten_on_refresh() {
+        let mut collector = SystemCollector::new();
+        let mut children: Vec<_> = (0..20)
+            .map(|_| {
+                std::process::Command::new("sleep")
+                    .arg("30")
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        let pids: Vec<_> = children
+            .iter()
+            .map(|child| sysinfo::Pid::from_u32(child.id()))
+            .collect();
+        collector.refresh();
+        assert!(
+            pids.iter()
+                .all(|pid| collector.system.process(*pid).is_some())
+        );
+        for child in &mut children {
+            child.kill().unwrap();
+            child.wait().unwrap();
+        }
+        collector.refresh();
+        let remembered: Vec<_> = pids
+            .iter()
+            .filter(|pid| collector.system.process(**pid).is_some())
+            .collect();
+        assert!(remembered.is_empty(), "still tracking {remembered:?}");
+    }
+
     use super::*;
 
     #[test]

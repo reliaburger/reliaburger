@@ -59,6 +59,8 @@ The `sysinfo` crate gives us cross-platform system metrics without writing platf
 - **Node-level:** CPU usage, memory used/total, disk used/total, network rx/tx bytes and packets
 - **Per-process:** CPU percentage and RSS memory for each running container (by PID)
 
+One refresh call cost us a release candidate. `System::refresh_all()` looks like the obvious choice, but in sysinfo 0.33 it refreshes processes *without* removing the ones that have exited, and sysinfo keeps each tracked process's `/proc/<pid>/stat` file open so the next refresh is cheaper. Bun raises its open-file limit to about a million, so nothing capped that cache either. The V02 soak's workloads start a short-lived process every second or so, and after half an hour one node's Bun held 1,532 open files (992 of them `stat` files for processes long gone) and 951 MB of memory. The collector now refreshes memory, CPU and processes separately, asks for dead processes to be removed, and turns sysinfo's file cache off. `exited_processes_are_forgotten_on_refresh` starts twenty `sleep`s, lets one refresh see them, kills them, and checks the next refresh has forgotten every one; with `refresh_all` it still tracks all twenty.
+
 Collection runs every 10 seconds. Each sample is a `(timestamp, metric_name, labels_json, value)` tuple, stored as an Arrow RecordBatch. When the batch fills up, it's flushed to a Parquet file.
 
 ## Prometheus scraping
