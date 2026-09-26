@@ -940,7 +940,8 @@ fn aggregate_is_for_app(labels_json: &str, app_id: &crate::meat::types::AppId) -
 /// report only carries the host port). VIPs are then allocated
 /// cluster-wide by the catalogue, preserving existing allocations before
 /// adding newcomers. Declared services retain their VIP even when reports
-/// temporarily contain no running backend.
+/// temporarily contain no running backend, and a live node that hasn't
+/// reported under this leader yet keeps its committed backends.
 ///
 /// Only services whose app declares a port appear: a portless app has no
 /// VIP and nothing to resolve.
@@ -1006,6 +1007,36 @@ fn build_endpoint_catalog(
                     host_port,
                     healthy,
                 });
+        }
+    }
+
+    // A member gossip still counts, but that hasn't reported under this
+    // leader, keeps the backends the committed catalogue gave it. A fresh
+    // leader starts with no reports at all and a restarted agent takes a few
+    // seconds to send its first, while the containers behind those backends
+    // carry on serving. Dropping them would make every consumer's connect
+    // hook refuse live services until the reports arrived. The node's own
+    // report stays authoritative the moment it lands, and a producer
+    // retirement still withdraws a backend here.
+    for (qualified, service) in &desired.endpoint_catalog.services {
+        let Some((_, _, backends)) = grouped.get_mut(qualified) else {
+            continue; // no longer a declared service
+        };
+        for backend in &service.backends {
+            let node_id = NodeId::new(&backend.node_id);
+            let still_there = members.iter().any(|member| {
+                member.node_id == node_id
+                    && matches!(member.state, NodeState::Alive | NodeState::Suspect)
+                    && member.address.ip() == std::net::IpAddr::V4(backend.node_ip)
+            });
+            if still_there
+                && !reports.reports.contains_key(&node_id)
+                && !desired
+                    .producer_retirements
+                    .blocks(&backend.node_id, backend.execution.as_ref())
+            {
+                backends.push(backend.clone());
+            }
         }
     }
 
@@ -2913,6 +2944,108 @@ image = "busybox:latest"
             svc.backends
                 .iter()
                 .any(|b| b.node_id == "node-b" && !b.healthy)
+        );
+    }
+
+    /// A live node that hasn't reported under this leader keeps the backends
+    /// the committed catalogue gave it. A fresh leader starts with no reports
+    /// at all, and a restarted agent needs a few seconds before its first one;
+    /// dropping those backends made every node's connect hook refuse live
+    /// services with EPERM until the reports arrived (V02 soak).
+    #[test]
+    fn build_endpoint_catalog_keeps_committed_backends_of_live_unreported_nodes() {
+        use crate::onion::catalog::CatalogBackend;
+
+        let mut desired = crate::council::types::DesiredState::default();
+        desired.apps.insert(
+            crate::meat::types::AppId::new("redis", "default"),
+            spec_from_toml("[app.redis]\nimage = \"x:1\"\nport = 6379\n"),
+        );
+        let execution: crate::grill::RuntimeExecution = serde_json::from_value(serde_json::json!({
+            "instance_id": "default__redis-0", "generation": "a".repeat(64)
+        }))
+        .unwrap();
+        let committed = CatalogBackend {
+            execution: Some(execution.clone()),
+            node_id: "node-b".into(),
+            node_ip: "127.0.0.1".parse().unwrap(),
+            host_port: 36555,
+            healthy: true,
+        };
+        desired.endpoint_catalog =
+            build_endpoint_catalog(&[], &AggregatedState::default(), &desired).unwrap();
+        desired
+            .endpoint_catalog
+            .services
+            .get_mut("default__redis")
+            .unwrap()
+            .backends = vec![committed.clone()];
+
+        // Only the new leader has reported so far.
+        let mut reports = AggregatedState::default();
+        reports
+            .reports
+            .insert(NodeId::new("node-a"), report(4000, 0));
+        let members = vec![member("node-a", 5001), member("node-b", 5002)];
+        let catalog = build_endpoint_catalog(&members, &reports, &desired).unwrap();
+        assert_eq!(
+            catalog.services["default__redis"].backends,
+            vec![committed.clone()],
+            "a live node's committed backend survives until it reports"
+        );
+
+        // Suspect is still a member that may be serving.
+        let mut suspect = members.clone();
+        suspect[1].state = NodeState::Suspect;
+        let catalog = build_endpoint_catalog(&suspect, &reports, &desired).unwrap();
+        assert_eq!(catalog.services["default__redis"].backends.len(), 1);
+
+        // Its own report is authoritative, even when it names nothing.
+        let mut reported = reports.clone();
+        reported
+            .reports
+            .insert(NodeId::new("node-b"), report(4000, 0));
+        let catalog = build_endpoint_catalog(&members, &reported, &desired).unwrap();
+        assert!(catalog.services["default__redis"].backends.is_empty());
+
+        // A dead, departed or re-addressed node can't be serving there.
+        for gone in [Some(NodeState::Dead), Some(NodeState::Left), None] {
+            let mut members = members.clone();
+            match gone {
+                Some(state) => members[1].state = state,
+                None => {
+                    members.pop();
+                }
+            }
+            let catalog = build_endpoint_catalog(&members, &reports, &desired).unwrap();
+            assert!(
+                catalog.services["default__redis"].backends.is_empty(),
+                "{gone:?}"
+            );
+        }
+        let mut moved = members.clone();
+        moved[1].address = "127.0.0.2:5002".parse().unwrap();
+        let catalog = build_endpoint_catalog(&moved, &reports, &desired).unwrap();
+        assert!(catalog.services["default__redis"].backends.is_empty());
+
+        // A producer retirement still withdraws it.
+        let mut retiring = desired.clone();
+        retiring.producer_retirements = retiring
+            .producer_retirements
+            .plan_retirement("node-b", &execution)
+            .unwrap();
+        let catalog = build_endpoint_catalog(&members, &reports, &retiring).unwrap();
+        assert!(catalog.services["default__redis"].backends.is_empty());
+
+        // A deleted app takes its service with it.
+        let mut deleted = desired.clone();
+        deleted.apps.clear();
+        let catalog = build_endpoint_catalog(&members, &reports, &deleted).unwrap();
+        assert!(
+            catalog
+                .services
+                .get("default__redis")
+                .is_none_or(|service| service.backends.is_empty())
         );
     }
 
