@@ -37,6 +37,3 @@ docs/website/demo/
 
 # MacBook specific files
 .DS_Store
-
-# VS Code specific files
-.vscode/

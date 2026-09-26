@@ -120,5 +120,6 @@ relish dev destroy
 
 ## Run a cluster on your own Linux servers
 
-You can also deploy reliaburger to pre-existing Linux VMs or bare-metal servers
-if you already have that computing power available. Check this [procedure here](../linux-servers.md).
+Already have Linux VMs or bare-metal servers? You can run Reliaburger on them
+directly. The [Linux servers guide](https://github.com/reliaburger/reliaburger/blob/main/docs/linux-servers.md)
+walks through a three-node cluster, from firewall rules to systemd units.

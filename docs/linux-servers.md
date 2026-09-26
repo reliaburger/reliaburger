@@ -5,7 +5,8 @@ virtual machines (or physical servers) running rootful `runc` and eBPF, forming
 a three-node Raft council with mutual TLS (mTLS), and running the demo container
 workload.
 
-Many times, VMs are already deployed and you want to take advantage of existing configurations and runtimes.
+Often the VMs already exist, and you want to use the configuration and
+runtimes you've already got on them.
 
 If you want an automated, disposable local cluster on macOS or Linux using
 managed Lima VMs instead, see the [quickstart guide](quickstart.md).
@@ -18,24 +19,19 @@ managed Lima VMs instead, see the [quickstart guide](quickstart.md).
 
 Every node must meet the following minimum specification:
 
-- **OS / Architecture**: Linux x86_64 or aarch64 (e.g. Ubuntu 24.04+, Debian 12+, RHEL 9+).
+- **OS / Architecture**: Ubuntu 24.04+ or Debian 12+, on x86_64 or aarch64.
+  Other distributions may work, but we haven't tested them.
 - **Kernel**: Linux 5.8 or later with cgroup v2 enabled.
 - **Privileges**: Root or `sudo` access on all three nodes.
 - **BPF filesystem**: `bpffs` mounted at `/sys/fs/bpf`.
 - **Resources**: At least 2 CPU cores, 2 GiB RAM, and 10 GiB available disk space per node.
-- **Required packages**: `runc`, `uidmap` (or `shadow-utils`), `iptables`, `iproute2` (or `iproute`), `nftables`, `btrfs-progs`, and `curl`.
+- **Required packages**: `runc`, `uidmap`, `iptables`, `iproute2`, `nftables`, `btrfs-progs`, and `curl`.
 
 Install the required packages on all three nodes:
 
-**Debian / Ubuntu:**
 ```sh
 sudo apt-get update
 sudo apt-get install -y runc uidmap iptables iproute2 btrfs-progs nftables curl
-```
-
-**RHEL 9 / Rocky Linux 9 / AlmaLinux 9:**
-```sh
-sudo dnf install -y runc shadow-utils iptables iproute btrfs-progs nftables curl
 ```
 
 Ensure the BPF virtual filesystem is mounted:
@@ -54,30 +50,40 @@ Assign hostnames or static IP addresses to your three VMs. For this guide, we us
 | `node-02` | Joining node, Council voter | `192.168.0.102` |
 | `node-03` | Joining node, Council voter | `192.168.0.103` |
 
-Ensure the following ports are open between the nodes:
+Ensure the following ports are open:
 
 | Port | Protocol | Purpose | Direction |
 |------|----------|---------|-----------|
-| `9117` | TCP | Bun API and Web Dashboard (Brioche) | Intersite / Operator |
-| `9443` | UDP | SWIM Gossip (Mustard) | Node-to-node |
+| `9117` | TCP | Bun API and web dashboard (Brioche) | Node-to-node, and operators (see §5) |
+| `9443` | UDP | SWIM gossip (Mustard) | Node-to-node |
 | `9444` | TCP | Raft consensus (Council) | Node-to-node |
-| `9445` | TCP | State reporting tree (Mayo) | Node-to-node |
-| `5050` | TCP | Pickle OCI image registry | Intersite / Node-to-node |
-| `53` | UDP/TCP | Service discovery DNS (`.internal`) | Node-to-node |
-| `80`, `443` | TCP | Ingress HTTP/HTTPS proxy (Wrapper) | External / Ingress |
+| `9445` | TCP | Reporting tree (state reports to the council) | Node-to-node |
+| `5050` | TCP | Pickle OCI image registry | Node-to-node |
+| `10000`-`60000` | TCP | Container host ports (`[network] port_range`); ingress reaches replicas on other nodes through them | Node-to-node |
+| `53` | UDP and TCP | Service discovery DNS (`.internal`) | Workloads to their own node |
+| `80`, `443` | TCP | Ingress HTTP/HTTPS proxy (Wrapper) | External |
 
-To quickly open these ports on host firewalls:
+Bun manages its own nftables perimeter on top of that: once it's running, only
+cluster members (and the `bootstrap_peers` you list in `node.toml`) can reach
+the API, cluster and container host ports. Your host firewall still has to let
+that traffic in. With UFW, run this on every node:
 
-- **On Debian / Ubuntu (`ufw`)**:
 ```sh
-sudo ufw allow 9117/tcp && sudo ufw allow 9443/tcp && sudo ufw allow 9443/udp && sudo ufw allow 9444/tcp && sudo ufw allow 9445/tcp && sudo ufw allow 5050/tcp && sudo ufw allow 80/tcp && sudo ufw allow 443/tcp
+for peer in 192.168.0.101 192.168.0.102 192.168.0.103; do
+  sudo ufw allow proto udp from "$peer" to any port 9443
+  sudo ufw allow proto tcp from "$peer" to any port 9117,9444,9445,5050,10000:60000
+done
+sudo ufw allow 53/udp
+sudo ufw allow 53/tcp
+sudo ufw allow 80/tcp
+sudo ufw allow 443/tcp
 ```
 
-- **On RHEL 9 / Rocky Linux 9 / AlmaLinux 9 (`firewalld`)**:
-```sh
-sudo firewall-cmd --permanent --add-port={9117/tcp,9443/tcp,9443/udp,9444/tcp,9445/tcp,5050/tcp,80/tcp,443/tcp}
-sudo firewall-cmd --reload
-```
+There's one more trap. Docker, and UFW when it's enabled, set the `FORWARD`
+chain's policy to `DROP`. Bun enables IPv4 forwarding but doesn't override
+another firewall's rules, so a node can reach its containers while
+container-to-container traffic is still dropped. The
+[runc notes](README.md#runc-linux) cover what to check.
 
 ---
 
@@ -95,7 +101,7 @@ ARCH="$(uname -m)"
 case "$ARCH" in
   x86_64|amd64)   ARCH="x86_64" ;;
   aarch64|arm64)  ARCH="aarch64" ;;
-  *) echo "Unsupported architecture: $ARCH" >&2; exit 1 ;;
+  *) echo "Unsupported architecture: $ARCH; the release has x86_64 and aarch64 builds" >&2 ;;
 esac
 
 # Release version to install (e.g. v0.1.0 or vX.Y.Z)
@@ -110,8 +116,10 @@ curl -fsSL -o /tmp/SHA256SUMS "${BASE_URL}/SHA256SUMS"
 # Verify download integrity against the release checksums
 (cd /tmp && sha256sum --check --ignore-missing SHA256SUMS)
 
-# Install to /usr/local/bin
-sudo install -m 0755 /tmp/bun-linux-${ARCH} /usr/local/bin/bun
+# Install bun as a versioned binary behind a `bun` symlink, the layout
+# self-upgrade and rollback expect (see §9)
+sudo install -m 0755 /tmp/bun-linux-${ARCH} /usr/local/bin/bun-${VERSION}
+sudo ln -sfn bun-${VERSION} /usr/local/bin/bun
 sudo install -m 0755 /tmp/relish-linux-${ARCH} /usr/local/bin/relish
 rm -f /tmp/bun-linux-${ARCH} /tmp/relish-linux-${ARCH} /tmp/SHA256SUMS
 ```
@@ -123,7 +131,10 @@ bun --version
 relish --version
 ```
 
-*(Optional: If building from source instead of using pre-built releases, run `cargo build --release --bin bun --bin relish` from a repository checkout, then copy `target/release/bun` and `target/release/relish` into `/usr/local/bin`.)*
+*(Optional: If building from source instead of using pre-built releases, install
+`clang llvm libbpf-dev` and run `cargo build --locked --release --features ebpf --bin bun --bin relish`
+from a repository checkout, the same build the release uses. Then install
+`target/release/bun` and `target/release/relish` as above.)*
 
 ### 2.2 Create configuration and state directories
 
@@ -134,12 +145,12 @@ sudo install -d -m 0755 /var/lib/reliaburger
 
 ---
 
-## 3. Bootstrap the cluster on the One-burger node (`node-01`)
+## 3. Bootstrap the cluster on the first node (`node-01`)
 
 The first node generates the cluster PKI (Root CA and Node CA), the age encryption keypair,
 the initial security bootstrap state, and its own node identity.
 
-### 3.1 Initialize cluster credentials
+### 3.1 Initialise cluster credentials
 
 On **Node 1 (`192.168.0.101`)**, run:
 
@@ -155,13 +166,15 @@ This writes the following files under `/etc/reliaburger`:
 - `app.toml`: Sample application manifest file.
 - `identity/`: Node 1's mTLS certificates (`node.crt`, `node.key`, `root-ca.crt`, etc.).
 
-> **Important**: Make a note of the **Root CA fingerprint** printed to stderr (e.g. `sha256:abcd...`). You can also inspect it later. Also, backup the `prod-master.key` and `prod-root-ca.age` together.
+> **Important**: `relish init` prints two `Root CA:` lines to stderr. Copy the
+> one that starts with `sha256:`; that's the root CA fingerprint the joining
+> nodes pin in §4. Back up `prod-master.key` and `prod-root-ca.age` together.
 
 ### 3.2 Write the Node 1 configuration
 
 Create `/etc/reliaburger/node.toml` on **Node 1**:
 
-```ini
+```toml
 [node]
 name = "node-01"
 
@@ -194,10 +207,6 @@ https_port = 443
 
 [images]
 registry_port = 5050
-
-[testing]
-safety_class = "development"
-allowed_operations = ["inject_workload_faults", "alter_node_state"]
 ```
 
 ### 3.3 Set up the systemd service and start Bun
@@ -214,7 +223,7 @@ Wants=network-online.target
 Type=simple
 ExecStartPre=/bin/sh -ec 'mountpoint -q /sys/fs/bpf || mount -t bpf bpf /sys/fs/bpf'
 ExecStart=/usr/local/bin/bun --cluster --runtime runc --config /etc/reliaburger/node.toml --listen 127.0.0.1:9117
-Restart=on-failure
+Restart=always
 RestartSec=2
 LimitNOFILE=1048576
 KillMode=process
@@ -224,7 +233,10 @@ TimeoutStopSec=30
 WantedBy=multi-user.target
 ```
 
-> **Security Note (`--listen 127.0.0.1:9117`)**: During bootstrap, when no API tokens exist yet, Bun enforces a fail-closed policy (`AUTH3`) and strictly refuses binding non-loopback addresses (such as `0.0.0.0:9117`). Once the first admin token is minted below, you can change `--listen` to `0.0.0.0:9117` if remote access to this node's API is needed.
+> **Security note (`--listen 127.0.0.1:9117`)**: until the first API token
+> exists, the API has no credentials to check, so Bun fails closed (`AUTH3`)
+> and refuses to bind anything but a loopback address such as `127.0.0.1:9117`.
+> You'll mint that token next, then open the listener in §3.5.
 
 Enable and start the service:
 
@@ -241,23 +253,24 @@ sudo systemctl status reliaburger.service
 
 ### 3.4 Mint the administrator token
 
-Because `/etc/reliaburger/` was created with restricted root-only permissions (`0700`), run `token create` with `sudo` (or copy `root-ca.crt` to your user directory first):
+`/etc/reliaburger/` is readable by root only (`0700`), so first copy the public
+root CA certificate somewhere your own user can read it. Then mint the first
+admin token and save it straight into a private file:
 
 ```sh
-# Mint the admin token using sudo
-ADMIN_TOKEN=$(sudo relish --ca-cert /etc/reliaburger/identity/root-ca.crt \
-  --endpoint https://127.0.0.1:9117 \
-  token create --name admin --role admin | tail -n 1)
+# The public Root CA certificate, for non-root CLI use
+install -d -m 0700 ~/.reliaburger
+sudo install -m 0644 -o "$(id -u)" -g "$(id -g)" \
+  /etc/reliaburger/identity/root-ca.crt ~/.reliaburger/root-ca.crt
 
-# Copy the public Root CA certificate to your user directory for non-root CLI use
-mkdir -p ~/.reliaburger
-sudo cp /etc/reliaburger/identity/root-ca.crt ~/.reliaburger/root-ca.crt
-sudo chown $(id -u):$(id -g) ~/.reliaburger/root-ca.crt
-
-# Export connection settings for your regular user session
 export RELIABURGER_CA_CERT="$HOME/.reliaburger/root-ca.crt"
-export RELIABURGER_TOKEN="$ADMIN_TOKEN"
 export RELIABURGER_ENDPOINT="https://127.0.0.1:9117"
+
+# relish prints the token once, on stdout; keep it owner-only
+relish token create --name admin --role admin \
+  | install -m 0600 /dev/stdin ~/.reliaburger/admin.token
+
+export RELIABURGER_TOKEN="$(cat ~/.reliaburger/admin.token)"
 ```
 
 Verify that the CLI can authenticate as a normal user:
@@ -266,9 +279,13 @@ Verify that the CLI can authenticate as a normal user:
 relish status
 ```
 
-### 3.5 Open API listener to all interfaces
+### 3.5 Open the API listener to the other nodes
 
-Now that the token store is populated, if you want Node 1's API to be accessible directly over the network (e.g. from your laptop at `https://192.168.0.101:9117`):
+This step isn't optional. Nodes 2 and 3 enrol through Node 1's API in §4, and
+once they're running the nodes keep calling each other's APIs. Bun's own
+perimeter firewall still limits port 9117 to cluster members and
+`bootstrap_peers`. Now that the token store is populated, Bun accepts a
+non-loopback listener:
 
 1. Edit `/etc/systemd/system/reliaburger.service` and change `--listen 127.0.0.1:9117` to `--listen 0.0.0.0:9117`.
 2. Reload and restart:
@@ -276,26 +293,25 @@ Now that the token store is populated, if you want Node 1's API to be accessible
 sudo systemctl daemon-reload
 sudo systemctl restart reliaburger.service
 ```
-3. Update `RELIABURGER_ENDPOINT`:
+3. Check that the API is back (the `127.0.0.1` endpoint still works, since
+   `0.0.0.0` includes loopback):
 ```sh
-export RELIABURGER_ENDPOINT="https://192.168.0.101:9117"
-export RELIABURGER_CA_CERT="$HOME/.reliaburger/root-ca.crt"
-export RELIABURGER_TOKEN="<YOUR_ADMIN_TOKEN>"
 relish status
 ```
 
 ---
 
-## 4. Enroll Node 2 and Node 3 (Side-burger nodes)
+## 4. Enrol Node 2 and Node 3 (the joining nodes)
 
 Nodes 2 and 3 require the cluster's master key to decrypt shared cluster secrets, plus a single-use join token to request signed mTLS node certificates from the cluster CA.
 
 ### 4.1 Copy the master key to Node 2 and Node 3
 
-The cluster master key (`prod-master.key`) unlocks the cluster CA and shared secrets. Because `/etc/reliaburger/` is owned by `root:root` with `0700` permissions, transfer it via `/tmp` and set strict `0600` permissions.
+The cluster master key (`prod-master.key`) unlocks the cluster CA and shared
+secrets. Stream it over SSH straight into place, owned by root with `0600`
+permissions, so it never lands anywhere else on disk.
 
-#### From Node 1 (`node-01`):
-Copy the key to Node 2 and Node 3:
+From **Node 1 (`node-01`)**:
 
 ```sh
 # Copy to Node 2
@@ -303,68 +319,43 @@ sudo cat /etc/reliaburger/prod-master.key | ssh user@192.168.0.102 \
 'sudo install -m 0600 -o root -g root /dev/stdin /etc/reliaburger/prod-master.key'
 
 # Copy to Node 3
-sudo cat /etc/reliaburger/prod-master.key | ssh user@192.168.0.102 \
+sudo cat /etc/reliaburger/prod-master.key | ssh user@192.168.0.103 \
 'sudo install -m 0600 -o root -g root /dev/stdin /etc/reliaburger/prod-master.key'
 ```
 
-> **Note**: `prod` is the name of reliaburger cluster initialized at the beginning of this procedure.
+> **Note**: `prod` is the cluster name you passed to `relish init` in §3.1.
 
-#### On Node 2 (`node-02`):
-Move the key into place and restrict permissions:
+### 4.2 Create single-use join tokens
 
-```sh
-sudo mv /tmp/prod-master.key /etc/reliaburger/prod-master.key
-sudo chown root:root /etc/reliaburger/prod-master.key
-sudo chmod 0600 /etc/reliaburger/prod-master.key
-```
-
-#### On Node 3 (`node-03`):
-Move the key into place and restrict permissions:
+On **Node 1**, with the environment from §3.4 still exported, mint one join
+token per node and stream each into an owner-only file on its node (`relish
+join` refuses a token file other users can read):
 
 ```sh
-sudo mv /tmp/prod-master.key /etc/reliaburger/prod-master.key
-sudo chown root:root /etc/reliaburger/prod-master.key
-sudo chmod 0600 /etc/reliaburger/prod-master.key
+relish join-token create --node-id node-02 --ttl 15m \
+  | ssh user@192.168.0.102 'install -m 0600 /dev/stdin ~/node-02.join'
+relish join-token create --node-id node-03 --ttl 15m \
+  | ssh user@192.168.0.103 'install -m 0600 /dev/stdin ~/node-03.join'
 ```
 
-### 4.2 Create single-use join tokens and get the Root CA fingerprint
+Each token enrols only the node it names, once, and expires after 15 minutes.
+You'll also need the `sha256:` root CA fingerprint `relish init` printed in
+§3.1: `relish join` refuses a member that offers a different root CA.
 
-#### 1. (Optional) Calculate the Root CA fingerprint
-
-In case you didn't take note of the Root CA fingerprint during the `relish init` step.
-
-On **Node 1**, compute the SHA-256 fingerprint of `root-ca.crt` (or omit `--ca-fingerprint` during join):
-
-```sh
-# Calculate the DER certificate SHA-256 fingerprint
-ROOT_CA_FINGERPRINT="sha256:$(sudo openssl x509 -in /etc/reliaburger/identity/root-ca.crt -outform DER | sha256sum | awk '{print $1}')"
-
-echo "Root CA Fingerprint: $ROOT_CA_FINGERPRINT"
-```
-
-#### 2. Mint single-use join tokens
-On **Node 1** (or from your operator terminal with `RELIABURGER_TOKEN` set), mint join tokens for Node 2 and Node 3:
-
-```sh
-relish join-token create --node-id node-02 --ttl 15m
-relish join-token create --node-id node-03 --ttl 15m
-```
-
-Save each generated token string.
-
-### 4.3 Enroll Node 2 (`node-02`)
+### 4.3 Enrol Node 2 (`node-02`)
 
 On **Node 2 (`192.168.0.102`)**:
 
-1. Enroll node identity using `relish join`:
+1. Enrol the node identity using `relish join`, then delete the spent token:
 
 ```sh
 sudo relish join \
-  --token-file "<FILE_WITH_NODE02_TOKEN>" \
+  --token-file ~/node-02.join \
   --node-id node-02 \
   --identity-dir /etc/reliaburger/identity \
-  --ca-fingerprint "<ROOT_CA_FINGERPRINT>" \
+  --ca-fingerprint "sha256:<ROOT_CA_FINGERPRINT>" \
   https://192.168.0.101:9117
+rm ~/node-02.join
 ```
 
 2. Create `/etc/reliaburger/node.toml` on **Node 2**:
@@ -400,13 +391,11 @@ https_port = 443
 
 [images]
 registry_port = 5050
-
-[testing]
-safety_class = "development"
-allowed_operations = ["inject_workload_faults", "alter_node_state"]
 ```
 
-3. Create `/etc/systemd/system/reliaburger.service` and start Bun:
+3. Create `/etc/systemd/system/reliaburger.service` and start Bun. A joining
+   node can listen on `0.0.0.0` from the start: it keeps the listener closed
+   until the cluster's API credentials have replicated to it.
 
 ```ini
 [Unit]
@@ -418,7 +407,7 @@ Wants=network-online.target
 Type=simple
 ExecStartPre=/bin/sh -ec 'mountpoint -q /sys/fs/bpf || mount -t bpf bpf /sys/fs/bpf'
 ExecStart=/usr/local/bin/bun --cluster --runtime runc --config /etc/reliaburger/node.toml --listen 0.0.0.0:9117
-Restart=on-failure
+Restart=always
 RestartSec=2
 LimitNOFILE=1048576
 KillMode=process
@@ -433,19 +422,20 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now reliaburger.service
 ```
 
-### 4.4 Enroll Node 3 (`node-03`)
+### 4.4 Enrol Node 3 (`node-03`)
 
 On **Node 3 (`192.168.0.103`)**:
 
-1. Enroll node identity using `relish join`:
+1. Enrol the node identity using `relish join`, then delete the spent token:
 
 ```sh
 sudo relish join \
-  --token-file "<FILE_WITH_NODE03_TOKEN>" \
+  --token-file ~/node-03.join \
   --node-id node-03 \
   --identity-dir /etc/reliaburger/identity \
-  --ca-fingerprint "<ROOT_CA_FINGERPRINT>" \
+  --ca-fingerprint "sha256:<ROOT_CA_FINGERPRINT>" \
   https://192.168.0.101:9117
+rm ~/node-03.join
 ```
 
 2. Create `/etc/reliaburger/node.toml` on **Node 3**:
@@ -481,10 +471,6 @@ https_port = 443
 
 [images]
 registry_port = 5050
-
-[testing]
-safety_class = "development"
-allowed_operations = ["inject_workload_faults", "alter_node_state"]
 ```
 
 3. Create `/etc/systemd/system/reliaburger.service` and start Bun:
@@ -499,7 +485,7 @@ Wants=network-online.target
 Type=simple
 ExecStartPre=/bin/sh -ec 'mountpoint -q /sys/fs/bpf || mount -t bpf bpf /sys/fs/bpf'
 ExecStart=/usr/local/bin/bun --cluster --runtime runc --config /etc/reliaburger/node.toml --listen 0.0.0.0:9117
-Restart=on-failure
+Restart=always
 RestartSec=2
 LimitNOFILE=1048576
 KillMode=process
@@ -518,25 +504,26 @@ sudo systemctl enable --now reliaburger.service
 
 ## 5. Install and configure Relish on your laptop
 
-You can manage (like a pro) the entire cluster remotely from your local workstation (whether you use a **MacBook** or a **Windows PC**) without needing an SSH shell into the VMs.
+You can manage the entire cluster from your own workstation, whether it's a
+Mac or a Windows PC, without keeping a shell open on the VMs.
 
 ### 5.1 Install Relish on your laptop
 
-#### On macOS (MacBook - Apple Silicon or Intel)
+#### On macOS (Apple silicon or Intel)
 
-**Option A: Fast install via script**
+**Option A: Install script**
 ```sh
 curl -fsSL https://reliaburger.com/install.sh | sh -s -- --install-only
 ```
 
 **Option B: Direct download from GitHub Releases**
 ```sh
-# Detect Apple Silicon (arm64) vs Intel (x86_64)
+# Detect Apple silicon (arm64) vs Intel (x86_64)
 ARCH="$(uname -m)"
 case "$ARCH" in
   arm64|aarch64) ARCH="aarch64" ;;
   x86_64)        ARCH="x86_64" ;;
-  *) echo "Unsupported architecture: $ARCH" >&2; exit 1 ;;
+  *) echo "Unsupported architecture: $ARCH; the release has x86_64 and aarch64 builds" >&2 ;;
 esac
 
 # Release version to install (e.g. v0.1.0 or vX.Y.Z)
@@ -560,9 +547,9 @@ relish --version
 
 ---
 
-#### On Windows PC
+#### On Windows
 
-Native Windows support is on the roadmap. For now, run `relish` inside **WSL2** (Windows Subsystem for Linux) using the Linux installer:
+Run `relish` inside **WSL2** (Windows Subsystem for Linux) using the Linux installer:
 
 ```sh
 curl -fsSL https://reliaburger.com/install.sh | sh -s -- --install-only
@@ -570,29 +557,46 @@ curl -fsSL https://reliaburger.com/install.sh | sh -s -- --install-only
 
 ---
 
-### 5.2 Copy the Root CA certificate to your laptop
+### 5.2 Copy the Root CA certificate and admin token to your laptop
 
-Copy the cluster Root CA certificate generated on Node 1 to your laptop so `relish` can securely verify the cluster over TLS.
+`relish` verifies the cluster against its root CA, so copy the user-readable
+copy you made in §3.4. Copy the admin token too, keeping it owner-only:
 
 #### On macOS / Linux / WSL:
 ```sh
-mkdir -p ~/.reliaburger
-scp user@192.168.0.101:/etc/reliaburger/identity/root-ca.crt ~/.reliaburger/root-ca.crt
+mkdir -p -m 0700 ~/.reliaburger
+scp user@192.168.0.101:.reliaburger/root-ca.crt ~/.reliaburger/root-ca.crt
+(umask 077 && ssh user@192.168.0.101 'cat ~/.reliaburger/admin.token' > ~/.reliaburger/admin.token)
 ```
 
 ---
 
-### 5.3 Configure connection environment variables
+### 5.3 Connect through SSH and set the environment
 
-Set the cluster endpoint, CA certificate path, and administrator token (minted in step 3.4) on your laptop:
+Bun's perimeter firewall only admits cluster members to port 9117, so your
+laptop reaches the API through an SSH tunnel. The tunnel delivers your requests
+to Node 1 on loopback, which the perimeter always lets through. Relish checks the
+node certificate against the cluster CA rather than a host name, so the
+`127.0.0.1` endpoint verifies fine:
+
+```sh
+# Forward local port 19117 to Node 1's API, in the background
+ssh -f -N -L 19117:127.0.0.1:9117 user@192.168.0.101
+```
+
+Then point `relish` at the tunnel, the CA certificate, and the admin token
+from §5.2:
 
 #### On macOS / Linux / WSL (Zsh or Bash):
 ```sh
-export RELIABURGER_ENDPOINT="https://192.168.0.101:9117"
+export RELIABURGER_ENDPOINT="https://127.0.0.1:19117"
 export RELIABURGER_CA_CERT="$HOME/.reliaburger/root-ca.crt"
-export RELIABURGER_TOKEN="<ADMIN_TOKEN>"
+export RELIABURGER_TOKEN="$(cat ~/.reliaburger/admin.token)"
 ```
-*(Tip: Add these exports to your `~/.zshrc` or `~/.bashrc` to make them persistent across terminal sessions.)*
+
+The endpoint and CA path are safe to add to your `~/.zshrc` or `~/.bashrc`.
+The token isn't: keep it in a `0600` file or your secrets manager (e.g. Vault)
+and export it when you need it.
 
 ---
 
@@ -626,13 +630,13 @@ relish status
 
 ## 7. Deploy and run the demo application
 
-Now deploy a containerized HTTP web service across the 3-node cluster directly from your laptop.
+Now deploy a containerised HTTP web service across the 3-node cluster directly from your laptop.
 
 ### 7.1 Create the demo application manifest
 
 Save the following configuration as `hello.toml` on your laptop:
 
-```ini
+```toml
 [app.hello]
 image = "public.ecr.aws/docker/library/busybox@sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028"
 command = [
@@ -707,8 +711,9 @@ Launch a temporary, authenticated browser session on your laptop:
 relish dashboard
 ```
 
-Relish opens the Brioche dashboard locally using read-only session over TLS with a bearer token 
-to your default web browser (press `Ctrl-C` when done).
+Relish serves a read-only view of the Brioche dashboard on a local port, talks
+to the cluster over TLS with your bearer token, and opens it in your default
+browser. Press `Ctrl-C` when you're done.
 
 ---
 
@@ -733,7 +738,11 @@ Simulate the loss of `node-03`:
 sudo systemctl stop reliaburger.service
 ```
 
-> **Note**: `systemctl stop reliaburger.service` doesn't quite simulate losing the node completely, but it interrupts the communication and schedule new workloads. The systemd unit uses `KillMode=process`, and container owners are designed to outlive Bun, so node 3's containers keep serving while the cluster reschedules them elsewhere.
+> **Note**: stopping the service doesn't quite simulate losing the whole node,
+> but it does cut Node 3 off from the cluster, and the scheduler moves its
+> workloads elsewhere. The systemd unit uses `KillMode=process`, and container
+> owners are designed to outlive Bun, so Node 3's containers keep serving while
+> the cluster reschedules them.
 
 From your laptop, observe the cluster behaviour:
 
@@ -754,16 +763,27 @@ Node 3 rejoins gossip, catches up with the Raft log, and resumes serving as an a
 
 Reliaburger includes a built-in chaos engineering subsystem (Smoker) for injecting controlled network, workload, and node faults directly via `relish fault`.
 
-#### 1. Cluster Safety Policy
-Because destructive operations can affect live clusters, the `bun` agent enforces a server-side safety policy (`[testing]` section in `/etc/reliaburger/node.toml`). Ensure your nodes have:
+#### 1. Cluster safety policy
 
-```ini
+Faults can take down real traffic, so Bun enforces a server-side safety policy
+(the `[testing]` section in `node.toml`). The node configs above leave it out
+on purpose: with no `[testing]` section, the safety class is `unknown`, which
+is protected, and every fault is refused (`403: cluster policy does not allow
+this operation`).
+
+Only opt in on a test cluster you're happy to break. Add this to
+`/etc/reliaburger/node.toml` on every node, then restart the nodes one at a
+time with `sudo systemctl restart reliaburger.service`:
+
+```toml
 [testing]
 safety_class = "development"
 allowed_operations = ["inject_workload_faults", "alter_node_state"]
 ```
 
-> **Note**: On production or unconfigured clusters (`safety_class = "unknown"`), fault injection is blocked by default (`403: cluster policy does not allow this operation`). Destructive operations also require the `--acknowledge` flag.
+That admits workload faults and `node-kill`/`node-drain`. Every injection also
+needs the `--acknowledge` flag. The [chaos chapter](manual/05_chaos.md) of the
+manual lists the roles and grants each fault needs.
 
 #### 2. Simulate node failure with `node-kill`
 Simulate an abrupt node failure on `node-03` for 5 minutes:
@@ -771,6 +791,10 @@ Simulate an abrupt node failure on `node-03` for 5 minutes:
 ```sh
 relish fault node-kill node-03 --duration 5m --acknowledge
 ```
+
+Smoker refuses to kill the council leader unless you add `--include-leader`.
+`relish council` shows which node leads; if it's `node-03`, pick another node
+or add the flag.
 
 View active faults across the cluster:
 
@@ -789,14 +813,41 @@ relish fault clear
 ```sh
 relish fault delay hello 200ms --duration 2m --acknowledge
 ```
-- **Simulate packet loss (25% packet drop)**:
+- **Fail 25% of new connections**:
 ```sh
-relish fault drop hello --loss 25% --duration 2m --acknowledge
+relish fault drop hello 25% --duration 2m --acknowledge
 ```
 
 ---
 
-## 9. Summary of essential CLI commands
+## 9. Upgrading
+
+The [operations chapter](manual/12_operations.md) of the manual covers
+`relish upgrade`, which rolls a new `bun` across the cluster: workers first,
+then council members one by one, the leader last. This guide already set up
+two of its requirements: systemd restarts Bun whenever it exits
+(`Restart=always`), and `/usr/local/bin/bun` is a symlink to a versioned
+binary, so older versions stay beside it for rollback.
+
+The third requirement is yours to add. A network upgrade needs two signatures
+on the new binary, the release's and your own, and every node refuses one
+without a key to check yours against. Generate an operator key pair with
+`relish dev keygen --out keys/` and countersign each release binary with
+`relish dev countersign-binary`, as the manual describes. Countersigning
+prints the `ed25519:…` public key; put it in each node's `node.toml` and
+restart the nodes one at a time:
+
+```toml
+[upgrades]
+external_signing_key = "ed25519:<YOUR_PUBLIC_KEY>"
+```
+
+`relish upgrade start` checks every node for that key before it starts, and
+names any node that's missing it.
+
+---
+
+## 10. Summary of essential CLI commands
 
 | Task | Command |
 |------|---------|
