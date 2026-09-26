@@ -735,6 +735,38 @@ def expected_renewals(elapsed, period):
     return max(0, int(elapsed // period) - 1)
 
 
+FINAL_TIER_SECONDS = 8 * 3600
+
+
+def acceptance_line(metadata, result, elapsed):
+    """What the run says about the V02 gate (plan D3): only a clean final tier passes it."""
+    tier = metadata.get("tier") or "custom"
+    clean = result == "PASS"
+    if tier == "fast":
+        if clean:
+            return ("**Fast tier: clean.** The iteration loop only, not acceptance: the V02 gate needs a clean "
+                    "final-tier run (8 h, full schedule) on the final candidate.")
+        return "**Fast tier: not clean.** Fix what failed and run the fast tier again before a final-tier run."
+    if tier != "final":
+        return "**No tier (a custom run).** Neither tier's evidence, so it says nothing about the V02 gate."
+    if not clean:
+        return ("**Final tier: not clean. The V02 gate does not pass.** A product fix means a fresh fast-tier run, "
+                "then a fresh final-tier run.")
+    shortfalls = []
+    if metadata.get("schedule", "full") != "full":
+        shortfalls.append(f"it ran the {metadata['schedule']} schedule")
+    if min(elapsed, metadata.get("duration_target") or 0) < FINAL_TIER_SECONDS:
+        shortfalls.append(f"it soaked for {duration_text(elapsed)}")
+    digest = metadata.get("candidate_digest") or "`not checked`"
+    if "not checked" in digest:
+        shortfalls.append("the candidate digest was not checked (--qualified-digest)")
+    if shortfalls:
+        return (f"**Final tier: clean, but not acceptance:** {'; '.join(shortfalls)}. The V02 gate needs 8 h on "
+                "the full schedule against a pinned candidate.")
+    return (f"**Final tier: clean. The V02 soak gate passes** for the candidate whose `candidate.json` has "
+            f"SHA-256 {digest}, if it is the final candidate.")
+
+
 def render(evidence, record):
     evidence = Path(evidence)
     record = Path(record)
@@ -771,9 +803,11 @@ def render(evidence, record):
     if (open_failures or gate_failed) and result == "PASS":
         result = "FAIL"
 
+    tier = metadata.get("tier") or "custom"
     lines = [f"# Sustained soak (V02): {result}", ""]
-    lines += [f"{time.strftime('%-d %B %Y', time.gmtime(started))}. {metadata.get('schedule', 'full')} schedule, "
-              f"{duration_text(elapsed)} of soak on a three-node quickstart cluster.", ""]
+    lines += [f"{time.strftime('%-d %B %Y', time.gmtime(started))}. {tier} tier, {metadata.get('schedule', 'full')} "
+              f"schedule, {duration_text(elapsed)} of soak on a three-node quickstart cluster.", ""]
+    lines += [acceptance_line(metadata, result, elapsed), ""]
     lines += ["## Candidate and host", "", "| | |", "|---|---|"]
     for key, label in (("base_url", "Staged base URL"), ("candidate_digest", "`candidate.json` SHA-256"),
                        ("versions", "Running versions"), ("soak_bun", "Soak build"), ("host", "Host"),
