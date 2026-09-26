@@ -146,6 +146,7 @@ pub const ROUTE_MATRIX: &[Route] = &[
     route(Post, "/v1/upgrade/start", Admin),
     route(Get, "/v1/upgrade/cluster", AnyToken),
     route(Post, "/v1/upgrade/resume", Admin),
+    route(Post, "/v1/upgrade/abort", Admin),
     route(Post, "/v1/upgrade/cluster-rollback", Admin),
     route(Post, "/v1/cluster/elect", Admin),
     // Chaos.
@@ -474,6 +475,7 @@ mod tests {
             "upgrade_rollback_handler",
             "upgrade_start_handler",
             "upgrade_resume_handler",
+            "upgrade_abort_handler",
             "upgrade_cluster_rollback_handler",
             "cluster_elect_handler",
         ] {

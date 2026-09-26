@@ -156,6 +156,13 @@ pub enum ClusterUpgradePhase {
     Paused {
         reason: String,
     },
+    /// Ended by the operator from `Paused` without finishing
+    /// (`relish upgrade abort`, or a cluster rollback that replaced it).
+    /// Terminal: the orchestrator archives it to history. Appended last
+    /// because the Raft log encodes enum variants by index.
+    Aborted {
+        reason: String,
+    },
 }
 
 /// A node's role at plan time (decides its position in the rolling order).

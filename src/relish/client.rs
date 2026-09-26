@@ -2301,6 +2301,13 @@ impl BunClient {
             .map(|_| ())
     }
 
+    /// End a paused cluster upgrade in which no node moved (leader only).
+    /// Returns the aborted run's id.
+    pub async fn upgrade_abort(&self) -> Result<String, RelishError> {
+        let response = self.post_json("/v1/upgrade/abort", String::new()).await?;
+        Ok(response["upgrade_id"].as_str().unwrap_or("?").to_string())
+    }
+
     async fn get_json(&self, path: &str) -> Result<serde_json::Value, RelishError> {
         let url = format!("{}{path}", self.base_url);
         let response = self

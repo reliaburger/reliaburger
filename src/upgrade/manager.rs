@@ -199,6 +199,13 @@ impl UpgradeManager {
             .cloned()
     }
 
+    /// Can this node accept a cluster (network) upgrade? Those directives
+    /// fetch the binary from Pickle and so need the operator's external
+    /// key to verify it; without one every directive is refused.
+    pub fn accepts_network_upgrades(&self) -> bool {
+        self.external_key.is_some()
+    }
+
     /// Is an upgrade currently in flight on this node? (Cheap: one stat.)
     pub fn upgrade_in_flight(&self) -> bool {
         self.marker_path.exists()

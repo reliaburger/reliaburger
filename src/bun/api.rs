@@ -408,6 +408,7 @@ pub fn router_with_upgrade(
         .route("/v1/upgrade/start", post(upgrade_start_handler))
         .route("/v1/upgrade/cluster", get(upgrade_cluster_handler))
         .route("/v1/upgrade/resume", post(upgrade_resume_handler))
+        .route("/v1/upgrade/abort", post(upgrade_abort_handler))
         .route(
             "/v1/upgrade/cluster-rollback",
             post(upgrade_cluster_rollback_handler),
@@ -1716,6 +1717,10 @@ async fn version_handler(State(state): State<ApiState>) -> impl IntoResponse {
             // Ids this node attempted and reverted — the orchestrator
             // reads these to detect node-side reverts.
             "failed_upgrade_ids": manager.reverted_upgrade_ids(),
+            // The leader refuses a cluster upgrade up front when a node
+            // reports false, rather than recording a run the node will
+            // refuse and leaving it paused.
+            "accepts_network_upgrades": manager.accepts_network_upgrades(),
         })),
         None => Json(serde_json::json!({
             "version": crate::upgrade::version::compiled_version().to_string(),
@@ -2001,18 +2006,32 @@ async fn upgrade_start_handler(
         }
     };
 
-    if council.desired_state().await.active_upgrade.is_some() {
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({ "error": "an upgrade is already in progress" })),
-        )
-            .into_response();
+    if let Some(active) = council.desired_state().await.active_upgrade {
+        return upgrade_in_progress(&active);
     }
 
     // Refuse same-version and unrequested downgrades before anything is
     // recorded: once in Raft, a same-version run would "complete" without
     // swapping a single byte.
-    let running = probe_running_binaries(&state, &derived_nodes).await;
+    let (running, readiness) = probe_running_binaries(&state, &derived_nodes).await;
+    let direction = request
+        .direction
+        .unwrap_or(crate::upgrade::types::UpgradeDirection::Upgrade);
+    // Every node fetches an upgrade from Pickle and so demands the external
+    // signature. A run the nodes will refuse would only pause and then block
+    // every later start, so refuse it here instead.
+    if direction == crate::upgrade::types::UpgradeDirection::Upgrade
+        && let Err(e) = crate::upgrade::plan::check_network_prerequisites(
+            request.external_signature.as_deref(),
+            &readiness,
+        )
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response();
+    }
     match crate::upgrade::plan::check_target(
         &request.target_version,
         &request.binary_sha256,
@@ -2057,9 +2076,7 @@ async fn upgrade_start_handler(
         embedded_signature: request.embedded_signature,
         external_signature: request.external_signature,
         parallel: request.parallel.max(1),
-        direction: request
-            .direction
-            .unwrap_or(crate::upgrade::types::UpgradeDirection::Upgrade),
+        direction,
         phase: crate::upgrade::types::ClusterUpgradePhase::Preparing,
         registry_address: request.registry_address,
         allow_downgrade: request.allow_downgrade,
@@ -2087,14 +2104,18 @@ async fn upgrade_start_handler(
     }
 }
 
-/// Ask every planned node what it runs, for the start-time target gate.
+/// Ask every planned node what it runs and whether it can verify a
+/// network upgrade, for the start-time gates.
 ///
 /// Probes run concurrently, each bounded. An unreachable node is left out:
 /// the orchestrator re-checks every node as the walk reaches it.
 async fn probe_running_binaries(
     state: &ApiState,
     nodes: &[crate::upgrade::types::NodeUpgradeRecord],
-) -> Vec<crate::upgrade::plan::RunningBinary> {
+) -> (
+    Vec<crate::upgrade::plan::RunningBinary>,
+    Vec<crate::upgrade::plan::NetworkReadiness>,
+) {
     use crate::upgrade::orchestrator::NodeControl as _;
 
     let control = crate::upgrade::orchestrator::HttpNodeControl::with_http(
@@ -2111,18 +2132,76 @@ async fn probe_running_binaries(
             .await
             .ok()
             .flatten()?;
-            Some(crate::upgrade::plan::RunningBinary {
-                node: format!("node {}", record.node_id),
-                version: probe.version,
-                sha256: probe.binary_sha256,
-            })
+            let node = format!("node {}", record.node_id);
+            Some((
+                crate::upgrade::plan::RunningBinary {
+                    node: node.clone(),
+                    version: probe.version,
+                    sha256: probe.binary_sha256,
+                },
+                crate::upgrade::plan::NetworkReadiness {
+                    node,
+                    accepts_network_upgrades: probe.accepts_network_upgrades,
+                },
+            ))
         }
     });
     futures_util::future::join_all(probes)
         .await
         .into_iter()
         .flatten()
-        .collect()
+        .unzip()
+}
+
+/// The 409 for a start or rollback while another run is active. A paused
+/// run says how to get out of it: resume, abort or roll back.
+fn upgrade_in_progress(active: &crate::upgrade::types::ClusterUpgradeState) -> Response {
+    let error = match &active.phase {
+        crate::upgrade::types::ClusterUpgradePhase::Paused { reason } => format!(
+            "upgrade {} is paused ({reason}); run `relish upgrade resume`, \
+             `relish upgrade abort`, or `relish upgrade rollback <version>` first",
+            active.upgrade_id
+        ),
+        _ => format!("upgrade {} is already in progress", active.upgrade_id),
+    };
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({ "error": error })),
+    )
+        .into_response()
+}
+
+/// Archive a paused run that the operator ended: record it as `Aborted`,
+/// then move it to history.
+///
+/// Two Raft writes. If the second is lost, the orchestrator archives the
+/// aborted run on its next tick, and a start meanwhile gets a 409 that
+/// names it.
+// `Response` is large but it IS the HTTP reply to send on failure.
+#[allow(clippy::result_large_err)]
+async fn archive_aborted_upgrade(
+    council: &crate::council::CouncilNode,
+    aborted: crate::upgrade::types::ClusterUpgradeState,
+) -> Result<(), Response> {
+    let upgrade_id = aborted.upgrade_id.clone();
+    let writes = [
+        crate::council::types::RaftRequest::UpgradeUpdate {
+            state: Box::new(aborted),
+        },
+        crate::council::types::RaftRequest::UpgradeClear { upgrade_id },
+    ];
+    for write in writes {
+        if let Err(e) = council.write(write).await {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": format!("could not end the paused upgrade (are we the leader?): {e}")
+                })),
+            )
+                .into_response());
+        }
+    }
+    Ok(())
 }
 
 /// Build the leader's authoritative view of every node for upgrade
@@ -2251,9 +2330,53 @@ async fn upgrade_resume_handler(
     }
 }
 
+/// End a paused cluster upgrade in which no node moved (admin, leader
+/// only). A run that already swapped nodes is refused with a pointer to
+/// `relish upgrade rollback`, which walks them back.
+async fn upgrade_abort_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+) -> Response {
+    if let Err(resp) = authorize_cluster_admin(auth.as_deref()) {
+        return resp;
+    }
+    let Some(council) = &state.council else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "no council on this node" })),
+        )
+            .into_response();
+    };
+    let Some(upgrade) = council.desired_state().await.active_upgrade else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "no upgrade in progress" })),
+        )
+            .into_response();
+    };
+    let upgrade_id = upgrade.upgrade_id.clone();
+    let aborted = match crate::upgrade::orchestrator::abort(upgrade, "aborted by the operator") {
+        Ok(aborted) => aborted,
+        Err(e) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response();
+        }
+    };
+    if let Err(resp) = archive_aborted_upgrade(council, aborted).await {
+        return resp;
+    }
+    Json(serde_json::json!({ "status": "aborted", "upgrade_id": upgrade_id })).into_response()
+}
+
 /// Start a cluster-wide rolling rollback (admin, leader only). The
 /// binaries are already on every node's disk, so there is no registry or
 /// signature material — just a target version and the node list.
+///
+/// A paused run is replaced: it is archived as aborted and the rollback
+/// walks every node, moved or not, to the target.
 async fn upgrade_cluster_rollback_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
@@ -2284,13 +2407,16 @@ async fn upgrade_cluster_rollback_handler(
                 .into_response();
         }
     };
-    if council.desired_state().await.active_upgrade.is_some() {
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({ "error": "an upgrade is already in progress" })),
-        )
-            .into_response();
-    }
+    let paused = match council.desired_state().await.active_upgrade {
+        None => None,
+        Some(active) => match crate::upgrade::orchestrator::supersede(
+            active.clone(),
+            &format!("replaced by a rollback to {}", request.target_version),
+        ) {
+            Ok(superseded) => Some(superseded),
+            Err(_) => return upgrade_in_progress(&active),
+        },
+    };
 
     // Validate each rollback node's identity against the authoritative gossip /
     // Raft view, exactly as upgrade_start does (M13/UPG2). The old rollback path
@@ -2344,6 +2470,14 @@ async fn upgrade_cluster_rollback_handler(
         allow_downgrade: false,
         nodes: derived_nodes,
     };
+
+    // Archive the paused run only once the rollback plan is valid, so a
+    // malformed request leaves it where it was.
+    if let Some(superseded) = paused
+        && let Err(resp) = archive_aborted_upgrade(council, superseded).await
+    {
+        return resp;
+    }
 
     match council
         .write(crate::council::types::RaftRequest::UpgradeUpdate {
@@ -12541,11 +12675,12 @@ schedule = "* * * * *"
     }
 
     /// Every route that upgrades, rolls back or re-elects the cluster.
-    const CLUSTER_ADMIN_ROUTES: [&str; 6] = [
+    const CLUSTER_ADMIN_ROUTES: [&str; 7] = [
         "/v1/upgrade/apply",
         "/v1/upgrade/rollback",
         "/v1/upgrade/start",
         "/v1/upgrade/resume",
+        "/v1/upgrade/abort",
         "/v1/upgrade/cluster-rollback",
         "/v1/cluster/elect",
     ];

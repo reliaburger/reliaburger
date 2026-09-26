@@ -546,7 +546,7 @@ pub active_upgrade: Option<ClusterUpgradeState>,
 pub upgrade_history: Vec<ClusterUpgradeState>,
 ```
 
-`ClusterUpgradeState` is the whole plan as data: target version, signatures, worker parallelism, direction (upgrade or rollback), the cluster phase (`Preparing → UpgradingWorkers → UpgradingCouncil → TransferringLeadership → UpgradingLeader → Completed`, with `Paused { reason }` as the escape hatch), and one `NodeUpgradeRecord` per node — role, address, observed version, per-node phase. When leadership moves mid-run, the new leader reads this and continues from exactly where the old one stopped. No handover protocol; the handover *is* the replication that already happened.
+`ClusterUpgradeState` is the whole plan as data: target version, signatures, worker parallelism, direction (upgrade or rollback), the cluster phase (`Preparing → UpgradingWorkers → UpgradingCouncil → TransferringLeadership → UpgradingLeader → Completed`, with `Paused { reason }` as the escape hatch, and `Aborted { reason }` for a pause the operator ended; see "A pause with no way out" at the end of the chapter), and one `NodeUpgradeRecord` per node — role, address, observed version, per-node phase. When leadership moves mid-run, the new leader reads this and continues from exactly where the old one stopped. No handover protocol; the handover *is* the replication that already happened.
 
 Two new log entries drive it, and their design follows the deploy machinery from Chapter 7: `UpgradeUpdate { state }` (last-writer-wins full replacement — only the leader's orchestrator writes, so merging semantics would be complexity without a customer) and `UpgradeClear { upgrade_id }` (archive to bounded history). The clear checks the id: a stale clear racing a newer upgrade must not delete the wrong run.
 
@@ -816,3 +816,64 @@ fn authorize_cluster_admin(
 ```
 
 The `?` after the first call returns its error response early, so the function reads as the two rules it enforces, in order. The service token still passes, which matters: it's what the orchestrator presents when it directs each node. A unit test posts to all six routes with a scoped Admin and expects 403, another checks an unscoped Admin gets through, and a source-scanning test in `bun::authz` fails if any of those handlers stops calling the helper.
+
+## A pause with no way out
+
+The V02 soak found the next hole on its first night. The harness ran `relish upgrade start --binary …` against a cluster whose nodes had no `upgrades.external_signing_key`. The leader accepted the plan and recorded it in Raft. Then the first node refused its directive with a 409, "network upgrades require upgrades.external_signing_key in node.toml", and the run paused, exactly as §14.9 says it should.
+
+It stayed paused for twelve hours. `resume` would only repeat the refusal. Every later `relish upgrade start` got "an upgrade is already in progress", and so did `relish upgrade rollback v0.1.0`, because both handlers refused to touch the active slot while anything sat in it. The pause that was meant to hand control back to the operator had taken it away. Nothing but hand-editing Raft state could clear it.
+
+Two changes fix it, one on each side of the pause.
+
+### Don't record a run the nodes will refuse
+
+Every cluster directive fetches the binary from Pickle, so every node treats it as a network upgrade and demands the operator's external signature and a key to check it with. The leader can know that before it writes anything. `/v1/version` now reports `accepts_network_upgrades` (true when the node has an external key), the start handler reads it in the same probe that already fetches each node's version and digest, and a pure gate in `upgrade::plan` decides:
+
+```rust
+pub fn check_network_prerequisites(
+    external_signature: Option<&str>,
+    nodes: &[NetworkReadiness],
+) -> Result<(), UpgradeError> {
+    if external_signature.is_none_or(str::is_empty) {
+        return Err(UpgradeError::ExternalSignatureRequired);
+    }
+    let unready: Vec<&str> = nodes
+        .iter()
+        .filter(|node| node.accepts_network_upgrades == Some(false))
+        .map(|node| node.node.as_str())
+        .collect();
+    ...
+}
+```
+
+`Option::is_none_or` is true for `None`, and otherwise asks the closure about the value inside, so one call covers "no signature" and "an empty one". `str::is_empty` is passed as a function rather than written as a closure: any function with the right signature works where a closure is expected. `accepts_network_upgrades` is an `Option<bool>` on purpose. `Some(false)` is a node that told us it will refuse; `None` is a node too old to say, and the walk will find out the old way. Refusing on `None` would stop every upgrade *from* a build that predates the field, which is the one upgrade you can't avoid.
+
+The probe used to return one `Vec`. It now builds a pair per node and splits them with `Iterator::unzip`, which turns an iterator of `(A, B)` into an `(Vec<A>, Vec<B>)` in one pass. So a start that would have paused on its first node now fails straight away with "node n1 cannot accept a cluster upgrade: set upgrades.external_signing_key in node.toml on every node first", and nothing reaches Raft.
+
+### A way out of a pause
+
+A pre-check can't catch everything. A node can still refuse for its own reasons, or crash-loop and revert. So the pause needs exits, and there are now three:
+
+- `relish upgrade resume` retries, as before.
+- `relish upgrade abort` (new, `POST /v1/upgrade/abort`) ends the run and leaves every node where it is.
+- `relish upgrade rollback <version>` now *replaces* a paused run instead of being refused by it.
+
+Abort is only safe when no node moved. `orchestrator::abort` is another pure function over the replicated state. It refuses a run that isn't `Paused`, and it refuses one where any node is `Healthy` (on the target), `Directed` or `Verifying` (told to swap, and maybe still swapping). Dropping the plan then would leave those nodes on a different version with nothing tracking them. The refusal names them and points at `rollback`. Failed, rolled-back and never-directed nodes are all on their old binary, so for everything else, abort really is "as if we never started".
+
+A rollback doesn't need that condition, because it walks every node to its own target, moved or not. Its handler now asks `orchestrator::supersede` whether the active run may be replaced (only a paused one may) and archives it before recording the rollback. The archive happens *after* the rollback plan has been validated, so a malformed request leaves the paused run where it was.
+
+Both paths end the old run the same way. We added a phase:
+
+```rust
+pub enum ClusterUpgradePhase {
+    // ...
+    Paused { reason: String },
+    Aborted { reason: String },
+}
+```
+
+It goes last for the reason the `RaftRequest` comment spells out: the Raft log is bincode, which writes an enum variant as its index, so inserting a variant in the middle would make every stored entry after it decode as its neighbour. The handler writes the run with its `Aborted` phase, then clears it into history, so `relish upgrade status` shows what happened to it instead of a bare "paused". Those are two Raft writes. If the leader dies between them, the orchestrator loop finds an `Aborted` run in the active slot and archives it on its next tick, the same recovery it already had for `Completed`.
+
+Two small things changed on the way. The 409 for a start or rollback against a paused run now names the run and all three exits rather than "an upgrade is already in progress". And `abort` goes through `authorize_cluster_admin` like every other upgrade route, which the source-scanning test in `bun::authz` now checks too.
+
+The tests follow the layers. `plan::tests` covers the gate (no signature, empty signature, nodes that refuse, nodes that don't say). `orchestrator::tests` covers abort on a clean pause, refusal for each of the three "moved" phases, refusal when not paused, supersede over a node that did move, and a `step` that leaves an aborted run alone. The cluster suite gets two real-binary tests. `start_refuses_when_a_node_cannot_verify_network_upgrades` boots two nodes, one without an external key, and checks that `relish upgrade start` fails naming that node with nothing recorded. `paused_upgrade_can_be_aborted_or_replaced_by_a_rollback` poisons a worker's binary so the run pauses, aborts it through relish, starts again (accepted, now that the slot is free), lets it pause a second time, and replaces that one with `relish upgrade rollback v0.1.0`, which completes.
