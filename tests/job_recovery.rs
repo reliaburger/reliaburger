@@ -13,8 +13,8 @@ use reliaburger::relish::client::BunClient;
 #[path = "support/bun_process.rs"]
 mod bun_process;
 use bun_process::{
-    BunProcess, BunStart, WAIT, assert_success, reserve_address, reserve_ports, run_relish,
-    spawn_bun_with_port_retry, wait_for_bind, wait_for_relish, write_portable_node_config,
+    BunProcess, WAIT, assert_success, reserve_address, reserve_ports, run_relish,
+    spawn_bun_with_port_retry, wait_for_relish, write_portable_node_config,
 };
 
 struct Node {
@@ -739,16 +739,34 @@ async fn node_job_lease_reaps_a_surviving_process_after_bun_is_killed() {
     );
     drop(persisted);
     tokio::time::sleep(Duration::from_millis(3100)).await;
-    let mut restarted = BunProcess::spawn(
-        &node_path,
-        address,
-        true,
-        root.path().join("job-restarted.log"),
-    );
-    assert!(matches!(
-        wait_for_bind(&mut restarted, address),
-        BunStart::Ready(_)
-    ));
+    // The dead Bun's four ports stay free for the lease to expire and for the
+    // restart to reach its Raft bind (several seconds), long enough for a
+    // concurrent test to reserve one of them. Restart on the same ports, and
+    // only if that loses the race move the node to freshly reserved ones.
+    let mut first_attempt = true;
+    let (mut restarted, address) = spawn_bun_with_port_retry(true, || {
+        let api = if std::mem::take(&mut first_attempt) {
+            address
+        } else {
+            let [gossip, raft, reporting] = reserve_ports();
+            node.cluster.gossip_port = gossip;
+            node.cluster.raft_port = raft;
+            node.cluster.reporting_port = reporting;
+            std::fs::write(&node_path, toml::to_string_pretty(&node).unwrap()).unwrap();
+            reserve_address()
+        };
+        (
+            node_path.clone(),
+            api,
+            root.path().join("job-restarted.log"),
+        )
+    });
+    let client = reliaburger::relish::client::BunClient::new_with_ca(
+        &format!("https://{address}"),
+        Some(token),
+        &ca_bytes,
+    )
+    .unwrap();
     let recovered = tokio::time::timeout(Duration::from_secs(25), async {
         loop {
             restarted.assert_running();
