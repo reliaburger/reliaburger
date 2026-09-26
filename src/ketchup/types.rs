@@ -78,6 +78,9 @@ pub enum KetchupError {
     NotFound { app: String, namespace: String },
     #[error("query rejected: {reason}")]
     QueryRejected { reason: String },
+    /// Another exporter holds this directory's export checkpoint lock.
+    #[error("export checkpoint is busy: another export is in flight")]
+    ExportBusy,
 }
 
 // ---------------------------------------------------------------------------

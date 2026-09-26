@@ -166,7 +166,9 @@ fn destination_url(destination: &str) -> Result<url::Url, KetchupError> {
 /// Ships any `.parquet` files in `source_dir` whose durable id isn't yet in
 /// the checkpoint to `{destination}/{node_id}/{sha256}-{filename}`, then records
 /// each id. `destination` may be a local path, `file://…`, `s3://…` or
-/// `gs://…`. The source must exist. A competing exporter returns a busy error.
+/// `gs://…`. The source must exist. While another exporter holds the checkpoint
+/// this returns [`KetchupError::ExportBusy`] without touching anything; that
+/// exporter is shipping the same files, so callers can skip or retry.
 /// The supplied snapshot is replaced only after uploads and checkpoint persistence
 /// succeed; callers must not separately save it over the authoritative file.
 pub async fn export_logs(
@@ -185,28 +187,30 @@ pub async fn export_logs(
             options.mode(0o600);
         }
         let lock = options.open(directory.join("_export_checkpoint.lock"))?;
-        lock.try_lock().map_err(|error| {
-            std::io::Error::other(format!("export checkpoint is busy: {error}"))
-        })?;
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => return Err(KetchupError::ExportBusy),
+            Err(std::fs::TryLockError::Error(error)) => return Err(KetchupError::Io(error)),
+        }
         let path = directory.join(CHECKPOINT_FILENAME);
         let current = match std::fs::read(&path) {
             Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| {
-                std::io::Error::other(format!(
+                KetchupError::Io(std::io::Error::other(format!(
                     "invalid export checkpoint {}: {error}",
                     path.display()
-                ))
+                )))
             })?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 ExportCheckpoint::default()
             }
             Err(error) => {
-                return Err(std::io::Error::other(format!(
+                return Err(KetchupError::Io(std::io::Error::other(format!(
                     "read export checkpoint {}: {error}",
                     path.display()
-                )));
+                ))));
             }
         };
-        Ok::<_, std::io::Error>((lock, current))
+        Ok::<_, KetchupError>((lock, current))
     })
     .await
     .map_err(|error| KetchupError::Io(std::io::Error::other(error.to_string())))??;
@@ -491,6 +495,36 @@ mod tests {
             .find(|path| path != &first_path)
             .unwrap();
         assert_eq!(std::fs::read(second_path).unwrap(), b"second batch");
+    }
+
+    #[tokio::test]
+    async fn competing_export_is_reported_as_busy_not_as_io_failure() {
+        let source = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        std::fs::write(source.path().join("logs_000000.parquet"), b"data").unwrap();
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(source.path().join("_export_checkpoint.lock"))
+            .unwrap();
+        holder.try_lock().unwrap();
+
+        let mut checkpoint = ExportCheckpoint::default();
+        let result = export_logs(
+            source.path(),
+            dest.path().to_str().unwrap(),
+            "node-1",
+            &mut checkpoint,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(KetchupError::ExportBusy)),
+            "{result:?}"
+        );
+        assert!(exported_files(dest.path()).is_empty());
     }
 
     #[tokio::test]

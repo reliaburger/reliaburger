@@ -14,7 +14,17 @@
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::ketchup::export::{ExportCheckpoint, export_logs};
+use crate::ketchup::export::{ExportCheckpoint, ExportResult, export_logs};
+use crate::ketchup::types::KetchupError;
+
+/// How long disk-pressure relief waits for another exporter (Bun's periodic
+/// export task, a manual `relish logs-export`) to release the checkpoint.
+/// The two share one directory and Bun starts both timers together, so they
+/// regularly collide; waiting lets this tick prune what that export shipped.
+const EXPORT_BUSY_WAIT: Duration = Duration::from_secs(60);
+
+/// Pause between attempts to take a busy export checkpoint.
+const EXPORT_BUSY_POLL: Duration = Duration::from_millis(100);
 
 /// Result of a disk pressure check.
 #[derive(Debug, Clone)]
@@ -55,6 +65,10 @@ pub fn dir_parquet_size(dir: &Path) -> u64 {
 /// Returns `None` if no export destination is configured (pruning
 /// still happens based on retention_days).
 ///
+/// If another exporter holds the checkpoint, waits for it (bounded by
+/// `EXPORT_BUSY_WAIT`) rather than skipping the tick; a failed or timed-out
+/// export leaves every local file in place and reports `export_error`.
+///
 /// Async because export ships to an object store (`s3://`/`gs://`/local)
 /// via `object_store`.
 pub async fn check_and_relieve(
@@ -76,7 +90,7 @@ pub async fn check_and_relieve(
 
     // If we have a destination, export un-exported files first
     if let Some(dest) = export_dest {
-        match export_logs(source_dir, dest, node_id, checkpoint).await {
+        match export_when_free(source_dir, dest, node_id, checkpoint).await {
             Ok(export_result) => {
                 result.exported = export_result.files_exported > 0;
                 result.files_exported = export_result.files_exported;
@@ -148,6 +162,28 @@ pub async fn check_and_relieve(
     }
 
     result
+}
+
+/// Export, waiting up to [`EXPORT_BUSY_WAIT`] for a competing exporter.
+///
+/// Polls rather than blocking on the file lock so the wait stays cancellable:
+/// a blocked `flock` in `spawn_blocking` would outlive a cancelled caller and
+/// take the lock later with nobody to use it.
+async fn export_when_free(
+    source_dir: &Path,
+    destination: &str,
+    node_id: &str,
+    checkpoint: &mut ExportCheckpoint,
+) -> Result<ExportResult, KetchupError> {
+    let deadline = tokio::time::Instant::now() + EXPORT_BUSY_WAIT;
+    loop {
+        match export_logs(source_dir, destination, node_id, checkpoint).await {
+            Err(KetchupError::ExportBusy) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(EXPORT_BUSY_POLL).await;
+            }
+            other => return other,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -241,6 +277,44 @@ mod tests {
         assert!(!result.exported);
         assert_eq!(result.files_pruned, 0);
         assert!(source.exists());
+    }
+
+    #[tokio::test]
+    async fn waits_for_an_in_flight_export_then_exports_and_prunes() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let source = directory.path().join("logs_000000.parquet");
+        tokio::fs::write(&source, b"test log bytes").await.unwrap();
+        // Another exporter (Bun's periodic export task) holds the checkpoint.
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(directory.path().join("_export_checkpoint.lock"))
+            .unwrap();
+        holder.try_lock().unwrap();
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            drop(holder);
+        });
+
+        let mut checkpoint = ExportCheckpoint::default();
+        let result = check_and_relieve(
+            directory.path(),
+            Some(destination.path().to_str().unwrap()),
+            "node",
+            &mut checkpoint,
+            1,
+            0,
+        )
+        .await;
+        release.await.unwrap();
+
+        assert_eq!(result.export_error, None);
+        assert_eq!(result.files_exported, 1);
+        assert_eq!(result.files_pruned, 1);
+        assert!(!source.exists());
     }
 
     #[test]
