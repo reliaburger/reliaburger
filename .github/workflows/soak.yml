@@ -121,6 +121,10 @@ jobs:
           qemu-img --version
 
       - name: Soak
+        # A record that says FAIL fails this step (and the job); the later
+        # steps still publish it. When the harness gains `--tier fast|final`,
+        # a `tier` choice input passes straight through here, and the
+        # budget check above maps it to its duration and schedule.
         run: |
           scripts/release/qualify-sustained.sh \
               --base-url "$BASE_URL" --qualified-digest "$QUALIFIED_DIGEST" \
