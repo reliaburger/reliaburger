@@ -265,19 +265,47 @@ this lands.
    Run it at least twice per host for V04: once with nothing cached (the
    script always starts empty) and again for repeatability.
 
-4. **Record it.** Copy each host's record into
+4. **Soak it (V02)** on Apple silicon, in two tiers
+   ([plan](plans/2026-09-25-v02-sustained.md), D3). Build and sign the soak
+   bun first (D2). After each round of fixes, run the fast tier: every fault
+   kind and every special on the compressed schedule, in about 90 minutes.
+
+   ```sh
+   scripts/release/qualify-sustained.sh --tier fast \
+     --base-url https://github.com/reliaburger/reliaburger/releases/download/staging-v0.1.0-RUN_ID-ATTEMPT \
+     --qualified-digest QUALIFIED_DIGEST --soak-bun /path/to/bun-v0.1.0-soak.1
+   ```
+
+   Once the fast tier is clean on the final candidate, run the final tier
+   once: 8 hours on the full schedule, which catches slow accumulation.
+
+   ```sh
+   scripts/release/qualify-sustained.sh --tier final \
+     --base-url https://github.com/reliaburger/reliaburger/releases/download/staging-v0.1.0-RUN_ID-ATTEMPT \
+     --qualified-digest QUALIFIED_DIGEST --soak-bun /path/to/bun-v0.1.0-soak.1 \
+     --record docs/qualification/DATE-sustained-v02.md
+   ```
+
+   The record's second paragraph states the verdict. A fast run can only say
+   "fast tier: clean"; only a clean final-tier run, 8 hours on the full
+   schedule with the digest checked, says the V02 gate passes. A product fix
+   found during the final run means a new candidate, a fresh fast run and
+   then a fresh final run. `--resume --evidence DIR` continues an interrupted
+   run with its original tier.
+
+5. **Record it.** Copy each host's record into
    `docs/qualification/DATE-staged-install-HOST.md`, alongside the run ID,
    attempt, commit and digest. Gates V03 and V04 in
    [progress.md](progress.md) point at these records.
 
-5. **Clean up the staging pre-releases.** Delete them before promotion so the
+6. **Clean up the staging pre-releases.** Delete them before promotion so the
    release page and the release notes' "previous tag" don't pick them up:
 
    ```sh
    gh release delete staging-v0.1.0-RUN_ID-ATTEMPT --cleanup-tag --yes
    ```
 
-6. **Promote** as described above, with the same run ID and digest. The
+7. **Promote** as described above, with the same run ID and digest. The
    staging tag can't be promoted: it doesn't match `v1.2.3`, `candidate.py`
    refuses it as a version, and `promote.yml` refuses any tag containing
    `staging`.
