@@ -7439,26 +7439,30 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.egress_affected_workloads
             .extend(affected_apps.iter().cloned());
         for (app_name, namespace) in affected_apps {
-            // A pending stop has already withdrawn and signalled the app;
-            // its own completion records the exit.
-            if self
-                .pending_stops
-                .contains_key(&(app_name.clone(), namespace.clone()))
-            {
-                continue;
-            }
             eprintln!("sesame: stopping {namespace}/{app_name}: live kernel policy was lost");
-            if let Err(error) = self.stop_app(&app_name, &namespace).await {
+            // The stop waits out its grace off the loop; if it fails, its
+            // completion fences execution (`fence_after_failed_stop`).
+            if let Err(error) = self.stop_app_unattended(&app_name, &namespace).await {
                 eprintln!(
                     "sesame: failed to stop {namespace}/{app_name} after egress loss: {error}"
                 );
-                if let Err(error) = self.fence_app_execution(&app_name, &namespace).await {
-                    eprintln!(
-                        "sesame: execution fencing remains unconfirmed for {namespace}/{app_name}: {error}"
-                    );
-                }
+                self.fence_after_failed_stop(&app_name, &namespace).await;
             }
         }
+    }
+
+    /// Force-kill an app whose graceful stop failed, keeping every
+    /// allocation it still owns.
+    async fn fence_after_failed_stop(&mut self, app_name: &str, namespace: &str) {
+        #[cfg(all(feature = "ebpf", target_os = "linux"))]
+        if let Err(error) = self.fence_app_execution(app_name, namespace).await {
+            eprintln!(
+                "sesame: execution fencing remains unconfirmed for {namespace}/{app_name}: {error}"
+            );
+        }
+        // Only the egress fence asks for this, and it exists only with eBPF.
+        #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
+        let _ = (app_name, namespace);
     }
 
     /// Stop unsafe execution while preserving refused discovery and policy cleanup.
@@ -8653,10 +8657,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
     /// Stop an app's instances, waiting for their exit inline.
     ///
-    /// Operator stops and retirements go through `request_app_stop` instead,
-    /// which awaits the same exit off the command loop. This inline form
-    /// serves the egress-loss fence, which already runs as one fenced step.
-    #[cfg(any(test, all(feature = "ebpf", target_os = "linux")))]
+    /// Operator stops, retirements and the egress fence all await the exit
+    /// off the command loop instead (`request_app_stop`,
+    /// `stop_app_unattended`). This inline form lets tests drive a whole stop
+    /// without running the loop.
+    #[cfg(test)]
     async fn stop_app(&mut self, app_name: &str, namespace: &str) -> Result<(), BunError> {
         let stop = self.begin_app_stop(app_name, namespace).await?;
         self.app_exit_wait(&stop).await?;
@@ -17798,6 +17803,8 @@ host = "remote.local"
     }
 
     /// Two stubborn stops overlap: together they cost one grace, not two.
+    /// Serial stops take at least two graces; the 1.8 bound leaves a
+    /// loaded runner room without admitting them.
     #[tokio::test]
     async fn concurrent_sigterm_ignoring_stops_overlap() {
         let (tx, shutdown, handle, grill, volumes) = stubborn_agent();
@@ -17816,7 +17823,7 @@ host = "remote.local"
         let elapsed = started.elapsed();
 
         assert!(
-            elapsed < STUBBORN_GRACE * 7 / 4,
+            elapsed < STUBBORN_GRACE * 9 / 5,
             "stops serialised: {elapsed:?} for two {STUBBORN_GRACE:?} graces"
         );
         for app in ["first", "second"] {
@@ -17857,6 +17864,119 @@ host = "remote.local"
 
         shutdown.cancel();
         handle.await.unwrap();
+    }
+
+    /// A retirement that arrives while an operator stop is pending joins it,
+    /// then forgets ownership once the shared stop confirms the exit.
+    #[tokio::test]
+    async fn a_retire_joining_a_pending_stop_releases_ownership() {
+        let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+        agent.set_stop_grace(std::time::Duration::from_millis(500));
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        let id = InstanceId("default__web-0".into());
+        grill.set_ignore_stop(true);
+        grill.set_state(&id, ContainerState::Running);
+        let handle = tokio::spawn(async move { agent.run().await });
+
+        let stopped = send_stop(&tx, "web");
+        let (response, retired) = oneshot::channel();
+        tx.send(AgentCommand::Retire {
+            app_name: "web".into(),
+            namespace: "default".into(),
+            response,
+        })
+        .await
+        .unwrap();
+        stopped.await.unwrap().unwrap();
+        retired.await.unwrap().unwrap();
+
+        let (status, _) = timed_status(&tx).await;
+        assert!(
+            status.is_empty(),
+            "the joined retirement must release ownership"
+        );
+        let stops = grill
+            .calls()
+            .iter()
+            .filter(|(op, i)| op == "stop" && i == &id)
+            .count();
+        assert_eq!(stops, 1, "the retirement must not signal again");
+
+        shutdown.cancel();
+        handle.await.unwrap();
+    }
+
+    /// The egress fence's stop returns before any grace passes and leaves the
+    /// wait to `stop_waits`, which still ends in SIGKILL and Stopped.
+    #[tokio::test]
+    async fn an_unattended_stop_returns_before_its_grace() {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        agent.set_stop_grace(std::time::Duration::from_millis(500));
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        let id = InstanceId("default__web-0".into());
+        grill.set_ignore_stop(true);
+        grill.set_state(&id, ContainerState::Running);
+
+        let started = Instant::now();
+        agent.stop_app_unattended("web", "default").await.unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_millis(400));
+        assert_eq!(
+            agent.supervisor.get_instance(&id).map(|i| i.state),
+            Some(ContainerState::Stopping)
+        );
+        // A second fence joins the pending stop rather than starting another.
+        agent.stop_app_unattended("web", "default").await.unwrap();
+        assert_eq!(agent.stop_waits.len(), 1);
+
+        let outcome = agent.stop_waits.join_next_with_id().await.unwrap();
+        agent.complete_app_stop(outcome).await;
+        assert_eq!(
+            agent.supervisor.get_instance(&id).map(|i| i.state),
+            Some(ContainerState::Stopped)
+        );
+        assert!(
+            grill.calls().iter().any(|(op, i)| op == "kill" && i == &id),
+            "a stubborn workload must still be force-killed"
+        );
+    }
+
+    /// When a stop the egress fence relied on fails, its completion fences
+    /// execution at once instead of leaving it to a later tick.
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    #[tokio::test]
+    async fn a_failed_stop_the_egress_fence_relies_on_fences_at_once() {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        agent.set_stop_grace(std::time::Duration::from_millis(200));
+        let config = Config::parse("[app.web]\nimage = \"myapp:v1\"\n").unwrap();
+        expect_complete(&drain_deploy(&mut agent, config).await);
+        let id = InstanceId("default__web-0".into());
+        grill.set_ignore_stop(true);
+        grill.set_ignore_kill(true);
+        grill.set_state(&id, ContainerState::Running);
+
+        // An operator stop is pending when the egress fence arrives.
+        let (response, stopped) = oneshot::channel();
+        agent
+            .request_app_stop("web".into(), "default".into(), StopPurpose::Stop, response)
+            .await;
+        agent.stop_app_unattended("web", "default").await.unwrap();
+
+        let outcome = agent.stop_waits.join_next_with_id().await.unwrap();
+        agent.complete_app_stop(outcome).await;
+
+        assert!(
+            stopped.await.unwrap().is_err(),
+            "the stop must report its failure"
+        );
+        let kills = grill
+            .calls()
+            .iter()
+            .filter(|(op, i)| op == "kill" && i == &id)
+            .count();
+        assert_eq!(
+            kills, 2,
+            "the fence must force-kill again after the failed stop"
+        );
     }
 
     /// A deploy must not replace instances a pending stop still owns.
