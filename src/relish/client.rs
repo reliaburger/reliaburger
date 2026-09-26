@@ -124,6 +124,34 @@ impl LogOptions {
     }
 }
 
+/// Render queried log entries as lines, oldest first.
+///
+/// When the lines come from more than one instance, each line starts with
+/// `[instance] `. During a rolling deploy or after a restart an old and a new
+/// instance both appear in a tail, and unlabelled their output reads as one
+/// app skipping values.
+fn render_log_entries(entries: &[crate::ketchup::types::LogEntry], options: &LogOptions) -> String {
+    let shown: Vec<&crate::ketchup::types::LogEntry> = entries
+        .iter()
+        .filter(|entry| options.matches(&entry.line))
+        .collect();
+    let instances: std::collections::BTreeSet<Option<&str>> = shown
+        .iter()
+        .map(|entry| entry.instance.as_deref())
+        .collect();
+    let label = instances.len() > 1;
+    let mut output = String::new();
+    for entry in shown {
+        if label {
+            output.push_str(&format!("[{}] ", entry.instance.as_deref().unwrap_or("-")));
+        }
+        output.push_str(&entry.line);
+        output.push('\n');
+    }
+    output.pop();
+    output
+}
+
 /// Classify a reqwest send error as either a timeout or a connection failure.
 fn classify_error(e: reqwest::Error) -> RelishError {
     if e.is_timeout() {
@@ -1441,34 +1469,22 @@ impl BunClient {
             .send()
             .await
             && response.status().is_success()
-            && let Ok(result) = response.json::<serde_json::Value>().await
+            && let Ok(result) = response
+                .json::<crate::ketchup::types::LogQueryResult>()
+                .await
         {
-            let mut output = String::new();
-            if let Some(entries) = result["entries"].as_array() {
-                for entry in entries {
-                    let line = entry["line"].as_str().unwrap_or("");
-                    // Filters also apply client-side: json_field has no
-                    // server-side equivalent, and grep re-checking is
-                    // harmless when the server already filtered.
-                    if options.matches(line) {
-                        output.push_str(line);
-                        output.push('\n');
-                    }
-                }
-            }
+            // Filters also apply client-side: json_field has no server-side
+            // equivalent, and grep re-checking is harmless when the server
+            // already filtered.
+            let output = render_log_entries(&result.entries, options);
 
             // Show warnings if any nodes were unreachable
-            if let Some(warnings) = result["warnings"].as_array() {
-                for w in warnings {
-                    if let Some(node_id) = w.get("NodeUnresponsive") {
-                        let id = node_id["node_id"].as_str().unwrap_or("unknown");
-                        eprintln!("warning: node {id} did not respond");
+            for warning in &result.warnings {
+                match warning {
+                    crate::ketchup::types::LogQueryWarning::NodeUnresponsive { node_id } => {
+                        eprintln!("warning: node {node_id} did not respond");
                     }
                 }
-            }
-
-            if output.ends_with('\n') {
-                output.pop();
             }
 
             // If we got entries, return them
@@ -2384,6 +2400,72 @@ mod tests {
         for error in [applied, rolled_back] {
             assert!(matches!(error, RelishError::ApiError { body, .. } if body == message));
         }
+    }
+
+    /// Serve one canned `/v1/logs/query` answer and return what `relish logs`
+    /// prints for it.
+    async fn render_queried_logs(entries: Vec<crate::ketchup::types::LogEntry>) -> String {
+        use axum::{Json, Router, routing::get};
+        let result = crate::ketchup::types::LogQueryResult {
+            entries,
+            node_count: 1,
+            warnings: vec![],
+        };
+        let app = Router::new().route(
+            "/v1/logs/query/{app}/{namespace}",
+            get(move || {
+                let result = result.clone();
+                async move { Json(result) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = BunClient::new_with_token(&format!("http://{address}"), None);
+        let output = client
+            .logs("soak-redis-client", "default", &LogOptions::default())
+            .await
+            .unwrap();
+        server.abort();
+        output
+    }
+
+    fn queried(sequence: u64, instance: &str, line: &str) -> crate::ketchup::types::LogEntry {
+        crate::ketchup::types::LogEntry {
+            timestamp: sequence / 1_000_000_000,
+            sequence,
+            instance: Some(instance.to_string()),
+            stream: crate::ketchup::types::LogStream::Stdout,
+            line: line.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn logs_from_one_instance_print_bare() {
+        let output = render_queried_logs(vec![
+            queried(1, "soak-redis-client-0", "INCR 1"),
+            queried(2, "soak-redis-client-0", "INCR 2"),
+        ])
+        .await;
+        assert_eq!(output, "INCR 1\nINCR 2");
+    }
+
+    /// V02 soak: during a rolling deploy two instances INCR the same counter,
+    /// and an unlabelled tail read as one client stepping by two.
+    #[tokio::test]
+    async fn logs_from_several_instances_name_each_line_s_instance() {
+        let output = render_queried_logs(vec![
+            queried(1, "soak-redis-client-0", "INCR 3550"),
+            queried(2, "soak-redis-client-1", "INCR 3551"),
+            queried(3, "soak-redis-client-0", "INCR 3552"),
+        ])
+        .await;
+        assert_eq!(
+            output,
+            "[soak-redis-client-0] INCR 3550\n\
+             [soak-redis-client-1] INCR 3551\n\
+             [soak-redis-client-0] INCR 3552"
+        );
     }
 
     #[tokio::test]

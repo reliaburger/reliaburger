@@ -734,7 +734,7 @@ impl super::Grill for ProcessGrill {
     async fn follow_logs(
         &self,
         instance: &InstanceId,
-        lines_tx: tokio::sync::mpsc::Sender<String>,
+        lines_tx: tokio::sync::mpsc::Sender<crate::ketchup::types::CapturedLine>,
     ) {
         // Snapshot how this instance's logs are captured.
         let (stdout_buf, log_stem) = if let Some(control) = &self.control {
@@ -750,71 +750,48 @@ impl super::Grill for ProcessGrill {
             }
         };
 
-        let mut offset = 0usize;
-        let mut partial_line = String::new();
+        let mut reader = crate::grill::capture::CaptureReader::new(
+            crate::ketchup::types::LogStream::Stdout,
+            log_stem.as_ref().map(|stem| log_file(stem, "stdout")),
+        );
 
         loop {
             // New bytes since the last poll, from the file or the buffer.
-            let new_data = if let Some(stem) = &log_stem {
-                let contents = std::fs::read(log_file(stem, "stdout")).unwrap_or_default();
-                if offset < contents.len() {
-                    let data = contents[offset..].to_vec();
-                    offset = contents.len();
-                    Some(data)
-                } else {
-                    None
-                }
+            let offset = usize::try_from(reader.read_offset()).unwrap_or(usize::MAX);
+            let new_data = if let Some(file) = reader.file() {
+                let contents = std::fs::read(file).unwrap_or_default();
+                contents.get(offset..).unwrap_or_default().to_vec()
             } else {
                 let buf = stdout_buf.lock().await;
-                if offset < buf.len() {
-                    let data = buf[offset..].to_vec();
-                    offset = buf.len();
-                    Some(data)
-                } else {
-                    None
-                }
+                buf.get(offset..).unwrap_or_default().to_vec()
             };
 
-            let no_new_data = new_data.is_none();
-            if let Some(data) = new_data {
-                partial_line.push_str(&String::from_utf8_lossy(&data));
-
-                // Send all complete lines
-                while let Some(newline_pos) = partial_line.find('\n') {
-                    let line = partial_line[..newline_pos].to_string();
-                    partial_line = partial_line[newline_pos + 1..].to_string();
-                    if lines_tx.send(line).await.is_err() {
-                        return;
-                    }
+            let no_new_data = new_data.is_empty();
+            for line in reader.push(&new_data) {
+                if lines_tx.send(line).await.is_err() {
+                    return;
                 }
             }
 
             // Check if the process has exited and no more data is coming
-            if self.control.is_some() {
+            let exited = if self.control.is_some() {
                 match self.state(instance).await {
-                    Ok(ContainerState::Stopped) if no_new_data => {
-                        if !partial_line.is_empty() {
-                            let _ = lines_tx.send(std::mem::take(&mut partial_line)).await;
-                        }
-                        return;
-                    }
+                    Ok(ContainerState::Stopped) => true,
                     Err(_) => return,
-                    _ => {}
+                    _ => false,
                 }
             } else {
                 let procs = self.processes.lock().await;
-                if let Some(entry) = procs.get(instance) {
-                    let exited = entry.state == ContainerState::Stopped
-                        || entry.state == ContainerState::Stopping;
-                    if exited && no_new_data {
-                        if !partial_line.is_empty() {
-                            let _ = lines_tx.send(std::mem::take(&mut partial_line)).await;
-                        }
-                        return;
-                    }
-                } else {
+                let Some(entry) = procs.get(instance) else {
                     return;
+                };
+                entry.state == ContainerState::Stopped || entry.state == ContainerState::Stopping
+            };
+            if exited && no_new_data {
+                if let Some(line) = reader.finish() {
+                    let _ = lines_tx.send(line).await;
                 }
+                return;
             }
 
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -1168,6 +1145,72 @@ mod tests {
         .expect("file-backed log was not written");
         assert!(logged.contains("to file"), "got {logged:?}");
         assert!(dir.path().join("test-0.stdout").is_file());
+    }
+
+    /// Read the first line `follow_logs` produces for `id`, as a fresh
+    /// forwarder would after an agent restart.
+    async fn first_followed_line(
+        grill: &ProcessGrill,
+        id: &InstanceId,
+    ) -> crate::ketchup::types::CapturedLine {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
+        let follower = grill.clone();
+        let follow_id = id.clone();
+        let task = tokio::spawn(async move { follower.follow_logs(&follow_id, sender).await });
+        let line = tokio::time::timeout(std::time::Duration::from_secs(5), receiver.recv())
+            .await
+            .expect("no line followed")
+            .expect("follow ended without a line");
+        drop(receiver);
+        task.abort();
+        line
+    }
+
+    /// V02 soak regression: every agent restart re-follows adopted
+    /// instances from the start of their capture files. The replayed lines
+    /// must carry the same positions, so the log store recognises them and
+    /// doesn't store the instance's whole history again as new lines.
+    #[tokio::test]
+    async fn refollowing_a_capture_file_replays_the_same_positions_and_the_store_keeps_one_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let grill = ProcessGrill::with_log_dir(dir.path().to_path_buf());
+        let id = InstanceId("test-0".to_string());
+        grill.create(&id, &echo_spec("ACK 1")).await.unwrap();
+        grill.start(&id).await.unwrap();
+
+        let before_restart = first_followed_line(&grill, &id).await;
+        let after_restart = first_followed_line(&grill, &id).await;
+        assert_eq!(before_restart.line, "ACK 1");
+        assert_eq!(
+            before_restart.position,
+            Some(crate::ketchup::types::CapturePosition {
+                file: dir.path().join("test-0.stdout"),
+                end_offset: "ACK 1\n".len() as u64,
+            })
+        );
+        assert_eq!(after_restart, before_restart);
+
+        let store_dir = tempfile::tempdir().unwrap();
+        let record =
+            |captured: crate::ketchup::types::CapturedLine| crate::ketchup::types::LogRecord {
+                app: "echo".to_string(),
+                namespace: "default".to_string(),
+                instance: id.0.clone(),
+                stream: captured.stream,
+                line: captured.line,
+                position: captured.position,
+            };
+        let mut store = crate::ketchup::log_store::LogStore::new(store_dir.path().to_path_buf());
+        assert!(store.ingest(&record(before_restart)));
+        store.flush().await.unwrap();
+        let mut store = crate::ketchup::log_store::LogStore::new(store_dir.path().to_path_buf());
+        assert!(!store.ingest(&record(after_restart)));
+        let stored = store
+            .query("echo", "default", None, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(stored.len(), 1);
+        grill.kill(&id).await.unwrap();
     }
 
     #[tokio::test]

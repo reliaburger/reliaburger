@@ -1666,15 +1666,13 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // explicitly just before flushing.
     let mut feeder_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
-    // Drain container log lines from the agent into the LogStore.
+    // Drain container log lines from the agent into the LogStore. The store
+    // skips lines it already holds, which a forwarder re-reads after a restart.
     {
         let drain_store = Arc::clone(&log_store);
         feeder_handles.push(tokio::spawn(async move {
             while let Some(rec) = log_rx.recv().await {
-                drain_store
-                    .write()
-                    .await
-                    .append(&rec.app, &rec.namespace, rec.stream, &rec.line);
+                drain_store.write().await.ingest(&rec);
             }
         }));
     }

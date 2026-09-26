@@ -485,7 +485,7 @@ impl super::Grill for AppleContainerGrill {
     async fn follow_logs(
         &self,
         instance: &InstanceId,
-        lines_tx: tokio::sync::mpsc::Sender<String>,
+        lines_tx: tokio::sync::mpsc::Sender<crate::ketchup::types::CapturedLine>,
     ) {
         let mut child = match tokio::process::Command::new(&self.container_program)
             .args(["logs", "--follow", &instance.0])
@@ -501,7 +501,14 @@ impl super::Grill for AppleContainerGrill {
             let reader = tokio::io::BufReader::new(stdout);
             let mut lines = tokio::io::AsyncBufReadExt::lines(reader);
             while let Ok(Some(line)) = lines.next_line().await {
-                if lines_tx.send(line).await.is_err() {
+                // `container logs` gives no byte offsets, so a restarted agent
+                // re-ingests an adopted Apple container's earlier output.
+                let captured = crate::ketchup::types::CapturedLine {
+                    stream: crate::ketchup::types::LogStream::Stdout,
+                    line,
+                    position: None,
+                };
+                if lines_tx.send(captured).await.is_err() {
                     break;
                 }
             }

@@ -246,7 +246,7 @@ relish logs api --json-field level=error
 
 Here's something you don't see in most observability stacks: the same SQL engine that queries your metrics also queries your logs.
 
-Ketchup stores logs in the same Arrow/DataFusion/Parquet stack that Mayo uses for metrics. The schema is five columns: `timestamp`, `app`, `namespace`, `stream`, and `line`. Want to find all errors from the web app in the last hour?
+Ketchup stores logs in the same Arrow/DataFusion/Parquet stack that Mayo uses for metrics. The schema started as five columns: `timestamp`, `app`, `namespace`, `stream`, and `line`. (It has seven now; "Tails that tell the truth" below explains the other two.) Want to find all errors from the web app in the last hour?
 
 ```sql
 SELECT timestamp, line FROM logs
@@ -497,6 +497,151 @@ its own statuses to its own samples (`bun::top::node_rows`), and the node you
 ask merges finished rows. A PID never crosses a machine boundary without the
 node it belongs to.
 
+## Tails that tell the truth
+
+The V02 soak runs a tiny app that appends 1, 2, 3, … to a file ten times a
+second and logs `ACK n` after each append. Every few minutes the harness runs
+`relish logs soak-writer --tail 20` and saves the answer. The file on disk was
+always gapless. The tail wasn't:
+
+```
+ACK 967
+ACK 968
+ACK 974
+ACK 969
+ACK 975
+ACK 970
+```
+
+After a node's Bun was SIGKILLed, or its VM powered off, it got stranger:
+lines from an hour earlier showed up as the newest. And a CI run showed the
+Redis client counting up in twos. Three symptoms, three causes, and none of
+them in the app.
+
+**One-second timestamps with no tie-breaker.** `LogStore` stamped each line
+with `as_secs()` and queries said `ORDER BY timestamp`. At ten lines a second,
+ten rows share every timestamp. SQL doesn't promise any order among equal
+keys, and DataFusion reads the Parquet files and the in-memory buffer as
+separate partitions and merges them, so rows from two flushes that landed in
+the same second came back interleaved. That's the `968, 974, 969, 975`
+pattern, and a unit test that writes 200 lines inside one second, flushing
+every nine, reproduced it exactly.
+
+**`LIMIT` without `DESC`.** The same query appended `LIMIT n` for a tail. `ORDER
+BY timestamp LIMIT 20` is the *first* twenty rows. A cluster query hid this by
+fetching everything and trimming after the merge, but a single node answered
+`--tail 20` with the oldest twenty lines it had.
+
+**Re-reading capture files from the start.** When Bun restarts, it adopts
+running containers and starts a log forwarder for each. The runtime's
+`follow_logs` began at byte zero, so the store received the container's whole
+history again and stamped every line with *now*. Hour-old `ACK`s became the
+newest rows. The Redis client's "stepping by two" was the same thing: an old
+instance from a rolling deploy, which had shared the counter with its
+replacement and so only ever saw every other value, got re-ingested wholesale
+and filled the tail.
+
+The fix gives every row an identity that means something.
+
+A new `sequence` column holds the ingest time in nanoseconds, bumped so it
+rises strictly on each node:
+
+```rust
+let sequence = nanos.max(self.ingested.last_sequence.saturating_add(1));
+self.ingested.last_sequence = sequence;
+```
+
+`saturating_add` is Rust's way of saying "add, but stick at `u64::MAX`
+instead of wrapping". Plain `+` on integers panics on overflow in a debug
+build and wraps silently in release, so for a value that must only ever grow
+we pick the behaviour explicitly. Queries now `ORDER BY sequence`, and a tail
+is a subquery that takes the newest N and puts them back in order:
+
+```sql
+SELECT * FROM (... ORDER BY sequence DESC NULLS LAST LIMIT 20) AS tailed
+ORDER BY sequence ASC NULLS FIRST
+```
+
+Why nanoseconds and not a plain counter? A counter orders one node's rows
+perfectly and says nothing about two nodes. Nanoseconds order each node
+exactly and interleave nodes as well as their clocks agree, which is the most
+anyone can promise without a shared clock. The cross-node merge sorts on
+`(sequence, node)`, so an exact tie still renders the same way every time,
+and it deduplicates on `(node, sequence)`. The earlier dedup key,
+`(node, timestamp, stream, line)`, had its own quiet bug: an app that printed
+the same line twice in one second lost one of them.
+
+The forwarder problem needed the runtime's help. A capture file is
+append-only, so the byte offset just past a line's newline names that line
+for good. A new `grill::capture::CaptureReader` turns raw chunks into lines
+and remembers that offset for each one, counting raw bytes so a line of
+invalid UTF-8 (which becomes `U+FFFD` in the `String`) doesn't shift the
+positions after it. `follow_logs` now sends a `CapturedLine` carrying the
+stream and that position, which also means stderr is finally labelled as
+stderr instead of everything being called stdout.
+
+The runc runtime reads stdout and stderr through one reader each:
+
+```rust
+let mut readers = [
+    (LogStream::Stdout, "stdout"),
+    (LogStream::Stderr, "stderr"),
+]
+.map(|(stream, extension)| {
+    CaptureReader::new(stream, Some(stem.with_extension(extension)))
+});
+```
+
+That's `map` on a fixed-size array, `[T; N]`, not on an iterator. It returns
+another array of the same length, `[CaptureReader; 2]`, with no `Vec` and no
+heap allocation. Go has fixed arrays too but no way to map over one; in
+Python you'd get a list back.
+
+The store then does the bookkeeping. It keeps the highest offset it has
+ingested per capture file and refuses anything at or below it:
+
+```rust
+if let Some(position) = &record.position {
+    let seen = self.ingested.offsets.get(&position.file).copied();
+    if seen.is_some_and(|offset| position.end_offset <= offset) {
+        return false;
+    }
+    self.ingested.offsets.insert(position.file.clone(), position.end_offset);
+}
+```
+
+`Option::is_some_and` is "there's a value and this predicate holds for it",
+which reads better than `matches!(seen, Some(offset) if ...)`. On every flush
+the store writes those offsets, plus the last sequence, to
+`ingest-checkpoint.json`, with the same temp-file, fsync, rename, directory
+fsync dance as the Parquet file, and always *after* the Parquet file. Which
+order you pick decides what a crash between the two writes costs. Checkpoint
+first, and a crash loses the batch: the offsets say the lines are stored, and
+they aren't. Parquet first, and a crash stores one batch twice. We take the
+duplicate. The same reasoning covers a power cut: lines still in the buffer
+never reached a checkpoint, so the replay after the reboot stores them, once,
+and skips everything older.
+
+Keying on the file path works because each runc generation writes its own
+capture files, and the process runtime only ever appends. A restarted
+instance is a new file and starts from its first line; an adopted one resumes
+where the store left off. The Apple runtime is the exception: `container
+logs --follow` hands us lines with no offsets, so an adopted Apple container
+is still ingested again after a restart. It's a laptop runtime and the
+comment in `apple.rs` says so.
+
+Last, the old-and-new-instance overlap is real during a rolling deploy, so
+hiding it would be wrong. Each row now records the `instance` that wrote it,
+and when a tail spans more than one instance `relish logs` prefixes each line
+with `[instance]`, the way `relish logs -f` already did. Two clients
+incrementing one counter now look like two clients.
+
+Both new columns are nullable. A node upgraded in place keeps its old Parquet
+files, and DataFusion fills a column a file lacks with nulls; `NULLS FIRST`
+sorts those rows before anything the new binary wrote, which is where they
+belong. `files_without_sequence_or_instance_still_read_and_sort_first`
+writes an old five-column file by hand to prove it.
+
 ## When nothing looks like success
 
 Both hardening passes share a pattern, and later reviews kept finding more of it: a failure that comes back dressed as an empty, successful answer. A directory called `blocked.parquet` made the exporter and both retention loops report success. A peer that sent `200 OK` and then went quiet hung a log query. A node that answered `{}` convinced the diagnostic collector there were no alerts. None of these crash. They lie quietly, which is worse.
@@ -631,7 +776,7 @@ Almost everything in this chapter is a pure data transform: a sample becomes a `
 The three subsystems carry their own tests at the bottom of each source file:
 
 - **Mayo (metrics):** Arrow schema validation, DataFusion SQL over the metrics table, Parquet round-trips, Prometheus text parsing, and the alert state machine. The alert tests read like the transition table itself — `inactive_to_pending_on_breach`, `pending_to_firing_after_duration`, `firing_to_inactive_on_recovery`, `pending_to_inactive_on_recovery`, `missing_metric_does_not_fire`. Each builds an evaluator, feeds it a metric value, and asserts the resulting state. The hardening work added a matching set of failure-path tests, one per edge from the previous section: `query_metric_name_injection_is_neutralised` and `app_metrics_name_injection_cannot_bypass_predicate` (the SQL escape), `resent_window_does_not_double_count` and `restart_resumes_flush_counter_without_clobbering` (idempotent, durable rollups), `stale_telemetry_does_not_resolve_a_firing_alert` (the value-not-boolean state machine), `slack_payload_matches_provider_shape` and `pagerduty_payload_matches_events_v2_shape` (the provider webhook contracts), and `query_proceeds_during_flush` plus `corrupt_parquet_file_does_not_fail_query` (the off-lock flush and corrupt-file skip). Each names the failure it prevents.
-- **Ketchup (logs):** `append_and_query`, grep/tail/time-range filters, and the SQL path (`app` filter, time range, `LIKE` grep, `LIMIT`). The log-path hardening added a matching set of failure tests, one per edge above: `bounded_sql_rejects_non_select`, `bounded_sql_rejects_other_tables` and `bounded_sql_caps_returned_rows` (the seatbelt on `/v1/logs/sql`); `unreachable_node_is_a_partial_failure` and `grep_value_with_ampersand_and_question_mark_transmitted_intact` (honest, correctly-encoded fan-out); `identical_lines_from_two_replicas_both_survive` and `separated_duplicates_from_one_node_dedup` (the stable dedup identity); `reused_filename_with_new_contents_is_not_skipped` (durable checkpoint ids); and `flush_shared_persists_the_buffer_on_shutdown` (the final flush on stop).
+- **Ketchup (logs):** `append_and_query`, grep/tail/time-range filters, and the SQL path (`app` filter, time range, `LIKE` grep, `LIMIT`). The log-path hardening added a matching set of failure tests, one per edge above: `bounded_sql_rejects_non_select`, `bounded_sql_rejects_other_tables` and `bounded_sql_caps_returned_rows` (the seatbelt on `/v1/logs/sql`); `unreachable_node_is_a_partial_failure` and `grep_value_with_ampersand_and_question_mark_transmitted_intact` (honest, correctly-encoded fan-out); `identical_lines_from_two_replicas_both_survive` and `repeated_identical_lines_from_one_node_both_survive` (the `(node, sequence)` dedup identity); `tail_returns_the_newest_lines_in_emission_order`, `lines_within_one_second_keep_emission_order_across_flushes` and `lines_sharing_a_second_come_back_in_sequence_order` (the V02 ordering bugs); `restart_does_not_reingest_lines_already_flushed`, `lines_lost_with_the_buffer_are_ingested_again_after_a_crash` and `refollowing_a_capture_file_replays_the_same_positions_and_the_store_keeps_one_copy` (exactly-once ingestion across restarts); `logs_from_several_instances_name_each_line_s_instance` (labelled tails); `reused_filename_with_new_contents_is_not_skipped` (durable checkpoint ids); and `flush_shared_persists_the_buffer_on_shutdown` (the final flush on stop).
 - **Brioche (dashboard):** HTML rendering, and two security-flavoured tests worth calling out — `render_app_detail_escapes_html` (no stored-XSS through an app name) and `render_app_detail_masks_encrypted_env` (a secret never reaches the page). These are unit tests because the renderer is a pure function from data to a string; you assert on the string.
 
 ### End-to-end: the demo script

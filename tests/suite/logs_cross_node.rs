@@ -123,15 +123,16 @@ async fn three_nodes_merge_sorted() {
     }
 }
 
-/// One node that reports the SAME line twice (a retransmit) collapses that
-/// duplicate — but an identical line from a DIFFERENT replica is a distinct
-/// event and survives (OBS6 / M4: dedup by (node, timestamp, line) identity).
+/// An app that prints the same line twice printed two lines, and an identical
+/// line from a DIFFERENT replica is a third event. Only a row one node reports
+/// twice (same sequence, a retransmit) is a duplicate; see
+/// `ketchup::query::tests::cross_source_duplicates_from_same_node_dedup`.
 #[tokio::test]
-async fn per_node_duplicates_collapse_but_cross_replica_events_survive() {
+async fn repeated_lines_and_cross_replica_events_all_survive() {
     let dir1 = tempfile::tempdir().unwrap();
     let mut store1 = LogStore::new(dir1.path().to_path_buf());
     store1.append_at(1, "web", "default", LogStream::Stdout, "unique to node1");
-    // Same node reports the shared line twice — one real event, retransmitted.
+    // The same node prints the shared line twice in one second: two events.
     store1.append_at(2, "web", "default", LogStream::Stdout, "shared line");
     store1.append_at(2, "web", "default", LogStream::Stdout, "shared line");
     store1.flush().await.unwrap();
@@ -166,15 +167,14 @@ async fn per_node_duplicates_collapse_but_cross_replica_events_survive() {
     .await
     .unwrap();
 
-    // node1's two "shared line" rows collapse to one; node2's "shared line" is
-    // a separate event. So: unique1, shared(node1), shared(node2), unique2 = 4.
+    // unique1, shared(node1) twice, shared(node2), unique2 = 5.
     let shared = result
         .entries
         .iter()
         .filter(|e| e.line == "shared line")
         .count();
-    assert_eq!(shared, 2, "one per replica should survive");
-    assert_eq!(result.entries.len(), 4);
+    assert_eq!(shared, 3, "every printed line should survive");
+    assert_eq!(result.entries.len(), 5);
 }
 
 /// Grep filter is applied per-node before merge.
@@ -234,6 +234,8 @@ async fn partial_results_when_node_unreachable() {
     let entries: Vec<_> = (1..=3)
         .map(|timestamp| LogEntry {
             timestamp,
+            sequence: timestamp,
+            instance: None,
             stream: LogStream::Stdout,
             line: format!("node1 ts={timestamp}"),
         })

@@ -4758,7 +4758,9 @@ async fn logs_cross_node_handler(
         end: query.end,
         grep: query.grep.clone(),
         json_field: None,
-        tail: None, // apply tail after merge
+        // The newest N cluster-wide are among each node's newest N, so every
+        // node sends only its own tail; the merge below trims to N again.
+        tail: query.tail,
     };
 
     // If we have council + membership, do cross-node fan-out

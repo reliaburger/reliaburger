@@ -10,12 +10,14 @@ use std::path::Path;
 use std::time::Duration;
 
 use super::*;
+use crate::grill::capture::CaptureReader;
 use crate::grill::command::{
     ClaimedCommandExecutor, CommandOutput, CommandState, RuntimeCommandExecutor,
 };
 use crate::grill::runc_intent::{
     IntentConfiguration, IntentGeneration, IntentJournal, IntentPhase, RuntimeRole,
 };
+use crate::ketchup::types::{CapturedLine, LogStream};
 
 /// Shared exclusive claims and the executable that starts independent owners.
 #[derive(Clone)]
@@ -875,7 +877,7 @@ impl RuncGrill {
     pub(super) async fn owned_follow_logs(
         &self,
         instance: &InstanceId,
-        sender: tokio::sync::mpsc::Sender<String>,
+        sender: tokio::sync::mpsc::Sender<CapturedLine>,
     ) {
         let source = self
             .owned_operation(instance, |_runtime, _id, context| async move {
@@ -890,31 +892,27 @@ impl RuncGrill {
             return;
         };
         let mut terminal = context.is_none();
-        let mut offsets = [0u64; 2];
-        let mut partial = [String::new(), String::new()];
+        let mut readers = [(LogStream::Stdout, "stdout"), (LogStream::Stderr, "stderr")].map(
+            |(stream, extension)| CaptureReader::new(stream, Some(stem.with_extension(extension))),
+        );
         loop {
-            for (index, extension) in ["stdout", "stderr"].iter().enumerate() {
-                if let Ok(bytes) =
-                    read_from_offset(&stem.with_extension(extension), offsets[index]).await
-                {
-                    offsets[index] += bytes.len() as u64;
-                    partial[index].push_str(&String::from_utf8_lossy(&bytes));
-                    while let Some(newline) = partial[index].find('\n') {
-                        let line: String = partial[index].drain(..=newline).collect();
-                        if sender
-                            .send(line.trim_end_matches('\n').to_owned())
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
+            for reader in &mut readers {
+                let Some(file) = reader.file().map(std::path::Path::to_path_buf) else {
+                    continue;
+                };
+                let Ok(bytes) = read_from_offset(&file, reader.read_offset()).await else {
+                    continue;
+                };
+                for line in reader.push(&bytes) {
+                    if sender.send(line).await.is_err() {
+                        return;
                     }
                 }
             }
             if terminal || sender.is_closed() {
-                for line in &mut partial {
-                    if !line.is_empty() {
-                        let _ = sender.send(std::mem::take(line)).await;
+                for reader in &mut readers {
+                    if let Some(line) = reader.finish() {
+                        let _ = sender.send(line).await;
                     }
                 }
                 return;
