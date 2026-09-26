@@ -139,14 +139,16 @@ def instances_by_node(status):
 
 # --- invariants (pure) -------------------------------------------------------
 
-def sequence_findings(check, values, highest, target=None):
-    """A strictly increasing counter must never go backwards (writer ACKs, redis INCRs)."""
+def sequence_findings(check, values, highest, source, target=None):
+    """Log-view ordering: the writer's ACKs and redis INCRs, as `relish logs`
+    returns them, must keep rising. Still failures, but about the order the
+    log view shows, not what was stored; `source` says what decides that."""
     findings = []
     for before, after in zip(values, values[1:]):
         if after <= before:
-            findings.append(finding(check, "fail", f"went backwards from {before} to {after}", target))
+            findings.append(finding(check, "fail", f"log view went backwards from {before} to {after} ({source})", target))
     if values and highest is not None and values[-1] < highest:
-        findings.append(finding(check, "fail", f"latest value {values[-1]} is below the {highest} acknowledged earlier", target))
+        findings.append(finding(check, "fail", f"log view ends at {values[-1]}, below the {highest} an earlier check saw ({source})", target))
     return findings
 
 
@@ -390,12 +392,18 @@ def evaluate(evidence, snapshot):
             findings.append(finding("ingress-http", "info" if fault_window else "fail",
                                     "podinfo answered " + (http.strip() or "nothing")))
 
-    for check, name, prefix in (("writer-ack", "writer-log.txt", "ACK"), ("redis-counter", "redis-log.txt", "INCR")):
+    # The writer file (writer-gap, writer-regression) is the data-loss check;
+    # these only see lines through the log view. State keeps the old keys.
+    for check, order_check, name, prefix, source in (
+            ("writer-ack", "writer-log-order", "writer-log.txt", "ACK",
+             "line order in the log view; the writer file checks decide data loss"),
+            ("redis-counter", "redis-log-order", "redis-log.txt", "INCR",
+             "line order in the log view, not a read of the stored counter")):
         text = read(snapshot, name)
         if text is None:
             continue
         values = parse_sequence(text, prefix)
-        findings += sequence_findings(check, values, state.get(check))
+        findings += sequence_findings(order_check, values, state.get(check), source)
         if values:
             if values[-1] == state.get(check) and not fault_window:
                 findings.append(finding(check, "warn", f"not advancing at {values[-1]}"))
@@ -851,8 +859,10 @@ def render(evidence, record):
     lines.append("")
     progress = state.get("progress", {})
     lines += ["## Data", "",
-              f"- Volume writer: highest ACK {state.get('writer-ack', 'none')}",
-              f"- Redis counter: highest {state.get('redis-counter', 'none')}"]
+              f"- Volume writer: highest ACK {state.get('writer-ack', 'none')} in the log view; "
+              "the writer file checks (writer-gap, writer-regression) decide data loss, "
+              "and `*-log-order` failures are about the order the log view returned lines in",
+              f"- Redis counter: highest INCR {state.get('redis-counter', 'none')} in the log view"]
     for node, count in sorted(state.get("export_counts", {}).items()):
         lines.append(f"- Export {node}: {count['source']} source files, {count['destination']} at the destination")
     lines.append(f"- Registry images pushed and re-verified: {len(state.get('registry_pushed', []))}")

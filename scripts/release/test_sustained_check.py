@@ -89,12 +89,31 @@ class WriterAndRedis(Evidence):
     def test_redis_counter_going_backwards_within_one_tail_fails(self):
         code, verdict = self.evaluate(self.snapshot(**{"redis__log_txt": "INCR 41\nINCR 42\nINCR 1\nINCR 2\n"}))
         self.assertEqual(code, 1)
-        self.assertIn("redis-counter", self.failures(verdict))
+        self.assertIn("redis-log-order", self.failures(verdict))
 
     def test_redis_counter_below_an_earlier_tail_fails(self):
         self.evaluate(self.snapshot(**{"redis__log_txt": "INCR 41\nINCR 42\n"}))
         code, verdict = self.evaluate(self.snapshot(**{"redis__log_txt": "ERR Could not connect\nINCR 3\nINCR 4\n"}))
-        self.assertIn("redis-counter", self.failures(verdict))
+        self.assertIn("redis-log-order", self.failures(verdict))
+
+    def test_writer_log_going_backwards_is_a_log_order_failure_not_data_loss(self):
+        self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 10\nACK 11\n"}))
+        code, verdict = self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 12\nACK 9\nACK 13\n",
+                                                        "writer__file_txt": "LAST 13\n"}))
+        self.assertEqual(code, 1)
+        self.assertEqual(self.failures(verdict), ["writer-log-order"])
+        detail = next(item["detail"] for item in verdict["findings"] if item["check"] == "writer-log-order")
+        self.assertIn("log view", detail)
+        self.assertIn("writer file", detail)
+
+    def test_log_order_findings_never_claim_data_loss(self):
+        self.evaluate(self.snapshot(**{"redis__log_txt": "INCR 41\nINCR 42\n", "writer__log_txt": "ACK 10\n"}))
+        _, verdict = self.evaluate(self.snapshot(**{"redis__log_txt": "INCR 3\nINCR 2\n", "writer__log_txt": "ACK 5\nACK 4\n"}))
+        details = [item["detail"] for item in verdict["findings"] if item["check"].endswith("-log-order")]
+        self.assertEqual(len(details), 4)
+        for detail in details:
+            self.assertTrue(detail.startswith("log view"), detail)
+            self.assertNotIn("acknowledged", detail)
 
     def test_redis_errors_during_an_outage_do_not_fail(self):
         self.evaluate(self.snapshot(**{"redis__log_txt": "INCR 41\n"}))
@@ -377,6 +396,7 @@ class Record(Evidence):
         self.assertIn("| fault:bun-kill-follower | 2 | 2 | 0 | 0 | 60 s / 60 s |", text)
         self.assertIn("| upgrade | 1 | 0 | 0 | 1 | n/a |", text)
         self.assertIn("highest ACK 20000", text)
+        self.assertIn("the writer file checks (writer-gap, writer-regression) decide data loss", text)
         self.assertIn("not supplied: upgrade slots skipped", text)
         self.assertIn("short leaf lifetimes unavailable", text)
 
