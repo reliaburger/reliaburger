@@ -4884,9 +4884,9 @@ async fn logs_entries_handler(
 
 /// `GET /v1/logs/query/{app}/{namespace}?start=S&end=E&grep=G&tail=N`
 ///
-/// Cross-node log query. Looks up which nodes run the app from the
-/// council placement state, fans out the query to those nodes, and
-/// merge-sorts results by timestamp.
+/// Cross-node log query. Fans out to every live member (an app's lines stay
+/// on each node it ever ran on, see [`crate::ketchup::query::query_targets`])
+/// and merges the answers in ingest order.
 async fn logs_cross_node_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
@@ -4917,41 +4917,31 @@ async fn logs_cross_node_handler(
         let desired = council.desired_state().await;
         let app_id = AppId::new(&app, &namespace);
 
-        // Find which nodes run this app
-        let node_ids: Vec<crate::meat::NodeId> = desired
+        // Where the app runs now; its history may be on any live member.
+        let placed: Vec<String> = desired
             .scheduling
             .get(&app_id)
-            .map(|placements| placements.iter().map(|p| p.node_id.clone()).collect())
+            .map(|placements| placements.iter().map(|p| p.node_id.0.clone()).collect())
             .unwrap_or_default();
-
-        if node_ids.is_empty() {
-            return Json(LogQueryResult {
-                entries: vec![],
-                node_count: 0,
-                warnings: vec![],
+        let live: Vec<(String, String)> = membership
+            .read()
+            .await
+            .iter()
+            .map(|member| {
+                (
+                    member.node_id.0.clone(),
+                    state.cluster_http.url(&member.address.to_string(), ""),
+                )
             })
-            .into_response();
-        }
-
-        // Resolve NodeIds to HTTP URLs via membership table
-        let members = membership.read().await;
-        let mut nodes: Vec<(String, String)> = Vec::new();
-        let mut warnings = Vec::new();
-
-        for node_id in &node_ids {
-            if let Some(info) = members.iter().find(|m| m.node_id == *node_id) {
-                nodes.push((
-                    node_id.0.clone(),
-                    state.cluster_http.url(&info.address.to_string(), ""),
-                ));
-            } else {
-                // No membership entry — can't even reach it. A partial failure.
-                warnings.push(LogQueryWarning::NodeUnresponsive {
-                    node_id: node_id.0.clone(),
-                });
-            }
-        }
-        drop(members);
+            .collect();
+        let targets = crate::ketchup::query::query_targets(&placed, &live);
+        let nodes = targets.reachable;
+        // A placed node with no membership entry can't be reached at all.
+        let mut warnings: Vec<LogQueryWarning> = targets
+            .unreachable
+            .into_iter()
+            .map(|node_id| LogQueryWarning::NodeUnresponsive { node_id })
+            .collect();
 
         let node_count = nodes.len() + warnings.len();
 
