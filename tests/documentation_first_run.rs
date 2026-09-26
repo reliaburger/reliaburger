@@ -632,6 +632,19 @@ fn published_first_run_snippets_do_not_drift() {
     assert_eq!(servers.matches("[testing]\nsafety_class").count(), 1);
     assert!(servers.contains("manual/12_operations.md"));
     assert!(servers.contains("external_signing_key"));
+    // The laptop reaches Node 1's API through `[security] operator_cidrs`,
+    // with the SSH tunnel kept as the alternative. The configured value must
+    // pass the same validation Bun runs at startup.
+    let operator_line = servers
+        .lines()
+        .find(|line| line.starts_with("operator_cidrs = "))
+        .expect("Node 1's config must set operator_cidrs");
+    let node_config =
+        reliaburger::config::NodeConfig::parse(&format!("[security]\n{operator_line}\n")).unwrap();
+    assert!(!node_config.security.operator_cidrs.is_empty());
+    node_config.validate().unwrap();
+    assert!(servers.contains("export RELIABURGER_ENDPOINT=\"https://192.168.0.101:9117\""));
+    assert!(servers.contains("ssh -f -N -L 19117:127.0.0.1:9117"));
 }
 
 /// Every `relish fault` command in the Linux servers guide must parse.

@@ -65,8 +65,9 @@ Ensure the following ports are open:
 
 Bun manages its own nftables perimeter on top of that: once it's running, only
 cluster members (and the `bootstrap_peers` you list in `node.toml`) can reach
-the API, cluster and container host ports. Your host firewall still has to let
-that traffic in. With UFW, run this on every node:
+the API, cluster and container host ports. Your laptop gets in to the API port,
+and only that port, through `operator_cidrs` (see §5.3). Your host firewall
+still has to let that traffic in. With UFW, run this on every node:
 
 ```sh
 for peer in 192.168.0.101 192.168.0.102 192.168.0.103; do
@@ -192,6 +193,8 @@ identity_dir = "/etc/reliaburger/identity"
 master_key_path = "/etc/reliaburger/prod-master.key"
 bootstrap_path = "/etc/reliaburger/prod-security-bootstrap.json"
 bootstrap_peers = ["192.168.0.101", "192.168.0.102", "192.168.0.103"]
+# Your laptop's address (or network): admitted to the API port only, see §5.3
+operator_cidrs = ["192.168.0.50/32"]
 
 [ebpf]
 enabled = true
@@ -571,27 +574,49 @@ scp user@192.168.0.101:.reliaburger/root-ca.crt ~/.reliaburger/root-ca.crt
 
 ---
 
-### 5.3 Connect through SSH and set the environment
+### 5.3 Reach the API and set the environment
 
-Bun's perimeter firewall only admits cluster members to port 9117, so your
-laptop reaches the API through an SSH tunnel. The tunnel delivers your requests
-to Node 1 on loopback, which the perimeter always lets through. Relish checks the
-node certificate against the cluster CA rather than a host name, so the
-`127.0.0.1` endpoint verifies fine:
+Bun's perimeter firewall drops port 9117 from anything that isn't a cluster
+member, a bootstrap peer, or an address in `[security] operator_cidrs`. Node 1's
+config in §3.2 lists `192.168.0.50/32`; put your laptop's address (or your
+admin network, e.g. `192.168.0.0/24`) there instead, and restart Bun if you
+change it later:
+
+```sh
+sudo systemctl restart reliaburger.service
+```
+
+It only opens the API port (never gossip, Raft or reporting), and every call
+still needs your token and verifies against the cluster CA. Bun refuses to start
+on a malformed entry, a `/0`, or a CIDR with host bits set. If you run UFW,
+let your laptop through to the API on Node 1 as well:
+
+```sh
+sudo ufw allow proto tcp from 192.168.0.50 to any port 9117
+```
+
+Then point `relish` at Node 1, the CA certificate, and the admin token from
+§5.2:
+
+#### On macOS / Linux / WSL (Zsh or Bash):
+```sh
+export RELIABURGER_ENDPOINT="https://192.168.0.101:9117"
+export RELIABURGER_CA_CERT="$HOME/.reliaburger/root-ca.crt"
+export RELIABURGER_TOKEN="$(cat ~/.reliaburger/admin.token)"
+```
+
+#### Alternative: an SSH tunnel
+
+If you'd rather not open 9117 to any extra address (or your laptop's address
+keeps changing), leave `operator_cidrs` out and tunnel instead. The tunnel
+delivers your requests to Node 1 on loopback, which the perimeter always lets
+through. Relish checks the node certificate against the cluster CA rather than
+a host name, so the `127.0.0.1` endpoint verifies fine:
 
 ```sh
 # Forward local port 19117 to Node 1's API, in the background
 ssh -f -N -L 19117:127.0.0.1:9117 user@192.168.0.101
-```
-
-Then point `relish` at the tunnel, the CA certificate, and the admin token
-from §5.2:
-
-#### On macOS / Linux / WSL (Zsh or Bash):
-```sh
 export RELIABURGER_ENDPOINT="https://127.0.0.1:19117"
-export RELIABURGER_CA_CERT="$HOME/.reliaburger/root-ca.crt"
-export RELIABURGER_TOKEN="$(cat ~/.reliaburger/admin.token)"
 ```
 
 The endpoint and CA path are safe to add to your `~/.zshrc` or `~/.bashrc`.
