@@ -275,6 +275,11 @@ mutate the Apple daemon, and their recovery guarantees are not yet complete.
 The adapter and its manual development tests remain in the repository for future
 work; they are outside the 0.1.0 runtime profile.
 
+### Linux containers: pre-existing Linux VMs
+
+For 0.1.0, you can also deploy reliaburger to pre-existing Linux VMs or bare-metal servers
+if you already have that computing power available. Check this [procedure here](quickstart-2.md).
+
 ### ProcessGrill (built-in fallback)
 
 Spawns native processes on macOS and Linux, without namespaces, cgroups or rootfs
