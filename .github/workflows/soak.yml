@@ -11,9 +11,6 @@ name: V02 soak
 # No soak build is signed here, so the upgrade slots are skipped and the
 # record says so.
 on:
-  # TEMPORARY: proving runs before the workflow exists on main.
-  push:
-    branches: [ci/soak-workflow]
   workflow_dispatch:
     inputs:
       staging_tag:
@@ -53,16 +50,12 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 355
     env:
-      STAGING_TAG: ${{ inputs.staging_tag || 'staging-v0.1.0-36173986955-1' }}
-      QUALIFIED_DIGEST: ${{ inputs.qualified_digest || 'e5acdbf0e9fc61508dcaf9460e2a79b73fcf10fb94b8a27ff4e4962636950b51' }}
-      SOAK_DURATION: ${{ inputs.duration || '30m' }}
-      SOAK_SCHEDULE: ${{ inputs.schedule || 'compressed' }}
+      STAGING_TAG: ${{ inputs.staging_tag }}
+      QUALIFIED_DIGEST: ${{ inputs.qualified_digest }}
+      SOAK_DURATION: ${{ inputs.duration }}
+      SOAK_SCHEDULE: ${{ inputs.schedule }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Shellcheck the harness (TEMPORARY)
-        continue-on-error: true
-        run: shellcheck --version && shellcheck scripts/release/qualify-sustained.sh scripts/release/qualify-staged-install.sh
 
       - name: Check the inputs fit in one hosted job
         run: |
