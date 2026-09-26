@@ -512,6 +512,33 @@ Can you see why we need all three? The reporting tree is accurate but bounded by
 
 There's a subtlety worth noting. During a network partition, a node might be marked Dead by gossip even though it's still running containers. If those containers serve same-node clients (loopback connections never touch the network), they keep working — the partitioned node's *local* service map still has them, and the local map always wins in the merge. Only cross-node connections are affected, which is exactly what you'd expect from a partition. When it heals, Mustard's incarnation counter (remember that from Chapter 2?) rejoins the node cleanly and its backends reappear in the next catalogue.
 
+#### Silence isn't absence
+
+"The new leader inherits the last catalogue and republishes from its own reports" hides a trap, and the V02 soak walked straight into it. A new leader's report aggregator starts empty on purpose: reports received under the old term don't count as current truth, so a stale report can't convince the scheduler that something still runs. For the first few seconds of a term the leader has heard from almost nobody. Its first catalogue rebuild therefore said that nearly every service had no backends, it committed that, and every node dutifully installed it. The connect hook, faithful as ever, answered `EPERM` for every VIP whose backends had "vanished". In the soak a Redis client on the same node as Redis got `Operation not permitted` for two seconds after the leader was killed, and a client elsewhere lost Redis for much longer when the Redis node's Bun was SIGKILLed mid-deploy and took its time to report again. The containers never stopped. Only the leader's knowledge of them did.
+
+The fix is a rule that the scheduler already follows for placement (an unheard node keeps what it runs): *a node that hasn't reported under this leader keeps the backends the committed catalogue gave it*, as long as gossip still counts it as a member at the same address:
+
+```rust
+for backend in &service.backends {
+    let node_id = NodeId::new(&backend.node_id);
+    let still_there = members.iter().any(|member| {
+        member.node_id == node_id
+            && matches!(member.state, NodeState::Alive | NodeState::Suspect)
+            && member.address.ip() == std::net::IpAddr::V4(backend.node_ip)
+    });
+    if still_there
+        && !reports.reports.contains_key(&node_id)
+        && !desired.producer_retirements.blocks(&backend.node_id, backend.execution.as_ref())
+    {
+        backends.push(backend.clone());
+    }
+}
+```
+
+`matches!` is the boolean form of `match`: it's true when the value fits the pattern, and `Alive | Suspect` is one pattern with two alternatives. It saves a four-line `match` that returns `true` or `false`.
+
+Everything that should still remove a backend still does. The node's own report is authoritative the moment it arrives, even when it names nothing. A Dead or Left member, or one that came back at a different address, can't be serving there. A producer retirement (the node asking to release an address) still withdraws the backend, so carrying it forward never blocks an address release for longer than the retirement protocol already does. What we gave up is a small window in which a node that silently lost an instance *and* hasn't reported yet keeps advertising it. A connection there gets `ECONNREFUSED` from a closed port, which is what a crashed backend looks like anyway, rather than `EPERM` from a hook refusing a service that's alive.
+
 ### Why userspace DNS, not eBPF?
 
 The original design called for fully in-kernel DNS interception using `cgroup/sendmsg4` and `cgroup/recvmsg4` eBPF hooks. We tried it. It doesn't work *at those hooks*.

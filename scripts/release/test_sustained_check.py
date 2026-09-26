@@ -237,6 +237,80 @@ class Exports(Evidence):
         self.assertEqual(self.failures(verdict), ["snapshot-missing"])
 
 
+class Registry(Evidence):
+    """Pickle refuses tag reads without a leader; that's not the same as losing an image."""
+
+    MANIFEST = b'{"schemaVersion": 2}'
+    BLOB = b"layer"
+
+    def push_state(self):
+        state = checker.load_state(self.evidence)
+        state["registry_pushed"] = [{"tag": "baseline",
+                                     "manifest": "sha256:" + checker.hashlib.sha256(self.MANIFEST).hexdigest(),
+                                     "blobs": ["sha256:" + checker.hashlib.sha256(self.BLOB).hexdigest()]}]
+        checker.save_state(self.evidence, state)
+
+    def verify(self, manifest_answers):
+        """Run `registry verify` against canned answers for the manifest GETs."""
+        self.push_state()
+        answers = list(manifest_answers)
+        calls = []
+
+        def request(args, method, path, body=None, headers=None):
+            calls.append(path)
+            if "/manifests/" in path:
+                status, body = answers.pop(0)
+                return status, {}, body
+            return 200, {}, self.BLOB
+
+        args = type("Args", (), {"evidence": self.evidence, "action": "verify"})()
+        original, sleep = checker.registry_request, checker.time.sleep
+        checker.registry_request, checker.time.sleep = request, lambda _: None
+        try:
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                checker.registry_command(args)
+        finally:
+            checker.registry_request, checker.time.sleep = original, sleep
+        return json.loads(out.getvalue()), calls
+
+    def test_a_brief_503_is_retried_and_not_reported(self):
+        result, calls = self.verify([(503, b""), (200, self.MANIFEST)])
+        self.assertEqual((result["problems"], result["unavailable"]), ([], []))
+        self.assertEqual(sum("/manifests/" in path for path in calls), 2)
+
+    def test_a_lasting_503_is_unavailable_not_a_problem(self):
+        result, calls = self.verify([(503, b"")] * checker.REGISTRY_UNAVAILABLE_TRIES)
+        self.assertEqual(result["problems"], [])
+        self.assertEqual(len(result["unavailable"]), 1)
+        self.assertEqual(sum("/manifests/" in path for path in calls), checker.REGISTRY_UNAVAILABLE_TRIES)
+
+    def test_changed_or_missing_bytes_are_problems_at_once(self):
+        for answer, words in (((200, b"other"), "changed"), ((404, b""), "returned 404")):
+            result, calls = self.verify([answer])
+            self.assertEqual(len(result["problems"]), 1)
+            self.assertIn(words, result["problems"][0])
+            self.assertEqual(sum("/manifests/" in path for path in calls), 1)
+
+    def test_unavailable_registry_is_info_inside_a_fault_window(self):
+        state = checker.load_state(self.evidence)
+        state["window"] = "quorum-loss"
+        checker.save_state(self.evidence, state)
+        _, verdict = self.evaluate(self.snapshot(registry_json={"problems": [], "unavailable": ["x returned 503"]}))
+        self.assertNotIn("registry", self.failures(verdict))
+
+    def test_unavailable_registry_fails_outside_a_fault_window(self):
+        _, verdict = self.evaluate(self.snapshot(registry_json={"problems": [], "unavailable": ["x returned 503"]}))
+        self.assertIn("registry", self.failures(verdict))
+
+    def test_changed_image_fails_even_inside_a_fault_window(self):
+        state = checker.load_state(self.evidence)
+        state["window"] = "quorum-loss"
+        checker.save_state(self.evidence, state)
+        _, verdict = self.evaluate(self.snapshot(registry_json={"problems": ["x changed"], "unavailable": []}))
+        self.assertIn("registry", self.failures(verdict))
+
+
 class Recovery(Evidence):
     def test_one_leader_and_three_voters_settle(self):
         code, verdict = self.evaluate(self.snapshot(kind="settle", **{

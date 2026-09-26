@@ -50,6 +50,11 @@ RSS_GROWTH = 1.25
 FD_WINDOW = 6 * 3600
 REPEAT_WINDOW = 1800
 LEAK_KINDS = ("runc", "netns", "lease", "veth", "cgroup", "bpf", "listen")
+# Pickle resolves every tag through the council's committed catalogue and
+# answers 503 while there is no leader. A few tries ride out an election;
+# a quorum loss outlasts them and is judged against the fault window.
+REGISTRY_UNAVAILABLE_TRIES = 3
+REGISTRY_UNAVAILABLE_PAUSE = 5
 
 
 # --- state -----------------------------------------------------------------
@@ -461,6 +466,10 @@ def evaluate(evidence, snapshot):
     if registry is not None:
         for problem in registry.get("problems", []):
             findings.append(finding("registry", "fail", problem))
+        # Refusing reads without a leader is Pickle failing closed, not data
+        # loss. Outside a fault window nothing excuses it.
+        for problem in registry.get("unavailable", []):
+            findings.append(finding("registry", "info" if fault_window else "fail", problem))
 
     clean = None
     if meta.get("kind") in ("settle", "heavy"):
@@ -668,6 +677,27 @@ def registry_push_blob(args, repository, data):
     return digest
 
 
+def registry_get(args, path, headers=None):
+    """GET from Pickle, retrying a 503 a bounded number of times."""
+    for attempt in range(REGISTRY_UNAVAILABLE_TRIES):
+        if attempt:
+            time.sleep(REGISTRY_UNAVAILABLE_PAUSE)
+        status, _, body = registry_request(args, "GET", path, None, headers)
+        if status != 503:
+            break
+    return status, body
+
+
+def registry_judge(result, what, status, body, digest):
+    """A 503 means the catalogue is unavailable; anything else must be the exact bytes."""
+    if status == 503:
+        result["unavailable"].append(f"{what} returned 503 after {REGISTRY_UNAVAILABLE_TRIES} tries")
+    elif status != 200:
+        result["problems"].append(f"{what} returned {status}")
+    elif "sha256:" + hashlib.sha256(body).hexdigest() != digest:
+        result["problems"].append(f"{what} changed")
+
+
 def registry_command(args):
     """Push a tiny unique image, or re-fetch every pushed one and check its bytes."""
     state = load_state(args.evidence)
@@ -693,15 +723,14 @@ def registry_command(args):
                            "blobs": [layer_digest, config_digest]})
             result["pushed"] = args.tag
         else:
+            result["unavailable"] = []
             for image in pushed:
-                status, _, body = registry_request(args, "GET", f"/v2/{repository}/manifests/{image['tag']}", None,
-                                                   {"Accept": "application/vnd.oci.image.manifest.v1+json"})
-                if status != 200 or "sha256:" + hashlib.sha256(body).hexdigest() != image["manifest"]:
-                    result["problems"].append(f"{repository}:{image['tag']} manifest returned {status} or changed")
+                status, body = registry_get(args, f"/v2/{repository}/manifests/{image['tag']}",
+                                            {"Accept": "application/vnd.oci.image.manifest.v1+json"})
+                registry_judge(result, f"{repository}:{image['tag']} manifest", status, body, image["manifest"])
                 for digest in image["blobs"]:
-                    status, _, body = registry_request(args, "GET", f"/v2/{repository}/blobs/{digest}")
-                    if status != 200 or "sha256:" + hashlib.sha256(body).hexdigest() != digest:
-                        result["problems"].append(f"{repository} blob {digest[:19]} returned {status} or changed")
+                    status, body = registry_get(args, f"/v2/{repository}/blobs/{digest}")
+                    registry_judge(result, f"{repository} blob {digest[:19]}", status, body, digest)
                 result["checked"] += 1
     except (OSError, RuntimeError, ssl.SSLError, http.client.HTTPException) as error:
         # Unreachable is not data loss; the next check retries.
