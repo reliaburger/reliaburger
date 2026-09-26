@@ -207,6 +207,7 @@ mod tests {
             timeout,
             deadline: crate::testkit::deadline::Deadline::after(timeout).unwrap(),
             peer_route: crate::testkit::context::PeerRoute::Direct,
+            wait_note: Default::default(),
         };
         let case = cases()
             .into_iter()
