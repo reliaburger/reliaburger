@@ -1923,6 +1923,19 @@ the parent's setup and the child's later calculation can't race into an
 accidental OOM. `memory.swap.max = 0` also keeps the evidence about resident
 pressure rather than swap throughput.
 
+The helper sizes its ballast once. It doesn't chase the target afterwards: if
+other processes free memory, node usage drifts below 90%, and if they grow, it
+drifts above. We considered a loop that tops the ballast up and gives it back,
+and said no. A ballast that shrinks whenever the workload grows hands the
+workload the very memory the experiment was meant to take away, and a control
+loop fighting the kernel's reclaim is a new source of flakiness rather than a
+fault. The acceptance test learned this the hard way. It used to assert the
+node-wide `MemTotal - MemAvailable` after apply, and on a CI runner still
+reclaiming the previous suite that figure came in 100 MB short of a target the
+helper had hit exactly. It now checks what the controller promises: the
+helper cgroup's `memory.current` holds the delta measured just before apply,
+and stays under `memory.max`.
+
 This helper runs before Bun constructs Tokio's runtime. We replaced
 `#[tokio::main]` with an ordinary `main` which handles the hidden synchronous
 subcommand first and explicitly builds the normal multi-thread runtime for the

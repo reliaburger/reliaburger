@@ -99,7 +99,12 @@ Bun is the userspace agent that manages containers on each node. Smoker uses Bun
 - **Node-pressure control.** Whole-node CPU/memory pressure uses a separate,
   Bun-owned cgroup and child helper. Bun itself never joins the pressured
   cgroup. The operator must opt in with the server's `saturate_capacity`
-  permission and zero-by-default CPU/memory ceilings.
+  permission and zero-by-default CPU/memory ceilings. `--memory N%` means
+  "bring node usage to N%": the helper reads `MemAvailable` once after
+  joining its cgroup and holds that delta resident for the fault's lifetime.
+  It does not top up or release ballast as other processes' usage moves, so
+  the node-wide figure drifts with the background; the guarantee is the
+  helper cgroup's resident charge, capped by `memory.max` at N% of RAM.
 - **Process signals.** Process faults (SIGKILL, SIGSTOP, SIGCONT) are sent by Bun to the container's PID namespace via `kill(2)`.
 - **Fault lifecycle.** Bun tracks active faults, enforces expiry timers, and cleans up fault state on expiry, crash recovery, or explicit `relish fault clear`.
 

@@ -10,7 +10,8 @@ use reliaburger::smoker::node_pressure::{
 };
 use reliaburger::smoker::types::FaultId;
 
-fn pressure_target() -> (u8, u64) {
+/// A memory-usage target a few points above the node's current usage.
+fn pressure_target() -> u8 {
     let meminfo = std::fs::read_to_string("/proc/meminfo").expect("read meminfo");
     let (total, available) = parse_linux_meminfo(&meminfo).expect("parse meminfo");
     let used = total.saturating_sub(available);
@@ -20,9 +21,8 @@ fn pressure_target() -> (u8, u64) {
         / total.max(1);
     // Target three points above current usage, not one: the delta must dwarf
     // the tens of megabytes a live host reclaims and frees on its own, or the
-    // reached-the-target assertion measures noise instead of the helper.
-    let target = u8::try_from(used_percentage_ceiling.saturating_add(3).min(90)).unwrap();
-    (target, memory_bytes_to_target(total, available, target))
+    // resident-ballast assertion measures noise instead of the helper.
+    u8::try_from(used_percentage_ceiling.saturating_add(3).min(90)).unwrap()
 }
 
 #[tokio::test]
@@ -39,10 +39,7 @@ async fn node_pressure_consumes_capacity_outside_bun_and_cleans_up() {
     // snapshotting the target, or the baseline is a moving number.
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-    let (memory_percentage, expected_memory_bytes) = pressure_target();
-    eprintln!(
-        "requesting {memory_percentage}% memory pressure (initial delta {expected_memory_bytes} bytes)"
-    );
+    let memory_percentage = pressure_target();
     let limits = NodePressureLimits {
         max_cpu_percentage: 5,
         max_memory_percentage: memory_percentage,
@@ -56,6 +53,14 @@ async fn node_pressure_consumes_capacity_outside_bun_and_cleans_up() {
         "rootful cgroup-v2 controller should be available"
     );
 
+    // Snapshot the delta right before apply, so only the milliseconds until
+    // the helper's own MemAvailable read separate the two measurements.
+    let meminfo = std::fs::read_to_string("/proc/meminfo").expect("read meminfo");
+    let (total, available) = parse_linux_meminfo(&meminfo).expect("parse meminfo");
+    let expected_memory_bytes = memory_bytes_to_target(total, available, memory_percentage);
+    eprintln!(
+        "requesting {memory_percentage}% memory pressure (delta {expected_memory_bytes} bytes)"
+    );
     let id = FaultId(42_424);
     controller
         .apply(id, 5, memory_percentage)
@@ -83,7 +88,7 @@ async fn node_pressure_consumes_capacity_outside_bun_and_cleans_up() {
         )
     );
     let meminfo = std::fs::read_to_string("/proc/meminfo").expect("read meminfo after pressure");
-    let (total, available) = parse_linux_meminfo(&meminfo).expect("parse meminfo after pressure");
+    let (total, _) = parse_linux_meminfo(&meminfo).expect("parse meminfo after pressure");
     let target_bytes = node_memory_max(total, memory_percentage);
     // Hosted runners use memory-balloon drivers, so MemTotal can drift a few
     // kilobytes between the controller's read and this one. The ceiling only
@@ -112,23 +117,31 @@ async fn node_pressure_consumes_capacity_outside_bun_and_cleans_up() {
     let parent_membership = std::fs::read_to_string("/proc/self/cgroup").unwrap();
     assert!(!parent_membership.contains("reliaburger-chaos/fault-42424"));
 
-    let used_after = total.saturating_sub(available);
+    // The helper sizes its ballast once, from the node's usage at the moment
+    // it joins the cgroup; it does not chase the node-wide figure afterwards.
+    // Other processes on a shared runner keep allocating and freeing (the
+    // previous suite's teardown can hand back 100 MB after the helper has
+    // read MemAvailable), so `MemTotal - MemAvailable` measured here is not
+    // what the controller promises. What it does promise is that the helper
+    // cgroup holds the delta it was asked for, resident and charged. The
+    // helper's read happens milliseconds after ours, so the tolerance only
+    // covers background growth inside that window plus the helper's own
+    // pre-join footprint.
     let measurement_tolerance = 64 * 1024 * 1024;
+    let helper_memory = std::fs::read_to_string(cgroup.join("memory.current"))
+        .unwrap()
+        .trim()
+        .parse::<u64>()
+        .unwrap();
     assert!(
-        used_after.saturating_add(measurement_tolerance) >= target_bytes,
-        "node uses {used_after} bytes, below the {target_bytes}-byte target"
+        helper_memory.saturating_add(measurement_tolerance) >= expected_memory_bytes,
+        "helper cgroup holds {helper_memory} bytes, below the requested \
+         {expected_memory_bytes}-byte delta"
     );
-    if expected_memory_bytes >= 32 * 1024 * 1024 {
-        let helper_memory = std::fs::read_to_string(cgroup.join("memory.current"))
-            .unwrap()
-            .trim()
-            .parse::<u64>()
-            .unwrap();
-        assert!(
-            helper_memory >= 16 * 1024 * 1024,
-            "helper cgroup made only {helper_memory} bytes resident"
-        );
-    }
+    assert!(
+        helper_memory <= memory_ceiling,
+        "helper cgroup holds {helper_memory} bytes, above its {memory_ceiling}-byte ceiling"
+    );
 
     controller.clear(id).await.expect("clear node pressure");
     assert!(!cgroup.exists(), "clear must remove the owned cgroup");
