@@ -16,7 +16,9 @@
 #   --base-url URL          staged candidate directory (the staging pre-release)
 #   --qualified-digest SHA  require candidate.json to have this SHA-256
 #   --soak-bun PATH         signed soak build named bun-v0.1.0-soak.1 with PATH.sig
-#                           beside it; without it the upgrade slots are skipped
+#                           (release signature) beside it; the harness adds the
+#                           operator signature to a copy (OpenSSL 3 needed);
+#                           without it the upgrade slots are skipped
 #   --tier T                fast (compressed schedule, 90m: the iteration loop
 #                           after each round of fixes) or final (full schedule,
 #                           8h: the acceptance run on the final candidate)
@@ -190,6 +192,41 @@ meta_get() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get
 
 # Kill a command that outlives its budget (macOS has no timeout(1)).
 with_timeout() { perl -e 'alarm shift; exec @ARGV or die "exec: $!\n"' "$@"; }
+
+# --- the operator signature -----------------------------------------------------
+
+# Network upgrades, and a cluster's `upgrade start --binary` is one (the nodes
+# fetch it from the registry), need a second signature from the operator's key
+# in [upgrades] external_signing_key. The soak plays the operator: a throwaway
+# Ed25519 key, kept in the evidence so --resume reuses it, and a copy of the
+# soak build's envelope with that key's signature added. The release signature
+# is copied as it is; the release key is never needed. openssl rather than
+# `relish dev countersign-binary`, so it works whatever relish the candidate has.
+operator_public=
+soak_sig=
+countersign_soak_bun() {
+    local key=$evidence/config/operator.key signature
+    if [ ! -f "$key" ]; then
+        [ "$resume" = false ] || fail '--soak-bun on --resume needs a run that started with --soak-bun'
+        (umask 077 && openssl genpkey -algorithm ed25519 -outform DER -out "$key" 2>/dev/null) \
+            || fail 'openssl cannot make an Ed25519 key (OpenSSL 3 is needed, not LibreSSL)'
+    fi
+    operator_public="ed25519:$(openssl pkey -inform DER -in "$key" -pubout -outform DER | tail -c 32 | base64 | tr -d '\n')"
+    signature=$(openssl pkeyutl -sign -inkey "$key" -keyform DER -rawin -in "$soak_bun" | base64 | tr -d '\n') \
+        || fail 'openssl cannot sign with Ed25519 (OpenSSL 3 is needed, not LibreSSL)'
+    mkdir -p "$evidence/upgrade"
+    soak_sig=$evidence/upgrade/${soak_bun##*/}.sig
+    python3 - "$soak_bun.sig" "$soak_sig" "$(sha256 "$soak_bun")" "$signature" <<'PY' || fail "$soak_bun.sig does not belong to $soak_bun"
+import json, sys
+source, target, digest, signature = sys.argv[1:]
+envelope = json.load(open(source))
+if envelope.get("sha256", "").lower() != digest or not envelope.get("embedded"):
+    sys.exit(1)
+envelope["external"] = signature
+json.dump(envelope, open(target, "w"), indent=2)
+PY
+}
+[ -z "$soak_bun" ] || countersign_soak_bun
 
 # --- the cluster --------------------------------------------------------------
 
@@ -476,6 +513,9 @@ configure_nodes() {
     meta deviations+ 'node.toml `[logs]`/`[metrics]` export to file:///var/lib/reliaburger/soak-export every 60 s with max_storage_mb = 8, `[storage.snapshots]` every 900 s (compressed: 120 s), retain 4, uploaded to the same directory'
     meta deviations+ 'node.toml `[ingress] tls_cert/tls_key` point at an operator pair from a soak CA, 45-minute leaves rotated by the harness'
     meta deviations+ 'node.toml `[node.labels] soak-volume` = "writer" on node 2 and "redis" on node 3, to pin the volume apps'
+    if [ -n "$operator_public" ]; then
+        meta deviations+ "node.toml \`[upgrades] external_signing_key\` = a throwaway operator key the harness made for this run (\`$operator_public\`); the soak build's \`.sig\` gets that key's external signature beside the release one (D2)"
+    fi
     if [ "$leaf_supported" = yes ]; then
         meta deviations+ "node.toml \`[security] leaf_lifetime_override_secs = $leaf_lifetime\` (D1)"
         meta leaf_lifetime_secs "json:$leaf_lifetime"
@@ -502,6 +542,7 @@ configure_nodes() {
         )
         [ -z "$label" ] || settings+=("node.labels.soak-volume=\"$label\"")
         [ "$leaf_supported" != yes ] || settings+=("security.leaf_lifetime_override_secs=$leaf_lifetime")
+        [ -z "$operator_public" ] || settings+=("upgrades.external_signing_key=\"$operator_public\"")
         check toml-set "$evidence/config/node-$node.soak.toml" "${settings[@]}"
         push_pair "$node" "$tls/current/cert.pem" "$tls/current/key.pem"
         gsh_in "$node" < <(printf 'set -e\numask 077\nmkdir -p /var/lib/reliaburger/soak-export\ncat > /etc/reliaburger/node.toml.new <<"TOML"\n%s\nTOML\nmv /etc/reliaburger/node.toml.new /etc/reliaburger/node.toml\n' "$(cat "$evidence/config/node-$node.soak.toml")")
@@ -883,6 +924,20 @@ slot_power_off() {
     settle fault:power-off 480 || true
 }
 
+# Every chaos kind against the rails: kill and pause meet the replica minimum,
+# so they aim at the three-replica frontend, one replica at a time; delay,
+# drop, partition and dns are network faults, which no replica rail guards;
+# the scenario runs its own checks.
+# Print one running instance of APP, or nothing unless at least two run.
+one_of_several() {
+    rel --output json status > "$evidence/.chaos-status.json" 2>/dev/null || return 0
+    python3 - "$evidence/.chaos-status.json" "$1" <<'PY'
+import json, sys
+ids = sorted(i["id"] for i in json.load(open(sys.argv[1])) if i["app_name"] == sys.argv[2] and i["state"] == "running")
+print(ids[0] if len(ids) >= 2 else "")
+PY
+}
+
 chaos_index=0
 slot_chaos() {
     local round
@@ -890,7 +945,7 @@ slot_chaos() {
 }
 
 chaos_one() {
-    local kinds=(kill delay partition scenario pause drop dns) kind result=0 output=$evidence/snapshots/chaos-$chaos_index.log
+    local kinds=(kill delay partition scenario pause drop dns) kind instance result=0 output=$evidence/snapshots/chaos-$chaos_index.log
     kind=${kinds[chaos_index % ${#kinds[@]}]}
     chaos_index=$(( chaos_index + 1 ))
     say "fault: chaos $kind"
@@ -900,7 +955,15 @@ chaos_one() {
         kill) rel fault kill frontend --count 1 --acknowledge --reason v02 > "$output" 2>&1 || result=$? ;;
         delay) rel fault delay frontend 200ms --duration 60s --acknowledge --reason v02 > "$output" 2>&1 || result=$? ;;
         partition) rel fault partition soak-redis --from soak-redis-client --duration 60s --acknowledge --reason v02 > "$output" 2>&1 || result=$? ;;
-        pause) rel fault pause soak-spammer --duration 60s --acknowledge --reason v02 > "$output" 2>&1 || result=$? ;;
+        # One frontend instance: the replica-minimum rail counts an unscoped
+        # pause as freezing every replica, and refuses it whatever the count.
+        pause)
+            instance=$(one_of_several frontend)
+            if [ -n "$instance" ]; then
+                rel fault pause frontend --instance "$instance" --duration 60s --acknowledge --reason v02 > "$output" 2>&1 || result=$?
+            else
+                printf 'fewer than two running frontend instances to pause one of\n' > "$output"; result=1
+            fi ;;
         drop) rel fault drop frontend 10% --duration 60s --acknowledge --reason v02 > "$output" 2>&1 || result=$? ;;
         dns) rel fault dns soak-redis nxdomain --duration 60s --acknowledge --reason v02 > "$output" 2>&1 || result=$? ;;
         scenario)
@@ -1012,7 +1075,8 @@ slot_upgrade() {
     [ "$schedule" = full ] || inject=1
     say "upgrade walk $upgrade_walks to $target$([ "$inject" -eq 1 ] && echo ', with a fault mid-walk')"
     open_window upgrade
-    with_timeout 300 "$limactl" copy "$soak_bun" "$soak_bun.sig" "${vm[1]}:/var/tmp/" > /dev/null
+    # The countersigned envelope, under the name upgrade start looks for.
+    with_timeout 300 "$limactl" copy "$soak_bun" "$soak_sig" "${vm[1]}:/var/tmp/" > /dev/null
     gsh 1 "install -m 600 /dev/null /root/.soak-token && cat > /root/.soak-token" < "$evidence/.token"
     started=$(date +%s)
     gsh 1 "RELIABURGER_TOKEN=\$(cat /root/.soak-token) relish --endpoint https://127.0.0.1:9117 --ca-cert /etc/reliaburger/identity/root-ca.crt upgrade start --binary /var/tmp/$name --registry ${address[1]}:5050 --allow-downgrade" \

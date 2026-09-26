@@ -30,12 +30,20 @@ It needs three things on every node:
 - **Two signatures for network upgrades**: the release's, checked against the
   key compiled into the running binary, and your own, from the key you name in
   `[upgrades] external_signing_key`. Generate that keypair with
-  `relish dev keygen --out keys/` and countersign each release binary with
-  `relish dev sign-binary`.
+  `relish dev keygen --out keys/` (or
+  `openssl genpkey -algorithm ed25519 -outform DER -out operator.key`) and
+  countersign each release binary with
+  `relish dev countersign-binary --external-key keys/release.key bun-v0.2.0`.
+  That adds your signature to the release's `bun-v0.2.0.sig` and leaves the
+  release signature as it is; it also prints the `ed25519:…` public key to
+  put in node.toml.
 
-For air-gapped clusters, `relish upgrade start --binary ./bun-v0.2.0` rolls a
-local binary instead. It needs only the release signature, in
-`bun-v0.2.0.sig` beside it (or `--sig`).
+`relish upgrade start --binary ./bun-v0.2.0` rolls a local binary instead of
+downloading one, with its signatures in `bun-v0.2.0.sig` beside it (or
+`--sig`). On a single node that's an air-gapped upgrade and needs only the
+release signature. In a cluster the other nodes fetch the binary from the
+registry, which counts as the network, so every node wants both signatures:
+countersign it first.
 
 relish pushes the binary to the registry of the node it's connected to and
 tells the other nodes to fetch it from that node's cluster address. From a

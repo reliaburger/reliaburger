@@ -1122,22 +1122,54 @@ pub fn sign_binary(
         external,
     };
 
-    // Default output appends ".sig" (with_extension would eat "0" from
-    // a name like bun-v0.2.0).
-    let sig_path = match out {
-        Some(path) => path.to_path_buf(),
-        None => {
-            let mut name = binary
-                .file_name()
-                .map(|n| n.to_os_string())
-                .unwrap_or_default();
-            name.push(".sig");
-            binary.with_file_name(name)
-        }
-    };
+    let sig_path = out
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| sidecar_sig_path(binary));
     envelope.store(&sig_path)?;
     println!("sign-binary: wrote {}", sig_path.display());
     Ok(())
+}
+
+/// Add the operator's external signature to a binary's existing envelope.
+///
+/// Reads the release envelope from `sig` (default `{binary}.sig`), signs the
+/// binary with `external_key` and writes the envelope back (or to `out`).
+/// The release signature is copied, never recomputed, so this needs no
+/// release key. Returns the external public key, in the `ed25519:` form
+/// `[upgrades] external_signing_key` takes.
+pub fn countersign_binary(
+    external_key: &std::path::Path,
+    binary: &std::path::Path,
+    sig: Option<&std::path::Path>,
+    out: Option<&std::path::Path>,
+) -> Result<String, RelishError> {
+    use crate::upgrade::signing::{self, SignatureEnvelope};
+
+    let sig_path = sig
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| sidecar_sig_path(binary));
+    let envelope = SignatureEnvelope::load(&sig_path)?;
+    let bytes = std::fs::read(binary)?;
+    let pkcs8 = std::fs::read(external_key)?;
+    let countersigned = signing::countersign(&envelope, &pkcs8, &bytes)?;
+    let public = signing::encode_public_key(&signing::public_key_from_pkcs8(&pkcs8)?);
+
+    let out_path = out.map(std::path::Path::to_path_buf).unwrap_or(sig_path);
+    countersigned.store(&out_path)?;
+    println!("countersign-binary: wrote {}", out_path.display());
+    println!("external public key: {public}");
+    Ok(public)
+}
+
+/// `{binary}.sig`. Appends rather than using `with_extension`, which would
+/// eat the "0" from a name like bun-v0.2.0.
+fn sidecar_sig_path(binary: &std::path::Path) -> std::path::PathBuf {
+    let mut name = binary
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(".sig");
+    binary.with_file_name(name)
 }
 
 // ---------------------------------------------------------------------------
@@ -1147,6 +1179,63 @@ pub fn sign_binary(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A release-signed binary in `dir` plus a separate operator key, as a
+    /// release leaves it before the operator countersigns.
+    fn released_binary(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        use crate::upgrade::signing::generate_keypair;
+        let binary = dir.join("bun-v0.2.0");
+        std::fs::write(&binary, b"the binary").unwrap();
+        let (release, _) = generate_keypair().unwrap();
+        std::fs::write(dir.join("release.key"), release).unwrap();
+        sign_binary(&dir.join("release.key"), &binary, None, None).unwrap();
+        let (operator, _) = generate_keypair().unwrap();
+        std::fs::write(dir.join("operator.key"), operator).unwrap();
+        (binary, dir.join("operator.key"))
+    }
+
+    #[test]
+    fn countersign_binary_adds_the_external_signature_in_place() {
+        use crate::upgrade::signing::{SignatureEnvelope, parse_public_key, public_key_from_pkcs8};
+        let dir = tempfile::tempdir().unwrap();
+        let (binary, operator) = released_binary(dir.path());
+        let sig = dir.path().join("bun-v0.2.0.sig");
+        let released = SignatureEnvelope::load(&sig).unwrap();
+        assert!(released.external.is_none());
+
+        let public = countersign_binary(&operator, &binary, None, None).unwrap();
+
+        let countersigned = SignatureEnvelope::load(&sig).unwrap();
+        assert_eq!(countersigned.embedded, released.embedded);
+        assert!(countersigned.external.is_some());
+        assert_eq!(
+            parse_public_key(&public).unwrap(),
+            public_key_from_pkcs8(&std::fs::read(&operator).unwrap()).unwrap()
+        );
+    }
+
+    #[test]
+    fn countersign_binary_can_write_elsewhere_and_leave_the_release_envelope() {
+        use crate::upgrade::signing::SignatureEnvelope;
+        let dir = tempfile::tempdir().unwrap();
+        let (binary, operator) = released_binary(dir.path());
+        let sig = dir.path().join("bun-v0.2.0.sig");
+        let out = dir.path().join("countersigned.sig");
+
+        countersign_binary(&operator, &binary, Some(&sig), Some(&out)).unwrap();
+
+        assert!(SignatureEnvelope::load(&sig).unwrap().external.is_none());
+        assert!(SignatureEnvelope::load(&out).unwrap().external.is_some());
+    }
+
+    #[test]
+    fn countersign_binary_refuses_an_envelope_for_another_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let (binary, operator) = released_binary(dir.path());
+        std::fs::write(&binary, b"different bytes").unwrap();
+        let err = countersign_binary(&operator, &binary, None, None).unwrap_err();
+        assert!(err.to_string().contains("hash mismatch"), "{err}");
+    }
 
     #[test]
     fn generate_lima_yaml_contains_essentials() {

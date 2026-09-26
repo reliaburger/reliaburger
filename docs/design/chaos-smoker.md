@@ -45,7 +45,7 @@ relish fault disk-io web 10mbps --acknowledge
 
 # Process faults
 relish fault kill web-3 --acknowledge
-relish fault pause payment-service --acknowledge
+relish fault pause payment-service --instance <id> --acknowledge
 
 # Node-level faults
 relish fault node-drain node-05 --acknowledge
@@ -1487,7 +1487,7 @@ or a client-supplied JSON field.
 Smoker prevents faults that would make the cluster unrecoverable:
 
 - **Quorum protection.** Cannot partition more than `(council_size - 1) / 2` council nodes. This is the hard limit that preserves Raft quorum. It cannot be overridden.
-- **Replica minimum.** Cannot kill more replicas of an app than `replicas - 1`. At least one instance must survive. Cannot be overridden.
+- **Replica minimum.** Cannot kill more replicas of an app than `replicas - 1`. At least one instance must survive. A pause counts as one replica with `--instance`, otherwise as all of them. Cannot be overridden.
 - **Leader protection.** Cannot target the cluster leader without the explicit `--include-leader` flag.
 - **Node percentage limit.** Cannot inject faults on more than 50% of nodes simultaneously without `--override-safety`.
 

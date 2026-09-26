@@ -45,6 +45,15 @@ Four variants. The `match` in `evaluate_safety` handles every one. The compiler 
 `relish fault kill web --count 0 --acknowledge` (kill all) is rejected if it
 would leave zero surviving replicas. At least one must survive.
 
+A pause meets the same rail, and for a long time the rail counted every pause
+as freezing the whole service, even `relish fault pause web --instance
+default__web-0`, which touches one. So every pause was refused, whatever the
+replica count. Our soak harness found it by pausing a three-replica frontend
+and getting a 400 back. Now a pause scoped with `--instance` counts as one
+replica; an unscoped one still counts as all of them, because that's what it
+does. A `--node` pause might touch fewer, but the rail can't tell how many, so
+it assumes the worst.
+
 **Leader protection** blocks faults targeting the cluster leader unless you explicitly pass `--include-leader`. This is overridable because sometimes you *want* to test leader failover — but you should know you're doing it.
 
 **Node percentage** blocks faults affecting more than 50% of nodes unless you pass `--override-safety`. Again, overridable with intent.
@@ -79,8 +88,8 @@ The registry is wrapped in `Arc<tokio::sync::Mutex<FaultRegistry>>` because the 
 
 The simplest faults are process signals.
 `relish fault kill web-3 --acknowledge` sends SIGKILL to the container's main
-process. `relish fault pause web --acknowledge` sends SIGSTOP, which freezes
-the process. Health checks fail after the configured timeout, triggering the
+process. `relish fault pause web --instance default__web-0 --acknowledge`
+sends SIGSTOP, which freezes the process. Health checks fail after the configured timeout, triggering the
 restart logic.
 
 A pause used to be a trap. SIGSTOP froze the process, but nothing ever un-froze it — expiry deleted the registry entry and left the workload wedged. You had to remember to send a separate `--resume` (SIGCONT) fault by hand. That's exactly the kind of "cleanup that doesn't clean up" a chaos tool must not have. Now a pause records the PIDs it froze, and when the fault clears or expires the agent SIGCONTs them automatically. The manual resume still exists, but you no longer *need* it: the process comes back on its own when the fault's time is up.

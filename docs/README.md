@@ -696,7 +696,7 @@ Commands:
 | `fault memory <target> <pct> --acknowledge` | Push memory toward the limit |
 | `fault disk-io <target> <rate> [--write-only] --acknowledge` | Throttle disk I/O for a service |
 | `fault kill <target> --acknowledge` | Kill instances of a service (SIGKILL) |
-| `fault pause <target> --acknowledge` | Freeze instances of a service (SIGSTOP) |
+| `fault pause <target> --instance <id> --acknowledge` | Freeze one instance of a service (SIGSTOP); an unscoped pause freezes every replica, which the replica rail refuses |
 | `fault resume <target> --acknowledge` | Unfreeze (SIGCONT) previously paused instances |
 | `fault node-drain <node> --acknowledge` | Withdraw a node from scheduling for a bounded duration |
 | `fault node-kill <node> --acknowledge` | Quiesce a node's cluster transports for a bounded duration |
@@ -718,6 +718,7 @@ Commands:
 | `dev clean` | Clean cargo build artefacts in the test VM |
 | `dev keygen --out <dir>` | Generate an Ed25519 release signing keypair |
 | `dev sign-binary --key <key> <binary>` | Sign a binary, producing a detached `.sig` envelope |
+| `dev countersign-binary --external-key <key> <binary>` | Add the operator signature to a release `.sig` envelope, keeping the release signature |
 | `upgrade check` | Check the release metadata for available updates |
 | `upgrade start <version>` | Start a rolling binary upgrade (network) |
 | `upgrade start --binary <path>` | Upgrade from a local signed binary (air-gapped) |

@@ -11,7 +11,7 @@ relish fault drop api 10% --acknowledge                    # failed connections
 relish fault dns redis nxdomain --acknowledge              # DNS misery
 relish fault partition web --from payment --acknowledge    # block traffic between apps
 relish fault kill web --count 1 --acknowledge              # SIGKILL an instance
-relish fault pause web --acknowledge                       # SIGSTOP (freeze)
+relish fault pause web --instance ID --acknowledge         # SIGSTOP (freeze) one instance
 relish fault cpu web 50% --acknowledge                     # burn CPU in the cgroup
 relish fault memory web 90% --acknowledge                  # push toward the limit
 relish fault disk-io web 10mbps --write-only --acknowledge # throttle disk I/O
@@ -74,8 +74,9 @@ That admits workload faults and `node-kill`/`node-drain`, but not
 You don't need to know where a replica runs. The node you talk to looks up
 which nodes run the target, checks the replica rail against every replica in
 the cluster (so `kill web --count 3` on a three-replica app is refused even
-though each node holds one), and forwards each owner its share under your own
-credential, so the owner repeats every check. Add `--node NAME` to pick the
+though each node holds one, and a pause without `--instance` counts as
+freezing every replica, so it's always refused), and forwards each owner its
+share under your own credential, so the owner repeats every check. Add `--node NAME` to pick the
 node. A fault spread over several nodes becomes one fault per node, and the
 command prints each one. `relish fault list` shows every node's faults with a
 `NODE` column, and `relish fault clear <id>` finds the node that holds that
