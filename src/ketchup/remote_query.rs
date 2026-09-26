@@ -16,7 +16,7 @@ use datafusion::datasource::listing::{
 use datafusion::prelude::*;
 
 use super::log_store::log_schema;
-use super::types::{KetchupError, LogEntry, LogStream};
+use super::types::{KetchupError, LogEntry};
 
 /// Working-memory ceiling for an operator log-search query (O13). `relish
 /// logs-search` runs arbitrary SQL against a Parquet archive on the operator's
@@ -40,7 +40,8 @@ fn bounded_session(config: SessionConfig) -> Result<SessionContext, KetchupError
 ///
 /// The SQL query runs against a `logs` table with columns:
 /// `timestamp (u64)`, `app (utf8)`, `namespace (utf8)`,
-/// `stream (utf8)`, `line (utf8)`.
+/// `stream (utf8)`, `line (utf8)`, `sequence (u64)`, `instance (utf8)`.
+/// The query must select `timestamp`, `stream` and `line`.
 pub async fn query_remote(source_path: &str, sql: &str) -> Result<Vec<LogEntry>, KetchupError> {
     // Turn on Parquet bloom-filter pruning for the read path. We write
     // bloom filters on the `app` and `namespace` columns at flush time, so
@@ -89,58 +90,7 @@ pub async fn query_remote(source_path: &str, sql: &str) -> Result<Vec<LogEntry>,
         )))
     })?;
 
-    // Parse results into LogEntry
-    let mut entries = Vec::new();
-    for batch in &batches {
-        if batch.num_columns() < 5 {
-            continue;
-        }
-        let timestamps = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .ok_or_else(|| {
-                KetchupError::Io(std::io::Error::other("timestamp column type mismatch"))
-            })?;
-        let _apps = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| KetchupError::Io(std::io::Error::other("app column type mismatch")))?;
-        let _namespaces = batch
-            .column(2)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| {
-                KetchupError::Io(std::io::Error::other("namespace column type mismatch"))
-            })?;
-        let streams = batch
-            .column(3)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| {
-                KetchupError::Io(std::io::Error::other("stream column type mismatch"))
-            })?;
-        let lines = batch
-            .column(4)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| KetchupError::Io(std::io::Error::other("line column type mismatch")))?;
-
-        for i in 0..batch.num_rows() {
-            let stream = match streams.value(i) {
-                "stderr" => LogStream::Stderr,
-                _ => LogStream::Stdout,
-            };
-            entries.push(LogEntry {
-                timestamp: timestamps.value(i),
-                stream,
-                line: lines.value(i).to_string(),
-            });
-        }
-    }
-
-    Ok(entries)
+    super::log_store::batches_to_entries(&batches)
 }
 
 /// Query exported Parquet logs and return results as formatted JSON.
@@ -230,6 +180,7 @@ mod tests {
 
     use super::*;
     use crate::ketchup::log_store::LogStore;
+    use crate::ketchup::types::LogStream;
 
     /// Helper: create a LogStore, insert entries, flush to Parquet.
     async fn store_with_entries(

@@ -15,10 +15,11 @@ pub struct Compatibility {
     pub state: u32,
 }
 
-/// Supported formats, including committed generation-bound consumer withdrawal receipts.
+/// Supported formats, including sequenced, instance-tagged log rows (Parquet
+/// schema and the `/v1/logs/entries` fan-out answer).
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 24,
-    state: 40,
+    protocol: 25,
+    state: 41,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.

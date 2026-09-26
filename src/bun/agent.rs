@@ -3518,8 +3518,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let app = app_name.to_string();
         let namespace = namespace.to_string();
 
-        let (line_tx, mut line_rx) = mpsc::channel::<String>(256);
-        // Producer: the runtime streams complete stdout lines into line_tx.
+        let (line_tx, mut line_rx) = mpsc::channel::<crate::ketchup::types::CapturedLine>(256);
+        // Producer: the runtime streams complete lines, from the start of the
+        // instance's output, into line_tx. The log store drops the ones it
+        // already holds, so an adopted instance isn't ingested twice.
         let follow_grill = grill;
         let follow_id = id.clone();
         tokio::spawn(async move {
@@ -3527,12 +3529,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         });
         // Consumer: tag each line and forward it to the log sink.
         tokio::spawn(async move {
-            while let Some(line) = line_rx.recv().await {
+            while let Some(captured) = line_rx.recv().await {
                 let record = crate::ketchup::types::LogRecord {
                     app: app.clone(),
                     namespace: namespace.clone(),
-                    stream: crate::ketchup::types::LogStream::Stdout,
-                    line,
+                    instance: id.0.clone(),
+                    stream: captured.stream,
+                    line: captured.line,
+                    position: captured.position,
                 };
                 if log_tx.send(record).await.is_err() {
                     break;
@@ -9533,23 +9537,18 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         // loop is never blocked waiting for a client to disconnect.
         for id in instance_ids {
             let grill = self.supervisor.grill().clone();
-            let Some(prefix) = prefix(&id) else {
-                let tx = lines.clone();
-                tokio::spawn(async move {
-                    grill.follow_logs(&id, tx).await;
-                });
-                continue;
-            };
-            // A labelled follow reads the instance through its own channel
-            // and stamps each line on the way through.
-            let (instance_tx, mut instance_rx) = mpsc::channel::<String>(64);
+            // Each instance streams through its own channel; a labelled
+            // follow stamps each line with its node and instance on the way.
+            let prefix = prefix(&id).unwrap_or_default();
+            let (instance_tx, mut instance_rx) =
+                mpsc::channel::<crate::ketchup::types::CapturedLine>(64);
             tokio::spawn(async move {
                 grill.follow_logs(&id, instance_tx).await;
             });
             let tx = lines.clone();
             tokio::spawn(async move {
-                while let Some(line) = instance_rx.recv().await {
-                    if tx.send(format!("{prefix}{line}")).await.is_err() {
+                while let Some(captured) = instance_rx.recv().await {
+                    if tx.send(format!("{prefix}{}", captured.line)).await.is_err() {
                         return;
                     }
                 }

@@ -355,7 +355,7 @@ async fn runc_owned_completed_log_reader_cannot_block_a_replacement_generation()
     let reader = runtime.clone();
     let log_id = id.clone();
     let stream = tokio::spawn(async move { reader.follow_logs(&log_id, sender).await });
-    assert_eq!(receiver.recv().await.unwrap(), "first");
+    assert_eq!(receiver.recv().await.unwrap().line, "first");
     // The reader is now stalled on its tiny output channel, after retirement.
     runtime
         .create(&id, &spec(root.path(), "exit 0"))

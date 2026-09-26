@@ -648,7 +648,7 @@ impl super::Grill for RuncGrill {
     async fn follow_logs(
         &self,
         instance: &InstanceId,
-        lines_tx: tokio::sync::mpsc::Sender<String>,
+        lines_tx: tokio::sync::mpsc::Sender<crate::ketchup::types::CapturedLine>,
     ) {
         self.owned_follow_logs(instance, lines_tx).await;
     }

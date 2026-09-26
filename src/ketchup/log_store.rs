@@ -8,8 +8,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use datafusion::arrow::array::StringArray;
 use datafusion::arrow::array::UInt64Array;
+use datafusion::arrow::array::{Array, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::datasource::MemTable;
@@ -128,6 +128,9 @@ fn log_writer_properties() -> WriterProperties {
 }
 
 /// Arrow schema for the logs table.
+///
+/// `instance` is nullable because the node's own lines (`bun` startup
+/// messages) come from no instance.
 pub fn log_schema() -> Schema {
     Schema::new(vec![
         Field::new("timestamp", DataType::UInt64, false),
@@ -135,7 +138,114 @@ pub fn log_schema() -> Schema {
         Field::new("namespace", DataType::Utf8, false),
         Field::new("stream", DataType::Utf8, false),
         Field::new("line", DataType::Utf8, false),
+        Field::new("sequence", DataType::UInt64, false),
+        Field::new("instance", DataType::Utf8, true),
     ])
+}
+
+/// Turn query batches into [`LogEntry`] rows, reading columns by name.
+///
+/// A query must select `timestamp`, `stream` and `line`. When it leaves out
+/// `sequence`, rows are numbered in the order the query returned them, which
+/// is the order its own `ORDER BY` asked for.
+pub(crate) fn batches_to_entries(batches: &[RecordBatch]) -> Result<Vec<LogEntry>, KetchupError> {
+    let mut entries = Vec::new();
+    for batch in batches {
+        let timestamps = required_column::<UInt64Array>(batch, "timestamp")?;
+        let streams = required_column::<StringArray>(batch, "stream")?;
+        let lines = required_column::<StringArray>(batch, "line")?;
+        let sequences = optional_column::<UInt64Array>(batch, "sequence");
+        let instances = optional_column::<StringArray>(batch, "instance");
+        for row in 0..batch.num_rows() {
+            let stream = match streams.value(row) {
+                "stderr" => LogStream::Stderr,
+                _ => LogStream::Stdout,
+            };
+            let sequence = match sequences {
+                Some(column) => column.value(row),
+                None => entries.len() as u64,
+            };
+            let instance = instances
+                .filter(|column| column.is_valid(row))
+                .map(|column| column.value(row).to_string());
+            entries.push(LogEntry {
+                timestamp: timestamps.value(row),
+                sequence,
+                instance,
+                stream,
+                line: lines.value(row).to_string(),
+            });
+        }
+    }
+    Ok(entries)
+}
+
+fn required_column<'a, T: 'static>(
+    batch: &'a RecordBatch,
+    name: &str,
+) -> Result<&'a T, KetchupError> {
+    batch
+        .column_by_name(name)
+        .and_then(|column| column.as_any().downcast_ref::<T>())
+        .ok_or_else(|| {
+            KetchupError::Io(std::io::Error::other(format!(
+                "query result has no usable {name} column"
+            )))
+        })
+}
+
+fn optional_column<'a, T: 'static>(batch: &'a RecordBatch, name: &str) -> Option<&'a T> {
+    batch
+        .column_by_name(name)
+        .and_then(|column| column.as_any().downcast_ref::<T>())
+}
+
+/// Name of the ingest checkpoint kept beside the Parquet files.
+const CHECKPOINT_FILE: &str = "ingest-checkpoint.json";
+
+/// What the store has durably ingested, saved after every successful flush.
+///
+/// `offsets` is the highest capture-file offset whose line reached Parquet,
+/// per capture file. A restarted agent re-reads capture files from the start;
+/// the store skips every line at or below these offsets instead of storing it
+/// a second time under a new timestamp. `last_sequence` keeps
+/// [`LogEntry::sequence`] rising across a restart even if the clock stepped
+/// back while the node was down.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct IngestCheckpoint {
+    last_sequence: u64,
+    offsets: std::collections::BTreeMap<PathBuf, u64>,
+}
+
+impl IngestCheckpoint {
+    /// Load the checkpoint from `data_dir`, forgetting capture files that no
+    /// longer exist. A missing or unreadable checkpoint starts empty: at worst
+    /// the store ingests a line twice, never loses one.
+    fn load(data_dir: &std::path::Path) -> Self {
+        let path = data_dir.join(CHECKPOINT_FILE);
+        let mut checkpoint = match std::fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+                eprintln!(
+                    "ketchup: ignoring unreadable ingest checkpoint {}: {error}",
+                    path.display()
+                );
+                Self::default()
+            }),
+            Err(_) => Self::default(),
+        };
+        checkpoint.offsets.retain(|file, _| file.exists());
+        checkpoint
+    }
+
+    /// Durably replace the checkpoint: a unique temp file, fsync, rename over
+    /// the old one, then fsync the directory. A reader sees the old
+    /// checkpoint or the new one, never half of either.
+    fn save(&self, data_dir: &std::path::Path) -> Result<(), KetchupError> {
+        let bytes = serde_json::to_vec(self)
+            .map_err(|error| KetchupError::Io(std::io::Error::other(error.to_string())))?;
+        crate::sesame::identity::atomic_write(&data_dir.join(CHECKPOINT_FILE), &bytes)?;
+        Ok(())
+    }
 }
 
 /// Returns the next flush counter for `data_dir`, one past the highest existing
@@ -174,16 +284,21 @@ pub struct LogPendingFlush {
     data_dir: std::path::PathBuf,
     path: std::path::PathBuf,
     batch: RecordBatch,
+    /// What the store will have durably ingested once `batch` is on disk.
+    checkpoint: IngestCheckpoint,
 }
 
 /// Persist a [`LogPendingFlush`] on the blocking pool, with no lock held so
 /// concurrent appends/queries proceed while the write is in flight (M7).
-/// Durable write (M6): temp file, fsync, atomic rename, dir fsync.
+/// Durable write (M6): temp file, fsync, atomic rename, dir fsync. The ingest
+/// checkpoint follows the Parquet file, never precedes it, so a crash between
+/// the two re-ingests one batch rather than losing it.
 pub async fn write_log_pending(pending: LogPendingFlush) -> Result<(), KetchupError> {
     let LogPendingFlush {
         data_dir,
         path,
         batch,
+        checkpoint,
     } = pending;
     tokio::task::spawn_blocking(move || -> Result<(), KetchupError> {
         std::fs::create_dir_all(&data_dir)?;
@@ -205,7 +320,7 @@ pub async fn write_log_pending(pending: LogPendingFlush) -> Result<(), KetchupEr
         {
             let _ = dir_file.sync_all();
         }
-        Ok(())
+        checkpoint.save(&data_dir)
     })
     .await
     .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?
@@ -237,9 +352,11 @@ pub async fn flush_shared(
 /// A buffered log entry waiting to be flushed.
 struct BufferedLogEntry {
     timestamp: u64,
+    sequence: u64,
     app: String,
     namespace: String,
-    stream: String,
+    instance: Option<String>,
+    stream: LogStream,
     line: String,
 }
 
@@ -254,19 +371,24 @@ pub struct LogStore {
     data_dir: PathBuf,
     /// Seeded past any existing `logs_NNNNNN.parquet` so restarts don't clobber.
     flush_counter: u64,
+    /// Everything ingested so far, flushed or not. Flushing saves a copy.
+    ingested: IngestCheckpoint,
 }
 
 impl LogStore {
     /// Open (or create) a log store writing Parquet to `data_dir`.
     ///
-    /// Existing `logs_NNNNNN.parquet` files remain queryable and the flush
-    /// counter resumes past the highest one.
+    /// Existing `logs_NNNNNN.parquet` files remain queryable, the flush
+    /// counter resumes past the highest one, and the ingest checkpoint picks
+    /// up where the last successful flush left it.
     pub fn new(data_dir: PathBuf) -> Self {
         let flush_counter = next_flush_counter(&data_dir, "logs");
+        let ingested = IngestCheckpoint::load(&data_dir);
         Self {
             buffer: Vec::new(),
             data_dir,
             flush_counter,
+            ingested,
         }
     }
 
@@ -275,13 +397,18 @@ impl LogStore {
         &self.data_dir
     }
 
-    /// Append a log line.
+    /// Append a line the node itself wrote (not a workload's output).
     pub fn append(&mut self, app: &str, namespace: &str, stream: LogStream, line: &str) {
-        let timestamp = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        self.append_at(timestamp, app, namespace, stream, line);
+        let now = now_nanos();
+        self.push(
+            now / NANOS_PER_SECOND,
+            now,
+            app,
+            namespace,
+            None,
+            stream,
+            line,
+        );
     }
 
     /// Append a log line with an explicit timestamp (for testing).
@@ -293,15 +420,73 @@ impl LogStore {
         stream: LogStream,
         line: &str,
     ) {
-        let stream_str = match stream {
-            LogStream::Stdout => "stdout",
-            LogStream::Stderr => "stderr",
-        };
+        let nanos = timestamp.saturating_mul(NANOS_PER_SECOND);
+        self.push(timestamp, nanos, app, namespace, None, stream, line);
+    }
+
+    /// Ingest a workload line from a log forwarder, stamped with the current
+    /// time.
+    ///
+    /// Returns `false`, storing nothing, when the line's capture position is
+    /// at or below what this store already holds from that file: a restarted
+    /// agent re-reads capture files from the start, and those lines are
+    /// already here under their original timestamps.
+    pub fn ingest(&mut self, record: &super::types::LogRecord) -> bool {
+        self.ingest_at_nanos(now_nanos(), record)
+    }
+
+    /// As [`ingest`](Self::ingest) with an explicit wall-clock time (for
+    /// testing).
+    pub fn ingest_at(&mut self, timestamp: u64, record: &super::types::LogRecord) -> bool {
+        self.ingest_at_nanos(timestamp.saturating_mul(NANOS_PER_SECOND), record)
+    }
+
+    fn ingest_at_nanos(&mut self, nanos: u64, record: &super::types::LogRecord) -> bool {
+        if let Some(position) = &record.position {
+            let seen = self.ingested.offsets.get(&position.file).copied();
+            if seen.is_some_and(|offset| position.end_offset <= offset) {
+                return false;
+            }
+            self.ingested
+                .offsets
+                .insert(position.file.clone(), position.end_offset);
+        }
+        self.push(
+            nanos / NANOS_PER_SECOND,
+            nanos,
+            &record.app,
+            &record.namespace,
+            Some(record.instance.clone()),
+            record.stream,
+            &record.line,
+        );
+        true
+    }
+
+    // One argument per stored column; a struct would only rename them.
+    #[allow(clippy::too_many_arguments)]
+    fn push(
+        &mut self,
+        timestamp: u64,
+        nanos: u64,
+        app: &str,
+        namespace: &str,
+        instance: Option<String>,
+        stream: LogStream,
+        line: &str,
+    ) {
+        // Wall-clock nanoseconds order lines across nodes; the bump keeps the
+        // order strict within this node when two lines share a clock reading
+        // or the clock steps back.
+        let sequence = nanos.max(self.ingested.last_sequence.saturating_add(1));
+        self.ingested.last_sequence = sequence;
         self.buffer.push(BufferedLogEntry {
             timestamp,
+            sequence,
             app: app.to_string(),
             namespace: namespace.to_string(),
-            stream: stream_str.to_string(),
+            instance,
+            stream,
             line: line.to_string(),
         });
         // Bound memory if flushing is failing (M8): drop the oldest entries
@@ -326,8 +511,18 @@ impl LogStore {
         let timestamps: Vec<u64> = self.buffer.iter().map(|e| e.timestamp).collect();
         let apps: Vec<&str> = self.buffer.iter().map(|e| e.app.as_str()).collect();
         let namespaces: Vec<&str> = self.buffer.iter().map(|e| e.namespace.as_str()).collect();
-        let streams: Vec<&str> = self.buffer.iter().map(|e| e.stream.as_str()).collect();
+        let streams: Vec<&str> = self
+            .buffer
+            .iter()
+            .map(|e| match e.stream {
+                LogStream::Stdout => "stdout",
+                LogStream::Stderr => "stderr",
+            })
+            .collect();
         let lines: Vec<&str> = self.buffer.iter().map(|e| e.line.as_str()).collect();
+        let sequences: Vec<u64> = self.buffer.iter().map(|e| e.sequence).collect();
+        let instances: Vec<Option<&str>> =
+            self.buffer.iter().map(|e| e.instance.as_deref()).collect();
 
         let batch = RecordBatch::try_new(
             Arc::new(log_schema()),
@@ -337,6 +532,8 @@ impl LogStore {
                 Arc::new(StringArray::from(namespaces)),
                 Arc::new(StringArray::from(streams)),
                 Arc::new(StringArray::from(lines)),
+                Arc::new(UInt64Array::from(sequences)),
+                Arc::new(StringArray::from(instances)),
             ],
         )
         .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?;
@@ -360,6 +557,7 @@ impl LogStore {
             data_dir: self.data_dir.clone(),
             path,
             batch,
+            checkpoint: self.ingested.clone(),
         }))
     }
 
@@ -500,7 +698,9 @@ impl LogStore {
     }
 
     /// Query logs using SQL, returning structured LogEntry results.
-    /// Requires the query to return all 5 columns in schema order.
+    ///
+    /// The query must select at least `timestamp`, `stream` and `line`; see
+    /// [`batches_to_entries`] for how the optional columns are read.
     pub async fn query_sql(&self, sql: &str) -> Result<Vec<LogEntry>, KetchupError> {
         let ctx = self.session().await?;
         let df = ctx
@@ -513,36 +713,14 @@ impl LogStore {
             .await
             .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?;
 
-        let mut results = Vec::new();
-        for batch in &batches {
-            if batch.num_columns() < 5 {
-                continue;
-            }
-            let timestamps = batch.column(0).as_any().downcast_ref::<UInt64Array>();
-            let apps = batch.column(1).as_any().downcast_ref::<StringArray>();
-            let _namespaces = batch.column(2).as_any().downcast_ref::<StringArray>();
-            let streams = batch.column(3).as_any().downcast_ref::<StringArray>();
-            let lines = batch.column(4).as_any().downcast_ref::<StringArray>();
-
-            if let (Some(ts), Some(_app), Some(st), Some(ln)) = (timestamps, apps, streams, lines) {
-                for i in 0..batch.num_rows() {
-                    let stream = match st.value(i) {
-                        "stderr" => LogStream::Stderr,
-                        _ => LogStream::Stdout,
-                    };
-                    results.push(LogEntry {
-                        timestamp: ts.value(i),
-                        stream,
-                        line: ln.value(i).to_string(),
-                    });
-                }
-            }
-        }
-
-        Ok(results)
+        batches_to_entries(&batches)
     }
 
-    /// Convenience: query by app, time range, grep pattern, and limit.
+    /// Query one app's logs by time range and grep pattern, oldest first.
+    ///
+    /// Rows come back in ingest order (`sequence`), which is emission order
+    /// per instance. With `tail`, only the newest `tail` matching rows come
+    /// back, still oldest first.
     pub async fn query(
         &self,
         app: &str,
@@ -550,7 +728,7 @@ impl LogStore {
         start: Option<u64>,
         end: Option<u64>,
         grep: Option<&str>,
-        limit: Option<usize>,
+        tail: Option<usize>,
     ) -> Result<Vec<LogEntry>, KetchupError> {
         // M1: escape single quotes so an app/namespace/grep param can't
         // break out of the SQL string literal and read other tenants' logs.
@@ -572,14 +750,30 @@ impl LogStore {
         }
 
         let where_clause = conditions.join(" AND ");
-        let limit_clause = limit.map(|l| format!(" LIMIT {l}")).unwrap_or_default();
-
-        let sql = format!(
-            "SELECT timestamp, app, namespace, stream, line FROM logs \
-             WHERE {where_clause} ORDER BY timestamp{limit_clause}"
+        let select = format!(
+            "SELECT timestamp, app, namespace, stream, line, sequence, instance \
+             FROM logs WHERE {where_clause}"
         );
+        // A tail takes the newest rows, then puts them back in order.
+        let sql = match tail {
+            Some(tail) => format!(
+                "SELECT * FROM ({select} ORDER BY sequence DESC LIMIT {tail}) AS tailed \
+                 ORDER BY sequence"
+            ),
+            None => format!("{select} ORDER BY sequence"),
+        };
         self.query_sql(&sql).await
     }
+}
+
+const NANOS_PER_SECOND: u64 = 1_000_000_000;
+
+/// Wall-clock nanoseconds since the Unix epoch, saturating far in the future.
+fn now_nanos() -> u64 {
+    let since_epoch = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    u64::try_from(since_epoch.as_nanos()).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
@@ -784,6 +978,267 @@ mod tests {
         assert_eq!(files, 3, "restart clobbered an existing log file");
     }
 
+    /// V02 soak regression: `relish logs --tail N` must return the newest N
+    /// lines, oldest first, even when they all share one second and straddle
+    /// several Parquet files and the unflushed buffer.
+    #[tokio::test]
+    async fn tail_returns_the_newest_lines_in_emission_order() {
+        let (mut store, _dir) = test_store();
+        for i in 0..30 {
+            store.append_at(
+                7,
+                "writer",
+                "default",
+                LogStream::Stdout,
+                &format!("ACK {i}"),
+            );
+            if i % 8 == 7 {
+                store.flush().await.unwrap();
+            }
+        }
+
+        let lines: Vec<String> = store
+            .query("writer", "default", None, None, None, Some(10))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.line)
+            .collect();
+        let expected: Vec<String> = (20..30).map(|i| format!("ACK {i}")).collect();
+        assert_eq!(lines, expected);
+    }
+
+    /// A writer logging ten lines a second puts ten rows under every
+    /// one-second timestamp. Sorting on the timestamp alone left their order
+    /// to DataFusion, which interleaved Parquet files (`ACK 968, 974, 969`).
+    #[tokio::test]
+    async fn lines_within_one_second_keep_emission_order_across_flushes() {
+        let (mut store, _dir) = test_store();
+        for i in 0..200 {
+            store.append_at(
+                7,
+                "writer",
+                "default",
+                LogStream::Stdout,
+                &format!("ACK {i}"),
+            );
+            if i % 9 == 8 {
+                store.flush().await.unwrap();
+            }
+        }
+
+        let lines: Vec<String> = store
+            .query("writer", "default", None, None, None, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.line)
+            .collect();
+        let expected: Vec<String> = (0..200).map(|i| format!("ACK {i}")).collect();
+        assert_eq!(lines, expected);
+    }
+
+    /// A line the writer app printed, as the forwarder hands it over: `ACK n`
+    /// is the n-th line of `file`, and every line is `LINE_BYTES` long.
+    fn writer_line(file: &std::path::Path, n: u64) -> crate::ketchup::types::LogRecord {
+        crate::ketchup::types::LogRecord {
+            app: "writer".to_string(),
+            namespace: "default".to_string(),
+            instance: "writer-0".to_string(),
+            stream: LogStream::Stdout,
+            line: format!("ACK {n:04}"),
+            position: Some(crate::ketchup::types::CapturePosition {
+                file: file.to_path_buf(),
+                end_offset: n * LINE_BYTES,
+            }),
+        }
+    }
+
+    const LINE_BYTES: u64 = "ACK 0000\n".len() as u64;
+
+    /// A capture file that exists, so the checkpoint doesn't forget it.
+    fn capture_file(dir: &tempfile::TempDir, name: &str) -> PathBuf {
+        let path = dir.path().join(name);
+        std::fs::write(&path, b"").unwrap();
+        path
+    }
+
+    async fn writer_lines(store: &LogStore) -> Vec<String> {
+        store
+            .query("writer", "default", None, None, None, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.line)
+            .collect()
+    }
+
+    fn acks(range: std::ops::RangeInclusive<u64>) -> Vec<String> {
+        range.map(|n| format!("ACK {n:04}")).collect()
+    }
+
+    /// V02 soak regression: after a SIGKILLed or powered-off Bun came back,
+    /// the forwarder re-read every adopted container's capture file from the
+    /// start and the store took all of it again under new timestamps, so
+    /// hour-old lines showed up as the newest.
+    #[tokio::test]
+    async fn restart_does_not_reingest_lines_already_flushed() {
+        let dir = tempfile::tempdir().unwrap();
+        let captures = tempfile::tempdir().unwrap();
+        let file = capture_file(&captures, "writer.stdout");
+        {
+            let mut store = LogStore::new(dir.path().to_path_buf());
+            for n in 1..=10 {
+                assert!(store.ingest_at(100, &writer_line(&file, n)));
+            }
+            store.flush().await.unwrap();
+        }
+
+        // The restarted agent replays the whole file, then new output follows.
+        let mut store = LogStore::new(dir.path().to_path_buf());
+        for n in 1..=10 {
+            assert!(
+                !store.ingest_at(4_000, &writer_line(&file, n)),
+                "line {n} was ingested twice"
+            );
+        }
+        for n in 11..=12 {
+            assert!(store.ingest_at(4_000, &writer_line(&file, n)));
+        }
+
+        assert_eq!(writer_lines(&store).await, acks(1..=12));
+        let tail = store
+            .query("writer", "default", None, None, None, Some(1))
+            .await
+            .unwrap();
+        assert_eq!(tail[0].line, "ACK 0012");
+    }
+
+    /// Lines still in the buffer when the node died never reached Parquet,
+    /// so the replay after the restart must store them rather than skip them.
+    #[tokio::test]
+    async fn lines_lost_with_the_buffer_are_ingested_again_after_a_crash() {
+        let dir = tempfile::tempdir().unwrap();
+        let captures = tempfile::tempdir().unwrap();
+        let file = capture_file(&captures, "writer.stdout");
+        {
+            let mut store = LogStore::new(dir.path().to_path_buf());
+            for n in 1..=5 {
+                store.ingest_at(100, &writer_line(&file, n));
+            }
+            store.flush().await.unwrap();
+            for n in 6..=8 {
+                store.ingest_at(100, &writer_line(&file, n));
+            }
+            // Power cut: dropped without a flush.
+        }
+
+        let mut store = LogStore::new(dir.path().to_path_buf());
+        let stored: Vec<bool> = (1..=8)
+            .map(|n| store.ingest_at(200, &writer_line(&file, n)))
+            .collect();
+        assert_eq!(
+            stored,
+            vec![false, false, false, false, false, true, true, true]
+        );
+        assert_eq!(writer_lines(&store).await, acks(1..=8));
+    }
+
+    /// A restarted instance writes a new capture file (a new generation), so
+    /// the old file's offsets say nothing about it.
+    #[tokio::test]
+    async fn a_new_capture_file_starts_from_its_first_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let captures = tempfile::tempdir().unwrap();
+        let old = capture_file(&captures, "generation-1.stdout");
+        let new = capture_file(&captures, "generation-2.stdout");
+        let mut store = LogStore::new(dir.path().to_path_buf());
+        for n in 1..=3 {
+            store.ingest_at(100, &writer_line(&old, n));
+        }
+        store.flush().await.unwrap();
+
+        let mut store = LogStore::new(dir.path().to_path_buf());
+        assert!(store.ingest_at(200, &writer_line(&new, 1)));
+    }
+
+    /// Sequence order must survive a restart even if the clock stepped back
+    /// while the node was down, or the newest lines would sort first.
+    #[tokio::test]
+    async fn sequence_keeps_rising_across_a_restart_when_the_clock_steps_back() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut store = LogStore::new(dir.path().to_path_buf());
+            store.append_at(1_000, "writer", "default", LogStream::Stdout, "ACK 0001");
+            store.flush().await.unwrap();
+        }
+        let mut store = LogStore::new(dir.path().to_path_buf());
+        store.append_at(5, "writer", "default", LogStream::Stdout, "ACK 0002");
+
+        assert_eq!(writer_lines(&store).await, acks(1..=2));
+    }
+
+    /// A torn or hand-edited checkpoint must not stop the node logging; the
+    /// worst case is ingesting some lines a second time.
+    #[tokio::test]
+    async fn unreadable_checkpoint_opens_an_empty_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let captures = tempfile::tempdir().unwrap();
+        let file = capture_file(&captures, "writer.stdout");
+        std::fs::write(dir.path().join(CHECKPOINT_FILE), b"{\"last_seq").unwrap();
+
+        let mut store = LogStore::new(dir.path().to_path_buf());
+        assert!(store.ingest_at(100, &writer_line(&file, 1)));
+        assert_eq!(writer_lines(&store).await, acks(1..=1));
+    }
+
+    /// Each flush replaces the checkpoint wholesale through a temp file and a
+    /// rename, so no temp file is left behind and the file on disk is always
+    /// one complete checkpoint.
+    #[tokio::test]
+    async fn flush_replaces_the_checkpoint_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let captures = tempfile::tempdir().unwrap();
+        let file = capture_file(&captures, "writer.stdout");
+        let mut store = LogStore::new(dir.path().to_path_buf());
+        for n in 1..=2 {
+            store.ingest_at(100, &writer_line(&file, n));
+            store.flush().await.unwrap();
+        }
+
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| !name.ends_with(".parquet"))
+            .collect();
+        assert_eq!(names, vec![CHECKPOINT_FILE.to_string()]);
+        let saved: IngestCheckpoint =
+            serde_json::from_slice(&std::fs::read(dir.path().join(CHECKPOINT_FILE)).unwrap())
+                .unwrap();
+        assert_eq!(saved.offsets.get(&file), Some(&(2 * LINE_BYTES)));
+        assert_eq!(saved, store.ingested);
+    }
+
+    #[tokio::test]
+    async fn ingested_entries_keep_their_instance_and_stream() {
+        let (mut store, _dir) = test_store();
+        let mut record = writer_line(std::path::Path::new("/nonexistent/writer.stderr"), 1);
+        record.stream = LogStream::Stderr;
+        store.ingest_at(100, &record);
+        store.flush().await.unwrap();
+        store.append_at(101, "writer", "default", LogStream::Stdout, "from the node");
+
+        let entries = store
+            .query("writer", "default", None, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(entries[0].instance.as_deref(), Some("writer-0"));
+        assert_eq!(entries[0].stream, LogStream::Stderr);
+        assert_eq!(entries[0].timestamp, 100);
+        assert_eq!(entries[1].instance, None);
+        assert!(entries[0].sequence < entries[1].sequence);
+    }
+
     #[tokio::test]
     async fn query_after_flush() {
         let (mut store, _dir) = test_store();
@@ -922,14 +1377,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn schema_has_five_columns() {
+    async fn schema_has_seven_columns() {
         let schema = log_schema();
-        assert_eq!(schema.fields().len(), 5);
+        assert_eq!(schema.fields().len(), 7);
         assert_eq!(schema.field(0).name(), "timestamp");
         assert_eq!(schema.field(1).name(), "app");
         assert_eq!(schema.field(2).name(), "namespace");
         assert_eq!(schema.field(3).name(), "stream");
         assert_eq!(schema.field(4).name(), "line");
+        assert_eq!(schema.field(5).name(), "sequence");
+        assert_eq!(schema.field(6).name(), "instance");
     }
 
     // --- Phase 12: ZSTD compression + bloom filters (archive path) ---
@@ -952,36 +1409,48 @@ mod tests {
         (dir, path)
     }
 
+    /// A log batch with the given `app` and `line` columns and realistic
+    /// values everywhere else: one-second timestamps, nanosecond sequences
+    /// roughly 10 ms apart, and a handful of instances.
+    fn batch_of(apps: Vec<&str>, lines: Vec<&str>) -> RecordBatch {
+        let rows = lines.len();
+        let base = 1_790_368_624_000_000_000u64;
+        let sequences: Vec<u64> = (0..rows as u64).map(|i| base + i * 10_000_371).collect();
+        let timestamps: Vec<u64> = sequences.iter().map(|s| s / NANOS_PER_SECOND).collect();
+        let instances: Vec<Option<&str>> = (0..rows)
+            .map(|i| Some(["web-0", "web-1", "web-2"][i % 3]))
+            .collect();
+        RecordBatch::try_new(
+            Arc::new(log_schema()),
+            vec![
+                Arc::new(UInt64Array::from(timestamps)),
+                Arc::new(StringArray::from(apps)),
+                Arc::new(StringArray::from(vec!["default"; rows])),
+                Arc::new(StringArray::from(vec!["stdout"; rows])),
+                Arc::new(StringArray::from(lines)),
+                Arc::new(UInt64Array::from(sequences)),
+                Arc::new(StringArray::from(instances)),
+            ],
+        )
+        .unwrap()
+    }
+
     /// A batch of semi-realistic, semi-repetitive log lines.
     fn log_batch(rows: usize) -> (RecordBatch, usize) {
-        let timestamps: Vec<u64> = (0..rows as u64).collect();
         let apps: Vec<&str> = (0..rows)
             .map(|i| if i % 2 == 0 { "web" } else { "api" })
             .collect();
-        let namespaces: Vec<&str> = vec!["default"; rows];
-        let streams: Vec<&str> = vec!["stdout"; rows];
         let lines: Vec<String> = (0..rows)
             .map(|i| format!("GET /api/v1/users/{} 200 OK in {}ms", i % 100, i % 50))
             .collect();
         // Raw-text size: roughly what the flat .log file would hold.
         let raw_text_bytes: usize = lines
             .iter()
-            .zip(&timestamps)
-            .map(|(l, ts)| l.len() + ts.to_string().len() + 3) // "{ts} O {line}\n"
+            .enumerate()
+            .map(|(i, l)| l.len() + i.to_string().len() + 3) // "{ts} O {line}\n"
             .sum();
         let line_refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
-        let batch = RecordBatch::try_new(
-            Arc::new(log_schema()),
-            vec![
-                Arc::new(UInt64Array::from(timestamps)),
-                Arc::new(StringArray::from(apps)),
-                Arc::new(StringArray::from(namespaces)),
-                Arc::new(StringArray::from(streams)),
-                Arc::new(StringArray::from(line_refs)),
-            ],
-        )
-        .unwrap();
-        (batch, raw_text_bytes)
+        (batch_of(apps, line_refs), raw_text_bytes)
     }
 
     #[test]
@@ -1087,17 +1556,7 @@ mod tests {
         let n = 2000usize;
         let apps: Vec<String> = (0..n).map(|i| format!("app-{i}")).collect();
         let app_refs: Vec<&str> = apps.iter().map(|s| s.as_str()).collect();
-        let batch = RecordBatch::try_new(
-            Arc::new(log_schema()),
-            vec![
-                Arc::new(UInt64Array::from((0..n as u64).collect::<Vec<_>>())),
-                Arc::new(StringArray::from(app_refs)),
-                Arc::new(StringArray::from(vec!["default"; n])),
-                Arc::new(StringArray::from(vec!["stdout"; n])),
-                Arc::new(StringArray::from(vec!["x"; n])),
-            ],
-        )
-        .unwrap();
+        let batch = batch_of(app_refs, vec!["x"; n]);
         let (_dir, path) = write_parquet(&batch, log_writer_properties());
 
         let props = ReaderProperties::builder()
