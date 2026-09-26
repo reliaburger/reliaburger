@@ -32,8 +32,12 @@ _book/
 # Python release-tool bytecode
 __pycache__/
 
-# Copied from examples/kubernetes/ by the Pages workflow; never committed
+# Copied from examples/ by the Pages workflow; never committed
 docs/website/demo/
+
+# `go build` output in the tour's demo app; the tarball and relish's embedded
+# examples must carry only the source
+examples/demo/burger/burger
 
 # MacBook specific files
 .DS_Store

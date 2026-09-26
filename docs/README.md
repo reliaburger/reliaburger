@@ -811,6 +811,18 @@ relish apply -f examples/kubernetes/podinfo.yaml
 curl -H 'Host: podinfo.localhost' http://127.0.0.1:18080/
 ```
 
+`examples/demo/burger` is the five-minute tour's home-built app: a small Go
+service (standard library only), its test and a cross-compiling Dockerfile.
+`relish build` has a node with Buildah build it into Pickle (the quickstart's
+VMs have Buildah), and each `/order` names the podinfo backend it reached by
+service name, so apply podinfo first:
+
+```bash
+relish build examples/demo/burger/burger.toml
+relish apply examples/demo/burger/burger.toml
+curl -H 'Host: burger.localhost' http://127.0.0.1:18080/order
+```
+
 ### Internal DNS on rootful runc
 
 The `.internal` responder is opt-in and currently supports rootful runc on

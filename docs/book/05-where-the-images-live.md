@@ -950,6 +950,55 @@ The honest limits for 0.1.0 are in the manual and design doc. Basic-auth clients
 
 Opening the door to docker also showed us who else could walk through it. The Basic middleware makes every client take the bearer path, and the bearer path checked the token's role but never its scope, so a Deployer scoped to one namespace could push to any repository. Repositories now map to namespaces (`team-a/web` belongs to `team-a`), and a scoped token can only push and pull inside its own. Chapter 10 has the rule and the awkward cases, like what a bare `web` belongs to.
 
+## A burger in the five-minute tour
+
+For a long time the tour ran podinfo and nothing of yours. Pulling somebody else's image proves the runtime works. It doesn't prove the thing this chapter is about: that you can go from source to a running, signed image without Docker on your laptop or an account anywhere. So the tour now builds `examples/demo/burger`, a Go service of about 130 lines that takes a burger order and asks podinfo's backend, by its service name, which kitchen cooked it:
+
+```sh
+curl -fsSL https://reliaburger.com/demo/burger.tar.gz | tar xz
+relish build burger/burger.toml
+relish apply burger/burger.toml
+curl http://burger.localhost:18080/order
+```
+
+Three things had to change for those four lines to work on a laptop cluster.
+
+The quickstart's VMs had no Buildah. The guest image now carries it, and with it the Ubuntu packages it depends on: containers-common, the CNI plugins and netavark. That's about 75 MiB installed, most of it the CNI plugins, which a build that never touches the network doesn't need. We took them anyway. Leaving out a hard dependency with `dpkg --force` would save a few megabytes and cost us a package manager that no longer trusts its own state.
+
+`relish build` uploaded the context to `localhost:5050`. On a node that's the registry. On a laptop it's nothing at all, because the quickstart forwards the registry to `127.0.0.1:15050`. The CLI already knew that: the managed context records every host forward, and `relish upgrade` has used it since chapter 14. So the build now asks for the declared forward when you don't name a port:
+
+```rust
+match (registry_port, declared_registry) {
+    (Some(port), _) => context_upload_url(scheme, port, digest),
+    (None, Some(origin)) => match origin.trim_end_matches('/').split_once("://") {
+        Some((declared_scheme, address)) => {
+            context_upload_url_at(declared_scheme, address, digest)
+        }
+        None => context_upload_url_at(scheme, origin.trim_end_matches('/'), digest),
+    },
+    (None, None) => context_upload_url(scheme, DEFAULT_PICKLE_PORT, digest),
+}
+```
+
+Matching on a tuple, `(a, b)`, checks both values at once, and `_` means "any value, and I don't care which". The first arm reads "an explicit port wins, whatever the context says". Go would need a small `if` ladder here. The `match` also has to cover every combination, so a fourth case can't slip through unhandled. The forward and the API forward lead to the same VM, so the node that receives the build request finds its context in its own registry.
+
+And the Dockerfile had to be quick for two platforms. Builds target `linux/amd64` and `linux/arm64` by default. The usual way to build for an architecture you aren't running on is to emulate it with QEMU's user-mode binfmt handlers, and that makes a compiler several times slower. The burger's Dockerfile never runs a foreign instruction:
+
+```dockerfile
+FROM --platform=$BUILDPLATFORM public.ecr.aws/docker/library/golang:1.27.1-alpine@sha256:8a59… AS build
+ARG TARGETARCH
+RUN --network=none CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH go build -o /out/burger .
+
+FROM scratch
+COPY --from=build /out/burger /burger
+```
+
+`$BUILDPLATFORM` is the builder's own platform, so the Go stage always runs natively. `$TARGETARCH` is the platform being built, and Go's compiler cross-compiles to it without help. The final stage is `scratch`, an empty image with nothing to execute, so the foreign platform only ever gets files copied into it. Go makes this unusually easy. A C program would need a cross toolchain per target, and Rust a linker and a target standard library for each.
+
+We measured it with the node's own Buildah invocation (vfs storage, both platforms) in a 4-vCPU Ubuntu 24.04 VM on an Apple M2 Max: 27 to 35 s from cold, almost all of it pulling the 72 MB Go image, then 17 s once that's cached. The same build for arm64 alone took 32 s cold and 8 s warm. Once the base image is there, the second platform costs about ten seconds, which isn't worth a `platform` override in a demo. The base image is pinned by digest and comes from the ECR mirror of Docker Hub's official image, for the same reason podinfo's Redis does: no anonymous pull limits.
+
+Measuring turned up a problem we haven't fixed. Buildah keeps a two-platform build as a manifest list, and the runner exports it with `buildah push`, which picks the builder's own platform out of the list. So Pickle receives a single-architecture image. On a quickstart that's harmless, since every node shares the host's architecture. On a mixed cluster the other architecture's nodes would pull an image they can't run. The fix needs `buildah manifest push --all` and a runner that registers each platform's manifest before the index. Until it lands, the manual's "both platforms" means "both are built".
+
 ## Tests
 
 Pickle is almost entirely testable in-process. A blob store is a directory, the OCI API is an axum router, and the catalog is a `Vec` — none of that needs the internet or another node. So the default suite spins up a Pickle server in the test, pushes a manifest and its blobs, then pulls them back, all without leaving the process.

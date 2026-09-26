@@ -124,6 +124,15 @@
                   reload and the hostname changes as each replica answers.</p>
               </li>
               <li>
+                <pre><code data-tour>curl -fsSL https://reliaburger.com/demo/burger.tar.gz | tar xz</code>
+<code data-tour>relish build burger/burger.toml</code>
+<code data-tour>relish apply burger/burger.toml</code>
+<code data-tour>curl http://burger.localhost:18080/order</code></pre>
+                <p>Now an app of your own: a small Go service and its Dockerfile. A node builds it
+                  with Buildah, straight into the cluster’s own registry, signed. Each order names the
+                  podinfo backend that cooked it, found by its service name.</p>
+              </li>
+              <li>
                 <pre><code data-tour>relish path frontend --to redis</code></pre>
                 <p>Walk the path from a frontend to Redis, hop by hop: DNS, the virtual IP, the eBPF service map in
                   the kernel, the firewall, any active faults, then a real TCP connect from inside the

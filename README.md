@@ -31,6 +31,13 @@ relish apply -f https://reliaburger.com/demo/podinfo.yaml
 relish status                        # three frontends, spread across the nodes
 open http://podinfo.localhost:18080  # through the built-in ingress
 
+# Build a small Go app on the cluster (Buildah on a node, into the built-in
+# registry, signed), then run it next to podinfo
+curl -fsSL https://reliaburger.com/demo/burger.tar.gz | tar xz
+relish build burger/burger.toml
+relish apply burger/burger.toml
+curl http://burger.localhost:18080/order   # calls podinfo's backend by name
+
 # See every hop from frontend to Redis: DNS, VIP, eBPF map, firewall, TCP
 relish path frontend --to redis
 

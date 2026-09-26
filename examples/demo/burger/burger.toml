@@ -1,0 +1,33 @@
+# The five-minute tour's home-built app: build it on the cluster, then run it
+# next to podinfo. From the directory above this one:
+#
+#   relish build burger/burger.toml    # a node builds it with Buildah into Pickle
+#   relish apply burger/burger.toml
+#   curl http://burger.localhost:18080/order
+#
+# Each order names the podinfo backend replica that "cooked" it, reached by its
+# service name, so apply podinfo first:
+#   relish apply -f https://reliaburger.com/demo/podinfo.yaml
+#
+# The Go source, its test and the Dockerfile sit next to this file.
+
+# Tar this directory, upload it to Pickle, and have a node with Buildah build
+# the Dockerfile (for linux/amd64 and linux/arm64) and push it as burger:v1.
+[build.burger]
+context = "."
+destination = "pickle://burger:v1"
+
+[app.burger]
+# A bare name: nodes pull it from the cluster's own registry.
+image = "burger:v1"
+port = 8080
+replicas = 2
+cpu = "50m-500m"
+memory = "16Mi-64Mi"
+env = { BACKEND_URL = "http://backend:9898/" }
+
+[app.burger.health]
+path = "/healthz"
+
+[app.burger.ingress]
+host = "burger.localhost"
