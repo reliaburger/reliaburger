@@ -361,28 +361,7 @@ retain_versions = 3
                     .cluster_state_from(node)
                     .await
                     .is_some_and(|state| state["active"].is_null());
-                let live_members = async {
-                    let response = self
-                        .client
-                        .get(format!("http://{}/v1/cluster/nodes", node.api))
-                        .send()
-                        .await
-                        .ok()?
-                        .error_for_status()
-                        .ok()?;
-                    response
-                        .json::<Vec<reliaburger::bun::agent::NodeStatus>>()
-                        .await
-                        .ok()
-                }
-                .await;
-                let membership_ready = live_members.is_some_and(|members| {
-                    self.nodes.iter().all(|expected| {
-                        members.iter().any(|member| {
-                            member.node_id == expected.name && member.state == "alive"
-                        })
-                    })
-                });
+                let membership_ready = self.knows_every_member(node).await;
                 if leader_agrees && upgrade_idle && membership_ready {
                     return leader;
                 }
@@ -393,6 +372,40 @@ retain_versions = 3
             );
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
+    }
+
+    /// Whether `node` sees every harness node alive AND has heard each one
+    /// advertise its API endpoint. An upgrade plan is validated against
+    /// exactly that view, and a leader that has just restarted learns its
+    /// peers from a membership sync before their own gossip arrives: until
+    /// then it would refuse the plan as "not advertised yet".
+    async fn knows_every_member(&self, node: &ClusterNode) -> bool {
+        let members = async {
+            let response = self
+                .client
+                .get(format!("http://{}/v1/cluster/nodes", node.api))
+                .send()
+                .await
+                .ok()?
+                .error_for_status()
+                .ok()?;
+            response
+                .json::<Vec<reliaburger::bun::agent::NodeStatus>>()
+                .await
+                .ok()
+        }
+        .await;
+        members.is_some_and(|members| {
+            self.nodes.iter().all(|expected| {
+                members.iter().any(|member| {
+                    member.node_id == expected.name
+                        && member.state == "alive"
+                        && member
+                            .api_address
+                            .is_some_and(|address| address.to_string() == expected.api)
+                })
+            })
+        })
     }
 
     async fn node_version(&self, api: &str) -> Option<String> {
@@ -437,7 +450,7 @@ retain_versions = 3
     }
 
     async fn plan_nodes(&self) -> (Vec<serde_json::Value>, String, String) {
-        let leader = self.wait_for_leader().await;
+        let leader = self.wait_for_idle_leader().await;
         let (list, worker) = self.plan_nodes_for(&leader);
         (list, leader, worker)
     }
@@ -1076,6 +1089,10 @@ async fn paused_upgrade_can_be_aborted_or_replaced_by_a_rollback() {
     // ...and a cluster rollback replaces the paused run instead of being
     // refused with "already in progress".
     let leader = harness.wait_for_leader().await;
+    wait_for("the leader to know every node's API", WAIT, || async {
+        harness.knows_every_member(harness.node(&leader)).await
+    })
+    .await;
     let client = harness.relish_client(harness.node(&leader));
     reliaburger::relish::upgrade::rollback(&client, Some("v0.1.0".to_string()), Vec::new())
         .await

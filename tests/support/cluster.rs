@@ -594,6 +594,7 @@ fn spawn_gossip_membership_table(
                 .map(|m| NodeMembershipInfo {
                     node_id: m.node_id.clone(),
                     address: SocketAddr::new(m.address.ip(), m.address.port() + 3),
+                    api_advertised: true,
                 })
                 .collect();
             *table.write().await = snapshot;
@@ -620,6 +621,7 @@ fn spawn_directory_membership_table(
                 .map(|(node_id, endpoints)| NodeMembershipInfo {
                     node_id: node_id.clone(),
                     address: endpoints.api_address,
+                    api_advertised: true,
                 })
                 .collect();
             *table.write().await = snapshot;

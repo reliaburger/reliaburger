@@ -1345,6 +1345,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                                     m.address,
                                     gossip_to_api_offset,
                                 ),
+                                api_advertised: directory.endpoints.contains_key(&m.node_id),
                             };
                             (m.state == NodeState::Alive, info)
                         })

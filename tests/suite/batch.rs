@@ -647,6 +647,7 @@ async fn lost_callback_batch_still_terminates_via_the_pull_watcher() {
         membership: Some(vec![NodeMembershipInfo {
             node_id: reliaburger::meat::NodeId("leader".to_string()),
             address: dead_leader_address,
+            api_advertised: true,
         }]),
         ..Default::default()
     })
@@ -658,10 +659,12 @@ async fn lost_callback_batch_still_terminates_via_the_pull_watcher() {
         NodeMembershipInfo {
             node_id: reliaburger::meat::NodeId("leader".to_string()),
             address: dead_leader_address,
+            api_advertised: true,
         },
         NodeMembershipInfo {
             node_id: reliaburger::meat::NodeId("runner".to_string()),
             address: runner_address,
+            api_advertised: true,
         },
     ];
 
@@ -765,6 +768,7 @@ async fn leader_restart_mid_batch_resumes_from_the_durable_record() {
     let membership = vec![NodeMembershipInfo {
         node_id: reliaburger::meat::NodeId("runner".to_string()),
         address: runner_address,
+        api_advertised: true,
     }];
     let new_leader = Harness::start_with(HarnessOptions {
         council: Some(Arc::clone(&council)),
