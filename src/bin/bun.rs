@@ -1405,6 +1405,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                 shutdown.clone(),
                 cluster_http.clone(),
                 Some(data_base.clone()),
+                config.runtime.stop_confirmation_timeout(),
             );
         }
     }

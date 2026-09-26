@@ -606,6 +606,7 @@ async fn lease_retirement_waits_for_paused_worker_across_leader_change() {
         nodes[2].shutdown.clone(),
         reliaburger::cluster::ClusterHttp::plaintext(),
         Some(checkpoint.path().into()),
+        reliaburger::config::node::RuntimeSection::default().stop_confirmation_timeout(),
     );
     wait_until(
         "confirmed worker retirement",

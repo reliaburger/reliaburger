@@ -366,6 +366,7 @@ async fn consumer_reconciler_retries_lost_receipts_after_tls_leader_change() {
         shutdown.clone(),
         http,
         Some(root.path().join("placements")),
+        reliaburger::config::node::RuntimeSection::default().stop_confirmation_timeout(),
     );
     tokio::time::timeout(Duration::from_secs(15), async {
         while observed[0].load(Ordering::SeqCst) == 0 {
