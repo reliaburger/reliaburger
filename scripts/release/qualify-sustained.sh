@@ -17,9 +17,15 @@
 #   --qualified-digest SHA  require candidate.json to have this SHA-256
 #   --soak-bun PATH         signed soak build named bun-v0.1.0-soak.1 with PATH.sig
 #                           beside it; without it the upgrade slots are skipped
-#   --duration D            soak length: 40m, 24h, 2d (default 24h)
-#   --schedule S            full (hourly cycle) or compressed (10-minute cycle,
-#                           for dry runs); default full
+#   --tier T                fast (compressed schedule, 90m: the iteration loop
+#                           after each round of fixes) or final (full schedule,
+#                           8h: the acceptance run on the final candidate)
+#   --duration D            soak length: 40m, 8h, 2d (default: the tier's, or 24h)
+#   --schedule S            full (hourly cycle) or compressed (10-minute cycle);
+#                           default: the tier's, or full
+#                           An explicit --duration or --schedule overrides the
+#                           tier; a final tier shorter than 8h or not on the
+#                           full schedule never counts as acceptance
 #   --evidence DIR          evidence directory (default: a new
 #                           /var/tmp/reliaburger-v02.XXXXXX)
 #   --record FILE           where to write the record (default: in the evidence
@@ -47,8 +53,9 @@ podinfo=$repository/examples/kubernetes/podinfo.yaml
 base_url=
 qualified_digest=
 soak_bun=
-duration_text=24h
-schedule=full
+tier=
+duration_text=
+schedule=
 evidence=
 record=
 home=
@@ -59,6 +66,7 @@ while [ "$#" -gt 0 ]; do
         --base-url) base_url=${2:-}; shift 2 ;;
         --qualified-digest) qualified_digest=${2:-}; shift 2 ;;
         --soak-bun) soak_bun=${2:-}; shift 2 ;;
+        --tier) tier=${2:-}; shift 2 ;;
         --duration) duration_text=${2:-}; shift 2 ;;
         --schedule) schedule=${2:-}; shift 2 ;;
         --evidence) evidence=${2:-}; shift 2 ;;
@@ -71,19 +79,41 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
+# A resumed run keeps the tier, schedule and length it started with.
+if [ "$resume" = true ] && [ -f "${evidence:-.}/metadata.json" ]; then
+    started_with() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get(sys.argv[2], ""))' "$evidence/metadata.json" "$1"; }
+    [ -n "$tier" ] || tier=$(started_with tier)
+    [ -n "$schedule" ] || schedule=$(started_with schedule)
+    [ -n "$duration_text" ] || { duration_text=$(started_with duration_target); duration_text=${duration_text:+$(( duration_text / 60 ))m}; }
+fi
+# The two tiers (plan D3): fast for the fix-and-rerun loop, final for acceptance.
+case $tier in
+    fast) : "${schedule:=compressed}" "${duration_text:=90m}" ;;
+    final) : "${schedule:=full}" "${duration_text:=8h}" ;;
+    ''|custom) tier=custom; : "${schedule:=full}" "${duration_text:=24h}" ;;
+    *) fail '--tier must be fast or final' ;;
+esac
+
 case $duration_text in
     *[0-9]m) duration=$(( ${duration_text%m} * 60 )) ;;
     *[0-9]h) duration=$(( ${duration_text%h} * 3600 )) ;;
     *[0-9]d) duration=$(( ${duration_text%d} * 86400 )) ;;
     *) fail '--duration must look like 40m, 24h or 2d' ;;
 esac
-# Schedule parameters: cycle length, power-off hold, TLS rotation period and
-# how often the catalogue pulse, offline export and registry push run.
+# Schedule parameters: cycle length, power-off hold, TLS rotation period, how
+# often the catalogue pulse, offline export and registry push run, and how many
+# chaos kinds each chaos slot runs. Two a slot lets an 8-hour full run (four
+# chaos slots with upgrade walks) reach all seven kinds. The run always
+# completes min_cycles cycles, even when faults overrun their slots: every
+# hour of a full run (so every special its length schedules), and cycles 0-3
+# of a compressed one, which carry every fault kind and every special.
 case $schedule in
     full) cycle=3600; hold_min=60; hold_max=180; rotation=900; kill_offset=20
-          quorum_hold=300; pulse_every=1; export_every=6; push_every=1 ;;
+          quorum_hold=300; pulse_every=1; export_every=6; push_every=1; chaos_per_slot=2
+          min_cycles=$(( duration / cycle )) ;;
     compressed) cycle=600; hold_min=20; hold_max=40; rotation=300; kill_offset=10
-          quorum_hold=60; pulse_every=0; export_every=2; push_every=1 ;;
+          quorum_hold=60; pulse_every=0; export_every=2; push_every=1; chaos_per_slot=2
+          min_cycles=4 ;;
     *) fail '--schedule must be full or compressed' ;;
 esac
 slot=$(( cycle / 6 ))
@@ -855,6 +885,11 @@ slot_power_off() {
 
 chaos_index=0
 slot_chaos() {
+    local round
+    for (( round = 0; round < chaos_per_slot; round++ )); do chaos_one; done
+}
+
+chaos_one() {
     local kinds=(kill delay partition scenario pause drop dns) kind result=0 output=$evidence/snapshots/chaos-$chaos_index.log
     kind=${kinds[chaos_index % ${#kinds[@]}]}
     chaos_index=$(( chaos_index + 1 ))
@@ -972,6 +1007,9 @@ slot_upgrade() {
     name=${soak_bun##*/}
     target=${name#bun-v}
     inject=$(( upgrade_walks % 2 ))
+    # Compressed runs see two walks at most, so both carry a fault: a leader
+    # SIGKILL on the first and a follower power-off on the second.
+    [ "$schedule" = full ] || inject=1
     say "upgrade walk $upgrade_walks to $target$([ "$inject" -eq 1 ] && echo ', with a fault mid-walk')"
     open_window upgrade
     with_timeout 300 "$limactl" copy "$soak_bun" "$soak_bun.sig" "${vm[1]}:/var/tmp/" > /dev/null
@@ -1057,6 +1095,10 @@ run_cycle() {
     current_slot="$index:leader-kill"; wait_until $(( start + slot )); run_slot slot_bun_kill leader
     if [ $(( index % 2 )) -eq 1 ] && [ -n "$soak_bun" ]; then
         current_slot="$index:upgrade"; wait_until $(( start + 2 * slot )); run_slot slot_upgrade
+        # Compressed runs chaos after the walk too, so cycles 0-3 cover all seven kinds.
+        if [ "$schedule" = compressed ]; then
+            current_slot="$index:chaos"; wait_until $(( start + 4 * slot )); run_slot slot_chaos
+        fi
     else
         [ $(( index % 2 )) -eq 0 ] || event --phase upgrade --verdict skipped --detail 'no --soak-bun'
         current_slot="$index:deploy-kill"; wait_until $(( start + 2 * slot )); run_slot slot_deploy_kill
@@ -1079,9 +1121,10 @@ run_cycle() {
 }
 
 # Specials scale with the run: graceful stop/start at each half, quorum loss
-# at 40% and 85% of the hours, every VM off at 70%. A 12 h run gets graceful
-# at 6 and 12, quorum loss at 5 and 10, all off at 8.
+# at 40% and 85% of the hours, every VM off at 70%. An 8 h final-tier run gets
+# graceful at 4 and 8, quorum loss at 3 and 7, all off at 6.
 # The compressed schedule runs one of each on cycles 1-3 instead.
+# min_cycles makes sure every scheduled one gets its cycle.
 special_for_cycle() {
     local index=$1 hour
     if [ "$schedule" = compressed ]; then
@@ -1149,6 +1192,7 @@ finish() {
 # --- main ------------------------------------------------------------------------
 
 start_run() {
+    meta tier "$tier"
     meta schedule "$schedule"
     meta evidence "\`$evidence\`"
     meta started_at "json:$(date +%s)"
@@ -1183,6 +1227,9 @@ if [ "$resume" = true ]; then
     last_event=$(tail -n 1 "$evidence/events.jsonl" | python3 -c 'import json,sys; print(json.load(sys.stdin)["ts"])')
     gap=$(( $(date +%s) - last_event ))
     event --phase pause --duration "$gap" --detail 'resumed after an interruption'
+    # Carry on the chaos rotation and the walk count where the run left off.
+    chaos_index=$(python3 -c 'import json,sys; print(sum(1 for e in map(json.loads, open(sys.argv[1])) if e.get("phase", "").startswith("fault:chaos-") and "exit" in e))' "$evidence/events.jsonl")
+    upgrade_walks=$(python3 -c 'import json,sys; print(sum(1 for e in map(json.loads, open(sys.argv[1])) if e.get("phase") == "upgrade:upgrade"))' "$evidence/events.jsonl")
     ingress_rotations=$(find "$tls" -maxdepth 1 -name 'leaf-*' | wc -l | tr -d ' ')
     say "resuming at cycle $first_cycle after a $gap s gap"
     paused=$(python3 -c 'import json,sys; print(sum(e.get("duration", 0) for e in map(json.loads, open(sys.argv[1])) if e.get("phase") == "pause"))' "$evidence/events.jsonl")
@@ -1230,8 +1277,9 @@ next_heavy=$(( $(date +%s) + heavy_every ))
 index=$first_cycle
 while :; do
     cycle_start=$(( started_at + index * cycle ))
-    # A cycle that starts finishes; none starts once the soak time is up.
-    if [ "$cycle_start" -ge "$end" ] || [ "$(date +%s)" -ge "$end" ]; then break; fi
+    # A cycle that starts finishes; none starts once the soak time is up,
+    # unless the run hasn't yet reached min_cycles.
+    if [ "$index" -ge "$min_cycles" ] && { [ "$cycle_start" -ge "$end" ] || [ "$(date +%s)" -ge "$end" ]; }; then break; fi
     [ "$cycle_start" -ge "$(date +%s)" ] || cycle_start=$(date +%s)
     run_cycle "$index" "$cycle_start"
     index=$(( index + 1 ))
