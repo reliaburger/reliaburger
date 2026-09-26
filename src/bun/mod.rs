@@ -130,6 +130,10 @@ pub enum BunError {
         reason: &'static str,
     },
 
+    /// A stop this request joined, or was waiting on, did not complete.
+    #[error("stop did not complete: {reason}")]
+    StopIncomplete { reason: String },
+
     /// An `exec` did not finish within its deadline.
     #[error("exec timed out after {seconds}s")]
     ExecTimeout { seconds: u64 },

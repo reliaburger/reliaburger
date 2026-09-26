@@ -1028,6 +1028,61 @@ Each node's placement reconciler polls the leader every couple of seconds and de
 
 `DeployBackoff` remembers consecutive failures per placement and the specification they were for. The same specification waits 5 s, then 10, 20, 40, up to five minutes; a changed specification is new desired state and is tried at once, with the count reset. Success clears the record, and so does the leader withdrawing the placement. Eight minutes of a broken app is now a handful of attempts, and the journal says when the next one is due.
 
+## A stubborn process shouldn't freeze the node either
+
+We moved deploys off the command loop and thought we were done. The V02 soak disagreed. Its journals filled with `agent status timed out`, `snapshot collection failed or timed out` every five seconds, and `retirement of … exceeded ten seconds; ownership retained`, all on a node that was doing nothing more exciting than retiring a few apps.
+
+The apps were `busybox sleep` and `httpd`. Run as PID 1, both ignore SIGTERM, and so do plenty of shell scripts. That's fine as far as correctness goes: the stop sends SIGTERM, waits out the ten-second grace, sends SIGKILL and confirms the exit. The trouble was *where* it waited. `Stop` and `Retire` still ran inside `handle_command`, so the loop sat in that grace for ten seconds per app. Status requests timed out behind it (their limit is five seconds). The report worker gave up. A second retirement queued behind the first, and a third behind that. A burst of stubborn retirements made the node deaf for tens of seconds.
+
+The fix follows the deploy worker's rule: slow waiting moves to a task, and every state change stays on the loop. A stop now has three parts:
+
+1. `begin_app_stop` runs on the loop. It retires the schedule, withdraws the app's routing and moves its instances to `Stopping`. Nothing's been signalled yet.
+2. `app_exit_wait` builds a future that owns clones of everything it needs (the grill, the drain tracker, the grace) and borrows nothing from the agent. It drains each replica, sends SIGTERM, waits out the grace and escalates to SIGKILL, for every replica at once.
+3. `finish_app_stop` runs on the loop again, once the wait reports back. It records `Stopped`, commits job phases and releases the instances' artifacts and discovery keys. A retirement then forgets ownership, and a lease retirement removes its test storage.
+
+The signature of the middle step is where Rust earns its keep:
+
+```rust
+fn app_exit_wait(
+    &self,
+    stop: &AppStop,
+) -> impl std::future::Future<Output = Result<(), BunError>> + Send + 'static {
+    // … clone the grill, the drains, the grace …
+    async move {
+        let waits = ids.iter().map(|id| {
+            drain_and_stop_instance(&drains, &grill, id, grace, confirmation_timeout)
+        });
+        futures_util::future::join_all(waits)
+            .await
+            .into_iter()
+            .find_map(Result::err)
+            .map_or(Ok(()), Err)
+    }
+}
+```
+
+`'static` is the promise that the future holds no borrowed references, so it can outlive the call that made it. If the `async move` block had quietly captured `self`, the compiler would reject the signature, because `self` is only borrowed for the length of the call. In Go you'd find that mistake at run time, as a data race; here it doesn't build. `join_all` polls every replica's wait together, so three stubborn replicas cost one grace, not three.
+
+The agent keeps these futures in a `tokio::task::JoinSet`, a set of spawned tasks you can await in completion order, and the loop's `select!` gains one arm:
+
+```rust
+Some(outcome) = self.stop_waits.join_next_with_id(),
+    if !self.stop_waits.is_empty() => {
+    self.complete_app_stop(outcome).await;
+}
+```
+
+The `if` after the future is a `select!` precondition: while nothing is stopping, the branch is switched off rather than polled. `join_next_with_id` hands back the finished task's id even when the task panicked, which is how the loop always finds the callers waiting on that stop, so nobody waits forever.
+
+Moving the wait off the loop opened gaps that the old serial code closed by accident, because nothing else could run in the middle of a stop. Each one needed an explicit answer:
+
+- **A second stop of the same app** joins the pending one. It doesn't signal again, and both callers get the outcome.
+- **A deploy of an app that's still stopping** is refused with "still stopping; retry". The reconciler retries anyway, and a deploy mustn't replace instances that a stop still owns.
+- **Shutdown with stops pending** aborts the waits (shutdown SIGTERMs and kills everything itself) and tells each caller the stop was unconfirmed, so they keep what they own.
+- **A crash mid-stop** leaves the instances owned and unconfirmed, exactly as before. The reconciler still has them recorded, so it sends `Retire` again after the restart, and that stop starts over.
+
+What didn't change is the guarantee that matters: a port, an address or a volume is released only after the runtime has confirmed the old process is gone. `Retire` still answers only after the exit, and the tests hold both ends of that. With a process-runtime workload running `sh -c "trap '' TERM; sleep 60"`, `Status` must answer in under a second while the stop waits, the stop must take at least the grace and end with the process gone, a retirement must keep its instance listed until the exit, and two stubborn stops must finish in less than one and three-quarter graces. Each of those fails against the old loop. The overlap test, for example, reported `4.03s for two 2s graces`.
+
 ## What we deferred
 
 Blue-green deploys, autoscaling, the Lettuce GitOps engine, and Kubernetes migration tools are all Phase 9. The `DeployPhase` enum already carries the blue-green states (you'll have spotted `StartingGreen` and friends in the transition tests), and `execute` delegates to a separate blue-green path — but we'll cover that in Chapter 9. Rolling deploys with automatic rollback cover the vast majority of production deployment needs, and they're the foundation everything else builds on.

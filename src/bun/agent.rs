@@ -1602,6 +1602,7 @@ pub struct PartitionBlocklists {
 
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 use super::egress_owners::{EgressBinding, PolicyPhase};
+mod app_stop;
 mod consumer;
 mod startup_recovery;
 pub use consumer::ConsumerUpdate;
@@ -1610,6 +1611,7 @@ mod discovery_recovery;
 mod egress_ownership;
 mod producer_release;
 mod runtime_inventory;
+use app_stop::{AppStop, PendingStops, StopPurpose};
 use discovery_ownership::DiscoveryOwnership;
 use runtime_inventory::{LOOP_RUNTIME_INVENTORY_TIMEOUT, RUNTIME_INVENTORY_TIMEOUT};
 
@@ -1869,6 +1871,11 @@ pub struct BunAgent<G: Grill> {
     stop_grace: std::time::Duration,
     /// The same wait for node shutdown: `SHUTDOWN_GRACE_SECS` by default.
     shutdown_grace: std::time::Duration,
+    /// Operator stops and retirements whose exit is still being awaited.
+    pending_stops: PendingStops,
+    /// Their exit waits, off the command loop so a workload that ignores
+    /// SIGTERM can't stall every other command for its grace.
+    stop_waits: tokio::task::JoinSet<Result<(), BunError>>,
 }
 
 impl<G: Grill + Clone + 'static> BunAgent<G> {
@@ -1996,6 +2003,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             drains: new_shared_drains(),
             stop_grace: std::time::Duration::from_secs(STOP_GRACE_SECS),
             shutdown_grace: std::time::Duration::from_secs(SHUTDOWN_GRACE_SECS),
+            pending_stops: PendingStops::new(),
+            stop_waits: tokio::task::JoinSet::new(),
         }
     }
 
@@ -2119,6 +2128,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             drains: new_shared_drains(),
             stop_grace: std::time::Duration::from_secs(STOP_GRACE_SECS),
             shutdown_grace: std::time::Duration::from_secs(SHUTDOWN_GRACE_SECS),
+            pending_stops: PendingStops::new(),
+            stop_waits: tokio::task::JoinSet::new(),
         }
     }
 
@@ -3570,11 +3581,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         loop {
             tokio::select! {
                 _ = self.shutdown.cancelled() => {
+                    self.abandon_pending_stops();
                     self.shutdown_all().await;
                     break;
                 }
                 Some(cmd) = self.command_rx.recv() => {
                     self.handle_command(cmd).await;
+                }
+                Some(outcome) = self.stop_waits.join_next_with_id(),
+                    if !self.stop_waits.is_empty() => {
+                    self.complete_app_stop(outcome).await;
                 }
                 Some(op) = self.deploy_ops_rx.recv() => {
                     self.handle_deploy_op(op).await;
@@ -3991,6 +4007,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             let _ = events.send(ApplyEvent::Error { message }).await;
             return;
         }
+        // A stopping workload still owns its instances until their exit is
+        // confirmed; a deploy must not replace them underneath the stop.
+        if let Some(target) = self.stopping_target(&config) {
+            let message = format!(
+                "workload {}/{} is still stopping; retry once its exit is confirmed",
+                target.namespace, target.name
+            );
+            let _ = events.send(ApplyEvent::Error { message }).await;
+            return;
+        }
         let operation = match self.deploy_operations.start(&config).await {
             Ok(operation) => operation,
             Err(error) => {
@@ -4151,24 +4177,33 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 namespace,
                 response,
             } => {
-                let result = self.stop_workload_when_idle(&app_name, &namespace).await;
-                let _ = response.send(result);
+                self.request_app_stop(app_name, namespace, StopPurpose::Stop, response)
+                    .await;
             }
             AgentCommand::Retire {
                 app_name,
                 namespace,
                 response,
             } => {
-                let result = self.retire_workload(&app_name, &namespace).await;
-                let _ = response.send(result);
+                self.request_app_stop(app_name, namespace, StopPurpose::Retire, response)
+                    .await;
             }
             AgentCommand::RetireTestResources {
                 app_name,
                 namespace,
                 response,
             } => {
-                let result = self.retire_test_resources(&app_name, &namespace).await;
-                let _ = response.send(result);
+                if let Err(error) = Self::require_test_namespace(&app_name, &namespace) {
+                    let _ = response.send(Err(error));
+                } else {
+                    self.request_app_stop(
+                        app_name,
+                        namespace,
+                        StopPurpose::RetireTestResources,
+                        response,
+                    )
+                    .await;
+                }
             }
             AgentCommand::Status { response } => {
                 let statuses = self.get_status().await;
@@ -7396,6 +7431,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.egress_affected_workloads
             .extend(affected_apps.iter().cloned());
         for (app_name, namespace) in affected_apps {
+            // A pending stop has already withdrawn and signalled the app;
+            // its own completion records the exit.
+            if self
+                .pending_stops
+                .contains_key(&(app_name.clone(), namespace.clone()))
+            {
+                continue;
+            }
             eprintln!("sesame: stopping {namespace}/{app_name}: live kernel policy was lost");
             if let Err(error) = self.stop_app(&app_name, &namespace).await {
                 eprintln!(
@@ -8468,8 +8511,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     /// Refuse user/cleanup stops while a deploy can still mutate the target.
-    async fn stop_workload_when_idle(
-        &mut self,
+    async fn refuse_while_deploying(
+        &self,
         app_name: &str,
         namespace: &str,
     ) -> Result<(), BunError> {
@@ -8495,15 +8538,27 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 operation_id: operation.id,
             });
         }
-        self.stop_app(app_name, namespace).await
+        Ok(())
     }
 
-    /// Forget ownership only after stop has confirmed every instance's exit.
+    /// Retire a workload inline: the same steps a `Retire` command takes, for
+    /// tests that drive the agent without running its loop.
+    #[cfg(test)]
     async fn retire_workload(&mut self, app_name: &str, namespace: &str) -> Result<(), BunError> {
-        match self.stop_workload_when_idle(app_name, namespace).await {
+        self.refuse_while_deploying(app_name, namespace).await?;
+        match self.stop_app(app_name, namespace).await {
             Ok(()) | Err(BunError::AppNotFound { .. }) => {}
             Err(error) => return Err(error),
         }
+        self.release_retired_workload(app_name, namespace).await
+    }
+
+    /// Forget a workload's ownership once its stop has confirmed every exit.
+    async fn release_retired_workload(
+        &mut self,
+        app_name: &str,
+        namespace: &str,
+    ) -> Result<(), BunError> {
         let instances: Vec<_> = self
             .supervisor
             .list_instances()
@@ -8524,18 +8579,19 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         Ok(())
     }
 
-    async fn retire_test_resources(
-        &mut self,
-        app_name: &str,
-        namespace: &str,
-    ) -> Result<(), BunError> {
-        if !crate::testkit::lease::valid_test_namespace(namespace) {
-            return Err(BunError::RetirementState {
-                instance_id: InstanceId(format!("{namespace}/{app_name}")),
-                reason: "managed storage retirement requires an owned test namespace".into(),
-            });
+    /// Managed storage retirement only ever touches an owned test namespace.
+    fn require_test_namespace(app_name: &str, namespace: &str) -> Result<(), BunError> {
+        if crate::testkit::lease::valid_test_namespace(namespace) {
+            return Ok(());
         }
-        self.retire_workload(app_name, namespace).await?;
+        Err(BunError::RetirementState {
+            instance_id: InstanceId(format!("{namespace}/{app_name}")),
+            reason: "managed storage retirement requires an owned test namespace".into(),
+        })
+    }
+
+    /// Remove a retired lease's disposable managed storage.
+    async fn retire_test_storage(&self, app_name: &str, namespace: &str) -> Result<(), BunError> {
         let manager = crate::grill::volume::VolumeManager::new(self.volumes_dir.clone());
         let namespace = namespace.to_string();
         let app = app_name.to_string();
@@ -8587,8 +8643,28 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         })
     }
 
-    /// Stop an app's instances.
+    /// Stop an app's instances, waiting for their exit inline.
+    ///
+    /// Operator stops and retirements go through `request_app_stop` instead,
+    /// which awaits the same exit off the command loop. This inline form
+    /// serves the egress-loss fence, which already runs as one fenced step.
+    #[cfg(any(test, all(feature = "ebpf", target_os = "linux")))]
     async fn stop_app(&mut self, app_name: &str, namespace: &str) -> Result<(), BunError> {
+        let stop = self.begin_app_stop(app_name, namespace).await?;
+        self.app_exit_wait(&stop).await?;
+        self.finish_app_stop(app_name, namespace, stop).await
+    }
+
+    /// Withdraw an app's routing and move its instances to Stopping.
+    ///
+    /// Nothing is signalled yet: `app_exit_wait` sends SIGTERM, waits out
+    /// the grace and escalates, and `finish_app_stop` releases ownership only
+    /// after that wait has confirmed every exit.
+    async fn begin_app_stop(
+        &mut self,
+        app_name: &str,
+        namespace: &str,
+    ) -> Result<AppStop, BunError> {
         // A schedule exists before its first instance. Retire future firings
         // even when there is no running process (or runtime cleanup fails).
         let mut next = self.scheduled_jobs.clone();
@@ -8643,21 +8719,66 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             self.supervisor.stop_app(app_name, namespace).await?;
         }
 
-        // DEP6: SIGTERM, wait for the runtime to confirm exit, escalate to
-        // SIGKILL on timeout. Only then do we record Stopped. Recording it
-        // before the process exits let container and supervisor state
-        // diverge — a "stopped" app whose process was still serving traffic.
-        let mut first_error = None;
-        for id in &instances {
-            if let Err(error) = self.stop_and_wait_for_exit(id, self.stop_grace).await {
-                first_error.get_or_insert(error);
-            }
+        Ok(AppStop {
+            instances,
+            owns_job,
+        })
+    }
+
+    /// The exit wait for a begun stop, detached from `self` so it can run on
+    /// a spawned task while the command loop keeps serving.
+    ///
+    /// DEP6: SIGTERM, wait for the runtime to confirm exit, escalate to
+    /// SIGKILL on timeout. Only then may the caller record Stopped. Recording
+    /// it before the process exits let container and supervisor state
+    /// diverge — a "stopped" app whose process was still serving traffic.
+    /// Every replica waits at once, so a stop costs one grace, not one each.
+    fn app_exit_wait(
+        &self,
+        stop: &AppStop,
+    ) -> impl std::future::Future<Output = Result<(), BunError>> + Send + 'static {
+        let ids: Vec<InstanceId> = stop
+            .instances
+            .iter()
+            .filter(|id| {
+                !self
+                    .recorded_jobs
+                    .get(&id.0)
+                    .is_some_and(|job| job.runtime_absent)
+            })
+            .cloned()
+            .collect();
+        let grill = self.supervisor.grill().clone();
+        let drains = self.drains.clone();
+        let grace = self.stop_grace;
+        let confirmation_timeout = self.stop_confirmation_timeout;
+        async move {
+            let waits = ids.iter().map(|id| {
+                drain_and_stop_instance(&drains, &grill, id, grace, confirmation_timeout)
+            });
+            // Try every replica, but report the first failure: ownership and
+            // enforcement stay until all exits are confirmed, and a later stop
+            // can retry the incomplete cleanup.
+            futures_util::future::join_all(waits)
+                .await
+                .into_iter()
+                .find_map(Result::err)
+                .map_or(Ok(()), Err)
         }
-        // Try every replica, but preserve ownership and enforcement until all
-        // exits are confirmed. A later stop can retry the incomplete cleanup.
-        if let Some(error) = first_error {
-            return Err(error);
-        }
+    }
+
+    /// Record a stop whose exits are confirmed and release what it owned.
+    async fn finish_app_stop(
+        &mut self,
+        app_name: &str,
+        namespace: &str,
+        stop: AppStop,
+    ) -> Result<(), BunError> {
+        let AppStop {
+            instances,
+            owns_job,
+        } = stop;
+        let service_id = crate::onion::service_id::ServiceId::new(namespace, app_name);
 
         // Transition Stopping → Stopped now the exit is confirmed.
         for id in &instances {
@@ -10100,29 +10221,6 @@ impl<G: Grill + Clone + 'static> PreparedTrace<G> {
 }
 
 impl<G: Grill + Clone + 'static> BunAgent<G> {
-    /// Stop one instance, requiring observed exit even after force-kill.
-    async fn stop_and_wait_for_exit(
-        &self,
-        id: &InstanceId,
-        grace: std::time::Duration,
-    ) -> Result<(), BunError> {
-        if self
-            .recorded_jobs
-            .get(&id.0)
-            .is_some_and(|job| job.runtime_absent)
-        {
-            return Ok(());
-        }
-        drain_and_stop_instance(
-            &self.drains,
-            self.supervisor.grill(),
-            id,
-            grace,
-            self.stop_confirmation_timeout,
-        )
-        .await
-    }
-
     /// Withdraw local routing and poll request release without blocking the agent loop.
     async fn poll_instance_withdrawal(
         &mut self,
@@ -17519,6 +17617,295 @@ host = "remote.local"
 
         shutdown.cancel();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(3), handle).await;
+    }
+
+    // ---------------------------------------------------------------------
+    // Stops whose SIGTERM is ignored wait off the command loop.
+    // ---------------------------------------------------------------------
+
+    /// The stop grace the stubborn-workload tests use: long enough that a
+    /// loop blocked on it is unmistakable, short enough to keep them quick.
+    const STUBBORN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+    /// A process-runtime workload whose whole process group ignores SIGTERM,
+    /// as busybox `sleep` and many shells do as PID 1. It touches
+    /// `<dir>/<name>.trapped` once the trap is in place.
+    fn stubborn_app(name: &str, dir: &std::path::Path) -> String {
+        let trapped = dir.join(format!("{name}.trapped"));
+        format!(
+            "[app.{name}]\nimage = \"proc-grill:ignored\"\ncommand = [\"sh\", \"-c\", \"trap '' TERM; touch '{}'; sleep 60\"]\n",
+            trapped.display()
+        )
+    }
+
+    /// Deploy stubborn apps and wait until each has installed its trap, so
+    /// a SIGTERM can't land before the shell gets to ignore it.
+    async fn deploy_stubborn(
+        tx: &mpsc::Sender<AgentCommand>,
+        dir: &std::path::Path,
+        names: &[&str],
+    ) {
+        let config: String = names.iter().map(|name| stubborn_app(name, dir)).collect();
+        expect_complete(&send_deploy(tx, Config::parse(&config).unwrap()).await);
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !names
+                .iter()
+                .all(|name| dir.join(format!("{name}.trapped")).exists())
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("stubborn workloads never installed their trap");
+    }
+
+    /// Run a process-runtime agent with `STUBBORN_GRACE`, keeping a grill
+    /// handle so tests can see whether the process is really gone.
+    fn stubborn_agent() -> (
+        mpsc::Sender<AgentCommand>,
+        CancellationToken,
+        tokio::task::JoinHandle<()>,
+        crate::grill::process::ProcessGrill,
+        tempfile::TempDir,
+    ) {
+        let (tx, rx) = mpsc::channel(32);
+        let shutdown = CancellationToken::new();
+        let grill = crate::grill::process::ProcessGrill::new();
+        let grill_handle = grill.clone();
+        let port_allocator = PortAllocator::new(30000, 31000);
+        let mut agent = BunAgent::new(grill, port_allocator, rx, shutdown.clone());
+        let volumes = tempfile::tempdir().unwrap();
+        agent.set_volumes_dir(volumes.path().to_path_buf());
+        agent.set_stop_grace(STUBBORN_GRACE);
+        agent.set_shutdown_grace(std::time::Duration::from_millis(200));
+        let handle = tokio::spawn(async move { agent.run().await });
+        (tx, shutdown, handle, grill_handle, volumes)
+    }
+
+    /// Ask for status and return it with how long the loop took to answer.
+    async fn timed_status(
+        tx: &mpsc::Sender<AgentCommand>,
+    ) -> (Vec<InstanceStatus>, std::time::Duration) {
+        let started = Instant::now();
+        let (response, reply) = oneshot::channel();
+        tx.send(AgentCommand::Status { response }).await.unwrap();
+        let status = tokio::time::timeout(std::time::Duration::from_secs(10), reply)
+            .await
+            .expect("status never answered")
+            .unwrap();
+        (status, started.elapsed())
+    }
+
+    fn send_stop(
+        tx: &mpsc::Sender<AgentCommand>,
+        app_name: &str,
+    ) -> oneshot::Receiver<Result<(), BunError>> {
+        let (response, reply) = oneshot::channel();
+        tx.try_send(AgentCommand::Stop {
+            app_name: app_name.into(),
+            namespace: "default".into(),
+            response,
+        })
+        .unwrap();
+        reply
+    }
+
+    /// The V02 soak's stall: a workload that ignores SIGTERM made the agent
+    /// wait its whole grace inside the command loop, so `/v1/status` and the
+    /// report worker timed out behind it. Status must answer at once while
+    /// the stop is still waiting, and the stop must still end in SIGKILL.
+    #[tokio::test]
+    async fn status_answers_promptly_while_a_sigterm_ignoring_stop_waits() {
+        let (tx, shutdown, handle, grill, volumes) = stubborn_agent();
+        deploy_stubborn(&tx, volumes.path(), &["stubborn"]).await;
+        let id = InstanceId("default__stubborn-0".into());
+
+        let started = Instant::now();
+        let stopped = send_stop(&tx, "stubborn");
+        let (status, answered_in) = timed_status(&tx).await;
+
+        assert!(
+            answered_in < std::time::Duration::from_secs(1),
+            "status waited {answered_in:?} behind the stop"
+        );
+        let instance = status.iter().find(|i| i.id == id.0).unwrap();
+        assert_eq!(instance.state, ContainerState::Stopping.to_string());
+        assert_eq!(grill.state(&id).await.unwrap(), ContainerState::Stopping);
+
+        tokio::time::timeout(std::time::Duration::from_secs(15), stopped)
+            .await
+            .expect("stop never finished")
+            .unwrap()
+            .unwrap();
+        assert!(
+            started.elapsed() >= STUBBORN_GRACE,
+            "the workload must get its full grace before SIGKILL"
+        );
+        assert_eq!(grill.state(&id).await.unwrap(), ContainerState::Stopped);
+        let (status, _) = timed_status(&tx).await;
+        let instance = status.iter().find(|i| i.id == id.0).unwrap();
+        assert_eq!(instance.state, ContainerState::Stopped.to_string());
+
+        shutdown.cancel();
+        handle.await.unwrap();
+    }
+
+    /// A retirement keeps ownership (status, port) while the process lives,
+    /// and releases it only once the runtime has confirmed the exit.
+    #[tokio::test]
+    async fn retirement_releases_ownership_only_after_the_process_exits() {
+        let (tx, shutdown, handle, grill, volumes) = stubborn_agent();
+        deploy_stubborn(&tx, volumes.path(), &["stubborn"]).await;
+        let id = InstanceId("default__stubborn-0".into());
+
+        let (response, retired) = oneshot::channel();
+        tx.send(AgentCommand::Retire {
+            app_name: "stubborn".into(),
+            namespace: "default".into(),
+            response,
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let (status, answered_in) = timed_status(&tx).await;
+        assert!(answered_in < std::time::Duration::from_secs(1));
+        assert!(
+            status.iter().any(|i| i.id == id.0),
+            "ownership was released before the process exited"
+        );
+        assert_eq!(grill.state(&id).await.unwrap(), ContainerState::Stopping);
+
+        tokio::time::timeout(std::time::Duration::from_secs(15), retired)
+            .await
+            .expect("retirement never finished")
+            .unwrap()
+            .unwrap();
+        assert_eq!(grill.state(&id).await.unwrap(), ContainerState::Stopped);
+        let (status, _) = timed_status(&tx).await;
+        assert!(status.is_empty(), "retirement must release ownership");
+
+        shutdown.cancel();
+        handle.await.unwrap();
+    }
+
+    /// Two stubborn stops overlap: together they cost one grace, not two.
+    #[tokio::test]
+    async fn concurrent_sigterm_ignoring_stops_overlap() {
+        let (tx, shutdown, handle, grill, volumes) = stubborn_agent();
+        deploy_stubborn(&tx, volumes.path(), &["first", "second"]).await;
+
+        let started = Instant::now();
+        let first = send_stop(&tx, "first");
+        let second = send_stop(&tx, "second");
+        for stopped in [first, second] {
+            tokio::time::timeout(std::time::Duration::from_secs(15), stopped)
+                .await
+                .expect("stop never finished")
+                .unwrap()
+                .unwrap();
+        }
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < STUBBORN_GRACE * 7 / 4,
+            "stops serialised: {elapsed:?} for two {STUBBORN_GRACE:?} graces"
+        );
+        for app in ["first", "second"] {
+            let id = InstanceId(format!("default__{app}-0"));
+            assert_eq!(grill.state(&id).await.unwrap(), ContainerState::Stopped);
+        }
+
+        shutdown.cancel();
+        handle.await.unwrap();
+    }
+
+    /// A second stop of a workload that is already stopping joins the first
+    /// rather than signalling again, and both callers learn the outcome.
+    #[tokio::test]
+    async fn a_second_stop_joins_the_pending_one() {
+        let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+        agent.set_stop_grace(std::time::Duration::from_millis(500));
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        grill.set_ignore_stop(true);
+        grill.set_state(
+            &InstanceId("default__web-0".into()),
+            ContainerState::Running,
+        );
+        let handle = tokio::spawn(async move { agent.run().await });
+
+        let first = send_stop(&tx, "web");
+        let second = send_stop(&tx, "web");
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+
+        let id = InstanceId("default__web-0".into());
+        let stops = grill
+            .calls()
+            .iter()
+            .filter(|(op, i)| op == "stop" && i == &id)
+            .count();
+        assert_eq!(stops, 1, "a joined stop must not signal again");
+
+        shutdown.cancel();
+        handle.await.unwrap();
+    }
+
+    /// A deploy must not replace instances a pending stop still owns.
+    #[tokio::test]
+    async fn deploy_is_refused_while_the_workload_is_stopping() {
+        let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+        agent.set_stop_grace(std::time::Duration::from_secs(1));
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        grill.set_ignore_stop(true);
+        grill.set_state(
+            &InstanceId("default__web-0".into()),
+            ContainerState::Running,
+        );
+        let handle = tokio::spawn(async move { agent.run().await });
+
+        let stopped = send_stop(&tx, "web");
+        let events = send_deploy(&tx, basic_config()).await;
+        match events.last() {
+            Some(ApplyEvent::Error { message }) => {
+                assert!(message.contains("still stopping"), "{message}")
+            }
+            other => panic!("deploy over a pending stop was not refused: {other:?}"),
+        }
+        stopped.await.unwrap().unwrap();
+
+        shutdown.cancel();
+        handle.await.unwrap();
+    }
+
+    /// Shutdown doesn't wait out a pending stop's grace; the caller learns
+    /// the stop is unconfirmed and keeps what it owns.
+    #[tokio::test]
+    async fn shutdown_reports_pending_stops_unconfirmed() {
+        let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+        agent.set_stop_grace(std::time::Duration::from_secs(60));
+        agent.set_shutdown_grace(std::time::Duration::from_millis(200));
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        grill.set_ignore_stop(true);
+        grill.set_state(
+            &InstanceId("default__web-0".into()),
+            ContainerState::Running,
+        );
+        let handle = tokio::spawn(async move { agent.run().await });
+
+        let stopped = send_stop(&tx, "web");
+        let _ = timed_status(&tx).await;
+        shutdown.cancel();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), stopped)
+            .await
+            .expect("shutdown waited out the stop grace")
+            .unwrap();
+        assert!(
+            matches!(result, Err(BunError::StopIncomplete { .. })),
+            "{result:?}"
+        );
+        handle.await.unwrap();
     }
 
     #[tokio::test]
