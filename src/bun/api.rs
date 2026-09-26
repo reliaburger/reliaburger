@@ -47,7 +47,15 @@ use super::agent::{AgentCommand, ApplyEvent, InstanceStatus};
 #[derive(Debug, Clone)]
 pub struct NodeMembershipInfo {
     pub node_id: crate::meat::NodeId,
+    /// The node's API endpoint: the one it advertised over gossip, or a
+    /// port-offset guess until that advertisement arrives.
     pub address: std::net::SocketAddr,
+    /// `true` when `address` is the node's own advertisement. A guess is
+    /// fine for best-effort fan-out, but anything that compares or
+    /// publishes the address as the node's identity (upgrade plans, the
+    /// nodes listing) must wait for the real thing: nodes sharing a host
+    /// pick their ports independently, so one node's offset is not another's.
+    pub api_advertised: bool,
 }
 
 /// Every member gossip still knows (alive, suspect or dead, not left), with
@@ -2012,13 +2020,7 @@ async fn upgrade_start_handler(
         authoritative.get(id).cloned()
     }) {
         Ok(nodes) => nodes,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": e.to_string() })),
-            )
-                .into_response();
-        }
+        Err(e) => return plan_error_response(&e),
     };
 
     if let Some(active) = council.desired_state().await.active_upgrade {
@@ -2219,6 +2221,22 @@ async fn archive_aborted_upgrade(
     Ok(())
 }
 
+/// Reply to a refused upgrade plan. A node whose endpoint the leader hasn't
+/// heard yet is a 503 (retry shortly); a claim that contradicts the cluster
+/// is the caller's fault, a 400.
+fn plan_error_response(error: &crate::upgrade::plan::PlanError) -> Response {
+    let status = if error.is_transient() {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    (
+        status,
+        Json(serde_json::json!({ "error": error.to_string() })),
+    )
+        .into_response()
+}
+
 /// Build the leader's authoritative view of every node for upgrade
 /// planning (UPG2): node id → its API address (from gossip membership) and
 /// role (from the Raft voter set + current leader). This is the source of
@@ -2259,7 +2277,7 @@ async fn build_authoritative_view(
         view.insert(
             name,
             AuthoritativeNode {
-                address: member.address.to_string(),
+                address: member.api_advertised.then(|| member.address.to_string()),
                 role,
             },
         );
@@ -2455,13 +2473,7 @@ async fn upgrade_cluster_rollback_handler(
         authoritative.get(id).cloned()
     }) {
         Ok(nodes) => nodes,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": e.to_string() })),
-            )
-                .into_response();
-        }
+        Err(e) => return plan_error_response(&e),
     };
 
     let upgrade_id = format!(
@@ -5079,7 +5091,7 @@ async fn nodes_handler(State(state): State<ApiState>) -> Response {
                 for node in &mut nodes {
                     node.api_address = members
                         .iter()
-                        .find(|member| member.node_id.0 == node.node_id)
+                        .find(|member| member.node_id.0 == node.node_id && member.api_advertised)
                         .map(|member| member.address);
                 }
             }
@@ -13691,10 +13703,12 @@ schedule = "* * * * *"
             NodeMembershipInfo {
                 node_id: crate::meat::NodeId::new("node-alpha"),
                 address: "127.0.0.1:9101".parse().unwrap(),
+                api_advertised: true,
             },
             NodeMembershipInfo {
                 node_id: crate::meat::NodeId::new("node-beta"),
                 address: "127.0.0.1:9102".parse().unwrap(),
+                api_advertised: true,
             },
         ]));
         // No token store, so the request is open; membership at position 11.
@@ -14116,6 +14130,7 @@ schedule = "* * * * *"
         let members = Arc::new(RwLock::new(vec![NodeMembershipInfo {
             node_id: crate::meat::NodeId::new("unresponsive"),
             address,
+            api_advertised: true,
         }]));
         let app = router(
             cmd_tx,
@@ -14208,6 +14223,7 @@ schedule = "* * * * *"
         let members = Arc::new(RwLock::new(vec![NodeMembershipInfo {
             node_id: crate::meat::NodeId::new("peer"),
             address: peer_address,
+            api_advertised: true,
         }]));
         let app = router(
             cmd_tx,
@@ -14508,7 +14524,7 @@ schedule = "* * * * *"
             };
             response
                 .send(
-                    ["one", "unknown"]
+                    ["one", "guessed", "unknown"]
                         .into_iter()
                         .map(|id| super::super::agent::NodeStatus {
                             node_id: id.to_string(),
@@ -14524,10 +14540,20 @@ schedule = "* * * * *"
                 )
                 .unwrap();
         });
-        let membership = Arc::new(RwLock::new(vec![NodeMembershipInfo {
-            node_id: crate::meat::NodeId::new("one"),
-            address: "[::1]:19117".parse().unwrap(),
-        }]));
+        let membership = Arc::new(RwLock::new(vec![
+            NodeMembershipInfo {
+                node_id: crate::meat::NodeId::new("one"),
+                address: "[::1]:19117".parse().unwrap(),
+                api_advertised: true,
+            },
+            // Known to gossip, but its own directory extension hasn't
+            // arrived: the address is only a port-offset guess.
+            NodeMembershipInfo {
+                node_id: crate::meat::NodeId::new("guessed"),
+                address: "[::1]:19999".parse().unwrap(),
+                api_advertised: false,
+            },
+        ]));
         let app = router(
             tx,
             None,
@@ -14557,7 +14583,10 @@ schedule = "* * * * *"
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let nodes: Vec<crate::bun::agent::NodeStatus> = serde_json::from_slice(&body).unwrap();
         assert_eq!(nodes[0].api_address, Some("[::1]:19117".parse().unwrap()));
+        // A guess is not evidence: clients building an upgrade plan would
+        // hand it back as the node's address and be refused.
         assert_eq!(nodes[1].api_address, None);
+        assert_eq!(nodes[2].api_address, None);
         worker.await.unwrap();
     }
 
@@ -15488,6 +15517,7 @@ mod cluster_routing_tests {
             self.membership.write().await.push(NodeMembershipInfo {
                 node_id: crate::meat::NodeId::new(name),
                 address,
+                api_advertised: true,
             });
         }
 
@@ -15619,6 +15649,7 @@ mod cluster_routing_tests {
             membership.push(NodeMembershipInfo {
                 node_id: crate::meat::NodeId::new(*name),
                 address: listener.local_addr().unwrap(),
+                api_advertised: true,
             });
             listeners.push(listener);
         }
