@@ -207,6 +207,18 @@ The whole feature is one new module because the reader from the previous section
 
 The cost is binary size, and rust-embed softens it twice. Its `compression` feature compresses each embedded file in release builds (source code deflates well), and in debug builds it doesn't embed at all — assets load from disk at runtime, so `cargo test` iterations don't pay for a 5 MB copy of `src/` on every link. That split, incidentally, is why an embed-backed test can pass in debug and still deserve a release-build check in CI.
 
+## The command list writes itself
+
+The manual explains how to use relish, but people landing on the repository want something shorter first: what can this thing do? The README answered that with nothing, and `docs/README.md` answered it with a hand-kept table of nearly a hundred rows that had already started to disagree with `--help`. A third copy in the README would have made three places to forget.
+
+We already had one list that can't be wrong, because it *is* the parser. Chapter 1 showed how clap's derive turns the `Command` enum and its `///` comments into argument parsing and help text. The same derive also implements clap's `CommandFactory` trait for `Cli`, which adds an associated function (Rust's name for a function attached to a type rather than to a value, like a static method in Java or a `@classmethod` in Python): `Cli::command()` returns the whole command tree as data. `src/relish/command_reference.rs` walks it with `get_subcommands()`, `get_positionals()` and `get_about()`, skips anything marked `hide = true`, and writes a collapsible Markdown list: one line per command, its required flags and positional arguments, and the first line of its doc comment.
+
+The one thing clap doesn't know is how a human would group the commands. That lives in a small `GROUPS` table next to the renderer, each group linking to the manual chapter that goes deeper. `render` returns a `Result`, and forgetting to place a new command in a group is an error that names the command, not a silent omission.
+
+Keeping the README honest is a test in the relish binary. It renders the tree, splices it between the `<!-- relish-commands:start -->` and `<!-- relish-commands:end -->` markers, and fails if the file would change, telling you to run `make readme-commands`. That target runs the same test with `RELIABURGER_UPDATE_README` set, and the test writes the file instead of comparing it: the approach `insta` takes with `INSTA_UPDATE`, without a hidden subcommand shipping in every binary. The test carries `#[cfg(feature = "kubernetes")]`, conditional compilation that removes it from builds without the default feature, because `import` and `export` only exist there and the README describes the default build.
+
+We considered a hand-written section plus a test that every command appears in it. That catches a missing command, but not a stale description or a changed argument, and it still leaves someone typing the list. Generating it cost about as much code as checking it.
+
 ## What we learned
 
 The TUI is mostly a lesson in boundaries. One task owns mutable state. Renderers borrow it. Providers own I/O. Effects cross the line between the two. Once those boundaries were explicit, keyboard tests, HTTP tests and screen tests stopped needing special cases.

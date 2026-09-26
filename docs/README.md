@@ -542,6 +542,10 @@ the token hash and expiry to Raft, and prints the plaintext once. During an
 election, retry against the current leader: a follower returns an error and
 does not commit or disclose a usable token.
 
+For the whole walkthrough on three Linux VMs or bare-metal servers you
+already run, from packages and firewall rules to systemd units, see
+[Running Reliaburger on your own Linux servers](linux-servers.md).
+
 Keep `[cluster].name` identical on every node. `relish init`, `relish setup`
 and `relish dev create` write it for you; Bun validates it as a DNS-style SPIFFE trust domain.
 The value is immutable for the life of the process and becomes the prefix of
@@ -626,108 +630,11 @@ cargo run --bin relish -- tui       # the same, explicitly
 cargo run --bin relish -- <command>
 ```
 
-Commands:
-
-| Command | Description |
-|---------|-------------|
-| `tui` (or no command) | Interactive dashboard for apps, nodes, jobs, events, logs, metrics and routes |
-| `setup` | Guided install: detect/install bun (signature-verified) and write a starter config (`--yes` for defaults) |
-| `manual` | Read the built-in manual in a searchable terminal reader |
-| `manual --web` | Serve the manual as one HTML page and open the browser |
-| `manual examples` | Write the embedded example configs into the current directory |
-| `source [query]` | Browse and fuzzy-search the embedded source tree (e.g. `relish source ebpf`) |
-| `apply <path>`, `apply -f <path-or-url>` | Deploy workloads from a TOML config file, or from Kubernetes YAML (imported in memory; migration report on stderr); `-f` also takes an `https://` URL |
-| `dashboard` | Open a read-only web dashboard using the current authenticated CLI context |
-| `status` | List workloads across the cluster with node names; fail if a member cannot answer |
-| `logs <name>` | Show captured stdout/stderr for an app |
-| `logs <name> --tail N` | Show only the last N lines |
-| `logs <name> --follow` / `-f` | Stream new log lines as they appear |
-| `logs-export --dest <dir>` | Export Parquet log files to a directory |
-| `logs-search <dir> <sql>` | Run SQL over an exported Parquet log archive |
-| `inspect <name>` | Detailed info about an app (bare app name) |
-| `wtf [--app <app>] [--watch [--interval <secs>]]` | Correlated cluster-health diagnosis (exit 0 OK / 1 criticals / 2 warnings-only) |
-| `path <src> --to <dst>` | Walk the network path from a workload: DNS, service map, firewall, faults and TCP (exit 0/1/2) |
-| `exec <app> <cmd...>` | Execute a command inside a running instance |
-| `stop <app>` | Scale an app to zero, keeping its configuration; `apply` starts it again |
-| `delete <app>` | Remove an app from the cluster and stop its instances |
-| `init [dir]` | Generate PKI and an mTLS-required starter config (`--development-plaintext` is an explicit local-only exception) |
-| `nodes` | List cluster nodes and their gossip state |
-| `council` | Show council (Raft) composition and status |
-| `council recover --data-dir <dir>` | Recover a cluster after total council loss (read `--help` first) |
-| `join --token <token> --node-id <id> <api-addr>` | Enrol a node identity with an existing cluster member |
-| `join-token create --node-id <id> --ttl 15m` | Mint one Admin-authorised, single-use token that enrols exactly that node id |
-| `test [--profile <profile>]` | Run the 39-case live-cluster catalogue; full profiles fail on required skips, unknown evidence or unconfirmed cleanup |
-| `bench [--quick] [--compare <file>]` | Run reproducible data-plane benchmarks (`--disruptive`/`--capacity` need `--yes`) |
-| `resolve <name>` | Resolve a service name to its VIP and backends |
-| `routes` | Show ingress routing table |
-| `top` | Every workload on every node with its latest CPU and memory |
-| `metrics <app> [--name <metric>] [--since 15m]` | An app's scraped Prometheus metrics: one number per metric, or one line per instance with a rate and sparkline |
-| `deploy <path>` | Trigger a rolling deploy for an app |
-| `history <app>` | Show deploy history for an app |
-| `rollback <app>` | Rollback an app to the previous version |
-| `lint <path>` | Validate a config file without deploying |
-| `compile <path>` | Merge and resolve configs into one TOML document |
-| `diff <path-a> [path-b]` | Structural diff between two configs (local; not cluster drift) |
-| `fmt <path>` | Format a TOML config in place (`--check` to verify only) |
-| `images` | List images in the local Pickle registry |
-| `build <path>` | Build OCI images from `[build.*]` sections and push to Pickle (async: submits, then polls; `--timeout` bounds the wait) |
-| `batch <path>` | Submit `[job.*]` sections as a high-throughput batch across the cluster |
-| `batch-status <id>` | Show a submitted batch's progress (`--wait --timeout` polls to a terminal state) |
-| `sign <image> --key <path>` | Sign a Pickle image's manifest digest with your ECDSA P-256 key (tags resolve to digests; nodes admit it when `[images.trust_policy] keys` lists the key) |
-| `sign keygen --out <path>` | Generate an image signing key and print the public key for `trust_policy.keys` |
-| `import -f <file>` | Convert Kubernetes YAML to Reliaburger TOML (`kubernetes` build feature; `-f` repeatable, `--strict`) |
-| `export -f <file>` | Convert Reliaburger TOML to Kubernetes YAML (`kubernetes` build feature) |
-| `snapshot create <app>` | Snapshot an app's managed volumes (Btrfs-backed; `--volume` for one, `--name` to label) |
-| `snapshot list <app>` | List an app's snapshots, newest first |
-| `snapshot restore <app> <name>` | Restore a snapshot over the live volume (stop the app first) |
-| `snapshot delete <app> <name>` | Delete a snapshot |
-| `secret pubkey [dir]` | Print the cluster's age public key (from the API, or offline from a `relish init` directory) |
-| `secret encrypt --pubkey <key> <value>` | Encrypt a value for use in app configs |
-| `secret rotate [--finalize]` | Start (or finalise) secret encryption-key rotation |
-| `token create --name <name>` | Create an API token (`--role`, `--apps`, `--namespaces`, `--ttl-days`) |
-| `token list` | List API tokens with role, creation time and expiry (UTC) |
-| `token revoke <name>` | Revoke an API token by name |
-| `fault delay <target> <delay>` | Delays traffic to the target with a `tc` netem qdisc on each caller container (runc only); `--from APP` limits it to one caller |
-| `fault drop <target> <pct> --acknowledge` | Fail a percentage of connections (ECONNREFUSED) |
-| `fault dns <target> nxdomain --acknowledge` | Return NXDOMAIN for DNS resolution |
-| `fault partition <target> [--from <app>] --acknowledge` | Block connect() from one source app (or all callers) to a service; requires Linux eBPF |
-| `fault bandwidth <target> <rate>` | Reserved contract; currently refused until the TC packet path ships |
-| `fault cpu <target> <pct> --acknowledge` | Consume CPU in a service's cgroup |
-| `fault memory <target> <pct> --acknowledge` | Push memory toward the limit |
-| `fault disk-io <target> <rate> [--write-only] --acknowledge` | Throttle disk I/O for a service |
-| `fault kill <target> --acknowledge` | Kill instances of a service (SIGKILL) |
-| `fault pause <target> --instance <id> --acknowledge` | Freeze one instance of a service (SIGSTOP); an unscoped pause freezes every replica, which the replica rail refuses |
-| `fault resume <target> --acknowledge` | Unfreeze (SIGCONT) previously paused instances |
-| `fault node-drain <node> --acknowledge` | Withdraw a node from scheduling for a bounded duration |
-| `fault node-kill <node> --acknowledge` | Quiesce a node's cluster transports for a bounded duration |
-| `fault node-pressure <node> --cpu 80% --memory 90% --acknowledge` | Consume server-bounded Linux node capacity in an owned cgroup |
-| `fault kill <target> --namespace <ns> --acknowledge` | Confine a workload fault to one tenant (defaults to `default`; a scoped token must name a namespace it may touch) |
-| `fault list` | List all active faults |
-| `fault clear [id]` | Clear workload faults (or a specific workload fault by ID) |
-| `fault clear <service> --namespace <ns>` | Clear a service's faults in one namespace (omit `--namespace` to clear every namespace; needs an unscoped token) |
-| `fault clear <id> --node <node>` | Reverse a node fault on its owning node |
-| `fault scenario <file> --acknowledge` | Run a scripted chaos scenario from a TOML file |
-| `dev create` | Create a local dev cluster (Lima VMs; each node runs `bun` rootful under `sudo` for runc/netns) |
-| `dev status` | Show dev cluster status |
-| `dev shell <node>` | Open a shell on a dev cluster node |
-| `dev stop` | Stop a dev cluster (VMs stay on disk) |
-| `dev start` | Start a stopped dev cluster |
-| `dev destroy` | Destroy a dev cluster (delete all VMs) |
-| `dev test [filter]` | Run Linux-gated tests in the persistent build VM (`--recreate` to rebuild it) |
-| `dev disk` | Show disk usage in the test VM |
-| `dev clean` | Clean cargo build artefacts in the test VM |
-| `dev keygen --out <dir>` | Generate an Ed25519 release signing keypair |
-| `dev sign-binary --key <key> <binary>` | Sign a binary, producing a detached `.sig` envelope |
-| `dev countersign-binary --external-key <key> <binary>` | Add the operator signature to a release `.sig` envelope, keeping the release signature |
-| `upgrade check` | Check the release metadata for available updates |
-| `upgrade start <version>` | Start a rolling binary upgrade (network) |
-| `upgrade start --binary <path>` | Upgrade from a local signed binary (air-gapped) |
-| `upgrade start ... --allow-downgrade` | Allow a target older than the running version |
-| `upgrade plan <version>` | Preview the rolling order and estimated duration |
-| `upgrade status` | Show upgrade progress (cluster or node) |
-| `upgrade rollback [version]` | Roll back to a previous binary version (replaces a paused upgrade) |
-| `upgrade resume` | Resume a paused upgrade under a fresh attempt id |
-| `upgrade abort` | End a paused upgrade in which no node has moved |
+Every command, grouped by task with a link to the manual chapter that explains
+it, is under *Everything relish can do* in the [top-level README](../README.md).
+That list is generated from relish's own command definitions, so it matches
+the binary. `relish help COMMAND` (or `--help` on any command) shows every
+flag.
 
 Use `test --chaos --filter dead_worker_node_has_workloads_rescheduled` to select
 an exact supported chaos scenario. Omitting the filter runs all five, including

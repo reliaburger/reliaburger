@@ -23,11 +23,15 @@ relish upgrade rollback v0.1.0        # also replaces a paused upgrade
 It needs three things on every node:
 
 - **A supervisor that restarts bun whenever it exits**, such as systemd with
-  `Restart=always`. Bun replaces itself with the new binary, and recovering
-  from a bad one depends on being started again.
-- **A versioned binary directory.** `bun` is a symlink to `bun-vX.Y.Z`, and
-  the previous versions stay beside it for rollback (`[upgrades]
-  retain_versions`, default 3). `relish setup` installs it this way.
+  `Restart=always`. Bun replaces itself with the new binary in place, and
+  recovering from a bad one depends on being started again. `on-failure`
+  covers every exit bun makes on purpose; `always` also covers a release that
+  exits cleanly while it's being verified. The quickstart uses `always`.
+- **A writable binary directory.** Bun keeps `bun-vX.Y.Z` files beside its
+  own binary and makes `bun` a symlink to the active one, with the previous
+  versions kept for rollback (`[upgrades] retain_versions`, default 3). A
+  plain `bun` binary is fine: the first upgrade copies it to `bun-vX.Y.Z` and
+  turns `bun` into the symlink.
 - **Two signatures for network upgrades**: the release's, checked against the
   key compiled into the running binary, and your own, from the key you name in
   `[upgrades] external_signing_key`. Generate that keypair with

@@ -5,6 +5,7 @@ pub mod bench_cmd;
 /// The binary (`src/bin/relish.rs`) handles argument parsing and exit codes;
 /// this module handles everything else.
 pub mod client;
+pub mod command_reference;
 pub mod commands;
 pub mod compile;
 pub mod dashboard;

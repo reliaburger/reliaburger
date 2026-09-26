@@ -403,7 +403,7 @@ enum Command {
         #[command(subcommand)]
         action: DevAction,
     },
-    /// Rolling binary upgrades (Phase 14).
+    /// Roll a new bun binary across the cluster, or back.
     Upgrade {
         #[command(subcommand)]
         action: UpgradeAction,
@@ -579,7 +579,7 @@ enum ManualAction {
 
 #[derive(Subcommand)]
 enum CouncilCommand {
-    /// Recover a cluster whose entire council was lost (12b.2 D21/CP12).
+    /// Recover a cluster whose entire council was lost.
     ///
     /// Run this against a STOPPED surviving node. It restores the desired
     /// state from a sealed backup (or this node's own durable snapshot),
@@ -1918,6 +1918,34 @@ mod tests {
             output: cli.output,
             token: cli.token,
         })
+    }
+
+    /// The README's command list is rendered from `Cli`. With
+    /// `RELIABURGER_UPDATE_README` set (`make readme-commands`), this test
+    /// rewrites the region instead of checking it.
+    // Import and export only exist with the default `kubernetes` feature, so
+    // the README describes that build.
+    #[cfg(feature = "kubernetes")]
+    #[test]
+    fn readme_command_list_matches_the_cli() {
+        use clap::CommandFactory;
+        use reliaburger::relish::command_reference::{
+            GROUPS, REGENERATE_COMMAND, render, replace_region,
+        };
+
+        let readme_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md");
+        let readme = std::fs::read_to_string(&readme_path).unwrap();
+        let section = render(&Cli::command(), GROUPS).unwrap_or_else(|e| panic!("{e}"));
+        let updated = replace_region(&readme, &section).unwrap_or_else(|e| panic!("{e}"));
+
+        if std::env::var_os("RELIABURGER_UPDATE_README").is_some() {
+            std::fs::write(&readme_path, &updated).unwrap();
+            return;
+        }
+        assert!(
+            updated == readme,
+            "README.md's relish command list is out of date; run `{REGENERATE_COMMAND}`"
+        );
     }
 
     #[test]

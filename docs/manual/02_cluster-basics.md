@@ -117,3 +117,9 @@ relish dev create --nodes 3
 relish dev shell reliaburger-1
 relish dev destroy
 ```
+
+## Run a cluster on your own Linux servers
+
+Already have Linux VMs or bare-metal servers? You can run Reliaburger on them
+directly. The [Linux servers guide](https://github.com/reliaburger/reliaburger/blob/main/docs/linux-servers.md)
+walks through a three-node cluster, from firewall rules to systemd units.

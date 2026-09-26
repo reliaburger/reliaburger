@@ -1,4 +1,4 @@
-.PHONY: build test test-cargo test-doc test-slow test-images test-linux test-rootless-runc test-cluster test-upgrade test-upgrade-node test-upgrade-cluster test-apple coverage check fmt lint audit clean pdf loc help bench bench-large pickle-test-macos ci ci-full observability-demo kubernetes-demo toml-demo
+.PHONY: build test test-cargo test-doc test-slow test-images test-linux test-rootless-runc test-cluster test-upgrade test-upgrade-node test-upgrade-cluster test-apple coverage check fmt lint audit clean pdf loc help bench bench-large pickle-test-macos ci ci-full observability-demo kubernetes-demo toml-demo readme-commands
 
 CARGO = cargo
 NEXTEST_PROFILE ?= default
@@ -121,6 +121,9 @@ pickle-test-macos: build ## Push/pull a real Docker image through Pickle (macOS 
 ci: fmt-check lint test test-doc ## Run portable CI checks
 
 ci-full: fmt-check lint test bench ## Run everything including benchmarks
+
+readme-commands: ## Regenerate the relish command list in README.md from the CLI definition
+	RELIABURGER_UPDATE_README=1 $(CARGO) test --bin relish readme_command_list_matches_the_cli
 
 # --- Documentation targets ---
 
