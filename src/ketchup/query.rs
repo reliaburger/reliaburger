@@ -53,6 +53,37 @@ pub struct FanOutResult {
     pub failures: Vec<NodeFailure>,
 }
 
+/// Which nodes a cluster-wide log query asks, and which it can't reach.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryTargets {
+    /// `(node id, API address)` for every node to ask.
+    pub reachable: Vec<(String, String)>,
+    /// Nodes the query should ask but that have no live membership entry.
+    pub unreachable: Vec<String>,
+}
+
+/// Pick the nodes a log query fans out to: every live member.
+///
+/// A node stores the lines of the instances it ran, and keeps them after the
+/// app moves on. So an app's history is spread over every node it ever ran
+/// on, which placement (where it runs *now*) doesn't record. Asking only the
+/// placed nodes returned whatever those nodes last stored as "the tail",
+/// however old. A node that never ran the app answers with nothing.
+///
+/// `placed` is where the scheduler runs the app now; a placed node missing
+/// from `members` (every live member as `(node id, API address)`) is
+/// reported unreachable, because its lines are certainly wanted.
+pub fn query_targets(placed: &[String], members: &[(String, String)]) -> QueryTargets {
+    QueryTargets {
+        reachable: members.to_vec(),
+        unreachable: placed
+            .iter()
+            .filter(|node| !members.iter().any(|(id, _)| id == *node))
+            .cloned()
+            .collect(),
+    }
+}
+
 /// Merge entries from multiple nodes in ingest order, deduplicating by
 /// `(node, sequence)`.
 ///
@@ -290,6 +321,49 @@ mod tests {
         closed
             .expect("cancelled query left a detached request")
             .unwrap();
+    }
+
+    fn members(ids: &[&str]) -> Vec<(String, String)> {
+        ids.iter()
+            .map(|id| (id.to_string(), format!("https://{id}:9117")))
+            .collect()
+    }
+
+    fn reachable_ids(targets: &QueryTargets) -> Vec<&str> {
+        targets
+            .reachable
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .collect()
+    }
+
+    /// V02 soak: soak-redis-client ran on node 1, then node 3, then node 2
+    /// for half an hour. After a whole-cluster restart it was placed on node
+    /// 1 again, the query asked node 1 alone, and node 1's newest stored lines
+    /// were half an hour old. Every live member holds some of an app's
+    /// history, so every live member is asked.
+    #[test]
+    fn a_query_asks_every_live_member_not_just_where_the_app_runs_now() {
+        let targets = query_targets(&["n1".to_string()], &members(&["n1", "n2", "n3"]));
+        assert_eq!(reachable_ids(&targets), vec!["n1", "n2", "n3"]);
+        assert!(targets.unreachable.is_empty());
+    }
+
+    /// Right after a restart nothing may be placed yet; the history is still
+    /// on disk and the query still answers from it.
+    #[test]
+    fn an_unplaced_app_is_still_queried_everywhere() {
+        let targets = query_targets(&[], &members(&["n1", "n2"]));
+        assert_eq!(reachable_ids(&targets), vec!["n1", "n2"]);
+    }
+
+    /// A placed node gossip no longer lists can't be asked, and the answer
+    /// says so rather than looking complete.
+    #[test]
+    fn a_placed_node_missing_from_membership_is_reported_unreachable() {
+        let targets = query_targets(&["n4".to_string()], &members(&["n1"]));
+        assert_eq!(reachable_ids(&targets), vec!["n1"]);
+        assert_eq!(targets.unreachable, vec!["n4".to_string()]);
     }
 
     #[test]

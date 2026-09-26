@@ -91,6 +91,41 @@ async fn store_with_entries(
     (Arc::new(RwLock::new(store)), dir)
 }
 
+/// V02 soak regression: an app that moved away from node 1 and came back
+/// after a whole-cluster restart. Node 1 holds its lines from half an hour
+/// ago, node 2 holds everything since. Asking only where the app is placed
+/// now (node 1) returned the half-hour-old lines as the tail.
+#[tokio::test]
+async fn tail_after_an_app_moves_back_includes_the_nodes_it_ran_on_meanwhile() {
+    let (old_home, _dir1) = store_with_entries(&[100, 101, 102], "INCR").await;
+    let (meanwhile, _dir2) = store_with_entries(&[200, 201, 202], "INCR").await;
+    let url1 = start_server(test_router(old_home)).await;
+    let url2 = start_server(test_router(meanwhile)).await;
+    let members = nodes(&[url1, url2]);
+
+    let targets = reliaburger::ketchup::query::query_targets(&["node1".to_string()], &members);
+    let query = LogQuery {
+        app: "web".to_string(),
+        namespace: "default".to_string(),
+        tail: Some(2),
+        ..Default::default()
+    };
+    let result = fan_out_query(
+        &query,
+        &targets.reachable,
+        &reqwest::Client::new(),
+        std::time::Duration::from_secs(5),
+        None,
+    )
+    .await
+    .unwrap();
+
+    let mut entries = result.entries;
+    let newest = entries.split_off(entries.len().saturating_sub(2));
+    let timestamps: Vec<u64> = newest.iter().map(|e| e.timestamp).collect();
+    assert_eq!(timestamps, vec![201, 202]);
+}
+
 /// 3 nodes with disjoint timestamps. All lines should appear in the
 /// merged result, sorted by timestamp.
 #[tokio::test]
