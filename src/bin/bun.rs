@@ -1317,9 +1317,8 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         let membership_table: Arc<RwLock<Vec<api::NodeMembershipInfo>>> =
             Arc::new(RwLock::new(Vec::new()));
         api_membership = Some(Arc::clone(&membership_table));
-        let known_table: Arc<RwLock<Vec<api::NodeMembershipInfo>>> =
-            Arc::new(RwLock::new(Vec::new()));
-        api_known_members = Some(api::KnownMembers(Arc::clone(&known_table)));
+        let known_members = api::KnownMembers(Arc::new(RwLock::new(Vec::new())));
+        api_known_members = Some(known_members.clone());
         let mut refresher_rx = membership_rx;
         // Each node advertises its real API endpoint over gossip (the
         // directory, 12b.2). Prefer that authoritative `api_address`: a
@@ -1354,6 +1353,8 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                 };
                 // Live members for fan-out; every known member for the relay
                 // and fault reversal, which must reach a node-killed peer.
+                // Gossip stops publishing a member once it is dead, so the
+                // known table remembers members that drop out of this view.
                 let snapshot: Vec<api::NodeMembershipInfo> =
                     snapshot.into_iter().map(|(_, info)| info).collect();
                 let known: Vec<api::NodeMembershipInfo> = snapshot
@@ -1362,7 +1363,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                     .chain(known.into_iter().map(|(_, info)| info))
                     .collect();
                 *membership_table.write().await = snapshot;
-                *known_table.write().await = known;
+                known_members.refresh(known).await;
                 tokio::select! {
                     _ = refresher_shutdown.cancelled() => break,
                     changed = refresher_rx.changed() => {

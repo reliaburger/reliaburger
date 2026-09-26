@@ -150,7 +150,7 @@ pub fn describe_test_policy(policy: &crate::testkit::safety::ClusterTestPolicy) 
 }
 
 /// Guest service supervised and restarted by systemd; logs go to its journal.
-pub const SERVICE: &str = "[Unit]\nDescription=Reliaburger node\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStartPre=/bin/sh -ec 'mountpoint -q /sys/fs/bpf || mount -t bpf bpf /sys/fs/bpf'\nExecStart=/usr/local/bin/bun --cluster --runtime runc --config /etc/reliaburger/node.toml --listen 0.0.0.0:9117\nRestart=on-failure\nRestartSec=2\nLimitNOFILE=1048576\nKillMode=process\nTimeoutStopSec=30\n\n[Install]\nWantedBy=multi-user.target\n";
+pub const SERVICE: &str = "[Unit]\nDescription=Reliaburger node\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStartPre=/bin/sh -ec 'mountpoint -q /sys/fs/bpf || mount -t bpf bpf /sys/fs/bpf'\nExecStart=/usr/local/bin/bun --cluster --runtime runc --config /etc/reliaburger/node.toml --listen 0.0.0.0:9117\nRestart=always\nRestartSec=2\nLimitNOFILE=1048576\nKillMode=process\nTimeoutStopSec=30\n\n[Install]\nWantedBy=multi-user.target\n";
 
 #[cfg(test)]
 mod tests {
@@ -162,6 +162,14 @@ mod tests {
         // SIGKILL them on every restart and leave their records unowned.
         assert!(SERVICE.contains("\nKillMode=process\n"), "{SERVICE}");
         assert!(!SERVICE.contains("KillMode=mixed"));
+    }
+
+    #[test]
+    fn service_restarts_bun_even_after_a_clean_exit() {
+        // A release that exits 0 while its upgrade is being verified (or a
+        // stray SIGTERM) would leave the node down under `on-failure`, and
+        // the automatic revert only runs when bun starts again.
+        assert!(SERVICE.contains("\nRestart=always\n"), "{SERVICE}");
     }
 
     #[test]

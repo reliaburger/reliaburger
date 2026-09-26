@@ -153,6 +153,14 @@ fn render_log_entries(entries: &[crate::ketchup::types::LogEntry], options: &Log
 }
 
 /// Classify a reqwest send error as either a timeout or a connection failure.
+/// How long [`BunClient::clear_fault`] keeps asking while the owning node
+/// answers 504 because the leader has not yet released a node fault's
+/// reservation. The leader releases it once it sees the healed node alive,
+/// which takes a gossip round or two; each attempt already waits 4 s.
+pub const FAULT_CLEAR_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+/// Pause between those attempts.
+const FAULT_CLEAR_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(500);
+
 fn classify_error(e: reqwest::Error) -> RelishError {
     if e.is_timeout() {
         RelishError::RequestTimeout
@@ -1721,8 +1729,46 @@ impl BunClient {
         })
     }
 
-    /// Clear a specific fault by ID.
+    /// Clear one fault by id, on `node` when given.
+    ///
+    /// Reversing a node fault is immediate, but the owning node then waits a
+    /// few seconds for the leader to release the fault's cluster reservation
+    /// and answers 504 "retry the clear" if it hasn't yet. A clear is
+    /// idempotent (the node keeps the reservation until it is released), so
+    /// this asks again for up to [`FAULT_CLEAR_RETRY_BUDGET`] before handing
+    /// the 504 back.
     pub async fn clear_fault(
+        &self,
+        id: u64,
+        node: Option<&str>,
+        acknowledged: bool,
+    ) -> Result<String, RelishError> {
+        self.clear_fault_within(id, node, acknowledged, FAULT_CLEAR_RETRY_BUDGET)
+            .await
+    }
+
+    /// [`Self::clear_fault`], retrying a 504 for at most `budget`.
+    pub(crate) async fn clear_fault_within(
+        &self,
+        id: u64,
+        node: Option<&str>,
+        acknowledged: bool,
+        budget: std::time::Duration,
+    ) -> Result<String, RelishError> {
+        let deadline = tokio::time::Instant::now() + budget;
+        loop {
+            match self.clear_fault_once(id, node, acknowledged).await {
+                Err(RelishError::ApiError { status: 504, .. })
+                    if tokio::time::Instant::now() + FAULT_CLEAR_RETRY_PAUSE < deadline =>
+                {
+                    tokio::time::sleep(FAULT_CLEAR_RETRY_PAUSE).await;
+                }
+                result => return result,
+            }
+        }
+    }
+
+    async fn clear_fault_once(
         &self,
         id: u64,
         node: Option<&str>,
@@ -2371,6 +2417,78 @@ mod tests {
         assert!(
             BunClient::new_with_ca("https://127.0.0.1:9117", None, b"not a certificate").is_err()
         );
+    }
+
+    /// Serve `DELETE /v1/fault/{id}` answering 504 "not yet released" to the
+    /// first `pending` calls, then 200. Returns the base URL and call count.
+    async fn serve_fault_clear(pending: usize) -> (String, Arc<Mutex<usize>>) {
+        use axum::{Router, http::StatusCode, routing::delete};
+        let calls = Arc::new(Mutex::new(0usize));
+        let seen = Arc::clone(&calls);
+        let app = Router::new().route(
+            "/v1/fault/{id}",
+            delete(move || {
+                let seen = Arc::clone(&seen);
+                async move {
+                    let call = {
+                        let mut calls = seen.lock().unwrap();
+                        *calls += 1;
+                        *calls
+                    };
+                    if call <= pending {
+                        (
+                            StatusCode::GATEWAY_TIMEOUT,
+                            axum::Json(serde_json::json!({
+                                "error": "fault 1 is reversed on this node, but the cluster has \
+                                          not yet released its reservation; retry the clear \
+                                          before injecting again"
+                            })),
+                        )
+                    } else {
+                        (
+                            StatusCode::OK,
+                            axum::Json(serde_json::json!({ "message": "cleared fault 1" })),
+                        )
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{address}"), calls)
+    }
+
+    /// The server reverses the fault, then answers 504 while the leader has
+    /// not yet released the node-fault reservation and asks for a retry. A
+    /// clear is idempotent, so the client asks again rather than failing.
+    #[tokio::test]
+    async fn fault_clear_retries_until_the_reservation_is_released() {
+        let (base, calls) = serve_fault_clear(2).await;
+        let client = BunClient::new_with_token(&base, None);
+        let message = client.clear_fault(1, Some("node-2"), false).await.unwrap();
+        assert_eq!(message, "cleared fault 1");
+        assert_eq!(*calls.lock().unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn fault_clear_gives_up_on_a_reservation_that_is_never_released() {
+        let (base, calls) = serve_fault_clear(usize::MAX).await;
+        let client = BunClient::new_with_token(&base, None);
+        let error = client
+            .clear_fault_within(
+                1,
+                Some("node-2"),
+                false,
+                std::time::Duration::from_millis(300),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, RelishError::ApiError { status: 504, body } if body.contains("retry the clear")),
+            "{error:?}"
+        );
+        assert!(*calls.lock().unwrap() >= 1);
     }
 
     #[tokio::test]

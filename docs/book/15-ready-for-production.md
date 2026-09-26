@@ -2568,6 +2568,116 @@ proxy on a different port. Both registry cases must pass, and the proxy must
 have seen them. What none of this proves is a three-node laptop run end to end;
 that's the next V02 soak's job.
 
+It was. The soak on candidate 1117dbb finally injected the node-kill: the
+three replicas ran, the target went quiet, the survivors picked up its
+replica. Then the case failed anyway, twice in five cycles, with a reason
+that should have been impossible by now:
+
+```text
+owned fault cleanup failed: 2: API error (status 404):
+target node rb-3fd6f1a419a3-2 is not alive or is unknown
+```
+
+That's the very message `KnownMembers` was meant to retire. The table's doc
+comment promised "alive, suspect or dead". But Bun fills it from the gossip
+membership watch, and gossip publishes `MembershipTable::snapshot()`, which is
+`active_members()`: everything that isn't *down*. Dead counts as down. So a
+node-killed peer sits in the table while it's suspect, and disappears from it
+at the exact moment it's declared dead. And the case clears its fault only
+after the survivors have rescheduled the replica, which the scheduler does
+only once the node is dead. The fallback covered a window the case never
+reached. The unit test hadn't noticed because it built the known table by
+hand, with the dead node in it.
+
+The cost was bigger than one failed case. The fault stayed in force until it
+expired, and a chaos case sets expiry to its own timeout plus a 30-second
+margin: 630 seconds. In the first cycle the node was still dead when the
+soak's 300-second settle gave up (21:02:59 BST, six minutes after the kill)
+and when the heavy check found it missing, along with the pinned
+`soak-writer` it should have been running. Only the soak's next graceful stop
+brought it back, by restarting Bun, which forgets in-memory faults. In the
+fifth cycle the next fault's settle took 223 seconds instead of 18, ending
+seconds after the 630-second expiry.
+
+We could have made gossip publish dead members too. Half the cluster reads
+that watch, though (the scheduler, the council, the upgrade orchestrator,
+Pickle), and they all rely on "published" meaning "worth talking to". The
+question here is narrower: where did this node last say it lives? That's
+memory, and the table can keep it:
+
+```rust
+pub async fn refresh(&self, current: Vec<NodeMembershipInfo>) {
+    let mut table = self.0.write().await;
+    let remembered: Vec<_> = table
+        .drain(..)
+        .filter(|old| !current.iter().any(|member| member.node_id == old.node_id))
+        .collect();
+    *table = current;
+    table.extend(remembered);
+}
+```
+
+`drain(..)` empties the vector in place and hands its elements over one at a
+time *by value*, so we can keep some of them without cloning. The `..` is a
+range with no ends, meaning "all of it". `filter` keeps the members that
+`current` doesn't mention (`any` stops at the first match), `*table = current`
+moves the new list in, and `extend` appends the remembered ones behind it. A
+member that comes back simply appears in `current` again and its fresh address
+wins. A member that has really gone stays listed and fails to connect, which
+is the honest answer for a reversal aimed at it.
+
+Two tests pin it down. In `bun::api`,
+`a_node_fault_clear_reaches_a_member_gossip_has_declared_dead` drops a node
+from the live table *and* refreshes the known table without it, as gossip
+does, then clears its fault through another node. Before the fix it failed
+with the soak's own 404. The cluster test
+`a_killed_worker_has_its_replica_rescheduled_on_the_survivors` now carries on
+where it used to stop: it waits until the router node's gossip no longer
+publishes the target, clears the fault through the router, and waits for
+every survivor to see the target alive again. Against the old table it failed
+with the same 404; with the new one the whole test, cluster start to rejoin, takes
+about twenty seconds. The test harness now attaches a `KnownMembers` fed
+from gossip the way Bun does, so that path is no longer something only a
+laptop cluster exercises.
+
+CI then found the next link in the chain on its first run. The clear reached
+the dead node, the node reversed the fault, and then answered 504:
+
+```text
+fault 1 is reversed on this node, but the cluster has not yet released its
+reservation; retry the clear before injecting again
+```
+
+A node fault holds a cluster-wide reservation (one experiment at a time), and
+the leader releases it only once it sees the healed node alive again. The
+node waits 4 s for that before answering; on a busy CI runner, gossip took
+longer. The message says "retry", and a retry is safe: the node keeps the
+reservation's sequence number until the leader fences it, so asking again just
+waits again. But nothing retried. Not the test, and not the two real clients
+either, `relish fault clear` and the chaos cleanup, which would have reported
+the case as failed with a perfectly healthy cluster. So the retry went into
+`BunClient::clear_fault` itself, where every caller gets it:
+
+```rust
+loop {
+    match self.clear_fault_once(id, node, acknowledged).await {
+        Err(RelishError::ApiError { status: 504, .. })
+            if tokio::time::Instant::now() + FAULT_CLEAR_RETRY_PAUSE < deadline =>
+        {
+            tokio::time::sleep(FAULT_CLEAR_RETRY_PAUSE).await;
+        }
+        result => return result,
+    }
+}
+```
+
+The first arm is a *match guard*: the pattern matches only a 504, and the
+`if` after it adds a condition the pattern can't express, here "and there's
+still time for another go". Anything else, success included, falls through to
+`result => return result`, which binds the whole value to a name and hands it
+back unchanged. The budget is 30 seconds, after which the caller sees the 504
+it would have seen before.
+
 ## Walk the path you actually care about
 
 Say `web` can't reach `redis`. Checking Bun's own DNS and TCP access might tell
