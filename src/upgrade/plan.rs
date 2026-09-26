@@ -228,10 +228,10 @@ pub fn check_target(
 pub struct NetworkReadiness {
     /// How to name the node in an error: `node n1`.
     pub node: String,
-    /// `Some(false)` when the node has no `upgrades.external_signing_key`
-    /// and so refuses every network directive. `None` when the node doesn't
-    /// say (a build from before it reported this): the walk finds out.
-    pub accepts_network_upgrades: Option<bool>,
+    /// False when the node has no `upgrades.external_signing_key`, has no
+    /// upgrade manager, or doesn't report the field at all: each of those
+    /// refuses every network directive.
+    pub accepts_network_upgrades: bool,
 }
 
 /// Refuse a cluster upgrade that every node would refuse anyway.
@@ -250,7 +250,7 @@ pub fn check_network_prerequisites(
     }
     let unready: Vec<&str> = nodes
         .iter()
-        .filter(|node| node.accepts_network_upgrades == Some(false))
+        .filter(|node| !node.accepts_network_upgrades)
         .map(|node| node.node.as_str())
         .collect();
     if unready.is_empty() {
@@ -493,7 +493,7 @@ mod tests {
         );
     }
 
-    fn readiness(node: &str, accepts: Option<bool>) -> NetworkReadiness {
+    fn readiness(node: &str, accepts: bool) -> NetworkReadiness {
         NetworkReadiness {
             node: format!("node {node}"),
             accepts_network_upgrades: accepts,
@@ -502,7 +502,7 @@ mod tests {
 
     #[test]
     fn cluster_upgrade_without_an_external_signature_is_refused() {
-        let nodes = [readiness("a", Some(true))];
+        let nodes = [readiness("a", true)];
         let err = check_network_prerequisites(None, &nodes).unwrap_err();
         assert!(
             matches!(err, UpgradeError::ExternalSignatureRequired),
@@ -515,9 +515,9 @@ mod tests {
     #[test]
     fn cluster_upgrade_is_refused_when_a_node_has_no_external_key() {
         let nodes = [
-            readiness("a", Some(true)),
-            readiness("b", Some(false)),
-            readiness("c", Some(false)),
+            readiness("a", true),
+            readiness("b", false),
+            readiness("c", false),
         ];
         let err = check_network_prerequisites(Some("sig"), &nodes).unwrap_err();
         assert!(
@@ -528,8 +528,8 @@ mod tests {
     }
 
     #[test]
-    fn cluster_upgrade_proceeds_when_every_node_can_verify_or_does_not_say() {
-        let nodes = [readiness("a", Some(true)), readiness("b", None)];
+    fn cluster_upgrade_proceeds_when_every_node_can_verify() {
+        let nodes = [readiness("a", true), readiness("b", true)];
         check_network_prerequisites(Some("sig"), &nodes).unwrap();
         check_network_prerequisites(Some("sig"), &[]).unwrap();
     }

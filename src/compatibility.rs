@@ -15,11 +15,11 @@ pub struct Compatibility {
     pub state: u32,
 }
 
-/// Supported formats, including sequenced, instance-tagged log rows (Parquet
-/// schema and the `/v1/logs/entries` fan-out answer).
+/// Supported formats, including the `Aborted` cluster-upgrade phase and the
+/// `accepts_network_upgrades` field every node's `/v1/version` must report.
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 25,
-    state: 41,
+    protocol: 26,
+    state: 42,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.

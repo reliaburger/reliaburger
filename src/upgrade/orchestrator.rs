@@ -38,8 +38,8 @@ pub struct NodeProbe {
     /// Hex SHA-256 of the binary the node runs, when it reports one.
     pub binary_sha256: Option<String>,
     /// Whether the node has an external key to verify network upgrades
-    /// with. `None` when the node doesn't report it.
-    pub accepts_network_upgrades: Option<bool>,
+    /// with. A node that doesn't say can't: every 0.1.0 node reports it.
+    pub accepts_network_upgrades: bool,
 }
 
 /// Effects the orchestrator performs on nodes. Mocked in unit tests; the
@@ -656,7 +656,7 @@ impl NodeControl for HttpNodeControl {
         );
 
         let binary_sha256 = value["binary_sha256"].as_str().map(String::from);
-        let accepts_network_upgrades = value["accepts_network_upgrades"].as_bool();
+        let accepts_network_upgrades = value["accepts_network_upgrades"].as_bool().unwrap_or(false);
 
         Some(NodeProbe {
             version,
@@ -921,7 +921,7 @@ mod tests {
                     upgrade_in_flight: in_flight,
                     failed_upgrade_ids: Vec::new(),
                     binary_sha256: Some(fixture_sha256(version).to_string()),
-                    accepts_network_upgrades: Some(true),
+                    accepts_network_upgrades: true,
                 },
             );
         }
@@ -935,7 +935,7 @@ mod tests {
                     upgrade_in_flight: false,
                     failed_upgrade_ids: vec![failed_id.to_string()],
                     binary_sha256: Some(fixture_sha256(version).to_string()),
-                    accepts_network_upgrades: Some(true),
+                    accepts_network_upgrades: true,
                 },
             );
         }
@@ -1609,6 +1609,40 @@ mod tests {
         assert_eq!(state.nodes[1].phase, NodeUpgradePhase::Pending);
         // The healthy node is untouched.
         assert_eq!(state.nodes[0].phase, NodeUpgradePhase::Healthy);
+    }
+
+    /// Serve `/v1/version` with `body` and `/v1/health` as ok, and probe it.
+    async fn probe_version_body(body: serde_json::Value) -> NodeProbe {
+        let router = axum::Router::new()
+            .route(
+                "/v1/version",
+                axum::routing::get(move || {
+                    let body = body.clone();
+                    async move { axum::Json(body) }
+                }),
+            )
+            .route(
+                "/v1/health",
+                axum::routing::get(|| async { axum::Json(serde_json::json!({"status": "ok"})) }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let probe = HttpNodeControl::new(None).probe(&address).await.unwrap();
+        server.abort();
+        probe
+    }
+
+    #[tokio::test]
+    async fn a_node_that_does_not_report_network_readiness_cannot_accept_one() {
+        let silent = probe_version_body(serde_json::json!({"version": "v0.1.0"})).await;
+        assert!(!silent.accepts_network_upgrades);
+        let ready = probe_version_body(serde_json::json!({
+            "version": "v0.1.0",
+            "accepts_network_upgrades": true,
+        }))
+        .await;
+        assert!(ready.accepts_network_upgrades);
     }
 
     fn paused(nodes: Vec<NodeUpgradeRecord>) -> ClusterUpgradeState {

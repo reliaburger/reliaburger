@@ -1740,6 +1740,8 @@ async fn version_handler(State(state): State<ApiState>) -> impl IntoResponse {
             "compatibility": crate::compatibility::CURRENT,
             "upgrade_in_flight": false,
             "failed_upgrade_ids": [],
+            // No upgrade manager, so no way to apply a directive at all.
+            "accepts_network_upgrades": false,
         })),
     }
 }
