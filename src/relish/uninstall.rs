@@ -67,6 +67,15 @@ pub struct Plan {
     pub root: PathBuf,
 }
 
+impl Plan {
+    /// Whether executing the plan deletes `path`, directly or through a link.
+    /// Only meaningful before [`execute`]: afterwards there's nothing left to
+    /// resolve the paths against.
+    pub fn removes(&self, path: &Path) -> bool {
+        self.remove.iter().any(|removed| same_file(removed, path))
+    }
+}
+
 /// Files and directories under `RELIABURGER_HOME` that only the installer
 /// and the quickstart create.
 const OWNED: &[&str] = &["tools", "cache", "lima", "setup.lock"];
@@ -201,12 +210,16 @@ pub fn run(yes: bool) -> Result<(), UninstallError> {
     if !yes {
         confirm()?;
     }
+    // Ask before removing: once our own binary is gone, Linux reports
+    // current_exe() as "/…/relish (deleted)", which matches nothing.
+    let running = std::env::current_exe().ok();
+    let ours = running
+        .as_deref()
+        .is_some_and(|running| plan.removes(running));
     execute(&plan)?;
     println!("removed");
 
-    if let Ok(running) = std::env::current_exe()
-        && !plan.remove.iter().any(|path| same_file(path, &running))
-    {
+    if let Some(running) = running.filter(|_| !ours) {
         println!(
             "note: this relish ({}) wasn't installed by install.sh; remove it the way you installed it",
             running.display()
@@ -353,6 +366,26 @@ mod tests {
         assert!(!root.exists(), "an emptied home is removed too");
         assert!(local_bin.is_dir(), "~/.local/bin itself is the user's");
         assert!(std::fs::symlink_metadata(local_bin.join("relish")).is_err());
+    }
+
+    #[test]
+    fn recognises_its_own_binary_only_before_removing_it() {
+        let (temp, root, local_bin) = installed_home();
+        let plan = plan(&root, Some(&local_bin)).unwrap();
+        let elsewhere = temp.path().join("cargo/bin/relish");
+        std::fs::create_dir_all(elsewhere.parent().unwrap()).unwrap();
+        std::fs::write(&elsewhere, "binary").unwrap();
+
+        assert!(plan.removes(&root.join("bin/relish")));
+        // Running through ~/.local/bin/relish resolves to the same binary.
+        assert!(plan.removes(&local_bin.join("relish")));
+        assert!(!plan.removes(&elsewhere));
+
+        // Afterwards the binary is gone, and Linux names it "(deleted)":
+        // that's why `run` asks before it executes the plan.
+        execute(&plan).unwrap();
+        let deleted = PathBuf::from(format!("{} (deleted)", root.join("bin/relish").display()));
+        assert!(!plan.removes(&deleted));
     }
 
     #[test]
