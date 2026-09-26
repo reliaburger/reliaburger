@@ -121,6 +121,34 @@ pub struct TestContext {
     pub deadline: Deadline,
     /// How [`Self::node_clients`] reaches peer nodes.
     pub peer_route: PeerRoute,
+    /// What the case's current wait is waiting for, for a timeout report.
+    pub(crate) wait_note: WaitNote,
+}
+
+/// What a case's poll helper is waiting for and what it last saw.
+///
+/// A helper gives up on the same deadline the runner enforces, so the runner
+/// usually cancels the body before the helper's own message comes back. The
+/// helper writes that message here on every poll instead, and the runner adds
+/// it to the timeout. Clones share one note.
+#[derive(Clone, Default)]
+pub(crate) struct WaitNote(std::sync::Arc<tokio::sync::Mutex<Option<String>>>);
+
+impl WaitNote {
+    /// Replace the note with the current wait's state.
+    pub(crate) async fn record(&self, note: String) {
+        *self.0.lock().await = Some(note);
+    }
+
+    /// Forget the note once its wait is over.
+    pub(crate) async fn clear(&self) {
+        *self.0.lock().await = None;
+    }
+
+    /// The note left by a wait that never finished, if any.
+    pub(crate) async fn take(&self) -> Option<String> {
+        self.0.lock().await.take()
+    }
 }
 
 impl TestContext {
@@ -384,6 +412,7 @@ impl TestContext {
              timeout = 2\n\
              threshold_unhealthy = 3\n\
              threshold_healthy = 1\n",
+            script = container_http_script(port, 0),
             ns = self.namespace,
         )
     }
@@ -501,21 +530,23 @@ impl TestContext {
                 Ok(instances) => {
                     last = instances;
                     if predicate(&last) {
+                        self.wait_note.clear().await;
                         return Ok(());
                     }
                     None
                 }
                 Err(error) => Some(error),
             };
+            let seen: Vec<&str> = last.iter().map(|i| i.state.as_str()).collect();
+            let waiting = format!(
+                "waiting for {app} to reach {what} cluster-wide; \
+                 last saw {} instance(s): {seen:?}; last query error: {last_error:?}",
+                last.len()
+            );
             if self.deadline.remaining().is_zero() {
-                let seen: Vec<&str> = last.iter().map(|i| i.state.as_str()).collect();
-                return Err(format!(
-                    "timed out after {:?} waiting for {app} to reach {what} cluster-wide; \
-                     last saw {} instance(s): {seen:?}; last query error: {last_error:?}",
-                    self.timeout,
-                    last.len()
-                ));
+                return Err(format!("timed out after {:?} {waiting}", self.timeout));
             }
+            self.wait_note.record(waiting).await;
             tokio::time::sleep(Duration::from_millis(500).min(self.deadline.remaining())).await;
         }
     }
@@ -646,21 +677,22 @@ impl TestContext {
                     })
                     .collect();
                 if predicate(&last) {
+                    self.wait_note.clear().await;
                     return Ok(());
                 }
             }
+            let seen: Vec<(&str, &str)> = last
+                .iter()
+                .map(|instance| (instance.app_name.as_str(), instance.state.as_str()))
+                .collect();
+            let waiting = format!(
+                "waiting for {app} to reach {what}; last saw {} instance(s): {seen:?}",
+                last.len()
+            );
             if self.deadline.remaining().is_zero() {
-                let seen: Vec<(&str, &str)> = last
-                    .iter()
-                    .map(|instance| (instance.app_name.as_str(), instance.state.as_str()))
-                    .collect();
-                return Err(format!(
-                    "timed out after {:?} waiting for {app} to reach {what}; \
-                     last saw {} instance(s): {seen:?}",
-                    self.timeout,
-                    last.len()
-                ));
+                return Err(format!("timed out after {:?} {waiting}", self.timeout));
             }
+            self.wait_note.record(waiting).await;
             tokio::time::sleep(poll.min(self.deadline.remaining())).await;
         }
     }
@@ -832,6 +864,29 @@ fn merge_cleanup(left: CleanupOutcome, right: CleanupOutcome) -> CleanupOutcome 
 /// A stable, per-app port in the ephemeral range, so two apps in one case
 /// don't collide. Deterministic (an FNV-1a hash of the name) so a case's
 /// spec is reproducible between runs.
+/// The shell script behind every HTTP container fixture, for `/bin/sh -c`.
+///
+/// It writes the `/hostname` file its health check asks for and serves only
+/// that directory, naming BusyBox by absolute path. The pinned image has no
+/// `PATH` and no `/etc/hostname`, so a fixture that leans on either never turns
+/// healthy on a real container runtime. `startup_delay_secs` holds the server
+/// back, for cases that need a deploy to stay in flight for a while.
+pub(crate) fn container_http_script(port: u16, startup_delay_secs: u32) -> String {
+    let delay = if startup_delay_secs == 0 {
+        String::new()
+    } else {
+        format!("/bin/busybox sleep {startup_delay_secs}; ")
+    };
+    format!(
+        "{delay}/bin/busybox mkdir -p {HTTP_ROOT}; \
+         printf 'reliaburger-test' > {HTTP_ROOT}/hostname; \
+         exec /bin/busybox httpd -f -p {port} -h {HTTP_ROOT}"
+    )
+}
+
+/// The directory [`container_http_script`] creates and serves.
+const HTTP_ROOT: &str = "/tmp/reliaburger-test-http";
+
 fn testapp_port(app: &str) -> u16 {
     let mut hash: u32 = 2_166_136_261;
     for byte in app.bytes() {
@@ -858,6 +913,7 @@ mod tests {
             timeout: Duration::from_millis(200),
             deadline: Deadline::after(Duration::from_millis(200)).unwrap(),
             peer_route: PeerRoute::Direct,
+            wait_note: Default::default(),
         }
     }
 
