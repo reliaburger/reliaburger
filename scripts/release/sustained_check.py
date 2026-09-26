@@ -12,6 +12,7 @@ Subcommands:
   event EVIDENCE --phase P [--target T] [--command C] [--exit N] [--duration S] [--verdict V] [--detail D]
   expect EVIDENCE restart NODE          a harnessed bun kill: one systemd restart is explained
   window EVIDENCE open|close [LABEL]    faults in progress; outages are allowed while open
+  power-cut EVIDENCE                    a node lost power: a log tail may end below an earlier one once
   baseline EVIDENCE SNAPSHOT            record each node's leak inventory as the baseline
   evaluate EVIDENCE SNAPSHOT            findings; exit 1 on a new failure, 3 when not yet settled
   seen EVIDENCE KEY                     exit 0 if a harness failure KEY was bundled in the last half hour
@@ -398,7 +399,13 @@ def evaluate(evidence, snapshot):
                                     "podinfo answered " + (http.strip() or "nothing")))
 
     # The writer file (writer-gap, writer-regression) is the data-loss check;
-    # these only see lines through the log view. State keeps the old keys.
+    # these only see lines through the log view. State keeps the old keys:
+    # state[check] is the highest value ever seen and never goes down (the
+    # writer-regression check compares the file against it), while
+    # "log-baseline" is what the next tail must not end below.
+    baselines = state.setdefault("log-baseline", {})
+    power_cut_excused = False
+    advanced = False
     for check, order_check, name, prefix, source in (
             ("writer-ack", "writer-log-order", "writer-log.txt", "ACK",
              "line order in the log view; the writer file checks decide data loss"),
@@ -408,12 +415,28 @@ def evaluate(evidence, snapshot):
         if text is None:
             continue
         values = parse_sequence(text, prefix)
-        findings += sequence_findings(order_check, values, state.get(check), source)
+        baseline = baselines.get(check, state.get(check))
+        order = sequence_findings(order_check, values, baseline, source)
+        if state.get("power_cut") and values and baseline is not None and values[-1] < baseline:
+            # A powered-off node loses the stdout it hadn't synced yet, as any
+            # log does; the tail may end below what an earlier check saw. Only
+            # the "ends below" finding is excused, and the baseline restarts
+            # from here; lines going backwards within one tail still fail.
+            order = [dict(item, severity="info", detail=item["detail"] + "; after a power cut, lines not yet synced are lost from the log view")
+                     if "below the" in item["detail"] else item for item in order]
+            baselines[check] = values[-1]
+            power_cut_excused = True
+        elif values:
+            advanced = advanced or baseline is None or values[-1] > baseline
+            baselines[check] = max(values[-1], baseline or 0)
+        findings += order
         if values:
             if values[-1] == state.get(check) and not fault_window:
                 findings.append(finding(check, "warn", f"not advancing at {values[-1]}"))
             state[check] = max(values[-1], state.get(check, 0))
             state.setdefault("progress", {})[check] = values[-1]
+    if state.get("power_cut") and not fault_window and advanced and not power_cut_excused:
+        state.pop("power_cut")
 
     writer = read(snapshot, "writer-file.txt")
     if writer is not None:
@@ -956,6 +979,8 @@ def main(argv=None):
     expect.add_argument("evidence")
     expect.add_argument("what", choices=["restart"])
     expect.add_argument("node")
+    power_cut = commands.add_parser("power-cut", help="a node's power was cut: the log view may lose unsynced lines")
+    power_cut.add_argument("evidence")
     window = commands.add_parser("window")
     window.add_argument("evidence")
     window.add_argument("action", choices=["open", "close", "settled"])
@@ -1004,6 +1029,11 @@ def main(argv=None):
         state = load_state(args.evidence)
         restarts = state.setdefault("restarts", {}).setdefault(args.node, {"boot": None, "n": 0, "expected": 0})
         restarts["expected"] += 1
+        save_state(args.evidence, state)
+        return 0
+    if args.command == "power-cut":
+        state = load_state(args.evidence)
+        state["power_cut"] = True
         save_state(args.evidence, state)
         return 0
     if args.command == "window":
