@@ -115,6 +115,41 @@ class WriterAndRedis(Evidence):
             self.assertTrue(detail.startswith("log view"), detail)
             self.assertNotIn("acknowledged", detail)
 
+    def power_cut(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            checker.main(["power-cut", str(self.evidence)])
+
+    def test_a_tail_ending_lower_after_a_power_cut_is_info_once(self):
+        self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 40639\nACK 40640\n",
+                                        "redis__log_txt": "INCR 2503\nINCR 2504\n"}))
+        self.power_cut()
+        code, verdict = self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 40313\nACK 40314\n",
+                                                        "redis__log_txt": "INCR 781\nINCR 782\n"}))
+        self.assertEqual(self.failures(verdict), [])
+        excused = [item for item in verdict["findings"] if item["check"].endswith("-log-order")]
+        self.assertEqual({item["severity"] for item in excused}, {"info"})
+        self.assertTrue(all("power cut" in item["detail"] for item in excused))
+        # The baseline restarts from the lower tail; the next tail only has to rise.
+        _, verdict = self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 40641\n", "redis__log_txt": "INCR 2600\n"}))
+        self.assertEqual(self.failures(verdict), [])
+        # Once the tails have advanced outside a window the excuse is spent.
+        _, verdict = self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 10\n"}))
+        self.assertIn("writer-log-order", self.failures(verdict))
+
+    def test_a_power_cut_never_lowers_what_the_writer_file_must_hold(self):
+        self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 40640\n"}))
+        self.power_cut()
+        self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 40314\n"}))
+        code, verdict = self.evaluate(self.snapshot(**{"writer__file_txt": "LAST 40314\n"}))
+        self.assertEqual(code, 1)
+        self.assertIn("writer-regression", self.failures(verdict))
+
+    def test_lines_going_backwards_within_one_tail_still_fail_after_a_power_cut(self):
+        self.evaluate(self.snapshot(**{"redis__log_txt": "INCR 41\n"}))
+        self.power_cut()
+        _, verdict = self.evaluate(self.snapshot(**{"redis__log_txt": "INCR 50\nINCR 45\n"}))
+        self.assertIn("redis-log-order", self.failures(verdict))
+
     def test_redis_errors_during_an_outage_do_not_fail(self):
         self.evaluate(self.snapshot(**{"redis__log_txt": "INCR 41\n"}))
         code, verdict = self.evaluate(self.snapshot(**{"redis__log_txt": "INCR 41\nERR Could not connect\nINCR 42\n"}))

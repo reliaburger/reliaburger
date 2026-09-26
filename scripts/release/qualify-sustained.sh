@@ -898,6 +898,7 @@ power_offs=0
 power_off() {
     local node=$1
     down[node]=1
+    check power-cut "$evidence"
     "$limactl" stop --force "${vm[node]}" > "$evidence/snapshots/power-off-$node-$(date +%s).log" 2>&1 || true
 }
 power_on() {
