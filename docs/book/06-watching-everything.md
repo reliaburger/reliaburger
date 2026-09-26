@@ -708,6 +708,37 @@ let committed = tokio::task::spawn_blocking(move || {
 
 `Ok::<_, KetchupError>(current)` uses the "turbofish" `::<>` to name the closure's error type, which the compiler can't infer by itself; `_` lets it fill in the rest. The `??` unwraps two layers: `spawn_blocking` returns an error if the thread panicked, and inside that sits our own `Result`. Finally, `*checkpoint = committed` writes through the caller's `&mut` reference, so the caller only ever sees a committed snapshot.
 
+#### Busy is not broken
+
+The V02 soak turned that lock into a wall of red. Every node's journal said `log export failed during disk pressure: io error: export checkpoint is busy` a few hundred times, with `log export error: ... busy` close behind. Was the soak losing logs?
+
+No. `check_and_relieve` returns early whenever its export fails, and it only prunes a file whose exact bytes are in the checkpoint, so a busy lock left every file on disk. The cause was mundane: Bun starts the 60-second export timer and the 300-second disk-pressure timer together, and 300 is a multiple of 60, so every fifth export tick lands on a disk-pressure tick. One of the two loses the `try_lock`. When the periodic export lost, nothing happened: the other exporter was shipping the same files. When disk pressure lost, it skipped pruning for five minutes, which with an 8 MB cap is exactly when you want it to prune.
+
+So a busy lock is now its own error variant, `KetchupError::ExportBusy`, instead of a stringly-typed `io::Error`. `std::fs::File::try_lock` already tells the two cases apart:
+
+```rust
+match lock.try_lock() {
+    Ok(()) => {}
+    Err(std::fs::TryLockError::WouldBlock) => return Err(KetchupError::ExportBusy),
+    Err(std::fs::TryLockError::Error(error)) => return Err(KetchupError::Io(error)),
+}
+```
+
+The periodic task matches `Err(KetchupError::ExportBusy) => {}` and stays quiet. Disk pressure waits for its turn instead:
+
+```rust
+loop {
+    match export_logs(source_dir, destination, node_id, checkpoint).await {
+        Err(KetchupError::ExportBusy) if tokio::time::Instant::now() < deadline => {
+            tokio::time::sleep(EXPORT_BUSY_POLL).await;
+        }
+        other => return other,
+    }
+}
+```
+
+The `if` after the pattern is a *match guard*: the arm only matches when the pattern fits and the condition holds, so a busy error past the 60-second deadline falls through to `other` and is reported like any failure. Why poll every 100 ms rather than call the blocking `lock()` in `spawn_blocking`? Because a thread parked in `flock` can't be cancelled. If the caller gave up, the thread would still wake up later holding the lock with nobody to release it until it finished. A `tokio::time::sleep` is dropped cleanly on shutdown. The test holds the lock from outside, releases it after 300 ms, and checks that the same `check_and_relieve` call then exports and prunes the file.
+
 ### Errors that used to vanish
 
 Retention in the metrics and rollup stores ignored `remove_file` errors and counted the file as deleted anyway; now only successful removals count. The exporter forgives exactly one read failure, `NotFound`, because retention can delete a file between listing the directory and opening it.

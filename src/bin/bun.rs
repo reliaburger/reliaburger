@@ -1956,6 +1956,10 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                             Ok(result) if result.files_exported > 0 => {
                                 println!("bun: exported {} log file(s) to {}", result.files_exported, export_dest);
                             }
+                            // Disk-pressure relief (or a manual export) holds the
+                            // checkpoint and is shipping these same files; the
+                            // next tick picks up anything it missed.
+                            Err(reliaburger::ketchup::types::KetchupError::ExportBusy) => {}
                             Err(e) => eprintln!("bun: log export error: {e}"),
                             _ => {}
                         }
