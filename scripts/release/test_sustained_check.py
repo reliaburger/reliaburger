@@ -353,7 +353,8 @@ class Record(Evidence):
             "schedule": "compressed", "started_at": NOW, "finished_at": NOW + 2400,
             "base_url": "<https://example.invalid/staging>", "candidate_digest": "`abc`",
             "soak_bun": "not supplied: upgrade slots skipped", "deviations": ["provision_isolated_workloads"],
-            "cycles": 4, "ingress_rotation_secs": 300}))
+            "cycles": 4, "ingress_rotation_secs": 300,
+            "teardown": "`relish local destroy --yes` and `relish uninstall --yes` succeeded"}))
         for offset, seconds in ((0, 40), (100, 60)):
             checker.append_event(self.evidence, ts=NOW + offset, phase="fault:bun-kill-follower", target="rb-a-2")
             checker.append_event(self.evidence, ts=NOW + offset + seconds, phase="fault:bun-kill-follower",
@@ -379,6 +380,7 @@ class Record(Evidence):
         self.assertIn("highest ACK 20000", text)
         self.assertIn("not supplied: upgrade slots skipped", text)
         self.assertIn("short leaf lifetimes unavailable", text)
+        self.assertIn("- Teardown: `relish local destroy --yes` and `relish uninstall --yes` succeeded", text)
 
     def test_an_open_failure_renders_fail_with_its_row(self):
         self.write_run(failures=["fault:power-off did not settle within 480 s"])

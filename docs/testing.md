@@ -72,7 +72,7 @@ a user would install it. The runbook is [`releasing.md`](releasing.md).
 | Gate | What it does | Where |
 |---|---|---|
 | Staged install | `curl \| sh` against the exact signed candidate, from empty caches, then the homepage tour and a full teardown | [`qualify-staged-install.sh`](../scripts/release/qualify-staged-install.sh), [records](qualification/) |
-| Sustained soak | Hours of continuous writes, certificate renewals, killed agents, powered-off VMs, quorum loss and upgrade round trips, with invariants checked every 30 seconds | [`qualify-sustained.sh`](../scripts/release/qualify-sustained.sh), [plan](plans/2026-09-25-v02-sustained.md) |
+| Sustained soak | Hours of continuous writes, certificate renewals, killed agents, powered-off VMs, quorum loss and upgrade round trips, with invariants checked every 30 seconds | [`qualify-sustained.sh`](../scripts/release/qualify-sustained.sh), [plan](plans/2026-09-25-v02-sustained.md); up to about 4 h without upgrade walks on a hosted Linux runner with [`soak.yml`](../.github/workflows/soak.yml) ([runbook](releasing.md#soaking-a-candidate-in-ci)) |
 | Loops | Upgrade, council recovery and lease tests repeated for hours on Linux x86, Linux Arm and macOS | [`v02-loops.yml`](../.github/workflows/v02-loops.yml) |
 
 ## When a test flakes
