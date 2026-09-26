@@ -2640,6 +2640,44 @@ about twenty seconds. The test harness now attaches a `KnownMembers` fed
 from gossip the way Bun does, so that path is no longer something only a
 laptop cluster exercises.
 
+CI then found the next link in the chain on its first run. The clear reached
+the dead node, the node reversed the fault, and then answered 504:
+
+```text
+fault 1 is reversed on this node, but the cluster has not yet released its
+reservation; retry the clear before injecting again
+```
+
+A node fault holds a cluster-wide reservation (one experiment at a time), and
+the leader releases it only once it sees the healed node alive again. The
+node waits 4 s for that before answering; on a busy CI runner, gossip took
+longer. The message says "retry", and a retry is safe: the node keeps the
+reservation's sequence number until the leader fences it, so asking again just
+waits again. But nothing retried. Not the test, and not the two real clients
+either, `relish fault clear` and the chaos cleanup, which would have reported
+the case as failed with a perfectly healthy cluster. So the retry went into
+`BunClient::clear_fault` itself, where every caller gets it:
+
+```rust
+loop {
+    match self.clear_fault_once(id, node, acknowledged).await {
+        Err(RelishError::ApiError { status: 504, .. })
+            if tokio::time::Instant::now() + FAULT_CLEAR_RETRY_PAUSE < deadline =>
+        {
+            tokio::time::sleep(FAULT_CLEAR_RETRY_PAUSE).await;
+        }
+        result => return result,
+    }
+}
+```
+
+The first arm is a *match guard*: the pattern matches only a 504, and the
+`if` after it adds a condition the pattern can't express, here "and there's
+still time for another go". Anything else, success included, falls through to
+`result => return result`, which binds the whole value to a name and hands it
+back unchanged. The budget is 30 seconds, after which the caller sees the 504
+it would have seen before.
+
 ## Walk the path you actually care about
 
 Say `web` can't reach `redis`. Checking Bun's own DNS and TCP access might tell
