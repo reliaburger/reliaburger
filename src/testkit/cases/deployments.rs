@@ -206,6 +206,7 @@ mod tests {
             capabilities: crate::bun::capabilities::ClusterCapabilities::default(),
             timeout,
             deadline: crate::testkit::deadline::Deadline::after(timeout).unwrap(),
+            peer_route: crate::testkit::context::PeerRoute::Direct,
         };
         let case = cases()
             .into_iter()

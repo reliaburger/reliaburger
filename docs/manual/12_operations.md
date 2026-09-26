@@ -16,7 +16,8 @@ relish upgrade plan v0.2.0            # the rolling order and an estimate
 relish upgrade start v0.2.0           # download, verify, roll
 relish upgrade status
 relish upgrade resume                 # continue a paused upgrade
-relish upgrade rollback v0.1.0
+relish upgrade abort                  # end a paused upgrade that moved no node
+relish upgrade rollback v0.1.0        # also replaces a paused upgrade
 ```
 
 It needs three things on every node:
@@ -56,6 +57,18 @@ different bytes: build it with a new version instead. If the bytes are
 identical it reports that there's nothing to do. Moving to an older version
 needs `--allow-downgrade` (note that `v0.2.0-rc.1` is older than `v0.2.0`);
 `relish upgrade rollback` goes back to a retained version without it.
+
+`start` also asks every node whether it can verify a cluster upgrade. A node
+without `[upgrades] external_signing_key` would refuse the binary, so `start`
+fails there and names the node, and nothing is recorded.
+
+A node that refuses or reverts pauses the upgrade, and a paused upgrade blocks
+every new `start`. There are three ways on: fix the cause and
+`relish upgrade resume`; `relish upgrade abort`, which ends the upgrade when no
+node has moved to the new version yet; or `relish upgrade rollback <version>`,
+which replaces the paused upgrade and walks every node, moved or not, back to
+that version. `abort` refuses once a node has moved, and says which, because
+ending the upgrade then would leave the cluster on two versions.
 
 Rolling upgrades need matching protocol and state formats; `bun --compatibility`
 prints what a binary supports. Development builds' state isn't migrated.

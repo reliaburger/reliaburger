@@ -724,6 +724,7 @@ relish upgrade status               # Show upgrade progress
 relish upgrade rollback             # Roll back to previous version
 relish upgrade rollback <version>   # Roll back to specific version
 relish upgrade resume               # Resume a paused upgrade
+relish upgrade abort                # End a paused upgrade that moved no node
 
 # Fault injection (Smoker)
 relish fault delay <app> <duration> --acknowledge       # Reserved; rejected until TC ships

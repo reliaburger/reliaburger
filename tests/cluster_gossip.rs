@@ -921,6 +921,7 @@ async fn node_renewal_retries_directly_after_leader_failure_and_persists_the_new
         members.push(reliaburger::bun::api::NodeMembershipInfo {
             node_id: reliaburger::meat::NodeId::new(names[index]),
             address,
+            api_advertised: true,
         });
     }
     let local_api = members[worker_index].address;

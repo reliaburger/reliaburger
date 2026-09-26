@@ -725,8 +725,9 @@ Commands:
 | `upgrade start ... --allow-downgrade` | Allow a target older than the running version |
 | `upgrade plan <version>` | Preview the rolling order and estimated duration |
 | `upgrade status` | Show upgrade progress (cluster or node) |
-| `upgrade rollback [version]` | Roll back to a previous binary version |
+| `upgrade rollback [version]` | Roll back to a previous binary version (replaces a paused upgrade) |
 | `upgrade resume` | Resume a paused upgrade under a fresh attempt id |
+| `upgrade abort` | End a paused upgrade in which no node has moved |
 
 Use `test --chaos --filter dead_worker_node_has_workloads_rescheduled` to select
 an exact supported chaos scenario. Omitting the filter runs all five, including

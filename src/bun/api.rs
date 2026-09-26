@@ -47,8 +47,29 @@ use super::agent::{AgentCommand, ApplyEvent, InstanceStatus};
 #[derive(Debug, Clone)]
 pub struct NodeMembershipInfo {
     pub node_id: crate::meat::NodeId,
+    /// The node's API endpoint: the one it advertised over gossip, or a
+    /// port-offset guess until that advertisement arrives.
     pub address: std::net::SocketAddr,
+    /// `true` when `address` is the node's own advertisement. A guess is
+    /// fine for best-effort fan-out, but anything that compares or
+    /// publishes the address as the node's identity (upgrade plans, the
+    /// nodes listing) must wait for the real thing: nodes sharing a host
+    /// pick their ports independently, so one node's offset is not another's.
+    pub api_advertised: bool,
 }
+
+/// Every member gossip still knows (alive, suspect or dead, not left), with
+/// its API address.
+///
+/// [`ApiState::membership`] holds only live members, which is right for
+/// fan-out and for injecting faults. A node-kill fault, though, closes a
+/// node's cluster transports and leaves its management API open: gossip calls
+/// it dead while it can still answer. The node relay and node-fault reversal
+/// reach it through this table, so a caller outside the cluster network can
+/// still inspect it and heal it. `bun` attaches it as a layer; without it the
+/// relay reaches live members only.
+#[derive(Clone)]
+pub struct KnownMembers(pub Arc<RwLock<Vec<NodeMembershipInfo>>>);
 
 /// Shared state for API handlers.
 #[derive(Clone)]
@@ -408,6 +429,7 @@ pub fn router_with_upgrade(
         .route("/v1/upgrade/start", post(upgrade_start_handler))
         .route("/v1/upgrade/cluster", get(upgrade_cluster_handler))
         .route("/v1/upgrade/resume", post(upgrade_resume_handler))
+        .route("/v1/upgrade/abort", post(upgrade_abort_handler))
         .route(
             "/v1/upgrade/cluster-rollback",
             post(upgrade_cluster_rollback_handler),
@@ -1716,12 +1738,18 @@ async fn version_handler(State(state): State<ApiState>) -> impl IntoResponse {
             // Ids this node attempted and reverted — the orchestrator
             // reads these to detect node-side reverts.
             "failed_upgrade_ids": manager.reverted_upgrade_ids(),
+            // The leader refuses a cluster upgrade up front when a node
+            // reports false, rather than recording a run the node will
+            // refuse and leaving it paused.
+            "accepts_network_upgrades": manager.accepts_network_upgrades(),
         })),
         None => Json(serde_json::json!({
             "version": crate::upgrade::version::compiled_version().to_string(),
             "compatibility": crate::compatibility::CURRENT,
             "upgrade_in_flight": false,
             "failed_upgrade_ids": [],
+            // No upgrade manager, so no way to apply a directive at all.
+            "accepts_network_upgrades": false,
         })),
     }
 }
@@ -1992,27 +2020,35 @@ async fn upgrade_start_handler(
         authoritative.get(id).cloned()
     }) {
         Ok(nodes) => nodes,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": e.to_string() })),
-            )
-                .into_response();
-        }
+        Err(e) => return plan_error_response(&e),
     };
 
-    if council.desired_state().await.active_upgrade.is_some() {
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({ "error": "an upgrade is already in progress" })),
-        )
-            .into_response();
+    if let Some(active) = council.desired_state().await.active_upgrade {
+        return upgrade_in_progress(&active);
     }
 
     // Refuse same-version and unrequested downgrades before anything is
     // recorded: once in Raft, a same-version run would "complete" without
     // swapping a single byte.
-    let running = probe_running_binaries(&state, &derived_nodes).await;
+    let (running, readiness) = probe_running_binaries(&state, &derived_nodes).await;
+    let direction = request
+        .direction
+        .unwrap_or(crate::upgrade::types::UpgradeDirection::Upgrade);
+    // Every node fetches an upgrade from Pickle and so demands the external
+    // signature. A run the nodes will refuse would only pause and then block
+    // every later start, so refuse it here instead.
+    if direction == crate::upgrade::types::UpgradeDirection::Upgrade
+        && let Err(e) = crate::upgrade::plan::check_network_prerequisites(
+            request.external_signature.as_deref(),
+            &readiness,
+        )
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response();
+    }
     match crate::upgrade::plan::check_target(
         &request.target_version,
         &request.binary_sha256,
@@ -2057,9 +2093,7 @@ async fn upgrade_start_handler(
         embedded_signature: request.embedded_signature,
         external_signature: request.external_signature,
         parallel: request.parallel.max(1),
-        direction: request
-            .direction
-            .unwrap_or(crate::upgrade::types::UpgradeDirection::Upgrade),
+        direction,
         phase: crate::upgrade::types::ClusterUpgradePhase::Preparing,
         registry_address: request.registry_address,
         allow_downgrade: request.allow_downgrade,
@@ -2087,14 +2121,18 @@ async fn upgrade_start_handler(
     }
 }
 
-/// Ask every planned node what it runs, for the start-time target gate.
+/// Ask every planned node what it runs and whether it can verify a
+/// network upgrade, for the start-time gates.
 ///
 /// Probes run concurrently, each bounded. An unreachable node is left out:
 /// the orchestrator re-checks every node as the walk reaches it.
 async fn probe_running_binaries(
     state: &ApiState,
     nodes: &[crate::upgrade::types::NodeUpgradeRecord],
-) -> Vec<crate::upgrade::plan::RunningBinary> {
+) -> (
+    Vec<crate::upgrade::plan::RunningBinary>,
+    Vec<crate::upgrade::plan::NetworkReadiness>,
+) {
     use crate::upgrade::orchestrator::NodeControl as _;
 
     let control = crate::upgrade::orchestrator::HttpNodeControl::with_http(
@@ -2111,18 +2149,92 @@ async fn probe_running_binaries(
             .await
             .ok()
             .flatten()?;
-            Some(crate::upgrade::plan::RunningBinary {
-                node: format!("node {}", record.node_id),
-                version: probe.version,
-                sha256: probe.binary_sha256,
-            })
+            let node = format!("node {}", record.node_id);
+            Some((
+                crate::upgrade::plan::RunningBinary {
+                    node: node.clone(),
+                    version: probe.version,
+                    sha256: probe.binary_sha256,
+                },
+                crate::upgrade::plan::NetworkReadiness {
+                    node,
+                    accepts_network_upgrades: probe.accepts_network_upgrades,
+                },
+            ))
         }
     });
     futures_util::future::join_all(probes)
         .await
         .into_iter()
         .flatten()
-        .collect()
+        .unzip()
+}
+
+/// The 409 for a start or rollback while another run is active. A paused
+/// run says how to get out of it: resume, abort or roll back.
+fn upgrade_in_progress(active: &crate::upgrade::types::ClusterUpgradeState) -> Response {
+    let error = match &active.phase {
+        crate::upgrade::types::ClusterUpgradePhase::Paused { reason } => format!(
+            "upgrade {} is paused ({reason}); run `relish upgrade resume`, \
+             `relish upgrade abort`, or `relish upgrade rollback <version>` first",
+            active.upgrade_id
+        ),
+        _ => format!("upgrade {} is already in progress", active.upgrade_id),
+    };
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({ "error": error })),
+    )
+        .into_response()
+}
+
+/// Archive a paused run that the operator ended: record it as `Aborted`,
+/// then move it to history.
+///
+/// Two Raft writes. If the second is lost, the orchestrator archives the
+/// aborted run on its next tick, and a start meanwhile gets a 409 that
+/// names it.
+// `Response` is large but it IS the HTTP reply to send on failure.
+#[allow(clippy::result_large_err)]
+async fn archive_aborted_upgrade(
+    council: &crate::council::CouncilNode,
+    aborted: crate::upgrade::types::ClusterUpgradeState,
+) -> Result<(), Response> {
+    let upgrade_id = aborted.upgrade_id.clone();
+    let writes = [
+        crate::council::types::RaftRequest::UpgradeUpdate {
+            state: Box::new(aborted),
+        },
+        crate::council::types::RaftRequest::UpgradeClear { upgrade_id },
+    ];
+    for write in writes {
+        if let Err(e) = council.write(write).await {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": format!("could not end the paused upgrade (are we the leader?): {e}")
+                })),
+            )
+                .into_response());
+        }
+    }
+    Ok(())
+}
+
+/// Reply to a refused upgrade plan. A node whose endpoint the leader hasn't
+/// heard yet is a 503 (retry shortly); a claim that contradicts the cluster
+/// is the caller's fault, a 400.
+fn plan_error_response(error: &crate::upgrade::plan::PlanError) -> Response {
+    let status = if error.is_transient() {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    (
+        status,
+        Json(serde_json::json!({ "error": error.to_string() })),
+    )
+        .into_response()
 }
 
 /// Build the leader's authoritative view of every node for upgrade
@@ -2165,7 +2277,7 @@ async fn build_authoritative_view(
         view.insert(
             name,
             AuthoritativeNode {
-                address: member.address.to_string(),
+                address: member.api_advertised.then(|| member.address.to_string()),
                 role,
             },
         );
@@ -2251,9 +2363,53 @@ async fn upgrade_resume_handler(
     }
 }
 
+/// End a paused cluster upgrade in which no node moved (admin, leader
+/// only). A run that already swapped nodes is refused with a pointer to
+/// `relish upgrade rollback`, which walks them back.
+async fn upgrade_abort_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+) -> Response {
+    if let Err(resp) = authorize_cluster_admin(auth.as_deref()) {
+        return resp;
+    }
+    let Some(council) = &state.council else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "no council on this node" })),
+        )
+            .into_response();
+    };
+    let Some(upgrade) = council.desired_state().await.active_upgrade else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "no upgrade in progress" })),
+        )
+            .into_response();
+    };
+    let upgrade_id = upgrade.upgrade_id.clone();
+    let aborted = match crate::upgrade::orchestrator::abort(upgrade, "aborted by the operator") {
+        Ok(aborted) => aborted,
+        Err(e) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response();
+        }
+    };
+    if let Err(resp) = archive_aborted_upgrade(council, aborted).await {
+        return resp;
+    }
+    Json(serde_json::json!({ "status": "aborted", "upgrade_id": upgrade_id })).into_response()
+}
+
 /// Start a cluster-wide rolling rollback (admin, leader only). The
 /// binaries are already on every node's disk, so there is no registry or
 /// signature material — just a target version and the node list.
+///
+/// A paused run is replaced: it is archived as aborted and the rollback
+/// walks every node, moved or not, to the target.
 async fn upgrade_cluster_rollback_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
@@ -2284,13 +2440,16 @@ async fn upgrade_cluster_rollback_handler(
                 .into_response();
         }
     };
-    if council.desired_state().await.active_upgrade.is_some() {
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({ "error": "an upgrade is already in progress" })),
-        )
-            .into_response();
-    }
+    let paused = match council.desired_state().await.active_upgrade {
+        None => None,
+        Some(active) => match crate::upgrade::orchestrator::supersede(
+            active.clone(),
+            &format!("replaced by a rollback to {}", request.target_version),
+        ) {
+            Ok(superseded) => Some(superseded),
+            Err(_) => return upgrade_in_progress(&active),
+        },
+    };
 
     // Validate each rollback node's identity against the authoritative gossip /
     // Raft view, exactly as upgrade_start does (M13/UPG2). The old rollback path
@@ -2314,13 +2473,7 @@ async fn upgrade_cluster_rollback_handler(
         authoritative.get(id).cloned()
     }) {
         Ok(nodes) => nodes,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": e.to_string() })),
-            )
-                .into_response();
-        }
+        Err(e) => return plan_error_response(&e),
     };
 
     let upgrade_id = format!(
@@ -2344,6 +2497,14 @@ async fn upgrade_cluster_rollback_handler(
         allow_downgrade: false,
         nodes: derived_nodes,
     };
+
+    // Archive the paused run only once the rollback plan is valid, so a
+    // malformed request leaves it where it was.
+    if let Some(superseded) = paused
+        && let Err(resp) = archive_aborted_upgrade(council, superseded).await
+    {
+        return resp;
+    }
 
     match council
         .write(crate::council::types::RaftRequest::UpgradeUpdate {
@@ -4942,7 +5103,7 @@ async fn nodes_handler(State(state): State<ApiState>) -> Response {
                 for node in &mut nodes {
                     node.api_address = members
                         .iter()
-                        .find(|member| member.node_id.0 == node.node_id)
+                        .find(|member| member.node_id.0 == node.node_id && member.api_advertised)
                         .map(|member| member.address);
                 }
             }
@@ -4959,8 +5120,8 @@ const MAX_RELAY_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 /// A path probe runs for up to 25 seconds on the target; allow for the hop.
 const RELAY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// The per-node reads `relish wtf` and `relish path` make, and nothing else.
-/// The relay is a reachability aid, not a general proxy.
+/// The per-node reads `relish wtf`, `relish path` and `relish test` make, and
+/// nothing else. The relay is a reachability aid, not a general proxy.
 fn relay_allows(method: &axum::http::Method, path: &str) -> bool {
     const READS: &[&str] = &[
         "v1/health",
@@ -4972,15 +5133,23 @@ fn relay_allows(method: &axum::http::Method, path: &str) -> bool {
         "v1/alerts",
         "v1/fault",
         "v1/cluster/council",
+        "v1/cluster/nodes",
         "v1/capabilities",
     ];
     match *method {
-        axum::http::Method::GET => READS.contains(&path),
+        // `relish test` compares each node's own deploy history.
+        axum::http::Method::GET => READS.contains(&path) || is_deploy_history_path(path),
         // `relish exec` reaches an instance on another node this way too;
         // the target repeats the exec authorisation with the caller's token.
         axum::http::Method::POST => path == "v1/path" || is_exec_path(path),
         _ => false,
     }
+}
+
+/// `v1/deploys/history/{app}` and nothing longer (the namespace is a query).
+fn is_deploy_history_path(path: &str) -> bool {
+    path.strip_prefix("v1/deploys/history/")
+        .is_some_and(|app| !app.is_empty() && !app.contains('/'))
 }
 
 /// `v1/exec/{app}/{namespace}` and nothing longer.
@@ -5005,6 +5174,7 @@ fn is_exec_path(path: &str) -> bool {
 /// never adds the node's service identity.
 async fn node_relay_handler(
     State(state): State<ApiState>,
+    known: Option<axum::Extension<KnownMembers>>,
     Path((node, path)): Path<(String, String)>,
     method: axum::http::Method,
     uri: axum::http::Uri,
@@ -5018,10 +5188,11 @@ async fn node_relay_handler(
         )
             .into_response();
     }
-    let mut url = match target_node_api_url(&state, &node, &format!("/{path}")).await {
-        Ok(url) => url,
-        Err(response) => return response,
-    };
+    let mut url =
+        match known_node_api_url(&state, known.as_deref(), &node, &format!("/{path}")).await {
+            Ok(url) => url,
+            Err(response) => return response,
+        };
     if let Some(query) = uri.query() {
         url.push('?');
         url.push_str(query);
@@ -6649,6 +6820,37 @@ async fn target_node_api_url(
     Ok(state.cluster_http.url(&address.to_string(), path))
 }
 
+/// Resolve a member gossip still knows, live or not, to one of its API URLs.
+///
+/// A live member resolves as in [`target_node_api_url`]; otherwise
+/// [`KnownMembers`] supplies the address of a suspect or dead one. For reads
+/// and reversals only: injecting into a node the cluster has lost stays
+/// refused.
+// `Response` is large but it IS the HTTP reply to send on failure.
+#[allow(clippy::result_large_err)]
+async fn known_node_api_url(
+    state: &ApiState,
+    known: Option<&KnownMembers>,
+    target_node: &str,
+    path: &str,
+) -> Result<String, Response> {
+    let live = target_node_api_url(state, target_node, path).await;
+    let Some(known) = known.filter(|_| live.is_err()) else {
+        return live;
+    };
+    let address = known
+        .0
+        .read()
+        .await
+        .iter()
+        .find(|member| member.node_id == crate::meat::NodeId::new(target_node))
+        .map(|member| member.address);
+    match address {
+        Some(address) => Ok(state.cluster_http.url(&address.to_string(), path)),
+        None => live,
+    }
+}
+
 /// Preserve the end user's credential so the target node repeats every
 /// authentication and server-policy check.
 fn copy_forwarded_auth(
@@ -6747,6 +6949,7 @@ struct FaultClearQuery {
 async fn fault_clear_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
+    known: Option<axum::Extension<KnownMembers>>,
     headers: HeaderMap,
     Path(id): Path<u64>,
     Query(query): Query<FaultClearQuery>,
@@ -6782,32 +6985,38 @@ async fn fault_clear_handler(
             &caller,
         )
         .is_ok();
-    let allow_node_fault = if let Some(target_node) =
-        query.node.as_deref().filter(|target| !target.is_empty())
-    {
-        // Node routing is not itself authority. Preserve the three independent
-        // reversal grants and let the owning agent inspect the actual fault
-        // before it removes anything.
-        let allow_node_fault = state
-            .static_capabilities
-            .test_policy
-            .authorise_reversal(
-                crate::testkit::safety::OperationPermission::AlterNodeState,
-                &caller,
-            )
-            .is_ok();
-        if state
-            .node_name
-            .as_deref()
-            .is_some_and(|name| name != target_node)
-        {
-            return forward_node_fault_clear(&state, target_node, &headers, id, query.acknowledged)
+    let allow_node_fault =
+        if let Some(target_node) = query.node.as_deref().filter(|target| !target.is_empty()) {
+            // Node routing is not itself authority. Preserve the three independent
+            // reversal grants and let the owning agent inspect the actual fault
+            // before it removes anything.
+            let allow_node_fault = state
+                .static_capabilities
+                .test_policy
+                .authorise_reversal(
+                    crate::testkit::safety::OperationPermission::AlterNodeState,
+                    &caller,
+                )
+                .is_ok();
+            if state
+                .node_name
+                .as_deref()
+                .is_some_and(|name| name != target_node)
+            {
+                return forward_node_fault_clear(
+                    &state,
+                    known.as_deref(),
+                    target_node,
+                    &headers,
+                    id,
+                    query.acknowledged,
+                )
                 .await;
-        }
-        allow_node_fault
-    } else {
-        false
-    };
+            }
+            allow_node_fault
+        } else {
+            false
+        };
     let has_any_reversal_grant = allow_workload_fault || allow_node_fault || allow_node_pressure;
     if query.node.is_some() && !has_any_reversal_grant {
         return (
@@ -6911,13 +7120,15 @@ async fn wait_for_node_fault_release(state: &ApiState, sequence: u64) -> bool {
 /// Route manual reversal to the node which owns the local fault id.
 async fn forward_node_fault_clear(
     state: &ApiState,
+    known: Option<&KnownMembers>,
     target_node: &str,
     headers: &HeaderMap,
     fault_id: u64,
     acknowledged: bool,
 ) -> Response {
     let path = format!("/v1/fault/{fault_id}");
-    let url = match target_node_api_url(state, target_node, &path).await {
+    // A node-killed target is dead to gossip but still holds its fault.
+    let url = match known_node_api_url(state, known, target_node, &path).await {
         Ok(url) => url,
         Err(response) => return response,
     };
@@ -12541,11 +12752,12 @@ schedule = "* * * * *"
     }
 
     /// Every route that upgrades, rolls back or re-elects the cluster.
-    const CLUSTER_ADMIN_ROUTES: [&str; 6] = [
+    const CLUSTER_ADMIN_ROUTES: [&str; 7] = [
         "/v1/upgrade/apply",
         "/v1/upgrade/rollback",
         "/v1/upgrade/start",
         "/v1/upgrade/resume",
+        "/v1/upgrade/abort",
         "/v1/upgrade/cluster-rollback",
         "/v1/cluster/elect",
     ];
@@ -13503,10 +13715,12 @@ schedule = "* * * * *"
             NodeMembershipInfo {
                 node_id: crate::meat::NodeId::new("node-alpha"),
                 address: "127.0.0.1:9101".parse().unwrap(),
+                api_advertised: true,
             },
             NodeMembershipInfo {
                 node_id: crate::meat::NodeId::new("node-beta"),
                 address: "127.0.0.1:9102".parse().unwrap(),
+                api_advertised: true,
             },
         ]));
         // No token store, so the request is open; membership at position 11.
@@ -13928,6 +14142,7 @@ schedule = "* * * * *"
         let members = Arc::new(RwLock::new(vec![NodeMembershipInfo {
             node_id: crate::meat::NodeId::new("unresponsive"),
             address,
+            api_advertised: true,
         }]));
         let app = router(
             cmd_tx,
@@ -14020,6 +14235,7 @@ schedule = "* * * * *"
         let members = Arc::new(RwLock::new(vec![NodeMembershipInfo {
             node_id: crate::meat::NodeId::new("peer"),
             address: peer_address,
+            api_advertised: true,
         }]));
         let app = router(
             cmd_tx,
@@ -14320,7 +14536,7 @@ schedule = "* * * * *"
             };
             response
                 .send(
-                    ["one", "unknown"]
+                    ["one", "guessed", "unknown"]
                         .into_iter()
                         .map(|id| super::super::agent::NodeStatus {
                             node_id: id.to_string(),
@@ -14336,10 +14552,20 @@ schedule = "* * * * *"
                 )
                 .unwrap();
         });
-        let membership = Arc::new(RwLock::new(vec![NodeMembershipInfo {
-            node_id: crate::meat::NodeId::new("one"),
-            address: "[::1]:19117".parse().unwrap(),
-        }]));
+        let membership = Arc::new(RwLock::new(vec![
+            NodeMembershipInfo {
+                node_id: crate::meat::NodeId::new("one"),
+                address: "[::1]:19117".parse().unwrap(),
+                api_advertised: true,
+            },
+            // Known to gossip, but its own directory extension hasn't
+            // arrived: the address is only a port-offset guess.
+            NodeMembershipInfo {
+                node_id: crate::meat::NodeId::new("guessed"),
+                address: "[::1]:19999".parse().unwrap(),
+                api_advertised: false,
+            },
+        ]));
         let app = router(
             tx,
             None,
@@ -14369,7 +14595,10 @@ schedule = "* * * * *"
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let nodes: Vec<crate::bun::agent::NodeStatus> = serde_json::from_slice(&body).unwrap();
         assert_eq!(nodes[0].api_address, Some("[::1]:19117".parse().unwrap()));
+        // A guess is not evidence: clients building an upgrade plan would
+        // hand it back as the node's address and be refused.
         assert_eq!(nodes[1].api_address, None);
+        assert_eq!(nodes[2].api_address, None);
         worker.await.unwrap();
     }
 
@@ -15300,6 +15529,7 @@ mod cluster_routing_tests {
             self.membership.write().await.push(NodeMembershipInfo {
                 node_id: crate::meat::NodeId::new(name),
                 address,
+                api_advertised: true,
             });
         }
 
@@ -15431,9 +15661,11 @@ mod cluster_routing_tests {
             membership.push(NodeMembershipInfo {
                 node_id: crate::meat::NodeId::new(*name),
                 address: listener.local_addr().unwrap(),
+                api_advertised: true,
             });
             listeners.push(listener);
         }
+        let known = KnownMembers(Arc::new(RwLock::new(membership.clone())));
         let membership = Arc::new(RwLock::new(membership));
         let mut nodes = Vec::new();
         for ((name, instances), listener) in layout.into_iter().zip(listeners) {
@@ -15488,7 +15720,8 @@ mod cluster_routing_tests {
                 super::super::readiness::ReadinessTracker::new(),
                 None,
                 None,
-            );
+            )
+            .layer(axum::Extension(known.clone()));
             let url = format!("http://{}", listener.local_addr().unwrap());
             let cancelled = stop.clone();
             tokio::spawn(async move {
@@ -15865,6 +16098,48 @@ mod cluster_routing_tests {
         )
         .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// A node-kill fault leaves the target's API open while gossip calls it
+    /// dead. The relay must still reach it, or nobody outside the cluster
+    /// network can watch it or clear the fault.
+    #[tokio::test]
+    async fn the_relay_reaches_a_member_gossip_no_longer_counts_as_alive() {
+        let cluster = start_cluster(vec![
+            ("node-1", vec![]),
+            ("node-2", vec![instance("default/web-0", "web", "running")]),
+        ])
+        .await;
+        cluster
+            .membership
+            .write()
+            .await
+            .retain(|member| member.node_id != crate::meat::NodeId::new("node-2"));
+
+        let (status, body) = relay(
+            &cluster,
+            reqwest::Method::GET,
+            "/v1/nodes/node-2/relay/v1/status",
+            Some(cluster.operator.as_str()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let statuses: Vec<InstanceStatus> = serde_json::from_str(&body).unwrap();
+        assert_eq!(statuses.len(), 1);
+        cluster.stop.cancel();
+    }
+
+    #[test]
+    fn the_relay_forwards_one_apps_deploy_history_and_nothing_nested() {
+        let get = axum::http::Method::GET;
+        assert!(relay_allows(&get, "v1/deploys/history/web"));
+        assert!(!relay_allows(&get, "v1/deploys/history/"));
+        assert!(!relay_allows(&get, "v1/deploys/history/web/extra"));
+        assert!(!relay_allows(&get, "v1/deploys/history"));
+        assert!(!relay_allows(
+            &axum::http::Method::POST,
+            "v1/deploys/history/web"
+        ));
     }
 
     #[test]

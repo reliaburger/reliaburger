@@ -22,8 +22,11 @@ use super::version::BinaryVersion;
 /// The leader's authoritative view of one node: what relish must match.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthoritativeNode {
-    /// API address (`host:port`) the orchestrator will POST directives to.
-    pub address: String,
+    /// API address (`host:port`) the orchestrator will POST directives to,
+    /// as the node advertised it over gossip. `None` while the leader only
+    /// knows the node from another member's membership sync and has yet to
+    /// hear its advertisement: a derived guess is not an identity.
+    pub address: Option<String>,
     pub role: NodeRole,
 }
 
@@ -60,6 +63,10 @@ pub fn role_from_raft(
 /// A worker↔council relabel among non-leaders is not rejected — both go
 /// before the leader — but the built record still carries the authoritative
 /// role, so the plan the orchestrator walks never depends on the claim.
+///
+/// [`AddressNotAdvertised`](PlanError::AddressNotAdvertised) is different in
+/// kind: the leader can't check the claim yet, so it refuses rather than
+/// compare against a guess (see [`PlanError::is_transient`]).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PlanError {
     #[error("node {node_id:?} is not a live cluster member")]
@@ -78,6 +85,17 @@ pub enum PlanError {
         claimed: String,
         authoritative: String,
     },
+    #[error("node {node_id:?} has not advertised its API address to the leader yet; retry shortly")]
+    AddressNotAdvertised { node_id: String },
+}
+
+impl PlanError {
+    /// `true` when the refusal reflects gossip still converging (the same
+    /// request can succeed moments later), not a claim the cluster
+    /// contradicts.
+    pub fn is_transient(&self) -> bool {
+        matches!(self, PlanError::AddressNotAdvertised { .. })
+    }
 }
 
 /// One node as named in the client's start request.
@@ -97,6 +115,8 @@ pub struct RequestedNode {
 /// - unknown to the cluster → [`PlanError::UnknownNode`];
 /// - a claim that crosses the leader boundary (claims Leader but isn't, or
 ///   is the leader but claims otherwise) → [`PlanError::LeaderMismatch`];
+/// - the node hasn't advertised its address to the leader yet →
+///   [`PlanError::AddressNotAdvertised`];
 /// - claimed address disagrees with the authoritative address →
 ///   [`PlanError::AddressMismatch`].
 ///
@@ -128,18 +148,23 @@ where
                 authoritative: authoritative.role,
             });
         }
-        if node.address != authoritative.address {
+        let Some(address) = authoritative.address else {
+            return Err(PlanError::AddressNotAdvertised {
+                node_id: node.node_id.clone(),
+            });
+        };
+        if node.address != address {
             return Err(PlanError::AddressMismatch {
                 node_id: node.node_id.clone(),
                 claimed: node.address.clone(),
-                authoritative: authoritative.address.clone(),
+                authoritative: address,
             });
         }
 
         records.push(NodeUpgradeRecord {
             node_id: node.node_id.clone(),
             // Authoritative, not the client's copy.
-            address: authoritative.address,
+            address,
             role: authoritative.role,
             from_version: None,
             phase: NodeUpgradePhase::Pending,
@@ -222,6 +247,46 @@ pub fn check_target(
     }
 }
 
+/// Whether one node can accept a cluster (network) upgrade directive, as
+/// input to [`check_network_prerequisites`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkReadiness {
+    /// How to name the node in an error: `node n1`.
+    pub node: String,
+    /// False when the node has no `upgrades.external_signing_key`, has no
+    /// upgrade manager, or doesn't report the field at all: each of those
+    /// refuses every network directive.
+    pub accepts_network_upgrades: bool,
+}
+
+/// Refuse a cluster upgrade that every node would refuse anyway.
+///
+/// Cluster directives always fetch the binary from Pickle, so every node
+/// demands the operator's external signature and a key to check it with.
+/// Recording a run that the first node rejects leaves a paused upgrade
+/// behind, and that paused upgrade blocks every later start until an
+/// operator clears it. Checking up front turns that into one clear 409.
+pub fn check_network_prerequisites(
+    external_signature: Option<&str>,
+    nodes: &[NetworkReadiness],
+) -> Result<(), UpgradeError> {
+    if external_signature.is_none_or(str::is_empty) {
+        return Err(UpgradeError::ExternalSignatureRequired);
+    }
+    let unready: Vec<&str> = nodes
+        .iter()
+        .filter(|node| !node.accepts_network_upgrades)
+        .map(|node| node.node.as_str())
+        .collect();
+    if unready.is_empty() {
+        Ok(())
+    } else {
+        Err(UpgradeError::NodesLackExternalKey {
+            nodes: unready.join(", "),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -241,21 +306,21 @@ mod tests {
             (
                 "leader".to_string(),
                 AuthoritativeNode {
-                    address: "10.0.0.1:9117".to_string(),
+                    address: Some("10.0.0.1:9117".to_string()),
                     role: NodeRole::Leader,
                 },
             ),
             (
                 "c1".to_string(),
                 AuthoritativeNode {
-                    address: "10.0.0.2:9117".to_string(),
+                    address: Some("10.0.0.2:9117".to_string()),
                     role: NodeRole::Council,
                 },
             ),
             (
                 "w1".to_string(),
                 AuthoritativeNode {
-                    address: "10.0.0.3:9117".to_string(),
+                    address: Some("10.0.0.3:9117".to_string()),
                     role: NodeRole::Worker,
                 },
             ),
@@ -325,6 +390,40 @@ mod tests {
         let requested = vec![requested("leader", "10.0.0.9:9117", NodeRole::Leader)];
         let err = derive_upgrade_nodes(&requested, |id| view.get(id).cloned()).unwrap_err();
         assert!(matches!(err, PlanError::AddressMismatch { .. }));
+    }
+
+    #[test]
+    fn unadvertised_address_is_refused_as_not_yet_known() {
+        // A restarted leader learns a member from a peer's membership sync
+        // before that member's own gossip tells it the API endpoint. Until
+        // then it only has a port-offset guess, which is wrong whenever nodes
+        // pick their ports independently. Comparing the client's (correct)
+        // address against that guess used to report a spurious mismatch.
+        let mut view = view();
+        view.insert(
+            "fresh".to_string(),
+            AuthoritativeNode {
+                address: None,
+                role: NodeRole::Council,
+            },
+        );
+        let requested = vec![requested("fresh", "10.0.0.4:9117", NodeRole::Council)];
+        let err = derive_upgrade_nodes(&requested, |id| view.get(id).cloned()).unwrap_err();
+        assert_eq!(
+            err,
+            PlanError::AddressNotAdvertised {
+                node_id: "fresh".to_string()
+            }
+        );
+        assert!(err.is_transient());
+    }
+
+    #[test]
+    fn identity_rejections_are_not_transient() {
+        let view = view();
+        let requested = vec![requested("leader", "10.0.0.9:9117", NodeRole::Leader)];
+        let err = derive_upgrade_nodes(&requested, |id| view.get(id).cloned()).unwrap_err();
+        assert!(!err.is_transient());
     }
 
     #[test]
@@ -451,5 +550,46 @@ mod tests {
                 node_id: "ghost".to_string()
             }
         );
+    }
+
+    fn readiness(node: &str, accepts: bool) -> NetworkReadiness {
+        NetworkReadiness {
+            node: format!("node {node}"),
+            accepts_network_upgrades: accepts,
+        }
+    }
+
+    #[test]
+    fn cluster_upgrade_without_an_external_signature_is_refused() {
+        let nodes = [readiness("a", true)];
+        let err = check_network_prerequisites(None, &nodes).unwrap_err();
+        assert!(
+            matches!(err, UpgradeError::ExternalSignatureRequired),
+            "{err}"
+        );
+        let err = check_network_prerequisites(Some(""), &nodes).unwrap_err();
+        assert!(matches!(err, UpgradeError::ExternalSignatureRequired));
+    }
+
+    #[test]
+    fn cluster_upgrade_is_refused_when_a_node_has_no_external_key() {
+        let nodes = [
+            readiness("a", true),
+            readiness("b", false),
+            readiness("c", false),
+        ];
+        let err = check_network_prerequisites(Some("sig"), &nodes).unwrap_err();
+        assert!(
+            matches!(err, UpgradeError::NodesLackExternalKey { ref nodes } if nodes == "node b, node c"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("upgrades.external_signing_key"));
+    }
+
+    #[test]
+    fn cluster_upgrade_proceeds_when_every_node_can_verify() {
+        let nodes = [readiness("a", true), readiness("b", true)];
+        check_network_prerequisites(Some("sig"), &nodes).unwrap();
+        check_network_prerequisites(Some("sig"), &[]).unwrap();
     }
 }

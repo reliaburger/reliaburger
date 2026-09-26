@@ -41,6 +41,40 @@ pub enum UpgradeError {
     #[error("network upgrades require upgrades.external_signing_key in node.toml")]
     ExternalKeyRequired,
 
+    /// A cluster upgrade was started without the operator's external
+    /// signature. Every node fetches the binary from Pickle, so every node
+    /// would refuse it.
+    #[error(
+        "cluster upgrades need an external signature: sign the binary with \
+         `relish dev sign-binary --external-key` before starting"
+    )]
+    ExternalSignatureRequired,
+
+    /// Some nodes have no external key to verify a cluster upgrade with.
+    #[error(
+        "{nodes} cannot accept a cluster upgrade: set upgrades.external_signing_key \
+         in node.toml on every node first"
+    )]
+    NodesLackExternalKey {
+        /// `node n1, node n2`.
+        nodes: String,
+    },
+
+    /// `relish upgrade abort` on an upgrade that isn't paused.
+    #[error("the upgrade is {phase}, not paused; only a paused upgrade can be aborted")]
+    AbortNotPaused { phase: String },
+
+    /// `relish upgrade abort` on a paused upgrade that already moved nodes.
+    #[error(
+        "{nodes} already moved to {target} (or may be mid-swap); aborting would leave \
+         the cluster on mixed versions: roll back with `relish upgrade rollback <version>` instead"
+    )]
+    AbortWouldStrandNodes {
+        /// `node n1, node n2`.
+        nodes: String,
+        target: crate::upgrade::version::BinaryVersion,
+    },
+
     /// An upgrade marker file was unreadable or malformed.
     #[error("invalid upgrade marker {path}: {reason}")]
     InvalidMarker { path: PathBuf, reason: String },

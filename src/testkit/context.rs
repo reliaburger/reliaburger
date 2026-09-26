@@ -37,6 +37,53 @@ pub const BUN_BINARY_PATH: &str = "/usr/local/bin/bun";
 /// on repeated acceptance runs.
 pub const PINNED_TEST_WORKLOAD_IMAGE: &str = "public.ecr.aws/docker/library/busybox@sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028";
 
+/// How the runner reaches a peer node's own API.
+///
+/// Some reads are node-local (`/v1/status` lists only that node's
+/// instances), so cases fan out to every node. From inside the cluster each
+/// node's advertised API address works. From a laptop behind a quickstart's
+/// port forwards it doesn't: the host reaches node 1's forwarded port and
+/// nothing else, so peers go through the entry node's relay instead.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PeerRoute {
+    /// Each node at its advertised API endpoint.
+    #[default]
+    Direct,
+    /// Each peer through the entry node's `/v1/nodes/{node}/relay`.
+    Relay,
+}
+
+impl PeerRoute {
+    /// Pick the route once per run, by asking each peer's `/v1/health` both
+    /// ways.
+    ///
+    /// Direct unless some peer fails directly but answers through the relay.
+    /// A peer that answers neither way is down, which says nothing about the
+    /// route. A cluster the caller can reach stays direct: one hop, and it
+    /// still reaches a node that gossip has forgotten.
+    pub async fn detect(client: &BunClient, entry_node: &str) -> Self {
+        let Ok(nodes) = client.nodes().await else {
+            return Self::Direct;
+        };
+        for node in nodes.iter().filter(|node| node.node_id != entry_node) {
+            if answers_health(client.for_node(node)).await {
+                continue;
+            }
+            if answers_health(client.via_node(&node.node_id)).await {
+                return Self::Relay;
+            }
+        }
+        Self::Direct
+    }
+}
+
+async fn answers_health(client: Result<BunClient, crate::relish::RelishError>) -> bool {
+    match client {
+        Ok(client) => client.health().await.is_ok(),
+        Err(_) => false,
+    }
+}
+
 /// One test case's handle on the cluster.
 #[derive(Clone)]
 pub struct TestContext {
@@ -56,6 +103,8 @@ pub struct TestContext {
     pub timeout: Duration,
     /// One absolute case deadline. Poll helpers must not start fresh budgets.
     pub deadline: Deadline,
+    /// How [`Self::node_clients`] reaches peer nodes.
+    pub peer_route: PeerRoute,
 }
 
 impl TestContext {
@@ -157,6 +206,19 @@ impl TestContext {
     /// Fault owner shared with the runner's unconditional teardown path.
     pub fn chaos(&self) -> &crate::testkit::chaos::ChaosGuard {
         &self.chaos_guard
+    }
+
+    /// The client that injects and later reverses a node fault aimed at the
+    /// node `node_client` reaches.
+    ///
+    /// Directly, that is the target's own API. Through the relay it is the
+    /// entry node: the relay forwards no fault requests, but Bun routes a
+    /// node fault, and its reversal, to the `target_node` it names.
+    pub fn fault_owner(&self, node_client: BunClient) -> BunClient {
+        match self.peer_route {
+            PeerRoute::Direct => node_client,
+            PeerRoute::Relay => self.client.clone(),
+        }
     }
 
     /// Wait until `app` has at least `replicas` instances in the `running`
@@ -313,9 +375,11 @@ impl TestContext {
     /// A `BunClient` for every node in the cluster, paired with its node id.
     ///
     /// `/v1/status` is node-local, so a case that reasons about cluster-wide
-    /// placement fans out with this. Each node must supply its own resolved API
-    /// endpoint. Missing evidence fails collection; it never guesses a port or
-    /// silently omits a node. The entry client's credentials and CA are reused.
+    /// placement fans out with this. The entry node is the connection the run
+    /// already has. Peers go by [`Self::peer_route`]: directly, where each must
+    /// supply its own resolved API endpoint, or through the entry node's relay.
+    /// Missing evidence fails collection; it never guesses a port or silently
+    /// omits a node. The entry client's credentials and CA are reused.
     pub async fn node_clients(&self) -> Result<Vec<(String, BunClient)>, String> {
         if self
             .lease_id
@@ -335,10 +399,15 @@ impl TestContext {
         nodes
             .into_iter()
             .map(|node| {
-                let client = self
-                    .client
-                    .for_node(&node)
-                    .map_err(|error| error.to_string())?;
+                let client = if node.node_id == self.capabilities.node_id {
+                    Ok(self.client.clone())
+                } else {
+                    match self.peer_route {
+                        PeerRoute::Direct => self.client.for_node(&node),
+                        PeerRoute::Relay => self.client.via_node(&node.node_id),
+                    }
+                }
+                .map_err(|error| error.to_string())?;
                 Ok((node.node_id, client))
             })
             .collect()
@@ -599,10 +668,16 @@ impl TestContext {
                     // durable ownership evidence, but runtime absence still
                     // needs the independent check below.
                 }
-                Ok(Err(crate::relish::RelishError::AgentUnreachable))
-                | Ok(Err(crate::relish::RelishError::RequestTimeout)) => {
+                Ok(Err(crate::relish::RelishError::AgentUnreachable)) => {
                     return CleanupOutcome::Unknown {
                         reason: "could not reach the lease owner to confirm cleanup".to_string(),
+                    };
+                }
+                // Reached it, but the lease was still held when the release's
+                // own 30 s budget ran out: not the same as unreachable.
+                Ok(Err(crate::relish::RelishError::RequestTimeout)) => {
+                    return CleanupOutcome::Unknown {
+                        reason: "the lease owner did not confirm cleanup within 30 s".to_string(),
                     };
                 }
                 Ok(Err(error)) => {
@@ -760,6 +835,7 @@ mod tests {
             capabilities: ClusterCapabilities::default(),
             timeout: Duration::from_millis(200),
             deadline: Deadline::after(Duration::from_millis(200)).unwrap(),
+            peer_route: PeerRoute::Direct,
         }
     }
 
@@ -782,6 +858,139 @@ mod tests {
         assert_eq!(clients.len(), 2);
         assert_eq!(clients[0].1.base_url(), "http://127.0.0.1:19117");
         assert_eq!(clients[1].1.base_url(), "http://[::1]:29117");
+    }
+
+    /// Two nodes as the entry node lists them. `one` is the entry node; both
+    /// advertise API addresses the caller may or may not reach.
+    fn two_nodes(entry_api: &str, peer_api: &str) -> serde_json::Value {
+        serde_json::json!([
+            {"node_id":"one", "address":"10.0.0.1:7946", "api_address":entry_api,
+             "state":"alive", "incarnation":1, "is_council":true, "is_leader":true, "labels":{}},
+            {"node_id":"two", "address":"10.0.0.2:7946", "api_address":peer_api,
+             "state":"alive", "incarnation":1, "is_council":true, "is_leader":false, "labels":{}}
+        ])
+    }
+
+    /// A loopback port nothing listens on.
+    async fn closed_port() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.local_addr().unwrap()
+    }
+
+    /// Serve `router` on a fresh loopback port.
+    async fn serve(router: axum::Router) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        (base, server)
+    }
+
+    /// An entry node that lists `nodes` and relays `health` and `status` for
+    /// node `two` only, as the real relay would for a reachable peer.
+    fn entry_router(nodes: serde_json::Value, relay_answers: bool) -> axum::Router {
+        use axum::{extract::Path, http::StatusCode, response::IntoResponse, routing::get};
+        axum::Router::new()
+            .route(
+                "/v1/cluster/nodes",
+                get(move || {
+                    let nodes = nodes.clone();
+                    async move { axum::Json(nodes) }
+                }),
+            )
+            .route(
+                "/v1/nodes/{node}/relay/{*path}",
+                get(
+                    move |Path((node, path)): Path<(String, String)>| async move {
+                        if !relay_answers || node != "two" {
+                            return StatusCode::BAD_GATEWAY.into_response();
+                        }
+                        match path.as_str() {
+                            "v1/health" => {
+                                axum::Json(serde_json::json!({"status": "ok"})).into_response()
+                            }
+                            "v1/status" => axum::Json(serde_json::json!([])).into_response(),
+                            _ => StatusCode::NOT_FOUND.into_response(),
+                        }
+                    },
+                ),
+            )
+    }
+
+    #[tokio::test]
+    async fn relayed_peers_go_through_the_entry_node_and_the_entry_node_uses_its_own_connection() {
+        // Neither advertised address is reachable, as from a laptop: the
+        // guests' own API ports mean nothing on the host.
+        let unreachable = closed_port().await.to_string();
+        let (base, server) = serve(entry_router(two_nodes(&unreachable, &unreachable), true)).await;
+        let mut context = context("rbtest-relay");
+        context.client = BunClient::new(&base);
+        context.capabilities.node_id = "one".to_string();
+        context.peer_route = PeerRoute::Relay;
+
+        let clients = context.node_clients().await.unwrap();
+        assert_eq!(clients[0].0, "one");
+        assert_eq!(clients[0].1.base_url(), base);
+        assert_eq!(clients[1].0, "two");
+        assert_eq!(
+            clients[1].1.base_url(),
+            format!("{base}/v1/nodes/two/relay")
+        );
+        // The per-node read the cleanup check makes arrives through the relay.
+        assert!(clients[1].1.status().await.unwrap().is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn direct_route_still_uses_the_entry_connection_for_the_entry_node() {
+        let unreachable = closed_port().await.to_string();
+        let (base, server) = serve(entry_router(
+            two_nodes(&unreachable, "127.0.0.1:29117"),
+            true,
+        ))
+        .await;
+        let mut context = context("rbtest-direct");
+        context.client = BunClient::new(&base);
+        context.capabilities.node_id = "one".to_string();
+
+        let clients = context.node_clients().await.unwrap();
+        server.abort();
+        assert_eq!(clients[0].1.base_url(), base);
+        assert_eq!(clients[1].1.base_url(), "http://127.0.0.1:29117");
+    }
+
+    #[tokio::test]
+    async fn peer_route_is_relay_when_a_peer_answers_only_through_the_entry_node() {
+        let unreachable = closed_port().await.to_string();
+        let (base, server) = serve(entry_router(two_nodes(&unreachable, &unreachable), true)).await;
+        let route = PeerRoute::detect(&BunClient::new(&base), "one").await;
+        server.abort();
+        assert_eq!(route, PeerRoute::Relay);
+    }
+
+    #[tokio::test]
+    async fn peer_route_stays_direct_when_every_peer_answers_directly() {
+        let (peer, peer_server) = serve(axum::Router::new().route(
+            "/v1/health",
+            axum::routing::get(|| async { axum::Json(serde_json::json!({"status": "ok"})) }),
+        ))
+        .await;
+        let peer = peer.trim_start_matches("http://").to_string();
+        let unreachable = closed_port().await.to_string();
+        let (base, server) = serve(entry_router(two_nodes(&unreachable, &peer), true)).await;
+        let route = PeerRoute::detect(&BunClient::new(&base), "one").await;
+        server.abort();
+        peer_server.abort();
+        assert_eq!(route, PeerRoute::Direct);
+    }
+
+    #[tokio::test]
+    async fn a_peer_down_both_ways_says_nothing_about_the_route() {
+        let unreachable = closed_port().await.to_string();
+        let (base, server) =
+            serve(entry_router(two_nodes(&unreachable, &unreachable), false)).await;
+        let route = PeerRoute::detect(&BunClient::new(&base), "one").await;
+        server.abort();
+        assert_eq!(route, PeerRoute::Direct);
     }
 
     #[tokio::test]

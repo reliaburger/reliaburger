@@ -85,10 +85,13 @@ fn node_request(
 
 async fn inject_node_fault(
     context: &TestContext,
-    owner: BunClient,
+    target_client: BunClient,
     request: FaultRequest,
 ) -> Result<FaultSummary, String> {
-    context.chaos().inject_fault(owner, &request).await
+    context
+        .chaos()
+        .inject_fault(context.fault_owner(target_client), &request)
+        .await
 }
 
 async fn clear_owned_faults(context: &TestContext) -> Result<(), String> {
@@ -620,6 +623,94 @@ pub fn all() -> Vec<TestCase> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// From a laptop the target's own API is out of reach, and the relay
+    /// refuses fault requests. The node-kill must go to the entry node, which
+    /// routes it (and the reversal) to the target it names.
+    #[tokio::test]
+    async fn relayed_node_faults_are_injected_and_reversed_through_the_entry_node() {
+        use axum::extract::{Query, State};
+        use axum::routing::{delete, post};
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        type Seen = Arc<Mutex<Vec<String>>>;
+        async fn inject(
+            State(seen): State<Seen>,
+            axum::Json(request): axum::Json<FaultRequest>,
+        ) -> axum::Json<FaultSummary> {
+            let target = request.target_node.clone().unwrap_or_default();
+            seen.lock().await.push(format!("inject {target}"));
+            axum::Json(FaultSummary {
+                id: 7,
+                fault_type: "node-kill".to_string(),
+                target_service: String::new(),
+                target_instance: None,
+                target_node: request.target_node,
+                remaining_secs: 30,
+                injected_by: "test".to_string(),
+                node: None,
+                routed: Vec::new(),
+            })
+        }
+        async fn clear(
+            State(seen): State<Seen>,
+            axum::extract::Path(id): axum::extract::Path<u64>,
+            Query(query): Query<std::collections::HashMap<String, String>>,
+        ) -> axum::Json<serde_json::Value> {
+            let node = query.get("node").cloned().unwrap_or_default();
+            seen.lock().await.push(format!("clear {id} {node}"));
+            axum::Json(serde_json::json!({ "message": "cleared" }))
+        }
+
+        let seen: Seen = Arc::default();
+        let entry = axum::Router::new()
+            .route("/v1/fault", post(inject))
+            .route("/v1/fault/{id}", delete(clear))
+            .with_state(Arc::clone(&seen));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, entry).await.unwrap() });
+
+        let timeout = Duration::from_secs(5);
+        let context = TestContext {
+            client: BunClient::new_with_token(&base, None),
+            namespace: "rbtest-chaos-00".to_string(),
+            lease_id: None,
+            chaos_guard: crate::testkit::chaos::ChaosGuard::default(),
+            capabilities: crate::bun::capabilities::ClusterCapabilities::default(),
+            timeout,
+            deadline: crate::testkit::deadline::Deadline::after(timeout).unwrap(),
+            peer_route: crate::testkit::context::PeerRoute::Relay,
+        };
+        let relayed_worker = context.client.via_node("worker-2").unwrap();
+
+        inject_node_fault(
+            &context,
+            relayed_worker,
+            node_request(
+                &context,
+                FaultType::NodeKill {
+                    kill_containers: true,
+                },
+                "worker-2",
+                false,
+                "relay test",
+            ),
+        )
+        .await
+        .unwrap();
+        clear_owned_faults(&context).await.unwrap();
+        server.abort();
+
+        assert_eq!(
+            *seen.lock().await,
+            vec![
+                "inject worker-2".to_string(),
+                "clear 7 worker-2".to_string()
+            ]
+        );
+    }
 
     #[test]
     fn fault_expiry_outlives_the_case_deadline() {

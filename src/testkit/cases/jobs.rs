@@ -144,6 +144,7 @@ mod tests {
             capabilities: crate::bun::capabilities::ClusterCapabilities::default(),
             timeout,
             deadline: crate::testkit::deadline::Deadline::after(timeout).unwrap(),
+            peer_route: crate::testkit::context::PeerRoute::Direct,
         };
         let result = tokio::time::timeout(
             Duration::from_secs(2),
@@ -238,6 +239,7 @@ mod tests {
             capabilities: crate::bun::capabilities::ClusterCapabilities::default(),
             timeout,
             deadline: crate::testkit::deadline::Deadline::after(timeout).unwrap(),
+            peer_route: crate::testkit::context::PeerRoute::Direct,
         };
         let result = tokio::time::timeout(
             Duration::from_secs(2),
