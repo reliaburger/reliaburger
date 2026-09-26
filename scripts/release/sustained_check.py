@@ -789,6 +789,8 @@ def render(evidence, record):
     if paused:
         lines.append(f"- Soak clock paused for {duration_text(paused)} (environment)")
     lines.append(f"- Cycles completed: {metadata.get('cycles', 0)}")
+    if metadata.get("teardown"):
+        lines.append(f"- Teardown: {metadata['teardown']}")
     lines.append("")
 
     counts = {}
