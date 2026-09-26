@@ -150,6 +150,34 @@ class WriterAndRedis(Evidence):
         _, verdict = self.evaluate(self.snapshot(**{"redis__log_txt": "INCR 50\nINCR 45\n"}))
         self.assertIn("redis-log-order", self.failures(verdict))
 
+    def open_window(self, label="bun-kill-leader"):
+        with contextlib.redirect_stdout(io.StringIO()):
+            checker.main(["window", str(self.evidence), "open", label])
+
+    def close_window(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            checker.main(["window", str(self.evidence), "settled"])
+
+    def test_a_dip_inside_a_fault_window_is_info_and_judged_after_it(self):
+        self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 10945\nACK 10946\n"}))
+        self.open_window()
+        _, verdict = self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 10495\nACK 10496\n"}))
+        self.assertEqual(self.failures(verdict), [])
+        dip = next(item for item in verdict["findings"] if item["check"] == "writer-log-order")
+        self.assertEqual(dip["severity"], "info")
+        self.close_window()
+        # Caught up: fine. Still below the old baseline: a failure.
+        _, verdict = self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 10950\n"}))
+        self.assertEqual(self.failures(verdict), [])
+
+    def test_a_dip_that_outlasts_its_fault_window_fails(self):
+        self.evaluate(self.snapshot(**{"redis__log_txt": "INCR 2282\n"}))
+        self.open_window()
+        self.evaluate(self.snapshot(**{"redis__log_txt": "INCR 2133\n"}))
+        self.close_window()
+        _, verdict = self.evaluate(self.snapshot(**{"redis__log_txt": "INCR 2140\n"}))
+        self.assertIn("redis-log-order", self.failures(verdict))
+
     def test_redis_errors_during_an_outage_do_not_fail(self):
         self.evaluate(self.snapshot(**{"redis__log_txt": "INCR 41\n"}))
         code, verdict = self.evaluate(self.snapshot(**{"redis__log_txt": "INCR 41\nERR Could not connect\nINCR 42\n"}))
