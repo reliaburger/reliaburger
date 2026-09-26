@@ -874,6 +874,22 @@ enum DevAction {
         /// Binary to sign.
         binary: std::path::PathBuf,
     },
+    /// Add your external signature to a release binary's .sig envelope,
+    /// keeping the release signature as it is (no release key needed).
+    CountersignBinary {
+        /// PKCS#8 Ed25519 private key (DER), e.g. from `relish dev keygen`
+        /// or `openssl genpkey -algorithm ed25519 -outform DER`.
+        #[arg(long)]
+        external_key: std::path::PathBuf,
+        /// The release envelope to countersign (default: {binary}.sig).
+        #[arg(long)]
+        sig: Option<std::path::PathBuf>,
+        /// Where to write the countersigned envelope (default: over --sig).
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+        /// Binary the envelope belongs to.
+        binary: std::path::PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1641,6 +1657,18 @@ async fn main() -> ExitCode {
                 external_key.as_deref(),
                 out.as_deref(),
             ),
+            DevAction::CountersignBinary {
+                external_key,
+                sig,
+                out,
+                binary,
+            } => reliaburger::relish::dev::countersign_binary(
+                external_key,
+                binary,
+                sig.as_deref(),
+                out.as_deref(),
+            )
+            .map(|_| ()),
         },
         Command::Upgrade { action } => {
             let client = reliaburger::relish::client::BunClient::default_local();

@@ -102,13 +102,57 @@ pub fn generate_keypair() -> Result<(Vec<u8>, PublicKey), UpgradeError> {
     Ok((pkcs8.as_ref().to_vec(), public))
 }
 
-/// Sign bytes with a PKCS#8 Ed25519 private key. Returns the base64 signature.
-pub fn sign(pkcs8: &[u8], bytes: &[u8]) -> Result<String, UpgradeError> {
-    let key_pair = Ed25519KeyPair::from_pkcs8(pkcs8).map_err(|_| UpgradeError::InvalidKey {
+/// Parse a PKCS#8 Ed25519 private key document (DER).
+///
+/// Accepts both versions: v2, which carries the public key and is what
+/// [`generate_keypair`] writes, and v1, which is what
+/// `openssl genpkey -algorithm ed25519 -outform DER` writes. Operators make
+/// their external key with whatever tool they trust, so v1 has to work.
+fn key_pair(pkcs8: &[u8]) -> Result<Ed25519KeyPair, UpgradeError> {
+    Ed25519KeyPair::from_pkcs8_maybe_unchecked(pkcs8).map_err(|_| UpgradeError::InvalidKey {
         input: "<pkcs8 private key>".to_string(),
         reason: "not a valid Ed25519 PKCS#8 document".to_string(),
-    })?;
-    Ok(BASE64.encode(key_pair.sign(bytes)))
+    })
+}
+
+/// The public half of a PKCS#8 Ed25519 private key.
+pub fn public_key_from_pkcs8(pkcs8: &[u8]) -> Result<PublicKey, UpgradeError> {
+    key_pair(pkcs8)?
+        .public_key()
+        .as_ref()
+        .try_into()
+        .map_err(|_| UpgradeError::InvalidKey {
+            input: "<pkcs8 private key>".to_string(),
+            reason: "public key is not 32 bytes".to_string(),
+        })
+}
+
+/// Sign bytes with a PKCS#8 Ed25519 private key. Returns the base64 signature.
+pub fn sign(pkcs8: &[u8], bytes: &[u8]) -> Result<String, UpgradeError> {
+    Ok(BASE64.encode(key_pair(pkcs8)?.sign(bytes)))
+}
+
+/// Add the operator's external signature to a release envelope.
+///
+/// The release (embedded) signature is carried over untouched, so the
+/// operator never needs the release key. Refuses an envelope whose hash
+/// doesn't match `bytes`: that envelope belongs to another binary.
+pub fn countersign(
+    envelope: &SignatureEnvelope,
+    external_pkcs8: &[u8],
+    bytes: &[u8],
+) -> Result<SignatureEnvelope, UpgradeError> {
+    let actual = sha256_hex(bytes);
+    if !actual.eq_ignore_ascii_case(&envelope.sha256) {
+        return Err(UpgradeError::HashMismatch {
+            expected: envelope.sha256.clone(),
+            actual,
+        });
+    }
+    Ok(SignatureEnvelope {
+        external: Some(sign(external_pkcs8, bytes)?),
+        ..envelope.clone()
+    })
 }
 
 fn verify_one(key: &PublicKey, bytes: &[u8], signature: &[u8]) -> bool {
@@ -367,6 +411,88 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, UpgradeError::ExternalSignatureInvalid));
+    }
+
+    /// A PKCS#8 v1 document as `openssl genpkey -algorithm ed25519 -outform DER`
+    /// writes it: the seed without the public key ring's own keys carry.
+    fn openssl_style_pkcs8(seed: &[u8; 32]) -> Vec<u8> {
+        let mut document = hex::decode("302e020100300506032b657004220420").unwrap();
+        document.extend_from_slice(seed);
+        document
+    }
+
+    #[test]
+    fn signs_with_a_pkcs8_v1_key_as_openssl_writes_it() {
+        let seed = [7u8; 32];
+        let pkcs8 = openssl_style_pkcs8(&seed);
+        let public = public_key_from_pkcs8(&pkcs8).unwrap();
+        let expected: PublicKey = Ed25519KeyPair::from_seed_unchecked(&seed)
+            .unwrap()
+            .public_key()
+            .as_ref()
+            .try_into()
+            .unwrap();
+        assert_eq!(public, expected);
+
+        let bytes = b"the binary";
+        let signature = BASE64.decode(sign(&pkcs8, bytes).unwrap()).unwrap();
+        assert!(verify_one(&public, bytes, &signature));
+    }
+
+    #[test]
+    fn public_key_from_pkcs8_rejects_garbage() {
+        assert!(matches!(
+            public_key_from_pkcs8(b"not a key"),
+            Err(UpgradeError::InvalidKey { .. })
+        ));
+    }
+
+    #[test]
+    fn countersign_adds_the_external_signature_and_keeps_the_release_one() {
+        let keys = test_keys();
+        let bytes = b"the binary";
+        let released = envelope_for(bytes, &keys, false);
+
+        let countersigned = countersign(&released, &keys.external_pkcs8, bytes).unwrap();
+
+        assert_eq!(countersigned.embedded, released.embedded);
+        assert_eq!(countersigned.sha256, released.sha256);
+        verify_binary(
+            bytes,
+            &countersigned,
+            &[keys.release_public],
+            Some(&keys.external_public),
+            true,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn countersign_replaces_an_earlier_external_signature() {
+        let keys = test_keys();
+        let other = test_keys();
+        let bytes = b"the binary";
+        let mut released = envelope_for(bytes, &keys, false);
+        released.external = Some(sign(&other.external_pkcs8, bytes).unwrap());
+
+        let countersigned = countersign(&released, &keys.external_pkcs8, bytes).unwrap();
+
+        verify_binary(
+            bytes,
+            &countersigned,
+            &[keys.release_public],
+            Some(&keys.external_public),
+            true,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn countersign_refuses_an_envelope_for_other_bytes() {
+        let keys = test_keys();
+        let released = envelope_for(b"the binary", &keys, false);
+        let err = countersign(&released, &keys.external_pkcs8, b"another binary").unwrap_err();
+        assert!(matches!(err, UpgradeError::HashMismatch { .. }));
     }
 
     #[test]

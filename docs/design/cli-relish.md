@@ -786,6 +786,7 @@ relish dev disk                             # Disk usage in the test VM
 relish dev clean                            # Clean build artefacts in the test VM
 relish dev keygen --out <dir>               # Generate a release signing keypair
 relish dev sign-binary --key <key> <binary> # Sign a binary (.sig envelope)
+relish dev countersign-binary --external-key <key> <binary>  # Add the operator signature
 
 # Manual, source, setup
 relish manual                               # Read the built-in manual (TUI)

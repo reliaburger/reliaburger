@@ -116,7 +116,7 @@ Reliaburger requires **two** signatures on every network-distributed binary, fro
 1. **The embedded release key.** A set of Ed25519 public keys compiled into the binary itself. Signature by one of these proves the file came out of the Reliaburger release process. If this key leaks, the *project* has a problem.
 2. **The external key.** An Ed25519 public key the operator generates themselves and puts in `node.toml` (`upgrades.external_signing_key`). Signature by this proves *this cluster's operator* approved *this specific binary*. If this key leaks, one organisation has a problem — and rotating it is a config change, not a re-release.
 
-An attacker has to compromise both, and they don't live in the same place. That's the whole design. Air-gapped upgrades (`relish upgrade start --binary`, where an operator hand-carries a file to the cluster) require only the embedded signature — the operator's approval is implicit in the hand-carrying — matching how `UpgradeConfig` was specced in the design doc.
+An attacker has to compromise both, and they don't live in the same place. That's the whole design. Air-gapped upgrades (`relish upgrade start --binary`, where an operator hand-carries a file to the cluster) require only the embedded signature — the operator's approval is implicit in the hand-carrying — matching how `UpgradeConfig` was specced in the design doc. That holds on one node. In a cluster the other nodes fetch the hand-carried file from the registry, which is the network again, so they want both signatures.
 
 Why Ed25519, when Chapter 10's image signing used ECDSA P-256? The image path needed X.509 certificate *chains* — delegation, intermediates, revocation. Binary signing needs none of that; it's a fixed set of raw keys, and for raw keys Ed25519 is the boring, fast, hard-to-misuse choice. We already have an implementation in the tree: `ring`, which has been signing our OIDC tokens since the identity work. No new dependency, no new audit surface.
 
@@ -191,6 +191,33 @@ In a release build that branch collapses to the warning. A production binary's t
 - **A single dual-purpose key.** Two signatures from keys in the same drawer is theatre. Different owners or don't bother.
 
 The tests are the specification again: correct dual signatures verify; a wrong hash fails before any signature work; tampered bytes fail even with a "fixed-up" hash; an unknown release key fails; the second key of a rotation-window set passes; a network upgrade without the external key or signature fails with the right error; air-gapped skips what it may skip and still rejects a present-but-wrong signature. `cargo test --lib upgrade::signing`.
+
+### Countersigning without the release key
+
+For a long while the only signing tool was `relish dev sign-binary --key release.key [--external-key operator.key]`. Look at who holds which key and you'll spot the problem: the release key belongs to the project, the external key to the operator, and the one command that could add the operator's signature demanded both. Nobody outside the project could countersign a release. Our own V02 soak harness walked straight into it: it started every upgrade walk with a release-signed soak build, each node asked for the second signature, and every walk was refused.
+
+So there's a second command, `relish dev countersign-binary --external-key operator.key bun-v0.2.0`, built on one small function:
+
+```rust
+pub fn countersign(
+    envelope: &SignatureEnvelope,
+    external_pkcs8: &[u8],
+    bytes: &[u8],
+) -> Result<SignatureEnvelope, UpgradeError> {
+    let actual = sha256_hex(bytes);
+    if !actual.eq_ignore_ascii_case(&envelope.sha256) {
+        return Err(UpgradeError::HashMismatch { expected: envelope.sha256.clone(), actual });
+    }
+    Ok(SignatureEnvelope {
+        external: Some(sign(external_pkcs8, bytes)?),
+        ..envelope.clone()
+    })
+}
+```
+
+`..envelope.clone()` is the struct update syntax from Chapter 1: every field not named comes from the envelope, so the release signature is copied, never recomputed. The hash check stops you countersigning a `.sig` that belongs to a different binary, which would otherwise produce an envelope that fails on every node.
+
+One more wrinkle. `ring` has two ways to load a PKCS#8 private key: `from_pkcs8`, which insists on version 2 (the document carries the public key, and ring checks it matches), and `from_pkcs8_maybe_unchecked`, which also takes version 1. `openssl genpkey -algorithm ed25519` writes version 1. Operators should be able to make their key with whatever tool they trust, so signing now uses the second. Nothing is lost: a signature that doesn't match the operator's real public key fails verification on every node anyway.
 
 Next: where verified binaries live on disk, and how to swap one in atomically.
 
