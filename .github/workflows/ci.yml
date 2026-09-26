@@ -25,10 +25,14 @@ permissions:
 # Caches: GitHub keeps 10 GB per repository. Jobs that build the same profile
 # share one key, and only pushes to main save, even when tests fail. PRs,
 # stacked or not, restore main's cache instead of evicting each other's.
+# Debug builds keep line tables only: backtraces still name files and lines,
+# and each target cache is roughly half the size, so they all fit.
+# Artefacts: reports are kept 14 days; release candidates keep their 90.
 
 env:
   CARGO_TERM_COLOR: always
   NEXTEST_PROFILE: ci
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
   changes:
@@ -154,6 +158,7 @@ jobs:
           name: junit-portable
           path: target/nextest/ci/junit.xml
           if-no-files-found: warn
+          retention-days: 14
       - name: Upload coverage
         if: always()
         uses: actions/upload-artifact@v4
@@ -161,6 +166,7 @@ jobs:
           name: coverage
           path: target/coverage
           if-no-files-found: warn
+          retention-days: 14
 
   linux:
     name: privileged Linux
@@ -210,6 +216,7 @@ jobs:
           name: oci-interruption-evidence
           path: /var/tmp/reliaburger-oci-interruptions.*/
           if-no-files-found: ignore
+          retention-days: 14
       - name: Run only provisioned Linux tests
         # The qualification step above already ran owned_runc and owned_network
         # in a private namespace.
@@ -339,3 +346,4 @@ jobs:
           name: criterion
           path: target/criterion
           if-no-files-found: error
+          retention-days: 14
