@@ -426,6 +426,13 @@ def evaluate(evidence, snapshot):
                      if "below the" in item["detail"] else item for item in order]
             baselines[check] = values[-1]
             power_cut_excused = True
+        elif fault_window and values and baseline is not None and values[-1] < baseline:
+            # A bun that just restarted (killed, upgraded) re-reads its
+            # capture files; until it has, the newest lines are missing from
+            # the view. That's judged once the window closes, against the
+            # unchanged baseline, so a dip that never recovers still fails.
+            order = [dict(item, severity="info", detail=item["detail"] + "; inside a fault window, judged again once it settles")
+                     if "below the" in item["detail"] else item for item in order]
         elif values:
             advanced = advanced or baseline is None or values[-1] > baseline
             baselines[check] = max(values[-1], baseline or 0)
