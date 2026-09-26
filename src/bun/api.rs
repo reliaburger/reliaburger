@@ -58,8 +58,8 @@ pub struct NodeMembershipInfo {
     pub api_advertised: bool,
 }
 
-/// Every member gossip still knows (alive, suspect or dead, not left), with
-/// its API address.
+/// Every member this node has seen through gossip, with its last API address:
+/// alive, suspect, and dead ones gossip no longer publishes.
 ///
 /// [`ApiState::membership`] holds only live members, which is right for
 /// fan-out and for injecting faults. A node-kill fault, though, closes a
@@ -70,6 +70,26 @@ pub struct NodeMembershipInfo {
 /// relay reaches live members only.
 #[derive(Clone)]
 pub struct KnownMembers(pub Arc<RwLock<Vec<NodeMembershipInfo>>>);
+
+impl KnownMembers {
+    /// Take gossip's latest published members, remembering the rest.
+    ///
+    /// Gossip's published view drops a member the moment it is declared dead,
+    /// which is exactly when a node-kill fault on it needs clearing. So a
+    /// member missing from `current` keeps its last address rather than
+    /// vanishing; a fresh entry for the same node replaces it. A remembered
+    /// node that really has gone just fails to connect, which is the honest
+    /// answer for a reversal aimed at it.
+    pub async fn refresh(&self, current: Vec<NodeMembershipInfo>) {
+        let mut table = self.0.write().await;
+        let remembered: Vec<_> = table
+            .drain(..)
+            .filter(|old| !current.iter().any(|member| member.node_id == old.node_id))
+            .collect();
+        *table = current;
+        table.extend(remembered);
+    }
+}
 
 /// Shared state for API handlers.
 #[derive(Clone)]
@@ -15584,6 +15604,7 @@ mod cluster_routing_tests {
     struct FakeCluster {
         nodes: Vec<FakeNode>,
         membership: Arc<RwLock<Vec<NodeMembershipInfo>>>,
+        known: KnownMembers,
         operator: String,
         /// A read-only token confined to the `api` app.
         api_reader: String,
@@ -15698,6 +15719,24 @@ mod cluster_routing_tests {
                         let count = injected.lock().await.drain(..).count();
                         let _ = response.send(Ok(format!("{name} cleared {count}")));
                     }
+                    AgentCommand::ClearFault {
+                        fault_id, response, ..
+                    } => {
+                        let mut injected = injected.lock().await;
+                        let result = match usize::try_from(fault_id) {
+                            Ok(index) if (1..=injected.len()).contains(&index) => {
+                                injected.remove(index - 1);
+                                Ok(crate::bun::agent::FaultClearance {
+                                    message: format!("{name} cleared fault {fault_id}"),
+                                    reservation: None,
+                                })
+                            }
+                            _ => Err(crate::bun::BunError::FaultRejected {
+                                reason: format!("no fault {fault_id}"),
+                            }),
+                        };
+                        let _ = response.send(result);
+                    }
                     _ => {}
                 }
             }
@@ -15806,6 +15845,7 @@ mod cluster_routing_tests {
         FakeCluster {
             nodes,
             membership,
+            known,
             operator: created.plaintext,
             api_reader: api_reader.plaintext,
             stop,
@@ -16198,6 +16238,76 @@ mod cluster_routing_tests {
         let statuses: Vec<InstanceStatus> = serde_json::from_str(&body).unwrap();
         assert_eq!(statuses.len(), 1);
         cluster.stop.cancel();
+    }
+
+    /// Gossip stops publishing a member once it declares it dead, which is
+    /// exactly when a node-kill fault needs clearing. The entry node must
+    /// still reach the killed node's open API, or the clear that would heal
+    /// it is refused and the node stays dead until the fault expires.
+    #[tokio::test]
+    async fn a_node_fault_clear_reaches_a_member_gossip_has_declared_dead() {
+        let cluster = start_cluster(vec![
+            ("node-1", vec![]),
+            (
+                "node-2",
+                vec![
+                    instance("default/web-0", "web", "running"),
+                    instance("default/web-1", "web", "running"),
+                ],
+            ),
+        ])
+        .await;
+        assert_eq!(inject(&cluster, 0, &kill(1)).await.0, StatusCode::OK);
+        assert_eq!(cluster.nodes[1].injected.lock().await.len(), 1);
+
+        // Gossip declares node-2 dead: it vanishes from the published view.
+        let dead = crate::meat::NodeId::new("node-2");
+        let live: Vec<_> = cluster
+            .membership
+            .read()
+            .await
+            .iter()
+            .filter(|member| member.node_id != dead)
+            .cloned()
+            .collect();
+        *cluster.membership.write().await = live.clone();
+        cluster.known.refresh(live).await;
+
+        let (status, body) = relay(
+            &cluster,
+            reqwest::Method::DELETE,
+            "/v1/fault/1?node=node-2",
+            Some(cluster.operator.as_str()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("node-2 cleared fault 1"), "{body}");
+        assert!(cluster.nodes[1].injected.lock().await.is_empty());
+        cluster.stop.cancel();
+    }
+
+    #[tokio::test]
+    async fn known_members_take_a_returning_members_new_address_once() {
+        let member = |name: &str, port: u16| NodeMembershipInfo {
+            node_id: crate::meat::NodeId::new(name),
+            address: std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+            api_advertised: true,
+        };
+        let known = KnownMembers(Arc::default());
+        known
+            .refresh(vec![member("node-1", 1001), member("node-2", 1002)])
+            .await;
+        known.refresh(vec![member("node-1", 1001)]).await;
+        known
+            .refresh(vec![member("node-1", 1001), member("node-2", 2002)])
+            .await;
+
+        let table = known.0.read().await;
+        let ports: Vec<_> = table
+            .iter()
+            .map(|member| (member.node_id.0.as_str(), member.address.port()))
+            .collect();
+        assert_eq!(ports, vec![("node-1", 1001), ("node-2", 2002)]);
     }
 
     #[test]
