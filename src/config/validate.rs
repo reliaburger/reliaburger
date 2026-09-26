@@ -546,6 +546,17 @@ impl NodeConfig {
 
         self.validate_leaf_lifetime_override()?;
 
+        // A bad operator CIDR would otherwise surface only as a warning when
+        // the firewall reconciles, leaving the operator locked out with no
+        // clear cause.
+        for value in &self.security.operator_cidrs {
+            crate::firewall::rules::parse_cidr(value).map_err(|error| ConfigError::Validation {
+                field: "security.operator_cidrs".to_string(),
+                context: "node config".to_string(),
+                reason: error.to_string(),
+            })?;
+        }
+
         self.testing
             .validate()
             .map_err(|error| ConfigError::Validation {
@@ -1072,6 +1083,52 @@ mod tests {
                 .to_string()
                 .contains("security.leaf_lifetime_override_secs")
         );
+    }
+
+    #[test]
+    fn operator_cidrs_default_to_empty() {
+        let config = NodeConfig::parse("").unwrap();
+        assert!(config.security.operator_cidrs.is_empty());
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn operator_cidrs_accept_v4_v6_and_bare_addresses() {
+        let config = NodeConfig::parse(
+            "[security]\noperator_cidrs = [\"192.168.0.0/24\", \"10.1.2.3/32\", \"2001:db8::/32\", \"10.1.2.4\"]\n",
+        )
+        .unwrap();
+        assert_eq!(config.security.operator_cidrs.len(), 4);
+        config.validate().unwrap();
+    }
+
+    fn assert_operator_cidr_refused(value: &str, reason_contains: &str) {
+        let mut config = NodeConfig::default();
+        config.security.operator_cidrs = vec!["10.0.0.0/8".to_string(), value.to_string()];
+        let error = config.validate().unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                ConfigError::Validation { field, reason, .. }
+                    if field == "security.operator_cidrs" && reason.contains(reason_contains)
+            ),
+            "{value}: {error:?}"
+        );
+        assert!(error.to_string().contains(value), "{error}");
+    }
+
+    #[test]
+    fn malformed_operator_cidrs_are_refused_at_load() {
+        assert_operator_cidr_refused("not-a-cidr", "expected address");
+        assert_operator_cidr_refused("10.0.0.0/33", "out of range");
+        assert_operator_cidr_refused("10.0.0.0/8; accept", "invalid prefix length");
+        assert_operator_cidr_refused("192.168.0.17/24", "did you mean 192.168.0.0/24");
+    }
+
+    #[test]
+    fn operator_cidrs_refuse_the_whole_internet() {
+        assert_operator_cidr_refused("0.0.0.0/0", "/0 prefix");
+        assert_operator_cidr_refused("::/0", "/0 prefix");
     }
 
     #[test]

@@ -899,6 +899,84 @@ We deliberately match `ct direction reply`, not every established connection:
 an inbound connection must still obey the current peer policy after membership
 changes. Both IPv4 and IPv6 tables use the same ordering.
 
+### Let the operator in, and only to the API
+
+The first people to run Reliaburger on their own Linux boxes hit the perimeter
+from the other side. They set up three nodes, minted an admin token, pointed
+`relish` on their laptop at `https://192.168.0.101:9117` and got... nothing. A
+hang, then a timeout. The laptop isn't a cluster member and isn't a bootstrap
+peer, so its SYN met `tcp dport 9117 drop`. The guide's workaround was an SSH
+tunnel into Node 1's loopback, which works but is a strange thing to require
+for talking to your own cluster.
+
+The rule generator had supported an allowlist for the management port since
+Chapter 3. Nothing in `node.toml` fed it. So the fix is mostly plumbing, plus a
+decision about what the allowlist may open:
+
+```toml
+[security]
+operator_cidrs = ["192.168.0.0/24", "10.1.2.3/32", "2001:db8:1::/48"]
+```
+
+It lives in `[security]` next to `bootstrap_peers`, the other perimeter
+allowlist, and it opens exactly one port: the API. Gossip, Raft and reporting
+stay members-only, because no human needs to speak those protocols. The Pickle
+registry port isn't in the perimeter's drop list at all (it has its own TLS and
+auth), so there's nothing to open there. The rendered rule is as narrow as it
+reads:
+
+```
+ip saddr { 192.168.0.0/24, 10.1.2.3/32 } tcp dport 9117 accept
+```
+
+Why `operator_cidrs` and not `bootstrap_peers`? A bootstrap peer is a machine
+that's about to become a node, so it gets the cluster ports too. An operator's
+laptop never will. Two lists with two meanings beat one list with a comment
+saying "careful what you put here".
+
+This only changes who can *reach* the port. Every request still needs a token,
+and with `require_mtls` the transport is still TLS against the cluster CA.
+
+Validation runs at config load, in `NodeConfig::validate`, rather than when the
+firewall reconciles. The reconcile path treats a bad CIDR as a warning and
+keeps the old ruleset, which is right for a running node but a terrible way to
+tell someone they made a typo: they'd just stay locked out. Two values are
+refused on top of plain syntax errors. A `/0` admits the whole internet, which
+is never what "let my laptop in" means, and there's no override flag, because
+the fix is always to list the networks you actually use. And a CIDR with host
+bits set, like `192.168.0.17/24`, is an error that names the network you
+probably meant:
+
+```rust
+fn mask_to_prefix(address: IpAddr, prefix_len: u8) -> IpAddr {
+    match address {
+        IpAddr::V4(v4) => {
+            let mask = u32::MAX.checked_shl(32 - u32::from(prefix_len)).unwrap_or(0);
+            IpAddr::V4((u32::from(v4) & mask).into())
+        }
+        // ...the same for IPv6 with u128
+    }
+}
+```
+
+`u32::from(v4)` turns an `Ipv4Addr` into its 32-bit integer (the `From` trait
+is Rust's standard conversion interface), and `.into()` goes back the other
+way; the compiler works out the target type from the `IpAddr::V4(...)` around
+it. `checked_shl` is a shift that returns `None` instead of misbehaving when
+you shift by the full width. In C, `x << 32` on a 32-bit integer is undefined
+behaviour; in Rust a plain `<<` by 32 panics in debug builds. We refuse `/0`
+before we ever get here, but `unwrap_or(0)` keeps the function total anyway.
+
+There's no hot reload of `node.toml`, so "the config reload path" is a restart:
+Bun reads the list at startup, `configure_perimeter` hands it to the agent and
+clears the cached membership set, and the first reconcile renders it. Every
+later reconcile (on a membership change) re-renders from the same config, so
+the operator rule survives nodes coming and going. A unit test pins the
+rendered text; a privileged test in `tests/owned_network.rs` applies the real
+ruleset inside a throwaway network namespace and connects from two addresses,
+proving the operator reaches 9117 but not 9443, and that an outsider on the same
+subnet reaches neither.
+
 An enrolled node can join gossip before Raft has replicated its API tokens.
 Refusing its public listener immediately caused a restart loop which delayed
 replication further. Bun now waits up to thirty seconds for the token refresh

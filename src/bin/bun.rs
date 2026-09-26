@@ -1117,6 +1117,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         ],
         api_port,
         config.security.bootstrap_peers.clone(),
+        config.security.operator_cidrs.clone(),
     );
     agent.set_smoker_config(config.smoker.to_smoker_config());
     agent.set_node_leaf_lifetime(config.security.node_leaf_lifetime());

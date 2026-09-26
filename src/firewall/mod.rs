@@ -1,13 +1,15 @@
 /// nftables perimeter firewall.
 ///
-/// Blocks external access to Reliaburger's own ports: container
-/// host ports (30000-31000), cluster ports (gossip, Raft, reporting),
-/// and the management API. Cluster nodes and admin CIDRs bypass
-/// the blocks. Everything else (SSH, operator services) is untouched.
+/// Blocks external access to Reliaburger's own ports: container host
+/// ports (`[network] port_range`), cluster ports (gossip, Raft,
+/// reporting) and the management API. Cluster nodes bypass every block;
+/// listed bootstrap peers reach the management and cluster ports; operator
+/// CIDRs (`[security] operator_cidrs`) reach the management API port only.
+/// Everything else (SSH, operator services) is untouched.
 ///
-/// Uses the `reliaburger` nftables table (shared with netns port
-/// mapping). Rules are reconciled on cluster membership changes
-/// and at a 30-second interval.
+/// Uses its own `reliaburger_fw` nftables table, separate from the
+/// `reliaburger` table `grill::netns` uses for port mapping. Rules are
+/// reconciled at startup and whenever cluster membership changes.
 ///
 /// Linux only. On macOS, the firewall module compiles but all
 /// operations are no-ops.

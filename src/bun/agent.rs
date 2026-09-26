@@ -2347,17 +2347,20 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         Ok(metas)
     }
 
-    /// Configure the actual protected listener ports and explicit enrolment peers.
-    /// This grants network reachability only; protocol authentication still applies.
+    /// Configure the actual protected listener ports, explicit enrolment peers
+    /// and operator networks allowed to the management port. This grants
+    /// network reachability only; protocol authentication still applies.
     pub fn configure_perimeter(
         &mut self,
         cluster_ports: Vec<u16>,
         management_port: u16,
         bootstrap_peers: Vec<std::net::IpAddr>,
+        operator_cidrs: Vec<String>,
     ) {
         self.perimeter_config.cluster_ports = cluster_ports;
         self.perimeter_config.management_port = management_port;
         self.perimeter_config.bootstrap_peers = bootstrap_peers;
+        self.perimeter_config.operator_cidrs = operator_cidrs;
         self.last_firewall_nodes = None;
     }
 
@@ -9000,7 +9003,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         ) {
             Ok(ruleset) => ruleset,
             Err(e) => {
-                // A malformed admin CIDR never reaches nft (NET8); the
+                // A malformed operator CIDR never reaches nft (NET8); the
                 // previous ruleset stays in force.
                 eprintln!("warning: firewall ruleset generation failed: {e}");
                 return;
