@@ -145,9 +145,17 @@ pub enum UpgradeError {
     #[error("no older version installed to roll back to")]
     NoRollbackTarget,
 
-    /// Downloading the binary failed.
+    /// Downloading the binary failed for good: the source answered, and
+    /// the answer was no (a 4xx such as 404 for a blob it doesn't hold).
     #[error("failed to fetch binary from {url}: {reason}")]
     FetchFailed { url: String, reason: String },
+
+    /// The binary's source could not serve it right now: the connection
+    /// failed or timed out, or the registry answered 5xx, 408 or 429. A
+    /// registry that is restarting looks exactly like this, so callers
+    /// retry it rather than treat it as a refusal.
+    #[error("binary source {url} is unavailable: {reason}")]
+    FetchUnavailable { url: String, reason: String },
 
     /// Release metadata was unreadable or malformed.
     #[error("invalid release metadata: {reason}")]
@@ -160,4 +168,16 @@ pub enum UpgradeError {
     /// An underlying filesystem operation failed.
     #[error(transparent)]
     Io(#[from] std::io::Error),
+}
+
+impl UpgradeError {
+    /// Would the same request plausibly succeed if repeated shortly?
+    ///
+    /// Only an unavailable binary source is. Everything else (a signature
+    /// or hash that doesn't verify, a missing external key, a version the
+    /// policy refuses, a blob the registry says it doesn't have) gives the
+    /// same answer every time, so retrying only delays the pause.
+    pub fn is_transient(&self) -> bool {
+        matches!(self, Self::FetchUnavailable { .. })
+    }
 }

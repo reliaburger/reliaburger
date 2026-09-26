@@ -1809,6 +1809,14 @@ async fn upgrade_apply_handler(
             })),
         )
             .into_response(),
+        // "Not right now" (the binary's registry is unreachable or
+        // restarting) is a 503, so the orchestrator re-sends the directive
+        // instead of pausing the whole run on one blip.
+        Ok(Err(crate::bun::BunError::Upgrade(error))) if error.is_transient() => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        )
+            .into_response(),
         Ok(Err(e)) => (
             StatusCode::CONFLICT,
             Json(serde_json::json!({ "error": e.to_string() })),
@@ -12771,6 +12779,91 @@ schedule = "* * * * *"
             );
             shutdown.cancel();
         }
+    }
+
+    /// The status a node answers an upgrade directive with when preparing
+    /// it fails with `error`, via a stand-in agent.
+    async fn upgrade_apply_status(error: crate::upgrade::UpgradeError) -> StatusCode {
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(4);
+        let mut error = Some(error);
+        tokio::spawn(async move {
+            while let Some(command) = cmd_rx.recv().await {
+                if let AgentCommand::UpgradeApply { response, .. } = command
+                    && let Some(error) = error.take()
+                {
+                    let _ = response.send(Err(crate::bun::BunError::Upgrade(error)));
+                }
+            }
+        });
+        let created = crate::sesame::token::create_token(
+            "cluster-admin",
+            crate::sesame::types::ApiRole::Admin,
+            crate::sesame::types::TokenScope::default(),
+            None,
+        )
+        .unwrap();
+        let store = crate::sesame::auth::new_token_store();
+        store.write().await.push(created.token);
+        let app = router(
+            cmd_tx,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(store),
+            None,
+            None,
+            None,
+            None,
+            9117,
+            None,
+        );
+        let directive = crate::upgrade::types::UpgradeDirective {
+            upgrade_id: "up-1".to_string(),
+            target_version: "v0.2.0".parse().unwrap(),
+            binary_sha256: "abc".to_string(),
+            embedded_signature: String::new(),
+            external_signature: None,
+            source: crate::upgrade::types::BinarySource::Pickle {
+                registry_address: "10.0.0.1:5050".to_string(),
+            },
+            network_provenance: true,
+            allow_downgrade: false,
+        };
+        post_status(
+            app,
+            "/v1/upgrade/apply",
+            &created.plaintext,
+            &serde_json::to_string(&directive).unwrap(),
+        )
+        .await
+    }
+
+    /// A registry that isn't serving is "not right now": 503, which the
+    /// orchestrator retries. A blob it doesn't hold, or bytes that don't
+    /// verify, are a refusal: 409, which pauses the run.
+    #[tokio::test]
+    async fn upgrade_apply_answers_503_only_when_the_binary_source_is_unavailable() {
+        use crate::upgrade::UpgradeError;
+        let unavailable = UpgradeError::FetchUnavailable {
+            url: "https://10.0.0.1:5050/v2/reliaburger-bun/blobs/sha256:abc".to_string(),
+            reason: "error sending request".to_string(),
+        };
+        assert_eq!(
+            upgrade_apply_status(unavailable).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let missing = UpgradeError::FetchFailed {
+            url: "https://10.0.0.1:5050/v2/reliaburger-bun/blobs/sha256:abc".to_string(),
+            reason: "status 404 Not Found".to_string(),
+        };
+        assert_eq!(upgrade_apply_status(missing).await, StatusCode::CONFLICT);
+        assert_eq!(
+            upgrade_apply_status(UpgradeError::EmbeddedSignatureInvalid).await,
+            StatusCode::CONFLICT
+        );
     }
 
     #[tokio::test]

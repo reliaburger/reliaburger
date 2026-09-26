@@ -15,11 +15,12 @@ pub struct Compatibility {
     pub state: u32,
 }
 
-/// Supported formats, including the `Aborted` cluster-upgrade phase and the
-/// `accepts_network_upgrades` field every node's `/v1/version` must report.
+/// Supported formats, including the per-node `directive_retry` record in a
+/// cluster upgrade and the 503 a node answers a directive with when the
+/// binary's registry is unavailable (the orchestrator retries it).
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 26,
-    state: 42,
+    protocol: 27,
+    state: 43,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.
