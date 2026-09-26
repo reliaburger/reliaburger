@@ -3807,19 +3807,7 @@ async fn placements_handler(
                 }
             })
             .collect(),
-        ingress: desired
-            .apps
-            .iter()
-            .filter_map(|(id, spec)| {
-                spec.ingress
-                    .clone()
-                    .map(|config| crate::cluster::orchestrate::IngressAssignment {
-                        name: id.name.clone(),
-                        namespace: id.namespace.clone(),
-                        config,
-                    })
-            })
-            .collect(),
+        ingress: crate::cluster::orchestrate::cluster_ingress(&desired),
     })
     .into_response()
 }

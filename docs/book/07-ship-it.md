@@ -1011,6 +1011,17 @@ For most of the project `relish stop web` in a cluster did two things: it delete
 
 Now there are two commands with two meanings. `relish stop` writes `AppStop`, which keeps the specification and puts the app in `stopped_apps`; the scheduler treats a stopped app as an override of zero replicas, and every node's reconciler retires its instances the ordinary way, the leader's included. Applying the app clears the mark. `relish delete` writes `AppDelete`, which removes it altogether. Neither reaches past a reconciler to stop a container itself, so the bookkeeping that decides what to redeploy is never out of step with what runs.
 
+Keeping the specification had a side effect we missed. Every node's routing table gets the cluster's ingress routes from the leader, built by walking the apps in desired state, and a stopped app is still in there. So its route stayed, with no backends behind it, and the proxy answered its host with 503 instead of 404. The next soak pulse caught it: `ingress_removes_route_after_stop` waited five minutes for a 404 that never came. `cluster_ingress` now skips anything in `stopped_apps`:
+
+```rust
+desired
+    .apps
+    .iter()
+    .filter(|(id, _)| !desired.stopped_apps.contains(*id))
+```
+
+`filter` hands the closure a reference to each `(key, value)` pair, so `id` is a `&&AppId` there; `*id` strips one layer to get the `&AppId` that `contains` wants. A stopped app keeps its service and VIP, though, with zero backends, so the same name and address come back when you apply it again.
+
 ## Two seconds is too eager
 
 Each node's placement reconciler polls the leader every couple of seconds and deploys whatever its share of the placements says. If a deploy failed, the next poll simply tried again. Kubernetes has `CrashLoopBackOff` for exactly this; we had a supervisor back-off for instances that crash after starting, but a deploy that never produces a running instance never reaches the supervisor. The V02 soak found the result: an app whose binary had been truncated by a power cut reached generation `g170` in eight minutes, every attempt a fresh container, a fresh journal entry and a fresh log line.
