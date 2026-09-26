@@ -31,6 +31,14 @@ class GuestImagePinTests(unittest.TestCase):
         for package in PINS["packages"]:
             self.assertRegex(package, r"^[a-z0-9][a-z0-9+.-]*$")
 
+    def test_nodes_can_build_images(self):
+        # `relish build` needs Buildah on a node, and the five-minute tour
+        # builds examples/demo/burger on the quickstart cluster. Its
+        # dependencies (containers-common, the CNI plugins, netavark) come
+        # with it; the node runs it with the vfs storage driver, so it needs
+        # no fuse-overlayfs.
+        self.assertIn("buildah", PINS["packages"])
+
 
 class BuildScriptTests(unittest.TestCase):
     def test_script_parses_and_is_executable(self):

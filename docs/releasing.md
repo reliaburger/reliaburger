@@ -417,9 +417,16 @@ need their own evidence after publication. No candidate has been staged yet:
 Each quickstart VM boots from a guest image the release builds itself: the
 dated Ubuntu 24.04 cloud image named in `scripts/release/guest-images.json`
 with that file's `packages` (runc, uidmap, btrfs-progs, nftables, iptables,
-iproute2) already installed. Without them baked in, every VM spent 15–40 s of
+iproute2, buildah) already installed. Without them baked in, every VM spent 15–40 s of
 its first boot in `apt-get update` and `install`, against Ubuntu's live mirrors
 ([measurements](qualification/2026-09-24-guest-image.md)).
+
+Buildah is there so the five-minute tour can `relish build` on the cluster.
+With what it pulls in that the stock image lacks (`containers-common`, the CNI
+plugins and netavark, `fuse-overlayfs`), it adds about 75 MiB installed,
+going by Ubuntu 24.04's package sizes: 47 MiB of that is
+`containernetworking-plugins`. Expect the compressed image to grow by roughly
+25–40 MiB; record the real figure with the next image build.
 
 `scripts/release/build_guest_image.sh` builds one image, for the host's own
 architecture:
