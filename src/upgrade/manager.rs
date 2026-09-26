@@ -30,12 +30,14 @@ use super::version::BinaryVersion;
 const STATUS_HISTORY_LIMIT: usize = 20;
 
 /// How hard a node tries to fetch a binary whose source is unavailable
-/// before it answers the directive with a transient refusal.
+/// before it answers the directive with a transient refusal, and how long
+/// any one attempt may take.
 ///
-/// The budget is short on purpose: the fetch runs while the agent holds its
-/// command loop and the orchestrator waits on the HTTP answer. Longer outages
-/// are the orchestrator's job, which re-sends the directive for minutes
-/// (see `orchestrator::DIRECTIVE_RETRY_WINDOW`).
+/// Everything here is short and bounded on purpose: the fetch runs while
+/// the agent holds its command loop and the orchestrator waits on the HTTP
+/// answer, so a registry that accepts and then hangs must not stall the
+/// agent. Longer outages are the orchestrator's job, which re-sends the
+/// directive for minutes (see `orchestrator::DIRECTIVE_RETRY_WINDOW`).
 #[derive(Debug, Clone, Copy)]
 struct FetchRetry {
     /// Stop retrying once another backoff would pass this much time.
@@ -43,12 +45,24 @@ struct FetchRetry {
     /// The first wait; each later one doubles, up to `max_backoff`.
     initial_backoff: std::time::Duration,
     max_backoff: std::time::Duration,
+    /// Connecting and receiving the response headers, per attempt.
+    response_timeout: std::time::Duration,
+    /// One whole attempt, headers and body.
+    attempt_timeout: std::time::Duration,
+    /// The whole fetch, every attempt and backoff included. No attempt is
+    /// allowed to run past it, so this is a hard upper bound.
+    ceiling: std::time::Duration,
 }
 
+/// Connect + headers in 5 s; a ~100 MB binary over a LAN in well under a
+/// minute; the whole fetch, retries included, within 75 s.
 const DEFAULT_FETCH_RETRY: FetchRetry = FetchRetry {
     budget: std::time::Duration::from_secs(10),
     initial_backoff: std::time::Duration::from_millis(500),
     max_backoff: std::time::Duration::from_secs(4),
+    response_timeout: std::time::Duration::from_secs(5),
+    attempt_timeout: std::time::Duration::from_secs(60),
+    ceiling: std::time::Duration::from_secs(75),
 };
 
 /// A prepared upgrade: verified, staged, marked. Ready for [`execute`].
@@ -715,14 +729,23 @@ impl UpgradeManager {
 
     /// Fetch `url`, riding out a source that is briefly unavailable (a
     /// registry restarting with its node) for up to the retry budget.
-    /// A permanent failure returns at once.
+    /// A permanent failure returns at once; nothing runs past the ceiling.
     async fn fetch_with_retry(&self, url: &str) -> Result<Vec<u8>, UpgradeError> {
         let started = tokio::time::Instant::now();
         let mut backoff = self.fetch_retry.initial_backoff;
         loop {
-            let error = match self.fetch_once(url).await {
-                Ok(bytes) => return Ok(bytes),
-                Err(error) => error,
+            let remaining = self.fetch_retry.ceiling.saturating_sub(started.elapsed());
+            let attempt_timeout = self.fetch_retry.attempt_timeout.min(remaining);
+            let error = match tokio::time::timeout(attempt_timeout, self.fetch_once(url)).await {
+                Ok(Ok(bytes)) => return Ok(bytes),
+                Ok(Err(error)) => error,
+                Err(_) => UpgradeError::FetchUnavailable {
+                    url: url.to_string(),
+                    reason: format!(
+                        "no complete response within {}ms",
+                        attempt_timeout.as_millis()
+                    ),
+                },
             };
             if !error.is_transient() || started.elapsed() + backoff > self.fetch_retry.budget {
                 return Err(error);
@@ -747,12 +770,18 @@ impl UpgradeManager {
         // `get` carries the internal service token as a bearer: on a
         // routable cluster the registry sets `require_read_auth`, so a
         // bearer-less binary fetch 401s (B2).
-        let response = self
-            .cluster_http
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| unavailable(e.to_string()))?;
+        let response = tokio::time::timeout(
+            self.fetch_retry.response_timeout,
+            self.cluster_http.get(url).send(),
+        )
+        .await
+        .map_err(|_| {
+            unavailable(format!(
+                "no response headers within {}ms",
+                self.fetch_retry.response_timeout.as_millis()
+            ))
+        })?
+        .map_err(|e| unavailable(e.to_string()))?;
         let status = response.status();
         if super::is_transient_status(status) {
             return Err(unavailable(format!("status {status}")));
@@ -910,6 +939,9 @@ mod tests {
             budget: std::time::Duration::from_millis(300),
             initial_backoff: std::time::Duration::from_millis(10),
             max_backoff: std::time::Duration::from_millis(50),
+            response_timeout: std::time::Duration::from_millis(200),
+            attempt_timeout: std::time::Duration::from_millis(500),
+            ceiling: std::time::Duration::from_secs(1),
         };
 
         Fixture {
@@ -1637,6 +1669,10 @@ mod tests {
         Status(&'static str),
         /// Answer 200 with the blob.
         Blob,
+        /// Accept the request and never answer.
+        Silent,
+        /// Send the headers and half the blob, then stall.
+        StallMidBody,
     }
 
     /// A registry that gives `script`'s answers in order, then serves the
@@ -1668,6 +1704,24 @@ mod tests {
                             "HTTP/1.1 {line}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
                         );
                         let _ = socket.write_all(response.as_bytes()).await;
+                    }
+                    RegistryAnswer::Silent => {
+                        tokio::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+                            drop(socket);
+                        });
+                    }
+                    RegistryAnswer::StallMidBody => {
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                            blob.len()
+                        );
+                        let _ = socket.write_all(head.as_bytes()).await;
+                        let _ = socket.write_all(&blob[..blob.len() / 2]).await;
+                        tokio::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+                            drop(socket);
+                        });
                     }
                     RegistryAnswer::Blob => {
                         let head = format!(
@@ -1760,6 +1814,35 @@ mod tests {
         assert!(requests.load(std::sync::atomic::Ordering::SeqCst) > 1);
         // Nothing staged: the running system is untouched.
         assert!(!fixture.binary_dir.join("bun-v0.2.0").exists());
+    }
+
+    /// A registry that accepts and then hangs (before the headers, or
+    /// halfway through the body) must not hold the agent's command loop:
+    /// every attempt times out, and the whole fetch ends by the ceiling.
+    #[tokio::test]
+    async fn a_hanging_registry_is_a_transient_failure_within_the_ceiling() {
+        for answer in [RegistryAnswer::Silent, RegistryAnswer::StallMidBody] {
+            let fixture = fixture();
+            let binary = compatible_binary(b"a registry that hangs");
+            let (registry, requests) = flaky_registry(vec![answer; 1000], binary.clone()).await;
+            let directive = pickle_directive(&fixture, &binary, &registry);
+
+            let started = std::time::Instant::now();
+            let error = fixture
+                .manager
+                .prepare(&directive, vec![])
+                .await
+                .unwrap_err();
+            let took = started.elapsed();
+
+            assert!(
+                matches!(error, UpgradeError::FetchUnavailable { .. }),
+                "{error}"
+            );
+            // The test ceiling is 1 s; allow scheduling slack, not a hang.
+            assert!(took < std::time::Duration::from_secs(3), "took {took:?}");
+            assert!(requests.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+        }
     }
 
     /// Bytes that fail verification are a refusal, even though they came

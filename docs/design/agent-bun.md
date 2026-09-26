@@ -1230,7 +1230,8 @@ Three decisions shape everything that follows, and each earns its keep against t
 2. Fetch the binary from Pickle, content-addressed by binary_sha256 (the
    leader stored it there before starting the run). Air-gapped upgrades read
    the local file instead. An unavailable registry (connection error,
-   cut-off body, 5xx/408/429) is retried for 10 s; if it is still down the
+   cut-off body, 5xx/408/429, or a timeout: 5 s for headers, 60 s per
+   attempt, 75 s ceiling for the whole fetch) is retried for 10 s; if it is still down the
    node answers 503, which the leader treats as transient and re-sends with
    backoff (3 s doubling to 30 s) for up to 2 minutes before pausing. Any
    other refusal (409: a 4xx from the registry, a failed verification, a
