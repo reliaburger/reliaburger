@@ -19,6 +19,8 @@
 #                           https://reliaburger.com/install.sh; a local file
 #                           such as docs/website/install.sh is fetched as file://)
 #   --manifest FILE|URL     tour manifest (default: examples/kubernetes/podinfo.yaml)
+#   --demo-app FILE         the tour's build step (default: examples/demo/burger/burger.toml);
+#                           built on the cluster with `relish build`, then applied
 #   --record FILE           where to write the record (default: in the evidence directory)
 #   --keep                  leave the cluster and the installation for debugging
 #   SETUP_ARGS              extra `relish setup --quickstart` options, such as
@@ -33,6 +35,7 @@ base_url=
 qualified_digest=
 bootstrap=https://reliaburger.com/install.sh
 manifest=$repository/examples/kubernetes/podinfo.yaml
+demo_app=$repository/examples/demo/burger/burger.toml
 record=
 keep=false
 setup_args=()
@@ -42,6 +45,7 @@ while [ "$#" -gt 0 ]; do
         --qualified-digest) qualified_digest=${2:-}; shift 2 ;;
         --bootstrap) bootstrap=${2:-}; shift 2 ;;
         --manifest) manifest=${2:-}; shift 2 ;;
+        --demo-app) demo_app=${2:-}; shift 2 ;;
         --record) record=${2:-}; shift 2 ;;
         --keep) keep=true; shift ;;
         -h|--help) usage; exit 0 ;;
@@ -106,6 +110,17 @@ step() {
     "$relish" "$@" 2>&1 | tee -a "$evidence/tour.log" || status=$?
     tour_rows+="| \`relish $*\` | $(( $(date +%s) - started )) s | $status |"$'\n'
     return "$status"
+}
+
+# Two burger instances running: the demo app's replicas.
+burgers_running() {
+    "$relish" status 2>/dev/null | awk '
+        NR > 1 && $3 == "burger" && $5 == "running" { n++ } END { exit !(n >= 2) }'
+}
+
+# The quickstart's ingress forward, from the context setup saved.
+ingress_origin() {
+    sed -n 's/.*"ingress_http": *"\([^"]*\)".*/\1/p' "$home/context.json" 2>/dev/null | head -n 1
 }
 
 # Every instance running, with at least one of each tour app.
@@ -270,4 +285,37 @@ step 'status' status
 step 'path' path frontend --to redis
 sleep 10
 step 'metrics' metrics frontend
+
+# The tour's build step, unconditionally: the release's guest image carries
+# Buildah, so a candidate whose nodes can't build fails here rather than in
+# front of a user. The build's own wait bounds it (960 s by default).
+step 'build the demo app' build "$demo_app"
+step 'apply the demo app' apply "$demo_app"
+stage='waiting for the demo app'
+deadline=$(( $(date +%s) + 180 ))
+until burgers_running; do
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+        "$relish" status >>"$evidence/tour.log" 2>&1 || true
+        fail 'burger not running after 180 s'
+    fi
+    sleep 5
+done
+stage='ordering a burger through the ingress'
+ingress=$(ingress_origin)
+ingress=${ingress:-http://127.0.0.1:18080}
+deadline=$(( $(date +%s) + 60 ))
+# An order names the podinfo backend that answered, so it proves the built
+# image runs, the ingress routes to it and it found `backend` by name.
+until order=$(curl -fsS -H 'Host: burger.localhost' "$ingress/order" 2>>"$evidence/tour.log") \
+        && printf '%s\n' "$order" | grep -q '"kitchen":"[^"]'; do
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+        fail "no burger order through $ingress after 60 s"
+    fi
+    sleep 3
+done
+printf '\n$ curl -H "Host: burger.localhost" %s/order\n%s\n' "$ingress" "$order" | tee -a "$evidence/tour.log"
+tour_rows+="| \`curl http://burger.localhost/order\` (through $ingress) | | 0 |"$'\n'
+# qualify-sustained.sh soaks the cluster this leaves (--keep); hand it the
+# same apps as before the build step.
+step 'remove the demo app' delete burger
 result=PASS
