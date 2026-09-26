@@ -1015,7 +1015,7 @@ slot_upgrade() {
     with_timeout 300 "$limactl" copy "$soak_bun" "$soak_bun.sig" "${vm[1]}:/var/tmp/" > /dev/null
     gsh 1 "install -m 600 /dev/null /root/.soak-token && cat > /root/.soak-token" < "$evidence/.token"
     started=$(date +%s)
-    gsh 1 "RELIABURGER_TOKEN=\$(cat /root/.soak-token) relish --endpoint https://127.0.0.1:9117 --ca-cert /etc/reliaburger/identity/root-ca.crt upgrade start --binary /var/tmp/$name --registry ${address[1]}:5050" \
+    gsh 1 "RELIABURGER_TOKEN=\$(cat /root/.soak-token) relish --endpoint https://127.0.0.1:9117 --ca-cert /etc/reliaburger/identity/root-ca.crt upgrade start --binary /var/tmp/$name --registry ${address[1]}:5050 --allow-downgrade" \
         > "$evidence/snapshots/upgrade-$upgrade_walks-start.log" 2>&1 || record_failure upgrade "upgrade start failed; see upgrade-$upgrade_walks-start.log"
     if [ "$inject" -eq 1 ]; then
         sleep "$(random_between 10 60)"
