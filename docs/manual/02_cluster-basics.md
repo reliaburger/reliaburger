@@ -64,6 +64,12 @@ private file instead of the command line. `join` only enrols the identity (into
 config with `[cluster] name` matching the cluster and `join` listing an
 existing member's gossip address (port 9443), and start `bun --cluster`.
 
+On Linux as root, Bun runs its own nftables perimeter: only cluster members
+reach the API (9117) and the cluster ports. List a joining node's address in
+the members' `[security] bootstrap_peers` so it can enrol before gossip knows
+it, and list your own laptop's network in `[security] operator_cidrs` so
+`relish` can reach the API from there (see `security`).
+
 ## Watch it
 
 ```sh

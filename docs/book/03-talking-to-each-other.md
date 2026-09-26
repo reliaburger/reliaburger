@@ -905,19 +905,19 @@ The nftables input chain in the `reliaburger` table has `policy accept` (everyth
 
 2. **Cluster ports (9443, 9444, 9445)**: Gossip, Raft consensus, and reporting tree communication. Only cluster node IPs should reach these.
 
-3. **Management port (9117)**: The Bun agent API. Only cluster nodes and admin CIDRs.
+3. **Management port (9117)**: The Bun agent API. Only cluster nodes and operator CIDRs.
 
-Cluster nodes get a blanket `accept` rule that comes *before* all the `drop` rules. So inter-node traffic is never blocked — gossip, scheduling, state replication all work normally. Admin CIDRs get access to the management port specifically.
+Cluster nodes get a blanket `accept` rule that comes *before* all the `drop` rules. So inter-node traffic is never blocked — gossip, scheduling, state replication all work normally. Operator CIDRs (`[security] operator_cidrs`, wired up in Chapter 4) get access to the management port specifically.
 
-The order matters in nftables: first match wins. Cluster node accept → admin CIDR accept → drop rules → everything else passes.
+The order matters in nftables: first match wins. Cluster node accept → operator CIDR accept → drop rules → everything else passes.
 
 ### Two address families, two tables
 
 An early version of this ruleset lived in a single `table ip reliaburger_fw`. Spot the problem? In nftables, the `ip` family only matches IPv4 packets. Every one of those carefully ordered drop rules was void for IPv6 traffic — a client connecting to `[::1]` equivalent addresses or the node's global v6 address sailed past the "blocked" management port. A firewall that only guards one address family isn't half a firewall; it's a decoy.
 
-The generator now renders the same policy twice: once for `table ip reliaburger_fw` and once for `table ip6 reliaburger_fw` (same name, different family — nftables treats them as distinct tables). Port drops appear in both. Source-address rules go where they belong: v4 cluster nodes and admin CIDRs into the `ip` table, v6 ones into `ip6`. A test pins that a v6 admin CIDR never leaks into the v4 half and vice versa.
+The generator now renders the same policy twice: once for `table ip reliaburger_fw` and once for `table ip6 reliaburger_fw` (same name, different family — nftables treats them as distinct tables). Port drops appear in both. Source-address rules go where they belong: v4 cluster nodes and operator CIDRs into the `ip` table, v6 ones into `ip6`. A test pins that a v6 operator CIDR never leaks into the v4 half and vice versa.
 
-Two more hardening notes from the same pass. First, admin CIDRs come from `node.toml`, and the old code interpolated them into the `nft -f` script as raw strings — a config value of `10.0.0.0/8; drop` would have become part of the ruleset. Now every CIDR is parsed into a real address and prefix length, validated (`10.1.2.3/8` with host bits set is an error, not a guess), and only the re-serialised form is ever rendered. Config is input; input gets validated. Second, the `nft` invocation itself now runs under a ten-second `tokio::time::timeout` — a wedged nft process used to be able to hang the agent's event loop indefinitely.
+Two more hardening notes from the same pass. First, operator CIDRs come from `node.toml`, and the old code interpolated them into the `nft -f` script as raw strings — a config value of `10.0.0.0/8; drop` would have become part of the ruleset. Now every CIDR is parsed into a real address and prefix length, validated (`10.1.2.3/8` with host bits set is an error, not a guess), and only the re-serialised form is ever rendered. Config is input; input gets validated. Second, the `nft` invocation itself now runs under a ten-second `tokio::time::timeout` — a wedged nft process used to be able to hang the agent's event loop indefinitely.
 
 ### Testable without root
 

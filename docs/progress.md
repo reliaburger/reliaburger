@@ -949,6 +949,13 @@ whole theme lands.
     like `10.0.0.0/8; drop` is a parse error, never an injected rule), the perimeter renders
     both `ip` and `ip6` `reliaburger_fw` tables with family-appropriate sources, and every
     `nft` invocation is bounded by a 10s timeout (NET8, old nftables Lows).
+  - [x] Operator API access (0.1.0): `[security] operator_cidrs` in `node.toml` feeds the
+    perimeter's operator allowlist, admitting those IPv4/IPv6 networks to the API port only
+    (never gossip, Raft, reporting or host ports). Refused at config load: malformed values,
+    `/0` in either family, and host bits set. Default empty renders no rule (quickstart
+    unchanged). Unit tests pin the rendered rule; `tests/owned_network.rs` applies the real
+    ruleset in a throwaway netns and proves operator→9117 connects while operator→9443 and
+    outsider→9117 are dropped. The Linux servers guide uses it instead of an SSH tunnel.
   - [x] Start-window closed on root-mode runc: the agent creates the instance's cgroup
     directory itself, programs egress against its inode, then starts (create → program →
     start) in fresh deploy, rolling redeploy and crash-restart; programming errors delete
