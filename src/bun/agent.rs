@@ -76,6 +76,14 @@ const SHUTDOWN_GRACE_SECS: u64 = 5;
 /// before it escalates to SIGKILL (DEP6).
 const STOP_GRACE_SECS: u64 = 10;
 
+/// The longest one confirmed stop can take with the production grace, given
+/// the runtime's `stop_confirmation_timeout`: a drain of up to one grace, the
+/// stop request, the grace itself, then the force-kill and its exit check.
+/// Callers that wait for a stop or retirement size their deadline from this.
+pub fn stop_completion_bound(confirmation_timeout: std::time::Duration) -> std::time::Duration {
+    std::time::Duration::from_secs(STOP_GRACE_SECS) * 2 + confirmation_timeout * 3
+}
+
 /// A trace starts processes inside a workload and may remain in flight for two
 /// eight-second probe bounds. Refuse excess work instead of building an
 /// unbounded queue of authenticated diagnostic tasks.

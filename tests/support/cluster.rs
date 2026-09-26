@@ -456,6 +456,7 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
         shutdown.clone(),
         reliaburger::cluster::ClusterHttp::plaintext(),
         Some(reconciler_state_dir),
+        reliaburger::config::node::RuntimeSection::default().stop_confirmation_timeout(),
     );
 
     // HTTP API (serves /v1/placements for the reconcilers).

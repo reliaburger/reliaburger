@@ -13,6 +13,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -33,6 +34,14 @@ use crate::reporting::aggregator::AggregatedState;
 /// assignments.
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
 const RECONCILE_IO_TIMEOUT: Duration = Duration::from_secs(10);
+/// How many retirements one reconcile cycle has in flight at once.
+const MAX_CONCURRENT_RETIREMENTS: usize = 4;
+
+/// The deadline for one retirement: queueing behind other agent commands,
+/// then the longest a confirmed stop can take.
+fn retire_timeout(io_timeout: Duration, stop_confirmation_timeout: Duration) -> Duration {
+    io_timeout + crate::bun::agent::stop_completion_bound(stop_confirmation_timeout)
+}
 
 /// The leader's latest reading of the endpoint withdrawal ledger, exported as
 /// Mayo metrics by Bun's collection loop. Followers report zero: only the
@@ -1330,6 +1339,9 @@ pub fn spawn_placement_reconciler(
     // Production nodes persist ownership before runtime mutation. `None` is
     // for ephemeral embedded tests and cannot provide restart recovery.
     state_dir: Option<std::path::PathBuf>,
+    // The agent's `[runtime] stop_confirmation_timeout_secs`, which bounds
+    // how long a retirement may take.
+    stop_confirmation_timeout: Duration,
 ) -> tokio::task::JoinHandle<()> {
     spawn_placement_reconciler_with_io_timeout(
         node_name,
@@ -1342,12 +1354,13 @@ pub fn spawn_placement_reconciler(
         cluster_http,
         state_dir,
         RECONCILE_IO_TIMEOUT,
+        retire_timeout(RECONCILE_IO_TIMEOUT, stop_confirmation_timeout),
     )
 }
 
 /// [`spawn_placement_reconciler`] with an explicit deadline for each leader
-/// request and agent reply, so tests of a stalled peer need not wait out
-/// the production [`RECONCILE_IO_TIMEOUT`].
+/// request and agent reply, and for each retirement, so tests of a stalled
+/// peer need not wait out the production deadlines.
 #[allow(clippy::too_many_arguments)]
 fn spawn_placement_reconciler_with_io_timeout(
     node_name: String,
@@ -1360,6 +1373,7 @@ fn spawn_placement_reconciler_with_io_timeout(
     cluster_http: crate::cluster::ClusterHttp,
     state_dir: Option<std::path::PathBuf>,
     io_timeout: Duration,
+    retire_timeout: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let client = cluster_http.client().clone();
@@ -1522,7 +1536,7 @@ fn spawn_placement_reconciler_with_io_timeout(
 
             // The leader retains owners across rescheduling and local journal
             // loss. Its instructions therefore supplement our local inventory.
-            let mut removed: std::collections::BTreeMap<_, Vec<&LeaseRetirement>> = applied
+            let mut removed: std::collections::BTreeMap<_, Vec<LeaseRetirement>> = applied
                 .keys()
                 .filter(|key| !seen.contains(*key))
                 .map(|key| (key.clone(), Vec::new()))
@@ -1534,37 +1548,54 @@ fn spawn_placement_reconciler_with_io_timeout(
                     eprintln!("orchestrator: refusing conflicting retirement instruction");
                     continue;
                 }
-                removed.entry(key).or_default().push(retirement);
+                removed.entry(key).or_default().push(retirement.clone());
             }
-            for ((name, namespace), confirmations) in removed {
-                let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-                // Queueing and acknowledgement share one deadline. An unknown
-                // outcome keeps ownership and lets other owners progress.
-                let retire = async {
-                    let command = if confirmations.is_empty() {
-                        AgentCommand::Retire {
-                            app_name: name.clone(),
-                            namespace: namespace.clone(),
-                            response: response_tx,
-                        }
-                    } else {
-                        AgentCommand::RetireTestResources {
-                            app_name: name.clone(),
-                            namespace: namespace.clone(),
-                            response: response_tx,
-                        }
-                    };
-                    cmd_tx
-                        .send(command)
-                        .await
-                        .map_err(|_| "agent command channel closed")?;
-                    response_rx
-                        .await
-                        .map_err(|_| "agent dropped retirement response")
-                };
-                let retired = tokio::select! {
+            // Retirements run side by side: each may wait out a stubborn
+            // workload's stop grace, and one must not hold up the rest.
+            // Each future owns its inputs: a spawned task can't hold futures
+            // that borrow from a closure's arguments.
+            let mut retirements = futures_util::stream::iter(removed.into_iter().map(
+                |((name, namespace), confirmations)| {
+                    let cmd_tx = cmd_tx.clone();
+                    async move {
+                        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+                        // Queueing and acknowledgement share one deadline. An unknown
+                        // outcome keeps ownership and lets other owners progress.
+                        let retire = async {
+                            let command = if confirmations.is_empty() {
+                                AgentCommand::Retire {
+                                    app_name: name.clone(),
+                                    namespace: namespace.clone(),
+                                    response: response_tx,
+                                }
+                            } else {
+                                AgentCommand::RetireTestResources {
+                                    app_name: name.clone(),
+                                    namespace: namespace.clone(),
+                                    response: response_tx,
+                                }
+                            };
+                            cmd_tx
+                                .send(command)
+                                .await
+                                .map_err(|_| "agent command channel closed")?;
+                            response_rx
+                                .await
+                                .map_err(|_| "agent dropped retirement response")
+                        };
+                        let retired = tokio::time::timeout(retire_timeout, retire).await;
+                        (name, namespace, confirmations, retired)
+                    }
+                },
+            ))
+            .buffer_unordered(MAX_CONCURRENT_RETIREMENTS);
+            loop {
+                let next = tokio::select! {
                     _ = shutdown.cancelled() => return,
-                    result = tokio::time::timeout(io_timeout, retire) => result,
+                    next = retirements.next() => next,
+                };
+                let Some((name, namespace, confirmations, retired)) = next else {
+                    break;
                 };
                 match retired {
                     Ok(Ok(Ok(()))) => {
@@ -1580,7 +1611,7 @@ fn spawn_placement_reconciler_with_io_timeout(
                         for confirmation in confirmations {
                             let mut request = client
                                 .post(format!("{leader_url}/v1/test/leases/retired"))
-                                .json(confirmation);
+                                .json(&confirmation);
                             if let Some(token) = &service_token {
                                 request = request.bearer_auth(token);
                             }
@@ -1608,7 +1639,7 @@ fn spawn_placement_reconciler_with_io_timeout(
                     }
                     Err(_) => {
                         eprintln!(
-                            "orchestrator: retirement of {name}/{namespace} exceeded ten seconds; ownership retained"
+                            "orchestrator: retirement of {name}/{namespace} exceeded {retire_timeout:?}; ownership retained"
                         );
                     }
                 }
@@ -1731,6 +1762,15 @@ mod tests {
         directory: &std::path::Path,
         commands: mpsc::Sender<AgentCommand>,
     ) -> tokio::task::JoinHandle<()> {
+        reconciler_with_retire_deadline(address, directory, commands, Duration::from_secs(2))
+    }
+
+    fn reconciler_with_retire_deadline(
+        address: std::net::SocketAddr,
+        directory: &std::path::Path,
+        commands: mpsc::Sender<AgentCommand>,
+        retire_timeout: Duration,
+    ) -> tokio::task::JoinHandle<()> {
         let (_, metrics_rx) = watch::channel(openraft::RaftMetrics::new_initial(1));
         let (_, directory_rx) = watch::channel(crate::mustard::directory::NodeDirectory {
             leader: Some(crate::mustard::message::LeaderHint {
@@ -1756,7 +1796,116 @@ mod tests {
             crate::cluster::ClusterHttp::plaintext(),
             Some(directory.to_path_buf()),
             Duration::from_secs(2),
+            retire_timeout,
         )
+    }
+
+    /// The production retirement deadline outlasts a stop that waits out the
+    /// whole grace and then force-kills, plus time queued behind other work.
+    #[test]
+    fn retirement_deadline_outlasts_a_stubborn_stop() {
+        let confirmation =
+            crate::config::node::RuntimeSection::default().stop_confirmation_timeout();
+        let deadline = retire_timeout(RECONCILE_IO_TIMEOUT, confirmation);
+        assert!(deadline > crate::bun::agent::stop_completion_bound(confirmation));
+        assert!(deadline > RECONCILE_IO_TIMEOUT);
+    }
+
+    /// V02 soak: retirements of SIGTERM-ignoring apps ran one at a time, each
+    /// timing out ("exceeded ten seconds") before its stop could finish. A
+    /// cycle's retirements now wait side by side, so three stops that each
+    /// take one grace finish in about one grace, all in the first cycle.
+    #[tokio::test]
+    async fn a_cycles_retirements_wait_out_their_stops_side_by_side() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = axum::Router::new().route(
+            "/v1/placements/worker",
+            axum::routing::get(|| async { axum::Json(NodeAssignments::default()) }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let root = tempfile::tempdir().unwrap();
+        let checkpoint = crate::cluster::applied::checkpoint_path(root.path());
+        let apps = ["first", "second", "third"];
+        crate::cluster::applied::save(
+            &checkpoint,
+            &apps
+                .iter()
+                .map(|app| {
+                    (
+                        (app.to_string(), "default".to_string()),
+                        AssignmentState::Pending,
+                    )
+                })
+                .collect(),
+        )
+        .unwrap();
+        let grace = Duration::from_millis(1500);
+        let (commands, mut received) = mpsc::channel(8);
+        let reconciler = reconciler_with_retire_deadline(address, root.path(), commands, grace * 2);
+        // A stand-in agent whose every stop waits out the grace, concurrently.
+        let retirements = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = retirements.clone();
+        let agent = tokio::spawn(async move {
+            while let Some(command) = received.recv().await {
+                match command {
+                    AgentCommand::Status { response } => {
+                        let _ = response.send(vec![]);
+                    }
+                    AgentCommand::SyncClusterConsumer { response, .. } => {
+                        let _ = response.send(Ok(crate::bun::agent::ConsumerUpdate {
+                            published: true,
+                            receipts: vec![],
+                        }));
+                    }
+                    AgentCommand::Retire {
+                        app_name, response, ..
+                    } => {
+                        recorded
+                            .lock()
+                            .unwrap()
+                            .push((app_name, std::time::Instant::now()));
+                        tokio::spawn(async move {
+                            tokio::time::sleep(grace).await;
+                            let _ = response.send(Ok(()));
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let retired = tokio::time::timeout(Duration::from_secs(15), async {
+            while !crate::cluster::applied::load(&checkpoint)
+                .unwrap()
+                .is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            std::time::Instant::now()
+        })
+        .await
+        .expect("retirements never completed");
+        reconciler.abort();
+        let _ = reconciler.await;
+        agent.abort();
+        let _ = agent.await;
+        server.abort();
+        let _ = server.await;
+
+        let retirements = retirements.lock().unwrap().clone();
+        let mut names: Vec<_> = retirements.iter().map(|(name, _)| name.as_str()).collect();
+        names.sort();
+        assert_eq!(
+            names, apps,
+            "each retirement must succeed on its first attempt"
+        );
+        let first = retirements.iter().map(|(_, at)| *at).min().unwrap();
+        let elapsed = retired - first;
+        assert!(
+            elapsed < grace * 2,
+            "retirements serialised: {elapsed:?} for three {grace:?} stops"
+        );
     }
 
     #[tokio::test]
@@ -2218,6 +2367,7 @@ command = ["false"]
             shutdown.clone(),
             crate::cluster::ClusterHttp::plaintext(),
             Some(root.path().to_path_buf()),
+            crate::config::node::RuntimeSection::default().stop_confirmation_timeout(),
         );
         let mut deploys = Vec::new();
         let _ = tokio::time::timeout(Duration::from_millis(4500), async {
@@ -2322,6 +2472,7 @@ namespace = "rbtest-interrupted"
             shutdown.clone(),
             crate::cluster::ClusterHttp::plaintext(),
             Some(root.path().to_path_buf()),
+            crate::config::node::RuntimeSection::default().stop_confirmation_timeout(),
         );
         let (observed, events) = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
@@ -2365,6 +2516,7 @@ namespace = "rbtest-interrupted"
             shutdown.clone(),
             crate::cluster::ClusterHttp::plaintext(),
             Some(root.path().to_path_buf()),
+            crate::config::node::RuntimeSection::default().stop_confirmation_timeout(),
         );
         // Model a lost cleanup reply before allowing confirmed retirement.
         for attempt in 0..2 {
@@ -2433,6 +2585,7 @@ namespace = "rbtest-interrupted"
             write_shutdown.clone(),
             crate::cluster::ClusterHttp::plaintext(),
             Some(root.path().to_path_buf()),
+            crate::config::node::RuntimeSection::default().stop_confirmation_timeout(),
         );
         tokio::time::timeout(Duration::from_secs(6), async {
             let mut polls = 0;
@@ -2476,6 +2629,7 @@ namespace = "rbtest-interrupted"
             refused_shutdown.clone(),
             crate::cluster::ClusterHttp::plaintext(),
             Some(root.path().to_path_buf()),
+            crate::config::node::RuntimeSection::default().stop_confirmation_timeout(),
         );
         assert!(
             tokio::time::timeout(Duration::from_millis(2100), received.recv())
