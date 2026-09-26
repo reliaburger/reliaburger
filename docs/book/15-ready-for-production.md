@@ -1874,10 +1874,11 @@ Reversal still needs Admin plus `alter_node_state`, but it needs neither
 destructive acknowledgement nor the protected-cluster mutation switch. A
 Deployer with `inject_workload_faults` may clear workload faults and leaves
 node faults alone. Fault IDs and timers still live in the target process,
-though. If peers have already
-removed the failed node from their live directory, the operator must point
-Relish at that node's still-open API to clear it; expiry needs no route and
-will restore it automatically. Durable lease ownership for node state remains
+though. A node that gossip has marked suspect or dead is still reachable
+this way: forwarded reversals (and the node relay) look it up among every
+member gossip still knows, not just the live ones. Only once gossip has
+forgotten the node entirely must the operator point Relish at its still-open
+API to clear it; expiry needs no route and will restore it automatically. Durable lease ownership for node state remains
 unfinished. The chaos catalogue must account for that rather than turning
 cleanup uncertainty into a cheerful skip.
 
@@ -2357,7 +2358,7 @@ client builds a relayed client with `BunClient::via_node`, whose base URL is
 `diagnostics`, `events`, `probe_path` and friends) just works, because each one
 formats its path onto the base URL.
 
-The relay on the server is deliberately not a proxy. It forwards ten `GET`
+The relay on the server is deliberately not a proxy. It forwards a short list of `GET`
 paths and two kinds of `POST` (`/v1/path`, and `/v1/exec/{app}/{namespace}`
 since the V02 triage found `relish exec` could only reach instances on the
 entry node), refuses everything else with a 404,
@@ -2367,6 +2368,123 @@ dialling the node directly. A test proves it: a token scoped to one app asks a
 peer's `/v1/status` through the relay and gets back only that app's
 instances. If the relay had quietly used the node's identity, the peer would
 have shown everything.
+
+### The catalogue needed the same door
+
+`wtf` got its door in; `relish test` didn't. The V02 soak ran
+`relish test --profile full-runc --filter volumes,image-registry,workload-identity,ingress,deployments`
+from the Mac against the quickstart cluster, every cycle for twelve hours, and
+the same ten of fifteen cases failed every time. Two separate reachability
+bugs, neither of them in the cases themselves.
+
+The volume, ingress and identity cases timed out. Each waits for its app with
+`wait_running_cluster`, which fans out to every node's `/v1/status` through
+`TestContext::node_clients`, and `node_clients` dialled each node's advertised
+API address. Including the entry node's own, which on a Lima guest is its
+guest port and means nothing on the Mac. The poll loop treats an unreachable
+node as "try again", so each case spun until its five-minute deadline, and
+cleanup then couldn't confirm anything either ("could not inspect cleanup on
+node rb-…-1"). The fix has two halves. The entry node is now the connection the
+run already has, always. Peers go by a `PeerRoute`:
+
+```rust
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PeerRoute {
+    #[default]
+    Direct,
+    Relay,
+}
+```
+
+`#[derive(Default)]` on an enum needs to be told which variant is the default,
+and `#[default]` on `Direct` does that. It's what the bench suites and unit
+fixtures get without having to say so.
+
+Why not relay everything, as `wtf` does? Because inside the cluster network
+the direct route is the one the chaos catalogue was designed around: it injects
+a node fault through the target's own API and clears it the same way, which
+keeps working even after every peer has forgotten the target. The relay
+refuses fault `POST`s by design (there's a test that says so). So `relish test`
+keeps the direct route wherever it works, and asks once per run. `PeerRoute::detect` tries each peer's `/v1/health` directly, and only if
+one fails does it try the same peer through the relay. Direct everywhere means
+`Direct`; a peer that answers only through the entry node means `Relay`; a peer
+that answers neither way is simply down and decides nothing. That's one probe
+per peer per run, and it only costs its five-second timeout when a peer really
+is out of reach.
+
+The chaos catalogue then needed three more things, because the soak's
+`dead_worker_node_has_workloads_rescheduled` timed out from the Mac in exactly
+the same way. First, a node fault can't go through the relay, but it doesn't
+have to: Bun already routes a node fault, and its reversal, to the
+`target_node` the request names. So `TestContext::fault_owner` hands the chaos
+guard the target's own client on a direct route and the entry node's client on
+a relayed one. Second, the observer that watches the target go `dead` and come
+back may itself be a relayed peer, so `GET /v1/cluster/nodes` joined the relay's
+reads. Third, and this one is on the server: a node-kill closes the target's
+cluster transports but leaves its API open, and the relay only knew *live*
+members. The moment gossip declared the target dead, every relayed status poll
+and the fault reversal got "target node is not alive or is unknown". Bun now
+keeps a second table, `KnownMembers`, with every member gossip still knows
+(alive, suspect or dead, not left), and the relay and forwarded reversals fall
+back to it. Injection still refuses a node the cluster has lost. The table
+reaches the handlers as an axum `Extension` layer rather than another
+parameter on a constructor that already takes about thirty, and a handler asks for
+it as `Option<axum::Extension<KnownMembers>>`, so a router built without it
+(most tests) behaves as before.
+
+So the relay's allow-list grew by two reads: `GET /v1/cluster/nodes`, and
+`GET /v1/deploys/history/{app}` because the deployment cases compare each
+node's own history. One app segment, nothing nested, like the exec rule.
+
+The registry cases failed faster: "blob upload POST failed … https://127.0.0.1:5050".
+They push to `ctx.registry_base()`, the registry origin from the capability
+report. A managed connection replaces the node's listener with the host
+forward from the local context (quickstart writes `https://127.0.0.1:15050`
+there). But the soak picks a live node for every call, so it passes
+`--endpoint https://127.0.0.1:<that node's API forward>`, and an explicit
+endpoint bypasses the context completely. What was left was the node's own
+listener, `0.0.0.0:5050`, rewritten to the API host: a port nothing forwards.
+
+The context's credentials should stay bypassed; that's the point of
+`--endpoint`. Its forwards are a different kind of fact. They describe how this
+host reaches that cluster's registry and ingress, and they stay true whichever
+node's API you picked. The only question is whether it *is* that cluster. The
+answer relish already has is the CA it pinned for the connection, so
+`LocalContext::forwards_for_ca` hands the forwards over only when the
+connection's CA is byte-for-byte the context's:
+
+```rust
+let connection_ca_pem = connection_ca_pem?;
+let context_ca_pem = std::fs::read(&self.ca_cert).ok()?;
+(context_ca_pem == connection_ca_pem).then(|| self.service_endpoints.clone())
+```
+
+`?` works on `Option` as well as `Result`: `None` returns `None` from the
+function straight away. `.ok()` turns the read's `Result` into an `Option`,
+dropping the error, which is right here: an unreadable CA file means "no
+forwards", not a failed command. And `bool::then` runs the closure and wraps
+its value in `Some` only when the bool is true. No CA, a different CA or a
+missing file all mean no forwards, and relish behaves exactly as before.
+
+The last change was a message. A lease release that got through but wasn't
+confirmed within its 30-second budget used to say "could not reach the lease
+owner", the same words as a connection refused. It now says the owner didn't
+confirm cleanup in time, which points at the server rather than the network.
+
+`testkit::context` has unit tests for both routes (entry node on its own
+connection, peers at `{entry}/v1/nodes/{node}/relay`, a `/v1/status` answered
+through a fake relay) and for detection (relay when a peer answers only that
+way, direct when every peer answers, direct when a peer answers neither way).
+`chaos::scenarios` checks that a relayed node-kill is injected and reversed
+through the entry node, naming the target both times, and `bun::api` checks that
+the relay reaches a member gossip no longer counts as alive.
+`local_context` tests the CA match. The integration test
+`registry_cases_push_through_the_contexts_forward_with_an_explicit_endpoint`
+runs the real `relish test --filter image-registry` with `--endpoint` against
+a secure single node, with a context whose registry forward is a counting TCP
+proxy on a different port. Both registry cases must pass, and the proxy must
+have seen them. What none of this proves is a three-node laptop run end to end;
+that's the next V02 soak's job.
 
 ## Walk the path you actually care about
 

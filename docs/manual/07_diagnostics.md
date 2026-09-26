@@ -123,6 +123,14 @@ timeouts and unconfirmed cleanup. The server must grant
 `provision_isolated_workloads`. Any failure exits non-zero. `--chaos` runs the
 destructive recovery catalogue instead; see `chaos`.
 
+From a laptop, `relish test` works against a `relish local` cluster with or
+without `--endpoint`. It reaches the other nodes through the node it's
+connected to when it can't reach them directly, and it uses the registry and
+ingress forwards from the local context whenever the connection trusts that
+cluster's CA (`--ca-cert` pointing at the same certificate). `--chaos` works
+the same way: node faults go through the connected node, which routes them to
+their target and back.
+
 ## `relish bench`: is it fast enough?
 
 `bench` deploys leased benchmark workloads, measures the real data plane

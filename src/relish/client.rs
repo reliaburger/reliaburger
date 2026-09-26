@@ -552,7 +552,19 @@ impl BunClient {
     /// precedence over the ordinary localhost default.
     pub fn default_local() -> Self {
         if let Some(endpoint) = resolve_endpoint() {
-            return Self::new(&endpoint);
+            let client = Self::new(&endpoint);
+            // An explicit endpoint picks the node; the managed context's host
+            // forwards still describe how this host reaches the cluster's
+            // registry and ingress, when it is the same cluster.
+            let forwards = super::local_context::default_path()
+                .and_then(|path| super::local_context::LocalContext::load(&path))
+                .ok()
+                .flatten()
+                .and_then(|context| context.forwards_for_ca(client.ca_pem.as_deref()));
+            return match forwards {
+                Some(forwards) => client.with_service_endpoints(forwards),
+                None => client,
+            };
         }
         let context = super::local_context::default_path()
             .and_then(|path| super::local_context::LocalContext::load(&path));

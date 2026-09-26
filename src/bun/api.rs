@@ -50,6 +50,19 @@ pub struct NodeMembershipInfo {
     pub address: std::net::SocketAddr,
 }
 
+/// Every member gossip still knows (alive, suspect or dead, not left), with
+/// its API address.
+///
+/// [`ApiState::membership`] holds only live members, which is right for
+/// fan-out and for injecting faults. A node-kill fault, though, closes a
+/// node's cluster transports and leaves its management API open: gossip calls
+/// it dead while it can still answer. The node relay and node-fault reversal
+/// reach it through this table, so a caller outside the cluster network can
+/// still inspect it and heal it. `bun` attaches it as a layer; without it the
+/// relay reaches live members only.
+#[derive(Clone)]
+pub struct KnownMembers(pub Arc<RwLock<Vec<NodeMembershipInfo>>>);
+
 /// Shared state for API handlers.
 #[derive(Clone)]
 pub struct ApiState {
@@ -5093,8 +5106,8 @@ const MAX_RELAY_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 /// A path probe runs for up to 25 seconds on the target; allow for the hop.
 const RELAY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// The per-node reads `relish wtf` and `relish path` make, and nothing else.
-/// The relay is a reachability aid, not a general proxy.
+/// The per-node reads `relish wtf`, `relish path` and `relish test` make, and
+/// nothing else. The relay is a reachability aid, not a general proxy.
 fn relay_allows(method: &axum::http::Method, path: &str) -> bool {
     const READS: &[&str] = &[
         "v1/health",
@@ -5106,15 +5119,23 @@ fn relay_allows(method: &axum::http::Method, path: &str) -> bool {
         "v1/alerts",
         "v1/fault",
         "v1/cluster/council",
+        "v1/cluster/nodes",
         "v1/capabilities",
     ];
     match *method {
-        axum::http::Method::GET => READS.contains(&path),
+        // `relish test` compares each node's own deploy history.
+        axum::http::Method::GET => READS.contains(&path) || is_deploy_history_path(path),
         // `relish exec` reaches an instance on another node this way too;
         // the target repeats the exec authorisation with the caller's token.
         axum::http::Method::POST => path == "v1/path" || is_exec_path(path),
         _ => false,
     }
+}
+
+/// `v1/deploys/history/{app}` and nothing longer (the namespace is a query).
+fn is_deploy_history_path(path: &str) -> bool {
+    path.strip_prefix("v1/deploys/history/")
+        .is_some_and(|app| !app.is_empty() && !app.contains('/'))
 }
 
 /// `v1/exec/{app}/{namespace}` and nothing longer.
@@ -5139,6 +5160,7 @@ fn is_exec_path(path: &str) -> bool {
 /// never adds the node's service identity.
 async fn node_relay_handler(
     State(state): State<ApiState>,
+    known: Option<axum::Extension<KnownMembers>>,
     Path((node, path)): Path<(String, String)>,
     method: axum::http::Method,
     uri: axum::http::Uri,
@@ -5152,10 +5174,11 @@ async fn node_relay_handler(
         )
             .into_response();
     }
-    let mut url = match target_node_api_url(&state, &node, &format!("/{path}")).await {
-        Ok(url) => url,
-        Err(response) => return response,
-    };
+    let mut url =
+        match known_node_api_url(&state, known.as_deref(), &node, &format!("/{path}")).await {
+            Ok(url) => url,
+            Err(response) => return response,
+        };
     if let Some(query) = uri.query() {
         url.push('?');
         url.push_str(query);
@@ -6783,6 +6806,37 @@ async fn target_node_api_url(
     Ok(state.cluster_http.url(&address.to_string(), path))
 }
 
+/// Resolve a member gossip still knows, live or not, to one of its API URLs.
+///
+/// A live member resolves as in [`target_node_api_url`]; otherwise
+/// [`KnownMembers`] supplies the address of a suspect or dead one. For reads
+/// and reversals only: injecting into a node the cluster has lost stays
+/// refused.
+// `Response` is large but it IS the HTTP reply to send on failure.
+#[allow(clippy::result_large_err)]
+async fn known_node_api_url(
+    state: &ApiState,
+    known: Option<&KnownMembers>,
+    target_node: &str,
+    path: &str,
+) -> Result<String, Response> {
+    let live = target_node_api_url(state, target_node, path).await;
+    let Some(known) = known.filter(|_| live.is_err()) else {
+        return live;
+    };
+    let address = known
+        .0
+        .read()
+        .await
+        .iter()
+        .find(|member| member.node_id == crate::meat::NodeId::new(target_node))
+        .map(|member| member.address);
+    match address {
+        Some(address) => Ok(state.cluster_http.url(&address.to_string(), path)),
+        None => live,
+    }
+}
+
 /// Preserve the end user's credential so the target node repeats every
 /// authentication and server-policy check.
 fn copy_forwarded_auth(
@@ -6881,6 +6935,7 @@ struct FaultClearQuery {
 async fn fault_clear_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
+    known: Option<axum::Extension<KnownMembers>>,
     headers: HeaderMap,
     Path(id): Path<u64>,
     Query(query): Query<FaultClearQuery>,
@@ -6916,32 +6971,38 @@ async fn fault_clear_handler(
             &caller,
         )
         .is_ok();
-    let allow_node_fault = if let Some(target_node) =
-        query.node.as_deref().filter(|target| !target.is_empty())
-    {
-        // Node routing is not itself authority. Preserve the three independent
-        // reversal grants and let the owning agent inspect the actual fault
-        // before it removes anything.
-        let allow_node_fault = state
-            .static_capabilities
-            .test_policy
-            .authorise_reversal(
-                crate::testkit::safety::OperationPermission::AlterNodeState,
-                &caller,
-            )
-            .is_ok();
-        if state
-            .node_name
-            .as_deref()
-            .is_some_and(|name| name != target_node)
-        {
-            return forward_node_fault_clear(&state, target_node, &headers, id, query.acknowledged)
+    let allow_node_fault =
+        if let Some(target_node) = query.node.as_deref().filter(|target| !target.is_empty()) {
+            // Node routing is not itself authority. Preserve the three independent
+            // reversal grants and let the owning agent inspect the actual fault
+            // before it removes anything.
+            let allow_node_fault = state
+                .static_capabilities
+                .test_policy
+                .authorise_reversal(
+                    crate::testkit::safety::OperationPermission::AlterNodeState,
+                    &caller,
+                )
+                .is_ok();
+            if state
+                .node_name
+                .as_deref()
+                .is_some_and(|name| name != target_node)
+            {
+                return forward_node_fault_clear(
+                    &state,
+                    known.as_deref(),
+                    target_node,
+                    &headers,
+                    id,
+                    query.acknowledged,
+                )
                 .await;
-        }
-        allow_node_fault
-    } else {
-        false
-    };
+            }
+            allow_node_fault
+        } else {
+            false
+        };
     let has_any_reversal_grant = allow_workload_fault || allow_node_fault || allow_node_pressure;
     if query.node.is_some() && !has_any_reversal_grant {
         return (
@@ -7045,13 +7106,15 @@ async fn wait_for_node_fault_release(state: &ApiState, sequence: u64) -> bool {
 /// Route manual reversal to the node which owns the local fault id.
 async fn forward_node_fault_clear(
     state: &ApiState,
+    known: Option<&KnownMembers>,
     target_node: &str,
     headers: &HeaderMap,
     fault_id: u64,
     acknowledged: bool,
 ) -> Response {
     let path = format!("/v1/fault/{fault_id}");
-    let url = match target_node_api_url(state, target_node, &path).await {
+    // A node-killed target is dead to gossip but still holds its fault.
+    let url = match known_node_api_url(state, known, target_node, &path).await {
         Ok(url) => url,
         Err(response) => return response,
     };
@@ -15569,6 +15632,7 @@ mod cluster_routing_tests {
             });
             listeners.push(listener);
         }
+        let known = KnownMembers(Arc::new(RwLock::new(membership.clone())));
         let membership = Arc::new(RwLock::new(membership));
         let mut nodes = Vec::new();
         for ((name, instances), listener) in layout.into_iter().zip(listeners) {
@@ -15623,7 +15687,8 @@ mod cluster_routing_tests {
                 super::super::readiness::ReadinessTracker::new(),
                 None,
                 None,
-            );
+            )
+            .layer(axum::Extension(known.clone()));
             let url = format!("http://{}", listener.local_addr().unwrap());
             let cancelled = stop.clone();
             tokio::spawn(async move {
@@ -16000,6 +16065,48 @@ mod cluster_routing_tests {
         )
         .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// A node-kill fault leaves the target's API open while gossip calls it
+    /// dead. The relay must still reach it, or nobody outside the cluster
+    /// network can watch it or clear the fault.
+    #[tokio::test]
+    async fn the_relay_reaches_a_member_gossip_no_longer_counts_as_alive() {
+        let cluster = start_cluster(vec![
+            ("node-1", vec![]),
+            ("node-2", vec![instance("default/web-0", "web", "running")]),
+        ])
+        .await;
+        cluster
+            .membership
+            .write()
+            .await
+            .retain(|member| member.node_id != crate::meat::NodeId::new("node-2"));
+
+        let (status, body) = relay(
+            &cluster,
+            reqwest::Method::GET,
+            "/v1/nodes/node-2/relay/v1/status",
+            Some(cluster.operator.as_str()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let statuses: Vec<InstanceStatus> = serde_json::from_str(&body).unwrap();
+        assert_eq!(statuses.len(), 1);
+        cluster.stop.cancel();
+    }
+
+    #[test]
+    fn the_relay_forwards_one_apps_deploy_history_and_nothing_nested() {
+        let get = axum::http::Method::GET;
+        assert!(relay_allows(&get, "v1/deploys/history/web"));
+        assert!(!relay_allows(&get, "v1/deploys/history/"));
+        assert!(!relay_allows(&get, "v1/deploys/history/web/extra"));
+        assert!(!relay_allows(&get, "v1/deploys/history"));
+        assert!(!relay_allows(
+            &axum::http::Method::POST,
+            "v1/deploys/history/web"
+        ));
     }
 
     #[test]
