@@ -503,6 +503,14 @@ Our `make coverage` runs the portable suite once under instrumentation and emits
 HTML report. On Linux CI that same run is the test gate, so we don't pay for the suite twice. The first combined Linux CI measurement covered
 79.65% of lines, so CI starts at 78.65%, one percentage point lower, and can ratchet upwards.
 
+Instrumented programmes write their counters to a `.profraw` file as they exit. Our
+crash-recovery tests SIGKILL instrumented Bun processes on purpose, and one day a kill landed
+mid-write: all 4,708 tests passed, then `llvm-profdata` refused the truncated file and failed
+the whole report. The report steps now pass `--failure-mode all`, which skips an unreadable
+profile with a warning and only fails when none can be read. Skipping one killed process's
+partial counts can pull coverage down a hair. It can't push it up, so the floor still means
+what it says.
+
 Coverage finds unvisited code. It does not tell us whether an assertion is useful, whether a
 webhook test accidentally exercised startup, or whether a five-second performance limit is
 portable. The audit found all three in a suite with lots of coverage. Read the uncovered

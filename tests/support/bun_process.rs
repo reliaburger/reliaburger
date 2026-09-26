@@ -172,7 +172,10 @@ pub fn wait_for_bind(bun: &mut BunProcess, address: SocketAddr) -> BunStart {
         {
             return BunStart::Ready(address);
         }
-        assert!(Instant::now() < deadline, "bun never listened on {address}");
+        if Instant::now() >= deadline {
+            let log = std::fs::read_to_string(&bun.log_path).unwrap_or_default();
+            panic!("bun never listened on {address}:\n{log}");
+        }
         std::thread::sleep(Duration::from_millis(25));
     }
 }

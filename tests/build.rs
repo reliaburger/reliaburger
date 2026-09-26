@@ -623,10 +623,12 @@ async fn builder_failure_retries_on_another_builder() {
             NodeMembershipInfo {
                 node_id: reliaburger::meat::NodeId("bad-builder".to_string()),
                 address: bad_addr,
+                api_advertised: true,
             },
             NodeMembershipInfo {
                 node_id: reliaburger::meat::NodeId("good-builder".to_string()),
                 address: good_addr,
+                api_advertised: true,
             },
         ]),
         builder_nodes: vec!["bad-builder".to_string(), "good-builder".to_string()],

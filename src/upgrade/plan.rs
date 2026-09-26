@@ -22,8 +22,11 @@ use super::version::BinaryVersion;
 /// The leader's authoritative view of one node: what relish must match.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthoritativeNode {
-    /// API address (`host:port`) the orchestrator will POST directives to.
-    pub address: String,
+    /// API address (`host:port`) the orchestrator will POST directives to,
+    /// as the node advertised it over gossip. `None` while the leader only
+    /// knows the node from another member's membership sync and has yet to
+    /// hear its advertisement: a derived guess is not an identity.
+    pub address: Option<String>,
     pub role: NodeRole,
 }
 
@@ -60,6 +63,10 @@ pub fn role_from_raft(
 /// A worker↔council relabel among non-leaders is not rejected — both go
 /// before the leader — but the built record still carries the authoritative
 /// role, so the plan the orchestrator walks never depends on the claim.
+///
+/// [`AddressNotAdvertised`](PlanError::AddressNotAdvertised) is different in
+/// kind: the leader can't check the claim yet, so it refuses rather than
+/// compare against a guess (see [`PlanError::is_transient`]).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PlanError {
     #[error("node {node_id:?} is not a live cluster member")]
@@ -78,6 +85,17 @@ pub enum PlanError {
         claimed: String,
         authoritative: String,
     },
+    #[error("node {node_id:?} has not advertised its API address to the leader yet; retry shortly")]
+    AddressNotAdvertised { node_id: String },
+}
+
+impl PlanError {
+    /// `true` when the refusal reflects gossip still converging (the same
+    /// request can succeed moments later), not a claim the cluster
+    /// contradicts.
+    pub fn is_transient(&self) -> bool {
+        matches!(self, PlanError::AddressNotAdvertised { .. })
+    }
 }
 
 /// One node as named in the client's start request.
@@ -97,6 +115,8 @@ pub struct RequestedNode {
 /// - unknown to the cluster → [`PlanError::UnknownNode`];
 /// - a claim that crosses the leader boundary (claims Leader but isn't, or
 ///   is the leader but claims otherwise) → [`PlanError::LeaderMismatch`];
+/// - the node hasn't advertised its address to the leader yet →
+///   [`PlanError::AddressNotAdvertised`];
 /// - claimed address disagrees with the authoritative address →
 ///   [`PlanError::AddressMismatch`].
 ///
@@ -128,18 +148,23 @@ where
                 authoritative: authoritative.role,
             });
         }
-        if node.address != authoritative.address {
+        let Some(address) = authoritative.address else {
+            return Err(PlanError::AddressNotAdvertised {
+                node_id: node.node_id.clone(),
+            });
+        };
+        if node.address != address {
             return Err(PlanError::AddressMismatch {
                 node_id: node.node_id.clone(),
                 claimed: node.address.clone(),
-                authoritative: authoritative.address.clone(),
+                authoritative: address,
             });
         }
 
         records.push(NodeUpgradeRecord {
             node_id: node.node_id.clone(),
             // Authoritative, not the client's copy.
-            address: authoritative.address,
+            address,
             role: authoritative.role,
             from_version: None,
             phase: NodeUpgradePhase::Pending,
@@ -282,21 +307,21 @@ mod tests {
             (
                 "leader".to_string(),
                 AuthoritativeNode {
-                    address: "10.0.0.1:9117".to_string(),
+                    address: Some("10.0.0.1:9117".to_string()),
                     role: NodeRole::Leader,
                 },
             ),
             (
                 "c1".to_string(),
                 AuthoritativeNode {
-                    address: "10.0.0.2:9117".to_string(),
+                    address: Some("10.0.0.2:9117".to_string()),
                     role: NodeRole::Council,
                 },
             ),
             (
                 "w1".to_string(),
                 AuthoritativeNode {
-                    address: "10.0.0.3:9117".to_string(),
+                    address: Some("10.0.0.3:9117".to_string()),
                     role: NodeRole::Worker,
                 },
             ),
@@ -366,6 +391,40 @@ mod tests {
         let requested = vec![requested("leader", "10.0.0.9:9117", NodeRole::Leader)];
         let err = derive_upgrade_nodes(&requested, |id| view.get(id).cloned()).unwrap_err();
         assert!(matches!(err, PlanError::AddressMismatch { .. }));
+    }
+
+    #[test]
+    fn unadvertised_address_is_refused_as_not_yet_known() {
+        // A restarted leader learns a member from a peer's membership sync
+        // before that member's own gossip tells it the API endpoint. Until
+        // then it only has a port-offset guess, which is wrong whenever nodes
+        // pick their ports independently. Comparing the client's (correct)
+        // address against that guess used to report a spurious mismatch.
+        let mut view = view();
+        view.insert(
+            "fresh".to_string(),
+            AuthoritativeNode {
+                address: None,
+                role: NodeRole::Council,
+            },
+        );
+        let requested = vec![requested("fresh", "10.0.0.4:9117", NodeRole::Council)];
+        let err = derive_upgrade_nodes(&requested, |id| view.get(id).cloned()).unwrap_err();
+        assert_eq!(
+            err,
+            PlanError::AddressNotAdvertised {
+                node_id: "fresh".to_string()
+            }
+        );
+        assert!(err.is_transient());
+    }
+
+    #[test]
+    fn identity_rejections_are_not_transient() {
+        let view = view();
+        let requested = vec![requested("leader", "10.0.0.9:9117", NodeRole::Leader)];
+        let err = derive_upgrade_nodes(&requested, |id| view.get(id).cloned()).unwrap_err();
+        assert!(!err.is_transient());
     }
 
     #[test]

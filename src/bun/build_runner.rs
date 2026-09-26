@@ -2016,10 +2016,12 @@ mod tests {
             super::super::api::NodeMembershipInfo {
                 node_id: plain,
                 address: std::net::SocketAddr::from(([10, 0, 0, 1], 9117)),
+                api_advertised: true,
             },
             super::super::api::NodeMembershipInfo {
                 node_id: builder.clone(),
                 address: std::net::SocketAddr::from(([10, 0, 0, 2], 9117)),
+                api_advertised: true,
             },
         ];
 
