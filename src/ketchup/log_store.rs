@@ -129,9 +129,8 @@ fn log_writer_properties() -> WriterProperties {
 
 /// Arrow schema for the logs table.
 ///
-/// `sequence` and `instance` are nullable so Parquet files written before
-/// they existed still read: DataFusion fills a column a file lacks with
-/// nulls, and a null `sequence` sorts first, which is right for older files.
+/// `instance` is nullable because the node's own lines (`bun` startup
+/// messages) come from no instance.
 pub fn log_schema() -> Schema {
     Schema::new(vec![
         Field::new("timestamp", DataType::UInt64, false),
@@ -139,7 +138,7 @@ pub fn log_schema() -> Schema {
         Field::new("namespace", DataType::Utf8, false),
         Field::new("stream", DataType::Utf8, false),
         Field::new("line", DataType::Utf8, false),
-        Field::new("sequence", DataType::UInt64, true),
+        Field::new("sequence", DataType::UInt64, false),
         Field::new("instance", DataType::Utf8, true),
     ])
 }
@@ -163,8 +162,7 @@ pub(crate) fn batches_to_entries(batches: &[RecordBatch]) -> Result<Vec<LogEntry
                 _ => LogStream::Stdout,
             };
             let sequence = match sequences {
-                Some(column) if column.is_valid(row) => column.value(row),
-                Some(_) => 0,
+                Some(column) => column.value(row),
                 None => entries.len() as u64,
             };
             let instance = instances
@@ -239,22 +237,13 @@ impl IngestCheckpoint {
         checkpoint
     }
 
-    /// Durably replace the checkpoint: temp file, fsync, rename, dir fsync.
+    /// Durably replace the checkpoint: a unique temp file, fsync, rename over
+    /// the old one, then fsync the directory. A reader sees the old
+    /// checkpoint or the new one, never half of either.
     fn save(&self, data_dir: &std::path::Path) -> Result<(), KetchupError> {
         let bytes = serde_json::to_vec(self)
             .map_err(|error| KetchupError::Io(std::io::Error::other(error.to_string())))?;
-        let path = data_dir.join(CHECKPOINT_FILE);
-        let temporary = path.with_extension("json.tmp");
-        {
-            use std::io::Write;
-            let mut file = std::fs::File::create(&temporary)?;
-            file.write_all(&bytes)?;
-            file.sync_all()?;
-        }
-        std::fs::rename(&temporary, &path)?;
-        if let Ok(directory) = std::fs::File::open(data_dir) {
-            let _ = directory.sync_all();
-        }
+        crate::sesame::identity::atomic_write(&data_dir.join(CHECKPOINT_FILE), &bytes)?;
         Ok(())
     }
 }
@@ -765,15 +754,13 @@ impl LogStore {
             "SELECT timestamp, app, namespace, stream, line, sequence, instance \
              FROM logs WHERE {where_clause}"
         );
-        // A tail takes the newest rows, then puts them back in order. Rows
-        // from files older than the `sequence` column have none and are the
-        // oldest, so they sort first.
+        // A tail takes the newest rows, then puts them back in order.
         let sql = match tail {
             Some(tail) => format!(
-                "SELECT * FROM ({select} ORDER BY sequence DESC NULLS LAST LIMIT {tail}) \
-                 AS tailed ORDER BY sequence ASC NULLS FIRST"
+                "SELECT * FROM ({select} ORDER BY sequence DESC LIMIT {tail}) AS tailed \
+                 ORDER BY sequence"
             ),
-            None => format!("{select} ORDER BY sequence ASC NULLS FIRST"),
+            None => format!("{select} ORDER BY sequence"),
         };
         self.query_sql(&sql).await
     }
@@ -1205,40 +1192,31 @@ mod tests {
         assert_eq!(writer_lines(&store).await, acks(1..=1));
     }
 
-    /// A node upgraded in place keeps its Parquet files, written before the
-    /// `sequence` and `instance` columns existed. They must still read, and
-    /// sort before anything the new binary writes.
+    /// Each flush replaces the checkpoint wholesale through a temp file and a
+    /// rename, so no temp file is left behind and the file on disk is always
+    /// one complete checkpoint.
     #[tokio::test]
-    async fn files_without_sequence_or_instance_still_read_and_sort_first() {
+    async fn flush_replaces_the_checkpoint_atomically() {
         let dir = tempfile::tempdir().unwrap();
-        let old_schema = Arc::new(Schema::new(log_schema().fields()[..5].to_vec()));
-        let batch = RecordBatch::try_new(
-            old_schema.clone(),
-            vec![
-                Arc::new(UInt64Array::from(vec![5_000u64])),
-                Arc::new(StringArray::from(vec!["writer"])),
-                Arc::new(StringArray::from(vec!["default"])),
-                Arc::new(StringArray::from(vec!["stdout"])),
-                Arc::new(StringArray::from(vec!["ACK 0001"])),
-            ],
-        )
-        .unwrap();
-        let file = std::fs::File::create(dir.path().join("logs_000000.parquet")).unwrap();
-        let mut writer = ArrowWriter::try_new(file, old_schema, None).unwrap();
-        writer.write(&batch).unwrap();
-        writer.close().unwrap();
-
+        let captures = tempfile::tempdir().unwrap();
+        let file = capture_file(&captures, "writer.stdout");
         let mut store = LogStore::new(dir.path().to_path_buf());
-        store.append_at(1, "writer", "default", LogStream::Stdout, "ACK 0002");
-        store.flush().await.unwrap();
+        for n in 1..=2 {
+            store.ingest_at(100, &writer_line(&file, n));
+            store.flush().await.unwrap();
+        }
 
-        let entries = store
-            .query("writer", "default", None, None, None, None)
-            .await
-            .unwrap();
-        let lines: Vec<&str> = entries.iter().map(|e| e.line.as_str()).collect();
-        assert_eq!(lines, vec!["ACK 0001", "ACK 0002"]);
-        assert_eq!(entries[0].instance, None);
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| !name.ends_with(".parquet"))
+            .collect();
+        assert_eq!(names, vec![CHECKPOINT_FILE.to_string()]);
+        let saved: IngestCheckpoint =
+            serde_json::from_slice(&std::fs::read(dir.path().join(CHECKPOINT_FILE)).unwrap())
+                .unwrap();
+        assert_eq!(saved.offsets.get(&file), Some(&(2 * LINE_BYTES)));
+        assert_eq!(saved, store.ingested);
     }
 
     #[tokio::test]

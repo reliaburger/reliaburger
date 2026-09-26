@@ -558,8 +558,8 @@ we pick the behaviour explicitly. Queries now `ORDER BY sequence`, and a tail
 is a subquery that takes the newest N and puts them back in order:
 
 ```sql
-SELECT * FROM (... ORDER BY sequence DESC NULLS LAST LIMIT 20) AS tailed
-ORDER BY sequence ASC NULLS FIRST
+SELECT * FROM (... ORDER BY sequence DESC LIMIT 20) AS tailed
+ORDER BY sequence
 ```
 
 Why nanoseconds and not a plain counter? A counter orders one node's rows
@@ -613,8 +613,7 @@ if let Some(position) = &record.position {
 `Option::is_some_and` is "there's a value and this predicate holds for it",
 which reads better than `matches!(seen, Some(offset) if ...)`. On every flush
 the store writes those offsets, plus the last sequence, to
-`ingest-checkpoint.json`, with the same temp-file, fsync, rename, directory
-fsync dance as the Parquet file, and always *after* the Parquet file. Which
+`ingest-checkpoint.json`, always *after* the Parquet file. Which
 order you pick decides what a crash between the two writes costs. Checkpoint
 first, and a crash loses the batch: the offsets say the lines are stored, and
 they aren't. Parquet first, and a crash stores one batch twice. We take the
@@ -636,11 +635,22 @@ and when a tail spans more than one instance `relish logs` prefixes each line
 with `[instance]`, the way `relish logs -f` already did. Two clients
 incrementing one counter now look like two clients.
 
-Both new columns are nullable. A node upgraded in place keeps its old Parquet
-files, and DataFusion fills a column a file lacks with nulls; `NULLS FIRST`
-sorts those rows before anything the new binary wrote, which is where they
-belong. `files_without_sequence_or_instance_still_read_and_sort_first`
-writes an old five-column file by hand to prove it.
+What about the Parquet files a node wrote before `sequence` existed? Our
+first cut made the column nullable so they'd still read, with `NULLS FIRST`
+to sort them before everything new. Then we deleted it. Before 0.1.0 we
+don't carry old formats forward; we bump the generation and start a fresh
+cluster (Chapter 14 has the policy). The logs table is durable state and
+the `/v1/logs/entries` answer is a node-to-node wire format, so both moved:
+protocol 24 to 25, state 40 to 41. A node upgraded in place now refuses to
+start at its state stamp instead of quietly half-reading old log files, and
+`sequence` is a required column. Only `instance` stays nullable, because
+the node's own startup lines don't come from any instance.
+
+The checkpoint itself goes through the same `atomic_write` helper the
+identity code uses: a uniquely named temp file, `fsync`, rename over the old
+checkpoint, `fsync` the directory. `flush_replaces_the_checkpoint_atomically`
+checks that two flushes leave exactly one complete checkpoint and no temp
+files behind.
 
 ## When nothing looks like success
 
