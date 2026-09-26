@@ -2,7 +2,7 @@
 
 This roadmap defines the implementation phases for Reliaburger, ordered by dependency. Each phase builds on the previous and ends with a concrete, demonstrable milestone.
 
-**Methodology:** Every phase starts by writing tests, then implementing until they pass. Each phase produces a chapter of the Reliaburger book, combining design narrative with Rust implementation walkthrough. See [AGENTS.md](../AGENTS.md) for the full methodology.
+**Methodology:** Every phase starts by writing tests, then implementing until they pass. Each phase produces a chapter of the Reliaburger book, combining design narrative with Rust implementation walkthrough. See [CLAUDE.md](../CLAUDE.md) for the full methodology.
 
 For the full architectural vision, see [whitepaper.md](whitepaper.md). For implementation details on each component, see the [design/](design/) directory.
 
