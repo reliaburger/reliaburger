@@ -671,6 +671,9 @@ enum UpgradeAction {
     },
     /// Resume a paused upgrade.
     Resume,
+    /// End a paused upgrade in which no node has moved. When some nodes
+    /// already swapped, use `rollback <version>` instead.
+    Abort,
 }
 
 #[derive(Subcommand)]
@@ -1715,6 +1718,7 @@ async fn main() -> ExitCode {
                     node_addresses,
                 } => reliaburger::relish::upgrade::rollback(&client, version, node_addresses).await,
                 UpgradeAction::Resume => reliaburger::relish::upgrade::resume(&client).await,
+                UpgradeAction::Abort => reliaburger::relish::upgrade::abort(&client).await,
             }
         }
         Command::Manual {

@@ -37,6 +37,9 @@ pub struct NodeProbe {
     pub failed_upgrade_ids: Vec<String>,
     /// Hex SHA-256 of the binary the node runs, when it reports one.
     pub binary_sha256: Option<String>,
+    /// Whether the node has an external key to verify network upgrades
+    /// with. A node that doesn't say can't: every 0.1.0 node reports it.
+    pub accepts_network_upgrades: bool,
 }
 
 /// Effects the orchestrator performs on nodes. Mocked in unit tests; the
@@ -98,7 +101,9 @@ pub async fn step<C: NodeControl>(
     context: &StepContext,
 ) -> ClusterUpgradeState {
     match state.phase.clone() {
-        ClusterUpgradePhase::Completed | ClusterUpgradePhase::Paused { .. } => state,
+        ClusterUpgradePhase::Completed
+        | ClusterUpgradePhase::Paused { .. }
+        | ClusterUpgradePhase::Aborted { .. } => state,
 
         ClusterUpgradePhase::Preparing => {
             // The binary was verified and pushed to Pickle by whoever
@@ -508,6 +513,82 @@ pub fn resume(mut state: ClusterUpgradeState) -> ClusterUpgradeState {
     state
 }
 
+/// End a paused upgrade without finishing it (`relish upgrade abort`).
+///
+/// Only a paused run can be aborted, and only when no node has moved: a
+/// node that reached the target (`Healthy`) or was told to swap and may
+/// still be doing so (`Directed`, `Verifying`) would be left on another
+/// version with nothing tracking it. Those runs need a cluster rollback,
+/// which walks every node back and replaces the paused run. Failed,
+/// rolled-back and never-directed nodes are all on their old binary, so
+/// dropping the plan leaves the cluster exactly where it started.
+///
+/// Returns the state marked [`ClusterUpgradePhase::Aborted`], ready to
+/// persist and archive.
+pub fn abort(
+    state: ClusterUpgradeState,
+    reason: &str,
+) -> Result<ClusterUpgradeState, super::UpgradeError> {
+    if !matches!(state.phase, ClusterUpgradePhase::Paused { .. }) {
+        return Err(super::UpgradeError::AbortNotPaused {
+            phase: phase_name(&state.phase).to_string(),
+        });
+    }
+    let moved: Vec<String> = state
+        .nodes
+        .iter()
+        .filter(|record| {
+            matches!(
+                record.phase,
+                NodeUpgradePhase::Healthy
+                    | NodeUpgradePhase::Directed
+                    | NodeUpgradePhase::Verifying
+            )
+        })
+        .map(|record| format!("node {}", record.node_id))
+        .collect();
+    if !moved.is_empty() {
+        return Err(super::UpgradeError::AbortWouldStrandNodes {
+            nodes: moved.join(", "),
+            target: state.target_version.clone(),
+        });
+    }
+    supersede(state, reason)
+}
+
+/// Mark a paused run as replaced by another operation (a cluster rollback).
+///
+/// Unlike [`abort`] this doesn't care which nodes moved: the replacement
+/// walks every node to its own target, so nothing is stranded. Only a
+/// paused run may be replaced.
+pub fn supersede(
+    mut state: ClusterUpgradeState,
+    reason: &str,
+) -> Result<ClusterUpgradeState, super::UpgradeError> {
+    let ClusterUpgradePhase::Paused { reason: paused } = &state.phase else {
+        return Err(super::UpgradeError::AbortNotPaused {
+            phase: phase_name(&state.phase).to_string(),
+        });
+    };
+    state.phase = ClusterUpgradePhase::Aborted {
+        reason: format!("{reason} (it was paused: {paused})"),
+    };
+    Ok(state)
+}
+
+fn phase_name(phase: &ClusterUpgradePhase) -> &'static str {
+    match phase {
+        ClusterUpgradePhase::Preparing => "preparing",
+        ClusterUpgradePhase::UpgradingWorkers => "upgrading workers",
+        ClusterUpgradePhase::UpgradingCouncil => "upgrading the council",
+        ClusterUpgradePhase::TransferringLeadership => "transferring leadership",
+        ClusterUpgradePhase::UpgradingLeader => "upgrading the leader",
+        ClusterUpgradePhase::Completed => "completed",
+        ClusterUpgradePhase::Paused { .. } => "paused",
+        ClusterUpgradePhase::Aborted { .. } => "aborted",
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The real NodeControl (HTTP) and the driver loop
 // ---------------------------------------------------------------------------
@@ -575,6 +656,7 @@ impl NodeControl for HttpNodeControl {
         );
 
         let binary_sha256 = value["binary_sha256"].as_str().map(String::from);
+        let accepts_network_upgrades = value["accepts_network_upgrades"].as_bool().unwrap_or(false);
 
         Some(NodeProbe {
             version,
@@ -582,6 +664,7 @@ impl NodeControl for HttpNodeControl {
             upgrade_in_flight,
             failed_upgrade_ids,
             binary_sha256,
+            accepts_network_upgrades,
         })
     }
 
@@ -730,11 +813,16 @@ pub async fn run_orchestrator(
         };
         if matches!(
             upgrade.phase,
-            ClusterUpgradePhase::Paused { .. } | ClusterUpgradePhase::Completed
+            ClusterUpgradePhase::Paused { .. }
+                | ClusterUpgradePhase::Completed
+                | ClusterUpgradePhase::Aborted { .. }
         ) {
-            // Completed states are normally cleared below; this handles a
-            // leader that crashed between phases.
-            if upgrade.phase == ClusterUpgradePhase::Completed {
+            // Completed and aborted states are normally cleared by whoever
+            // ended them; this handles a leader that crashed in between.
+            if matches!(
+                upgrade.phase,
+                ClusterUpgradePhase::Completed | ClusterUpgradePhase::Aborted { .. }
+            ) {
                 let _ = council
                     .write(RaftRequest::UpgradeClear {
                         upgrade_id: upgrade.upgrade_id.clone(),
@@ -833,6 +921,7 @@ mod tests {
                     upgrade_in_flight: in_flight,
                     failed_upgrade_ids: Vec::new(),
                     binary_sha256: Some(fixture_sha256(version).to_string()),
+                    accepts_network_upgrades: true,
                 },
             );
         }
@@ -846,6 +935,7 @@ mod tests {
                     upgrade_in_flight: false,
                     failed_upgrade_ids: vec![failed_id.to_string()],
                     binary_sha256: Some(fixture_sha256(version).to_string()),
+                    accepts_network_upgrades: true,
                 },
             );
         }
@@ -1519,5 +1609,133 @@ mod tests {
         assert_eq!(state.nodes[1].phase, NodeUpgradePhase::Pending);
         // The healthy node is untouched.
         assert_eq!(state.nodes[0].phase, NodeUpgradePhase::Healthy);
+    }
+
+    /// Serve `/v1/version` with `body` and `/v1/health` as ok, and probe it.
+    async fn probe_version_body(body: serde_json::Value) -> NodeProbe {
+        let router = axum::Router::new()
+            .route(
+                "/v1/version",
+                axum::routing::get(move || {
+                    let body = body.clone();
+                    async move { axum::Json(body) }
+                }),
+            )
+            .route(
+                "/v1/health",
+                axum::routing::get(|| async { axum::Json(serde_json::json!({"status": "ok"})) }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let probe = HttpNodeControl::new(None).probe(&address).await.unwrap();
+        server.abort();
+        probe
+    }
+
+    #[tokio::test]
+    async fn a_node_that_does_not_report_network_readiness_cannot_accept_one() {
+        let silent = probe_version_body(serde_json::json!({"version": "v0.1.0"})).await;
+        assert!(!silent.accepts_network_upgrades);
+        let ready = probe_version_body(serde_json::json!({
+            "version": "v0.1.0",
+            "accepts_network_upgrades": true,
+        }))
+        .await;
+        assert!(ready.accepts_network_upgrades);
+    }
+
+    fn paused(nodes: Vec<NodeUpgradeRecord>) -> ClusterUpgradeState {
+        let mut state = cluster_state(nodes, 1);
+        state.phase = ClusterUpgradePhase::Paused {
+            reason: "directive to w1 refused: 409".to_string(),
+        };
+        state
+    }
+
+    #[test]
+    fn abort_ends_a_paused_run_in_which_no_node_moved() {
+        let state = paused(vec![
+            record(
+                "w1",
+                NodeRole::Worker,
+                NodeUpgradePhase::Failed {
+                    reason: "refused".to_string(),
+                },
+            ),
+            record("c1", NodeRole::Council, NodeUpgradePhase::Pending),
+            record("leader", NodeRole::Leader, NodeUpgradePhase::Pending),
+        ]);
+
+        let aborted = abort(state, "aborted by the operator").unwrap();
+
+        let ClusterUpgradePhase::Aborted { reason } = &aborted.phase else {
+            panic!("expected Aborted, got {:?}", aborted.phase);
+        };
+        assert!(reason.contains("aborted by the operator"), "{reason}");
+        assert!(reason.contains("directive to w1 refused"), "{reason}");
+    }
+
+    #[test]
+    fn abort_refuses_a_run_that_already_moved_a_node() {
+        for moved in [
+            NodeUpgradePhase::Healthy,
+            NodeUpgradePhase::Directed,
+            NodeUpgradePhase::Verifying,
+        ] {
+            let state = paused(vec![
+                record("w1", NodeRole::Worker, moved.clone()),
+                record("c1", NodeRole::Council, NodeUpgradePhase::Pending),
+            ]);
+            let err = abort(state, "aborted").unwrap_err();
+            assert!(
+                matches!(err, super::super::UpgradeError::AbortWouldStrandNodes { ref nodes, .. } if nodes == "node w1"),
+                "{moved:?}: {err}"
+            );
+            assert!(err.to_string().contains("relish upgrade rollback"));
+        }
+    }
+
+    #[test]
+    fn abort_refuses_a_run_that_is_not_paused() {
+        let state = cluster_state(
+            vec![record("w1", NodeRole::Worker, NodeUpgradePhase::Pending)],
+            1,
+        );
+        let err = abort(state, "aborted").unwrap_err();
+        assert!(
+            matches!(err, super::super::UpgradeError::AbortNotPaused { .. }),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn supersede_replaces_a_paused_run_even_with_moved_nodes() {
+        let state = paused(vec![record(
+            "w1",
+            NodeRole::Worker,
+            NodeUpgradePhase::Healthy,
+        )]);
+        let replaced = supersede(state, "replaced by a rollback to v0.1.0").unwrap();
+        assert!(matches!(
+            replaced.phase,
+            ClusterUpgradePhase::Aborted { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn step_leaves_an_aborted_run_alone() {
+        let control = MockControl::default();
+        control.set("addr-w1", "0.1.0", true, false);
+        let mut state = cluster_state(
+            vec![record("w1", NodeRole::Worker, NodeUpgradePhase::Pending)],
+            1,
+        );
+        state.phase = ClusterUpgradePhase::Aborted {
+            reason: "aborted".to_string(),
+        };
+        let next = step(state.clone(), &control, &context_alive(["leader"])).await;
+        assert_eq!(next, state);
+        assert!(control.directed().is_empty());
     }
 }

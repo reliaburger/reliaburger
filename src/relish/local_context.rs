@@ -116,6 +116,26 @@ impl LocalContext {
         .map(|client| client.with_service_endpoints(self.service_endpoints.clone()))
     }
 
+    /// This context's host forwards, for a connection pinned to the same
+    /// cluster CA.
+    ///
+    /// `--endpoint` bypasses the context's credentials so an operator can
+    /// talk to any node, say node 2 through its own API forward. The
+    /// registry and ingress forwards are still how this host reaches that
+    /// cluster, and without them relish falls back to the node's own
+    /// listener address, which means nothing outside the VM. The CA is the
+    /// identity check: a connection that trusts the same root CA talks to
+    /// the same cluster. Anything else (no CA, another CA, an unreadable
+    /// file) gets no forwards.
+    pub fn forwards_for_ca(
+        &self,
+        connection_ca_pem: Option<&[u8]>,
+    ) -> Option<crate::bun::capabilities::ServiceEndpoints> {
+        let connection_ca_pem = connection_ca_pem?;
+        let context_ca_pem = std::fs::read(&self.ca_cert).ok()?;
+        (context_ca_pem == connection_ca_pem).then(|| self.service_endpoints.clone())
+    }
+
     fn validate(&self) -> Result<(), RelishError> {
         if self.schema != 1
             || self.owner.is_empty()
@@ -365,5 +385,26 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn forwards_apply_only_to_a_connection_pinned_to_the_same_ca() {
+        let root = tempfile::tempdir().unwrap();
+        let ca_cert = root.path().join("root-ca.crt");
+        std::fs::write(&ca_cert, b"cluster ca").unwrap();
+        let mut context = context(root.path(), "cluster-a");
+        context.ca_cert = ca_cert;
+        context.service_endpoints.registry = Some("https://127.0.0.1:15050".to_string());
+
+        let forwards = context.forwards_for_ca(Some(b"cluster ca")).unwrap();
+        assert_eq!(
+            forwards.registry.as_deref(),
+            Some("https://127.0.0.1:15050")
+        );
+        assert!(context.forwards_for_ca(Some(b"another ca")).is_none());
+        assert!(context.forwards_for_ca(None).is_none());
+
+        context.ca_cert = root.path().join("missing.crt");
+        assert!(context.forwards_for_ca(Some(b"cluster ca")).is_none());
     }
 }

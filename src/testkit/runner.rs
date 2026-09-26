@@ -65,6 +65,8 @@ pub struct RunConfig {
     /// per-case isolation against a live cluster.
     pub fixed_namespace: Option<String>,
     pub(crate) lease_ownership: LeaseOwnership,
+    /// How cases reach peer nodes (see [`PeerRoute::detect`]).
+    pub peer_route: crate::testkit::context::PeerRoute,
 }
 
 /// Invalid runner input, rejected before tasks, leases or requests are created.
@@ -150,6 +152,7 @@ pub async fn run(cases: Vec<TestCase>, config: RunConfig) -> Result<TestReport, 
         let name = case.name.to_string();
         let group = case.group;
         let lease_ownership = config.lease_ownership;
+        let peer_route = config.peer_route;
 
         let handle = set.spawn(async move {
             // Acquire *inside* the task, not before spawning: the semaphore is
@@ -166,6 +169,7 @@ pub async fn run(cases: Vec<TestCase>, config: RunConfig) -> Result<TestReport, 
                 timeout,
                 profile,
                 lease_ownership,
+                peer_route,
             )
             .await;
             Indexed { index, result }
@@ -221,6 +225,8 @@ pub async fn run(cases: Vec<TestCase>, config: RunConfig) -> Result<TestReport, 
 }
 
 /// Run one case: skip-check, timed execution, then unconditional teardown.
+// Each argument is one per-run setting the case context is built from.
+#[allow(clippy::too_many_arguments)]
 async fn run_one(
     case: &TestCase,
     client: BunClient,
@@ -229,6 +235,7 @@ async fn run_one(
     timeout: Duration,
     profile: TestProfile,
     lease_ownership: LeaseOwnership,
+    peer_route: crate::testkit::context::PeerRoute,
 ) -> TestCaseResult {
     let start = Instant::now();
     let started_at = now_rfc3339();
@@ -450,6 +457,7 @@ async fn run_one(
         capabilities: capabilities.clone(),
         timeout,
         deadline,
+        peer_route,
     };
 
     // The case body gets its own task so a panic is data and the outer owner
@@ -618,6 +626,7 @@ mod tests {
             profile: TestProfile::Development,
             fixed_namespace: None,
             lease_ownership: LeaseOwnership::UnleasedForUnitTests,
+            peer_route: crate::testkit::context::PeerRoute::Direct,
         }
     }
 

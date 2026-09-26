@@ -302,6 +302,13 @@ pub async fn resume(client: &BunClient) -> Result<(), RelishError> {
     Ok(())
 }
 
+/// `relish upgrade abort` — end a paused upgrade that moved no node.
+pub async fn abort(client: &BunClient) -> Result<(), RelishError> {
+    let upgrade_id = client.upgrade_abort().await?;
+    println!("upgrade {upgrade_id} aborted; every node stays on its current version");
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Rendering (pure, snapshot-tested)
 // ---------------------------------------------------------------------------

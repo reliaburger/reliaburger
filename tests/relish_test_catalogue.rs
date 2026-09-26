@@ -26,9 +26,16 @@ fn secure_catalogue_node_jobs_have_durable_ownership_and_confirmed_cleanup() {
     qualify_process_catalogue("jobs");
 }
 
-fn qualify_process_catalogue(group: &str) {
-    let root = tempfile::tempdir().unwrap();
-    let cluster_dir = root.path().join("cluster");
+/// A secure single-node Bun on the process runtime, with an admin token.
+struct SecureNode {
+    bun: bun_process::BunProcess,
+    endpoint: String,
+    ca: std::path::PathBuf,
+    token: String,
+}
+
+fn start_secure_process_node(root: &std::path::Path) -> SecureNode {
+    let cluster_dir = root.join("cluster");
     assert_success(
         &run_relish(&[
             "init",
@@ -44,11 +51,11 @@ fn qualify_process_catalogue(group: &str) {
     let mut node = reliaburger::config::NodeConfig::from_file(&node_path).unwrap();
     node.node.name = Some("node-01".into());
     node.network.advertise_address = Some("127.0.0.1".into());
-    node.storage.data = root.path().join("data");
-    node.storage.images = root.path().join("images");
-    node.storage.logs = root.path().join("logs");
-    node.storage.metrics = root.path().join("metrics");
-    node.storage.volumes = root.path().join("volumes");
+    node.storage.data = root.join("data");
+    node.storage.images = root.join("images");
+    node.storage.logs = root.join("logs");
+    node.storage.metrics = root.join("metrics");
+    node.storage.volumes = root.join("volumes");
     node.images.registry_port = 0;
     node.process_workloads.allowed_binaries =
         vec!["/bin/sh".into(), "/bin/sleep".into(), "/bin/true".into()];
@@ -65,12 +72,12 @@ fn qualify_process_catalogue(group: &str) {
         (
             node_path.clone(),
             reserve_address(),
-            root.path().join("token-lease-bun.log"),
+            root.join("token-lease-bun.log"),
         )
     });
     let endpoint = format!("https://{address}");
-    let ca = cluster_dir.join("identity/root-ca.crt");
-    let ca = ca.to_str().unwrap();
+    let ca_path = cluster_dir.join("identity/root-ca.crt");
+    let ca = ca_path.to_str().unwrap();
     wait_for_relish(
         &mut bun,
         &["--endpoint", &endpoint, "--ca-cert", ca, "status"],
@@ -88,8 +95,7 @@ fn qualify_process_catalogue(group: &str) {
         "admin",
     ]);
     assert_success(&token, "create catalogue admin");
-    let token = String::from_utf8(token.stdout).unwrap();
-    let token = token.trim();
+    let token = String::from_utf8(token.stdout).unwrap().trim().to_string();
     let deadline = Instant::now() + WAIT;
     // The auth-store refresh is asynchronous; wait until anonymous management
     // is refused, so the probe cannot accidentally run in bootstrap mode.
@@ -104,6 +110,22 @@ fn qualify_process_catalogue(group: &str) {
         );
         std::thread::sleep(Duration::from_millis(100));
     }
+    SecureNode {
+        bun,
+        endpoint,
+        ca: ca_path,
+        token,
+    }
+}
+
+fn qualify_process_catalogue(group: &str) {
+    let root = tempfile::tempdir().unwrap();
+    let secure = start_secure_process_node(root.path());
+    let _bun = secure.bun;
+    let endpoint = secure.endpoint;
+    let ca = secure.ca.to_str().unwrap();
+    let token = secure.token.as_str();
+    let node_data = root.path().join("data");
     let output = run_relish(&[
         "--endpoint",
         &endpoint,
@@ -135,8 +157,7 @@ fn qualify_process_catalogue(group: &str) {
             assert_eq!(case["outcome"]["status"], "pass", "{case}");
             assert_eq!(case["cleanup"]["status"], "confirmed", "{case}");
         }
-        let leases =
-            std::fs::read_to_string(node.storage.data.join("node-test-leases.json")).unwrap();
+        let leases = std::fs::read_to_string(node_data.join("node-test-leases.json")).unwrap();
         assert!(!leases.contains("node-jobs-"), "{leases}");
         return;
     }
@@ -186,6 +207,124 @@ fn runc_catalogue_verifies_workload_spiffe_certificates() {
 #[ignore = "requires rootful runc, networking tools and registry access"]
 fn runc_catalogue_deploys_the_exact_image_pushed_to_pickle() {
     qualify_runc_catalogue("image-registry");
+}
+
+/// The V02 soak ran `relish test --endpoint <a node's forwarded API>` from the
+/// Mac. `--endpoint` bypassed the managed context, so the registry cases
+/// pushed to the node's own listener port, which nothing forwards. Relish now
+/// keeps the context's host forwards for a connection pinned to the same
+/// cluster CA. Here the forward is a counting TCP proxy on another port: the
+/// cases must pass *through it*.
+#[test]
+fn registry_cases_push_through_the_contexts_forward_with_an_explicit_endpoint() {
+    let root = tempfile::tempdir().unwrap();
+    let secure = start_secure_process_node(root.path());
+    let _bun = secure.bun;
+    let ca = secure.ca.to_str().unwrap();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+
+    let reported = runtime
+        .block_on(
+            reliaburger::relish::client::BunClient::new_with_ca(
+                &secure.endpoint,
+                Some(&secure.token),
+                &std::fs::read(&secure.ca).unwrap(),
+            )
+            .unwrap()
+            .capabilities_as_reported(),
+        )
+        .unwrap();
+    let listener = reported
+        .service_endpoints
+        .registry
+        .expect("the node reports its registry listener");
+    let registry_port = url::Url::parse(&listener)
+        .unwrap()
+        .port_or_known_default()
+        .unwrap();
+
+    let connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let forward = runtime
+        .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+        .unwrap();
+    let forward_port = forward.local_addr().unwrap().port();
+    assert_ne!(forward_port, registry_port);
+    let counted = connections.clone();
+    runtime.spawn(async move {
+        while let Ok((mut inbound, _)) = forward.accept().await {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::spawn(async move {
+                if let Ok(mut outbound) =
+                    tokio::net::TcpStream::connect(("127.0.0.1", registry_port)).await
+                {
+                    let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                }
+            });
+        }
+    });
+
+    // The managed context a quickstart would write, declaring that forward.
+    let home = root.path().join("relish-home");
+    reliaburger::relish::local_context::LocalContext {
+        schema: 1,
+        owner: "forward-fixture".to_string(),
+        endpoint: secure.endpoint.clone(),
+        token: secure.token.clone(),
+        ca_cert: secure.ca.clone(),
+        service_endpoints: reliaburger::bun::capabilities::ServiceEndpoints {
+            registry: Some(format!("https://127.0.0.1:{forward_port}")),
+            ..Default::default()
+        },
+    }
+    .save(&home.join("context.json"))
+    .unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_relish"))
+        .args([
+            "--endpoint",
+            &secure.endpoint,
+            "--ca-cert",
+            ca,
+            "--token",
+            &secure.token,
+            "--output",
+            "json",
+            "test",
+            "--filter",
+            "image-registry",
+            "--timeout",
+            "30s",
+        ])
+        .env("RELIABURGER_HOME", &home)
+        .env_remove("RELIABURGER_ENDPOINT")
+        .env_remove("RELIABURGER_TOKEN")
+        .env_remove("RELIABURGER_CA_CERT")
+        .output()
+        .unwrap();
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "invalid catalogue JSON: {error}; stdout={}; stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
+    for name in [
+        "push_and_pull_image_roundtrip",
+        "manifest_catalog_lists_pushed_image",
+    ] {
+        let case = report["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|case| case["name"] == name)
+            .unwrap_or_else(|| panic!("{name} missing from {report}"));
+        assert_eq!(case["outcome"]["status"], "pass", "{case}");
+    }
+    assert!(
+        connections.load(std::sync::atomic::Ordering::SeqCst) > 0,
+        "the registry cases never used the declared forward: {report}"
+    );
 }
 
 #[cfg(target_os = "linux")]

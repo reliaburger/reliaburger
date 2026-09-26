@@ -222,6 +222,46 @@ pub fn check_target(
     }
 }
 
+/// Whether one node can accept a cluster (network) upgrade directive, as
+/// input to [`check_network_prerequisites`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkReadiness {
+    /// How to name the node in an error: `node n1`.
+    pub node: String,
+    /// False when the node has no `upgrades.external_signing_key`, has no
+    /// upgrade manager, or doesn't report the field at all: each of those
+    /// refuses every network directive.
+    pub accepts_network_upgrades: bool,
+}
+
+/// Refuse a cluster upgrade that every node would refuse anyway.
+///
+/// Cluster directives always fetch the binary from Pickle, so every node
+/// demands the operator's external signature and a key to check it with.
+/// Recording a run that the first node rejects leaves a paused upgrade
+/// behind, and that paused upgrade blocks every later start until an
+/// operator clears it. Checking up front turns that into one clear 409.
+pub fn check_network_prerequisites(
+    external_signature: Option<&str>,
+    nodes: &[NetworkReadiness],
+) -> Result<(), UpgradeError> {
+    if external_signature.is_none_or(str::is_empty) {
+        return Err(UpgradeError::ExternalSignatureRequired);
+    }
+    let unready: Vec<&str> = nodes
+        .iter()
+        .filter(|node| !node.accepts_network_upgrades)
+        .map(|node| node.node.as_str())
+        .collect();
+    if unready.is_empty() {
+        Ok(())
+    } else {
+        Err(UpgradeError::NodesLackExternalKey {
+            nodes: unready.join(", "),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -451,5 +491,46 @@ mod tests {
                 node_id: "ghost".to_string()
             }
         );
+    }
+
+    fn readiness(node: &str, accepts: bool) -> NetworkReadiness {
+        NetworkReadiness {
+            node: format!("node {node}"),
+            accepts_network_upgrades: accepts,
+        }
+    }
+
+    #[test]
+    fn cluster_upgrade_without_an_external_signature_is_refused() {
+        let nodes = [readiness("a", true)];
+        let err = check_network_prerequisites(None, &nodes).unwrap_err();
+        assert!(
+            matches!(err, UpgradeError::ExternalSignatureRequired),
+            "{err}"
+        );
+        let err = check_network_prerequisites(Some(""), &nodes).unwrap_err();
+        assert!(matches!(err, UpgradeError::ExternalSignatureRequired));
+    }
+
+    #[test]
+    fn cluster_upgrade_is_refused_when_a_node_has_no_external_key() {
+        let nodes = [
+            readiness("a", true),
+            readiness("b", false),
+            readiness("c", false),
+        ];
+        let err = check_network_prerequisites(Some("sig"), &nodes).unwrap_err();
+        assert!(
+            matches!(err, UpgradeError::NodesLackExternalKey { ref nodes } if nodes == "node b, node c"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("upgrades.external_signing_key"));
+    }
+
+    #[test]
+    fn cluster_upgrade_proceeds_when_every_node_can_verify() {
+        let nodes = [readiness("a", true), readiness("b", true)];
+        check_network_prerequisites(Some("sig"), &nodes).unwrap();
+        check_network_prerequisites(Some("sig"), &[]).unwrap();
     }
 }
