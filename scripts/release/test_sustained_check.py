@@ -403,6 +403,58 @@ class Record(Evidence):
         self.assertEqual(checker.render(self.evidence, record), 1)
         self.assertIn("| workload identity rotations (soak-identity, per node) | 1 | ≥ 5 | FAIL |", record.read_text())
 
+    def render_tier(self, tier, failures=(), **metadata):
+        self.write_run(failures=failures)
+        run = json.loads((self.evidence / "metadata.json").read_text())
+        if tier == "final":
+            run.update(schedule="full", finished_at=NOW + 8 * 3600 + 120, duration_target=8 * 3600,
+                       ingress_rotation_secs=None)
+            state = checker.load_state(self.evidence)
+            state["renewals"]["workload-identity"] = {name: 16 for name in NODES}
+            checker.save_state(self.evidence, state)
+        else:
+            run.update(duration_target=90 * 60)
+        run.update(tier=tier, **metadata)
+        (self.evidence / "metadata.json").write_text(json.dumps(run))
+        record = self.evidence / "record.md"
+        code = checker.render(self.evidence, record)
+        return code, record.read_text()
+
+    def test_a_clean_fast_tier_says_clean_but_never_claims_acceptance(self):
+        code, text = self.render_tier("fast")
+        self.assertEqual(code, 0)
+        self.assertIn("fast tier, compressed schedule", text)
+        self.assertIn("**Fast tier: clean.**", text)
+        self.assertIn("not acceptance", text)
+        self.assertNotIn("gate passes", text)
+
+    def test_a_clean_final_tier_passes_the_gate(self):
+        code, text = self.render_tier("final")
+        self.assertEqual(code, 0)
+        self.assertIn("final tier, full schedule, 8 h 02 min", text)
+        self.assertIn("**Final tier: clean. The V02 soak gate passes** for the candidate whose `candidate.json` "
+                      "has SHA-256 `abc`", text)
+
+    def test_a_final_tier_with_an_open_failure_does_not_pass_the_gate(self):
+        code, text = self.render_tier("final", failures=["bun RSS 31% above its warm sample"])
+        self.assertEqual(code, 1)
+        self.assertIn("**Final tier: not clean. The V02 gate does not pass.**", text)
+        self.assertNotIn("gate passes", text)
+
+    def test_a_short_or_unpinned_final_tier_is_not_acceptance(self):
+        code, text = self.render_tier("final", finished_at=NOW + 4 * 3600, duration_target=4 * 3600,
+                                      candidate_digest="`not checked`")
+        self.assertEqual(code, 0)
+        self.assertIn("**Final tier: clean, but not acceptance:** it soaked for 4 h 00 min; "
+                      "the candidate digest was not checked", text)
+        self.assertNotIn("gate passes", text)
+
+    def test_a_run_without_a_tier_says_nothing_about_the_gate(self):
+        self.write_run()
+        record = self.evidence / "record.md"
+        self.assertEqual(checker.render(self.evidence, record), 0)
+        self.assertIn("**No tier (a custom run).**", record.read_text())
+
     def test_render_refuses_to_overwrite(self):
         self.write_run()
         record = self.evidence / "record.md"
