@@ -304,7 +304,7 @@ pub(crate) fn canonical_repository(name: &str) -> &str {
 /// <repo>` and are exempt by construction: unsigned upstream content
 /// stays deployable under `require_signatures` (it was never signable
 /// by us). Pinned by `check_image_schedulable_exempts_pull_through_cache`.
-/// TODO(Phase 13+): upstream trust policy (digest pinning, cosign).
+/// TODO(F03 in docs/progress.md): upstream trust policy (digest pinning, cosign).
 fn lookup_pickle_manifest<'a>(
     image_ref: &str,
     catalog: &'a crate::pickle::types::ManifestCatalog,

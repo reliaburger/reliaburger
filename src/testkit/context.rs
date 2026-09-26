@@ -42,7 +42,7 @@ pub const PINNED_TEST_WORKLOAD_IMAGE: &str = "public.ecr.aws/docker/library/busy
 /// The kernel drops any signal PID 1 has no handler for, and neither
 /// `busybox sleep` nor `busybox httpd` installs one. Run bare, each fixture
 /// sat out Bun's full stop grace (ten seconds) on every lease cleanup.
-const SIGTERM_TRAP: &str = "trap 'kill $! 2>/dev/null; exit 0' TERM; ";
+pub(crate) const SIGTERM_TRAP: &str = "trap 'kill $! 2>/dev/null; exit 0' TERM; ";
 
 /// Wrap `script` for `/bin/sh -c` so a SIGTERM stops it at once.
 ///
@@ -393,11 +393,6 @@ impl TestContext {
     /// the app name.
     pub fn container_http_spec(&self, app: &str, replicas: u32) -> String {
         let port = testapp_port(app);
-        let script = exit_on_sigterm(&format!(
-            "/bin/busybox mkdir -p /tmp/reliaburger-test-http; \
-             printf 'reliaburger-test' > /tmp/reliaburger-test-http/hostname; \
-             /bin/busybox httpd -f -p {port} -h /tmp/reliaburger-test-http"
-        ));
         format!(
             "[app.{app}]\n\
              image = \"{PINNED_TEST_WORKLOAD_IMAGE}\"\n\
@@ -877,11 +872,13 @@ pub(crate) fn container_http_script(port: u16, startup_delay_secs: u32) -> Strin
     } else {
         format!("/bin/busybox sleep {startup_delay_secs}; ")
     };
-    format!(
+    // No `exec`: httpd runs under the trapping shell, so PID 1 exits on
+    // SIGTERM instead of sitting out the stop grace.
+    exit_on_sigterm(&format!(
         "{delay}/bin/busybox mkdir -p {HTTP_ROOT}; \
          printf 'reliaburger-test' > {HTTP_ROOT}/hostname; \
-         exec /bin/busybox httpd -f -p {port} -h {HTTP_ROOT}"
-    )
+         /bin/busybox httpd -f -p {port} -h {HTTP_ROOT}"
+    ))
 }
 
 /// The directory [`container_http_script`] creates and serves.

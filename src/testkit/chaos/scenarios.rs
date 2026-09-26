@@ -632,6 +632,7 @@ pub fn all() -> Vec<TestCase> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::context::SIGTERM_TRAP;
 
     /// From a laptop the target's own API is out of reach, and the relay
     /// refuses fault requests. The node-kill must go to the entry node, which
@@ -751,7 +752,11 @@ mod tests {
             "{:?}",
             app_spec.command
         );
-        let script = &app_spec.command[2];
+        let wrapped = &app_spec.command[2];
+        let script = wrapped
+            .strip_prefix(SIGTERM_TRAP)
+            .and_then(|body| body.strip_suffix(" & wait"))
+            .unwrap_or_else(|| panic!("{wrapped:?} doesn't exit on SIGTERM"));
         let root = script
             .rsplit(" -h ")
             .next()
