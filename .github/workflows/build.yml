@@ -81,6 +81,7 @@ jobs:
         with:
           name: reliaburger-pdfs
           path: docs/_book/*.pdf
+          retention-days: 30
 
   test-packaging:
     runs-on: ubuntu-24.04
@@ -136,6 +137,7 @@ jobs:
           name: binaries-${{ matrix.suffix }}
           path: dist/*
           if-no-files-found: error
+          retention-days: 7
 
   build-guest-images:
     # The quickstart's VM image: pinned Ubuntu plus the node packages, so a
@@ -172,6 +174,7 @@ jobs:
           if-no-files-found: error
           # The qcow2 clusters are compressed already.
           compression-level: 0
+          retention-days: 7
 
   candidate:
     if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'

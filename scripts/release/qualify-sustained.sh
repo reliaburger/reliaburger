@@ -1272,7 +1272,8 @@ start_run() {
     if [ "$(uname -s)" = Darwin ]; then
         meta host "macOS $(sw_vers -productVersion), $(sysctl -n machdep.cpu.brand_string), $(( $(sysctl -n hw.memsize) / 1073741824 )) GiB"
     else
-        meta host "$(uname -srm)"
+        # shellcheck source=/dev/null
+        meta host "$(. /etc/os-release && printf '%s' "$PRETTY_NAME"), $(uname -srm), $(awk -F': ' '/^model name/ {print $2; exit}' /proc/cpuinfo), $(nproc) CPUs, $(awk '/^MemTotal/ {print int($2 / 1048576); exit}' /proc/meminfo) GiB"
     fi
 }
 

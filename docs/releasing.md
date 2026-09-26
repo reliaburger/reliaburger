@@ -310,6 +310,63 @@ this lands.
    refuses it as a version, and `promote.yml` refuses any tag containing
    `staging`.
 
+## Soaking a candidate in CI
+
+The V02 sustained soak ([plan](plans/2026-09-25-v02-sustained.md)) also runs
+on a hosted Linux runner. Once a candidate is staged:
+
+```sh
+gh workflow run soak.yml --ref main \
+  -f staging_tag=staging-v0.1.0-RUN_ID-ATTEMPT \
+  -f qualified_digest=QUALIFIED_DIGEST \
+  -f duration=90m -f schedule=compressed
+```
+
+`staging_tag` also takes the staged base URL. The job runs on `ubuntu-24.04`
+(x86_64, 4 vCPUs, 16 GiB), opens `/dev/kvm` to the runner user with the udev
+rule GitHub documents for the Android emulator, installs QEMU (the Linux
+quickstart leaves QEMU to the user) and runs `qualify-sustained.sh` with the
+inputs. The harness bootstraps the three-node quickstart cluster with
+`curl | sh` from the staging pre-release, soaks it and tears it down. The
+cluster's three VMs (2 vCPUs and 2 GiB each) overcommit the runner's four
+cores but fit in memory, so no VM sizing changes. It isn't slow: in the
+first run `curl | sh` to a ready cluster took 84 s, the whole setup to the
+first fault under 4 minutes, and faults settled in 20–90 s.
+
+The record lands in the job summary. The artefacts, kept for 30 days, are
+`soak-record-*` (the Markdown record), `soak-evidence-*` (the whole evidence
+directory, less the cluster token and the soak CA's keys) and, when the job
+fails, `soak-failures-*` (the failure bundles, the bootstrap log and any Lima
+logs). A record that says FAIL fails the job; that's the soak doing its job,
+not the workflow breaking. Triage the failure rows as the plan describes.
+
+What it covers, and what it doesn't:
+
+- **Hosted jobs stop at 6 hours.** The workflow refuses a duration that
+  wouldn't fit next to about 45 minutes of setup, one cycle that starts just
+  before the end and teardown: up to 285 minutes compressed, 235 minutes on
+  the full schedule. That covers the compressed (fast) tier and full-schedule
+  runs of about four hours. The 8-hour final tier, and the 12-hour lane A run,
+  still need a long-running host or a self-hosted runner.
+- **No upgrade walks.** They need a private soak build (`0.1.0-soak.1`) signed
+  with the release key (D2), and nothing in CI signs with it, so the harness
+  skips the upgrade slots and the record says so. Run those on a host that
+  holds the key.
+- **One platform.** Linux x86_64 with Lima's QEMU driver. The macOS VZ path is
+  lane A's host.
+
+**Follow-up: a signed soak build in CI.** Upgrade slots on Actions would need
+a job that builds bun at the candidate commit with version `0.1.0-soak.1` and
+signs it with `relish dev sign-binary --key`. That means the release signing
+key as an Actions secret, reachable from a workflow anyone with write access
+can dispatch, on a runner that also runs third-party actions. A binary signed
+that way is a genuine release-signed bun below 0.1.0: if it leaked from an
+artefact or a cache, any cluster that trusts the release key would accept it
+as a downgrade target. Doing it safely needs its own environment with
+required reviewers, the key used in one step and never written to disk,
+signing inside the soak job so the build never leaves the runner or becomes
+an artefact, and ideally a separate soak key that only soak clusters trust. None of that is in place, so CI doesn't try.
+
 ## Qualifying a candidate from another host
 
 `stage.yml` is the usual way to get the candidate onto HTTPS. Any other HTTPS
