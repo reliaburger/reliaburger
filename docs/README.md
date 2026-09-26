@@ -275,11 +275,6 @@ mutate the Apple daemon, and their recovery guarantees are not yet complete.
 The adapter and its manual development tests remain in the repository for future
 work; they are outside the 0.1.0 runtime profile.
 
-### Linux containers: run a cluster on your own Linux servers
-
-For 0.1.0, you can also deploy reliaburger to pre-existing Linux VMs or bare-metal servers
-if you already have that computing power available. Check this [procedure here](linux-servers.md).
-
 ### ProcessGrill (built-in fallback)
 
 Spawns native processes on macOS and Linux, without namespaces, cgroups or rootfs
@@ -546,6 +541,10 @@ to `1h` (default `15m`), requires an Admin bearer after bootstrap, commits only
 the token hash and expiry to Raft, and prints the plaintext once. During an
 election, retry against the current leader: a follower returns an error and
 does not commit or disclose a usable token.
+
+For the whole walkthrough on three Linux VMs or bare-metal servers you
+already run, from packages and firewall rules to systemd units, see
+[Running Reliaburger on your own Linux servers](linux-servers.md).
 
 Keep `[cluster].name` identical on every node. `relish init`, `relish setup`
 and `relish dev create` write it for you; Bun validates it as a DNS-style SPIFFE trust domain.
