@@ -117,3 +117,8 @@ relish dev create --nodes 3
 relish dev shell reliaburger-1
 relish dev destroy
 ```
+
+## Run a cluster on your own Linux servers
+
+You can also deploy reliaburger to pre-existing Linux VMs or bare-metal servers
+if you already have that computing power available. Check this [procedure here](../linux-servers.md).
