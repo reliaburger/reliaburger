@@ -1220,6 +1220,11 @@ async fn losing_the_leader_node_places_only_its_replica_on_the_survivors() {
 /// kills its containers must bring the app back to three running replicas on
 /// the two survivors. The killed node's API stays open, so whatever it
 /// reports is observed but not counted: only the survivors carry the load.
+///
+/// Then the case heals the node the way `relish test` from a laptop does:
+/// through another node, after gossip has declared the target dead and
+/// stopped publishing it. The clear must still reach the target, and the
+/// target must rejoin, instead of staying dead until the fault expires.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 #[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
 async fn a_killed_worker_has_its_replica_rescheduled_on_the_survivors() {
@@ -1259,7 +1264,7 @@ async fn a_killed_worker_has_its_replica_rescheduled_on_the_survivors() {
         .filter(|node| node.name != target.name)
         .collect();
 
-    entry
+    let summary = entry
         .client
         .inject_fault(&FaultRequest {
             fault_type: FaultType::NodeKill {
@@ -1298,6 +1303,32 @@ async fn a_killed_worker_has_its_replica_rescheduled_on_the_survivors() {
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+
+    let router = survivors[0];
+    let declared_dead = wait_until(Duration::from_secs(60), || {
+        peer_state(router, &target.name).is_none()
+    })
+    .await;
+    assert!(
+        declared_dead,
+        "{} still publishes {} as {:?}",
+        router.name,
+        target.name,
+        peer_state(router, &target.name)
+    );
+    router
+        .client
+        .clear_fault(summary.id, Some(&target.name), false)
+        .await
+        .expect("the clear reaches a node gossip has declared dead");
+    let rejoined = wait_until(Duration::from_secs(30), || {
+        survivors.iter().all(|observer| {
+            peer_state(observer, &target.name)
+                == Some(reliaburger::mustard::state::NodeState::Alive)
+        })
+    })
+    .await;
+    assert!(rejoined, "{} did not rejoin after its clear", target.name);
     shutdown.cancel();
 }
 
