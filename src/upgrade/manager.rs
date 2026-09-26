@@ -29,6 +29,28 @@ use super::version::BinaryVersion;
 /// How many history entries `status()` returns.
 const STATUS_HISTORY_LIMIT: usize = 20;
 
+/// How hard a node tries to fetch a binary whose source is unavailable
+/// before it answers the directive with a transient refusal.
+///
+/// The budget is short on purpose: the fetch runs while the agent holds its
+/// command loop and the orchestrator waits on the HTTP answer. Longer outages
+/// are the orchestrator's job, which re-sends the directive for minutes
+/// (see `orchestrator::DIRECTIVE_RETRY_WINDOW`).
+#[derive(Debug, Clone, Copy)]
+struct FetchRetry {
+    /// Stop retrying once another backoff would pass this much time.
+    budget: std::time::Duration,
+    /// The first wait; each later one doubles, up to `max_backoff`.
+    initial_backoff: std::time::Duration,
+    max_backoff: std::time::Duration,
+}
+
+const DEFAULT_FETCH_RETRY: FetchRetry = FetchRetry {
+    budget: std::time::Duration::from_secs(10),
+    initial_backoff: std::time::Duration::from_millis(500),
+    max_backoff: std::time::Duration::from_secs(4),
+};
+
 /// A prepared upgrade: verified, staged, marked. Ready for [`execute`].
 ///
 /// [`execute`]: UpgradeManager::execute
@@ -84,6 +106,8 @@ pub struct UpgradeManager {
     /// Hex SHA-256 of the running binary, hashed once on first use (see
     /// [`UpgradeManager::running_binary_sha256`]).
     running_sha256: std::sync::Arc<tokio::sync::OnceCell<String>>,
+    /// Retry policy for an unavailable binary source.
+    fetch_retry: FetchRetry,
 }
 
 /// Derive the store stem from the executable path bun was invoked as.
@@ -149,6 +173,7 @@ impl UpgradeManager {
             max_boot_attempts: config.max_boot_attempts,
             cluster_http: crate::cluster::ClusterHttp::plaintext(),
             running_sha256: std::sync::Arc::new(tokio::sync::OnceCell::new()),
+            fetch_retry: DEFAULT_FETCH_RETRY,
         })
     }
 
@@ -683,31 +708,66 @@ impl UpgradeManager {
                         directive.binary_sha256
                     ),
                 );
-                // `get` carries the internal service token as a bearer: on a
-                // routable cluster the registry sets `require_read_auth`, so a
-                // bearer-less binary fetch 401s (B2).
-                let response = self.cluster_http.get(&url).send().await.map_err(|e| {
-                    UpgradeError::FetchFailed {
-                        url: url.clone(),
-                        reason: e.to_string(),
-                    }
-                })?;
-                if !response.status().is_success() {
-                    return Err(UpgradeError::FetchFailed {
-                        url,
-                        reason: format!("status {}", response.status()),
-                    });
-                }
-                let bytes = response
-                    .bytes()
-                    .await
-                    .map_err(|e| UpgradeError::FetchFailed {
-                        url,
-                        reason: e.to_string(),
-                    })?;
-                Ok(bytes.to_vec())
+                self.fetch_with_retry(&url).await
             }
         }
+    }
+
+    /// Fetch `url`, riding out a source that is briefly unavailable (a
+    /// registry restarting with its node) for up to the retry budget.
+    /// A permanent failure returns at once.
+    async fn fetch_with_retry(&self, url: &str) -> Result<Vec<u8>, UpgradeError> {
+        let started = tokio::time::Instant::now();
+        let mut backoff = self.fetch_retry.initial_backoff;
+        loop {
+            let error = match self.fetch_once(url).await {
+                Ok(bytes) => return Ok(bytes),
+                Err(error) => error,
+            };
+            if !error.is_transient() || started.elapsed() + backoff > self.fetch_retry.budget {
+                return Err(error);
+            }
+            eprintln!(
+                "bun: {error}; retrying the binary fetch in {}ms",
+                backoff.as_millis()
+            );
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(self.fetch_retry.max_backoff);
+        }
+    }
+
+    /// One GET of the binary, classified: connection trouble, a cut-off
+    /// body and 5xx/408/429 are [`UpgradeError::FetchUnavailable`]; any
+    /// other non-success status is [`UpgradeError::FetchFailed`].
+    async fn fetch_once(&self, url: &str) -> Result<Vec<u8>, UpgradeError> {
+        let unavailable = |reason: String| UpgradeError::FetchUnavailable {
+            url: url.to_string(),
+            reason,
+        };
+        // `get` carries the internal service token as a bearer: on a
+        // routable cluster the registry sets `require_read_auth`, so a
+        // bearer-less binary fetch 401s (B2).
+        let response = self
+            .cluster_http
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| unavailable(e.to_string()))?;
+        let status = response.status();
+        if super::is_transient_status(status) {
+            return Err(unavailable(format!("status {status}")));
+        }
+        if !status.is_success() {
+            return Err(UpgradeError::FetchFailed {
+                url: url.to_string(),
+                reason: format!("status {status}"),
+            });
+        }
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| unavailable(e.to_string()))?;
+        Ok(bytes.to_vec())
     }
 
     /// First-upgrade bootstrap: if the running version has no versioned
@@ -833,7 +893,7 @@ mod tests {
             release_keys_override: Some(vec![encode_public_key(&release_public)]),
             ..UpgradeSection::default()
         };
-        let manager = UpgradeManager::new(
+        let mut manager = UpgradeManager::new(
             &config,
             &data_dir,
             &binary_dir.join("bun"),
@@ -845,6 +905,12 @@ mod tests {
             ],
         )
         .unwrap();
+        // Same retry behaviour, a test-sized budget.
+        manager.fetch_retry = FetchRetry {
+            budget: std::time::Duration::from_millis(300),
+            initial_backoff: std::time::Duration::from_millis(10),
+            max_backoff: std::time::Duration::from_millis(50),
+        };
 
         Fixture {
             _dir: dir,
@@ -1495,7 +1561,7 @@ mod tests {
 
         let plaintext = fixture.manager.fetch_binary(&directive).await;
         match plaintext {
-            Err(UpgradeError::FetchFailed { url, .. }) => {
+            Err(UpgradeError::FetchUnavailable { url, .. }) => {
                 assert!(url.starts_with("http://127.0.0.1:1/v2/"), "got {url}");
             }
             other => panic!("expected a fetch failure, got {other:?}"),
@@ -1507,7 +1573,7 @@ mod tests {
             .fetch_binary(&directive)
             .await;
         match secure {
-            Err(UpgradeError::FetchFailed { url, .. }) => {
+            Err(UpgradeError::FetchUnavailable { url, .. }) => {
                 assert!(url.starts_with("https://127.0.0.1:1/v2/"), "got {url}");
             }
             other => panic!("expected a fetch failure, got {other:?}"),
@@ -1560,6 +1626,158 @@ mod tests {
             request.contains("authorization: bearer rbrg_service"),
             "binary fetch did not carry the service-token bearer:\n{request}"
         );
+    }
+
+    /// What a [`flaky_registry`] does with one request.
+    #[derive(Clone, Copy)]
+    enum RegistryAnswer {
+        /// Close the connection without answering (a registry mid-restart).
+        Hangup,
+        /// Answer with this status line and no body.
+        Status(&'static str),
+        /// Answer 200 with the blob.
+        Blob,
+    }
+
+    /// A registry that gives `script`'s answers in order, then serves the
+    /// blob. Returns its address and a count of requests it saw.
+    async fn flaky_registry(
+        script: Vec<RegistryAnswer>,
+        blob: Vec<u8>,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = requests.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = vec![0u8; 8192];
+                let _ = socket.read(&mut buf).await;
+                let index = seen.fetch_add(1, Ordering::SeqCst);
+                let answer = script.get(index).copied().unwrap_or(RegistryAnswer::Blob);
+                match answer {
+                    RegistryAnswer::Hangup => drop(socket),
+                    RegistryAnswer::Status(line) => {
+                        let response = format!(
+                            "HTTP/1.1 {line}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                        );
+                        let _ = socket.write_all(response.as_bytes()).await;
+                    }
+                    RegistryAnswer::Blob => {
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                            blob.len()
+                        );
+                        let _ = socket.write_all(head.as_bytes()).await;
+                        let _ = socket.write_all(&blob).await;
+                    }
+                }
+            }
+        });
+        (address, requests)
+    }
+
+    /// A directive for a properly signed binary served by `registry`.
+    fn pickle_directive(fixture: &Fixture, bytes: &[u8], registry: &str) -> UpgradeDirective {
+        UpgradeDirective {
+            source: BinarySource::Pickle {
+                registry_address: registry.to_string(),
+            },
+            network_provenance: true,
+            ..directive_for(fixture, bytes, "pickle-1")
+        }
+    }
+
+    /// The V02 soak failure, node side: the leader restarted, and a worker
+    /// asked its registry for the binary before it was listening again.
+    #[tokio::test]
+    async fn prepare_rides_out_a_registry_that_is_briefly_unavailable() {
+        let fixture = fixture();
+        let binary = compatible_binary(b"from a restarting registry");
+        let (registry, requests) = flaky_registry(
+            vec![
+                RegistryAnswer::Hangup,
+                RegistryAnswer::Status("503 Service Unavailable"),
+            ],
+            binary.clone(),
+        )
+        .await;
+        let directive = pickle_directive(&fixture, &binary, &registry);
+
+        let prepared = fixture.manager.prepare(&directive, vec![]).await.unwrap();
+
+        assert!(prepared.is_some());
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn a_blob_the_registry_does_not_hold_is_refused_without_retrying() {
+        let fixture = fixture();
+        let binary = compatible_binary(b"never pushed");
+        let (registry, requests) = flaky_registry(
+            vec![RegistryAnswer::Status("404 Not Found")],
+            binary.clone(),
+        )
+        .await;
+        let directive = pickle_directive(&fixture, &binary, &registry);
+
+        let error = fixture
+            .manager
+            .prepare(&directive, vec![])
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, UpgradeError::FetchFailed { .. }), "{error}");
+        assert!(!error.is_transient());
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_registry_down_for_the_whole_budget_is_a_transient_failure() {
+        let fixture = fixture();
+        let binary = compatible_binary(b"registry never comes back");
+        let (registry, requests) =
+            flaky_registry(vec![RegistryAnswer::Hangup; 1000], binary.clone()).await;
+        let directive = pickle_directive(&fixture, &binary, &registry);
+
+        let error = fixture
+            .manager
+            .prepare(&directive, vec![])
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, UpgradeError::FetchUnavailable { .. }),
+            "{error}"
+        );
+        assert!(error.is_transient());
+        assert!(requests.load(std::sync::atomic::Ordering::SeqCst) > 1);
+        // Nothing staged: the running system is untouched.
+        assert!(!fixture.binary_dir.join("bun-v0.2.0").exists());
+    }
+
+    /// Bytes that fail verification are a refusal, even though they came
+    /// from a registry: retrying would fetch the same bytes again.
+    #[tokio::test]
+    async fn a_binary_that_fails_verification_is_not_transient() {
+        let fixture = fixture();
+        let binary = compatible_binary(b"the signed one");
+        let (registry, _) = flaky_registry(Vec::new(), compatible_binary(b"something else")).await;
+        let directive = pickle_directive(&fixture, &binary, &registry);
+
+        let error = fixture
+            .manager
+            .prepare(&directive, vec![])
+            .await
+            .unwrap_err();
+
+        assert!(!error.is_transient(), "{error}");
     }
 
     #[test]

@@ -879,3 +879,72 @@ Two small things changed on the way. The 409 for a start or rollback against a p
 The tests follow the layers. `plan::tests` covers the gate (no signature, empty signature, nodes that refuse), and `orchestrator::tests` checks that a `/v1/version` without the field probes as "can't accept". The same module covers abort on a clean pause, refusal for each of the three "moved" phases, refusal when not paused, supersede over a node that did move, and a `step` that leaves an aborted run alone. The cluster suite gets two real-binary tests. `start_refuses_when_a_node_cannot_verify_network_upgrades` boots two nodes, one without an external key, and checks that `relish upgrade start` fails naming that node with nothing recorded. `paused_upgrade_can_be_aborted_or_replaced_by_a_rollback` poisons a worker's binary so the run pauses, aborts it through relish, starts again (accepted, now that the slot is free), lets it pause a second time, and replaces that one with `relish upgrade rollback v0.1.0`, which completes.
 
 Running the whole upgrade suite twice in a row turned up a leak of our own. A single-node test deploys a workload on a fixed port, and workloads run under detached process owners precisely so they survive Bun's `exec`. They survived the test too. The next run found port 46071 already serving and its own instance never appeared. The harness now kills every process whose command line names its temporary directory, both in `shutdown` and in a `Drop` implementation. `Drop` is Rust's destructor: the compiler calls `drop(&mut self)` when a value goes out of scope, including while a panic unwinds the stack, so a failed assertion can't skip the cleanup the way it skips a `shutdown().await` at the end of the test.
+
+## One blip is not a refusal
+
+The V02 soak's next finding came from a chaos step, not a misconfiguration. Mid-walk, the harness SIGKILLed the leader's Bun. Node 3 had already upgraded. systemd brought the leader back three seconds later, and within the same second its orchestrator (the state lives in Raft, so the restart is just a resume) sent node 2 its directive. Node 2 asked the leader's Pickle registry for the binary. The registry wasn't listening yet: in the journal, "Pickle registry listening" comes eight lines *after* the pause. The fetch failed with "error sending request", node 2 answered 409 like any other refusal, and the orchestrator did what §14.9 told it to on a refusal. It paused. Ten minutes later the harness gave up and rolled back.
+
+Nothing was wrong with the binary, the signatures or node 2. The registry was simply three seconds late. So the question is: which failures mean "no", and which mean "not right now"?
+
+### Two kinds of failure, in the types
+
+"No" is anything that will give the same answer next time: a hash or signature that doesn't verify, a missing external key, a version the policy refuses, a registry that answers 404 because it doesn't hold the blob. "Not right now" is anything about reachability: a connection refused or reset, a body cut off halfway, a 5xx, a 408 or a 429. One helper, `upgrade::is_transient_status`, draws that line for HTTP statuses, and both sides of the directive use it.
+
+On the node, `fetch_binary` used to return `FetchFailed` for everything. It now has a sibling variant, `FetchUnavailable`, and `UpgradeError::is_transient()` is a one-line `matches!` over it. The node rides out an unavailable source itself for a short budget (10 s, backing off from 500 ms), because the fetch runs while the agent holds its command loop and the orchestrator is waiting on the HTTP answer. If the source is still down after that, the API answers **503** instead of 409. A guard on a match arm does it:
+
+```rust
+Ok(Err(crate::bun::BunError::Upgrade(error))) if error.is_transient() => (
+    StatusCode::SERVICE_UNAVAILABLE,
+    Json(serde_json::json!({ "error": error.to_string() })),
+)
+    .into_response(),
+Ok(Err(e)) => (StatusCode::CONFLICT, /* … */).into_response(),
+```
+
+The `if` after the pattern is a *match guard*: the arm only matches when the pattern fits *and* the condition holds, otherwise matching falls through to the next arm. Order matters, so the more specific arm goes first.
+
+On the leader, `NodeControl::direct_upgrade` used to return `Result<(), String>`. A `String` can't tell you whether to retry without someone parsing it, which is exactly the stringly-typed API the project guide warns about. It now returns a two-variant error:
+
+```rust
+pub enum DirectiveError {
+    Transient(String),
+    Refused(String),
+}
+```
+
+A Go programmer would reach for a sentinel error and `errors.Is`. The Rust version is stronger in one specific way: the orchestrator `match`es on the result, and the compiler refuses to build it until both variants have an arm. Nobody can add a third kind of failure later and forget to decide what the walk does with it. A failure to reach the node at all is `Transient` too, since a node that is itself restarting looks just like that.
+
+### Retrying without losing your place
+
+A transient failure leaves the node `Pending` and fills in a new `directive_retry` field on its record: attempts so far, when the first one failed, when the last one did, and what it said. Because that record lives in Raft, a leader that changes mid-retry carries on with the same count and the same window rather than starting over. The orchestrator re-sends when the backoff has passed (3 s, doubling, capped at 30 s) and gives up after `DIRECTIVE_RETRY_WINDOW`, two minutes from the first failure. Only then does the node go `Failed`, with a reason that says how long it tried, and the run pauses as before. A refusal skips all of that and pauses on the spot.
+
+The subtle part is the concurrency budget. A council member waiting out its backoff still *holds its slot*. If it didn't, the next tick would see a free slot and direct the next council member, and the walk would quietly reorder itself around a node that is owed its turn. So pass 2 takes the slot before it even looks at the backoff:
+
+```rust
+slots -= 1;
+if record
+    .directive_retry
+    .as_ref()
+    .is_some_and(|retry| !retry_due(retry, context.now))
+{
+    continue;
+}
+```
+
+`as_ref()` turns an `&Option<DirectiveRetry>` into an `Option<&DirectiveRetry>`, so we can look inside without moving the value out of the record, and `is_some_and` is `false` for `None` and the closure's answer for `Some`. Writing this turned up an older bug in the same loop. A refused directive marked the node `Failed` but didn't use up its slot, so with `parallel = 2` the loop went on to direct the *next* worker in the same tick, past the failure that was about to pause the run. A refusal now ends pass 2, the same rule pass 1 already applied.
+
+`set_phase` clears `directive_retry` on every transition out of `Pending`, and `resume` clears it too, so a resumed run gets a fresh two minutes. The new field changes what the Raft log stores, and the 503 changes what a directive can answer, so `compatibility::CURRENT` moved to protocol 27 and state 43.
+
+### What we decided not to do
+
+We thought about letting a node fetch the blob from *any* Pickle node rather than the one address in the directive. It would have dodged this particular outage. It isn't simple, though. `relish upgrade start` pushes the binary to one registry, and nothing guarantees the other nodes hold that raw blob by the time the walk reaches them. A node would also need a list of peer registries it doesn't have today. The retry fixes the failure we actually saw, a registry that is late, and a registry that is *gone* is still a pause the operator should see.
+
+We also didn't make the orchestrator wait for its own registry after a restart. The registry in the directive needn't be the leader's, and a retry covers that case and every other kind of blip with one mechanism.
+
+### Tests
+
+`orchestrator::tests` scripts the mock node's answers. `transient_directive_failure_keeps_the_node_pending_and_retries` walks the clock through two transient failures, checks that no attempt happens inside a backoff and that the third one succeeds. `transient_failures_past_the_retry_window_pause_the_run` ticks every three seconds for two minutes (between four and ten attempts, never paused) and then checks the pause names the last error. `refused_directive_pauses_at_once_and_starts_no_sibling` pins the refusal path, including the sibling bug. `a_node_retrying_holds_its_place_in_the_rolling_order` checks the slot. Three more point the real `HttpNodeControl` at a canned 503, a canned 409 and a closed port.
+
+In `manager::tests`, `flaky_registry` is a tiny TCP server that follows a script (hang up, answer a status, or serve the blob) and counts requests. `prepare_rides_out_a_registry_that_is_briefly_unavailable` gets a hang-up, then a 503, then the blob, and stages it on the third request. A 404 fails after exactly one request and isn't transient. A registry that never comes back is reported transient with nothing staged, and bytes that don't verify aren't transient even though they came over the network. An API test checks the 503/409 split end to end.
+
+The cluster suite gets `a_registry_outage_at_directive_time_does_not_pause_the_upgrade`. It puts a TCP proxy in front of the leader's registry that hangs up on everything for the first 25 seconds, longer than a node's own 10 s budget, so the orchestrator has to re-send. It points the upgrade at the proxy and requires the run to reach `Completed` with every node on v0.2.0, and requires that the outage actually turned fetches away. Otherwise the test would prove nothing.

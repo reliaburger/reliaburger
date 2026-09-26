@@ -143,6 +143,7 @@ where
             role: authoritative.role,
             from_version: None,
             phase: NodeUpgradePhase::Pending,
+            directive_retry: None,
             since: None,
         });
     }
