@@ -1523,6 +1523,23 @@ shell into it to write and read a file. A firewall case runs `busybox httpd` as
 the target and `wget`s it from another container. An ingress case puts `httpd`
 behind the proxy and sends it an HTTP request with the right `Host` header.
 
+There's a catch with running `sleep` or `httpd` as a container's first
+process. PID 1 is special: the kernel drops any signal it has no handler for,
+and neither command installs one for SIGTERM. So every stop sat out bun's full
+ten-second grace before the SIGKILL. Bun stops workloads on its single command
+loop, so a node retiring several test apps couldn't even answer `/v1/status`,
+and the V02 soak's catalogue pulse reported six passing cases with cleanup
+"not confirmed within 30 s". The fixtures now run under a shell that traps the
+signal:
+
+```sh
+trap 'kill $! 2>/dev/null; exit 0' TERM; /bin/busybox sleep infinity & wait
+```
+
+The command runs in the background because a trapped signal interrupts `wait`
+but not a foreground child. `$!` is the background job's PID, so the trap takes
+it down too.
+
 A tag isn't an identity, though. `busybox:latest` can point at different bytes
 between two runs, which makes a failure impossible to reproduce and lets the
 runtime architectures drift apart. The catalogue uses BusyBox 1.37.0's OCI

@@ -37,6 +37,22 @@ pub const BUN_BINARY_PATH: &str = "/usr/local/bin/bun";
 /// on repeated acceptance runs.
 pub const PINNED_TEST_WORKLOAD_IMAGE: &str = "public.ecr.aws/docker/library/busybox@sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028";
 
+/// Shell prefix that makes a container fixture's PID 1 exit on SIGTERM.
+///
+/// The kernel drops any signal PID 1 has no handler for, and neither
+/// `busybox sleep` nor `busybox httpd` installs one. Run bare, each fixture
+/// sat out Bun's full stop grace (ten seconds) on every lease cleanup.
+const SIGTERM_TRAP: &str = "trap 'kill $! 2>/dev/null; exit 0' TERM; ";
+
+/// Wrap `script` for `/bin/sh -c` so a SIGTERM stops it at once.
+///
+/// The script's last command runs in the background under a waiting shell,
+/// because a trapped signal interrupts `wait` but not a foreground child.
+/// The result has no `"` or `\`, so it embeds in a TOML basic string as is.
+fn exit_on_sigterm(script: &str) -> String {
+    format!("{SIGTERM_TRAP}{script} & wait")
+}
+
 /// How the runner reaches a peer node's own API.
 ///
 /// Some reads are node-local (`/v1/status` lists only that node's
@@ -334,8 +350,9 @@ impl TestContext {
         format!(
             "[app.{app}]\n\
              image = \"{PINNED_TEST_WORKLOAD_IMAGE}\"\n\
-             command = [\"/bin/busybox\", \"sleep\", \"infinity\"]\n\
+             command = [\"/bin/sh\", \"-c\", \"{script}\"]\n\
              namespace = \"{ns}\"\n",
+            script = exit_on_sigterm("/bin/busybox sleep infinity"),
             ns = self.namespace,
         )
     }
@@ -348,10 +365,15 @@ impl TestContext {
     /// the app name.
     pub fn container_http_spec(&self, app: &str, replicas: u32) -> String {
         let port = testapp_port(app);
+        let script = exit_on_sigterm(&format!(
+            "/bin/busybox mkdir -p /tmp/reliaburger-test-http; \
+             printf 'reliaburger-test' > /tmp/reliaburger-test-http/hostname; \
+             /bin/busybox httpd -f -p {port} -h /tmp/reliaburger-test-http"
+        ));
         format!(
             "[app.{app}]\n\
              image = \"{PINNED_TEST_WORKLOAD_IMAGE}\"\n\
-             command = [\"/bin/sh\", \"-c\", \"/bin/busybox mkdir -p /tmp/reliaburger-test-http; printf 'reliaburger-test' > /tmp/reliaburger-test-http/hostname; exec /bin/busybox httpd -f -p {port} -h /tmp/reliaburger-test-http\"]\n\
+             command = [\"/bin/sh\", \"-c\", \"{script}\"]\n\
              port = {port}\n\
              replicas = {replicas}\n\
              namespace = \"{ns}\"\n\
@@ -1456,9 +1478,59 @@ mod tests {
         let idle = Config::parse(&ctx.container_idle_spec("box")).unwrap();
         let box_app = idle.app.get("box").expect("app box");
         assert_eq!(box_app.namespace.as_deref(), Some("rbtest-abc-00"));
-        assert!(box_app.command.iter().any(|a| a == "sleep"));
+        assert!(box_app.command[2].contains("/bin/busybox sleep infinity"));
         assert!(box_app.health.is_none());
         assert!(std::path::Path::new(&box_app.command[0]).is_absolute());
+    }
+
+    /// A container's PID 1 ignores any signal it has no handler for, so a bare
+    /// `busybox sleep` or `httpd` sat out Bun's whole stop grace on every
+    /// lease cleanup, holding the node's agent loop for ten seconds each.
+    #[test]
+    fn container_fixtures_trap_sigterm_as_pid_one() {
+        let ctx = context("rbtest-abc-00");
+        let specs = [
+            ("web", ctx.container_http_spec("web", 1)),
+            ("box", ctx.container_idle_spec("box")),
+        ];
+        for (app, spec) in specs {
+            let config = Config::parse(&spec).unwrap();
+            let command = &config.app[app].command;
+            assert_eq!(command[..2], ["/bin/sh", "-c"], "{app}: {command:?}");
+            assert!(command[2].starts_with(SIGTERM_TRAP), "{app}: {command:?}");
+            assert!(command[2].ends_with("& wait"), "{app}: {command:?}");
+        }
+    }
+
+    /// The trap wrapper, run by the host's `sh`: TERM ends it at once with
+    /// status 0 while its long-running child is still going.
+    #[tokio::test]
+    async fn sigterm_wrapper_exits_promptly_while_its_child_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let ready = dir.path().join("ready");
+        let script = exit_on_sigterm(&format!("touch {}; sleep 30", ready.display()));
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .args(["-c", &script])
+            .spawn()
+            .unwrap();
+        let started = std::time::Instant::now();
+        while !ready.exists() {
+            assert!(started.elapsed() < Duration::from_secs(20), "never ready");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let pid = child.id().unwrap().to_string();
+        let killed = tokio::process::Command::new("kill")
+            .args(["-TERM", &pid])
+            .status()
+            .await
+            .unwrap();
+        assert!(killed.success());
+
+        let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
+            .await
+            .expect("the wrapper ignored SIGTERM")
+            .unwrap();
+        assert_eq!(status.code(), Some(0));
     }
 
     #[test]
