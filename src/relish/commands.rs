@@ -1746,11 +1746,11 @@ pub async fn wait_for_batch(
 /// uploads it to Pickle, and submits a build job.
 pub async fn build(
     path: &std::path::Path,
-    registry_port: u16,
+    registry_port: Option<u16>,
     timeout_secs: u64,
 ) -> Result<(), RelishError> {
     use crate::config::Config;
-    use crate::pickle::build::{digest_of, execute_build, tar_context};
+    use crate::pickle::build::{cli_context_upload_url, digest_of, execute_build, tar_context};
 
     let config = Config::from_file(path)?;
     if config.build.is_empty() {
@@ -1789,8 +1789,12 @@ pub async fn build(
         // O2: address the registry the way it actually serves. Hardcoding
         // `http://` failed outright against a TLS registry, and where it
         // worked it pushed the context — the caller's source tree — in clear.
-        let upload_url =
-            crate::pickle::build::context_upload_url(client.scheme(), registry_port, &digest);
+        let upload_url = cli_context_upload_url(
+            client.scheme(),
+            registry_port,
+            client.declared_registry(),
+            &digest,
+        );
         let resp = client
             .http()?
             .post(&upload_url)
@@ -1811,16 +1815,13 @@ pub async fn build(
         }
         println!("  context uploaded to Pickle");
 
-        // Prepare the build job (for display; the agent re-derives it)
-        let job = execute_build(
-            spec,
-            &digest,
-            Some(registry_port),
-            client.scheme() == "https",
-        )
-        .map_err(|e| RelishError::ApiError {
-            status: 0,
-            body: format!("build preparation failed: {e}"),
+        // Prepare the build job (for display; the agent re-derives it with
+        // its own registry port, which a host forward doesn't change).
+        let job = execute_build(spec, &digest, None, client.scheme() == "https").map_err(|e| {
+            RelishError::ApiError {
+                status: 0,
+                body: format!("build preparation failed: {e}"),
+            }
         })?;
 
         println!(

@@ -338,9 +338,11 @@ enum Command {
     Build {
         /// Path to a TOML config file with [build.*] sections.
         path: PathBuf,
-        /// Pickle registry port for context upload and image push.
-        #[arg(long, default_value_t = 5050)]
-        registry_port: u16,
+        /// Upload the context to the Pickle registry on this port of this
+        /// host. Default: the managed context's registry forward (15050 on
+        /// a quickstart), else 5050.
+        #[arg(long)]
+        registry_port: Option<u16>,
         /// Give up waiting after this many seconds (the server-side
         /// build timeout is 900s; the margin covers queueing).
         #[arg(long, default_value_t = 960)]
@@ -3251,7 +3253,14 @@ mod tests {
     fn parse_build_command() {
         let cli = parse(&["relish", "build", "build.toml"]).unwrap();
         match cli.command {
-            Command::Build { timeout, .. } => assert_eq!(timeout, 960),
+            Command::Build {
+                timeout,
+                registry_port,
+                ..
+            } => {
+                assert_eq!(timeout, 960);
+                assert_eq!(registry_port, None);
+            }
             _ => panic!("expected Build"),
         }
     }
