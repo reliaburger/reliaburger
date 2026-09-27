@@ -111,7 +111,10 @@ jobs:
           set -euo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y -qq qemu-system-x86 ovmf zstd
-          zstd -q -d image/mkosi.output/reliaburger-os_*.raw.zst -o "$RUNNER_TEMP/disk.raw"
+          zstd -q -d "$(ls image/mkosi.output/reliaburger-os_*.raw.zst | grep -v -e usr -e verity)" -o "$RUNNER_TEMP/disk.raw"
+          # An 8 GB disk, like the Wyse 3040: first boot adds slot B and grows
+          # the data partition into the free space.
+          truncate -s 8G "$RUNNER_TEMP/disk.raw"
           cp /usr/share/OVMF/OVMF_VARS_4M.fd "$RUNNER_TEMP/vars.fd"
           log="$RUNNER_TEMP/serial.log"
           # 2 GiB, like the Wyse 3040.
@@ -157,7 +160,7 @@ jobs:
         with:
           name: appliance-${{ matrix.arch }}
           path: |
-            image/mkosi.output/*.raw.zst
+            image/mkosi.output/*.raw*
             image/mkosi.output/*.efi
             image/mkosi.output/*.manifest
             image/mkosi.output/*.SHA256SUMS*

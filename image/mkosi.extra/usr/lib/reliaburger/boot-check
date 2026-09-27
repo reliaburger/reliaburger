@@ -7,6 +7,9 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
     if curl -fsS --max-time 2 http://127.0.0.1:9117/v1/health >/dev/null 2>&1 \
         || curl -fsSk --max-time 2 https://127.0.0.1:9117/v1/health >/dev/null 2>&1; then
         echo "reliaburger: bun healthy ($(/usr/lib/reliaburger/bin/bun --version 2>/dev/null))"
+        # The layout, so a boot test log shows the slots and the data partition.
+        lsblk -o NAME,SIZE,FSTYPE,PARTLABEL,MOUNTPOINTS 2>/dev/null | sed 's/^/reliaburger: disk: /'
+        findmnt -n -o TARGET,SOURCE,FSTYPE,OPTIONS / /usr 2>/dev/null | sed 's/^/reliaburger: mount: /'
         exit 0
     fi
     sleep 2
