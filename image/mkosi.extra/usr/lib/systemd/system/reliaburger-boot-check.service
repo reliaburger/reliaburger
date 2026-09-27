@@ -1,0 +1,17 @@
+# Reports on the console once bun answers its health endpoint. The CI boot
+# test waits for this line; the A/B update path (spike S4) will order the
+# same check before boot-complete.target so a slot is only blessed once bun
+# is healthy.
+[Unit]
+Description=Reliaburger boot check
+After=reliaburger.service
+Wants=reliaburger.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+StandardOutput=journal+console
+ExecStart=/usr/lib/reliaburger/boot-check
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,15 @@
+#!/bin/sh
+# Wait up to five minutes for bun's liveness endpoint, then say so on the
+# console. Exits non-zero (and says why) if bun never answers.
+set -u
+deadline=$(( $(date +%s) + 300 ))
+while [ "$(date +%s)" -lt "$deadline" ]; do
+    if curl -fsS --max-time 2 http://127.0.0.1:9117/v1/health >/dev/null 2>&1 \
+        || curl -fsSk --max-time 2 https://127.0.0.1:9117/v1/health >/dev/null 2>&1; then
+        echo "reliaburger: bun healthy ($(/usr/lib/reliaburger/bin/bun --version 2>/dev/null))"
+        exit 0
+    fi
+    sleep 2
+done
+echo "reliaburger: bun not healthy after 300 s"
+exit 1

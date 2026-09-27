@@ -1,0 +1,21 @@
+# bun on the appliance. The same restart and kill policy as the quickstart's
+# unit (src/relish/quickstart/provision.rs): owners outlive bun restarts.
+# Spike S1 runs bun standalone on loopback; appliance mode (claim, seed,
+# cluster config) replaces the ExecStart line in Phase 1.
+[Unit]
+Description=Reliaburger node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=/bin/sh -ec 'mountpoint -q /sys/fs/bpf || mount -t bpf bpf /sys/fs/bpf'
+ExecStart=/usr/lib/reliaburger/bin/bun --runtime runc --listen 127.0.0.1:9117
+Restart=always
+RestartSec=2
+LimitNOFILE=1048576
+KillMode=process
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

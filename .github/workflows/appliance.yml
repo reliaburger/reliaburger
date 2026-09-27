@@ -1,0 +1,166 @@
+name: Appliance image
+
+# The Reliaburger appliance: Ubuntu 26.04 built with mkosi, one native build
+# per architecture. This is spike stage S1
+# (docs/plans/2026-09-28-plan-appliance-image.md): it builds, boot-tests on
+# x86-64, and signs with a throwaway key. The weekly schedule, the OS signing
+# key and publishing come after the spike.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bun_release:
+        description: Release tag to take bun and relish from (default is the newest v* release, else the newest staging candidate)
+        required: false
+  pull_request:
+    branches: [main]
+    paths:
+      - "image/**"
+      - ".github/workflows/appliance.yml"
+
+concurrency:
+  group: appliance-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  image:
+    name: image (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 75
+    env:
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        # The tools tree, the package downloads and the image all land on the
+        # runner's root disk; drop toolchains this job never uses.
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Set up mkosi v27
+        uses: systemd/mkosi@f2b04fcd671110e3a7372027162752f71de0c9b0 # v27
+
+      - name: Fetch bun and relish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED: ${{ inputs.bun_release }}
+        run: |
+          set -euo pipefail
+          tag="$REQUESTED"
+          if [ -z "$tag" ]; then
+            tag=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 50 --json tagName \
+              --jq '[.[].tagName | select(startswith("v"))][0] // empty')
+          fi
+          if [ -z "$tag" ]; then
+            tag=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 50 --json tagName \
+              --jq '[.[].tagName | select(startswith("staging-v"))][0]')
+          fi
+          echo "BUN_RELEASE=$tag" >> "$GITHUB_ENV"
+          mkdir -p dl
+          gh release download "$tag" --repo "$GITHUB_REPOSITORY" --dir dl \
+            -p "bun-linux-$ARCH" -p "relish-linux-$ARCH" -p SHA256SUMS
+          (cd dl && sha256sum --check --ignore-missing SHA256SUMS)
+          install -D -m 0755 "dl/bun-linux-$ARCH" image/bin-tree/usr/lib/reliaburger/bin/bun
+          install -D -m 0755 "dl/relish-linux-$ARCH" image/bin-tree/usr/lib/reliaburger/bin/relish
+          echo "### bun and relish from \`$tag\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build the image
+        run: |
+          set -euo pipefail
+          version="$(date -u +%Y.%V).${GITHUB_RUN_NUMBER}"
+          echo "IMAGE_VERSION=$version" >> "$GITHUB_ENV"
+          start=$(date +%s)
+          mkosi -C image --image-version "$version" \
+            --extra-tree "$GITHUB_WORKSPACE/image/bin-tree" build
+          echo "BUILD_SECONDS=$(( $(date +%s) - start ))" >> "$GITHUB_ENV"
+
+      - name: Record sizes
+        run: |
+          set -euo pipefail
+          cd image/mkosi.output
+          {
+            echo "### Appliance $IMAGE_VERSION ($ARCH), built in ${BUILD_SECONDS} s"
+            echo '```'
+            ls -l
+            echo '```'
+            echo "Packages: $(jq '.packages | length' *.manifest 2>/dev/null || echo '?')"
+            echo "Kernel: $(jq -r '.packages[] | select(.name | startswith("linux-image-")) | "\(.name) \(.version)"' *.manifest 2>/dev/null | tr '\n' ' ')"
+            echo "Firmware: $(jq -r '.packages[] | select(.name | startswith("linux-firmware")) | .name' *.manifest 2>/dev/null | tr '\n' ' ')"
+            du -sh ../mkosi.tools 2>/dev/null | sed 's/^/Tools tree: /' || true
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Boot test (x86-64, KVM)
+        if: matrix.arch == 'x86_64'
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-system-x86 ovmf zstd
+          zstd -q -d image/mkosi.output/reliaburger-os_*.raw.zst -o "$RUNNER_TEMP/disk.raw"
+          cp /usr/share/OVMF/OVMF_VARS_4M.fd "$RUNNER_TEMP/vars.fd"
+          log="$RUNNER_TEMP/serial.log"
+          # 2 GiB, like the Wyse 3040.
+          qemu-system-x86_64 -machine q35,accel=kvm -cpu host -smp 2 -m 2048 \
+            -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
+            -drive if=pflash,format=raw,file="$RUNNER_TEMP/vars.fd" \
+            -drive if=virtio,format=raw,file="$RUNNER_TEMP/disk.raw" \
+            -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
+            -display none -serial "file:$log" -no-reboot &
+          qemu=$!
+          start=$(date +%s)
+          result=timeout
+          while [ $(( $(date +%s) - start )) -lt 600 ]; do
+            if grep -q "reliaburger: bun healthy" "$log" 2>/dev/null; then result=pass; break; fi
+            if grep -q "reliaburger: bun not healthy" "$log" 2>/dev/null; then result=fail; break; fi
+            if ! kill -0 "$qemu" 2>/dev/null; then result=exited; break; fi
+            sleep 5
+          done
+          elapsed=$(( $(date +%s) - start ))
+          kill "$qemu" 2>/dev/null || true
+          echo "--- serial console (last 150 lines) ---"
+          tail -n 150 "$log" || true
+          echo "### Boot test: $result after ${elapsed} s" >> "$GITHUB_STEP_SUMMARY"
+          grep "reliaburger:" "$log" >> "$GITHUB_STEP_SUMMARY" || true
+          [ "$result" = pass ]
+
+      - name: Sign with a throwaway key
+        # Spike only: a fresh Ed25519 key per run, so the signature proves the
+        # pipeline works and nothing else. The OS signing key comes later, in
+        # its own protected environment.
+        run: |
+          set -euo pipefail
+          cd image/mkosi.output
+          openssl genpkey -algorithm ed25519 -out "$RUNNER_TEMP/spike.key"
+          openssl pkey -in "$RUNNER_TEMP/spike.key" -pubout -out spike-signing-key.pub.pem
+          sums=$(ls *.SHA256SUMS)
+          openssl pkeyutl -sign -inkey "$RUNNER_TEMP/spike.key" -rawin -in "$sums" -out "$sums.sig"
+          openssl pkeyutl -verify -pubin -inkey spike-signing-key.pub.pem -rawin -in "$sums" -sigfile "$sums.sig"
+          rm -f "$RUNNER_TEMP/spike.key"
+
+      - name: Upload the image
+        uses: actions/upload-artifact@v4
+        with:
+          name: appliance-${{ matrix.arch }}
+          path: |
+            image/mkosi.output/*.raw.zst
+            image/mkosi.output/*.efi
+            image/mkosi.output/*.manifest
+            image/mkosi.output/*.SHA256SUMS*
+            image/mkosi.output/spike-signing-key.pub.pem
+          if-no-files-found: error
+          # zstd-compressed already; spike artefacts are for the next day's lab.
+          compression-level: 0
+          retention-days: 1
