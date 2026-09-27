@@ -63,8 +63,13 @@ pub async fn validate_purge_boundary(
 pub enum CouncilError {
     #[error("raft fatal: {0}")]
     Fatal(String),
-    #[error("not leader, leader is node {leader:?}")]
-    ForwardToLeader { leader: Option<u64> },
+    /// A write reached a follower. `leader` is the leader's node name, when
+    /// this node knows it.
+    #[error("not the leader{}", match leader {
+        Some(name) => format!(" (the leader is {name})"),
+        None => ", and no leader is known".to_string(),
+    })]
+    ForwardToLeader { leader: Option<String> },
     #[error("raft initialisation failed: {0}")]
     InitError(String),
     #[error("raft write failed: {0}")]

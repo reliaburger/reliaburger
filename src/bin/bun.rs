@@ -2366,6 +2366,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         None => None,
     };
 
+    let leader_directory = registry_directory.clone().map(api::LeaderDirectory);
     let registry_forwarder = if let Some(directory) = registry_directory {
         let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
         if let Some(identity) = &api_identity {
@@ -2441,6 +2442,10 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     };
     let app = match api_known_members {
         Some(known) => app.layer(axum::Extension(known)),
+        None => app,
+    };
+    let app = match leader_directory {
+        Some(directory) => app.layer(axum::Extension(directory)),
         None => app,
     };
     let app = match &api_identity {

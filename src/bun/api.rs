@@ -71,6 +71,15 @@ pub struct NodeMembershipInfo {
 #[derive(Clone)]
 pub struct KnownMembers(pub Arc<RwLock<Vec<NodeMembershipInfo>>>);
 
+/// The gossip control-plane directory, which names the leader and its API
+/// endpoint to every node, including workers outside Raft that have no
+/// leader in their own metrics. `bun` attaches it as a layer; without it a
+/// follower finds the leader through Raft alone.
+#[derive(Clone)]
+pub struct LeaderDirectory(
+    pub tokio::sync::watch::Receiver<crate::mustard::directory::NodeDirectory>,
+);
+
 impl KnownMembers {
     /// Take gossip's latest published members, remembering the rest.
     ///
@@ -1957,6 +1966,110 @@ fn agent_unavailable() -> Response {
         .into_response()
 }
 
+/// Marks an upgrade control call a follower has already forwarded, so two
+/// nodes that disagree about the leader can't pass it back and forth.
+const UPGRADE_FORWARDED_HEADER: &str = "x-reliaburger-upgrade-forwarded";
+
+/// How long a follower waits for the leader to answer a forwarded upgrade
+/// call. A start probes every node (five seconds each, concurrently) before
+/// its Raft write, so the budget is well above that.
+const UPGRADE_FORWARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Send an upgrade control call on to the leader when this node isn't it.
+///
+/// Only the leader can record a run, and openraft doesn't forward client
+/// writes, so `relish upgrade start` against a follower used to fail with
+/// "not leader". `None` means handle the call here: this node leads (and if
+/// it has just lost that, its Raft write says so). The caller's own
+/// credential travels with the request, so the leader repeats every
+/// authorisation check; the follower never adds its service identity.
+async fn forward_upgrade_to_leader(
+    state: &ApiState,
+    council: &crate::council::CouncilNode,
+    directory: Option<&LeaderDirectory>,
+    path: &str,
+    headers: &HeaderMap,
+    body: &str,
+) -> Option<Response> {
+    let leads = {
+        let metrics = council.metrics();
+        let metrics = metrics.borrow();
+        metrics.current_leader == Some(metrics.id)
+    };
+    if leads {
+        return None;
+    }
+    let unavailable = |error: &str| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": error })),
+        )
+            .into_response()
+    };
+    if headers.contains_key(UPGRADE_FORWARDED_HEADER) {
+        return Some(unavailable(
+            "this node was named the leader but isn't; retry once the election settles",
+        ));
+    }
+    let advertised = directory.and_then(|LeaderDirectory(directory)| {
+        let metrics = council.metrics();
+        let metrics = metrics.borrow();
+        crate::cluster::directory::leader_api_address(&metrics, &directory.borrow())
+    });
+    let leader_url = match advertised {
+        Some(address) => state.cluster_http.url(&address.to_string(), ""),
+        None => match leader_api_url(state, council).await {
+            Some(url) => url,
+            None => return Some(unavailable("no cluster leader known yet; retry shortly")),
+        },
+    };
+    let request = state
+        .cluster_http
+        .client()
+        .post(format!("{leader_url}{path}"))
+        .header(UPGRADE_FORWARDED_HEADER, "1")
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .body(body.to_string());
+    let request = copy_forwarded_auth(request, headers);
+    let exchange = async {
+        let response = request.send().await?;
+        let status = response.status().as_u16();
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .cloned();
+        let body = response.bytes().await?;
+        Ok::<_, reqwest::Error>((status, content_type, body))
+    };
+    let response = match tokio::time::timeout(UPGRADE_FORWARD_TIMEOUT, exchange).await {
+        Ok(Ok((status, content_type, body))) => {
+            let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+            let mut response = (status, body).into_response();
+            if let Some(content_type) = content_type
+                && let Ok(value) = axum::http::HeaderValue::from_bytes(content_type.as_bytes())
+            {
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::CONTENT_TYPE, value);
+            }
+            response
+        }
+        Ok(Err(error)) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "error": format!("failed to forward the upgrade call to the leader: {error}")
+            })),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            Json(serde_json::json!({ "error": "the leader did not answer the upgrade call in time" })),
+        )
+            .into_response(),
+    };
+    Some(response)
+}
+
 /// A node in a cluster upgrade start request.
 #[derive(serde::Deserialize)]
 struct StartUpgradeNode {
@@ -1974,6 +2087,8 @@ struct StartUpgradeNode {
 async fn upgrade_start_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
+    directory: Option<axum::Extension<LeaderDirectory>>,
+    headers: HeaderMap,
     body: String,
 ) -> Response {
     if let Err(resp) = authorize_cluster_admin(auth.as_deref()) {
@@ -2008,6 +2123,18 @@ async fn upgrade_start_handler(
         )
             .into_response();
     };
+    if let Some(forwarded) = forward_upgrade_to_leader(
+        &state,
+        council,
+        directory.as_deref(),
+        "/v1/upgrade/start",
+        &headers,
+        &body,
+    )
+    .await
+    {
+        return forwarded;
+    }
     let request: StartRequest = match serde_json::from_str(&body) {
         Ok(request) => request,
         Err(e) => {
@@ -2142,7 +2269,7 @@ async fn upgrade_start_handler(
         Err(e) => (
             StatusCode::CONFLICT,
             Json(serde_json::json!({
-                "error": format!("could not record the upgrade (are we the leader?): {e}")
+                "error": format!("could not record the upgrade: {e}")
             })),
         )
             .into_response(),
@@ -2240,7 +2367,7 @@ async fn archive_aborted_upgrade(
             return Err((
                 StatusCode::CONFLICT,
                 Json(serde_json::json!({
-                    "error": format!("could not end the paused upgrade (are we the leader?): {e}")
+                    "error": format!("could not end the paused upgrade: {e}")
                 })),
             )
                 .into_response());
@@ -2342,6 +2469,8 @@ async fn upgrade_cluster_handler(
 async fn upgrade_resume_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
+    directory: Option<axum::Extension<LeaderDirectory>>,
+    headers: HeaderMap,
 ) -> Response {
     if let Err(resp) = authorize_cluster_admin(auth.as_deref()) {
         return resp;
@@ -2353,6 +2482,18 @@ async fn upgrade_resume_handler(
         )
             .into_response();
     };
+    if let Some(forwarded) = forward_upgrade_to_leader(
+        &state,
+        council,
+        directory.as_deref(),
+        "/v1/upgrade/resume",
+        &headers,
+        "",
+    )
+    .await
+    {
+        return forwarded;
+    }
     let Some(upgrade) = council.desired_state().await.active_upgrade else {
         return (
             StatusCode::NOT_FOUND,
@@ -2397,6 +2538,8 @@ async fn upgrade_resume_handler(
 async fn upgrade_abort_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
+    directory: Option<axum::Extension<LeaderDirectory>>,
+    headers: HeaderMap,
 ) -> Response {
     if let Err(resp) = authorize_cluster_admin(auth.as_deref()) {
         return resp;
@@ -2408,6 +2551,18 @@ async fn upgrade_abort_handler(
         )
             .into_response();
     };
+    if let Some(forwarded) = forward_upgrade_to_leader(
+        &state,
+        council,
+        directory.as_deref(),
+        "/v1/upgrade/abort",
+        &headers,
+        "",
+    )
+    .await
+    {
+        return forwarded;
+    }
     let Some(upgrade) = council.desired_state().await.active_upgrade else {
         return (
             StatusCode::NOT_FOUND,
@@ -2441,6 +2596,8 @@ async fn upgrade_abort_handler(
 async fn upgrade_cluster_rollback_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
+    directory: Option<axum::Extension<LeaderDirectory>>,
+    headers: HeaderMap,
     body: String,
 ) -> Response {
     if let Err(resp) = authorize_cluster_admin(auth.as_deref()) {
@@ -2458,6 +2615,18 @@ async fn upgrade_cluster_rollback_handler(
         )
             .into_response();
     };
+    if let Some(forwarded) = forward_upgrade_to_leader(
+        &state,
+        council,
+        directory.as_deref(),
+        "/v1/upgrade/cluster-rollback",
+        &headers,
+        &body,
+    )
+    .await
+    {
+        return forwarded;
+    }
     let request: RollbackRequest = match serde_json::from_str(&body) {
         Ok(request) => request,
         Err(e) => {
@@ -11140,6 +11309,283 @@ schedule = "* * * * *"
         for server in servers {
             server.await.unwrap();
         }
+    }
+
+    /// One request the fake leader received: path, bearer, loop marker, body.
+    type SeenAtLeader = (String, Option<String>, bool, String);
+
+    /// Serve a fake leader API on `listener` that accepts every request and
+    /// records what it saw.
+    fn serve_recording_leader(
+        listener: tokio::net::TcpListener,
+    ) -> Arc<tokio::sync::Mutex<Vec<SeenAtLeader>>> {
+        let seen = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+        let leader = axum::Router::new().fallback(move |request: axum::extract::Request| {
+            let recorder = recorder.clone();
+            async move {
+                let path = request.uri().path().to_string();
+                let bearer = request
+                    .headers()
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok())
+                    .map(String::from);
+                let looped = request.headers().contains_key(UPGRADE_FORWARDED_HEADER);
+                let body = request.into_body().collect().await.unwrap().to_bytes();
+                let body = String::from_utf8_lossy(&body).to_string();
+                recorder.lock().await.push((path, bearer, looped, body));
+                (
+                    StatusCode::ACCEPTED,
+                    Json(serde_json::json!({ "status": "recorded by the leader" })),
+                )
+            }
+        });
+        tokio::spawn(async move { axum::serve(listener, leader).await.unwrap() });
+        seen
+    }
+
+    /// A three-node council led by node 1, whose API is a fake that records
+    /// every request and accepts it. Returns node 2's real router (a
+    /// follower) with `token` in its store, what the leader has seen, and
+    /// the council nodes to shut down.
+    async fn follower_of_a_recording_leader(
+        token: crate::sesame::types::ApiToken,
+    ) -> (
+        Router,
+        Arc<tokio::sync::Mutex<Vec<SeenAtLeader>>>,
+        Vec<Arc<crate::council::CouncilNode>>,
+    ) {
+        use crate::council::CouncilNode;
+        use crate::council::log_store::MemLogStore;
+        use crate::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
+        use crate::council::state_machine::CouncilStateMachine;
+        use crate::council::types::{CouncilConfig, CouncilNodeInfo};
+
+        let leader_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let leader_port = leader_listener.local_addr().unwrap().port();
+        let network = InMemoryRaftRouter::new();
+        let mut nodes = Vec::new();
+        let mut members = std::collections::BTreeMap::new();
+        for id in 1..=3 {
+            // Without gossip, a follower finds the leader's API at its Raft
+            // IP and the cluster's API port.
+            members.insert(
+                id,
+                CouncilNodeInfo {
+                    addr: std::net::SocketAddr::from(([127, 0, 0, 1], 7000 + id as u16)),
+                    name: format!("node-{id}"),
+                },
+            );
+            let node = Arc::new(
+                CouncilNode::new(
+                    id,
+                    CouncilConfig::default(),
+                    InMemoryRaftNetworkFactory::new(id, network.clone()),
+                    MemLogStore::new(),
+                    CouncilStateMachine::new(),
+                    None,
+                )
+                .await
+                .unwrap(),
+            );
+            network.register(id, node.raft().clone()).await;
+            nodes.push(node);
+        }
+        nodes[0].initialize(members).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while nodes[1].current_leader().await != Some(1) {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let seen = serve_recording_leader(leader_listener);
+
+        let (commands, _receiver) = mpsc::channel(4);
+        let store = crate::sesame::auth::new_token_store();
+        *store.write().await = vec![token];
+        let follower = router(
+            commands,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(nodes[1].clone()),
+            Some(store),
+            Some("internal".into()),
+            None,
+            None,
+            None,
+            leader_port,
+            None,
+        );
+        (follower, seen, nodes)
+    }
+
+    #[tokio::test]
+    async fn a_follower_forwards_upgrade_control_calls_to_the_leader_with_the_callers_token() {
+        let (admin, admin_key) = a_user_token(crate::sesame::types::ApiRole::Admin);
+        let (follower, seen, nodes) = follower_of_a_recording_leader(admin).await;
+
+        let calls = [
+            ("/v1/upgrade/start", r#"{"target_version":"v0.2.0"}"#),
+            ("/v1/upgrade/resume", ""),
+            ("/v1/upgrade/abort", ""),
+            (
+                "/v1/upgrade/cluster-rollback",
+                r#"{"target_version":"v0.1.0"}"#,
+            ),
+        ];
+        for (path, body) in calls {
+            let (status, reply) =
+                post_authenticated(follower.clone(), path, &admin_key, body, None).await;
+            assert_eq!(
+                status,
+                StatusCode::ACCEPTED,
+                "{path}: {}",
+                String::from_utf8_lossy(&reply)
+            );
+            assert!(
+                String::from_utf8_lossy(&reply).contains("recorded by the leader"),
+                "{path} was answered by the follower"
+            );
+        }
+        let seen = seen.lock().await.clone();
+        let expected: Vec<SeenAtLeader> = calls
+            .iter()
+            .map(|(path, body)| {
+                (
+                    path.to_string(),
+                    Some(format!("Bearer {admin_key}")),
+                    true,
+                    body.to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(seen, expected);
+        for node in nodes {
+            node.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_follower_checks_upgrade_authority_and_never_forwards_twice() {
+        let (reader, reader_key) = a_user_token(crate::sesame::types::ApiRole::ReadOnly);
+        let (follower, seen, nodes) = follower_of_a_recording_leader(reader).await;
+
+        let (status, _) =
+            post_authenticated(follower.clone(), "/v1/upgrade/abort", &reader_key, "", None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        // A request another node already forwarded, arriving at a node that
+        // isn't the leader either: the two disagree about who leads.
+        let looped = follower
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/upgrade/abort")
+                    .header("authorization", "Bearer internal")
+                    .header(UPGRADE_FORWARDED_HEADER, "1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(looped.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(seen.lock().await.is_empty(), "nothing reaches the leader");
+        for node in nodes {
+            node.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_worker_outside_raft_forwards_upgrade_calls_to_the_leader_gossip_names() {
+        use crate::council::CouncilNode;
+        use crate::council::log_store::MemLogStore;
+        use crate::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
+        use crate::council::state_machine::CouncilStateMachine;
+        use crate::council::types::CouncilConfig;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let leader_api = listener.local_addr().unwrap();
+        let seen = serve_recording_leader(listener);
+        // Never initialised and never added: its own Raft knows no leader.
+        let worker = Arc::new(
+            CouncilNode::new(
+                9,
+                CouncilConfig::default(),
+                InMemoryRaftNetworkFactory::new(9, InMemoryRaftRouter::new()),
+                MemLogStore::new(),
+                CouncilStateMachine::new(),
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+        let (_directory_tx, directory_rx) =
+            tokio::sync::watch::channel(crate::mustard::directory::NodeDirectory {
+                leader: Some(crate::mustard::message::LeaderHint {
+                    node_id: crate::meat::NodeId::new("node-1"),
+                    term: 1,
+                    api_address: leader_api,
+                    reporting_address: leader_api,
+                }),
+                ..Default::default()
+            });
+        let (admin, admin_key) = a_user_token(crate::sesame::types::ApiRole::Admin);
+        let (commands, _receiver) = mpsc::channel(4);
+        let store = crate::sesame::auth::new_token_store();
+        *store.write().await = vec![admin];
+        let router = |directory: Option<LeaderDirectory>| {
+            let app = router(
+                commands.clone(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(worker.clone()),
+                Some(store.clone()),
+                Some("internal".into()),
+                None,
+                None,
+                None,
+                // No Raft leader to take an address from: only the
+                // directory knows where the leader's API is.
+                1,
+                None,
+            );
+            match directory {
+                Some(directory) => app.layer(axum::Extension(directory)),
+                None => app,
+            }
+        };
+
+        let (status, _) =
+            post_authenticated(router(None), "/v1/upgrade/abort", &admin_key, "", None).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+
+        let (status, reply) = post_authenticated(
+            router(Some(LeaderDirectory(directory_rx))),
+            "/v1/upgrade/abort",
+            &admin_key,
+            "",
+            None,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "{}",
+            String::from_utf8_lossy(&reply)
+        );
+        let seen = seen.lock().await.clone();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, "/v1/upgrade/abort");
+        assert_eq!(seen[0].1, Some(format!("Bearer {admin_key}")));
+        worker.shutdown().await.unwrap();
     }
 
     #[tokio::test]
