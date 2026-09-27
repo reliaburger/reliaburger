@@ -2305,7 +2305,11 @@ Post-12b user-experience work (not a roadmap phase). Plan:
     and `ClusterSource` pulls the node's own platform from an index.
   - [x] Buildah runs on its own storage under `<storage.data>/buildah` and is
     pruned after every build; base images stay cached up to
-    `[images] build_cache_max_bytes` (1 GiB). Builds on one node queue.
+    `[images] build_cache_max_bytes` (100 GiB; quickstart nodes 1 GiB). Builds
+    on one node queue (maintainer: fine as is).
+  - [x] `relish images` shows a multi-platform image as one row with its
+    platforms (table and JSON); the catalogue records each index entry's
+    platform (`protocol` 28, `state` 45).
   - [ ] VM checks (plan, "Needs a VM later"): the tour end to end on a
     quickstart, a mixed-architecture pull, a networked `RUN` step next to the
     perimeter firewall; re-record `assets/tour.cast`.

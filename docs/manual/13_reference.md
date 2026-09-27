@@ -113,7 +113,7 @@ startup instead of being ignored.
 | `[network]` | `advertise_address`, host `port_range` |
 | `[security]` | master key, bootstrap and identity paths, `require_mtls`, `bootstrap_peers` (joining nodes through the perimeter), `operator_cidrs` (your networks to the API port only, see `security`), `leaf_lifetime_override_secs` (development only, see below) |
 | `[ebpf]`, `[dns]`, `[ingress]` | the data plane (see `networking`) |
-| `[images]` | registry, pull-through cache, mirrors, trust policy |
+| `[images]` | registry, pull-through cache, mirrors, trust policy, builds (`build_timeout_secs`, `max_context_bytes`, `build_cache_max_bytes`: 100 GiB, 1 GiB on a quickstart; see `images-and-volumes`) |
 | `[metrics]`, `[logs]`, `[alerts]` | observability (see `observability`) |
 | `[gitops]`, `[upgrades]` | see `operations` |
 | `[smoker]`, `[testing]` | fault durations and the fault and test policy (see `chaos`) |

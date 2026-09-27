@@ -95,7 +95,8 @@ After every build (success or failure), under a node-wide build lock:
 2. `buildah manifest rm <list>` (multi-platform) or `buildah rmi --force <tag>`;
 3. `buildah rmi --prune` (the unnamed per-platform and stage images);
 4. if the storage root is still over `[images] build_cache_max_bytes`
-   (default 1 GiB; 0 keeps nothing), `buildah rmi --all --force`.
+   (default 100 GiB, 1 GiB on quickstart nodes; 0 keeps nothing),
+   `buildah rmi --all --force`.
 
 Named base images (the `FROM` images) stay cached below the cap, so a warm
 build stays warm. The demo's Go base image is about 750 MB in vfs, under the
@@ -172,6 +173,32 @@ this).
       multi-node cluster, acceptance, demo app, build/guest-image jobs).
 - [ ] 8. The VM checks below, once no soak is running.
 
+### Round 2: maintainer answers (27 September)
+
+- [x] 9. `relish images` shows a multi-platform image as one row with its
+      platforms. The registry records each index entry's platform in the
+      catalogue at `PUT` (`LayerDescriptor::platform`), `ImageSummary` gains
+      `platforms` (omitted when empty), platform manifests with only digest
+      "tags" get no row, and `relish sign` still resolves a platform digest.
+      This changes the Raft catalogue and the node-to-node registry query, so
+      `CURRENT` goes to `protocol` 28, `state` 45: nodes on these formats
+      refuse older state, so upgrading an existing cluster needs a fresh
+      cluster or a migration (maintainer to decide before this ships).
+      Tests: `pickle::types` listing tests, the index `PUT` test, an `insta`
+      snapshot of the table, `relish sign` resolution.
+- [x] 10. `[images] build_cache_max_bytes` defaults to 100 GiB; the quickstart
+      `node.toml` (`relish/quickstart/provision.rs`) sets 1 GiB. Tests for
+      both; manual 11 and 13, `docs/README.md`, design doc, book.
+- [x] 11. Decision recorded: builds on one node queue behind the build lock,
+      and that's fine as is (maintainer, 27 September).
+- [ ] 12. After 0.1.0, time the tour on a real quickstart from `curl … | sh`
+      to the first `/order` reply. Keep the "five-minute" name for now;
+      rename it if the tour takes longer than five minutes.
+
+Note: 0.1.0 lists "multi-platform images in the built-in registry aren't
+supported yet" as a known limitation (release-docs PR, not this one). The
+multi-arch pull fix here ships after 0.1.0.
+
 ## Needs a VM later (don't do it during the soak)
 
 - Run the tour end to end on a quickstart (`relish build burger/burger.toml`,
@@ -186,10 +213,13 @@ this).
 
 ## Open questions
 
-- Is 1 GiB the right default cache cap? It keeps the demo warm on a 10 GiB
-  quickstart disk.
-- Should `relish images` hide the per-platform digest entries a multi-arch
-  push creates (they show up as digest "tags", as they already do for a
-  `docker push` of a multi-arch image)?
-- Should the homepage still call it a "five-minute" tour (open question 5 in
-  the PR)?
+All answered by the maintainer on 27 September:
+
+- Cache cap: 100 GiB default, 1 GiB on quickstart nodes (step 10).
+- `relish images`: one row per multi-platform image, with its platforms
+  (step 9).
+- Builds queue per node: fine as is (step 11).
+- "Five-minute" tour: keep the name; time it after 0.1.0 (step 12).
+
+Still for the maintainer: the format bump in step 9 (`protocol` 28,
+`state` 45) means a cluster on the older formats can't be upgraded in place.

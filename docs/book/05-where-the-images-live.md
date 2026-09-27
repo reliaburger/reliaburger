@@ -1011,13 +1011,22 @@ The pull side had a matching hole. Pickle's catalogue records an index with its 
 
 Signing needed a decision. A deploy verifies the manifest its tag names and pins the app to that digest, so that a tag moved between verification and pull changes nothing. For a multi-arch image, the tag names the index. The index's bytes list each platform manifest by digest, and every blob Pickle stores is checked against its digest, so a valid signature over the index covers whichever platform a node ends up pulling. We sign each platform manifest as well. It costs one Raft entry per platform, and it means an app pinned to one platform's digest verifies too.
 
+The listing needed one more fix. A multi-arch push leaves three catalogue entries: the index under its tag, and two platform manifests whose "tags" are their own digests, because that's how a push by digest is recorded. `relish images` showed all three as separate images, and nothing in the catalogue said which platform each was for: that lives in the index blob, and the node answering a listing may not hold it. So the registry now records each index entry's platform in the catalogue as it accepts the index, in a new `platform: Option<String>` on `LayerDescriptor`. The listing folds platform manifests into their index's row and prints the platforms instead.
+
+```rust
+#[serde(default, skip_serializing_if = "Option::is_none")]
+pub platform: Option<String>,
+```
+
+The two serde attributes keep old and new data readable by each other: `default` lets a catalogue written before the field existed load with `None`, and `skip_serializing_if` leaves the field out when there's nothing to say. The format still changed, so the compatibility generations go up (`protocol` 28, `state` 45), as every change to what nodes send each other or store does.
+
 ### Cleaning up after Buildah
 
 A cold build of the burger left about 900 MB in `/var/lib/containers`, on a quickstart disk of 10 GiB. Buildah keeps everything it touched: the Go base image, a working container per stage, an image per platform, the manifest list. Nothing removed any of it.
 
 The obvious fix, `buildah rmi --all` after each build, is also the dangerous one. `/var/lib/containers/storage` is Buildah's default, shared with podman and anything else on the host that uses the same libraries. An operator's own images live there. So the runner now gives Buildah storage of its own, `--root <storage.data>/buildah/root`, and prunes only that.
 
-After every build, whether it worked or not, the runner removes its working containers, the build's manifest list or image, and every image that has no name (the per-platform images and multi-stage intermediates). Base images have names (`golang:1.27.1-alpine`), so they survive, and the next build of the same app starts warm. If what's left is still over `[images] build_cache_max_bytes` (1 GiB by default), the whole cache goes. The Go base image takes about 750 MB in vfs, so the demo stays warm on a quickstart.
+After every build, whether it worked or not, the runner removes its working containers, the build's manifest list or image, and every image that has no name (the per-platform images and multi-stage intermediates). Base images have names (`golang:1.27.1-alpine`), so they survive, and the next build of the same app starts warm. If what's left is still over `[images] build_cache_max_bytes`, the whole cache goes. The default is 100 GiB, sized for a build server's disk. A quickstart node's 10 GiB disk can't spare that, so `relish setup --quickstart` writes 1 GiB into its `node.toml`. The Go base image takes about 750 MB in vfs, so the demo stays warm on a quickstart.
 
 Pruning `--all` containers is only safe if no other build is using the storage, so builds on one node now take turns:
 

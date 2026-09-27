@@ -11,6 +11,20 @@ pulls anywhere in the cluster come from peers.
 relish images             # what the cluster's registry holds
 ```
 
+A multi-platform image is one row, with the platforms it offers:
+
+```text
+REPOSITORY                     TAG             PLATFORMS                      LAYERS         SIZE
+burger                         v1              linux/amd64, linux/arm64            -       9.4 MB
+podinfo                        6.5.4           -                                   4      32.1 MB
+```
+
+LAYERS is `-` because each platform has its own. `relish images -o json`
+lists them under `platforms`, each with its own manifest `digest`, `layers`
+and `total_size`; a single-platform image has no `platforms` field. The
+image's `digest` is the index's, which is what a deploy of `burger:v1`
+verifies and pins.
+
 Private registries take credentials from environment variables that Bun reads
 at startup, so the password never sits in the config:
 
@@ -74,8 +88,8 @@ platforms quickly.
 A node builds one image at a time, in its own Buildah storage under
 `<storage.data>/buildah`. After every build it removes the build's containers
 and images and keeps base images for the next build, up to
-`[images] build_cache_max_bytes` (1 GiB by default; `0` keeps nothing). Past
-that, it removes every cached image.
+`[images] build_cache_max_bytes` (100 GiB by default, 1 GiB on a quickstart
+node; `0` keeps nothing). Past that, it removes every cached image.
 
 A `RUN` step that uses the network gets Buildah's own bridge (`podman0`,
 `10.88.0.0/16`), with Buildah's firewall rules next to Reliaburger's. The two
