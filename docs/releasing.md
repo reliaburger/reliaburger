@@ -93,10 +93,25 @@ roll or roll back only when both generations match exactly. The agent verifies
 the signed executable and checks this contract before staging it. Joins and
 cluster transports also enforce compatibility; absent evidence is a refusal.
 
-For a future incompatible wire or state change, bump the relevant generation
-and design migration separately. Leader-last upgrade ordering does not make an
-unknown Raft request safe during elections. Qualify the actual old/new binary
-pair before advertising it as supported.
+### Compatibility after 0.1.0
+
+A released cluster must upgrade in place, so a format change falls into one of
+two kinds:
+
+- **Additive: no bump.** A new optional field in a JSON or TOML record that old
+  nodes tolerate: it reads with `#[serde(default)]`, an `Option` is written with
+  `#[serde(skip_serializing_if = "Option::is_none")]`, no struct on its path has
+  `#[serde(deny_unknown_fields)]`, and an old node that ignores or drops the
+  field still behaves correctly.
+- **Incompatible: bump and migrate.** Anything old nodes can't read: renaming,
+  removing or retyping a field, a new enum variant, or any change to a
+  bincode-encoded struct (bincode is positional). Bump `protocol` or `state` in
+  `src/compatibility.rs`. Because generations must match exactly, the bump alone
+  would strand a released cluster, so it ships with a designed migration.
+
+Leader-last upgrade ordering does not make an unknown Raft request safe during
+elections. Qualify the actual old/new binary pair before advertising it as
+supported.
 
 ## Signing identity
 
