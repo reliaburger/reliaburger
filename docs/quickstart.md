@@ -1,9 +1,8 @@
 # A laptop cluster
 
-The managed quickstart is being qualified for 0.1.0. The public command below
-requires the signed GitHub release and the Pages site to be published. Don't
-expect it to work before then. Five minutes remains an acceptance target,
-not a measured guarantee.
+The managed quickstart installs the signed 0.1.0 release (released on
+YYYY-MM-DD) and builds a laptop cluster from it. Five minutes is the target;
+how long it takes depends on your connection and on what's already cached.
 
 ## Install and boot
 
@@ -166,13 +165,13 @@ relish setup --quickstart --release-mirror https://YOUR_HOST/candidate
 
 This keeps guest-image and binary signatures enabled. It
 cannot be combined with development binaries. Repeat the mirror option when
-resuming. The [release guide](releasing.md#qualifying-a-staged-candidate) covers
+resuming. The [release guide](releasing.md#qualifying-a-candidate-from-another-host) covers
 candidate verification and the matching installer environment variable.
 
 ## Development qualification
 
-Before a release exists, build Linux `bun` and `relish` with `--features ebpf`
-and supply their directory explicitly:
+To try a change that isn't in a release, build Linux `bun` and `relish` with
+`--features ebpf` and supply their directory explicitly:
 
 ```sh
 RELIABURGER_HOME=/absolute/path/to/isolated-state \
@@ -188,9 +187,9 @@ boot to take 15–40 s longer. It still verifies the Lima archive. It prints a
 notice and does not count as qualification of a signed, downloadable release.
 Use the same `RELIABURGER_HOME` for subsequent CLI and lifecycle commands.
 
-The outstanding release gates are tracked in the
-[0.1.0 plan](plans/2026-09-16-v0.1.0-release-plan.md), including clean-host timing,
-interrupted setup, real container networking, restart, recovery and cleanup.
+The [release runbook](releasing.md) lists the gates a candidate passes before
+it's published, including clean-host timing, interrupted setup, real container
+networking, restart, recovery and cleanup.
 
 The demo uses Docker's public ECR BusyBox repository, pinned to the same image
 index digest as the test workload. It does not need a Docker Hub login. Public

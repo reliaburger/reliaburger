@@ -18,9 +18,9 @@ it heal. Five minutes is the target.
 
 ## Five minutes, zero to cluster
 
-The one-line installer arrives with 0.1.0. Until the signed release is
-published, it stops with a release-not-published message. You'll need macOS, or
-Linux with QEMU and KVM, plus about 8 GiB of free memory and 15 GiB of disk.
+0.1.0 is out (released on YYYY-MM-DD), and the one-line installer fetches its
+signed release. You'll need macOS, or Linux with QEMU and KVM, plus about 8 GiB
+of free memory and 15 GiB of disk.
 
 ```sh
 # Install relish and build a three-node cluster in Linux VMs
@@ -317,8 +317,8 @@ and its trade-offs; the [design docs](docs/design/) cover each subsystem.
   whose outcome is unknown waits for `relish apply <file> --rerun-jobs`.
 
 The [documentation](docs/README.md#010-scope-and-limits) has the full list.
-[progress.md](docs/progress.md) tracks what's done and what's left before the
-release.
+[progress.md](docs/progress.md) tracks what's done and the backlog after
+0.1.0.
 
 ## Run it from source
 
