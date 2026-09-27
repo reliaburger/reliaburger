@@ -15,7 +15,7 @@ This file replaces `2026-09-27-plan-kairos-spike.md`. The maintainer chose the o
 - [x] Research note: netbooting VMs on a Mac (§8)
 - [x] Research note: Dell Wyse 3040 constraints (§9)
 - [x] This file: the spike stages
-- [ ] PR #218 title and body
+- [x] PR #218 title and body
 - [ ] Maintainer approval of the spike (not started)
 
 ## What the spike must prove
