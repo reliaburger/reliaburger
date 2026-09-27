@@ -295,6 +295,7 @@ Smaller fixes that CI runs turned up along the way:
 Fixes from the [static review in PR #258](https://github.com/reliaburger/reliaburger/pull/258) (its IDs):
 
 - [x] **B14** Match GitOps trusted signing keys exactly against the `VALIDSIG` signing or primary fingerprint (GPG) or the `SHA256:` fingerprint (SSH), not as a substring of all verifier output. Follow-up: verify against a private `GNUPGHOME` holding only the trusted keys.
+- [x] **B15** Treat a committed but refused GitOps write (`CouncilResponse::Refused`) as unapplied, so the sync doesn't advance `last_applied_commit` past it.
 
 ### Engineering follow-ups
 

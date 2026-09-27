@@ -771,8 +771,11 @@ async fn apply_changes(council: &CouncilNode, changes: &[ResourceChange]) -> Res
     let mut applied = 0;
     for change in changes {
         let Some(request) = change_to_request(change) else { continue };
-        if let Err(e) = council.write(request).await {
-            return Err(change_id(change).to_string());   // stop; don't advance
+        match council.write(request).await {
+            Ok(CouncilResponse::Refused { .. }) | Err(_) => {
+                return Err(change_id(change).to_string());   // stop; don't advance
+            }
+            Ok(_) => {}
         }
         applied += 1;
     }
@@ -785,6 +788,8 @@ async fn apply_changes(council: &CouncilNode, changes: &[ResourceChange]) -> Res
 The caller advances `last_applied_commit` only on `Ok`. On `Err`, it leaves the commit untouched and moves on; the next tick sees an unapplied commit and re-runs the whole set. That only works because the writes are idempotent — applying a `NamespaceSpec` that's already there is an upsert, a harmless no-op — so re-running a partially-applied sync converges instead of double-counting. Idempotence is what buys you "just retry the whole thing," which is the simplest correct recovery there is.
 
 The test for this drives `apply_changes` against a council that was never made leader, so every write is refused. The function must stop at the first failure and report *which* change failed, and the app must never reach desired state. Run it against the old code and the commit advances over a wholesale failure; run it against the new code and the failure surfaces, the commit holds, and the next tick gets another go.
+
+The first version of this fix only checked the outer `Err`, and a static review (B15) caught what that misses. `council.write` returns `Result<CouncilResponse, CouncilError>`, and `Err` only means Raft didn't commit the entry. An entry can commit and still be *refused*: the state machine applies it in log order, decides it isn't allowed, and answers `Ok(CouncilResponse::Refused { reason })` with desired state untouched. An app in an `rbtest-*` namespace is one, since only a leased test write may create those. That `Ok` counted as applied, and the commit advanced past a change that never happened. The `match` above names the refusal next to the transport error, so both stop the sync. The pattern `A | B` in one arm matches either shape, and `Ok(_)` after it catches every other response. The test drives `apply_changes` on a real leader with an `rbtest-lease/web` app and expects the refusal to come back as that resource's id.
 
 ## The namespace bug that got away
 
