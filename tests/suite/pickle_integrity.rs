@@ -588,6 +588,7 @@ async fn a_peer_committed_manifest_is_visible_through_the_authoritative_catalogu
             digest: config_digest.clone(),
             size: 11,
             media_type: "application/vnd.oci.image.config.v1+json".to_string(),
+            platform: None,
         },
         layers: vec![],
         repository: "team/service".to_string(),

@@ -4236,11 +4236,13 @@ mod tests {
                     digest: test_digest("cfg"),
                     size: 512,
                     media_type: String::new(),
+                    platform: None,
                 },
                 layers: vec![crate::pickle::types::LayerDescriptor {
                     digest: test_digest("layer1"),
                     size: 4096,
                     media_type: String::new(),
+                    platform: None,
                 }],
                 repository: "myapp".to_string(),
                 tags: std::collections::BTreeSet::new(),

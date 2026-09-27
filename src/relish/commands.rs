@@ -1568,22 +1568,32 @@ pub fn resolve_image_digest(
     let not_found = || RelishError::ImageNotInRegistry {
         image: image.to_string(),
     };
+    // A multi-platform image lists its platform manifests under the index;
+    // a digest can name either.
+    let holds = |summary: &crate::pickle::types::ImageSummary, digest: &str| {
+        summary.digest == digest || summary.platforms.iter().any(|p| p.digest == digest)
+    };
     let found = if image.starts_with("sha256:") {
-        images.iter().find(|summary| summary.digest == image)
+        images
+            .iter()
+            .find(|summary| holds(summary, image))
+            .map(|_| image)
     } else if let Some((name, digest)) = image.split_once('@') {
         let repository = canonical_repository(name);
         images
             .iter()
-            .find(|summary| summary.repository == repository && summary.digest == digest)
+            .find(|summary| summary.repository == repository && holds(summary, digest))
+            .map(|_| digest)
     } else {
         let (name, tag) = split_repo_tag(image);
         let repository = canonical_repository(name);
         images
             .iter()
             .find(|summary| summary.repository == repository && summary.tags.contains(tag))
+            .map(|summary| summary.digest.as_str())
     };
-    let summary = found.ok_or_else(not_found)?;
-    crate::pickle::types::Digest::new(&summary.digest).map_err(|_| not_found())
+    let digest = found.ok_or_else(not_found)?;
+    crate::pickle::types::Digest::new(digest).map_err(|_| not_found())
 }
 
 pub async fn images(output: OutputFormat) -> Result<(), RelishError> {
@@ -1602,45 +1612,60 @@ pub async fn images(output: OutputFormat) -> Result<(), RelishError> {
         }
         return Ok(());
     }
-    let images = result["images"].as_array();
-    match images {
-        Some(imgs) if imgs.is_empty() => {
-            println!("no images in local registry");
-        }
-        Some(imgs) => {
-            println!(
-                "{:<30} {:<15} {:>8} {:>12}",
-                "REPOSITORY", "TAG", "LAYERS", "SIZE"
-            );
-            for img in imgs {
-                let repo = img["repository"].as_str().unwrap_or("?");
-                let tags = img["tags"]
-                    .as_array()
-                    .map(|t| {
-                        t.iter()
-                            .filter_map(|v| v.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    })
-                    .unwrap_or_default();
-                let tag_display = if tags.is_empty() { "<none>" } else { &tags };
-                let layers = img["layers"].as_u64().unwrap_or(0);
-                let size = img["total_size"].as_u64().unwrap_or(0);
-                let size_display = if size >= 1_000_000 {
-                    format!("{:.1} MB", size as f64 / 1_000_000.0)
-                } else if size >= 1_000 {
-                    format!("{:.1} KB", size as f64 / 1_000.0)
-                } else {
-                    format!("{size} B")
-                };
-                println!("{repo:<30} {tag_display:<15} {layers:>8} {size_display:>12}");
-            }
-        }
-        None => {
-            println!("no images in local registry");
-        }
-    }
+    let images: Vec<crate::pickle::types::ImageSummary> =
+        serde_json::from_value(result["images"].clone()).map_err(|e| RelishError::ApiError {
+            status: 0,
+            body: format!("failed to parse images response: {e}"),
+        })?;
+    print!("{}", format_images_table(&images));
     Ok(())
+}
+
+/// Render `relish images` as a table: one row per image, with a
+/// multi-platform image's platforms in its PLATFORMS column and `-` for
+/// LAYERS (each platform has its own; `--output json` lists them).
+pub fn format_images_table(images: &[crate::pickle::types::ImageSummary]) -> String {
+    if images.is_empty() {
+        return "no images in local registry\n".to_string();
+    }
+    let mut out = format!(
+        "{:<30} {:<15} {:<28} {:>8} {:>12}\n",
+        "REPOSITORY", "TAG", "PLATFORMS", "LAYERS", "SIZE"
+    );
+    for image in images {
+        let tags = image.tags.iter().cloned().collect::<Vec<_>>().join(", ");
+        let tags = if tags.is_empty() {
+            "<none>".to_string()
+        } else {
+            tags
+        };
+        let (platforms, layers) = if image.platforms.is_empty() {
+            ("-".to_string(), image.layers.to_string())
+        } else {
+            let names: Vec<&str> = image
+                .platforms
+                .iter()
+                .map(|p| p.platform.as_str())
+                .collect();
+            (names.join(", "), "-".to_string())
+        };
+        let size = format_image_size(image.total_size);
+        out.push_str(&format!(
+            "{:<30} {tags:<15} {platforms:<28} {layers:>8} {size:>12}\n",
+            image.repository
+        ));
+    }
+    out
+}
+
+fn format_image_size(size: u64) -> String {
+    if size >= 1_000_000 {
+        format!("{:.1} MB", size as f64 / 1_000_000.0)
+    } else if size >= 1_000 {
+        format!("{:.1} KB", size as f64 / 1_000.0)
+    } else {
+        format!("{size} B")
+    }
 }
 
 /// Poll a build to a terminal state, bounded by `timeout` and Ctrl-C
@@ -2884,6 +2909,7 @@ spec:
             tags: tags.iter().map(|t| t.to_string()).collect(),
             layers: 1,
             total_size: 100,
+            platforms: Vec::new(),
         }
     }
 
@@ -2893,6 +2919,65 @@ spec:
             summary("myapp", MYAPP_V2, &["v2", "latest"]),
             summary("team/app", TEAM_APP, &["v1"]),
         ]
+    }
+
+    const BURGER_INDEX: &str =
+        "sha256:4444444444444444444444444444444444444444444444444444444444444444";
+    const BURGER_AMD64: &str =
+        "sha256:5555555555555555555555555555555555555555555555555555555555555555";
+    const BURGER_ARM64: &str =
+        "sha256:6666666666666666666666666666666666666666666666666666666666666666";
+
+    fn multi_platform_summary() -> crate::pickle::types::ImageSummary {
+        let platform = |name: &str, digest: &str, size| crate::pickle::types::PlatformSummary {
+            platform: name.to_string(),
+            digest: digest.to_string(),
+            layers: 1,
+            total_size: size,
+        };
+        crate::pickle::types::ImageSummary {
+            repository: "burger".to_string(),
+            digest: BURGER_INDEX.to_string(),
+            tags: ["v1".to_string()].into(),
+            layers: 0,
+            total_size: 9_400_000,
+            platforms: vec![
+                platform("linux/amd64", BURGER_AMD64, 4_800_000),
+                platform("linux/arm64", BURGER_ARM64, 4_600_000),
+            ],
+        }
+    }
+
+    #[test]
+    fn images_table_shows_a_multi_platform_image_on_one_row_with_its_platforms() {
+        let mut images = registry_listing();
+        images.push(multi_platform_summary());
+        insta::assert_snapshot!(format_images_table(&images));
+    }
+
+    #[test]
+    fn images_table_says_so_when_the_registry_is_empty() {
+        assert_eq!(format_images_table(&[]), "no images in local registry\n");
+    }
+
+    #[test]
+    fn sign_resolves_a_multi_platform_tag_to_the_index_and_accepts_a_platform_digest() {
+        let images = vec![multi_platform_summary()];
+        assert_eq!(
+            resolve_image_digest("burger:v1", &images).unwrap().as_str(),
+            BURGER_INDEX
+        );
+        let pinned = format!("burger@{BURGER_ARM64}");
+        assert_eq!(
+            resolve_image_digest(&pinned, &images).unwrap().as_str(),
+            BURGER_ARM64
+        );
+        assert_eq!(
+            resolve_image_digest(BURGER_AMD64, &images)
+                .unwrap()
+                .as_str(),
+            BURGER_AMD64
+        );
     }
 
     #[test]

@@ -14832,6 +14832,7 @@ schedule = "* * * * *"
                         digest,
                         size: 2,
                         media_type: "application/vnd.oci.image.config.v1+json".into(),
+                        platform: None,
                     },
                     layers: Vec::new(),
                     repository: repository.to_string(),

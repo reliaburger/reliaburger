@@ -548,6 +548,7 @@ fn manifest_with_holders(
             digest: config_digest.clone(),
             size: 24,
             media_type: "application/vnd.oci.image.config.v1+json".to_string(),
+            platform: None,
         },
         layers: layer_digests
             .iter()
@@ -556,6 +557,7 @@ fn manifest_with_holders(
                 digest: d.clone(),
                 size: *size,
                 media_type: "application/vnd.oci.image.layer.v1.tar+gzip".to_string(),
+                platform: None,
             })
             .collect(),
         repository: repo.to_string(),

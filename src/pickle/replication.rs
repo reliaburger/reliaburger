@@ -798,6 +798,7 @@ mod tests {
             digest: heal_digest(s),
             size: 100,
             media_type: "application/vnd.oci.image.layer.v1.tar+gzip".to_string(),
+            platform: None,
         };
         ImageManifest {
             digest: heal_digest(suffix),

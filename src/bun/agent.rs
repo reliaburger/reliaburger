@@ -15971,6 +15971,7 @@ mod tests {
                     digest: Digest::from_sha256_hex(&"c".repeat(64)),
                     size: 100,
                     media_type: "application/vnd.oci.image.config.v1+json".to_string(),
+                    platform: None,
                 },
                 layers: vec![],
                 repository: repository.to_string(),

@@ -221,6 +221,7 @@ mod tests {
             digest: test_digest(suffix),
             size: 1024,
             media_type: "application/vnd.oci.image.layer.v1.tar+gzip".to_string(),
+            platform: None,
         }
     }
 
