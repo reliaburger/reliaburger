@@ -771,8 +771,11 @@ async fn apply_changes(council: &CouncilNode, changes: &[ResourceChange]) -> Res
     let mut applied = 0;
     for change in changes {
         let Some(request) = change_to_request(change) else { continue };
-        if let Err(e) = council.write(request).await {
-            return Err(change_id(change).to_string());   // stop; don't advance
+        match council.write(request).await {
+            Ok(CouncilResponse::Refused { .. }) | Err(_) => {
+                return Err(change_id(change).to_string());   // stop; don't advance
+            }
+            Ok(_) => {}
         }
         applied += 1;
     }
@@ -785,6 +788,8 @@ async fn apply_changes(council: &CouncilNode, changes: &[ResourceChange]) -> Res
 The caller advances `last_applied_commit` only on `Ok`. On `Err`, it leaves the commit untouched and moves on; the next tick sees an unapplied commit and re-runs the whole set. That only works because the writes are idempotent — applying a `NamespaceSpec` that's already there is an upsert, a harmless no-op — so re-running a partially-applied sync converges instead of double-counting. Idempotence is what buys you "just retry the whole thing," which is the simplest correct recovery there is.
 
 The test for this drives `apply_changes` against a council that was never made leader, so every write is refused. The function must stop at the first failure and report *which* change failed, and the app must never reach desired state. Run it against the old code and the commit advances over a wholesale failure; run it against the new code and the failure surfaces, the commit holds, and the next tick gets another go.
+
+The first version of this fix only checked the outer `Err`, and a static review (B15) caught what that misses. `council.write` returns `Result<CouncilResponse, CouncilError>`, and `Err` only means Raft didn't commit the entry. An entry can commit and still be *refused*: the state machine applies it in log order, decides it isn't allowed, and answers `Ok(CouncilResponse::Refused { reason })` with desired state untouched. An app in an `rbtest-*` namespace is one, since only a leased test write may create those. That `Ok` counted as applied, and the commit advanced past a change that never happened. The `match` above names the refusal next to the transport error, so both stop the sync. The pattern `A | B` in one arm matches either shape, and `Ok(_)` after it catches every other response. The test drives `apply_changes` on a real leader with an `rbtest-lease/web` app and expects the refusal to come back as that resource's id.
 
 ## The namespace bug that got away
 
@@ -892,6 +897,18 @@ One subtlety cost us a test. `git rev-parse --end-of-options HEAD` *echoes the s
 The same wrapper learned two more manners. A clone left over at the data path is now *checked* before it's reused — its `remote.origin.url` and tracked branch must still match the config — because a stale clone from a repointed `[gitops] repo`, or one left behind by a failover, would otherwise sync the wrong repository entirely. On a mismatch, Lettuce discards it and clones fresh. And the file merge, which used to `HashMap::extend` files in whatever order the hash felt like, now sorts by path first: two nodes handed the identical repo must converge on the identical config, and "last writer wins by hash order" is not a property you can reason about. A resource declared twice across files is reported as a duplicate against the later file rather than silently overwritten.
 
 The listing itself uses `git ls-tree -r`, which always descends into subdirectories. For a while `[gitops]` still accepted a `recursive` flag that did nothing, and `recursive = false` earned a startup warning because it promised a shallow sync it never delivered. We kept it "so existing configs still parse". Before 0.1.0 there are no existing configs worth a shim, so the field is gone. `GitOpsConfig` has `#[serde(deny_unknown_fields)]`, so a leftover `recursive = ...` is now a parse error that names the key, which is louder and more honest than a warning scrolling past in the Bun log.
+
+The static review in PR #258 (B17) found two ways that listing could shrink without anyone noticing, and in a reconciler a missing file is a deletion. First, plain `ls-tree` output is for humans: a path with a tab or a non-ASCII byte comes out C-quoted, so `café.toml` prints as `"caf\303\251.toml"`. That string doesn't end in `.toml`, so the loop skipped it, and every app it declared was removed on the next sync. Now the listing runs with `-z`, which prints raw paths terminated by NUL bytes, and the loop splits the bytes on zero rather than splitting a string into lines:
+
+```rust
+for entry in output.stdout.split(|byte| *byte == 0) {
+    if !entry.ends_with(b".toml") {
+        continue;
+    }
+    let name = std::str::from_utf8(entry).map_err(|_| /* … */)?;
+```
+
+`output.stdout` is a `Vec<u8>`, and `split` takes a closure (`|byte| *byte == 0`, Rust's lambda syntax) that marks the separators. `b".toml"` is a byte-string literal, a `&[u8; 5]` rather than a `&str`, so the suffix test works on raw bytes before we've decided they're text. Rust's `str` is always valid UTF-8, so turning bytes into one is a fallible `from_utf8`; a name that isn't valid UTF-8 fails the sync rather than being skipped. Second, a `.toml` whose `git show` failed was dropped from the result. It now fails the whole listing, because a partial desired state is exactly the thing that deletes apps. The tests build a real repository with `café.toml`, `tab\tname.toml` and a non-ASCII subdirectory and expect all of them back; another unpacks the clone's objects, deletes one blob and expects an error that names the file.
 
 ## A broken sync you can actually see
 

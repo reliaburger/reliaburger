@@ -113,7 +113,7 @@ never syncs the wrong repository.
 
 Lettuce parses TOML files in a defined order to handle cross-references:
 
-1. **Discovery.** Walk all `.toml` files under `path`, subdirectories included (`git ls-tree -r`). There is no shallow mode and no `recursive` key.
+1. **Discovery.** Walk all `.toml` files under `path`, subdirectories included (`git ls-tree -r -z`, so paths with tabs or non-ASCII bytes arrive unquoted). There is no shallow mode and no `recursive` key. A listed file that can't be read, or whose path isn't UTF-8, fails the whole sync: a partial file set would delete what the missing file declares.
 2. **Namespace resolution.** Files can declare `[namespace]` blocks. If a file doesn't declare a namespace, it inherits the namespace from its parent directory name, or falls back to `default`.
 3. **Parse and validate.** Each file is parsed with the `toml` crate. Validation checks:
    - Required fields present (`image` or `exec`/`script` for apps/jobs)
@@ -581,12 +581,14 @@ Lettuce interprets the result:
 
 1. Run `git verify-commit <sha>` and inspect its exit status and output.
 2. `git` determines the signature type (GPG or SSH) and validates it against the keyring.
-3. For GPG signatures: the signing key fingerprint reported by `git` is checked against `SigningKeySet.gpg_fingerprints`.
-4. For SSH signatures: the key fingerprint in `SHA256:<base64>` format is checked against `SigningKeySet.ssh_fingerprints`.
+3. For GPG signatures: `git verify-commit --raw` prints GnuPG's `--status-fd` lines. Only a `[GNUPG:] VALIDSIG` line counts, and its signing-key fingerprint (first field) or primary-key fingerprint (tenth field) must *equal* an entry in `trusted_signing_keys`, ignoring case, spaces and a `0x` prefix. A substring match over the whole output isn't enough (B14): a longer fingerprint, or a user id that merely contains the trusted one, would satisfy it.
+4. For SSH signatures: the `SHA256:<base64>` fingerprint at the end of `ssh-keygen`'s `Good "git" signature for …` line must equal an entry exactly (base64 is case-sensitive).
 5. If the signature is valid and the key is trusted, set `SignatureStatus::Verified`.
 6. If the signature is valid but the key isn't trusted, set `SignatureStatus::UntrustedKey` and reject.
 7. If the signature is invalid, set `SignatureStatus::InvalidSignature` and reject.
 8. If there's no signature and verification is required, set `SignatureStatus::Unsigned` and reject.
+
+Lettuce doesn't import the trusted keys itself: `git` uses the node's ambient GnuPG home and `gpg.ssh.allowedSignersFile`, so the operator installs the public keys there. The exact fingerprint comparison is what keeps an extra key in that keyring from counting. Running `git` against a private `GNUPGHOME` holding only the trusted keys would be stricter still, but it needs the key material, not just fingerprints, in `[gitops]`; that's a follow-up, not 0.1.0.
 
 **On rejection:** The `SyncState.last_error` field is updated with the commit SHA, author, and reason for rejection, and the sync is recorded as failed. Emitting a Ketchup event and firing an alert via the alerting subsystem on rejection are **planned — not yet implemented**; the rejection is visible through sync state (and any Brioche view of it), not through the event log or alerts.
 
