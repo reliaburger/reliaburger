@@ -740,15 +740,18 @@ families and optional refactors remain explicitly separate from release gates.
 
 ## Release closure: 0.1.0
 
-The implementation and hardening work after Phase 15 is recorded in
-[progress.md](progress.md), including Phase 16's audit fixes. The next delivery
-is the [0.1.0 release plan](plans/2026-09-16-v0.1.0-release-plan.md), which closes
-these phases with signed release artefacts, a managed laptop cluster and measured
-acceptance on the downloaded product. It doesn't start a new architecture phase.
+**Released on YYYY-MM-DD.** The implementation and hardening work after Phase 15
+is recorded in [progress.md](progress.md), including Phase 16's audit fixes. The
+[0.1.0 release plan](plans/2026-09-16-v0.1.0-release-plan.md) closed these phases
+with signed release artefacts, a managed laptop cluster and acceptance on the
+downloaded product, rather than starting a new architecture phase. Historical
+phase checkboxes are implementation evidence; the release's acceptance gates and
+their records are in [progress.md](progress.md#acceptance-and-release-gates).
 
-The release gates remain open until the actual candidate passes the portable,
-Linux runtime, multi-node and clean-install checks. Historical phase checkboxes
-are implementation evidence, not a substitute for those gates.
+Work after 0.1.0 comes from the backlog in [progress.md](progress.md) (the
+missing capabilities F01–F12 and the remaining engineering follow-ups) and the
+v2 list below. Each piece starts with a dated plan in [plans/](plans/); later
+releases follow the same [release runbook](releasing.md).
 
 ---
 

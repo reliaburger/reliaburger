@@ -7,12 +7,20 @@ have tracked defects or acceptance gates; those stay unchecked. Git history and 
 [archived plans](plans/archive/) hold the per-change evidence (regressions, test
 runs, CI results) that used to live here.
 
-> **0.1.0 status (22 September 2026):** the codebase completion backlog below is
-> done, including C34. What's left before release is the [PR #167 review
-> fixes](plans/2026-09-22-pr167-review-fixes.md) and the four acceptance gates
-> V01–V04; see [remaining work](plans/2026-09-22-v0.1.0-remaining-work.md). The
-> original [release-readiness review](plans/2026-09-16-v0.1.0-release-plan.md)
-> defines the supported scope and the clean-install and real-cluster gates.
+> **0.1.0 released on YYYY-MM-DD.** The tag `v0.1.0` points at candidate
+> commit `CANDIDATE_COMMIT`, promoted unchanged from the build it was qualified
+> on ([runbook](releasing.md)). The [release-readiness
+> review](plans/2026-09-16-v0.1.0-release-plan.md) and the [remaining
+> work](plans/2026-09-22-v0.1.0-remaining-work.md) plan are now history: they
+> record the supported scope and the [acceptance gates](#acceptance-and-release-gates),
+> with their evidence in [qualification/](qualification/).
+>
+> **After 0.1.0:** the open items are the
+> [missing capabilities](#missing-capabilities-and-longer-term-scope) (F01–F12),
+> the one open [engineering follow-up](#engineering-follow-ups) (H05) and the
+> [known flakes](#known-flakes). The limits 0.1.0 ships with are in the
+> [documentation](README.md#010-scope-and-limits). New work starts with a dated
+> plan in [plans/](plans/).
 
 ## Current completion backlog (17 September 2026)
 
@@ -326,7 +334,8 @@ Smaller fixes that CI runs turned up along the way:
 ### Acceptance and release gates
 
 A 0.1.0 release signing identity is committed and its private key is configured
-in repository Actions. Signed candidate qualification is still V03.
+in repository Actions. These are the acceptance gates for 0.1.0; their records
+are in [qualification/](qualification/).
 
 - [ ] **V01** (gate) Qualify the complete live three-node catalogue on independent Runc nodes.
 - [ ] **V02** (gate) Qualify sustained TLS, storage and upgrade recovery on the release candidate.
@@ -417,7 +426,7 @@ that used to fail passes.
 | V02 soak: `/v1/status` 503 "agent status timed out", "snapshot collection failed or timed out" every 5 s, and "retirement of … exceeded ten seconds; ownership retained" while a node retired apps | 26 Sep (V02 soak) | Product: `Stop`, `Retire` and `RetireTestResources` waited out the 10 s stop grace inside the agent's command loop, one instance after another, so a workload whose PID 1 ignores SIGTERM (busybox `sleep`/`httpd`, many shells) stalled every other command; the egress fence did the same. The node reconciler then retired apps one at a time with a 10 s deadline equal to the grace, so each stubborn retirement timed out on its first try. PR #232 only made the test fixtures trap SIGTERM | Fixed: the loop withdraws routing and marks the instances Stopping, a `JoinSet` task drains, signals and escalates every replica at once, and the loop records the exit and releases ownership when it reports back; the egress fence uses the same off-loop stop and fences at once if it fails; a second stop joins the pending one, a deploy of a stopping app is refused, shutdown reports pending stops unconfirmed. The reconciler's retirement deadline is its I/O deadline plus `stop_completion_bound`, and a cycle retires up to four apps at once (`status_answers_promptly_while_a_sigterm_ignoring_stop_waits`, `retirement_releases_ownership_only_after_the_process_exits`, `concurrent_sigterm_ignoring_stops_overlap`, `a_cycles_retirements_wait_out_their_stops_side_by_side` and more, all fail before) |
 | V02 soak (fast tier, d149f52): chaos `dead_worker_node_has_workloads_rescheduled` passed with cleanup `unknown` ("the lease owner did not confirm cleanup within 30 s"); a later run was clean | 27 Sep (V02 soak) | Harness: the runner still waited a hard-coded 30 s for lease cleanup after the row above raised one retirement's deadline to 60 s (I/O deadline plus `stop_completion_bound`), so the 26 Sep verdict that 30 s is right no longer held. Here the owner, the leader, was still rolling out the frontend replicas it inherited from the killed worker (`frontend-g3-*` starting at 04:44:18 UTC), and a reconcile tick finishes its deploys before its retirements; the release began at 04:43:39 and the test instances were gone by 04:44:33 | Fixed: the release budget is `lease_retirement_bound` (next poll + one retirement + acknowledgement, 72 s by default) and teardown adds 30 s for faults and the runtime check (`lease_cleanup_keeps_waiting_while_owners_are_within_their_retirement_bound`, failed before). Still open (product): a retirement waits behind the same node's in-flight deploys, each bounded only by the 300 s deploy deadline |
 
-## Current release checklist
+## 0.1.0 release checklist
 
 - [x] Commit the release scope and acceptance plan.
 - [x] Validate setup liveness and bounded subsystem readiness.

@@ -1,8 +1,14 @@
 # Cutting a release
 
-The [0.1.0 plan](plans/2026-09-16-v0.1.0-release-plan.md) defines the acceptance
-gates. A green build alone doesn't qualify the laptop quickstart or its timing.
-No public 0.1.0 release has been published by this work.
+0.1.0 went through this procedure and was promoted on YYYY-MM-DD: one build,
+staged over HTTPS, qualified, then published unchanged. The
+[0.1.0 plan](plans/2026-09-16-v0.1.0-release-plan.md) defined its acceptance
+gates (V01–V04 in [progress.md](progress.md#acceptance-and-release-gates)); a
+later release keeps them unless a dated plan changes them. A green build alone
+doesn't qualify the laptop quickstart or its timing.
+
+The commands below use 0.1.0's names (`v0.1.0`, `staging-v0.1.0-…`) as the
+worked example. Substitute the version you're releasing.
 
 ## What the workflow builds
 
@@ -126,7 +132,7 @@ with their configured external key.
 ## Metadata and publication
 
 Candidate building and release publication are separate manual operations.
-After this workflow is on `main`, run:
+Run:
 
 ```sh
 gh workflow run build.yml --ref main
@@ -168,14 +174,12 @@ The digest input must come from the qualification record. Copying a fresh digest
 from unqualified downloads defeats the gate. Workflow verification establishes
 identity and byte preservation; it cannot establish that somebody actually ran
 the cold-install and recovery tests. Those remain operator acceptance criteria.
-The complete hosted candidate, staging and promotion paths have not yet been
-exercised. Actual pre-publication mirror delivery (see
-[Staging a candidate](#staging-a-candidate)) remains part of V03; downloading
-an Actions artefact alone does not qualify the public quickstart.
+Downloading an Actions artefact alone does not qualify the public quickstart;
+the candidate has to be delivered over HTTPS first (see
+[Staging a candidate](#staging-a-candidate)).
 
 GitHub documents the [default-branch requirement for manual workflows](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/manually-run-a-workflow)
 and the [release asset digest fields](https://docs.github.com/en/rest/releases/releases).
-This PR must land before those manual workflows can run.
 
 - `metadata.json` selects **Bun** by platform, preserving the existing schema
   and upgrade reader.
@@ -188,19 +192,18 @@ This PR must land before those manual workflows can run.
 
 The website and installer are separate static assets under `docs/website`,
 published by `static.yml`. GitHub Pages cannot select a different response for
-curl and a browser at `/`; the planned shell endpoint is `/install.sh`.
+curl and a browser at `/`; the shell endpoint is `/install.sh`. The bootstrap
+installs the version in its `RELIABURGER_VERSION` default (`v0.1.0` today), so
+bump that default in the same change that announces a newer release.
 
-Before tagging 0.1.0, complete the managed-cluster and clean-install gates in the
-release plan. Record timing from an empty cache, the actual artefact digests,
+Before tagging a release, complete the managed-cluster and clean-install gates. Record timing from an empty cache, the actual artefact digests,
 host and guest versions, memory use, and the successful sample workload. Don't
 publish a five-minute claim from a source build or a warmed VM.
 
 ## Staging a candidate
 
-Before promoting 0.1.0, publish the exact signed candidate to HTTPS and run
-the real `curl … | sh` install against it on every host we advertise. The
-workflows below need to be on `main`; the first real staging run happens once
-this lands.
+Before promoting a release, publish the exact signed candidate to HTTPS and run
+the real `curl … | sh` install against it on every host we advertise.
 
 1. **Build the candidate on main.**
 
@@ -310,6 +313,12 @@ this lands.
    refuses it as a version, and `promote.yml` refuses any tag containing
    `staging`.
 
+8. **Update the docs** once the release is public: the release date in the
+   status boxes of [progress.md](progress.md) and the homepage
+   (`docs/website/index.html`), and the bootstrap's default version if it
+   changed. The website deploys from `main`, so merge that change after
+   promotion, not before.
+
 ## Soaking a candidate in CI
 
 The V02 sustained soak ([plan](plans/2026-09-25-v02-sustained.md)) also runs
@@ -409,8 +418,7 @@ which complete file set is under qualification.
 
 Record the mirror URL and all downloaded hashes with the cold-run measurements.
 A staged run qualifies those signed bytes; final public URL/Pages checks still
-need their own evidence after publication. No candidate has been staged yet:
-`stage.yml` first runs once it is on `main`.
+need their own evidence after publication.
 
 ## Guest images and bootstrap installer
 
@@ -485,4 +493,4 @@ See [quickstart.md](quickstart.md) for the managed workflow. Before publishing,
 run it from the signed candidate with empty caches, including three-node and
 single-node runs, interruption/resume, stop/start and destroy. A run using
 `--development-binaries` is useful integration evidence but doesn't replace
-this gate. The installer and five-minute promise remain pending until it passes.
+this gate. Don't advertise a timing this gate hasn't measured.

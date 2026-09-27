@@ -37,7 +37,7 @@ For book, manual or website prose, follow [docs/book/STYLE.md](docs/book/STYLE.m
 
 ### 1. Follow the Plan
 
-Every roadmap phase is done. Current work is closing out the 0.1.0 release: read the status box at the top of [docs/progress.md](docs/progress.md) and the plan it links before starting. New work goes through a dated plan in `docs/plans/`.
+Every roadmap phase is done and 0.1.0 is released (YYYY-MM-DD). Current work is the post-0.1.0 backlog: read the status box at the top of [docs/progress.md](docs/progress.md), which links the open items (missing capabilities F01–F12, engineering follow-ups, known flakes), before starting. New work goes through a dated plan in `docs/plans/`; the 0.1.0 release plans there are history. Releases follow [docs/releasing.md](docs/releasing.md).
 
 ### 2. Tests First
 
@@ -125,7 +125,7 @@ See [docs/testing.md](docs/testing.md) and [docs/design/test-harness.md](docs/de
 - Releases follow [docs/releasing.md](docs/releasing.md): `build.yml` → `stage.yml` → qualification with `scripts/release/qualify-*.sh` (including the V02 soak, `qualify-sustained.sh --tier fast|final`), recorded in `docs/qualification/` → `promote.yml`.
 - Only the maintainer tags and promotes. Agents never do.
 - Any change to a wire or durable-state format bumps `protocol` or `state` in `CURRENT` in `src/compatibility.rs`.
-- No legacy code, shims or migrations before 0.1.0. Old state is refused; start a fresh cluster.
+- Development-era (pre-0.1.0) state is refused, never migrated; start a fresh cluster. From 0.1.0 on, an incompatible wire or state change bumps its generation and designs its migration separately ([cluster compatibility](docs/releasing.md#cluster-compatibility)).
 
 ## Commit Hygiene
 
