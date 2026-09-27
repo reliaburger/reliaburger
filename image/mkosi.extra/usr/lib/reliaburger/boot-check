@@ -10,7 +10,6 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
         # The layout, so a boot test log shows the slots and the data partition.
         lsblk -o NAME,SIZE,FSTYPE,PARTLABEL,MOUNTPOINTS 2>/dev/null | sed 's/^/reliaburger: disk: /'
         findmnt -n -o TARGET,SOURCE,FSTYPE,OPTIONS / /usr 2>/dev/null | sed 's/^/reliaburger: mount: /'
-        systemd-repart --dry-run=yes --no-pager 2>&1 | tail -n 30 | sed 's/^/reliaburger: repart-now: /'
         journalctl -b -o cat --no-pager -u systemd-repart.service -u systemd-growfs-root.service 2>/dev/null \
             | tail -n 40 | sed 's/^/reliaburger: journal: /'
         exit 0

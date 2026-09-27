@@ -29,8 +29,8 @@
   - throwaway Ed25519 signature over `SHA256SUMS`
   - 1-day artefacts
 - [x] x86_64 boot test: QEMU + OVMF under KVM on the hosted runner, pass only on bun's health marker on the serial console
-- [ ] Iteration 2: `/usr` as EROFS with dm-verity (the A/B-ready layout, research §7.2) instead of a writable root
-- [ ] Record sizes and timings here, and tick S1 in the spike plan
+- [x] Iteration 2: `/usr` as EROFS with dm-verity (the A/B-ready layout, research §7.2) instead of a writable root
+- [x] Record sizes and timings here, and tick S1 in the spike plan
 - [ ] Deferred to S2 preparation, not S1: the installer UKI (streaming `/usr` to disk), the ISO, the iPXE binaries
 
 ## Log
@@ -57,6 +57,42 @@
 **Findings.**
 - **The UKI is too big.** The kernel-modules initrd mkosi appends carries far more modules (and their firmware) than we need. That's two ESP slots' worth of the Wyse's 512 MiB, and slow over TFTP/HTTP. Next: an explicit `KernelInitrdModules=` list.
 - Harmless build noise: tmpfiles can't resolve `kvm` and `tss` inside the build sandbox, and presets skip masked units.
+
+**27 Sep, iteration 2a: a smaller UKI.** An explicit `KernelInitrdModules=` list covers virtio, NVMe, AHCI, MMC (the Wyse's eMMC), USB storage, dm-verity, and ext4/btrfs/erofs/vfat. **The UKI dropped from 226.6 to 73.0 MB (x86_64) and from 213.4 to 58.6 MB (aarch64).** Run 36348874813, still boots to healthy bun.
+
+**27 Sep, iteration 2b: the A/B-ready layout.**
+- **Build time** (`image/mkosi.repart/`):
+  - the ESP, fixed at 512 MiB;
+  - slot A of `/usr`, as EROFS with dm-verity, fixed at 1100 MiB, labelled `reliaburger_<version>`;
+  - its verity hashes, 64 MiB;
+  - the data partition: Btrfs holding `/etc` and `/var`, minimised, grown on boot.
+- mkosi puts `usrhash=` on the UKI, so the UKI pins its own `/usr`, and the boot needs no `root=` (GPT auto-discovery).
+- **First boot** (`image/mkosi.extra/usr/lib/repart.d/`): systemd-repart in the initrd grows the data partition and appends an empty slot B (`_empty`) for systemd-sysupdate.
+- **Why the data partition carries `/etc`:** a `/usr`-only image would boot with an empty `/etc`, but Ubuntu keeps things in `/etc` that the system needs to work (linker paths, alternatives, certificates). The cost is that `/etc` changes in later images don't reach nodes that are already installed. That's a known gap to close before Phase 3's updates.
+- Run 36349309427 built but picked a split partition for the boot test: mkosi now also splits out the ESP and data partitions, so the boot test takes the whole-disk file by name.
+- Run 36349844223 booted, **but systemd-repart in the initrd said "No changes"**. The first-boot definitions were in the initrd (`mkosi.initrd.conf/`), yet repart printed only the four existing partitions, and I didn't find out why. Moving them to `/usr/lib/repart.d` in the image (the unit also looks in `/sysusr/usr/lib/repart.d`) fixed it.
+- **Run 36350274906: green on both architectures, 8 GB disk, 2 GiB RAM.** On first boot repart grew the data partition from 109 MB to 5.2 GB and added both halves of slot B; the root filesystem grew too; bun was healthy at 11.6 s. Resulting layout (the Wyse budget, research §9.3):
+
+```
+vda1  512M vfat            esp                             /boot
+vda2  1.1G erofs           reliaburger_2026.39.10          (/usr, verity)
+vda3   64M DM_verity_hash  reliaburger_2026.39.10_verity
+vda4  5.2G btrfs           reliaburger-data                /
+vda5  1.1G                 _empty                          (slot B)
+vda6   64M                 _empty                          (slot B verity)
+```
+
+| Run 36350274906 | x86_64 | aarch64 |
+|---|---|---|
+| Whole disk, zstd | 450.1 MB | 403.8 MB |
+| `/usr` slot image, zstd (what an update ships) | 350.9 MB | 321.8 MB |
+| `/usr` verity, zstd | 4.9 MB | 5.2 MB |
+| UKI | 76.5 MB | 61.5 MB |
+| Tools tree (not cached) | 1.6 GB | 1.7 GB |
+| Job time | 5 min 8 s | 2 min 42 s |
+| Artefact (1 day) | 883 MB | 792 MB |
+
+**S1 is done**, apart from the items deferred to S2 preparation below. An update would ship roughly the UKI plus the `/usr` image: about 430 MB (x86_64) or 380 MB (aarch64) a week, well inside the ~1 GiB slot.
 
 ## Picking up S2 on the lab Mac (M1, 64 GB, from Monday 28 Sep)
 
