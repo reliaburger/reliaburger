@@ -2,6 +2,8 @@
 
 Reviewed commit: `0eb6071da897b836d27e19d277a9a8e69a96ccbb`, the observed `main` tip when this pass began. The [first report](2026-09-27-static-release-review.md) reviewed `0a5dfc696a757193e4173af1618c64586c02f0b9`. These are two fixed snapshots, not a claim about the eventual release candidate.
 
+**Coverage and test methods:** the [dedicated testing assessment](2026-09-27-testing-assessment.md) answers review questions 3 and 4 with a subsystem assessment, method inventory, concrete harness/CI findings and prioritised improvements.
+
 **Recommendation:** triage the six new P1 findings below before advertising the affected security and GitOps guarantees. The three P2 findings concern reconciliation, application failures and bounded shutdown. Each includes a proposed fix and regression. This report changes no implementation and does not redirect the release qualification already running.
 
 ## Method and limits

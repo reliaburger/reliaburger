@@ -4,6 +4,8 @@ Reviewed commit: `0a5dfc696a757193e4173af1618c64586c02f0b9`, copied from `fix/ti
 
 **Second-pass update:** see the [additional review against main at `0eb6071d`](2026-09-27-static-release-review-second-pass.md) for nine further findings and changes since this snapshot. B08's metric mapping, B09's distribution conversion and the Btrfs restore test selection have since been addressed in source. The findings and recommendations below describe the original reviewed commit.
 
+**Coverage and test methods:** the [dedicated testing assessment](2026-09-27-testing-assessment.md) answers review questions 3 and 4 with a subsystem assessment, method inventory, concrete harness/CI findings and prioritised improvements.
+
 **Recommendation:** review the snapshot authorisation/data-integrity findings and the broken built-in autoscaling signal before tagging. Complete the already planned V01–V04 gates independently. Keep the declared future capabilities deferred, but remove contradictory claims from release-facing documentation.
 
 ## Scope and non-interference
