@@ -458,14 +458,16 @@ retain_versions = 3
     /// Sign + push the v0.2.0 binary to the leader's registry, start the
     /// upgrade, return (upgrade_id, leader, worker).
     async fn start_upgrade(&self) -> (String, String, String) {
-        self.start_upgrade_fetching_from(None).await
+        self.start_upgrade_fetching_from(None, None).await
     }
 
     /// [`Self::start_upgrade`], but tell the nodes to fetch the binary from
-    /// `registry` (a proxy in front of the leader's) when given.
+    /// `registry` (a proxy in front of the leader's) when given, and send
+    /// the start call to node `through` instead of the leader when given.
     async fn start_upgrade_fetching_from(
         &self,
         registry: Option<String>,
+        through: Option<&str>,
     ) -> (String, String, String) {
         let (nodes, leader, worker) = self.plan_nodes().await;
         let leader_node = self.node(&leader);
@@ -506,13 +508,18 @@ retain_versions = 3
         });
         let response = self
             .client
-            .post(format!("http://{}/v1/upgrade/start", leader_node.api))
+            .post(format!(
+                "http://{}/v1/upgrade/start",
+                self.node(through.unwrap_or(&leader)).api
+            ))
             .json(&request)
             .send()
             .await
             .expect("upgrade start");
-        assert_eq!(response.status().as_u16(), 202, "upgrade start refused");
-        let body: serde_json::Value = response.json().await.unwrap();
+        let status = response.status().as_u16();
+        let body = response.text().await.unwrap_or_default();
+        assert_eq!(status, 202, "upgrade start refused: {body}");
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
         (
             body["upgrade_id"].as_str().unwrap_or("?").to_string(),
             leader,
@@ -826,6 +833,45 @@ async fn relish_pushes_through_a_forward_while_nodes_fetch_from_the_cluster_addr
         "nodes must fetch from the leader's cluster registry address, not the forward"
     );
     let upgrade_id = active["upgrade_id"].as_str().unwrap().to_string();
+    let (_, phase) = harness.watch_upgrade(&upgrade_id, false).await;
+    assert_eq!(phase, "Completed");
+    harness.wait_for_versions("v0.2.0").await;
+
+    harness.shutdown().await;
+}
+
+/// The V02 soak ran `relish upgrade start` against node 1 after a leader
+/// kill had made it a follower, and got 409 "could not record the upgrade
+/// (are we the leader?)". A node that isn't the leader now forwards the call,
+/// with the caller's credential, and the run it starts completes.
+///
+/// This harness keeps a one-voter council, so the node here is outside Raft
+/// altogether and finds the leader through the gossip directory. The Raft
+/// follower case is `bun::api`'s
+/// `a_follower_forwards_upgrade_control_calls_to_the_leader_with_the_callers_token`.
+#[tokio::test]
+#[ignore = "requires RELIABURGER_UPGRADE_TESTS=1 and a multi-core host"]
+async fn upgrade_start_sent_to_a_node_that_is_not_the_leader_reaches_the_leader() {
+    assert!(
+        upgrade_tests_enabled(),
+        "set RELIABURGER_UPGRADE_TESTS=1 on a provisioned multi-core host"
+    );
+    let _serial = SERIAL.lock().await;
+    let harness = ClusterHarness::start(4).await;
+    let leader = harness.wait_for_idle_leader().await;
+    let other = harness
+        .nodes
+        .iter()
+        .find(|node| node.name != leader)
+        .unwrap();
+    wait_for("the node to know every member's API", WAIT, || async {
+        harness.knows_every_member(other).await
+    })
+    .await;
+
+    let (upgrade_id, _, _) = harness
+        .start_upgrade_fetching_from(None, Some(&other.name))
+        .await;
     let (_, phase) = harness.watch_upgrade(&upgrade_id, false).await;
     assert_eq!(phase, "Completed");
     harness.wait_for_versions("v0.2.0").await;
@@ -1185,7 +1231,7 @@ async fn a_registry_outage_at_directive_time_does_not_pause_the_upgrade() {
         Duration::from_secs(25),
     )
     .await;
-    let (upgrade_id, _, _) = harness.start_upgrade_fetching_from(Some(proxy)).await;
+    let (upgrade_id, _, _) = harness.start_upgrade_fetching_from(Some(proxy), None).await;
     let (_, phase) = harness.watch_upgrade(&upgrade_id, true).await;
 
     assert_eq!(phase, "Completed", "the outage paused the upgrade");

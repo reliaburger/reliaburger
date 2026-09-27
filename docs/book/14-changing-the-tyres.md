@@ -956,3 +956,125 @@ We also didn't make the orchestrator wait for its own registry after a restart. 
 In `manager::tests`, `flaky_registry` is a tiny TCP server that follows a script (hang up, answer a status, or serve the blob) and counts requests. `prepare_rides_out_a_registry_that_is_briefly_unavailable` gets a hang-up, then a 503, then the blob, and stages it on the third request. A 404 fails after exactly one request and isn't transient. A registry that never comes back is reported transient with nothing staged. So is one that accepts and never answers, or stalls halfway through the body, and `a_hanging_registry_is_a_transient_failure_within_the_ceiling` checks that it gives up within the ceiling instead of hanging. Finally, and bytes that don't verify aren't transient even though they came over the network. An API test checks the 503/409 split end to end.
 
 The cluster suite gets `a_registry_outage_at_directive_time_does_not_pause_the_upgrade`. It puts a TCP proxy in front of the leader's registry that hangs up on everything for the first 25 seconds, longer than a node's own 10 s budget, so the orchestrator has to re-send. It points the upgrade at the proxy and requires the run to reach `Completed` with every node on v0.2.0, and requires that the outage actually turned fetches away. Otherwise the test would prove nothing.
+
+## Asking the wrong node
+
+The next soak killed the leader, waited for a new one, and ran the same
+`relish upgrade start` it always runs, on node 1. Node 1 was a follower now:
+
+```text
+error: API error (status 409): {"error":"could not record the upgrade
+(are we the leader?): not leader, leader is node Some(5870141345109727948)"}
+```
+
+Two things are wrong with that. The first is that it failed at all. `relish
+apply`, `stop` and `delete` have forwarded to the leader from a follower for a
+long time (openraft doesn't forward client writes, so every node's API has to),
+and so does node decommissioning. The upgrade handlers were written for the
+leader and never got the same treatment, so the operator had to go and find
+the leader first. After a leader kill, that's exactly when you don't know
+which node it is.
+
+Now `start`, `resume`, `abort` and the cluster `rollback` all begin with the
+same question, before they parse anything:
+
+```rust
+if let Some(forwarded) = forward_upgrade_to_leader(
+    &state,
+    council,
+    directory.as_deref(),
+    "/v1/upgrade/start",
+    &headers,
+    &body,
+)
+.await
+{
+    return forwarded;
+}
+```
+
+`forward_upgrade_to_leader` returns `None` when this node leads, and the
+handler carries on as before. Otherwise it returns the leader's reply, status
+and body, which the handler passes straight back. The call keeps the caller's
+own `Authorization` header, like a forwarded `apply`, so the leader checks
+*your* permissions. The follower checks them first as well, so a read-only
+token is refused without a network hop. A forwarded request carries an
+`x-reliaburger-upgrade-forwarded` header, and a node that receives one without
+being the leader answers 503 instead of passing it on: two nodes with
+different ideas about who leads can't bounce a request between them. Only the
+control call moves. The binary was already pushed to the registry named by
+`--registry` (or the connected node's), and every node fetches it from there,
+whoever records the run.
+
+Where is the leader? A Raft follower knows from its own metrics. A worker
+outside Raft doesn't, but the gossip directory carries a leader hint to every
+node, and the registry's forwarder already used it. That lookup now lives in
+one place, `cluster::directory::leader_api_address`, and the API gets the
+directory as an axum `Extension`, the same trick `KnownMembers` uses. The
+handler asks for it as `directory: Option<axum::Extension<LeaderDirectory>>`,
+so a router built without it (most tests) still works and resolves through
+Raft alone. `Extension` implements `Deref`, so `as_deref()` turns the
+`Option<Extension<LeaderDirectory>>` into the `Option<&LeaderDirectory>` the
+function wants. Inside, a closure takes the tuple struct apart right in its
+parameter list:
+
+```rust
+let advertised = directory.and_then(|LeaderDirectory(directory)| {
+    let metrics = council.metrics();
+    let metrics = metrics.borrow();
+    crate::cluster::directory::leader_api_address(&metrics, &directory.borrow())
+});
+```
+
+`|LeaderDirectory(directory)|` is a pattern, not just a name, so `directory`
+is the `watch::Receiver` inside. Both `borrow()` guards live only inside the
+closure, which matters: a `watch::Ref` holds a read lock and isn't `Send`, so
+keeping one across the `.await` that follows wouldn't compile in a spawned
+task.
+
+The second problem is the message. `Some(5870141345109727948)` is the leader's
+Raft id, a hash of its name, printed with `{:?}`. Nobody can act on it. The
+error now carries the leader's *name*, which openraft hands back alongside the
+id, and says so in words:
+
+```rust
+#[error("not the leader{}", match leader {
+    Some(name) => format!(" (the leader is {name})"),
+    None => ", and no leader is known".to_string(),
+})]
+ForwardToLeader { leader: Option<String> },
+```
+
+thiserror's `#[error(...)]` takes format arguments after the string like
+`format!` does, and an argument can be any expression, a whole `match`
+included. Inside the attribute, the variant's fields are in scope by name.
+
+### Tests
+
+`bun::api` builds a three-node in-memory council and replaces the leader's
+API with a fake that records every request. Through a real follower router,
+`a_follower_forwards_upgrade_control_calls_to_the_leader_with_the_callers_token`
+sends all four calls and checks that each one arrived at the leader with the
+same path, body and bearer token, marked as forwarded, and that the leader's
+reply came back. Before the change, the follower answered `start` itself with a
+400. `a_follower_checks_upgrade_authority_and_never_forwards_twice` sends a
+read-only token (403, nothing forwarded) and an already-forwarded request (503,
+nothing forwarded). `a_worker_outside_raft_forwards_upgrade_calls_to_the_leader_gossip_names`
+gives an uninitialised council node a directory hint and checks the call
+reaches the leader it names; without the directory it gets a 503. In
+`council::node`, `write_on_follower_returns_forward_error` now checks the
+message names `node-N`.
+
+The cluster suite gets
+`upgrade_start_sent_to_a_node_that_is_not_the_leader_reaches_the_leader`,
+which sends the start to a node other than the leader and waits for the run
+to finish. Before the change the node refused it with its own, leaderless
+view of the plan. Its council has a single voter, so that node is outside
+Raft and finds the leader through the directory: the Raft-follower path is the
+API test's job.
+
+One gap is left, and the manual says so. relish builds the `start` and
+`rollback` plans from the connected node's `/v1/cluster/nodes`, and a worker
+outside Raft doesn't know which node leads, so its plan names none and the
+leader refuses it. Forwarding gets the call to the right place; it can't fix
+a plan built from a node that doesn't know the answer.

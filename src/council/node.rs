@@ -137,7 +137,7 @@ impl CouncilNode {
             Err(e) => match e {
                 openraft::error::RaftError::APIError(ClientWriteError::ForwardToLeader(fwd)) => {
                     Err(CouncilError::ForwardToLeader {
-                        leader: fwd.leader_id,
+                        leader: fwd.leader_node.map(|node| node.name),
                     })
                 }
                 other => Err(CouncilError::WriteFailed(other.to_string())),
@@ -1238,6 +1238,18 @@ mod tests {
             "expected ForwardToLeader, got {:?}",
             result
         );
+        // The message names the leader as operators know it, not by its
+        // internal Raft id ("leader is node Some(5870141345109727948)").
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            format!("not the leader (the leader is node-{leader_id})")
+        );
+    }
+
+    #[test]
+    fn forward_error_without_a_known_leader_says_so() {
+        let error = CouncilError::ForwardToLeader { leader: None };
+        assert_eq!(error.to_string(), "not the leader, and no leader is known");
     }
 
     // -----------------------------------------------------------------------

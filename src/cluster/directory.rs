@@ -120,6 +120,35 @@ pub fn resolve_leader_view(
         .map(hint_view)
 }
 
+/// Where to send a request that only the leader can serve: the current
+/// leader's advertised API endpoint.
+///
+/// Raft metrics say who leads when this node is a Raft member, and the
+/// directory says where that node's API is. A worker outside the council, or
+/// a node that hasn't learned a Raft term yet, has only the gossip hint. This
+/// is a route, not a proof of leadership: the destination must still pass its
+/// own quorum check before it acts.
+pub fn leader_api_address(
+    metrics: &openraft::RaftMetrics<u64, CouncilNodeInfo>,
+    directory: &NodeDirectory,
+) -> Option<SocketAddr> {
+    resolve_leader(metrics, directory, 0, 0)
+        .and_then(|leader| {
+            directory
+                .endpoints
+                .get(&leader.node_id)
+                .map(|node| node.api_address)
+                .or_else(|| {
+                    directory
+                        .leader
+                        .as_ref()
+                        .filter(|hint| hint.node_id == leader.node_id && hint.term == leader.term)
+                        .map(|hint| hint.api_address)
+                })
+        })
+        .or_else(|| directory.leader.as_ref().map(|leader| leader.api_address))
+}
+
 fn hint_view(hint: &crate::mustard::message::LeaderHint) -> LeaderView {
     LeaderView {
         node_id: hint.node_id.clone(),

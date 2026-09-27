@@ -56,6 +56,15 @@ laptop running a `relish local` cluster, the push goes through the registry
 forward and works without flags. `--registry host:port` names one address for
 both the push and the fetch.
 
+Only the leader records and walks an upgrade, but you don't have to find it.
+A council node that isn't the leader passes `start`, `resume`, `abort` and a
+cluster `rollback` on to the leader with your own credentials, so the leader
+checks your permissions as usual. The binary still goes to the registry of
+the node you're connected to. A worker outside the council passes the calls
+on too, but relish builds the `start` and `rollback` plans from the node list
+of the node it's connected to, and a worker's list doesn't say which node
+leads, so the leader refuses the plan. Run those two against a council node.
+
 `start` refuses a candidate with the version the nodes already run but
 different bytes: build it with a new version instead. If the bytes are
 identical it reports that there's nothing to do. Moving to an older version

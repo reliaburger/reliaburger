@@ -359,28 +359,7 @@ impl RegistryForwarder {
             if let Some(council) = council {
                 let metrics = council.metrics();
                 let metrics = metrics.borrow();
-                crate::cluster::directory::resolve_leader(&metrics, &directory, 0, 0)
-                    .and_then(|leader| {
-                        directory
-                            .endpoints
-                            .get(&leader.node_id)
-                            .map(|node| node.api_address)
-                            .or_else(|| {
-                                directory
-                                    .leader
-                                    .as_ref()
-                                    .filter(|hint| {
-                                        hint.node_id == leader.node_id && hint.term == leader.term
-                                    })
-                                    .map(|hint| hint.api_address)
-                            })
-                    })
-                    .or_else(|| {
-                        // A fresh worker may not have learned any Raft term yet.
-                        // This route hint never advances consensus or a reporting
-                        // epoch: the destination must independently prove quorum.
-                        directory.leader.as_ref().map(|leader| leader.api_address)
-                    })
+                crate::cluster::directory::leader_api_address(&metrics, &directory)
             } else {
                 directory.leader.as_ref().map(|leader| leader.api_address)
             }

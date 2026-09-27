@@ -2678,6 +2678,34 @@ still time for another go". Anything else, success included, falls through to
 back unchanged. The budget is 30 seconds, after which the caller sees the 504
 it would have seen before.
 
+The next candidate, 77f366b, failed all three volume cases with a 404 that
+looked like a product bug:
+
+```text
+exec in vol-persist failed: API error (status 404):
+{"error":"app \"vol-persist\" not found in namespace \"rbtest-…-09\""}
+```
+
+Nothing between the two candidates touched exec, the scheduler or the
+volume cases. The cases had always sent their exec to the entry node, and
+the entry node only execs into instances it runs itself. Every earlier pass
+was placement luck: the soak pins its own volume apps to nodes 2 and 3, so a
+fresh one-replica app usually landed on node 1. `relish exec` already finds
+the node running the app, and so did the other catalogue cases, through
+`TestContext::exec_in_workload`. The volume cases were the last to call
+`ctx.client.exec` directly. They now go through the same helper, and a unit
+test serves a fake entry node that answers exec with the real 404 while the
+app runs on a peer behind its relay. It failed with the soak's message before
+the change.
+
+Reading the restart case closely turned up a second problem. Since stop
+became asynchronous, `stop` returns while the instance is still `stopping`.
+The case redeployed straight away, which Bun refuses for a workload that's
+still stopping, and if the redeploy had got through, the "running" instance it
+waited for could have been the old one (the replacement reuses its id), so
+the marker check would have passed without a restart at all. It now waits
+until every instance is `stopped` or `failed` before redeploying.
+
 ## Walk the path you actually care about
 
 Say `web` can't reach `redis`. Checking Bun's own DNS and TCP access might tell
