@@ -167,7 +167,10 @@ this).
       Main was merged into the branch (merge commit; one conflict in
       `docs/linux-servers.md`, resolved to main's package list plus the PR's
       Buildah line).
-- [ ] 7. PR body updated; CI green with `full-ci`.
+- [x] 7. PR body updated (still a draft); CI green with `full-ci` on 44486883
+      (portable Linux/macOS, privileged Linux with the gated Buildah tests,
+      multi-node cluster, acceptance, demo app, build/guest-image jobs).
+- [ ] 8. The VM checks below, once no soak is running.
 
 ## Needs a VM later (don't do it during the soak)
 
