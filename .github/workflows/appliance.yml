@@ -136,8 +136,8 @@ jobs:
           done
           elapsed=$(( $(date +%s) - start ))
           kill "$qemu" 2>/dev/null || true
-          echo "--- serial console (last 150 lines) ---"
-          tail -n 150 "$log" || true
+          echo "--- serial console ---"
+          cat "$log" || true
           echo "### Boot test: $result after ${elapsed} s" >> "$GITHUB_STEP_SUMMARY"
           grep "reliaburger:" "$log" >> "$GITHUB_STEP_SUMMARY" || true
           [ "$result" = pass ]
