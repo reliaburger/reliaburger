@@ -293,19 +293,58 @@ def snapshot_archive_findings(state, node, text):
     return findings
 
 
-def restart_findings(state, node, inventory):
-    """systemd restarts of bun that no harness kill explains."""
+# How long a harness kill can wait for the systemd restart it explains; an
+# older expectation never excuses a later restart.
+EXPECT_WINDOW = 600
+
+
+def restart_expectations(evidence, node):
+    """Times the harness said it would kill `node`'s bun, oldest first.
+
+    They live in their own append-only file: the harness records a kill while
+    a background check may be loading and rewriting state.json, and a write
+    there could be lost."""
+    path = Path(evidence) / "restart-expectations.jsonl"
+    if not path.exists():
+        return []
+    times = []
+    for line in path.read_text().splitlines():
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if entry.get("node") == node:
+            times.append(entry["ts"])
+    return times
+
+
+def restart_findings(state, node, inventory, expectations, now):
+    """systemd restarts of bun that no harness kill explains.
+
+    Each expectation explains at most one restart, and stays available until
+    a restart uses it or it is EXPECT_WINDOW old, so a check that runs between
+    the kill being recorded and systemd restarting bun doesn't use it up."""
     boot = (inventory.get("boot") or [None])[0]
     count = inventory_number(inventory, "nrestarts")
     if count is None:
         return []
-    restarts = state.setdefault("restarts", {}).setdefault(node, {"boot": boot, "n": count, "expected": 0})
+    restarts = state.setdefault("restarts", {}).setdefault(node, {"boot": boot, "n": count, "used": len(expectations)})
+    restarts.pop("expected", None)
+    restarts.setdefault("used", 0)
     findings = []
+    pending = expectations[restarts["used"]:]
+    fresh = [ts for ts in pending if now - ts <= EXPECT_WINDOW]
+    restarts["used"] += len(pending) - len(fresh)
     if restarts["boot"] == boot:
-        unexplained = count - restarts["n"] - restarts["expected"]
-        if unexplained > 0:
-            findings.append(finding("bun-restart", "fail", f"{unexplained} systemd restart(s) of bun without a harness kill", node))
-    restarts.update(boot=boot, n=count, expected=0)
+        observed = max(count - restarts["n"], 0)
+        explained = min(observed, len(fresh))
+        restarts["used"] += explained
+        if observed > explained:
+            findings.append(finding("bun-restart", "fail", f"{observed - explained} systemd restart(s) of bun without a harness kill", node))
+    else:
+        # A new boot starts systemd's counter again; nothing carries over.
+        restarts["used"] = len(expectations)
+    restarts.update(boot=boot, n=count)
     panics = inventory_number(inventory, "panics") or 0
     if panics:
         findings.append(finding("bun-panic", "fail", f"{panics} panic line(s) in the journal", node))
@@ -488,7 +527,7 @@ def evaluate(evidence, snapshot):
         text = read(snapshot, f"inventory-{node}.txt")
         if text is not None:
             inventory = parse_inventory(text)
-            findings += restart_findings(state, node, inventory)
+            findings += restart_findings(state, node, inventory, restart_expectations(evidence, node), now)
             findings += resource_trend_findings(state, node, inventory, now)
             if by_node is not None and node in baseline:
                 leaks += leak_findings(baseline[node]["inventory"], inventory,
@@ -986,6 +1025,7 @@ def main(argv=None):
     expect.add_argument("evidence")
     expect.add_argument("what", choices=["restart"])
     expect.add_argument("node")
+    expect.add_argument("--at", type=int, help="when the kill happens (default: now)")
     power_cut = commands.add_parser("power-cut", help="a node's power was cut: the log view may lose unsynced lines")
     power_cut.add_argument("evidence")
     window = commands.add_parser("window")
@@ -1033,10 +1073,8 @@ def main(argv=None):
                      settle_seconds=args.settle_seconds)
         return 0
     if args.command == "expect":
-        state = load_state(args.evidence)
-        restarts = state.setdefault("restarts", {}).setdefault(args.node, {"boot": None, "n": 0, "expected": 0})
-        restarts["expected"] += 1
-        save_state(args.evidence, state)
+        with open(Path(args.evidence) / "restart-expectations.jsonl", "a") as out:
+            out.write(json.dumps({"node": args.node, "ts": args.at if args.at is not None else int(time.time())}) + "\n")
         return 0
     if args.command == "power-cut":
         state = load_state(args.evidence)
