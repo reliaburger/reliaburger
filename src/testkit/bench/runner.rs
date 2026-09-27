@@ -110,6 +110,7 @@ pub async fn run(
 
         let ttl_seconds = timeout
             .saturating_add(CLEANUP_TIMEOUT)
+            .saturating_add(crate::relish::client::lease_release_budget())
             .as_secs()
             .saturating_add(1);
         if ttl_seconds > capabilities.test_policy.max_lease_seconds {
@@ -160,7 +161,10 @@ pub async fn run(
             .cleanup(Deadline::after(CLEANUP_TIMEOUT).expect("cleanup is non-zero"))
             .await;
         let lease_cleanup = leases
-            .cleanup(Deadline::after(CLEANUP_TIMEOUT).expect("cleanup is non-zero"))
+            .cleanup(
+                Deadline::after(crate::relish::client::lease_release_budget())
+                    .expect("cleanup is non-zero"),
+            )
             .await;
         let cleanup_error = cleanup_failure(fault_cleanup, lease_cleanup.err());
         match (execution, cleanup_error) {
