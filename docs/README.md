@@ -40,6 +40,13 @@ the backlog after it.
   [compatibility policy](releasing.md#cluster-compatibility).
 - **One Bun per writable image store.** Registry startup claims exclusive
   ownership of the image store's upload directory.
+- **Multi-platform images don't run from Pickle.** A node pulling an OCI
+  image index or Docker manifest list from the built-in registry treats it as
+  a single image and fails to run it. That covers `docker buildx build
+  --platform linux/amd64,linux/arm64 --push` and `relish build` with more than
+  one platform (the default), which also stores only the builder's platform.
+  Push or build a single platform matching your nodes; see
+  [Images and volumes](manual/11_images-and-volumes.md#multi-platform-images).
 - **Test volumes have no snapshots.** Disposable test-volume snapshots aren't
   supported.
 

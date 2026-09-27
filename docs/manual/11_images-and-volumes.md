@@ -104,6 +104,32 @@ anonymously to a standalone node's loopback registry before its first API
 token exists. Pickle has no Docker token service, and it doesn't support
 deleting images through the registry API.
 
+## Multi-platform images
+
+0.1.0 can't run a multi-platform image (an OCI image index or Docker manifest
+list) stored in Pickle. A node pulling one treats the index as a single image
+and the workload fails to start. This hits `docker buildx build --platform
+linux/amd64,linux/arm64 --push` and multi-platform `relish build`, which is the
+default; a multi-platform `relish build` also stores only the builder's own
+platform. A release after 0.1.0 fixes both.
+
+Until then, push and build one platform that matches your nodes:
+
+```sh
+docker buildx build --platform linux/arm64 -t NODE:5050/api:v1 --push .
+```
+
+```toml
+[build.api]
+context = "./api"
+destination = "pickle://api:v1.2.3"
+platform = ["linux/arm64"]      # or ["linux/amd64"], whatever your nodes run
+```
+
+On a cluster whose nodes share one architecture, multi-platform images from
+an upstream registry work: the pull-through cache picks the node's platform
+from the index and stores that single image.
+
 ## Volumes
 
 ```toml
