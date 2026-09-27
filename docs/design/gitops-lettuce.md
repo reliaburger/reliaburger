@@ -113,7 +113,7 @@ never syncs the wrong repository.
 
 Lettuce parses TOML files in a defined order to handle cross-references:
 
-1. **Discovery.** Walk all `.toml` files under `path`, subdirectories included (`git ls-tree -r`). There is no shallow mode and no `recursive` key.
+1. **Discovery.** Walk all `.toml` files under `path`, subdirectories included (`git ls-tree -r -z`, so paths with tabs or non-ASCII bytes arrive unquoted). There is no shallow mode and no `recursive` key. A listed file that can't be read, or whose path isn't UTF-8, fails the whole sync: a partial file set would delete what the missing file declares.
 2. **Namespace resolution.** Files can declare `[namespace]` blocks. If a file doesn't declare a namespace, it inherits the namespace from its parent directory name, or falls back to `default`.
 3. **Parse and validate.** Each file is parsed with the `toml` crate. Validation checks:
    - Required fields present (`image` or `exec`/`script` for apps/jobs)

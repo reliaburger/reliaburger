@@ -296,6 +296,7 @@ Fixes from the [static review in PR #258](https://github.com/reliaburger/reliabu
 
 - [x] **B14** Match GitOps trusted signing keys exactly against the `VALIDSIG` signing or primary fingerprint (GPG) or the `SHA256:` fingerprint (SSH), not as a substring of all verifier output. Follow-up: verify against a private `GNUPGHOME` holding only the trusted keys.
 - [x] **B15** Treat a committed but refused GitOps write (`CouncilResponse::Refused`) as unapplied, so the sync doesn't advance `last_applied_commit` past it.
+- [x] **B17** List GitOps files with `ls-tree -z` so tab and non-ASCII paths aren't dropped, and fail the sync when a listed file can't be read, instead of deleting what it declared.
 
 ### Engineering follow-ups
 

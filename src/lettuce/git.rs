@@ -245,8 +245,12 @@ impl GitRepo {
             format!("{sha}:{prefix}")
         };
 
+        // `-z` prints each path raw and NUL-terminated. Without it git
+        // C-quotes any path holding a tab or a non-ASCII byte, and the quoted
+        // name neither ends in `.toml` nor names a blob, so the file silently
+        // dropped out of desired state and its apps were deleted (B17).
         let output = Command::new("git")
-            .args(["ls-tree", "-r", "--name-only", "--end-of-options"])
+            .args(["ls-tree", "-r", "-z", "--name-only", "--end-of-options"])
             .arg(&tree_arg)
             .current_dir(&self.path)
             .output()
@@ -264,18 +268,25 @@ impl GitRepo {
             )));
         }
 
-        let listing = String::from_utf8_lossy(&output.stdout);
         let mut files = HashMap::new();
 
-        for line in listing.lines() {
-            if !line.ends_with(".toml") {
+        for entry in output.stdout.split(|byte| *byte == 0) {
+            if !entry.ends_with(b".toml") {
                 continue;
             }
+            // A config path must be text to be a map key; refuse rather
+            // than skip, since skipping would delete what it declares.
+            let name = std::str::from_utf8(entry).map_err(|_| {
+                LettuceError::GitFailed(format!(
+                    "{sha}: path {:?} is not valid UTF-8",
+                    String::from_utf8_lossy(entry)
+                ))
+            })?;
 
             let blob_path = if prefix.is_empty() {
-                line.to_string()
+                name.to_string()
             } else {
-                format!("{prefix}/{line}")
+                format!("{prefix}/{name}")
             };
 
             // Read file content. `--end-of-options` guards the object spec
@@ -287,10 +298,17 @@ impl GitRepo {
                 .output()
                 .map_err(|e| LettuceError::GitFailed(e.to_string()))?;
 
-            if content_output.status.success() {
-                let content = String::from_utf8_lossy(&content_output.stdout).to_string();
-                files.insert(line.to_string(), content);
+            // A file that's listed but unreadable fails the whole sync (B17).
+            // Dropping it would leave a partial desired state, and the diff
+            // would delete everything that file declares.
+            if !content_output.status.success() {
+                return Err(LettuceError::GitFailed(format!(
+                    "git show {sha}:{blob_path:?} failed: {}",
+                    String::from_utf8_lossy(&content_output.stderr).trim()
+                )));
             }
+            let content = String::from_utf8_lossy(&content_output.stdout).to_string();
+            files.insert(name.to_string(), content);
         }
 
         Ok(files)
@@ -561,6 +579,11 @@ mod tests {
 
     /// Create a test git repo with a TOML file.
     fn create_test_repo() -> (TempDir, PathBuf) {
+        create_test_repo_with_files(&[("app.toml", "[app.web]\nimage = \"myapp:v1\"\n")])
+    }
+
+    /// Create a test git repo whose one commit holds `files` (path, content).
+    fn create_test_repo_with_files(files: &[(&str, &str)]) -> (TempDir, PathBuf) {
         let dir = TempDir::new().unwrap();
         let repo_path = dir.path().join("test-repo");
 
@@ -596,15 +619,14 @@ mod tests {
             .output()
             .unwrap();
 
-        // Add a TOML file
-        fs::write(
-            working.join("app.toml"),
-            "[app.web]\nimage = \"myapp:v1\"\n",
-        )
-        .unwrap();
+        for (path, content) in files {
+            let file = working.join(path);
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(file, content).unwrap();
+        }
 
         Command::new("git")
-            .args(["add", "app.toml"])
+            .args(["add", "--all"])
             .current_dir(&working)
             .output()
             .unwrap();
@@ -676,6 +698,111 @@ mod tests {
 
         assert!(files.contains_key("app.toml"), "keys: {:?}", files.keys());
         assert!(files["app.toml"].contains("[app.web]"));
+    }
+
+    /// B17: git quotes a path with non-ASCII bytes or a tab in plain
+    /// `ls-tree` output (`"caf\303\251.toml"`), and the quoted name neither
+    /// ends in `.toml` nor names a blob. Those files were silently left
+    /// out of desired state, so the sync deleted whatever they declared.
+    #[test]
+    fn list_toml_files_reads_non_ascii_and_tab_filenames() {
+        let (dir, repo_path) = create_test_repo_with_files(&[
+            ("café.toml", "[app.cafe]\nimage = \"cafe:v1\"\n"),
+            ("tab\tname.toml", "[app.tab]\nimage = \"tab:v1\"\n"),
+            (
+                "über dir/zürich.toml",
+                "[app.zurich]\nimage = \"zurich:v1\"\n",
+            ),
+            ("plain.toml", "[app.plain]\nimage = \"plain:v1\"\n"),
+        ]);
+        let clone_path = dir.path().join("clone");
+        let url = format!("file://{}", repo_path.display());
+        let repo = GitRepo::clone_or_open(&url, &clone_path, "main").unwrap();
+        let sha = repo.head_sha().unwrap();
+
+        let files = repo.list_toml_files(&sha, "/").unwrap();
+
+        let mut names: Vec<&str> = files.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            [
+                "café.toml",
+                "plain.toml",
+                "tab\tname.toml",
+                "über dir/zürich.toml"
+            ]
+        );
+        assert!(files["café.toml"].contains("[app.cafe]"));
+        assert!(files["tab\tname.toml"].contains("[app.tab]"));
+        assert!(files["über dir/zürich.toml"].contains("[app.zurich]"));
+
+        // Under a path prefix the listing is relative to it.
+        let files = repo.list_toml_files(&sha, "über dir").unwrap();
+        assert_eq!(files.keys().collect::<Vec<_>>(), ["zürich.toml"]);
+        assert!(files["zürich.toml"].contains("[app.zurich]"));
+    }
+
+    /// B17: a listed `.toml` whose blob can't be read used to be dropped,
+    /// leaving a partial desired state that deletes what the file
+    /// declared. The whole listing must fail instead.
+    #[test]
+    fn list_toml_files_fails_when_a_blob_cannot_be_read() {
+        let (dir, repo_path) = create_test_repo_with_files(&[
+            ("app.toml", "[app.web]\nimage = \"myapp:v1\"\n"),
+            ("other.toml", "[app.other]\nimage = \"other:v1\"\n"),
+        ]);
+        let clone_path = dir.path().join("clone");
+        let url = format!("file://{}", repo_path.display());
+        let repo = GitRepo::clone_or_open(&url, &clone_path, "main").unwrap();
+        let sha = repo.head_sha().unwrap();
+
+        let blob = git_stdout(&clone_path, &["rev-parse", &format!("{sha}:other.toml")]);
+        remove_object(&clone_path, &blob);
+
+        let result = repo.list_toml_files(&sha, "/");
+        assert!(
+            matches!(result, Err(LettuceError::GitFailed(ref message)) if message.contains("other.toml")),
+            "an unreadable blob must fail the listing, not vanish from it: {result:?}"
+        );
+    }
+
+    fn git_stdout(repo: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?} failed");
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    /// Delete one object from a bare repo: unpack every pack into loose
+    /// objects, then remove that object's file.
+    fn remove_object(repo: &Path, object: &str) {
+        let pack_dir = repo.join("objects/pack");
+        for entry in fs::read_dir(&pack_dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "pack")
+            {
+                let pack = fs::read(&path).unwrap();
+                for extension in ["pack", "idx", "rev"] {
+                    let _ = fs::remove_file(path.with_extension(extension));
+                }
+                let mut child = Command::new("git")
+                    .arg("unpack-objects")
+                    .current_dir(repo)
+                    .stdin(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                std::io::Write::write_all(child.stdin.as_mut().unwrap(), &pack).unwrap();
+                assert!(child.wait().unwrap().success());
+            }
+        }
+        let loose = repo.join("objects").join(&object[..2]).join(&object[2..]);
+        fs::remove_file(&loose).unwrap();
     }
 
     /// GIT4: a commit SHA or path beginning with `-` must not be able to
