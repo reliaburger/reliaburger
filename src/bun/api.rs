@@ -7049,7 +7049,7 @@ async fn send_node_request(
     request: reqwest::RequestBuilder,
     operation: &str,
 ) -> Response {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + NODE_REQUEST_TIMEOUT;
     let response = match tokio::time::timeout_at(deadline, request.send()).await {
         Ok(Ok(response)) => response,
         Ok(Err(error)) => {
@@ -7207,18 +7207,33 @@ async fn fault_clear_handler(
         )
             .into_response();
     }
-    match ask_agent(&state.cmd_tx, |response| AgentCommand::ClearFault {
+    // One budget covers the agent's answer and the release wait, so a node
+    // that forwarded this clear hears this node's own verdict, not its own
+    // deadline passing.
+    let deadline = tokio::time::Instant::now() + NODE_FAULT_CLEAR_BUDGET;
+    let cleared = ask_agent(&state.cmd_tx, |response| AgentCommand::ClearFault {
         fault_id: id,
         allow_workload_fault,
         allow_node_fault,
         allow_node_pressure,
         response,
-    })
-    .await
-    {
+    });
+    let Ok(cleared) = tokio::time::timeout_at(deadline, cleared).await else {
+        // A clear already queued still runs; asking again is idempotent.
+        return (
+            StatusCode::GATEWAY_TIMEOUT,
+            Json(serde_json::json!({
+                "error": format!(
+                    "the agent has not answered the clear of fault {id} yet; retry the clear"
+                )
+            })),
+        )
+            .into_response();
+    };
+    match cleared {
         Ok(Ok(clearance)) => {
             if let Some(sequence) = clearance.reservation
-                && !wait_for_node_fault_release(&state, sequence).await
+                && !wait_for_node_fault_release(&state, sequence, deadline).await
             {
                 return (
                     StatusCode::GATEWAY_TIMEOUT,
@@ -7258,23 +7273,32 @@ async fn fault_clear_handler(
     }
 }
 
-/// How long a clear waits for the council to release a node fault's
-/// reservation. It stays under the 5-second deadline a forwarding node gives
-/// the owning node, so a forwarded clear reports this node's own verdict.
-const NODE_FAULT_RELEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
+/// How long a node that forwards a node-level request waits for the owning
+/// node's answer.
+const NODE_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long a clear may spend on the owning node: the agent's answer plus the
+/// wait for the council to release a node fault's reservation. It stays a
+/// second under [`NODE_REQUEST_TIMEOUT`], so a forwarded clear reports this
+/// node's own verdict rather than the forwarder's timeout.
+const NODE_FAULT_CLEAR_BUDGET: std::time::Duration =
+    NODE_REQUEST_TIMEOUT.saturating_sub(std::time::Duration::from_secs(1));
 
 /// Wait until the council no longer holds the reservation a cleared node fault
-/// owned, or the deadline passes. Returns whether it was released.
+/// owned, or `deadline` passes. Returns whether it was released.
 ///
 /// The leader's reaper releases a reservation only after it has fenced the
 /// target node through its own live membership view. So once this returns
 /// `true`, the leader that will judge the next node fault has already seen
 /// this node back, and the single experiment slot is free again.
-async fn wait_for_node_fault_release(state: &ApiState, sequence: u64) -> bool {
+async fn wait_for_node_fault_release(
+    state: &ApiState,
+    sequence: u64,
+    deadline: tokio::time::Instant,
+) -> bool {
     let Some(council) = &state.council else {
         return true;
     };
-    let deadline = tokio::time::Instant::now() + NODE_FAULT_RELEASE_TIMEOUT;
     loop {
         let released = council
             .desired_state()
@@ -10787,6 +10811,71 @@ mod tests {
             StatusCode::OK
         );
         shutdown.cancel();
+    }
+
+    /// A node forwarding a clear gives the owning node [`NODE_REQUEST_TIMEOUT`].
+    /// When the owning agent is busy, the owning node must still answer inside
+    /// that, with its own retryable 504, instead of letting the forwarder's
+    /// deadline pass first.
+    #[tokio::test(start_paused = true)]
+    async fn a_clear_answers_within_its_budget_when_the_agent_is_busy() {
+        // An agent that never gets round to the command.
+        let (cmd_tx, _cmd_rx) = mpsc::channel(4);
+        let app = router_with_upgrade(
+            cmd_tx,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            9117,
+            None,
+            None,
+            None,
+            "default".to_string(),
+            Some("node-2".to_string()),
+            900,
+            crate::cluster::ClusterHttp::plaintext(),
+            5050,
+            "http",
+            256 * 1024 * 1024,
+            false,
+            workload_fault_static_capabilities(),
+            crate::bun::readiness::ReadinessTracker::new(),
+            None,
+            None,
+        );
+        let started = tokio::time::Instant::now();
+        let response = tokio::time::timeout(
+            NODE_REQUEST_TIMEOUT * 2,
+            app.oneshot(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri("/v1/fault/7")
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        )
+        .await
+        .expect("the clear never answered")
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert!(started.elapsed() < NODE_REQUEST_TIMEOUT);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&body).contains("retry the clear"),
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
     }
 
     #[tokio::test]
