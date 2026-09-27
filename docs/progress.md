@@ -292,6 +292,10 @@ Smaller fixes that CI runs turned up along the way:
 - [x] **C59** Resolve OCI indexes for the Linux container target, independently of the client's operating system.
 - [x] **C60** Hold Pickle registry requests to the caller's token scope (found while landing PR #194). A namespace-scoped Deployer could push to any repository over Bearer and Basic alike. Every write (upload start, chunk, completion, manifest `PUT`, copy confirmation) and every routable read now requires a repository named `<namespace>/<app>` inside the scope; bare names, `cache/…` and malformed names are refused to scoped tokens, except blob-only uploads to `_buildcontext` and `reliaburger-bun`. A scoped reader's blob `GET` must be for a blob the named repository references. `/v1/build` destinations use the same rule (a bare destination no longer counts as `default`), and `/v1/images` lists only readable repositories. Unscoped tokens, the service token and the bootstrap window are unchanged.
 
+Fixes from the [static review in PR #258](https://github.com/reliaburger/reliaburger/pull/258) (its IDs):
+
+- [x] **B14** Match GitOps trusted signing keys exactly against the `VALIDSIG` signing or primary fingerprint (GPG) or the `SHA256:` fingerprint (SSH), not as a substring of all verifier output. Follow-up: verify against a private `GNUPGHOME` holding only the trusted keys.
+
 ### Engineering follow-ups
 
 - [x] **H01** Reconcile scheduler/quota/scrape wiring, roadmap test locations, cleanup evidence and disabled-auth chaos policy with their callers; all-feature Rustdoc builds with warnings denied.
