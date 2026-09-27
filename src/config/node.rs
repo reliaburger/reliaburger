@@ -787,7 +787,7 @@ impl Default for ImagesSection {
             external_registries: Vec::new(),
             build_timeout_secs: 900,
             max_context_bytes: 256 * 1024 * 1024,
-            build_cache_max_bytes: 1024 * 1024 * 1024,
+            build_cache_max_bytes: 100 * 1024 * 1024 * 1024,
             trust_policy: TrustPolicySection::default(),
             mirrors: crate::grill::image::ImageMirrors::default(),
         }
@@ -1397,9 +1397,9 @@ mod tests {
     }
 
     #[test]
-    fn build_cache_cap_defaults_to_one_gib_and_is_configurable() {
+    fn build_cache_cap_defaults_to_100_gib_and_is_configurable() {
         let nc = NodeConfig::parse("").unwrap();
-        assert_eq!(nc.images.build_cache_max_bytes, 1024 * 1024 * 1024);
+        assert_eq!(nc.images.build_cache_max_bytes, 100 * 1024 * 1024 * 1024);
         let nc = NodeConfig::parse("[images]\nbuild_cache_max_bytes = 0\n").unwrap();
         assert_eq!(nc.images.build_cache_max_bytes, 0);
     }
