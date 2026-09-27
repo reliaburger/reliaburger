@@ -2,6 +2,8 @@
 
 Reviewed commit: `0a5dfc696a757193e4173af1618c64586c02f0b9`, copied from `fix/tier-1-merge-blockers` into the isolated `release-010-analysis` worktree. This is a fixed-source review, not a verdict on changes the release task may subsequently make.
 
+**Second-pass update:** see the [additional review against main at `0eb6071d`](2026-09-27-static-release-review-second-pass.md) for nine further findings and changes since this snapshot. B08's metric mapping, B09's distribution conversion and the Btrfs restore test selection have since been addressed in source. The findings and recommendations below describe the original reviewed commit.
+
 **Recommendation:** review the snapshot authorisation/data-integrity findings and the broken built-in autoscaling signal before tagging. Complete the already planned V01–V04 gates independently. Keep the declared future capabilities deferred, but remove contradictory claims from release-facing documentation.
 
 ## Scope and non-interference
