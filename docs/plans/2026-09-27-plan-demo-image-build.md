@@ -146,7 +146,9 @@ this).
       Unit tests with fake OCI layouts; portable-suite test uploading a
       two-platform layout to a real Pickle router
       (`registry_routable_push::a_multi_platform_layout_publishes_every_platform`).
-- [ ] 2. Index-aware cluster pull (`ClusterSource`), unit + portable tests.
+- [x] 2. Index-aware cluster pull (`ClusterSource`), unit + portable tests
+      (`pickle_cluster::a_multi_platform_image_pulls_the_nodes_own_platform`,
+      `…_without_the_nodes_platform_is_refused`; `p2p::tests::platform_selection_*`).
 - [x] 3. Dedicated Buildah storage root, build lock, cleanup commands,
       `[images] build_cache_max_bytes`. Unit tests for commands and the cap.
       (Landed in the same commit as step 1: the runner rewrite covers both.

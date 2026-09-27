@@ -159,6 +159,14 @@ impl ImageManifest {
         }
         digests
     }
+
+    /// Whether this entry is an image index (a multi-platform image) rather
+    /// than one platform's image. The registry records an index with its own
+    /// blob as the config descriptor and its platform manifests as "layers",
+    /// so it can't be unpacked as it stands: a pull first picks a platform.
+    pub fn is_index(&self) -> bool {
+        self.config.digest == self.digest
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -766,6 +774,9 @@ pub enum PickleError {
     ManifestNotFound { repository: String, tag: String },
     #[error("missing layer: {0}")]
     MissingLayer(Digest),
+    /// A multi-platform image offers nothing this node can run.
+    #[error("image index has no manifest for linux/{architecture}")]
+    NoPlatformManifest { architecture: String },
     #[error("upload session not found: {0}")]
     UploadNotFound(String),
     #[error("invalid upload id: {0}")]
