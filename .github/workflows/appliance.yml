@@ -93,6 +93,7 @@ jobs:
         run: |
           set -euo pipefail
           cd image/mkosi.output
+          ls -l
           {
             echo "### Appliance $IMAGE_VERSION ($ARCH), built in ${BUILD_SECONDS} s"
             echo '```'
@@ -111,7 +112,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y -qq qemu-system-x86 ovmf zstd
-          zstd -q -d "$(ls image/mkosi.output/reliaburger-os_*.raw.zst | grep -v -e usr -e verity)" -o "$RUNNER_TEMP/disk.raw"
+          zstd -q -d "image/mkosi.output/reliaburger-os_${IMAGE_VERSION}.raw.zst" -o "$RUNNER_TEMP/disk.raw"
           # An 8 GB disk, like the Wyse 3040: first boot adds slot B and grows
           # the data partition into the free space.
           truncate -s 8G "$RUNNER_TEMP/disk.raw"
@@ -161,6 +162,8 @@ jobs:
           name: appliance-${{ matrix.arch }}
           path: |
             image/mkosi.output/*.raw*
+            !image/mkosi.output/*.esp.raw*
+            !image/mkosi.output/*.root-*.raw*
             image/mkosi.output/*.efi
             image/mkosi.output/*.manifest
             image/mkosi.output/*.SHA256SUMS*
