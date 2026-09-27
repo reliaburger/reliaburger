@@ -358,6 +358,7 @@ that used to fail passes.
 
 | Test | First seen | Cause | Status |
 |---|---|---|---|
+| `grill::process::tests::stop_terminates_shell_descendants` ("ParseIntError { kind: Empty }", portable Linux) | 27 Sep (CI on #261) | Harness: the shell's `echo $! > child.pid` creates the file before writing it, and the poll read it empty | Fixed: the script writes a temp file and renames it into place, and the poll retries until the pid parses |
 | `oci_crash::normal_clustered_bun_recovers_enrolled_consumer_before_adoption` | 23 Sep | Product: rollout finalisation dropped the service reservation retirement needs | Fixed (C3.1) |
 | `placement::concurrent_node_kills_and_leader_change_preserve_reserved_capacity` | 22 Sep | Product: a returning node spread stale suspicions; a clear didn't wait for re-admission | Fixed (C3.2) |
 | `cluster_failover::decommissioned_worker_releases_cleanup_and_stays_retired_after_leader_change` | 20 Sep | Harness: waited on the leader's appended, not applied, membership | Fixed (C3.4) |
