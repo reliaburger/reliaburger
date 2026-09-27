@@ -133,4 +133,5 @@ token and CA, so you don't install a certificate in your browser or paste a
 token. Ctrl-C closes it; `--no-open` prints the link instead. You can also open
 a node's API address in a browser directly (<http://127.0.0.1:9117/> on a
 source build): once the cluster has tokens, it asks you to paste one and gives
-you a read-only session for 12 hours.
+you a read-only session for 12 hours, or until the token expires or is revoked
+if that comes first.
