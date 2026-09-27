@@ -1018,6 +1018,69 @@ The `101`-then-splice tests are the ones that pin this down. It's not enough to 
 
 TLS handshakes got the same "bound the resource" treatment from the other side. Spawning a task per handshake (the fix from a couple of sections ago) stops one slow handshaker blocking the accept loop, but it doesn't stop *ten thousand* slow handshakers spawning ten thousand tasks. So the accept loop now grabs a handshake permit from a second semaphore before it spends any work, and wraps the handshake itself in a `tokio::time::timeout`. A peer that opens a socket and never sends a ClientHello is dropped on the deadline, and its permit returns to the pool. Bounded concurrency plus a deadline: a flood costs a fixed amount of memory and clears itself.
 
+### Connections that never say goodbye (V02 soak fix)
+
+The handshake deadline covered connections that never *start*. Nobody had thought hard about connections that never *end*, until the V02 soak left a quickstart cluster running for a few hours. Bun's memory on one node went 240 MB, 396, 570, 734 within an hour. `ss -tanp` on the node told the story: 320 established TCP connections owned by Bun, 209 of them on the API port, 46 on the registry and 40 on ingress port 80, nearly all from `127.0.0.1:<something>`. The other nodes had about 25.
+
+Who talks to a node from its own loopback address? Lima does. A quickstart node is a Lima VM, and every port the Mac reaches (the API, the registry, ingress) arrives through Lima's port forwarder, which dials the service from inside the guest. The soak harness polls those ports every 30 seconds. We ran a tiny Python server in a Lima VM, `curl`ed it five times from the Mac and looked at the guest: five connections, all still `ESTABLISHED` minutes after every `curl` had exited, the other ends owned by `lima-guestagent`. The forwarder never passes the host's close on to the guest. Worse, when the server writes into one of those orphans, the agent swallows about 10 MB and then stops reading altogether.
+
+So each poll left one socket behind. On its own that's a Lima bug. The reason it became *our* bug is that Hyper, the HTTP library under axum, has no idle deadline unless you give it one. Its HTTP/1 `header_read_timeout` exists (and defaults to 30 seconds), but it only runs if the connection builder has a *timer* to drive it, and `axum::serve` builds one without. HTTP/2 keep-alive pings: same story, off without a timer. The API and registry's TLS listener already retired a connection after an hour (a lifetime cap we added for certificate rotation), which is why the TLS ports levelled off at a couple of hundred sockets instead of growing forever. Plain port 80 had no limit at all.
+
+The fix lives in `sesame::connection`, and all three listeners now share it. `serve_router_plain` replaces `axum::serve` for the plain API, registry and ingress ports; `serve_router_over_tls` and the ingress's own TLS loop hand each handshaken stream to the same `serve_http_connection`. Every connection gets the deadlines in `ConnectionTimeouts::PRODUCTION`:
+
+| Deadline | Value | What it catches |
+|----------|-------|-----------------|
+| TLS handshake | 10 s | a socket that never sends a ClientHello |
+| First byte, then HTTP/1 request head | 75 s | a connection that never sends a request; an idle keep-alive connection; a slowloris head |
+| HTTP/2 ping, then ack | 30 s, then 20 s | an HTTP/2 peer that stopped answering |
+| Write stall | 300 s | a response or WebSocket nobody reads any more |
+| TCP keepalive | 60 s idle, 15 s probes | a peer that vanished off the network |
+
+The nice surprise was in Hyper's source. We expected to build an idle timer ourselves, but Hyper restarts the header-read clock every time an HTTP/1 connection finishes a response and goes back to waiting for the next request head. So the header-read timeout *is* the keep-alive idle timeout, and it never runs while a response is streaming, because Hyper isn't reading a head then. `relish logs -f` on a quiet app can go minutes between lines without tripping it. We picked 75 seconds, nginx's default, because it's shorter than reqwest's 90-second pool idle time: a client that sees our FIN drops the pooled connection instead of reusing it.
+
+Two gaps were left that no Hyper setting covers. Hyper's auto-detecting server first reads the connection preface to decide between HTTP/1 and HTTP/2, and that read has no deadline, so a client that connects and says nothing sits there forever. And a streaming response to one of Lima's orphans fills the socket buffer and then waits on a write that never completes. Both are properties of the byte stream, not of HTTP, so we wrap the stream. `StallGuardedIo<S>` sits between the socket (or TLS session) and Hyper:
+
+```rust
+impl<S: AsyncRead + Unpin> AsyncRead for StallGuardedIo<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let before = buf.filled().len();
+        let poll = Pin::new(&mut self.inner).poll_read(cx, buf);
+        let Some(deadline) = self.first_byte.as_mut() else {
+            return poll;
+        };
+        match poll {
+            Poll::Ready(Ok(())) if buf.filled().len() > before => self.first_byte = None,
+            Poll::Pending if deadline.as_mut().poll(cx).is_ready() => {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "no request arrived on the connection",
+                )));
+            }
+            _ => {}
+        }
+        poll
+    }
+}
+```
+
+If you've written Go, you're used to `conn.SetReadDeadline` and a blocking `Read`. Tokio's I/O traits work the other way round. `AsyncRead` has one method, `poll_read`, which the runtime calls whenever it thinks progress is possible. It either fills the buffer and returns `Poll::Ready`, or returns `Poll::Pending` after registering the task's *waker* (inside `cx`) with whatever will make progress possible later. `Pin<&mut Self>` is a promise that the value won't move in memory while it's being polled; futures such as `tokio::time::Sleep` may hold pointers into themselves, so we keep ours in a `Pin<Box<...>>` and poll it in place with `as_mut()`.
+
+That's the whole trick: when the inner read is pending, we also poll the deadline's `Sleep`, which registers the *same* waker with Tokio's timer. Whichever fires first (a byte arriving or the timer) wakes the task, and on the next poll we either clear the deadline or return `TimedOut`. Hyper sees an I/O error and closes the connection. `let ... else` is Rust's guard clause: bind the pattern or run the `else` block, which must leave the function. Once the first byte arrives, `first_byte` becomes `None` and reads have no deadline at all; the header-read timeout owns idleness from then on.
+
+The write side does the same with a stall timer that starts when a write first returns `Pending` and is dropped the moment any write completes. A slow reader that drains a few bytes a minute keeps its download. Only a peer that accepts nothing for five whole minutes is cut off. Why so long? Because someone piping `relish logs -f` into `less` stops reading while they scroll, and we'd rather keep an orphaned stream a few minutes longer than cut off a human. The wrapper stays on the stream after an HTTP upgrade, so a WebSocket gets the same protection, and nothing else: a quiet WebSocket is fine for as long as it likes.
+
+TCP keepalive (set with `socket2`, because Tokio's `TcpStream` doesn't expose the knobs) is the belt to those braces. It notices a peer that dropped off the network, but not Lima's case, where the forwarder is alive and happily acknowledges the probes on behalf of a client that left hours ago. That's why the HTTP-level deadlines had to exist.
+
+The tests in `tests/suite/server_idle_connections.rs` run the real accept loops with millisecond deadlines. Forty idle keep-alive connections, forty that never send a byte, a half-sent request head, an HTTP/2 client that sends its preface and never acknowledges a ping, TLS sessions that go quiet: every one must be closed by the server within five seconds. The positive tests matter as much. A streaming response goes silent for three times the idle deadline and must still deliver its last line, and a WebSocket through ingress must echo after sitting idle for four deadlines. `forwarder_that_never_closes_upstream_does_not_accumulate_connections` replays the soak in miniature. We ran the suite against a build with the timers switched off: nine tests failed, and only the three positive ones passed.
+
+Then we measured the real binary on Linux. A Python forwarder that behaves like Lima's (it never closes upstream), eight rounds of 300 requests each to the API and the registry, and a look at Bun 80 seconds after each round. The old Bun kept every socket: 4,800 of them after eight rounds, and resident memory climbed in a straight line from 111 MB to 741 MB, about 130 KB per plain-HTTP connection in a debug build (TLS sessions cost more). The new Bun was back to zero sockets after every round.
+
+Its memory was less tidy, and that's worth being honest about. Each round still parks 600 connections at once for 75 seconds, and glibc's allocator spreads those buffers over one arena per thread and doesn't hand fragmented arenas back to the kernel. Resident memory crept up to about 397 MB over eight rounds and flattened out. With `MALLOC_ARENA_MAX=2` the same run levelled off at 284 MB after round two, and the same requests sent directly (every client closes its own socket) left Bun flat at 113 MB, exactly like an idle Bun. So what's left is allocator high-water, not a leak, and the soak's real rate (one poll every 30 seconds) keeps only a handful of idle connections alive at any moment.
+
 ### Count the request before you hide the route
 
 The permit fixed WebSockets that started *during* a drain. It said nothing about a slow request that reached its backend a second *before* the drain began. The tracker had never counted it, so the drain reported "complete" while the request was still waiting for its answer, and Bun stopped the container underneath it. A gated test server that acknowledges a request and then waits to be released made this easy to reproduce.
