@@ -2411,7 +2411,11 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         api_aggregated_rx.clone(),
         config.cluster.name.clone(),
         Some(node_name.clone()),
-        config.images.build_timeout_secs,
+        reliaburger::bun::build_runner::BuildSettings::new(
+            config.images.build_timeout_secs,
+            &config.storage.data.join("buildah"),
+            config.images.build_cache_max_bytes,
+        ),
         cluster_http.clone(),
         config.images.registry_port,
         registry_scheme,

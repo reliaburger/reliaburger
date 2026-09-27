@@ -92,7 +92,7 @@ impl TestHarness {
             None,
             "default".to_string(),
             None,
-            900,
+            reliaburger::bun::build_runner::BuildSettings::with_timeout(900),
             reliaburger::cluster::ClusterHttp::plaintext(),
             5050,
             "http",

@@ -53,6 +53,58 @@ pub struct BuildahJob {
     pub local_tag: String,
     /// Digest of the context blob in Pickle (for the build node to download).
     pub context_blob_digest: String,
+    /// The platforms the build targets, as the spec lists them. More than one
+    /// means `local_tag` names a Buildah manifest list, not an image.
+    pub platforms: Vec<String>,
+}
+
+impl BuildahJob {
+    /// Whether the build produces a manifest list (one image per platform).
+    pub fn is_multi_platform(&self) -> bool {
+        self.platforms.len() > 1
+    }
+}
+
+/// Where Buildah keeps its images and containers on a build node.
+///
+/// Builds used the host default (`/var/lib/containers/storage`), which other
+/// tools on the host (an operator's podman) share. The runner prunes this
+/// storage after every build, so it must own it outright: pruning a shared
+/// root could delete someone else's images.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildahStorage {
+    /// Buildah's `--root`: images, layers and containers.
+    pub root: PathBuf,
+    /// Buildah's `--runroot`: locks and other transient state.
+    pub runroot: PathBuf,
+}
+
+impl BuildahStorage {
+    /// Storage under `base`: `base/root` and `base/run`.
+    pub fn under(base: &Path) -> Self {
+        Self {
+            root: base.join("root"),
+            runroot: base.join("run"),
+        }
+    }
+}
+
+/// Prefix a `buildah …` command with the storage flags, so it acts on the
+/// node's own Buildah storage. Global flags go straight after the program
+/// name, before the subcommand.
+pub fn with_buildah_storage(cmd: &[String], storage: &BuildahStorage) -> Vec<String> {
+    let Some((program, rest)) = cmd.split_first() else {
+        return Vec::new();
+    };
+    let mut args = vec![
+        program.clone(),
+        "--root".to_string(),
+        storage.root.to_string_lossy().into_owned(),
+        "--runroot".to_string(),
+        storage.runroot.to_string_lossy().into_owned(),
+    ];
+    args.extend(rest.iter().cloned());
+    args
 }
 
 /// Result of a build job.
@@ -103,6 +155,12 @@ pub enum BuildError {
 
     #[error("build context has more than {limit} entries")]
     ContextTooManyEntries { limit: usize },
+
+    #[error("exported image lacks requested platform(s) {missing:?}; it has {exported:?}")]
+    MissingPlatforms {
+        missing: Vec<String>,
+        exported: Vec<String>,
+    },
 
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
@@ -196,6 +254,7 @@ pub fn execute_build(
         destination: dest,
         local_tag,
         context_blob_digest: context_digest.to_string(),
+        platforms: spec.platform.clone(),
     })
 }
 
@@ -268,15 +327,103 @@ fn buildah_push_args(local_tag: &str, tls_verify: bool) -> Vec<String> {
 /// processes. So the clustered runner uses this command to write a local
 /// layout, then uploads it through the registry client that carries the token
 /// as a bearer header. A local layout export needs no TLS and no credentials.
-pub fn buildah_push_to_oci_args(local_tag: &str, oci_layout_dir: &str, tag: &str) -> Vec<String> {
-    vec![
+///
+/// A multi-platform build leaves a manifest list under `local_tag`, and
+/// `buildah push` of a list exports only the builder's own platform. So a
+/// multi-platform job exports with `buildah manifest push --all`, which writes
+/// the index and every platform's image into the layout.
+pub fn buildah_export_to_oci_args(job: &BuildahJob, oci_layout_dir: &Path) -> Vec<String> {
+    let destination = format!(
+        "oci:{}:{}",
+        oci_layout_dir.to_string_lossy(),
+        job.destination.tag
+    );
+    let mut args = vec![
         "buildah".to_string(),
-        "push".to_string(),
         "--storage-driver".to_string(),
         "vfs".to_string(),
-        local_tag.to_string(),
-        format!("oci:{oci_layout_dir}:{tag}"),
+    ];
+    if job.is_multi_platform() {
+        args.extend([
+            "manifest".to_string(),
+            "push".to_string(),
+            "--all".to_string(),
+        ]);
+    } else {
+        args.push("push".to_string());
+    }
+    args.push(job.local_tag.clone());
+    args.push(destination);
+    args
+}
+
+/// The commands that remove what one build left in Buildah's storage, run
+/// after every build, whether it succeeded or not.
+///
+/// In order: every working container (`rm --all`; the runner holds the
+/// node's build lock, so none belongs to another build), the build's own
+/// manifest list or image, then every unnamed image (`rmi --prune`: the
+/// per-platform images a list pointed at, and multi-stage intermediates).
+/// Named base images (`FROM golang:…`) survive, so the next build of the same
+/// app starts warm; [`buildah_cache_wipe_args`] bounds them.
+pub fn buildah_cleanup_commands(job: &BuildahJob) -> Vec<Vec<String>> {
+    let buildah = |args: &[&str]| -> Vec<String> {
+        std::iter::once("buildah")
+            .chain(["--storage-driver", "vfs"])
+            .chain(args.iter().copied())
+            .map(str::to_string)
+            .collect()
+    };
+    let own_image = if job.is_multi_platform() {
+        buildah(&["manifest", "rm", &job.local_tag])
+    } else {
+        buildah(&["rmi", "--force", &job.local_tag])
+    };
+    vec![
+        buildah(&["rm", "--all"]),
+        own_image,
+        buildah(&["rmi", "--prune"]),
     ]
+}
+
+/// Bytes used by the files under `root`, without following symlinks. A
+/// missing directory holds nothing. Blocking: call it off the async runtime.
+pub fn storage_size_bytes(root: &Path) -> std::io::Result<u64> {
+    let mut total = 0u64;
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                pending.push(entry.path());
+            } else if file_type.is_file() {
+                total += entry.metadata()?.len();
+            }
+        }
+    }
+    Ok(total)
+}
+
+/// The command that empties Buildah's image cache, run when the storage root
+/// is still over `[images] build_cache_max_bytes` after a build's cleanup.
+pub fn buildah_cache_wipe_args() -> Vec<String> {
+    [
+        "buildah",
+        "--storage-driver",
+        "vfs",
+        "rmi",
+        "--all",
+        "--force",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
 }
 
 /// Build the URL to download a context blob from Pickle.
@@ -422,6 +569,299 @@ pub fn parse_oci_index(index_json: &[u8]) -> Result<OciLayoutTop, BuildError> {
         digest: top.digest,
         media_type: top.media_type,
     })
+}
+
+/// One platform's image manifest, named by an exported image index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlatformManifest {
+    /// Digest of the platform's image manifest.
+    pub digest: String,
+    /// Its media type, used as the `Content-Type` on the manifest `PUT`.
+    pub media_type: String,
+    /// `os/architecture`, plus `/variant` when the index gives one.
+    pub platform: String,
+}
+
+/// What an exported OCI layout holds: the top manifest, and for a
+/// multi-platform build the platform manifests its index names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OciLayoutImage {
+    /// The manifest `index.json` points at: an image or an image index.
+    pub top: OciLayoutTop,
+    /// Empty for a single-platform image.
+    pub platform_manifests: Vec<PlatformManifest>,
+}
+
+impl OciLayoutImage {
+    /// Every manifest digest the upload published, the top one first. These
+    /// are the digests the runner signs.
+    pub fn manifest_digests(&self) -> Vec<&str> {
+        std::iter::once(self.top.digest.as_str())
+            .chain(self.platform_manifests.iter().map(|m| m.digest.as_str()))
+            .collect()
+    }
+}
+
+const OCI_IMAGE_MANIFEST_MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
+
+/// The fields of a manifest or index that tell them apart.
+#[derive(serde::Deserialize)]
+struct ManifestProbe {
+    #[serde(rename = "mediaType")]
+    media_type: Option<String>,
+    manifests: Option<Vec<IndexEntry>>,
+}
+
+#[derive(serde::Deserialize)]
+struct IndexEntry {
+    digest: String,
+    #[serde(rename = "mediaType")]
+    media_type: Option<String>,
+    platform: Option<IndexPlatform>,
+}
+
+#[derive(serde::Deserialize)]
+struct IndexPlatform {
+    os: String,
+    architecture: String,
+    variant: Option<String>,
+}
+
+fn layout_error(reason: String) -> BuildError {
+    BuildError::PushFailed { reason }
+}
+
+/// The path of a blob inside an OCI layout, refusing a digest that isn't
+/// `sha256:` plus 64 hex characters (a digest in `index.json` is data from
+/// Buildah, and it becomes a path).
+fn layout_blob_path(oci_dir: &Path, digest: &str) -> Result<PathBuf, BuildError> {
+    let valid = crate::pickle::types::Digest::new(digest).map_err(|e| {
+        layout_error(format!(
+            "oci layout names an invalid digest {digest:?}: {e}"
+        ))
+    })?;
+    let hex = valid.as_str().trim_start_matches("sha256:").to_string();
+    Ok(oci_dir.join("blobs").join("sha256").join(hex))
+}
+
+fn read_manifest_probe(oci_dir: &Path, digest: &str) -> Result<ManifestProbe, BuildError> {
+    let path = layout_blob_path(oci_dir, digest)?;
+    let bytes = std::fs::read(&path)
+        .map_err(|e| layout_error(format!("oci layout is missing manifest {digest}: {e}")))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|e| layout_error(format!("manifest {digest} is not valid json: {e}")))
+}
+
+/// Read an exported OCI layout: the top manifest from `index.json`, and when
+/// that is an image index, the platform manifests it lists.
+///
+/// Every platform manifest must be present in the layout, name its platform,
+/// and be an image manifest: an index nested inside the index is refused, as
+/// Pickle's pull resolves exactly one level.
+pub fn read_oci_layout(oci_dir: &Path) -> Result<OciLayoutImage, BuildError> {
+    let index_bytes = std::fs::read(oci_dir.join("index.json"))
+        .map_err(|e| layout_error(format!("reading oci layout index.json: {e}")))?;
+    let top = parse_oci_index(&index_bytes)?;
+    let probe = read_manifest_probe(oci_dir, &top.digest)?;
+    let Some(entries) = probe.manifests else {
+        return Ok(OciLayoutImage {
+            top,
+            platform_manifests: Vec::new(),
+        });
+    };
+
+    let mut platform_manifests = Vec::new();
+    for entry in entries {
+        let Some(platform) = entry.platform else {
+            return Err(layout_error(format!(
+                "image index entry {} names no platform",
+                entry.digest
+            )));
+        };
+        let child = read_manifest_probe(oci_dir, &entry.digest)?;
+        if child.manifests.is_some() {
+            return Err(layout_error(format!(
+                "image index entry {} is itself an index",
+                entry.digest
+            )));
+        }
+        let platform = match platform.variant {
+            Some(variant) => format!("{}/{}/{variant}", platform.os, platform.architecture),
+            None => format!("{}/{}", platform.os, platform.architecture),
+        };
+        let media_type = entry
+            .media_type
+            .or(child.media_type)
+            .unwrap_or_else(|| OCI_IMAGE_MANIFEST_MEDIA_TYPE.to_string());
+        platform_manifests.push(PlatformManifest {
+            digest: entry.digest,
+            media_type,
+            platform,
+        });
+    }
+    // The top descriptor's media type drives the index PUT's Content-Type;
+    // fall back to what the index says about itself.
+    let top = OciLayoutTop {
+        media_type: top.media_type.or(probe.media_type),
+        ..top
+    };
+    Ok(OciLayoutImage {
+        top,
+        platform_manifests,
+    })
+}
+
+/// `os/architecture` of a platform string, dropping any variant, so
+/// `linux/arm64` matches an export that says `linux/arm64/v8`.
+fn os_and_architecture(platform: &str) -> String {
+    platform.split('/').take(2).collect::<Vec<_>>().join("/")
+}
+
+/// Check that an export carries every platform the build asked for.
+///
+/// A single-platform build (or one that names no platform) exports one
+/// image, so there is nothing to compare. A multi-platform build must export
+/// an index naming each requested platform: this is the check that would
+/// have caught `buildah push` quietly exporting only the builder's own
+/// architecture.
+pub fn check_exported_platforms(
+    requested: &[String],
+    image: &OciLayoutImage,
+) -> Result<(), BuildError> {
+    if requested.len() <= 1 {
+        return Ok(());
+    }
+    let exported: Vec<String> = image
+        .platform_manifests
+        .iter()
+        .map(|m| m.platform.clone())
+        .collect();
+    let exported_short: Vec<String> = exported.iter().map(|p| os_and_architecture(p)).collect();
+    let missing: Vec<String> = requested
+        .iter()
+        .filter(|p| !exported_short.contains(&os_and_architecture(p)))
+        .cloned()
+        .collect();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(BuildError::MissingPlatforms { missing, exported })
+    }
+}
+
+/// Upload an exported OCI layout to the local registry, presenting `bearer`
+/// (the internal service token) as the write credential (B1).
+///
+/// `buildah push` could only present the service token as HTTP Basic
+/// `--creds`, which Pickle refuses over plaintext and which would expose the
+/// token on Buildah's command line over TLS. So the runner exports a local
+/// layout and this uploads it, in the order Pickle's manifest validation
+/// needs:
+///
+/// 1. every blob under `blobs/sha256/` (configs, layers, manifests);
+/// 2. for an image index, each platform manifest `PUT` by its digest, which
+///    makes it a catalogue entry a node can pull by digest;
+/// 3. the top manifest `PUT` under `tag`.
+///
+/// Returns what was published, so the caller can sign every manifest.
+#[allow(clippy::too_many_arguments)]
+pub async fn upload_oci_layout(
+    client: &reqwest::Client,
+    scheme: &str,
+    port: u16,
+    repository: &str,
+    tag: &str,
+    oci_dir: &Path,
+    bearer: Option<&str>,
+) -> Result<OciLayoutImage, BuildError> {
+    let with_bearer = |req: reqwest::RequestBuilder| match bearer {
+        Some(token) => req.bearer_auth(token),
+        None => req,
+    };
+
+    let layout_dir = oci_dir.to_path_buf();
+    let image = tokio::task::spawn_blocking(move || read_oci_layout(&layout_dir))
+        .await
+        .map_err(|e| layout_error(format!("reading the oci layout failed: {e}")))??;
+
+    let blobs_dir = oci_dir.join("blobs").join("sha256");
+    let mut entries = tokio::fs::read_dir(&blobs_dir)
+        .await
+        .map_err(|e| layout_error(format!("reading oci layout blobs: {e}")))?;
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|e| layout_error(format!("reading oci layout blobs: {e}")))?
+    {
+        if !entry.file_type().await.is_ok_and(|t| t.is_file()) {
+            continue;
+        }
+        let path = entry.path();
+        let Some(hex) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let digest = format!("sha256:{hex}");
+        let body = tokio::fs::read(&path)
+            .await
+            .map_err(|e| layout_error(format!("reading blob {digest}: {e}")))?;
+        let url = oci_blob_upload_url(scheme, port, repository, &digest);
+        let response = with_bearer(client.post(&url).body(body))
+            .send()
+            .await
+            .map_err(|e| layout_error(format!("blob {digest} upload failed: {e}")))?;
+        if !response.status().is_success() {
+            return Err(layout_error(format!(
+                "registry refused blob {digest}: {}",
+                response.status()
+            )));
+        }
+    }
+
+    // The manifest bytes must be exactly what Buildah wrote (the digest must
+    // match), so they come straight from the blob files.
+    let put_manifest = |reference: String, digest: String, media_type: Option<String>| {
+        let with_bearer = &with_bearer;
+        let blobs_dir = &blobs_dir;
+        async move {
+            let hex = digest.trim_start_matches("sha256:");
+            let bytes = tokio::fs::read(blobs_dir.join(hex))
+                .await
+                .map_err(|e| layout_error(format!("reading manifest {digest}: {e}")))?;
+            let url = oci_manifest_put_url(scheme, port, repository, &reference);
+            let mut request = client.put(&url).body(bytes);
+            if let Some(media_type) = media_type {
+                request = request.header("content-type", media_type);
+            }
+            let response = with_bearer(request)
+                .send()
+                .await
+                .map_err(|e| layout_error(format!("manifest {reference} put failed: {e}")))?;
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                return Err(layout_error(format!(
+                    "registry refused manifest {reference} ({status}): {body}"
+                )));
+            }
+            Ok::<(), BuildError>(())
+        }
+    };
+
+    for manifest in &image.platform_manifests {
+        put_manifest(
+            manifest.digest.clone(),
+            manifest.digest.clone(),
+            Some(manifest.media_type.clone()),
+        )
+        .await?;
+    }
+    put_manifest(
+        tag.to_string(),
+        image.top.digest.clone(),
+        image.top.media_type.clone(),
+    )
+    .await?;
+    Ok(image)
 }
 
 /// The registry repository a `pickle://` destination pushes to.
@@ -840,16 +1280,356 @@ mod tests {
         assert!(!job.push_cmd.contains(&"--tls-verify=false".to_string()));
     }
 
+    fn job_for_platforms(platforms: &[&str]) -> BuildahJob {
+        let mut spec = spec_with_destination("pickle://myapp:v3");
+        spec.platform = platforms.iter().map(|p| p.to_string()).collect();
+        execute_build(&spec, "sha256:abc", Some(5000), false).unwrap()
+    }
+
     /// B1: the clustered runner exports the image to a local OCI layout dir
     /// (`oci:{dir}:{tag}`) instead of a `docker://` push, because buildah
     /// cannot present the service-token bearer that Pickle requires for writes.
     #[test]
-    fn buildah_push_to_oci_exports_a_local_layout() {
-        let cmd = buildah_push_to_oci_args("localhost:5000/myapp:v3", "/build/oci", "v3");
-        assert!(cmd.contains(&"localhost:5000/myapp:v3".to_string()));
-        assert!(cmd.contains(&"oci:/build/oci:v3".to_string()));
-        assert!(!cmd.iter().any(|a| a.starts_with("docker://")));
+    fn a_single_platform_build_exports_its_image_to_a_local_layout() {
+        let job = job_for_platforms(&["linux/amd64"]);
+        let cmd = buildah_export_to_oci_args(&job, Path::new("/build/oci"));
+        assert_eq!(
+            cmd,
+            [
+                "buildah",
+                "--storage-driver",
+                "vfs",
+                "push",
+                "localhost:5000/myapp:v3",
+                "oci:/build/oci:v3"
+            ]
+        );
         assert!(!cmd.iter().any(|a| a.starts_with("--tls-verify")));
+    }
+
+    /// `buildah push` of a manifest list exports only the builder's own
+    /// platform; `manifest push --all` exports every one.
+    #[test]
+    fn a_multi_platform_build_exports_the_whole_manifest_list() {
+        let job = job_for_platforms(&["linux/amd64", "linux/arm64"]);
+        let cmd = buildah_export_to_oci_args(&job, Path::new("/build/oci"));
+        assert_eq!(
+            cmd,
+            [
+                "buildah",
+                "--storage-driver",
+                "vfs",
+                "manifest",
+                "push",
+                "--all",
+                "localhost:5000/myapp:v3",
+                "oci:/build/oci:v3"
+            ]
+        );
+    }
+
+    #[test]
+    fn storage_flags_go_before_the_subcommand() {
+        let storage = BuildahStorage::under(Path::new("/data/buildah"));
+        let job = job_for_platforms(&["linux/amd64", "linux/arm64"]);
+        let cmd = with_buildah_storage(&job.build_cmd, &storage);
+        assert_eq!(
+            cmd[..6],
+            [
+                "buildah",
+                "--root",
+                "/data/buildah/root",
+                "--runroot",
+                "/data/buildah/run",
+                "bud"
+            ]
+        );
+        assert!(with_buildah_storage(&[], &storage).is_empty());
+    }
+
+    #[test]
+    fn cleanup_removes_the_manifest_list_of_a_multi_platform_build() {
+        let job = job_for_platforms(&["linux/amd64", "linux/arm64"]);
+        let commands = buildah_cleanup_commands(&job);
+        let tails: Vec<Vec<&str>> = commands
+            .iter()
+            .map(|c| c[3..].iter().map(String::as_str).collect())
+            .collect();
+        assert_eq!(
+            tails,
+            vec![
+                vec!["rm", "--all"],
+                vec!["manifest", "rm", "localhost:5000/myapp:v3"],
+                vec!["rmi", "--prune"],
+            ]
+        );
+        assert!(
+            commands
+                .iter()
+                .all(|c| c[..3] == ["buildah", "--storage-driver", "vfs"])
+        );
+    }
+
+    #[test]
+    fn cleanup_removes_the_image_of_a_single_platform_build() {
+        let job = job_for_platforms(&["linux/arm64"]);
+        let commands = buildah_cleanup_commands(&job);
+        assert_eq!(
+            commands[1][3..],
+            ["rmi", "--force", "localhost:5000/myapp:v3"]
+        );
+    }
+
+    #[test]
+    fn the_cache_wipe_removes_every_image() {
+        assert_eq!(
+            buildah_cache_wipe_args(),
+            [
+                "buildah",
+                "--storage-driver",
+                "vfs",
+                "rmi",
+                "--all",
+                "--force"
+            ]
+        );
+    }
+
+    #[test]
+    fn storage_size_counts_files_in_nested_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("a/b")).unwrap();
+        std::fs::write(dir.path().join("top"), vec![0u8; 100]).unwrap();
+        std::fs::write(dir.path().join("a/b/deep"), vec![0u8; 23]).unwrap();
+        assert_eq!(storage_size_bytes(dir.path()).unwrap(), 123);
+        assert_eq!(
+            storage_size_bytes(&dir.path().join("missing")).unwrap(),
+            0,
+            "a root Buildah never created holds nothing"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn storage_size_does_not_follow_symlinks() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("big"), vec![0u8; 4096]).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("link")).unwrap();
+        assert_eq!(storage_size_bytes(dir.path()).unwrap(), 0);
+    }
+
+    // --- exported OCI layouts ---
+
+    /// Write `bytes` into a layout's blob directory, returning its digest.
+    fn write_layout_blob(dir: &Path, bytes: &[u8]) -> String {
+        let digest = digest_of(bytes);
+        let blobs = dir.join("blobs").join("sha256");
+        std::fs::create_dir_all(&blobs).unwrap();
+        std::fs::write(blobs.join(digest.trim_start_matches("sha256:")), bytes).unwrap();
+        digest
+    }
+
+    fn write_layout_index(dir: &Path, top_digest: &str, top_media_type: &str) {
+        let index = serde_json::json!({
+            "schemaVersion": 2,
+            "manifests": [{ "mediaType": top_media_type, "digest": top_digest, "size": 1 }],
+        });
+        std::fs::write(dir.join("index.json"), index.to_string()).unwrap();
+    }
+
+    fn image_manifest(architecture: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": { "digest": digest_of(architecture.as_bytes()), "size": 5 },
+            "layers": [],
+        }))
+        .unwrap()
+    }
+
+    /// A layout holding an index over `platforms` (`(os/arch, variant)`).
+    fn write_multi_platform_layout(dir: &Path, platforms: &[(&str, Option<&str>)]) -> String {
+        let entries: Vec<serde_json::Value> = platforms
+            .iter()
+            .map(|(platform, variant)| {
+                let (os, architecture) = platform.split_once('/').unwrap();
+                let manifest = image_manifest(architecture);
+                let digest = write_layout_blob(dir, &manifest);
+                let mut platform = serde_json::json!({ "os": os, "architecture": architecture });
+                if let Some(variant) = variant {
+                    platform["variant"] = serde_json::json!(variant);
+                }
+                serde_json::json!({
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "digest": digest,
+                    "size": manifest.len(),
+                    "platform": platform,
+                })
+            })
+            .collect();
+        let index = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": entries,
+        }))
+        .unwrap();
+        let index_digest = write_layout_blob(dir, &index);
+        write_layout_index(
+            dir,
+            &index_digest,
+            "application/vnd.oci.image.index.v1+json",
+        );
+        index_digest
+    }
+
+    #[test]
+    fn a_single_image_layout_has_no_platform_manifests() {
+        let dir = tempfile::tempdir().unwrap();
+        let digest = write_layout_blob(dir.path(), &image_manifest("amd64"));
+        write_layout_index(dir.path(), &digest, OCI_IMAGE_MANIFEST_MEDIA_TYPE);
+        let image = read_oci_layout(dir.path()).unwrap();
+        assert_eq!(image.top.digest, digest);
+        assert!(image.platform_manifests.is_empty());
+        assert_eq!(image.manifest_digests(), vec![digest.as_str()]);
+    }
+
+    #[test]
+    fn an_index_layout_lists_every_platform_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let index_digest = write_multi_platform_layout(
+            dir.path(),
+            &[("linux/amd64", None), ("linux/arm64", Some("v8"))],
+        );
+        let image = read_oci_layout(dir.path()).unwrap();
+        assert_eq!(image.top.digest, index_digest);
+        assert_eq!(
+            image.top.media_type.as_deref(),
+            Some("application/vnd.oci.image.index.v1+json")
+        );
+        let platforms: Vec<&str> = image
+            .platform_manifests
+            .iter()
+            .map(|m| m.platform.as_str())
+            .collect();
+        assert_eq!(platforms, vec!["linux/amd64", "linux/arm64/v8"]);
+        assert_eq!(image.manifest_digests().len(), 3);
+        assert_eq!(image.manifest_digests()[0], index_digest);
+    }
+
+    #[test]
+    fn an_index_naming_a_manifest_missing_from_the_layout_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        write_multi_platform_layout(dir.path(), &[("linux/amd64", None)]);
+        let image = read_oci_layout(dir.path()).unwrap();
+        let hex = image.platform_manifests[0]
+            .digest
+            .trim_start_matches("sha256:");
+        std::fs::remove_file(dir.path().join("blobs/sha256").join(hex)).unwrap();
+        let err = read_oci_layout(dir.path()).unwrap_err();
+        assert!(err.to_string().contains("missing manifest"), "{err}");
+    }
+
+    #[test]
+    fn an_index_entry_without_a_platform_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = image_manifest("amd64");
+        let digest = write_layout_blob(dir.path(), &manifest);
+        let index = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "manifests": [{ "digest": digest, "size": manifest.len() }],
+        }))
+        .unwrap();
+        let index_digest = write_layout_blob(dir.path(), &index);
+        write_layout_index(
+            dir.path(),
+            &index_digest,
+            "application/vnd.oci.image.index.v1+json",
+        );
+        let err = read_oci_layout(dir.path()).unwrap_err();
+        assert!(err.to_string().contains("names no platform"), "{err}");
+    }
+
+    #[test]
+    fn a_nested_index_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner = write_multi_platform_layout(dir.path(), &[("linux/amd64", None)]);
+        let outer = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": [{
+                "digest": inner,
+                "size": 1,
+                "platform": { "os": "linux", "architecture": "amd64" },
+            }],
+        }))
+        .unwrap();
+        let outer_digest = write_layout_blob(dir.path(), &outer);
+        write_layout_index(
+            dir.path(),
+            &outer_digest,
+            "application/vnd.oci.image.index.v1+json",
+        );
+        let err = read_oci_layout(dir.path()).unwrap_err();
+        assert!(err.to_string().contains("itself an index"), "{err}");
+    }
+
+    #[test]
+    fn a_layout_digest_that_is_not_sha256_hex_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        write_layout_index(
+            dir.path(),
+            "sha256:../../etc/passwd",
+            OCI_IMAGE_MANIFEST_MEDIA_TYPE,
+        );
+        let err = read_oci_layout(dir.path()).unwrap_err();
+        assert!(err.to_string().contains("invalid digest"), "{err}");
+    }
+
+    fn requested(platforms: &[&str]) -> Vec<String> {
+        platforms.iter().map(|p| p.to_string()).collect()
+    }
+
+    #[test]
+    fn an_export_with_every_requested_platform_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        write_multi_platform_layout(
+            dir.path(),
+            &[("linux/amd64", None), ("linux/arm64", Some("v8"))],
+        );
+        let image = read_oci_layout(dir.path()).unwrap();
+        check_exported_platforms(&requested(&["linux/amd64", "linux/arm64"]), &image).unwrap();
+    }
+
+    /// The bug this change fixes: `buildah push` of a list exported one
+    /// platform. The runner now fails such a build instead of storing it.
+    #[test]
+    fn an_export_missing_a_requested_platform_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        write_multi_platform_layout(dir.path(), &[("linux/arm64", None)]);
+        let image = read_oci_layout(dir.path()).unwrap();
+        let err = check_exported_platforms(&requested(&["linux/amd64", "linux/arm64"]), &image)
+            .unwrap_err();
+        match err {
+            BuildError::MissingPlatforms { missing, exported } => {
+                assert_eq!(missing, vec!["linux/amd64"]);
+                assert_eq!(exported, vec!["linux/arm64"]);
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn a_single_image_export_fails_a_multi_platform_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let digest = write_layout_blob(dir.path(), &image_manifest("arm64"));
+        write_layout_index(dir.path(), &digest, OCI_IMAGE_MANIFEST_MEDIA_TYPE);
+        let image = read_oci_layout(dir.path()).unwrap();
+        assert!(
+            check_exported_platforms(&requested(&["linux/amd64", "linux/arm64"]), &image).is_err()
+        );
+        check_exported_platforms(&requested(&["linux/arm64"]), &image).unwrap();
+        check_exported_platforms(&[], &image).unwrap();
     }
 
     // --- context URLs ---

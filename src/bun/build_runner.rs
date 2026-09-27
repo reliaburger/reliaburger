@@ -37,6 +37,39 @@ pub const TERMINAL_BUILD_RETENTION_SECS: u64 = 3600;
 /// cap-at-50 precedent).
 pub const MAX_TERMINAL_BUILDS: usize = 50;
 
+/// How this node runs image builds.
+#[derive(Debug, Clone)]
+pub struct BuildSettings {
+    /// `[images] build_timeout_secs`: ceiling per Buildah stage.
+    pub timeout_secs: u64,
+    /// The node's own Buildah storage (`<storage.data>/buildah`).
+    pub storage: crate::pickle::build::BuildahStorage,
+    /// `[images] build_cache_max_bytes`: how much Buildah storage may stay
+    /// behind after a build's own images are removed.
+    pub cache_max_bytes: u64,
+}
+
+impl BuildSettings {
+    /// Settings with Buildah's storage under `storage_base`.
+    pub fn new(timeout_secs: u64, storage_base: &std::path::Path, cache_max_bytes: u64) -> Self {
+        Self {
+            timeout_secs,
+            storage: crate::pickle::build::BuildahStorage::under(storage_base),
+            cache_max_bytes,
+        }
+    }
+
+    /// Settings for a router that never runs a build (tests, the plain
+    /// `router`): the default cache cap, storage under the temp directory.
+    pub fn with_timeout(timeout_secs: u64) -> Self {
+        Self::new(
+            timeout_secs,
+            &std::env::temp_dir().join("reliaburger-buildah"),
+            crate::config::node::ImagesSection::default().build_cache_max_bytes,
+        )
+    }
+}
+
 /// Request body for `/v1/build` and `/v1/build/run`.
 ///
 /// `deny_unknown_fields` (JOB2): the registry destination is now
@@ -664,100 +697,6 @@ pub async fn transfer_context_to_builder(
     Ok(())
 }
 
-/// Upload a buildah-exported OCI image layout to the local registry, presenting
-/// `bearer` (the internal service token) as the write credential (B1).
-///
-/// `buildah push` could only present the service token as HTTP Basic
-/// `--creds`, which Pickle refuses over plaintext and which would expose the
-/// token in buildah's command line over TLS. So the push writes a
-/// local OCI layout and this function uploads it: every blob under
-/// `blobs/sha256/` goes up as a monolithic blob (covering the config, the
-/// layers, and — for a multi-platform build — the sub-manifests), then the top
-/// manifest named by `index.json` is `PUT` under `tag`. Pickle's manifest
-/// validation then finds every referenced blob already present.
-async fn upload_oci_layout(
-    client: &reqwest::Client,
-    scheme: &str,
-    port: u16,
-    repository: &str,
-    tag: &str,
-    oci_dir: &std::path::Path,
-    bearer: Option<&str>,
-) -> Result<(), String> {
-    let with_bearer = |req: reqwest::RequestBuilder| match bearer {
-        Some(token) => req.bearer_auth(token),
-        None => req,
-    };
-
-    let index_bytes = tokio::fs::read(oci_dir.join("index.json"))
-        .await
-        .map_err(|e| format!("reading oci layout index.json: {e}"))?;
-    let top = crate::pickle::build::parse_oci_index(&index_bytes).map_err(|e| e.to_string())?;
-
-    // Upload every blob in the layout. Configs, layers and any sub-manifests
-    // all live here as content-addressed files named by their hex digest.
-    let blobs_dir = oci_dir.join("blobs").join("sha256");
-    let mut entries = tokio::fs::read_dir(&blobs_dir)
-        .await
-        .map_err(|e| format!("reading oci layout blobs: {e}"))?;
-    while let Some(entry) = entries
-        .next_entry()
-        .await
-        .map_err(|e| format!("reading oci layout blobs: {e}"))?
-    {
-        if !entry
-            .file_type()
-            .await
-            .map(|t| t.is_file())
-            .unwrap_or(false)
-        {
-            continue;
-        }
-        let path = entry.path();
-        let Some(hex) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        let digest = format!("sha256:{hex}");
-        let body = tokio::fs::read(&path)
-            .await
-            .map_err(|e| format!("reading blob {digest}: {e}"))?;
-        let url = crate::pickle::build::oci_blob_upload_url(scheme, port, repository, &digest);
-        let response = with_bearer(client.post(&url).body(body))
-            .send()
-            .await
-            .map_err(|e| format!("blob {digest} upload failed: {e}"))?;
-        if !response.status().is_success() {
-            return Err(format!(
-                "registry refused blob {digest}: {}",
-                response.status()
-            ));
-        }
-    }
-
-    // PUT the top manifest under the tag: this records the catalogue entry and
-    // pins every referenced blob. The bytes must be exactly what buildah wrote
-    // (the digest must match), so they come straight from the blob file.
-    let top_hex = top.digest.strip_prefix("sha256:").unwrap_or(&top.digest);
-    let manifest_bytes = tokio::fs::read(blobs_dir.join(top_hex))
-        .await
-        .map_err(|e| format!("reading top manifest {}: {e}", top.digest))?;
-    let url = crate::pickle::build::oci_manifest_put_url(scheme, port, repository, tag);
-    let mut request = client.put(&url).body(manifest_bytes);
-    if let Some(media_type) = &top.media_type {
-        request = request.header("content-type", media_type);
-    }
-    let response = with_bearer(request)
-        .send()
-        .await
-        .map_err(|e| format!("manifest put failed: {e}"))?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(format!("registry refused the manifest ({status}): {body}"));
-    }
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // Signing
 // ---------------------------------------------------------------------------
@@ -923,8 +862,9 @@ impl BuildRunnerContext {
 }
 
 /// The lifted build body: fetch the context blob from the local
-/// registry, extract, run `buildah bud` + `buildah push` (bounded by
-/// `[images] build_timeout_secs`), then sign the pushed manifest.
+/// registry, extract, run `buildah bud` and export the image (bounded by
+/// `[images] build_timeout_secs`), prune Buildah's storage, upload the image
+/// to Pickle, then sign every pushed manifest.
 /// When `[images.trust_policy] require_signatures` is set, signing is
 /// part of the terminal-state definition: no trusted signature, no
 /// `Completed` (JOB7). Every failure lands in the tracker with a
@@ -950,8 +890,6 @@ async fn run_build_inner(
     ctx: &BuildRunnerContext,
 ) -> Result<String, String> {
     let state = &ctx.api;
-    let timeout = std::time::Duration::from_secs(state.build_timeout_secs);
-
     // A unique, self-cleaning build directory. `ScopedDir::drop` removes
     // it on every exit path below, so no failure leaves a stray context.
     let base = std::env::temp_dir().join("reliaburger-build");
@@ -976,14 +914,6 @@ async fn run_build_inner(
         state.registry_scheme == "https",
     )
     .map_err(|e| format!("invalid build spec: {e}"))?;
-    // The clustered push does not go over `docker://` (buildah cannot present
-    // the service-token bearer Pickle requires): buildah exports the image to
-    // a local OCI layout and the runner uploads it below (B1).
-    let oci_push_cmd = crate::pickle::build::buildah_push_to_oci_args(
-        &job.local_tag,
-        &oci_dir.to_string_lossy(),
-        &job.destination.tag,
-    );
 
     // Stream the context blob to disk with a hard byte cap (no whole-body
     // buffer), then extract through the hardened unpacker (bounds
@@ -1045,17 +975,94 @@ async fn run_build_inner(
         Err(e) => return Err(format!("context extraction task failed: {e}")),
     }
 
-    // Build, then export. The `push` step writes an OCI image layout to the
-    // local `oci_dir`; the upload that follows lands it in Pickle through the
-    // standard handlers (real holders, catalog persistence, Raft propose — all
-    // for free), authenticated with the service-token bearer that buildah
-    // could not present itself (B1).
-    for (label, cmd) in [("build", &job.build_cmd), ("push", &oci_push_cmd)] {
-        let (program, args) = match cmd.split_first() {
-            Some(pair) => pair,
-            None => continue,
+    // Build and export under the node's build lock, then prune what the build
+    // left in Buildah's storage whatever the outcome. The export is a local
+    // OCI layout in `oci_dir` (outside Buildah's storage), so the upload
+    // after the lock can't be disturbed by the next build's pruning.
+    let exported = {
+        let _build_lock = state.build_lock.lock().await;
+        let exported = run_buildah_stages(&job, &ctx_dir, &oci_dir, &state.build).await;
+        prune_build_storage(&job, &ctx_dir, &state.build).await;
+        exported
+    };
+    exported?;
+
+    // A multi-platform build must have exported every platform it asked for:
+    // `buildah push` of a manifest list once exported only the builder's own.
+    let layout_dir = oci_dir.clone();
+    let layout =
+        tokio::task::spawn_blocking(move || crate::pickle::build::read_oci_layout(&layout_dir))
+            .await
+            .map_err(|e| format!("reading the exported image failed: {e}"))?
+            .map_err(|e| e.to_string())?;
+    crate::pickle::build::check_exported_platforms(&job.platforms, &layout)
+        .map_err(|e| e.to_string())?;
+
+    // Upload the exported OCI layout to the local registry, presenting the
+    // service-token bearer. Pickle authorises registry writes by that bearer,
+    // which `buildah push` has no way to send (B1).
+    let published = crate::pickle::build::upload_oci_layout(
+        state.cluster_http.client(),
+        state.registry_scheme,
+        state.registry_port,
+        &job.destination.name,
+        &job.destination.tag,
+        &oci_dir,
+        state.service_token.as_deref(),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    // Sign what was pushed so it deploys under require_signatures. With the
+    // policy set, signing is part of success (JOB7); without it, a failure is
+    // a warning and the unsigned image stays useful.
+    match sign_published_image(state, request, &job, &published).await {
+        Ok(()) => {}
+        Err(reason) if state.require_signatures => {
+            return Err(format!(
+                "image pushed but the trust policy requires signatures and signing failed: {reason}"
+            ));
+        }
+        Err(reason) => {
+            eprintln!(
+                "bun: build {build_id}: image pushed but unsigned ({reason}); \
+                 deploys need require_signatures = false"
+            );
+        }
+    }
+
+    Ok(format!("{}:{}", job.destination.name, job.destination.tag))
+}
+
+/// Run `buildah bud` and the export into `oci_dir`, each bounded by the
+/// per-stage timeout, on the node's own Buildah storage.
+async fn run_buildah_stages(
+    job: &crate::pickle::build::BuildahJob,
+    ctx_dir: &std::path::Path,
+    oci_dir: &std::path::Path,
+    settings: &BuildSettings,
+) -> Result<(), String> {
+    use crate::pickle::build::{buildah_export_to_oci_args, with_buildah_storage};
+
+    let timeout = std::time::Duration::from_secs(settings.timeout_secs);
+    // The clustered push does not go over `docker://` (buildah cannot present
+    // the service-token bearer Pickle requires): buildah exports the image to
+    // a local OCI layout and the runner uploads it afterwards (B1).
+    let stages = [
+        (
+            "build",
+            with_buildah_storage(&job.build_cmd, &settings.storage),
+        ),
+        (
+            "export",
+            with_buildah_storage(&buildah_export_to_oci_args(job, oci_dir), &settings.storage),
+        ),
+    ];
+    for (label, cmd) in &stages {
+        let Some((program, args)) = cmd.split_first() else {
+            continue;
         };
-        match run_bounded(program, args, &ctx_dir, timeout).await {
+        match run_bounded(program, args, ctx_dir, timeout).await {
             Ok(out) if out.status.success() => {}
             Ok(out) => {
                 let stderr = String::from_utf8_lossy(&out.stderr);
@@ -1073,63 +1080,128 @@ async fn run_build_inner(
             }
         }
     }
+    Ok(())
+}
 
-    // Upload the exported OCI layout to the local registry, presenting the
-    // service-token bearer. Pickle authorises registry writes by that bearer,
-    // which `buildah push` has no way to send (B1).
-    upload_oci_layout(
-        state.cluster_http.client(),
-        state.registry_scheme,
-        state.registry_port,
-        &job.destination.name,
-        &job.destination.tag,
-        &oci_dir,
-        state.service_token.as_deref(),
-    )
-    .await?;
-
-    // Sign the pushed manifest so it deploys under require_signatures.
-    // With the policy set, signing is part of success (JOB7); without
-    // it, a failure is a warning and the unsigned image stays useful.
-    let digest = pushed_manifest_digest(state, &job.destination.name, &job.destination.tag).await;
-    let sign_outcome: Result<(), String> = match (&state.council, digest) {
-        (Some(council), Some(digest)) => {
-            let namespace = request.spec.namespace.as_deref().unwrap_or("default");
-            let node_name = state.node_name.as_deref().unwrap_or("local");
-            // Reuse a persistent code-signing identity across builds instead
-            // of minting a fresh ephemeral CSR each time.
-            match get_or_provision_build_signer(
-                state.build_signers.as_ref(),
-                council,
-                &state.trust_domain,
-                namespace,
-                node_name,
-            )
-            .await
-            {
-                Ok(signer) => sign_pushed_image(council, &signer, &digest).await,
-                Err(e) => Err(e),
-            }
-        }
-        (Some(_), None) => Err("pushed image not found in the catalogue".to_string()),
-        (None, _) => Err("no council available for signing".to_string()),
+/// Remove what a build left in Buildah's storage: its containers, its own
+/// image or manifest list and every unnamed image. If the storage is still
+/// over `[images] build_cache_max_bytes` afterwards, empty the image cache.
+///
+/// Runs after every build, success or failure, while the caller holds the
+/// build lock. A cleanup step that fails (removing the image a failed build
+/// never produced, say) is logged and never fails the build.
+async fn prune_build_storage(
+    job: &crate::pickle::build::BuildahJob,
+    ctx_dir: &std::path::Path,
+    settings: &BuildSettings,
+) {
+    use crate::pickle::build::{
+        buildah_cache_wipe_args, buildah_cleanup_commands, storage_size_bytes, with_buildah_storage,
     };
-    match sign_outcome {
-        Ok(()) => {}
-        Err(reason) if state.require_signatures => {
-            return Err(format!(
-                "image pushed but the trust policy requires signatures and signing failed: {reason}"
-            ));
-        }
-        Err(reason) => {
-            eprintln!(
-                "bun: build {build_id}: image pushed but unsigned ({reason}); \
-                 deploys need require_signatures = false"
-            );
-        }
+
+    let timeout = std::time::Duration::from_secs(settings.timeout_secs);
+    for cmd in buildah_cleanup_commands(job) {
+        run_cleanup_command(
+            &with_buildah_storage(&cmd, &settings.storage),
+            ctx_dir,
+            timeout,
+        )
+        .await;
     }
 
-    Ok(format!("{}:{}", job.destination.name, job.destination.tag))
+    let root = settings.storage.root.clone();
+    let size = match tokio::task::spawn_blocking(move || storage_size_bytes(&root)).await {
+        Ok(Ok(size)) => size,
+        Ok(Err(e)) => {
+            eprintln!("bun: build cleanup: measuring Buildah storage failed: {e}");
+            return;
+        }
+        Err(e) => {
+            eprintln!("bun: build cleanup: measuring Buildah storage failed: {e}");
+            return;
+        }
+    };
+    if size > settings.cache_max_bytes {
+        eprintln!(
+            "bun: build cleanup: Buildah storage holds {size} bytes, over the {} byte cache cap; \
+             removing every cached image",
+            settings.cache_max_bytes
+        );
+        let wipe = with_buildah_storage(&buildah_cache_wipe_args(), &settings.storage);
+        run_cleanup_command(&wipe, ctx_dir, timeout).await;
+    }
+}
+
+/// Run one cleanup command, logging instead of failing.
+async fn run_cleanup_command(cmd: &[String], dir: &std::path::Path, timeout: std::time::Duration) {
+    let Some((program, args)) = cmd.split_first() else {
+        return;
+    };
+    match run_bounded(program, args, dir, timeout).await {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            eprintln!(
+                "bun: build cleanup: `{}` failed: {}",
+                cmd.join(" "),
+                stderr.trim()
+            );
+        }
+        Err(BoundedError::Timeout) => {
+            eprintln!("bun: build cleanup: `{}` timed out", cmd.join(" "));
+        }
+        Err(BoundedError::Spawn(e)) => {
+            eprintln!("bun: build cleanup: `{}` did not start: {e}", cmd.join(" "));
+        }
+    }
+}
+
+/// Sign every manifest a build published: the image (or image index) the tag
+/// names, and for a multi-platform build each platform's manifest.
+///
+/// A deploy verifies the manifest its tag names and pins that digest. For a
+/// multi-platform image that is the index, and the index's bytes name each
+/// platform manifest by digest, so its signature already covers the platform
+/// a node pulls. Signing the platform manifests too means a reference pinned
+/// to one platform's digest verifies as well.
+async fn sign_published_image(
+    state: &ApiState,
+    request: &BuildSubmitRequest,
+    job: &crate::pickle::build::BuildahJob,
+    published: &crate::pickle::build::OciLayoutImage,
+) -> Result<(), String> {
+    let Some(council) = &state.council else {
+        return Err("no council available for signing".to_string());
+    };
+    let tagged = pushed_manifest_digest(state, &job.destination.name, &job.destination.tag)
+        .await
+        .ok_or_else(|| "pushed image not found in the catalogue".to_string())?;
+    if tagged.as_str() != published.top.digest {
+        return Err(format!(
+            "the catalogue tags {} at {}, not the pushed {}",
+            job.destination.tag,
+            tagged.as_str(),
+            published.top.digest
+        ));
+    }
+    let namespace = request.spec.namespace.as_deref().unwrap_or("default");
+    let node_name = state.node_name.as_deref().unwrap_or("local");
+    // Reuse a persistent code-signing identity across builds instead of
+    // minting a fresh ephemeral CSR each time.
+    let signer = get_or_provision_build_signer(
+        state.build_signers.as_ref(),
+        council,
+        &state.trust_domain,
+        namespace,
+        node_name,
+    )
+    .await?;
+    for digest in published.manifest_digests() {
+        let digest = crate::pickle::types::Digest::new(digest)
+            .map_err(|e| format!("pushed manifest digest {digest:?} is invalid: {e}"))?;
+        sign_pushed_image(council, &signer, &digest).await?;
+    }
+    Ok(())
 }
 
 /// The manifest digest the push landed under, from the local catalog

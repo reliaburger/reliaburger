@@ -141,13 +141,17 @@ this).
 ## Steps
 
 - [x] 0. Plan (this file).
-- [ ] 1. Multi-arch export + index-aware upload in `pickle::build`, runner
+- [x] 1. Multi-arch export + index-aware upload in `pickle::build`, runner
       switched over, platform check, signing of index + platform manifests.
       Unit tests with fake OCI layouts; portable-suite test uploading a
-      two-platform layout to a real Pickle router.
+      two-platform layout to a real Pickle router
+      (`registry_routable_push::a_multi_platform_layout_publishes_every_platform`).
 - [ ] 2. Index-aware cluster pull (`ClusterSource`), unit + portable tests.
-- [ ] 3. Dedicated Buildah storage root, build lock, cleanup commands,
+- [x] 3. Dedicated Buildah storage root, build lock, cleanup commands,
       `[images] build_cache_max_bytes`. Unit tests for commands and the cap.
+      (Landed in the same commit as step 1: the runner rewrite covers both.
+      `BuildSettings` replaced the `build_timeout_secs` argument of
+      `router_with_upgrade`.)
 - [ ] 4. Gated real-Buildah tests (`tests/build.rs`, CI privileged Linux job
       runs them): two-platform build lands as an index with two catalogued
       platform manifests; signed build signs all three; storage pruned.

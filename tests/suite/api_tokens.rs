@@ -65,7 +65,7 @@ async fn api() -> (Arc<CouncilNode>, Router) {
         None,
         "test".into(),
         None,
-        900,
+        reliaburger::bun::build_runner::BuildSettings::with_timeout(900),
         reliaburger::cluster::ClusterHttp::plaintext(),
         5050,
         "http",

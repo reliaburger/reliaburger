@@ -44,6 +44,9 @@ struct HarnessOptions {
     registry_port: u16,
     pickle_catalog: Option<Arc<RwLock<reliaburger::pickle::types::ManifestCatalog>>>,
     require_signatures: bool,
+    /// Build settings; the gated Buildah tests give each harness its own
+    /// Buildah storage so they can inspect what a build left behind.
+    build_settings: Option<reliaburger::bun::build_runner::BuildSettings>,
 }
 
 struct Harness {
@@ -115,7 +118,9 @@ impl Harness {
             Some(aggregated_rx),
             "default".to_string(),
             options.node_name,
-            600,
+            options.build_settings.unwrap_or_else(|| {
+                reliaburger::bun::build_runner::BuildSettings::with_timeout(600)
+            }),
             reliaburger::cluster::ClusterHttp::plaintext(),
             if options.registry_port == 0 {
                 5050
