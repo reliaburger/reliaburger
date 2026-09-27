@@ -152,7 +152,15 @@ fn render_log_entries(entries: &[crate::ketchup::types::LogEntry], options: &Log
     output
 }
 
-/// Classify a reqwest send error as either a timeout or a connection failure.
+/// How long [`BunClient::release_test_lease`] waits for server-confirmed
+/// cleanup: the product's own bound for an owner to retire a released lease's
+/// resources, with the default runtime configuration.
+pub fn lease_release_budget() -> std::time::Duration {
+    crate::cluster::orchestrate::lease_retirement_bound(
+        crate::config::node::RuntimeSection::default().stop_confirmation_timeout(),
+    )
+}
+
 /// How long [`BunClient::clear_fault`] keeps asking while the owning node
 /// answers 504 because the leader has not yet released a node fault's
 /// reservation. The leader releases it once it sees the healed node alive,
@@ -161,6 +169,7 @@ pub const FAULT_CLEAR_RETRY_BUDGET: std::time::Duration = std::time::Duration::f
 /// Pause between those attempts.
 const FAULT_CLEAR_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// Classify a reqwest send error as either a timeout or a connection failure.
 fn classify_error(e: reqwest::Error) -> RelishError {
     if e.is_timeout() {
         RelishError::RequestTimeout
@@ -1131,11 +1140,12 @@ impl BunClient {
         parse_typed_response(response).await
     }
 
-    /// Release a lease and wait up to 30 seconds for server-confirmed cleanup.
-    /// An accepted request keeps polling durable ownership until it disappears.
-    /// Transient leader unavailability retries within the same overall deadline.
+    /// Release a lease and wait up to [`lease_release_budget`] for
+    /// server-confirmed cleanup. An accepted request keeps polling durable
+    /// ownership until it disappears. Transient leader unavailability retries
+    /// within the same overall deadline.
     pub async fn release_test_lease(&self, lease_id: &str) -> Result<(), RelishError> {
-        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        tokio::time::timeout(lease_release_budget(), async {
             let url = format!("{}/v1/test/leases/{lease_id}", self.base_url);
             let response = loop {
                 let response = self
@@ -2939,13 +2949,75 @@ mod tests {
             .await
             .unwrap();
         tokio::time::pause();
-        tokio::time::advance(std::time::Duration::from_secs(31)).await;
+        tokio::time::advance(lease_release_budget() + std::time::Duration::from_secs(1)).await;
         let result = cleanup.await.unwrap();
         server.abort();
         let _ = server.await;
         assert!(
             matches!(result, Err(RelishError::RequestTimeout)),
             "{result:?}"
+        );
+    }
+
+    /// V02 soak: an owner that was still retiring 30 s after the release made
+    /// cleanup `unknown`, although the product allows a retirement longer
+    /// than that. The wait now lasts as long as the product's own bound.
+    #[tokio::test]
+    async fn lease_cleanup_keeps_waiting_while_owners_are_within_their_retirement_bound() {
+        use std::sync::Arc;
+        let polled = Arc::new(tokio::sync::Notify::new());
+        let handler_polled = polled.clone();
+        let router = axum::Router::new().route(
+            "/v1/test/leases/fixture",
+            axum::routing::any(move |method: axum::http::Method| {
+                let polled = handler_polled.clone();
+                async move {
+                    if method == axum::http::Method::DELETE {
+                        return axum::http::StatusCode::ACCEPTED;
+                    }
+                    polled.notify_one();
+                    axum::http::StatusCode::OK
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = BunClient::new_with_token(&format!("http://{address}"), None);
+        // Driven on this task rather than spawned, so the paused clock below
+        // advances only when this task has nothing else to do.
+        let cleanup = client.release_test_lease("fixture");
+        tokio::pin!(cleanup);
+        tokio::select! {
+            result = &mut cleanup => panic!("cleanup ended before its first poll: {result:?}"),
+            _ = polled.notified() => {}
+        }
+        // A paused clock jumps to the earliest pending timer whenever the
+        // runtime waits on I/O. Sleeping here makes 31 s that earliest timer,
+        // so the release's own deadline can only fire first if it's shorter.
+        tokio::time::pause();
+        tokio::select! {
+            result = &mut cleanup => panic!(
+                "gave up on an owner still inside the product's retirement bound: {result:?}"
+            ),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(31)) => {}
+        }
+        let result = cleanup.await;
+        server.abort();
+        let _ = server.await;
+        assert!(
+            matches!(result, Err(RelishError::RequestTimeout)),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn lease_release_budget_is_the_products_retirement_bound() {
+        let confirmation =
+            crate::config::node::RuntimeSection::default().stop_confirmation_timeout();
+        assert_eq!(
+            lease_release_budget(),
+            crate::cluster::orchestrate::lease_retirement_bound(confirmation)
         );
     }
 

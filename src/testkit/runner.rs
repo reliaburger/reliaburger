@@ -30,10 +30,18 @@ use super::report::{
     TestProfile, TestReport, UnknownKind,
 };
 
-/// How long teardown gets before the runner records that cleanup is unknown.
-/// A hung agent must not wedge the whole run, but lack of cleanup evidence
-/// must not disappear behind a green case result either.
-const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+/// Teardown time beyond the lease release: reversing owned faults and
+/// checking independently that the runtime holds nothing of the case's.
+const TEARDOWN_MARGIN: Duration = Duration::from_secs(30);
+
+/// How long teardown gets before the runner records that cleanup is unknown:
+/// the lease release's own budget, which is the product's bound for an owner
+/// to retire what the lease held, plus [`TEARDOWN_MARGIN`]. A hung agent must
+/// not wedge the whole run, but lack of cleanup evidence must not disappear
+/// behind a green case result either.
+fn teardown_timeout() -> Duration {
+    crate::relish::client::lease_release_budget() + TEARDOWN_MARGIN
+}
 
 /// Resource ownership mode. Production command wiring always requires server
 /// leases; the unleased variant exists only for runner unit tests whose tiny
@@ -369,7 +377,7 @@ async fn run_one(
 
     let (namespace, lease_id) = match lease_ownership {
         LeaseOwnership::Required => {
-            let lifetime = timeout.saturating_add(TEARDOWN_TIMEOUT);
+            let lifetime = timeout.saturating_add(teardown_timeout());
             let ttl_seconds = lifetime
                 .as_secs()
                 .saturating_add(u64::from(lifetime.subsec_nanos() != 0));
@@ -494,7 +502,7 @@ async fn run_one(
         }
     };
 
-    let cleanup_deadline = Deadline::after(TEARDOWN_TIMEOUT).expect("non-zero cleanup timeout");
+    let cleanup_deadline = Deadline::after(teardown_timeout()).expect("non-zero cleanup timeout");
     let cleanup = context.teardown(cleanup_deadline).await;
     let finished_at = now_rfc3339();
     let evidence = matches!(outcome, TestOutcome::Pass)
@@ -1193,12 +1201,14 @@ mod tests {
         );
         let mut observed = records.lock().await.clone();
         observed.sort();
+        // The sub-second case timeout rounds the lease up by one second.
+        let ttl = teardown_timeout().as_secs() + 1;
         assert_eq!(
             observed,
             vec![
-                "create:rbtest-fixed-00:31".to_string(),
-                "create:rbtest-fixed-01:31".to_string(),
-                "create:rbtest-fixed-02:31".to_string(),
+                format!("create:rbtest-fixed-00:{ttl}"),
+                format!("create:rbtest-fixed-01:{ttl}"),
+                format!("create:rbtest-fixed-02:{ttl}"),
                 "release:lease-1".to_string(),
                 "release:lease-2".to_string(),
                 "release:lease-3".to_string(),
@@ -1284,6 +1294,15 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    /// V02 soak: teardown gave the lease release 30 s, less than one owner's
+    /// retirement may take, so a passing case reported cleanup `unknown`.
+    #[test]
+    fn teardown_outlasts_the_lease_release_budget() {
+        let release = crate::relish::client::lease_release_budget();
+        assert!(teardown_timeout() > release, "{:?}", teardown_timeout());
+        assert!(release > Duration::from_secs(30), "{release:?}");
     }
 
     #[tokio::test]
