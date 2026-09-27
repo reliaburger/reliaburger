@@ -467,6 +467,9 @@ pub enum AgentCommand {
         namespace: String,
         app_name: String,
         name: String,
+        /// Container mount path; required when several volumes share
+        /// the snapshot name.
+        volume: Option<String>,
         response: oneshot::Sender<Result<(), BunError>>,
     },
     /// Delete a snapshot.
@@ -474,6 +477,9 @@ pub enum AgentCommand {
         namespace: String,
         app_name: String,
         name: String,
+        /// Container mount path; required when several volumes share
+        /// the snapshot name.
+        volume: Option<String>,
         response: oneshot::Sender<Result<(), BunError>>,
     },
     /// Resolve a service name to its VIP and backends.
@@ -2331,44 +2337,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// The constructors default it; the binary overrides from config.
     pub fn set_volumes_dir(&mut self, dir: std::path::PathBuf) {
         self.volumes_dir = dir;
-    }
-
-    /// Snapshot one volume of an app — or, with `volume: None`, every
-    /// provisioned volume (discovered from sidecars, so this works for
-    /// stopped apps too). Multi-volume snapshots share one timestamp.
-    /// Create volume snapshots. Free of `&self` (takes `volumes_dir`) so it can
-    /// run on `spawn_blocking` — btrfs subprocess + fs walks must not run on the
-    /// agent command loop (M7).
-    fn snapshot_create(
-        volumes_dir: &std::path::Path,
-        namespace: &str,
-        app_name: &str,
-        volume: Option<String>,
-        name: Option<String>,
-    ) -> Result<Vec<crate::grill::snapshot::SnapshotMeta>, BunError> {
-        let volumes = match volume {
-            Some(v) => vec![v],
-            None => {
-                let found = crate::grill::volume::VolumeManager::new(volumes_dir)
-                    .provisioned_volumes(namespace, app_name);
-                if found.is_empty() {
-                    return Err(crate::grill::snapshot::SnapshotError::NoVolumes {
-                        namespace: namespace.to_string(),
-                        app: app_name.to_string(),
-                    }
-                    .into());
-                }
-                found
-            }
-        };
-
-        let manager = crate::grill::snapshot::SnapshotManager::new(volumes_dir);
-        let now = std::time::SystemTime::now();
-        let mut metas = Vec::with_capacity(volumes.len());
-        for volume_path in &volumes {
-            metas.push(manager.create(namespace, app_name, volume_path, name.as_deref(), now)?);
-        }
-        Ok(metas)
     }
 
     /// Configure the actual protected listener ports, explicit enrolment peers
@@ -4450,8 +4418,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 // btrfs subprocess + fs walks off the command loop (M7).
                 let volumes_dir = self.volumes_dir.clone();
                 tokio::task::spawn_blocking(move || {
-                    let result =
-                        Self::snapshot_create(&volumes_dir, &namespace, &app_name, volume, name);
+                    let result = crate::grill::snapshot::SnapshotManager::new(&volumes_dir)
+                        .create_for_app(
+                            &namespace,
+                            &app_name,
+                            volume.as_deref(),
+                            name.as_deref(),
+                            std::time::SystemTime::now(),
+                        )
+                        .map_err(BunError::from);
                     let _ = response.send(result);
                 });
             }
@@ -4471,6 +4446,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 namespace,
                 app_name,
                 name,
+                volume,
                 response,
             } => {
                 // The running-instance check needs supervisor state, so it stays
@@ -4490,7 +4466,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     let volumes_dir = self.volumes_dir.clone();
                     tokio::task::spawn_blocking(move || {
                         let result = crate::grill::snapshot::SnapshotManager::new(&volumes_dir)
-                            .restore(&namespace, &app_name, &name)
+                            .restore(&namespace, &app_name, &name, volume.as_deref())
                             .map_err(BunError::from);
                         let _ = response.send(result);
                     });
@@ -4500,6 +4476,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 namespace,
                 app_name,
                 name,
+                volume,
                 response,
             } => {
                 let volumes_dir = self.volumes_dir.clone();
@@ -4507,7 +4484,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     let manager = crate::grill::snapshot::SnapshotManager::new(&volumes_dir);
                     let _ = response.send(
                         manager
-                            .delete(&namespace, &app_name, &name)
+                            .delete(&namespace, &app_name, &name, volume.as_deref())
                             .map_err(BunError::from),
                     );
                 });
@@ -15806,6 +15783,7 @@ mod tests {
             namespace: "default".to_string(),
             app_name: "web".to_string(),
             name: "whatever".to_string(),
+            volume: None,
             response: resp_tx,
         })
         .await

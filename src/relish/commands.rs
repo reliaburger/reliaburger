@@ -2207,17 +2207,31 @@ pub async fn snapshot_list(app: &str, namespace: &str) -> Result<(), RelishError
 }
 
 /// Restore a snapshot over its live volume (stop the app first).
-pub async fn snapshot_restore(app: &str, namespace: &str, name: &str) -> Result<(), RelishError> {
+/// `volume` picks between volumes that share the snapshot name.
+pub async fn snapshot_restore(
+    app: &str,
+    namespace: &str,
+    name: &str,
+    volume: Option<&str>,
+) -> Result<(), RelishError> {
     let client = BunClient::default_local();
-    client.snapshot_restore(app, namespace, name).await?;
+    client
+        .snapshot_restore(app, namespace, name, volume)
+        .await?;
     println!("restored {namespace}/{app} from snapshot {name}");
     Ok(())
 }
 
-/// Delete a snapshot.
-pub async fn snapshot_delete(app: &str, namespace: &str, name: &str) -> Result<(), RelishError> {
+/// Delete a snapshot. `volume` picks between volumes that share the
+/// snapshot name.
+pub async fn snapshot_delete(
+    app: &str,
+    namespace: &str,
+    name: &str,
+    volume: Option<&str>,
+) -> Result<(), RelishError> {
     let client = BunClient::default_local();
-    client.snapshot_delete(app, namespace, name).await?;
+    client.snapshot_delete(app, namespace, name, volume).await?;
     println!("deleted snapshot {name} of {namespace}/{app}");
     Ok(())
 }

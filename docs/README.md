@@ -947,6 +947,10 @@ upload_url = "s3://backups/burger"    # optional; file:// and gs:// work too
 Snapshot archives upload as `.tar.gz` through `object_store`; credentials come
 from each backend's standard environment variables. On non-Btrfs filesystems
 snapshots return a clear error (sized volumes fall back to loop-mounted ext4).
+A snapshot request may only name the app's own managed volumes and a custom
+name of 1–128 characters from `[A-Za-z0-9._-]` (no leading dot); anything else
+is a 400. A multi-volume snapshot shares one name, so `restore` and `delete` of
+that name take `--volume`. `retain` must be at least 1 when `interval_secs` is set.
 
 ### Apps
 
