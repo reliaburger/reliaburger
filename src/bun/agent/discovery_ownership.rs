@@ -50,7 +50,43 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 }
 
+/// How the durable journal accounts for a runtime address hold the agent
+/// has no in-memory record of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum JournalReference {
+    /// The journal records exactly this hold.
+    Recorded,
+    /// The journal is authoritative and names no hold for this instance.
+    Unrecorded,
+    /// Ownership is disabled, uncertain, or records a different hold.
+    Unknown,
+}
+
 impl<G: Grill + Clone + 'static> BunAgent<G> {
+    /// Classify a runtime hold against the durable discovery journal. A
+    /// launch is only allowed after its hold is recorded, so an unrecorded
+    /// hold belongs to an instance that never started.
+    pub(super) fn journal_reference(
+        &self,
+        held: &crate::grill::runc_intent::NetworkReference,
+    ) -> JournalReference {
+        let (DiscoveryOwnership::Ready(journal) | DiscoveryOwnership::Recovered(journal)) =
+            &self.discovery_ownership
+        else {
+            return JournalReference::Unknown;
+        };
+        match journal
+            .inventory()
+            .references
+            .iter()
+            .find(|owner| owner.reference.instance_id == held.instance_id)
+        {
+            None => JournalReference::Unrecorded,
+            Some(owner) if owner.reference == *held => JournalReference::Recorded,
+            Some(_) => JournalReference::Unknown,
+        }
+    }
+
     /// Preserve attempted publications before any kernel or userspace acknowledgement.
     pub(super) async fn persist_discovery_publication(
         &mut self,
