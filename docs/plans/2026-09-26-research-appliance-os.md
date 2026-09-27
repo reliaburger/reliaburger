@@ -36,7 +36,7 @@
   - G3/G4: address and name detection;
   - G5: no master-key rotation;
   - G6: no token list or revoke.
-- **Spike:** about 9–11 engineer-days in five stages, the last on the Wyse 3040s. It's in [`2026-09-27-plan-appliance-spike.md`](2026-09-27-plan-appliance-spike.md). It **awaits maintainer approval**, and it needs the second Mac.
+- **Spike:** about 9.5–10.5 engineer-days in six stages, with the Wyse 3040s as the last hands-on stage. It's in [`2026-09-27-plan-appliance-spike.md`](2026-09-27-plan-appliance-spike.md). It **awaits maintainer approval**, and it needs the second Mac.
 
 ---
 
@@ -540,7 +540,7 @@ So the baseline is **UEFI PXE, then iPXE over TFTP, then HTTP**. Direct HTTP Boo
 
 Effort is in engineer-weeks, including tests and book and manual updates per `CLAUDE.md`. *Revised on 27 Sep 2026 for the maintainer's decision: the Talos extension is gone, the weekly build moves into Phase 1, aarch64 moves into Phase 1 (VM iteration needs it), and Phase 3's update design is decided (§7.6).*
 
-### Phase 0: spike (~9–11 days, awaiting approval)
+### Phase 0: spike (~9.5–10.5 days, awaiting approval)
 
 See [`2026-09-27-plan-appliance-spike.md`](2026-09-27-plan-appliance-spike.md) and the summary in §6.
 
@@ -657,7 +657,7 @@ The design is decided in §7.6:
 4. an A/B OS update with a forced fallback;
 5. ten Wyse 3040s netbooted from the Mac on a wired LAN.
 
-That's about 9–11 engineer-days, with stages 2–5 on the second Mac.
+That's about 9.5–10.5 engineer-days including the write-up, with stages 2–5 on the second Mac.
 
 **Exit criteria:**
 - one CI run yields signed artefacts for both architectures;
