@@ -2716,6 +2716,101 @@ product was wrong. A stopped app forgot which node held its volume, so the
 redeploy could start it on another node with an empty one. Chapter 7 has the
 fix.
 
+The candidate after that, 0eb6071, failed the dead-worker case again, and the
+504 was back with different words:
+
+```text
+owned fault cleanup failed: 2: API error (status 504):
+node fault reversal request to rb-…-2 timed out
+```
+
+This time it wasn't the reservation. That message comes from the entry node,
+which gives the owning node five seconds to answer a forwarded clear. Node 2
+did reverse the fault (its journal says so at 21:15:12 BST), but it never
+answered anyone in time again: seven minutes later `relish wtf` still reported
+"rb-…-2 did not answer", and every agent query to it timed out. Its journal
+showed why. The fault had killed all six of its containers, so every replica
+was a pending restart, and every restart was stuck waiting for the cluster to
+confirm its old endpoint was withdrawn. Each health tick walked all six, and
+each one spent about 400 ms on runtime cleanup it couldn't finish yet. A tick
+took two and a half seconds, and the tick interval is one.
+
+The agent loop is one `tokio::select!` over the command channel, a few other
+queues and that one-second tick. By default `select!` polls its branches in a
+random order, which is fair when every branch is cheap. Here the tick was
+always due, because ticks that fall behind fire at once, so every queued
+command had to win a coin toss against a two-and-a-half-second tick, and lost
+about half the time. The fault clear, the leader's fence and, worst of all,
+the consumer-view update that would have let the restarts finish all queued
+behind ticks and timed out. The node had talked itself into a corner: the
+restarts kept the loop busy, and the busy loop kept the restarts from ever
+finishing.
+
+The fix is one word:
+
+```rust
+tokio::select! {
+    biased;
+    _ = self.shutdown.cancelled() => { /* ... */ }
+    Some(cmd) = self.command_rx.recv() => { /* ... */ }
+    // stop completions, deploy operations, snapshot requests ...
+    _ = health_interval.tick() => { /* the periodic work */ }
+}
+```
+
+`biased;` is a directive to the macro, not a branch: it tells `select!` to
+poll the branches top to bottom every time. Shutdown wins over everything, a
+waiting command over any background work, and the tick runs only when nothing
+else is waiting. A command now waits for at most the tick already running.
+The obvious risk is starvation, a branch near the top that's always ready and
+never lets the tick run. Commands are requests with replies, so each caller
+waits for its answer before sending the next; nothing floods the channel.
+
+The test builds exactly that node: three replicas in pending restart, a mock
+runtime that takes 400 ms to fail each cleanup, so every tick lasts 1.2 s. It
+waits for a tick to start, queues eight status commands, and counts the
+cleanups that run before all eight are answered. At most the rest of the
+running tick is allowed. Before `biased;` it counted 57, nineteen whole ticks
+for eight commands, and took 23 s; now it takes about three.
+
+The same failure also showed a budget that didn't add up. The owning node's
+clear handler waited for its agent without any deadline, then waited up to
+4 s for the reservation release, while the forwarder gave it 5 s in total.
+Any agent delay over a second meant the forwarder's timeout, not the owning
+node's own answer. Both numbers now come from one constant:
+
+```rust
+const NODE_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const NODE_FAULT_CLEAR_BUDGET: Duration =
+    NODE_REQUEST_TIMEOUT.saturating_sub(Duration::from_secs(1));
+```
+
+`saturating_sub` is a `const fn`, so the compiler works out the budget and a
+change to the forwarding timeout carries the clear's budget with it. The
+handler sets one deadline on arrival, and both waits share it:
+
+```rust
+let deadline = tokio::time::Instant::now() + NODE_FAULT_CLEAR_BUDGET;
+let Ok(cleared) = tokio::time::timeout_at(deadline, cleared).await else {
+    return (StatusCode::GATEWAY_TIMEOUT, /* "...; retry the clear" */)
+        .into_response();
+};
+```
+
+`let ... else` is a refutable `let`: if the pattern (`Ok(cleared)`) matches,
+the binding lives on in the rest of the function; if it doesn't, the `else`
+block runs, and it must leave the function (`return`, `break` or a panic).
+It's the early-return guard from Go, minus the separate `if err != nil`. A
+busy agent now gets the client a 504 that says "retry", which `clear_fault`
+already retries, and the clear that was queued still runs. The API test
+stalls the agent completely and checks that the clear answers inside
+`NODE_REQUEST_TIMEOUT`. Before, it never answered at all.
+
+Was it the new connection timeouts in 0eb6071? No. The forwarded clear
+reached node 2 and ran there; the request was slow on the far side, not lost
+on a dead pooled connection. The earlier candidates were lucky: the loop was
+as unfair then, and the case passes whenever the coin tosses go its way.
+
 ## Walk the path you actually care about
 
 Say `web` can't reach `redis`. Checking Bun's own DNS and TCP access might tell
