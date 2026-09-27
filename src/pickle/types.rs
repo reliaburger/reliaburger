@@ -1420,6 +1420,92 @@ mod tests {
         assert_eq!(tagged.tags, BTreeSet::from(["v1-arm64".to_string()]));
     }
 
+    /// Remove every `key` from a JSON tree, producing what a binary from
+    /// before the field existed would have written.
+    fn strip_key(value: &mut serde_json::Value, key: &str) {
+        match value {
+            serde_json::Value::Object(map) => {
+                map.remove(key);
+                map.values_mut().for_each(|v| strip_key(v, key));
+            }
+            serde_json::Value::Array(items) => items.iter_mut().for_each(|v| strip_key(v, key)),
+            _ => {}
+        }
+    }
+
+    /// `LayerDescriptor::platform` is additive, so there's no format bump: a
+    /// catalogue written before it existed still loads, and lists images.
+    #[test]
+    fn a_catalogue_written_without_platforms_loads_and_lists_its_images() {
+        let mut catalog = ManifestCatalog::default();
+        commit_multi_platform(&mut catalog, "burger", "v1");
+        catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
+            manifest: test_manifest("podinfo", "b1"),
+            tag: "6.5".into(),
+            holder_nodes: BTreeSet::from([1]),
+        });
+        let mut old = serde_json::to_value(&catalog).unwrap();
+        strip_key(&mut old, "platform");
+        assert!(!old.to_string().contains("\"platform\""));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("catalog.json");
+        std::fs::write(&path, old.to_string()).unwrap();
+        let loaded = ManifestCatalog::load_from(&path).unwrap();
+
+        let mut images = loaded.images();
+        images.sort_by(|a, b| a.repository.cmp(&b.repository));
+        assert_eq!(images.len(), 2);
+        // An index an older node accepted has no platform names to show,
+        // but it is still one image with two platforms.
+        let names: Vec<&str> = images[0]
+            .platforms
+            .iter()
+            .map(|p| p.platform.as_str())
+            .collect();
+        assert_eq!(names, vec!["unknown", "unknown"]);
+        assert!(images[1].platforms.is_empty());
+        assert_eq!(images[1].layers, 2);
+    }
+
+    /// What an older node sees: its structs have no `platform` or
+    /// `platforms`, and none of them denies unknown fields (only the
+    /// registry request envelopes do, and serde doesn't apply that to
+    /// nested structs). So new data parses there, the new fields ignored.
+    #[test]
+    fn data_written_with_platforms_parses_with_the_structs_older_nodes_use() {
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct OldLayerDescriptor {
+            digest: Digest,
+            size: u64,
+            media_type: String,
+        }
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct OldImageSummary {
+            repository: String,
+            digest: String,
+            tags: BTreeSet<String>,
+            layers: usize,
+            total_size: u64,
+        }
+
+        let mut catalog = ManifestCatalog::default();
+        commit_multi_platform(&mut catalog, "burger", "v1");
+        let index = catalog.get_manifest_by_tag("burger", "v1").unwrap();
+        let entry = serde_json::to_string(&index.layers[0]).unwrap();
+        assert!(entry.contains("\"platform\""), "{entry}");
+        let old: OldLayerDescriptor = serde_json::from_str(&entry).unwrap();
+        assert_eq!(old.digest, index.layers[0].digest);
+
+        let summaries = serde_json::to_string(&catalog.images()).unwrap();
+        assert!(summaries.contains("\"platforms\""), "{summaries}");
+        let old: Vec<OldImageSummary> = serde_json::from_str(&summaries).unwrap();
+        assert_eq!(old.len(), 1);
+    }
+
     #[test]
     fn an_image_summary_without_platforms_omits_the_field() {
         let mut catalog = ManifestCatalog::default();

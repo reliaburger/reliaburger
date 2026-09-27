@@ -1018,7 +1018,7 @@ The listing needed one more fix. A multi-arch push leaves three catalogue entrie
 pub platform: Option<String>,
 ```
 
-The two serde attributes keep old and new data readable by each other: `default` lets a catalogue written before the field existed load with `None`, and `skip_serializing_if` leaves the field out when there's nothing to say. The format still changed, so the compatibility generations go up (`protocol` 28, `state` 45), as every change to what nodes send each other or store does.
+The two serde attributes keep old and new data readable by each other: `default` lets a catalogue written before the field existed load with `None`, and `skip_serializing_if` leaves the field out when there's nothing to say. Together they make the change additive, so we left the compatibility generations alone. A node running this code reads a catalogue an older node wrote: the entries come back with no platform names and the listing says `unknown`. An older node reads what this one writes, because none of the nested structs refuse unknown fields. `#[serde(deny_unknown_fields)]` sits only on the registry request envelopes, and serde doesn't apply it to the structs inside them, so the old node ignores `platform`. Two tests pin both directions: one strips `platform` from a serialised catalogue and loads it, and the other parses new output with copies of the old structs.
 
 ### Cleaning up after Buildah
 

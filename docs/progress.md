@@ -2309,7 +2309,8 @@ Post-12b user-experience work (not a roadmap phase). Plan:
     on one node queue (maintainer: fine as is).
   - [x] `relish images` shows a multi-platform image as one row with its
     platforms (table and JSON); the catalogue records each index entry's
-    platform (`protocol` 28, `state` 45).
+    platform. The change is additive (an optional field, old data loads, old
+    readers ignore it), so there's no compatibility bump.
   - [ ] VM checks (plan, "Needs a VM later"): the tour end to end on a
     quickstart, a mixed-architecture pull, a networked `RUN` step next to the
     perimeter firewall; re-record `assets/tour.cast`.

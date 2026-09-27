@@ -18,13 +18,10 @@ pub struct Compatibility {
 /// Supported formats, including the per-node `directive_retry` record in a
 /// cluster upgrade, the 503 a node answers a directive with when the
 /// binary's registry is unavailable (the orchestrator retries it), and the
-/// nodes each app last ran on (`DesiredState::last_placed_nodes`), and the
-/// platform an image index names for each entry (`LayerDescriptor::platform`,
-/// in the Raft catalogue) with the platforms an image listing reports
-/// (`ImageSummary::platforms`, in registry queries between nodes).
+/// nodes each app last ran on (`DesiredState::last_placed_nodes`).
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 28,
-    state: 45,
+    protocol: 27,
+    state: 44,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.

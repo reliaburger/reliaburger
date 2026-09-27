@@ -180,10 +180,27 @@ this).
       catalogue at `PUT` (`LayerDescriptor::platform`), `ImageSummary` gains
       `platforms` (omitted when empty), platform manifests with only digest
       "tags" get no row, and `relish sign` still resolves a platform digest.
-      This changes the Raft catalogue and the node-to-node registry query, so
-      `CURRENT` goes to `protocol` 28, `state` 45: nodes on these formats
-      refuse older state, so upgrading an existing cluster needs a fresh
-      cluster or a migration (maintainer to decide before this ships).
+      No compatibility bump (maintainer decision): the field is optional and
+      additive. Old catalogues load (entries show `unknown` platforms), and
+      old nodes ignore the new fields, because `deny_unknown_fields` is only on
+      the registry request envelopes and serde doesn't apply it to nested
+      structs. `CURRENT` stays at main's protocol 27, state 44. Tests:
+      `a_catalogue_written_without_platforms_loads_and_lists_its_images`,
+      `data_written_with_platforms_parses_with_the_structs_older_nodes_use`.
+      Encoding audit (additive only holds for self-describing formats), all
+      JSON: Raft log entries `src/council/durable_log.rs:133` (bincode only
+      wraps the unchanged `EncryptedEntry` ciphertext envelope, :140); Raft RPCs
+      incl. AppendEntries `src/council/network.rs:273` (decode) / :729
+      (encode); snapshots `src/council/state_machine.rs:1998` and :2154;
+      sealed backups `src/council/backup.rs:171`, :305; Pickle's on-disk
+      catalogue `src/pickle/types.rs:719`; registry proposals
+      `src/pickle/authority.rs:373`; registry query answers
+      (`ImageSummary`) `src/bun/api.rs:5762`. The bincode paths (gossip
+      `src/mustard/message.rs`, reporting `src/reporting/types.rs` and
+      `transport.rs`, rollups `src/mayo/rollup.rs`) carry none of the changed
+      types. New enum variants (`PickleError::NoPlatformManifest`,
+      `BuildError::MissingPlatforms`) aren't serialised; no `RaftRequest` or
+      `RegistryMutation` variant was added.
       Tests: `pickle::types` listing tests, the index `PUT` test, an `insta`
       snapshot of the table, `relish sign` resolution.
 - [x] 10. `[images] build_cache_max_bytes` defaults to 100 GiB; the quickstart
@@ -223,5 +240,4 @@ All answered by the maintainer on 27 September:
 - Builds queue per node: fine as is (step 11).
 - "Five-minute" tour: keep the name; time it after 0.1.0 (step 12).
 
-Still for the maintainer: the format bump in step 9 (`protocol` 28,
-`state` 45) means a cluster on the older formats can't be upgraded in place.
+The format bump first proposed in step 9 was dropped: the change is additive.
