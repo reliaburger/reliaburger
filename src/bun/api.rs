@@ -5482,26 +5482,25 @@ async fn ui_session_handler(
             crate::sesame::types::TokenScope::default(),
         ))
     } else {
-        // Snapshot the tokens under the lock, then run the Argon2id verify on
-        // the blocking pool (M7) so the deliberately-slow hashing doesn't stall
-        // the async runtime worker.
+        // Snapshot the tokens under the lock, then verify through the same
+        // bounded path as a bearer (B12): a malformed token is refused by a
+        // string check before any hashing, and a well-shaped one waits for a
+        // permit from the process-wide Argon2 semaphore. This route is
+        // unauthenticated, so calling Argon2 directly here would let anyone on
+        // the network pin every core and exhaust memory with junk logins.
         let tokens = auth.tokens.read().await.clone();
-        let candidate = form.token.clone();
-        tokio::task::spawn_blocking(move || {
-            crate::sesame::auth::authenticate(&candidate, &tokens)
-                .ok()
-                .map(|ctx| {
-                    (
-                        ctx.token_name,
-                        crate::sesame::types::TokenScope {
-                            apps: ctx.scoped_apps,
-                            namespaces: ctx.scoped_namespaces,
-                        },
-                    )
-                })
-        })
-        .await
-        .unwrap_or(None)
+        crate::sesame::auth::authenticate_off_lock(&form.token, tokens)
+            .await
+            .ok()
+            .map(|ctx| {
+                (
+                    ctx.token_name,
+                    crate::sesame::types::TokenScope {
+                        apps: ctx.scoped_apps,
+                        namespaces: ctx.scoped_namespaces,
+                    },
+                )
+            })
     };
 
     let Some((name, scope)) = identity else {
@@ -15409,6 +15408,59 @@ schedule = "* * * * *"
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        shutdown.cancel();
+    }
+
+    /// Build a POST /ui/session request carrying `token`.
+    fn login_request(token: &str) -> axum::http::Request<Body> {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/ui/session")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from(format!("token={token}")))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_malformed_login_is_refused_without_touching_argon2() {
+        // Every verification permit is held, so any login that reached the
+        // Argon2 path would block. A junk token must be refused by the shape
+        // check alone, promptly (B12).
+        let (app, shutdown, _t) = ui_setup(crate::sesame::types::ApiRole::ReadOnly);
+        let _permits = crate::sesame::auth::hold_all_verify_permits().await;
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            app.clone().oneshot(login_request("nope")),
+        )
+        .await
+        .expect("a malformed login must not wait for an Argon2 permit")
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn a_well_shaped_login_shares_the_argon2_concurrency_bound() {
+        // With every permit held, a login that looks like a real token has to
+        // queue for the same semaphore the bearer path uses (B12) rather than
+        // hashing on the blocking pool unbounded.
+        let (app, shutdown, token) = ui_setup(crate::sesame::types::ApiRole::ReadOnly);
+        let permits = crate::sesame::auth::hold_all_verify_permits().await;
+        let pending = tokio::spawn(app.clone().oneshot(login_request(&token)));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !pending.is_finished(),
+            "login verified without waiting for a permit"
+        );
+
+        // Releasing the permits lets the queued login finish normally.
+        drop(permits);
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(10), pending)
+            .await
+            .expect("login should proceed once a permit frees up")
+            .unwrap()
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
         shutdown.cancel();
     }
 

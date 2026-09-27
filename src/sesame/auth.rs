@@ -198,7 +198,11 @@ fn token_principal_id(token: &ApiToken) -> String {
 /// `async fn` returning `Result` is Rust's way of saying "this may await and
 /// may fail"; `.await` on the `spawn_blocking` handle yields until the
 /// blocking thread finishes without parking the async worker.
-async fn authenticate_off_lock(
+///
+/// Every path that verifies a presented token against the store goes through
+/// here: the bearer middleware and the unauthenticated `POST /ui/session`
+/// login alike, so neither can run unbounded Argon2 on a stranger's behalf.
+pub(crate) async fn authenticate_off_lock(
     plaintext: &str,
     tokens: Vec<ApiToken>,
 ) -> Result<AuthContext, (StatusCode, String)> {
@@ -237,6 +241,16 @@ async fn authenticate_off_lock(
             "authentication failed".to_string(),
         )),
     }
+}
+
+/// Hold every verification permit, so a test can prove a caller waits on the
+/// shared Argon2 bound instead of hashing on its own.
+#[cfg(test)]
+pub(crate) async fn hold_all_verify_permits() -> tokio::sync::SemaphorePermit<'static> {
+    VERIFY_PERMITS
+        .acquire_many(MAX_CONCURRENT_VERIFICATIONS as u32)
+        .await
+        .unwrap()
 }
 
 /// Check that the authenticated context has sufficient role.

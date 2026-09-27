@@ -611,6 +611,23 @@ There is one deliberate asymmetry worth calling out. A session is **always read-
 
 The middleware change is small: after the bearer check, if there's no token, look for the session cookie and, if it names a live session, attach a read-only context. If neither is present, a browser navigation (one that says `Accept: text/html`) gets a `303` to the login page instead of a bare `401` — because a human staring at a JSON error is a worse experience than a form. Public routes stay public: health, version, JWKS, the static assets, and the login page itself.
 
+#### The login form is a public Argon2 endpoint
+
+Public routes stay public, and one of them does something expensive. `POST /ui/session` has to check the pasted token against the store, which means Argon2. In Chapter 10 we bounded that work for bearers: a string check turns away anything that isn't `rbrg_` plus 64 hex characters, and a process-wide semaphore (`VERIFY_PERMITS`) admits at most four hashes at a time. The login handler didn't use any of it. It had its own copy of the verification, a `spawn_blocking` straight into `authenticate`, with no shape check and no permit.
+
+You can't demand a credential from someone who's trying to log in, so anyone who could reach a node could post junk tokens as fast as they liked. Each one ran Argon2 against every stored token, about 19 MiB apiece, on a blocking pool that grows to 512 threads. That's roughly 10 GB and every core pinned, from an unauthenticated form. A static review of the release (PR #258) caught it.
+
+The fix is one call. `authenticate_off_lock` became `pub(crate)` (visible anywhere in our crate, invisible outside it) and the login handler uses it instead of rolling its own:
+
+```rust
+let tokens = auth.tokens.read().await.clone();
+crate::sesame::auth::authenticate_off_lock(&form.token, tokens)
+    .await
+    .ok()
+```
+
+Two tests pin both halves. With every permit held (a test-only `hold_all_verify_permits` calls `acquire_many` on the semaphore), a login of `nope` still comes back `401` inside the timeout, so it never went near Argon2. A well-shaped login under the same conditions is still pending after 200 ms, and finishes with a redirect once we drop the permits. A bound only works if every path to the expensive thing goes through it. Two copies of the same check is one too many.
+
 ### Node detail page
 
 Navigate to `/ui/node/node-01` for per-node resource charts (system CPU and memory from Mayo) and a table of all running instances on that node. App names link back to their detail pages.
