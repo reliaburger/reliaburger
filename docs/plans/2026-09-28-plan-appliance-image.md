@@ -16,26 +16,47 @@
 
 ## S1 checklist
 
-- [ ] Branch `feat/appliance-image` from `origin/main`, this plan, and a draft PR
-- [ ] `image/`: mkosi configuration for Ubuntu 26.04 (`resolute`), x86_64 and aarch64
+- [x] Branch `feat/appliance-image` from `origin/main`, this plan, and a draft PR (#259)
+- [x] `image/`: mkosi configuration for Ubuntu 26.04 (`resolute`), x86_64 and aarch64
   - generic kernel, `linux-firmware-minimal` plus only the Wyse's firmware (`-realtek`, `-intel-graphics`)
   - the `guest-images.json` packages
   - bun and relish from the latest (staging) release, checked against its `SHA256SUMS`
   - `reliaburger.service`, and a boot-check unit that reports bun's health on the serial console
   - the Wyse 3040 `dw_dmac` blacklist, and DHCP on wired links
-- [ ] `.github/workflows/appliance.yml`:
+- [x] `.github/workflows/appliance.yml`:
   - mkosi v27 action on `ubuntu-24.04` and `ubuntu-24.04-arm`, unprivileged, default tools tree, no cache
   - sizes in the step summary
   - throwaway Ed25519 signature over `SHA256SUMS`
   - 1-day artefacts
-- [ ] x86_64 boot test: QEMU + OVMF under KVM on the hosted runner, pass only on bun's health marker on the serial console
+- [x] x86_64 boot test: QEMU + OVMF under KVM on the hosted runner, pass only on bun's health marker on the serial console
 - [ ] Iteration 2: `/usr` as EROFS with dm-verity (the A/B-ready layout, research §7.2) instead of a writable root
 - [ ] Record sizes and timings here, and tick S1 in the spike plan
 - [ ] Deferred to S2 preparation, not S1: the installer UKI (streaming `/usr` to disk), the ISO, the iPXE binaries
 
 ## Log
 
-(Filled in as CI runs.)
+**27 Sep, iteration 1 (writable ext4 root, the mkosi default layout).**
+- Run 36347688705 failed while picking bun's release: the newest `v*` tag is an old `v0.0.1rc1` pre-release without `SHA256SUMS`. Now it takes published releases, else the newest staging candidate.
+- Run 36347933911 failed because `systemd-repart` (which mkosi's default initrd installs) is in **universe** on 26.04. Enabled universe: it's built from the same systemd source as main. Also moved `dbus-broker` (universe) to `dbus` (main).
+- Run 36348190616 built, but mkosi wrote to `image/`; set `OutputDirectory=`.
+- **Run 36348503730: green on both architectures.**
+  - Built from `staging-v0.1.0-36336992775-1` (bun 0.1.0).
+  - Kernel `linux-image-7.0.0-34-generic`, Ubuntu 26.04.1.
+  - Tools tree: Debian testing with systemd 261, **1.6–1.7 GB**, built in about a minute.
+  - Whole job: about 4.5 min on x86_64 and 3 min on arm64.
+  - **x86_64 boot under KVM with 2 GiB: `reliaburger: bun healthy (bun 0.1.0)` at 12.2 s kernel time.**
+
+| | x86_64 | aarch64 |
+|---|---|---|
+| Disk image, zstd | 576.4 MB | 534.1 MB |
+| Disk image, minimal raw size | 1.4 GB | 1.5 GB |
+| UKI | **226.6 MB** | **213.4 MB** |
+| Default initrd | 31.5 MB | 30.9 MB |
+| Artefact (1 day) | 842 MB | 784 MB |
+
+**Findings.**
+- **The UKI is too big.** The kernel-modules initrd mkosi appends carries far more modules (and their firmware) than we need. That's two ESP slots' worth of the Wyse's 512 MiB, and slow over TFTP/HTTP. Next: an explicit `KernelInitrdModules=` list.
+- Harmless build noise: tmpfiles can't resolve `kvm` and `tss` inside the build sandbox, and presets skip masked units.
 
 ## Picking up S2 on the lab Mac (M1, 64 GB, from Monday 28 Sep)
 
