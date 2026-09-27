@@ -15,7 +15,7 @@
 - **The image: our own mkosi build on Ubuntu 26.04 LTS** (§3.1), riding **Ubuntu's generic kernel**, which Canonical patches (§3.2). `bun` is the only service. There's no SSH and no package manager, and the image carries only the packages we list (the same list as the quickstart guest).
   - We sign the UKI and never build or sign kernels.
   - We build both x86_64 (the real hardware) and aarch64 (fast VMs on Apple silicon).
-- **Netboot lives in `relish`** (`relish image serve`, §4.7):
+- **Netboot lives in `relish`** (`relish netboot`, §4.7):
   - a ProxyDHCP answer next to the home router's DHCP;
   - TFTP for a pinned iPXE, and HTTP for iPXE chains and UEFI HTTP Boot;
   - it serves only our signed release artefacts, from the laptop or from the first installed node.
@@ -28,7 +28,7 @@
 - **Iterate in VMs on a Mac, then test on real hardware** (§8, §9).
   - The maintainer has no KVM box, so iteration uses raw QEMU on the second Mac: aarch64 guests at native speed under HVF, plus an x86_64 smoke run under TCG emulation.
   - Clients netboot over a shared L2 network (socket_vmnet), with the netboot server in a small Lima VM.
-  - The final stage is **ten Dell Wyse 3040 thin clients**: 2 GB RAM, 8 or 16 GB eMMC, UEFI PXE only. 2 GB is enough for bun plus a few small workloads, but only just. The image and the retention settings need an appliance profile.
+  - The final stage is **ten Dell Wyse 3040 thin clients**: 2 GB RAM, 8 GB eMMC (all ten), UEFI PXE only. 2 GB is enough for bun plus a few small workloads, but only just. The image and the retention settings need an appliance profile.
 - **Join flow: claim over the LAN** (§4.2 d). Seed mode on USB covers headless installs. Network boot never serves secrets.
 - **Repo gaps that still block unattended joins** (§4.3):
   - G1: `master.key` is copied by hand;
@@ -37,6 +37,17 @@
   - G5: no master-key rotation;
   - G6: no token list or revoke.
 - **Spike:** about 9.5–10.5 engineer-days in six stages, with the Wyse 3040s as the last hands-on stage. It's in [`2026-09-27-plan-appliance-spike.md`](2026-09-27-plan-appliance-spike.md). It **awaits maintainer approval**, and it needs the second Mac.
+
+**Approved (maintainer, 27 Sep 2026):** the spike is approved, and the open questions are answered:
+1. A separate Ed25519 **OS signing key** in a protected environment, with a reviewer's click on each weekly signing at first (§7.5).
+2. The channel is **GitHub Releases** plus a signed `os-channel.json` on **GitHub Pages** (§7.4).
+3. The netboot command is **`relish netboot`**.
+4. Updates are **notify-only, to an explicit pin** (§7.6).
+5. All ten Wyse 3040s have **8 GB eMMC**, so the 8 GB layout in §9.3 is the only one. A monitor, keyboard and switch will be there.
+6. The lab Mac is a **64 GB M1 MacBook Pro** (Apple silicon), free from Monday 28 Sep: the VM lab is aarch64 under HVF (§8). socket_vmnet as a root service is fine.
+7. The **quickstart guest moves to Ubuntu 26.04** in the same release as the appliance, so both share one package list (§3.1, §5 Phase 1).
+
+Stage S1 (the image in CI) starts on `feat/appliance-image`; see the spike plan.
 
 ---
 
@@ -443,7 +454,7 @@ There are two install paths: USB sticks, or network boot from the laptop (§4.7)
 | # | Step | USB | Network boot |
 |---|---|---|---|
 | 1 | `relish image download` fetches and verifies the signed x86_64 appliance image (~0.5–0.8 GB **[estimate]**) | 3–6 min | 3–6 min |
-| 2 | USB: `relish image write /dev/diskN` (two sticks let two machines run at once). Network: `relish image serve` starts ProxyDHCP, TFTP and HTTP on the laptop, with one firewall prompt on macOS. | 3–4 min | 1 min |
+| 2 | USB: `relish image write /dev/diskN` (two sticks let two machines run at once). Network: `relish netboot` starts ProxyDHCP, TFTP and HTTP on the laptop, with one firewall prompt on macOS. | 3–4 min | 1 min |
 | 3 | `relish cluster create home --bare-metal` generates the PKI, admin context and master-key backup prompt on the laptop | 1 min | 1 min |
 | 4 | USB: for each machine, plug in, pick the stick in the boot menu (F11/F12), auto-install, reboot into `unclaimed`. About 5 min each; with 2 sticks, 3 rounds. Network: power all five on and pick "IPv4 PXE" or "IPv4 HTTP" once in each boot menu, and they install in parallel. Five × 0.6 GB is ~3 GB: about 30 s on wired gigabit, 3–5 min from a laptop on Wi-Fi. On either path, mini PCs often need Secure Boot turned off or our key enrolled the first time. | 15–20 min | 6–10 min |
 | 5 | `relish machines` lists 5 unclaimed machines. Compare fingerprints. | 2 min | 2 min |
@@ -455,21 +466,21 @@ There are two install paths: USB sticks, or network boot from the laptop (§4.7)
 - Network boot saves its time in step 4: no stick shuffling, and all five machines install at once. Step 4 is also where it can go wrong: firmware that ignores ProxyDHCP offers, or a boot menu that hides network boot until you enable "Network Stack". When that happens, that one machine falls back to a stick and the other four carry on.
 - Seed-mode installs (option c) stay USB-only on purpose, because network boot never serves secrets (§4.7).
 
-### 4.7 Network boot: `relish image serve`
+### 4.7 Network boot: `relish netboot`
 
 USB sticks are the slowest, most hands-on part of §4.6. Every mini PC in the hardware table below can boot from the network instead, and Kairos AuroraBoot's "pixie" mode shows one binary can make that painless. So network boot should be a first-class path, served by `relish` itself, not a "bring your own dnsmasq" appendix.
 
 **How a machine finds us without touching the router: ProxyDHCP.**
 1. The machine's firmware broadcasts a DHCPDISCOVER with option 60 set to `PXEClient:Arch:...` (legacy PXE) or `HTTPClient:Arch:...` (UEFI HTTP Boot).
 2. The home router answers as usual with an IP address.
-3. `relish image serve` answers the same broadcast on UDP 67 with a **proxy offer**. It assigns no address (`yiaddr` 0.0.0.0), echoes option 60 (`PXEClient` or `HTTPClient`), puts PXE vendor options in option 43, and names the boot file. For PXE that's a TFTP path plus `next-server`. For HTTP Boot, option 67 carries a full URL. Some PXE clients then ask again on UDP 4011.
+3. `relish netboot` answers the same broadcast on UDP 67 with a **proxy offer**. It assigns no address (`yiaddr` 0.0.0.0), echoes option 60 (`PXEClient` or `HTTPClient`), puts PXE vendor options in option 43, and names the boot file. For PXE that's a TFTP path plus `next-server`. For HTTP Boot, option 67 carries a full URL. Some PXE clients then ask again on UDP 4011.
 4. The firmware takes its address from the router and its boot instructions from us.
 
 So we never hand out an address, and we can't break the router's DHCP. The limits:
 - Only PXE and HTTP Boot clients listen to us. Everything else on the LAN ignores proxy offers.
 - EDK2's `HttpBootDxe` explicitly pairs a router's address-only offer with a proxy offer carrying a URI (`HttpOfferTypeProxyIpUri`). A dnsmasq user confirmed proxy HTTP Boot works (June 2022). Whether AMI and Insyde firmware on consumer mini PCs honour proxy offers for **HTTP** Boot is **[unverified]**. For legacy PXE it's decades-old behaviour.
 - We have to share a broadcast domain with the machines. Guest Wi-Fi, "AP isolation" and VLANs break it.
-- Two ProxyDHCP servers on one LAN race each other. `relish image serve` should listen for a few seconds first and refuse to start if it hears another proxy answering **[inference]**.
+- Two ProxyDHCP servers on one LAN race each other. `relish netboot` should listen for a few seconds first and refuse to start if it hears another proxy answering **[inference]**.
 
 **TFTP or HTTP?** HTTP wherever we can.
 - **UEFI HTTP Boot** (UEFI 2.5, 2015) fetches the boot file by URL. EDK2 accepts an EFI binary *or* an ISO, which it mounts as a RAM disk. A UKI works directly as the boot file (kraxel, July 2024). It's fast and has no practical size limit.
@@ -492,7 +503,7 @@ So we never hand out an address, and we can't break the router's DHCP. The limit
 - The laptop has to stay awake (`relish` can hold a power assertion while serving) and on the same LAN segment. Wired is better: five machines pulling an image over Wi-Fi turns step 4's transfer from seconds into minutes.
 - On Linux, `relish` needs `CAP_NET_BIND_SERVICE` or root for the same ports.
 
-**Or serve from the first node.** Once node 1 is installed (from a stick, or netbooted from the laptop) and claimed, it can do the serving: `relish image serve --node home-1`. That suits the rest of the fleet better:
+**Or serve from the first node.** Once node 1 is installed (from a stick, or netbooted from the laptop) and claimed, it can do the serving: `relish netboot --node home-1`. That suits the rest of the fleet better:
 - node 1 is wired, always on, and already holds the verified image (the running OS, or the next version sysupdate staged);
 - the laptop can go to sleep;
 - adding a sixth machine or replacing a dead one later is "plug it in and network-boot", with no laptop or stick at all.
@@ -505,7 +516,7 @@ It's a bun subsystem that an admin opens through the API; it serves, then stops.
 - **Integrity comes from signatures, not transport.** Plain HTTP and TFTP have no integrity, and a rogue proxy on the LAN can win the race. Secure Boot verifies the UKI, and the UKI verifies the image it pulls. With Secure Boot off, a LAN attacker can serve a malicious installer, just as they could swap a USB stick. The claim fingerprint and `--confirm` (§4.2 d) still stop that machine from joining silently. HTTPS Boot with our CA enrolled in firmware (EDK2's `TlsCaCertificate`, Dell's certificate import) would close the gap, but it's rarely practical on consumer boards.
 - **Optional allow-list.** `--mac` limits the proxy to known machines, so it doesn't offer an installer to a colleague's laptop that happens to try network boot first.
 
-**How it fits the claim flow.** Network boot only replaces "get the generic image onto the disk". After the reboot the machine sits in `unclaimed` and announces itself over mDNS, exactly as after a USB install. `relish image serve` can watch its own boot log and the mDNS browse together and print "5 booted, 5 unclaimed", which tells the operator step 4 is done.
+**How it fits the claim flow.** Network boot only replaces "get the generic image onto the disk". After the reboot the machine sits in `unclaimed` and announces itself over mDNS, exactly as after a USB install. `relish netboot` can watch its own boot log and the mDNS browse together and print "5 booted, 5 unclaimed", which tells the operator step 4 is done.
 
 **Which hardware supports what.**
 
@@ -569,7 +580,7 @@ See [`2026-09-27-plan-appliance-spike.md`](2026-09-27-plan-appliance-spike.md) a
 **Image (`image/mkosi.conf` and friends):**
 - Ubuntu 26.04 LTS, **x86_64 and aarch64**, with the distro's generic kernel (§3.2) and a pruned `linux-firmware` allow-list (§9.3);
 - `[Match]` blocks that keep Debian 13 buildable (§3.1);
-- the package list shared with `guest-images.json`;
+- the package list shared with `guest-images.json`, **and the quickstart guest moved to Ubuntu 26.04 in the same release** (approved 27 Sep), so the guest and the appliance share one archive and one list;
 - the systemd unit reused from `provision.rs::SERVICE`;
 - no SSH;
 - an EROFS or squashfs `/usr` with dm-verity, `systemd-repart` for the data partition (Btrfs), and a UKI;
@@ -597,8 +608,8 @@ See [`2026-09-27-plan-appliance-spike.md`](2026-09-27-plan-appliance-spike.md) a
 
 Unchanged from §4.7:
 - **Installer UKI** that pulls and verifies the image from its boot origin, and **streams** `/usr` onto the disk rather than into RAM. The 2 GB Wyse can't hold a full image in tmpfs (§9.2).
-- **`relish image serve`** on macOS and Linux: ProxyDHCP (`dhcproto`), a minimal TFTP for iPXE, HTTP via axum, a refusal when another proxy or `bootpd` is already answering, a `--mac` allow-list, and a time-boxed window. It serves only verified release artefacts.
-- **`relish image serve --node <name>`**: the same server as a bun subsystem.
+- **`relish netboot`** on macOS and Linux: ProxyDHCP (`dhcproto`), a minimal TFTP for iPXE, HTTP via axum, a refusal when another proxy or `bootpd` is already answering, a `--mac` allow-list, and a time-boxed window. It serves only verified release artefacts.
+- **`relish netboot --node <name>`**: the same server as a bun subsystem.
 - **Vendored iPXE** for x86_64 and arm64 EFI, pinned, with an embedded chain script.
 - **Tests:** the proxy-offer builder and property tests from §4.7; the Mac lab (§8.4 level 2); and the x86_64 CI lab on a bridge, which hosted runners allow with `sudo`.
 
@@ -624,7 +635,7 @@ The design is decided in §7.6:
 
 - Ubuntu 26.04 via mkosi, distro kernel, x86_64 and aarch64.
 - Seed-mode join with node-bound tokens, plus G1 and G2.
-- `relish image serve` netboot, because it's what turns ten Wyse boxes from ten USB sessions into ten power buttons.
+- `relish netboot` netboot, because it's what turns ten Wyse boxes from ten USB sessions into ten power buttons.
 - `bun` self-upgrade as today. Weekly images are published, but a node takes a new OS by reinstalling until Phase 3 lands.
 - **Proof point:** five aarch64 VMs on a Mac and ten Wyse 3040s netboot, join and pass the tour.
 
@@ -688,7 +699,7 @@ Per architecture (`x86_64`, `aarch64`), from one mkosi configuration:
 |---|---|---|
 | `reliaburger-os_<v>_<arch>.efi` | UKI: kernel, initrd, and a command line with `usrhash=` pinning the verity root of this build's `/usr` | sysupdate (ESP), CI boot test |
 | `reliaburger-os_<v>_<arch>.usr.raw.zst` and `.usr-verity.raw.zst` | the EROFS/squashfs `/usr` and its dm-verity hash tree | sysupdate (inactive `/usr` slot), the installer |
-| `reliaburger-os-installer_<v>_<arch>.efi` | the installer UKI for netboot: small initrd that partitions the disk and streams `/usr` onto it (§4.7, §9.2) | `relish image serve` (UEFI HTTP Boot, or iPXE chain) |
+| `reliaburger-os-installer_<v>_<arch>.efi` | the installer UKI for netboot: small initrd that partitions the disk and streams `/usr` onto it (§4.7, §9.2) | `relish netboot` (UEFI HTTP Boot, or iPXE chain) |
 | `reliaburger-os_<v>_<arch>.iso` | the installer on bootable media | USB sticks |
 | `reliaburger-os_<v>_<arch>.raw.zst` | a complete installed disk | `dd` installs, QEMU tests, `relish image write` |
 | `ipxe-<arch>.efi` (x86_64 and arm64) | pinned, vendored iPXE with an embedded chain script | TFTP stage of PXE |
@@ -706,7 +717,7 @@ The UKI's `usrhash=` ties the kernel and the exact `/usr` together. So with Secu
 
   mkosi then **builds unprivileged in a user namespace**. `RepartOffline=yes` is its default: "`systemd-repart` will not use loopback devices to build disk images". The mkosi man page says only `RepartOffline=no` needs root and loop devices, which we don't need unless we use `Subvolumes=`. So **no privileged container and no loop devices on the hosted runner**. The `build-guest-images` job needs `sudo` for its loop mounts; this one shouldn't.
 - **Tools tree.** The runner's Ubuntu 24.04 has systemd 255. The UKI (`ukify`), `systemd-repart` verity options and systemd 258's `rd.systemd.pull=` `bootorigin` (§4.7) need newer tools. `ToolsTree=yes` makes mkosi build its own, pinned tools image, so the host's versions stop mattering. The build time and size of the tools tree are **[unmeasured]**, and the spike records them.
-- **Boot test.** Standard 2-vCPU Linux hosted runners expose KVM (GitHub changelog, 2 Apr 2024), and the mkosi action makes `/dev/kvm` usable. So the x86_64 job boots the raw disk in QEMU+OVMF and waits for bun's `/v1/health`. It also runs a netboot test on a bridge (`sudo ip link add ... type bridge`, dnsmasq address-only, the proxy from `relish image serve`). **The arm64 hosted runner has no `/dev/kvm`**, so aarch64 gets a build-only check in CI plus the Mac lab (§8).
+- **Boot test.** Standard 2-vCPU Linux hosted runners expose KVM (GitHub changelog, 2 Apr 2024), and the mkosi action makes `/dev/kvm` usable. So the x86_64 job boots the raw disk in QEMU+OVMF and waits for bun's `/v1/health`. It also runs a netboot test on a bridge (`sudo ip link add ... type bridge`, dnsmasq address-only, the proxy from `relish netboot`). **The arm64 hosted runner has no `/dev/kvm`**, so aarch64 gets a build-only check in CI plus the Mac lab (§8).
 - **Estimated time per run:** 15–30 minutes per architecture, including the tools tree **[estimate]**.
 
 ### 7.4 Caching, storage and retention
@@ -772,7 +783,7 @@ PR #215 shows where the limits are: artefacts had reached 287 GiB, and the cache
 
 - **Lima's VZ backend** (the quickstart's default) can't network-boot: Apple's Virtualization framework EFI loader has no PXE or HTTP Boot, and Lima's docs don't mention netboot at all.
 - **Lima's QEMU backend** boots a disk image and waits for its guest agent and cloud-init. A netbooting machine has neither, so Lima would time out. **So the netboot *clients* are plain `qemu-system-*` processes.**
-- **Lima is still useful for the server side.** A small Ubuntu VM on the same L2 network runs the netboot server: `relish image serve` (Linux build) once it exists, or `dnsmasq` in proxy mode as a stand-in during the spike. It can also build images locally with mkosi if CI is too slow a loop.
+- **Lima is still useful for the server side.** A small Ubuntu VM on the same L2 network runs the netboot server: `relish netboot` (Linux build) once it exists, or `dnsmasq` in proxy mode as a stand-in during the spike. It can also build images locally with mkosi if CI is too slow a loop.
 
 ### 8.2 Architectures
 
@@ -828,7 +839,7 @@ networks:
 EOF
 limactl start --name rb-lan rb-lan.yaml     # [unverified: exact image URL and networks.socket key]
 
-# Inside rb-lan, until relish image serve exists: dnsmasq as a pure ProxyDHCP + TFTP.
+# Inside rb-lan, until relish netboot exists: dnsmasq as a pure ProxyDHCP + TFTP.
 sudo dnsmasq --no-daemon --port=0 --interface=lima0 \
   --dhcp-range=192.168.105.0,proxy --enable-tftp --tftp-root=/srv/tftp \
   --dhcp-userclass=set:ipxe,iPXE \
@@ -858,7 +869,7 @@ Five of those, with different MACs and disks, is the claim lab from Phase 2. The
 
 There's no DHCP on that hub, so one extra VM plays the router (dnsmasq handing out addresses only), and another runs the netboot server. Multicast over macOS loopback for this purpose is **[unverified]**. Use it only if socket_vmnet's root step is unwelcome.
 
-**Level 3: bridged to the real LAN.** This is also the product topology. `relish image serve` runs **natively on macOS**, and the Wyse boxes (or VMs bridged with socket_vmnet `--vmnet-mode=bridged --vmnet-interface=en0`) sit on the wired LAN behind the home router. That's where the macOS questions from §4.7 get answered: non-root UDP 67/69/4011, the firewall prompt, and whether `bootpd` is running. Wi-Fi interfaces generally can't be bridged, so use Ethernet on the Mac **[unverified for vmnet]**.
+**Level 3: bridged to the real LAN.** This is also the product topology. `relish netboot` runs **natively on macOS**, and the Wyse boxes (or VMs bridged with socket_vmnet `--vmnet-mode=bridged --vmnet-interface=en0`) sit on the wired LAN behind the home router. That's where the macOS questions from §4.7 get answered: non-root UDP 67/69/4011, the firewall prompt, and whether `bootpd` is running. Wi-Fi interfaces generally can't be bridged, so use Ethernet on the Mac **[unverified for vmnet]**.
 
 ### 8.5 What needs the second Mac
 
@@ -876,7 +887,7 @@ Everything in §8: levels 1–3, the x86_64 TCG smoke run, and serving the Wyse 
 |---|---|
 | CPU | Intel Atom x5-Z8350 ("Cherry Trail", Airmont), 4 cores, 1.44 GHz, x86_64, fanless |
 | RAM | **2 GB DDR3L, soldered**, single channel. Not upgradeable. |
-| Storage | **8 or 16 GB eMMC, soldered**. Linux sees `/dev/mmcblk0`, plus `mmcblk0boot0`, `mmcblk0boot1` and `mmcblk0rpmb`. |
+| Storage | **8 GB eMMC, soldered** (the 3040 also came with 16 GB; all ten of ours are 8 GB, so 8 GB is the only layout we plan for). Linux sees `/dev/mmcblk0`, plus `mmcblk0boot0`, `mmcblk0boot1` and `mmcblk0rpmb`. |
 | Network | Realtek RTL8111/8168 gigabit (`r8169`, needs `rtl_nic` firmware). Wi-Fi only via an SDIO M.2 card or a USB dongle. |
 | Firmware | UEFI only once switched from the factory CSM mode ("it is not possible to reactivate the CSM"). F2 setup, F12 boot menu. Latest BIOS 1.2.5. Default BIOS password "Fireport". Secure Boot off by default (and it stays off for us). |
 | Power | 5 V or 12 V barrel supplies, depending on the batch. Use the one each unit shipped with. |
@@ -907,7 +918,7 @@ Some consequences:
 
 **Disk selection.** The installer must pick `/dev/mmcblk0`: not removable, the largest disk. It must never touch `mmcblk0boot0`, `mmcblk0boot1` or `mmcblk0rpmb`, which are tiny hardware partitions of the same chip. §4.5's "largest non-removable disk" rule needs an explicit exclusion for those names. Some firmware also forgets NVRAM boot entries, so the installer writes both a boot entry and the removable-media fallback `\EFI\BOOT\BOOTX64.EFI` (the Debian wiki's install note says the same).
 
-**Layout on an 8 GB part** (about 7.3 GiB usable **[unverified]**):
+**The layout (8 GB is the only one: all ten units are 8 GB)** (about 7.3 GiB usable **[unverified]**):
 
 | Partition | Size |
 |---|---|
@@ -920,7 +931,7 @@ That fits only if `/usr` stays **under ~1 GiB compressed**. The biggest risk is 
 - `intel` for the Atom's audio and ISP, if needed;
 - nothing for Wi-Fi by default.
 
-mkosi's `RemoveFiles=` (or a postinst script) prunes the rest, and drops docs, man pages and locales. The 16 GB units have plenty of room.
+mkosi's `RemoveFiles=` (or a postinst script) prunes the rest, and drops docs, man pages and locales.
 
 **What fills `RB_DATA`**, from the V02 soak's resource table (three nodes, 12 hours):
 - the data directory: 10–780 MB, mostly Raft and the stores;
@@ -967,7 +978,7 @@ mkosi's `RemoveFiles=` (or a postinst script) prunes the rest, and drops docs, m
 ### 9.7 How the final stage runs
 
 1. Update and configure all ten BIOSes (§9.4). Record the menu names and time spent.
-2. Put the second Mac on Ethernet on the same switch as the Wyse boxes, behind an ordinary home router. Run `relish image serve` natively, or dnsmasq-proxy in a bridged VM if `relish image serve` isn't ready.
+2. Put the second Mac on Ethernet on the same switch as the Wyse boxes, behind an ordinary home router. Run `relish netboot` natively, or dnsmasq-proxy in a bridged VM if `relish netboot` isn't ready.
 3. Netboot all ten at once. They install and reboot into `unclaimed`.
 4. Claim them: three or five council voters, the rest workers.
 5. Run the tour. Pull a power cord.
@@ -994,7 +1005,7 @@ It would have saved most of Phases 1, 2b and 3's image, installer and netboot wo
 3. **Upstream has moved away from Ubuntu.** Since v4.0 (Feb 2026) the project publishes prebuilt artefacts only for its own Hadron distro, and says the old flavour repositories "are no longer actively updated". CI **builds** `ubuntu:26.04` in its `_build-flavors.yaml` smoke matrix but **boot-tests** only Hadron and one `ubuntu:20.04` cell. We'd be the only pipeline proving Ubuntu 26.04 boots.
 4. **A small core.** About four people wrote almost all of the monorepo's last 12 months of commits, behind a single sponsor (Spectro Cloud).
 5. **Persistence doesn't match bun.** `/var` and `/etc` are ephemeral, and `kairos-agent`'s partitioner can't format Btrfs (`agent/pkg/partitioner/mkfs.go` handles only ext2–4, xfs and fat). We'd work around both.
-6. **Netboot is the part we want to own anyway.** `relish image serve` gives one binary, the operator's existing trust (the release key and the claim flow), and no Docker on the laptop. AuroraBoot's netboot doesn't work from its Docker image on macOS at all; the native binary needs `xorriso`.
+6. **Netboot is the part we want to own anyway.** `relish netboot` gives one binary, the operator's existing trust (the release key and the claim flow), and no Docker on the laptop. AuroraBoot's netboot doesn't work from its Docker image on macOS at all; the native binary needs `xorriso`.
 
 What we keep from the exercise: the netboot flow (ProxyDHCP, iPXE, streamed install) matches AuroraBoot's design, which is reassuring. The rule "cloud-config and netboot carry no secrets" applies to our seed and claim design unchanged. The sources are in the Sources section.
 
