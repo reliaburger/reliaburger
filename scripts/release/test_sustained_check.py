@@ -281,11 +281,37 @@ class Leaks(Evidence):
     def test_unexplained_systemd_restart_fails_but_a_harness_kill_does_not(self):
         status = [{"node": "rb-a-1", "id": "default__web-0"}]
         self.evaluate(self.snapshot(**{"status_json": status, "inventory__rb-a-1_txt": INVENTORY}))
-        checker.main(["expect", str(self.evidence), "restart", "rb-a-1"])
+        checker.main(["expect", str(self.evidence), "restart", "rb-a-1", "--at", str(NOW)])
         _, explained = self.evaluate(self.snapshot(**{"status_json": status, "inventory__rb-a-1_txt": INVENTORY.replace("nrestarts 0", "nrestarts 1")}))
         _, unexplained = self.evaluate(self.snapshot(**{"status_json": status, "inventory__rb-a-1_txt": INVENTORY.replace("nrestarts 0", "nrestarts 2")}))
         self.assertEqual(self.failures(explained), [])
         self.assertIn("bun-restart", self.failures(unexplained))
+
+    def test_a_check_between_the_kill_and_the_restart_keeps_the_expectation(self):
+        status = [{"node": "rb-a-1", "id": "default__web-0"}]
+        self.evaluate(self.snapshot(**{"status_json": status, "inventory__rb-a-1_txt": INVENTORY}))
+        checker.main(["expect", str(self.evidence), "restart", "rb-a-1", "--at", str(NOW)])
+        # systemd hasn't restarted bun yet when this check runs.
+        _, before = self.evaluate(self.snapshot(**{"status_json": status, "inventory__rb-a-1_txt": INVENTORY}))
+        _, after = self.evaluate(self.snapshot(**{"status_json": status, "inventory__rb-a-1_txt": INVENTORY.replace("nrestarts 0", "nrestarts 1")}))
+        self.assertEqual(self.failures(before), [])
+        self.assertEqual(self.failures(after), [])
+
+    def test_an_expectation_survives_a_check_saving_older_state(self):
+        status = [{"node": "rb-a-1", "id": "default__web-0"}]
+        self.evaluate(self.snapshot(**{"status_json": status, "inventory__rb-a-1_txt": INVENTORY}))
+        stale = checker.load_state(self.evidence)
+        checker.main(["expect", str(self.evidence), "restart", "rb-a-1", "--at", str(NOW)])
+        checker.save_state(self.evidence, stale)  # a concurrent check writing back what it loaded
+        _, verdict = self.evaluate(self.snapshot(**{"status_json": status, "inventory__rb-a-1_txt": INVENTORY.replace("nrestarts 0", "nrestarts 1")}))
+        self.assertEqual(self.failures(verdict), [])
+
+    def test_an_old_expectation_does_not_excuse_a_later_restart(self):
+        status = [{"node": "rb-a-1", "id": "default__web-0"}]
+        self.evaluate(self.snapshot(**{"status_json": status, "inventory__rb-a-1_txt": INVENTORY}))
+        checker.main(["expect", str(self.evidence), "restart", "rb-a-1", "--at", str(NOW - checker.EXPECT_WINDOW - 1)])
+        _, verdict = self.evaluate(self.snapshot(**{"status_json": status, "inventory__rb-a-1_txt": INVENTORY.replace("nrestarts 0", "nrestarts 1")}))
+        self.assertIn("bun-restart", self.failures(verdict))
 
     def test_file_descriptors_growing_every_hour_for_six_hours_fail(self):
         samples = [[NOW - 6 * 3600 + hour * 3600 + minute * 300, 300 + hour * 10] for hour in range(6) for minute in range(12)]
