@@ -2,7 +2,7 @@
 
 *27 September 2026. Companion to [the appliance OS research](2026-09-26-research-appliance-os.md) (draft PR #218). Docs only.*
 
-> **Status: approved on 27 Sep 2026.** S1 (CI only) is in progress on `feat/appliance-image`; its working notes are in [`2026-09-28-plan-appliance-image.md`](2026-09-28-plan-appliance-image.md) on that branch. S2–S5 run on the lab Mac (a 64 GB M1 MacBook Pro, free from Monday 28 Sep), never on the Mac running the soak. S5 also needs the ten Wyse 3040s.
+> **Status: approved on 27 Sep 2026. S1 is done** (27 Sep, draft PR #259, `feat/appliance-image`); its working notes are in [`2026-09-28-plan-appliance-image.md`](2026-09-28-plan-appliance-image.md) on that branch. S2–S5 run on the lab Mac (a 64 GB M1 MacBook Pro, free from Monday 28 Sep), never on the Mac running the soak. S5 also needs the ten Wyse 3040s.
 
 This file replaces `2026-09-27-plan-kairos-spike.md`. The maintainer chose the own mkosi image on Ubuntu with a netboot server built into `relish`. Kairos is now an alternative that was considered (research §10.1), and Talos is parked with no spike steps (§10.2).
 
@@ -17,7 +17,7 @@ This file replaces `2026-09-27-plan-kairos-spike.md`. The maintainer chose the o
 - [x] This file: the spike stages
 - [x] PR #218 title and body
 - [x] Maintainer approval of the spike (27 Sep 2026)
-- [ ] S1 image in CI (in progress, `feat/appliance-image`)
+- [x] S1 image in CI (27 Sep, draft PR #259, `feat/appliance-image`). Both architectures build unprivileged on hosted runners in 3–5 minutes. The x86_64 image boots under KVM with 2 GiB on an 8 GB disk to a healthy bun in about 12 s, with the A/B layout: an EROFS+verity `/usr` slot A, an empty slot B added on first boot, and a Btrfs data partition. The UKI is 73 MB, and an update ships about 430 MB. Sizes and the log are in [`2026-09-28-plan-appliance-image.md`](https://github.com/reliaburger/reliaburger/blob/feat/appliance-image/docs/plans/2026-09-28-plan-appliance-image.md). Deferred to S2 preparation: the installer UKI, the ISO and iPXE.
 - [ ] S2–S6 (lab Mac from 28 Sep, then the Wyse fleet)
 
 ## What the spike must prove
