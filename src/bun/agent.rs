@@ -3582,7 +3582,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
 
         loop {
+            // Branches are polled in order, so the periodic tick runs only when
+            // nothing else is waiting. A tick can take seconds (every pending
+            // restart retries its runtime cleanup), and ticks that fall behind
+            // are due at once. Polled in random order, each queued command had
+            // to win a coin toss against the next slow tick; callers timed out,
+            // the consumer view that would let restarts finish never landed,
+            // and the node stopped answering. Now a command waits for at most
+            // the tick already running.
             tokio::select! {
+                biased;
                 _ = self.shutdown.cancelled() => {
                     self.abandon_pending_stops();
                     self.shutdown_all().await;
@@ -16205,6 +16214,82 @@ interval = 1
             "a slow health probe blocked the command loop"
         );
         assert!(stopped.is_ok(), "a slow health probe blocked shutdown");
+    }
+
+    /// V02 soak: a node killed with `kill_containers` comes back with every
+    /// replica waiting for its restart, and each health tick spends a few
+    /// hundred milliseconds per replica on runtime cleanup it cannot finish
+    /// yet. Ticks then run back to back. Commands queued behind one of those
+    /// ticks (a fault clear, the leader's fence, the consumer view that would
+    /// let the restarts finish) must be answered before the next tick starts,
+    /// not raced against it one coin toss at a time.
+    #[tokio::test]
+    async fn queued_commands_are_answered_before_the_next_slow_health_tick() {
+        let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+        let config =
+            Config::parse("[app.web]\nimage = 'web:v1'\nport = 8080\nreplicas = 3\n").unwrap();
+        expect_complete(&drain_deploy(&mut agent, config).await);
+        let ids: Vec<InstanceId> = agent
+            .supervisor
+            .list_instances()
+            .iter()
+            .map(|instance| instance.id.clone())
+            .collect();
+        assert_eq!(ids.len(), 3);
+        for id in &ids {
+            let instance = agent.supervisor.get_instance_mut(id).unwrap();
+            instance.state = ContainerState::Pending;
+            instance.restart_count = 1;
+        }
+        // Each pending restart spends 400 ms failing to clean up its old
+        // runtime, so every tick lasts 1.2 s: longer than the 1 s interval.
+        const PER_RESTART: std::time::Duration = std::time::Duration::from_millis(400);
+        grill.set_kill_delay(Some(PER_RESTART));
+        grill.set_fail_kill(true);
+        let kills = |grill: &MockGrill| {
+            grill
+                .calls()
+                .iter()
+                .filter(|(operation, _)| operation == "kill")
+                .count()
+        };
+        let task = tokio::spawn(async move { agent.run().await });
+        // Wait until a slow tick is under way, so the commands queue behind it.
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while kills(&grill) < ids.len() + 1 {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let kills_when_queued = kills(&grill);
+        let mut replies = Vec::new();
+        for _ in 0..8 {
+            let (response, reply) = oneshot::channel();
+            tx.send(AgentCommand::Status { response }).await.unwrap();
+            replies.push(reply);
+        }
+        for reply in replies {
+            tokio::time::timeout(std::time::Duration::from_secs(30), reply)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        let kills_while_queued = kills(&grill) - kills_when_queued;
+        shutdown.cancel();
+        let mut task = task;
+        if tokio::time::timeout(std::time::Duration::from_secs(10), &mut task)
+            .await
+            .is_err()
+        {
+            task.abort();
+        }
+        // At most the rest of the tick that was already running.
+        assert!(
+            kills_while_queued <= ids.len(),
+            "{kills_while_queued} restart cleanups ran while 8 commands waited: \
+             later health ticks overtook queued commands"
+        );
     }
 
     #[tokio::test]
