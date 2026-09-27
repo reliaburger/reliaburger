@@ -43,6 +43,17 @@ fn retire_timeout(io_timeout: Duration, stop_confirmation_timeout: Duration) -> 
     io_timeout + crate::bun::agent::stop_completion_bound(stop_confirmation_timeout)
 }
 
+/// The longest one owner may take, once a test lease is released, to confirm
+/// its share of the cleanup: waiting for its next placement poll, one whole
+/// retirement, then its acknowledgement to the leader. Owners retire side by
+/// side, so this also bounds the whole release when nothing else holds the
+/// owner's reconcile tick (a deploy it's still finishing runs first).
+pub fn lease_retirement_bound(stop_confirmation_timeout: Duration) -> Duration {
+    RECONCILE_INTERVAL
+        + retire_timeout(RECONCILE_IO_TIMEOUT, stop_confirmation_timeout)
+        + RECONCILE_IO_TIMEOUT
+}
+
 /// The leader's latest reading of the endpoint withdrawal ledger, exported as
 /// Mayo metrics by Bun's collection loop. Followers report zero: only the
 /// leader judges the replicated ledger.
@@ -1809,6 +1820,17 @@ mod tests {
         let deadline = retire_timeout(RECONCILE_IO_TIMEOUT, confirmation);
         assert!(deadline > crate::bun::agent::stop_completion_bound(confirmation));
         assert!(deadline > RECONCILE_IO_TIMEOUT);
+    }
+
+    /// A released lease's owner first waits for its next poll, then retires,
+    /// then acknowledges: the bound covers all three, not the retirement alone.
+    #[test]
+    fn lease_retirement_bound_covers_poll_retirement_and_acknowledgement() {
+        let confirmation =
+            crate::config::node::RuntimeSection::default().stop_confirmation_timeout();
+        let bound = lease_retirement_bound(confirmation);
+        assert!(bound > retire_timeout(RECONCILE_IO_TIMEOUT, confirmation) + RECONCILE_INTERVAL);
+        assert!(bound > Duration::from_secs(30), "{bound:?}");
     }
 
     /// V02 soak: retirements of SIGTERM-ignoring apps ran one at a time, each
