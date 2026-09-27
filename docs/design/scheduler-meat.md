@@ -659,6 +659,16 @@ fn bin_packing_score(node: &NodeCapacity, request: &Resources) -> f64 {
 
 Higher utilisation after placement is better (the node is more "full"). An imbalance penalty discourages placing CPU-heavy workloads on memory-heavy nodes and vice versa, which would leave stranded resources.
 
+#### Apps with Managed Volumes
+
+A managed volume lives on one node, so placement follows the data. Desired state keeps `last_placed_nodes`: the nodes of the app's last non-empty scheduling decision. `relish stop` commits an empty decision, which leaves that record alone. When a fixed-replica app with a managed volume has no placement left to keep (it was stopped and is applied again), the leader puts its replicas back on those nodes before scoring anything:
+
+- A home node that is alive, ready and still matches the app's required labels gets the replica, reserved in the pass's cache.
+- A home node that could run it but hasn't room (or hasn't reported to this leader yet) makes the app wait: placing it elsewhere would start it on an empty volume.
+- A home node that is gone, not ready, or no longer matches the labels is dropped, and that replica goes through the normal pipeline. That's the documented loss of a local volume with its node, or the operator moving the app on purpose.
+
+`relish delete` forgets the record. Apps without a managed volume are placed by score as usual.
+
 #### Daemon Mode (`replicas = "*"`)
 
 When `replicas = "*"` is specified, Meat does not run the placement pipeline. Instead:

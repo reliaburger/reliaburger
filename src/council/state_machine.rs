@@ -315,6 +315,7 @@ impl StateMachineInner {
                 self.state.apps.remove(app_id);
                 self.state.stopped_apps.remove(app_id);
                 self.state.scheduling.remove(app_id);
+                self.state.last_placed_nodes.remove(app_id);
                 // A deleted app leaves no baseline for an override to sit
                 // above; drop it so a re-created app of the same name starts
                 // from its own spec, not a ghost override (DEP8).
@@ -378,6 +379,18 @@ impl StateMachineInner {
                         });
                     }
                     lease.placements = owners;
+                }
+                // A stop commits an empty decision; where the app ran must
+                // outlive it, because that's where its managed volumes are.
+                if !decision.placements.is_empty() {
+                    self.state.last_placed_nodes.insert(
+                        decision.app_id.clone(),
+                        decision
+                            .placements
+                            .iter()
+                            .map(|placement| placement.node_id.clone())
+                            .collect(),
+                    );
                 }
                 self.state
                     .scheduling
@@ -2387,6 +2400,76 @@ mod tests {
         let state = sm.desired_state().await;
         assert!(!state.apps.contains_key(&app_id));
         assert!(!state.stopped_apps.contains(&app_id));
+    }
+
+    /// A managed volume stays on its node, so the cluster has to remember
+    /// where a stopped app ran after its placements have gone.
+    #[tokio::test]
+    async fn a_stop_keeps_the_nodes_the_app_last_ran_on_until_delete() {
+        let mut sm = CouncilStateMachine::new();
+        let app_id = AppId::new("web", "prod");
+        let decision = |index, nodes: &[&str]| {
+            normal_entry(
+                1,
+                index,
+                RaftRequest::SchedulingDecision(SchedulingDecision {
+                    app_id: app_id.clone(),
+                    placements: nodes
+                        .iter()
+                        .map(|node| Placement {
+                            node_id: NodeId::new(*node),
+                            resources: Resources::new(100, 0, 0),
+                        })
+                        .collect(),
+                }),
+            )
+        };
+        let upsert = normal_entry(
+            1,
+            1,
+            RaftRequest::AppSpec {
+                app_id: app_id.clone(),
+                spec: Box::new(default_spec()),
+            },
+        );
+        let stop = normal_entry(
+            1,
+            3,
+            RaftRequest::AppStop {
+                app_id: app_id.clone(),
+            },
+        );
+        // The stopped app's decision places nothing.
+        sm.apply(vec![
+            upsert,
+            decision(2, &["node-2"]),
+            stop,
+            decision(4, &[]),
+        ])
+        .await
+        .unwrap();
+        let state = sm.desired_state().await;
+        assert!(state.scheduling[&app_id].is_empty());
+        assert_eq!(state.last_placed_nodes[&app_id], [NodeId::new("node-2")]);
+
+        sm.apply(vec![decision(5, &["node-3"])]).await.unwrap();
+        let state = sm.desired_state().await;
+        assert_eq!(state.last_placed_nodes[&app_id], [NodeId::new("node-3")]);
+
+        let delete = normal_entry(
+            1,
+            6,
+            RaftRequest::AppDelete {
+                app_id: app_id.clone(),
+            },
+        );
+        sm.apply(vec![delete]).await.unwrap();
+        assert!(
+            !sm.desired_state()
+                .await
+                .last_placed_nodes
+                .contains_key(&app_id)
+        );
     }
 
     #[tokio::test]

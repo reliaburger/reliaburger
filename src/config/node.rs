@@ -317,6 +317,13 @@ pub struct SecuritySection {
     /// Known joining peers allowed through the perimeter to management and cluster
     /// ports before membership exists. Does not change protocol authentication.
     pub bootstrap_peers: Vec<std::net::IpAddr>,
+    /// Operator networks allowed through the perimeter firewall to this node's
+    /// API port (`--listen`, default 9117) and to no other port. IPv4 or IPv6
+    /// CIDRs, or bare addresses for a single host. `/0` and CIDRs with host
+    /// bits set are rejected at load. Empty by default: only cluster members,
+    /// bootstrap peers and loopback reach the API. API authentication is
+    /// unchanged; this only affects the packet filter.
+    pub operator_cidrs: Vec<String>,
 
     /// Acknowledge running cluster transports (gossip, Raft, reporting) in
     /// the clear on a routable address. Without `require_mtls`, a clustered

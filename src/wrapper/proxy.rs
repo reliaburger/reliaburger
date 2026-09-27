@@ -19,6 +19,7 @@ use tokio_util::sync::CancellationToken;
 use super::rate_limit::{RateLimitResult, ShardedRateLimiter};
 use super::routing::{BackendScope, RoutingTable};
 use super::types::{WrapperConfig, WrapperError};
+use crate::sesame::connection::ConnectionTimeouts;
 
 /// Shared state for the proxy handlers.
 pub struct ProxyState {
@@ -128,6 +129,7 @@ pub struct BoundProxy {
     /// pile up tasks (ING2).
     handshake_limit: Arc<Semaphore>,
     handshake_timeout: std::time::Duration,
+    connection_timeouts: ConnectionTimeouts,
     state: Arc<ProxyState>,
     shutdown: CancellationToken,
 }
@@ -240,6 +242,7 @@ pub async fn bind_proxy_with_tls(
         file_cert_resolver,
         handshake_limit: Arc::new(Semaphore::new(config.max_tls_handshakes)),
         handshake_timeout: config.tls_handshake_timeout,
+        connection_timeouts: ConnectionTimeouts::PRODUCTION,
         state,
         shutdown,
     })
@@ -262,6 +265,15 @@ fn local_addr(listener: &TcpListener) -> Result<SocketAddr, WrapperError> {
 }
 
 impl BoundProxy {
+    /// Replace the idle, stall and keepalive deadlines applied to accepted
+    /// connections. Tests shrink them to milliseconds; production keeps
+    /// [`ConnectionTimeouts::PRODUCTION`]. The TLS handshake deadline stays
+    /// `WrapperConfig::tls_handshake_timeout`.
+    pub fn with_connection_timeouts(mut self, timeouts: ConnectionTimeouts) -> Self {
+        self.connection_timeouts = timeouts;
+        self
+    }
+
     /// Serve both listeners until the shutdown token fires.
     pub async fn serve(self) -> Result<(), WrapperError> {
         // The two listeners share one handler but tag requests with the
@@ -277,18 +289,15 @@ impl BoundProxy {
             .layer(axum::Extension(ServedOverTls(true)))
             .with_state(Arc::clone(&self.state));
 
-        let http = {
-            let app = http_router.into_make_service_with_connect_info::<SocketAddr>();
-            let shutdown = self.shutdown.clone();
-            let listener = self.http_listener;
-            async move {
-                axum::serve(listener, app)
-                    .with_graceful_shutdown(async move {
-                        shutdown.cancelled().await;
-                    })
-                    .await
-                    .map_err(|e| WrapperError::ProxyFailed(e.to_string()))
-            }
+        let http = async {
+            crate::sesame::connection::serve_router_plain(
+                self.http_listener,
+                http_router,
+                self.connection_timeouts,
+                self.shutdown.clone(),
+            )
+            .await;
+            Ok::<(), WrapperError>(())
         };
 
         let https = serve_tls(
@@ -296,7 +305,10 @@ impl BoundProxy {
             self.tls_acceptor,
             https_router,
             self.handshake_limit,
-            self.handshake_timeout,
+            ConnectionTimeouts {
+                tls_handshake: self.handshake_timeout,
+                ..self.connection_timeouts
+            },
             self.shutdown.clone(),
         );
 
@@ -323,13 +335,9 @@ async fn serve_tls(
     acceptor: tokio_rustls::TlsAcceptor,
     router: axum::Router,
     handshake_limit: Arc<Semaphore>,
-    handshake_timeout: std::time::Duration,
+    timeouts: ConnectionTimeouts,
     shutdown: CancellationToken,
 ) -> Result<(), WrapperError> {
-    use tower::Service;
-
-    let mut make_service = router.into_make_service_with_connect_info::<SocketAddr>();
-
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => return Ok(()),
@@ -349,17 +357,17 @@ async fn serve_tls(
                     Err(_) => continue,
                 };
 
-                let service = match make_service.call(remote).await {
-                    Ok(service) => service,
-                    Err(infallible) => match infallible {},
-                };
+                let _ = crate::sesame::connection::configure_accepted_socket(&tcp, &timeouts);
+                let router = router
+                    .clone()
+                    .layer(axum::Extension(axum::extract::ConnectInfo(remote)));
                 let acceptor = acceptor.clone();
                 let connection_shutdown = shutdown.clone();
                 tokio::spawn(async move {
                     // Hold the handshake permit only until the handshake
                     // resolves; the request itself is bounded separately.
                     let handshake = tokio::time::timeout(
-                        handshake_timeout,
+                        timeouts.tls_handshake,
                         acceptor.accept(tcp),
                     ).await;
                     drop(permit);
@@ -369,25 +377,17 @@ async fn serve_tls(
                         _ => return,
                     };
                     use crate::sesame::connection::{
-                        LifetimeLimitedIo, MAX_TLS_CONNECTION_LIFETIME, TLS_CONNECTION_DRAIN_GRACE,
+                        LifetimeLimitedIo, MAX_TLS_CONNECTION_LIFETIME, serve_http_connection,
                     };
                     let tls_stream = LifetimeLimitedIo::new(tls_stream, MAX_TLS_CONNECTION_LIFETIME);
-                    let hyper_service = hyper_util::service::TowerToHyperService::new(service);
-                    let builder = hyper_util::server::conn::auto::Builder::new(
-                        hyper_util::rt::TokioExecutor::new(),
-                    );
-                    let connection = builder.serve_connection_with_upgrades(
-                        hyper_util::rt::TokioIo::new(tls_stream), hyper_service,
-                    );
-                    tokio::pin!(connection);
-                    let drain_after = MAX_TLS_CONNECTION_LIFETIME.saturating_sub(TLS_CONNECTION_DRAIN_GRACE);
-                    tokio::select! {
-                        _ = &mut connection => return,
-                        _ = connection_shutdown.cancelled() => {},
-                        _ = tokio::time::sleep(drain_after) => {},
-                    }
-                    connection.as_mut().graceful_shutdown();
-                    let _ = tokio::time::timeout(TLS_CONNECTION_DRAIN_GRACE, connection).await;
+                    serve_http_connection(
+                        tls_stream,
+                        router,
+                        timeouts,
+                        Some(MAX_TLS_CONNECTION_LIFETIME),
+                        connection_shutdown,
+                    )
+                    .await;
                 });
             }
         }

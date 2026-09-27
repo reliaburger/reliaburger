@@ -1774,7 +1774,11 @@ pub struct TestLease {
 
 `LeasedPlacement` is a small struct of an `AppId` and a `NodeId` that derives `Ord`, so a `BTreeSet` can hold each pair once, in a deterministic order. The scheduler adds a pair in the same Raft entry that publishes the placement, and rescheduling adds a new owner rather than replacing the old one. `BTreeMap<String, BTreeSet<u64>>` nests one collection in another: each repository name maps to the set of node numbers that might hold its bytes.
 
-Cleanup then waits for each of those owners to say, in so many words, that it's done. A worker acknowledges retirement only after it has observed the runtime exit, removed the instance's identity directory and adoption record, unmounted and deleted any test volume, and saved its own checkpoint. The acknowledgement carries the lease's ID, so a late reply can't release a replacement lease's resources. Registry uploads wait behind the `workloads_retired` flag: there's no point deleting an image that a still-running container might need. The HTTP API tells the caller where it stands. `202 Accepted` means cleanup is under way; `204 No Content` means every recorded owner has confirmed. Relish polls on 202, retries a 503 from a follower that has briefly lost its leader, and puts one 30-second deadline around the whole lot, so a retry never quietly earns a fresh 30 seconds.
+Cleanup then waits for each of those owners to say, in so many words, that it's done. A worker acknowledges retirement only after it has observed the runtime exit, removed the instance's identity directory and adoption record, unmounted and deleted any test volume, and saved its own checkpoint. The acknowledgement carries the lease's ID, so a late reply can't release a replacement lease's resources. Registry uploads wait behind the `workloads_retired` flag: there's no point deleting an image that a still-running container might need. The HTTP API tells the caller where it stands. `202 Accepted` means cleanup is under way; `204 No Content` means every recorded owner has confirmed. Relish polls on 202, retries a 503 from a follower that has briefly lost its leader, and puts one deadline around the whole lot, so a retry never quietly earns a fresh one.
+
+How long should that deadline be? We first picked 30 seconds, and the V02 soak showed why a round number was the wrong answer. A chaos case killed a worker, watched its replicas move, healed the node and passed. Then the release sat at 202 for the full 30 seconds and the report said cleanup was `unknown`. Nothing was stuck. The owner, the leader, was still rolling out the frontend replicas it had inherited from the dead node, and a node's reconcile tick finishes its deploys before it starts retirements. The test instances vanished within 55 seconds of the release. Meanwhile the product's own deadline for a *single* retirement was already 60 seconds: ten for queueing behind other agent commands, plus `stop_completion_bound`, the longest a stop may take when a workload ignores SIGTERM. The runner was giving up on the server sooner than the server gives up on itself.
+
+So the number is no longer ours to pick. `lease_retirement_bound` in `src/cluster/orchestrate.rs` adds up what an owner does after a release (wait for its next placement poll, retire, acknowledge to the leader) from the same constants the reconciler uses. Relish's `lease_release_budget` is that bound with the default runtime configuration, and the case runner's teardown is that budget plus 30 seconds for reversing faults and checking the runtime independently. `pub fn` rather than `const` here isn't a style choice: `RuntimeSection::default()` builds a struct at run time, and Rust only lets a `const` call functions marked `const fn`, which `Default::default` isn't. If someone later lengthens the stop grace, the runner's patience grows with it instead of silently turning green runs into `unknown` ones.
 
 What if a worker will never come back? Waiting forever keeps the record honest but leaves the operator stuck. `relish decommission-node worker-a --workloads-stopped --reason "powered off"` is the escape hatch, and it's deliberately a *different* kind of evidence. Only an unscoped Admin can submit it. Raft records who said it, why and when, releases that node's outstanding placements, and permanently retires the node identity, so an old disk can't come back with an old certificate and resume work the cluster has already forgotten. Bun observing a process exit and an operator promising they've pulled the plug are both valid reasons to finish cleanup. They're not the same reason, and the audit record says which one it was.
 
@@ -2567,6 +2571,150 @@ a secure single node, with a context whose registry forward is a counting TCP
 proxy on a different port. Both registry cases must pass, and the proxy must
 have seen them. What none of this proves is a three-node laptop run end to end;
 that's the next V02 soak's job.
+
+It was. The soak on candidate 1117dbb finally injected the node-kill: the
+three replicas ran, the target went quiet, the survivors picked up its
+replica. Then the case failed anyway, twice in five cycles, with a reason
+that should have been impossible by now:
+
+```text
+owned fault cleanup failed: 2: API error (status 404):
+target node rb-3fd6f1a419a3-2 is not alive or is unknown
+```
+
+That's the very message `KnownMembers` was meant to retire. The table's doc
+comment promised "alive, suspect or dead". But Bun fills it from the gossip
+membership watch, and gossip publishes `MembershipTable::snapshot()`, which is
+`active_members()`: everything that isn't *down*. Dead counts as down. So a
+node-killed peer sits in the table while it's suspect, and disappears from it
+at the exact moment it's declared dead. And the case clears its fault only
+after the survivors have rescheduled the replica, which the scheduler does
+only once the node is dead. The fallback covered a window the case never
+reached. The unit test hadn't noticed because it built the known table by
+hand, with the dead node in it.
+
+The cost was bigger than one failed case. The fault stayed in force until it
+expired, and a chaos case sets expiry to its own timeout plus a 30-second
+margin: 630 seconds. In the first cycle the node was still dead when the
+soak's 300-second settle gave up (21:02:59 BST, six minutes after the kill)
+and when the heavy check found it missing, along with the pinned
+`soak-writer` it should have been running. Only the soak's next graceful stop
+brought it back, by restarting Bun, which forgets in-memory faults. In the
+fifth cycle the next fault's settle took 223 seconds instead of 18, ending
+seconds after the 630-second expiry.
+
+We could have made gossip publish dead members too. Half the cluster reads
+that watch, though (the scheduler, the council, the upgrade orchestrator,
+Pickle), and they all rely on "published" meaning "worth talking to". The
+question here is narrower: where did this node last say it lives? That's
+memory, and the table can keep it:
+
+```rust
+pub async fn refresh(&self, current: Vec<NodeMembershipInfo>) {
+    let mut table = self.0.write().await;
+    let remembered: Vec<_> = table
+        .drain(..)
+        .filter(|old| !current.iter().any(|member| member.node_id == old.node_id))
+        .collect();
+    *table = current;
+    table.extend(remembered);
+}
+```
+
+`drain(..)` empties the vector in place and hands its elements over one at a
+time *by value*, so we can keep some of them without cloning. The `..` is a
+range with no ends, meaning "all of it". `filter` keeps the members that
+`current` doesn't mention (`any` stops at the first match), `*table = current`
+moves the new list in, and `extend` appends the remembered ones behind it. A
+member that comes back simply appears in `current` again and its fresh address
+wins. A member that has really gone stays listed and fails to connect, which
+is the honest answer for a reversal aimed at it.
+
+Two tests pin it down. In `bun::api`,
+`a_node_fault_clear_reaches_a_member_gossip_has_declared_dead` drops a node
+from the live table *and* refreshes the known table without it, as gossip
+does, then clears its fault through another node. Before the fix it failed
+with the soak's own 404. The cluster test
+`a_killed_worker_has_its_replica_rescheduled_on_the_survivors` now carries on
+where it used to stop: it waits until the router node's gossip no longer
+publishes the target, clears the fault through the router, and waits for
+every survivor to see the target alive again. Against the old table it failed
+with the same 404; with the new one the whole test, cluster start to rejoin, takes
+about twenty seconds. The test harness now attaches a `KnownMembers` fed
+from gossip the way Bun does, so that path is no longer something only a
+laptop cluster exercises.
+
+CI then found the next link in the chain on its first run. The clear reached
+the dead node, the node reversed the fault, and then answered 504:
+
+```text
+fault 1 is reversed on this node, but the cluster has not yet released its
+reservation; retry the clear before injecting again
+```
+
+A node fault holds a cluster-wide reservation (one experiment at a time), and
+the leader releases it only once it sees the healed node alive again. The
+node waits 4 s for that before answering; on a busy CI runner, gossip took
+longer. The message says "retry", and a retry is safe: the node keeps the
+reservation's sequence number until the leader fences it, so asking again just
+waits again. But nothing retried. Not the test, and not the two real clients
+either, `relish fault clear` and the chaos cleanup, which would have reported
+the case as failed with a perfectly healthy cluster. So the retry went into
+`BunClient::clear_fault` itself, where every caller gets it:
+
+```rust
+loop {
+    match self.clear_fault_once(id, node, acknowledged).await {
+        Err(RelishError::ApiError { status: 504, .. })
+            if tokio::time::Instant::now() + FAULT_CLEAR_RETRY_PAUSE < deadline =>
+        {
+            tokio::time::sleep(FAULT_CLEAR_RETRY_PAUSE).await;
+        }
+        result => return result,
+    }
+}
+```
+
+The first arm is a *match guard*: the pattern matches only a 504, and the
+`if` after it adds a condition the pattern can't express, here "and there's
+still time for another go". Anything else, success included, falls through to
+`result => return result`, which binds the whole value to a name and hands it
+back unchanged. The budget is 30 seconds, after which the caller sees the 504
+it would have seen before.
+
+The next candidate, 77f366b, failed all three volume cases with a 404 that
+looked like a product bug:
+
+```text
+exec in vol-persist failed: API error (status 404):
+{"error":"app \"vol-persist\" not found in namespace \"rbtest-…-09\""}
+```
+
+Nothing between the two candidates touched exec, the scheduler or the
+volume cases. The cases had always sent their exec to the entry node, and
+the entry node only execs into instances it runs itself. Every earlier pass
+was placement luck: the soak pins its own volume apps to nodes 2 and 3, so a
+fresh one-replica app usually landed on node 1. `relish exec` already finds
+the node running the app, and so did the other catalogue cases, through
+`TestContext::exec_in_workload`. The volume cases were the last to call
+`ctx.client.exec` directly. They now go through the same helper, and a unit
+test serves a fake entry node that answers exec with the real 404 while the
+app runs on a peer behind its relay. It failed with the soak's message before
+the change.
+
+Reading the restart case closely turned up a second problem. Since stop
+became asynchronous, `stop` returns while the instance is still `stopping`.
+The case redeployed straight away, which Bun refuses for a workload that's
+still stopping, and if the redeploy had got through, the "running" instance it
+waited for could have been the old one (the replacement reuses its id), so
+the marker check would have passed without a restart at all. It now waits
+until every instance is `stopped` or `failed` before redeploying.
+
+With the exec going to the right node, the next candidate's fast tier failed
+the restart case for real: the marker was gone. The case was right and the
+product was wrong. A stopped app forgot which node held its volume, so the
+redeploy could start it on another node with an empty one. Chapter 7 has the
+fix.
 
 ## Walk the path you actually care about
 

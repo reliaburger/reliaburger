@@ -593,8 +593,8 @@ pub struct NftablesState {
     /// IP addresses of all cluster nodes (from Mustard gossip).
     pub cluster_nodes: HashSet<IpAddr>,
 
-    /// Admin CIDR ranges allowed to access management ports.
-    pub admin_cidrs: Vec<IpNet>,
+    /// Operator CIDR ranges allowed to reach the API port (only that port).
+    pub operator_cidrs: Vec<IpNet>,
 
     /// Per-app egress sets (app name -> resolved destinations).
     pub egress_sets: HashMap<String, Vec<ResolvedEgressEntry>>,
@@ -1212,11 +1212,34 @@ secret_key = true    # generate a separate age keypair for this namespace (plann
 # an [egress] block.
 # Options: "deny" (default, recommended), "allow" (escape hatch for migration).
 default_egress = "deny"
-
-# Admin CIDR ranges allowed to access management ports.
-# These are added to the admin_cidrs nftables set.
-admin_cidrs = ["10.0.0.0/8", "192.168.1.0/24"]
 ```
+
+```toml
+[security]
+# Operator networks allowed through the perimeter to this node's API port
+# (`bun --listen`, default 9117) and to no other port. Implemented.
+operator_cidrs = ["10.0.0.0/8", "192.168.1.0/24", "2001:db8:1::/48"]
+```
+
+`operator_cidrs` sits in `[security]` beside `bootstrap_peers`, the other
+perimeter allowlist, and is node-local (it is not replicated through Raft or
+gossip). The two lists differ on purpose: a bootstrap peer is a future cluster
+member and may reach the API and the gossip, Raft and reporting ports; an
+operator network reaches the API port only, because no human client speaks the
+cluster protocols. The Pickle registry port is not in the perimeter's drop set
+(it relies on its own TLS and authentication), so the list does not mention it.
+
+Validation happens at config load (`NodeConfig::validate`), so Bun refuses to
+start rather than silently keeping the operator locked out. Entries are IPv4 or
+IPv6 CIDRs, or bare addresses (a single host). A `/0` in either family is
+refused with no override: opening the API to every address is never what the
+setting is for. A CIDR with host bits set (`192.168.0.17/24`) is refused with
+the intended network in the error. Only the parsed, re-serialised form reaches
+`nft -f`. The default is empty, which renders no operator rule at all, so the
+laptop quickstart (whose API forward arrives on the node's loopback) is
+unaffected. Token and mTLS authentication on the API are unchanged; this is a
+packet-filter setting only. The list is read at startup; changing it means
+restarting Bun.
 
 ```toml
 # Per-app egress allowlist.
@@ -1547,7 +1570,7 @@ Decrypted values are held in memory and injected as env vars. There is no per-re
 
 ### 10.3 Firewall Verification
 
-- **nftables perimeter test:** From outside the cluster, attempt to connect to management ports and app ports. Verify that connections are rejected unless originating from `admin_cidrs` or cluster nodes.
+- **nftables perimeter test:** From outside the cluster, attempt to connect to management ports and app ports. Verify that connections are rejected unless originating from cluster nodes, `bootstrap_peers`, or (API port only) `operator_cidrs`. Implemented for `operator_cidrs` as `operator_cidr_reaches_the_api_port_but_not_cluster_ports` in `tests/owned_network.rs`, which applies the real ruleset in a throwaway network namespace.
 - **eBPF firewall test:** Deploy two apps in the same namespace with `allow_from` restrictions. Verify that unauthorized apps receive `EPERM`. Verify that authorised apps connect successfully. Verify that apps in different namespaces cannot communicate without explicit cross-namespace rules.
 - **Egress allowlist test:** Deploy an app with an `egress` block. Verify that TCP and UDP connections to allowed IPv4/IPv6 destinations succeed and connections to disallowed destinations are dropped. Verify DNS resolution refresh by changing the DNS record and confirming the eBPF maps update.
 - **`relish firewall test` integration:** Verify that the `--from` / `--to` diagnostic command accurately reports whether a connection would be permitted.

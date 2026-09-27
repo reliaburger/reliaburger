@@ -20,6 +20,35 @@ and CA, but an explicit endpoint doesn't borrow them. Plain `http://` is
 allowed only to a loopback address, so a bearer token never crosses the network
 in the clear.
 
+### Reaching a node from another machine
+
+A clustered Linux node runs its own nftables perimeter firewall. Out of the box
+it admits only cluster members, the `bootstrap_peers` you listed, and loopback
+to the API port. To use `relish` from your laptop, list your address or network
+in the node's config and restart Bun:
+
+```toml
+[security]
+operator_cidrs = ["192.168.0.0/24", "10.1.2.3/32", "2001:db8:1::/48"]
+```
+
+The Bun API also has to listen on a routable address (`bun --listen
+0.0.0.0:9117`), which it allows only once an API token exists.
+
+- It opens the API port (`--listen`, default 9117) and nothing else: gossip,
+  Raft and reporting stay members-only.
+- It changes the packet filter only. Every call still needs a token, and TLS
+  still verifies against the cluster CA.
+- IPv4 and IPv6 both work; a bare address means that one host.
+- Bun refuses to start on a malformed entry, a `/0` (`0.0.0.0/0`, `::/0`: list
+  the networks you actually use), or a CIDR with host bits set
+  (`192.168.0.17/24`; the error names `192.168.0.0/24`).
+- It's read at startup; there's no live reload.
+
+Rootless Bun and macOS don't run the perimeter, so the setting has no effect
+there. The laptop quickstart doesn't need it either: it reaches each node's API
+through a port forward that arrives on the node's loopback.
+
 ## API tokens
 
 ```sh

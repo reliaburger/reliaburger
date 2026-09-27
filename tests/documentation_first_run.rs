@@ -3,9 +3,9 @@
 //! The standalone path starts one Bun and applies the shipped example. The
 //! secure cluster path runs `relish init`, mints the first admin token, deploys
 //! and enrols joiners with post-bootstrap join tokens. The drift tests read the
-//! READMEs, whitepaper, Relish design doc and book chapters that publish those
-//! commands, so CI's docs-only detection (`scripts/ci/select-jobs.sh`) relies on
-//! this binary.
+//! READMEs, whitepaper, Relish design doc, Linux servers guide and book chapters
+//! that publish those commands, so CI's docs-only detection
+//! (`scripts/ci/select-jobs.sh`) relies on this binary.
 //!
 //! These are black-box tests on purpose. A parser unit test can prove that a
 //! flag exists, but it cannot prove that the documented Bun and Relish
@@ -560,6 +560,7 @@ fn published_first_run_snippets_do_not_drift() {
         root.join("docs/whitepaper.md"),
         root.join("docs/design/cli-relish.md"),
         root.join("docs/book/02-finding-friends.md"),
+        root.join("docs/linux-servers.md"),
     ];
     for document in documents {
         let text = std::fs::read_to_string(&document).unwrap();
@@ -592,6 +593,87 @@ fn published_first_run_snippets_do_not_drift() {
     assert!(security_book.contains("join-token create --node-id node-02 --ttl 15m"));
     assert!(!security_book.contains("Right now, you\ncan't"));
     assert!(!security_book.contains("relish join --token rbrg_join_1_a7f3b9c2... 10.0.1.5:9443"));
+
+    // The Linux servers guide (#214) and the review fixes that followed it.
+    let servers = std::fs::read_to_string(root.join("docs/linux-servers.md")).unwrap();
+    assert!(
+        !servers.contains("/tmp/prod-master.key"),
+        "the master key is streamed with install /dev/stdin, never staged in /tmp"
+    );
+    for node in ["192.168.0.102", "192.168.0.103"] {
+        assert!(
+            servers.contains(&format!(
+                "prod-master.key | ssh user@{node} \\\n'sudo install -m 0600"
+            )),
+            "the guide must stream the master key to {node}"
+        );
+    }
+    // Joins and the nodes' own API calls need the bootstrap node's API on a
+    // routable address once the first admin token exists.
+    assert!(servers.contains("--listen 127.0.0.1:9117"));
+    assert!(servers.contains("change `--listen 127.0.0.1:9117` to `--listen 0.0.0.0:9117`"));
+    assert!(!servers.contains("if you want Node 1's API"));
+    // Gossip is UDP only; the RHEL path (no btrfs-progs in RHEL 9) is untested.
+    assert!(!servers.contains("9443/tcp"));
+    assert!(!servers.contains("dnf install"));
+    assert!(servers.contains("sudo ufw allow 53/udp") && servers.contains("sudo ufw allow 53/tcp"));
+    // Packaged binaries embed the eBPF object; a source build must match.
+    assert!(servers.contains("--features ebpf"));
+    // Joiners pin the fingerprint `relish init` prints; there's no openssl
+    // detour and no advice to skip the pin.
+    assert!(servers.contains("--ca-fingerprint"));
+    assert!(!servers.contains("openssl"));
+    assert!(!servers.contains("omit `--ca-fingerprint`"));
+    // Credentials stay in owner-only files, never in shell rc files.
+    assert!(servers.contains("install -m 0600 /dev/stdin ~/.reliaburger/admin.token"));
+    assert!(!servers.contains("RELIABURGER_TOKEN=\"<"));
+    // The fault policy is an explicit opt-in (one snippet, in the chaos
+    // section), never part of the production node configs.
+    assert_eq!(servers.matches("[testing]\nsafety_class").count(), 1);
+    assert!(servers.contains("manual/12_operations.md"));
+    assert!(servers.contains("external_signing_key"));
+    // The laptop reaches Node 1's API through `[security] operator_cidrs`,
+    // with the SSH tunnel kept as the alternative. The configured value must
+    // pass the same validation Bun runs at startup.
+    let operator_line = servers
+        .lines()
+        .find(|line| line.starts_with("operator_cidrs = "))
+        .expect("Node 1's config must set operator_cidrs");
+    let node_config =
+        reliaburger::config::NodeConfig::parse(&format!("[security]\n{operator_line}\n")).unwrap();
+    assert!(!node_config.security.operator_cidrs.is_empty());
+    node_config.validate().unwrap();
+    assert!(servers.contains("export RELIABURGER_ENDPOINT=\"https://192.168.0.101:9117\""));
+    assert!(servers.contains("ssh -f -N -L 19117:127.0.0.1:9117"));
+}
+
+/// Every `relish fault` command in the Linux servers guide must parse.
+///
+/// Port 1 refuses immediately. Exit 1 proves clap accepted the documented
+/// shape and dispatched the handler; a syntax error exits 2.
+#[test]
+fn linux_servers_guide_fault_commands_parse() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let guide = std::fs::read_to_string(root.join("docs/linux-servers.md")).unwrap();
+    let commands: Vec<&str> = guide
+        .lines()
+        .filter(|line| line.starts_with("relish fault "))
+        .collect();
+    assert!(
+        commands.len() >= 5,
+        "expected the guide's fault examples, found {commands:?}"
+    );
+    for command in commands {
+        let mut args: Vec<&str> = command.split_whitespace().skip(1).collect();
+        args.extend(["--endpoint", "http://127.0.0.1:1"]);
+        let output = run_relish(&args);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "`{command}` should parse and then fail to connect\nstderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 #[test]

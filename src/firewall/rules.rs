@@ -5,12 +5,12 @@
 /// port) — everything else (SSH, operator services) is untouched.
 ///
 /// The chain policy is `accept`. We add explicit `drop` rules for
-/// our port ranges from non-cluster, non-admin sources. This way
+/// our port ranges from non-cluster, non-operator sources. This way
 /// we never lock operators out of their own machines.
 ///
 /// Rules are rendered for both the `ip` and `ip6` families (NET8): an
 /// IPv4-only perimeter left every drop rule void over IPv6. All
-/// administrator-supplied CIDRs are parsed and re-serialised before
+/// operator-supplied CIDRs are parsed and re-serialised before
 /// they reach the ruleset — raw config strings are never interpolated
 /// into `nft -f` input.
 use std::collections::BTreeSet;
@@ -34,11 +34,12 @@ pub struct PerimeterConfig {
     /// Cluster communication ports (gossip, Raft, reporting).
     /// Only accessible from cluster node IPs.
     pub cluster_ports: Vec<u16>,
-    /// Admin CIDRs allowed to reach the management port. IPv4 and IPv6
-    /// accepted; a bare address means a single host.
-    pub admin_cidrs: Vec<String>,
+    /// Operator CIDRs (`[security] operator_cidrs`) allowed to reach the
+    /// management port — and only that port. IPv4 and IPv6 accepted; a bare
+    /// address means a single host.
+    pub operator_cidrs: Vec<String>,
     /// Management port (Bun API, default: 9117).
-    /// Accessible from cluster nodes and admin CIDRs.
+    /// Accessible from cluster nodes and operator CIDRs.
     pub management_port: u16,
     /// Explicit peers permitted to reach authenticated enrolment and cluster ports
     /// before gossip discovers them. Does not open container host ports.
@@ -52,7 +53,7 @@ impl Default for PerimeterConfig {
             enabled: true,
             host_port_range: (10000, 60000),
             cluster_ports: vec![9443, 9444, 9445],
-            admin_cidrs: Vec::new(),
+            operator_cidrs: Vec::new(),
             management_port: 9117,
             bootstrap_peers: Vec::new(),
         }
@@ -87,7 +88,7 @@ pub type ClusterNodes = BTreeSet<IpAddr>;
 #[cfg(target_os = "linux")]
 const NFT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Parse an administrator-supplied CIDR (or bare address) into a
+/// Parse an operator-supplied CIDR (or bare address) into a
 /// validated `(address, prefix length)` pair. Rendering only ever
 /// re-serialises this — a config value like `10.0.0.0/8; drop` is a
 /// parse error, not an injected rule.
@@ -121,10 +122,43 @@ pub fn parse_cidr(value: &str) -> Result<(IpAddr, u8), FirewallError> {
     if prefix_len > max {
         return Err(FirewallError::InvalidCidr {
             value: value.to_string(),
-            reason: format!("prefix length {prefix_len} out of range (0-{max})"),
+            reason: format!("prefix length {prefix_len} out of range (1-{max})"),
+        });
+    }
+    // A /0 admits the whole internet, which is never what "let my laptop
+    // in" means. There is no override: list the networks you actually use.
+    if prefix_len == 0 {
+        return Err(FirewallError::InvalidCidr {
+            value: value.to_string(),
+            reason: "a /0 prefix admits every address; list specific networks instead".to_string(),
+        });
+    }
+    let network = mask_to_prefix(address, prefix_len);
+    if network != address {
+        return Err(FirewallError::InvalidCidr {
+            value: value.to_string(),
+            reason: format!("host bits set; did you mean {network}/{prefix_len}?"),
         });
     }
     Ok((address, prefix_len))
+}
+
+/// Clear every bit of `address` beyond the first `prefix_len` bits.
+fn mask_to_prefix(address: IpAddr, prefix_len: u8) -> IpAddr {
+    match address {
+        IpAddr::V4(v4) => {
+            let mask = u32::MAX
+                .checked_shl(32 - u32::from(prefix_len))
+                .unwrap_or(0);
+            IpAddr::V4((u32::from(v4) & mask).into())
+        }
+        IpAddr::V6(v6) => {
+            let mask = u128::MAX
+                .checked_shl(128 - u32::from(prefix_len))
+                .unwrap_or(0);
+            IpAddr::V6((u128::from(v6) & mask).into())
+        }
+    }
 }
 
 /// Serialise a validated CIDR back to nftables syntax.
@@ -138,7 +172,7 @@ fn render_family_table(
     saddr_keyword: &str,
     config: &PerimeterConfig,
     node_ips: &[IpAddr],
-    admin_cidrs: &[(IpAddr, u8)],
+    operator_cidrs: &[(IpAddr, u8)],
 ) -> String {
     let mut rules = String::new();
 
@@ -214,14 +248,14 @@ fn render_family_table(
         }
     }
 
-    // Allow admin CIDRs to reach management port
-    if !admin_cidrs.is_empty() {
-        let cidrs: Vec<String> = admin_cidrs
+    // Allow operator CIDRs to reach management port
+    if !operator_cidrs.is_empty() {
+        let cidrs: Vec<String> = operator_cidrs
             .iter()
             .map(|(address, len)| render_cidr(*address, *len))
             .collect();
         let cidr_set = cidrs.join(", ");
-        rules.push_str("    # Allow management from admin CIDRs\n");
+        rules.push_str("    # Allow management from operator CIDRs\n");
         rules.push_str(&format!(
             "    {saddr_keyword} saddr {{ {cidr_set} }} tcp dport {} accept\n",
             config.management_port
@@ -265,19 +299,19 @@ fn render_family_table(
 /// ports from non-authorised sources. SSH and everything else the
 /// operator runs is untouched.
 ///
-/// Errors when an admin CIDR does not parse; nothing unvalidated is
+/// Errors when an operator CIDR does not parse; nothing unvalidated is
 /// ever rendered.
 pub fn generate_ruleset(
     config: &PerimeterConfig,
     cluster_nodes: &ClusterNodes,
 ) -> Result<String, FirewallError> {
-    let mut admin_v4: Vec<(IpAddr, u8)> = Vec::new();
-    let mut admin_v6: Vec<(IpAddr, u8)> = Vec::new();
-    for value in &config.admin_cidrs {
+    let mut operator_v4: Vec<(IpAddr, u8)> = Vec::new();
+    let mut operator_v6: Vec<(IpAddr, u8)> = Vec::new();
+    for value in &config.operator_cidrs {
         let (address, prefix_len) = parse_cidr(value)?;
         match address {
-            IpAddr::V4(_) => admin_v4.push((address, prefix_len)),
-            IpAddr::V6(_) => admin_v6.push((address, prefix_len)),
+            IpAddr::V4(_) => operator_v4.push((address, prefix_len)),
+            IpAddr::V6(_) => operator_v6.push((address, prefix_len)),
         }
     }
 
@@ -292,9 +326,13 @@ pub fn generate_ruleset(
         .filter(IpAddr::is_ipv6)
         .collect();
 
-    let mut rules = render_family_table("ip", "ip", config, &nodes_v4, &admin_v4);
+    let mut rules = render_family_table("ip", "ip", config, &nodes_v4, &operator_v4);
     rules.push_str(&render_family_table(
-        "ip6", "ip6", config, &nodes_v6, &admin_v6,
+        "ip6",
+        "ip6",
+        config,
+        &nodes_v6,
+        &operator_v6,
     ));
     Ok(rules)
 }
@@ -530,9 +568,9 @@ mod tests {
     }
 
     #[test]
-    fn admin_cidrs_reach_management_port() {
+    fn operator_cidrs_reach_management_port() {
         let mut config = default_config();
-        config.admin_cidrs = vec!["192.168.1.0/24".to_string()];
+        config.operator_cidrs = vec!["192.168.1.0/24".to_string()];
         let nodes = ClusterNodes::new();
         let rules = generate(&config, &nodes);
 
@@ -593,9 +631,9 @@ mod tests {
     /// A config value carrying nft syntax must be a parse error, never an
     /// injected rule.
     #[test]
-    fn malformed_admin_cidr_is_rejected_not_interpolated() {
+    fn malformed_operator_cidr_is_rejected_not_interpolated() {
         let mut config = default_config();
-        config.admin_cidrs = vec!["10.0.0.0/8; drop".to_string()];
+        config.operator_cidrs = vec!["10.0.0.0/8; drop".to_string()];
         let err = generate_ruleset(&config, &ClusterNodes::new()).unwrap_err();
         assert!(
             matches!(err, FirewallError::InvalidCidr { .. }),
@@ -604,23 +642,23 @@ mod tests {
     }
 
     #[test]
-    fn admin_cidr_prefix_out_of_range_rejected() {
+    fn operator_cidr_prefix_out_of_range_rejected() {
         let mut config = default_config();
-        config.admin_cidrs = vec!["10.0.0.0/33".to_string()];
+        config.operator_cidrs = vec!["10.0.0.0/33".to_string()];
         assert!(generate_ruleset(&config, &ClusterNodes::new()).is_err());
     }
 
     #[test]
-    fn admin_cidr_garbage_rejected() {
+    fn operator_cidr_garbage_rejected() {
         let mut config = default_config();
-        config.admin_cidrs = vec!["not-a-cidr".to_string()];
+        config.operator_cidrs = vec!["not-a-cidr".to_string()];
         assert!(generate_ruleset(&config, &ClusterNodes::new()).is_err());
     }
 
     #[test]
-    fn bare_admin_address_becomes_host_prefix() {
+    fn bare_operator_address_becomes_host_prefix() {
         let mut config = default_config();
-        config.admin_cidrs = vec!["192.168.1.9".to_string()];
+        config.operator_cidrs = vec!["192.168.1.9".to_string()];
         let rules = generate(&config, &ClusterNodes::new());
         assert!(rules.contains("192.168.1.9/32"));
     }
@@ -641,9 +679,9 @@ mod tests {
     }
 
     #[test]
-    fn v6_admin_cidr_lands_only_in_ip6_table() {
+    fn v6_operator_cidr_lands_only_in_ip6_table() {
         let mut config = default_config();
-        config.admin_cidrs = vec!["2001:db8::/32".to_string()];
+        config.operator_cidrs = vec!["2001:db8::/32".to_string()];
         let rules = generate(&config, &ClusterNodes::new());
 
         let ip6_start = rules.find("table ip6 reliaburger_fw {\n").unwrap();
@@ -663,6 +701,84 @@ mod tests {
         assert!(v4_half.contains("ip saddr { 10.0.1.1 } accept"));
         assert!(!v4_half.contains("fd00::1"));
         assert!(v6_half.contains("ip6 saddr { fd00::1 } accept"));
+    }
+
+    #[test]
+    fn operator_cidrs_admit_the_api_port_and_nothing_else() {
+        let mut config = default_config();
+        config.operator_cidrs = vec![
+            "192.168.0.0/24".to_string(),
+            "10.1.2.3/32".to_string(),
+            "2001:db8:1::/48".to_string(),
+        ];
+        let rules = generate(&config, &cluster_with_nodes(&["10.0.1.1"]));
+
+        let operator_lines: Vec<&str> = rules
+            .lines()
+            .filter(|line| {
+                line.contains("192.168.0.0/24")
+                    || line.contains("10.1.2.3/32")
+                    || line.contains("2001:db8:1::/48")
+            })
+            .collect();
+        assert_eq!(
+            operator_lines,
+            vec![
+                "    ip saddr { 192.168.0.0/24, 10.1.2.3/32 } tcp dport 9117 accept",
+                "    ip6 saddr { 2001:db8:1::/48 } tcp dport 9117 accept",
+            ]
+        );
+        // Operators never get a blanket accept, UDP, or the cluster ports.
+        for port in ["9443", "9444", "9445", "10000-60000"] {
+            assert!(
+                operator_lines.iter().all(|line| !line.contains(port)),
+                "operator rule mentions {port}"
+            );
+        }
+        // Every drop still applies to everyone else.
+        assert!(rules.contains("tcp dport 9443 drop"));
+        assert!(rules.contains("tcp dport 9117 drop"));
+    }
+
+    #[test]
+    fn no_operator_cidrs_leaves_the_api_port_closed_to_outsiders() {
+        let rules = generate(&default_config(), &ClusterNodes::new());
+        assert!(!rules.contains("tcp dport 9117 accept"));
+        assert!(rules.contains("tcp dport 9117 drop"));
+    }
+
+    #[test]
+    fn operator_cidr_follows_a_custom_management_port() {
+        let mut config = default_config();
+        config.management_port = 19117;
+        config.operator_cidrs = vec!["10.9.0.0/16".to_string()];
+        let rules = generate(&config, &ClusterNodes::new());
+        assert!(rules.contains("ip saddr { 10.9.0.0/16 } tcp dport 19117 accept"));
+        assert!(!rules.contains("dport 9117"));
+    }
+
+    #[test]
+    fn zero_prefix_is_rejected_for_both_families() {
+        for value in ["0.0.0.0/0", "::/0"] {
+            let err = parse_cidr(value).unwrap_err();
+            assert!(err.to_string().contains("/0 prefix"), "{value}: {err}");
+        }
+    }
+
+    #[test]
+    fn host_bits_are_rejected_with_the_intended_network() {
+        let err = parse_cidr("192.168.0.17/24").unwrap_err();
+        assert!(
+            err.to_string().contains("did you mean 192.168.0.0/24"),
+            "{err}"
+        );
+        let err = parse_cidr("2001:db8::1/64").unwrap_err();
+        assert!(
+            err.to_string().contains("did you mean 2001:db8::/64"),
+            "{err}"
+        );
+        assert!(parse_cidr("10.1.2.3/32").is_ok());
+        assert!(parse_cidr("2001:db8::1/128").is_ok());
     }
 
     #[test]

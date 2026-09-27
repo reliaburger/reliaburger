@@ -152,6 +152,23 @@ fn render_log_entries(entries: &[crate::ketchup::types::LogEntry], options: &Log
     output
 }
 
+/// How long [`BunClient::release_test_lease`] waits for server-confirmed
+/// cleanup: the product's own bound for an owner to retire a released lease's
+/// resources, with the default runtime configuration.
+pub fn lease_release_budget() -> std::time::Duration {
+    crate::cluster::orchestrate::lease_retirement_bound(
+        crate::config::node::RuntimeSection::default().stop_confirmation_timeout(),
+    )
+}
+
+/// How long [`BunClient::clear_fault`] keeps asking while the owning node
+/// answers 504 because the leader has not yet released a node fault's
+/// reservation. The leader releases it once it sees the healed node alive,
+/// which takes a gossip round or two; each attempt already waits 4 s.
+pub const FAULT_CLEAR_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+/// Pause between those attempts.
+const FAULT_CLEAR_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Classify a reqwest send error as either a timeout or a connection failure.
 fn classify_error(e: reqwest::Error) -> RelishError {
     if e.is_timeout() {
@@ -1123,11 +1140,12 @@ impl BunClient {
         parse_typed_response(response).await
     }
 
-    /// Release a lease and wait up to 30 seconds for server-confirmed cleanup.
-    /// An accepted request keeps polling durable ownership until it disappears.
-    /// Transient leader unavailability retries within the same overall deadline.
+    /// Release a lease and wait up to [`lease_release_budget`] for
+    /// server-confirmed cleanup. An accepted request keeps polling durable
+    /// ownership until it disappears. Transient leader unavailability retries
+    /// within the same overall deadline.
     pub async fn release_test_lease(&self, lease_id: &str) -> Result<(), RelishError> {
-        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        tokio::time::timeout(lease_release_budget(), async {
             let url = format!("{}/v1/test/leases/{lease_id}", self.base_url);
             let response = loop {
                 let response = self
@@ -1721,8 +1739,46 @@ impl BunClient {
         })
     }
 
-    /// Clear a specific fault by ID.
+    /// Clear one fault by id, on `node` when given.
+    ///
+    /// Reversing a node fault is immediate, but the owning node then waits a
+    /// few seconds for the leader to release the fault's cluster reservation
+    /// and answers 504 "retry the clear" if it hasn't yet. A clear is
+    /// idempotent (the node keeps the reservation until it is released), so
+    /// this asks again for up to [`FAULT_CLEAR_RETRY_BUDGET`] before handing
+    /// the 504 back.
     pub async fn clear_fault(
+        &self,
+        id: u64,
+        node: Option<&str>,
+        acknowledged: bool,
+    ) -> Result<String, RelishError> {
+        self.clear_fault_within(id, node, acknowledged, FAULT_CLEAR_RETRY_BUDGET)
+            .await
+    }
+
+    /// [`Self::clear_fault`], retrying a 504 for at most `budget`.
+    pub(crate) async fn clear_fault_within(
+        &self,
+        id: u64,
+        node: Option<&str>,
+        acknowledged: bool,
+        budget: std::time::Duration,
+    ) -> Result<String, RelishError> {
+        let deadline = tokio::time::Instant::now() + budget;
+        loop {
+            match self.clear_fault_once(id, node, acknowledged).await {
+                Err(RelishError::ApiError { status: 504, .. })
+                    if tokio::time::Instant::now() + FAULT_CLEAR_RETRY_PAUSE < deadline =>
+                {
+                    tokio::time::sleep(FAULT_CLEAR_RETRY_PAUSE).await;
+                }
+                result => return result,
+            }
+        }
+    }
+
+    async fn clear_fault_once(
         &self,
         id: u64,
         node: Option<&str>,
@@ -2373,6 +2429,78 @@ mod tests {
         );
     }
 
+    /// Serve `DELETE /v1/fault/{id}` answering 504 "not yet released" to the
+    /// first `pending` calls, then 200. Returns the base URL and call count.
+    async fn serve_fault_clear(pending: usize) -> (String, Arc<Mutex<usize>>) {
+        use axum::{Router, http::StatusCode, routing::delete};
+        let calls = Arc::new(Mutex::new(0usize));
+        let seen = Arc::clone(&calls);
+        let app = Router::new().route(
+            "/v1/fault/{id}",
+            delete(move || {
+                let seen = Arc::clone(&seen);
+                async move {
+                    let call = {
+                        let mut calls = seen.lock().unwrap();
+                        *calls += 1;
+                        *calls
+                    };
+                    if call <= pending {
+                        (
+                            StatusCode::GATEWAY_TIMEOUT,
+                            axum::Json(serde_json::json!({
+                                "error": "fault 1 is reversed on this node, but the cluster has \
+                                          not yet released its reservation; retry the clear \
+                                          before injecting again"
+                            })),
+                        )
+                    } else {
+                        (
+                            StatusCode::OK,
+                            axum::Json(serde_json::json!({ "message": "cleared fault 1" })),
+                        )
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{address}"), calls)
+    }
+
+    /// The server reverses the fault, then answers 504 while the leader has
+    /// not yet released the node-fault reservation and asks for a retry. A
+    /// clear is idempotent, so the client asks again rather than failing.
+    #[tokio::test]
+    async fn fault_clear_retries_until_the_reservation_is_released() {
+        let (base, calls) = serve_fault_clear(2).await;
+        let client = BunClient::new_with_token(&base, None);
+        let message = client.clear_fault(1, Some("node-2"), false).await.unwrap();
+        assert_eq!(message, "cleared fault 1");
+        assert_eq!(*calls.lock().unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn fault_clear_gives_up_on_a_reservation_that_is_never_released() {
+        let (base, calls) = serve_fault_clear(usize::MAX).await;
+        let client = BunClient::new_with_token(&base, None);
+        let error = client
+            .clear_fault_within(
+                1,
+                Some("node-2"),
+                false,
+                std::time::Duration::from_millis(300),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, RelishError::ApiError { status: 504, body } if body.contains("retry the clear")),
+            "{error:?}"
+        );
+        assert!(*calls.lock().unwrap() >= 1);
+    }
+
     #[tokio::test]
     async fn malformed_bearer_is_an_error_instead_of_an_anonymous_request() {
         let client = BunClient::new_with_token("http://127.0.0.1:9", Some("bad\nheader"));
@@ -2821,13 +2949,75 @@ mod tests {
             .await
             .unwrap();
         tokio::time::pause();
-        tokio::time::advance(std::time::Duration::from_secs(31)).await;
+        tokio::time::advance(lease_release_budget() + std::time::Duration::from_secs(1)).await;
         let result = cleanup.await.unwrap();
         server.abort();
         let _ = server.await;
         assert!(
             matches!(result, Err(RelishError::RequestTimeout)),
             "{result:?}"
+        );
+    }
+
+    /// V02 soak: an owner that was still retiring 30 s after the release made
+    /// cleanup `unknown`, although the product allows a retirement longer
+    /// than that. The wait now lasts as long as the product's own bound.
+    #[tokio::test]
+    async fn lease_cleanup_keeps_waiting_while_owners_are_within_their_retirement_bound() {
+        use std::sync::Arc;
+        let polled = Arc::new(tokio::sync::Notify::new());
+        let handler_polled = polled.clone();
+        let router = axum::Router::new().route(
+            "/v1/test/leases/fixture",
+            axum::routing::any(move |method: axum::http::Method| {
+                let polled = handler_polled.clone();
+                async move {
+                    if method == axum::http::Method::DELETE {
+                        return axum::http::StatusCode::ACCEPTED;
+                    }
+                    polled.notify_one();
+                    axum::http::StatusCode::OK
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = BunClient::new_with_token(&format!("http://{address}"), None);
+        // Driven on this task rather than spawned, so the paused clock below
+        // advances only when this task has nothing else to do.
+        let cleanup = client.release_test_lease("fixture");
+        tokio::pin!(cleanup);
+        tokio::select! {
+            result = &mut cleanup => panic!("cleanup ended before its first poll: {result:?}"),
+            _ = polled.notified() => {}
+        }
+        // A paused clock jumps to the earliest pending timer whenever the
+        // runtime waits on I/O. Sleeping here makes 31 s that earliest timer,
+        // so the release's own deadline can only fire first if it's shorter.
+        tokio::time::pause();
+        tokio::select! {
+            result = &mut cleanup => panic!(
+                "gave up on an owner still inside the product's retirement bound: {result:?}"
+            ),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(31)) => {}
+        }
+        let result = cleanup.await;
+        server.abort();
+        let _ = server.await;
+        assert!(
+            matches!(result, Err(RelishError::RequestTimeout)),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn lease_release_budget_is_the_products_retirement_bound() {
+        let confirmation =
+            crate::config::node::RuntimeSection::default().stop_confirmation_timeout();
+        assert_eq!(
+            lease_release_budget(),
+            crate::cluster::orchestrate::lease_retirement_bound(confirmation)
         );
     }
 

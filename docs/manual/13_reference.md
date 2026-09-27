@@ -54,6 +54,11 @@ loopback IP.
 | 80, 443 | ingress, when enabled | `[ingress] http_port`, `https_port` |
 | 53 | `.internal` DNS, when enabled | `[dns] listen` |
 
+On a clustered Linux node, Bun's perimeter firewall drops 9117, 9443–9445 and
+the host port range for anyone but cluster members, `[security]
+bootstrap_peers` (API and cluster ports) and `[security] operator_cidrs` (API
+port only). Loopback is always allowed.
+
 A laptop cluster forwards `127.0.0.1:19117`–`19119` to each node's API,
 `localhost:18080` to node 1's ingress and `localhost:15050` to its registry.
 `relish setup --quickstart --api-port --ingress-port --registry-port` moves
@@ -106,7 +111,7 @@ startup instead of being ignored.
 | `[storage]` | data directories, `[storage.snapshots]` (see `images-and-volumes`) |
 | `[resources]` | CPU and memory held back for the node itself (`500m` or `0.5` cores, `512Mi`) |
 | `[network]` | `advertise_address`, host `port_range` |
-| `[security]` | master key, bootstrap and identity paths, `require_mtls`, `leaf_lifetime_override_secs` (development only, see below) |
+| `[security]` | master key, bootstrap and identity paths, `require_mtls`, `bootstrap_peers` (joining nodes through the perimeter), `operator_cidrs` (your networks to the API port only, see `security`), `leaf_lifetime_override_secs` (development only, see below) |
 | `[ebpf]`, `[dns]`, `[ingress]` | the data plane (see `networking`) |
 | `[images]` | registry, pull-through cache, mirrors, trust policy |
 | `[metrics]`, `[logs]`, `[alerts]` | observability (see `observability`) |

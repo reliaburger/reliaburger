@@ -23,11 +23,15 @@ relish upgrade rollback v0.1.0        # also replaces a paused upgrade
 It needs three things on every node:
 
 - **A supervisor that restarts bun whenever it exits**, such as systemd with
-  `Restart=always`. Bun replaces itself with the new binary, and recovering
-  from a bad one depends on being started again.
-- **A versioned binary directory.** `bun` is a symlink to `bun-vX.Y.Z`, and
-  the previous versions stay beside it for rollback (`[upgrades]
-  retain_versions`, default 3). `relish setup` installs it this way.
+  `Restart=always`. Bun replaces itself with the new binary in place, and
+  recovering from a bad one depends on being started again. `on-failure`
+  covers every exit bun makes on purpose; `always` also covers a release that
+  exits cleanly while it's being verified. The quickstart uses `always`.
+- **A writable binary directory.** Bun keeps `bun-vX.Y.Z` files beside its
+  own binary and makes `bun` a symlink to the active one, with the previous
+  versions kept for rollback (`[upgrades] retain_versions`, default 3). A
+  plain `bun` binary is fine: the first upgrade copies it to `bun-vX.Y.Z` and
+  turns `bun` into the symlink.
 - **Two signatures for network upgrades**: the release's, checked against the
   key compiled into the running binary, and your own, from the key you name in
   `[upgrades] external_signing_key`. Generate that keypair with
@@ -51,6 +55,15 @@ tells the other nodes to fetch it from that node's cluster address. From a
 laptop running a `relish local` cluster, the push goes through the registry
 forward and works without flags. `--registry host:port` names one address for
 both the push and the fetch.
+
+Only the leader records and walks an upgrade, but you don't have to find it.
+A council node that isn't the leader passes `start`, `resume`, `abort` and a
+cluster `rollback` on to the leader with your own credentials, so the leader
+checks your permissions as usual. The binary still goes to the registry of
+the node you're connected to. A worker outside the council passes the calls
+on too, but relish builds the `start` and `rollback` plans from the node list
+of the node it's connected to, and a worker's list doesn't say which node
+leads, so the leader refuses the plan. Run those two against a council node.
 
 `start` refuses a candidate with the version the nodes already run but
 different bytes: build it with a new version instead. If the bytes are

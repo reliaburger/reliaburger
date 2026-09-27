@@ -1117,6 +1117,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         ],
         api_port,
         config.security.bootstrap_peers.clone(),
+        config.security.operator_cidrs.clone(),
     );
     agent.set_smoker_config(config.smoker.to_smoker_config());
     agent.set_node_leaf_lifetime(config.security.node_leaf_lifetime());
@@ -1316,9 +1317,8 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         let membership_table: Arc<RwLock<Vec<api::NodeMembershipInfo>>> =
             Arc::new(RwLock::new(Vec::new()));
         api_membership = Some(Arc::clone(&membership_table));
-        let known_table: Arc<RwLock<Vec<api::NodeMembershipInfo>>> =
-            Arc::new(RwLock::new(Vec::new()));
-        api_known_members = Some(api::KnownMembers(Arc::clone(&known_table)));
+        let known_members = api::KnownMembers(Arc::new(RwLock::new(Vec::new())));
+        api_known_members = Some(known_members.clone());
         let mut refresher_rx = membership_rx;
         // Each node advertises its real API endpoint over gossip (the
         // directory, 12b.2). Prefer that authoritative `api_address`: a
@@ -1353,6 +1353,8 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                 };
                 // Live members for fan-out; every known member for the relay
                 // and fault reversal, which must reach a node-killed peer.
+                // Gossip stops publishing a member once it is dead, so the
+                // known table remembers members that drop out of this view.
                 let snapshot: Vec<api::NodeMembershipInfo> =
                     snapshot.into_iter().map(|(_, info)| info).collect();
                 let known: Vec<api::NodeMembershipInfo> = snapshot
@@ -1361,7 +1363,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                     .chain(known.into_iter().map(|(_, info)| info))
                     .collect();
                 *membership_table.write().await = snapshot;
-                *known_table.write().await = known;
+                known_members.refresh(known).await;
                 tokio::select! {
                     _ = refresher_shutdown.cancelled() => break,
                     changed = refresher_rx.changed() => {
@@ -2364,6 +2366,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         None => None,
     };
 
+    let leader_directory = registry_directory.clone().map(api::LeaderDirectory);
     let registry_forwarder = if let Some(directory) = registry_directory {
         let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
         if let Some(identity) = &api_identity {
@@ -2445,6 +2448,10 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         Some(known) => app.layer(axum::Extension(known)),
         None => app,
     };
+    let app = match leader_directory {
+        Some(directory) => app.layer(axum::Extension(directory)),
+        None => app,
+    };
     let app = match &api_identity {
         Some(identity) => app.layer(axum::Extension(identity.clone())),
         None => app,
@@ -2521,23 +2528,26 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         move |ready| async move {
             ready.ready();
 
+            let timeouts = reliaburger::sesame::connection::ConnectionTimeouts::PRODUCTION;
             match api_acceptor {
                 Some(acceptor) => {
                     reliaburger::sesame::connection::serve_router_over_tls(
                         listener,
                         acceptor,
                         app,
+                        timeouts,
                         server_shutdown,
                     )
                     .await
                 }
                 None => {
-                    axum::serve(listener, app)
-                        .with_graceful_shutdown(async move {
-                            server_shutdown.cancelled().await;
-                        })
-                        .await
-                        .ok();
+                    reliaburger::sesame::connection::serve_router_plain(
+                        listener,
+                        app,
+                        timeouts,
+                        server_shutdown,
+                    )
+                    .await
                 }
             }
         },
@@ -2835,23 +2845,26 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         move |ready| async move {
             ready.ready();
 
+            let timeouts = reliaburger::sesame::connection::ConnectionTimeouts::PRODUCTION;
             match pickle_acceptor {
                 Some(acceptor) => {
                     reliaburger::sesame::connection::serve_router_over_tls(
                         pickle_listener,
                         acceptor,
                         pickle_app,
+                        timeouts,
                         pickle_shutdown,
                     )
                     .await
                 }
                 None => {
-                    axum::serve(pickle_listener, pickle_app)
-                        .with_graceful_shutdown(async move {
-                            pickle_shutdown.cancelled().await;
-                        })
-                        .await
-                        .ok();
+                    reliaburger::sesame::connection::serve_router_plain(
+                        pickle_listener,
+                        pickle_app,
+                        timeouts,
+                        pickle_shutdown,
+                    )
+                    .await
                 }
             }
         },
@@ -3775,6 +3788,7 @@ mod tests {
             listener,
             tokio_rustls::TlsAcceptor::from(config),
             router,
+            reliaburger::sesame::connection::ConnectionTimeouts::PRODUCTION,
             shutdown.clone(),
         ));
         let mut roots = rustls::RootCertStore::empty();
@@ -3882,6 +3896,7 @@ mod tests {
             listener,
             tokio_rustls::TlsAcceptor::from(config),
             router,
+            reliaburger::sesame::connection::ConnectionTimeouts::PRODUCTION,
             shutdown.clone(),
         ));
         let http = mtls::build_cluster_http_client(&client, mtls::CrlHandle::default()).unwrap();

@@ -16,11 +16,12 @@ pub struct Compatibility {
 }
 
 /// Supported formats, including the per-node `directive_retry` record in a
-/// cluster upgrade and the 503 a node answers a directive with when the
-/// binary's registry is unavailable (the orchestrator retries it).
+/// cluster upgrade, the 503 a node answers a directive with when the
+/// binary's registry is unavailable (the orchestrator retries it), and the
+/// nodes each app last ran on (`DesiredState::last_placed_nodes`).
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 27,
-    state: 43,
+    state: 44,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.

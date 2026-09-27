@@ -41,6 +41,3 @@ examples/demo/burger/burger
 
 # MacBook specific files
 .DS_Store
-
-# VS Code specific files
-.vscode/

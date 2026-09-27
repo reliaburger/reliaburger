@@ -64,6 +64,12 @@ private file instead of the command line. `join` only enrols the identity (into
 config with `[cluster] name` matching the cluster and `join` listing an
 existing member's gossip address (port 9443), and start `bun --cluster`.
 
+On Linux as root, Bun runs its own nftables perimeter: only cluster members
+reach the API (9117) and the cluster ports. List a joining node's address in
+the members' `[security] bootstrap_peers` so it can enrol before gossip knows
+it, and list your own laptop's network in `[security] operator_cidrs` so
+`relish` can reach the API from there (see `security`).
+
 ## Watch it
 
 ```sh
@@ -120,5 +126,6 @@ relish dev destroy
 
 ## Run a cluster on your own Linux servers
 
-You can also deploy reliaburger to pre-existing Linux VMs or bare-metal servers
-if you already have that computing power available. Check this [procedure here](../linux-servers.md).
+Already have Linux VMs or bare-metal servers? You can run Reliaburger on them
+directly. The [Linux servers guide](https://github.com/reliaburger/reliaburger/blob/main/docs/linux-servers.md)
+walks through a three-node cluster, from firewall rules to systemd units.

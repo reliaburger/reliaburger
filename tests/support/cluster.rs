@@ -32,7 +32,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use reliaburger::bun::agent::{AgentCommand, BunAgent, PartitionBlocklists};
-use reliaburger::bun::api::{self, NodeMembershipInfo};
+use reliaburger::bun::api::{self, KnownMembers, NodeMembershipInfo};
 use reliaburger::cluster::identity::raft_id_from_name;
 use reliaburger::cluster::orchestrate::{spawn_leader_scheduler, spawn_placement_reconciler};
 use reliaburger::cluster::runtime::{self, ClusterParams, CouncilReconcilerConfig};
@@ -267,6 +267,8 @@ pub struct WiredNodeOptions {
     pub operator_token: Option<ApiToken>,
     /// Serve the development test policy that admits fault injection.
     pub fault_injection: bool,
+    /// Node labels, for placement constraints.
+    pub labels: BTreeMap<String, String>,
 }
 
 /// A running wired node and everything a test observes it through.
@@ -313,6 +315,7 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
         service_identity,
         operator_token,
         fault_injection,
+        labels,
     } = options;
     let raft_port = gossip_port + 1;
     let reporting_port = gossip_port + 2;
@@ -350,7 +353,7 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
             rollup_interval: metrics_rollup.unwrap_or(Duration::from_secs(60)),
             identity: None,
             backup: Default::default(),
-            labels: BTreeMap::new(),
+            labels,
             self_disk_pressured_rx: None,
             readiness: Some(readiness.clone()),
         },
@@ -409,10 +412,14 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
     }
 
     let membership_table: Arc<RwLock<Vec<NodeMembershipInfo>>> = Arc::new(RwLock::new(Vec::new()));
+    // Every member gossip has shown, so the relay and node-fault reversal
+    // reach a node-killed peer as `bun` wires them.
+    let known_members = KnownMembers(Arc::new(RwLock::new(Vec::new())));
     tasks.push(match membership {
         MembershipSource::Gossip => spawn_gossip_membership_table(
             membership_rx.clone(),
             Arc::clone(&membership_table),
+            known_members.clone(),
             shutdown.clone(),
         ),
         MembershipSource::Directory => spawn_directory_membership_table(
@@ -533,6 +540,7 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
         Some(admission) => app.layer(axum::Extension(admission)),
         None => app,
     };
+    let app = app.layer(axum::Extension(known_members));
     let api_shutdown = shutdown.clone();
     tasks.push(tokio::spawn(async move {
         axum::serve(listener, app)
@@ -584,21 +592,33 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
 fn spawn_gossip_membership_table(
     mut rx: watch::Receiver<Vec<MembershipSnapshot>>,
     table: Arc<RwLock<Vec<NodeMembershipInfo>>>,
+    known: KnownMembers,
     shutdown: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            let snapshot: Vec<NodeMembershipInfo> = rx
-                .borrow()
-                .iter()
-                .filter(|m| m.state == NodeState::Alive)
-                .map(|m| NodeMembershipInfo {
+            let (snapshot, published): (Vec<NodeMembershipInfo>, Vec<NodeMembershipInfo>) = {
+                let members = rx.borrow();
+                let info = |m: &MembershipSnapshot| NodeMembershipInfo {
                     node_id: m.node_id.clone(),
                     address: SocketAddr::new(m.address.ip(), m.address.port() + 3),
                     api_advertised: true,
-                })
-                .collect();
+                };
+                (
+                    members
+                        .iter()
+                        .filter(|m| m.state == NodeState::Alive)
+                        .map(info)
+                        .collect(),
+                    members
+                        .iter()
+                        .filter(|m| m.state != NodeState::Left)
+                        .map(info)
+                        .collect(),
+                )
+            };
             *table.write().await = snapshot;
+            known.refresh(published).await;
             tokio::select! {
                 _ = shutdown.cancelled() => break,
                 changed = rx.changed() => if changed.is_err() { break },

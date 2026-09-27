@@ -78,6 +78,7 @@ k8s-openapi = { version = "0.22", default-features = false, features = ["latest"
 hyper-util = { version = "0.1", features = ["tokio", "server-auto", "service"] }
 hyper = { version = "1", features = ["http1"] }
 tower = "0.5"
+socket2 = "0.6"
 pulldown-cmark = "0.13.4"
 nucleo-matcher = "0.3.1"
 hickory-proto = { version = "0.26.3", default-features = false, features = ["std"] }

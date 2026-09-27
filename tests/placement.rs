@@ -102,6 +102,31 @@ async fn start_node_with_auth(
     shutdown: &CancellationToken,
     auth: Option<NodeFaultAuth>,
 ) -> Node {
+    start_node_with(name, gossip_port, seeds, shutdown, auth, Default::default()).await
+}
+
+async fn start_labelled_node(
+    name: &str,
+    gossip_port: u16,
+    seeds: Vec<SocketAddr>,
+    shutdown: &CancellationToken,
+    labels: &[(&str, &str)],
+) -> Node {
+    let labels = labels
+        .iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect();
+    start_node_with(name, gossip_port, seeds, shutdown, None, labels).await
+}
+
+async fn start_node_with(
+    name: &str,
+    gossip_port: u16,
+    seeds: Vec<SocketAddr>,
+    shutdown: &CancellationToken,
+    auth: Option<NodeFaultAuth>,
+    labels: std::collections::BTreeMap<String, String>,
+) -> Node {
     let wired = start_wired_node(WiredNodeOptions {
         name: name.to_string(),
         gossip_port,
@@ -124,6 +149,7 @@ async fn start_node_with_auth(
             .map(|_| "placement-test-internal-service-identity".to_string()),
         operator_token: auth.as_ref().map(|auth| auth.token.clone()),
         fault_injection: auth.is_some(),
+        labels,
     })
     .await;
 
@@ -443,6 +469,114 @@ async fn cluster_stop_scales_to_zero_until_apply_and_delete_removes_the_app() {
             c.shutdown().await.ok();
         }
         let _ = &n.name;
+    }
+}
+
+/// The nodes with a live instance of `app`.
+async fn nodes_with_live(nodes: &[&Node], app: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    for node in nodes {
+        if let Ok(statuses) = node.client.status().await
+            && statuses.iter().any(|s| {
+                s.app_name == app && !matches!(s.state.as_str(), "stopped" | "stopping" | "failed")
+            })
+        {
+            found.push(node.name.clone());
+        }
+    }
+    found
+}
+
+/// Apply `toml` through `node` until `app` is live, and say where.
+async fn apply_until_live(node: &Node, nodes: &[&Node], toml: &str, app: &str) -> Vec<String> {
+    let config = reliaburger::config::Config::parse(toml).unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+    let mut last_apply: Option<tokio::time::Instant> = None;
+    while tokio::time::Instant::now() < deadline {
+        let live = nodes_with_live(nodes, app).await;
+        if !live.is_empty() {
+            return live;
+        }
+        if last_apply.is_none_or(|t| t.elapsed() >= Duration::from_secs(8)) {
+            let _ = tokio::time::timeout(Duration::from_secs(15), node.client.apply(&config)).await;
+            last_apply = Some(tokio::time::Instant::now());
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    panic!("{app} never came up");
+}
+
+/// Stop `app` and wait until no node runs a live instance of it.
+async fn stop_until_gone(node: &Node, nodes: &[&Node], app: &str) {
+    tokio::time::timeout(Duration::from_secs(15), node.client.stop(app, "default"))
+        .await
+        .expect("stop did not hang")
+        .expect("stop succeeded");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while tokio::time::Instant::now() < deadline {
+        if nodes_with_live(nodes, app).await.is_empty() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    panic!("{app} was not torn down after stop");
+}
+
+/// V02 soak on 9e6a6b6: `relish stop` then `apply` brought a volume app back
+/// on another node, with an empty volume. It must go back to the node that
+/// holds its data, even when the scheduler would now rather go elsewhere.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
+async fn a_stopped_volume_app_starts_again_on_the_node_that_holds_its_volume() {
+    let shutdown = CancellationToken::new();
+
+    let n1 = start_labelled_node("v1", 18561, vec![], &shutdown, &[("zone", "a")]).await;
+    let n2 =
+        start_labelled_node("v2", 18565, vec![local(18561)], &shutdown, &[("zone", "b")]).await;
+    let n3 =
+        start_labelled_node("v3", 18569, vec![local(18561)], &shutdown, &[("zone", "b")]).await;
+    let nodes = [&n1, &n2, &n3];
+    let ready = wait_until(Duration::from_secs(30), || {
+        nodes.iter().any(|n| *n.thinks_leader.borrow())
+    })
+    .await;
+    assert!(ready, "no leader elected");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Pinned to zone b, db lands on v2, which then holds its volume.
+    let pinned = r#"
+        [app.db]
+        image = "proc-grill:image-ignored"
+        command = ["sleep", "600"]
+
+        [app.db.placement]
+        required = ["zone=b"]
+
+        [[app.db.volumes]]
+        path = "/data"
+    "#;
+    let home = apply_until_live(&n1, &nodes, pinned, "db").await;
+    assert_eq!(home, ["v2"]);
+
+    // Unpinned, every node is empty and the scheduler's own choice would be
+    // v1, the lowest node id.
+    stop_until_gone(&n1, &nodes, "db").await;
+    let unpinned = r#"
+        [app.db]
+        image = "proc-grill:image-ignored"
+        command = ["sleep", "600"]
+
+        [[app.db.volumes]]
+        path = "/data"
+    "#;
+    let back = apply_until_live(&n1, &nodes, unpinned, "db").await;
+    assert_eq!(back, home, "db must start again where its volume is");
+
+    shutdown.cancel();
+    for n in nodes {
+        if let Some(c) = &n.handle.council {
+            c.shutdown().await.ok();
+        }
     }
 }
 
@@ -1220,6 +1354,11 @@ async fn losing_the_leader_node_places_only_its_replica_on_the_survivors() {
 /// kills its containers must bring the app back to three running replicas on
 /// the two survivors. The killed node's API stays open, so whatever it
 /// reports is observed but not counted: only the survivors carry the load.
+///
+/// Then the case heals the node the way `relish test` from a laptop does:
+/// through another node, after gossip has declared the target dead and
+/// stopped publishing it. The clear must still reach the target, and the
+/// target must rejoin, instead of staying dead until the fault expires.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 #[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
 async fn a_killed_worker_has_its_replica_rescheduled_on_the_survivors() {
@@ -1259,7 +1398,7 @@ async fn a_killed_worker_has_its_replica_rescheduled_on_the_survivors() {
         .filter(|node| node.name != target.name)
         .collect();
 
-    entry
+    let summary = entry
         .client
         .inject_fault(&FaultRequest {
             fault_type: FaultType::NodeKill {
@@ -1298,6 +1437,32 @@ async fn a_killed_worker_has_its_replica_rescheduled_on_the_survivors() {
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+
+    let router = survivors[0];
+    let declared_dead = wait_until(Duration::from_secs(60), || {
+        peer_state(router, &target.name).is_none()
+    })
+    .await;
+    assert!(
+        declared_dead,
+        "{} still publishes {} as {:?}",
+        router.name,
+        target.name,
+        peer_state(router, &target.name)
+    );
+    router
+        .client
+        .clear_fault(summary.id, Some(&target.name), false)
+        .await
+        .expect("the clear reaches a node gossip has declared dead");
+    let rejoined = wait_until(Duration::from_secs(30), || {
+        survivors.iter().all(|observer| {
+            peer_state(observer, &target.name)
+                == Some(reliaburger::mustard::state::NodeState::Alive)
+        })
+    })
+    .await;
+    assert!(rejoined, "{} did not rejoin after its clear", target.name);
     shutdown.cancel();
 }
 

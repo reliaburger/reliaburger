@@ -129,6 +129,7 @@ async fn start_registry() -> Registry {
         tls_listener,
         acceptor,
         pickle_router(state.clone()),
+        reliaburger::sesame::connection::ConnectionTimeouts::PRODUCTION,
         shutdown.clone(),
     ));
 

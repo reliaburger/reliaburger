@@ -667,6 +667,13 @@ enum DeployOp {
         firewall: Option<Vec<String>>,
         reply: oneshot::Sender<Result<(), BunError>>,
     },
+    /// Forget fresh instances that never left Pending, so a deploy that failed
+    /// before touching the runtime leaves nothing for its retry to replace.
+    AbandonUnstartedInstances {
+        service: crate::onion::service_id::ServiceId,
+        instance_ids: Vec<InstanceId>,
+        reply: oneshot::Sender<()>,
+    },
     /// Store an app's ingress config for the routing table.
     StoreIngress {
         app_name: String,
@@ -1040,6 +1047,23 @@ impl DeployOps {
                 service: crate::onion::service_id::ServiceId::new(namespace, app_name),
                 reason: "agent loop closed before service registration".into(),
             }),
+        )
+        .await
+    }
+
+    async fn abandon_unstarted_instances(
+        &self,
+        app_name: &str,
+        namespace: &str,
+        instance_ids: &[InstanceId],
+    ) {
+        self.call(
+            |reply| DeployOp::AbandonUnstartedInstances {
+                service: crate::onion::service_id::ServiceId::new(namespace, app_name),
+                instance_ids: instance_ids.to_vec(),
+                reply,
+            },
+            (),
         )
         .await
     }
@@ -1620,7 +1644,7 @@ mod egress_ownership;
 mod producer_release;
 mod runtime_inventory;
 use app_stop::{AppStop, PendingStops, StopPurpose};
-use discovery_ownership::DiscoveryOwnership;
+use discovery_ownership::{DiscoveryOwnership, JournalReference};
 use runtime_inventory::{LOOP_RUNTIME_INVENTORY_TIMEOUT, RUNTIME_INVENTORY_TIMEOUT};
 
 /// An immutable, owned connectivity trace that can run outside the agent
@@ -2347,17 +2371,20 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         Ok(metas)
     }
 
-    /// Configure the actual protected listener ports and explicit enrolment peers.
-    /// This grants network reachability only; protocol authentication still applies.
+    /// Configure the actual protected listener ports, explicit enrolment peers
+    /// and operator networks allowed to the management port. This grants
+    /// network reachability only; protocol authentication still applies.
     pub fn configure_perimeter(
         &mut self,
         cluster_ports: Vec<u16>,
         management_port: u16,
         bootstrap_peers: Vec<std::net::IpAddr>,
+        operator_cidrs: Vec<String>,
     ) {
         self.perimeter_config.cluster_ports = cluster_ports;
         self.perimeter_config.management_port = management_port;
         self.perimeter_config.bootstrap_peers = bootstrap_peers;
+        self.perimeter_config.operator_cidrs = operator_cidrs;
         self.last_firewall_nodes = None;
     }
 
@@ -6927,7 +6954,20 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     reason: "original network reference still belongs to another generation".into(),
                 });
             }
-            self.persist_discovery_reference(&reference).await?;
+            if let Err(error) = self.persist_discovery_reference(&reference).await {
+                // A refusal decided in memory never reached the journal, so no
+                // publication can name this address yet. Hand it back now rather
+                // than leave a hold nothing tracks. After an uncertain write the
+                // journal may record it, so only retirement may release it.
+                if !matches!(self.discovery_ownership, DiscoveryOwnership::Uncertain) {
+                    let _ = self
+                        .supervisor
+                        .grill()
+                        .release_network_reference(&reference)
+                        .await;
+                }
+                return Err(error);
+            }
             self.network_references.insert(id.clone(), reference);
         }
         Ok(())
@@ -6938,21 +6978,36 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         id: &InstanceId,
         remote: Option<&crate::onion::producer::ProducerReleaseConfirmation>,
     ) -> Result<(), BunError> {
-        let Some(reference) = self.network_references.get(id).cloned() else {
-            if self
-                .supervisor
-                .grill()
-                .network_reference(id)
-                .await?
-                .is_some()
-            {
-                return Err(BunError::RetirementState {
-                    instance_id: id.clone(),
-                    reason: "retained network reference requires original discovery reconciliation"
-                        .into(),
-                });
+        let reference = match self.network_references.get(id).cloned() {
+            Some(reference) => reference,
+            None => {
+                let Some(held) = self.supervisor.grill().network_reference(id).await? else {
+                    return Ok(());
+                };
+                match self.journal_reference(&held) {
+                    // The hold was retained but its launch never recorded it, so
+                    // no publication ever named the address: nothing to withdraw.
+                    JournalReference::Unrecorded => {
+                        self.supervisor
+                            .grill()
+                            .release_network_reference(&held)
+                            .await?;
+                        return Ok(());
+                    }
+                    // Recorded by a write whose outcome was uncertain at the time.
+                    JournalReference::Recorded => {
+                        self.network_references.insert(id.clone(), held.clone());
+                        held
+                    }
+                    JournalReference::Unknown => {
+                        return Err(BunError::RetirementState {
+                            instance_id: id.clone(),
+                            reason: "retained network reference requires original discovery reconciliation"
+                                .into(),
+                        });
+                    }
+                }
             }
-            return Ok(());
         };
         self.authorise_local_discovery_release(&reference, remote)
             .await?;
@@ -9000,7 +9055,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         ) {
             Ok(ruleset) => ruleset,
             Err(e) => {
-                // A malformed admin CIDR never reaches nft (NET8); the
+                // A malformed operator CIDR never reaches nft (NET8); the
                 // previous ruleset stays in force.
                 eprintln!("warning: firewall ruleset generation failed: {e}");
                 return;
@@ -10609,6 +10664,28 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 .await;
                 let _ = reply.send(result);
             }
+            DeployOp::AbandonUnstartedInstances {
+                service,
+                instance_ids,
+                reply,
+            } => {
+                // A reservation that outlived a later publication step can only
+                // be re-registered by a rollout, which needs these owners.
+                if self.service_map.resolve(&service).is_none() {
+                    for id in &instance_ids {
+                        // Anything past Pending may own runtime artifacts, which
+                        // only the retirement path can prove released.
+                        if self
+                            .supervisor
+                            .get_instance(id)
+                            .is_some_and(|instance| instance.state == ContainerState::Pending)
+                        {
+                            self.supervisor.retire_instance(id).await;
+                        }
+                    }
+                }
+                let _ = reply.send(());
+            }
             DeployOp::StoreIngress {
                 app_name,
                 namespace,
@@ -11198,6 +11275,13 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                     .register_service_app(app_name, namespace, port, firewall)
                     .await
                 {
+                    // A node can receive a deploy before the council's allocation
+                    // for it reaches its view. Leaving these Pending instances
+                    // behind would turn the retry into a rollout of a service this
+                    // node never published, which can never succeed.
+                    self.ops
+                        .abandon_unstarted_instances(app_name, namespace, &ids)
+                        .await;
                     let _ = events
                         .send(ApplyEvent::Error {
                             message: error.to_string(),
@@ -23085,6 +23169,168 @@ host = "remote.local"
         assert!(journal.inventory().services.is_empty());
         assert!(journal.inventory().consumer.is_some());
     }
+    /// V02 soak: a restarted node received a deploy before the council's
+    /// allocation reached its view. The failed attempt left a Pending
+    /// instance behind, so every retry became a rollout of a service this
+    /// node had never published, and the deploy wedged for good.
+    #[tokio::test]
+    async fn deploy_before_its_committed_allocation_leaves_nothing_for_the_retry() {
+        let (mut agent, _root, catalog) = clustered_allocation_fixture().await;
+        agent.supervisor.grill().set_pid(std::process::id());
+        let events = drain_deploy(&mut agent, basic_config()).await;
+        match events.last() {
+            Some(ApplyEvent::Error { message }) => assert!(
+                message.contains("committed cluster allocation"),
+                "unexpected failure: {message}"
+            ),
+            other => panic!("deploy ran without its allocation: {other:?}"),
+        }
+        assert!(
+            agent
+                .supervisor
+                .list_instances()
+                .iter()
+                .all(|instance| instance.app_name != "web"),
+            "the failed attempt left instances for its retry to replace"
+        );
+        assert!(
+            !agent
+                .supervisor
+                .grill()
+                .calls()
+                .iter()
+                .any(|(_, id)| id.0.starts_with("default__web")),
+            "the failed attempt touched the runtime"
+        );
+
+        // The allocation arrives; the retry is an ordinary fresh deploy.
+        let (_, ingress) = cluster_publication_fixture();
+        let remote = catalog.services["default__remote"].clone();
+        let committed = catalog
+            .reconcile([
+                (
+                    crate::onion::service_id::ServiceId::new("default", "remote"),
+                    remote.port,
+                    remote.backends,
+                ),
+                (
+                    crate::onion::service_id::ServiceId::new("default", "web"),
+                    8080,
+                    vec![],
+                ),
+            ])
+            .unwrap();
+        agent
+            .synchronise_consumer(2, committed, ingress, vec![])
+            .await
+            .unwrap();
+        agent
+            .renew_view_lease(crate::onion::lease::boot_clock_ns())
+            .await;
+        let events = drain_deploy(&mut agent, basic_config()).await;
+        let (_, instances) = expect_complete(&events);
+        assert_eq!(instances, ["default__web-0".to_string()]);
+    }
+
+    /// A discovery-owning agent with a Pending `web` instance whose runtime
+    /// holds an address, for a service this node never published.
+    async fn unpublished_hold_fixture() -> (
+        TestAgent,
+        MockGrill,
+        tempfile::TempDir,
+        crate::grill::runc_intent::NetworkReference,
+    ) {
+        let (mut agent, _, _, grill) = test_agent_with_grill();
+        let root = tempfile::tempdir().unwrap();
+        agent
+            .enable_fresh_discovery_ownership(&root.path().join("discovery"))
+            .await
+            .unwrap();
+        let reference = original_test_network_reference();
+        grill.set_network_reference(reference.clone()).await;
+        let spec = basic_config().app.remove("web").unwrap();
+        let (reply, result) = oneshot::channel();
+        agent
+            .handle_deploy_op(DeployOp::SupervisorDeployApp {
+                app_name: "web".into(),
+                namespace: "default".into(),
+                spec: Box::new(spec),
+                reply,
+            })
+            .await;
+        assert_eq!(
+            result.await.unwrap().unwrap(),
+            std::slice::from_ref(&reference.instance_id)
+        );
+        (agent, grill, root, reference)
+    }
+
+    #[tokio::test]
+    async fn refused_reference_record_hands_the_runtime_hold_back() {
+        let (mut agent, grill, root, reference) = unpublished_hold_fixture().await;
+        let spec = basic_config().app.remove("web").unwrap();
+        let (reply, result) = oneshot::channel();
+        agent
+            .handle_deploy_op(DeployOp::ApplyNetworkPreStart {
+                instance_id: reference.instance_id.clone(),
+                app_name: "web".into(),
+                spec: Some(Box::new(spec)),
+                cgroup_path: root.path().join("cgroup"),
+                reply,
+            })
+            .await;
+        assert!(result.await.unwrap().is_err());
+        assert!(matches!(
+            agent.discovery_ownership,
+            DiscoveryOwnership::Ready(_)
+        ));
+        assert_eq!(
+            grill
+                .network_reference(&reference.instance_id)
+                .await
+                .unwrap(),
+            None,
+            "a hold nothing records outlived its refused launch"
+        );
+    }
+
+    #[tokio::test]
+    async fn retirement_releases_a_hold_the_journal_never_recorded() {
+        let (mut agent, grill, _root, reference) = unpublished_hold_fixture().await;
+        // The runtime kept a hold the agent lost track of before recording it.
+        agent
+            .release_network_reference(&reference.instance_id, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            grill
+                .network_reference(&reference.instance_id)
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn retirement_keeps_an_untracked_hold_without_an_authoritative_journal() {
+        let (mut agent, _, _, grill) = test_agent_with_grill();
+        let reference = original_test_network_reference();
+        grill.set_network_reference(reference.clone()).await;
+        assert!(
+            agent
+                .release_network_reference(&reference.instance_id, None)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            grill
+                .network_reference(&reference.instance_id)
+                .await
+                .unwrap(),
+            Some(reference)
+        );
+    }
+
     #[tokio::test]
     async fn clustered_startup_retains_orphan_ports_until_api_driven_cleanup_can_finish() {
         let (mut agent, grill, root, reference) = discovery_recovery_fixture().await;
