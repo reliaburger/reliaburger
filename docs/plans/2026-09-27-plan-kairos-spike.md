@@ -13,8 +13,9 @@ The maintainer asked for "an alternative recommendation that's using Kairos, wit
 - [x] Spike plan (marked awaiting approval) inside §7
 - [x] Recommendation: when to prefer Kairos, own mkosi, or Talos
 - [x] Update §0 summary and sources
-- [ ] Update the PR body
-- [ ] Commit and push each step to `research/appliance-os`
+- [x] Update the PR body
+- [x] Commit and push each step to `research/appliance-os`
+- [ ] Maintainer decision on §7.7 (spike not started)
 
 ## Constraints for whoever resumes this
 
