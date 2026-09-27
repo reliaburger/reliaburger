@@ -97,12 +97,18 @@ vda6   64M                 _empty                          (slot B verity)
 ## Picking up S2 on the lab Mac (M1, 64 GB, from Monday 28 Sep)
 
 Research §8.4, level 1:
-1. **Get the artefacts.** On the lab Mac run `brew install qemu gh`, then download the latest `appliance-aarch64` artefact from a green `appliance.yml` run: `gh run download <run-id> -n appliance-aarch64`. Artefacts expire after 1 day, so re-run the workflow if needed.
+1. **Get the artefacts.** On the lab Mac run `brew install qemu gh zstd`, then download the latest `appliance-aarch64` artefact from a green `appliance.yml` run: `gh run download <run-id> -n appliance-aarch64` (`gh workflow run appliance.yml --ref feat/appliance-image` starts a fresh one). Artefacts expire after 1 day. The artefact holds:
+   - the whole disk, `reliaburger-os_<v>.raw.zst`;
+   - the UKI, `.efi`;
+   - the `/usr` slot image and its verity, `.usr.raw.zst` and `.usr-verity.raw.zst`;
+   - the manifest;
+   - `SHA256SUMS`, its `.sig`, and the throwaway public key.
 2. **Before the installer UKI exists** (S2's own work item), boot the raw disk directly to check the image on HVF:
 
    ```sh
    Q="$(brew --prefix)/share/qemu"
-   zstd -d reliaburger-os_*_aarch64.raw.zst -o disk.raw
+   zstd -d "$(ls reliaburger-os_*.raw.zst | grep -v -e usr -e esp -e root)" -o disk.raw
+   qemu-img resize -f raw disk.raw 8G      # the Wyse's eMMC size: first boot adds slot B and grows the data partition
    cp "$Q/edk2-aarch64-vars.fd" vars.fd
    qemu-system-aarch64 -machine virt -accel hvf -cpu host -smp 4 -m 2048 \
      -drive if=pflash,format=raw,readonly=on,file="$Q/edk2-aarch64-code.fd" \
@@ -111,5 +117,6 @@ Research §8.4, level 1:
      -device virtio-net-pci,netdev=n0 -netdev user,id=n0 -nographic
    ```
 
-   Expect `reliaburger: bun healthy` on the console.
+   Expect `reliaburger: bun healthy`, then the disk layout (six partitions, slot B `_empty`) on the console. Quit QEMU with `Ctrl-a x`.
+   Verify the signature first if you like: `openssl pkeyutl -verify -pubin -inkey spike-signing-key.pub.pem -rawin -in reliaburger-os_<v>.SHA256SUMS -sigfile reliaburger-os_<v>.SHA256SUMS.sig`, then `shasum -a 256 -c reliaburger-os_<v>.SHA256SUMS --ignore-missing`. macOS's LibreSSL may not do Ed25519 with `-rawin`; `brew install openssl@3` if it complains.
 3. Then carry on with S2 in the spike plan: iPXE via `-netdev user,tftp=…,bootfile=…` and the installer UKI.
