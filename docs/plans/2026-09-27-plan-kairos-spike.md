@@ -8,11 +8,12 @@ The maintainer asked for "an alternative recommendation that's using Kairos, wit
 
 - [x] Read the whole research note and the PR (no review comments yet)
 - [x] Re-check repo facts against current `main` (327 commits past the note's `0a5dfc6`; `operator_cidrs` now exists)
-- [ ] Web research: Kairos framework images, `kairos-init`, supported Ubuntu versions, AuroraBoot netboot, cloud-config, persistence, upgrades, Trusted Boot, licence, community health
-- [ ] Write §7 "Alternative: Kairos on Ubuntu, netboot first" in the research note
-- [ ] Spike plan (marked awaiting approval) inside §7
-- [ ] Recommendation: when to prefer Kairos, own mkosi, or Talos
-- [ ] Update §0 summary, sources and the PR body
+- [x] Web research: Kairos framework images, `kairos-init`, supported Ubuntu versions, AuroraBoot netboot, cloud-config, persistence, upgrades, Trusted Boot, licence, community health
+- [x] Write §7 "Alternative: Kairos on Ubuntu, netboot first" in the research note
+- [x] Spike plan (marked awaiting approval) inside §7
+- [x] Recommendation: when to prefer Kairos, own mkosi, or Talos
+- [x] Update §0 summary and sources
+- [ ] Update the PR body
 - [ ] Commit and push each step to `research/appliance-os`
 
 ## Constraints for whoever resumes this

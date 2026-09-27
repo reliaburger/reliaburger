@@ -4,6 +4,8 @@
 
 *Revised the same day with four follow-up questions: forking Talos (§2.10), Ubuntu versus Debian as the mkosi base (§3.1), whether mkosi ties us to the distro kernel (§3.2), and network boot shipped by us (§4.7).*
 
+*Extended on 27 September 2026 with a separate alternative recommendation (§7): Kairos on Ubuntu 26.04, with netboot as the unified spike. §0–§6 are unchanged; §7 stands beside them and its spike awaits maintainer approval.*
+
 ---
 
 ## 0. Summary
@@ -32,6 +34,7 @@
   3. **`advertise_address` falls back to `127.0.0.1`, and node names default to `node-<gossip_port>`.** An appliance needs both detected automatically.
   4. **Join tokens are single-use, node-bound and at most 1 h.** They're good primitives, but a "fleet stick" needs something on top.
 - **Recommended join flow: "claim over the LAN".** Machines boot a generic signed image, show an "unclaimed" screen and announce themselves over mDNS. The operator runs `relish machines claim`, which pushes each machine an existing single-use, node-bound join token and the pinned CA fingerprint over TLS. No secrets ever live on a USB stick or go out over network boot. A seed-file mode (`relish image create`) covers headless installs.
+- **Alternative (§7, added 27 Sep): Kairos on Ubuntu 26.04, netboot first.** Build the appliance `FROM ubuntu:26.04` with `kairos-init`; AuroraBoot turns the one OCI image into netboot artefacts, a USB ISO and a raw disk, and its ProxyDHCP netboots machines next to the home router. Kairos brings the installer, A/B plus recovery, boot assessment and the netboot server; we'd trade away a minimal image (it installs SSH and a general-purpose package set) and depend on a small upstream that now publishes only Hadron artefacts and build-tests, but doesn't boot-test, Ubuntu 26.04. §7.8 says when to prefer it over mkosi or Talos. Its ~5-day unified spike (§7.7) **awaits maintainer approval**.
 - **First spike (about 4 days):** boot the mkosi Ubuntu 26.04 image and a Talos 1.14 k8s-less image with a host-mode `bun` extension side by side in QEMU, and run the existing tour on each. Then network-boot the mkosi UKI through a ProxyDHCP next to an ordinary DHCP server (details in §6).
 
 ---
@@ -664,6 +667,248 @@ That's roughly the Phase 1 scope, and it ships value before A/B. Network boot (P
 
 ---
 
+## 7. Alternative recommendation: Kairos on Ubuntu, with netboot as the unified spike
+
+*Added 27 September 2026 at the maintainer's request. This is a **separate alternative** to §6, not a revision of it: §0–§6 still stand as written. Kairos facts come from the Kairos docs source (`kairos-io/kairos-docs@main`), the `kairos-io/kairos` monorepo and the GitHub API, all fetched on 27 Sep 2026 (links in Sources). Repo facts come from `main` at `0eb6071d`, which is 327 commits newer than the `0a5dfc6` the rest of this note read. Progress on this section is tracked in [`2026-09-27-plan-kairos-spike.md`](2026-09-27-plan-kairos-spike.md).*
+
+### 7.0 In one paragraph
+
+Build the Reliaburger appliance as a **Kairos derivative of Ubuntu 26.04**: a Dockerfile `FROM ubuntu:26.04` that runs `kairos-init`, adds our package list, `bun`, `relish` and a systemd unit, and gets published as one OCI image. **AuroraBoot turns that one image into both netboot artefacts and a USB ISO**, so network boot and USB are the same image with two wrappers. Machines netboot through ProxyDHCP next to the home router's DHCP, auto-install to disk, reboot into an `unclaimed` bun, and get claimed over the LAN exactly as §4.2 (d) describes. Kairos gives us the installer, A/B plus recovery images, boot assessment and the netboot server now; we give up a minimal image, a verity `/usr`, and some control over the boot chain. **The spike (§7.7) awaits maintainer approval. Nobody should start building it yet.**
+
+### 7.1 What Kairos is in September 2026
+
+- **What it does.** Kairos turns an ordinary distribution container image into an immutable, image-based OS. `kairos-init` "kairosifies" the image (adds the Kairos agent, immucore, dracut initrd, GRUB, the partition and persistence layout). The result is an OCI image that installs to disk as **active, passive and recovery** system images, with upgrades that swap A and B and a recovery image as the last fallback ("A -> B -> Recovery").
+- **Configuration** is cloud-config (the `yip` dialect): an `install:` block for unattended installs, `stages:` for boot-time hooks (files, commands, mounts, users), `bind_mounts` for persistence, and templating.
+- **Kubernetes is optional.** "Core" images carry no Kubernetes engine; "standard" images add k3s or k0s through `--provider`. We'd build core.
+- **P2P cluster formation** (edgevpn, `p2p.network_token`) exists, but the docs still call it "experimental and has only been tested on local setups", and it exists to form k3s clusters. We wouldn't use it: Mustard, Raft and the join flow already do that job, and a shared `network_token` in every node's cloud-config is the "long-lived multi-use credential" §4.2 (b) rejects.
+- **Releases and people.**
+  - Kairos v4.3.0 shipped on 8 Sep 2026, the first release from the new monorepo (agent, SDK and provider merged in). Minor releases are roughly monthly: v4.0.0 on 27 Feb, v4.1.0 on 15 May, v4.2.0 on 18 Aug, v4.3.0 on 8 Sep 2026.
+  - AuroraBoot is at v0.27.1 (11 Sep 2026).
+  - Everything is **Apache-2.0**: `kairos`, `AuroraBoot`, `hadron`.
+  - Kairos has been a **CNCF Sandbox** project since 13 Apr 2024 and has applied for Incubation. **Spectro Cloud** is the lead sponsor.
+  - Over the last 12 months the monorepo has 1,739 commits. After removing bots and agent accounts, four people wrote almost all of it (414, 160, 73 and 35 commits). That's a core the same size as Talos's (§2.10), on a project with far less commercial weight behind it.
+- **The big 2026 change: Hadron.** Since v4.0 (Feb 2026) the project **publishes prebuilt artefacts only for Hadron**, its own minimal, upstream-first Linux (kernel 7.0.x in Hadron v0.2.0). In the maintainers' words, the per-distro matrix had grown past 500 artefacts per release. Other distros are "still supported ... for custom builds": you run `kairos-init` over your own base image, in your own pipeline. The docs now say the old Ubuntu flavour repositories "are no longer actively updated".
+
+**What that means for "a Kairos derivative built FROM an Ubuntu-based Kairos image".** There isn't a maintained Ubuntu-based Kairos image to build FROM any more. We'd build **FROM `ubuntu:26.04`** and run `kairos-init` ourselves, which is the documented path and what the Kairos factory GitHub Action automates. In practice that's the same thing, but it means **we own the Ubuntu flavour's release pipeline**, just as we would with mkosi.
+
+**How well upstream tests Ubuntu 26.04.**
+- Ubuntu 26.04 support landed in `kairos-init` with Kairos v4.1.0 (15 May 2026).
+- The monorepo's `_build-flavors.yaml` builds `ubuntu:24.04`, `ubuntu:25.10` and `ubuntu:26.04` on amd64 and arm64, plus 26.04 with Trusted Boot, on every CI run. That's a **container-build smoke test**.
+- The **QEMU boot and install tests** in `master.yaml` cover Hadron and one `ubuntu:20.04` cell, not 26.04.
+- So "Ubuntu 26.04 boots, installs and upgrades" is **[unverified upstream]** and the spike has to establish it.
+
+### 7.2 How Reliaburger sits on Kairos
+
+**The image.** One Dockerfile, built in CI on Linux runners (never on the maintainer's Mac):
+
+```dockerfile
+# image/kairos/Dockerfile (sketch, untested)
+FROM quay.io/kairos/kairos-init:v0.17.3 AS kairos-init
+
+FROM ubuntu:26.04
+ARG VERSION   # our release version; kairos-init writes it to /etc/kairos-release
+# scripts/release/guest-images.json's list (so guest and appliance can't drift), plus firmware for real hardware
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      runc uidmap btrfs-progs nftables iptables iproute2 linux-firmware \
+ && rm -rf /var/lib/apt/lists/*
+RUN --mount=type=bind,from=kairos-init,src=/kairos-init,dst=/kairos-init \
+    /kairos-init -l info --version "${VERSION}"
+COPY bun relish /usr/lib/reliaburger/bin/          # release binaries, verified before COPY
+COPY bun-launcher /usr/lib/reliaburger/bin/        # execs the newest verified bun (below)
+COPY reliaburger.service reliaburger-data.mount /etc/systemd/system/
+RUN systemctl enable reliaburger.service reliaburger-data.mount \
+ && systemctl mask ssh.service ssh.socket          # see "attack surface" below
+```
+
+- **Kernel.** For 26.04, `kairos-init` installs `linux-image-generic` (its package map says "Ubuntu 26.04 uses generic kernel instead of HWE"); for 24.04 it installs the 24.04 HWE kernel. So on 26.04 Kairos rides exactly the kernel §3.2 checked: 7.0 GA, with BTF, `CGROUP_BPF`, `USER_NS`, `NET_SCH_NETEM`, `INET_DIAG_DESTROY`, `BTRFS_FS`, `NF_TABLES` and `BLK_DEV_LOOP` all set. **Kernel coupling is the distro's, as with mkosi.** A kernel CVE means "rebuild the image when Ubuntu ships the package". The difference is that Kairos loads kernel and initrd from inside the system image (GRUB chainloads them), so a kernel update is always an A/B image swap and a reboot, never a package install.
+- **Initrd and boot chain.** Kairos uses dracut plus immucore for the initrd and **GRUB via `shim-signed` and `grub-efi-amd64-signed`** for the default (non-UKI) boot. That's Ubuntu's Microsoft-signed chain, so an installed node should boot with **Secure Boot on and no key enrolment** **[unverified on 26.04; §7.5 covers what that does and doesn't verify]**.
+- **bun as a systemd service.** The unit is the one `docs/linux-servers.md` §3.3 and `provision.rs` already use (`Restart=always`, `KillMode=process`, the bpffs `ExecStartPre`), with `ExecStart` pointing at the launcher.
+- **The guest bits.** runc, uidmap, btrfs-progs, nftables, iptables and iproute2 come from the Ubuntu archive at image build time, the same list and archive as the quickstart guest. Nothing is installed at run time, because the root is read-only.
+
+**Persistence.** This is the part that needs the most care, because Kairos's defaults don't match bun's layout:
+
+| Path | Kairos default | What bun needs | Plan |
+|---|---|---|---|
+| `/` and `/usr` | read-only (loop-mounted system image) | binaries, unit files | baked into the image |
+| `/var` | **ephemeral** (tmpfs overlay), except bind-mounted subpaths such as `/var/log` | `/var/lib/reliaburger/{data,images,logs,metrics,volumes}` must persist | a **dedicated data partition** (below), not a bind mount |
+| `/etc` | **ephemeral**, except listed bind mounts | `node.toml`, identity, master key | keep them under the data partition (`/var/lib/reliaburger/etc/`), pointed at by the unit, so there's one place to back up and wipe |
+| `/usr/local` | persistent (`COS_PERSISTENT`), hosts the bind mounts under `/usr/local/.state` | nothing | left to Kairos |
+| `/oem` | persistent (`COS_OEM`), holds cloud-config | non-secret install-time config | cloud-config only; **never secrets** |
+
+- **Why a dedicated partition.** `bind_mounts` would put `/var/lib/reliaburger` on `COS_PERSISTENT`, which is ext4 and shared with Kairos's own state. Bun prefers Btrfs for volumes (`src/grill/volume.rs`, with the loop-ext4 fallback), and a dedicated partition lets `relish` wipe or back up cluster state without touching the OS. So the install config adds an extra partition:
+
+  ```yaml
+  install:
+    partitions:
+      persistent: { size: 2048 }        # give Kairos a fixed slice...
+    extra-partitions:
+      - name: reliaburger
+        size: 0                         # ...and bun the rest of the disk
+        fs: none                        # see below
+        label: RB_DATA
+  ```
+
+- **One snag found in the source:** `kairos-agent`'s partitioner only formats `ext2`–`ext4`, `xfs` and `fat`/`vfat` (`agent/pkg/partitioner/mkfs.go`). It has no Btrfs. So the partition is created unformatted (`fs: none`). A oneshot unit that runs before `reliaburger-data.mount` does `mkfs.btrfs -L RB_DATA` only when the partition has no filesystem, and the mount unit mounts it at `/var/lib/reliaburger`. The docs also say extra partitions are "not automounted, only created and formatted", so our mount unit is needed either way. Setting `size: 0` on an extra partition while fixing `persistent` follows the docs' own comment in the configuration reference **[untested]**.
+- **Encryption.** Kairos can bind partition encryption to the TPM (kcrypt, `bind-pcrs`). That would cover `RB_DATA` and the master key on it, and later feed `AttestationMode::Tpm`. It stays out of v1, and whether kcrypt can encrypt a non-Kairos partition by label is **[unverified]**.
+
+**Delivering `node.toml`, join tokens and `operator_cidrs`.** Cloud-config is the delivery channel for *non-secret* settings only. Network boot serves the cloud-config over plain HTTP to anything that asks, and AuroraBoot's netboot passes a `config_url` to every booted machine. So the split is:
+
+| Setting | How it gets there | Why |
+|---|---|---|
+| Install policy (disk selection, partition sizes, `install.auto`, reboot) | cloud-config served by AuroraBoot or embedded in the ISO | not secret; the same for every machine |
+| `operator_cidrs`, cluster name, seed endpoints, root CA **fingerprint**, network overrides | cloud-config `stages` writing a `node.toml` fragment into `/var/lib/reliaburger/etc/` on first boot | none of these are secret: the fingerprint is a public hash, and `operator_cidrs` opens only 9117, which still needs a token (`docs/linux-servers.md` §5.3). `operator_cidrs` is now in `[security]` on `main`, which closes the static half of gap G2 in §4.3 |
+| `advertise_address`, node name | detected by bun in appliance mode (G3, G4) or set at claim time | per-machine |
+| **Join token, `master.key`, bootstrap bundle** | **only through the claim** (§4.2 d), over TLS pinned to the machine's claim fingerprint. Seed mode (§4.2 c) is the headless fallback, and it stays **USB-only**: `auroraboot build-iso --cloud-config` bakes the seed into a per-cluster ISO, and `iso.overlay_iso` can carry a seed file next to it. | a netboot-served cloud-config is broadcast to the LAN; a token in it is a token anyone on the LAN can use |
+
+So Kairos changes *where the generic settings come from*, not the security model. G1 (master-key delivery) and G5 (rotation) are still open on `main`: `docs/linux-servers.md` §4.1 still streams `prod-master.key` to each node over SSH.
+
+**Upgrades: Kairos A/B next to bun's self-upgrade.** There are two cadences, as in §2.6 and §5:
+
+1. **bun and relish, often, without a reboot.** The image's copy of `bun` lives in read-only `/usr`, so the existing symlink upgrade can't swap it. We point `[upgrades] binary_dir` at `/var/lib/reliaburger/bin` (on `RB_DATA`) and let the launcher exec the newest verified `bun` there, falling back to the image's copy. That's today's Ed25519-countersigned upgrade, unchanged (`docs/linux-servers.md` §9).
+2. **The OS (kernel, Ubuntu packages, Kairos agent and our baked bun), roughly weekly, with a reboot.** Bun's orchestrator (`src/upgrade/orchestrator.rs`) keeps its council-aware order and health gates. For an OS step on each node it would:
+   1. download and **verify our Ed25519 signature** over the OS image;
+   2. run `kairos-agent upgrade --source ocifile:<verified tarball>` locally. It's a root CLI on the same box, so bun needs **no second API and no second PKI**, which is the big difference from Talos (§2.7);
+   3. drain, reboot, wait for rejoin;
+   4. only then upgrade the recovery image (`kairos-agent upgrade --recovery`, which Kairos deliberately keeps as a separate step).
+
+   Serving the image from Pickle (`--source oci:<node>:5050/...`) would avoid the tarball, but it needs `kairos-agent` to trust Pickle's TLS **[untested]**.
+3. **Rollback.** On a non-UKI install, Kairos's boot assessment uses GRUB variables and sentinels to fall back to the previous image when a boot after an upgrade fails (it adds `panic=5` and `systemd.crash_reboot=yes`). That covers "doesn't boot". "Boots but bun won't rejoin" is our health gate's job. It would set GRUB's next entry to the passive image (`grub_options next_entry`) and reboot **[design sketch, untested]**. Under Trusted Boot, Kairos's boot-assessment page still says the systemd-boot fallback isn't implemented, but its tracking issue (kairos-io/kairos#2864) was closed as completed on 27 Nov 2024, and v4.1.0 added "assessment suffix handling" for systemd-boot. So the docs look stale **[unverified]**.
+4. **How the two interact.** An OS upgrade ships a baked `bun`. If `binary_dir` holds a newer verified one, the launcher keeps using it; if it holds an older one, the launcher uses the image's copy. Neither cadence can downgrade the other **[design rule to test in the spike]**.
+
+**Attack surface: what `kairos-init` adds.** On Debian-family bases `kairos-init`'s package map installs a general-purpose set, including `openssh-server`, `fail2ban`, `neovim`, `snmpd`, `lldpd`, `nfs-common`, `open-iscsi`, `mdadm` and `isc-dhcp-server`. That's a long way from §1's "no SSH, no shell, no package manager" appliance.
+- We can mask services and `apt-get purge` after `kairos-init`, but whether Kairos's own stages expect some of them (for example `08_ssh.yaml`) is **[unverified]**.
+- `ssh_hardening` enforces key-only SSH if we keep it as a debug path.
+- This is the biggest *product* cost of Kairos against mkosi, where the image contains only what we list.
+
+### 7.3 Netboot as the unified path
+
+**One image, three artefacts.** From the single OCI image in §7.2, AuroraBoot produces:
+
+| Artefact | How | Used for |
+|---|---|---|
+| kernel, initrd and `squashfs` | `auroraboot netboot <iso> <out> <prefix>`, or implicitly when AuroraBoot serves a `container_image` | PXE via iPXE |
+| install ISO, optionally with an embedded cloud-config | `auroraboot build-iso` (`--set disable_netboot=true`, `--cloud-config`) | USB fallback, UEFI HTTP Boot of an ISO, and seed-mode sticks |
+| raw EFI disk | `--set disk.efi=true` (needs `--privileged` for loop devices) | the QEMU tests in CI |
+
+That's the "unified spike": **one image definition, built once per release, with netboot and USB as two wrappers around the same bits.** The build record, signature and digest are per image, not per wrapper.
+
+**From power-on to a claimed node (netboot).**
+
+1. `auroraboot` runs on the laptop, or on node 1 later (below), with `container_image` set to our signed release image and a **generic** cloud-config (`install.auto: true`, the disk policy, the `RB_DATA` partition, no secrets).
+2. A mini PC's firmware sends a PXE DHCPDISCOVER. The home router gives it an address, and AuroraBoot's built-in **ProxyDHCP** (Pixiecore) answers with boot instructions. AuroraBoot's log shows "DHCP: Offering to boot <MAC>", then "HTTP: Sending ipxe boot script". Firmware without PXE can boot Kairos's generic iPXE ISO from a stick, which then finds the ProxyDHCP.
+3. iPXE fetches the kernel and initrd over HTTP (port 8090 by default). The live system then pulls the squashfs and the cloud-config from the same server.
+4. With `install.auto`, the live system installs to the chosen disk (the `device` value, which can be `auto` or a `script://` selector since v4.1.0) and reboots from disk.
+5. On first boot from disk, the `RB_DATA` unit formats and mounts the data partition, and bun starts in **appliance mode**: `unclaimed`, claim fingerprint and QR on tty1, `_reliaburger-unclaimed._tcp` over mDNS (§4.2 d).
+6. The operator runs `relish machines`, compares fingerprints, runs `relish machines claim <first> --create`, then `relish machines claim --all`. From here on it's §4.6 steps 5–8, unchanged.
+
+**The first node.** The PKI is generated **on the laptop** (`relish cluster create --bare-metal`, §4.4), and node 1 gets its bootstrap bundle through the claim. Once node 1 is claimed it can take over serving: run AuroraBoot as a bun-managed service, or `relish image serve --node home-1` (§4.7) once that exists, with the 60-minute window. The laptop can then sleep, and a sixth machine is "plug in and power on".
+
+**DHCP and ProxyDHCP on a home LAN.** Everything §4.7 says about ProxyDHCP applies unchanged, because AuroraBoot does the same dance. It never leases addresses, it coexists with the router, it needs a shared broadcast domain (no guest Wi-Fi or AP isolation), and two proxies on one LAN race each other. AuroraBoot needs UDP 67 and TCP 8080/8090 free. The AuroraBoot docs add two facts that matter:
+- **macOS:** netboot doesn't work from AuroraBoot's Docker image on a Mac, because Docker runs in a VM that can't see the host network. The docs recommend running the native AuroraBoot binary instead, with `xorriso` from Homebrew. Whether that binary can bind UDP 67 without root on macOS is the same **[unverified]** question as §4.7's.
+- **Secure Boot over the network:** AuroraBoot's UKI netboot (`uki-pxe`) works **only over UEFI HTTP Boot, with the machine in setup mode** (Secure Boot off, no keys enrolled), so the ISO can enrol its keys on first boot. PXE with UKI and Secure Boot "is not yet supported and probably won't be". Non-UKI netboot runs through iPXE, so a machine with Secure Boot on needs the Microsoft-signed iPXE shim or has to turn Secure Boot off for the install boot **[unverified with AuroraBoot's bundled iPXE]**. Once installed, the shim and GRUB chain boots with Secure Boot on (§7.2).
+
+**Diskless mode.** Kairos also supports running from RAM (`kairos.ram`, with `kairos.ram.create_partitions` keeping `COS_OEM` and `COS_PERSISTENT` on the local disk). §4.7's argument still holds: a cluster whose nodes can't boot while the netboot server is down is fragile. So v1 installs to disk.
+
+**Timing for five mini PCs.** The same as §4.6's network-boot column, about **25–40 minutes**, give or take the Kairos install step. That step (copying the image into the active, passive and recovery slots) takes a few minutes per machine, in parallel **[estimate]**. The image is bigger than an mkosi one: the old Kairos core ISOs were about 390 MB, and an Ubuntu base with `linux-firmware` and `kairos-init`'s package set will be larger **[unmeasured; the spike records it]**.
+
+### 7.4 What we'd still build ourselves on Kairos
+
+Kairos removes the image, installer, A/B, recovery and netboot-server work from §5. It doesn't remove:
+- **bun appliance mode** (§5 Phase 1): the claim server, mDNS, the tty1 screen, the data-partition unit, and address and name detection (G3, G4);
+- **G1** (master-key delivery after join), **G5** (rotation), and the join-window half of **G2**;
+- **`relish machines` / `relish image`** on the laptop;
+- **the OS step in the upgrade orchestrator** (`kairos-agent upgrade` plus the health-gated rollback);
+- **the release pipeline for our Ubuntu flavour**: a CI job that rebuilds the image whenever Ubuntu ships a kernel or a USN touching our packages, which is now about weekly (§3.1), plus a Kairos version bump roughly monthly.
+
+AuroraBoot v0.20+ also ships a **fleet server** with a web UI, node manager, phone-home, a Secure Boot key store and netboot. It overlaps our claim flow and Brioche, and adopting it would give the operator a second management plane, the same objection as Talos's `talosctl` (§2.9). **Use AuroraBoot as a boot server only.**
+
+### 7.5 Comparison: Kairos on Ubuntu, own mkosi image, Talos
+
+| | **Kairos 4.3 on Ubuntu 26.04** (this section) | **Own mkosi image, Ubuntu 26.04** (§6) | **Talos 1.14, k8s-less, host-mode extension** (§2) |
+|---|---|---|---|
+| **Up-front effort** | **S–M**: Dockerfile plus `kairos-init`, the data-partition unit, trimming packages, and the OS step in the orchestrator. Installer, A/B, recovery, ISO and netboot come for free. | **M–L**: mkosi recipe, repart installer, sysupdate A/B, UKI signing, our own netboot server (§4.7). | **M–L**: extension, musl build, bundled tools, machine-config generation, `imager` CI. |
+| **Ongoing burden** | Rebuild on Ubuntu kernels and USNs (weekly); follow Kairos minors (monthly) and a young monorepo; we're the only pipeline testing Ubuntu 26.04 boots. | Rebuild on Ubuntu kernels and USNs (weekly); mkosi bumps. | Talos minors every ~4 months, patches every 1–2 weeks; vendor roadmap overlap. |
+| **Main risks** | Upstream focus has moved to Hadron and Kubernetes; Ubuntu 26.04 isn't boot-tested upstream; a small core (about four people); a larger image with a general-purpose package set; persistence gotchas (`/var` and `/etc` ephemeral). | Assembling the boot, installer and netboot pieces ourselves (Incus OS shows it's done); Secure Boot key enrolment on consumer boards. | Experimental, controlplane-only k8s-less mode; host-mode services are new; two APIs and two PKIs. |
+| **OS upgrades** | `kairos-agent upgrade` A/B plus a separate recovery upgrade; GRUB boot assessment falls back on failed boot (under Trusted Boot the docs and the issue tracker disagree). Driven locally by bun, no second API. | `systemd-sysupdate` A/B with boot counting; driven locally by bun. | `talosctl upgrade` A/B with automatic rollback; needs Talos API credentials in bun. |
+| **bun upgrades** | Symlink swap in `binary_dir` on `RB_DATA`, no reboot | The same | The same, from `/var` |
+| **Secure Boot out of the box** | **Yes on the default path**: Ubuntu's Microsoft-signed shim, GRUB and kernel **[unverified on 26.04]**. The dracut initrd and the system image aren't signature-checked, so this only proves the kernel is Ubuntu's. | Only with our db key enrolled, or Secure Boot off | Talos's own keys: enrolment or Secure Boot off |
+| **Verified whole-OS boot** | Trusted Boot: a signed UKI (a "USI" carrying the whole OS, running from RAM), TPM2-bound encrypted partitions, keys enrolled via setup mode. It works, but it needs TPM2 and setup mode, and its boot-assessment fallback is documented as missing (probably stale, see above). | UKI plus verity `/usr` with our key: the design Incus OS ships | UKI and Secure Boot supported |
+| **Image signing** | Our Ed25519 over the OCI digest (bun verifies before `kairos-agent` sees it). Kairos's own images use cosign, which doesn't apply to ours. | Our Ed25519 over the image, with sysupdate's GPG question still open (§5 Phase 3) | Talos-signed base plus our extension |
+| **Fit with "single binary, the OS disappears"** | ⚠️ bun is the only *workload*, but the OS carries a second agent (`kairos-agent`, immucore, yip) and SSH that we have to mask. Operators never see it unless we expose AuroraBoot's fleet UI (we shouldn't). | ✅ bun is the only thing we add; systemd pieces only | ❌ `talosctl` and machine config beside `relish` |
+| **Netboot** | ✅ **Built in** (AuroraBoot ProxyDHCP, iPXE, HTTP); UKI netboot needs HTTP Boot in setup mode | We build `relish image serve` (§4.7, Phase 2b) | Image Factory iPXE, or our own server |
+| **Licences** | Apache-2.0 (Kairos, AuroraBoot, Hadron) over Ubuntu's archive | Our recipe over Ubuntu's archive; mkosi is a build tool and ships nothing | MPL-2.0; Omni and Discovery are BUSL |
+| **Community health** | CNCF Sandbox (applying for Incubation), Spectro Cloud-led, 1.8k stars, ~4 core committers, releases every 2–6 weeks | mkosi and systemd: large, healthy upstreams. Incus OS and ParticleOS as precedents. | Strong but concentrated; Sidero now owned by Yardi, with its own edge-container product due in Dec 2026 |
+
+### 7.6 Unknowns, stated plainly
+
+- Whether an Ubuntu 26.04 `kairos-init` image **boots, installs and upgrades** on amd64. Upstream only build-tests it.
+- Whether `kairos-init`'s extra packages can be purged, or SSH masked, without breaking Kairos's own stages.
+- Whether a `fs: none` extra partition sized `0` works, and whether our mkfs-then-mount unit runs early enough for bun.
+- Whether GRUB boot assessment plus `next_entry` gives us a clean "boots but unhealthy, so roll back" path.
+- Secure Boot on the default path: does Ubuntu 26.04's shim boot on older mini-PC firmware after the Microsoft 2011 CA expiry (§3.1)? And can AuroraBoot's iPXE hand over under Secure Boot?
+- The AuroraBoot native binary on macOS: can it bind UDP 67 without root, and does it netboot a real machine?
+- Image size and install time per machine.
+- Whether owners and containers survive a `kairos-agent upgrade` reboot cycle with Raft state intact (they should, since `RB_DATA` isn't touched, but it's untested).
+
+### 7.7 Spike plan: Kairos + Ubuntu 26.04 + netboot, unified
+
+> **Status: awaiting maintainer approval. Do not start building.** The spike runs later, after approval, and after the release soak has freed the Mac. None of it runs on the maintainer's Mac while the soak is going.
+
+**Scope.** One spike that replaces §6's four tracks if this alternative is chosen. The Talos track is dropped, and the mkosi track shrinks to an optional comparison day. It proves one image definition, netboot and USB from that image, the claim-shaped join, and both upgrade cadences.
+
+**Hardware.**
+- A **Linux host with KVM** (x86_64, 8+ cores, 32 GB RAM, 100 GB free disk), with Docker and buildx, QEMU, OVMF, a Linux bridge and dnsmasq. A GitHub-hosted runner can do the image build but not the bridged netboot lab.
+- Optional but valuable: **one or two real mini PCs** (ideally a Dell or Lenovo business box and a consumer AMI box) and a spare USB stick, on a wired switch.
+- A Mac for the one macOS check, **only after the soak ends**.
+
+**Steps.**
+
+| # | Step | Success looks like | Estimate |
+|---|---|---|---|
+| S0 | Set up the lab: a bridge `rb-lab0`, dnsmasq handing out **addresses only** (no boot options) to stand in for the home router, and a local registry | A VM on the bridge gets an address and nothing else | 0.5 d |
+| S1 | Write `image/kairos/Dockerfile` (§7.2): `FROM ubuntu:26.04`, `kairos-init` v0.17.3, the `guest-images.json` packages, bun, relish, the launcher, the unit, the `RB_DATA` format and mount units, SSH masked. Build `v0.0.1-spike`. Record size and package list. | The image builds; `/etc/kairos-release` shows our version; the list of kairos-init packages we'd want to purge is written down | 1 d |
+| S2 | Run AuroraBoot on that image to get netboot artefacts **and** an ISO **and** a raw EFI disk from the same digest | Three artefacts from one build, with sizes recorded | 0.5 d |
+| S3 | **Netboot install:** 3 OVMF VMs PXE-boot through AuroraBoot's ProxyDHCP next to the address-only dnsmasq, auto-install with the generic cloud-config, reboot from disk. Then a 4th VM from the ISO (the USB path), and one VM through UEFI HTTP Boot of the ISO. | All VMs reach "bun started, `RB_DATA` mounted as btrfs at `/var/lib/reliaburger`", with no DHCP changes to the "router" | 1 d |
+| S4 | **Cluster and tour:** no claim server exists yet, so stand in for it. Generate the PKI on the lab host (`relish init`), hand node 1 its bundle and nodes 2–3 their join tokens through a **lab-only per-MAC `kairos.config_url`** on the host (documented as *not* the product path). Run `scripts/demo/tour.sh`. Check eBPF attach to the root cgroup, userns containers at uid 2e9, netem, `ss -K`, and the nftables perimeter with `operator_cidrs`. | The tour passes on 3 Kairos nodes; the checks are recorded | 1 d |
+| S5 | **Upgrades:** build `v0.0.2-spike` (a package bump). On one node run the verify-then-`kairos-agent upgrade --source ocifile:` step by hand, reboot, and confirm rejoin with Raft, images and volumes intact. Break a third image on purpose and confirm boot assessment falls back. Swap bun through `binary_dir`, run an OS upgrade on top, and confirm the launcher's no-downgrade rule. | Both cadences work and don't fight; a bad OS image falls back without hands | 1 d |
+| S6 | **Real hardware (optional):** netboot one or two mini PCs from the lab host on a wired LAN with an ordinary router. Record the firmware settings needed (Network Stack, Secure Boot state) and wall-clock time. | At least one physical machine goes from power-on to "bun started" by netboot | 0.5 d |
+| S7 | **Write-up:** a qualification record under `docs/qualification/`, and an update to this section with measured numbers and a go/no-go. Plus the macOS AuroraBoot-binary check once the soak is over. | A decision the maintainer can sign off | 0.5 d |
+
+**Total: about 5–6 engineer-days**, or 4.5–5 without real hardware. Add a day if the maintainer wants the mkosi comparison (§6 track 2) run on the same lab, which would make the go/no-go a like-for-like one.
+
+**Exit criteria.**
+1. One image digest yields the netboot, ISO and raw artefacts.
+2. Three VMs install over PXE next to an unmodified address-only DHCP server, and one installs from the ISO.
+3. The tour passes on the resulting cluster, with bun state on a Btrfs `RB_DATA`.
+4. An OS A/B upgrade and a bun `binary_dir` upgrade both work on the same node, and a broken OS image falls back automatically.
+5. A written list of what `kairos-init` installed that we'd remove, and whether removing it is safe.
+6. A go/no-go: Kairos for the v1 appliance, or back to mkosi.
+
+**Not in the spike:** the claim server, mDNS, `relish machines`, G1, G5, Trusted Boot/UKI, aarch64, AuroraBoot's fleet server.
+
+### 7.8 Recommendation: when to prefer which
+
+- **Prefer Kairos on Ubuntu** when **time to a working bare-metal appliance** matters most, and we accept a heavier image and a second on-box agent. It turns §5's image, installer, A/B and netboot work (Phases 1, 2b and 3, about 8–12 weeks) into roughly the Dockerfile, the data partition and the orchestrator hook. That frees the effort for the parts only we can build: appliance mode, the claim flow, G1 and G5. **Netboot works on day one**, and one image serves netboot and USB. This is the right choice for a v1 appliance and for proving the "five mini PCs in under an hour" story quickly.
+- **Prefer the own mkosi image** (§6) when the **product** matters most: a minimal image with no SSH and nothing we didn't list, verity `/usr`, sysupdate and a UKI we sign, and no dependency on a small upstream whose focus has moved to Hadron and Kubernetes. It's more work up front but less exposure to someone else's roadmap. It stays the **long-term target**.
+- **Prefer Talos** only when the users are **already running Talos** and want Reliaburger next to it, and only once k8s-less mode and host-mode services are GA (re-check in 2027, §2.9). Don't fork it (§2.10).
+
+**My recommendation.** Treat Kairos on Ubuntu as a serious candidate for the *first* appliance release, and decide on the spike's evidence, not on this note:
+- If S1–S5 pass, ship v1 on Kairos, and keep the mkosi recipe as the planned successor once appliance mode and the claim flow are stable.
+- If Ubuntu 26.04 boots poorly under `kairos-init`, or the package set can't be trimmed, fall back to §6.
+
+Most of what the spike builds carries over either way: the Ubuntu package list, the data-partition unit, the launcher, the netboot lab, and the orchestrator's OS-step interface (`kairos-agent upgrade` today, `systemd-sysupdate` later).
+
+**Open questions for the maintainer.**
+1. Is an image that *contains* SSH and a general-purpose package set, masked and trimmed, acceptable for v1? Or is "nothing we didn't list" a hard requirement? If it's hard, Kairos is out.
+2. Is AuroraBoot acceptable as a second, laptop-side tool for v1 netboot? Or must `relish image serve` own netboot from the first release?
+3. Secure Boot: is Ubuntu's signed shim chain, which verifies the kernel but not the rest of the OS, good enough for v1? Or do we need a verified whole-OS boot (Kairos Trusted Boot or an mkosi UKI) from the start?
+4. Ubuntu 26.04 for both the appliance and the quickstart guest (still 24.04 on `main`), as §3.1 decided?
+5. Which Linux KVM host and which physical mini PCs can the spike use, and when is the Mac free after the soak?
+6. Is a lab-only per-MAC `kairos.config_url` acceptable in the spike as the stand-in for the claim flow?
+7. Should the spike include the one-day mkosi comparison?
+
+---
+
 ## Sources
 
 **Talos**
@@ -805,6 +1050,32 @@ That's roughly the Phase 1 scope, and it ships value before A/B. Network boot (P
 - k3s tokens: https://docs.k3s.io/cli/token
 - Tailscale auth keys: https://tailscale.com/kb/1085/auth-keys
 
+**Kairos alternative (§7; all fetched 27 Sep 2026)**
+- Docs source, used instead of the rendered site because it's current and unambiguous: https://github.com/kairos-io/kairos-docs (paths below are under `docs/`, `blog/` or `quickstart/` on `main`)
+- Network booting and in-RAM mode: https://kairos.io/docs/installation/netboot/ (`docs/installation/netboot.md`)
+- AuroraBoot reference (ProxyDHCP prerequisites, macOS, `build-iso`, `netboot`, `start-pixie`, raw disks, UKI over HTTP Boot): https://kairos.io/docs/reference/auroraboot/ (`docs/reference/auroraboot.md`)
+- Configuration reference (`install`, `partitions`, `extra-partitions`, `bind_mounts`, `ssh_hardening`, `p2p`, kcrypt fields): https://kairos.io/docs/reference/configuration/ (`docs/reference/configuration.md`)
+- Immutability and default persistent paths: https://kairos.io/docs/architecture/immutable/ (`docs/architecture/immutable.md`)
+- Extra persistent paths after install: https://kairos.io/docs/examples/extra_persistent_paths_after_install/
+- Manual upgrades (`kairos-agent upgrade --source oci:|ocifile:|dir:|file:`, `--recovery`): https://kairos.io/docs/upgrade/manual/ (`docs/upgrade/manual.md`)
+- Boot assessment: https://kairos.io/docs/upgrade/boot_assessment/ and its tracking issue, closed as completed on 27 Nov 2024: https://github.com/kairos-io/kairos/issues/2864
+- Trusted Boot architecture (USI, keys, TPM2): https://kairos.io/docs/architecture/trustedboot/
+- P2P (experimental): https://kairos.io/docs/installation/p2p/
+- Image support matrix (Hadron-only prebuilt artefacts, legacy flavours not updated): https://kairos.io/docs/reference/image_matrix/
+- Kairos factory and `kairos-init` flags: https://kairos.io/docs/reference/kairos-factory/
+- Extending the system with a Dockerfile: https://kairos.io/quickstart/extending-the-system-dockerfile/
+- "Hadron-Only Artifacts with Ongoing Distro Support" (25 Feb 2026): https://kairos.io/blog/2026/02/25/kairos-v4-hadron-artifacts-and-distro-flexibility
+- "Kairos v4.1.0: From Image Build to Managed Nodes with AuroraBoot" (15 May 2026; Ubuntu 26.04 in `kairos-init`, AuroraBoot fleet server): https://kairos.io/blog/2026/05/15/kairos-v4-1-0-hadron-ubuntu-boot-install-foundations
+- Releases: https://github.com/kairos-io/kairos/releases (v4.3.0, 8 Sep 2026) and https://github.com/kairos-io/AuroraBoot/releases (v0.27.1, 11 Sep 2026)
+- CI matrices (checked myself): https://github.com/kairos-io/kairos/blob/master/.github/workflows/_build-flavors.yaml, https://github.com/kairos-io/kairos/blob/master/.github/workflows/master.yaml and https://github.com/kairos-io/kairos/blob/master/.github/workflows/release.yaml
+- `kairos-init` package map (kernel per Ubuntu release, shim and GRUB, the Debian-family base package set; checked myself): https://github.com/kairos-io/kairos/blob/master/kairos-init/pkg/values/packagemaps.go
+- Partitioner filesystems (no Btrfs; checked myself): https://github.com/kairos-io/kairos/blob/master/agent/pkg/partitioner/mkfs.go
+- Licences, stars and commit authors: the GitHub API for `kairos-io/kairos`, `kairos-io/AuroraBoot` and `kairos-io/hadron`
+- CNCF project page: https://www.cncf.io/projects/kairos/ and Sandbox issue https://github.com/cncf/sandbox/issues/52
+- Spectro Cloud and Hadron: https://www.spectrocloud.com/news/announcing-hadron-a-lightweight-security-first-linux-distribution
+- iPXE bootstrap ISO for machines without PXE: https://github.com/kairos-io/ipxe-dhcp/releases
+- Reliaburger `main` at `0eb6071d`: `docs/linux-servers.md` (unit file, `operator_cidrs`, master-key copy over SSH, `binary_dir` upgrades) and `scripts/release/guest-images.json` (still Ubuntu 24.04)
+
 **Still [unverified]**
 - Talos runc path and `iptables` backend.
 - Whether owners survive a restart under the host-mode runner on a real node.
@@ -818,4 +1089,5 @@ That's roughly the Phase 1 scope, and it ships value before A/B. Network boot (P
 - Whether consumer AMI/Insyde firmware honours ProxyDHCP offers for UEFI HTTP Boot.
 - That a non-root process on macOS can bind UDP 67/69/4011 on the wildcard address.
 - The exact Secure Boot hand-over from Microsoft-signed iPXE to our UKI.
+- Kairos on Ubuntu 26.04 booting, installing and upgrading (upstream only build-tests it), and everything else listed in §7.6.
 - That the perimeter blocks a LAN laptop in practice (derived from `src/firewall/rules.rs` and `src/bun/agent.rs`, not tested on hardware).
