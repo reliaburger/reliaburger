@@ -1418,12 +1418,14 @@ impl BunClient {
     }
 
     /// Restore a snapshot over its live volume. The app must be
-    /// stopped first; a 409 means it isn't.
+    /// stopped first; a 409 means it isn't, or that several volumes
+    /// share the name and `volume` must pick one.
     pub async fn snapshot_restore(
         &self,
         app: &str,
         namespace: &str,
         name: &str,
+        volume: Option<&str>,
     ) -> Result<(), RelishError> {
         let url = format!(
             "{}/v1/snapshots/{}/{}/restore",
@@ -1432,7 +1434,7 @@ impl BunClient {
         let response = self
             .http()?
             .post(&url)
-            .json(&serde_json::json!({ "name": name }))
+            .json(&serde_json::json!({ "name": name, "volume": volume }))
             .send()
             .await
             .map_err(classify_error)?;
@@ -1445,23 +1447,24 @@ impl BunClient {
         Ok(())
     }
 
-    /// Delete a snapshot.
+    /// Delete a snapshot. `volume` picks between volumes that share
+    /// the name.
     pub async fn snapshot_delete(
         &self,
         app: &str,
         namespace: &str,
         name: &str,
+        volume: Option<&str>,
     ) -> Result<(), RelishError> {
         let url = format!(
             "{}/v1/snapshots/{}/{}/{}",
             self.base_url, namespace, app, name
         );
-        let response = self
-            .http()?
-            .delete(&url)
-            .send()
-            .await
-            .map_err(classify_error)?;
+        let mut request = self.http()?.delete(&url);
+        if let Some(volume) = volume {
+            request = request.query(&[("volume", volume)]);
+        }
+        let response = request.send().await.map_err(classify_error)?;
 
         let status = response.status().as_u16();
         if !response.status().is_success() {

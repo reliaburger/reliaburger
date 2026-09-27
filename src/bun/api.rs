@@ -5862,20 +5862,33 @@ struct SnapshotCreateBody {
 #[derive(serde::Deserialize)]
 struct SnapshotRestoreBody {
     name: String,
+    /// Container mount path; required when several volumes share the name.
+    volume: Option<String>,
 }
 
-/// Map snapshot failures to honest status codes: a running app is a
-/// conflict, missing things are 404, a non-btrfs volume is the
-/// client's setup problem, anything else is ours.
+#[derive(serde::Deserialize)]
+struct SnapshotDeleteQuery {
+    /// Container mount path; required when several volumes share the name.
+    volume: Option<String>,
+}
+
+/// Map snapshot failures to honest status codes: a running app or an
+/// ambiguous name is a conflict, missing things are 404, a non-btrfs
+/// volume or an out-of-scope input is the client's problem, anything
+/// else is ours.
 fn snapshot_error_response(error: &crate::bun::BunError) -> Response {
     use crate::grill::snapshot::SnapshotError;
     let status = match error {
-        crate::bun::BunError::Snapshot(SnapshotError::AppRunning { .. }) => StatusCode::CONFLICT,
+        crate::bun::BunError::Snapshot(
+            SnapshotError::AppRunning { .. } | SnapshotError::Ambiguous { .. },
+        ) => StatusCode::CONFLICT,
         crate::bun::BunError::Snapshot(
             SnapshotError::NotFound { .. } | SnapshotError::NoVolumes { .. },
         ) => StatusCode::NOT_FOUND,
         crate::bun::BunError::Snapshot(
-            SnapshotError::UnsupportedFilesystem { .. } | SnapshotError::TestStorage,
+            SnapshotError::UnsupportedFilesystem { .. }
+            | SnapshotError::TestStorage
+            | SnapshotError::InvalidInput(_),
         ) => StatusCode::BAD_REQUEST,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
@@ -5955,6 +5968,7 @@ async fn snapshot_restore_handler(
         namespace,
         app_name: app,
         name: body.name,
+        volume: body.volume,
         response,
     })
     .await
@@ -5969,6 +5983,7 @@ async fn snapshot_delete_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
     Path((namespace, app, name)): Path<(String, String, String)>,
+    Query(query): Query<SnapshotDeleteQuery>,
 ) -> Response {
     if let Err(resp) =
         crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::Deployer)
@@ -5982,6 +5997,7 @@ async fn snapshot_delete_handler(
         namespace,
         app_name: app,
         name,
+        volume: query.volume,
         response,
     })
     .await
@@ -14329,6 +14345,146 @@ schedule = "* * * * *"
             setup_with_role("auth2-snap", crate::sesame::types::ApiRole::ReadOnly).await;
         let status = post_status(app, "/v1/snapshots/default/web", &tok, "{}").await;
         assert_eq!(status, StatusCode::FORBIDDEN);
+        shutdown.cancel();
+    }
+
+    /// B01: a Deployer scoped to `a/web` passes the route's scope check,
+    /// so the snapshot inputs themselves must not reach outside `a/web`.
+    /// A traversal volume used to snapshot `b/db`'s volume, and an
+    /// absolute or `..` name placed a root-owned subvolume anywhere.
+    #[tokio::test]
+    async fn scoped_deployer_cannot_escape_its_app_through_snapshot_inputs() {
+        let volumes_dir = tempfile::tempdir().unwrap();
+        let volumes = crate::grill::volume::VolumeManager::new(volumes_dir.path());
+        for (namespace, app) in [("a", "web"), ("b", "db")] {
+            volumes
+                .create_managed_volume(namespace, app, std::path::Path::new("/data"), None)
+                .unwrap();
+        }
+        let tree = |root: &std::path::Path| {
+            let mut out = Vec::new();
+            let mut stack = vec![root.to_path_buf()];
+            while let Some(dir) = stack.pop() {
+                for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                    if entry.file_type().unwrap().is_dir() {
+                        stack.push(entry.path());
+                    }
+                    out.push(entry.path());
+                }
+            }
+            out.sort();
+            out
+        };
+        let before = tree(volumes_dir.path());
+
+        let (cmd_tx, cmd_rx) = mpsc::channel(32);
+        let shutdown = CancellationToken::new();
+        let mut agent = BunAgent::new(
+            MockGrill::new(),
+            PortAllocator::new(30000, 31000),
+            cmd_rx,
+            shutdown.clone(),
+        );
+        agent.set_volumes_dir(volumes_dir.path().to_path_buf());
+        tokio::spawn(async move {
+            agent.run().await;
+        });
+        let scope = crate::sesame::types::TokenScope {
+            apps: Some(vec!["web".to_string()]),
+            namespaces: Some(vec!["a".to_string()]),
+        };
+        let created = crate::sesame::token::create_token(
+            "a-web",
+            crate::sesame::types::ApiRole::Deployer,
+            scope,
+            None,
+        )
+        .unwrap();
+        let store = crate::sesame::auth::new_token_store();
+        store.write().await.push(created.token);
+        let app = router(
+            cmd_tx,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(store),
+            None,
+            None,
+            None,
+            None,
+            9117,
+            None,
+        );
+        let tok = created.plaintext;
+
+        // Refused as invalid input: on a non-btrfs tempdir a merely
+        // "unsupported filesystem" 400 would hide that validation never ran.
+        let send = |method: &'static str, uri: &'static str, body: String| {
+            let request = axum::http::Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("authorization", format!("Bearer {tok}"))
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap();
+            let app = app.clone();
+            async move {
+                let response = app.oneshot(request).await.unwrap();
+                let status = response.status();
+                let bytes = response.into_body().collect().await.unwrap().to_bytes();
+                (status, String::from_utf8_lossy(&bytes).into_owned())
+            }
+        };
+        let refused = |(status, body): (StatusCode, String), what: &str| {
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{what}: {body}");
+            assert!(
+                body.contains("invalid snapshot request"),
+                "{what} was not refused as invalid input: {body}"
+            );
+        };
+
+        for body in [
+            serde_json::json!({ "volume": "/../../b/db/data" }),
+            serde_json::json!({ "volume": "../../b/db/data" }),
+            serde_json::json!({ "name": "/abs/path" }),
+            serde_json::json!({ "name": "../../../../tmp/owned" }),
+            serde_json::json!({ "name": "a/b" }),
+            serde_json::json!({ "volume": "/data", "name": ".." }),
+        ] {
+            let what = format!("create {body}");
+            refused(
+                send("POST", "/v1/snapshots/a/web", body.to_string()).await,
+                &what,
+            );
+        }
+        for body in [
+            serde_json::json!({ "name": "../../../b/db/data/x" }),
+            serde_json::json!({ "name": "1", "volume": "/../../b/db/data" }),
+        ] {
+            let what = format!("restore {body}");
+            refused(
+                send("POST", "/v1/snapshots/a/web/restore", body.to_string()).await,
+                &what,
+            );
+        }
+        refused(
+            send(
+                "DELETE",
+                "/v1/snapshots/a/web/1?volume=/../../b/db/data",
+                String::new(),
+            )
+            .await,
+            "delete",
+        );
+
+        assert_eq!(
+            tree(volumes_dir.path()),
+            before,
+            "a refused request touched the volumes directory"
+        );
         shutdown.cancel();
     }
 

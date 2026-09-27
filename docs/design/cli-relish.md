@@ -698,8 +698,8 @@ relish join-token create --node-id <id> [--ttl 15m]   # One single-use node-enro
 # Volume snapshots (Btrfs-backed)
 relish snapshot create <app> [--volume <path>] [--name <name>] [-n <ns>]
 relish snapshot list <app> [-n <ns>]
-relish snapshot restore <app> <name> [-n <ns>]
-relish snapshot delete <app> <name> [-n <ns>]
+relish snapshot restore <app> <name> [--volume <path>] [-n <ns>]
+relish snapshot delete <app> <name> [--volume <path>] [-n <ns>]
 
 # Image registry (Pickle)
 relish images                       # List images in the local registry
