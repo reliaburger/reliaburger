@@ -195,6 +195,8 @@ this).
       to the first `/order` reply. Keep the "five-minute" name for now;
       rename it if the tour takes longer than five minutes.
 
+CI for steps 9–11 is green with `full-ci` on 54bba46e.
+
 Note: 0.1.0 lists "multi-platform images in the built-in registry aren't
 supported yet" as a known limitation (release-docs PR, not this one). The
 multi-arch pull fix here ships after 0.1.0.
