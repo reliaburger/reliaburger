@@ -993,7 +993,13 @@ mod tests {
     async fn stop_terminates_shell_descendants() {
         let dir = tempfile::tempdir().unwrap();
         let pid_file = dir.path().join("child.pid");
-        let script = format!("sleep 60 & echo $! > {}; wait", pid_file.display());
+        // Write the pid beside the file and rename it into place: `>` creates
+        // the file before `echo` fills it, and the poll below could read it
+        // empty in between.
+        let script = format!(
+            "sleep 60 & echo $! > {path}.tmp && mv {path}.tmp {path}; wait",
+            path = pid_file.display()
+        );
         let grill = ProcessGrill::new();
         let id = InstanceId("process-tree-0".to_string());
 
@@ -1008,8 +1014,11 @@ mod tests {
 
         let descendant_pid = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
-                if let Ok(contents) = std::fs::read_to_string(&pid_file) {
-                    break contents.trim().parse::<u32>().unwrap();
+                if let Ok(pid) = std::fs::read_to_string(&pid_file)
+                    .map_err(|_| ())
+                    .and_then(|contents| contents.trim().parse::<u32>().map_err(|_| ()))
+                {
+                    break pid;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
