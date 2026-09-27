@@ -14,7 +14,7 @@ use openraft::storage::LogState;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::config::app::AppSpec;
-use crate::meat::types::{AppId, Placement, SchedulingDecision};
+use crate::meat::types::{AppId, NodeId, Placement, SchedulingDecision};
 use crate::pickle::types::{
     AttachSignature, DeleteTag, GcReport, ManifestCatalog, ManifestCommit, UpdateLayerLocations,
 };
@@ -407,6 +407,15 @@ pub struct DesiredState {
     /// next apply of the app clears them.
     #[serde(default)]
     pub stopped_apps: std::collections::BTreeSet<AppId>,
+    /// The nodes each app's replicas were last placed on, kept after a stop
+    /// empties its placements. A managed volume lives on its node, so an app
+    /// that starts again goes back to where its data is.
+    #[serde(
+        default,
+        serialize_with = "map_as_vec::serialize",
+        deserialize_with = "map_as_vec::deserialize"
+    )]
+    pub last_placed_nodes: HashMap<AppId, Vec<NodeId>>,
     /// GitOps sync state.
     pub gitops_sync_state: Option<crate::lettuce::types::SyncState>,
     /// GitOps coordinator election.

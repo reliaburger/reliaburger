@@ -2710,6 +2710,12 @@ waited for could have been the old one (the replacement reuses its id), so
 the marker check would have passed without a restart at all. It now waits
 until every instance is `stopped` or `failed` before redeploying.
 
+With the exec going to the right node, the next candidate's fast tier failed
+the restart case for real: the marker was gone. The case was right and the
+product was wrong. A stopped app forgot which node held its volume, so the
+redeploy could start it on another node with an empty one. Chapter 7 has the
+fix.
+
 ## Walk the path you actually care about
 
 Say `web` can't reach `redis`. Checking Bun's own DNS and TCP access might tell

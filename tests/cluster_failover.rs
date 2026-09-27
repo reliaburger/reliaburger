@@ -150,6 +150,7 @@ async fn start_node_for_test(
         service_identity: Some(RETIREMENT_SERVICE_TOKEN.into()),
         operator_token: operator,
         fault_injection: false,
+        labels: Default::default(),
     })
     .await
 }

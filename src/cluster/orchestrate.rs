@@ -670,7 +670,7 @@ fn plan_scheduling_pass_with_dns(
         // places the rest. Losing one node of three must not move the
         // replicas on the other two: they're serving, and replacing them
         // would restart them for nothing.
-        let kept: Vec<crate::meat::types::Placement> = match effective_spec.replicas {
+        let mut kept: Vec<crate::meat::types::Placement> = match effective_spec.replicas {
             Replicas::Fixed(_) => desired
                 .scheduling
                 .get(app_id)
@@ -685,6 +685,25 @@ fn plan_scheduling_pass_with_dns(
                 .unwrap_or_default(),
             Replicas::DaemonSet => Vec::new(),
         };
+        // An app with no placement left (it was stopped, or is starting
+        // again) goes back to the nodes that hold its managed volumes.
+        if kept.is_empty() && matches!(effective_spec.replicas, Replicas::Fixed(_)) {
+            let home = VolumeHome {
+                cache,
+                alive,
+                unheard,
+                dns_required,
+            };
+            match home.reserve(app_id, spec, desired.last_placed_nodes.get(app_id), want) {
+                HomeOutcome::Placed(placements) => kept = placements,
+                HomeOutcome::Busy(node) => {
+                    eprintln!(
+                        "scheduler: {app_id} waits for room on {node}, which holds its volumes"
+                    );
+                    continue;
+                }
+            }
+        }
         if !kept.is_empty() {
             let missing = want - kept.len();
             if missing == 0 {
@@ -723,6 +742,91 @@ fn plan_scheduling_pass_with_dns(
         }
     }
     decisions
+}
+
+/// What returning an app to the nodes that hold its volumes came to.
+enum HomeOutcome {
+    /// Replicas reserved on their volumes' nodes; empty when the app has no
+    /// managed volume or none of its nodes can run it any more, so the
+    /// scheduler places it freely.
+    Placed(Vec<crate::meat::types::Placement>),
+    /// A node holding the app's volumes could run it but has no room yet (or
+    /// hasn't reported). Placing it elsewhere would start it on an empty
+    /// volume, so it waits.
+    Busy(NodeId),
+}
+
+/// The leader's view of the nodes a returning app's volumes live on.
+struct VolumeHome<'a> {
+    cache: &'a mut ClusterStateCache,
+    alive: &'a HashSet<NodeId>,
+    unheard: &'a HashSet<NodeId>,
+    dns_required: bool,
+}
+
+impl VolumeHome<'_> {
+    /// Reserve up to `want` replicas of `app_id` on the nodes it last ran on,
+    /// if it has a managed volume.
+    ///
+    /// A node that is gone, not ready, or no longer matches the app's
+    /// required labels is dropped: that's the documented loss of a local
+    /// volume with its node, or the operator moving the app on purpose.
+    fn reserve(
+        self,
+        app_id: &crate::meat::types::AppId,
+        spec: &AppSpec,
+        last_nodes: Option<&Vec<NodeId>>,
+        want: usize,
+    ) -> HomeOutcome {
+        let has_managed_volume = spec.volumes.iter().any(|volume| volume.source.is_none());
+        let Some(last_nodes) = last_nodes.filter(|_| has_managed_volume) else {
+            return HomeOutcome::Placed(Vec::new());
+        };
+        let resources = scheduler_resources(spec);
+        let required = spec
+            .placement
+            .as_ref()
+            .map(|p| crate::meat::scheduler::parse_label_list(&p.required))
+            .unwrap_or_default();
+        let mut homes = Vec::new();
+        for node_id in last_nodes.iter().take(want) {
+            let placement = crate::meat::types::Placement {
+                node_id: node_id.clone(),
+                resources,
+            };
+            let holds = placement_holds(
+                &placement,
+                spec,
+                self.cache,
+                self.alive,
+                self.unheard,
+                self.dns_required,
+            );
+            if !holds {
+                continue;
+            }
+            let reported = self
+                .cache
+                .get_node(node_id)
+                .filter(|_| !self.unheard.contains(node_id));
+            let Some(node) = reported else {
+                return HomeOutcome::Busy(node_id.clone());
+            };
+            if !node.matches_labels(&required) {
+                continue;
+            }
+            if !node.can_fit(&resources) {
+                return HomeOutcome::Busy(node_id.clone());
+            }
+            homes.push(placement);
+        }
+        // Reserve only once every home is known to fit, so a wait leaves
+        // no phantom reservation behind for the rest of the pass.
+        for placement in &homes {
+            self.cache.reserve(&placement.node_id, app_id, &resources);
+        }
+        HomeOutcome::Placed(homes)
+    }
 }
 
 /// Whether an existing placement can stay where it is: its node is alive and
@@ -3482,6 +3586,96 @@ image = "busybox:latest"
 
         assert_eq!(decisions.len(), 1);
         assert!(nodes_of(&decisions[0]).is_empty(), "{decisions:?}");
+    }
+
+    fn app_with_volume(cpu_request: u64) -> AppSpec {
+        let mut spec = app_spec(cpu_request, 1);
+        spec.volumes.push(crate::config::types::VolumeSpec {
+            path: "/data".into(),
+            source: None,
+            size: None,
+        });
+        spec
+    }
+
+    /// Two nodes where the scheduler, left to itself, prefers `busy`: it
+    /// bin-packs onto the fuller node. The volume app last ran on `home`.
+    fn stopped_and_applied_again(spec: AppSpec) -> (DesiredState, ClusterStateCache) {
+        let app = AppId::new("db", "default");
+        let mut desired = DesiredState::default();
+        desired.apps.insert(app.clone(), spec);
+        // `relish stop` committed an empty decision, then `apply` cleared
+        // the stop mark.
+        desired.scheduling.insert(app.clone(), Vec::new());
+        desired
+            .last_placed_nodes
+            .insert(app, vec![NodeId::new("home")]);
+        let mut cache = ClusterStateCache::new();
+        let mut busy = sched_node("busy", 4000, BTreeMap::new());
+        busy.allocated = Resources::new(3000, 0, 0);
+        cache.set_node(busy);
+        cache.set_node(sched_node("home", 4000, BTreeMap::new()));
+        (desired, cache)
+    }
+
+    /// V02 soak on 9e6a6b6: a marker written into `vol-persist`'s managed
+    /// volume was gone after `relish stop` and `apply`. The stop cleared the
+    /// app's placements, so the redeploy went wherever the scheduler liked,
+    /// onto a node with a new, empty volume. The data was still on the old
+    /// node.
+    #[test]
+    fn a_volume_app_comes_back_on_the_node_that_holds_its_volume() {
+        let (desired, mut cache) = stopped_and_applied_again(app_with_volume(100));
+        let alive = HashSet::from([NodeId::new("busy"), NodeId::new("home")]);
+
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+
+        assert_eq!(decisions.len(), 1, "{decisions:?}");
+        assert_eq!(nodes_of(&decisions[0]), ["home"]);
+    }
+
+    /// Placing it elsewhere would hand it an empty volume, so an app whose
+    /// home is alive but full waits for room there instead.
+    #[test]
+    fn a_volume_app_waits_for_room_on_the_node_that_holds_its_volume() {
+        let (desired, mut cache) = stopped_and_applied_again(app_with_volume(100));
+        let mut full = sched_node("home", 4000, BTreeMap::new());
+        full.allocated = Resources::new(4000, 0, 0);
+        cache.set_node(full);
+        let alive = HashSet::from([NodeId::new("busy"), NodeId::new("home")]);
+
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+
+        assert!(decisions.is_empty(), "{decisions:?}");
+    }
+
+    /// A dead home is the documented case of a local volume being lost with
+    /// its node: the app starts elsewhere rather than not at all.
+    #[test]
+    fn a_volume_app_whose_node_is_gone_is_placed_elsewhere() {
+        let (desired, mut cache) = stopped_and_applied_again(app_with_volume(100));
+        let alive = HashSet::from([NodeId::new("busy")]);
+
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+
+        assert_eq!(decisions.len(), 1, "{decisions:?}");
+        assert_eq!(nodes_of(&decisions[0]), ["busy"]);
+    }
+
+    /// Without a managed volume there's nothing to go back for.
+    #[test]
+    fn an_app_without_a_volume_is_placed_by_score_after_a_stop() {
+        let (desired, mut cache) = stopped_and_applied_again(app_spec(100, 1));
+        let alive = HashSet::from([NodeId::new("busy"), NodeId::new("home")]);
+
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+
+        assert_eq!(decisions.len(), 1, "{decisions:?}");
+        assert_eq!(nodes_of(&decisions[0]), ["busy"]);
     }
 
     /// #211 made `relish stop` keep the spec; the app's ingress route must
