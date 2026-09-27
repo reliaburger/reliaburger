@@ -1,41 +1,42 @@
-# Reliaburger as the OS: Talos, alternatives, and a five-mini-PC join flow
+# Reliaburger as the OS: an mkosi appliance on Ubuntu, netboot from relish, and bare-metal joins
 
 *Research note, 26 September 2026. The repo facts come from reading `main` at `0a5dfc6`. External facts come from primary sources fetched today; the URLs are in the Sources section. **[unverified]** marks a claim nobody has tested or confirmed from a primary source. **[inference]** marks my own reading of code or docs.*
 
 *Revised the same day with four follow-up questions: forking Talos (§2.10), Ubuntu versus Debian as the mkosi base (§3.1), whether mkosi ties us to the distro kernel (§3.2), and network boot shipped by us (§4.7).*
 
-*Extended on 27 September 2026 with a separate alternative recommendation (§7): Kairos on Ubuntu 26.04, with netboot as the unified spike. §0–§6 are unchanged; §7 stands beside them and its spike awaits maintainer approval.*
+*Decided on 27 September 2026: the maintainer chose the own mkosi image on Ubuntu with netboot built into `relish`. §0, §5 and §6 are rewritten for that decision. §7 (weekly builds and OS updates), §8 (iterating in VMs on a Mac) and §9 (the Dell Wyse 3040 final stage) are new. The Kairos alternative written earlier the same day is condensed into §10.1, and Talos is parked (§2, §10.2).*
 
 ---
 
 ## 0. Summary
 
-- **Talos can now host `bun`, but it's the wrong base for our appliance.**
-  - Talos v1.14.0 (3 Sep 2026) added the two things we'd need:
-    - an **experimental Kubernetes-less, etcd-less mode**;
-    - **host-mode extension services** (`runnerMode: host`), which run in the root namespaces and signal only the main PID when they stop.
-  - The costs:
-    - The k8s-less mode is experimental, and upstream says "only controlplane mode will be supported/tested".
-    - The rootfs is musl-based and has no `ip`, `tc`, `ss`, `mount`, `fallocate` or `losetup`.
-    - User namespaces are off by default (`user.max_user_namespaces=0`).
-    - A custom extension can't come from the public Image Factory, so we'd run our own `imager` pipeline anyway.
-    - The operator would manage two APIs and two PKIs: `talosctl` plus machine secrets, and `relish` plus the cluster CA.
-    - Sidero announced its own "beyond Kubernetes" container scheduling for December 2026.
-- **Don't fork Talos either** (§2.10). A fork would keep the parts we'd most like to replace (apid, the Talos PKI, machine config), and it would saddle us with a musl toolchain, bldr and a kernel that upstream bumps about three times a month. Upstream's own core is about 4–5 people. Sidero is now building Kubernetes-less edge containers itself, so a fork would chase a moving target that also competes with us.
-- **Recommendation: build our own appliance image** with **mkosi** (UKI, verity `/usr`, `systemd-repart`, `systemd-sysupdate` A/B). This is the design Incus OS ships.
-  - **Base: Ubuntu 26.04 LTS, not Debian 13** (changed in this revision, §3.1). Ubuntu gives us a supported runc 1.4 in `main` (trixie's runc is the EOL 1.1 line with an open CVE), Linux 7.0, standard support to May 2031, a kernel update roughly every week, and the same distro as the quickstart guest image. Debian stays a close second, and the mkosi recipe should keep it buildable.
-  - **Kernel: ride the distro's** (§3.2). mkosi doesn't tie us to it, but every kernel option bun needs is already on in both distros' stock configs, and owning a kernel means owning ~5,500 CVEs a year.
-  - **Fallback:** a Kairos "core" image via `kairos-init` if we want A/B ISO/PXE with the least tooling of our own.
-  - **Later:** offer Talos as a "bring your own Talos" system extension once k8s-less mode leaves experimental.
-- **Network boot is a first-class install path** (§4.7). `relish image serve` runs a ProxyDHCP, TFTP and HTTP boot server on the operator's laptop, or on the first installed node, so the other machines install with no USB stick. It coexists with the home router's DHCP. USB stays the fallback.
-- **Four repo gaps block unattended bare-metal joins, whatever OS we pick:**
-  1. **Every node needs the 32-byte `master.key`, and nothing delivers it except out-of-band copying.** The quickstart copies it with `limactl`. Its derived service token is Admin-equivalent for everything except user-management routes. I found no master-key rotation.
-  2. **The perimeter firewall drops the management port (9117) and cluster ports** from anything that isn't a member, loopback, or an exact `bootstrap_peers` IP. `PerimeterConfig.admin_cidrs` exists but isn't wired to node config. So a DHCP joiner, or the operator's laptop on the LAN, can't reach the join API today (from the code; not tested on a LAN).
-  3. **`advertise_address` falls back to `127.0.0.1`, and node names default to `node-<gossip_port>`.** An appliance needs both detected automatically.
-  4. **Join tokens are single-use, node-bound and at most 1 h.** They're good primitives, but a "fleet stick" needs something on top.
-- **Recommended join flow: "claim over the LAN".** Machines boot a generic signed image, show an "unclaimed" screen and announce themselves over mDNS. The operator runs `relish machines claim`, which pushes each machine an existing single-use, node-bound join token and the pinned CA fingerprint over TLS. No secrets ever live on a USB stick or go out over network boot. A seed-file mode (`relish image create`) covers headless installs.
-- **Alternative (§7, added 27 Sep): Kairos on Ubuntu 26.04, netboot first.** Build the appliance `FROM ubuntu:26.04` with `kairos-init`; AuroraBoot turns the one OCI image into netboot artefacts, a USB ISO and a raw disk, and its ProxyDHCP netboots machines next to the home router. Kairos brings the installer, A/B plus recovery, boot assessment and the netboot server; we'd trade away a minimal image (it installs SSH and a general-purpose package set) and depend on a small upstream that now publishes only Hadron artefacts and build-tests, but doesn't boot-test, Ubuntu 26.04. §7.8 says when to prefer it over mkosi or Talos. Its ~5-day unified spike (§7.7) **awaits maintainer approval**.
-- **First spike (about 4 days):** boot the mkosi Ubuntu 26.04 image and a Talos 1.14 k8s-less image with a host-mode `bun` extension side by side in QEMU, and run the existing tour on each. Then network-boot the mkosi UKI through a ProxyDHCP next to an ordinary DHCP server (details in §6).
+**Decision (maintainer, 27 Sep 2026):** build our own appliance image with mkosi on Ubuntu, and put the netboot server inside `relish`. Kairos was considered and not chosen (§10.1). Talos is parked, to revisit later (§10.2).
+
+- **The image: our own mkosi build on Ubuntu 26.04 LTS** (§3.1), riding **Ubuntu's generic kernel**, which Canonical patches (§3.2). `bun` is the only service. There's no SSH and no package manager, and the image carries only the packages we list (the same list as the quickstart guest).
+  - We sign the UKI and never build or sign kernels.
+  - We build both x86_64 (the real hardware) and aarch64 (fast VMs on Apple silicon).
+- **Netboot lives in `relish`** (`relish image serve`, §4.7):
+  - a ProxyDHCP answer next to the home router's DHCP;
+  - TFTP for a pinned iPXE, and HTTP for iPXE chains and UEFI HTTP Boot;
+  - it serves only our signed release artefacts, from the laptop or from the first installed node.
+
+  USB stays the fallback.
+- **Weekly builds** (§7): GitHub Actions rebuilds the appliance weekly, and on demand, with the latest Canonical kernel and packages.
+  - Outputs per architecture: a UKI, a verity `/usr` image, an installer UKI for netboot, an ISO and a raw disk.
+  - Everything is signed with Ed25519 and published as its own release channel.
+  - Nodes never update themselves. The cluster pins a target OS version, and bun's orchestrator rolls it out with **`systemd-sysupdate` A/B slots and systemd-boot boot counting**. If the new version doesn't come back healthy, the node falls back to the old slot on its own.
+- **Iterate in VMs on a Mac, then test on real hardware** (§8, §9).
+  - The maintainer has no KVM box, so iteration uses raw QEMU on the second Mac: aarch64 guests at native speed under HVF, plus an x86_64 smoke run under TCG emulation.
+  - Clients netboot over a shared L2 network (socket_vmnet), with the netboot server in a small Lima VM.
+  - The final stage is **ten Dell Wyse 3040 thin clients**: 2 GB RAM, 8 or 16 GB eMMC, UEFI PXE only. 2 GB is enough for bun plus a few small workloads, but only just. The image and the retention settings need an appliance profile.
+- **Join flow: claim over the LAN** (§4.2 d). Seed mode on USB covers headless installs. Network boot never serves secrets.
+- **Repo gaps that still block unattended joins** (§4.3):
+  - G1: `master.key` is copied by hand;
+  - G2: the time-boxed join window. The static half landed on `main` as `[security] operator_cidrs`;
+  - G3/G4: address and name detection;
+  - G5: no master-key rotation;
+  - G6: no token list or revoke.
+- **Spike:** about 9–11 engineer-days in five stages, the last on the Wyse 3040s. It's in [`2026-09-27-plan-appliance-spike.md`](2026-09-27-plan-appliance-spike.md). It **awaits maintainer approval**, and it needs the second Mac.
 
 ---
 
@@ -63,6 +64,8 @@
 ---
 
 ## 2. How it could work with Talos
+
+*Background, not pursued (maintainer decision, 27 Sep 2026): Talos is parked, to revisit later (§10.2). This section is kept as the research record; its spike and plan items are gone.*
 
 ### 2.1 What Talos is today
 
@@ -264,6 +267,7 @@ Legend: ✅ good, ⚠️ workable with effort, ❌ poor.
 - **Ubuntu autoinstall** is the cheapest way to *prove the join UX*.
 - **Kairos core** is the cheapest way to get *A/B plus ISO/PXE*.
 - **Own mkosi image** is the best *long-term product*: full control, no second API, and a published precedent in Incus OS. Incus OS uses Debian 13, mkosi, UKI plus Secure Boot, sysupdate A/B, the payload as a sysext, a daemon-only API with no shell, and a `SEED_DATA` seed partition.
+- **Decision (27 Sep 2026): own mkosi image on Ubuntu 26.04.** Kairos was evaluated in depth and not chosen (§10.1).
 - A **Talos fork** isn't in the table because §2.10 rules it out: it would score like Talos on fit and tooling, but with XL effort and the kernel CVE feed on us.
 
 ### 3.1 Which distro under mkosi: Ubuntu 26.04 or Debian 13?
@@ -401,7 +405,7 @@ Every row passes, so no. `INET_DIAG_DESTROY` is the one kernels do sometimes lac
 | # | Gap | Fix |
 |---|---|---|
 | G1 | `master.key` has to be copied by hand to every node | After a successful join, the joiner fetches the key over the CA-pinned, **node-cert-authenticated** mTLS connection. Either add an endpoint such as `GET /v1/cluster/master-key` (System route, node identity required, audited) or extend `JoinBundle`. Optionally seal it to the CSR's P-256 key with HPKE for defence in depth. |
-| G2 | The perimeter drops 9117 for the laptop and for DHCP joiners | Wire `admin_cidrs` into `[security]` or `[firewall]` config. Add a **time-boxed `join_window` CIDR** (for example the LAN /24 for 60 minutes after `relish machines claim`) that opens only 9117. That exposes `/v1/cluster/ca` and `/v1/cluster/join`, which are token-gated anyway. |
+| G2 | The perimeter drops 9117 for the laptop and for DHCP joiners. *(27 Sep: the static half landed on `main` as `[security] operator_cidrs`, API port only; the time-boxed join window is still open.)* | Wire `admin_cidrs` into `[security]` or `[firewall]` config. Add a **time-boxed `join_window` CIDR** (for example the LAN /24 for 60 minutes after `relish machines claim`) that opens only 9117. That exposes `/v1/cluster/ca` and `/v1/cluster/join`, which are token-gated anyway. |
 | G3 | `advertise_address` defaults to 127.0.0.1 | Appliance mode detects the address from the default-route interface, and warns if DHCP changes it. Recommend DHCP reservations. |
 | G4 | Node name defaults to `node-<gossip_port>` | Appliance names come from the cluster plus an ordinal assigned at claim time (`home-3`), recorded against DMI serial and MAC. |
 | G5 | No master-key rotation | Needed so we can recover from a rogue enrolment or a lost stick. It's a bigger security-design item: re-wrap CA keys and secrets, re-derive the service token, and roll it out cluster-wide. |
@@ -425,6 +429,8 @@ Every row passes, so no. `INET_DIAG_DESTROY` is the one kernels do sometimes lac
   | ESP | 1 GiB |
   | `usr-A`/`usr-B` (verity) | 2 × ~2 GiB |
   | Data | rest |
+
+  On an 8 GB eMMC (the Wyse 3040) the `/usr` slots shrink to ~1.1 GiB each and the ESP to 512 MiB (§9.3).
 
   The data partition (`/var`) should be **btrfs**, since bun prefers Btrfs for volumes (`docs/design/agent-bun.md`). The loop-mounted ext4 fallback stays in place.
 - **Network.** DHCP on all links by default. Static configuration goes in the seed or claim payload (address, gateway, DNS). mDNS is embedded in bun (for example the `mdns-sd` crate), because Flatcar and FCOS ship no Avahi and we don't want OS mDNS. Seeds may be `host:port`, and bun already accepts hostname seeds (`src/bin/bun.rs:634`). NTP comes from `systemd-timesyncd`, since certificates need sane clocks.
@@ -532,380 +538,469 @@ So the baseline is **UEFI PXE, then iPXE over TFTP, then HTTP**. Direct HTTP Boo
 
 ## 5. Implementation plan
 
-Effort is in engineer-weeks, including tests and book and manual updates per `CLAUDE.md`.
+Effort is in engineer-weeks, including tests and book and manual updates per `CLAUDE.md`. *Revised on 27 Sep 2026 for the maintainer's decision: the Talos extension is gone, the weekly build moves into Phase 1, aarch64 moves into Phase 1 (VM iteration needs it), and Phase 3's update design is decided (§7.6).*
 
-### Phase 0: spike (~3 days, §6)
+### Phase 0: spike (~9–11 days, awaiting approval)
 
-### Phase 1: MVP appliance, seed mode (~4–6 weeks)
+See [`2026-09-27-plan-appliance-spike.md`](2026-09-27-plan-appliance-spike.md) and the summary in §6.
+
+### Phase 1: MVP appliance, seed mode (~5–7 weeks)
 
 **Security and bun:**
 - G1: master-key delivery over mTLS after join, with tests for refusal without a node cert and refusal for retired nodes.
-- G2: `admin_cidrs` wired, plus a time-boxed `join_window`.
+- G2: the time-boxed `join_window` on top of the `operator_cidrs` that `main` already has.
 - G3/G4: advertise-address detection and appliance naming.
 - G6: seeded join tokens in the initial `SecurityState`.
 
 **New `bun --appliance` mode** (a module such as `src/appliance/`), as a pure state machine with unit tests:
 - read the seed (`RELIABURGER-SEED` partition);
 - lay out state under `/var/lib/reliaburger`;
-- write `node.toml` from the seed;
+- write `node.toml` from the seed, with the **appliance profile**: bounded `[metrics]` and `[logs]` `max_storage_mb`, shorter `[images] gc_retain_days` (§9.3);
 - enrol by calling the existing join code in-process, not by shelling out to `relish join`;
 - zero the create-seed after first boot;
 - run the tty1 status screen.
 
-**Self-upgrade:** a launcher in the image execs `/var/lib/reliaburger/bin/bun`. The existing `binary_dir` and symlink swap stay unchanged.
+**Self-upgrade:** a launcher in the image execs the newest verified `bun` in `/var/lib/reliaburger/bin` (`[upgrades] binary_dir`), falling back to the image's copy. The existing symlink swap stays unchanged.
 
 **`relish`:**
 - `relish cluster create --bare-metal` (generalised bare-metal context);
 - `relish image download | write | seed`.
 
-**Image:**
-- an mkosi recipe (for example `image/mkosi.conf`), Ubuntu 26.04 LTS, x86_64, with the distro's generic kernel and `linux-firmware` (§3.2), and `[Match]` blocks that keep Debian 13 buildable (§3.1);
-- package list shared with `guest-images.json` so the guest image and the appliance can't drift, and the guest moved to 26.04 in the same release;
-- `Snapshot=` pinned to `snapshot.ubuntu.com`, with every package version in the build record;
-- systemd unit reused from `provision.rs::SERVICE`;
+**Image (`image/mkosi.conf` and friends):**
+- Ubuntu 26.04 LTS, **x86_64 and aarch64**, with the distro's generic kernel (§3.2) and a pruned `linux-firmware` allow-list (§9.3);
+- `[Match]` blocks that keep Debian 13 buildable (§3.1);
+- the package list shared with `guest-images.json`;
+- the systemd unit reused from `provision.rs::SERVICE`;
 - no SSH;
-- `systemd-repart` for data;
-- installer mode ("boot from USB, install to disk") via a small repart-based first-boot installer or mkosi's ISO output.
+- an EROFS or squashfs `/usr` with dm-verity, `systemd-repart` for the data partition (Btrfs), and a UKI;
+- an installer UKI and ISO output (§4.7, §7.2).
 
-**CI** (`.github/workflows/build.yml`):
-- a `build-appliance-images` job next to `build-guest-images`, on native runners;
-- `SourceDateEpoch`;
-- the build record as a JSON artefact;
-- the image digest signed into release metadata with the existing Ed25519 release keys, the way `guest-image-metadata.json` already is, and verified by `relish image download`;
-- a scheduled rebuild when Ubuntu publishes a new kernel or a USN touching the package list (about weekly for kernels from 28 Sep 2026), so riding the distro kernel doesn't mean shipping a stale one.
+**CI:** the weekly `appliance.yml` workflow (§7): build both architectures, run a boot test under KVM on x86_64, sign, and publish to the OS channel.
 
 **Tests:**
-- unit tests for the seed parser and appliance state machine;
-- a **QEMU+OVMF boot test** in CI on KVM runners: boot the ISO headless, install to a virtio disk, reboot, assert `/v1/health`.
+- unit tests for the seed parser and the appliance state machine;
+- a **QEMU+OVMF boot test** on the x86_64 hosted runner (KVM is available there): install from the raw disk, reboot, assert `/v1/health`.
 
 ### Phase 2: claim over the LAN (~3–4 weeks)
 
 - A claim server in appliance mode: self-signed key, console fingerprint and QR.
 - mDNS announce and browse.
 - `relish machines [claim]`, `relish join-token list/revoke`.
-- A **5-node virtual lab:** 5 QEMU VMs on a bridge with dnsmasq DHCP, driven by a script (for example `scripts/lab/five-node.sh`) that:
-  1. claims all nodes;
-  2. runs `scripts/demo/tour.sh`;
-  3. kills a VM;
-  4. checks rescheduling;
+- A **virtual lab** that runs on a Mac (§8), not only on Linux with KVM. It:
+  1. netboots five aarch64 VMs;
+  2. claims them;
+  3. runs `scripts/demo/tour.sh`;
+  4. kills a VM and checks rescheduling;
   5. writes a qualification record under `docs/qualification/`.
 
-### Phase 2b: network boot (~2–3 weeks)
+### Phase 2b: network boot in `relish` (~2–3 weeks)
 
-Before this revision, PXE sat in Phase 4 polish. §4.7 makes it a first-class path, so it follows the claim flow directly, since it's only useful once machines can be claimed without a seed.
-- **Installer UKI** that pulls and verifies the full image from its boot origin (`rd.systemd.pull=` with `bootorigin`, systemd ≥ 258; Ubuntu 26.04 ships 259) and writes it to disk.
-- **`relish image serve`** on macOS and Linux: ProxyDHCP (`dhcproto`), a minimal TFTP for iPXE, HTTP via axum, a refusal when another proxy or `bootpd` is already answering, `--mac` allow-list, and a time-boxed window. It serves only verified release artefacts.
-- **`relish image serve --node <name>`**: the same server as a bun subsystem, opened through the admin API and closed after 60 minutes.
-- **Vendored iPXE** (pinned, the Microsoft-signed shim build) with an embedded chain script.
-- **Tests:** unit tests for the proxy-offer builder (PXE and HTTPClient variants, no `yiaddr`, option 43/60/67) as table-driven cases; property tests that we never answer a non-PXE DISCOVER; a **CI lab** with QEMU+OVMF on a bridge, a dnsmasq handing out addresses *only* (no boot options), and `relish image serve` as the proxy, covering both OVMF PXE and OVMF HTTP Boot, ending in five `unclaimed` machines.
-- **Hardware qualification:** at least one Dell or Lenovo business mini PC (HTTP Boot) and one consumer AMI box (PXE only), with a Mac and a Linux laptop as the server.
+Unchanged from §4.7:
+- **Installer UKI** that pulls and verifies the image from its boot origin, and **streams** `/usr` onto the disk rather than into RAM. The 2 GB Wyse can't hold a full image in tmpfs (§9.2).
+- **`relish image serve`** on macOS and Linux: ProxyDHCP (`dhcproto`), a minimal TFTP for iPXE, HTTP via axum, a refusal when another proxy or `bootpd` is already answering, a `--mac` allow-list, and a time-boxed window. It serves only verified release artefacts.
+- **`relish image serve --node <name>`**: the same server as a bun subsystem.
+- **Vendored iPXE** for x86_64 and arm64 EFI, pinned, with an embedded chain script.
+- **Tests:** the proxy-offer builder and property tests from §4.7; the Mac lab (§8.4 level 2); and the x86_64 CI lab on a bridge, which hosted runners allow with `sudo`.
 
-### Phase 3: immutable A/B (~3–5 weeks)
+### Phase 3: OS updates with A/B slots (~3–4 weeks)
 
-- verity `/usr`, UKI, `systemd-sysupdate` slots.
-- An `UpgradeManager` backend: `Symlink` (today) or `ImageSlot`. The orchestrator keeps its council-aware order and health gates. For OS releases each node step becomes "stage slot, drain, reboot, verify rejoin, else roll back".
-- Open question: sysupdate verifies with GPG and SHA256SUMS, so either bun verifies Ed25519 first and feeds sysupdate a local verified source, or we also publish GPG signatures. **[design decision]**
-- Secure Boot: our own db key, documented enrolment or disable instructions, and TPM2-sealed data-partition encryption as an option. That later unlocks `AttestationMode::Tpm`.
+The design is decided in §7.6:
+- `systemd-sysupdate` transfers for the UKI (with boot-counting tries) and for the verity `/usr` into the inactive slot.
+- A **boot-check unit** ordered before `boot-complete.target` that waits for bun to come back healthy and rejoin, so `systemd-bless-boot` only blesses a slot that actually works.
+- `UpgradeManager` gains an `OsSlot` backend next to `Symlink`. `relish os list | upgrade | status` and a cluster-wide pinned `os.target_version` in Raft.
+- Tests:
+  - unit tests for the version, channel and pin logic;
+  - a CI boot test that upgrades 2026.40 → 2026.41 in QEMU;
+  - a deliberately broken image that must fall back without hands.
 
 ### Phase 4: polish (~2–3 weeks)
 
-- aarch64 images (for Raspberry Pi-class boards through an overlay); G5 master-key rotation.
+- Secure Boot (our db key, enrolment docs) and TPM2-sealed data-partition encryption, which later unlocks `AttestationMode::Tpm`. Both are optional: the Wyse fleet runs with Secure Boot off.
+- G5, master-key rotation.
 - Book chapter and manual "Bare metal" chapter.
-- A physical-hardware qualification on real mini PCs.
-
-### Optional: Talos extension (~2–3 weeks, 2027)
-
-- A `siderolabs/extensions`-style repo with a host-mode service, a static musl `bun`, and bundled runc, iproute2 and util-linux.
-- `relish image create --base talos` generates a k8s-less machine config with `SysctlConfig` and embedded config.
+- Physical qualification on the Wyse 3040 fleet (§9), repeated on each major release.
 
 ### Minimal first version
 
-- x86_64 only, Ubuntu 26.04 via mkosi, distro kernel, mutable root (A/B deferred).
-- `bun` self-upgrade as today.
+- Ubuntu 26.04 via mkosi, distro kernel, x86_64 and aarch64.
 - Seed-mode join with node-bound tokens, plus G1 and G2.
-- QEMU boot test in CI.
-- **Proof point:** 5 VMs join from one seeded image and pass the tour.
-
-That's roughly the Phase 1 scope, and it ships value before A/B. Network boot (Phase 2b) is the first thing to add after it, since it's what turns "five sticks" into "five power buttons".
+- `relish image serve` netboot, because it's what turns ten Wyse boxes from ten USB sessions into ten power buttons.
+- `bun` self-upgrade as today. Weekly images are published, but a node takes a new OS by reinstalling until Phase 3 lands.
+- **Proof point:** five aarch64 VMs on a Mac and ten Wyse 3040s netboot, join and pass the tour.
 
 ---
 
-## 6. Recommendation, risks and the first spike
+## 6. Recommendation, risks and the spike
 
-**Recommendation:**
-1. Build a **Reliaburger appliance image on Ubuntu 26.04 LTS with mkosi**, following the Incus OS design, with `bun` as the only service. This revision changes the base from Debian 13 (§3.1): runc 1.4 in `main`, a longer support tail, a faster kernel cadence and one distro shared with the quickstart guest outweigh Debian's reproducibility record. Keep the recipe buildable on Debian 13. Keep bun's own symlink self-upgrade for the agent, and add sysupdate A/B for the OS in Phase 3.
-2. **Ride the distro kernel** (§3.2). Sign only the UKI; don't build or sign kernels.
-3. Make the join flow **claim over the LAN (option d)**, with **seed mode (option c)** as the MVP and the headless path.
-4. Make **network boot a first-class install path** (§4.7, Phase 2b), served by `relish image serve` from the laptop or the first node, with USB as the fallback.
-5. Fix gaps G1 and G2 first. They block *every* bare-metal install, not just the appliance.
-6. **Don't fork Talos** (§2.10). Treat upstream Talos as a later "bring your own Talos" target, not the base.
-7. If effort matters more than control, **Kairos core on an Ubuntu base** is the fallback. It gives ISO/PXE/A/B out of the box, at the cost of persistence bind-mounts and upstream churn.
+**Recommendation (maintainer decision, 27 Sep 2026):**
+1. **Own mkosi image on Ubuntu 26.04 LTS**, following the Incus OS design, with `bun` as the only service. **Ride Ubuntu's generic kernel** (Canonical-patched, §3.2), sign only the UKI, and keep the recipe buildable on Debian 13. Build **x86_64 and aarch64**.
+2. **Netboot is built into `relish`** (§4.7, Phase 2b): ProxyDHCP next to the home router, TFTP for iPXE, HTTP for everything else, serving only our signed artefacts, from the laptop or node 1. USB is the fallback.
+3. **Weekly signed builds in GitHub Actions** (§7). Nodes move between them only when the operator pins a new version. The rollout goes through `systemd-sysupdate` A/B slots with boot counting, driven by bun's council-aware orchestrator.
+4. Make the join flow **claim over the LAN (option d)**, with **seed mode (option c)** as the MVP and the headless path.
+5. Fix gaps **G1 and G2** first. They block every bare-metal install, not just the appliance.
+6. **Iterate on aarch64 VMs on a Mac and finish on real hardware** (§8, §9): ten Dell Wyse 3040s.
+7. **Not chosen:** Kairos (§10.1). **Parked:** Talos, to revisit later (§10.2). **Don't fork Talos** (§2.10).
 
 **Key risks:**
+- **2 GB of RAM on the Wyse 3040.** It's workable for bun plus a few small workloads (§9.2), but a leak like the one the V02 soak found (#220, bun RSS near 1 GB) would take a node down. The appliance profile, zram, and a per-node memory alert in `relish wtf` are the mitigations.
+- **8 GB eMMC.** Two `/usr` slots, an ESP and a Btrfs data partition fit only with a pruned image. Metrics, logs, images and Raft need bounded retention (§9.3). eMMC endurance is unknown.
+- **x86_64 only under emulation on the Mac.** Most iteration happens on aarch64. x86-specific bugs (firmware, iPXE, the Realtek NIC, Cherry Trail quirks) only show up in the TCG smoke run, in CI, or on the Wyse itself.
+- **Signing on a schedule.** A weekly job that signs unattended puts a signing key on a runner (§7.5). A separate OS key in a protected environment keeps that away from the release key.
 - **Master-key blast radius.** Any enrolment path that hands out `master.key` turns a token leak into a cluster compromise. G1 plus approval-gated enrolment keep that bounded, and G5 (rotation) makes it recoverable.
-- **Secure Boot on consumer mini PCs.** Enrolling our own key is fiddly, on USB and network boot alike. The v1 docs must cover "disable Secure Boot" honestly. The Microsoft UEFI CA 2011 expiry (27 June 2026) makes shim-based chains less dependable on older firmware, which is one more reason to prefer our own db key.
-- **Owning an OS.** Canonical fixes the CVEs, but we have to rebuild and publish images promptly: a CI schedule plus a USN feed check. With Ubuntu's new kernel cadence that's roughly a weekly image.
-- **LAN realities.** mDNS across VLANs, DHCP address changes, and consumer routers without reservations. Network boot adds firmware that ignores ProxyDHCP, AP isolation and a second proxy on the same LAN.
-- **Talos direction.** If Talos Containers GA (Dec 2026) makes k8s-less first-class, the Talos option gets cheaper. Re-check then.
+- **Owning an OS.** Canonical fixes the CVEs, but we must rebuild and publish promptly. The weekly job and "skip when nothing changed" make that cheap. Nodes stay on their pinned version until someone moves them.
+- **LAN realities.** Firmware that ignores ProxyDHCP (the Wyse's PXE entries disappear after a CMOS reset, §9.4), AP isolation, a second proxy on the LAN, and consumer routers without DHCP reservations.
 
-**First spike (≈4 days, QEMU on a Linux box with KVM, plus an hour on a Mac):**
-1. **Talos track.** Build a Talos 1.14.1 image with `imager`:
-   - a custom host-mode extension (bun, relish, a launcher, pinned runc, static iproute2 and util-linux);
-   - embedded k8s-less config with `SysctlConfig user.max_user_namespaces`.
+**The spike** is in [`2026-09-27-plan-appliance-spike.md`](2026-09-27-plan-appliance-spike.md). **It awaits maintainer approval and nobody should start building.** It has five stages:
+1. build the image in CI for both architectures;
+2. netboot one aarch64 VM on the Mac through QEMU's built-in TFTP;
+3. five aarch64 VMs on a shared L2 with ProxyDHCP, plus an x86_64 TCG smoke run;
+4. an A/B OS update with a forced fallback;
+5. ten Wyse 3040s netbooted from the Mac on a wired LAN.
 
-   Boot three VMs, form a cluster by hand, and run `scripts/demo/tour.sh`. Record:
-   - eBPF attach to the root cgroup;
-   - userns containers at uid 2e9;
-   - whether owners survive `talosctl service ext-reliaburger restart`;
-   - netem and `ss -K`;
-   - an upgrade with the `/var` launcher.
-2. **mkosi track.** Build an Ubuntu 26.04 mkosi disk image with the `guest-images.json` packages, the generic kernel and the quickstart unit. Boot three VMs and run the same tour. Build the same recipe with `Distribution=debian` to prove the switch is a config change, and record image size for both.
-3. **Join track.** Prototype G1 (master-key fetch after join) and G2 (`admin_cidrs` and join window) against the mkosi VMs, and measure one seed-mode join end to end.
-4. **Network-boot track.** On a bridge with a dnsmasq that hands out addresses only, run dnsmasq in proxy mode as a stand-in for `relish image serve`. HTTP-boot the mkosi UKI in OVMF, and PXE-boot it through iPXE. Check that `rd.systemd.pull=` with `bootorigin` fetches and verifies the image and the installer writes it. Then, on a Mac, check that a non-root process can bind UDP 67, 69 and 4011 on the wildcard address and receives the broadcasts, and note the firewall prompt.
+That's about 9–11 engineer-days, with stages 2–5 on the second Mac.
 
-**Exit criteria:** the tour passes on both tracks, owners-survive-restart holds on Talos, a VM installs over both PXE and HTTP Boot next to an unmodified DHCP server, and a written go/no-go for Talos versus mkosi.
+**Exit criteria:**
+- one CI run yields signed artefacts for both architectures;
+- VMs and Wyse boxes install over PXE next to an unmodified DHCP server;
+- the tour passes on the Wyse cluster within the RAM and eMMC budgets;
+- a bad OS update falls back on its own.
 
 ---
 
-## 7. Alternative recommendation: Kairos on Ubuntu, with netboot as the unified spike
+## 7. Weekly appliance builds and how nodes update
 
-*Added 27 September 2026 at the maintainer's request. This is a **separate alternative** to §6, not a revision of it: §0–§6 still stand as written. Kairos facts come from the Kairos docs source (`kairos-io/kairos-docs@main`), the `kairos-io/kairos` monorepo and the GitHub API, all fetched on 27 Sep 2026 (links in Sources). Repo facts come from `main` at `0eb6071d`, which is 327 commits newer than the `0a5dfc6` the rest of this note read. Progress on this section is tracked in [`2026-09-27-plan-kairos-spike.md`](2026-09-27-plan-kairos-spike.md).*
+*Added 27 Sep 2026. Repo facts come from `main` at `0eb6071d` (`.github/workflows/build.yml`, `docs/releasing.md`, and PR #215, which cut artefact retention to days and trimmed the caches after both went over budget). External facts were fetched the same day. The workflow is a plan, not code.*
 
-### 7.0 In one paragraph
+### 7.1 What changes every week, and what doesn't
 
-Build the Reliaburger appliance as a **Kairos derivative of Ubuntu 26.04**: a Dockerfile `FROM ubuntu:26.04` that runs `kairos-init`, adds our package list, `bun`, `relish` and a systemd unit, and gets published as one OCI image. **AuroraBoot turns that one image into both netboot artefacts and a USB ISO**, so network boot and USB are the same image with two wrappers. Machines netboot through ProxyDHCP next to the home router's DHCP, auto-install to disk, reboot into an `unclaimed` bun, and get claimed over the LAN exactly as §4.2 (d) describes. Kairos gives us the installer, A/B plus recovery images, boot assessment and the netboot server now; we give up a minimal image, a verity `/usr`, and some control over the boot chain. **The spike (§7.7) awaits maintainer approval. Nobody should start building it yet.**
+Canonical now ships a kernel roughly weekly (§3.1), plus USNs for the packages on our list. The appliance should pick those up without anyone having to remember. So a **scheduled workflow rebuilds the image from the live Ubuntu archive every week**, and anyone can start it by hand. Each build:
+- installs the **latest released `bun` and `relish`**, not `main`. The OS channel moves on its own cadence, and bun already has its own upgrade path;
+- records every package version, the kernel version and the bun version in a build record, the way `build_guest_image.sh` does today;
+- **publishes nothing when nothing changed**. If the package manifest and bun version equal last week's, the run ends green without a release. That keeps storage flat in quiet weeks.
 
-### 7.1 What Kairos is in September 2026
+Version scheme: `YYYY.WW.N` (for example `2026.40.0`), which sorts, reads as a date, and can't be confused with bun's semver.
 
-- **What it does.** Kairos turns an ordinary distribution container image into an immutable, image-based OS. `kairos-init` "kairosifies" the image (adds the Kairos agent, immucore, dracut initrd, GRUB, the partition and persistence layout). The result is an OCI image that installs to disk as **active, passive and recovery** system images, with upgrades that swap A and B and a recovery image as the last fallback ("A -> B -> Recovery").
-- **Configuration** is cloud-config (the `yip` dialect): an `install:` block for unattended installs, `stages:` for boot-time hooks (files, commands, mounts, users), `bind_mounts` for persistence, and templating.
-- **Kubernetes is optional.** "Core" images carry no Kubernetes engine; "standard" images add k3s or k0s through `--provider`. We'd build core.
-- **P2P cluster formation** (edgevpn, `p2p.network_token`) exists, but the docs still call it "experimental and has only been tested on local setups", and it exists to form k3s clusters. We wouldn't use it: Mustard, Raft and the join flow already do that job, and a shared `network_token` in every node's cloud-config is the "long-lived multi-use credential" §4.2 (b) rejects.
-- **Releases and people.**
-  - Kairos v4.3.0 shipped on 8 Sep 2026, the first release from the new monorepo (agent, SDK and provider merged in). Minor releases are roughly monthly: v4.0.0 on 27 Feb, v4.1.0 on 15 May, v4.2.0 on 18 Aug, v4.3.0 on 8 Sep 2026.
-  - AuroraBoot is at v0.27.1 (11 Sep 2026).
-  - Everything is **Apache-2.0**: `kairos`, `AuroraBoot`, `hadron`.
-  - Kairos has been a **CNCF Sandbox** project since 13 Apr 2024 and has applied for Incubation. **Spectro Cloud** is the lead sponsor.
-  - Over the last 12 months the monorepo has 1,739 commits. After removing bots and agent accounts, four people wrote almost all of it (414, 160, 73 and 35 commits). That's a core the same size as Talos's (§2.10), on a project with far less commercial weight behind it.
-- **The big 2026 change: Hadron.** Since v4.0 (Feb 2026) the project **publishes prebuilt artefacts only for Hadron**, its own minimal, upstream-first Linux (kernel 7.0.x in Hadron v0.2.0). In the maintainers' words, the per-distro matrix had grown past 500 artefacts per release. Other distros are "still supported ... for custom builds": you run `kairos-init` over your own base image, in your own pipeline. The docs now say the old Ubuntu flavour repositories "are no longer actively updated".
+### 7.2 What gets built
 
-**What that means for "a Kairos derivative built FROM an Ubuntu-based Kairos image".** There isn't a maintained Ubuntu-based Kairos image to build FROM any more. We'd build **FROM `ubuntu:26.04`** and run `kairos-init` ourselves, which is the documented path and what the Kairos factory GitHub Action automates. In practice that's the same thing, but it means **we own the Ubuntu flavour's release pipeline**, just as we would with mkosi.
+Per architecture (`x86_64`, `aarch64`), from one mkosi configuration:
 
-**How well upstream tests Ubuntu 26.04.**
-- Ubuntu 26.04 support landed in `kairos-init` with Kairos v4.1.0 (15 May 2026).
-- The monorepo's `_build-flavors.yaml` builds `ubuntu:24.04`, `ubuntu:25.10` and `ubuntu:26.04` on amd64 and arm64, plus 26.04 with Trusted Boot, on every CI run. That's a **container-build smoke test**.
-- The **QEMU boot and install tests** in `master.yaml` cover Hadron and one `ubuntu:20.04` cell, not 26.04.
-- So "Ubuntu 26.04 boots, installs and upgrades" is **[unverified upstream]** and the spike has to establish it.
+| Artefact | What it is | Used by |
+|---|---|---|
+| `reliaburger-os_<v>_<arch>.efi` | UKI: kernel, initrd, and a command line with `usrhash=` pinning the verity root of this build's `/usr` | sysupdate (ESP), CI boot test |
+| `reliaburger-os_<v>_<arch>.usr.raw.zst` and `.usr-verity.raw.zst` | the EROFS/squashfs `/usr` and its dm-verity hash tree | sysupdate (inactive `/usr` slot), the installer |
+| `reliaburger-os-installer_<v>_<arch>.efi` | the installer UKI for netboot: small initrd that partitions the disk and streams `/usr` onto it (§4.7, §9.2) | `relish image serve` (UEFI HTTP Boot, or iPXE chain) |
+| `reliaburger-os_<v>_<arch>.iso` | the installer on bootable media | USB sticks |
+| `reliaburger-os_<v>_<arch>.raw.zst` | a complete installed disk | `dd` installs, QEMU tests, `relish image write` |
+| `ipxe-<arch>.efi` (x86_64 and arm64) | pinned, vendored iPXE with an embedded chain script | TFTP stage of PXE |
+| `SHA256SUMS`, `os-<v>.json` + `.sig` | digests, the build record and our Ed25519 statement | bun, `relish image`, the installer |
 
-### 7.2 How Reliaburger sits on Kairos
+The UKI's `usrhash=` ties the kernel and the exact `/usr` together. So with Secure Boot on, verifying the UKI verifies the whole OS. With Secure Boot off (the Wyse fleet), integrity comes from the Ed25519 check before anything is staged (§7.5).
 
-**The image.** One Dockerfile, built in CI on Linux runners (never on the maintainer's Mac):
+### 7.3 Runners, privileges and time
 
-```dockerfile
-# image/kairos/Dockerfile (sketch, untested)
-FROM quay.io/kairos/kairos-init:v0.17.3 AS kairos-init
+- **Runners:** `ubuntu-24.04` for x86_64 and `ubuntu-24.04-arm` for aarch64. They're native, like `build-guest-images` today, because package scripts run for the image's own architecture.
+- **mkosi without root tricks.** mkosi ships a setup action (`systemd/mkosi@<pinned sha>`) whose steps:
+  - lift Ubuntu's AppArmor userns restrictions (`kernel.apparmor_restrict_unprivileged_userns=0`);
+  - remove AppArmor;
+  - open `/dev/kvm`.
 
-FROM ubuntu:26.04
-ARG VERSION   # our release version; kairos-init writes it to /etc/kairos-release
-# scripts/release/guest-images.json's list (so guest and appliance can't drift), plus firmware for real hardware
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      runc uidmap btrfs-progs nftables iptables iproute2 linux-firmware \
- && rm -rf /var/lib/apt/lists/*
-RUN --mount=type=bind,from=kairos-init,src=/kairos-init,dst=/kairos-init \
-    /kairos-init -l info --version "${VERSION}"
-COPY bun relish /usr/lib/reliaburger/bin/          # release binaries, verified before COPY
-COPY bun-launcher /usr/lib/reliaburger/bin/        # execs the newest verified bun (below)
-COPY reliaburger.service reliaburger-data.mount /etc/systemd/system/
-RUN systemctl enable reliaburger.service reliaburger-data.mount \
- && systemctl mask ssh.service ssh.socket          # see "attack surface" below
+  mkosi then **builds unprivileged in a user namespace**. `RepartOffline=yes` is its default: "`systemd-repart` will not use loopback devices to build disk images". The mkosi man page says only `RepartOffline=no` needs root and loop devices, which we don't need unless we use `Subvolumes=`. So **no privileged container and no loop devices on the hosted runner**. The `build-guest-images` job needs `sudo` for its loop mounts; this one shouldn't.
+- **Tools tree.** The runner's Ubuntu 24.04 has systemd 255. The UKI (`ukify`), `systemd-repart` verity options and systemd 258's `rd.systemd.pull=` `bootorigin` (§4.7) need newer tools. `ToolsTree=yes` makes mkosi build its own, pinned tools image, so the host's versions stop mattering. The build time and size of the tools tree are **[unmeasured]**, and the spike records them.
+- **Boot test.** Standard 2-vCPU Linux hosted runners expose KVM (GitHub changelog, 2 Apr 2024), and the mkosi action makes `/dev/kvm` usable. So the x86_64 job boots the raw disk in QEMU+OVMF and waits for bun's `/v1/health`. It also runs a netboot test on a bridge (`sudo ip link add ... type bridge`, dnsmasq address-only, the proxy from `relish image serve`). **The arm64 hosted runner has no `/dev/kvm`**, so aarch64 gets a build-only check in CI plus the Mac lab (§8).
+- **Estimated time per run:** 15–30 minutes per architecture, including the tools tree **[estimate]**.
+
+### 7.4 Caching, storage and retention
+
+PR #215 shows where the limits are: artefacts had reached 287 GiB, and the caches were at 11.2 GB against the repo's 10 GB cache limit, which causes eviction. So:
+- **No package cache.** A weekly build wants fresh packages anyway, and a cache of `.deb`s would just push the Rust target caches out. The tools tree is the only candidate for `actions/cache`, keyed by the mkosi version and the ISO week, and only if the spike shows it saves real time.
+- **Actions artefacts only for handing over between jobs** (build → sign → publish): `retention-days: 1`, `compression-level: 0` (the payloads are zstd already).
+- **Publish to GitHub Releases, as a separate channel.**
+  - Pre-release tags `os-2026.40.0` named "Reliaburger OS 2026.40.0", which keeps them apart from `v0.x` bun releases.
+  - Release assets don't count against Actions artefact storage. Each file must stay under GitHub's 2 GiB per-asset limit, which is why the raw disk is zstd-compressed.
+  - A prune step keeps the **last 8 weekly releases** plus any release a bun release names as its tested OS.
+- **Estimated size per week:** per architecture the UKI is 60–120 MB, `/usr` 400–700 MB compressed, and the ISO and raw disk about the same again. That's **~2–3 GB per week for both architectures, and 16–24 GB for eight kept weeks [estimate; the spike measures it]**.
+- **The channel pointer:** `os-channel.json`, signed, listing the newest version per architecture with its digests. It's published through GitHub Pages next to `install.sh` (`static.yml` already deploys Pages) and mirrored as a release asset. Bun reads the pointer and never lists releases.
+
+### 7.5 Signing and trust
+
+`docs/releasing.md` already warns against release signing on a scheduled runner. Its soak section rejects putting the release key in a job that "also runs third-party actions", because "a binary signed that way is a genuine release-signed bun". The same logic applies here, and it's sharper, because an OS image runs as root on every node. So:
+- **A separate OS signing key**, `RELIABURGER_OS_KEY` (Ed25519, PKCS#8, like the release key). Bun trusts it **only** for OS artefacts, from a second trust list beside `src/upgrade/keys.rs`. A leak can't sign a bun binary, and rotation doesn't touch the release identity.
+- **Sign in a job that runs nothing third-party.** The build jobs (mkosi, its setup action) upload digests and artefacts. A separate `sign` job:
+  - has only `actions/checkout`, `actions/download-artifact` and our own `scripts/release/package.py`-style signer;
+  - runs in a GitHub **environment `os-weekly`** restricted to `main`, holding the secret;
+  - signs a statement per artefact: version, architecture, asset name, SHA-256, kernel version, bun version, build record digest.
+- **A human in the loop to start with.** The environment requires one reviewer, so each week's build waits for a click before it's signed. Drop the reviewer once the pipeline has run cleanly for a while. That's a maintainer decision, and it's in the open questions.
+- **Operator countersignature stays optional**, as it is for bun (`[upgrades] external_signing_key`): a cluster can require its own signature on OS images too.
+- **Secure Boot keys** (a db key for the UKI) are a separate, later concern (Phase 4). The Wyse fleet runs with Secure Boot off.
+
+### 7.6 How a node discovers and applies an update
+
+**Decision: `systemd-sysupdate` with A/B `/usr` slots, UKIs with boot counting, and bun's orchestrator in charge.**
+
+1. **Discovery.** The council leader fetches `os-channel.json` once a day, and whenever someone runs `relish os list`, and checks its signature. A newer version than the cluster's pin raises an `os-update-available` notice in `relish wtf` and Brioche. **Nothing applies automatically.** An opt-in `[os] auto = "window"` policy with a maintenance window can come later.
+2. **Pinning.** The cluster's target is one value in Raft, `os.target_version`, set by `relish os upgrade 2026.41.0`. Nodes report their running version in their state reports, and `relish nodes` shows it. New nodes installed later from an older image get upgraded to the pin before they take workloads **[design]**.
+3. **Staging on each node, in the orchestrator's order** (workers first, council members one at a time, leader last; `src/upgrade/orchestrator.rs` already does this for bun):
+   1. download the artefacts, from the channel or from a peer that already has them, to save a home uplink ten times over;
+   2. verify the Ed25519 statement and the SHA-256 values, and write them into a root-only `/var/lib/reliaburger/os-staging/`;
+   3. run `systemd-sysupdate --definitions=/usr/lib/reliaburger/sysupdate.d update 2026.41.0`, whose transfers use **`Type=regular-file` sources in that staging directory**:
+      - `/usr` and its verity go to the inactive partition slot;
+      - the UKI goes to the ESP as `reliaburger-os_2026.41.0+3.efi`, three tries under systemd-boot's automatic boot assessment;
+      - `InstancesMax=2`.
+4. **Switch.** Drain the node, then reboot. systemd-boot picks the newest UKI, and its `usrhash=` selects the matching `/usr`.
+5. **Health gate.** `reliaburger-boot-check.service` is ordered `Before=boot-complete.target`. It waits (with a timeout) for bun to be healthy and back in the cluster. Only then does `systemd-bless-boot` mark the entry good.
+6. **Fallback.** If bun doesn't come back, the unit fails and the node reboots. After three failed tries, systemd-boot falls back to the previous UKI, which points at the previous `/usr` slot. The orchestrator sees the node rejoin on the old version, marks the rollout failed and stops it.
+7. **bun versus the OS.** The launcher uses the newest verified bun in `binary_dir`, or the image's own copy if that's newer. Neither update path can downgrade bun.
+
+**Why this design and not another:**
+
+| Option | Why not (or why) |
+|---|---|
+| **`systemd-sysupdate` + UKI + boot counting** (chosen) | Part of systemd, which the image already runs. Atomic per partition. Boot assessment is built into systemd-boot. It's what Incus OS and ParticleOS ship. Only `/usr` is duplicated (2 × ~1 GB), which matters on an 8 GB eMMC (§9.3). |
+| sysupdate with `url-file` sources | Would fetch straight from the channel, but sysupdate verifies downloads only with GPG (`SHA256SUMS.gpg` against a keyring). We'd run a second signature scheme next to Ed25519. With `regular-file` sources "no integrity or authentication verification is done", so bun verifies first and sysupdate only copies. |
+| Whole-disk A/B images (Kairos-style) | Duplicates everything, including space the data partition needs; loop-mounted images. |
+| RAUC or SWUpdate | Another daemon and bundle format beside systemd, for no feature we lack. |
+| OSTree or bootc | A different OS model (Fedora-centric), and a large tool for an image that's only a few packages. |
+| `apt upgrade` in place | No rollback, and drift comes back. That's the problem §1 set out to remove. |
+
+---
+
+## 8. Iterating in VMs on a Mac
+
+*Added 27 Sep 2026. The maintainer has no KVM machine. Iteration has to run on macOS, on the second Mac that's free after the release, **not on the Mac running the soak**. Commands are sketches, and anything marked **[unverified]** hasn't been run.*
+
+### 8.1 What Lima can and can't do here
+
+- **Lima's VZ backend** (the quickstart's default) can't network-boot: Apple's Virtualization framework EFI loader has no PXE or HTTP Boot, and Lima's docs don't mention netboot at all.
+- **Lima's QEMU backend** boots a disk image and waits for its guest agent and cloud-init. A netbooting machine has neither, so Lima would time out. **So the netboot *clients* are plain `qemu-system-*` processes.**
+- **Lima is still useful for the server side.** A small Ubuntu VM on the same L2 network runs the netboot server: `relish image serve` (Linux build) once it exists, or `dnsmasq` in proxy mode as a stand-in during the spike. It can also build images locally with mkosi if CI is too slow a loop.
+
+### 8.2 Architectures
+
+- **Apple silicon runs aarch64 guests under HVF** at near-native speed, so everyday iteration happens on aarch64. That's why the image and CI build both architectures (§7.2).
+- **x86_64 guests run only under TCG emulation**, which is much slower **[estimate: several times slower to boot, and an install could take tens of minutes]**. Use x86_64 for a **smoke run per milestone**. Pick `-cpu Westmere`, which has SSE4.2 and AES-NI but no AVX, like the Wyse's Atom **[inference]**, so an accidental AVX dependency shows up before the hardware stage.
+- The real target, the Wyse 3040, is x86_64. It's the final stage (§9).
+
+### 8.3 Firmware
+
+Homebrew's QEMU (11.1.1 today) ships EDK2 builds in `$(brew --prefix)/share/qemu/`, for example `edk2-aarch64-code.fd`, `edk2-aarch64-vars.fd` and `edk2-x86_64-code.fd`. QEMU's `roms/edk2-build.config` builds all of them with `NETWORK_HTTP_BOOT_ENABLE`, `NETWORK_IP6_ENABLE`, `NETWORK_TLS_ENABLE` and `NETWORK_ALLOW_HTTP_CONNECTIONS`. So **both architectures get UEFI PXE and UEFI HTTP Boot on virtio-net** without building any firmware. QEMU no longer ships an x86_64 vars template. For x86_64, either copy `OVMF_CODE_4M.fd` and `OVMF_VARS_4M.fd` out of Ubuntu's `ovmf` package (from the Lima server VM), or try `-bios edk2-x86_64-code.fd` for throwaway runs **[unverified]**.
+
+### 8.4 Networks: three levels
+
+**Level 1: one VM, no root, no ProxyDHCP.** QEMU's user-mode network has a built-in DHCP and TFTP server, and `bootfile=` names the PXE boot file. That's enough to test the iPXE → installer UKI → stream `/usr` → reboot loop, with the Mac serving HTTP on the slirp host alias `10.0.2.2`:
+
+```sh
+# On the second Mac. Artefacts from a CI run in ./art; iPXE and its script in ./tftp.
+Q="$(brew --prefix)/share/qemu"
+cp "$Q/edk2-aarch64-vars.fd" vars-c1.fd
+qemu-img create -f qcow2 c1.qcow2 8G            # the size of the smallest Wyse eMMC
+(cd art && python3 -m http.server 8080) &       # stands in for relish's HTTP side
+qemu-system-aarch64 -machine virt -accel hvf -cpu host -smp 4 -m 2048 \
+  -drive if=pflash,format=raw,readonly=on,file="$Q/edk2-aarch64-code.fd" \
+  -drive if=pflash,format=raw,file=vars-c1.fd \
+  -device virtio-net-pci,netdev=n0,mac=52:54:00:00:01:01,bootindex=1 \
+  -netdev user,id=n0,tftp="$PWD/tftp",bootfile=ipxe-arm64.efi \
+  -drive if=virtio,file=c1.qcow2 -nographic
+# tftp/boot.ipxe (embedded in or chained from ipxe-arm64.efi):
+#   #!ipxe
+#   dhcp
+#   chain http://10.0.2.2:8080/reliaburger-os-installer_2026.40.0_aarch64.efi
 ```
 
-- **Kernel.** For 26.04, `kairos-init` installs `linux-image-generic` (its package map says "Ubuntu 26.04 uses generic kernel instead of HWE"); for 24.04 it installs the 24.04 HWE kernel. So on 26.04 Kairos rides exactly the kernel §3.2 checked: 7.0 GA, with BTF, `CGROUP_BPF`, `USER_NS`, `NET_SCH_NETEM`, `INET_DIAG_DESTROY`, `BTRFS_FS`, `NF_TABLES` and `BLK_DEV_LOOP` all set. **Kernel coupling is the distro's, as with mkosi.** A kernel CVE means "rebuild the image when Ubuntu ships the package". The difference is that Kairos loads kernel and initrd from inside the system image (GRUB chainloads them), so a kernel update is always an A/B image swap and a reboot, never a package install.
-- **Initrd and boot chain.** Kairos uses dracut plus immucore for the initrd and **GRUB via `shim-signed` and `grub-efi-amd64-signed`** for the default (non-UKI) boot. That's Ubuntu's Microsoft-signed chain, so an installed node should boot with **Secure Boot on and no key enrolment** **[unverified on 26.04; §7.5 covers what that does and doesn't verify]**.
-- **bun as a systemd service.** The unit is the one `docs/linux-servers.md` §3.3 and `provision.rs` already use (`Restart=always`, `KillMode=process`, the bpffs `ExecStartPre`), with `ExecStart` pointing at the launcher.
-- **The guest bits.** runc, uidmap, btrfs-progs, nftables, iptables and iproute2 come from the Ubuntu archive at image build time, the same list and archive as the quickstart guest. Nothing is installed at run time, because the root is read-only.
+`-m 2048` mimics the Wyse's RAM, so an installer that buffers the image in RAM fails here first. UEFI **HTTP Boot** through slirp probably won't work, because slirp's DHCP doesn't send the `HTTPClient` vendor class EDK2 looks for **[unverified]**. Level 1 is PXE only.
 
-**Persistence.** This is the part that needs the most care, because Kairos's defaults don't match bun's layout:
+**Level 2: a shared L2 network with a real ProxyDHCP (the main lab).** `socket_vmnet` (Homebrew 1.2.2, or Lima's recommended `/opt/socket_vmnet` install) runs as root once and gives unprivileged QEMU processes a vmnet "shared" network: 192.168.105.0/24, gateway `192.168.105.1`, addresses from macOS's `bootpd`.
+- **That `bootpd` plays the home router:** it hands out addresses and no boot options, which is exactly what a real router does.
+- **The netboot server can't run on the Mac host in this mode**, because `bootpd` already owns UDP 67 there (the same clash §4.7 notes for Internet Sharing). So it runs in a **Lima VM on the same network**.
 
-| Path | Kairos default | What bun needs | Plan |
-|---|---|---|---|
-| `/` and `/usr` | read-only (loop-mounted system image) | binaries, unit files | baked into the image |
-| `/var` | **ephemeral** (tmpfs overlay), except bind-mounted subpaths such as `/var/log` | `/var/lib/reliaburger/{data,images,logs,metrics,volumes}` must persist | a **dedicated data partition** (below), not a bind mount |
-| `/etc` | **ephemeral**, except listed bind mounts | `node.toml`, identity, master key | keep them under the data partition (`/var/lib/reliaburger/etc/`), pointed at by the unit, so there's one place to back up and wipe |
-| `/usr/local` | persistent (`COS_PERSISTENT`), hosts the bind mounts under `/usr/local/.state` | nothing | left to Kairos |
-| `/oem` | persistent (`COS_OEM`), holds cloud-config | non-secret install-time config | cloud-config only; **never secrets** |
+```sh
+# Once, on the second Mac (asks for sudo).
+brew install qemu socket_vmnet lima
+sudo brew services start socket_vmnet      # shared mode, socket at $(brew --prefix)/var/run/socket_vmnet
 
-- **Why a dedicated partition.** `bind_mounts` would put `/var/lib/reliaburger` on `COS_PERSISTENT`, which is ext4 and shared with Kairos's own state. Bun prefers Btrfs for volumes (`src/grill/volume.rs`, with the loop-ext4 fallback), and a dedicated partition lets `relish` wipe or back up cluster state without touching the OS. So the install config adds an extra partition:
+# The server VM: Ubuntu 26.04 on the shared network.
+cat > rb-lan.yaml <<'EOF'
+vmType: qemu            # vz with socket_vmnet networks: [unverified], qemu is the safe choice
+images:
+  - location: "https://cloud-images.ubuntu.com/releases/resolute/release/ubuntu-26.04-server-cloudimg-arm64.img"
+    arch: "aarch64"
+networks:
+  - socket: "/opt/homebrew/var/run/socket_vmnet"
+EOF
+limactl start --name rb-lan rb-lan.yaml     # [unverified: exact image URL and networks.socket key]
 
-  ```yaml
-  install:
-    partitions:
-      persistent: { size: 2048 }        # give Kairos a fixed slice...
-    extra-partitions:
-      - name: reliaburger
-        size: 0                         # ...and bun the rest of the disk
-        fs: none                        # see below
-        label: RB_DATA
-  ```
+# Inside rb-lan, until relish image serve exists: dnsmasq as a pure ProxyDHCP + TFTP.
+sudo dnsmasq --no-daemon --port=0 --interface=lima0 \
+  --dhcp-range=192.168.105.0,proxy --enable-tftp --tftp-root=/srv/tftp \
+  --dhcp-userclass=set:ipxe,iPXE \
+  --pxe-service=tag:!ipxe,ARM64_EFI,"Reliaburger",ipxe-arm64.efi \
+  --pxe-service=tag:!ipxe,X86-64_EFI,"Reliaburger",ipxe-x86_64.efi \
+  --pxe-service=tag:ipxe,ARM64_EFI,"Reliaburger",http://192.168.105.2:8080/boot.ipxe
 
-- **One snag found in the source:** `kairos-agent`'s partitioner only formats `ext2`–`ext4`, `xfs` and `fat`/`vfat` (`agent/pkg/partitioner/mkfs.go`). It has no Btrfs. So the partition is created unformatted (`fs: none`). A oneshot unit that runs before `reliaburger-data.mount` does `mkfs.btrfs -L RB_DATA` only when the partition has no filesystem, and the mount unit mounts it at `/var/lib/reliaburger`. The docs also say extra partitions are "not automounted, only created and formatted", so our mount unit is needed either way. Setting `size: 0` on an extra partition while fixing `persistent` follows the docs' own comment in the configuration reference **[untested]**.
-- **Encryption.** Kairos can bind partition encryption to the TPM (kcrypt, `bind-pcrs`). That would cover `RB_DATA` and the master key on it, and later feed `AttestationMode::Tpm`. It stays out of v1, and whether kcrypt can encrypt a non-Kairos partition by label is **[unverified]**.
+# Each client, on the Mac: socket_vmnet_client passes the connected socket as fd 3.
+"$(brew --prefix)/opt/socket_vmnet/bin/socket_vmnet_client" \
+  "$(brew --prefix)/var/run/socket_vmnet" \
+  qemu-system-aarch64 -machine virt -accel hvf -cpu host -smp 4 -m 2048 \
+    -drive if=pflash,format=raw,readonly=on,file="$Q/edk2-aarch64-code.fd" \
+    -drive if=pflash,format=raw,file=vars-c2.fd \
+    -device virtio-net-pci,netdev=n0,mac=52:54:00:00:01:02,bootindex=1 \
+    -netdev socket,id=n0,fd=3 \
+    -drive if=virtio,file=c2.qcow2 -nographic
+```
 
-**Delivering `node.toml`, join tokens and `operator_cidrs`.** Cloud-config is the delivery channel for *non-secret* settings only. Network boot serves the cloud-config over plain HTTP to anything that asks, and AuroraBoot's netboot passes a `config_url` to every booted machine. So the split is:
+Five of those, with different MACs and disks, is the claim lab from Phase 2. The same `socket_vmnet_client` line with `qemu-system-x86_64 -machine q35 -accel tcg -cpu Westmere` is the x86_64 smoke run. The dnsmasq flags, CSA names and interface name are **[unverified sketch]**, and the spike fixes them.
 
-| Setting | How it gets there | Why |
+**Level 2b: no root at all.** QEMU's `-netdev dgram` joins processes into one L2 "hub" over UDP multicast:
+
+```sh
+-device virtio-net-pci,netdev=n0,mac=52:54:00:00:02:01 \
+-netdev dgram,id=n0,remote.type=inet,remote.host=230.0.0.1,remote.port=1234
+```
+
+There's no DHCP on that hub, so one extra VM plays the router (dnsmasq handing out addresses only), and another runs the netboot server. Multicast over macOS loopback for this purpose is **[unverified]**. Use it only if socket_vmnet's root step is unwelcome.
+
+**Level 3: bridged to the real LAN.** This is also the product topology. `relish image serve` runs **natively on macOS**, and the Wyse boxes (or VMs bridged with socket_vmnet `--vmnet-mode=bridged --vmnet-interface=en0`) sit on the wired LAN behind the home router. That's where the macOS questions from §4.7 get answered: non-root UDP 67/69/4011, the firewall prompt, and whether `bootpd` is running. Wi-Fi interfaces generally can't be bridged, so use Ethernet on the Mac **[unverified for vmnet]**.
+
+### 8.5 What needs the second Mac
+
+Everything in §8: levels 1–3, the x86_64 TCG smoke run, and serving the Wyse fleet. CI (§7) builds all the artefacts, so the second Mac only runs QEMU, Lima and `relish`. The soak Mac isn't touched.
+
+---
+
+## 9. Final hardware: ten Dell Wyse 3040 thin clients
+
+*Added 27 Sep 2026. Hardware facts come from the Debian wiki, Parkytowers' 3040 pages and Dell's 3040 user guide, fetched that day. Repo numbers come from `main`: the V02 12-hour soak record, the binary-size record and `src/config/node.rs`.*
+
+### 9.1 The machine
+
+| | Dell Wyse 3040 (N10D) |
+|---|---|
+| CPU | Intel Atom x5-Z8350 ("Cherry Trail", Airmont), 4 cores, 1.44 GHz, x86_64, fanless |
+| RAM | **2 GB DDR3L, soldered**, single channel. Not upgradeable. |
+| Storage | **8 or 16 GB eMMC, soldered**. Linux sees `/dev/mmcblk0`, plus `mmcblk0boot0`, `mmcblk0boot1` and `mmcblk0rpmb`. |
+| Network | Realtek RTL8111/8168 gigabit (`r8169`, needs `rtl_nic` firmware). Wi-Fi only via an SDIO M.2 card or a USB dongle. |
+| Firmware | UEFI only once switched from the factory CSM mode ("it is not possible to reactivate the CSM"). F2 setup, F12 boot menu. Latest BIOS 1.2.5. Default BIOS password "Fireport". Secure Boot off by default (and it stays off for us). |
+| Power | 5 V or 12 V barrel supplies, depending on the batch. Use the one each unit shipped with. |
+
+### 9.2 Is 2 GB of RAM enough?
+
+**Yes for the final test and small workloads, and only just.** The budget, per node:
+
+| Consumer | Estimate | Source |
 |---|---|---|
-| Install policy (disk selection, partition sizes, `install.auto`, reboot) | cloud-config served by AuroraBoot or embedded in the ISO | not secret; the same for every machine |
-| `operator_cidrs`, cluster name, seed endpoints, root CA **fingerprint**, network overrides | cloud-config `stages` writing a `node.toml` fragment into `/var/lib/reliaburger/etc/` on first boot | none of these are secret: the fingerprint is a public hash, and `operator_cidrs` opens only 9117, which still needs a token (`docs/linux-servers.md` §5.3). `operator_cidrs` is now in `[security]` on `main`, which closes the static half of gap G2 in §4.3 |
-| `advertise_address`, node name | detected by bun in appliance mode (G3, G4) or set at claim time | per-machine |
-| **Join token, `master.key`, bootstrap bundle** | **only through the claim** (§4.2 d), over TLS pinned to the machine's claim fingerprint. Seed mode (§4.2 c) is the headless fallback, and it stays **USB-only**: `auroraboot build-iso --cloud-config` bakes the seed into a per-cluster ISO, and `iso.overlay_iso` can carry a seed file next to it. | a netboot-served cloud-config is broadcast to the LAN; a token in it is a token anyone on the LAN can use |
+| Kernel, systemd, journald, networkd, timesyncd, udev | 150–250 MB | **[estimate]**, measured in the spike |
+| bun | **200–330 MB** at the start of a run; 470–780 MB "warm" later in the V02 soak, with peaks near 1 GB **before** the metrics-collector leak fix (#220) | `docs/qualification/2026-09-26-v02-soak-12h.md` (3 nodes, `rss_kb`); post-#220 numbers **[unmeasured]** |
+| bun's `reserved_memory` default | 512 MiB | `src/config/node.rs` |
+| Page cache for images, Btrfs metadata | whatever's left | |
+| **Left for workloads** | **~1.0–1.3 GB** | |
 
-So Kairos changes *where the generic settings come from*, not the security model. G1 (master-key delivery) and G5 (rotation) are still open on `main`: `docs/linux-servers.md` §4.1 still streams `prod-master.key` to each node over SSH.
+Some consequences:
+- A tour-sized load fits, and so does Redis with a small dataset or a couple of small HTTP services. Anything JVM-sized doesn't. For scale, the tour transcript's frontend app reports `process_resident_memory_bytes` of 123.3M across its three replicas (the transcript doesn't say whether that's a sum or a mean).
+- **Council members carry more**: Raft, the metrics rollup and the reporting tree. On ten nodes, use 3 or 5 voters and let the rest be workers.
+- **Mitigations:**
+  - zram swap (`systemd-zram-generator`, about half of RAM), which trades CPU the Atom has for RAM it hasn't;
+  - the appliance profile (§9.3);
+  - a `relish wtf` memory alert per node, which already exists as `memory_high`.
+- **The installer must stream.** A netbooted installer runs from RAM. If it downloaded a 0.5–1 GB image into tmpfs before writing it, it would compete with the kernel and initrd for 2 GB. So the installer writes `/usr` straight from HTTP onto the eMMC partition. `systemd-sysupdate` with a `url-file` source into a partition target does exactly that, or `systemd-pull raw` does it to a file. Verification then covers the written partition before it's marked bootable **[design; verify in the spike]**. A diskless, run-from-RAM mode is out of the question at 2 GB.
+- **What the spike measures:** idle and tour-loaded `MemAvailable` per node, bun RSS over a few hours, and whether zram gets used.
 
-**Upgrades: Kairos A/B next to bun's self-upgrade.** There are two cadences, as in §2.6 and §5:
+### 9.3 Is 8 GB of eMMC enough, and will it wear out?
 
-1. **bun and relish, often, without a reboot.** The image's copy of `bun` lives in read-only `/usr`, so the existing symlink upgrade can't swap it. We point `[upgrades] binary_dir` at `/var/lib/reliaburger/bin` (on `RB_DATA`) and let the launcher exec the newest verified `bun` there, falling back to the image's copy. That's today's Ed25519-countersigned upgrade, unchanged (`docs/linux-servers.md` §9).
-2. **The OS (kernel, Ubuntu packages, Kairos agent and our baked bun), roughly weekly, with a reboot.** Bun's orchestrator (`src/upgrade/orchestrator.rs`) keeps its council-aware order and health gates. For an OS step on each node it would:
-   1. download and **verify our Ed25519 signature** over the OS image;
-   2. run `kairos-agent upgrade --source ocifile:<verified tarball>` locally. It's a root CLI on the same box, so bun needs **no second API and no second PKI**, which is the big difference from Talos (§2.7);
-   3. drain, reboot, wait for rejoin;
-   4. only then upgrade the recovery image (`kairos-agent upgrade --recovery`, which Kairos deliberately keeps as a separate step).
+**Disk selection.** The installer must pick `/dev/mmcblk0`: not removable, the largest disk. It must never touch `mmcblk0boot0`, `mmcblk0boot1` or `mmcblk0rpmb`, which are tiny hardware partitions of the same chip. §4.5's "largest non-removable disk" rule needs an explicit exclusion for those names. Some firmware also forgets NVRAM boot entries, so the installer writes both a boot entry and the removable-media fallback `\EFI\BOOT\BOOTX64.EFI` (the Debian wiki's install note says the same).
 
-   Serving the image from Pickle (`--source oci:<node>:5050/...`) would avoid the tarball, but it needs `kairos-agent` to trust Pickle's TLS **[untested]**.
-3. **Rollback.** On a non-UKI install, Kairos's boot assessment uses GRUB variables and sentinels to fall back to the previous image when a boot after an upgrade fails (it adds `panic=5` and `systemd.crash_reboot=yes`). That covers "doesn't boot". "Boots but bun won't rejoin" is our health gate's job. It would set GRUB's next entry to the passive image (`grub_options next_entry`) and reboot **[design sketch, untested]**. Under Trusted Boot, Kairos's boot-assessment page still says the systemd-boot fallback isn't implemented, but its tracking issue (kairos-io/kairos#2864) was closed as completed on 27 Nov 2024, and v4.1.0 added "assessment suffix handling" for systemd-boot. So the docs look stale **[unverified]**.
-4. **How the two interact.** An OS upgrade ships a baked `bun`. If `binary_dir` holds a newer verified one, the launcher keeps using it; if it holds an older one, the launcher uses the image's copy. Neither cadence can downgrade the other **[design rule to test in the spike]**.
+**Layout on an 8 GB part** (about 7.3 GiB usable **[unverified]**):
 
-**Attack surface: what `kairos-init` adds.** On Debian-family bases `kairos-init`'s package map installs a general-purpose set, including `openssh-server`, `fail2ban`, `neovim`, `snmpd`, `lldpd`, `nfs-common`, `open-iscsi`, `mdadm` and `isc-dhcp-server`. That's a long way from §1's "no SSH, no shell, no package manager" appliance.
-- We can mask services and `apt-get purge` after `kairos-init`, but whether Kairos's own stages expect some of them (for example `08_ssh.yaml`) is **[unverified]**.
-- `ssh_hardening` enforces key-only SSH if we keep it as a debug path.
-- This is the biggest *product* cost of Kairos against mkosi, where the image contains only what we list.
+| Partition | Size |
+|---|---|
+| ESP (two or three UKIs of 60–120 MB each) | 512 MiB |
+| `usr-A` and `usr-B`, each with verity | 2 × ~1.1 GiB |
+| `RB_DATA` (Btrfs): Raft, images, logs, metrics, volumes | **~4.5 GiB** |
 
-### 7.3 Netboot as the unified path
+That fits only if `/usr` stays **under ~1 GiB compressed**. The biggest risk is `linux-firmware`, a very large package **[unverified size on 26.04]**. So the image keeps an allow-list of firmware:
+- `rtl_nic` and `i915` for the Wyse;
+- `intel` for the Atom's audio and ISP, if needed;
+- nothing for Wi-Fi by default.
 
-**One image, three artefacts.** From the single OCI image in §7.2, AuroraBoot produces:
+mkosi's `RemoveFiles=` (or a postinst script) prunes the rest, and drops docs, man pages and locales. The 16 GB units have plenty of room.
 
-| Artefact | How | Used for |
-|---|---|---|
-| kernel, initrd and `squashfs` | `auroraboot netboot <iso> <out> <prefix>`, or implicitly when AuroraBoot serves a `container_image` | PXE via iPXE |
-| install ISO, optionally with an embedded cloud-config | `auroraboot build-iso` (`--set disable_netboot=true`, `--cloud-config`) | USB fallback, UEFI HTTP Boot of an ISO, and seed-mode sticks |
-| raw EFI disk | `--set disk.efi=true` (needs `--privileged` for loop devices) | the QEMU tests in CI |
+**What fills `RB_DATA`**, from the V02 soak's resource table (three nodes, 12 hours):
+- the data directory: 10–780 MB, mostly Raft and the stores;
+- images: 100–420 MB;
+- logs and metrics: about 7–11 MB each;
+- volumes: under 30 MB.
 
-That's the "unified spike": **one image definition, built once per release, with netboot and USB as two wrappers around the same bits.** The build record, signature and digest are per image, not per wrapper.
+4.5 GiB covers that with room for a few small images, **provided retention is bounded**. The appliance profile sets:
+- `[metrics] max_storage_mb` and `[logs] max_storage_mb` (0, meaning unlimited, today) to around 256 each;
+- `[images] gc_retain_days` from 7 to 1 or 2;
+- `[upgrades] retain_versions` to 1 old bun;
+- journald to `SystemMaxUse=32M`.
 
-**From power-on to a claimed node (netboot).**
+**Wear.** Cheap eMMC has an endurance of the order of a few hundred times its capacity in writes **[unverified; vendor-specific]**. The write sources are Raft's log and snapshots, metrics, logs, image pulls and journald. Btrfs mount options for the data partition: `noatime,compress=zstd:1` (compression cuts bytes written), with the kernel's default async discard. The spike records bytes written per day from `/sys/block/mmcblk0/stat` on an idle node and a busy one. If the numbers point at a lifetime under a few years, lengthen `[metrics] collection_interval_secs` (10 s by default) and move logs to RAM with periodic export.
 
-1. `auroraboot` runs on the laptop, or on node 1 later (below), with `container_image` set to our signed release image and a **generic** cloud-config (`install.auto: true`, the disk policy, the `RB_DATA` partition, no secrets).
-2. A mini PC's firmware sends a PXE DHCPDISCOVER. The home router gives it an address, and AuroraBoot's built-in **ProxyDHCP** (Pixiecore) answers with boot instructions. AuroraBoot's log shows "DHCP: Offering to boot <MAC>", then "HTTP: Sending ipxe boot script". Firmware without PXE can boot Kairos's generic iPXE ISO from a stick, which then finds the ProxyDHCP.
-3. iPXE fetches the kernel and initrd over HTTP (port 8090 by default). The live system then pulls the squashfs and the cloud-config from the same server.
-4. With `install.auto`, the live system installs to the chosen disk (the `device` value, which can be `auto` or a `script://` selector since v4.1.0) and reboots from disk.
-5. On first boot from disk, the `RB_DATA` unit formats and mounts the data partition, and bun starts in **appliance mode**: `unclaimed`, claim fingerprint and QR on tty1, `_reliaburger-unclaimed._tcp` over mDNS (§4.2 d).
-6. The operator runs `relish machines`, compares fingerprints, runs `relish machines claim <first> --create`, then `relish machines claim --all`. From here on it's §4.6 steps 5–8, unchanged.
+### 9.4 Network boot on the 3040
 
-**The first node.** The PKI is generated **on the laptop** (`relish cluster create --bare-metal`, §4.4), and node 1 gets its bootstrap bundle through the claim. Once node 1 is claimed it can take over serving: run AuroraBoot as a bun-managed service, or `relish image serve --node home-1` (§4.7) once that exists, with the 60-minute window. The laptop can then sleep, and a sixth machine is "plug in and power on".
+- The firmware offers **UEFI PXE through the Realtek NIC**, with a boot entry named along the lines of "UEFI: IP4 Realtek PCIe GBE Family Controller" (IPv6 too).
+- Those entries **can disappear after a CMOS reset** until the network boot option is re-enabled in setup. The exact menu names aren't confirmed yet **[unverified]**, and the spike will write them down.
+- I found **no evidence of UEFI HTTP Boot** on the 3040, so plan for **PXE → iPXE over TFTP → HTTP**. That's exactly the baseline in §4.7.
+- **BIOS to-do per unit:**
+  - update to 1.2.5;
+  - UEFI mode with CSM off;
+  - network boot enabled and PXE first in the order (or F12 once);
+  - Secure Boot off (the default);
+  - optionally, power on after AC loss, so a power cut doesn't leave the cluster off.
 
-**DHCP and ProxyDHCP on a home LAN.** Everything §4.7 says about ProxyDHCP applies unchanged, because AuroraBoot does the same dance. It never leases addresses, it coexists with the router, it needs a shared broadcast domain (no guest Wi-Fi or AP isolation), and two proxies on one LAN race each other. AuroraBoot needs UDP 67 and TCP 8080/8090 free. The AuroraBoot docs add two facts that matter:
-- **macOS:** netboot doesn't work from AuroraBoot's Docker image on a Mac, because Docker runs in a VM that can't see the host network. The docs recommend running the native AuroraBoot binary instead, with `xorriso` from Homebrew. Whether that binary can bind UDP 67 without root on macOS is the same **[unverified]** question as §4.7's.
-- **Secure Boot over the network:** AuroraBoot's UKI netboot (`uki-pxe`) works **only over UEFI HTTP Boot, with the machine in setup mode** (Secure Boot off, no keys enrolled), so the ISO can enrol its keys on first boot. PXE with UKI and Secure Boot "is not yet supported and probably won't be". Non-UKI netboot runs through iPXE, so a machine with Secure Boot on needs the Microsoft-signed iPXE shim or has to turn Secure Boot off for the install boot **[unverified with AuroraBoot's bundled iPXE]**. Once installed, the shim and GRUB chain boots with Secure Boot on (§7.2).
+  Ten units makes this an hour of keyboard work on its own. Dell's BIOS settings can also be exported and imported with Dell's tools on some models **[unverified for the 3040]**.
+- **Bandwidth:** ten installs at 0.5–1 GB each is 5–10 GB. That's 1–2 minutes over wired gigabit from the Mac, and far longer over Wi-Fi. The Mac goes on Ethernet.
 
-**Diskless mode.** Kairos also supports running from RAM (`kairos.ram`, with `kairos.ram.create_partitions` keeping `COS_OEM` and `COS_PERSISTENT` on the local disk). §4.7's argument still holds: a cluster whose nodes can't boot while the netboot server is down is fragile. So v1 installs to disk.
+### 9.5 CPU and our eBPF needs
 
-**Timing for five mini PCs.** The same as §4.6's network-boot column, about **25–40 minutes**, give or take the Kairos install step. That step (copying the image into the active, passive and recovery slots) takes a few minutes per machine, in parallel **[estimate]**. The image is bigger than an mkosi one: the old Kairos core ISOs were about 390 MB, and an Ubuntu base with `linux-firmware` and `kairos-init`'s package set will be larger **[unmeasured; the spike records it]**.
+- The Z8350 is plain x86_64 with SSE4.2, AES-NI and VT-x, and **no AVX** **[from Intel ARK memory, unverified]**. Our release binaries target the default `x86_64-unknown-linux-gnu` baseline: `main` sets no `target-cpu` in `.cargo` or the workflows. So they don't assume AVX, and the `-cpu Westmere` smoke run (§8.2) guards that.
+- eBPF has **no CPU-model requirement**. The cgroup `connect4/6` and `sendmsg4/6` hooks, CO-RE with BTF, and the x86_64 BPF JIT all depend on the kernel config, and §3.2 showed Ubuntu 26.04's generic kernel has every option we need. User namespaces, netem, `INET_DIAG_DESTROY`, Btrfs and nftables are kernel features too.
+- **Performance:** four slow cores. Image unpacking, TLS handshakes and zstd compression will be noticeably slower than on the quickstart's VMs. The spike times a deploy and an image pull.
 
-### 7.4 What we'd still build ourselves on Kairos
+### 9.6 Known quirks to bake into the image
 
-Kairos removes the image, installer, A/B, recovery and netboot-server work from §5. It doesn't remove:
-- **bun appliance mode** (§5 Phase 1): the claim server, mDNS, the tty1 screen, the data-partition unit, and address and name detection (G3, G4);
-- **G1** (master-key delivery after join), **G5** (rotation), and the join-window half of **G2**;
-- **`relish machines` / `relish image`** on the laptop;
-- **the OS step in the upgrade orchestrator** (`kairos-agent upgrade` plus the health-gated rollback);
-- **the release pipeline for our Ubuntu flavour**: a CI job that rebuilds the image whenever Ubuntu ships a kernel or a USN touching our packages, which is now about weekly (§3.1), plus a Kairos version bump roughly monthly.
+- **Reboot and shutdown hang** on Cherry Trail: the HSUART DMA driver hangs. The Debian wiki's fix is to blacklist `dw_dmac` and `dw_dmac_core` (`install dw_dmac /bin/true`, and the same for `dw_dmac_core`). Ship that as a `modprobe.d` file in the image, and check in the spike whether Linux 7.0 still needs it. A node that can't reboot can't finish an A/B update.
+- **Firmware files:** `rtl_nic/rtl8168*` for networking, `i915` for the console. Audio needs `firmware-intel-sound` on Debian, but we don't need audio.
+- **Fanless:** watch for thermal throttling under sustained load **[unverified]**.
+- **Only one USB 3 port** and no serial port, so a console means HDMI-to-DisplayPort and a USB keyboard. The tty1 status screen (§4.5) is how the operator reads the claim fingerprint.
 
-AuroraBoot v0.20+ also ships a **fleet server** with a web UI, node manager, phone-home, a Secure Boot key store and netboot. It overlaps our claim flow and Brioche, and adopting it would give the operator a second management plane, the same objection as Talos's `talosctl` (§2.9). **Use AuroraBoot as a boot server only.**
+### 9.7 How the final stage runs
 
-### 7.5 Comparison: Kairos on Ubuntu, own mkosi image, Talos
+1. Update and configure all ten BIOSes (§9.4). Record the menu names and time spent.
+2. Put the second Mac on Ethernet on the same switch as the Wyse boxes, behind an ordinary home router. Run `relish image serve` natively, or dnsmasq-proxy in a bridged VM if `relish image serve` isn't ready.
+3. Netboot all ten at once. They install and reboot into `unclaimed`.
+4. Claim them: three or five council voters, the rest workers.
+5. Run the tour. Pull a power cord.
+6. Measure RAM (§9.2) and eMMC writes (§9.3) over 24 hours.
+7. Pin a new weekly OS version and roll it out (§7.6). Then force one bad image and check the fallback.
+8. Write `docs/qualification/<date>-wyse-3040.md`.
 
-| | **Kairos 4.3 on Ubuntu 26.04** (this section) | **Own mkosi image, Ubuntu 26.04** (§6) | **Talos 1.14, k8s-less, host-mode extension** (§2) |
-|---|---|---|---|
-| **Up-front effort** | **S–M**: Dockerfile plus `kairos-init`, the data-partition unit, trimming packages, and the OS step in the orchestrator. Installer, A/B, recovery, ISO and netboot come for free. | **M–L**: mkosi recipe, repart installer, sysupdate A/B, UKI signing, our own netboot server (§4.7). | **M–L**: extension, musl build, bundled tools, machine-config generation, `imager` CI. |
-| **Ongoing burden** | Rebuild on Ubuntu kernels and USNs (weekly); follow Kairos minors (monthly) and a young monorepo; we're the only pipeline testing Ubuntu 26.04 boots. | Rebuild on Ubuntu kernels and USNs (weekly); mkosi bumps. | Talos minors every ~4 months, patches every 1–2 weeks; vendor roadmap overlap. |
-| **Main risks** | Upstream focus has moved to Hadron and Kubernetes; Ubuntu 26.04 isn't boot-tested upstream; a small core (about four people); a larger image with a general-purpose package set; persistence gotchas (`/var` and `/etc` ephemeral). | Assembling the boot, installer and netboot pieces ourselves (Incus OS shows it's done); Secure Boot key enrolment on consumer boards. | Experimental, controlplane-only k8s-less mode; host-mode services are new; two APIs and two PKIs. |
-| **OS upgrades** | `kairos-agent upgrade` A/B plus a separate recovery upgrade; GRUB boot assessment falls back on failed boot (under Trusted Boot the docs and the issue tracker disagree). Driven locally by bun, no second API. | `systemd-sysupdate` A/B with boot counting; driven locally by bun. | `talosctl upgrade` A/B with automatic rollback; needs Talos API credentials in bun. |
-| **bun upgrades** | Symlink swap in `binary_dir` on `RB_DATA`, no reboot | The same | The same, from `/var` |
-| **Secure Boot out of the box** | **Yes on the default path**: Ubuntu's Microsoft-signed shim, GRUB and kernel **[unverified on 26.04]**. The dracut initrd and the system image aren't signature-checked, so this only proves the kernel is Ubuntu's. | Only with our db key enrolled, or Secure Boot off | Talos's own keys: enrolment or Secure Boot off |
-| **Verified whole-OS boot** | Trusted Boot: a signed UKI (a "USI" carrying the whole OS, running from RAM), TPM2-bound encrypted partitions, keys enrolled via setup mode. It works, but it needs TPM2 and setup mode, and its boot-assessment fallback is documented as missing (probably stale, see above). | UKI plus verity `/usr` with our key: the design Incus OS ships | UKI and Secure Boot supported |
-| **Image signing** | Our Ed25519 over the OCI digest (bun verifies before `kairos-agent` sees it). Kairos's own images use cosign, which doesn't apply to ours. | Our Ed25519 over the image, with sysupdate's GPG question still open (§5 Phase 3) | Talos-signed base plus our extension |
-| **Fit with "single binary, the OS disappears"** | ⚠️ bun is the only *workload*, but the OS carries a second agent (`kairos-agent`, immucore, yip) and SSH that we have to mask. Operators never see it unless we expose AuroraBoot's fleet UI (we shouldn't). | ✅ bun is the only thing we add; systemd pieces only | ❌ `talosctl` and machine config beside `relish` |
-| **Netboot** | ✅ **Built in** (AuroraBoot ProxyDHCP, iPXE, HTTP); UKI netboot needs HTTP Boot in setup mode | We build `relish image serve` (§4.7, Phase 2b) | Image Factory iPXE, or our own server |
-| **Licences** | Apache-2.0 (Kairos, AuroraBoot, Hadron) over Ubuntu's archive | Our recipe over Ubuntu's archive; mkosi is a build tool and ships nothing | MPL-2.0; Omni and Discovery are BUSL |
-| **Community health** | CNCF Sandbox (applying for Incubation), Spectro Cloud-led, 1.8k stars, ~4 core committers, releases every 2–6 weeks | mkosi and systemd: large, healthy upstreams. Incus OS and ParticleOS as precedents. | Strong but concentrated; Sidero now owned by Yardi, with its own edge-container product due in Dec 2026 |
+---
 
-### 7.6 Unknowns, stated plainly
+## 10. Alternatives considered
 
-- Whether an Ubuntu 26.04 `kairos-init` image **boots, installs and upgrades** on amd64. Upstream only build-tests it.
-- Whether `kairos-init`'s extra packages can be purged, or SSH masked, without breaking Kairos's own stages.
-- Whether a `fs: none` extra partition sized `0` works, and whether our mkfs-then-mount unit runs early enough for bun.
-- Whether GRUB boot assessment plus `next_entry` gives us a clean "boots but unhealthy, so roll back" path.
-- Secure Boot on the default path: does Ubuntu 26.04's shim boot on older mini-PC firmware after the Microsoft 2011 CA expiry (§3.1)? And can AuroraBoot's iPXE hand over under Secure Boot?
-- The AuroraBoot native binary on macOS: can it bind UDP 67 without root, and does it netboot a real machine?
-- Image size and install time per machine.
-- Whether owners and containers survive a `kairos-agent upgrade` reboot cycle with Raft state intact (they should, since `RB_DATA` isn't touched, but it's untested).
+### 10.1 Kairos on Ubuntu (considered 27 Sep 2026, not chosen)
 
-### 7.7 Spike plan: Kairos + Ubuntu 26.04 + netboot, unified
+The alternative:
+- build the image `FROM ubuntu:26.04` with `kairos-init` (Kairos 4.3.0, 8 Sep 2026, Apache-2.0, CNCF Sandbox);
+- let **AuroraBoot** turn the one OCI image into netboot artefacts, an ISO and a raw disk, and serve them with its built-in ProxyDHCP (Pixiecore) next to the home router;
+- get the installer, A/B plus recovery images and GRUB boot assessment for free.
 
-> **Status: awaiting maintainer approval. Do not start building.** The spike runs later, after approval, and after the release soak has freed the Mac. None of it runs on the maintainer's Mac while the soak is going.
+It would have saved most of Phases 1, 2b and 3's image, installer and netboot work.
 
-**Scope.** One spike that replaces §6's four tracks if this alternative is chosen. The Talos track is dropped, and the mkosi track shrinks to an optional comparison day. It proves one image definition, netboot and USB from that image, the claim-shaped join, and both upgrade cadences.
+**Why it wasn't chosen:**
+1. **It isn't a minimal appliance.** On Debian-family bases, `kairos-init`'s package map installs `openssh-server`, `fail2ban`, `neovim`, `snmpd`, `nfs-common`, `open-iscsi`, `isc-dhcp-server` and more. Trimming that fights upstream's own stages. On an 8 GB eMMC (§9.3) the extra weight hurts twice: once in each A/B image, and once in the recovery image.
+2. **A second agent on every node.** `kairos-agent`, immucore and yip, plus AuroraBoot as a second tool on the laptop. Its v0.20+ fleet server would be a second management plane beside `relish`.
+3. **Upstream has moved away from Ubuntu.** Since v4.0 (Feb 2026) the project publishes prebuilt artefacts only for its own Hadron distro, and says the old flavour repositories "are no longer actively updated". CI **builds** `ubuntu:26.04` in its `_build-flavors.yaml` smoke matrix but **boot-tests** only Hadron and one `ubuntu:20.04` cell. We'd be the only pipeline proving Ubuntu 26.04 boots.
+4. **A small core.** About four people wrote almost all of the monorepo's last 12 months of commits, behind a single sponsor (Spectro Cloud).
+5. **Persistence doesn't match bun.** `/var` and `/etc` are ephemeral, and `kairos-agent`'s partitioner can't format Btrfs (`agent/pkg/partitioner/mkfs.go` handles only ext2–4, xfs and fat). We'd work around both.
+6. **Netboot is the part we want to own anyway.** `relish image serve` gives one binary, the operator's existing trust (the release key and the claim flow), and no Docker on the laptop. AuroraBoot's netboot doesn't work from its Docker image on macOS at all; the native binary needs `xorriso`.
 
-**Hardware.**
-- A **Linux host with KVM** (x86_64, 8+ cores, 32 GB RAM, 100 GB free disk), with Docker and buildx, QEMU, OVMF, a Linux bridge and dnsmasq. A GitHub-hosted runner can do the image build but not the bridged netboot lab.
-- Optional but valuable: **one or two real mini PCs** (ideally a Dell or Lenovo business box and a consumer AMI box) and a spare USB stick, on a wired switch.
-- A Mac for the one macOS check, **only after the soak ends**.
+What we keep from the exercise: the netboot flow (ProxyDHCP, iPXE, streamed install) matches AuroraBoot's design, which is reassuring. The rule "cloud-config and netboot carry no secrets" applies to our seed and claim design unchanged. The sources are in the Sources section.
 
-**Steps.**
+### 10.2 Talos (parked, revisit later)
 
-| # | Step | Success looks like | Estimate |
-|---|---|---|---|
-| S0 | Set up the lab: a bridge `rb-lab0`, dnsmasq handing out **addresses only** (no boot options) to stand in for the home router, and a local registry | A VM on the bridge gets an address and nothing else | 0.5 d |
-| S1 | Write `image/kairos/Dockerfile` (§7.2): `FROM ubuntu:26.04`, `kairos-init` v0.17.3, the `guest-images.json` packages, bun, relish, the launcher, the unit, the `RB_DATA` format and mount units, SSH masked. Build `v0.0.1-spike`. Record size and package list. | The image builds; `/etc/kairos-release` shows our version; the list of kairos-init packages we'd want to purge is written down | 1 d |
-| S2 | Run AuroraBoot on that image to get netboot artefacts **and** an ISO **and** a raw EFI disk from the same digest | Three artefacts from one build, with sizes recorded | 0.5 d |
-| S3 | **Netboot install:** 3 OVMF VMs PXE-boot through AuroraBoot's ProxyDHCP next to the address-only dnsmasq, auto-install with the generic cloud-config, reboot from disk. Then a 4th VM from the ISO (the USB path), and one VM through UEFI HTTP Boot of the ISO. | All VMs reach "bun started, `RB_DATA` mounted as btrfs at `/var/lib/reliaburger`", with no DHCP changes to the "router" | 1 d |
-| S4 | **Cluster and tour:** no claim server exists yet, so stand in for it. Generate the PKI on the lab host (`relish init`), hand node 1 its bundle and nodes 2–3 their join tokens through a **lab-only per-MAC `kairos.config_url`** on the host (documented as *not* the product path). Run `scripts/demo/tour.sh`. Check eBPF attach to the root cgroup, userns containers at uid 2e9, netem, `ss -K`, and the nftables perimeter with `operator_cidrs`. | The tour passes on 3 Kairos nodes; the checks are recorded | 1 d |
-| S5 | **Upgrades:** build `v0.0.2-spike` (a package bump). On one node run the verify-then-`kairos-agent upgrade --source ocifile:` step by hand, reboot, and confirm rejoin with Raft, images and volumes intact. Break a third image on purpose and confirm boot assessment falls back. Swap bun through `binary_dir`, run an OS upgrade on top, and confirm the launcher's no-downgrade rule. | Both cadences work and don't fight; a bad OS image falls back without hands | 1 d |
-| S6 | **Real hardware (optional):** netboot one or two mini PCs from the lab host on a wired LAN with an ordinary router. Record the firmware settings needed (Network Stack, Secure Boot state) and wall-clock time. | At least one physical machine goes from power-on to "bun started" by netboot | 0.5 d |
-| S7 | **Write-up:** a qualification record under `docs/qualification/`, and an update to this section with measured numbers and a go/no-go. Plus the macOS AuroraBoot-binary check once the soak is over. | A decision the maintainer can sign off | 0.5 d |
-
-**Total: about 5–6 engineer-days**, or 4.5–5 without real hardware. Add a day if the maintainer wants the mkosi comparison (§6 track 2) run on the same lab, which would make the go/no-go a like-for-like one.
-
-**Exit criteria.**
-1. One image digest yields the netboot, ISO and raw artefacts.
-2. Three VMs install over PXE next to an unmodified address-only DHCP server, and one installs from the ISO.
-3. The tour passes on the resulting cluster, with bun state on a Btrfs `RB_DATA`.
-4. An OS A/B upgrade and a bun `binary_dir` upgrade both work on the same node, and a broken OS image falls back automatically.
-5. A written list of what `kairos-init` installed that we'd remove, and whether removing it is safe.
-6. A go/no-go: Kairos for the v1 appliance, or back to mkosi.
-
-**Not in the spike:** the claim server, mDNS, `relish machines`, G1, G5, Trusted Boot/UKI, aarch64, AuroraBoot's fleet server.
-
-### 7.8 Recommendation: when to prefer which
-
-- **Prefer Kairos on Ubuntu** when **time to a working bare-metal appliance** matters most, and we accept a heavier image and a second on-box agent. It turns §5's image, installer, A/B and netboot work (Phases 1, 2b and 3, about 8–12 weeks) into roughly the Dockerfile, the data partition and the orchestrator hook. That frees the effort for the parts only we can build: appliance mode, the claim flow, G1 and G5. **Netboot works on day one**, and one image serves netboot and USB. This is the right choice for a v1 appliance and for proving the "five mini PCs in under an hour" story quickly.
-- **Prefer the own mkosi image** (§6) when the **product** matters most: a minimal image with no SSH and nothing we didn't list, verity `/usr`, sysupdate and a UKI we sign, and no dependency on a small upstream whose focus has moved to Hadron and Kubernetes. It's more work up front but less exposure to someone else's roadmap. It stays the **long-term target**.
-- **Prefer Talos** only when the users are **already running Talos** and want Reliaburger next to it, and only once k8s-less mode and host-mode services are GA (re-check in 2027, §2.9). Don't fork it (§2.10).
-
-**My recommendation.** Treat Kairos on Ubuntu as a serious candidate for the *first* appliance release, and decide on the spike's evidence, not on this note:
-- If S1–S5 pass, ship v1 on Kairos, and keep the mkosi recipe as the planned successor once appliance mode and the claim flow are stable.
-- If Ubuntu 26.04 boots poorly under `kairos-init`, or the package set can't be trimmed, fall back to §6.
-
-Most of what the spike builds carries over either way: the Ubuntu package list, the data-partition unit, the launcher, the netboot lab, and the orchestrator's OS-step interface (`kairos-agent upgrade` today, `systemd-sysupdate` later).
-
-**Open questions for the maintainer.**
-1. Is an image that *contains* SSH and a general-purpose package set, masked and trimmed, acceptable for v1? Or is "nothing we didn't list" a hard requirement? If it's hard, Kairos is out.
-2. Is AuroraBoot acceptable as a second, laptop-side tool for v1 netboot? Or must `relish image serve` own netboot from the first release?
-3. Secure Boot: is Ubuntu's signed shim chain, which verifies the kernel but not the rest of the OS, good enough for v1? Or do we need a verified whole-OS boot (Kairos Trusted Boot or an mkosi UKI) from the start?
-4. Ubuntu 26.04 for both the appliance and the quickstart guest (still 24.04 on `main`), as §3.1 decided?
-5. Which Linux KVM host and which physical mini PCs can the spike use, and when is the Mac free after the soak?
-6. Is a lab-only per-MAC `kairos.config_url` acceptable in the spike as the stand-in for the claim flow?
-7. Should the spike include the one-day mkosi comparison?
+§2 is the full analysis, kept as background. In short, Talos 1.14 can host `bun` through an experimental, controlplane-only Kubernetes-less mode and brand-new host-mode extension services. But it brings a second API and PKI (`talosctl`), a musl rootfs without the tools bun shells out to, and user namespaces off by default. Its vendor also announced its own non-Kubernetes container scheduling for December 2026. Forking it is ruled out (§2.10). **There are no Talos spike steps or plan items any more.** Revisit once the k8s-less mode and host-mode services are GA, at the earliest in 2027, as a "bring your own Talos" extension for people already running it.
 
 ---
 
@@ -1050,7 +1145,7 @@ Most of what the spike builds carries over either way: the Ubuntu package list, 
 - k3s tokens: https://docs.k3s.io/cli/token
 - Tailscale auth keys: https://tailscale.com/kb/1085/auth-keys
 
-**Kairos alternative (§7; all fetched 27 Sep 2026)**
+**Kairos alternative (§10.1; all fetched 27 Sep 2026)**
 - Docs source, used instead of the rendered site because it's current and unambiguous: https://github.com/kairos-io/kairos-docs (paths below are under `docs/`, `blog/` or `quickstart/` on `main`)
 - Network booting and in-RAM mode: https://kairos.io/docs/installation/netboot/ (`docs/installation/netboot.md`)
 - AuroraBoot reference (ProxyDHCP prerequisites, macOS, `build-iso`, `netboot`, `start-pixie`, raw disks, UKI over HTTP Boot): https://kairos.io/docs/reference/auroraboot/ (`docs/reference/auroraboot.md`)
@@ -1076,6 +1171,32 @@ Most of what the spike builds carries over either way: the Ubuntu package list, 
 - iPXE bootstrap ISO for machines without PXE: https://github.com/kairos-io/ipxe-dhcp/releases
 - Reliaburger `main` at `0eb6071d`: `docs/linux-servers.md` (unit file, `operator_cidrs`, master-key copy over SSH, `binary_dir` upgrades) and `scripts/release/guest-images.json` (still Ubuntu 24.04)
 
+**Weekly builds and OS updates (§7; fetched 27 Sep 2026)**
+- mkosi setup action (unprivileged userns, `/dev/kvm`): https://github.com/systemd/mkosi/blob/main/action.yaml
+- mkosi man page (`RepartOffline=`, `ToolsTree=`, unprivileged user namespaces): https://github.com/systemd/mkosi/blob/main/mkosi/resources/man/mkosi.1.md
+- KVM on standard 2-vCPU Linux hosted runners: https://github.blog/changelog/2024-04-02-github-actions-hardware-accelerated-android-virtualization-now-available/
+- No `/dev/kvm` on `ubuntu-24.04-arm`: https://github.com/orgs/community/discussions/148648 and https://github.com/orgs/community/discussions/160591
+- GitHub-hosted runners reference: https://docs.github.com/en/actions/reference/runners/github-hosted-runners
+- `sysupdate.d(5)` (resource types, `Verify=`, `TriesLeft=`, `InstancesMax=`): https://man7.org/linux/man-pages/man5/sysupdate.d.5.html
+- Automatic Boot Assessment: https://systemd.io/AUTOMATIC_BOOT_ASSESSMENT/
+- Repo, `main` at `0eb6071d`: `.github/workflows/build.yml` (`build-guest-images`, `candidate`), `docs/releasing.md` (signing identity, guest images, the soak's signing caveat) and PR #215 (artefact retention and cache limits)
+
+**VMs on a Mac (§8; fetched 27 Sep 2026)**
+- QEMU EDK2 build options: https://gitlab.com/qemu-project/qemu/-/blob/master/roms/edk2-build.config and the shipped files in https://gitlab.com/qemu-project/qemu/-/tree/master/pc-bios
+- Homebrew formulae (qemu 11.1.1, socket_vmnet 1.2.2): https://formulae.brew.sh/formula/qemu and https://formulae.brew.sh/formula/socket_vmnet
+- socket_vmnet: https://github.com/lima-vm/socket_vmnet
+- Lima vmnet networks (shared 192.168.105.0/24, `bootpd`, bridged): https://lima-vm.io/docs/config/network/vmnet/
+- QEMU `-netdev dgram` multicast: https://www.mail-archive.com/qemu-devel@nongnu.org/msg1059033.html and https://john-millikin.com/improved-unix-socket-networking-in-qemu-7.2
+- dnsmasq man page (`--dhcp-range=...,proxy`, `--pxe-service`): https://thekelleys.org.uk/dnsmasq/docs/dnsmasq-man.html
+- iPXE on ARM64 EFI: https://ipxe.org/appnote/buildtargets
+
+**Dell Wyse 3040 (§9; fetched 27 Sep 2026)**
+- Debian wiki: https://wiki.debian.org/InstallingDebianOn/Dell/Wyse%203040
+- Parkytowers hardware and firmware pages: https://www.parkytowers.me.uk/thin/wyse/3040/ and https://www.parkytowers.me.uk/thin/wyse/3040/firmware.shtml
+- Dell 3040 user guide (boot sequence, BIOS access): https://www.dell.com/support/manuals/en-us/wyse-3040-thin-client/3040_ug/boot-sequence?guid=guid-569fa4de-9398-4878-ba44-a8e5b05ccff3&lang=en-us
+- Install write-ups: https://nickcharlton.net/posts/installing-debian-12-dell-wyse-3040 and https://mcgarrah.org/dell-wyse-3040-debian12/
+- Repo, `main`: `docs/qualification/2026-09-26-v02-soak-12h.md` (bun RSS, disk use), `docs/qualification/2026-09-24-binary-size.md` (bun 104.9 MB, relish 94.6 MB), `docs/qualification/2026-09-24-tour-transcript.md`, and `src/config/node.rs` (`reserved_memory`, `[metrics]`/`[logs]` `max_storage_mb`, `[images] gc_retain_days`)
+
 **Still [unverified]**
 - Talos runc path and `iptables` backend.
 - Whether owners survive a restart under the host-mode runner on a real node.
@@ -1089,5 +1210,9 @@ Most of what the spike builds carries over either way: the Ubuntu package list, 
 - Whether consumer AMI/Insyde firmware honours ProxyDHCP offers for UEFI HTTP Boot.
 - That a non-root process on macOS can bind UDP 67/69/4011 on the wildcard address.
 - The exact Secure Boot hand-over from Microsoft-signed iPXE to our UKI.
-- Kairos on Ubuntu 26.04 booting, installing and upgrading (upstream only build-tests it), and everything else listed in §7.6.
+- The appliance's image size, RAM use on 2 GB and eMMC writes per day (§9.2, §9.3), measured in the spike.
+- The Wyse 3040's BIOS menu names for network boot, and whether it has UEFI HTTP Boot (§9.4).
+- Whether the `dw_dmac` reboot-hang workaround is still needed on Linux 7.0 (§9.6).
+- The mkosi tools-tree build time on hosted runners, and whether the arm64 runner can build unprivileged the same way (§7.3).
+- The macOS lab details in §8.4: socket_vmnet with Lima's VZ backend, dnsmasq CSA names, slirp and UEFI HTTP Boot, multicast `-netdev dgram` on macOS, and an x86_64 vars file for QEMU 11.
 - That the perimeter blocks a LAN laptop in practice (derived from `src/firewall/rules.rs` and `src/bun/agent.rs`, not tested on hardware).
