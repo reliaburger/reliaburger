@@ -120,7 +120,11 @@ A managed volume lives under the node's `[storage] volumes` directory
 (`/var/lib/reliaburger/volumes` by default), one per app and mount path, and
 survives restarts and redeploys. Bun hands it to the container's user the first
 time it's mounted. It stays on its node, so it's local storage, not a
-network volume. A host-path volume is never chowned: make it readable (or
+network volume. An app with a managed volume stays with it too: after
+`relish stop`, the next `relish apply` starts it again on the node that holds
+its volume, and waits there if that node is short of room. Only when that node
+is gone (or no longer matches the app's `placement.required` labels) does it
+start elsewhere, on a new, empty volume. A host-path volume is never chowned: make it readable (or
 writable) by the container's mapped user yourself.
 
 ## Snapshots

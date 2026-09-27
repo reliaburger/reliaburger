@@ -1023,6 +1023,35 @@ desired
 
 `filter` hands the closure a reference to each `(key, value)` pair, so `id` is a `&&AppId` there; `*id` strips one layer to get the `&AppId` that `contains` wants. A stopped app keeps its service and VIP, though, with zero backends, so the same name and address come back when you apply it again.
 
+### A stopped app forgets where its data is
+
+Keeping the specification wasn't enough, either. The V02 soak's `volume_data_survives_instance_restart` case writes a marker into a managed volume, stops the app, applies it again and reads the marker back. On one fast-tier run it got this:
+
+```text
+marker did not survive the restart: "cat: can't open '/data/marker': No such file or directory"
+```
+
+Nothing had deleted anything. A stopped app is scheduled at zero replicas, so the leader commits a scheduling decision with no placements, and that empty list replaced the only record of where the app had run. The next `apply` sent it through the scheduler like a brand-new app, and the scheduler picked whichever node scored best that second. On a different node, Bun provisioned a fresh, empty volume under the same name. The marker was still sitting on the first node. For the user, that's data loss all the same, and the manual promised the opposite: a managed volume "survives restarts and redeploys", and its snapshot recipe is stop, restore, apply.
+
+The soak had passed this case before only by luck. It pins its own volume apps to nodes 2 and 3, so a fresh app usually landed on node 1 both times. And until the previous fix, when it didn't, the exec went to the wrong node and failed with a 404, which looked like a test bug.
+
+The fix is one more field in desired state, `last_placed_nodes`, which the state machine fills from every decision that places something and leaves alone when a decision is empty. `relish delete` clears it. The planner consults it only when an app with a managed volume has no placement left to keep:
+
+```rust
+struct VolumeHome<'a> {
+    cache: &'a mut ClusterStateCache,
+    alive: &'a HashSet<NodeId>,
+    unheard: &'a HashSet<NodeId>,
+    dns_required: bool,
+}
+```
+
+A struct that holds references needs a lifetime parameter, `'a`, which tells the compiler the struct can't outlive the cache and sets it borrows. Go would let you keep a pointer to the cache for as long as you liked. Here, `VolumeHome` is built inside one scheduling pass and gone by the end of it, and the compiler checks that. Its `reserve` method takes `self` by value, so calling it consumes the struct and releases the mutable borrow of the cache, and the rest of the pass can use the cache again.
+
+`reserve` sorts each home node into one of three outcomes. A home that's alive, ready and still matches the app's required labels gets the replica. A home that could run it but has no room makes the app wait, because starting it elsewhere is exactly the bug. A home that's gone, or that the operator has excluded with new labels, is dropped, and that replica goes through the normal scheduler: losing a local volume with its node is the documented trade-off of local storage. It checks every home before reserving any of them, so an app that ends up waiting doesn't leave phantom reservations behind for the apps after it in the same pass.
+
+The gated cluster test `a_stopped_volume_app_starts_again_on_the_node_that_holds_its_volume` reproduces the soak deterministically. Three nodes carry zone labels; the app is pinned to zone `b` and lands on `v2`. Then it's stopped and applied again without the pin, so every node is empty and the scheduler, left to itself, picks `v1`, the lowest node id. Before the fix, it came back on `v1`. The new field changes the durable state format, so `compatibility::CURRENT` moved to state 44.
+
 ## Two seconds is too eager
 
 Each node's placement reconciler polls the leader every couple of seconds and deploys whatever its share of the placements says. If a deploy failed, the next poll simply tried again. Kubernetes has `CrashLoopBackOff` for exactly this; we had a supervisor back-off for instances that crash after starting, but a deploy that never produces a running instance never reaches the supervisor. The V02 soak found the result: an app whose binary had been truncated by a power cut reached generation `g170` in eight minutes, every attempt a fresh container, a fresh journal entry and a fresh log line.

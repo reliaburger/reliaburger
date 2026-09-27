@@ -267,6 +267,8 @@ pub struct WiredNodeOptions {
     pub operator_token: Option<ApiToken>,
     /// Serve the development test policy that admits fault injection.
     pub fault_injection: bool,
+    /// Node labels, for placement constraints.
+    pub labels: BTreeMap<String, String>,
 }
 
 /// A running wired node and everything a test observes it through.
@@ -313,6 +315,7 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
         service_identity,
         operator_token,
         fault_injection,
+        labels,
     } = options;
     let raft_port = gossip_port + 1;
     let reporting_port = gossip_port + 2;
@@ -350,7 +353,7 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
             rollup_interval: metrics_rollup.unwrap_or(Duration::from_secs(60)),
             identity: None,
             backup: Default::default(),
-            labels: BTreeMap::new(),
+            labels,
             self_disk_pressured_rx: None,
             readiness: Some(readiness.clone()),
         },
