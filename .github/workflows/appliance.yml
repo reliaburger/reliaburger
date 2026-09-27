@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       bun_release:
-        description: Release tag to take bun and relish from (default is the newest v* release, else the newest staging candidate)
+        description: Release tag to take bun and relish from (default is the newest published v* release, else the newest staging candidate)
         required: false
   pull_request:
     branches: [main]
@@ -61,7 +61,9 @@ jobs:
           set -euo pipefail
           tag="$REQUESTED"
           if [ -z "$tag" ]; then
-            tag=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 50 --json tagName \
+            # Published releases only: old v0.0.x pre-releases lack SHA256SUMS.
+            tag=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 50 \
+              --exclude-pre-releases --exclude-drafts --json tagName \
               --jq '[.[].tagName | select(startswith("v"))][0] // empty')
           fi
           if [ -z "$tag" ]; then
