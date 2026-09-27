@@ -1233,7 +1233,8 @@ Brioche uses the same API token authentication as the Relish CLI (Section 11 of 
 **Session-cookie details:**
 
 - The cookie carries a random session id that maps, server-side, to the API token held in memory — the token itself is never placed in the cookie, so there is no per-node HKDF encryption to reason about. (Adding the `Secure` attribute, so the cookie is only sent over HTTPS, is a hardening follow-up; it is not set today.)
-- The session is dropped when it expires or on logout, and the user is redirected to the login page.
+- A session lasts at most 12 hours and never longer than the token it was created from (the cookie's `Max-Age` matches). It records the token's principal id (a digest of the token hash), and every request checks that exact token is still in the store and unexpired, so revoking or expiring the token ends its sessions and a new token issued under the same name doesn't revive them.
+- The session is dropped when it expires, when its token is revoked or expires, or on logout, and the user is redirected to the login page.
 - Logout (`POST /ui/logout`) clears the cookie.
 
 **OIDC flow (planned — not yet implemented):**

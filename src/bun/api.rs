@@ -5469,7 +5469,10 @@ async fn ui_session_handler(
 ) -> Response {
     // Accept the internal service token or any valid user token. The session
     // inherits the presented token's scope (C3), so a tenant-scoped token
-    // cannot widen to cluster-wide reads by exchanging itself for a cookie.
+    // cannot widen to cluster-wide reads by exchanging itself for a cookie. It
+    // also records which exact token it came from and that token's expiry
+    // (B11), so the auth middleware can end it when the token is revoked or
+    // lapses.
     let identity = if auth
         .service_token
         .as_deref()
@@ -5478,33 +5481,43 @@ async fn ui_session_handler(
         // The operator presented the real service token; the session is
         // unconfined (but still read-only), matching the service principal.
         Some((
-            crate::sesame::auth::SYSTEM_PRINCIPAL.to_string(),
-            crate::sesame::types::TokenScope::default(),
+            crate::sesame::session::SessionIdentity {
+                token_name: crate::sesame::auth::SYSTEM_PRINCIPAL.to_string(),
+                principal_id: crate::sesame::auth::SYSTEM_PRINCIPAL.to_string(),
+                scope: crate::sesame::types::TokenScope::default(),
+            },
+            None,
         ))
     } else {
-        // Snapshot the tokens under the lock, then run the Argon2id verify on
-        // the blocking pool (M7) so the deliberately-slow hashing doesn't stall
-        // the async runtime worker.
+        // Snapshot the tokens under the lock, then verify through the same
+        // bounded path as a bearer (B12): a malformed token is refused by a
+        // string check before any hashing, and a well-shaped one waits for a
+        // permit from the process-wide Argon2 semaphore. This route is
+        // unauthenticated, so calling Argon2 directly here would let anyone on
+        // the network pin every core and exhaust memory with junk logins.
         let tokens = auth.tokens.read().await.clone();
-        let candidate = form.token.clone();
-        tokio::task::spawn_blocking(move || {
-            crate::sesame::auth::authenticate(&candidate, &tokens)
-                .ok()
-                .map(|ctx| {
-                    (
-                        ctx.token_name,
-                        crate::sesame::types::TokenScope {
+        crate::sesame::auth::authenticate_off_lock(&form.token, tokens.clone())
+            .await
+            .ok()
+            .map(|ctx| {
+                let expires_at =
+                    crate::sesame::auth::find_token_by_principal(&ctx.principal_id, &tokens)
+                        .and_then(|token| token.expires_at);
+                (
+                    crate::sesame::session::SessionIdentity {
+                        token_name: ctx.token_name,
+                        principal_id: ctx.principal_id,
+                        scope: crate::sesame::types::TokenScope {
                             apps: ctx.scoped_apps,
                             namespaces: ctx.scoped_namespaces,
                         },
-                    )
-                })
-        })
-        .await
-        .unwrap_or(None)
+                    },
+                    expires_at,
+                )
+            })
     };
 
-    let Some((name, scope)) = identity else {
+    let Some((identity, expires_at)) = identity else {
         return (
             StatusCode::UNAUTHORIZED,
             axum::response::Html(crate::brioche::login::render_login(Some(
@@ -5514,10 +5527,14 @@ async fn ui_session_handler(
             .into_response();
     };
 
-    let id = auth.sessions.create(&name, scope).await;
+    let session = auth.sessions.create(identity, expires_at).await;
+    // The cookie lives no longer than the session, which lives no longer
+    // than the token.
     let cookie = format!(
-        "{}={id}; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200",
-        crate::sesame::session::SESSION_COOKIE
+        "{}={}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}",
+        crate::sesame::session::SESSION_COOKIE,
+        session.id,
+        session.lifetime.as_secs()
     );
     (
         [(axum::http::header::SET_COOKIE, cookie)],
@@ -15339,6 +15356,21 @@ schedule = "* * * * *"
     /// A router whose token store holds one user token of the given role.
     /// Returns the router, its shutdown handle, and the plaintext token.
     fn ui_setup(role: crate::sesame::types::ApiRole) -> (Router, CancellationToken, String) {
+        let (app, shutdown, plaintext, _store) = ui_setup_with_store(role, None);
+        (app, shutdown, plaintext)
+    }
+
+    /// Like `ui_setup`, but the token can expire and the caller keeps the
+    /// token store, so a test can revoke or reissue tokens after logging in.
+    fn ui_setup_with_store(
+        role: crate::sesame::types::ApiRole,
+        expires_at: Option<std::time::SystemTime>,
+    ) -> (
+        Router,
+        CancellationToken,
+        String,
+        crate::sesame::auth::TokenStore,
+    ) {
         let (cmd_tx, cmd_rx) = mpsc::channel(32);
         let shutdown = CancellationToken::new();
         let grill = MockGrill::new();
@@ -15352,7 +15384,7 @@ schedule = "* * * * *"
             "dash",
             role,
             crate::sesame::types::TokenScope::default(),
-            None,
+            expires_at,
         )
         .unwrap();
         let plaintext = created.plaintext.clone();
@@ -15368,7 +15400,7 @@ schedule = "* * * * *"
             None,
             None,
             None,
-            Some(store),
+            Some(store.clone()),
             None,
             None,
             None,
@@ -15376,7 +15408,7 @@ schedule = "* * * * *"
             9117,
             None,
         );
-        (app, shutdown, plaintext)
+        (app, shutdown, plaintext, store)
     }
 
     async fn ui_get(app: &Router, uri: &str, headers: &[(&str, &str)]) -> Response {
@@ -15498,6 +15530,103 @@ schedule = "* * * * *"
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        shutdown.cancel();
+    }
+
+    /// Build a POST /ui/session request carrying `token`.
+    fn login_request(token: &str) -> axum::http::Request<Body> {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/ui/session")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from(format!("token={token}")))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_malformed_login_is_refused_without_touching_argon2() {
+        // Every verification permit is held, so any login that reached the
+        // Argon2 path would block. A junk token must be refused by the shape
+        // check alone, promptly (B12).
+        let (app, shutdown, _t) = ui_setup(crate::sesame::types::ApiRole::ReadOnly);
+        let _permits = crate::sesame::auth::hold_all_verify_permits().await;
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            app.clone().oneshot(login_request("nope")),
+        )
+        .await
+        .expect("a malformed login must not wait for an Argon2 permit")
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn a_well_shaped_login_shares_the_argon2_concurrency_bound() {
+        // With every permit held, a login that looks like a real token has to
+        // queue for the same semaphore the bearer path uses (B12) rather than
+        // hashing on the blocking pool unbounded.
+        let (app, shutdown, token) = ui_setup(crate::sesame::types::ApiRole::ReadOnly);
+        let permits = crate::sesame::auth::hold_all_verify_permits().await;
+        let pending = tokio::spawn(app.clone().oneshot(login_request(&token)));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !pending.is_finished(),
+            "login verified without waiting for a permit"
+        );
+
+        // Releasing the permits lets the queued login finish normally.
+        drop(permits);
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(10), pending)
+            .await
+            .expect("login should proceed once a permit frees up")
+            .unwrap()
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn a_dashboard_session_ends_when_its_token_is_revoked() {
+        // B11: the cookie is only as good as the token it was exchanged for.
+        // A second token keeps the store non-empty, so auth stays enforced.
+        let (app, shutdown, token, store) =
+            ui_setup_with_store(crate::sesame::types::ApiRole::ReadOnly, None);
+        let spare = crate::sesame::token::create_token(
+            "spare",
+            crate::sesame::types::ApiRole::Admin,
+            crate::sesame::types::TokenScope::default(),
+            None,
+        )
+        .unwrap();
+        store.write().await.push(spare.token);
+        let id = login(&app, &token).await;
+        let cookie = format!("rb_session={id}");
+        let before = ui_get(&app, "/ui/fragment/apps", &[("cookie", &cookie)]).await;
+        assert_eq!(before.status(), StatusCode::OK);
+
+        store.write().await.retain(|t| t.name != "dash");
+        let after = ui_get(&app, "/ui/fragment/apps", &[("cookie", &cookie)]).await;
+        assert_eq!(after.status(), StatusCode::UNAUTHORIZED);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn the_session_cookie_expires_no_later_than_its_token() {
+        let expiry = std::time::SystemTime::now() + std::time::Duration::from_secs(600);
+        let (app, shutdown, token, _store) =
+            ui_setup_with_store(crate::sesame::types::ApiRole::ReadOnly, Some(expiry));
+        let resp = app.clone().oneshot(login_request(&token)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let cookie = resp.headers().get("set-cookie").unwrap().to_str().unwrap();
+        let max_age: u64 = cookie
+            .split("; ")
+            .find_map(|part| part.strip_prefix("Max-Age="))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(max_age <= 600, "cookie outlives its token: {cookie}");
+        assert!(max_age > 500, "cookie cut unexpectedly short: {cookie}");
         shutdown.cancel();
     }
 

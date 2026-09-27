@@ -74,7 +74,8 @@ every fault, or apply `[namespace]` and `[permission]` declarations.
 `create` prints the plaintext token once, on stdout, and the cluster keeps
 only a hash, so `TOKEN="$(relish token create ...)"` captures it. Tokens don't
 expire unless you give `--ttl-days`. `revoke` refuses to remove the last admin
-token; create its replacement first.
+token; create its replacement first. Revoking a token, or letting it expire,
+also ends every dashboard session that was logged in with it.
 
 A new cluster starts with no tokens, and until the first one exists the API is
 open. Bun only allows that on a loopback listener, so mint the first admin
