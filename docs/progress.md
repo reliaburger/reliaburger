@@ -13,6 +13,9 @@ runs, CI results) that used to live here.
 > V01–V04; see [remaining work](plans/2026-09-22-v0.1.0-remaining-work.md). The
 > original [release-readiness review](plans/2026-09-16-v0.1.0-release-plan.md)
 > defines the supported scope and the clean-install and real-cluster gates.
+> The [0.1.0 release closure record](qualification/2026-09-27-v0.1.0-release-closure.md)
+> (25–27 September) lists every V02 soak run, the PRs from #196 onwards with
+> each bug's cause and fix, and what's carried past 0.1.0.
 
 ## Current completion backlog (17 September 2026)
 

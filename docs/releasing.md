@@ -291,7 +291,10 @@ this lands.
    schedule with the digest checked, says the V02 gate passes. A product fix
    found during the final run means a new candidate, a fresh fast run and
    then a fresh final run. `--resume --evidence DIR` continues an interrupted
-   run with its original tier.
+   run with its original tier. The [0.1.0 release closure
+   record](qualification/2026-09-27-v0.1.0-release-closure.md) shows what these
+   runs found for 0.1.0, candidate by candidate, and the PR that fixed each
+   failure.
 
 5. **Record it.** Copy each host's record into
    `docs/qualification/DATE-staged-install-HOST.md`, alongside the run ID,
