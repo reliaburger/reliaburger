@@ -160,8 +160,13 @@ this).
       storage pruned (no containers or images left in the test's own root).
       Needs the `full-ci` label on this stacked PR to run.
 - [x] 5. CI: `demo app` job in `ci.yml` (`go vet` + `go test`, gated on `code`).
-- [ ] 6. Docs: manual 11, book ch. 5, design docs (`registry-pickle.md`),
-      progress register, README/docs README if needed.
+- [x] 6. Docs: manual 11 (platforms, pruning, network), book ch. 5 (new
+      subsections replacing the "problem we haven't fixed" paragraph, plus test
+      notes), `registry-pickle.md` (§3.3 pull flow, new §5.8.1, config note),
+      `docs/README.md` config sample, progress register (UX track entry).
+      Main was merged into the branch (merge commit; one conflict in
+      `docs/linux-servers.md`, resolved to main's package list plus the PR's
+      Buildah line).
 - [ ] 7. PR body updated; CI green with `full-ci`.
 
 ## Needs a VM later (don't do it during the soak)

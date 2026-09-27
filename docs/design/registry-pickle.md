@@ -217,6 +217,9 @@ Meat schedules app.api to Node 4 → Node 4 needs myapp:v1.4.2
     ▼ (cache miss)
 [2] Resolve manifest from Raft state (or local cache)
     ├── Manifest contains list of layer digests + sizes
+    ├── An image index (multi-platform image): fetch the index, pick the
+    │   linux/<this node's arch> entry, resolve that manifest by digest in
+    │   the same repository; no matching entry is an error, never a guess
     │
     ▼
 [3] Query peer location map (from Raft state)
@@ -960,6 +963,18 @@ run_before = ["app.api"]
 
 The Unix socket approach avoids granting the build container network access to the registry API (which would allow pushing to any repository). The socket is intercepted by Bun, which enforces the `build_push_to` scope before forwarding the request to the local Pickle store.
 
+#### 5.8.1 `relish build` as shipped
+
+The shipped path is `relish build` (`[build.*]` sections), not the socket above. The CLI uploads the context tarball to Pickle as a bare blob, and a node with Buildah builds it (`src/bun/build_runner.rs`):
+
+1. **Build and export** under a node-wide build lock, on Buildah storage the node owns (`--root <storage.data>/buildah/root`, `--runroot <storage.data>/buildah/run`). One platform: `buildah bud -t`, then `buildah push … oci:<dir>:<tag>`. Several (the default is `linux/amd64` + `linux/arm64`): `buildah bud --manifest`, then `buildah manifest push --all … oci:<dir>:<tag>`. Plain `buildah push` of a manifest list exports only the builder's own platform.
+2. **Prune**, still under the lock and whatever the outcome: `buildah rm --all`, `buildah manifest rm` (or `rmi --force`) of the build's own tag, `buildah rmi --prune`. Named base images stay cached; if the storage root is still over `[images] build_cache_max_bytes` (default 1 GiB, 0 keeps nothing), `buildah rmi --all --force`. Failures are logged, never fatal. The lock is what makes `rm --all` safe: builds on one node run one at a time.
+3. **Check platforms.** A multi-platform build whose layout lacks a requested `os/arch` fails (`BuildError::MissingPlatforms`).
+4. **Upload** (`pickle::build::upload_oci_layout`) with the service-token bearer: every blob, then each platform manifest `PUT` by digest, then the top manifest `PUT` by tag. Platform manifests become catalogue entries in the same repository, so a node can resolve them by digest and GC pins their layers.
+5. **Sign** the top manifest and every platform manifest with the namespace's build signer (§5.6). Deploys verify the tag's manifest (the index) and pin its digest; the index names each platform manifest by digest, so its signature covers the pulled platform. Signing the platform manifests as well makes a reference pinned to one platform's digest verify too. Under `require_signatures`, a signing failure fails the build.
+
+Build steps that use the network get Buildah's netavark bridge (`podman0`, `10.88.0.0/16`) and its own iptables-nft rules. These coexist with Reliaburger's tables: the perimeter firewall uses its own `reliaburger_fw` tables with an `accept`-policy `input` hook, container NAT masquerades `10.0.0.0/8` (covering Buildah's range), and every Reliaburger container has a `/32` route, so a node whose container subnet falls inside `10.88.0.0/16` still routes correctly.
+
 ---
 
 ## 6. Configuration
@@ -1032,7 +1047,8 @@ pub struct PickleConfig {
     pub trust_policy: TrustPolicySection,
     // Note: the shipped `ImagesSection` also carries registry_port,
     // registry_bind, p2p_concurrency, pull_through, cache_recheck_secs,
-    // build_timeout_secs, max_context_bytes and mirrors. There is no push_sync,
+    // build_timeout_secs, max_context_bytes, build_cache_max_bytes and
+    // mirrors. There is no push_sync,
     // pre_pull, or gc_retain_tags field.
 }
 

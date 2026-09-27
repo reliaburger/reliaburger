@@ -997,7 +997,47 @@ COPY --from=build /out/burger /burger
 
 We measured it with the node's own Buildah invocation (vfs storage, both platforms) in a 4-vCPU Ubuntu 24.04 VM on an Apple M2 Max: 27 to 35 s from cold, almost all of it pulling the 72 MB Go image, then 17 s once that's cached. The same build for arm64 alone took 32 s cold and 8 s warm. Once the base image is there, the second platform costs about ten seconds, which isn't worth a `platform` override in a demo. The base image is pinned by digest and comes from the ECR mirror of Docker Hub's official image, for the same reason podinfo's Redis does: no anonymous pull limits.
 
-Measuring turned up a problem we haven't fixed. Buildah keeps a two-platform build as a manifest list, and the runner exports it with `buildah push`, which picks the builder's own platform out of the list. So Pickle receives a single-architecture image. On a quickstart that's harmless, since every node shares the host's architecture. On a mixed cluster the other architecture's nodes would pull an image they can't run. The fix needs `buildah manifest push --all` and a runner that registers each platform's manifest before the index. Until it lands, the manual's "both platforms" means "both are built".
+Measuring turned up a problem. Buildah keeps a two-platform build as a manifest list, and the runner exported it with `buildah push`, which picks the builder's own platform out of the list. So Pickle received a single-architecture image under a spec that asked for two. On a quickstart that's harmless, since every node shares the host's architecture. On a mixed cluster, nodes of the other architecture would pull an image they can't run.
+
+### Every platform, all the way to the node
+
+The export was the easy part: `buildah manifest push --all` writes the index and every platform's image into the OCI layout. What Pickle does with that layout needed more thought.
+
+A registry stores an index like any other manifest, but the index only names its platform manifests by digest. For a node to fetch the arm64 image, that manifest has to exist in the repository on its own, pullable as `burger@sha256:…`. So the upload now runs in three steps: every blob, then each platform manifest `PUT` under its own digest, then the index `PUT` under the tag. Pickle's manifest validation already refused an index whose platform manifests weren't there, so the order isn't a choice.
+
+Then the runner checks what it exported against what the spec asked for. A two-platform build whose layout holds one image now fails with the platforms it's missing, rather than quietly storing half of what it promised. That check would have caught the original bug on the first run.
+
+The pull side had a matching hole. Pickle's catalogue records an index with its own blob as the "config" and its platform manifests as the "layers". That's the right shape for garbage collection and replication, which only care about which blobs an entry pins. It's the wrong shape to unpack. A node pulling a multi-arch image by tag would have untarred JSON manifests as filesystem layers, and this was true of multi-arch images pushed with `docker push` too. Now `ClusterSource` checks `manifest.is_index()`, fetches the index, picks the `linux/<arch>` entry for the node it runs on, and fetches that image instead.
+
+Signing needed a decision. A deploy verifies the manifest its tag names and pins the app to that digest, so that a tag moved between verification and pull changes nothing. For a multi-arch image, the tag names the index. The index's bytes list each platform manifest by digest, and every blob Pickle stores is checked against its digest, so a valid signature over the index covers whichever platform a node ends up pulling. We sign each platform manifest as well. It costs one Raft entry per platform, and it means an app pinned to one platform's digest verifies too.
+
+### Cleaning up after Buildah
+
+A cold build of the burger left about 900 MB in `/var/lib/containers`, on a quickstart disk of 10 GiB. Buildah keeps everything it touched: the Go base image, a working container per stage, an image per platform, the manifest list. Nothing removed any of it.
+
+The obvious fix, `buildah rmi --all` after each build, is also the dangerous one. `/var/lib/containers/storage` is Buildah's default, shared with podman and anything else on the host that uses the same libraries. An operator's own images live there. So the runner now gives Buildah storage of its own, `--root <storage.data>/buildah/root`, and prunes only that.
+
+After every build, whether it worked or not, the runner removes its working containers, the build's manifest list or image, and every image that has no name (the per-platform images and multi-stage intermediates). Base images have names (`golang:1.27.1-alpine`), so they survive, and the next build of the same app starts warm. If what's left is still over `[images] build_cache_max_bytes` (1 GiB by default), the whole cache goes. The Go base image takes about 750 MB in vfs, so the demo stays warm on a quickstart.
+
+Pruning `--all` containers is only safe if no other build is using the storage, so builds on one node now take turns:
+
+```rust
+let exported = {
+    let _build_lock = state.build_lock.lock().await;
+    let exported = run_buildah_stages(&job, &ctx_dir, &oci_dir, &state.build).await;
+    prune_build_storage(&job, &ctx_dir, &state.build).await;
+    exported
+};
+exported?;
+```
+
+A block in braces is an expression in Rust: its value is its last line, here the result of the build. `state.build_lock` is a `tokio::sync::Mutex<()>`, a mutex that guards no data, only a stretch of code. Locking it returns a guard, and the lock is released when the guard is dropped, which happens at the closing brace. Go would write `mu.Lock(); defer mu.Unlock()`, but `defer` waits for the whole function to return, and we want the upload after the block to run without the lock. The name matters: `_build_lock` is a variable that lives to the end of the block, while `let _ = …lock().await` would drop the guard on the spot and lock nothing at all. The `?` comes after the block, so a failed build still gets pruned before its error goes up.
+
+Queuing costs little. Builds are rare, each stage still has its timeout, and the alternative was working out which of Buildah's unnamed images belong to which concurrent build.
+
+### Builds that use the network
+
+A `RUN` step that fetches packages makes Buildah (netavark, on Ubuntu 24.04) create a `podman0` bridge on `10.88.0.0/16` with firewall rules of its own. We read our nftables code to see whether the two collide. They don't, in the ways that matter. The perimeter firewall lives in its own tables, filters only the `input` hook with an `accept` policy, and deletes only its own tables when it reloads. Container networking masquerades `10.0.0.0/8`, which covers Buildah's range too, and a second masquerade is harmless. A build step that tries to reach the node's API or registry comes from `10.88.x.x`, which the perimeter treats as a stranger. One node in 256 draws a container subnet inside `10.88.0.0/16`, but every Reliaburger container has its own `/32` route, so traffic still finds it. So we left Buildah's network alone, and the manual suggests `RUN --network=none` for steps that don't need it, as the burger's Dockerfile does.
 
 ## Tests
 
@@ -1012,6 +1052,7 @@ The 104 tests in `src/pickle/` cover:
 - **OCI API** — `full_push_pull_round_trip` drives the real `/v2/` handlers end to end against an in-process server; plus the not-found paths (`blob_head_not_found`, `manifest_get_not_found`) that must return the right status codes. The manifest-validation contract gets a rejection matrix: invalid JSON, missing or unknown media type, size mismatch, malformed descriptor digest, missing referenced blob, and a happy path asserting the GET returns byte-identical bytes.
 - **Standard clients** — a Deployer token as a Basic password over TLS pushes (`deployer_token_as_basic_password_over_tls_may_push`), a ReadOnly one is forbidden, an unknown one gets a 401 with a fresh `Basic` challenge, and a valid token over plaintext is still refused (`basic_credentials_over_plaintext_are_refused_even_with_a_valid_token`). `tests/suite/registry_standard_clients.rs` repeats the push through the real TLS listener, and its ignored `crane` test runs with `cargo nextest run --test suite --run-ignored=only -E 'test(crane)'` on a machine with crane installed.
 - **Garbage collection** — the safety rails get a test each: `gc_protects_sole_copy`, `gc_protects_active_deployment_images`, `gc_protects_tagged_manifest_layers`, `gc_protects_within_retention_window`, and the positive case `gc_collects_unreferenced_blob`. These are the tests that let you trust GC won't eat your last copy of a layer. `gc_never_nominates_a_catalogued_manifests_own_blob` pins the REG1 fix, and `tests/suite/pickle_integrity.rs` runs the full push → GC → peer-pull acceptance sequence against real in-process registries.
+- **Multi-platform builds** — fake OCI layouts written by the tests drive `read_oci_layout` (an index lists every platform; a missing, platformless or nested entry is refused) and `check_exported_platforms` (`an_export_missing_a_requested_platform_fails` is the original bug). `registry_routable_push::a_multi_platform_layout_publishes_every_platform` uploads a two-platform layout to a real registry and pulls each platform by digest, and `pickle_cluster::a_multi_platform_image_pulls_the_nodes_own_platform` pulls the same image as an amd64 node and as an arm64 one. The gated `buildah_build_lands_in_the_catalog` runs the real Buildah on CI's privileged Linux job and checks the index, both platform manifests, and that no containers or images stay behind.
 
 ### Hermetic protocol tests, provisioned runtime tests
 

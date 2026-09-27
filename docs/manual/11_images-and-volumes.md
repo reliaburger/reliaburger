@@ -56,13 +56,33 @@ Relish uploads the context to the registry: through the quickstart's registry
 forward (`127.0.0.1:15050`) on a laptop cluster, otherwise at `localhost:5050`,
 so run it on a node or through a forward to one (`--registry-port` names the
 port on this host). A node then builds it with Buildah, which must be installed
-there (the quickstart's VMs have it), for `linux/amd64` and `linux/arm64` by
-default. For now only the builder's own architecture reaches Pickle, which is
-fine when every node shares it (as a quickstart's do). The five-minute tour builds `examples/demo/burger` this way. A build has
-15 minutes (`[images] build_timeout_secs`) and a 256 MiB context. Refer to the
-result by its bare name, as `api:v1.2.3`, and nodes find it in Pickle. Built
-images are signed by the cluster, which matters when `require_signatures` is
-on (see `security`).
+there (the quickstart's VMs have it). The five-minute tour builds
+`examples/demo/burger` this way. A build has 15 minutes per stage
+(`[images] build_timeout_secs`) and a 256 MiB context. Refer to the result by
+its bare name, as `api:v1.2.3`, and nodes find it in Pickle. Built images are
+signed by the cluster, which matters when `require_signatures` is on (see
+`security`).
+
+A build targets `linux/amd64` and `linux/arm64` unless `platform` says
+otherwise (`platform = ["linux/arm64"]`). Pickle stores every platform under
+the one tag, and each node pulls the one that matches its own architecture. A
+build fails if a platform it asked for is missing from the result. Buildah
+runs a `RUN` step for a foreign platform under emulation, which is slow or
+missing, so a Dockerfile that cross-compiles (as the demo's does) builds both
+platforms quickly.
+
+A node builds one image at a time, in its own Buildah storage under
+`<storage.data>/buildah`. After every build it removes the build's containers
+and images and keeps base images for the next build, up to
+`[images] build_cache_max_bytes` (1 GiB by default; `0` keeps nothing). Past
+that, it removes every cached image.
+
+A `RUN` step that uses the network gets Buildah's own bridge (`podman0`,
+`10.88.0.0/16`), with Buildah's firewall rules next to Reliaburger's. The two
+don't interfere: Reliaburger's firewall only drops traffic to its own ports
+from outside the cluster, and that includes a build step trying to reach the
+node's API or registry. Add `--network=none` to `RUN` steps that don't need
+the network.
 
 ## Pushing with docker or crane
 
