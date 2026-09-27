@@ -164,7 +164,8 @@ pub fn lease_release_budget() -> std::time::Duration {
 /// How long [`BunClient::clear_fault`] keeps asking while the owning node
 /// answers 504 because the leader has not yet released a node fault's
 /// reservation. The leader releases it once it sees the healed node alive,
-/// which takes a gossip round or two; each attempt already waits 4 s.
+/// which takes a gossip round or two; each attempt already waits up to 4 s on
+/// the owning node (its agent's answer plus the release wait).
 pub const FAULT_CLEAR_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 /// Pause between those attempts.
 const FAULT_CLEAR_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(500);
