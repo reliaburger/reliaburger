@@ -962,7 +962,7 @@ mkosi's `RemoveFiles=` (or a postinst script) prunes the rest, and drops docs, m
 - **Reboot and shutdown hang** on Cherry Trail: the HSUART DMA driver hangs. The Debian wiki's fix is to blacklist `dw_dmac` and `dw_dmac_core` (`install dw_dmac /bin/true`, and the same for `dw_dmac_core`). Ship that as a `modprobe.d` file in the image, and check in the spike whether Linux 7.0 still needs it. A node that can't reboot can't finish an A/B update.
 - **Firmware files:** `rtl_nic/rtl8168*` for networking, `i915` for the console. Audio needs `firmware-intel-sound` on Debian, but we don't need audio.
 - **Fanless:** watch for thermal throttling under sustained load **[unverified]**.
-- **Only one USB 3 port** and no serial port, so a console means HDMI-to-DisplayPort and a USB keyboard. The tty1 status screen (§4.5) is how the operator reads the claim fingerprint.
+- **Only one USB 3 port** and no serial port, so a console means a DisplayPort monitor (or a DisplayPort-to-HDMI adapter) and a USB keyboard. The tty1 status screen (§4.5) is how the operator reads the claim fingerprint.
 
 ### 9.7 How the final stage runs
 
