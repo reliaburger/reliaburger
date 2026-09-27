@@ -154,10 +154,12 @@ this).
       (Landed in the same commit as step 1: the runner rewrite covers both.
       `BuildSettings` replaced the `build_timeout_secs` argument of
       `router_with_upgrade`.)
-- [ ] 4. Gated real-Buildah tests (`tests/build.rs`, CI privileged Linux job
-      runs them): two-platform build lands as an index with two catalogued
-      platform manifests; signed build signs all three; storage pruned.
-- [ ] 5. CI: `go test` for the demo app.
+- [x] 4. Gated real-Buildah tests (`tests/build.rs`, CI privileged Linux job
+      runs them under `make test-linux`): two-platform build lands as an index
+      with two catalogued platform manifests; signed build signs all three;
+      storage pruned (no containers or images left in the test's own root).
+      Needs the `full-ci` label on this stacked PR to run.
+- [x] 5. CI: `demo app` job in `ci.yml` (`go vet` + `go test`, gated on `code`).
 - [ ] 6. Docs: manual 11, book ch. 5, design docs (`registry-pickle.md`),
       progress register, README/docs README if needed.
 - [ ] 7. PR body updated; CI green with `full-ci`.

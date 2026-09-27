@@ -830,6 +830,34 @@ async fn cli_build_wait_times_out_with_the_last_known_state() {
     assert!(message.contains("running"), "{message}");
 }
 
+/// Build settings with Buildah storage of the test's own, so a test can check
+/// what a build left behind and parallel tests never prune each other.
+fn isolated_build_settings(dir: &std::path::Path) -> reliaburger::bun::build_runner::BuildSettings {
+    reliaburger::bun::build_runner::BuildSettings::new(600, dir, 1024 * 1024 * 1024)
+}
+
+/// Run `buildah <args>` against `settings`' storage and return stdout.
+fn buildah_output(
+    settings: &reliaburger::bun::build_runner::BuildSettings,
+    args: &[&str],
+) -> String {
+    let output = std::process::Command::new("buildah")
+        .arg("--root")
+        .arg(&settings.storage.root)
+        .arg("--runroot")
+        .arg(&settings.storage.runroot)
+        .args(["--storage-driver", "vfs"])
+        .args(args)
+        .output()
+        .expect("buildah runs");
+    assert!(
+        output.status.success(),
+        "buildah {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
 /// Roadmap (Phase 12): a real build — context blob in a real registry,
 /// buildah bud + push, manifest lands in the catalog — through the
 /// async submit/poll API. Lima only (`RELIABURGER_BUILDAH_TESTS=1`).
@@ -843,12 +871,15 @@ async fn buildah_build_lands_in_the_catalog() {
 
     let (registry_port, catalog, registry_shutdown, _dir) = start_registry().await;
     let digest = upload_trivial_context(registry_port).await;
+    let storage = tempfile::tempdir().unwrap();
+    let settings = isolated_build_settings(storage.path());
 
     // Buildah is present on this host, so the submit runs locally.
     let harness = Harness::start(HarnessOptions {
         node_name: Some("builder".to_string()),
         registry_port,
         pickle_catalog: Some(Arc::clone(&catalog)),
+        build_settings: Some(settings.clone()),
         ..Default::default()
     })
     .await;
@@ -888,11 +919,29 @@ async fn buildah_build_lands_in_the_catalog() {
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 
+    // The spec names no platform, so the build targets the default two. The
+    // tag must name an index over both, and each platform manifest must be
+    // catalogued by digest, so a node of either architecture can pull it.
     let catalog = catalog.read().await;
+    let index = catalog
+        .get_manifest_by_tag("hello", "v1")
+        .expect("built image missing from the catalog");
     assert!(
-        catalog.get_manifest_by_tag("hello", "v1").is_some(),
-        "built image missing from the catalog"
+        index.is_index(),
+        "a two-platform build must land as an index"
     );
+    assert_eq!(index.layers.len(), 2, "one manifest per platform");
+    for platform in &index.layers {
+        let manifest = catalog
+            .get_repository_manifest("hello", platform.digest.as_str())
+            .unwrap_or_else(|| panic!("platform manifest {} not catalogued", platform.digest));
+        assert!(!manifest.is_index());
+    }
+
+    // Nothing the build made stays in Buildah's storage: no containers and,
+    // as a `FROM scratch` build has no base image to cache, no images.
+    assert_eq!(buildah_output(&settings, &["containers", "-q"]).trim(), "");
+    assert_eq!(buildah_output(&settings, &["images", "-q"]).trim(), "");
 
     registry_shutdown.cancel();
 }
@@ -921,12 +970,14 @@ async fn buildah_build_signs_and_the_signature_verifies_on_deploy() {
         .map(|ca| ca.certificate_der.clone())
         .expect("root CA present");
 
+    let storage = tempfile::tempdir().unwrap();
     let harness = Harness::start(HarnessOptions {
         council: Some(Arc::clone(&council)),
         node_name: Some("builder".to_string()),
         registry_port,
         pickle_catalog: Some(Arc::clone(&catalog)),
         require_signatures: true,
+        build_settings: Some(isolated_build_settings(storage.path())),
         ..Default::default()
     })
     .await;
@@ -969,28 +1020,40 @@ async fn buildah_build_signs_and_the_signature_verifies_on_deploy() {
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 
-    // The pushed manifest carries a signature that verifies under the
-    // deploy-time trust policy and the cluster root CA.
-    let manifest = council
-        .manifest_catalog()
-        .await
+    // The index the tag names, and each platform manifest, carry a
+    // signature that verifies under the deploy-time trust policy and the
+    // cluster root CA.
+    let authoritative = council.manifest_catalog().await;
+    let index = authoritative
         .get_manifest_by_tag("hello", "v1")
         .cloned()
         .expect("built image missing from the authoritative catalog");
-    let signature = manifest
-        .signature
-        .expect("signed build must carry a signature");
-    reliaburger::pickle::signing::verify_signature(
-        &signature,
-        &manifest.digest,
-        &reliaburger::config::node::TrustPolicySection {
-            require_signatures: true,
-            keys: vec![],
-        },
-        Some(&root_ca_der),
-        None,
-    )
-    .expect("the build signature must verify on deploy");
+    let mut signed = vec![index.clone()];
+    for platform in &index.layers {
+        signed.push(
+            authoritative
+                .get_repository_manifest("hello", platform.digest.as_str())
+                .cloned()
+                .expect("platform manifest missing from the authoritative catalog"),
+        );
+    }
+    assert_eq!(signed.len(), 3, "the index and two platform manifests");
+    for manifest in signed {
+        let signature = manifest
+            .signature
+            .unwrap_or_else(|| panic!("{} must carry a signature", manifest.digest));
+        reliaburger::pickle::signing::verify_signature(
+            &signature,
+            &manifest.digest,
+            &reliaburger::config::node::TrustPolicySection {
+                require_signatures: true,
+                keys: vec![],
+            },
+            Some(&root_ca_der),
+            None,
+        )
+        .expect("the build signature must verify on deploy");
+    }
 
     registry_shutdown.cancel();
 }

@@ -92,6 +92,26 @@ jobs:
       - name: Lint every target, with all features and with none
         run: make lint
 
+  demo-app:
+    # The five-minute tour builds examples/demo/burger on a node. Its own Go
+    # tests take seconds, so they run on every code change.
+    name: demo app
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: examples/demo/burger/go.mod
+          cache: false
+      - name: Vet and test the demo app
+        working-directory: examples/demo/burger
+        run: |
+          go vet ./...
+          go test ./...
+
   minimum-rust:
     # The declared minimum compiler must build every target with and without
     # default features. The stable jobs run the tests, so running them again
