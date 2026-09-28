@@ -72,18 +72,39 @@ class Evidence(unittest.TestCase):
 class WriterAndRedis(Evidence):
     def test_writer_file_ending_below_an_acknowledged_write_is_a_regression(self):
         self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 10\nACK 11\nACK 12\n"}))
-        code, verdict = self.evaluate(self.snapshot(**{"writer__file_txt": "LAST 11\n"}))
+        code, verdict = self.evaluate(self.snapshot(**{"writer__file_txt": "MAX 11\nLAST 11\n"}))
         self.assertEqual(code, 1)
         self.assertIn("writer-regression", self.failures(verdict))
 
-    def test_writer_file_with_a_gap_fails(self):
-        code, verdict = self.evaluate(self.snapshot(**{"writer__file_txt": "BAD 7: 8\nLAST 7\n"}))
+    def test_writer_file_with_a_missing_value_is_lost_data(self):
+        code, verdict = self.evaluate(self.snapshot(**{"writer__file_txt": "BAD 7: 8\nMISSING 1 first 7\nMAX 9\nLAST 8\n"}))
         self.assertEqual(code, 1)
-        self.assertIn("writer-gap", self.failures(verdict))
+        self.assertEqual(self.failures(verdict), ["writer-lost"])
+
+    def test_writer_file_with_a_repeated_value_is_two_writers_not_lost_data(self):
+        # V02, 28 Sep 2026: line 21927 held 21926 again. The old check read
+        # that as a file ending at 21927 below ACK 23539; it held every value.
+        self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 23538\nACK 23539\n"}))
+        code, verdict = self.evaluate(self.snapshot(**{
+            "writer__file_txt": "BAD 21927: 21926\nDUP 1 first 21926\nMAX 23540\nLAST 23541\n"}))
+        self.assertEqual(code, 1)
+        self.assertEqual(self.failures(verdict), ["writer-duplicate"])
+        detail = next(item["detail"] for item in verdict["findings"] if item["check"] == "writer-duplicate")
+        self.assertIn("two writers", detail)
+
+    def test_writer_file_with_an_out_of_place_line_alone_is_a_gap(self):
+        code, verdict = self.evaluate(self.snapshot(**{"writer__file_txt": "BAD 3: x\nMAX 5\nLAST 5\n"}))
+        self.assertEqual(code, 1)
+        self.assertEqual(self.failures(verdict), ["writer-gap"])
+
+    def test_writer_file_without_a_summary_warns(self):
+        code, verdict = self.evaluate(self.snapshot(**{"writer__file_txt": "LAST 5\n"}))
+        self.assertEqual(self.failures(verdict), [])
+        self.assertIn("writer-file", [item["check"] for item in verdict["findings"]])
 
     def test_writer_file_at_or_beyond_the_highest_ack_passes(self):
         self.evaluate(self.snapshot(**{"writer__log_txt": "RESUME 0 after 0 lines\nACK 1\nACK 2\n"}))
-        code, verdict = self.evaluate(self.snapshot(**{"writer__file_txt": "LAST 5\n"}))
+        code, verdict = self.evaluate(self.snapshot(**{"writer__file_txt": "MAX 5\nLAST 5\n"}))
         self.assertEqual(self.failures(verdict), [])
 
     def test_redis_counter_going_backwards_within_one_tail_fails(self):
@@ -99,7 +120,7 @@ class WriterAndRedis(Evidence):
     def test_writer_log_going_backwards_is_a_log_order_failure_not_data_loss(self):
         self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 10\nACK 11\n"}))
         code, verdict = self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 12\nACK 9\nACK 13\n",
-                                                        "writer__file_txt": "LAST 13\n"}))
+                                                        "writer__file_txt": "MAX 13\nLAST 13\n"}))
         self.assertEqual(code, 1)
         self.assertEqual(self.failures(verdict), ["writer-log-order"])
         detail = next(item["detail"] for item in verdict["findings"] if item["check"] == "writer-log-order")
@@ -140,7 +161,7 @@ class WriterAndRedis(Evidence):
         self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 40640\n"}))
         self.power_cut()
         self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 40314\n"}))
-        code, verdict = self.evaluate(self.snapshot(**{"writer__file_txt": "LAST 40314\n"}))
+        code, verdict = self.evaluate(self.snapshot(**{"writer__file_txt": "MAX 40314\nLAST 40314\n"}))
         self.assertEqual(code, 1)
         self.assertIn("writer-regression", self.failures(verdict))
 
@@ -560,7 +581,7 @@ class Record(Evidence):
         self.assertIn("| fault:bun-kill-follower | 2 | 2 | 0 | 0 | 60 s / 60 s |", text)
         self.assertIn("| upgrade | 1 | 0 | 0 | 1 | n/a |", text)
         self.assertIn("highest ACK 20000", text)
-        self.assertIn("the writer file checks (writer-gap, writer-regression) decide data loss", text)
+        self.assertIn("the writer file checks (writer-lost, writer-regression) decide data loss", text)
         self.assertIn("not supplied: upgrade slots skipped", text)
         self.assertIn("short leaf lifetimes unavailable", text)
         self.assertIn("- Teardown: `relish local destroy --yes` and `relish uninstall --yes` succeeded", text)

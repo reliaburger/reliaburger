@@ -11195,13 +11195,9 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             if !existing.is_empty() {
                 // Dispatch on deploy strategy (E): blue-green stands up the
                 // whole new fleet before swapping; rolling replaces one at a
-                // time. Everything else about the deploy is identical.
-                let strategy = spec
-                    .deploy
-                    .as_ref()
-                    .map(crate::meat::deploy_types::DeployConfig::from_spec)
-                    .unwrap_or_default()
-                    .strategy;
+                // time. Everything else about the deploy is identical. An app
+                // with a managed volume always rolls stop-first (`for_app`).
+                let strategy = crate::meat::deploy_types::DeployConfig::for_app(spec).strategy;
                 let outcome = match strategy {
                     crate::meat::deploy_types::DeployStrategy::BlueGreen => {
                         self.blue_green_redeploy(app_name, namespace, spec, existing, &events, now)
@@ -11676,11 +11672,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             })
             .await;
 
-        let deploy_config = spec
-            .deploy
-            .as_ref()
-            .map(crate::meat::deploy_types::DeployConfig::from_spec)
-            .unwrap_or_default();
+        let deploy_config = crate::meat::deploy_types::DeployConfig::for_app(spec);
 
         let deploy_gen = match self.ops.next_deploy_gen(app_name).await {
             Ok(generation) => generation,
@@ -21723,6 +21715,152 @@ host = "remote.local"
             peak, 2,
             "peaked at {peak}; max_surge = 0 must never exceed the 2-replica target"
         );
+    }
+
+    /// Replay a grill call log and return the most instances of `app` that
+    /// were live at once, starting from `initially_live`.
+    fn peak_live_instances(
+        calls: &[(String, InstanceId)],
+        app_prefix: &str,
+        initially_live: &[&str],
+    ) -> usize {
+        let mut live: std::collections::HashSet<String> =
+            initially_live.iter().map(|id| id.to_string()).collect();
+        let mut peak = live.len();
+        for (op, id) in calls {
+            if !id.0.starts_with(app_prefix) {
+                continue;
+            }
+            match op.as_str() {
+                "start" => {
+                    live.insert(id.0.clone());
+                    peak = peak.max(live.len());
+                }
+                "stop" | "kill" => {
+                    live.remove(&id.0);
+                }
+                _ => {}
+            }
+        }
+        peak
+    }
+
+    /// V02 soak, 28 Sep 2026: after a power cut mid-upgrade, node 2 redeployed
+    /// the writer with the default rolling bounds. The replacement
+    /// (`soak-writer-g1-0`) started on the same managed volume while the old
+    /// instance was still appending, so two processes wrote `/data/seq` at
+    /// once and the file got `21926` twice. A managed volume has one writer:
+    /// an app that has one must retire the old instance before its
+    /// replacement starts, whatever `max_surge` says.
+    #[tokio::test]
+    async fn rolling_redeploy_of_a_volume_app_never_overlaps_writers() {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+
+        let config = Config::parse(
+            "[app.db]\nimage = \"db:v1\"\n\n[[app.db.volumes]]\npath = \"/data\"\n\n[app.db.deploy]\ndrain_timeout = \"0s\"\n",
+        )
+        .unwrap();
+
+        let (ev_tx, mut ev_rx) = mpsc::channel(256);
+        agent.deploy(config.clone(), &ev_tx).await;
+        drop(ev_tx);
+        while ev_rx.recv().await.is_some() {}
+        assert!(
+            grill
+                .calls()
+                .iter()
+                .any(|(op, id)| op == "start" && id.0 == "default__db-0"),
+            "the first deploy never started the app"
+        );
+
+        let calls_before = grill.calls().len();
+        let (ev_tx, mut ev_rx) = mpsc::channel(256);
+        agent.deploy(config, &ev_tx).await;
+        drop(ev_tx);
+        let mut errors = Vec::new();
+        while let Some(event) = ev_rx.recv().await {
+            if let ApplyEvent::Error { message } = event {
+                errors.push(message);
+            }
+        }
+        assert!(errors.is_empty(), "redeploy failed: {errors:?}");
+        let calls: Vec<(String, InstanceId)> = grill.calls().split_off(calls_before);
+
+        assert!(
+            calls
+                .iter()
+                .any(|(op, id)| op == "start" && id.0.starts_with("default__db-g")),
+            "the redeploy never started a replacement: {calls:?}"
+        );
+        let peak = peak_live_instances(&calls, "default__db", &["default__db-0"]);
+        assert_eq!(
+            peak, 1,
+            "two instances of a managed-volume app ran at once, both writing the \
+             same volume: {calls:?}"
+        );
+    }
+
+    /// Blue-green stands the whole new fleet up beside the old one, which
+    /// for a managed volume means two writers. A volume app rolls
+    /// stop-first instead.
+    #[tokio::test]
+    async fn blue_green_volume_app_redeploys_stop_first() {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+
+        let config = Config::parse(
+            "[app.db]\nimage = \"db:v1\"\n\n[[app.db.volumes]]\npath = \"/data\"\n\n[app.db.deploy]\nstrategy = \"blue-green\"\ndrain_timeout = \"0s\"\nhealth_timeout = \"1s\"\n",
+        )
+        .unwrap();
+
+        let (ev_tx, mut ev_rx) = mpsc::channel(256);
+        agent.deploy(config.clone(), &ev_tx).await;
+        drop(ev_tx);
+        while ev_rx.recv().await.is_some() {}
+
+        let calls_before = grill.calls().len();
+        let (ev_tx, mut ev_rx) = mpsc::channel(256);
+        agent.deploy(config, &ev_tx).await;
+        drop(ev_tx);
+        while ev_rx.recv().await.is_some() {}
+        let calls: Vec<(String, InstanceId)> = grill.calls().split_off(calls_before);
+
+        assert!(
+            calls
+                .iter()
+                .any(|(op, id)| op == "start" && id.0.starts_with("default__db-g")),
+            "the redeploy never started a replacement: {calls:?}"
+        );
+        let peak = peak_live_instances(&calls, "default__db", &["default__db-0"]);
+        assert_eq!(peak, 1, "blue and green both ran on one volume: {calls:?}");
+    }
+
+    /// A host-path volume is the operator's to share, so an app with only
+    /// that keeps its configured surge-first rollout.
+    #[tokio::test]
+    async fn host_path_volume_app_keeps_surge_first_rollout() {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        let shared = tempfile::tempdir().unwrap();
+
+        let config = Config::parse(&format!(
+            "[app.web]\nimage = \"web:v1\"\n\n[[app.web.volumes]]\npath = \"/srv\"\nsource = \"{}\"\n\n[app.web.deploy]\ndrain_timeout = \"0s\"\n",
+            shared.path().display()
+        ))
+        .unwrap();
+
+        let (ev_tx, mut ev_rx) = mpsc::channel(256);
+        agent.deploy(config.clone(), &ev_tx).await;
+        drop(ev_tx);
+        while ev_rx.recv().await.is_some() {}
+
+        let calls_before = grill.calls().len();
+        let (ev_tx, mut ev_rx) = mpsc::channel(256);
+        agent.deploy(config, &ev_tx).await;
+        drop(ev_tx);
+        while ev_rx.recv().await.is_some() {}
+        let calls: Vec<(String, InstanceId)> = grill.calls().split_off(calls_before);
+
+        let peak = peak_live_instances(&calls, "default__web", &["default__web-0"]);
+        assert_eq!(peak, 2, "surge-first rollout changed: {calls:?}");
     }
 
     /// A deploy config with no room to move in either direction is refused at

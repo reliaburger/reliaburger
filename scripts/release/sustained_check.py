@@ -159,18 +159,36 @@ def sequence_findings(check, values, highest, source, target=None):
 
 
 def writer_file_findings(text, highest_ack):
-    """The writer's file must hold 1..N with N at least the highest ACK seen."""
-    last = None
-    findings = []
+    """What the writer's file holds, from the harness's one-pass summary.
+
+    `MAX` is the highest value in the file and `LAST` its line count.
+    `MISSING` counts values in 1..MAX that aren't there, `DUP` values that
+    are there more than once, and `BAD` names the first line that isn't
+    its own line number. Only a missing value or a MAX below an ACK is
+    lost data. A duplicate means two writers appended at once, which the
+    product must never allow on one volume, so it fails too, but it is
+    reported as what it is.
+    """
+    fields = {}
     for line in text.splitlines():
-        if line.startswith("LAST "):
-            last = int(line.split()[1])
-        elif line.startswith("BAD "):
-            findings.append(finding("writer-gap", "fail", "sequence file line " + line[4:]))
-    if last is None:
-        return findings + [finding("writer-file", "warn", "no LAST line from the writer check")]
-    if highest_ack is not None and last < highest_ack:
-        findings.append(finding("writer-regression", "fail", f"file ends at {last} but ACK {highest_ack} was logged"))
+        key, _, rest = line.partition(" ")
+        if key in ("BAD", "DUP", "MISSING", "MAX", "LAST"):
+            fields.setdefault(key, rest)
+    if "MAX" not in fields or "LAST" not in fields:
+        return [finding("writer-file", "warn", "no MAX/LAST summary from the writer check")]
+    findings = []
+    maximum = int(fields["MAX"])
+    lines = int(fields["LAST"])
+    if "MISSING" in fields:
+        findings.append(finding("writer-lost", "fail", f"values absent from 1..{maximum}: {fields['MISSING']}"))
+    if highest_ack is not None and maximum < highest_ack:
+        findings.append(finding("writer-regression", "fail", f"file holds values up to {maximum} but ACK {highest_ack} was logged"))
+    if "DUP" in fields:
+        findings.append(finding("writer-duplicate", "fail",
+                                f"values written more than once: {fields['DUP']} ({lines} lines, max {maximum}); "
+                                "two writers appended to one volume"))
+    if "BAD" in fields and "MISSING" not in fields and "DUP" not in fields:
+        findings.append(finding("writer-gap", "fail", "sequence file line " + fields["BAD"]))
     return findings
 
 
@@ -437,7 +455,7 @@ def evaluate(evidence, snapshot):
             findings.append(finding("ingress-http", "info" if fault_window else "fail",
                                     "podinfo answered " + (http.strip() or "nothing")))
 
-    # The writer file (writer-gap, writer-regression) is the data-loss check;
+    # The writer file (writer-lost, writer-regression) is the data-loss check;
     # these only see lines through the log view. State keeps the old keys:
     # state[check] is the highest value ever seen and never goes down (the
     # writer-regression check compares the file against it), while
@@ -960,7 +978,7 @@ def render(evidence, record):
     progress = state.get("progress", {})
     lines += ["## Data", "",
               f"- Volume writer: highest ACK {state.get('writer-ack', 'none')} in the log view; "
-              "the writer file checks (writer-gap, writer-regression) decide data loss, "
+              "the writer file checks (writer-lost, writer-regression) decide data loss, "
               "and `*-log-order` failures are about the order the log view returned lines in",
               f"- Redis counter: highest INCR {state.get('redis-counter', 'none')} in the log view"]
     for node, count in sorted(state.get("export_counts", {}).items()):
