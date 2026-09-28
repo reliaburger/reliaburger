@@ -447,6 +447,38 @@ The second is a hazard the interleaving created. Retiring old instances *during*
 
 Testing this is where the pure planner pays off. The unit tests don't assert step sequences — that would pin the implementation — they replay a whole rollout and assert the *envelope*: peak total and minimum serving. A proptest then does the same for every combination of target, existing count and bounds that validation permits. And because a planner nothing calls is worse than no planner (this codebase has a long history of exactly that), there are agent-level tests that replay the grill's call log to count live containers: three replicas with `max_surge = 1` peak at four, and they peak at six against the old code.
 
+### One volume, one writer
+
+Surge-first is the right default for a web server. For an app with a managed volume it's quietly wrong, and the V02 soak found out how.
+
+The soak's writer is a shell loop on a managed volume: append the next number to `/data/seq`, `sync`, log `ACK n`. It started on node 2, and then the harness cut node 2's power in the middle of an upgrade walk. The node came back, the old binary started the writer again, and four seconds later the upgrade replaced the binary before its placement reconciler could record that deploy as applied. The new binary adopted the running writer, found the placement still pending and deployed it again. The app already had an instance, so that deploy was a rolling redeploy with the default `max_surge = 1`: start `soak-writer-g1-0`, wait for it, then retire `soak-writer-0`.
+
+Two instances of one app on one node share one managed volume. That's the design (`volumes/<namespace>/<app>/<path>`, one directory per app), and it's why a restart finds its data. So for a few seconds two shells appended to the same file. The new one read `21925` as the last line, the old one appended `21926`, and then the new one appended its own `21926`. Every acknowledged number was still in the file. It just had one of them twice, and a database with two processes appending to its write-ahead log wouldn't get off so lightly.
+
+The fix is a rule, not a knob. `DeployConfig::for_app` is what a node rolls an app out with: the app's own `[deploy]` table, except that an app with a managed volume always rolls stop-first (`max_surge = 0`, `max_unavailable` at least 1), and blue-green (which is one big surge) falls back to that too:
+
+```rust
+pub fn for_app(spec: &crate::config::app::AppSpec) -> Self {
+    let mut cfg = spec
+        .deploy
+        .as_ref()
+        .map(Self::from_spec)
+        .unwrap_or_default();
+    if spec.volumes.iter().any(|volume| volume.source.is_none()) {
+        cfg.strategy = DeployStrategy::Rolling;
+        cfg.max_surge = 0;
+        cfg.max_unavailable = cfg.max_unavailable.max(1);
+    }
+    cfg
+}
+```
+
+`spec.deploy.as_ref().map(Self::from_spec)` reads as: if there's a `[deploy]` table, parse it; `as_ref` borrows the `Option`'s contents rather than moving them out of `spec`, and `unwrap_or_default` supplies `DeployConfig::default()` when there's none. Host-path volumes (`source = "/srv/..."`) are left alone: the operator chose to share that directory and knows whether its users can.
+
+Stop-first costs a moment of unavailability on every redeploy of a volume app. We could have kept surge-first and fenced the volume instead (a lock file, or a lease the new instance waits on), but that asks every workload to cooperate, and the busybox loop that caught this never would. Kubernetes has the same trap: a `Deployment` with a `ReadWriteOnce` claim will happily run old and new pods on one node, which is why databases go in a `StatefulSet`. We'd rather not make you know that.
+
+The regression tests replay the grill's call log like the `max_surge` tests above: a volume app's redeploy must never have two instances live at once, a blue-green volume app must roll stop-first, and a host-path-only app keeps its surge. The soak's own check got fixed in the same change. Its `awk` stopped at the first line out of place and printed `LAST` from its `END` block, and `END` runs even after `exit`, so a file with one repeated line read as a file cut off at that line, below thousands of later ACKs. That looked like lost data for an hour. The check now reads the whole file and says which values are missing (lost data), which appear twice (two writers) and what the highest one is.
+
 ### "Healthy" has to mean the app answered
 
 One more audit finding, and it's the one that would have hurt most in production. The opening of this chapter promised "health-check each new instance before moving on". The live path's version of that promise was a poll on `grill.state == Running` — the *runtime's* view. The process came up, the container didn't crash, so: healthy, publish the backend, retire an old instance. At no point did anyone ask the app the question the operator configured: does `GET /healthz` return 200?
