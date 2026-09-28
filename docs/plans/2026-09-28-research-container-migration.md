@@ -1,7 +1,10 @@
-# Research: moving a running container between nodes (0.2.0)
+# Research: moving a running container between nodes (0.4.0)
 
 28 September 2026. Research and a recommendation only; no product code.
-Awaiting maintainer review.
+The maintainer answered the open questions the same day. The
+[decisions](#13-decisions-28-september-2026) are at the end, and the scope,
+design and estimate below follow them. The release is **0.4.0**, "Full
+container migration".
 
 ## Progress (for whoever resumes this)
 
@@ -11,7 +14,7 @@ Awaiting maintainer review.
 - [x] 3. CRIU, runc and the ecosystem today (sourced)
 - [x] 4. GPU checkpointing and where the demand really is (sourced)
 - [x] 5. Design for Reliaburger
-- [x] 6. Compatibility against the post-0.1.0 policy
+- [x] 6. Compatibility (pre-1.0: bump and start fresh)
 - [x] 7. Security
 - [x] 8. Observability and UX
 - [x] 9. Demo
@@ -20,49 +23,85 @@ Awaiting maintainer review.
 - [x] 12. Where the initial analysis holds and where it doesn't
 - [x] 13. Open questions for the maintainer
 - [x] Draft PR opened (#268)
+- [x] Maintainer decisions recorded (28 September 2026); scope, phasing and
+      effort revised for the full version
 
-All sections are written. Next step: the maintainer answers section 13; then, after the release soak frees the Lima VMs, spikes S1-S8 (section 10).
+All sections are written and the decisions are in. Next step: after the
+release soak frees the Lima VMs, and with an x86_64 Linux host for the
+pre-dump work, spikes S1-S11 (section 10). If a spike shows a piece can't
+work on our spec, go back to the maintainer rather than drop it quietly.
 
 ## 1. Recommendation
 
-Build the *move* first and the *memory* second. For 0.2.0, ship
-`relish migrate` and a real `relish drain` that move one runc instance to
-another node **stop-first**, carrying its managed volumes and its writable
-rootfs layer. Add an opt-in `checkpoint` mode on top that also carries the
-process memory with CRIU (through `runc checkpoint`/`runc restore`), and
-falls back to a cold start **on the target, with the data already moved**
-when CRIU refuses. Label the CRIU part experimental.
+*Revised after the maintainer's decisions of 28 September 2026. The first
+draft proposed shipping cold moves and drain in 0.2.0 with CRIU as an
+experimental opt-in, and leaving pre-dump, lazy pages, TCP handoff and jobs
+for later. The maintainer said no: 0.4.0 ships the whole thing.*
 
-Why this order? Because the fallback the maintainer asked for (a clean
-restart when CRIU says no) is itself a volume-carrying move, and Reliaburger
-can't do one today. Managed volumes are node-local and the scheduler sends an
-app back to the node that holds them (`VolumeHome`, `src/cluster/orchestrate.rs`).
-So the "boring" half is the half every stateful app needs, it's
-deterministic, and it's what Incus just shipped as "near-live" migration
-after calling CRIU fragile ([Incus 7.4](https://linuxiac.com/incus-7-4-adds-near-live-container-migration-for-zfs-and-btrfs/), accessed 28 Sep 2026).
-CRIU then turns a cold start into a warm one for the workloads it can handle.
+0.4.0, "Full container migration", ships every layer of the move, for apps
+and jobs:
 
-Two corrections to the brief. First, there is no drain to hook into:
-`relish drain` is still marked *planned* in the whitepaper, and the only
-"node drain" in the code is a chaos fault. Second, planned binary upgrades
-don't need migration at all, because runc owners outlive Bun and the new
-Bun adopts running instances. The maintenance case that does need it is a
-host reboot (kernel, firmware, hardware).
+1. **Drain and uncordon.** `relish drain <node>` cordons a node and empties
+   it; `relish uncordon` puts it back. Stateless instances are rescheduled;
+   stateful ones are migrated.
+2. **Cold moves that carry volumes.** Stop the source, copy its managed
+   volumes, cold-start on the target. This is what drain does unless the app
+   asks for more.
+3. **CRIU checkpoint and restore** (`mode = "checkpoint"`): the same move,
+   plus the process memory, through `runc checkpoint` and `runc restore`.
+4. **Live moves** (`mode = "live"`): volume pre-sync while the app runs,
+   iterative memory pre-dumps, lazy pages (post-copy restore) and TCP
+   handoff, so established connections survive and the frozen time covers
+   the last delta, not the whole memory.
 
-Keep it runc-rootful only. Drop established TCP connections and give the
-instance a new address on the target; clients reconnect, which is what Google
-did for Borg's CRIU migrations ([LPC 2018 slides](https://lpc.events/event/2/contributions/69/attachments/205/374/Task_Migration_at_Scale_Using_CRIU_-_LPC_2018.pdf), accessed 28 Sep 2026).
-Position it for long-running batch work first (the only use with production
-evidence), then single-instance dev and game servers. In 0.2.0 that means
-batch-style workers deployed as apps; moving a running *job* attempt is the
-first 0.3 item, because jobs have their own attempt ledger. GPU warm starts are a
-real market, but every shipping product we could verify uses gVisor or
-CRIU with NVIDIA patches that aren't upstream yet, we have no GPU hardware, and CUDA
-checkpointing needs host RAM at least as large as GPU memory in use. That's
-0.4 at the earliest.
+When CRIU refuses at dump time, a move falls back to cold on the target with
+the data already moved; within live mode, each layer whose precondition is
+missing is dropped on its own (section 5.7).
 
-Effort: roughly 12 to 16 focused weeks for 0.2.0, of which only about a quarter
-is CRIU. See [section 11](#11-effort-and-phasing).
+Why still build it in that order? Because each layer needs the one below
+it. The fallback the maintainer asked for (a clean restart when CRIU says
+no) is itself a volume-carrying move, and Reliaburger can't do one today.
+Managed volumes are node-local and the scheduler sends an app back to the
+node that holds them (`VolumeHome`, `src/cluster/orchestrate.rs`). Incus just
+shipped the same layering as "near-live" migration after calling CRIU
+fragile ([Incus 7.4](https://linuxiac.com/incus-7-4-adds-near-live-container-migration-for-zfs-and-btrfs/), accessed 28 Sep 2026).
+
+Two corrections to the brief still stand. First, there is no drain to hook
+into: `relish drain` is still marked *planned* in the whitepaper, and the
+only "node drain" in the code is a chaos fault. Second, planned binary
+upgrades don't need migration at all, because runc owners outlive Bun and
+the new Bun adopts running instances. The maintenance case that does need it
+is a host reboot (kernel, firmware, hardware).
+
+Two hard limits shape the design:
+
+- **Pre-dump needs soft-dirty tracking, which arm64 mainline kernels don't
+  have.** Live mode therefore takes two shapes, chosen per migration from
+  what the source node reports (`criu check --feature mem_dirty_track`): on
+  x86_64, pre-dump iterations then a short final dump; on arm64, a single
+  dump with lazy pages, so the frozen time is still small but the memory
+  streams in after restore. The Apple-silicon quickstart can demo live mode;
+  pre-dump itself needs x86_64 hardware to test (the 0.3.0 Wyse 3040s are
+  x86_64, and so are GitHub's hosted runners). Section 5.7.
+- **TCP handoff collides with node-local addresses.** Container addresses
+  come from a per-node `/23` and are never routed between nodes; clients
+  reach instances at `node_ip:host_port`. Keeping a connection means keeping
+  its 4-tuple on both ends. The design (section 5.3) takes the container
+  address over on the target and tunnels the handed-off connections through
+  the source for a bounded window. It needs no cluster-wide routing change,
+  at the price of the source staying up until those connections end or the
+  window closes.
+
+Still runc-rootful only. Position it for long-running batch work first (the
+use with production evidence), then single-instance dev and game servers.
+GPU warm starts stay out: every shipping product we could verify uses gVisor
+or CRIU with NVIDIA patches that aren't upstream yet, we have no GPU
+hardware, and CUDA checkpointing needs host RAM at least as large as the GPU
+memory in use.
+
+Effort: roughly **23 to 29 focused weeks** for one engineer, about twice the
+first draft's 12 to 16, and about half of it CRIU-specific now. See
+[section 11](#11-effort-and-phasing).
 
 ## 2. What the codebase does today
 
@@ -318,7 +357,7 @@ Apple's runtime runs each container in a VM behind a CLI with no checkpoint
 verb. ProcessGrill runs host processes with no namespaces: CRIU would have to
 restore host PIDs, host paths and host sockets on another host, which is the
 case CRIU is worst at. Both refuse `--checkpoint` with a clear error. The
-cold-start move (section 5) could serve them later, but 0.2.0 keeps it
+cold-start move (section 5) could serve them later, but 0.4.0 keeps it
 runc-only so there's one data path to test.
 
 ## 4. GPU checkpointing and where the demand really is
@@ -363,7 +402,7 @@ is real and shipping. But look at *what* ships: restoring a pre-warmed
 snapshot many times on one class of machine. That's a different product from
 migration. It needs a snapshot store with invalidation rules and GPUs we
 don't have; Reliaburger's GPU support today is detection only
-(`src/bun/gpu.rs`). Not 0.2.0, not 0.3.
+(`src/bun/gpu.rs`). Not 0.4.0.
 
 ### Demand for the other two
 
@@ -392,7 +431,7 @@ stop-and-copy downtime. A stateful dev or game server makes the better
 
 ## 5. Design for Reliaburger
 
-### 5.1 Scope for 0.2.0
+### 5.1 Scope for 0.4.0
 
 The maintainer's "checkpoint-on-drain" survives, with two changes: the drain
 has to be built, and the restart fallback has to be a *move*.
@@ -402,36 +441,47 @@ has to be built, and the restart fallback has to be a *move*.
 - `relish drain <node>` and `relish uncordon <node>`: cordon the node (no new
   placements), then empty it. Instances without managed volumes are
   rescheduled the way a rolling deploy would, respecting `max_unavailable`
-  (the whitepaper's promise for drain). Instances with managed volumes are
-  *migrated*.
+  (the whitepaper's promise for drain). Instances with managed volumes, and
+  running job attempts, are *migrated*. Instances with a host-path volume
+  block the drain; `relish drain --force` stops them, with their data left
+  in place.
 - `relish migrate <namespace>/<app> --to <node> [--instance <id>]
-  [--mode checkpoint|cold]`: move one instance on purpose.
-- Two modes, one pipeline:
+  [--mode cold|checkpoint|live]`: move one instance on purpose, and
+  `relish migrate <namespace>/<job> --attempt <n> --to <node>` for a running
+  job attempt.
+- Three modes, one pipeline, opted into per app or job with
+  `[app.<name>.migration] mode = "cold" | "checkpoint" | "live"` (and
+  `[job.<name>.migration]`). A drain moves anything that hasn't opted in
+  cold.
   - **cold**: stop the source, copy its managed volumes, cold-start on the
-    target. Works for any rootful runc app. This is the default for drain.
-  - **checkpoint** (opt-in per app, experimental): the same, plus `runc
-    checkpoint` on the source, the CRIU image and the writable rootfs layer in
-    the payload, and `runc restore` on the target. If CRIU refuses at dump
-    time, the source is still running (CRIU resumes it on failure) and the
-    migration continues as **cold**. If restore fails on the target, it
-    cold-starts there with the volumes already moved.
+    target. Works for any rootful runc app or job.
+  - **checkpoint**: the same, plus `runc checkpoint` on the source, the CRIU
+    image and the writable rootfs layer in the payload, and `runc restore`
+    on the target. If CRIU refuses at dump time, the source is still running
+    (CRIU resumes it on failure) and the migration continues as **cold**. If
+    restore fails on the target, it cold-starts there with the volumes
+    already moved.
+  - **live**: checkpoint, plus volume pre-sync while the app runs, memory
+    pre-dump iterations (x86_64) or lazy pages (both architectures), and TCP
+    handoff (section 5.7).
+- Jobs: a running attempt moves without spending a retry. It keeps its
+  attempt number; the job's durable attempt ledger (`src/bun/jobs.rs`) and
+  the batch tracker in Raft record the node change under the migration id,
+  so a crash mid-move can neither count it as a failure nor run it twice.
 - Rootful runc only.
 
 **Out, explicitly:**
 
-- Iterative pre-dump, lazy pages, page server (0.3 or later, section 11).
-- Keeping established TCP connections. They're closed at dump time; the
-  instance gets a new address on the target; clients reconnect.
-- GPUs, host-path volumes, rootless runc, Apple Container, ProcessGrill:
-  `migrate` refuses them up front, and drain reports them as blocking.
+- GPUs, rootless runc, Apple Container, ProcessGrill: `migrate` refuses them
+  up front, and drain reports them as blocking (or stops them with
+  `--force`).
 - Automatic triggers: rebalancing, spot/preemption notices, autoscaling.
   Rebalancing is a scheduler policy question we shouldn't answer in the same
   release as the mechanism.
-- Jobs. A job attempt has its own durable attempt ledger (`src/bun/jobs.rs`)
-  and the batch tracker in Raft, so moving one without consuming a retry is
-  its own design. It's the first follow-up, because batch is where the demand
-  evidence is (open question Q3).
 - Binary upgrades. They don't restart workloads (section 2).
+- Handing off a connection that doesn't come through the source node's
+  address or masquerade (a client on the source node that dialled the
+  container address directly). It's reset.
 
 **Eligibility** (checked by the leader before anything happens, reported by
 `relish migrate --dry-run`):
@@ -445,21 +495,29 @@ has to be built, and the restart fallback has to be a *move*.
    for the app or either node.
 4. The target is alive, ready, not cordoned, matches placement labels, has
    the resources, and has disk (and tmpfs, for checkpoint mode) for the payload.
-5. Checkpoint mode only: the app opted in, both nodes report the same CPU
-   model and a CRIU at or above the pinned minimum, and the source's CRIU is
-   no newer than the target's.
+5. Checkpoint and live modes: both nodes report CRIU 4.2 or newer and the
+   source's CRIU is no newer than the target's; the target's CPU has every
+   feature the source's had (section 7); and the source can hold the
+   plaintext dump in memory (section 5.5). A mode that fails these is
+   **refused** with the reason, never silently downgraded, and
+   `relish migrate --dry-run` says which modes would pass. During a drain,
+   an opted-in instance that fails them is listed as blocking, and the
+   operator can move it cold explicitly.
+6. Live mode's extra layers each have their own precondition (section 5.7).
+   A missing one drops that layer, not the move, and the status says which
+   layers ran.
 
 ### 5.2 What travels
 
-| State | Where it lives on the source | Cold | Checkpoint |
-|---|---|---|---|
-| Managed volumes | `volumes/<ns>/<app>/...` (plain, loop ext4, Btrfs) | tar stream | tar stream |
-| Writable rootfs layer | `<bundle>/rootfs-upper` | not moved (a cold restart starts fresh today too) | tar stream (restored files reference it) |
-| Process memory, fds, namespaces | kernel | none | CRIU image |
-| Image layers | image store | target pulls through Pickle **before** the source stops | same |
-| Captured stdout/stderr | `output.stdout`/`output.stderr` | stays; Ketchup has already ingested it | stays, see 5.4 |
-| Network identity | `/23` per node | new address and netns on the target | same; netns is external to CRIU |
-| Workload certificate | per instance, key generated on the node | new instance, new certificate | new certificate; old one revoked (section 7) |
+| State | Where it lives on the source | Cold | Checkpoint | Live |
+|---|---|---|---|---|
+| Managed volumes | `volumes/<ns>/<app>/...` (plain, loop ext4, Btrfs) | tar stream | tar stream | pre-synced while running, last delta after the freeze |
+| Writable rootfs layer | `<bundle>/rootfs-upper` | not moved (a cold restart starts fresh today too) | tar stream (restored files reference it) | pre-synced, last delta after the freeze |
+| Process memory, fds, namespaces | kernel | none | CRIU image | pre-dumps and a final dump, or lazy pages from the source's page server |
+| Image layers | image store | target pulls through Pickle **before** the source stops | same | same |
+| Captured stdout/stderr | `output.stdout`/`output.stderr` | stays; Ketchup has already ingested it | stays, see 5.4 | same |
+| Network identity | `/23` per node | new address and netns on the target | same; netns is external to CRIU | the container address is lent to the target for the handoff window (5.3) |
+| Workload certificate | per instance, key generated on the node | new instance, new certificate | new certificate; old one revoked (section 7) | same |
 
 The copy of each volume stays on the source, renamed out of the way
 (`volumes/.migrated/<migration-id>/...`), until the migration completes and a
@@ -467,10 +525,13 @@ retention period passes. That's what makes the fallbacks below possible, and
 it's also the one-writer rule from PR #267 in another form: the source copy
 is never mounted again unless the migration resolves *back* to the source.
 
-A plain `tar` of a stopped volume is consistent for every backend, so 0.2.0
-doesn't need `btrfs send`. Btrfs incremental send (or repeated rsync passes)
-is how 0.3 cuts downtime: pre-sync while the app runs, then send only the
-last delta after the stop, as Incus 7.4 does.
+A plain `tar` of a stopped volume is consistent for every backend, so cold
+and checkpoint modes don't need `btrfs send`. Live mode pre-syncs while the
+app runs, then sends only the last delta after the freeze, as Incus 7.4
+does: Btrfs volumes with a snapshot and incremental `btrfs send`, the other
+backends with repeated rsync-style passes (a file whose size or mtime
+changed goes again). The final pass runs after the freeze, so it's
+consistent for every backend.
 
 ### 5.3 Identity and networking
 
@@ -483,13 +544,62 @@ last delta after the stop, as Incus 7.4 does.
   them before the address is reused. The target instance is published by the
   leader once its health check passes. Nothing new is needed here, and that's
   one of the reasons to keep addresses node-local.
-- **TCP.** Drop, don't hand off. `--tcp-established` needs the same IP on the
-  target, and our per-node `/23` pools make that a network redesign
-  (routed per-instance `/32`s, or an overlay). Google made the same call for
-  Borg. `runc checkpoint` has no `--tcp-close` flag, so we pass CRIU's
-  `tcp-close` through the `org.criu.config` annotation (a small CRIU config
-  file Reliaburger writes per checkpoint). Without it, CRIU refuses to dump a
-  process with an established connection.
+- **TCP in cold and checkpoint modes.** Drop. `runc checkpoint` has no
+  `--tcp-close` flag, so we pass CRIU's `tcp-close` through the
+  `org.criu.config` annotation (a small CRIU config file Reliaburger writes
+  per checkpoint). Without it, CRIU refuses to dump a process with an
+  established connection.
+- **TCP handoff in live mode.** CRIU's `--tcp-established` restores a
+  connection with `TCP_REPAIR`, but only if the restored socket keeps its
+  4-tuple: the same local address in the target's netns, and the peer's
+  packets still reaching it. Neither holds today. Container addresses come
+  from a per-node `/23`, are never routed between nodes, and two nodes whose
+  names hash alike can own identical-looking ranges. Every client, inside or
+  outside the cluster, reaches an instance at `node_ip:host_port` through the
+  source's nftables DNAT, and outbound traffic leaves through the source's
+  masquerade. Both directions of every existing connection are pinned to the
+  source node.
+
+  Two designs fit:
+
+  1. **Forward through the source (proposed).** The target's netns borrows
+     the instance's container address for the migration: the target
+     reserves it in its `network_leases` journal under the migration id, and
+     refuses the handoff if it collides with an address of its own (the move
+     then drops connections and takes a fresh address, as checkpoint mode
+     does). Before restoring, the target reads the handed-off sockets'
+     4-tuples from the CRIU image into an nftables set. An IPIP tunnel
+     between the two node addresses carries those flows and only those.
+     Inbound packets still arrive at the source, pass its existing DNAT and
+     conntrack entry, and go down the tunnel instead of to a local veth; the
+     target policy-routes replies for tuples in the set back up the tunnel,
+     where the source's conntrack reverses the NAT exactly as before.
+     Outbound connections work the same way through the source's
+     masquerade. New connections never touch the tunnel: Onion publishes the
+     target's own `node_ip:host_port` backend once it's healthy, and the
+     source's is withdrawn through the existing ledger. The tunnel lasts for
+     a handoff window (default 10 minutes, per app), then comes down and any
+     survivors are reset. The source can't drain away while connections
+     still use it, so `relish drain` waits for the window (or `--timeout`),
+     and if the source dies the handed-off connections break, which is what
+     happens to them today anyway. Cost: about 3-4 weeks, most of it the
+     fencing (the borrowed address goes back through the same lease and
+     withdrawal rules as any other, `src/onion/lease.rs`) and the crash
+     cases. Nothing changes in how the rest of the cluster routes.
+  2. **Cluster-routable instance addresses.** Give every instance a
+     cluster-unique `/32` allocated by the leader and routed between nodes
+     (routes over gossip, or an overlay), so an address can simply move.
+     Cast AI needed a forked AWS VPC CNI for the same thing. It takes the
+     source out of the path, but it rewrites Onion's routing and its lease
+     invariant ("container addresses are never routed between nodes"), the
+     firewall's keys and every address test, for one feature. About 6-8
+     weeks, and a new class of split-brain bugs. Not for 0.4.0; it's the
+     answer if handoff through the source proves too limiting.
+
+  Ingress (Wrapper) holds its own upstream connections to the instance, and
+  from the source's point of view they're ordinary handed-off connections,
+  so they survive too. Spike S11 proves the tunnel and `TCP_REPAIR` together
+  on our spec.
 - **eBPF and firewall.** Onion's maps and the Sesame firewall live on the
   host and key on container addresses and cgroup ids, so nothing about them is
   inside the CRIU image. The target programs them for its new instance as
@@ -541,8 +651,8 @@ order of preference, to be settled by spike S2:
   `Cargo.lock`.
 - **At rest.** CRIU writes plaintext image files, so the source dumps into a
   private tmpfs sized from the instance's memory limit. If the node doesn't
-  have that much free memory, checkpoint mode isn't eligible and the
-  migration runs cold. The encrypted stream may spool to disk on either side;
+  have that much free memory, checkpoint and live modes are refused (see
+  below). The encrypted stream may spool to disk on either side;
   plaintext only exists in tmpfs, during dump and during restore.
 - **Space.** The leader checks both nodes' reported free space against the
   instance's volume usage plus memory limit plus a margin before starting.
@@ -554,8 +664,13 @@ order of preference, to be settled by spike S2:
 - **Expected downtime.** Stop-and-copy downtime is dump + transfer + restore,
   and transfer dominates: roughly the anonymous memory plus the volume size
   over the link. A 256 MiB in-memory Redis should be seconds; a 10 GiB
-  volume is 90 seconds or more on 1 Gbit/s. That's why volume pre-sync, not
-  memory pre-dump, is the first 0.3 item.
+  volume is 90 seconds or more on 1 Gbit/s. That's why live mode pre-syncs
+  volumes as well as memory: for most stateful apps the volume, not the
+  memory, sets the downtime.
+- **Not enough memory for the dump.** If the source can't hold the plaintext
+  dump in tmpfs (the instance's memory limit plus a margin, against what the
+  node reports free), checkpoint and live modes are refused (decision 6).
+  Plaintext never spills to disk.
 
 ### 5.6 Control plane
 
@@ -629,41 +744,78 @@ Every phase has a deadline in the record, so nothing waits forever.
 **How drain uses it.** `relish drain` commits a cordon, then works through
 the node's instances: stateless ones are rescheduled with surge, singletons
 with managed volumes become migrations (checkpoint if the app opted in, cold
-otherwise), and anything ineligible is listed as blocking with the reason.
-`relish drain --stop-blocking` stops those instead, with their data left in
-place. The drain finishes when the node runs nothing but system services.
+otherwise), running job attempts move the same way, and anything
+ineligible (host-path volumes, GPUs, runtimes that can't move) is listed as
+blocking with the reason. `relish drain --force` stops those instead, with
+their data left in place. The drain finishes when the node runs nothing but
+system services and no handoff window still routes through it.
 
-## 6. Compatibility against the post-0.1.0 policy
+### 5.7 Live mode
 
-The policy (PR #254's `CLAUDE.md` and `docs/releasing.md`) has two kinds of
-change: additive (optional JSON/TOML fields old nodes tolerate, no bump) and
-incompatible (bump `protocol` or `state` and ship a migration). PR #266
-proposes a third, **gated**: every node learns to decode the new entries, but
-the leader writes none of them until the cluster has run
-`RaftRequest::FinaliseClusterFeatures { level }`, after which rollback to
-0.1.x is refused. Migration can't be done additively, so it should ride the
-same gate, at the same feature level as task arrays if both land in 0.2.0.
-One finalisation per release is plenty for operators.
+Live mode is checkpoint mode with extra layers, each with its own
+precondition, each dropped on its own when the precondition fails:
 
-| Change | Kind under the policy | Handling |
+| Layer | What it does | Needs | Without it |
+|---|---|---|---|
+| Volume and rootfs pre-sync | Copy while running; send the last delta after the freeze | nothing new | always available |
+| Memory pre-dump iterations | `runc checkpoint --pre-dump` with `--parent-path`, repeated while the dirty set shrinks, then a final dump of the last dirty pages | soft-dirty tracking on the source (`criu check --feature mem_dirty_track`): x86_64 yes, arm64 mainline no | lazy pages alone |
+| Lazy pages (post-copy) | The source dumps and serves pages from a CRIU page server; the target restores at once and faults the rest in through `userfaultfd` | `userfaultfd` on the target (`criu check --feature uffd-noncoop`); CRIU's page server with TLS | a full dump before restore, as checkpoint mode |
+| TCP handoff | Section 5.3 | borrowed address free on the target; IPIP between the two nodes | connections dropped, fresh address |
+
+**Pre-dump policy.** Stop iterating when the dirty set is under a threshold
+(default 64 MiB), stops shrinking by at least a quarter per round, or hits a
+maximum number of rounds (default 5); then freeze. A process that dirties
+memory faster than the link carries it never converges, and that's exactly
+when lazy pages are the better tool, so an x86_64 live move that hits the
+round limit finishes the remainder with lazy pages.
+
+**arm64.** Soft-dirty patches for arm64 were posted in 2023-24 and not
+merged. Emulating it with repeated full dumps would cost more than it
+saves. So on arm64, live mode is volume pre-sync plus lazy pages plus TCP
+handoff: the freeze covers one dump of the process state *without* its
+pages, and the pages follow. That's the Apple-silicon quickstart's shape,
+and the demo works on it. Pre-dump is x86_64-only, reported per node and
+shown by `relish migrate --dry-run`; the release's x86_64 qualification
+(GitHub's hosted runners, cloud VMs or the Wyse 3040s from 0.3.0) covers it.
+If arm64 gains soft-dirty upstream, the capability check picks it up with
+no code change.
+
+**Lazy pages bring a new failure mode.** Until the last page arrives, the
+restored process depends on the source. If the source dies or the page
+server connection breaks, the process on the target faults on a missing page
+and dies. Volumes and the rootfs delta have already moved, so the fallback
+is a cold start on the target with the data, and the status says the memory
+was lost. The page server uses CRIU's TLS with a per-migration key pair
+whose fingerprints are in the Raft record, so pages are encrypted in transit
+like the rest of the payload. The migration isn't `Completed` until the last
+page has arrived and the source has let go.
+
+
+## 6. Compatibility (pre-1.0: bump and start fresh)
+
+The first draft proposed riding PR #266's "finalise cluster features" gate.
+That question is moot: the maintainer decided on 28 September 2026 that
+there's no backwards compatibility before 1.0.0 (PR #254's `CLAUDE.md` and
+`docs/releasing.md`). 0.4.0 is a development release, so its incompatible
+changes bump `protocol` and `state` in `src/compatibility.rs`, nodes refuse
+older peers and older state, and upgrading from 0.3.x means a fresh cluster.
+No gate, no migration, no additive-field rules.
+
+What changes, so the bump is deliberate and the tests know where to look:
+
+| Change | Encoding | Handling |
 |---|---|---|
-| `RaftRequest::MigrationStart`, `MigrationAdvance`, `MigrationFinish` | New enum variants: incompatible | Gated. `relish migrate` answers 409 "finalise the cluster upgrade first" until finalised |
-| `RaftRequest::NodeCordon`, `NodeUncordon` | New variants: incompatible | Gated with the rest. The upgrade cordon stays as it is |
-| `CouncilResponse` variants for the above, if any | New variants: incompatible | Gated; prefer reusing `Ok`/`Applied`/`Refused` |
-| `DesiredState.migrations`, `DesiredState.cordoned_nodes` | New optional JSON fields; `DesiredState` has no `deny_unknown_fields` | Additive on paper, meaningful only after the gate. `#[serde(default)]`, skip when empty |
-| `[app.migration]` in `AppSpec` (the opt-in) | `AppSpec` has `deny_unknown_fields`: incompatible even as an `Option` | Gated: apply refuses the field until finalised, because an old follower would refuse the whole `AppSpec` entry |
-| `NodeAssignments.migrations` ("migrating in/out" instructions) | New optional field; no `deny_unknown_fields` | Additive, and only ever non-empty after the gate |
-| Node routes: prepare, payload, report | New HTTP routes | Additive; new entries in the `authz.rs` route matrix |
-| `OciSpec` annotations and time offsets, time namespace entry | `OciSpec` has no `deny_unknown_fields`; namespace type is a string | Additive with `#[serde(default, skip_serializing_if = ...)]`. Worth a test that an old binary reads back a new intent journal |
-| Node-local migration journal (payload, tombstones, transfer state) | A new file no old binary reads | Its own file, so `IntentConfiguration` and the owner records (both `deny_unknown_fields`) don't change |
-| `StateReport` and reporting frames | bincode: any change is incompatible | Not touched. Progress goes over the new node route |
-| Metrics, events | New names | Additive |
-| CRIU image format | Not ours | Record the source's CRIU version in the record; refuse checkpoint mode when the target's is older |
-
-If the maintainer rejects the gate, the fallback is a `protocol`/`state`
-bump with a designed migration, which strands every 0.1.0 cluster that
-can't do a blue-green move. For a feature that's opt-in and experimental,
-that's the wrong trade.
+| `RaftRequest::MigrationStart`, `MigrationAdvance`, `MigrationFinish`, `NodeCordon`, `NodeUncordon` | JSON enum variants | protocol and state bump |
+| `CouncilResponse` variants for the above, if any | JSON | same bump; prefer reusing `Ok`/`Applied`/`Refused` |
+| `DesiredState.migrations`, `DesiredState.cordoned_nodes` | JSON snapshot | state bump |
+| `[app.<name>.migration]` and `[job.<name>.migration]` | TOML/JSON, `deny_unknown_fields` | protocol bump |
+| Batch tracker attempt records gain the migration id | JSON | state bump |
+| `NodeAssignments.migrations` ("migrating in/out" instructions) | JSON | protocol bump |
+| Node routes: prepare, payload, report, handoff | HTTP | new routes in the `authz.rs` matrix |
+| `OciSpec` time namespace and offsets | node-local JSON | covered by the state bump |
+| Node-local migration journal (payload, tombstones, transfer state, borrowed addresses) | new file | covered by the state bump |
+| `StateReport` and reporting frames | bincode | not touched; progress goes over the new node route |
+| CRIU image format | not ours | record the source's CRIU version; refuse when the target's is older |
 
 ## 7. Security
 
@@ -695,8 +847,19 @@ that's the wrong trade.
   CRIU version and surface it in `relish wtf`.
 - **Seccomp and AppArmor.** The generated spec has neither today. CRIU
   restores seccomp filters, and `runc restore --lsm-profile` exists for when
-  we add AppArmor. Nothing to do in 0.2.0 beyond a test that keeps the
+  we add AppArmor. Nothing to do in 0.4.0 beyond a test that keeps the
   checkpoint path honest when a profile appears.
+- **CPU features.** Restore is refused on a CPU that lacks any feature the
+  source's CPU had (decision 9). Each node reports its feature set with
+  `criu cpuinfo dump`; the leader checks that the target's is a superset
+  before it starts, and the restore runs with `--cpu-cap=cpu` so CRIU checks
+  again on the target. glibc and JITs keep using whatever they detected at
+  start-up, so the model needn't match, but nothing may be missing.
+- **Borrowed addresses.** TCP handoff lends the source's container address
+  to the target for a window. It's reserved and released through the same
+  lease and withdrawal rules as any other address, and the tunnel carries
+  only the tuples read from the dump, so it can't reach anything else on the
+  source.
 - **Egress.** A restored process must not run, even briefly, without its
   egress policy. Section 5.3's ordering (spike S4) is a security requirement,
   not a nicety.
@@ -706,12 +869,14 @@ that's the wrong trade.
 **Commands.**
 
 ```text
-relish migrate default/cache --to node-3                 # cold
+relish migrate default/cache --to node-3                 # the app's mode; cold if it has none
 relish migrate default/cache --to node-3 --mode checkpoint
-relish migrate default/cache --to node-3 --dry-run        # eligibility report
+relish migrate default/cache --to node-3 --mode live
+relish migrate default/cache --to node-3 --dry-run        # eligibility per mode and layer
+relish migrate default/render --attempt 7 --to node-3     # a running job attempt
 relish migrate status [<migration-id>]
 relish migrate cancel <migration-id>
-relish drain node-2 [--timeout 30m] [--stop-blocking]
+relish drain node-2 [--timeout 30m] [--force]
 relish drain status node-2
 relish uncordon node-2
 ```
@@ -720,11 +885,14 @@ The opt-in in the app file:
 
 ```toml
 [app.cache.migration]
-mode = "checkpoint"   # "checkpoint", "cold" (default for managed volumes) or "never"
+mode = "live"            # "cold" (what drain does without this), "checkpoint" or "live"
+handoff_window = "10m"   # live only: how long handed-off connections route via the source
 ```
 
-**Status** shows the phase, the mode (and whether it fell back, with CRIU's
-reason), bytes moved per kind, and the frozen time so far.
+**Status** shows the phase, the mode and which live layers ran (and whether
+it fell back, with CRIU's reason), pre-dump rounds and their dirty sizes,
+bytes moved per kind, lazy pages still outstanding, handed-off connections
+still routed through the source, and the frozen time so far.
 
 **Events** (Bun's event log and `relish status`): requested, prepared, source
 stopped (dump duration, payload size), transferred, restored or cold-started,
@@ -737,6 +905,8 @@ fell back (reason), aborted (reason), completed (downtime).
 - `reliaburger_migration_payload_bytes{kind="memory|rootfs|volume"}`
 - `reliaburger_migration_phase_seconds{phase}`
 - `reliaburger_migration_fallback_total{reason}`
+- `reliaburger_migration_predump_rounds` and `reliaburger_migration_lazy_pages_outstanding`
+- `reliaburger_migration_handoff_connections{migration}`
 
 **`relish wtf` checks:** CRIU missing or below the minimum on a runc node
 (`criu check`); an app opted into checkpoint that uses a host-path volume, a
@@ -749,9 +919,11 @@ days.
 volume or a GPU.
 
 **Docs.** A manual chapter ("Moving workloads"), a `docs/design/` section in
-`deployments.md` (drain) and `agent-bun.md` (checkpoint), and a book section.
-The book should tell the honest story: why stop-and-copy, why we drop TCP,
-what CRIU refuses, and why the fallback is the real feature.
+`deployments.md` (drain) and `agent-bun.md` (checkpoint and live), and a new
+book chapter for 0.4.0 (decision 10). The chapter should tell the honest
+story: why the volume move comes first, what CRIU refuses, why pre-dump is
+x86_64-only, why handed-off connections still route through the source, and
+why the fallback is the real feature.
 
 ## 9. Demo
 
@@ -789,6 +961,14 @@ relish migrate default/uring --to node-3 --mode checkpoint
 relish migrate status          # "fell back to cold: CRIU cannot dump io_uring"
 ```
 
+Then the live move, with a client connection that has to survive it:
+
+```sh
+relish exec default/cache-client -- redis-cli -h cache -r -1 -i 0.1 INCR counter &
+relish migrate default/cache --to node-2 --mode live
+relish migrate status          # pre-dump rounds or lazy pages, frozen time, handed-off connections
+```
+
 And the drain, with the soak's append-only writer on a managed volume:
 
 ```sh
@@ -800,9 +980,11 @@ relish drain status node-2     # empty; nothing blocking
 
 - `DBSIZE` and a sample of values match before and after; `uptime_in_seconds`
   keeps counting.
-- Frozen time for the 256 MiB cache under 10 seconds on the Apple-silicon
-  quickstart (to be confirmed by spike S7; this is a target, not a
-  measurement).
+- Frozen time for the 256 MiB cache under 10 seconds in checkpoint mode on
+  the Apple-silicon quickstart, and under 1 second in live mode (to be
+  confirmed by spikes S7 and S10; targets, not measurements).
+- The `INCR` client's connection never resets during the live move, and
+  the counter never goes backwards.
 - The io_uring workload ends up running on the target with its volume data,
   and the status names the reason.
 - The writer's sequence file has no gap and no repeated line (the PR #267
@@ -828,6 +1010,9 @@ spec):
 | S6 | Time namespace keeps `CLOCK_MONOTONIC` continuous across two VMs | Refuse checkpoint mode for apps that care, document |
 | S7 | Payload size and frozen time for Redis at 256 MiB and 1 GiB | Tune targets |
 | S8 | io_uring, POSIX mqueues and a GPU-less `/dev/nvidia*` bind are refused cleanly and the process keeps running | Tighten eligibility |
+| S9 | `runc checkpoint --pre-dump` with `--parent-path` on our spec, on x86_64; dirty-set convergence for Redis under write load; `mem_dirty_track` reported false on arm64 | Pre-dump waits; live mode is lazy pages only everywhere |
+| S10 | Lazy pages: `runc checkpoint --lazy-pages` with a TLS page server, `runc restore` with `criu lazy-pages` on the target, on both architectures; what the process sees when the page server dies | Live mode is pre-dump only (x86_64); back to the maintainer |
+| S11 | TCP handoff: borrowed address in the target netns, IPIP tunnel, 4-tuple set from the image, `--tcp-established` restore, source conntrack reversing the NAT | Back to the maintainer before building the routable-address design |
 
 **Unit tests** (portable, written first):
 
@@ -841,7 +1026,15 @@ spec):
 - The Raft apply: the `SourceStopped` entry moves the placement atomically;
   `Completed` updates `last_placed_nodes`; `decommission-node` resolves a
   migration.
-- The gate: every new request refused before finalisation.
+- The compatibility bump: fixtures take their pair from
+  `compatibility::CURRENT`, and a 0.3.x peer and 0.3.x state are refused.
+- Live-mode planning: layer selection from reported capabilities, pre-dump
+  convergence and round limits, and the fall-through to lazy pages.
+- Job attempts: a moved attempt keeps its number and spends no retry,
+  including across a crash at every phase.
+- CPU features: a target missing any source feature is refused.
+- Handoff: tuple sets from a sample image, borrowed-address collisions, and
+  the window's expiry.
 - Payload manifest, digest and encryption round-trip; a tampered stream is
   refused.
 - The authz matrix gains the new routes (its existing test fails otherwise).
@@ -860,7 +1053,13 @@ io_uring refusal path.
 **Gated cluster** (`make test-cluster` on three Lima VMs): a real cross-node
 migration with a managed volume in both modes; power off the source
 mid-dump; power off the target mid-restore; kill the leader mid-transfer;
-drain a node with a mix of stateless, cold and checkpoint apps.
+drain a node with a mix of stateless, cold, checkpoint and live apps and a
+running job; a live move with an open client connection; kill the source
+mid lazy-page transfer.
+
+**Gated x86_64** (GitHub's hosted runners if CRIU works there, otherwise
+cloud VMs or the Wyse 3040s): pre-dump iterations and their convergence,
+because the Apple-silicon Lima VMs can't run them.
 
 **Soak.** Add a migration loop to the V02 sustained qualification: every N
 minutes migrate the soak writer (cold) and a checkpoint-enabled in-memory
@@ -881,42 +1080,47 @@ upstream PPA (Ubuntu 24.04 has no archive package), pin the version, and make
 ## 11. Effort and phasing
 
 Rough, for one engineer (or agent plus reviewer) working in this codebase's
-style: owners, fences, receipts, crash tests at every step.
+style: owners, fences, receipts, crash tests at every step. Revised for the
+full version the maintainer asked for.
 
 | Piece | Weeks |
 |---|---|
-| Spikes S1-S8 (after the soak) | 1-1.5 |
-| Feature-level gate, if PR #266's M5 lands first; 1.5 weeks if we build it | 0.5-1.5 |
-| Cordon, `relish drain` for stateless apps, `uncordon`, status | 2 |
+| Spikes S1-S11 (after the soak; S9 needs x86_64) | 2-2.5 |
+| Compatibility bump and its tests (no gate) | 0.25 |
+| Cordon, `relish drain` for stateless apps, `uncordon`, `--force`, status | 2 |
 | Cold move: Raft record and state machine, node instructions, payload route, volume tar and tombstones, crash recovery, drain integration | 4-5 |
-| Checkpoint mode: runc checkpoint/restore under owners, stdio, cgroup and egress ordering, tmpfs and encryption, time namespace, CRIU packaging, certificate revocation | 3-4 |
-| Observability, `wtf`, lint, manual, design docs, book, soak loop, qualification | 1.5-2 |
-| **Total** | **12-16** |
+| Checkpoint mode: runc checkpoint/restore under owners, stdio, cgroup and egress ordering, tmpfs and encryption, time namespace, CPU feature check, CRIU packaging, certificate revocation | 3-4 |
+| Jobs: moving a running attempt without spending a retry, attempt ledger and batch tracker | 1.5-2 |
+| Live: volume and rootfs pre-sync (Btrfs send, rsync-style passes elsewhere) | 1.5-2 |
+| Live: memory pre-dump iterations, convergence policy, capability reporting (x86_64) | 1.5-2 |
+| Live: lazy pages, TLS page server, the source-loss fallback | 2-3 |
+| Live: TCP handoff through the source (section 5.3) | 3-4 |
+| Observability, `wtf`, lint, manual, design docs, the new book chapter, soak loop, qualification on both architectures | 2-2.5 |
+| **Total** | **23-29** |
 
-The CRIU-specific work is about a quarter of it. The rest is what any
-stateful move needs, and it's where the crash matrix lives.
+That's roughly five and a half to seven months for one engineer, about
+twice the first draft. CRIU-specific work is now about half of it (checkpoint
+mode, pre-dump, lazy pages and most of the handoff), up from a quarter. The
+routable-address alternative for TCP handoff would add another 3-4 weeks on
+top of the handoff line and isn't in the total.
 
-**0.2.0:** everything in section 5.1. Checkpoint mode labelled experimental;
-cold moves and drain are the supported feature. If the spikes sink
-checkpoint mode, ship cold moves and drain alone and say so.
+**Phasing inside 0.4.0.** Each step lands on `main` behind its own tests and
+is usable on its own; the release waits for all of them.
 
-**0.3:**
-
-1. Pre-sync volumes while the app runs (Btrfs incremental send, or rsync
-   passes elsewhere), then stop and send the last delta. The biggest
-   downtime win, and it helps cold moves too.
-2. Jobs: move a running attempt without spending a retry (possibly first, see Q3).
-3. Memory pre-dump (`--pre-dump`, `--parent-path`), **x86-64 only** until
-   arm64 has soft-dirty tracking.
-4. Lazy pages, only if S7-style measurements show memory transfer dominating
-   after (1). userfaultfd restores are the part Google called "very, very
-   difficult" to make incremental.
+1. Spikes S1-S11. Any failure goes back to the maintainer.
+2. Cordon, drain and uncordon for stateless apps.
+3. Cold moves with volumes, and drain moving stateful apps.
+4. Checkpoint mode.
+5. Jobs, in all three modes.
+6. Live: pre-sync, then lazy pages, then pre-dump (x86_64).
+7. Live: TCP handoff.
+8. Observability, docs, the book chapter, the soak loop and qualification.
 
 **Later, each its own design:** GPU warm starts (a snapshot store with
 invalidation rules, driver and CPU matching, and hardware to test on);
-keeping TCP connections (needs addresses that can move between nodes);
-automatic rebalancing and preemption-driven moves; rootless and non-runc
-runtimes.
+cluster-routable instance addresses, if handoff through the source proves
+too limiting; automatic rebalancing and preemption-driven moves; rootless
+and non-runc runtimes.
 
 ## 12. Where the initial analysis holds and where it doesn't
 
@@ -946,9 +1150,10 @@ runtimes.
 - *"youki uses rust-criu for its checkpoint support"*: for checkpoint only.
   Restore has been an open PR since February. We should shell out to runc,
   which already speaks CRIU for us.
-- *"Iterative pre-dump in 0.3"*: pre-dump needs soft-dirty tracking, which
-  arm64 mainline doesn't have, and our quickstart is Apple silicon. Volume
-  pre-sync is the better 0.3 downtime work.
+- *"Iterative pre-dump"*: pre-dump needs soft-dirty tracking, which arm64
+  mainline doesn't have, and our quickstart is Apple silicon. So it's
+  x86_64-only, with lazy pages covering arm64, and volume pre-sync matters
+  at least as much for downtime.
 - *GPU as a headline use*: every shipping LLM warm-start product we could
   verify restores a pre-warmed snapshot on the same class of machine, mostly
   via gVisor. That's a snapshot product, not migration, and we have no GPUs.
@@ -956,34 +1161,34 @@ runtimes.
   demo.
 - *Upgrades as a trigger*: they don't restart workloads. Reboots do.
 - *Effort*: the brief reads as a CRIU feature. It's a stateful-move feature
-  with a CRIU option, at 12 to 16 weeks, and three spikes could still
-  cut the CRIU part.
+  with CRIU on top, and with every layer in it's 23 to 29 weeks.
 - *Unmentioned*: a checkpoint carries workload private keys off the node,
   which contradicts the workload-identity design and needs revocation.
 
-## 13. Open questions for the maintainer
+## 13. Decisions (28 September 2026)
 
-1. **Framing.** Do you accept "move first, CRIU as an opt-in mode" for 0.2.0,
-   including shipping cold moves and drain alone if the spikes sink
-   checkpoint mode?
-2. **Gate.** Can migration share PR #266's feature-level finalisation (one
-   level for 0.2.0)? Without a gate it's a protocol bump.
-3. **Jobs.** Apps only in 0.2.0 with jobs first in 0.3, or jobs in 0.2.0
-   given batch is the best-evidenced use?
-4. **Opt-in shape.** `[app.<name>.migration] mode = "checkpoint" | "cold" |
-   "never"`, with managed-volume apps defaulting to `cold`? Or should drain
-   refuse to move stateful apps unless they opt in at all?
-5. **Host-path apps during drain.** Block the drain (default here) or stop
-   them with `--stop-blocking`?
-6. **Plaintext on disk.** When tmpfs is too small, refuse checkpoint mode
-   (proposed) or allow disk with a warning?
-7. **CRIU distribution.** Depend on the upstream PPA in guest images and
-   document it for other installs, or vendor a static `criu`? Minimum version
-   4.1 (pidfd) or 4.2?
-8. **Identity.** Is revoking the source instance's workload certificate on
-   completion acceptable, given apps that cache their identity must reload
-   it?
-9. **CPU policy.** Require identical CPU models for checkpoint mode (from a
-   node label), or run CRIU's `--cpu-cap` check and let it refuse?
-10. **Book.** Which chapter gets the story: Chapter 7 ("Ship It", where
-    deploys and draining live) or a section in Chapter 12?
+The maintainer answered the ten open questions on 28 September 2026. The
+questions as asked are kept in the PR history; the answers are:
+
+1. **Framing.** No to "move first, CRIU opt-in only". 0.4.0 implements the
+   whole thing: drain, cold moves with volumes, CRIU checkpoint and
+   restore, pre-dump iterations, lazy pages and TCP handoff.
+2. **Gate.** Moot. There's no backwards compatibility before 1.0.0, so
+   there's no finalisation gate to share: 0.4.0 bumps `protocol` and `state`
+   and needs a fresh cluster (section 6).
+3. **Jobs.** Both apps and jobs, in 0.4.0.
+4. **Opt-in shape.** `[app.<name>.migration] mode = "cold" | "checkpoint" |
+   "live"` (and the same for jobs). A drain moves anything that hasn't opted
+   in cold.
+5. **Host-path apps during drain.** They block the drain; `relish drain
+   --force` stops them.
+6. **Plaintext on disk.** Refuse checkpoint and live modes when memory can't
+   hold the plaintext dump. Never spill it to disk.
+7. **CRIU distribution.** From the upstream PPA, minimum version 4.2. (The
+   0.3.0 quickstart guest moves to Ubuntu 26.04; check the PPA publishes for
+   it before then.)
+8. **Identity.** Revoke the source instance's workload certificate when the
+   migration completes.
+9. **CPU policy.** Refuse restore on a CPU missing any feature the source
+   had (section 7).
+10. **Book.** A new chapter for 0.4.0.
