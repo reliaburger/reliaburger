@@ -748,10 +748,61 @@ downloaded product, rather than starting a new architecture phase. Historical
 phase checkboxes are implementation evidence; the release's acceptance gates and
 their records are in [progress.md](progress.md#acceptance-and-release-gates).
 
-Work after 0.1.0 comes from the backlog in [progress.md](progress.md) (the
-missing capabilities F01–F12 and the remaining engineering follow-ups) and the
-v2 list below. Each piece starts with a dated plan in [plans/](plans/); later
+Work after 0.1.0 follows the [release order](#releases-after-010) below, one
+headline feature per release, drawing on the backlog in [progress.md](progress.md)
+(the missing capabilities F01–F12 and the remaining engineering follow-ups) and
+the v2 list. Each piece starts with a dated plan in [plans/](plans/); later
 releases follow the same [release runbook](releasing.md).
+
+---
+
+## Releases after 0.1.0
+
+Each minor release after 0.1.0 ships one headline feature, with a single exit
+test that proves it. Everything else waits for a patch release or a later
+headline. Each release still starts with a dated plan in [plans/](plans/).
+
+- **0.1.x: polish, no headline.** The Go demo build in the tour, multi-platform
+  images and their platforms in `relish images`
+  ([#248](https://github.com/reliaburger/reliaburger/pull/248), which also
+  removes 0.1.0's multi-platform known limitation), and the should-fix findings
+  from the static review
+  ([#258](https://github.com/reliaburger/reliaburger/pull/258)): snapshot
+  hardening (B03, B04, B05, B07), GitOps (B13, B16, B19), the permission matrix
+  (B18), autoscaler `min = 0` and the testing assessment (T01–T07).
+- **0.2.0: "Bare metal in an hour".** The appliance OS (our own mkosi image on
+  Ubuntu 26.04 with the Canonical kernel), `relish netboot`, claiming machines
+  over the LAN, and weekly signed OS builds with A/B updates. Fleet v0 is folded
+  in: enrol, allocate, move and wipe machines between clusters from
+  `relish fleet`, with a first-class drain API. Exit test: ten Dell Wyse 3040s
+  go from power-on to two clusters, with a machine moved between them, from a
+  laptop. Research and spikes:
+  [#218](https://github.com/reliaburger/reliaburger/pull/218),
+  [#259](https://github.com/reliaburger/reliaburger/pull/259) (appliance image)
+  and [#265](https://github.com/reliaburger/reliaburger/pull/265) (fleet control
+  plane).
+- **0.3.0: "Move running containers".** `relish drain` and `relish migrate` move
+  an app together with its managed volumes, with an opt-in CRIU checkpoint mode
+  and a clean fallback when checkpointing isn't possible. This release
+  introduces the "finalise cluster features" gate, so incompatible Raft changes
+  only take effect once every node can read them
+  ([#268](https://github.com/reliaburger/reliaburger/pull/268)).
+- **0.4.0: "A million jobs".** Task arrays keep compact state in Raft and expand
+  on each node, and finish a million tasks in minutes on three nodes. They reuse
+  the feature gate ([#266](https://github.com/reliaburger/reliaburger/pull/266)).
+- **0.5.0: to be decided.** Either fleet v1 (a `relish fleet serve` service with
+  a web UI and cross-cluster OS rollouts) or GPU scheduling and warm starts
+  (F01), depending on demand. The rest of the backlog (F02–F11, H05) isn't
+  headline material; those items land alongside whichever release they fit.
+
+0.3.0 and 0.4.0 can swap places. Whichever lands first builds the feature gate.
+
+**Housekeeping after 0.1.0.** Consolidate the planning documents: archive
+finished plans under [plans/archive/](plans/archive/), collapse the completed
+sections of [progress.md](progress.md) into a short history that links the
+[qualification records](qualification/) and the release-closure record
+([#253](https://github.com/reliaburger/reliaburger/pull/253)), and keep one
+current backlog.
 
 ---
 

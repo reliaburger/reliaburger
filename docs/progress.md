@@ -19,8 +19,9 @@ runs, CI results) that used to live here.
 > [missing capabilities](#missing-capabilities-and-longer-term-scope) (F01–F12),
 > the one open [engineering follow-up](#engineering-follow-ups) (H05) and the
 > [known flakes](#known-flakes). The limits 0.1.0 ships with are in the
-> [documentation](README.md#010-scope-and-limits). New work starts with a dated
-> plan in [plans/](plans/).
+> [documentation](README.md#010-scope-and-limits). Releases after 0.1.0 ship
+> one headline feature each, in the [release order](roadmap.md#releases-after-010)
+> in the roadmap. New work starts with a dated plan in [plans/](plans/).
 
 ## Current completion backlog (17 September 2026)
 
