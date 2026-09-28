@@ -24,12 +24,16 @@ from `plans/million-jobs` unchanged), whose findings it keeps and whose
   `TaskRunner`, `ProcessRunner`, `FakeRunner`, `TaskPool::run_chunk`); M3.3,
   the ledger (`src/bun/task_ledger.rs`: 14-byte records in CRC32-framed
   blocks, `spawn_writer` group commit, `replay` with torn-tail handling).
-- **Next:** M4.1, `tests/suite/task_array_million.rs`: three `TaskPool`s
-  with `FakeRunner` and a ledger each, driven by `TaskArrayState` and
-  `plan_grants` through 1,000,000 tasks with 1% first-attempt failures and
-  one node lost mid-run (its chunks re-granted, stale reports refused).
-  Then M4.2, `benches/task_arrays.rs` (Criterion, `harness = false` in
-  `Cargo.toml`) and a `make bench-task-arrays` target.
+- M4.1 is in the portable suite (`tests/suite/task_array_million.rs`): 100k
+  tasks by default, `RELIABURGER_TASK_ARRAY_TASKS=1000000` for the full run.
+  Local numbers on 28 September (debug build, `FakeRunner`, 2 worker
+  threads): 1M tasks in 30.6 s, 422 leader entries, 2 stale reports
+  refused, final state 282 bytes of JSON.
+- **Next:** M4.2, `benches/task_arrays.rs` (Criterion, `harness = false` in
+  `Cargo.toml`) plus a `make bench-task-arrays` target; then the book
+  section (Chapter 12, after "When the leader forgets") and a
+  `docs/progress.md` entry. After that, everything left needs the M5
+  owner decision or a cluster (M0 after the soak).
 - **Local build constraints while the release soak runs:**
   `CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=$HOME/.cache/rb-target-millionjobs`;
   run only the targeted unit tests (`cargo test --lib meat::index_set` and so
@@ -647,7 +651,7 @@ k3s cluster of the same size, and publish both scripts.
 
 ### M4: in-process proof
 
-- [ ] M4.1 `tests/suite/task_array_million.rs` acceptance
+- [x] M4.1 `tests/suite/task_array_million.rs` acceptance (100k in the portable suite; 1M passed locally in 30.6 s debug, 32,700 tasks/s with `FakeRunner`)
 - [ ] M4.2 `benches/task_arrays.rs` and a `make bench-task-arrays` target
 
 ### M5: compatibility gate (owner decision first)
