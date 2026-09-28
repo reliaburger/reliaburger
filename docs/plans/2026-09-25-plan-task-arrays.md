@@ -1,6 +1,7 @@
 # Plan: task arrays and a 100,000-job tour step
 
-Status: proposed, after 0.1.0. Nothing here blocks the release.
+Status: superseded by [`2026-09-28-plan-million-jobs.md`](2026-09-28-plan-million-jobs.md),
+which keeps these findings and is the one to update. Kept for history.
 
 ## Why
 
