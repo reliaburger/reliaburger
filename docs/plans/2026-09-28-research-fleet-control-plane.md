@@ -108,19 +108,106 @@ Omni is the closest thing to what the maintainer described, so it gets the most 
 
 ### 2.2 Metal³/Ironic and MAAS
 
-*Pending the second research briefing; see the checklist.*
+**Metal³ and Ironic.** A BareMetalHost moves through:
+- stable states: `Unmanaged`, `ExternallyProvisioned`, `Available`, `Provisioned`, `Deleting`;
+- transient states: `Registering`, `Inspecting`, `Preparing`, `Provisioning`, `Deprovisioning`.
+
+Two design choices are worth copying:
+- **Errors live in a separate `errorType` field**, not in the provisioning state. A registration error can happen while a host is provisioning, and the state machine doesn't have to explode into every combination.
+- **Moving hosts between clusters is a first-class idea.** A `detached` annotation stops management without deprovisioning, and a status annotation carries the known inventory into the new management cluster, so the host isn't inspected again.
+
+One anti-pattern stands out. A bookkeeping error during adoption caused a host to be *deprovisioned* (baremetal-operator #915). **A failure to agree about state must never trigger a destructive action.** Our Quarantined state (§4.1) exists for exactly that.
+
+**Ironic's cleaning** is a good reference for wipe:
+- `erase_devices_metadata` takes seconds, and the data is "theoretically" recoverable.
+- `erase_devices` uses NVMe secure or crypto erase and ATA secure erase. It falls back to `shred` only if `continue_if_disk_secure_erase_fails` is set; otherwise cleaning fails.
+- `erase_devices_express` tries hardware erase first, then falls back to metadata.
+
+Failing closed and recording which method ran is the behaviour we want (§9).
+
+The Ironic Python Agent posts a hardware profile to `/v1/lookup` (keyed on MACs) and heartbeats with random jitter, 0.3–0.6 of the timeout, so a power cut doesn't come back as a thundering herd. "Fast track" keeps the agent running between inspection, cleaning and deployment, which is our Available state in all but name.
+
+**Almost everything in Metal³ assumes a BMC.** Ironic's BMC-less mode (`manual-management` plus `agent` power) is experimental:
+- only reboot works, and "power on/off commands will fail";
+- undeploy and rescue aren't supported;
+- "if any errors happen in the process, recovery will likely require BMC credentials".
+
+That's the Wyse's reality: **the only power verb we have is "the agent reboots itself"**. We need a physical-intervention state (Failed with "needs a human") and a hardware watchdog so a hung box reboots on its own.
+
+On trust, Ironic's discovery warns that it "allows anyone with API access to create nodes with given MAC addresses ... denial-of-service". Its agent token is issued first come, first served on the first lookup, and the docs admit it "does not remove the risk of a man-in-the-middle attack ... when TLS is not used". That's TOFU per boot, which is weaker than our TOFU once per machine lifetime with a pinned key afterwards.
+
+**MAAS.**
+- **Lifecycle:** New, Commissioning, Ready, Allocated, Deploying, Deployed, Releasing, Ready, plus Broken (set by an admin), Failed (set automatically) and Rescue mode.
+- **"New" means "visible to admins, but not yet trusted for workloads"**, which is the cleanest statement of our Unclaimed state I found.
+- **Enlistment:** an unknown machine PXE-boots an ephemeral image, reports its architecture and MACs, and shuts down. Commissioning then **creates an IPMI user on the BMC automatically**. Machines without a BMC get the "manual" power type: a human presses the button.
+- **Erase on release comes in three tiers:** zero the whole disk, firmware secure erase, or quick erase (the first and last megabyte).
+- **Architecture:** region controllers (REST API, PostgreSQL, DNS, UI) and rack controllers (DHCP, TFTP, image HTTP, power control per network). HA needs every region on one PostgreSQL, and making PostgreSQL itself HA "is external to MAAS". MAAS 3.5 added Temporal as a workflow engine.
+
+For ten thin clients, that's Django, PostgreSQL you run HA yourself and Temporal, so MAAS is mostly a lesson in what not to depend on.
 
 ### 2.3 Tinkerbell and Foreman
 
-*Pending.*
+**Tinkerbell.**
+- **Kubernetes CRDs:**
+  - `Hardware`: MACs, `netboot.allowPXE` and `allowWorkflow` gates, a BMC reference, and an `agentID` for discovery;
+  - `Template`: a workflow of container "actions";
+  - `Workflow`: PREPARING, PENDING, RUNNING, POST, SUCCESS, FAILED, TIMEOUT;
+  - `WorkflowRuleSet`: matches newly discovered hardware to a template.
+- **Components:** Smee (DHCP or ProxyDHCP plus iPXE), the Tink server and controller, the Tink agent running in HookOS (a LinuxKit in-memory OS), Rufio for BMCs, and metadata and serial helpers. They now ship as one "modular monolith" binary. But the Kubernetes API is the backend, and even the standalone mode embeds kube-apiserver and etcd.
+- **The one idea worth stealing is `toggleAllowNetboot`.** Netboot is enabled *before* a workflow and switched off *after it succeeds*. That makes network boot a one-shot permission scoped to an operation. For us it means **`relish fleet netboot` offers an installer only to MACs that are unknown or that the fleet has marked "reinstall"**. An enrolled machine never gets an installer it didn't ask for, which closes the "a netboot at the wrong moment reinstalls a member" hole.
 
-### 2.4 Incus OS, Kairos AuroraBoot
+**Foreman Discovery.**
+- **Discovery:** the discovery image boots over PXE or ISO. Nodes "self-register into Foreman and upload facts collected by Facter (serial id, network interfaces, memory, disks)", with the PXE `BOOTIF` MAC as identity.
+- **Discovery rules** combine:
+  - a search over those facts;
+  - a target **host group** (an inherited bundle of OS, partitioning and parameters);
+  - a hostname pattern;
+  - a priority;
+  - **a hosts limit per rule**.
 
-*Pending.*
+  That limit is a neat way to say "fill this cluster to N", and it's what our per-cluster `count` does (§8).
+- **Trust:** Foreman is honest about it: "Currently there is no authentication in the workflow". Enabling SSH on the discovery image puts a root password on the kernel command line (`fdi.rootpw=`), a textbook example of secrets in boot arguments.
+
+### 2.4 Incus OS with Operations Center, and Kairos AuroraBoot
+
+**Incus OS.**
+- Configuration arrives in a *seed*: a tar of YAML files at the start of the install image, or on a `SEED_DATA` USB.
+- Initial trust is a PEM client certificate in the seed ("at least one trusted client certificate must be provided").
+- It **requires TPM 2.0 and Secure Boot**, with a degraded mode that allows swtpm *or* Secure Boot off, but "NOT ... both". So its trust model doesn't carry over to the Wyse as-is.
+
+**Operations Center** (FuturFusion, Apache-2.0) is Incus OS's fleet manager.
+- It issues registration tokens "time bound by an expiration time and usage count limited by a maximum usage count" and bakes them into pre-seeded images. Servers "use the token to self-register".
+- Server states: pending → ready, plus deploying (with sub-steps), offline and unregistered. Servers keep their `connection_url` up to date.
+- Clusters form from registered servers, one-off or from templates, and it rolls out updates across all of them.
+
+The **bounded, expiring, use-limited registration token** is a good fit for our USB seed path (appliance research §4.2 c): a seed could carry a fleet enrolment token for "up to 10 machines in the next hour" instead of per-node join tokens. It still has to stay off the network (appliance §4.7: netboot never serves secrets).
+
+**Kairos AuroraBoot fleet server** (v0.20, May 2026) is the closest analogue to what's proposed here:
+- one deployment with a dashboard, a REST API, a node manager, a Secure Boot key store and a netboot server;
+- **SQLite by default**;
+- nodes **phone home** from a `phonehome:` stage baked into every artefact, heartbeating and polling for commands (upgrade, reboot, reset, config, shell);
+- a registration token generated on first boot;
+- a netboot server that is "unauthenticated by design", and logs a warning saying so.
+
+One concrete pitfall: registration is rate-limited per client IP (a burst of 20, then 0.5 per second). A fleet PXE-booting behind one NAT shares a bucket, so after 20 nodes only one node every two seconds can register (AuroraBoot PR #778). **Rate-limit per machine key, not per IP.** It's a second agent and a second management plane beside bun, which is why the appliance research didn't choose Kairos, but its shape confirms that "one binary, a small embedded database, pull-based agents" is where this kind of tool settles.
 
 ### 2.5 What the prior art adds up to
 
-*Pending.*
+| Idea | Seen in | Our take |
+|---|---|---|
+| A holding state before any trust ("New", `enroll`, "discovered", PendingMachine) | MAAS, Ironic, Foreman, Omni | **Unclaimed** (§4) |
+| Hardware ids as identity | everyone | **No.** Hints for humans only. Identity is a machine key (§5) |
+| A per-machine secret replacing a shared bootstrap credential | Omni unique tokens, Ironic agent token | Yes, as a machine key pinned once, then mTLS |
+| Classes as label selectors, counts per cluster | Omni, Foreman rule limits | Yes (§8) |
+| An automatic return to the pool after release | Omni, MAAS Releasing → Ready | Yes (Available) |
+| Wipe that fails closed and records its method | Ironic, MAAS tiers | Yes, as crypto-erase plus secure discard (§9) |
+| Errors separate from lifecycle state | Metal³ `errorType` | Yes: Failed, Quarantined and Unreachable as conditions (§4.1) |
+| No destructive action on a bookkeeping error | Metal³ #915 | Yes: mismatch means Quarantined, never wipe (§4.1) |
+| One-shot netboot permission | Tinkerbell | Yes (§6.2) |
+| Never block forever on an unreachable machine | Omni #2465, #2702 | Yes (§4.2) |
+| A BMC for power | Metal³, MAAS, Omni bare-metal, Tinkerbell Rufio | Not on the Wyse. Agent reboot plus a watchdog; power drivers in v2 |
+| Management plane dependencies | PostgreSQL + Temporal (MAAS), Kubernetes + etcd (Metal³, Tinkerbell), etcd (Omni), SQLite (AuroraBoot) | `redb`, which we already ship (§7) |
+| A WireGuard overlay | Omni SideroLink | Not for one LAN; an outbound TLS channel for multi-site (§12) |
 
 ---
 
@@ -199,6 +286,7 @@ States are from the fleet's point of view. The machine keeps its own local state
 - **Failed(install)**: netboot served an installer but no bun ever announced. Retry means a power cycle, so it's a human job without power control.
 - **Failed(join)**: the token expired or was refused, or the node never became Ready. The fleet retries once with a fresh token under a *new* node id, then goes to Available via Wiping (the machine might hold a half-written identity).
 - **Unreachable** is a condition, not a state: a Member the cluster still sees but the fleet can't reach is fine (the fleet is off the data path); an Available machine that vanished is probably unplugged. The fleet shows how long it's been unreachable and never blocks on it (Omni's #2465 lesson).
+- **Needs a human**: without a BMC (§2.2), a machine that hangs during install, wipe or update can only be recovered by the hardware watchdog (the appliance image should enable one) or by someone pressing the button. The fleet says which, and for how long it has been waiting.
 - **Quarantined**: the machine's self-report contradicts the fleet (a different key for a known MAC, a fleet pin that isn't ours, a wipe report that doesn't verify, a node id the fleet never assigned). The fleet refuses to allocate it and a human decides. It's the answer to "someone reinstalled this box by hand" as much as to an attacker.
 - **Upgrading** is a condition on Available or Member machines (§11).
 - **Retired** (terminal): hardware is dead or gone. The fleet keeps the record for history.
@@ -268,7 +356,8 @@ Pick per enrolment, loudest first:
 1. **`--confirm` (the default).** The fleet lists each machine's fingerprint, and you compare it with the console or scan the QR code with a phone. That's fine for ten boxes and tedious for a hundred.
 2. **`--expect N --window 15m`, a TOFU boot window.** You're netbooting a batch right now. The fleet enrols the first N machines that appear through *its own* `relish netboot` during the window, and refuses (and loudly reports) machine N+1. An attacker has to be on the same LAN, inside those 15 minutes, and would get caught by the count. That's the right default for a homelab rack you're standing next to.
 3. **`--allow-mac <file>`.** An inventory list from the purchase order narrows the window further. It's weak against a deliberate attacker (MACs are spoofable), but it stops the colleague's laptop that PXE-boots by accident.
-4. **TPM EK allow-list (v2, hardware with a TPM).** Enrolment requires a quote from a TPM whose endorsement key is on the list. That's what `AttestationMode::Tpm` was meant for. It makes enrolment unattended *and* strong, and it's the one mode that survives a malicious installer. It isn't possible on the Wyse.
+4. **A seed enrolment token on USB, for headless boxes with no console** (after Operations Center, §2.4). It expires and is limited in how many times it can be used ("up to 10 machines in the next hour"). It lives on a stick, never on the network, and the fleet stores only its hash, like today's join tokens.
+5. **TPM EK allow-list (v2, hardware with a TPM).** Enrolment requires a quote from a TPM whose endorsement key is on the list. That's what `AttestationMode::Tpm` was meant for. It makes enrolment unattended *and* strong, and it's the one mode that survives a malicious installer. It isn't possible on the Wyse.
 
 ### 5.4 Threats and answers
 
@@ -306,11 +395,13 @@ bun in appliance mode announces `_reliaburger-machine._tcp` (the appliance note'
 - `fl=<fleet fingerprint or empty>`;
 - `os=<OS version>`, `bun=<bun version>`, `arch`, `cpu`, `mem`, `disk`.
 
-`relish fleet machines` browses it. mDNS is one L2 segment and dies with AP isolation or VLANs, exactly like ProxyDHCP, so it matches the netboot boundary we already accept. It's embedded in bun (the appliance note suggests the `mdns-sd` crate), not Avahi.
+`relish fleet machines` browses it. Status reports and heartbeats use random jitter (Ironic's 0.3–0.6 of the interval), so ten boxes coming back from a power cut don't arrive at once. Rate limits key on the machine key, not the source IP (AuroraBoot's per-IP bucket starved a NATed fleet, §2.4). mDNS is one L2 segment and dies with AP isolation or VLANs, exactly like ProxyDHCP, so it matches the netboot boundary we already accept. It's embedded in bun (the appliance note suggests the `mdns-sd` crate), not Avahi.
 
 ### 6.2 Netboot registration
 
 `relish netboot` already sees every DHCP discover it answers (MAC, client arch). When it runs as part of the fleet (`relish fleet serve` or `relish fleet netboot`), it records **Booting** machines before bun exists, which is what makes the TOFU window (§5.3) and Failed(install) possible. It's also the only discovery that works for a box that never reaches bun.
+
+Borrowing Tinkerbell's `toggleAllowNetboot` (§2.3), the fleet's netboot **offers an installer only to unknown MACs and to machines the fleet has marked "reinstall"**. A member whose boot order still has PXE first then falls through to its disk instead of reinstalling. The installer also refuses to touch a disk that holds a `reliaburger-machine` partition unless the fleet signed a reinstall order, which covers the case where the MAC was spoofed or the fleet isn't the one serving.
 
 ### 6.3 Phone-home (v1 and multi-site)
 
@@ -656,6 +747,47 @@ All accessed 28 September 2026.
 - Metal agent RAID wipe: https://github.com/siderolabs/talos-metal-agent/pull/32
 - Known issues: https://github.com/siderolabs/omni/issues/2465, https://github.com/siderolabs/omni/issues/1044, https://github.com/siderolabs/omni/issues/583, https://github.com/siderolabs/omni/issues/2035, https://github.com/siderolabs/omni/issues/1995, https://github.com/siderolabs/omni/issues/2702, https://github.com/siderolabs/omni/issues/2637, https://github.com/siderolabs/omni/issues/3427
 
+**Metal³ and Ironic (§2.2)**
+- BareMetalHost state machine: https://book.metal3.io/bmo/state_machine
+- BareMetalHost types (`errorType`): https://github.com/metal3-io/baremetal-operator/blob/main/apis/metal3.io/v1alpha1/baremetalhost_types.go
+- Registration error during provisioning: https://github.com/openshift/console/pull/3964
+- Deprovisioning on a bookkeeping error: https://github.com/metal3-io/baremetal-operator/issues/915
+- Status annotation for moving hosts: https://book.metal3.io/bmo/status_annotation
+- Automated cleaning: https://book.metal3.io/bmo/automated_cleaning
+- Ironic states: https://docs.openstack.org/ironic/latest/user/states.html
+- Ironic cleaning: https://docs.openstack.org/ironic/latest/admin/cleaning.html
+- Ironic Python Agent: https://docs.openstack.org/ironic-python-agent/latest/admin/how_it_works.html
+- Fast track: https://docs.openstack.org/ironic/latest/admin/fast-track.html
+- BMC-less agent power: https://docs.openstack.org/ironic/latest/admin/agent-power.html
+- Discovery: https://docs.openstack.org/ironic/latest/admin/inspection/discovery.html
+- Agent token: https://docs.openstack.org/ironic/latest/admin/agent-token.html
+
+**MAAS (§2.2)**
+- Machine life cycle: https://canonical.com/maas/docs/3.7/explanation/the-machine-life-cycle/ and https://canonical.com/maas/docs/latest/explanation/the-machine-life-cycle/
+- Automatic BMC user creation: https://ubuntu.com/blog/maas-2-9-is-now-available
+- Manual power type: https://certification.canonical.com/docs/programmes/server/Environment_Setup_Guide/test-maas-server/
+- Storage erasure: https://old-docs.maas.io/2.5/en/installconfig-storage-erasure
+- Controllers: https://canonical.com/maas/docs/3.7/explanation/controllers/
+- High availability: https://canonical.com/maas/docs/how-to-manage-high-availability
+- MAAS 3.5 release notes (Temporal): https://canonical.com/maas/docs/3.7/uncategorized/maas-3-5-release-notes/
+
+**Tinkerbell and Foreman (§2.3)**
+- Tinkerbell API types: https://pkg.go.dev/github.com/tinkerbell/tinkerbell/api/v1alpha1/tinkerbell
+- Auto-discovery flags: https://pkg.go.dev/github.com/tinkerbell/tinkerbell/cmd/tinkerbell/flag
+- Smee: https://github.com/tinkerbell/smee
+- Tinkerbell monorepo: https://github.com/tinkerbell/tinkerbell
+- Install requirements: https://tinkerbell.org/docs/v0.22/setup/install/
+- Auto-enrolment roadmap item: https://github.com/tinkerbell/roadmap/issues/23
+- Foreman Discovery 18.0: https://theforeman.org/plugins/foreman_discovery/18.0/index.html
+
+**Incus OS, Operations Center, AuroraBoot (§2.4)**
+- Incus OS seed: https://linuxcontainers.org/incus-os/docs/main/reference/seed/
+- Incus OS requirements: https://linuxcontainers.org/incus-os/docs/main/getting-started/requirements/
+- Incus OS and Operations Center: https://linuxcontainers.org/incus-os/docs/main/reference/applications/operations-center/
+- Operations Center tokens, servers, clusters: https://docs.futurfusion.io/operations-center/main/reference/token/, https://docs.futurfusion.io/operations-center/main/reference/server/, https://docs.futurfusion.io/operations-center/main/reference/cluster/ and https://github.com/FuturFusion/operations-center
+- Kairos v4.1.0 and the AuroraBoot fleet server: https://kairos.io/blog/2026/05/15/kairos-v4-1-0-hadron-ubuntu-boot-install-foundations/
+- AuroraBoot: https://github.com/kairos-io/AuroraBoot and the rate-limit PR https://github.com/kairos-io/AuroraBoot/pull/778
+
 **Wipe and boot (§6, §9)**
 - `cryptsetup erase`: https://man7.org/linux/man-pages/man8/cryptsetup-erase.8.html
 - `blkdiscard --secure`: https://man7.org/linux/man-pages/man8/blkdiscard.8.html
@@ -666,3 +798,10 @@ All accessed 28 September 2026.
 - `src/sesame/types.rs` (`ApiRole`, `JoinToken`, `Crl::retired_nodes`), `src/sesame/join.rs` (TTL bounds, retired-id refusal), `src/cluster/retirement.rs` (`DecommissionRequest`), `src/bin/relish.rs` (`DecommissionNode`, `JoinToken`, `Council`), `src/relish/fault.rs` (`node_drain`), `src/council/node.rs` (retired voters refused), `src/upgrade/orchestrator.rs`, `Cargo.toml` (`redb`, `openraft`)
 - `docs/whitepaper.md` §21 (Franchise), `docs/design/security-sesame.md` §5.2 (join), `docs/design/gossip-mustard.md` (master-key-derived HMAC)
 - `research/appliance-os`: the appliance research note and spike plan; `feat/appliance-image`: `image/` and the S1 plan
+
+**Still [unverified]**
+- Whether the Wyse 3040's eMMC supports secure trim or secure erase (§9.2), and dm-crypt throughput on the Atom Z8350.
+- Whether the Wyse 3040 wakes on LAN from power-off, and which hardware watchdog its chipset exposes to Linux.
+- How the council reconciler replaces a voter that was decommissioned (§10.1).
+- Omni's full list of system inventory labels, its exact wipe method, and whether any Omni path uses a TPM for join identity.
+- MAAS's newer "failed disk erasing" state, and Tinkerbell's embedded standalone mode in detail.
