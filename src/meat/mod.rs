@@ -17,6 +17,7 @@ pub mod quota;
 pub mod scheduler;
 pub mod score;
 pub mod task_array;
+pub mod task_array_state;
 pub mod types;
 
 pub use cluster_state::{ClusterStateCache, SchedulerNodeState};
