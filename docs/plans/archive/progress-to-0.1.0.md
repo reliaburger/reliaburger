@@ -3082,5 +3082,5 @@ Plan and full checklist: [2026-09-28-plan-million-jobs.md](plans/2026-09-28-plan
 - [x] **In-process proof** — `tests/suite/task_array_million.rs` and `benches/task_arrays.rs` (`make bench-task-arrays`).
 - [x] **Compatibility decision** — no finalisation gate (28 September 2026): the wiring bumps `protocol` and `state`, and 0.2.0 needs a fresh cluster.
 - [x] **Wiring (M5)** — `RaftRequest::TaskArray` and `DesiredState::task_arrays` (`src/meat/task_array_store.rs`); the node executor behind the sync (`src/bun/task_array_node.rs`); the leader loop (`src/bun/task_array_leader.rs`); routes (`src/bun/task_array_api.rs`); `relish run --batch`, `relish batch cancel|results|logs`, arrays in `relish batch-status`. Portable suite `tests/suite/task_arrays.rs`.
-- [ ] **Multi-node in-process cluster test with a lost node (M5, gated `test-cluster`).**
+- [x] **Multi-node in-process cluster test with a lost node** — `tests/cluster_task_arrays.rs` in `make test-cluster`.
 - [ ] **Views, quickstart host processes, real-cluster numbers (M6–M8).**
