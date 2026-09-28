@@ -122,9 +122,10 @@ survives restarts and redeploys. Bun hands it to the container's user the first
 time it's mounted. It stays on its node, so it's local storage, not a
 network volume. An app with a managed volume stays with it too: after
 `relish stop`, the next `relish apply` starts it again on the node that holds
-its volume, and waits there if that node is short of room. Only when that node
-is gone (or no longer matches the app's `placement.required` labels) does it
-start elsewhere, on a new, empty volume. A host-path volume is never chowned: make it readable (or
+its volume, and waits there if that node is short of room, not ready, or in the
+middle of an upgrade. A running app stays put for the same reasons. Only when
+that node is gone (or no longer matches the app's `placement.required` labels)
+does it start elsewhere, on a new, empty volume. A host-path volume is never chowned: make it readable (or
 writable) by the container's mapped user yourself.
 
 ## Snapshots
