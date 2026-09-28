@@ -14,6 +14,7 @@ pub mod index_set;
 pub mod quota;
 pub mod scheduler;
 pub mod score;
+pub mod task_array;
 pub mod types;
 
 pub use cluster_state::{ClusterStateCache, SchedulerNodeState};
