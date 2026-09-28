@@ -1,9 +1,9 @@
 # Plan: a million jobs (task arrays at scale)
 
 Status: in progress on `feat/million-jobs`, for **0.2.0** ("A million jobs").
-Nothing on this branch changes a wire or durable format yet. When the wiring
-(M5) does, it bumps the compatibility generations and 0.2.0 needs a fresh
-cluster: the maintainer decided on 28 September 2026 that there's no
+Task arrays are wired into Raft, the API and `relish` (M5). The wiring bumped
+the compatibility generations to protocol 28 and state 45, so 0.2.0 needs a
+fresh cluster: the maintainer decided on 28 September 2026 that there's no
 backwards compatibility before 1.0.0 (see [Compatibility](#compatibility)).
 
 This file is the single source of truth. It supersedes
@@ -16,52 +16,78 @@ from `plans/million-jobs` unchanged), whose findings it keeps and whose
 *Keep this section current. Another agent resumes from here.*
 
 - **Branch:** `feat/million-jobs` (from `origin/main` at `087d882f`, plus a
-  merge of `plans/million-jobs`). Draft PR: "Million jobs: task arrays at
-  scale (after 0.1.0)".
-- **Done:** the plan (this file); M1 data model (`src/meat/index_set.rs`,
-  `src/meat/task_array.rs`); M2 leader state machine and grant policy
-  (`src/meat/task_array_state.rs`, including the 1M-task control-plane
-  budget test `a_million_task_array_fits_the_control_plane_budget`); M3.1
-  and M3.2, the runner seam and the pool (`src/bun/task_executor.rs`:
-  `TaskRunner`, `ProcessRunner`, `FakeRunner`, `TaskPool::run_chunk`); M3.3,
-  the ledger (`src/bun/task_ledger.rs`: 14-byte records in CRC32-framed
-  blocks, `spawn_writer` group commit, `replay` with torn-tail handling).
-- M4.1 is in the portable suite (`tests/suite/task_array_million.rs`): 100k
-  tasks by default, `RELIABURGER_TASK_ARRAY_TASKS=1000000` for the full run.
-  Local numbers on 28 September (debug build, `FakeRunner`, 2 worker
-  threads): 1M tasks in 30.6 s, 422 leader entries, 2 stale reports
-  refused, final state 282 bytes of JSON.
-- M4.2: `benches/task_arrays.rs`, run with `make bench-task-arrays`
-  (not part of `make bench`, so nightly CI time is unchanged). Only
-  smoke-tested (`cargo test --bench task_arrays`); the release-mode numbers
-  wait until the soak frees the machine. Record them here when run.
-- Book: Chapter 12 section "A million jobs without a million records"
-  (before "Lessons from the phase") covers M1-M4. `docs/progress.md` has an
-  "0.2.0: Million jobs" section; `docs/README.md` and
-  `docs/testing.md` list `make bench-task-arrays`.
+  merge of `plans/million-jobs`). Draft PR #266, "Million jobs: task arrays
+  at scale (0.2.0)", labelled `full-ci`.
+- **Done (library, M1-M4):** `src/meat/index_set.rs`, `task_array.rs`,
+  `task_array_state.rs`, `latency_histogram.rs`; `src/bun/task_executor.rs`,
+  `task_ledger.rs`; `tests/suite/task_array_million.rs` (100k default,
+  `RELIABURGER_TASK_ARRAY_TASKS=1000000` for the full run: 30.6 s debug);
+  `benches/task_arrays.rs` (`make bench-task-arrays`, release numbers still to
+  record).
+- **Done (wiring, M5), five commits `M5.1`-`M5.5`:**
+  - Raft: one variant, `RaftRequest::TaskArray(Box<TaskArrayWrite>)`
+    (`Register`, `Sync`, `Cancel`, `Requeue`), applied by
+    `TaskArrays::apply` in `src/meat/task_array_store.rs`;
+    `DesiredState::task_arrays`; `CouncilResponse::TaskArrayRegistered`. Ids
+    come from `batch_state`'s counter. Finished arrays are pruned after an
+    hour or past 20; at most 64 run at once. Compatibility 28/45.
+  - Node: `src/bun/task_array_node.rs` (`TaskArrayNode::sync`, results,
+    failed-task output; resume from the ledger via
+    `TaskPool::resume_chunk`; zero slots plus a reason for a binary off the
+    allowlist or a node with `mount_isolation`).
+  - Leader: `src/bun/task_array_leader.rs` (`TaskArrayService`, the loop
+    spawned from `router_with_upgrade`, one `Sync` entry per array per tick,
+    requeue for holders silent 30 s or refusing; standalone in memory).
+  - API: `src/bun/task_array_api.rs` (`POST /v1/batch/array`,
+    `POST /v1/batch/{id}/cancel`, `GET /v1/batch/{id}/results`,
+    `GET /v1/batch/{id}/tasks/{index}/logs`, node-to-node
+    `POST /v1/batch/array/sync` and two `local` reads; `GET /v1/batch/{id}`
+    answers arrays with `"kind": "array"`). `router_with_upgrade` gained a
+    last parameter, `task_arrays: Option<Arc<TaskArrayService>>`; `bun`
+    passes a process-runner executor under `<data>/task-arrays/`.
+  - CLI: `relish run --batch NAME --count N --exec PATH -- ARGS`,
+    `relish batch cancel|results|logs`, arrays in `relish batch-status`.
+  - Tests: unit tests in every new module; portable suite
+    `tests/suite/task_arrays.rs` (100,000 fake tasks through a single-node
+    council in 51 Raft entries; real processes; failures, results, logs,
+    cancel, refusal); gated `tests/cluster_task_arrays.rs` (three wired
+    nodes, follower killed mid-run) in `make test-cluster`.
+  - Docs: manual `01_deploy-an-app.md` "Task arrays"; book Chapter 12
+    "Wiring it in"; `docs/progress.md`; README; `docs/testing.md`.
 - **Next, in order:**
-  1. Record `make bench-task-arrays` release numbers here once the soak has
-     finished (it's CPU-heavy; don't run it while the soak is on).
-  2. M0 on a quickstart VM after the soak: fork/exec rate of `/usr/bin/true`
-     at 1x/2x/4x/8x vCPU concurrency, fsync latency, Raft commit rate.
-  3. M5 wiring. The compatibility decision is made (28 September 2026): no
-     finalisation gate; the wiring bumps `protocol` and `state` in
-     `src/compatibility.rs` and 0.2.0 needs a fresh cluster. Nothing blocks
-     M5 except the soak holding the machine.
-  4. Small library follow-ups, if wanted meanwhile: the
-     mergeable latency histogram is done (`src/meat/latency_histogram.rs`);
-     still open are recording start lag and run time into it from
-     `TaskPool` (a `PoolCounters` field) and an `rb-task` demo binary under
-     `examples/million-jobs/`.
+  1. Watch CI on PR #266 (`full-ci` is on, so `test-cluster` runs
+     `cluster_task_arrays`). It has never run: the local run was refused
+     while the soak held the machine. If it fails, the likely suspects are
+     the silence timeout (3 s) against gossip-derived membership, and port
+     block 23510-23540 clashing with another suite.
+  2. After the soak (about 03:30 BST): record `make bench-task-arrays`
+     release numbers here; M0 on a quickstart VM (fork/exec rate of
+     `/usr/bin/true` at 1x/2x/4x/8x vCPU concurrency, fsync latency, Raft
+     commit rate).
+  3. M6 views: `batch-status --watch` and `--cost`, rate and latency
+     histograms in the summary (record start lag and run time into
+     `LatencyHistogram` from `TaskPool`, add them to `ArrayProgress`, merge
+     on the leader), Ketchup sampling (first 100 successes, 1 in 1,000
+     after, every failure), Mayo counters, TUI view, dashboard card.
+  4. M7: mount isolation for tasks (today a node with
+     `[process_workloads] mount_isolation = true`, the Linux default, refuses
+     arrays with a reason) and host processes on quickstart nodes; an
+     `rb-task` demo binary under `examples/million-jobs/`.
+  5. Known limits worth a look before M8: grants reach a node one tick
+     after they're written (the leader could re-sync nodes that just got
+     grants within the same tick); each array gets its own pool per node,
+     so two arrays on one node can use twice its CPUs; results and logs
+     fan out to nodes one at a time (3 s timeout each); gossip-dead nodes
+     wait out the 30 s silence rather than being requeued at once.
 - **Local build constraints while the release soak runs:**
   `CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=$HOME/.cache/rb-target-millionjobs`;
-  run only the targeted unit tests (`cargo test --lib meat::index_set` and so
-  on) and leave the full suite to CI. No Lima VMs, quickstart clusters or
+  run only targeted tests (`cargo test --lib task_array`,
+  `cargo test --test suite task_arrays`) and leave the full suite to CI. No
+  Lima VMs, quickstart clusters, in-process multi-node clusters or
   `qualify-*.sh` until the soak finishes. Delete that target directory when
   the branch is done.
-- **Don't** touch `StateReport` or `ReportingMessage` (bincode) at all;
-  progress travels over the sync route. `RaftRequest` and `DesiredState`
-  change in M5, in the same change as the compatibility bump.
+- **Don't** touch `StateReport` or `ReportingMessage` (bincode); progress
+  travels over the sync route.
 
 ## Contents
 
