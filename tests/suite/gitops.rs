@@ -368,6 +368,39 @@ async fn apply_changes_stops_and_reports_on_write_failure() {
     node.shutdown().await.ok();
 }
 
+/// B15: a write the state machine commits but *refuses* (here an app in an
+/// `rbtest-*` test-lease namespace, which only a leased write may create)
+/// is a failure, not an applied change. Before the fix `apply_changes`
+/// checked only the outer `Err`, so the refused write counted as applied
+/// and the runner advanced `last_applied_commit` past a commit that never
+/// reached desired state.
+#[tokio::test]
+async fn apply_changes_reports_a_refused_write_as_a_failure() {
+    use reliaburger::lettuce::diff::{ChangePayload, ResourceChange};
+    use reliaburger::lettuce::runner::apply_changes;
+
+    let council = single_node_leader().await;
+    assert!(council.is_leader().await, "node must be leader");
+
+    let spec = reliaburger::config::Config::parse("[app.web]\nimage = \"x:1\"\n")
+        .unwrap()
+        .app
+        .remove("web")
+        .unwrap();
+    let changes = vec![ResourceChange::Add {
+        resource_id: "app.rbtest-lease/web".to_string(),
+        spec: ChangePayload::App(Box::new(spec)),
+    }];
+
+    let result = apply_changes(&council, &changes).await;
+    assert!(
+        matches!(result, Err(ref id) if id == "app.rbtest-lease/web"),
+        "a refused write must be reported as unapplied: {result:?}"
+    );
+    assert!(council.desired_state().await.apps.is_empty());
+    council.shutdown().await.ok();
+}
+
 /// GIT2: a `prod/web` removed from git deletes `prod/web`, and a
 /// same-named `default/web` that git never mentioned is untouched. Before
 /// the fix the diff keyed on the bare name, so a `prod` deletion could

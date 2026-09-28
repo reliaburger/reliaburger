@@ -2524,23 +2524,26 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         move |ready| async move {
             ready.ready();
 
+            let timeouts = reliaburger::sesame::connection::ConnectionTimeouts::PRODUCTION;
             match api_acceptor {
                 Some(acceptor) => {
                     reliaburger::sesame::connection::serve_router_over_tls(
                         listener,
                         acceptor,
                         app,
+                        timeouts,
                         server_shutdown,
                     )
                     .await
                 }
                 None => {
-                    axum::serve(listener, app)
-                        .with_graceful_shutdown(async move {
-                            server_shutdown.cancelled().await;
-                        })
-                        .await
-                        .ok();
+                    reliaburger::sesame::connection::serve_router_plain(
+                        listener,
+                        app,
+                        timeouts,
+                        server_shutdown,
+                    )
+                    .await
                 }
             }
         },
@@ -2838,23 +2841,26 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         move |ready| async move {
             ready.ready();
 
+            let timeouts = reliaburger::sesame::connection::ConnectionTimeouts::PRODUCTION;
             match pickle_acceptor {
                 Some(acceptor) => {
                     reliaburger::sesame::connection::serve_router_over_tls(
                         pickle_listener,
                         acceptor,
                         pickle_app,
+                        timeouts,
                         pickle_shutdown,
                     )
                     .await
                 }
                 None => {
-                    axum::serve(pickle_listener, pickle_app)
-                        .with_graceful_shutdown(async move {
-                            pickle_shutdown.cancelled().await;
-                        })
-                        .await
-                        .ok();
+                    reliaburger::sesame::connection::serve_router_plain(
+                        pickle_listener,
+                        pickle_app,
+                        timeouts,
+                        pickle_shutdown,
+                    )
+                    .await
                 }
             }
         },
@@ -3778,6 +3784,7 @@ mod tests {
             listener,
             tokio_rustls::TlsAcceptor::from(config),
             router,
+            reliaburger::sesame::connection::ConnectionTimeouts::PRODUCTION,
             shutdown.clone(),
         ));
         let mut roots = rustls::RootCertStore::empty();
@@ -3885,6 +3892,7 @@ mod tests {
             listener,
             tokio_rustls::TlsAcceptor::from(config),
             router,
+            reliaburger::sesame::connection::ConnectionTimeouts::PRODUCTION,
             shutdown.clone(),
         ));
         let http = mtls::build_cluster_http_client(&client, mtls::CrlHandle::default()).unwrap();

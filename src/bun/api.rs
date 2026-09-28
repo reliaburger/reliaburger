@@ -5469,7 +5469,10 @@ async fn ui_session_handler(
 ) -> Response {
     // Accept the internal service token or any valid user token. The session
     // inherits the presented token's scope (C3), so a tenant-scoped token
-    // cannot widen to cluster-wide reads by exchanging itself for a cookie.
+    // cannot widen to cluster-wide reads by exchanging itself for a cookie. It
+    // also records which exact token it came from and that token's expiry
+    // (B11), so the auth middleware can end it when the token is revoked or
+    // lapses.
     let identity = if auth
         .service_token
         .as_deref()
@@ -5478,33 +5481,43 @@ async fn ui_session_handler(
         // The operator presented the real service token; the session is
         // unconfined (but still read-only), matching the service principal.
         Some((
-            crate::sesame::auth::SYSTEM_PRINCIPAL.to_string(),
-            crate::sesame::types::TokenScope::default(),
+            crate::sesame::session::SessionIdentity {
+                token_name: crate::sesame::auth::SYSTEM_PRINCIPAL.to_string(),
+                principal_id: crate::sesame::auth::SYSTEM_PRINCIPAL.to_string(),
+                scope: crate::sesame::types::TokenScope::default(),
+            },
+            None,
         ))
     } else {
-        // Snapshot the tokens under the lock, then run the Argon2id verify on
-        // the blocking pool (M7) so the deliberately-slow hashing doesn't stall
-        // the async runtime worker.
+        // Snapshot the tokens under the lock, then verify through the same
+        // bounded path as a bearer (B12): a malformed token is refused by a
+        // string check before any hashing, and a well-shaped one waits for a
+        // permit from the process-wide Argon2 semaphore. This route is
+        // unauthenticated, so calling Argon2 directly here would let anyone on
+        // the network pin every core and exhaust memory with junk logins.
         let tokens = auth.tokens.read().await.clone();
-        let candidate = form.token.clone();
-        tokio::task::spawn_blocking(move || {
-            crate::sesame::auth::authenticate(&candidate, &tokens)
-                .ok()
-                .map(|ctx| {
-                    (
-                        ctx.token_name,
-                        crate::sesame::types::TokenScope {
+        crate::sesame::auth::authenticate_off_lock(&form.token, tokens.clone())
+            .await
+            .ok()
+            .map(|ctx| {
+                let expires_at =
+                    crate::sesame::auth::find_token_by_principal(&ctx.principal_id, &tokens)
+                        .and_then(|token| token.expires_at);
+                (
+                    crate::sesame::session::SessionIdentity {
+                        token_name: ctx.token_name,
+                        principal_id: ctx.principal_id,
+                        scope: crate::sesame::types::TokenScope {
                             apps: ctx.scoped_apps,
                             namespaces: ctx.scoped_namespaces,
                         },
-                    )
-                })
-        })
-        .await
-        .unwrap_or(None)
+                    },
+                    expires_at,
+                )
+            })
     };
 
-    let Some((name, scope)) = identity else {
+    let Some((identity, expires_at)) = identity else {
         return (
             StatusCode::UNAUTHORIZED,
             axum::response::Html(crate::brioche::login::render_login(Some(
@@ -5514,10 +5527,14 @@ async fn ui_session_handler(
             .into_response();
     };
 
-    let id = auth.sessions.create(&name, scope).await;
+    let session = auth.sessions.create(identity, expires_at).await;
+    // The cookie lives no longer than the session, which lives no longer
+    // than the token.
     let cookie = format!(
-        "{}={id}; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200",
-        crate::sesame::session::SESSION_COOKIE
+        "{}={}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}",
+        crate::sesame::session::SESSION_COOKIE,
+        session.id,
+        session.lifetime.as_secs()
     );
     (
         [(axum::http::header::SET_COOKIE, cookie)],
@@ -5845,20 +5862,33 @@ struct SnapshotCreateBody {
 #[derive(serde::Deserialize)]
 struct SnapshotRestoreBody {
     name: String,
+    /// Container mount path; required when several volumes share the name.
+    volume: Option<String>,
 }
 
-/// Map snapshot failures to honest status codes: a running app is a
-/// conflict, missing things are 404, a non-btrfs volume is the
-/// client's setup problem, anything else is ours.
+#[derive(serde::Deserialize)]
+struct SnapshotDeleteQuery {
+    /// Container mount path; required when several volumes share the name.
+    volume: Option<String>,
+}
+
+/// Map snapshot failures to honest status codes: a running app or an
+/// ambiguous name is a conflict, missing things are 404, a non-btrfs
+/// volume or an out-of-scope input is the client's problem, anything
+/// else is ours.
 fn snapshot_error_response(error: &crate::bun::BunError) -> Response {
     use crate::grill::snapshot::SnapshotError;
     let status = match error {
-        crate::bun::BunError::Snapshot(SnapshotError::AppRunning { .. }) => StatusCode::CONFLICT,
+        crate::bun::BunError::Snapshot(
+            SnapshotError::AppRunning { .. } | SnapshotError::Ambiguous { .. },
+        ) => StatusCode::CONFLICT,
         crate::bun::BunError::Snapshot(
             SnapshotError::NotFound { .. } | SnapshotError::NoVolumes { .. },
         ) => StatusCode::NOT_FOUND,
         crate::bun::BunError::Snapshot(
-            SnapshotError::UnsupportedFilesystem { .. } | SnapshotError::TestStorage,
+            SnapshotError::UnsupportedFilesystem { .. }
+            | SnapshotError::TestStorage
+            | SnapshotError::InvalidInput(_),
         ) => StatusCode::BAD_REQUEST,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
@@ -5938,6 +5968,7 @@ async fn snapshot_restore_handler(
         namespace,
         app_name: app,
         name: body.name,
+        volume: body.volume,
         response,
     })
     .await
@@ -5952,6 +5983,7 @@ async fn snapshot_delete_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
     Path((namespace, app, name)): Path<(String, String, String)>,
+    Query(query): Query<SnapshotDeleteQuery>,
 ) -> Response {
     if let Err(resp) =
         crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::Deployer)
@@ -5965,6 +5997,7 @@ async fn snapshot_delete_handler(
         namespace,
         app_name: app,
         name,
+        volume: query.volume,
         response,
     })
     .await
@@ -7049,7 +7082,7 @@ async fn send_node_request(
     request: reqwest::RequestBuilder,
     operation: &str,
 ) -> Response {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + NODE_REQUEST_TIMEOUT;
     let response = match tokio::time::timeout_at(deadline, request.send()).await {
         Ok(Ok(response)) => response,
         Ok(Err(error)) => {
@@ -7207,18 +7240,33 @@ async fn fault_clear_handler(
         )
             .into_response();
     }
-    match ask_agent(&state.cmd_tx, |response| AgentCommand::ClearFault {
+    // One budget covers the agent's answer and the release wait, so a node
+    // that forwarded this clear hears this node's own verdict, not its own
+    // deadline passing.
+    let deadline = tokio::time::Instant::now() + NODE_FAULT_CLEAR_BUDGET;
+    let cleared = ask_agent(&state.cmd_tx, |response| AgentCommand::ClearFault {
         fault_id: id,
         allow_workload_fault,
         allow_node_fault,
         allow_node_pressure,
         response,
-    })
-    .await
-    {
+    });
+    let Ok(cleared) = tokio::time::timeout_at(deadline, cleared).await else {
+        // A clear already queued still runs; asking again is idempotent.
+        return (
+            StatusCode::GATEWAY_TIMEOUT,
+            Json(serde_json::json!({
+                "error": format!(
+                    "the agent has not answered the clear of fault {id} yet; retry the clear"
+                )
+            })),
+        )
+            .into_response();
+    };
+    match cleared {
         Ok(Ok(clearance)) => {
             if let Some(sequence) = clearance.reservation
-                && !wait_for_node_fault_release(&state, sequence).await
+                && !wait_for_node_fault_release(&state, sequence, deadline).await
             {
                 return (
                     StatusCode::GATEWAY_TIMEOUT,
@@ -7258,23 +7306,32 @@ async fn fault_clear_handler(
     }
 }
 
-/// How long a clear waits for the council to release a node fault's
-/// reservation. It stays under the 5-second deadline a forwarding node gives
-/// the owning node, so a forwarded clear reports this node's own verdict.
-const NODE_FAULT_RELEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
+/// How long a node that forwards a node-level request waits for the owning
+/// node's answer.
+const NODE_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long a clear may spend on the owning node: the agent's answer plus the
+/// wait for the council to release a node fault's reservation. It stays a
+/// second under [`NODE_REQUEST_TIMEOUT`], so a forwarded clear reports this
+/// node's own verdict rather than the forwarder's timeout.
+const NODE_FAULT_CLEAR_BUDGET: std::time::Duration =
+    NODE_REQUEST_TIMEOUT.saturating_sub(std::time::Duration::from_secs(1));
 
 /// Wait until the council no longer holds the reservation a cleared node fault
-/// owned, or the deadline passes. Returns whether it was released.
+/// owned, or `deadline` passes. Returns whether it was released.
 ///
 /// The leader's reaper releases a reservation only after it has fenced the
 /// target node through its own live membership view. So once this returns
 /// `true`, the leader that will judge the next node fault has already seen
 /// this node back, and the single experiment slot is free again.
-async fn wait_for_node_fault_release(state: &ApiState, sequence: u64) -> bool {
+async fn wait_for_node_fault_release(
+    state: &ApiState,
+    sequence: u64,
+    deadline: tokio::time::Instant,
+) -> bool {
     let Some(council) = &state.council else {
         return true;
     };
-    let deadline = tokio::time::Instant::now() + NODE_FAULT_RELEASE_TIMEOUT;
     loop {
         let released = council
             .desired_state()
@@ -10789,6 +10846,71 @@ mod tests {
         shutdown.cancel();
     }
 
+    /// A node forwarding a clear gives the owning node [`NODE_REQUEST_TIMEOUT`].
+    /// When the owning agent is busy, the owning node must still answer inside
+    /// that, with its own retryable 504, instead of letting the forwarder's
+    /// deadline pass first.
+    #[tokio::test(start_paused = true)]
+    async fn a_clear_answers_within_its_budget_when_the_agent_is_busy() {
+        // An agent that never gets round to the command.
+        let (cmd_tx, _cmd_rx) = mpsc::channel(4);
+        let app = router_with_upgrade(
+            cmd_tx,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            9117,
+            None,
+            None,
+            None,
+            "default".to_string(),
+            Some("node-2".to_string()),
+            900,
+            crate::cluster::ClusterHttp::plaintext(),
+            5050,
+            "http",
+            256 * 1024 * 1024,
+            false,
+            workload_fault_static_capabilities(),
+            crate::bun::readiness::ReadinessTracker::new(),
+            None,
+            None,
+        );
+        let started = tokio::time::Instant::now();
+        let response = tokio::time::timeout(
+            NODE_REQUEST_TIMEOUT * 2,
+            app.oneshot(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri("/v1/fault/7")
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        )
+        .await
+        .expect("the clear never answered")
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert!(started.elapsed() < NODE_REQUEST_TIMEOUT);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&body).contains("retry the clear"),
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
     #[tokio::test]
     async fn injected_and_cleared_faults_emit_authenticated_structured_audit_events() {
         let (token, plaintext) = named_user_token("alice", crate::sesame::types::ApiRole::Deployer);
@@ -14226,6 +14348,146 @@ schedule = "* * * * *"
         shutdown.cancel();
     }
 
+    /// B01: a Deployer scoped to `a/web` passes the route's scope check,
+    /// so the snapshot inputs themselves must not reach outside `a/web`.
+    /// A traversal volume used to snapshot `b/db`'s volume, and an
+    /// absolute or `..` name placed a root-owned subvolume anywhere.
+    #[tokio::test]
+    async fn scoped_deployer_cannot_escape_its_app_through_snapshot_inputs() {
+        let volumes_dir = tempfile::tempdir().unwrap();
+        let volumes = crate::grill::volume::VolumeManager::new(volumes_dir.path());
+        for (namespace, app) in [("a", "web"), ("b", "db")] {
+            volumes
+                .create_managed_volume(namespace, app, std::path::Path::new("/data"), None)
+                .unwrap();
+        }
+        let tree = |root: &std::path::Path| {
+            let mut out = Vec::new();
+            let mut stack = vec![root.to_path_buf()];
+            while let Some(dir) = stack.pop() {
+                for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                    if entry.file_type().unwrap().is_dir() {
+                        stack.push(entry.path());
+                    }
+                    out.push(entry.path());
+                }
+            }
+            out.sort();
+            out
+        };
+        let before = tree(volumes_dir.path());
+
+        let (cmd_tx, cmd_rx) = mpsc::channel(32);
+        let shutdown = CancellationToken::new();
+        let mut agent = BunAgent::new(
+            MockGrill::new(),
+            PortAllocator::new(30000, 31000),
+            cmd_rx,
+            shutdown.clone(),
+        );
+        agent.set_volumes_dir(volumes_dir.path().to_path_buf());
+        tokio::spawn(async move {
+            agent.run().await;
+        });
+        let scope = crate::sesame::types::TokenScope {
+            apps: Some(vec!["web".to_string()]),
+            namespaces: Some(vec!["a".to_string()]),
+        };
+        let created = crate::sesame::token::create_token(
+            "a-web",
+            crate::sesame::types::ApiRole::Deployer,
+            scope,
+            None,
+        )
+        .unwrap();
+        let store = crate::sesame::auth::new_token_store();
+        store.write().await.push(created.token);
+        let app = router(
+            cmd_tx,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(store),
+            None,
+            None,
+            None,
+            None,
+            9117,
+            None,
+        );
+        let tok = created.plaintext;
+
+        // Refused as invalid input: on a non-btrfs tempdir a merely
+        // "unsupported filesystem" 400 would hide that validation never ran.
+        let send = |method: &'static str, uri: &'static str, body: String| {
+            let request = axum::http::Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("authorization", format!("Bearer {tok}"))
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap();
+            let app = app.clone();
+            async move {
+                let response = app.oneshot(request).await.unwrap();
+                let status = response.status();
+                let bytes = response.into_body().collect().await.unwrap().to_bytes();
+                (status, String::from_utf8_lossy(&bytes).into_owned())
+            }
+        };
+        let refused = |(status, body): (StatusCode, String), what: &str| {
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{what}: {body}");
+            assert!(
+                body.contains("invalid snapshot request"),
+                "{what} was not refused as invalid input: {body}"
+            );
+        };
+
+        for body in [
+            serde_json::json!({ "volume": "/../../b/db/data" }),
+            serde_json::json!({ "volume": "../../b/db/data" }),
+            serde_json::json!({ "name": "/abs/path" }),
+            serde_json::json!({ "name": "../../../../tmp/owned" }),
+            serde_json::json!({ "name": "a/b" }),
+            serde_json::json!({ "volume": "/data", "name": ".." }),
+        ] {
+            let what = format!("create {body}");
+            refused(
+                send("POST", "/v1/snapshots/a/web", body.to_string()).await,
+                &what,
+            );
+        }
+        for body in [
+            serde_json::json!({ "name": "../../../b/db/data/x" }),
+            serde_json::json!({ "name": "1", "volume": "/../../b/db/data" }),
+        ] {
+            let what = format!("restore {body}");
+            refused(
+                send("POST", "/v1/snapshots/a/web/restore", body.to_string()).await,
+                &what,
+            );
+        }
+        refused(
+            send(
+                "DELETE",
+                "/v1/snapshots/a/web/1?volume=/../../b/db/data",
+                String::new(),
+            )
+            .await,
+            "delete",
+        );
+
+        assert_eq!(
+            tree(volumes_dir.path()),
+            before,
+            "a refused request touched the volumes directory"
+        );
+        shutdown.cancel();
+    }
+
     #[tokio::test]
     async fn readonly_token_is_refused_rolling_back() {
         // AUTH2: app rollback now requires a Deployer.
@@ -15250,6 +15512,21 @@ schedule = "* * * * *"
     /// A router whose token store holds one user token of the given role.
     /// Returns the router, its shutdown handle, and the plaintext token.
     fn ui_setup(role: crate::sesame::types::ApiRole) -> (Router, CancellationToken, String) {
+        let (app, shutdown, plaintext, _store) = ui_setup_with_store(role, None);
+        (app, shutdown, plaintext)
+    }
+
+    /// Like `ui_setup`, but the token can expire and the caller keeps the
+    /// token store, so a test can revoke or reissue tokens after logging in.
+    fn ui_setup_with_store(
+        role: crate::sesame::types::ApiRole,
+        expires_at: Option<std::time::SystemTime>,
+    ) -> (
+        Router,
+        CancellationToken,
+        String,
+        crate::sesame::auth::TokenStore,
+    ) {
         let (cmd_tx, cmd_rx) = mpsc::channel(32);
         let shutdown = CancellationToken::new();
         let grill = MockGrill::new();
@@ -15263,7 +15540,7 @@ schedule = "* * * * *"
             "dash",
             role,
             crate::sesame::types::TokenScope::default(),
-            None,
+            expires_at,
         )
         .unwrap();
         let plaintext = created.plaintext.clone();
@@ -15279,7 +15556,7 @@ schedule = "* * * * *"
             None,
             None,
             None,
-            Some(store),
+            Some(store.clone()),
             None,
             None,
             None,
@@ -15287,7 +15564,7 @@ schedule = "* * * * *"
             9117,
             None,
         );
-        (app, shutdown, plaintext)
+        (app, shutdown, plaintext, store)
     }
 
     async fn ui_get(app: &Router, uri: &str, headers: &[(&str, &str)]) -> Response {
@@ -15409,6 +15686,103 @@ schedule = "* * * * *"
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        shutdown.cancel();
+    }
+
+    /// Build a POST /ui/session request carrying `token`.
+    fn login_request(token: &str) -> axum::http::Request<Body> {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/ui/session")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from(format!("token={token}")))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_malformed_login_is_refused_without_touching_argon2() {
+        // Every verification permit is held, so any login that reached the
+        // Argon2 path would block. A junk token must be refused by the shape
+        // check alone, promptly (B12).
+        let (app, shutdown, _t) = ui_setup(crate::sesame::types::ApiRole::ReadOnly);
+        let _permits = crate::sesame::auth::hold_all_verify_permits().await;
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            app.clone().oneshot(login_request("nope")),
+        )
+        .await
+        .expect("a malformed login must not wait for an Argon2 permit")
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn a_well_shaped_login_shares_the_argon2_concurrency_bound() {
+        // With every permit held, a login that looks like a real token has to
+        // queue for the same semaphore the bearer path uses (B12) rather than
+        // hashing on the blocking pool unbounded.
+        let (app, shutdown, token) = ui_setup(crate::sesame::types::ApiRole::ReadOnly);
+        let permits = crate::sesame::auth::hold_all_verify_permits().await;
+        let pending = tokio::spawn(app.clone().oneshot(login_request(&token)));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !pending.is_finished(),
+            "login verified without waiting for a permit"
+        );
+
+        // Releasing the permits lets the queued login finish normally.
+        drop(permits);
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(10), pending)
+            .await
+            .expect("login should proceed once a permit frees up")
+            .unwrap()
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn a_dashboard_session_ends_when_its_token_is_revoked() {
+        // B11: the cookie is only as good as the token it was exchanged for.
+        // A second token keeps the store non-empty, so auth stays enforced.
+        let (app, shutdown, token, store) =
+            ui_setup_with_store(crate::sesame::types::ApiRole::ReadOnly, None);
+        let spare = crate::sesame::token::create_token(
+            "spare",
+            crate::sesame::types::ApiRole::Admin,
+            crate::sesame::types::TokenScope::default(),
+            None,
+        )
+        .unwrap();
+        store.write().await.push(spare.token);
+        let id = login(&app, &token).await;
+        let cookie = format!("rb_session={id}");
+        let before = ui_get(&app, "/ui/fragment/apps", &[("cookie", &cookie)]).await;
+        assert_eq!(before.status(), StatusCode::OK);
+
+        store.write().await.retain(|t| t.name != "dash");
+        let after = ui_get(&app, "/ui/fragment/apps", &[("cookie", &cookie)]).await;
+        assert_eq!(after.status(), StatusCode::UNAUTHORIZED);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn the_session_cookie_expires_no_later_than_its_token() {
+        let expiry = std::time::SystemTime::now() + std::time::Duration::from_secs(600);
+        let (app, shutdown, token, _store) =
+            ui_setup_with_store(crate::sesame::types::ApiRole::ReadOnly, Some(expiry));
+        let resp = app.clone().oneshot(login_request(&token)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let cookie = resp.headers().get("set-cookie").unwrap().to_str().unwrap();
+        let max_age: u64 = cookie
+            .split("; ")
+            .find_map(|part| part.strip_prefix("Max-Age="))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(max_age <= 600, "cookie outlives its token: {cookie}");
+        assert!(max_age > 500, "cookie cut unexpectedly short: {cookie}");
         shutdown.cancel();
     }
 

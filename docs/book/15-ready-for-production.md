@@ -2710,6 +2710,184 @@ waited for could have been the old one (the replacement reuses its id), so
 the marker check would have passed without a restart at all. It now waits
 until every instance is `stopped` or `failed` before redeploying.
 
+With the exec going to the right node, the next candidate's fast tier failed
+the restart case for real: the marker was gone. The case was right and the
+product was wrong. A stopped app forgot which node held its volume, so the
+redeploy could start it on another node with an empty one. Chapter 7 has the
+fix.
+
+The candidate after that, 0eb6071, failed the dead-worker case again, and the
+504 was back with different words:
+
+```text
+owned fault cleanup failed: 2: API error (status 504):
+node fault reversal request to rb-…-2 timed out
+```
+
+This time it wasn't the reservation. That message comes from the entry node,
+which gives the owning node five seconds to answer a forwarded clear. Node 2
+did reverse the fault (its journal says so at 21:15:12 BST), but it never
+answered anyone in time again: seven minutes later `relish wtf` still reported
+"rb-…-2 did not answer", and every agent query to it timed out. Its journal
+showed why. The fault had killed all six of its containers, so every replica
+was a pending restart, and every restart was stuck waiting for the cluster to
+confirm its old endpoint was withdrawn. Each health tick walked all six, and
+each one spent about 400 ms on runtime cleanup it couldn't finish yet. A tick
+took two and a half seconds, and the tick interval is one.
+
+The agent loop is one `tokio::select!` over the command channel, a few other
+queues and that one-second tick. By default `select!` polls its branches in a
+random order, which is fair when every branch is cheap. Here the tick was
+always due, because ticks that fall behind fire at once, so every queued
+command had to win a coin toss against a two-and-a-half-second tick, and lost
+about half the time. The fault clear, the leader's fence and, worst of all,
+the consumer-view update that would have let the restarts finish all queued
+behind ticks and timed out. The node had talked itself into a corner: the
+restarts kept the loop busy, and the busy loop kept the restarts from ever
+finishing.
+
+The fix is one word:
+
+```rust
+tokio::select! {
+    biased;
+    _ = self.shutdown.cancelled() => { /* ... */ }
+    Some(req) = Self::recv_snapshot(&mut self.cluster) => { /* ... */ }
+    Some(cmd) = self.command_rx.recv() => { /* ... */ }
+    // stop completions, deploy operations ...
+    _ = health_interval.tick() => { /* the periodic work */ }
+}
+```
+
+`biased;` is a directive to the macro, not a branch: it tells `select!` to
+poll the branches top to bottom every time. Shutdown wins over everything, a
+waiting command over any background work, and the tick runs only when nothing
+else is waiting. A command now waits for at most the tick already running.
+The obvious risk is starvation, a branch near the top that's always ready and
+never lets the tick run. Commands are requests with replies, so each caller
+waits for its answer before sending the next; nothing floods the channel.
+
+The test builds exactly that node: three replicas in pending restart, a mock
+runtime that takes 400 ms to fail each cleanup, so every tick lasts 1.2 s. It
+waits for a tick to start, queues eight status commands, and counts the
+cleanups that run before all eight are answered. At most the rest of the
+running tick is allowed. Before `biased;` it counted 57, nineteen whole ticks
+for eight commands, and took 23 s; now it takes about three.
+
+The same failure also showed a budget that didn't add up. The owning node's
+clear handler waited for its agent without any deadline, then waited up to
+4 s for the reservation release, while the forwarder gave it 5 s in total.
+Any agent delay over a second meant the forwarder's timeout, not the owning
+node's own answer. Both numbers now come from one constant:
+
+```rust
+const NODE_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const NODE_FAULT_CLEAR_BUDGET: Duration =
+    NODE_REQUEST_TIMEOUT.saturating_sub(Duration::from_secs(1));
+```
+
+`saturating_sub` is a `const fn`, so the compiler works out the budget and a
+change to the forwarding timeout carries the clear's budget with it. The
+handler sets one deadline on arrival, and both waits share it:
+
+```rust
+let deadline = tokio::time::Instant::now() + NODE_FAULT_CLEAR_BUDGET;
+let Ok(cleared) = tokio::time::timeout_at(deadline, cleared).await else {
+    return (StatusCode::GATEWAY_TIMEOUT, /* "...; retry the clear" */)
+        .into_response();
+};
+```
+
+`let ... else` is a refutable `let`: if the pattern (`Ok(cleared)`) matches,
+the binding lives on in the rest of the function; if it doesn't, the `else`
+block runs, and it must leave the function (`return`, `break` or a panic).
+It's the early-return guard from Go, minus the separate `if err != nil`. A
+busy agent now gets the client a 504 that says "retry", which `clear_fault`
+already retries, and the clear that was queued still runs. The API test
+stalls the agent completely and checks that the clear answers inside
+`NODE_REQUEST_TIMEOUT`. Before, it never answered at all.
+
+Was it the new connection timeouts in 0eb6071? No. The forwarded clear
+reached node 2 and ran there; the request was slow on the far side, not lost
+on a dead pooled connection. The earlier candidates were lucky: the loop was
+as unfair then, and the case passes whenever the coin tosses go its way.
+
+### Busy isn't dead
+
+`biased;` bought fairness for commands, and the final tier of the soak on
+ff854cb found who paid for it. During the `relish test` pulse, node 3 logged
+`report worker: snapshot collection failed or timed out` every five seconds
+from 09:12:08 to 09:13:48 BST, and node 2 did the same in bursts until
+09:15:46. After 30 s without a report the leader marked each node stale, the
+scheduler called it not ready, and it moved apps off perfectly healthy nodes.
+Apps pinned by label had nowhere to go: node 1 logged `cannot place
+default/soak-redis: no eligible nodes` every two seconds for 46 s.
+
+The report worker doesn't read agent state itself. Once per interval it sends
+the agent loop a snapshot request and gives it two seconds to answer. In the
+biased order that request sat *below* the command channel, and the pulse keeps
+that channel busy: four test cases polling instance status, the placement
+reconciler, deploys and retirements, and every status request asks the runtime
+for each instance's pid and exit code. The earlier argument that "each caller
+waits for its reply, so nothing floods the channel" holds for one caller. It
+doesn't hold for a dozen of them taking turns. The channel was rarely empty,
+so the one request that decides whether the node is alive waited behind all
+of it, missed its deadline, and was answered later into a closed channel,
+which cost another inventory read.
+
+There were two fixes, one at each end of the channel. In the loop, the snapshot
+branch moved up to sit straight under shutdown, and a request the worker has
+already given up on is dropped unbuilt (`req.response.is_closed()`). A report
+arrives once every five seconds and costs a bounded amount of work, so it
+can't starve commands. It now waits for at most the one operation already
+running.
+
+That operation can still be long. Some of the loop's work awaits other
+machines: signing a follower's workload certificate goes to the leader with a
+ten-second limit. So the worker no longer treats a slow loop as a dead node. A
+report says two things: "I'm alive" and "here's what I run". Only the second
+needs the loop. When the loop misses the deadline, the worker re-sends the
+last snapshot it *did* answer, stamped with the time it was taken, and reads
+readiness straight from the node's `ReadinessTracker`, which never needed the
+loop in the first place:
+
+```rust
+let (snapshot, observed_wall) = match self.collect_snapshot().await {
+    Some(snapshot) => { /* remember it, with both clocks */ }
+    None => match self.recent_observation() {
+        Some(observed) => (observed.snapshot.clone(), observed.observed_wall),
+        None => return, // nothing honest to send
+    },
+};
+```
+
+Is re-sending old state a lie? It tells the leader nothing it didn't already
+hold: the aggregator keeps a stale node's last report either way. The only
+thing that changes is the verdict. The loop is the only writer of the agent's
+state, so while it's stuck nothing it knows has changed either. A loop that
+*never* answers again is wedged rather than busy, and a wedged node should
+still be fenced. So `recent_observation` only offers a snapshot younger than
+four stale windows (two minutes by default). After that the worker goes
+quiet and the leader does what it did before.
+
+`recent_observation` returns `Option<&ObservedSnapshot>`, a reference into the
+worker's own field. The `&` means the caller borrows the snapshot rather than
+taking it. The report builder consumes its snapshot by value, so the call
+site clones it and the cached copy stays put for the next busy interval.
+
+The tests come in two halves. In the agent, twenty `Status` commands queue up
+against a mock runtime that takes 100 ms per pid read, about six seconds of
+loop work, and a snapshot request must still come back inside the worker's
+two seconds. It didn't before. A second test queues three abandoned requests
+ahead of a live one with a runtime inventory that always hits its one-second
+limit. Before, the live one waited four seconds. In the worker, a test
+answers one snapshot and then goes silent: eight intervals later the leader
+is still getting the same `web` instance and readiness from the tracker. The
+guard rails get tests too. After the two-minute grace the worker sends
+nothing, a worker that has never had an answer sends nothing at all, and
+neither does one whose agent loop has exited (its end of the channel is
+closed, so it's gone, not busy).
+
 ## Walk the path you actually care about
 
 Say `web` can't reach `redis`. Checking Bun's own DNS and TCP access might tell

@@ -467,6 +467,9 @@ pub enum AgentCommand {
         namespace: String,
         app_name: String,
         name: String,
+        /// Container mount path; required when several volumes share
+        /// the snapshot name.
+        volume: Option<String>,
         response: oneshot::Sender<Result<(), BunError>>,
     },
     /// Delete a snapshot.
@@ -474,6 +477,9 @@ pub enum AgentCommand {
         namespace: String,
         app_name: String,
         name: String,
+        /// Container mount path; required when several volumes share
+        /// the snapshot name.
+        volume: Option<String>,
         response: oneshot::Sender<Result<(), BunError>>,
     },
     /// Resolve a service name to its VIP and backends.
@@ -2333,44 +2339,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.volumes_dir = dir;
     }
 
-    /// Snapshot one volume of an app — or, with `volume: None`, every
-    /// provisioned volume (discovered from sidecars, so this works for
-    /// stopped apps too). Multi-volume snapshots share one timestamp.
-    /// Create volume snapshots. Free of `&self` (takes `volumes_dir`) so it can
-    /// run on `spawn_blocking` — btrfs subprocess + fs walks must not run on the
-    /// agent command loop (M7).
-    fn snapshot_create(
-        volumes_dir: &std::path::Path,
-        namespace: &str,
-        app_name: &str,
-        volume: Option<String>,
-        name: Option<String>,
-    ) -> Result<Vec<crate::grill::snapshot::SnapshotMeta>, BunError> {
-        let volumes = match volume {
-            Some(v) => vec![v],
-            None => {
-                let found = crate::grill::volume::VolumeManager::new(volumes_dir)
-                    .provisioned_volumes(namespace, app_name);
-                if found.is_empty() {
-                    return Err(crate::grill::snapshot::SnapshotError::NoVolumes {
-                        namespace: namespace.to_string(),
-                        app: app_name.to_string(),
-                    }
-                    .into());
-                }
-                found
-            }
-        };
-
-        let manager = crate::grill::snapshot::SnapshotManager::new(volumes_dir);
-        let now = std::time::SystemTime::now();
-        let mut metas = Vec::with_capacity(volumes.len());
-        for volume_path in &volumes {
-            metas.push(manager.create(namespace, app_name, volume_path, name.as_deref(), now)?);
-        }
-        Ok(metas)
-    }
-
     /// Configure the actual protected listener ports, explicit enrolment peers
     /// and operator networks allowed to the management port. This grants
     /// network reachability only; protocol authentication still applies.
@@ -3614,11 +3582,29 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
 
         loop {
+            // Branches are polled in order, so the periodic tick runs only when
+            // nothing else is waiting. A tick can take seconds (every pending
+            // restart retries its runtime cleanup), and ticks that fall behind
+            // are due at once. Polled in random order, each queued command had
+            // to win a coin toss against the next slow tick; callers timed out,
+            // the consumer view that would let restarts finish never landed,
+            // and the node stopped answering. Now a command waits for at most
+            // the tick already running.
+            //
+            // Snapshot requests come before commands. The report worker asks
+            // once per interval and gives up after two seconds; queued behind
+            // a steady stream of commands, it missed that deadline for over a
+            // minute, and the leader moved apps off a healthy node. Reports
+            // are rare and bounded, so they can't starve commands.
             tokio::select! {
+                biased;
                 _ = self.shutdown.cancelled() => {
                     self.abandon_pending_stops();
                     self.shutdown_all().await;
                     break;
+                }
+                Some(req) = Self::recv_snapshot(&mut self.cluster) => {
+                    self.handle_snapshot_request(req).await;
                 }
                 Some(cmd) = self.command_rx.recv() => {
                     self.handle_command(cmd).await;
@@ -3629,9 +3615,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 }
                 Some(op) = self.deploy_ops_rx.recv() => {
                     self.handle_deploy_op(op).await;
-                }
-                Some(req) = Self::recv_snapshot(&mut self.cluster) => {
-                    self.handle_snapshot_request(req).await;
                 }
                 _ = health_interval.tick() => {
                     self.reopen_uncertain_discovery().await;
@@ -3686,6 +3669,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     async fn handle_snapshot_request(&self, req: CollectSnapshotRequest) {
         use crate::reporting::worker::{AgentSnapshot, InstanceSnapshot};
 
+        // The worker gave up on this one; building it would only delay the
+        // next live request by another inventory read.
+        if req.response.is_closed() {
+            return;
+        }
         let (capabilities, enforced_instances) = self.live_egress_report_state().await;
         #[cfg(all(feature = "ebpf", target_os = "linux"))]
         let egress_affected_workloads: Vec<
@@ -4450,8 +4438,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 // btrfs subprocess + fs walks off the command loop (M7).
                 let volumes_dir = self.volumes_dir.clone();
                 tokio::task::spawn_blocking(move || {
-                    let result =
-                        Self::snapshot_create(&volumes_dir, &namespace, &app_name, volume, name);
+                    let result = crate::grill::snapshot::SnapshotManager::new(&volumes_dir)
+                        .create_for_app(
+                            &namespace,
+                            &app_name,
+                            volume.as_deref(),
+                            name.as_deref(),
+                            std::time::SystemTime::now(),
+                        )
+                        .map_err(BunError::from);
                     let _ = response.send(result);
                 });
             }
@@ -4471,6 +4466,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 namespace,
                 app_name,
                 name,
+                volume,
                 response,
             } => {
                 // The running-instance check needs supervisor state, so it stays
@@ -4490,7 +4486,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     let volumes_dir = self.volumes_dir.clone();
                     tokio::task::spawn_blocking(move || {
                         let result = crate::grill::snapshot::SnapshotManager::new(&volumes_dir)
-                            .restore(&namespace, &app_name, &name)
+                            .restore(&namespace, &app_name, &name, volume.as_deref())
                             .map_err(BunError::from);
                         let _ = response.send(result);
                     });
@@ -4500,6 +4496,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 namespace,
                 app_name,
                 name,
+                volume,
                 response,
             } => {
                 let volumes_dir = self.volumes_dir.clone();
@@ -4507,7 +4504,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     let manager = crate::grill::snapshot::SnapshotManager::new(&volumes_dir);
                     let _ = response.send(
                         manager
-                            .delete(&namespace, &app_name, &name)
+                            .delete(&namespace, &app_name, &name, volume.as_deref())
                             .map_err(BunError::from),
                     );
                 });
@@ -11209,13 +11206,9 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             if !existing.is_empty() {
                 // Dispatch on deploy strategy (E): blue-green stands up the
                 // whole new fleet before swapping; rolling replaces one at a
-                // time. Everything else about the deploy is identical.
-                let strategy = spec
-                    .deploy
-                    .as_ref()
-                    .map(crate::meat::deploy_types::DeployConfig::from_spec)
-                    .unwrap_or_default()
-                    .strategy;
+                // time. Everything else about the deploy is identical. An app
+                // with a managed volume always rolls stop-first (`for_app`).
+                let strategy = crate::meat::deploy_types::DeployConfig::for_app(spec).strategy;
                 let outcome = match strategy {
                     crate::meat::deploy_types::DeployStrategy::BlueGreen => {
                         self.blue_green_redeploy(app_name, namespace, spec, existing, &events, now)
@@ -11690,11 +11683,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             })
             .await;
 
-        let deploy_config = spec
-            .deploy
-            .as_ref()
-            .map(crate::meat::deploy_types::DeployConfig::from_spec)
-            .unwrap_or_default();
+        let deploy_config = crate::meat::deploy_types::DeployConfig::for_app(spec);
 
         let deploy_gen = match self.ops.next_deploy_gen(app_name).await {
             Ok(generation) => generation,
@@ -15806,6 +15795,7 @@ mod tests {
             namespace: "default".to_string(),
             app_name: "web".to_string(),
             name: "whatever".to_string(),
+            volume: None,
             response: resp_tx,
         })
         .await
@@ -16227,6 +16217,207 @@ interval = 1
             "a slow health probe blocked the command loop"
         );
         assert!(stopped.is_ok(), "a slow health probe blocked shutdown");
+    }
+
+    /// A cluster agent whose report-worker end of the snapshot channel stays
+    /// with the test, so a test can ask for snapshots as the worker does.
+    fn test_cluster_agent_with_snapshots() -> (
+        TestAgent,
+        mpsc::Sender<AgentCommand>,
+        mpsc::Sender<CollectSnapshotRequest>,
+        CancellationToken,
+        MockGrill,
+    ) {
+        let (_membership_tx, membership_rx) = tokio::sync::watch::channel(Vec::new());
+        let (snapshot_tx, snapshot_rx) = mpsc::channel(16);
+        let (command_tx, command_rx) = mpsc::channel(64);
+        let shutdown = CancellationToken::new();
+        let cluster = ClusterHandle {
+            local_node_id: crate::meat::NodeId::new("test"),
+            membership_rx,
+            raft_metrics_rx: None,
+            council: None,
+            snapshot_rx,
+            wrapping_ikm: None,
+            partition_blocklists: PartitionBlocklists::default(),
+            crl_handle: Default::default(),
+        };
+        let grill = MockGrill::new();
+        let mut agent = BunAgent::with_cluster(
+            grill.clone(),
+            PortAllocator::new(30000, 31000),
+            command_rx,
+            shutdown.clone(),
+            cluster,
+            "test".to_string(),
+        );
+        let volumes = tempfile::tempdir().unwrap();
+        agent.set_volumes_dir(volumes.path().to_path_buf());
+        agent.set_stop_confirmation_timeout(TEST_STOP_CONFIRMATION_TIMEOUT);
+        let agent = TestAgent {
+            agent,
+            _volumes: volumes,
+        };
+        (agent, command_tx, snapshot_tx, shutdown, grill)
+    }
+
+    async fn stop_agent_task(shutdown: CancellationToken, mut task: tokio::task::JoinHandle<()>) {
+        shutdown.cancel();
+        if tokio::time::timeout(std::time::Duration::from_secs(10), &mut task)
+            .await
+            .is_err()
+        {
+            task.abort();
+        }
+    }
+
+    /// V02 final tier: during the `relish test` pulse the loop always had
+    /// work waiting, and the report worker's snapshot request sat behind all
+    /// of it. It missed its two-second deadline for over a minute, the leader
+    /// called the node stale, and healthy apps moved off it. A report must
+    /// wait for at most the one piece of work already running.
+    #[tokio::test]
+    async fn snapshot_request_is_answered_before_a_backlog_of_slow_commands() {
+        let (mut agent, tx, snapshot_tx, shutdown, grill) = test_cluster_agent_with_snapshots();
+        let config =
+            Config::parse("[app.web]\nimage = 'web:v1'\nport = 8080\nreplicas = 3\n").unwrap();
+        expect_complete(&drain_deploy(&mut agent, config).await);
+        // Three pid reads per Status at 100 ms each: twenty queued Status
+        // commands are six seconds of loop work.
+        grill.set_pid_delay(Some(std::time::Duration::from_millis(100)));
+        let mut replies = Vec::new();
+        for _ in 0..20 {
+            let (response, reply) = oneshot::channel();
+            tx.send(AgentCommand::Status { response }).await.unwrap();
+            replies.push(reply);
+        }
+        let task = tokio::spawn(async move { agent.run().await });
+        // Let the loop start on the backlog before the worker asks.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let (response, snapshot) = oneshot::channel();
+        snapshot_tx
+            .send(CollectSnapshotRequest { response })
+            .await
+            .unwrap();
+        let snapshot = tokio::time::timeout(std::time::Duration::from_secs(2), snapshot)
+            .await
+            .expect("the snapshot waited behind the whole command backlog")
+            .unwrap();
+        assert_eq!(snapshot.instances.len(), 3);
+        for reply in replies {
+            tokio::time::timeout(std::time::Duration::from_secs(30), reply)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        stop_agent_task(shutdown, task).await;
+    }
+
+    /// A request the worker already gave up on has nobody to answer. Building
+    /// it anyway (an inventory read of up to a second each) only pushed the
+    /// next live request further past its deadline.
+    #[tokio::test]
+    async fn abandoned_snapshot_requests_are_not_built() {
+        let (agent, _tx, snapshot_tx, shutdown, grill) = test_cluster_agent_with_snapshots();
+        let mut agent = agent;
+        grill.set_inventory_delay(Some(std::time::Duration::from_secs(5)));
+        for _ in 0..3 {
+            let (response, abandoned) = oneshot::channel();
+            drop(abandoned);
+            snapshot_tx
+                .send(CollectSnapshotRequest { response })
+                .await
+                .unwrap();
+        }
+        let (response, live) = oneshot::channel();
+        snapshot_tx
+            .send(CollectSnapshotRequest { response })
+            .await
+            .unwrap();
+        let task = tokio::spawn(async move { agent.run().await });
+        // The live request costs one bounded (1 s) inventory read; each
+        // abandoned one built first would add another.
+        tokio::time::timeout(std::time::Duration::from_millis(2500), live)
+            .await
+            .expect("abandoned requests were built before the live one")
+            .unwrap();
+        stop_agent_task(shutdown, task).await;
+    }
+
+    /// V02 soak: a node killed with `kill_containers` comes back with every
+    /// replica waiting for its restart, and each health tick spends a few
+    /// hundred milliseconds per replica on runtime cleanup it cannot finish
+    /// yet. Ticks then run back to back. Commands queued behind one of those
+    /// ticks (a fault clear, the leader's fence, the consumer view that would
+    /// let the restarts finish) must be answered before the next tick starts,
+    /// not raced against it one coin toss at a time.
+    #[tokio::test]
+    async fn queued_commands_are_answered_before_the_next_slow_health_tick() {
+        let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+        let config =
+            Config::parse("[app.web]\nimage = 'web:v1'\nport = 8080\nreplicas = 3\n").unwrap();
+        expect_complete(&drain_deploy(&mut agent, config).await);
+        let ids: Vec<InstanceId> = agent
+            .supervisor
+            .list_instances()
+            .iter()
+            .map(|instance| instance.id.clone())
+            .collect();
+        assert_eq!(ids.len(), 3);
+        for id in &ids {
+            let instance = agent.supervisor.get_instance_mut(id).unwrap();
+            instance.state = ContainerState::Pending;
+            instance.restart_count = 1;
+        }
+        // Each pending restart spends 400 ms failing to clean up its old
+        // runtime, so every tick lasts 1.2 s: longer than the 1 s interval.
+        const PER_RESTART: std::time::Duration = std::time::Duration::from_millis(400);
+        grill.set_kill_delay(Some(PER_RESTART));
+        grill.set_fail_kill(true);
+        let kills = |grill: &MockGrill| {
+            grill
+                .calls()
+                .iter()
+                .filter(|(operation, _)| operation == "kill")
+                .count()
+        };
+        let task = tokio::spawn(async move { agent.run().await });
+        // Wait until a slow tick is under way, so the commands queue behind it.
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while kills(&grill) < ids.len() + 1 {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let kills_when_queued = kills(&grill);
+        let mut replies = Vec::new();
+        for _ in 0..8 {
+            let (response, reply) = oneshot::channel();
+            tx.send(AgentCommand::Status { response }).await.unwrap();
+            replies.push(reply);
+        }
+        for reply in replies {
+            tokio::time::timeout(std::time::Duration::from_secs(30), reply)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        let kills_while_queued = kills(&grill) - kills_when_queued;
+        shutdown.cancel();
+        let mut task = task;
+        if tokio::time::timeout(std::time::Duration::from_secs(10), &mut task)
+            .await
+            .is_err()
+        {
+            task.abort();
+        }
+        // At most the rest of the tick that was already running.
+        assert!(
+            kills_while_queued <= ids.len(),
+            "{kills_while_queued} restart cleanups ran while 8 commands waited: \
+             later health ticks overtook queued commands"
+        );
     }
 
     #[tokio::test]
@@ -21660,6 +21851,152 @@ host = "remote.local"
             peak, 2,
             "peaked at {peak}; max_surge = 0 must never exceed the 2-replica target"
         );
+    }
+
+    /// Replay a grill call log and return the most instances of `app` that
+    /// were live at once, starting from `initially_live`.
+    fn peak_live_instances(
+        calls: &[(String, InstanceId)],
+        app_prefix: &str,
+        initially_live: &[&str],
+    ) -> usize {
+        let mut live: std::collections::HashSet<String> =
+            initially_live.iter().map(|id| id.to_string()).collect();
+        let mut peak = live.len();
+        for (op, id) in calls {
+            if !id.0.starts_with(app_prefix) {
+                continue;
+            }
+            match op.as_str() {
+                "start" => {
+                    live.insert(id.0.clone());
+                    peak = peak.max(live.len());
+                }
+                "stop" | "kill" => {
+                    live.remove(&id.0);
+                }
+                _ => {}
+            }
+        }
+        peak
+    }
+
+    /// V02 soak, 28 Sep 2026: after a power cut mid-upgrade, node 2 redeployed
+    /// the writer with the default rolling bounds. The replacement
+    /// (`soak-writer-g1-0`) started on the same managed volume while the old
+    /// instance was still appending, so two processes wrote `/data/seq` at
+    /// once and the file got `21926` twice. A managed volume has one writer:
+    /// an app that has one must retire the old instance before its
+    /// replacement starts, whatever `max_surge` says.
+    #[tokio::test]
+    async fn rolling_redeploy_of_a_volume_app_never_overlaps_writers() {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+
+        let config = Config::parse(
+            "[app.db]\nimage = \"db:v1\"\n\n[[app.db.volumes]]\npath = \"/data\"\n\n[app.db.deploy]\ndrain_timeout = \"0s\"\n",
+        )
+        .unwrap();
+
+        let (ev_tx, mut ev_rx) = mpsc::channel(256);
+        agent.deploy(config.clone(), &ev_tx).await;
+        drop(ev_tx);
+        while ev_rx.recv().await.is_some() {}
+        assert!(
+            grill
+                .calls()
+                .iter()
+                .any(|(op, id)| op == "start" && id.0 == "default__db-0"),
+            "the first deploy never started the app"
+        );
+
+        let calls_before = grill.calls().len();
+        let (ev_tx, mut ev_rx) = mpsc::channel(256);
+        agent.deploy(config, &ev_tx).await;
+        drop(ev_tx);
+        let mut errors = Vec::new();
+        while let Some(event) = ev_rx.recv().await {
+            if let ApplyEvent::Error { message } = event {
+                errors.push(message);
+            }
+        }
+        assert!(errors.is_empty(), "redeploy failed: {errors:?}");
+        let calls: Vec<(String, InstanceId)> = grill.calls().split_off(calls_before);
+
+        assert!(
+            calls
+                .iter()
+                .any(|(op, id)| op == "start" && id.0.starts_with("default__db-g")),
+            "the redeploy never started a replacement: {calls:?}"
+        );
+        let peak = peak_live_instances(&calls, "default__db", &["default__db-0"]);
+        assert_eq!(
+            peak, 1,
+            "two instances of a managed-volume app ran at once, both writing the \
+             same volume: {calls:?}"
+        );
+    }
+
+    /// Blue-green stands the whole new fleet up beside the old one, which
+    /// for a managed volume means two writers. A volume app rolls
+    /// stop-first instead.
+    #[tokio::test]
+    async fn blue_green_volume_app_redeploys_stop_first() {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+
+        let config = Config::parse(
+            "[app.db]\nimage = \"db:v1\"\n\n[[app.db.volumes]]\npath = \"/data\"\n\n[app.db.deploy]\nstrategy = \"blue-green\"\ndrain_timeout = \"0s\"\nhealth_timeout = \"1s\"\n",
+        )
+        .unwrap();
+
+        let (ev_tx, mut ev_rx) = mpsc::channel(256);
+        agent.deploy(config.clone(), &ev_tx).await;
+        drop(ev_tx);
+        while ev_rx.recv().await.is_some() {}
+
+        let calls_before = grill.calls().len();
+        let (ev_tx, mut ev_rx) = mpsc::channel(256);
+        agent.deploy(config, &ev_tx).await;
+        drop(ev_tx);
+        while ev_rx.recv().await.is_some() {}
+        let calls: Vec<(String, InstanceId)> = grill.calls().split_off(calls_before);
+
+        assert!(
+            calls
+                .iter()
+                .any(|(op, id)| op == "start" && id.0.starts_with("default__db-g")),
+            "the redeploy never started a replacement: {calls:?}"
+        );
+        let peak = peak_live_instances(&calls, "default__db", &["default__db-0"]);
+        assert_eq!(peak, 1, "blue and green both ran on one volume: {calls:?}");
+    }
+
+    /// A host-path volume is the operator's to share, so an app with only
+    /// that keeps its configured surge-first rollout.
+    #[tokio::test]
+    async fn host_path_volume_app_keeps_surge_first_rollout() {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        let shared = tempfile::tempdir().unwrap();
+
+        let config = Config::parse(&format!(
+            "[app.web]\nimage = \"web:v1\"\n\n[[app.web.volumes]]\npath = \"/srv\"\nsource = \"{}\"\n\n[app.web.deploy]\ndrain_timeout = \"0s\"\n",
+            shared.path().display()
+        ))
+        .unwrap();
+
+        let (ev_tx, mut ev_rx) = mpsc::channel(256);
+        agent.deploy(config.clone(), &ev_tx).await;
+        drop(ev_tx);
+        while ev_rx.recv().await.is_some() {}
+
+        let calls_before = grill.calls().len();
+        let (ev_tx, mut ev_rx) = mpsc::channel(256);
+        agent.deploy(config, &ev_tx).await;
+        drop(ev_tx);
+        while ev_rx.recv().await.is_some() {}
+        let calls: Vec<(String, InstanceId)> = grill.calls().split_off(calls_before);
+
+        let peak = peak_live_instances(&calls, "default__web", &["default__web-0"]);
+        assert_eq!(peak, 2, "surge-first rollout changed: {calls:?}");
     }
 
     /// A deploy config with no room to move in either direction is refused at

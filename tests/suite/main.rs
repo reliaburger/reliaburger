@@ -60,6 +60,7 @@ mod relish_cli;
 mod reporting_tree;
 mod runtime_executor;
 mod security_integration;
+mod server_idle_connections;
 mod service_endpoints;
 mod tls_connection_lifetime;
 mod uninstall;
