@@ -89,7 +89,11 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 - `relish rollback <APP>`: Rollback an app to the previous version
 - `relish stop <APP>`: Scale an app to zero, keeping its configuration; `relish apply` starts it again
 - `relish delete <APP>`: Remove an app from the cluster and stop all its instances
-- `relish batch <PATH>`: Submit a batch of jobs for high-throughput scheduling
+- `relish batch [PATH]`: Submit a batch of jobs, or manage a task array
+  - `relish batch cancel <ID>`: Stop a task array: tasks that haven't started never will, running ones get SIGTERM, then SIGKILL after 10 seconds
+  - `relish batch results <ID>`: Show each task's outcome, read from the nodes' ledgers
+  - `relish batch logs --index <INDEX> <ID>`: Print a failed task's output (the first and last 2 KiB)
+- `relish run --batch <NAME> --count <COUNT> --exec <EXEC> [ARGS]...`: Run a task array: one host binary, many indexed tasks
 - `relish batch-status <ID>`: Show the progress of a submitted batch
 
 **Work with config files** ([deploy an app](docs/manual/01_deploy-an-app.md), [coming from Kubernetes](docs/manual/09_kubernetes.md))
@@ -248,9 +252,11 @@ it would take out every replica or put the council's quorum at risk.
 `relish test --chaos` runs scripted recovery scenarios.
 
 **Deploys and GitOps.** Health-gated rolling deploys with automatic rollback,
-blue-green switches, autoscaling on metrics, jobs, cron and batch. Point the
-cluster at a Git repository and the leader keeps it in sync, verifying commit
-signatures if you ask it to.
+blue-green switches, autoscaling on metrics, jobs, cron and batch. Task arrays
+(`relish run --batch`) run one binary a hundred thousand times, each task its
+own retried process, for a Raft entry a second. Point the cluster at a Git
+repository and the leader keeps it in sync, verifying commit signatures if you
+ask it to.
 
 **Self-upgrade.** `relish upgrade start` rolls a new `bun` across the cluster:
 workers first, then council members one at a time, leader last. The new binary
