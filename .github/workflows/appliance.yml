@@ -97,6 +97,8 @@ jobs:
           ExecStart=/bin/false
           CONF
           echo "### Broken on purpose: bun won't start in this image" >> "$GITHUB_STEP_SUMMARY"
+          # Its boot tests would fail by design; skip them so it still uploads.
+          echo "BROKEN_BUN=1" >> "$GITHUB_ENV"
 
       - name: Throwaway signing key
         # Spike only: a fresh Ed25519 key per run, so the signature proves the
@@ -173,6 +175,7 @@ jobs:
           ls -l image/mkosi.output/netboot
 
       - name: Boot test
+        if: env.BROKEN_BUN != '1'
         # x86-64 runs under KVM. Hosted arm64 runners have no /dev/kvm, so
         # aarch64 falls back to TCG: slower, but it catches an image that
         # doesn't boot (like the 26.04 stubble kernel did) before the Mac lab.
@@ -233,7 +236,7 @@ jobs:
         # serves the installer and the signed image, and the installer
         # streams the image to disk and reboots. The disk comes first in the
         # boot order, so the second boot starts the installed system.
-        if: matrix.arch == 'x86_64'
+        if: matrix.arch == 'x86_64' && env.BROKEN_BUN != '1'
         timeout-minutes: 20
         run: |
           set -euo pipefail
