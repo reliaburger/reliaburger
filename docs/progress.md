@@ -3024,3 +3024,16 @@ and a handful of test cases whose assertions are too loose to catch the bug they
 - [x] **Remaining CLI robustness** — C17 rejects duration overflow, C23 reports encoded certificate expiry, C39 rejects invalid development paths before mutation, and C15/H01 correct the misplaced CA API documentation. Their regressions and verification are recorded above.
 - [x] **Cluster collection, deadlines, deployment history and ingress acceptance** — incomplete collection fails, waits share the case deadline, history must contain both tested versions, and ingress polls exact responses using credential-free clients and isolated hosts. Expired queued capabilities refresh; three live ingress cases passed.
 - [x] **Remaining test-harness robustness** — C29, C31–C33 and C35–C36 are complete; H01 now describes cleanup evidence and disabled-auth workload/node policy accurately. C30 catalogue fixtures are complete; C34 resource ownership and final hosted qualification are complete; H02 now records every helper disposition.
+
+## After 0.1.0: Million jobs (task arrays)
+
+Plan and full checklist: [2026-09-28-plan-million-jobs.md](plans/2026-09-28-plan-million-jobs.md)
+(draft PR #266, branch `feat/million-jobs`). Library-only so far; no wire or
+durable format has changed.
+
+- [x] **Data model** — `IndexRangeSet` (`src/meat/index_set.rs`), `TaskArraySpec`, chunk maths and `{index}` expansion (`src/meat/task_array.rs`).
+- [x] **Leader state and grant policy** — `TaskArrayState`, attempt fencing, requeue, cancel, `plan_grants` (`src/meat/task_array_state.rs`).
+- [x] **Node executor and ledger** — `TaskPool`, `ProcessRunner`, `FakeRunner` (`src/bun/task_executor.rs`); group-committed ledger with replay (`src/bun/task_ledger.rs`).
+- [x] **In-process proof** — `tests/suite/task_array_million.rs` and `benches/task_arrays.rs` (`make bench-task-arrays`).
+- [ ] **Compatibility gate (M5)** — needs the maintainer's decision on the finalisation gate before any Raft variant is added.
+- [ ] **Wiring, views, quickstart host processes, real-cluster numbers (M6–M9).**
