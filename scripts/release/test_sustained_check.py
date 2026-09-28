@@ -334,11 +334,33 @@ class Leaks(Evidence):
         _, verdict = self.evaluate(self.snapshot(**{"status_json": status, "inventory__rb-a-1_txt": INVENTORY.replace("nrestarts 0", "nrestarts 1")}))
         self.assertIn("bun-restart", self.failures(verdict))
 
-    def test_file_descriptors_growing_every_hour_for_six_hours_fail(self):
-        samples = [[NOW - 6 * 3600 + hour * 3600 + minute * 300, 300 + hour * 10] for hour in range(6) for minute in range(12)]
-        self.assertEqual([item["check"] for item in checker.fd_findings(samples, NOW)], ["leak-fd"])
-        samples[-5][1] = 250
-        self.assertEqual(checker.fd_findings(samples, NOW), [])
+    def test_file_descriptors_rising_every_ten_minutes_for_half_an_hour_fail(self):
+        # e8c9653's leader: the floor went 206 -> 254 -> 399 -> 531 while
+        # sockets piled up. Bun images live an hour or two between kills
+        # and upgrade walks, so a six-hour trend never got to run.
+        started = NOW - 3000
+        floors = [206, 254, 399, 531]
+        samples = [[started + 600 + bucket * 600 + minute * 60, floor + minute * 5]
+                   for bucket, floor in enumerate(floors) for minute in range(0, 10, 3)]
+        now = started + 3000
+        self.assertEqual([item["check"] for item in checker.fd_findings(samples, started, now)], ["leak-fd"])
+        # Not a complete window yet: the warm-up plus four buckets.
+        self.assertEqual(checker.fd_findings(samples, started, now - 60), [])
+
+    def test_bounded_file_descriptors_pass(self):
+        started = NOW - 3000
+        def samples(floors):
+            return [[started + 600 + bucket * 600 + minute * 60, floor + (100 if minute == 3 else 0)]
+                    for bucket, floor in enumerate(floors) for minute in range(0, 10, 3)]
+        now = started + 3000
+        # A settle burst doubles the count for a sample; the floor stays put.
+        self.assertEqual(checker.fd_findings(samples([55, 56, 55, 57]), started, now), [])
+        # Small steady rises (candidate e8c9653's node 3: 59 -> 72) are not a leak.
+        self.assertEqual(checker.fd_findings(samples([59, 63, 68, 72]), started, now), [])
+        # One step up (a peer's restart) and then flat is not a leak either.
+        self.assertEqual(checker.fd_findings(samples([60, 120, 121, 121]), started, now), [])
+        # A dip anywhere breaks the run.
+        self.assertEqual(checker.fd_findings(samples([200, 300, 290, 500]), started, now), [])
 
     def test_rss_over_a_quarter_above_the_warm_sample_fails(self):
         node = {}
@@ -346,6 +368,34 @@ class Leaks(Evidence):
         self.assertEqual(checker.rss_findings(node, 100, NOW, NOW - 3600), [])
         self.assertEqual(checker.rss_findings(node, 125, NOW, NOW - 7200), [])
         self.assertEqual([item["check"] for item in checker.rss_findings(node, 126, NOW, NOW - 7200)], ["leak-rss"])
+
+    def test_an_upgrade_exec_restarts_the_rss_warm_up(self):
+        # The candidate-9 soak: an upgrade walk exec'd bun in place (same pid,
+        # new image), RSS fell from 594 to 242 MB, and the warm sample was
+        # taken ten minutes later, before the new image had filled its
+        # working set. A fresh image gets a fresh hour.
+        state = {}
+        def sample(ts, image, rss_kb):
+            text = INVENTORY.replace("bun_rss_kb 300000", f"bun_rss_kb {rss_kb}") + f"bun_image {image}\n"
+            return checker.resource_trend_findings(state, "rb-a-2", checker.parse_inventory(text), ts)
+        start = NOW - 4 * 3600
+        self.assertEqual(sample(start, "a1", 217124), [])
+        self.assertEqual(sample(start + 3000, "b2", 242000), [])
+        self.assertEqual(sample(start + 3600 + 600, "b2", 479532), [])
+        self.assertEqual(sample(start + 5700, "b2", 625572), [])
+        self.assertEqual(sample(start + 3000 + 3600, "b2", 657000), [])
+        self.assertEqual([item["check"] for item in sample(start + 3000 + 7000, "b2", 830000)], ["leak-rss"])
+
+    def test_inventories_without_an_image_line_still_track_the_pid(self):
+        state = {}
+        def sample(ts, pid, rss_kb):
+            text = INVENTORY.replace("bun_pid 100", f"bun_pid {pid}").replace("bun_rss_kb 300000", f"bun_rss_kb {rss_kb}")
+            return checker.resource_trend_findings(state, "rb-a-1", checker.parse_inventory(text), ts)
+        self.assertEqual(sample(NOW, 100, 100000), [])
+        self.assertEqual(sample(NOW + 3600, 100, 100000), [])
+        self.assertEqual([item["check"] for item in sample(NOW + 3700, 100, 130000)], ["leak-rss"])
+        self.assertEqual(sample(NOW + 3800, 101, 50000), [])
+        self.assertEqual(sample(NOW + 3900, 101, 130000), [])
 
 
 class Exports(Evidence):
