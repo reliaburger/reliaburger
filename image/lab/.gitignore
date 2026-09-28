@@ -1,0 +1,3 @@
+# The lab's working state: VM disks, logs, keys, seeds, artefacts.
+work/
+seed-admin/target/

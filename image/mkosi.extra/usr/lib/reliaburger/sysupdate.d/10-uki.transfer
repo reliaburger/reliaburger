@@ -21,7 +21,9 @@ PathRelativeTo=boot
 MatchPattern=reliaburger-os_@v+@l-@d.efi \
              reliaburger-os_@v+@l.efi \
              reliaburger-os_@v.efi
-Mode=0444
+# Writable: systemd-boot renames the file to count down its tries (+3-0,
+# +2-1, ...), which a FAT read-only attribute would stop.
+Mode=0644
 TriesLeft=3
 TriesDone=0
 InstancesMax=2
