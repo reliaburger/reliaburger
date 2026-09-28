@@ -48,7 +48,14 @@ WTF_WARNING_LIMIT = 600
 NO_LEADER_LIMIT = 30
 RSS_WARMUP = 3600
 RSS_GROWTH = 1.25
-FD_WINDOW = 6 * 3600
+# A leak-fd window: floors over 10-minute buckets after a 10-minute warm-up,
+# each at least FD_STEP above the last, 25% up overall. Bun images rarely
+# live more than two hours in the soak, so the window has to be short.
+FD_WARMUP = 600
+FD_BUCKET = 600
+FD_RISES = 3
+FD_STEP = 10
+FD_GROWTH = 1.25
 REPEAT_WINDOW = 1800
 LEAK_KINDS = ("runc", "netns", "lease", "veth", "cgroup", "bpf", "listen")
 # Pickle resolves every tag through the council's committed catalogue and
@@ -235,20 +242,27 @@ def leak_findings(baseline, current, baseline_instances, current_instances, node
     return findings
 
 
-def fd_findings(samples, now):
-    """Fail when every hourly minimum over the last six hours is higher than the one before."""
-    window = [(ts, fd) for ts, fd in samples if ts >= now - FD_WINDOW]
-    if not window or window[0][0] > now - FD_WINDOW + 600:
+def fd_findings(samples, started, now):
+    """Fail when bun's fd floor rose sharply across each of the last four 10-minute windows.
+
+    Samples belong to one bun image (a new pid or exec starts over). The floor
+    (each window's minimum) ignores the bursts every settle causes; a leak
+    lifts it every time, a peer's restart once.
+    """
+    floors = {}
+    for ts, fd in samples:
+        if ts - started >= FD_WARMUP:
+            window = (ts - started - FD_WARMUP) // FD_BUCKET
+            floors[window] = min(floors.get(window, fd), fd)
+    last = (now - started - FD_WARMUP) // FD_BUCKET - 1
+    windows = range(last - FD_RISES, last + 1)
+    if any(window < 0 or window not in floors for window in windows):
         return []
-    minima = {}
-    for ts, fd in window:
-        bucket = min(5, int((ts - (now - FD_WINDOW)) // 3600))
-        minima[bucket] = min(minima.get(bucket, fd), fd)
-    if len(minima) < 6:
-        return []
-    values = [minima[bucket] for bucket in range(6)]
-    if all(after > before for before, after in zip(values, values[1:])):
-        return [finding("leak-fd", "fail", "bun file descriptors grew for six hours: " + " ".join(map(str, values)))]
+    values = [floors[window] for window in windows]
+    rising = all(after >= before + FD_STEP for before, after in zip(values, values[1:]))
+    if rising and values[-1] >= values[0] * FD_GROWTH:
+        return [finding("leak-fd", "fail", "bun's lowest fd count rose every 10 minutes for half an hour: "
+                        + " ".join(map(str, values)))]
     return []
 
 
@@ -647,13 +661,16 @@ def served_serial_findings(state, kind, node, serial, now):
 def resource_trend_findings(state, node, inventory, now):
     node_state = state.setdefault("resources", {}).setdefault(node, {})
     pid = inventory_number(inventory, "bun_pid")
+    image = (inventory.get("bun_image") or [None])[0]
     fd = inventory_number(inventory, "bun_fd")
     rss = inventory_number(inventory, "bun_rss_kb")
-    if pid != node_state.get("pid"):
-        node_state.update(pid=pid, fd_samples=[], started=now)
+    # An upgrade walk execs bun in place: same pid, a new image whose RSS
+    # starts from nothing. Either change is a new process to warm up.
+    if pid != node_state.get("pid") or image != node_state.get("image"):
+        node_state.update(pid=pid, image=image, fd_samples=[], started=now)
         node_state.pop("rss_warm_kb", None)
     if fd is not None:
-        node_state["fd_samples"] = [sample for sample in node_state["fd_samples"] if sample[0] >= now - FD_WINDOW] + [[now, fd]]
+        node_state["fd_samples"] = [sample for sample in node_state["fd_samples"] if sample[0] >= now - (FD_RISES + 3) * FD_BUCKET] + [[now, fd]]
     trend = state.setdefault("trends", {}).setdefault(node, {})
     for key, value in (("fd", fd), ("rss_kb", rss)):
         if value is None:
@@ -667,7 +684,7 @@ def resource_trend_findings(state, node, inventory, now):
             entry = trend.setdefault("disk_kb " + name, {"first": int(size), "max": int(size)})
             entry["last"] = int(size)
             entry["max"] = max(entry["max"], int(size))
-    findings = [dict(item, target=node) for item in fd_findings(node_state["fd_samples"], now)]
+    findings = [dict(item, target=node) for item in fd_findings(node_state["fd_samples"], node_state["started"], now)]
     findings += [dict(item, target=node) for item in rss_findings(node_state, rss, now, node_state["started"])]
     return findings
 

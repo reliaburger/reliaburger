@@ -655,6 +655,10 @@ echo "bun_pid $pid"
 if [ "${pid:-0}" -gt 0 ]; then
     echo "bun_fd $(ls /proc/"$pid"/fd | wc -l)"
     echo "bun_rss_kb $(awk '/^VmRSS/ {print $2}' /proc/"$pid"/status)"
+    # exec keeps the pid, but the kernel hands the new image a fresh
+    # auxiliary vector whose addresses ASLR randomises: its checksum tells a
+    # self-upgrade's exec apart from the process it replaced.
+    echo "bun_image $(cksum < /proc/"$pid"/auxv | cut -d' ' -f1)"
 fi
 runc --root /var/lib/reliaburger/data/instances/runc/state list -q 2>/dev/null | sed 's/^/runc /'
 ls /run/netns 2>/dev/null | sed 's/^/netns /'
