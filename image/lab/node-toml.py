@@ -2,6 +2,7 @@
 # node-toml.py <n> <count>: node.toml for lab node n of count (spike S3).
 # Mirrors src/relish/quickstart/provision.rs::node_config, plus
 # operator_cidrs for relish on the lab server (192.168.105.1).
+import os
 import sys
 n, count = int(sys.argv[1]), int(sys.argv[2])
 ip = lambda i: f"192.168.105.{100 + i}"
@@ -39,4 +40,11 @@ enabled = true
 [testing]
 safety_class = "development"
 allowed_operations = ["inject_workload_faults", "alter_node_state"]
+''', end="")
+# Cluster bun upgrades need the operator's countersignature too
+# (docs/manual/12_operations.md): OPERATOR_KEY="ed25519:..." adds its key.
+if os.environ.get("OPERATOR_KEY"):
+    print(f'''
+[upgrades]
+external_signing_key = "{os.environ["OPERATOR_KEY"]}"
 ''', end="")

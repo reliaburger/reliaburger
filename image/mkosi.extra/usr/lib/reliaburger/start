@@ -1,9 +1,35 @@
 #!/bin/sh
-# Starts bun: as a cluster node once a seed has installed
-# /etc/reliaburger/node.toml, otherwise standalone on loopback (what the CI
-# boot tests check).
+# Starts bun (research §7.6, item 7). /usr is read-only, but bun upgrades
+# itself by writing bun-vX.Y.Z beside its own binary and moving a bun
+# symlink. So bun runs from /var/lib/reliaburger/bin, and this launcher
+# installs the image's own bun there only when it's newer than the active
+# one: neither an OS update nor a bun upgrade can move bun backwards.
+#
+# With a seed's /etc/reliaburger/node.toml (spike S3) bun runs as a cluster
+# node; without one it runs standalone on loopback, which is what the CI boot
+# tests check.
+set -eu
+bin=/var/lib/reliaburger/bin
+image=/usr/lib/reliaburger/bin/bun
+
+version() { "$1" --version 2>/dev/null | awk '{ print $2 }'; }
+
+install -d -m 0755 "$bin"
+image_version=$(version "$image")
+active_version=
+[ -x "$bin/bun" ] && active_version=$(version "$bin/bun")
+if [ -z "$active_version" ] \
+    || [ "$(printf '%s\n%s\n' "$active_version" "$image_version" | sort -V | tail -n 1)" != "$active_version" ]; then
+    # First boot, or the image brought a newer bun than the active one.
+    install -m 0755 "$image" "$bin/.bun-v$image_version.tmp"
+    mv -f "$bin/.bun-v$image_version.tmp" "$bin/bun-v$image_version"
+    ln -sfn "bun-v$image_version" "$bin/.bun.tmp"
+    mv -Tf "$bin/.bun.tmp" "$bin/bun"
+    echo "reliaburger: bun $image_version from the image is now active (was ${active_version:-none})"
+fi
+
 if [ -f /etc/reliaburger/node.toml ]; then
-    exec /usr/lib/reliaburger/bin/bun --cluster --runtime runc \
+    exec "$bin/bun" --cluster --runtime runc \
         --config /etc/reliaburger/node.toml --listen 0.0.0.0:9117
 fi
-exec /usr/lib/reliaburger/bin/bun --runtime runc --listen 127.0.0.1:9117
+exec "$bin/bun" --runtime runc --listen 127.0.0.1:9117
