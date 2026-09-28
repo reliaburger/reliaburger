@@ -2,7 +2,7 @@
 
 *Research note, 28 September 2026. Docs only, no product code. It builds on the appliance OS research ([`2026-09-26-research-appliance-os.md`](2026-09-26-research-appliance-os.md), draft PR #218) and the S1 image work (`feat/appliance-image`, draft PR #259). Repo facts come from `main` at `087d882f`. External facts come from primary sources fetched today; the URLs are in the Sources section. **[unverified]** marks a claim nobody has confirmed from a primary source. **[inference]** marks my own reading of code or docs.*
 
-> **Status: complete, awaiting maintainer review.** Branch `research/fleet-control-plane`, based on `research/appliance-os`. Nobody should start building from this until the maintainer answers §15.
+> **Status: complete; maintainer decisions recorded (28 September 2026, [§15a](#15a-decisions-28-september-2026)).** Branch `research/fleet-control-plane`, based on `research/appliance-os`. The fleet control plane is **not** part of 0.3.0 ("Bare metal in an hour"); it's a later release. 0.3.0 ships the appliance claim flow, designed so the fleet can extend it later.
 
 ## Progress checklist (for whoever resumes this)
 
@@ -22,7 +22,7 @@
 - [x] Packaging decision: separate repo, integrated, or hybrid (§3, §14)
 - [x] Repo gaps, effort, risks, open questions and phased plan (§14–§17)
 - [x] Draft PR opened (#265)
-- [ ] Maintainer review
+- [x] Maintainer review: all nine questions answered "go with the recommendations" (§15a); fleet moves to a release after 0.3.0
 
 ---
 
@@ -38,7 +38,7 @@
 4. **Trust is established once per machine, not once per cluster.** Enrolling a machine into the fleet is the physical ceremony: compare the console fingerprint, or accept TOFU inside a short boot window. After that the machine pins the fleet's key, and every allocation, wipe and move is authenticated by keys that already exist. There's no TPM in the Wyse, so hardware attestation is an optional upgrade later, not a foundation (§5).
 5. **The fleet never touches `master.key`.** It mints a node-bound, single-use join token with a new scoped `Enroller` credential and pushes it down the machine channel. The node fetches the master key itself after joining (appliance gap G1).
 6. **No WireGuard overlay in v0 or v1.** A LAN plus mTLS with pinned keys is enough for one site. Multi-site gets an outbound "phone-home" TLS channel from the machine, not SideroLink-style WireGuard (§12).
-7. **Fold the appliance plan's Phase 2 claim flow into fleet v0**, rather than building `relish machines claim` and then a fleet on top of it. That saves roughly two weeks and one migration.
+7. **Fold the appliance plan's Phase 2 claim flow into fleet v0**, rather than building `relish machines claim` and then a fleet on top of it. That saves roughly two weeks and one migration. *Decided (§15a): yes. Because the fleet comes after 0.3.0, the 0.3.0 claim flow is built as the first slice of fleet enrolment: `relish fleet` naming, the identity partition and the LUKS data partition from the start, so the fleet extends it rather than replacing it.*
 
 **Not chosen:** a separate optional repo or binary (protocol version skew between two release trains, and a second thing to install, §3); putting fleet state inside one cluster's Raft (a cluster shouldn't own its peers' machines, §7); a Kubernetes-style management cluster (Tinkerbell and Cluster API's pattern, far too heavy for ten thin clients, §2.3).
 
@@ -660,6 +660,22 @@ Carried from the appliance research (G1–G6) where they block the fleet, plus n
 
 ---
 
+## 15a. Decisions (28 September 2026)
+
+The maintainer answered all nine questions on 28 September 2026: go with the recommendations. The fleet control plane is not in 0.3.0; it's a later release (the roadmap lists it under "Later").
+
+1. **Fold the appliance claim into fleet v0.** Yes. The commands are `relish fleet …`, not `relish machines …`, and the appliance layout gets a small identity partition (F3) and a LUKS data partition. Since the fleet ships after 0.3.0, the 0.3.0 claim flow must be designed so the fleet can extend it later: the machine key, the identity partition, the enrolment record and the versioned machine API (F4) arrive with the claim, and fleet v0 adds allocation, wipe and moves on top without changing the disk layout or re-enrolling machines. That changes PR #218's Phase 2 wording and PR #259's partition layout.
+2. **Default enrolment:** the timed boot window (§5.3 mode 2), with `--confirm` available for anyone who wants to check each console fingerprint.
+3. **The `Enroller` role:** a new `ApiRole` variant, not a scope on Admin tokens.
+4. **LUKS on every appliance's data partition**, for crypto-erase. Without a TPM it doesn't protect a stolen disk, and the docs say so.
+5. **Where v1 runs:** on the operator's laptop by default. A spare Wyse or an app on a managed cluster remain options.
+6. **Dead-node auto-replacement:** ships in v1, opt-in.
+7. **Power control:** Wake-on-LAN plus the power button is enough for now. Smart plugs and BMC drivers wait for v2 and demand.
+8. **Franchise:** the fleet stays separate. The fleet is about machines, Franchise about services.
+9. **Licence and packaging:** Apache-2.0, in-tree, on by default (no cargo feature).
+
+What this means for the plan below: the v0 estimate's "on top of appliance Phase 2 if folded in" figure (3–5 weeks) applies, because the claim flow lands in 0.3.0 already shaped for the fleet. The rest of v0 and all of v1 move to the fleet's own release.
+
 ## 16. Phased plan
 
 Effort is in engineer-weeks, including tests-first work and book and manual updates per `CLAUDE.md`. The estimates assume appliance Phase 1 (appliance mode, seed, G1/G2) and Phase 2b (`relish netboot`) exist.
@@ -709,7 +725,7 @@ Effort is in engineer-weeks, including tests-first work and book and manual upda
 - **eMMC secure discard support varies** by part **[unverified on the Wyse]**. Crypto-erase alone is still sound, because the key is gone.
 - **Drain semantics are new** (F1). A drain that says "done" too early moves a node with live placements. The preflight and a Ready-elsewhere wait mitigate it, and the chaos suite should cover it.
 - **Scope creep toward Omni.** Auth providers, a SaaS, multi-tenancy. v0 and v1 deliberately have one operator, one fleet key and one LAN.
-- **Coupling to the appliance timeline.** Fleet v0 can't start until appliance Phase 1 and G1 land, and it changes PR #259's disk layout (F3). Deciding question 1 early avoids reworking the layout.
+- **Coupling to the appliance timeline.** Fleet v0 can't start until appliance Phase 1 and G1 land. Question 1 is now decided (§15a), so the 0.3.0 layout carries the identity and LUKS data partitions from the start, and the fleet release shouldn't need to rework it.
 
 ---
 
