@@ -55,11 +55,10 @@ from `plans/million-jobs` unchanged), whose findings it keeps and whose
   - Docs: manual `01_deploy-an-app.md` "Task arrays"; book Chapter 12
     "Wiring it in"; `docs/progress.md`; README; `docs/testing.md`.
 - **Next, in order:**
-  1. Watch CI on PR #266 (`full-ci` is on, so `test-cluster` runs
-     `cluster_task_arrays`). It has never run: the local run was refused
-     while the soak held the machine. If it fails, the likely suspects are
-     the silence timeout (3 s) against gossip-derived membership, and port
-     block 23510-23540 clashing with another suite.
+  1. CI on PR #266 is green with `full-ci` (run 36486408185, commit
+     `348db40f`: lint, portable Linux and macOS, privileged Linux, minimum
+     Rust, benchmarks, acceptance, and the multi-node cluster job, which
+     runs `cluster_task_arrays`). Keep `full-ci` on while the wiring moves.
   2. After the soak (about 03:30 BST): record `make bench-task-arrays`
      release numbers here; M0 on a quickstart VM (fork/exec rate of
      `/usr/bin/true` at 1x/2x/4x/8x vCPU concurrency, fsync latency, Raft
@@ -682,7 +681,7 @@ k3s cluster of the same size, and publish both scripts.
 - [x] `POST /v1/batch/array`, `POST /v1/batch/array/sync`, `POST /v1/batch/{id}/cancel`, `GET /v1/batch/{id}` for arrays (`"kind": "array"`, per-node slots, counters and refusal reasons), `GET /v1/batch/{id}/results`, `GET /v1/batch/{id}/tasks/{index}/logs`, plus the two node-local reads (`src/bun/task_array_api.rs`, authz matrix rows, scope checks on submit, cancel, results and logs)
 - [x] leader sync loop with requeue on silence (`src/bun/task_array_leader.rs`: one `Sync` entry per array per tick, grants planned against the state with that tick's results applied; standalone nodes use an in-memory copy). Portable suite `tests/suite/task_arrays.rs`: 100,000 fake tasks through a single-node council in 51 Raft entries; real processes standalone and with failures, results and logs; cancel; refusal reasons
 - [x] `relish run --batch --count` (with `--chunk`, `--max-attempts`, `--max-failed`, `--timeout`, `--concurrency`, `--env`, args after `--`; `--help` states at-least-once), `relish batch cancel`, arrays in `relish batch-status` (counts, chunks, failed indices, per-node slots or refusal); `relish batch FILE` keeps working beside the new subcommands
-- [ ] multi-node in-process cluster test: `tests/cluster_task_arrays.rs` is written and in `make test-cluster` (three wired nodes, 100,000 fake tasks submitted through a follower, a follower killed mid-run and requeued after a 3 s silence timeout). Not yet run: the local run was blocked while the soak holds the machine, so it waits for CI with the `full-ci` label. Tick once it has passed there
+- [x] multi-node in-process cluster test: `tests/cluster_task_arrays.rs` in `make test-cluster` (three wired nodes, 100,000 fake tasks submitted through a follower, a follower killed mid-run and requeued after a 3 s silence timeout). Passed in CI run 36486408185 (`full-ci`, "multi-node cluster" job, 28 September); never run locally
 
 ### M6: views and data
 
