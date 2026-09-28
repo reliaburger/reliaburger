@@ -304,6 +304,10 @@ Fixes from the [static review in PR #258](https://github.com/reliaburger/reliabu
 - [x] **B15** Treat a committed but refused GitOps write (`CouncilResponse::Refused`) as unapplied, so the sync doesn't advance `last_applied_commit` past it.
 - [x] **B17** List GitOps files with `ls-tree -z` so tab and non-ASCII paths aren't dropped, and fail the sync when a listed file can't be read, instead of deleting what it declared.
 
+Fixes for the 0.1.1 milestone:
+
+- [x] **Known members forget departed nodes.** `KnownMembers` (#244) kept every member's last address until Bun restarted. Gossip now also publishes a roster with Dead and Left members (`set_roster_watch`, the live-only watch is unchanged); the known table forgets a member gossip reports as Left or the CRL lists as retired, and any down member not heard from for `KNOWN_MEMBER_RETENTION` (24 h, Smoker's hard fault ceiling), while still keeping a reaped dead member's address for fault clears.
+
 ### Engineering follow-ups
 
 - [x] **H01** Reconcile scheduler/quota/scrape wiring, roadmap test locations, cleanup evidence and disabled-auth chaos policy with their callers; all-feature Rustdoc builds with warnings denied.

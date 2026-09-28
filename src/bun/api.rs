@@ -66,10 +66,135 @@ pub struct NodeMembershipInfo {
 /// node's cluster transports and leaves its management API open: gossip calls
 /// it dead while it can still answer. The node relay and node-fault reversal
 /// reach it through this table, so a caller outside the cluster network can
-/// still inspect it and heal it. `bun` attaches it as a layer; without it the
-/// relay reaches live members only.
-#[derive(Clone)]
-pub struct KnownMembers(pub Arc<RwLock<Vec<NodeMembershipInfo>>>);
+/// still inspect it and heal it, and the nodes listing reports it as dead
+/// rather than dropping it. `bun` attaches it as a layer; without it the relay
+/// reaches live members only.
+///
+/// Remembering is bounded. A member that left on purpose, or whose identity
+/// the operator retired, is forgotten at once: nothing on it needs healing.
+/// A member unheard of for [`KNOWN_MEMBER_RETENTION`] is forgotten too.
+#[derive(Clone, Default)]
+pub struct KnownMembers(Arc<RwLock<Vec<KnownMember>>>);
+
+/// How long a down member's last address outlives the last time gossip heard
+/// from it.
+///
+/// A dead node's address is kept so a fault injected into it can be cleared.
+/// Injection needs a live target, and every fault expires within
+/// [`crate::smoker::types::MAX_FAULT_DURATION_NS`] (24 hours) of injection. So
+/// a node silent for longer holds no fault anyone could still clear, and its
+/// entry only feeds a stale row to `relish nodes`. A day also spans an
+/// overnight outage, so a node that died at 18:00 is still listed as dead the
+/// next morning.
+pub const KNOWN_MEMBER_RETENTION: std::time::Duration =
+    std::time::Duration::from_nanos(crate::smoker::types::MAX_FAULT_DURATION_NS);
+
+/// One member as gossip's roster reports it, with its API address resolved.
+#[derive(Debug, Clone)]
+pub struct RosterMember {
+    /// The member's identity and API endpoint.
+    pub info: NodeMembershipInfo,
+    /// The member's gossip endpoint.
+    pub gossip_address: std::net::SocketAddr,
+    /// The member's SWIM state as this node last saw it.
+    pub state: crate::mustard::state::NodeState,
+    /// The member's SWIM incarnation.
+    pub incarnation: u64,
+    /// The member's placement labels.
+    pub labels: std::collections::BTreeMap<String, String>,
+}
+
+/// A remembered member and when gossip last called it alive or suspect.
+#[derive(Debug, Clone)]
+struct KnownMember {
+    member: RosterMember,
+    last_heard: std::time::Instant,
+}
+
+impl KnownMembers {
+    /// Take gossip's latest roster, remembering members it has reaped.
+    ///
+    /// Gossip reaps a dead member a minute after declaring it dead, while a
+    /// node-kill fault on it may still need clearing. So a member missing from
+    /// `roster` keeps its last address, as dead, rather than vanishing; a
+    /// fresh entry for the same node replaces it. A remembered node that
+    /// really has gone just fails to connect, which is the honest answer for
+    /// a reversal aimed at it.
+    ///
+    /// Members gossip reports as Left, and those named in `retired`, are
+    /// dropped, as is any down member not heard from since
+    /// [`KNOWN_MEMBER_RETENTION`] before `now`.
+    pub async fn refresh(
+        &self,
+        roster: Vec<RosterMember>,
+        retired: &std::collections::BTreeSet<String>,
+        now: std::time::Instant,
+    ) {
+        use crate::mustard::state::NodeState;
+        let mut table = self.0.write().await;
+        let previous: Vec<KnownMember> = table.drain(..).collect();
+        let heard_before = |node_id: &crate::meat::NodeId| {
+            previous
+                .iter()
+                .find(|known| &known.member.info.node_id == node_id)
+                .map(|known| known.last_heard)
+        };
+        let mut next = Vec::new();
+        for member in &roster {
+            if member.state == NodeState::Left || retired.contains(&member.info.node_id.0) {
+                continue;
+            }
+            let last_heard = if member.state.is_down() {
+                heard_before(&member.info.node_id).unwrap_or(now)
+            } else {
+                now
+            };
+            next.push(KnownMember {
+                member: member.clone(),
+                last_heard,
+            });
+        }
+        for known in &previous {
+            let node_id = &known.member.info.node_id;
+            if roster.iter().any(|member| &member.info.node_id == node_id)
+                || retired.contains(&node_id.0)
+            {
+                continue;
+            }
+            // Gossip reaps only down members, and a Left one was forgotten
+            // the moment the roster showed it, so a reaped member was dead.
+            let mut known = known.clone();
+            known.member.state = NodeState::Dead;
+            next.push(known);
+        }
+        next.retain(|known| {
+            !known.member.state.is_down()
+                || now.saturating_duration_since(known.last_heard) <= KNOWN_MEMBER_RETENTION
+        });
+        *table = next;
+    }
+
+    /// The last API address of a member, live or down.
+    pub async fn api_address(&self, node_id: &crate::meat::NodeId) -> Option<std::net::SocketAddr> {
+        self.0
+            .read()
+            .await
+            .iter()
+            .find(|known| &known.member.info.node_id == node_id)
+            .map(|known| known.member.info.address)
+    }
+
+    /// Remembered members that are down: dead to gossip, or reaped by it.
+    pub async fn down(&self) -> Vec<RosterMember> {
+        self.0
+            .read()
+            .await
+            .iter()
+            .filter(|known| known.member.state.is_down())
+            .map(|known| known.member.clone())
+            .collect()
+    }
+}
 
 /// The gossip control-plane directory, which names the leader and its API
 /// endpoint to every node, including workers outside Raft that have no
@@ -79,26 +204,6 @@ pub struct KnownMembers(pub Arc<RwLock<Vec<NodeMembershipInfo>>>);
 pub struct LeaderDirectory(
     pub tokio::sync::watch::Receiver<crate::mustard::directory::NodeDirectory>,
 );
-
-impl KnownMembers {
-    /// Take gossip's latest published members, remembering the rest.
-    ///
-    /// Gossip's published view drops a member the moment it is declared dead,
-    /// which is exactly when a node-kill fault on it needs clearing. So a
-    /// member missing from `current` keeps its last address rather than
-    /// vanishing; a fresh entry for the same node replaces it. A remembered
-    /// node that really has gone just fails to connect, which is the honest
-    /// answer for a reversal aimed at it.
-    pub async fn refresh(&self, current: Vec<NodeMembershipInfo>) {
-        let mut table = self.0.write().await;
-        let remembered: Vec<_> = table
-            .drain(..)
-            .filter(|old| !current.iter().any(|member| member.node_id == old.node_id))
-            .collect();
-        *table = current;
-        table.extend(remembered);
-    }
-}
 
 /// Shared state for API handlers.
 #[derive(Clone)]
@@ -7047,12 +7152,8 @@ async fn known_node_api_url(
         return live;
     };
     let address = known
-        .0
-        .read()
-        .await
-        .iter()
-        .find(|member| member.node_id == crate::meat::NodeId::new(target_node))
-        .map(|member| member.address);
+        .api_address(&crate::meat::NodeId::new(target_node))
+        .await;
     match address {
         Some(address) => Ok(state.cluster_http.url(&address.to_string(), path)),
         None => live,
@@ -16595,7 +16696,14 @@ mod cluster_routing_tests {
             });
             listeners.push(listener);
         }
-        let known = KnownMembers(Arc::new(RwLock::new(membership.clone())));
+        let known = KnownMembers::default();
+        known
+            .refresh(
+                roster_of(&membership, crate::mustard::state::NodeState::Alive),
+                &Default::default(),
+                std::time::Instant::now(),
+            )
+            .await;
         let membership = Arc::new(RwLock::new(membership));
         let mut nodes = Vec::new();
         for ((name, instances), listener) in layout.into_iter().zip(listeners) {
@@ -17091,7 +17199,14 @@ mod cluster_routing_tests {
             .cloned()
             .collect();
         *cluster.membership.write().await = live.clone();
-        cluster.known.refresh(live).await;
+        cluster
+            .known
+            .refresh(
+                roster_of(&live, crate::mustard::state::NodeState::Alive),
+                &Default::default(),
+                std::time::Instant::now(),
+            )
+            .await;
 
         let (status, body) = relay(
             &cluster,
@@ -17106,28 +17221,173 @@ mod cluster_routing_tests {
         cluster.stop.cancel();
     }
 
-    #[tokio::test]
-    async fn known_members_take_a_returning_members_new_address_once() {
-        let member = |name: &str, port: u16| NodeMembershipInfo {
+    /// Gossip's roster for `members`, every one in `state`.
+    fn roster_of(
+        members: &[NodeMembershipInfo],
+        state: crate::mustard::state::NodeState,
+    ) -> Vec<RosterMember> {
+        members
+            .iter()
+            .map(|info| RosterMember {
+                info: info.clone(),
+                gossip_address: info.address,
+                state,
+                incarnation: 1,
+                labels: Default::default(),
+            })
+            .collect()
+    }
+
+    fn known_member(name: &str, port: u16) -> NodeMembershipInfo {
+        NodeMembershipInfo {
             node_id: crate::meat::NodeId::new(name),
             address: std::net::SocketAddr::from(([127, 0, 0, 1], port)),
             api_advertised: true,
-        };
-        let known = KnownMembers(Arc::default());
+        }
+    }
+
+    async fn known_ports(known: &KnownMembers) -> Vec<(String, u16)> {
+        let mut ports = Vec::new();
+        for name in ["node-1", "node-2", "node-3"] {
+            if let Some(address) = known.api_address(&crate::meat::NodeId::new(name)).await {
+                ports.push((name.to_string(), address.port()));
+            }
+        }
+        ports
+    }
+
+    #[tokio::test]
+    async fn known_members_take_a_returning_members_new_address_once() {
+        use crate::mustard::state::NodeState::Alive;
+        let known = KnownMembers::default();
+        let none = Default::default();
+        let now = std::time::Instant::now();
+        let both = [known_member("node-1", 1001), known_member("node-2", 1002)];
+        known.refresh(roster_of(&both, Alive), &none, now).await;
+        let one = [known_member("node-1", 1001)];
+        known.refresh(roster_of(&one, Alive), &none, now).await;
+        let returned = [known_member("node-1", 1001), known_member("node-2", 2002)];
+        known.refresh(roster_of(&returned, Alive), &none, now).await;
+
+        assert_eq!(
+            known_ports(&known).await,
+            vec![("node-1".to_string(), 1001), ("node-2".to_string(), 2002)]
+        );
+    }
+
+    /// The #244 behaviour: a node gossip declared dead, then reaped, keeps
+    /// its last address so a node-kill fault on it can still be cleared.
+    #[tokio::test]
+    async fn known_members_keep_a_dead_member_after_gossip_reaps_it() {
+        use crate::mustard::state::NodeState::{Alive, Dead};
+        let known = KnownMembers::default();
+        let none = Default::default();
+        let now = std::time::Instant::now();
+        let alive = [known_member("node-1", 1001), known_member("node-2", 1002)];
+        known.refresh(roster_of(&alive, Alive), &none, now).await;
+        let mut roster = roster_of(&alive[..1], Alive);
+        roster.extend(roster_of(&alive[1..], Dead));
+        known.refresh(roster, &none, now).await;
         known
-            .refresh(vec![member("node-1", 1001), member("node-2", 1002)])
-            .await;
-        known.refresh(vec![member("node-1", 1001)]).await;
-        known
-            .refresh(vec![member("node-1", 1001), member("node-2", 2002)])
+            .refresh(roster_of(&alive[..1], Alive), &none, now)
             .await;
 
-        let table = known.0.read().await;
-        let ports: Vec<_> = table
-            .iter()
-            .map(|member| (member.node_id.0.as_str(), member.address.port()))
-            .collect();
-        assert_eq!(ports, vec![("node-1", 1001), ("node-2", 2002)]);
+        assert_eq!(
+            known_ports(&known).await,
+            vec![("node-1".to_string(), 1001), ("node-2".to_string(), 1002)]
+        );
+        let down = known.down().await;
+        assert_eq!(down.len(), 1);
+        assert_eq!(down[0].info.node_id.0, "node-2");
+        assert_eq!(down[0].state, Dead);
+    }
+
+    #[tokio::test]
+    async fn known_members_forget_a_member_that_left() {
+        use crate::mustard::state::NodeState::{Alive, Left};
+        let known = KnownMembers::default();
+        let none = Default::default();
+        let now = std::time::Instant::now();
+        let alive = [known_member("node-1", 1001), known_member("node-2", 1002)];
+        known.refresh(roster_of(&alive, Alive), &none, now).await;
+        let mut roster = roster_of(&alive[..1], Alive);
+        roster.extend(roster_of(&alive[1..], Left));
+        known.refresh(roster, &none, now).await;
+        // Gossip reaps the Left entry; it must not come back as dead.
+        known
+            .refresh(roster_of(&alive[..1], Alive), &none, now)
+            .await;
+
+        assert_eq!(
+            known_ports(&known).await,
+            vec![("node-1".to_string(), 1001)]
+        );
+        assert!(known.down().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn known_members_forget_a_retired_member_live_or_remembered() {
+        use crate::mustard::state::NodeState::{Alive, Dead};
+        let known = KnownMembers::default();
+        let none = std::collections::BTreeSet::new();
+        let now = std::time::Instant::now();
+        let all = [
+            known_member("node-1", 1001),
+            known_member("node-2", 1002),
+            known_member("node-3", 1003),
+        ];
+        known.refresh(roster_of(&all, Alive), &none, now).await;
+        // node-2 dies and is reaped; node-3 is still dead in gossip's table.
+        let mut roster = roster_of(&all[..1], Alive);
+        roster.extend(roster_of(&all[2..], Dead));
+        known.refresh(roster.clone(), &none, now).await;
+
+        let retired =
+            std::collections::BTreeSet::from(["node-2".to_string(), "node-3".to_string()]);
+        known.refresh(roster, &retired, now).await;
+
+        assert_eq!(
+            known_ports(&known).await,
+            vec![("node-1".to_string(), 1001)]
+        );
+    }
+
+    #[tokio::test]
+    async fn known_members_forget_a_dead_member_unheard_of_for_the_retention() {
+        use crate::mustard::state::NodeState::Alive;
+        let known = KnownMembers::default();
+        let none = Default::default();
+        let start = std::time::Instant::now();
+        let alive = [known_member("node-1", 1001), known_member("node-2", 1002)];
+        known.refresh(roster_of(&alive, Alive), &none, start).await;
+        // node-2 dies and is reaped at once.
+        let later = start + std::time::Duration::from_secs(60);
+        known
+            .refresh(roster_of(&alive[..1], Alive), &none, later)
+            .await;
+
+        let just_inside = start + KNOWN_MEMBER_RETENTION;
+        known
+            .refresh(roster_of(&alive[..1], Alive), &none, just_inside)
+            .await;
+        assert_eq!(known_ports(&known).await.len(), 2);
+
+        let past = just_inside + std::time::Duration::from_secs(1);
+        known
+            .refresh(roster_of(&alive[..1], Alive), &none, past)
+            .await;
+        assert_eq!(
+            known_ports(&known).await,
+            vec![("node-1".to_string(), 1001)]
+        );
+    }
+
+    #[test]
+    fn known_member_retention_covers_the_longest_fault() {
+        assert_eq!(
+            KNOWN_MEMBER_RETENTION,
+            std::time::Duration::from_secs(24 * 3600)
+        );
     }
 
     #[test]
