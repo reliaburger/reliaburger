@@ -21,7 +21,7 @@ Awaiting maintainer review.
 - [x] 13. Open questions for the maintainer
 - [x] Draft PR opened (#268)
 
-Sections are filled in order and committed as each one lands.
+All sections are written. Next step: the maintainer answers section 13; then, after the release soak frees the Lima VMs, spikes S1-S8 (section 10).
 
 ## 1. Recommendation
 
