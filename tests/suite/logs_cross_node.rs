@@ -271,6 +271,7 @@ async fn partial_results_when_node_unreachable() {
             timestamp,
             sequence: timestamp,
             instance: None,
+            node: None,
             stream: LogStream::Stdout,
             line: format!("node1 ts={timestamp}"),
         })

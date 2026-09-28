@@ -673,6 +673,14 @@ enum DeployOp {
         firewall: Option<Vec<String>>,
         reply: oneshot::Sender<Result<(), BunError>>,
     },
+    /// Re-register the service and ingress route a completed stop released,
+    /// before a redeploy rolls over the stopped replicas it kept.
+    RestoreStoppedRouting {
+        app_name: String,
+        namespace: String,
+        spec: Box<AppSpec>,
+        reply: oneshot::Sender<Result<(), BunError>>,
+    },
     /// Forget fresh instances that never left Pending, so a deploy that failed
     /// before touching the runtime leaves nothing for its retry to replace.
     AbandonUnstartedInstances {
@@ -1047,6 +1055,27 @@ impl DeployOps {
                 namespace: namespace.to_string(),
                 port,
                 firewall,
+                reply,
+            },
+            Err(BunError::BackendPublication {
+                service: crate::onion::service_id::ServiceId::new(namespace, app_name),
+                reason: "agent loop closed before service registration".into(),
+            }),
+        )
+        .await
+    }
+
+    async fn restore_stopped_routing(
+        &self,
+        app_name: &str,
+        namespace: &str,
+        spec: &AppSpec,
+    ) -> Result<(), BunError> {
+        self.call(
+            |reply| DeployOp::RestoreStoppedRouting {
+                app_name: app_name.to_string(),
+                namespace: namespace.to_string(),
+                spec: Box::new(spec.clone()),
                 reply,
             },
             Err(BunError::BackendPublication {
@@ -8898,6 +8927,40 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         Ok(())
     }
 
+    /// Restore what `finish_app_stop` released for an app whose stopped
+    /// replicas are still owned, so a redeploy can publish into it again.
+    ///
+    /// Leaves a registered service and a stored route untouched: only a
+    /// completed stop removes them while the replicas stay owned. The VIP is
+    /// derived from the app's name, so the service comes back under the
+    /// address it had before the stop, as the cluster catalogue keeps it.
+    async fn restore_stopped_routing(
+        &mut self,
+        app_name: &str,
+        namespace: &str,
+        spec: &AppSpec,
+    ) -> Result<(), BunError> {
+        let service_id = crate::onion::service_id::ServiceId::new(namespace, app_name);
+        if let Some(port) = spec.port
+            && self.service_map.resolve(&service_id).is_none()
+        {
+            let firewall = spec
+                .firewall
+                .as_ref()
+                .filter(|firewall| !firewall.allow_from.is_empty())
+                .map(|firewall| firewall.allow_from.clone());
+            self.register_local_service(&service_id, port, firewall)?;
+            self.publish_backend_ebpf(&service_id).await?;
+            self.sync_firewall_ebpf().await;
+        }
+        if let Some(ingress) = &spec.ingress {
+            self.ingress_configs
+                .entry((namespace.to_string(), app_name.to_string()))
+                .or_insert_with(|| ingress.clone());
+        }
+        Ok(())
+    }
+
     /// Prepare every view before replacing any confirmed cluster publication.
     async fn publish_cluster_catalogue(
         &mut self,
@@ -10661,6 +10724,17 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 .await;
                 let _ = reply.send(result);
             }
+            DeployOp::RestoreStoppedRouting {
+                app_name,
+                namespace,
+                spec,
+                reply,
+            } => {
+                let result = self
+                    .restore_stopped_routing(&app_name, &namespace, &spec)
+                    .await;
+                let _ = reply.send(result);
+            }
             DeployOp::AbandonUnstartedInstances {
                 service,
                 instance_ids,
@@ -11204,6 +11278,22 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             let existing = self.ops.list_existing_owned(app_name, namespace).await;
 
             if !existing.is_empty() {
+                // A standalone `relish stop` keeps its stopped replicas owned
+                // but releases their service and ingress route. The rollout
+                // over them publishes backends into that service, so it has
+                // to exist again first.
+                if let Err(error) = self
+                    .ops
+                    .restore_stopped_routing(app_name, namespace, spec)
+                    .await
+                {
+                    let _ = events
+                        .send(ApplyEvent::Error {
+                            message: error.to_string(),
+                        })
+                        .await;
+                    return;
+                }
                 // Dispatch on deploy strategy (E): blue-green stands up the
                 // whole new fleet before swapping; rolling replaces one at a
                 // time. Everything else about the deploy is identical. An app
@@ -15642,6 +15732,52 @@ mod tests {
                 .contains_key(&("backup".into(), "blue".into()))
         );
         assert!(agent.supervisor.list_instances().is_empty());
+    }
+
+    /// A standalone `relish stop` keeps the stopped replicas owned but
+    /// releases the app's service and ingress route. Applying the same spec
+    /// again rolls over those stopped replicas, so the rollout itself must
+    /// restore what the stop released: the service under its original VIP,
+    /// its backends and its ingress route.
+    #[tokio::test]
+    async fn apply_after_stop_restores_the_service_and_ingress_route() {
+        let (mut agent, tx, shutdown) = test_agent();
+        let view = agent.service_map_watch();
+        let routes = agent.routing_table_handle();
+        let task = tokio::spawn(async move { agent.run().await });
+        let config = || {
+            Config::parse(
+                "[app.web]\nimage = 'myapp:v1'\nport = 8080\n\
+                 [app.web.ingress]\nhost = 'web.example'\n",
+            )
+            .unwrap()
+        };
+        let service = crate::onion::service_id::ServiceId::new("default", "web");
+        expect_complete(&send_deploy(&tx, config()).await);
+        let original_vip = view.borrow().resolve(&service).unwrap().vip;
+
+        let (response, stopped) = oneshot::channel();
+        tx.send(AgentCommand::Stop {
+            app_name: "web".into(),
+            namespace: "default".into(),
+            response,
+        })
+        .await
+        .unwrap();
+        stopped.await.unwrap().unwrap();
+        assert!(view.borrow().resolve(&service).is_none());
+        assert!(!routes.read().await.contains_host("web.example"));
+
+        let events = send_deploy(&tx, config()).await;
+        let restored = view.borrow().resolve(&service).cloned();
+        let routed = routes.read().await.contains_host("web.example");
+        shutdown.cancel();
+        task.await.unwrap();
+        expect_complete(&events);
+        let restored = restored.expect("the reapplied app has no service");
+        assert_eq!(restored.vip, original_vip);
+        assert_eq!(restored.backends.len(), 1, "{restored:?}");
+        assert!(routed, "the reapplied app has no ingress route");
     }
 
     /// Send a Deploy command and collect all events. Returns the list
@@ -20819,6 +20955,40 @@ host = "remote.local"
         agent.stop_app("web", "default").await.unwrap();
         assert!(events.iter().any(|event| matches!(event, ApplyEvent::Error { message } if message.contains("generation exhausted"))), "{events:?}");
         assert_eq!(calls.len(), before);
+    }
+
+    #[tokio::test]
+    async fn redeploying_the_same_spec_over_a_stopped_replica_runs_one_again() {
+        // A retirement whose stop finished but whose address release is
+        // still waiting on other nodes leaves the replica stopped and owned,
+        // with its service still registered. When the leader hands the
+        // placement back, the placement reconciler redeploys the identical
+        // spec, and that must converge on a running replica.
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        grill.set_pid(std::process::id());
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        let stop = agent.begin_app_stop("web", "default").await.unwrap();
+        agent.app_exit_wait(&stop).await.unwrap();
+        for id in &stop.instances {
+            let instance = agent.supervisor.get_instance_mut(id).unwrap();
+            instance.state = instance
+                .state
+                .transition_to(ContainerState::Stopped)
+                .unwrap();
+        }
+        let running = |agent: &BunAgent<MockGrill>| {
+            agent
+                .supervisor
+                .list_instances()
+                .iter()
+                .filter(|instance| instance.state == ContainerState::Running)
+                .count()
+        };
+        assert_eq!(running(&agent), 0);
+
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+
+        assert_eq!(running(&agent), 1, "the redeploy left no running replica");
     }
 
     #[tokio::test]

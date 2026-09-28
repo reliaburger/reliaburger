@@ -172,6 +172,7 @@ pub(crate) fn batches_to_entries(batches: &[RecordBatch]) -> Result<Vec<LogEntry
                 timestamp: timestamps.value(row),
                 sequence,
                 instance,
+                node: None,
                 stream,
                 line: lines.value(row).to_string(),
             });

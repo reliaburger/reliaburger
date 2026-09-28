@@ -1786,21 +1786,67 @@ fn spawn_placement_reconciler_with_io_timeout(
                         eprintln!(
                             "orchestrator: retirement of {name}/{namespace} failed, will retry: {e}"
                         );
+                        forget_convergence(
+                            &mut applied,
+                            (name, namespace),
+                            checkpoint_path.as_deref(),
+                        )
+                        .await;
                     }
                     Ok(Err(error)) => {
                         eprintln!(
                             "orchestrator: retirement of {name}/{namespace}: {error}; will retry"
                         );
+                        forget_convergence(
+                            &mut applied,
+                            (name, namespace),
+                            checkpoint_path.as_deref(),
+                        )
+                        .await;
                     }
                     Err(_) => {
                         eprintln!(
                             "orchestrator: retirement of {name}/{namespace} exceeded {retire_timeout:?}; ownership retained"
                         );
+                        forget_convergence(
+                            &mut applied,
+                            (name, namespace),
+                            checkpoint_path.as_deref(),
+                        )
+                        .await;
                     }
                 }
             }
         }
     })
+}
+
+/// Keep ownership of a workload whose retirement did not finish, but stop
+/// calling it converged.
+///
+/// A retirement that fails part-way has usually stopped the replicas already
+/// (the address release is what waits on other nodes). If the leader then
+/// hands the same assignment back, as it does when a node it briefly gave up
+/// on reports again, an `Applied` fingerprint would match and the stopped
+/// replicas would never be started. `Pending` still retires the workload if
+/// the assignment stays gone, and deploys it if the assignment returns.
+async fn forget_convergence(
+    applied: &mut AppliedMap,
+    key: (String, String),
+    checkpoint_path: Option<&std::path::Path>,
+) {
+    let Some(state) = applied.get_mut(&key) else {
+        return;
+    };
+    if matches!(state, AssignmentState::Pending) {
+        return;
+    }
+    *state = AssignmentState::Pending;
+    // The in-memory state already drives this process; a failed write only
+    // means a restart re-derives convergence from the runtime inventory.
+    if let Err(error) = persist_placements(checkpoint_path, applied).await {
+        eprintln!("orchestrator: cannot record unfinished retirement: {error}");
+    }
 }
 
 /// How long the reconciler waits for a deploy's terminal event before giving
@@ -2071,6 +2117,110 @@ mod tests {
         assert!(
             elapsed < grace * 2,
             "retirements serialised: {elapsed:?} for three {grace:?} stops"
+        );
+    }
+
+    /// V02 soak (final tier, setup): after every node's agent restarted, the
+    /// leader briefly moved `frontend` off node 2 and then placed it back with
+    /// the same spec. The retirement in between stopped the replica but could
+    /// not release its address yet ("other nodes have not yet confirmed the
+    /// endpoint's withdrawal"), so the replica stayed stopped. The checkpoint
+    /// still said the assignment was applied, so the returning placement was
+    /// skipped as already converged, and the app ran 2 of 3 replicas for good.
+    #[tokio::test]
+    async fn a_placement_returning_after_a_failed_retirement_is_deployed_again() {
+        let spec = spec_from_toml(
+            "[app.web]\nimage = \"proc-grill:image-ignored\"\ncommand = [\"sleep\", \"60\"]",
+        );
+        let assignment = NodeAssignment {
+            name: "web".into(),
+            namespace: "default".into(),
+            replicas: 1,
+            spec: spec.clone(),
+        };
+        let mut applied_spec = spec;
+        applied_spec.replicas = Replicas::Fixed(1);
+        let root = tempfile::tempdir().unwrap();
+        let checkpoint = crate::cluster::applied::checkpoint_path(root.path());
+        crate::cluster::applied::save(
+            &checkpoint,
+            &[(
+                ("web".to_string(), "default".to_string()),
+                AssignmentState::Applied {
+                    fingerprint: serde_json::to_string(&applied_spec).unwrap(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        )
+        .unwrap();
+
+        // The leader withdraws the assignment until the node has tried to
+        // retire it, then hands the identical assignment back.
+        let returned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let serve_returned = returned.clone();
+        let router = axum::Router::new().route(
+            "/v1/placements/worker",
+            axum::routing::get(move || {
+                let returned = serve_returned.load(std::sync::atomic::Ordering::SeqCst);
+                let assignment = assignment.clone();
+                async move {
+                    axum::Json(NodeAssignments {
+                        apps: if returned { vec![assignment] } else { vec![] },
+                        ..Default::default()
+                    })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let (commands, mut received) = mpsc::channel(8);
+        let reconciler = reconciler_for_deadline_test(address, root.path(), commands);
+
+        let redeployed = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match received.recv().await.unwrap() {
+                    AgentCommand::Status { response } => {
+                        // The replica runs when the restarted reconciler checks.
+                        let _ = response.send(vec![crate::bun::agent::InstanceStatus {
+                            id: "default__web-0".into(),
+                            app_name: "web".into(),
+                            namespace: "default".into(),
+                            state: "running".into(),
+                            restart_count: 0,
+                            host_port: Some(30000),
+                            exit_code: None,
+                            pid: Some(1),
+                        }]);
+                    }
+                    AgentCommand::SyncClusterConsumer { response, .. } => {
+                        let _ = response.send(Ok(crate::bun::agent::ConsumerUpdate {
+                            published: true,
+                            receipts: vec![],
+                        }));
+                    }
+                    AgentCommand::Retire { response, .. } => {
+                        // The stop went through; the address release did not.
+                        returned.store(true, std::sync::atomic::Ordering::SeqCst);
+                        let _ = response.send(Err(crate::bun::BunError::ProducerReleasePending {
+                            instance_id: crate::grill::InstanceId("default__web-0".into()),
+                            reason: "other nodes have not yet confirmed the endpoint's withdrawal",
+                        }));
+                    }
+                    AgentCommand::Deploy { .. } => break,
+                    _ => {}
+                }
+            }
+        })
+        .await;
+        reconciler.abort();
+        let _ = reconciler.await;
+        server.abort();
+        let _ = server.await;
+        assert!(
+            redeployed.is_ok(),
+            "the returning placement was skipped as already converged"
         );
     }
 
