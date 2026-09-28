@@ -44,9 +44,11 @@ from `plans/million-jobs` unchanged), whose findings it keeps and whose
      at 1x/2x/4x/8x vCPU concurrency, fsync latency, Raft commit rate.
   3. Ask the maintainer for the M5 decision (see "M5: the finalisation
      gate"). Nothing in M6 starts before that.
-  4. Small library follow-ups that don't need M5, if wanted meanwhile: a
-     mergeable latency histogram for start lag and run time (M7 needs it),
-     and a `rb-task` demo binary under `examples/million-jobs/`.
+  4. Small library follow-ups that don't need M5, if wanted meanwhile: the
+     mergeable latency histogram is done (`src/meat/latency_histogram.rs`);
+     still open are recording start lag and run time into it from
+     `TaskPool` (a `PoolCounters` field) and an `rb-task` demo binary under
+     `examples/million-jobs/`.
 - **Local build constraints while the release soak runs:**
   `CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=$HOME/.cache/rb-target-millionjobs`;
   run only the targeted unit tests (`cargo test --lib meat::index_set` and so
@@ -375,8 +377,9 @@ follow-up, since at-least-once already allows it.
 - **Cancellation.** Stop admitting, send SIGTERM to running tasks, SIGKILL
   after a 10 s grace, report partial chunks as cancelled.
 - **Counters** are plain integers plus a mergeable latency histogram
-  (log-linear buckets, 4 sub-buckets per power of two, about 19% relative
-  error, 128 `u64` buckets, merged by addition). No new crate needed.
+  (`src/meat/latency_histogram.rs`: log-linear buckets, 4 per power of two,
+  128 `u64` buckets in microseconds, merged by addition, percentiles within
+  25%, serialised sparsely). No new crate needed.
 
 ### Leader and node talk once a second (wiring, M6)
 

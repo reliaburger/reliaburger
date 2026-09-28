@@ -11,6 +11,7 @@ pub mod cron;
 pub mod deploy_types;
 pub mod filter;
 pub mod index_set;
+pub mod latency_histogram;
 pub mod quota;
 pub mod scheduler;
 pub mod score;
