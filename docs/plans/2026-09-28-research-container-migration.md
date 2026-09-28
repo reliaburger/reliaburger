@@ -14,12 +14,12 @@ Awaiting maintainer review.
 - [x] 6. Compatibility against the post-0.1.0 policy
 - [x] 7. Security
 - [x] 8. Observability and UX
-- [ ] 9. Demo
-- [ ] 10. Testing plan
-- [ ] 11. Effort and phasing
-- [ ] 12. Where the initial analysis holds and where it doesn't
-- [ ] 13. Open questions for the maintainer
-- [ ] Draft PR opened
+- [x] 9. Demo
+- [x] 10. Testing plan
+- [x] 11. Effort and phasing
+- [x] 12. Where the initial analysis holds and where it doesn't
+- [x] 13. Open questions for the maintainer
+- [x] Draft PR opened (#268)
 
 Sections are filled in order and committed as each one lands.
 
@@ -59,7 +59,7 @@ CRIU with NVIDIA patches that aren't upstream yet, we have no GPU hardware, and 
 checkpointing needs host RAM at least as large as GPU memory in use. That's
 0.4 at the earliest.
 
-Effort: roughly 11 to 14 focused weeks for 0.2.0, of which only about a third
+Effort: roughly 12 to 16 focused weeks for 0.2.0, of which only about a quarter
 is CRIU. See [section 11](#11-effort-and-phasing).
 
 ## 2. What the codebase does today
@@ -666,7 +666,7 @@ that's the wrong trade.
 ## 7. Security
 
 - **A checkpoint is a memory dump.** It holds whatever the process holds:
-  secrets from `EnvValue::Secret`, TLS private keys, database passwords,
+  decrypted `EnvValue::Encrypted` secrets, TLS private keys, database passwords,
   session tokens. Treat the payload like a secret: tmpfs for plaintext,
   age-encrypted to a per-migration key the target holds only in memory,
   node-id mTLS in transit, a digest committed in Raft, wiped when the
@@ -750,3 +750,238 @@ volume or a GPU.
 `deployments.md` (drain) and `agent-bun.md` (checkpoint), and a book section.
 The book should tell the honest story: why stop-and-copy, why we drop TCP,
 what CRIU refuses, and why the fallback is the real feature.
+
+## 9. Demo
+
+We have no GPU hardware, so the GPU story stays out of the demo. It isn't
+needed: the thing a checkpoint saves that a volume doesn't is *memory*, and
+an in-memory cache shows that better than anything.
+
+**The workload.** Redis with persistence off (`save ""`, `appendonly no`),
+the same pinned image the runc tests already use
+(`runc_redis_persists_to_a_managed_volume_across_restarts` in
+`src/grill/runc.rs`), 256 MiB of keys, one replica, `mode = "checkpoint"`.
+Its data lives *only* in memory, so a cold start would lose all of it. That's
+the "stateful dev or game server" case in miniature, and nobody needs it
+explained.
+
+**The script** (three-node quickstart cluster):
+
+```sh
+relish apply examples/migration/container-redis-memory.toml
+# DEBUG POPULATE is disabled by default since Redis 7, so fill it with a script
+relish exec default/cache -- redis-cli EVAL \
+  "for i=1,1000000 do redis.call('SET','key:'..i,string.rep('x',256)) end" 0
+relish exec default/cache -- redis-cli DBSIZE          # 1000000
+relish migrate default/cache --to node-3 --mode checkpoint
+relish migrate status                                   # phase, bytes, frozen time
+relish exec default/cache -- redis-cli DBSIZE          # still 1000000, now on node-3
+relish exec default/cache -- redis-cli INFO server | grep uptime_in_seconds   # didn't reset
+```
+
+Then the fallback, which is the part that makes it trustworthy:
+
+```sh
+relish apply examples/migration/container-io-uring.toml   # a workload CRIU refuses
+relish migrate default/uring --to node-3 --mode checkpoint
+relish migrate status          # "fell back to cold: CRIU cannot dump io_uring"
+```
+
+And the drain, with the soak's append-only writer on a managed volume:
+
+```sh
+relish drain node-2            # writer moves cold, cache moves with its memory
+relish drain status node-2     # empty; nothing blocking
+```
+
+**Success criteria.**
+
+- `DBSIZE` and a sample of values match before and after; `uptime_in_seconds`
+  keeps counting.
+- Frozen time for the 256 MiB cache under 10 seconds on the Apple-silicon
+  quickstart (to be confirmed by spike S7; this is a target, not a
+  measurement).
+- The io_uring workload ends up running on the target with its volume data,
+  and the status names the reason.
+- The writer's sequence file has no gap and no repeated line (the PR #267
+  check), and no instance of it ever runs on two nodes at once.
+- No payload, tmpfs or tombstone is left behind after the retention period.
+
+## 10. Testing plan
+
+Tests first, as always, but the spikes come before the tests, because three
+of them can change the design. None of them can run until the release soak
+is over and the Lima VMs are free.
+
+**Spikes** (runc 1.5.x and CRIU 4.2.1, both architectures, our generated
+spec):
+
+| Spike | Question | If it fails |
+|---|---|---|
+| S1 | Does `runc checkpoint`/`restore` work on our spec: user namespace, external netns, private overlay root, bind-mounted volumes and `resolv.conf`? | Checkpoint mode waits; cold mode ships alone |
+| S2 | Can restored stdio reach the target's capture files (section 5.4)? | Pipes through the owner, or checkpoint mode waits |
+| S3 | Restore into a *new* bundle, container id, netns and address, with `tcp-close` from `org.criu.config` | Checkpoint mode waits |
+| S4 | Pre-create the cgroup, install egress policy for its id, restore into it | Checkpoint mode refuses apps with egress rules |
+| S5 | Does the restored init still pass `owned_workload_cgroup`'s identity check, and can a new Bun adopt a restored generation? | Adjust the check; likely small |
+| S6 | Time namespace keeps `CLOCK_MONOTONIC` continuous across two VMs | Refuse checkpoint mode for apps that care, document |
+| S7 | Payload size and frozen time for Redis at 256 MiB and 1 GiB | Tune targets |
+| S8 | io_uring, POSIX mqueues and a GPU-less `/dev/nvidia*` bind are refused cleanly and the process keeps running | Tighten eligibility |
+
+**Unit tests** (portable, written first):
+
+- The migration state machine: every valid and invalid transition, and a
+  proptest that interleaves node crashes, leader changes and repeated
+  reports and checks the invariants: never two writers, the placement moves
+  exactly once or not at all, every migration ends terminal before its
+  deadline.
+- The fallback table in section 5.6, one test per row.
+- Eligibility: each refusal reason, including the singleton-per-node rule.
+- The Raft apply: the `SourceStopped` entry moves the placement atomically;
+  `Completed` updates `last_placed_nodes`; `decommission-node` resolves a
+  migration.
+- The gate: every new request refused before finalisation.
+- Payload manifest, digest and encryption round-trip; a tampered stream is
+  refused.
+- The authz matrix gains the new routes (its existing test fails otherwise).
+
+**Portable integration** (`tests/suite/`): `MockGrill` gains fake checkpoint
+and restore, and the in-process cluster harness drives a migration through a
+leader change, a target crash after `SourceStopped` and a source crash
+mid-dump.
+
+**Gated Linux** (`make test-linux`, a new `tests/migration_runc.rs` next to
+`tests/owned_runc.rs`): real runc and CRIU on one host, restoring into a
+different bundle, instance id and namespace, which exercises everything but
+the network hop; kill Bun mid-dump and mid-restore and check adoption; the
+io_uring refusal path.
+
+**Gated cluster** (`make test-cluster` on three Lima VMs): a real cross-node
+migration with a managed volume in both modes; power off the source
+mid-dump; power off the target mid-restore; kill the leader mid-transfer;
+drain a node with a mix of stateless, cold and checkpoint apps.
+
+**Soak.** Add a migration loop to the V02 sustained qualification: every N
+minutes migrate the soak writer (cold) and a checkpoint-enabled in-memory
+counter between nodes, including across the existing power-off faults. The
+writer check catches a double writer; the counter must never go backwards;
+no orphaned payloads at the end.
+
+**CI.** Unit and portable tests run everywhere. CRIU needs root and a
+suitable kernel; GitHub's `ubuntu-latest` runners can install it from the
+upstream PPA, so we should *try* the gated Linux migration tests in the
+existing "privileged Linux" job, and keep them Lima-only if the runner
+refuses. Unverified until someone tries.
+
+**Packaging.** Add `criu` to `scripts/release/guest-images.json` from the
+upstream PPA (Ubuntu 24.04 has no archive package), pin the version, and make
+`relish wtf` report it.
+
+## 11. Effort and phasing
+
+Rough, for one engineer (or agent plus reviewer) working in this codebase's
+style: owners, fences, receipts, crash tests at every step.
+
+| Piece | Weeks |
+|---|---|
+| Spikes S1-S8 (after the soak) | 1-1.5 |
+| Feature-level gate, if PR #266's M5 lands first; 1.5 weeks if we build it | 0.5-1.5 |
+| Cordon, `relish drain` for stateless apps, `uncordon`, status | 2 |
+| Cold move: Raft record and state machine, node instructions, payload route, volume tar and tombstones, crash recovery, drain integration | 4-5 |
+| Checkpoint mode: runc checkpoint/restore under owners, stdio, cgroup and egress ordering, tmpfs and encryption, time namespace, CRIU packaging, certificate revocation | 3-4 |
+| Observability, `wtf`, lint, manual, design docs, book, soak loop, qualification | 1.5-2 |
+| **Total** | **12-16** |
+
+The CRIU-specific work is about a quarter of it. The rest is what any
+stateful move needs, and it's where the crash matrix lives.
+
+**0.2.0:** everything in section 5.1. Checkpoint mode labelled experimental;
+cold moves and drain are the supported feature. If the spikes sink
+checkpoint mode, ship cold moves and drain alone and say so.
+
+**0.3:**
+
+1. Pre-sync volumes while the app runs (Btrfs incremental send, or rsync
+   passes elsewhere), then stop and send the last delta. The biggest
+   downtime win, and it helps cold moves too.
+2. Jobs: move a running attempt without spending a retry.
+3. Memory pre-dump (`--pre-dump`, `--parent-path`), **x86-64 only** until
+   arm64 has soft-dirty tracking.
+4. Lazy pages, only if S7-style measurements show memory transfer dominating
+   after (1). userfaultfd restores are the part Google called "very, very
+   difficult" to make incremental.
+
+**Later, each its own design:** GPU warm starts (a snapshot store with
+invalidation rules, driver and CPU matching, and hardware to test on);
+keeping TCP connections (needs addresses that can move between nodes);
+automatic rebalancing and preemption-driven moves; rootless and non-runc
+runtimes.
+
+## 12. Where the initial analysis holds and where it doesn't
+
+**Holds:**
+
+- Stop-and-copy first, pre-dump later. Google ran Borg's CRIU migrations
+  that way for batch and called it good enough there.
+- Opt-in per workload, with a clean fallback when CRIU refuses. CRIU refuses
+  plenty (io_uring, mqueues, devices), and even Incus calls it fragile.
+- Don't sell it for stateless web apps; they should just be rescheduled.
+- GPU warm-start demand is real and shipping (GKE, Modal, Dynamo).
+- It's demo-able.
+
+**Doesn't hold, or needs adjusting:**
+
+- *"Checkpoint-on-drain"*: Reliaburger has no drain. `relish drain` is
+  still planned in the whitepaper; the only node drain in the code is a
+  chaos fault. Build it first.
+- *"Fall back to a normal restart"*: there's no normal restart elsewhere for
+  a stateful app. Managed volumes are node-local and the scheduler sends the
+  app back to them. The fallback is a volume-carrying move, and that move is
+  most of the work.
+- *"More than anyone else ships"*: true against core Kubernetes (KEP-2008 is
+  checkpoint-only; KEP-5823 makes cross-node restore a non-goal). Not true
+  against Podman's export/import, Incus, Borg in 2018, or Cast AI and Cedana
+  today.
+- *"youki uses rust-criu for its checkpoint support"*: for checkpoint only.
+  Restore has been an open PR since February. We should shell out to runc,
+  which already speaks CRIU for us.
+- *"Iterative pre-dump in 0.3"*: pre-dump needs soft-dirty tracking, which
+  arm64 mainline doesn't have, and our quickstart is Apple silicon. Volume
+  pre-sync is the better 0.3 downtime work.
+- *GPU as a headline use*: every shipping LLM warm-start product we could
+  verify restores a pre-warmed snapshot on the same class of machine, mostly
+  via gVisor. That's a snapshot product, not migration, and we have no GPUs.
+  Lead with batch, where there's evidence; use a memory-only server for the
+  demo.
+- *Upgrades as a trigger*: they don't restart workloads. Reboots do.
+- *Effort*: the brief reads as a CRIU feature. It's a stateful-move feature
+  with a CRIU option, at 12 to 16 weeks, and three spikes could still
+  cut the CRIU part.
+- *Unmentioned*: a checkpoint carries workload private keys off the node,
+  which contradicts the workload-identity design and needs revocation.
+
+## 13. Open questions for the maintainer
+
+1. **Framing.** Do you accept "move first, CRIU as an opt-in mode" for 0.2.0,
+   including shipping cold moves and drain alone if the spikes sink
+   checkpoint mode?
+2. **Gate.** Can migration share PR #266's feature-level finalisation (one
+   level for 0.2.0)? Without a gate it's a protocol bump.
+3. **Jobs.** Apps only in 0.2.0 with jobs first in 0.3, or jobs in 0.2.0
+   given batch is the best-evidenced use?
+4. **Opt-in shape.** `[app.<name>.migration] mode = "checkpoint" | "cold" |
+   "never"`, with managed-volume apps defaulting to `cold`? Or should drain
+   refuse to move stateful apps unless they opt in at all?
+5. **Host-path apps during drain.** Block the drain (default here) or stop
+   them with `--stop-blocking`?
+6. **Plaintext on disk.** When tmpfs is too small, refuse checkpoint mode
+   (proposed) or allow disk with a warning?
+7. **CRIU distribution.** Depend on the upstream PPA in guest images and
+   document it for other installs, or vendor a static `criu`? Minimum version
+   4.1 (pidfd) or 4.2?
+8. **Identity.** Is revoking the source instance's workload certificate on
+   completion acceptable, given apps that cache their identity must reload
+   it?
+9. **CPU policy.** Require identical CPU models for checkpoint mode (from a
+   node label), or run CRIU's `--cpu-cap` check and let it refuse?
+10. **Book.** Which chapter gets the story: Chapter 7 ("Ship It", where
+    deploys and draining live) or a section in Chapter 12?
