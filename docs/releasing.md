@@ -139,8 +139,12 @@ It creates no Git tag or GitHub release. PR and ordinary main builds never use
 the release signing secret.
 
 Download that artefact for qualification. Preserve its run ID, attempt, source
-commit and the `candidate.json` SHA-256 printed in the job summary alongside
-the qualification results. The record covers every binary, signature, metadata
+commit and the `candidate.json` SHA-256 alongside the qualification results.
+The build prints that digest in the job summary and in the `candidate` job's
+log, and uploads `candidate.json` on its own as
+`candidate-manifest-<commit>-<attempt>` (kept for one day), so reading the
+digest never needs the whole candidate; see
+[Staging a candidate](#staging-a-candidate). The record covers every binary, signature, metadata
 file, installer, PDF and guest image. Artefacts expire after 90 days; archive the
 qualified files, and don't expect promotion to rebuild an expired candidate.
 Rerunning the candidate run requires recording and qualifying its new attempt.
@@ -208,10 +212,27 @@ this lands.
    gh workflow run build.yml --ref main
    ```
 
-   When it finishes, open the run's summary and note three things: the run ID
-   (from the URL), the candidate commit and the *Qualification manifest
-   SHA-256*. That digest is `QUALIFIED_DIGEST` from here on. Keep it with the
-   qualification records; never copy it from a later download.
+   When it finishes, note three things: the run ID (from the URL), the
+   candidate commit and the *Qualification manifest SHA-256*. That digest is
+   `QUALIFIED_DIGEST` from here on. The run's summary shows all three, and
+   from a terminal the log has the digest:
+
+   ```sh
+   gh run view RUN_ID --log | grep 'Qualification manifest SHA-256'
+   ```
+
+   Or fetch just the manifest (a few kilobytes, not the ~2 GB candidate) and
+   hash it; within a day of the build, while its artefact lasts:
+
+   ```sh
+   gh run download RUN_ID -n candidate-manifest-COMMIT-ATTEMPT -D manifest
+   shasum -a 256 manifest/candidate.json
+   ```
+
+   All three come from the build run itself, so they agree. Keep the digest
+   with the qualification records; never copy it from a later download or a
+   different run. None of this replaces verification: staging and promotion
+   still download the full candidate and check every byte against the digest.
 
 2. **Stage it.**
 
