@@ -1101,6 +1101,50 @@ A struct that holds references needs a lifetime parameter, `'a`, which tells the
 
 The gated cluster test `a_stopped_volume_app_starts_again_on_the_node_that_holds_its_volume` reproduces the soak deterministically. Three nodes carry zone labels; the app is pinned to zone `b` and lands on `v2`. Then it's stopped and applied again without the pin, so every node is empty and the scheduler, left to itself, picks `v1`, the lowest node id. Before the fix, it came back on `v1`. The new field changes the durable state format, so `compatibility::CURRENT` moved to state 44.
 
+### "Not ready" isn't "gone"
+
+The final-tier soak on the fixed candidate failed the same case, with the same message. This time the record of where the app ran was intact. What let us down was the line that dropped a home node that was "gone, not ready, or no longer matching the labels".
+
+Look at how the leader decides a node isn't ready. Each node's report worker sends a state report, a capability report and a readiness report every five seconds. If the leader hasn't received anything from a node for 30 seconds, it keeps the last state report, lists the node as stale and throws away its readiness and capability evidence, so the cache it schedules against says `ready: false`. During that pulse, the report workers on nodes 2 and 3 logged `snapshot collection failed or timed out` every five seconds, for more than a minute each. The soak's own volume apps, pinned to those nodes by label, tell us exactly when: the leader logged `cannot place default/soak-redis: no eligible nodes` while node 3 was stale and `cannot place default/soak-writer` while node 2 was. The test app's re-apply landed inside node 2's window. Its home looked not ready, so it was dropped like a dead node, and the scheduler started the app on another node with a fresh, empty volume. The node had been alive the whole time, with the marker on its disk.
+
+The pinned apps were only lucky: a label pin leaves the scheduler nowhere else to go. An unpinned app with a volume was worse off than the test. `placement_holds` decides whether a *running* placement can stay, and it said no for a stale or not-ready node, so a running database would have been restarted elsewhere on an empty volume. The upgrade cordon sets `ready: false` on the node being upgraded, so every `relish upgrade` walk would have done it on purpose.
+
+So the rule is now stricter, and it matches what the manual already promised. Only two things release a volume's node: gossip no longer having it alive, and the operator's `placement.required` labels excluding it. Everything else is a reason to wait, and the waits say why:
+
+```rust
+enum HomeOutcome {
+    Placed(Vec<crate::meat::types::Placement>),
+    Wait { node: NodeId, reason: HomeWait },
+}
+
+enum HomeWait {
+    Unreported,
+    NotReady,
+    NoRoom,
+}
+```
+
+`Wait` is a struct-like variant: its fields have names, like a C struct inside a tagged union, and a `match` binds them by name (`HomeOutcome::Wait { node, reason } => ...`). `HomeWait` implements `std::fmt::Display`, the trait `{}` formatting calls, which is Rust's equivalent of Go's `String()` method, so the log line reads `waits for rb-2, which holds its volumes: it isn't ready` instead of printing a debug dump.
+
+`placement_holds` gets the same rule for running apps. A fixed-replica app with a managed volume keeps its placement for as long as its node is alive:
+
+```rust
+if unheard.contains(&placement.node_id) || has_managed_volume(spec) {
+    return true;
+}
+cache
+    .get_node(&placement.node_id)
+    .is_none_or(|node| node_can_run(node, spec, dns_required))
+```
+
+`Option::is_none_or` is true for `None`, and otherwise calls the closure on the value inside. It replaces a `let ... else` with an early return: a node the leader has no report for keeps its placements, and a reported one keeps them only if it can run the app.
+
+We did think about keeping the old behaviour for "reported, fresh and not ready", which is real evidence of trouble, and moving only on silence. It doesn't help. A node that reports not ready still has the data, and a stateful app that's down until its node recovers is a better outcome than one that's up with nothing in it. Kubernetes makes the same call for local persistent volumes: the pod stays pending, bound to its node. An operator who really wants the app elsewhere changes its labels, or retires the node.
+
+The first test builds the scheduler's view the way the leader does, from an `AggregatedState` with node `home` listed stale, through `build_cluster_cache` and `unheard_nodes`. Before the fix, it placed the app on `busy`. A second test does the same for a running app, and checks that a node gossip has declared dead still releases it.
+
+The report worker's stalls are their own problem, and they're still open. Even with this fix, they make the leader move apps *without* volumes off a node that is running them fine.
+
 ## Two seconds is too eager
 
 Each node's placement reconciler polls the leader every couple of seconds and deploys whatever its share of the placements says. If a deploy failed, the next poll simply tried again. Kubernetes has `CrashLoopBackOff` for exactly this; we had a supervisor back-off for instances that crash after starting, but a deploy that never produces a running instance never reaches the supervisor. The V02 soak found the result: an app whose binary had been truncated by a power cut reached generation `g170` in eight minutes, every attempt a fresh container, a fresh journal entry and a fresh log line.
