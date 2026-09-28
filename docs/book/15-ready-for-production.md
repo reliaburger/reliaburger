@@ -2952,6 +2952,59 @@ of the 3.2 s the old walk took, without trying all eight. The other runs six
 ticks over six slow restarts and checks that each got its turn and that no
 instance got more than one attempt more than any other.
 
+The second long turn was the one #270 named: signing a follower's workload
+certificate. Only the leader holds the Workload CA, so a follower sends its
+CSR over mTLS and waits up to ten seconds for the answer. That wait ran inline
+twice over, from the deploy worker's `ProvisionIdentity` request and from the
+rotation tick. A slow leader meant ten seconds of nobody else getting an
+answer from the node.
+
+We already had the shape of the fix. #237 moved stop waits off the loop by
+splitting a stop into the part that must happen on the loop, the part that
+only waits, and the part that records the result back on the loop. Signing
+splits the same way. The loop generates the CSR (the private key never leaves
+the node), then spawns the signing into a `JoinSet`:
+
+```rust
+let task = self
+    .identity_signing_tasks
+    .spawn(async move {
+        let result = tokio::time::timeout(WORKLOAD_SIGNING_TIMEOUT, request.sign())
+            .await
+            .unwrap_or_else(|_| Err("workload signing timed out".to_string()));
+        SignedIdentity { spiffe_uri, private_key_der, result }
+    })
+    .id();
+```
+
+`async move` makes the future take ownership of everything it uses: the
+`Arc` to the council, a clone of the leader transport, the CSR bytes. That's
+what lets it outlive the function that spawned it, and the compiler insists
+on it, because `spawn` requires a `'static` future: one that borrows nothing
+from the caller's stack. In Go you'd capture the variables and hope nobody
+changes them underneath the goroutine. Here the borrow checker won't compile a
+future that could see them change.
+
+A new `select!` branch collects finished signings with `join_next_with_id`,
+writes the certificate files and records the identity, all on the loop, as
+before. The deploy worker's reply travels with the signing and is answered
+only when it's done, so the worker still waits, just not *on* the loop. Two
+details came out of the split. The rotation tick runs every second and a
+signing can take ten, so a request for an instance that already has a signing
+in flight joins it rather than sending a second CSR. And a signature can now
+arrive after its instance has been retired; retirement deleted the identity
+directory, so writing the files would recreate it with nobody left to delete
+it. The loop checks the instance still exists before it writes anything.
+
+The tests stand up a follower with a "leader" that accepts the TCP connection
+and then says nothing. The deploy worker's identity request must return in
+under a second, with its reply still pending (it took the full ten before);
+the rotation tick likewise. A leader that hangs up at once checks the other
+end: two requests for one instance share one signing, and both get answered
+when it fails. The last test hands the loop two finished signatures, one for
+a live instance and one for a retired one, and checks that only the live one
+gets files.
+
 ## Walk the path you actually care about
 
 Say `web` can't reach `redis`. Checking Bun's own DNS and TCP access might tell

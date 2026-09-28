@@ -1684,6 +1684,7 @@ pub use consumer::ConsumerUpdate;
 mod discovery_ownership;
 mod discovery_recovery;
 mod egress_ownership;
+mod identity_signing;
 mod producer_release;
 mod runtime_inventory;
 use app_stop::{AppStop, PendingStops, StopPurpose};
@@ -1954,6 +1955,11 @@ pub struct BunAgent<G: Grill> {
     /// Where the last budget-bounded restart tick stopped, so the next one
     /// carries on from there instead of retrying the same few.
     restart_rotation: RestartRotation,
+    /// Workload identity signings in flight, by the task running each.
+    identity_signings: identity_signing::IdentitySignings,
+    /// Those tasks. A follower's CSR waits on the leader for up to ten
+    /// seconds, which must not stall every other command.
+    identity_signing_tasks: tokio::task::JoinSet<identity_signing::SignedIdentity>,
 }
 
 /// The last instance each phase of `drive_pending_restarts` handled.
@@ -2108,6 +2114,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             pending_stops: PendingStops::new(),
             stop_waits: tokio::task::JoinSet::new(),
             restart_rotation: RestartRotation::default(),
+            identity_signings: identity_signing::IdentitySignings::new(),
+            identity_signing_tasks: tokio::task::JoinSet::new(),
         }
     }
 
@@ -2234,6 +2242,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             pending_stops: PendingStops::new(),
             stop_waits: tokio::task::JoinSet::new(),
             restart_rotation: RestartRotation::default(),
+            identity_signings: identity_signing::IdentitySignings::new(),
+            identity_signing_tasks: tokio::task::JoinSet::new(),
         }
     }
 
@@ -3666,6 +3676,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 biased;
                 _ = self.shutdown.cancelled() => {
                     self.abandon_pending_stops();
+                    self.abandon_identity_signings();
                     self.shutdown_all().await;
                     break;
                 }
@@ -3678,6 +3689,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 Some(outcome) = self.stop_waits.join_next_with_id(),
                     if !self.stop_waits.is_empty() => {
                     self.complete_app_stop(outcome).await;
+                }
+                Some(outcome) = self.identity_signing_tasks.join_next_with_id(),
+                    if !self.identity_signing_tasks.is_empty() => {
+                    self.finish_identity_provision(outcome);
                 }
                 Some(op) = self.deploy_ops_rx.recv() => {
                     self.handle_deploy_op(op).await;
@@ -3699,7 +3714,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     self.reconcile_firewall().await;
                     self.reresolve_egress().await;
                     self.sweep_kernel_networking().await;
-                    self.check_identity_rotation().await;
+                    self.check_identity_rotation();
                 }
             }
             // Local changes only mark the consumer view stale, so a burst of
@@ -9355,139 +9370,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
     }
 
-    /// Provision workload identity for an instance after it passes health check.
-    ///
-    /// Generates a SPIFFE CSR, submits it to the council for signing,
-    /// builds the identity bundle, and writes cert/key/JWT to the
-    /// instance's identity mount. No-op in standalone mode.
-    async fn provision_identity(
-        &mut self,
-        app_name: &str,
-        namespace: &str,
-        instance_id: &crate::grill::InstanceId,
-        is_job: bool,
-        events: &mpsc::Sender<ApplyEvent>,
-    ) {
-        let Some(ref cluster) = self.cluster else {
-            return; // standalone mode — no council to sign CSRs
-        };
-        let Some(ref council) = cluster.council else {
-            return;
-        };
-
-        let workload_type = if is_job {
-            crate::sesame::types::WorkloadType::Job
-        } else {
-            crate::sesame::types::WorkloadType::App
-        };
-
-        let spiffe_uri =
-            workload_spiffe_uri(&self.trust_domain, namespace, app_name, workload_type);
-
-        // Generate CSR (keypair stays local)
-        let (csr_der, private_key_der) =
-            match crate::sesame::identity::create_workload_csr(&spiffe_uri) {
-                Ok(pair) => pair,
-                Err(e) => {
-                    let _ = events
-                        .send(ApplyEvent::Progress {
-                            message: format!("identity: CSR generation failed: {e}"),
-                        })
-                        .await;
-                    return;
-                }
-            };
-
-        // Only the leader can sign. A follower used to call its own council,
-        // fail, and start the container with no identity at all.
-        let result = if council.is_leader().await {
-            council
-                .sign_workload_csr(
-                    &csr_der,
-                    &spiffe_uri,
-                    crate::sesame::identity::CertUsage::Mtls,
-                    &self.trust_domain,
-                    "local",
-                    &instance_id.0,
-                )
-                .await
-                .map(|signed| crate::cluster::workload_identity::SignedWorkload {
-                    cert_der: signed.cert_der,
-                    workload_ca_cert_der: signed.workload_ca_cert_der,
-                    root_ca_cert_der: signed.root_ca_cert_der,
-                    jwt_token: signed.jwt_token,
-                })
-                .map_err(|error| error.to_string())
-        } else {
-            match &self.workload_csr_client {
-                Some(client) => client
-                    .sign(&instance_id.0, workload_type, &csr_der)
-                    .await
-                    .map_err(|error| error.to_string()),
-                None => Err("no leader transport for workload signing".to_string()),
-            }
-        };
-
-        match result {
-            Ok(csr_result) => {
-                let jwt = csr_result.jwt_token.unwrap_or_default();
-                let identity = crate::sesame::identity::build_identity_bundle(
-                    spiffe_uri,
-                    csr_result.cert_der,
-                    private_key_der,
-                    &csr_result.workload_ca_cert_der,
-                    &csr_result.root_ca_cert_der,
-                    jwt,
-                );
-
-                // Write to the instance's own identity mount (PKI7). The
-                // dir was prepared before the container was created; a
-                // rotation for an adopted instance may find it missing, so
-                // prepare (idempotently) here too.
-                let identity_dir = self.instance_identity_dir(instance_id);
-                if let Err(e) = crate::sesame::identity::prepare_identity_dir(&identity_dir) {
-                    let _ = events
-                        .send(ApplyEvent::Progress {
-                            message: format!("identity: failed to prepare directory: {e}"),
-                        })
-                        .await;
-                    return;
-                }
-                if let Err(e) = crate::sesame::identity::write_identity_files(
-                    &identity,
-                    &identity_dir,
-                    Self::workload_identity_owner(&identity_dir),
-                ) {
-                    let _ = events
-                        .send(ApplyEvent::Progress {
-                            message: format!("identity: failed to write files: {e}"),
-                        })
-                        .await;
-                    return;
-                }
-
-                // Store in supervisor
-                if let Some(inst) = self.supervisor.get_instance_mut(instance_id) {
-                    inst.identity = Some(identity);
-                    inst.identity_mount = Some(identity_dir);
-                }
-
-                let _ = events
-                    .send(ApplyEvent::Progress {
-                        message: format!("{} identity provisioned ✓", instance_id.0),
-                    })
-                    .await;
-            }
-            Err(e) => {
-                let _ = events
-                    .send(ApplyEvent::Progress {
-                        message: format!("identity: CSR signing failed: {e}"),
-                    })
-                    .await;
-            }
-        }
-    }
-
     /// Issue a certificate bundle for a joining node.
     ///
     /// Runs on an existing cluster member. Validates the token against the
@@ -9637,7 +9519,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// provision identities for running instances that don't have one —
     /// a failed CSR at deploy time, or an adopted instance whose
     /// directory predates the per-instance layout, heals here (D9).
-    async fn check_identity_rotation(&mut self) {
+    fn check_identity_rotation(&mut self) {
         let now = std::time::SystemTime::now();
         let mut needs_rotation = Vec::new();
 
@@ -9689,18 +9571,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
         }
 
-        // Re-provision identities that need rotation. `provision_identity` emits
-        // best-effort progress events, but a background rotation tick has no SSE
-        // consumer for them. The old code held a capacity-1 receiver it never
-        // read, so the *second* send inside the *first* provision blocked the
-        // agent loop forever (H2). Drop the receiver instead: each `send` now
-        // fails fast (channel closed) and is swallowed, while the actual
-        // CSR-signing and file writes proceed unchanged.
-        let (dummy_tx, dummy_rx) = mpsc::channel(1);
-        drop(dummy_rx);
+        // Only start the signings here: they finish on the loop when their
+        // tasks report back, and one already running for an instance is joined.
         for (id, app, ns, is_job) in needs_rotation {
-            self.provision_identity(&app, &ns, &id, is_job, &dummy_tx)
-                .await;
+            self.begin_identity_provision(&app, &ns, &id, is_job, None);
         }
     }
 
@@ -10951,18 +10825,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 reply,
             } => {
                 // A no-op in standalone mode; a failure here is retried by the
-                // rotation loop rather than failing the deploy. The progress
-                // events it emits are dropped: the deploy already completed by
-                // the time identity provisioning runs. The sink is buffered
-                // wide enough (and provision emits only a handful of events),
-                // so provisioning never blocks on it; the drain then discards
-                // whatever it wrote.
-                let (sink, mut drain) = mpsc::channel(64);
-                self.provision_identity(&app_name, &namespace, &instance_id, is_job, &sink)
-                    .await;
-                drop(sink);
-                while drain.recv().await.is_some() {}
-                let _ = reply.send(());
+                // rotation loop rather than failing the deploy. The CSR runs
+                // off the loop, and the worker is answered when it finishes.
+                self.begin_identity_provision(
+                    &app_name,
+                    &namespace,
+                    &instance_id,
+                    is_job,
+                    Some(reply),
+                );
             }
             DeployOp::ReserveRollingInstance {
                 instance_id,
@@ -15285,6 +15156,10 @@ mod tests {
                 tokio::select! {
                     Some(op) = self.deploy_ops_rx.recv() => {
                         self.handle_deploy_op(op).await;
+                    }
+                    Some(outcome) = self.identity_signing_tasks.join_next_with_id(),
+                        if !self.identity_signing_tasks.is_empty() => {
+                        self.finish_identity_provision(outcome);
                     }
                     result = &mut task => {
                         let _ = result;
@@ -24118,6 +23993,209 @@ host = "remote.local"
         assert_eq!(
             entry.backends[0].host_port,
             launches[0].spec.port_mapping.unwrap().host_port
+        );
+    }
+
+    // --- workload identity signing off the command loop ---
+
+    /// A council that is not the leader, so signing goes to the leader transport.
+    async fn follower_council() -> Arc<CouncilNode> {
+        use crate::council::log_store::MemLogStore;
+        use crate::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
+        use crate::council::state_machine::CouncilStateMachine;
+        use crate::council::types::CouncilConfig;
+
+        let network = InMemoryRaftNetworkFactory::new(2, InMemoryRaftRouter::new());
+        let node = CouncilNode::new(
+            2,
+            CouncilConfig::default(),
+            network,
+            MemLogStore::new(),
+            CouncilStateMachine::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!node.is_leader().await);
+        Arc::new(node)
+    }
+
+    /// A leader transport whose "leader" accepts connections and then either
+    /// says nothing (`silent`) or hangs up at once.
+    async fn leader_transport(
+        silent: bool,
+    ) -> crate::cluster::workload_identity::WorkloadCsrClient {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                if silent {
+                    held.push(stream);
+                }
+            }
+        });
+        // A receiver keeps its last value after the sender goes.
+        let (_, metrics) = watch::channel(openraft::RaftMetrics::new_initial(2));
+        let directory = crate::mustard::directory::NodeDirectory {
+            leader: Some(crate::mustard::message::LeaderHint {
+                node_id: crate::meat::NodeId::new("leader"),
+                term: 0,
+                api_address: address,
+                reporting_address: address,
+            }),
+            ..Default::default()
+        };
+        let (_, directory) = watch::channel(directory);
+        crate::cluster::workload_identity::WorkloadCsrClient::new(
+            crate::cluster::ClusterHttp::secure(reqwest::Client::new()),
+            metrics,
+            directory,
+            0,
+        )
+    }
+
+    async fn follower_agent(silent_leader: bool) -> BunAgent<MockGrill> {
+        let mut agent = agent_with_council(follower_council().await);
+        agent.set_workload_csr_client(leader_transport(silent_leader).await);
+        agent
+    }
+
+    fn provision_op(instance: &str) -> (DeployOp, oneshot::Receiver<()>) {
+        let (reply, answered) = oneshot::channel();
+        let op = DeployOp::ProvisionIdentity {
+            app_name: "web".into(),
+            namespace: "default".into(),
+            instance_id: InstanceId(instance.into()),
+            is_job: false,
+            reply,
+        };
+        (op, answered)
+    }
+
+    /// PR #270's investigation: a follower's CSR goes to the leader with a
+    /// 10 s limit, and it ran inline from the deploy op, so a slow leader
+    /// held every queued command for up to 10 s. The loop now only starts
+    /// the signing; the deploy worker's reply comes when it has finished.
+    #[tokio::test]
+    async fn follower_csr_to_a_silent_leader_does_not_hold_the_command_loop() {
+        let mut agent = follower_agent(true).await;
+        let (op, mut answered) = provision_op("default__web-0");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            agent.handle_deploy_op(op),
+        )
+        .await
+        .expect("the identity CSR held the agent loop");
+        assert_eq!(agent.identity_signings.len(), 1);
+        assert!(
+            matches!(
+                answered.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ),
+            "the deploy worker was answered before its identity was signed"
+        );
+    }
+
+    /// The rotation tick provisions a missing identity the same way: it
+    /// starts the signing and moves on.
+    #[tokio::test]
+    async fn identity_rotation_does_not_wait_for_the_leader() {
+        // Deploy with no leader transport, so the deploy's own CSR fails
+        // fast; then the leader goes silent.
+        let mut agent = agent_with_council(follower_council().await);
+        let volumes = tempfile::tempdir().unwrap();
+        agent.set_volumes_dir(volumes.path().to_path_buf());
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        agent.set_workload_csr_client(leader_transport(true).await);
+        let id = agent.supervisor.list_instances()[0].id.clone();
+        agent.supervisor.get_instance_mut(&id).unwrap().identity = None;
+        agent.identity_retry_ticks = IDENTITY_RETRY_TICKS - 1;
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            agent.check_identity_rotation();
+        })
+        .await
+        .expect("the rotation tick waited for the leader");
+        assert_eq!(agent.identity_signings.len(), 1);
+    }
+
+    /// A deploy and the rotation tick asking for the same instance share one
+    /// CSR, and both are answered when it finishes, even when it fails.
+    #[tokio::test]
+    async fn concurrent_requests_for_one_identity_share_one_signing() {
+        let mut agent = follower_agent(false).await;
+        let (first, first_answered) = provision_op("default__web-0");
+        let (second, second_answered) = provision_op("default__web-0");
+        agent.handle_deploy_op(first).await;
+        agent.handle_deploy_op(second).await;
+        assert_eq!(agent.identity_signing_tasks.len(), 1);
+        let signing = agent.identity_signings.values().next().unwrap();
+        assert_eq!(signing.waiter_count(), 2);
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            agent.identity_signing_tasks.join_next_with_id(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        agent.finish_identity_provision(outcome);
+        for answered in [first_answered, second_answered] {
+            answered.await.expect("a waiter was dropped unanswered");
+        }
+        assert!(agent.identity_signings.is_empty());
+    }
+
+    /// A signed identity is written to the instance's mount and recorded;
+    /// one for an instance retired while its CSR was out is dropped, so it
+    /// can't recreate the directory retirement removed.
+    #[tokio::test]
+    async fn signed_identity_is_stored_only_for_a_live_instance() {
+        let (mut agent, _tx, _shutdown, _grill) = test_agent_with_grill();
+        let volumes = tempfile::tempdir().unwrap();
+        agent.set_volumes_dir(volumes.path().to_path_buf());
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        let live = agent.supervisor.list_instances()[0].id.clone();
+        agent.supervisor.get_instance_mut(&live).unwrap().identity = None;
+        let retired = InstanceId("default__web-9".into());
+
+        let issued = write_test_identity(volumes.path(), "scratch");
+        let signed = || {
+            super::identity_signing::SignedIdentity::for_test(
+                issued.spiffe_uri.clone(),
+                issued.private_key_der.clone(),
+                Ok(crate::cluster::workload_identity::SignedWorkload {
+                    cert_der: issued.certificate_der.clone(),
+                    workload_ca_cert_der: vec![1],
+                    root_ca_cert_der: vec![2],
+                    jwt_token: Some("jwt".into()),
+                }),
+            )
+        };
+        for id in [&live, &retired] {
+            let result = signed();
+            let task = agent
+                .identity_signing_tasks
+                .spawn(async move { result })
+                .id();
+            agent.identity_signings.insert(
+                task,
+                super::identity_signing::IdentitySigning::for_test(id.clone()),
+            );
+            let outcome = agent
+                .identity_signing_tasks
+                .join_next_with_id()
+                .await
+                .unwrap();
+            agent.finish_identity_provision(outcome);
+        }
+
+        let instance = agent.supervisor.get_instance(&live).unwrap();
+        assert_eq!(instance.identity.as_ref().unwrap().jwt_token, "jwt");
+        assert!(agent.instance_identity_dir(&live).exists());
+        assert!(
+            !agent.instance_identity_dir(&retired).exists(),
+            "a late signature recreated a retired instance's identity directory"
         );
     }
 }
