@@ -17,11 +17,13 @@ pub struct Compatibility {
 
 /// Supported formats, including the per-node `directive_retry` record in a
 /// cluster upgrade, the 503 a node answers a directive with when the
-/// binary's registry is unavailable (the orchestrator retries it), and the
-/// nodes each app last ran on (`DesiredState::last_placed_nodes`).
+/// binary's registry is unavailable (the orchestrator retries it), the
+/// nodes each app last ran on (`DesiredState::last_placed_nodes`), and task
+/// arrays (`RaftRequest::TaskArray`, `DesiredState::task_arrays` and the
+/// node ledgers under `task-arrays/`).
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 27,
-    state: 44,
+    protocol: 28,
+    state: 45,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.
@@ -175,6 +177,27 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         std::fs::create_dir(directory.path().join("identity")).unwrap();
         ensure_state_compatible(directory.path()).unwrap();
+    }
+
+    /// The generations before task arrays. There's no compatibility before
+    /// 1.0.0, so nodes and data from then are refused, not migrated.
+    const BEFORE_TASK_ARRAYS: Compatibility = Compatibility {
+        protocol: 27,
+        state: 44,
+    };
+
+    #[test]
+    fn peers_and_state_from_before_task_arrays_are_refused() {
+        assert!(BEFORE_TASK_ARRAYS.require_current().is_err());
+        let directory = tempfile::tempdir().unwrap();
+        let stamp = directory.path().join(STATE_STAMP);
+        let old = format!(r#"{{"format":{}}}"#, BEFORE_TASK_ARRAYS.state);
+        std::fs::write(&stamp, &old).unwrap();
+        assert!(matches!(
+            ensure_state_compatible(directory.path()),
+            Err(CompatibilityError::InvalidState(_))
+        ));
+        assert_eq!(std::fs::read_to_string(stamp).unwrap(), old);
     }
 
     #[test]

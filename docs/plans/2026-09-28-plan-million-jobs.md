@@ -465,7 +465,7 @@ changes, so the bump is deliberate and the tests know where to look.
 | Change | Where | Encoding | Handling |
 |---|---|---|---|
 | `IndexRangeSet`, `TaskArraySpec`, `TaskArrayState`, ledger | new library types | JSON / local file | library only until M5 |
-| `RaftRequest::TaskArrayRegister`, `TaskArraySync`, `TaskArrayCancel`, `TaskArrayRequeue` | `src/council/types.rs` | JSON, externally tagged | new variants: **protocol and state bump** in M5 |
+| `RaftRequest::TaskArray(TaskArrayWrite)`, one variant wrapping `Register`, `Sync`, `Cancel` and `Requeue` (`src/meat/task_array_store.rs`) | `src/council/types.rs` | JSON, externally tagged | new variant: **protocol and state bump** (done: protocol 28, state 45) |
 | `CouncilResponse::TaskArrayRegistered { batch_id }` | same | JSON | same bump |
 | `DesiredState::task_arrays` | `src/council/types.rs` | JSON snapshot | same bump |
 | `JobStatus`, `BatchRecord`, `BatchJobUpdate` | `src/meat/batch_tracker.rs` | JSON | **unchanged**; arrays never reuse them |
@@ -650,8 +650,8 @@ k3s cluster of the same size, and publish both scripts.
 ### M5: wiring
 
 - [x] compatibility decision recorded (28 September 2026): no gate, bump and start fresh
-- [ ] bump `protocol` and `state` in `src/compatibility.rs`; test that 0.1.x peers and state are refused
-- [ ] Raft variants and `DesiredState::task_arrays`
+- [x] bump `protocol` and `state` in `src/compatibility.rs` (27/44 to 28/45); test that peers and state from before are refused
+- [x] `RaftRequest::TaskArray(TaskArrayWrite)` and `DesiredState::task_arrays` (`src/meat/task_array_store.rs`; ids share the batch counter)
 - [ ] `POST /v1/batch/array`, sync route, cancel route
 - [ ] leader sync loop with requeue on silence
 - [ ] `relish run --batch --count`, `relish batch cancel`
