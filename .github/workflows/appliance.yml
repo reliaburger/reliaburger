@@ -12,6 +12,10 @@ on:
       bun_release:
         description: Release tag to take bun and relish from (default is the newest published v* release, else the newest staging candidate)
         required: false
+      broken_bun:
+        description: "Spike S4: build an image whose bun refuses to start, to test the A/B fallback"
+        type: boolean
+        default: false
   pull_request:
     branches: [main]
     paths:
@@ -78,6 +82,19 @@ jobs:
           install -D -m 0755 "dl/bun-linux-$ARCH" image/bin-tree/usr/lib/reliaburger/bin/bun
           install -D -m 0755 "dl/relish-linux-$ARCH" image/bin-tree/usr/lib/reliaburger/bin/relish
           echo "### bun and relish from \`$tag\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Break bun on purpose (spike S4)
+        if: inputs.broken_bun
+        run: |
+          set -euo pipefail
+          install -D -m 0644 /dev/stdin image/bin-tree/usr/lib/systemd/system/reliaburger.service.d/50-spike-broken.conf <<'CONF'
+          # Spike S4: this build's bun never starts, so its boot check fails and
+          # systemd-boot has to fall back to the previous version.
+          [Service]
+          ExecStart=
+          ExecStart=/bin/false
+          CONF
+          echo "### Broken on purpose: bun won't start in this image" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Throwaway signing key
         # Spike only: a fresh Ed25519 key per run, so the signature proves the

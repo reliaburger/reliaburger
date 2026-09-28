@@ -1,0 +1,10 @@
+#!/bin/sh
+# Unpacks the reliaburger.seed credential into /etc/reliaburger (spike S3;
+# see reliaburger-seed.service).
+set -eu
+umask 077
+install -d -m 0700 /etc/reliaburger
+tar -xzf "$CREDENTIALS_DIRECTORY/reliaburger.seed" -C /etc/reliaburger --no-same-owner
+chown -R root:root /etc/reliaburger
+chmod -R go-rwx /etc/reliaburger
+echo "reliaburger: seed installed: $(grep -m1 '^name' /etc/reliaburger/node.toml)"

@@ -100,5 +100,10 @@ sync
 peak=$(cat /sys/fs/cgroup/system.slice/reliaburger-install.service/memory.peak 2>/dev/null || echo 0)
 available=$(awk '/^MemAvailable:/ { print int($2 / 1024) }' /proc/meminfo)
 say "installed ${version} to ${disk} in $(($(date +%s) - started)) s; peak memory $((peak / 1048576)) MiB, ${available} MiB still available"
+# What the peak was made of (anon is the pipeline's own buffers; file is
+# page cache, which the kernel can drop).
+awk '$1 == "anon" || $1 == "file" || $1 == "kernel" || $1 == "sock" { printf "%s %d MiB\n", $1, $2 / 1048576 }' \
+    /sys/fs/cgroup/system.slice/reliaburger-install.service/memory.stat 2>/dev/null \
+    | sed 's/^/reliaburger-install: memory: /' || true
 say "rebooting into the installed system"
 systemctl reboot

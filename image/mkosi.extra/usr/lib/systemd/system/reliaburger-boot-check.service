@@ -1,11 +1,12 @@
 # Reports on the console once bun answers its health endpoint. The CI boot
-# test waits for this line; the A/B update path (spike S4) will order the
-# same check before boot-complete.target so a slot is only blessed once bun
-# is healthy.
+# test waits for this line. It also gates boot-complete.target, so
+# systemd-bless-boot only marks an updated UKI good once bun is healthy
+# (spike S4).
 [Unit]
 Description=Reliaburger boot check
 After=reliaburger.service
 Wants=reliaburger.service
+Before=boot-complete.target
 
 [Service]
 Type=oneshot
@@ -15,3 +16,4 @@ ExecStart=/usr/lib/reliaburger/boot-check
 
 [Install]
 WantedBy=multi-user.target
+RequiredBy=boot-complete.target

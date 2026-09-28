@@ -1,0 +1,27 @@
+# The UKI goes onto the ESP beside the running one, with three tries under
+# systemd-boot's boot counting. systemd-bless-boot marks it good once
+# boot-complete.target is reached, which reliaburger-boot-check.service
+# holds back until bun is healthy. Its usrhash= pins the /usr written by
+# 20-usr.transfer, so the UKI picks the slot.
+[Transfer]
+ProtectVersion=%A
+Verify=no
+
+[Source]
+# Staged and checked first (Ed25519, SHA-256) by os-stage, standing in for
+# bun (research §7.6), so sysupdate only copies.
+Type=regular-file
+Path=/var/lib/reliaburger/os-staging
+MatchPattern=reliaburger-os_@v.efi
+
+[Target]
+Type=regular-file
+Path=/EFI/Linux
+PathRelativeTo=boot
+MatchPattern=reliaburger-os_@v+@l-@d.efi \
+             reliaburger-os_@v+@l.efi \
+             reliaburger-os_@v.efi
+Mode=0444
+TriesLeft=3
+TriesDone=0
+InstancesMax=2

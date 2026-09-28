@@ -1,0 +1,9 @@
+#!/bin/sh
+# Starts bun: as a cluster node once a seed has installed
+# /etc/reliaburger/node.toml, otherwise standalone on loopback (what the CI
+# boot tests check).
+if [ -f /etc/reliaburger/node.toml ]; then
+    exec /usr/lib/reliaburger/bin/bun --cluster --runtime runc \
+        --config /etc/reliaburger/node.toml --listen 0.0.0.0:9117
+fi
+exec /usr/lib/reliaburger/bin/bun --runtime runc --listen 127.0.0.1:9117
