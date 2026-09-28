@@ -94,10 +94,21 @@ def finding(check, severity, detail, target=None):
 
 # --- parsers -----------------------------------------------------------------
 
-def parse_sequence(text, prefix):
-    """Numbers from lines like `ACK 12`, in log order."""
-    pattern = re.compile(r"\b" + re.escape(prefix) + r" (\d+)\b")
-    return [int(match.group(1)) for match in pattern.finditer(text)]
+def parse_runs(text, prefix):
+    """Numbers from lines like `ACK 12`, in log order, per run.
+
+    `relish logs` labels each line `[instance]`, or `[instance@node]` when one
+    instance name ran on two nodes, once the view holds more than one run. A
+    run is one process writing in order; the view interleaves runs by their
+    nodes' clocks, which isn't an order any of them wrote. Unlabelled lines
+    are one run."""
+    pattern = re.compile(r"^(?:\[([^\]]+)\] )?.*?\b" + re.escape(prefix) + r" (\d+)\b")
+    runs = {}
+    for line in text.splitlines():
+        match = pattern.match(line)
+        if match:
+            runs.setdefault(match.group(1), []).append(int(match.group(2)))
+    return runs
 
 
 def parse_inventory(text):
@@ -145,16 +156,25 @@ def instances_by_node(status):
 
 # --- invariants (pure) -------------------------------------------------------
 
-def sequence_findings(check, values, highest, source, target=None):
+def view_end(runs):
+    """The newest value in the view: the highest any run ended on."""
+    return max((values[-1] for values in runs.values() if values), default=None)
+
+
+def sequence_findings(check, runs, highest, source, target=None):
     """Log-view ordering: the writer's ACKs and redis INCRs, as `relish logs`
-    returns them, must keep rising. Still failures, but about the order the
-    log view shows, not what was stored; `source` says what decides that."""
+    returns them, must keep rising within each run (see `parse_runs`). Still
+    failures, but about the order the log view shows, not what was stored;
+    `source` says what decides that."""
     findings = []
-    for before, after in zip(values, values[1:]):
-        if after <= before:
-            findings.append(finding(check, "fail", f"log view went backwards from {before} to {after} ({source})", target))
-    if values and highest is not None and values[-1] < highest:
-        findings.append(finding(check, "fail", f"log view ends at {values[-1]}, below the {highest} an earlier check saw ({source})", target))
+    for label, values in runs.items():
+        run = f" in run {label}" if label else ""
+        for before, after in zip(values, values[1:]):
+            if after <= before:
+                findings.append(finding(check, "fail", f"log view went backwards from {before} to {after}{run} ({source})", target))
+    end = view_end(runs)
+    if end is not None and highest is not None and end < highest:
+        findings.append(finding(check, "fail", f"log view ends at {end}, below the {highest} an earlier check saw ({source})", target))
     return findings
 
 
@@ -471,34 +491,35 @@ def evaluate(evidence, snapshot):
         text = read(snapshot, name)
         if text is None:
             continue
-        values = parse_sequence(text, prefix)
+        runs = parse_runs(text, prefix)
+        end = view_end(runs)
         baseline = baselines.get(check, state.get(check))
-        order = sequence_findings(order_check, values, baseline, source)
-        if state.get("power_cut") and values and baseline is not None and values[-1] < baseline:
+        order = sequence_findings(order_check, runs, baseline, source)
+        if state.get("power_cut") and end is not None and baseline is not None and end < baseline:
             # A powered-off node loses the stdout it hadn't synced yet, as any
             # log does; the tail may end below what an earlier check saw. Only
             # the "ends below" finding is excused, and the baseline restarts
             # from here; lines going backwards within one tail still fail.
             order = [dict(item, severity="info", detail=item["detail"] + "; after a power cut, lines not yet synced are lost from the log view")
                      if "below the" in item["detail"] else item for item in order]
-            baselines[check] = values[-1]
+            baselines[check] = end
             power_cut_excused = True
-        elif fault_window and values and baseline is not None and values[-1] < baseline:
+        elif fault_window and end is not None and baseline is not None and end < baseline:
             # A bun that just restarted (killed, upgraded) re-reads its
             # capture files; until it has, the newest lines are missing from
             # the view. That's judged once the window closes, against the
             # unchanged baseline, so a dip that never recovers still fails.
             order = [dict(item, severity="info", detail=item["detail"] + "; inside a fault window, judged again once it settles")
                      if "below the" in item["detail"] else item for item in order]
-        elif values:
-            advanced = advanced or baseline is None or values[-1] > baseline
-            baselines[check] = max(values[-1], baseline or 0)
+        elif end is not None:
+            advanced = advanced or baseline is None or end > baseline
+            baselines[check] = max(end, baseline or 0)
         findings += order
-        if values:
-            if values[-1] == state.get(check) and not fault_window:
-                findings.append(finding(check, "warn", f"not advancing at {values[-1]}"))
-            state[check] = max(values[-1], state.get(check, 0))
-            state.setdefault("progress", {})[check] = values[-1]
+        if end is not None:
+            if end == state.get(check) and not fault_window:
+                findings.append(finding(check, "warn", f"not advancing at {end}"))
+            state[check] = max(end, state.get(check, 0))
+            state.setdefault("progress", {})[check] = end
     if state.get("power_cut") and not fault_window and advanced and not power_cut_excused:
         state.pop("power_cut")
 

@@ -117,6 +117,36 @@ class WriterAndRedis(Evidence):
         code, verdict = self.evaluate(self.snapshot(**{"redis__log_txt": "ERR Could not connect\nINCR 3\nINCR 4\n"}))
         self.assertIn("redis-log-order", self.failures(verdict))
 
+    def test_one_instance_on_two_nodes_is_ordered_per_node(self):
+        # V02 final tier, 28 Sep 2026 (ff854cb): the rollback walk moved
+        # soak-redis-client-0 from rb-2 to rb-3 under the same name. The tail
+        # interleaves the two runs by two nodes' clocks, so 11632 came before
+        # 11631. Each run rose; the order across runs isn't the client's.
+        self.evaluate(self.snapshot(**{"redis__log_txt": "INCR 11629\n"}))
+        code, verdict = self.evaluate(self.snapshot(**{"redis__log_txt":
+            "[soak-redis-client-0@rb-a-2] INCR 11630\n"
+            "[soak-redis-client-0@rb-a-3] INCR 11632\n"
+            "[soak-redis-client-0@rb-a-2] INCR 11631\n"
+            "[soak-redis-client-0@rb-a-3] INCR 11633\n"}))
+        self.assertEqual(self.failures(verdict), [])
+        # The next tail is judged against the newest line of either run.
+        _, verdict = self.evaluate(self.snapshot(**{"redis__log_txt": "INCR 11632\n"}))
+        self.assertIn("redis-log-order", self.failures(verdict))
+
+    def test_lines_going_backwards_within_one_labelled_run_still_fail(self):
+        _, verdict = self.evaluate(self.snapshot(**{"redis__log_txt":
+            "[soak-redis-client-0@rb-a-2] INCR 11631\n"
+            "[soak-redis-client-0@rb-a-3] INCR 11633\n"
+            "[soak-redis-client-0@rb-a-3] INCR 11632\n"}))
+        self.assertIn("redis-log-order", self.failures(verdict))
+        detail = next(item["detail"] for item in verdict["findings"] if item["check"] == "redis-log-order")
+        self.assertIn("soak-redis-client-0@rb-a-3", detail)
+
+    def test_an_unlabelled_tail_is_still_one_run(self):
+        # Without labels the view shows one instance, so any step back fails.
+        _, verdict = self.evaluate(self.snapshot(**{"redis__log_txt": "INCR 11632\nINCR 11631\n"}))
+        self.assertIn("redis-log-order", self.failures(verdict))
+
     def test_writer_log_going_backwards_is_a_log_order_failure_not_data_loss(self):
         self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 10\nACK 11\n"}))
         code, verdict = self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 12\nACK 9\nACK 13\n",
