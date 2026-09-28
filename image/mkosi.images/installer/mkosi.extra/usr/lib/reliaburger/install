@@ -12,6 +12,12 @@
 #                                systemd-stub records)
 #   reliaburger.disk=/dev/<name> install here instead of the largest fixed disk
 #   reliaburger.wipe=1           overwrite a disk that already has partitions
+#
+# After writing, it puts a boot entry for the disk first in the firmware's
+# boot order, so the machine boots its disk from now on even where network
+# boot came first. A machine that network-boots onto a disk that already
+# holds Reliaburger OS (and no reliaburger.wipe=1) is sent back to that disk
+# instead of being reinstalled.
 set -euo pipefail
 
 say() { echo "reliaburger-install: $*"; }
@@ -56,6 +62,26 @@ expected=$(awk -v f="$image" '{ n = $2; sub(/^\*/, "", n); if (n == f) print $1 
 [ -n "$expected" ] || fail "$image isn't listed in $sums"
 say "signature good; $image should hash to ${expected:0:16}…"
 
+# Put a firmware boot entry for $1's systemd-boot first in BootOrder,
+# replacing any earlier Reliaburger entry. The removable-media path
+# (\EFI\BOOT\BOOT*.EFI) stays as the fallback for firmware that drops
+# entries the OS created.
+boot_disk_first() {
+    local disk=$1 loader old new order
+    case $(uname -m) in
+        x86_64) loader='\EFI\systemd\systemd-bootx64.efi' ;;
+        aarch64) loader='\EFI\systemd\systemd-bootaa64.efi' ;;
+    esac
+    for old in $(efibootmgr | sed -n 's/^Boot\([0-9A-F]\{4\}\)\*\{0,1\} Reliaburger OS.*/\1/p'); do
+        efibootmgr -q -b "$old" -B || true
+    done
+    efibootmgr -q -c -d "$disk" -p 1 -L "Reliaburger OS" -l "$loader" || return 1
+    new=$(efibootmgr | sed -n 's/^Boot\([0-9A-F]\{4\}\)\*\{0,1\} Reliaburger OS.*/\1/p' | head -n 1)
+    order=$(efibootmgr | sed -n 's/^BootOrder: //p' | tr ',' '\n' | grep -vx "$new" | paste -sd, -)
+    efibootmgr -q -o "$new${order:+,$order}"
+    echo "$new"
+}
+
 disk=$(arg reliaburger.disk)
 if [ -z "$disk" ]; then
     # The largest fixed, writable disk. eMMC boot partitions are read-only.
@@ -67,6 +93,15 @@ fi
 size=$(blockdev --getsize64 "$disk")
 say "target $disk, $((size / 1000000)) MB"
 if [ -n "$(lsblk -nlo NAME "$disk" | tail -n +2)" ] || blkid -p "$disk" >/dev/null 2>&1; then
+    if [ "$(arg reliaburger.wipe)" != 1 ] && lsblk -nlo PARTLABEL "$disk" | grep -qx reliaburger-data; then
+        # Already installed, and this boot came from the network first:
+        # go back to the disk, this time and from now on.
+        entry=$(boot_disk_first "$disk") || fail "$disk holds Reliaburger OS, but no boot entry could be made for it"
+        efibootmgr -q -n "$entry"
+        say "$disk already holds Reliaburger OS; booting it (boot entry $entry, now first)"
+        systemctl reboot
+        exit 0
+    fi
     [ "$(arg reliaburger.wipe)" = 1 ] || fail "$disk isn't empty; boot with reliaburger.wipe=1 to overwrite it"
     say "wiping $disk"
     wipefs -a -q "$disk"
@@ -113,6 +148,11 @@ fi
 # then grows the data partition and adds slot B.
 sgdisk -e "$disk" >/dev/null
 sync
+if entry=$(boot_disk_first "$disk"); then
+    say "boot entry $entry for $disk is now first in the boot order"
+else
+    say "couldn't add a boot entry; relying on the firmware finding \\EFI\\BOOT on $disk"
+fi
 
 peak=$(cat "$cgroup/memory.peak" 2>/dev/null || echo 0)
 read -r anon file low </run/memory.max || anon=0 file=0 low=0

@@ -164,13 +164,18 @@ jobs:
           git -C "$RUNNER_TEMP/ipxe" fetch -q --depth 1 https://github.com/ipxe/ipxe "$IPXE_COMMIT"
           git -C "$RUNNER_TEMP/ipxe" checkout -q FETCH_HEAD
           case "$ARCH" in
-            x86_64) target=bin-x86_64-efi/ipxe.efi name=x86_64 ;;
-            aarch64) target=bin-arm64-efi/ipxe.efi name=arm64 ;;
+            x86_64) dir=bin-x86_64-efi name=x86_64 ;;
+            aarch64) dir=bin-arm64-efi name=arm64 ;;
           esac
-          make -s -C "$RUNNER_TEMP/ipxe/src" -j"$(nproc)" "$target" \
+          # snp.efi drives the NICs through the firmware's own drivers, which
+          # is what odd NICs (the Wyse's Realtek) need; it's the default, as
+          # in Sidero's Omni. ipxe.efi brings iPXE's drivers, for firmware
+          # whose network stack is broken but whose NIC iPXE knows.
+          make -s -C "$RUNNER_TEMP/ipxe/src" -j"$(nproc)" "$dir/snp.efi" "$dir/ipxe.efi" \
             EMBED="$GITHUB_WORKSPACE/image/netboot/embed.ipxe"
           mkdir -p image/mkosi.output/netboot
-          cp "$RUNNER_TEMP/ipxe/src/$target" "image/mkosi.output/netboot/ipxe-$name.efi"
+          cp "$RUNNER_TEMP/ipxe/src/$dir/snp.efi" "image/mkosi.output/netboot/ipxe-snp-$name.efi"
+          cp "$RUNNER_TEMP/ipxe/src/$dir/ipxe.efi" "image/mkosi.output/netboot/ipxe-$name.efi"
           cp image/netboot/boot.ipxe image/mkosi.output/netboot/
           ls -l image/mkosi.output/netboot
 
@@ -243,7 +248,7 @@ jobs:
           out="$GITHUB_WORKSPACE/image/mkosi.output"
           web="$RUNNER_TEMP/web" tftp="$RUNNER_TEMP/tftp"
           mkdir -p "$web/x86_64" "$tftp"
-          cp "$out/netboot/ipxe-x86_64.efi" "$out/netboot/boot.ipxe" "$tftp/"
+          cp "$out/netboot/ipxe-snp-x86_64.efi" "$out/netboot/boot.ipxe" "$tftp/"
           for f in "$out"/reliaburger-os_"$IMAGE_VERSION".{raw.zst,SHA256SUMS,SHA256SUMS.sig}; do
             ln -s "$f" "$web/x86_64/"
           done
@@ -258,7 +263,7 @@ jobs:
             -drive if=pflash,format=raw,file="$RUNNER_TEMP/netboot-vars.fd" \
             -drive if=none,id=d0,format=raw,file="$RUNNER_TEMP/blank.raw" \
             -device virtio-blk-pci,drive=d0,bootindex=1 \
-            -netdev user,id=n0,tftp="$tftp",bootfile=ipxe-x86_64.efi \
+            -netdev user,id=n0,tftp="$tftp",bootfile=ipxe-snp-x86_64.efi \
             -device virtio-net-pci,netdev=n0,bootindex=2 \
             -display none -serial "file:$log" &
           qemu=$!
