@@ -26,6 +26,7 @@ mod schedules;
 pub mod snapshot_worker;
 pub mod supervisor;
 pub mod task_executor;
+pub mod task_ledger;
 pub mod testapp;
 pub mod top;
 

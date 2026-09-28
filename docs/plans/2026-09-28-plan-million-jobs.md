@@ -21,14 +21,15 @@ from `plans/million-jobs` unchanged), whose findings it keeps and whose
   (`src/meat/task_array_state.rs`, including the 1M-task control-plane
   budget test `a_million_task_array_fits_the_control_plane_budget`); M3.1
   and M3.2, the runner seam and the pool (`src/bun/task_executor.rs`:
-  `TaskRunner`, `ProcessRunner`, `FakeRunner`, `TaskPool::run_chunk`).
-- **Next:** M3.3, the ledger in `src/bun/task_ledger.rs`, tests first. It
-  stores the pool's `TaskRecord`s as fixed 14-byte records (`index: u32,
-  attempts: u8, outcome: u8, exit_code: i32, run_ms: u32`; the exit code
-  needs 32 bits for negated signals) in CRC32-framed blocks, fsyncs at most
-  every 100 ms or 4,096 records, and replays to find which tasks of a held
-  chunk still need running. `crc32fast` is already in `Cargo.lock`
-  (transitively), so adding it as a direct dependency costs nothing.
+  `TaskRunner`, `ProcessRunner`, `FakeRunner`, `TaskPool::run_chunk`); M3.3,
+  the ledger (`src/bun/task_ledger.rs`: 14-byte records in CRC32-framed
+  blocks, `spawn_writer` group commit, `replay` with torn-tail handling).
+- **Next:** M4.1, `tests/suite/task_array_million.rs`: three `TaskPool`s
+  with `FakeRunner` and a ledger each, driven by `TaskArrayState` and
+  `plan_grants` through 1,000,000 tasks with 1% first-attempt failures and
+  one node lost mid-run (its chunks re-granted, stale reports refused).
+  Then M4.2, `benches/task_arrays.rs` (Criterion, `harness = false` in
+  `Cargo.toml`) and a `make bench-task-arrays` target.
 - **Local build constraints while the release soak runs:**
   `CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=$HOME/.cache/rb-target-millionjobs`;
   run only the targeted unit tests (`cargo test --lib meat::index_set` and so
@@ -642,7 +643,7 @@ k3s cluster of the same size, and publish both scripts.
 
 - [x] M3.1 `TaskRunner` seam: `FakeRunner` and `ProcessRunner`
 - [x] M3.2 worker pool: concurrency, retries, timeouts, cancellation
-- [ ] M3.3 ledger with group commit and replay
+- [x] M3.3 ledger with group commit and replay
 
 ### M4: in-process proof
 
