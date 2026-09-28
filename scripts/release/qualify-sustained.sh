@@ -744,7 +744,11 @@ collect() {
     done
     if [ "$kind" = heavy ]; then
         # The writer's volume lives on node 2; exec reaches the local instance.
-        [ "${down[2]}" = 1 ] || rel_on 2 exec soak-writer awk '$0 != NR { print "BAD " NR ": " $0; exit } END { print "LAST " NR }' /data/seq \
+        # One pass over the whole file: the first line out of place, then
+        # which values are missing or repeated. The old check's `exit` ran
+        # END with NR at the bad line, so one repeated line read as a file
+        # truncated there (V02, 28 Sep 2026).
+        [ "${down[2]}" = 1 ] || rel_on 2 exec soak-writer awk '$0 != NR && bad == "" { bad = NR ": " $0 } { if (count[$0]++ == 1) { dups++; if (first_dup == "") first_dup = $0 } if ($0 + 0 > max) max = $0 + 0 } END { if (bad != "") print "BAD " bad; missing = 0; for (i = 1; i <= max; i++) if (!(i in count)) { if (!missing) first_missing = i; missing++ } if (dups) print "DUP " dups " first " first_dup; if (missing) print "MISSING " missing " first " first_missing; print "MAX " max + 0; print "LAST " NR }' /data/seq \
             > "$directory/writer-file.txt" 2>/dev/null || rm -f "$directory/writer-file.txt"
         [ "${down[1]}" = 1 ] || registry verify > "$directory/registry.json" 2>/dev/null || true
     fi
