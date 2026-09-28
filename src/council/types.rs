@@ -398,6 +398,10 @@ pub enum RaftRequest {
     /// `generation` (F04 R4). The leader proposes it for the node that
     /// authenticated the request.
     AcknowledgeNodeTrust { node_id: String, generation: u64 },
+    /// Register, sync, cancel or requeue a task array (0.2.0, million
+    /// jobs). One variant wrapping the array's own write type, so the
+    /// rules live beside the data in `meat::task_array_store`.
+    TaskArray(Box<crate::meat::task_array_store::TaskArrayWrite>),
 }
 
 // ---------------------------------------------------------------------------
@@ -451,6 +455,9 @@ pub enum CouncilResponse {
     ApiTokensSwept { removed: Vec<String> },
     /// Replicated webhook admission committed at this trigger generation.
     GitOpsSyncRequested { generation: u64 },
+    /// A task array was registered under this id, taken from the same
+    /// counter as ordinary batches.
+    TaskArrayRegistered { batch_id: u64 },
 }
 
 // ---------------------------------------------------------------------------
@@ -519,6 +526,9 @@ pub struct DesiredState {
     /// Durable batch tracker: monotonic id counter plus in-flight and
     /// recently terminal batches (12b.2 JOB4).
     pub batch_state: crate::meat::batch_tracker::BatchDurableState,
+    /// Task arrays (0.2.0): chunk tables and counts, never a record per
+    /// task. Ids come from `batch_state`'s counter.
+    pub task_arrays: crate::meat::task_array_store::TaskArrays,
     /// Durable build tracker, same shape and rationale as `batch_state`.
     pub build_state: crate::bun::build_runner::BuildDurableState,
     /// Monotonic disaster-recovery epoch (12b.2 D21/CP12). Zero on a cluster

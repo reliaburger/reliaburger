@@ -327,6 +327,15 @@ impl BatchDurableState {
         self.execution_owners.get(&key)
     }
 
+    /// Take the shared ID after task-array registration has checked exhaustion.
+    pub fn allocate_id(&mut self) -> u64 {
+        let id = self.next_batch_id.max(1);
+        self.next_batch_id = id
+            .checked_add(1)
+            .expect("task-array ID allocation must be preflighted");
+        id
+    }
+
     /// Drop terminal batches older than the retention window, and cap
     /// how many terminal batches are kept (newest win).
     fn prune_terminal(&mut self, now_epoch_secs: u64) {
