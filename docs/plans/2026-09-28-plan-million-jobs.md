@@ -19,10 +19,16 @@ from `plans/million-jobs` unchanged), whose findings it keeps and whose
 - **Done:** the plan (this file); M1 data model (`src/meat/index_set.rs`,
   `src/meat/task_array.rs`); M2 leader state machine and grant policy
   (`src/meat/task_array_state.rs`, including the 1M-task control-plane
-  budget test `a_million_task_array_fits_the_control_plane_budget`).
-- **Next:** M3.1, the `TaskRunner` seam (`FakeRunner`, `ProcessRunner`) in
-  `src/bun/task_executor.rs`, tests first; then the pool (M3.2) and the
-  ledger (M3.3, `src/bun/task_ledger.rs`).
+  budget test `a_million_task_array_fits_the_control_plane_budget`); M3.1
+  and M3.2, the runner seam and the pool (`src/bun/task_executor.rs`:
+  `TaskRunner`, `ProcessRunner`, `FakeRunner`, `TaskPool::run_chunk`).
+- **Next:** M3.3, the ledger in `src/bun/task_ledger.rs`, tests first. It
+  stores the pool's `TaskRecord`s as fixed 14-byte records (`index: u32,
+  attempts: u8, outcome: u8, exit_code: i32, run_ms: u32`; the exit code
+  needs 32 bits for negated signals) in CRC32-framed blocks, fsyncs at most
+  every 100 ms or 4,096 records, and replays to find which tasks of a held
+  chunk still need running. `crc32fast` is already in `Cargo.lock`
+  (transitively), so adding it as a direct dependency costs nothing.
 - **Local build constraints while the release soak runs:**
   `CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=$HOME/.cache/rb-target-millionjobs`;
   run only the targeted unit tests (`cargo test --lib meat::index_set` and so
@@ -200,7 +206,7 @@ published.
 
 So the fair claim is about *per-task tracking at constant control-plane
 cost*. Reliaburger stores the template once and the progress as ranges, so the
-thing that grows with a million tasks is a node-local file of ten-byte
+thing that grows with a million tasks is a node-local file of fourteen-byte
 records, not a database of objects.
 
 ## Where we are today
@@ -337,8 +343,8 @@ follow-up, since at-least-once already allows it.
   binary) are fatal for the task without retry, because retrying can't fix
   them.
 - **Ledger.** One append-only file per array under
-  `<data>/task-arrays/<batch>/ledger`, fixed 12-byte records
-  (`index: u32, attempts: u8, outcome: u8, exit_code: i16, run_ms: u32`) in
+  `<data>/task-arrays/<batch>/ledger`, fixed 14-byte records
+  (`index: u32, attempts: u8, outcome: u8, exit_code: i32, run_ms: u32`) in
   framed blocks with a CRC32 each. Group commit: the writer fsyncs every 100 ms
   or 4,096 records, whichever comes first, and a chunk is reported complete
   only after its last record is durable. On restart the node replays the
@@ -412,7 +418,7 @@ the attempt number.
 | A scheduler decision | nothing; the chunk was granted once per 1,024 tasks |
 | A sandbox, a pause container, cgroups, a network namespace | one `fork`/`exec` from an existing worker |
 | Kubelet status updates to the API server | a counter increment |
-| Job controller status patch and finalizer removal | a 12-byte ledger record, group-committed |
+| Job controller status patch and finalizer removal | a 14-byte ledger record, group-committed |
 | Pod garbage collection | ledger deleted once per array |
 | Log files per container | a head and tail in memory, sampled into Ketchup |
 
@@ -634,8 +640,8 @@ k3s cluster of the same size, and publish both scripts.
 
 ### M3: node executor
 
-- [ ] M3.1 `TaskRunner` seam: `FakeRunner` and `ProcessRunner`
-- [ ] M3.2 worker pool: concurrency, retries, timeouts, cancellation
+- [x] M3.1 `TaskRunner` seam: `FakeRunner` and `ProcessRunner`
+- [x] M3.2 worker pool: concurrency, retries, timeouts, cancellation
 - [ ] M3.3 ledger with group commit and replay
 
 ### M4: in-process proof
