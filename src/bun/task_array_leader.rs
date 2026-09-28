@@ -45,6 +45,10 @@ pub const SILENCE_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long one node's sync call may take.
 pub const NODE_SYNC_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// How long a task-array Raft write may take before the caller gives up
+/// (the entry may still commit; every write is safe to repeat or drop).
+pub const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// The latest word from one node about one array, for status views.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeView {
@@ -133,7 +137,13 @@ pub(crate) async fn write_task_array(
             Err(error) => Err(TaskArrayWriteError::Refused(error.to_string())),
         };
     };
-    match council.write(RaftRequest::TaskArray(Box::new(write))).await {
+    let written = tokio::time::timeout(
+        WRITE_TIMEOUT,
+        council.write(RaftRequest::TaskArray(Box::new(write))),
+    )
+    .await
+    .map_err(|_| TaskArrayWriteError::Unavailable("the Raft write timed out".to_string()))?;
+    match written {
         Ok(CouncilResponse::TaskArrayRegistered { batch_id }) => Ok(Some(batch_id)),
         Ok(CouncilResponse::Refused { reason }) => Err(TaskArrayWriteError::Refused(reason)),
         Ok(_) => Ok(None),
