@@ -63,6 +63,11 @@ pub struct LogEntry {
     pub sequence: u64,
     /// The instance that wrote the line, when a workload wrote it.
     pub instance: Option<String>,
+    /// The node that stored the line. A cross-node query fills it in; a
+    /// node answering for itself leaves it out. An instance that moves
+    /// keeps its name, so only the node tells its two runs apart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
     /// Which stream produced this line.
     pub stream: LogStream,
     /// The log line content.
@@ -135,6 +140,7 @@ mod tests {
                 timestamp: 1000,
                 sequence: 1,
                 instance: None,
+                node: None,
                 stream: LogStream::Stdout,
                 line: "hello".to_string(),
             }],
@@ -166,6 +172,7 @@ mod tests {
             timestamp: 42,
             sequence: 42_000_000_001,
             instance: Some("web-0".to_string()),
+            node: Some("node-2".to_string()),
             stream: LogStream::Stderr,
             line: "error msg".to_string(),
         };
@@ -174,6 +181,7 @@ mod tests {
         assert_eq!(decoded.timestamp, 42);
         assert_eq!(decoded.sequence, 42_000_000_001);
         assert_eq!(decoded.instance.as_deref(), Some("web-0"));
+        assert_eq!(decoded.node.as_deref(), Some("node-2"));
         assert_eq!(decoded.stream, LogStream::Stderr);
         assert_eq!(decoded.line, "error msg");
     }

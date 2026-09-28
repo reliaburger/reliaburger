@@ -90,7 +90,10 @@ pub fn query_targets(placed: &[String], members: &[(String, String)]) -> QueryTa
 /// Each node's sequence rises strictly, so a node's own rows keep their
 /// order. Rows from different nodes interleave by their nanosecond
 /// sequences, with the node id breaking an exact tie so the result is
-/// deterministic.
+/// deterministic. That interleaving is only as good as the nodes' clocks
+/// and ingest delays, so it orders one node's lines, not two nodes' lines
+/// against each other; each entry names its node so a reader can tell the
+/// two apart.
 pub fn merge_node_logs(sources: Vec<NodeLogs>) -> Vec<LogEntry> {
     let mut seen: HashSet<(String, u64)> = HashSet::new();
     let mut merged: Vec<(String, LogEntry)> = Vec::new();
@@ -98,6 +101,10 @@ pub fn merge_node_logs(sources: Vec<NodeLogs>) -> Vec<LogEntry> {
     for source in sources {
         for entry in source.entries {
             if seen.insert((source.node_id.clone(), entry.sequence)) {
+                let entry = LogEntry {
+                    node: Some(source.node_id.clone()),
+                    ..entry
+                };
                 merged.push((source.node_id.clone(), entry));
             }
         }
@@ -230,6 +237,7 @@ mod tests {
             timestamp: sequence,
             sequence,
             instance: None,
+            node: None,
             stream: LogStream::Stdout,
             line: line.to_string(),
         }
@@ -400,6 +408,7 @@ mod tests {
                 timestamp: 1_790_368_624,
                 sequence: 1_790_368_624_000_000_000 + i * 100_000_000,
                 instance: Some("soak-writer-0".to_string()),
+                node: None,
                 stream: LogStream::Stdout,
                 line: format!("ACK {}", 968 + i),
             })
@@ -453,6 +462,29 @@ mod tests {
         ]);
         let lines: Vec<&str> = result.iter().map(|e| e.line.as_str()).collect();
         assert_eq!(lines, vec!["from n1", "from n2"]);
+    }
+
+    /// V02 soak, 28 Sep 2026: an upgrade walk moved `soak-redis-client-0`
+    /// from one node to another under the same name, and the merged tail
+    /// showed `INCR 11632` before `INCR 11631` with nothing to say two runs
+    /// on two clocks wrote them. Every merged line names its node.
+    #[test]
+    fn merged_entries_name_the_node_that_stored_them() {
+        let result = merge_node_logs(vec![
+            node("node-2", vec![entry(20, "INCR 11631")]),
+            node("node-3", vec![entry(10, "INCR 11632")]),
+        ]);
+        let stored: Vec<(Option<&str>, &str)> = result
+            .iter()
+            .map(|e| (e.node.as_deref(), e.line.as_str()))
+            .collect();
+        assert_eq!(
+            stored,
+            vec![
+                (Some("node-3"), "INCR 11632"),
+                (Some("node-2"), "INCR 11631")
+            ]
+        );
     }
 
     /// A node whose response is duplicated across the wire (retransmit) still

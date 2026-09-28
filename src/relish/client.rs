@@ -135,21 +135,39 @@ fn render_log_entries(entries: &[crate::ketchup::types::LogEntry], options: &Log
         .iter()
         .filter(|entry| options.matches(&entry.line))
         .collect();
-    let instances: std::collections::BTreeSet<Option<&str>> = shown
+    // A run is one instance on one node. An instance that moves keeps its
+    // name, and the view interleaves its two runs by two nodes' clocks, so
+    // the label names the node wherever the name alone would hide the move.
+    let runs: std::collections::BTreeSet<(Option<&str>, Option<&str>)> = shown
         .iter()
-        .map(|entry| entry.instance.as_deref())
+        .map(|entry| (entry.instance.as_deref(), entry.node.as_deref()))
         .collect();
-    let label = instances.len() > 1;
+    let label = runs.len() > 1;
     let mut output = String::new();
     for entry in shown {
         if label {
-            output.push_str(&format!("[{}] ", entry.instance.as_deref().unwrap_or("-")));
+            output.push_str(&format!("[{}] ", run_label(entry, &runs)));
         }
         output.push_str(&entry.line);
         output.push('\n');
     }
     output.pop();
     output
+}
+
+/// `instance`, or `instance@node` when that instance name ran on more than
+/// one node in `runs`.
+fn run_label(
+    entry: &crate::ketchup::types::LogEntry,
+    runs: &std::collections::BTreeSet<(Option<&str>, Option<&str>)>,
+) -> String {
+    let instance = entry.instance.as_deref();
+    let name = instance.unwrap_or("-");
+    let moved = runs.iter().filter(|(other, _)| *other == instance).count() > 1;
+    match &entry.node {
+        Some(node) if moved => format!("{name}@{node}"),
+        _ => name.to_string(),
+    }
 }
 
 /// How long [`BunClient::release_test_lease`] waits for server-confirmed
@@ -2586,8 +2604,19 @@ mod tests {
             timestamp: sequence / 1_000_000_000,
             sequence,
             instance: Some(instance.to_string()),
+            node: None,
             stream: crate::ketchup::types::LogStream::Stdout,
             line: line.to_string(),
+        }
+    }
+
+    fn stored_on(
+        node: &str,
+        entry: crate::ketchup::types::LogEntry,
+    ) -> crate::ketchup::types::LogEntry {
+        crate::ketchup::types::LogEntry {
+            node: Some(node.to_string()),
+            ..entry
         }
     }
 
@@ -2616,6 +2645,49 @@ mod tests {
             "[soak-redis-client-0] INCR 3550\n\
              [soak-redis-client-1] INCR 3551\n\
              [soak-redis-client-0] INCR 3552"
+        );
+    }
+
+    /// V02 soak, 28 Sep 2026: an upgrade walk moved `soak-redis-client-0`
+    /// to another node under the same name. Both runs' lines looked like one
+    /// instance's, so ordering them by two nodes' clocks read as the client
+    /// going backwards. The same name on two nodes gets the node in its label.
+    #[tokio::test]
+    async fn one_instance_on_two_nodes_names_each_line_s_node() {
+        let output = render_queried_logs(vec![
+            stored_on("rb-2", queried(1, "soak-redis-client-0", "INCR 11630")),
+            stored_on("rb-3", queried(2, "soak-redis-client-0", "INCR 11632")),
+            stored_on("rb-2", queried(3, "soak-redis-client-0", "INCR 11631")),
+            stored_on("rb-3", queried(4, "soak-redis-client-0", "INCR 11633")),
+        ])
+        .await;
+        assert_eq!(
+            output,
+            "[soak-redis-client-0@rb-2] INCR 11630\n\
+             [soak-redis-client-0@rb-3] INCR 11632\n\
+             [soak-redis-client-0@rb-2] INCR 11631\n\
+             [soak-redis-client-0@rb-3] INCR 11633"
+        );
+    }
+
+    /// One instance on one node prints bare even though the cross-node query
+    /// names the node, and several instances keep their short labels.
+    #[tokio::test]
+    async fn the_node_stays_out_of_labels_it_does_not_disambiguate() {
+        let output = render_queried_logs(vec![
+            stored_on("rb-2", queried(1, "soak-redis-client-0", "INCR 1")),
+            stored_on("rb-2", queried(2, "soak-redis-client-0", "INCR 2")),
+        ])
+        .await;
+        assert_eq!(output, "INCR 1\nINCR 2");
+        let output = render_queried_logs(vec![
+            stored_on("rb-2", queried(1, "soak-redis-client-0", "INCR 3550")),
+            stored_on("rb-3", queried(2, "soak-redis-client-1", "INCR 3551")),
+        ])
+        .await;
+        assert_eq!(
+            output,
+            "[soak-redis-client-0] INCR 3550\n[soak-redis-client-1] INCR 3551"
         );
     }
 

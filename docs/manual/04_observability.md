@@ -20,6 +20,13 @@ and instance, like `[rb-4f2a9c1e07b3-2 default__web-0] GET /healthz 200`. It
 picks up replicas scheduled onto new nodes as they appear. If a node goes
 away mid-stream, you get a `warning:` on stderr and the rest keep streaming.
 
+Without `-f`, lines from one instance print bare. Once the tail spans more
+than one instance, each line starts with `[default__web-0]`, and an instance
+that moved nodes keeps its name, so its two runs show as
+`[default__web-0@rb-4f2a9c1e07b3-2]`. Each run's lines are in the order it
+wrote them. Lines from different runs are interleaved by their nodes' clocks,
+so near-simultaneous lines from two runs can appear in either order.
+
 Retention and export are node config:
 
 ```toml
