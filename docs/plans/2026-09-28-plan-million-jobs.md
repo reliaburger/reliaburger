@@ -652,6 +652,7 @@ k3s cluster of the same size, and publish both scripts.
 - [x] compatibility decision recorded (28 September 2026): no gate, bump and start fresh
 - [x] bump `protocol` and `state` in `src/compatibility.rs` (27/44 to 28/45); test that peers and state from before are refused
 - [x] `RaftRequest::TaskArray(TaskArrayWrite)` and `DesiredState::task_arrays` (`src/meat/task_array_store.rs`; ids share the batch counter)
+- [x] node side of the sync (`src/bun/task_array_node.rs`): runs held chunks through `TaskPool` with the ledger, fences by attempt, resumes from the ledger after a restart (`TaskPool::resume_chunk`), refuses binaries off the allowlist and nodes with `mount_isolation` (M7 decides), keeps failed tasks' output, deletes an array's files once the cluster stops listing it
 - [ ] `POST /v1/batch/array`, sync route, cancel route
 - [ ] leader sync loop with requeue on silence
 - [ ] `relish run --batch --count`, `relish batch cancel`
