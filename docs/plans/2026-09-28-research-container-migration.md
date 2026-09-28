@@ -52,8 +52,10 @@ host reboot (kernel, firmware, hardware).
 Keep it runc-rootful only. Drop established TCP connections and give the
 instance a new address on the target; clients reconnect, which is what Google
 did for Borg's CRIU migrations ([LPC 2018 slides](https://lpc.events/event/2/contributions/69/attachments/205/374/Task_Migration_at_Scale_Using_CRIU_-_LPC_2018.pdf), accessed 28 Sep 2026).
-Position it for long-running batch jobs first (the only use with production
-evidence), then single-instance dev and game servers. GPU warm starts are a
+Position it for long-running batch work first (the only use with production
+evidence), then single-instance dev and game servers. In 0.2.0 that means
+batch-style workers deployed as apps; moving a running *job* attempt is the
+first 0.3 item, because jobs have their own attempt ledger. GPU warm starts are a
 real market, but every shipping product we could verify uses gVisor or
 CRIU with NVIDIA patches that aren't upstream yet, we have no GPU hardware, and CUDA
 checkpointing needs host RAM at least as large as GPU memory in use. That's
@@ -903,7 +905,7 @@ checkpoint mode, ship cold moves and drain alone and say so.
 1. Pre-sync volumes while the app runs (Btrfs incremental send, or rsync
    passes elsewhere), then stop and send the last delta. The biggest
    downtime win, and it helps cold moves too.
-2. Jobs: move a running attempt without spending a retry.
+2. Jobs: move a running attempt without spending a retry (possibly first, see Q3).
 3. Memory pre-dump (`--pre-dump`, `--parent-path`), **x86-64 only** until
    arm64 has soft-dirty tracking.
 4. Lazy pages, only if S7-style measurements show memory transfer dominating
