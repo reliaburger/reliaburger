@@ -16,8 +16,9 @@ from `plans/million-jobs` unchanged), whose findings it keeps and whose
 - **Branch:** `feat/million-jobs` (from `origin/main` at `087d882f`, plus a
   merge of `plans/million-jobs`). Draft PR: "Million jobs: task arrays at
   scale (after 0.1.0)".
-- **Done:** the plan (this file).
-- **Next:** M1.1, `IndexRangeSet` in `src/meat/index_set.rs`, tests first.
+- **Done:** the plan (this file); M1.1 `IndexRangeSet` (`src/meat/index_set.rs`).
+- **Next:** M1.2/M1.3, `TaskArraySpec`, chunk maths and template expansion in
+  `src/meat/task_array.rs`.
 - **Local build constraints while the release soak runs:**
   `CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=$HOME/.cache/rb-target-millionjobs`;
   run only the targeted unit tests (`cargo test --lib meat::index_set` and so
@@ -617,7 +618,7 @@ k3s cluster of the same size, and publish both scripts.
 
 ### M1: data model
 
-- [ ] M1.1 `IndexRangeSet` with unit and property tests
+- [x] M1.1 `IndexRangeSet` with unit and property tests
 - [ ] M1.2 `TaskArraySpec` validation and chunk maths
 - [ ] M1.3 template expansion and task environment
 
