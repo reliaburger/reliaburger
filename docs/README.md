@@ -459,10 +459,11 @@ cargo run --bin bun -- --listen 127.0.0.1:9217
 cargo run --bin bun -- --config node.toml
 ```
 
-The agent prints which runtime it selected on startup:
+The agent prints its version, the commit it was built from, and the runtime
+it selected on startup:
 
 ```
-bun: reliaburger node agent v0.1.0
+bun: reliaburger node agent v0.1.0 (3fcb1fd)
 bun: auto-detected runtime: process
 bun: API server listening on 127.0.0.1:9117
 ```

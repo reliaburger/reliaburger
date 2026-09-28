@@ -1867,6 +1867,9 @@ async fn version_handler(State(state): State<ApiState>) -> impl IntoResponse {
             // start gate and the orchestrator compare this digest with the
             // candidate's so a same-version build can't pass as a swap.
             "binary_sha256": manager.running_binary_sha256().await,
+            // The commit the running bytes were built from, so two builds
+            // with the same version are told apart at a glance.
+            "commit": crate::upgrade::version::build_commit(),
             "compatibility": crate::compatibility::CURRENT,
             "upgrade_in_flight": manager.upgrade_in_flight(),
             // Ids this node attempted and reverted — the orchestrator
@@ -1879,6 +1882,7 @@ async fn version_handler(State(state): State<ApiState>) -> impl IntoResponse {
         })),
         None => Json(serde_json::json!({
             "version": crate::upgrade::version::compiled_version().to_string(),
+            "commit": crate::upgrade::version::build_commit(),
             "compatibility": crate::compatibility::CURRENT,
             "upgrade_in_flight": false,
             "failed_upgrade_ids": [],
@@ -15599,6 +15603,33 @@ schedule = "* * * * *"
         assert_eq!(nodes[0].incarnation, 4);
         assert_eq!(nodes[0].labels["zone"], "a");
         worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn version_endpoint_reports_the_build_commit() {
+        let (app, shutdown) = test_setup();
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/version")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["commit"].as_str(),
+            crate::upgrade::version::build_commit()
+        );
+        assert!(json.get("commit").is_some(), "the field is always present");
+        assert_eq!(
+            json["version"],
+            crate::upgrade::version::compiled_version().to_string()
+        );
+        shutdown.cancel();
     }
 
     #[tokio::test]

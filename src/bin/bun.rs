@@ -26,7 +26,11 @@ use reliaburger::pickle::store::BlobStore;
 use reliaburger::pickle::types::ManifestCatalog;
 
 #[derive(Parser)]
-#[command(name = "bun", version, about = "Reliaburger node agent")]
+#[command(
+    name = "bun",
+    version = reliaburger::upgrade::version::VERSION_LINE.as_str(),
+    about = "Reliaburger node agent"
+)]
 struct Cli {
     /// Print supported protocol and state formats without opening runtime state.
     #[arg(long)]
@@ -710,7 +714,13 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     let exe_path = std::env::current_exe()
         .map_err(|e| anyhow::anyhow!("failed to resolve current executable path: {e}"))?;
     let running_version = reliaburger::upgrade::resolve_running_version(&exe_path);
-    println!("bun: reliaburger node agent {running_version}");
+    println!(
+        "bun: reliaburger node agent {}",
+        reliaburger::upgrade::version::describe(
+            &running_version,
+            reliaburger::upgrade::version::build_commit()
+        )
+    );
 
     // Load node config
     let config = if let Some(ref path) = cli.config {
@@ -1685,8 +1695,11 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         "system",
         reliaburger::ketchup::types::LogStream::Stdout,
         &format!(
-            "reliaburger node agent v{} started",
-            env!("CARGO_PKG_VERSION")
+            "reliaburger node agent {} started",
+            reliaburger::upgrade::version::describe(
+                &reliaburger::upgrade::version::compiled_version(),
+                reliaburger::upgrade::version::build_commit()
+            )
         ),
     );
     log_store_inner.append(
