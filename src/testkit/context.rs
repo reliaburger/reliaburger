@@ -723,10 +723,10 @@ impl TestContext {
                     };
                 }
                 // Reached it, but the lease was still held when the release's
-                // own 30 s budget ran out: not the same as unreachable.
+                // own budget ran out: not the same as unreachable.
                 Ok(Err(crate::relish::RelishError::RequestTimeout)) => {
                     return CleanupOutcome::Unknown {
-                        reason: "the lease owner did not confirm cleanup within 30 s".to_string(),
+                        reason: unconfirmed_release_reason(),
                     };
                 }
                 Ok(Err(error)) => {
@@ -839,6 +839,15 @@ impl TestContext {
     }
 }
 
+/// Why cleanup is unknown when the lease owner was reached but the release
+/// ran out of its budget, naming the budget it actually had.
+fn unconfirmed_release_reason() -> String {
+    format!(
+        "the lease owner did not confirm cleanup within {} s",
+        crate::relish::client::lease_release_budget().as_secs()
+    )
+}
+
 fn merge_cleanup(left: CleanupOutcome, right: CleanupOutcome) -> CleanupOutcome {
     use CleanupOutcome::{Confirmed, Failed, NotRequired, Unknown};
 
@@ -899,6 +908,18 @@ fn testapp_port(app: &str) -> u16 {
 mod tests {
     use super::*;
     use crate::config::Config;
+
+    /// V02: the report said "within 30 s" long after the release budget
+    /// became the product's retirement bound (72 s by default).
+    #[test]
+    fn an_unconfirmed_release_reports_the_budget_it_actually_had() {
+        let budget = crate::relish::client::lease_release_budget().as_secs();
+        assert_ne!(budget, 30);
+        assert_eq!(
+            unconfirmed_release_reason(),
+            format!("the lease owner did not confirm cleanup within {budget} s")
+        );
+    }
 
     fn context(namespace: &str) -> TestContext {
         TestContext {
