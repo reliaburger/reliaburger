@@ -59,6 +59,8 @@ pub struct MockGrill {
     /// Time each force-kill request takes, as `runc kill` does on a loaded host.
     kill_delay: Arc<Mutex<Option<std::time::Duration>>>,
     pid_delay: Arc<Mutex<Option<std::time::Duration>>>,
+    /// Per-instance pid delays, on top of `pid_delay`.
+    instance_pid_delays: Arc<Mutex<HashMap<InstanceId, std::time::Duration>>>,
     fail_create: Arc<AtomicBool>,
     fail_start: Arc<AtomicBool>,
     fail_state: Arc<AtomicBool>,
@@ -105,6 +107,7 @@ impl Default for MockGrill {
             inventory_delay: Arc::default(),
             kill_delay: Arc::default(),
             pid_delay: Arc::default(),
+            instance_pid_delays: Arc::default(),
             fail_create: Arc::default(),
             fail_start: Arc::default(),
             fail_state: Arc::default(),
@@ -357,6 +360,15 @@ impl MockGrill {
     /// Delay every pid read, as a runtime waiting on a busy lifecycle lock would.
     pub fn set_pid_delay(&self, delay: Option<std::time::Duration>) {
         *self.pid_delay.lock().unwrap() = delay;
+    }
+
+    /// Delay pid reads for one instance only, as runc does while that
+    /// instance's lifecycle lock is held.
+    pub fn set_instance_pid_delay(&self, instance: &InstanceId, delay: std::time::Duration) {
+        self.instance_pid_delays
+            .lock()
+            .unwrap()
+            .insert(instance.clone(), delay);
     }
 
     /// Delay every force-kill request, as a slow runtime on a loaded host would.
@@ -625,8 +637,14 @@ impl super::Grill for MockGrill {
             .and_then(|path| crate::sesame::egress::cgroup_id_of_path(path)))
     }
 
-    async fn pid(&self, _instance: &InstanceId) -> Option<u32> {
-        let delay = *self.pid_delay.lock().unwrap();
+    async fn pid(&self, instance: &InstanceId) -> Option<u32> {
+        let delay = self
+            .instance_pid_delays
+            .lock()
+            .unwrap()
+            .get(instance)
+            .copied()
+            .or(*self.pid_delay.lock().unwrap());
         if let Some(delay) = delay {
             tokio::time::sleep(delay).await;
         }

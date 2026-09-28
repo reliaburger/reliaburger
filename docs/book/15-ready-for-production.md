@@ -3005,6 +3005,53 @@ when it fails. The last test hands the loop two finished signatures, one for
 a live instance and one for a retired one, and checks that only the live one
 gets files.
 
+The third was status itself. Every `Status` command asks the runtime for each
+instance's pid and exit code, and runc answers both under the instance's
+lifecycle lock. A create that's pulling a slow image, or a stop waiting out
+its grace, holds that lock for seconds, and `get_status` waited on it with no
+deadline, one instance after another. One slow instance stalled the answer
+for all of them, and the loop with it.
+
+What should status say about an instance the runtime won't talk about yet?
+Not nothing: the agent still knows its app, state, port and restart count.
+Not "no pid" either, because that means something (the process has gone).
+So the answer carries what's known and says which part isn't:
+
+```rust
+/// The runtime didn't answer for this instance before the status
+/// deadline, so `pid` and `exit_code` are unknown rather than absent.
+#[serde(default, skip_serializing_if = "std::ops::Not::not")]
+pub runtime_unknown: bool,
+```
+
+The serde attributes keep the wire form backward compatible in both
+directions: an older peer's JSON without the field reads as `false`
+(`default`), and an unmarked status serialises exactly as before
+(`skip_serializing_if` takes a function path, and `std::ops::Not::not` is the
+`!` operator as a function). The CLI prints `?` in the PID column for a marked
+instance, next to the `-` that means "no process".
+
+The reads now share one deadline for the whole answer. They run eight at a
+time with `join_all`, which polls a batch of futures together and returns
+their results in order, each under `tokio::time::timeout_at(deadline, ...)`.
+`timeout_at` polls the inner future once before it checks the clock, so an
+instance that answers at once is never marked unknown just because an earlier
+batch used up the time.
+
+We first wrote this as a stream, `stream::iter(&instances).map(...).buffered(8)`,
+and got 380 errors saying ``implementation of `Send` is not general enough``.
+The closure passed to `map` takes a reference, which makes it generic over
+that reference's lifetime, and the compiler can't yet prove a future built
+from such a closure is `Send` for *every* lifetime, which `tokio::spawn`
+needs. Plain `for` loops that push futures into a `Vec` sidestep the question,
+and read just as well.
+
+Three tests cover it. One instance of three holds its lock for thirty seconds:
+status comes back well inside two seconds, with that instance marked, still
+`running`, and the other two with their pids. Six instances all holding their
+locks cost one deadline, not six. And the field round-trips, and stays out of
+the JSON when it's `false`.
+
 ## Walk the path you actually care about
 
 Say `web` can't reach `redis`. Checking Bun's own DNS and TCP access might tell

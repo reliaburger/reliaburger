@@ -76,6 +76,15 @@ const SHUTDOWN_GRACE_SECS: u64 = 5;
 /// before it escalates to SIGKILL (DEP6).
 const STOP_GRACE_SECS: u64 = 10;
 
+/// How long a status answer waits for the runtime's pids and exit codes.
+/// runc answers both under the instance's lifecycle lock, which a slow create
+/// or stop can hold for seconds; status then reports what it knows and marks
+/// the rest `runtime_unknown`, rather than holding the agent loop.
+const STATUS_RUNTIME_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// At most this many instances' runtime reads run at once for one status.
+const STATUS_RUNTIME_READ_CONCURRENCY: usize = 8;
+
 /// How long one health tick may keep starting pending restarts. A restart
 /// whose old runtime can't be cleaned up yet costs a few hundred
 /// milliseconds, and a node that lost every container has dozens of them.
@@ -1559,6 +1568,10 @@ pub struct InstanceStatus {
     pub exit_code: Option<i32>,
     /// OS process ID, if available.
     pub pid: Option<u32>,
+    /// The runtime didn't answer for this instance before the status
+    /// deadline, so `pid` and `exit_code` are unknown rather than absent.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub runtime_unknown: bool,
 }
 
 /// A workload status with the node that supplied it.
@@ -1960,6 +1973,14 @@ pub struct BunAgent<G: Grill> {
     /// Those tasks. A follower's CSR waits on the leader for up to ten
     /// seconds, which must not stall every other command.
     identity_signing_tasks: tokio::task::JoinSet<identity_signing::SignedIdentity>,
+}
+
+/// One instance's runtime view for a status answer.
+struct RuntimeEvidence {
+    pid: Option<u32>,
+    exit_code: Option<i32>,
+    /// The runtime didn't answer before the status deadline.
+    unknown: bool,
 }
 
 /// The last instance each phase of `drive_pending_restarts` handled.
@@ -9593,35 +9614,85 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     /// Get status of all instances.
+    ///
+    /// Every instance's runtime reads share one deadline,
+    /// `STATUS_RUNTIME_READ_TIMEOUT`. An instance whose runtime hasn't
+    /// answered by then is reported with what the agent knows and
+    /// `runtime_unknown` set.
     async fn get_status(&self) -> Vec<InstanceStatus> {
-        let mut statuses = Vec::new();
-        for instance in self.supervisor.list_instances() {
-            // An instance still being created has neither, and asking would
-            // hold the agent loop until its image pull finishes (Z6.7).
-            let creating = instance.is_being_created();
-            let pid = if creating {
-                None
-            } else {
-                self.supervisor.grill().pid(&instance.id).await
-            };
-            let exit_code = match self.recorded_jobs.get(&instance.id.0).map(|job| &job.phase) {
-                Some(super::jobs::JobPhase::Exited { code }) => Some(*code),
-                Some(super::jobs::JobPhase::Unknown) => None,
-                _ if creating => None,
-                _ => self.supervisor.grill().exit_code(&instance.id).await,
-            };
-            statuses.push(InstanceStatus {
+        let deadline = tokio::time::Instant::now() + STATUS_RUNTIME_READ_TIMEOUT;
+        let instances = self.supervisor.list_instances();
+        let mut evidence = Vec::with_capacity(instances.len());
+        for batch in instances.chunks(STATUS_RUNTIME_READ_CONCURRENCY) {
+            let mut reads = Vec::with_capacity(batch.len());
+            for instance in batch {
+                reads.push(self.runtime_evidence(instance, deadline));
+            }
+            evidence.extend(futures_util::future::join_all(reads).await);
+        }
+        instances
+            .iter()
+            .zip(evidence)
+            .map(|(instance, evidence)| InstanceStatus {
                 id: instance.id.0.clone(),
                 app_name: instance.app_name.clone(),
                 namespace: instance.namespace.clone(),
                 state: self.job_state_label(instance),
                 restart_count: instance.restart_count,
                 host_port: instance.host_port,
-                exit_code,
-                pid,
-            });
+                exit_code: evidence.exit_code,
+                pid: evidence.pid,
+                runtime_unknown: evidence.unknown,
+            })
+            .collect()
+    }
+
+    /// Ask the runtime for one instance's pid and exit code, giving up at
+    /// `deadline`. A recorded job outcome needs no runtime read.
+    async fn runtime_evidence(
+        &self,
+        instance: &super::supervisor::WorkloadInstance,
+        deadline: tokio::time::Instant,
+    ) -> RuntimeEvidence {
+        // An instance still being created has neither, and asking would
+        // hold the agent loop until its image pull finishes (Z6.7).
+        let creating = instance.is_being_created();
+        let recorded_exit = match self.recorded_jobs.get(&instance.id.0).map(|job| &job.phase) {
+            Some(super::jobs::JobPhase::Exited { code }) => Some(Some(*code)),
+            Some(super::jobs::JobPhase::Unknown) => Some(None),
+            _ if creating => Some(None),
+            _ => None,
+        };
+        if creating {
+            return RuntimeEvidence {
+                pid: None,
+                exit_code: recorded_exit.flatten(),
+                unknown: false,
+            };
         }
-        statuses
+        let grill = self.supervisor.grill();
+        let read = async {
+            let pid = grill.pid(&instance.id).await;
+            let exit_code = match recorded_exit {
+                Some(code) => code,
+                None => grill.exit_code(&instance.id).await,
+            };
+            (pid, exit_code)
+        };
+        // `timeout_at` polls the read once even past the deadline, so an
+        // instance that answers at once is never marked unknown.
+        match tokio::time::timeout_at(deadline, read).await {
+            Ok((pid, exit_code)) => RuntimeEvidence {
+                pid,
+                exit_code,
+                unknown: false,
+            },
+            Err(_) => RuntimeEvidence {
+                pid: None,
+                exit_code: recorded_exit.flatten(),
+                unknown: true,
+            },
+        }
     }
 
     fn get_job_status(&self) -> Vec<JobStatus> {
@@ -24197,5 +24268,83 @@ host = "remote.local"
             !agent.instance_identity_dir(&retired).exists(),
             "a late signature recreated a retired instance's identity directory"
         );
+    }
+
+    /// PR #270's investigation: runc answers `pid` and `exit_code` under the
+    /// instance's lifecycle lock, which a slow create or stop can hold for
+    /// seconds, and `get_status` waited on it with no deadline. Status now
+    /// answers anyway: what it knows, with the slow instance marked.
+    #[tokio::test]
+    async fn status_answers_promptly_when_one_instance_holds_its_runtime_lock() {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        let config =
+            Config::parse("[app.web]\nimage = 'web:v1'\nport = 8080\nreplicas = 3\n").unwrap();
+        expect_complete(&drain_deploy(&mut agent, config).await);
+        grill.set_pid(4242);
+        let slow = InstanceId("default__web-1".into());
+        grill.set_instance_pid_delay(&slow, std::time::Duration::from_secs(30));
+
+        let statuses = tokio::time::timeout(
+            STATUS_RUNTIME_READ_TIMEOUT + std::time::Duration::from_secs(2),
+            agent.get_status(),
+        )
+        .await
+        .expect("status waited for the busy instance");
+
+        assert_eq!(statuses.len(), 3);
+        for status in &statuses {
+            if status.id == slow.0 {
+                assert!(status.runtime_unknown, "{status:?}");
+                assert_eq!(status.pid, None);
+                assert_eq!(status.state, "running", "known state was dropped");
+            } else {
+                assert!(!status.runtime_unknown, "{status:?}");
+                assert_eq!(status.pid, Some(4242));
+            }
+        }
+    }
+
+    /// The deadline covers the whole answer, not each instance in turn:
+    /// several busy instances cost one deadline, not one each.
+    #[tokio::test]
+    async fn busy_instances_share_one_status_deadline() {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        let config =
+            Config::parse("[app.web]\nimage = 'web:v1'\nport = 8080\nreplicas = 6\n").unwrap();
+        expect_complete(&drain_deploy(&mut agent, config).await);
+        grill.set_pid_delay(Some(std::time::Duration::from_secs(30)));
+
+        let started = std::time::Instant::now();
+        let statuses = agent.get_status().await;
+        let took = started.elapsed();
+
+        assert!(
+            took < 2 * STATUS_RUNTIME_READ_TIMEOUT,
+            "six busy instances took {took:?}"
+        );
+        assert!(statuses.iter().all(|status| status.runtime_unknown));
+    }
+
+    /// A marked status still round-trips, and an unmarked one keeps its old
+    /// wire form.
+    #[test]
+    fn runtime_unknown_is_serialised_only_when_set() {
+        let mut status = InstanceStatus {
+            id: "default__web-0".into(),
+            app_name: "web".into(),
+            namespace: "default".into(),
+            state: "running".into(),
+            restart_count: 0,
+            host_port: None,
+            exit_code: None,
+            pid: Some(7),
+            runtime_unknown: false,
+        };
+        let plain = serde_json::to_value(&status).unwrap();
+        assert!(plain.get("runtime_unknown").is_none(), "{plain}");
+        status.runtime_unknown = true;
+        let marked: InstanceStatus =
+            serde_json::from_value(serde_json::to_value(&status).unwrap()).unwrap();
+        assert!(marked.runtime_unknown);
     }
 }

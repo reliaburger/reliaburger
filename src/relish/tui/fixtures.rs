@@ -52,6 +52,7 @@ impl TestScenario {
                         host_port: Some(8000 + app_index as u16),
                         exit_code: None,
                         pid: Some(1000 + app_index as u32 * 2 + replica),
+                        runtime_unknown: false,
                     },
                 });
             }

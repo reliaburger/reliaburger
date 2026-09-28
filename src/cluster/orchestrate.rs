@@ -2192,6 +2192,7 @@ mod tests {
                             host_port: Some(30000),
                             exit_code: None,
                             pid: Some(1),
+                            runtime_unknown: false,
                         }]);
                     }
                     AgentCommand::SyncClusterConsumer { response, .. } => {
@@ -2987,6 +2988,7 @@ image = "busybox:latest"
                 host_port: None,
                 exit_code: None,
                 pid: Some(42),
+                runtime_unknown: false,
             },
             crate::bun::agent::InstanceStatus {
                 id: "stopped-0".into(),
@@ -2997,6 +2999,7 @@ image = "busybox:latest"
                 host_port: None,
                 exit_code: Some(0),
                 pid: None,
+                runtime_unknown: false,
             },
         ];
         retain_live_assignments(&mut applied, &statuses);

@@ -16476,6 +16476,7 @@ mod cluster_routing_tests {
             host_port: None,
             exit_code: None,
             pid: Some(4242),
+            runtime_unknown: false,
         }
     }
 

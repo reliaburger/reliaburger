@@ -1323,6 +1323,7 @@ mod tests {
             host_port: None,
             exit_code: exit,
             pid: None,
+            runtime_unknown: false,
         };
         assert_eq!(
             job_outcome(&[status("stopped", Some(0))], "j", "default"),
