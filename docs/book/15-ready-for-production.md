@@ -2752,8 +2752,9 @@ The fix is one word:
 tokio::select! {
     biased;
     _ = self.shutdown.cancelled() => { /* ... */ }
+    Some(req) = Self::recv_snapshot(&mut self.cluster) => { /* ... */ }
     Some(cmd) = self.command_rx.recv() => { /* ... */ }
-    // stop completions, deploy operations, snapshot requests ...
+    // stop completions, deploy operations ...
     _ = health_interval.tick() => { /* the periodic work */ }
 }
 ```
@@ -2810,6 +2811,82 @@ Was it the new connection timeouts in 0eb6071? No. The forwarded clear
 reached node 2 and ran there; the request was slow on the far side, not lost
 on a dead pooled connection. The earlier candidates were lucky: the loop was
 as unfair then, and the case passes whenever the coin tosses go its way.
+
+### Busy isn't dead
+
+`biased;` bought fairness for commands, and the final tier of the soak on
+ff854cb found who paid for it. During the `relish test` pulse, node 3 logged
+`report worker: snapshot collection failed or timed out` every five seconds
+from 09:12:08 to 09:13:48 BST, and node 2 did the same in bursts until
+09:15:46. After 30 s without a report the leader marked each node stale, the
+scheduler called it not ready, and it moved apps off perfectly healthy nodes.
+Apps pinned by label had nowhere to go: node 1 logged `cannot place
+default/soak-redis: no eligible nodes` every two seconds for 46 s.
+
+The report worker doesn't read agent state itself. Once per interval it sends
+the agent loop a snapshot request and gives it two seconds to answer. In the
+biased order that request sat *below* the command channel, and the pulse keeps
+that channel busy: four test cases polling instance status, the placement
+reconciler, deploys and retirements, and every status request asks the runtime
+for each instance's pid and exit code. The earlier argument that "each caller
+waits for its reply, so nothing floods the channel" holds for one caller. It
+doesn't hold for a dozen of them taking turns. The channel was rarely empty,
+so the one request that decides whether the node is alive waited behind all
+of it, missed its deadline, and was answered later into a closed channel,
+which cost another inventory read.
+
+There were two fixes, one at each end of the channel. In the loop, the snapshot
+branch moved up to sit straight under shutdown, and a request the worker has
+already given up on is dropped unbuilt (`req.response.is_closed()`). A report
+arrives once every five seconds and costs a bounded amount of work, so it
+can't starve commands. It now waits for at most the one operation already
+running.
+
+That operation can still be long. Some of the loop's work awaits other
+machines: signing a follower's workload certificate goes to the leader with a
+ten-second limit. So the worker no longer treats a slow loop as a dead node. A
+report says two things: "I'm alive" and "here's what I run". Only the second
+needs the loop. When the loop misses the deadline, the worker re-sends the
+last snapshot it *did* answer, stamped with the time it was taken, and reads
+readiness straight from the node's `ReadinessTracker`, which never needed the
+loop in the first place:
+
+```rust
+let (snapshot, observed_wall) = match self.collect_snapshot().await {
+    Some(snapshot) => { /* remember it, with both clocks */ }
+    None => match self.recent_observation() {
+        Some(observed) => (observed.snapshot.clone(), observed.observed_wall),
+        None => return, // nothing honest to send
+    },
+};
+```
+
+Is re-sending old state a lie? It tells the leader nothing it didn't already
+hold: the aggregator keeps a stale node's last report either way. The only
+thing that changes is the verdict. The loop is the only writer of the agent's
+state, so while it's stuck nothing it knows has changed either. A loop that
+*never* answers again is wedged rather than busy, and a wedged node should
+still be fenced. So `recent_observation` only offers a snapshot younger than
+four stale windows (two minutes by default). After that the worker goes
+quiet and the leader does what it did before.
+
+`recent_observation` returns `Option<&ObservedSnapshot>`, a reference into the
+worker's own field. The `&` means the caller borrows the snapshot rather than
+taking it. The report builder consumes its snapshot by value, so the call
+site clones it and the cached copy stays put for the next busy interval.
+
+The tests come in two halves. In the agent, twenty `Status` commands queue up
+against a mock runtime that takes 100 ms per pid read, about six seconds of
+loop work, and a snapshot request must still come back inside the worker's
+two seconds. It didn't before. A second test queues three abandoned requests
+ahead of a live one with a runtime inventory that always hits its one-second
+limit. Before, the live one waited four seconds. In the worker, a test
+answers one snapshot and then goes silent: eight intervals later the leader
+is still getting the same `web` instance and readiness from the tracker. The
+guard rails get tests too. After the two-minute grace the worker sends
+nothing, a worker that has never had an answer sends nothing at all, and
+neither does one whose agent loop has exited (its end of the channel is
+closed, so it's gone, not busy).
 
 ## Walk the path you actually care about
 

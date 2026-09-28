@@ -3590,12 +3590,21 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             // the consumer view that would let restarts finish never landed,
             // and the node stopped answering. Now a command waits for at most
             // the tick already running.
+            //
+            // Snapshot requests come before commands. The report worker asks
+            // once per interval and gives up after two seconds; queued behind
+            // a steady stream of commands, it missed that deadline for over a
+            // minute, and the leader moved apps off a healthy node. Reports
+            // are rare and bounded, so they can't starve commands.
             tokio::select! {
                 biased;
                 _ = self.shutdown.cancelled() => {
                     self.abandon_pending_stops();
                     self.shutdown_all().await;
                     break;
+                }
+                Some(req) = Self::recv_snapshot(&mut self.cluster) => {
+                    self.handle_snapshot_request(req).await;
                 }
                 Some(cmd) = self.command_rx.recv() => {
                     self.handle_command(cmd).await;
@@ -3606,9 +3615,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 }
                 Some(op) = self.deploy_ops_rx.recv() => {
                     self.handle_deploy_op(op).await;
-                }
-                Some(req) = Self::recv_snapshot(&mut self.cluster) => {
-                    self.handle_snapshot_request(req).await;
                 }
                 _ = health_interval.tick() => {
                     self.reopen_uncertain_discovery().await;
@@ -3663,6 +3669,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     async fn handle_snapshot_request(&self, req: CollectSnapshotRequest) {
         use crate::reporting::worker::{AgentSnapshot, InstanceSnapshot};
 
+        // The worker gave up on this one; building it would only delay the
+        // next live request by another inventory read.
+        if req.response.is_closed() {
+            return;
+        }
         let (capabilities, enforced_instances) = self.live_egress_report_state().await;
         #[cfg(all(feature = "ebpf", target_os = "linux"))]
         let egress_affected_workloads: Vec<
@@ -16206,6 +16217,131 @@ interval = 1
             "a slow health probe blocked the command loop"
         );
         assert!(stopped.is_ok(), "a slow health probe blocked shutdown");
+    }
+
+    /// A cluster agent whose report-worker end of the snapshot channel stays
+    /// with the test, so a test can ask for snapshots as the worker does.
+    fn test_cluster_agent_with_snapshots() -> (
+        TestAgent,
+        mpsc::Sender<AgentCommand>,
+        mpsc::Sender<CollectSnapshotRequest>,
+        CancellationToken,
+        MockGrill,
+    ) {
+        let (_membership_tx, membership_rx) = tokio::sync::watch::channel(Vec::new());
+        let (snapshot_tx, snapshot_rx) = mpsc::channel(16);
+        let (command_tx, command_rx) = mpsc::channel(64);
+        let shutdown = CancellationToken::new();
+        let cluster = ClusterHandle {
+            local_node_id: crate::meat::NodeId::new("test"),
+            membership_rx,
+            raft_metrics_rx: None,
+            council: None,
+            snapshot_rx,
+            wrapping_ikm: None,
+            partition_blocklists: PartitionBlocklists::default(),
+            crl_handle: Default::default(),
+        };
+        let grill = MockGrill::new();
+        let mut agent = BunAgent::with_cluster(
+            grill.clone(),
+            PortAllocator::new(30000, 31000),
+            command_rx,
+            shutdown.clone(),
+            cluster,
+            "test".to_string(),
+        );
+        let volumes = tempfile::tempdir().unwrap();
+        agent.set_volumes_dir(volumes.path().to_path_buf());
+        agent.set_stop_confirmation_timeout(TEST_STOP_CONFIRMATION_TIMEOUT);
+        let agent = TestAgent {
+            agent,
+            _volumes: volumes,
+        };
+        (agent, command_tx, snapshot_tx, shutdown, grill)
+    }
+
+    async fn stop_agent_task(shutdown: CancellationToken, mut task: tokio::task::JoinHandle<()>) {
+        shutdown.cancel();
+        if tokio::time::timeout(std::time::Duration::from_secs(10), &mut task)
+            .await
+            .is_err()
+        {
+            task.abort();
+        }
+    }
+
+    /// V02 final tier: during the `relish test` pulse the loop always had
+    /// work waiting, and the report worker's snapshot request sat behind all
+    /// of it. It missed its two-second deadline for over a minute, the leader
+    /// called the node stale, and healthy apps moved off it. A report must
+    /// wait for at most the one piece of work already running.
+    #[tokio::test]
+    async fn snapshot_request_is_answered_before_a_backlog_of_slow_commands() {
+        let (mut agent, tx, snapshot_tx, shutdown, grill) = test_cluster_agent_with_snapshots();
+        let config =
+            Config::parse("[app.web]\nimage = 'web:v1'\nport = 8080\nreplicas = 3\n").unwrap();
+        expect_complete(&drain_deploy(&mut agent, config).await);
+        // Three pid reads per Status at 100 ms each: twenty queued Status
+        // commands are six seconds of loop work.
+        grill.set_pid_delay(Some(std::time::Duration::from_millis(100)));
+        let mut replies = Vec::new();
+        for _ in 0..20 {
+            let (response, reply) = oneshot::channel();
+            tx.send(AgentCommand::Status { response }).await.unwrap();
+            replies.push(reply);
+        }
+        let task = tokio::spawn(async move { agent.run().await });
+        // Let the loop start on the backlog before the worker asks.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let (response, snapshot) = oneshot::channel();
+        snapshot_tx
+            .send(CollectSnapshotRequest { response })
+            .await
+            .unwrap();
+        let snapshot = tokio::time::timeout(std::time::Duration::from_secs(2), snapshot)
+            .await
+            .expect("the snapshot waited behind the whole command backlog")
+            .unwrap();
+        assert_eq!(snapshot.instances.len(), 3);
+        for reply in replies {
+            tokio::time::timeout(std::time::Duration::from_secs(30), reply)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        stop_agent_task(shutdown, task).await;
+    }
+
+    /// A request the worker already gave up on has nobody to answer. Building
+    /// it anyway (an inventory read of up to a second each) only pushed the
+    /// next live request further past its deadline.
+    #[tokio::test]
+    async fn abandoned_snapshot_requests_are_not_built() {
+        let (agent, _tx, snapshot_tx, shutdown, grill) = test_cluster_agent_with_snapshots();
+        let mut agent = agent;
+        grill.set_inventory_delay(Some(std::time::Duration::from_secs(5)));
+        for _ in 0..3 {
+            let (response, abandoned) = oneshot::channel();
+            drop(abandoned);
+            snapshot_tx
+                .send(CollectSnapshotRequest { response })
+                .await
+                .unwrap();
+        }
+        let (response, live) = oneshot::channel();
+        snapshot_tx
+            .send(CollectSnapshotRequest { response })
+            .await
+            .unwrap();
+        let task = tokio::spawn(async move { agent.run().await });
+        // The live request costs one bounded (1 s) inventory read; each
+        // abandoned one built first would add another.
+        tokio::time::timeout(std::time::Duration::from_millis(2500), live)
+            .await
+            .expect("abandoned requests were built before the live one")
+            .unwrap();
+        stop_agent_task(shutdown, task).await;
     }
 
     /// V02 soak: a node killed with `kill_containers` comes back with every
