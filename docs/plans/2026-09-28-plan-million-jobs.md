@@ -33,9 +33,20 @@ from `plans/million-jobs` unchanged), whose findings it keeps and whose
   (not part of `make bench`, so nightly CI time is unchanged). Only
   smoke-tested (`cargo test --bench task_arrays`); the release-mode numbers
   wait until the soak frees the machine. Record them here when run.
-- **Next:** the book section (Chapter 12, after "When the leader
-  forgets") and a `docs/progress.md` entry. After that, everything left
-  needs the M5 owner decision or a cluster (M0 after the soak).
+- Book: Chapter 12 section "A million jobs without a million records"
+  (before "Lessons from the phase") covers M1-M4. `docs/progress.md` has an
+  "After 0.1.0: Million jobs" section; `docs/README.md` and
+  `docs/testing.md` list `make bench-task-arrays`.
+- **Next, in order:**
+  1. Record `make bench-task-arrays` release numbers here once the soak has
+     finished (it's CPU-heavy; don't run it while the soak is on).
+  2. M0 on a quickstart VM after the soak: fork/exec rate of `/usr/bin/true`
+     at 1x/2x/4x/8x vCPU concurrency, fsync latency, Raft commit rate.
+  3. Ask the maintainer for the M5 decision (see "M5: the finalisation
+     gate"). Nothing in M6 starts before that.
+  4. Small library follow-ups that don't need M5, if wanted meanwhile: a
+     mergeable latency histogram for start lag and run time (M7 needs it),
+     and a `rb-task` demo binary under `examples/million-jobs/`.
 - **Local build constraints while the release soak runs:**
   `CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=$HOME/.cache/rb-target-millionjobs`;
   run only the targeted unit tests (`cargo test --lib meat::index_set` and so

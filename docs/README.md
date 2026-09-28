@@ -411,6 +411,7 @@ Gossip protocol benchmarks use [criterion](https://docs.rs/criterion) for statis
 ```sh
 make bench         # reproducible transport and 5-250 node measurements
 make bench-large   # reproducible 500 and 1,000 node measurements
+make bench-task-arrays  # in-process task-array costs and the fork/exec floor
 ```
 
 CI runs both on pushes to `main`, nightly, and on pull requests that touch
