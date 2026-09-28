@@ -166,6 +166,10 @@ harness = false
 name = "gossip_large"
 harness = false
 
+[[bench]]
+name = "task_arrays"
+harness = false
+
 # Parquet 59.3 can reserve memory for a Thrift list count far larger than
 # the metadata that follows, aborting the process on a crafted or corrupted
 # archive. Upstream fixed it in Parquet 60 (apache/arrow-rs#10979), but

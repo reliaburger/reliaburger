@@ -29,11 +29,13 @@ from `plans/million-jobs` unchanged), whose findings it keeps and whose
   Local numbers on 28 September (debug build, `FakeRunner`, 2 worker
   threads): 1M tasks in 30.6 s, 422 leader entries, 2 stale reports
   refused, final state 282 bytes of JSON.
-- **Next:** M4.2, `benches/task_arrays.rs` (Criterion, `harness = false` in
-  `Cargo.toml`) plus a `make bench-task-arrays` target; then the book
-  section (Chapter 12, after "When the leader forgets") and a
-  `docs/progress.md` entry. After that, everything left needs the M5
-  owner decision or a cluster (M0 after the soak).
+- M4.2: `benches/task_arrays.rs`, run with `make bench-task-arrays`
+  (not part of `make bench`, so nightly CI time is unchanged). Only
+  smoke-tested (`cargo test --bench task_arrays`); the release-mode numbers
+  wait until the soak frees the machine. Record them here when run.
+- **Next:** the book section (Chapter 12, after "When the leader
+  forgets") and a `docs/progress.md` entry. After that, everything left
+  needs the M5 owner decision or a cluster (M0 after the soak).
 - **Local build constraints while the release soak runs:**
   `CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=$HOME/.cache/rb-target-millionjobs`;
   run only the targeted unit tests (`cargo test --lib meat::index_set` and so
@@ -576,16 +578,16 @@ it belongs in the portable suite. (M2.3 already runs the leader half of this, wi
 
 ## Benchmarks
 
-**In-process (M4, no cluster, runs in CI via `make bench`):** a
+**In-process (M4, no cluster, `make bench-task-arrays`):** a
 `benches/task_arrays.rs` Criterion suite:
 
 - `index_set/insert_sequential_1m` and `index_set/insert_sparse_10k`;
 - `state/plan_and_complete_1m` with 3 and 200 nodes (control-plane cost of a
   whole 1M-task run, no processes);
 - `state/json_encode_1m` (snapshot cost);
-- `executor/fake_1m` (pool and ledger overhead per task with a zero-cost
-  runner: this is the ceiling the process runner can't beat);
-- `executor/process_true_10k` at concurrency 1, 4 and 16, spawning
+- `executor/fake_64k` (pool overhead per task with a zero-cost runner:
+  this is the ceiling the process runner can't beat);
+- `executor/process_true_256` at concurrency 1, 4 and 16, spawning
   `/usr/bin/true` (the fork/exec floor on the machine running the bench; it's
   a benchmark, not a test, so it's never part of `make test`).
 
@@ -652,7 +654,7 @@ k3s cluster of the same size, and publish both scripts.
 ### M4: in-process proof
 
 - [x] M4.1 `tests/suite/task_array_million.rs` acceptance (100k in the portable suite; 1M passed locally in 30.6 s debug, 32,700 tasks/s with `FakeRunner`)
-- [ ] M4.2 `benches/task_arrays.rs` and a `make bench-task-arrays` target
+- [x] M4.2 `benches/task_arrays.rs` and a `make bench-task-arrays` target (smoke-tested with `cargo test --bench task_arrays`; release numbers not yet recorded, see below)
 
 ### M5: compatibility gate (owner decision first)
 
