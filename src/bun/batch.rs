@@ -1037,11 +1037,22 @@ pub async fn batch_status_handler(
             ))
             .into_response()
         }
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": format!("batch {batch_id} not found") })),
-        )
-            .into_response(),
+        None => {
+            // Task arrays share the id space; the summary says `"kind": "array"`.
+            let arrays = super::task_array_leader::read_task_arrays(&state).await;
+            if let Some(record) = arrays.get(batch_id) {
+                let nodes = state.task_arrays.node_views(batch_id).await;
+                return Json(super::task_array_api::array_summary(
+                    batch_id, record, &nodes,
+                ))
+                .into_response();
+            }
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": format!("batch {batch_id} not found") })),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -1049,7 +1060,7 @@ pub async fn batch_status_handler(
 // Leader forwarding + addressing helpers
 // ---------------------------------------------------------------------------
 
-async fn forward_to_leader(
+pub(crate) async fn forward_to_leader(
     state: &ApiState,
     council: &crate::council::CouncilNode,
     path: &str,
@@ -1074,7 +1085,7 @@ async fn forward_to_leader(
     proxy_response(request.send().await).await
 }
 
-async fn forward_get_to_leader(
+pub(crate) async fn forward_get_to_leader(
     state: &ApiState,
     council: &crate::council::CouncilNode,
     path: &str,

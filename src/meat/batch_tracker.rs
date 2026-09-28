@@ -311,6 +311,12 @@ impl BatchTracker {
         BatchId(self.state.register(record))
     }
 
+    /// Take the next batch id without registering a batch (a standalone
+    /// task array takes its id here).
+    pub fn allocate_id(&mut self) -> u64 {
+        self.state.allocate_id()
+    }
+
     /// Apply a job report, validating the transition.
     pub fn report(
         &mut self,

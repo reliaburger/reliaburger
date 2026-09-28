@@ -517,6 +517,7 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
             readiness,
             None,
             None,
+            None,
         )
     } else {
         api::router(

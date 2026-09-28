@@ -453,7 +453,8 @@ impl TaskArrayNode {
         limit: usize,
     ) -> Result<Vec<TaskResultRow>, TaskArrayNodeError> {
         let path = self.array_dir(batch_id).join("ledger");
-        let limit = limit.min(MAX_RESULT_ROWS);
+        // One past the cap, so the leader can tell a capped answer apart.
+        let limit = limit.min(MAX_RESULT_ROWS + 1);
         tokio::task::spawn_blocking(move || {
             if !path.exists() {
                 return Err(TaskArrayNodeError::UnknownArray { batch_id });
