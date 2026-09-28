@@ -17,8 +17,12 @@ from `plans/million-jobs` unchanged), whose findings it keeps and whose
   merge of `plans/million-jobs`). Draft PR: "Million jobs: task arrays at
   scale (after 0.1.0)".
 - **Done:** the plan (this file); M1 data model (`src/meat/index_set.rs`,
-  `src/meat/task_array.rs`).
-- **Next:** M2.1, `TaskArrayState` in `src/meat/task_array_state.rs`, tests first.
+  `src/meat/task_array.rs`); M2 leader state machine and grant policy
+  (`src/meat/task_array_state.rs`, including the 1M-task control-plane
+  budget test `a_million_task_array_fits_the_control_plane_budget`).
+- **Next:** M3.1, the `TaskRunner` seam (`FakeRunner`, `ProcessRunner`) in
+  `src/bun/task_executor.rs`, tests first; then the pool (M3.2) and the
+  ledger (M3.3, `src/bun/task_ledger.rs`).
 - **Local build constraints while the release soak runs:**
   `CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=$HOME/.cache/rb-target-millionjobs`;
   run only the targeted unit tests (`cargo test --lib meat::index_set` and so
@@ -549,13 +553,13 @@ a corrupt CRC in the middle stops replay with an error rather than skipping;
 group commit fsyncs at most once per interval (counted through a seam);
 replay reports which tasks of a held chunk need rerunning.
 
-**M4.1 In-process acceptance.** `tests/task_array_million.rs` drives the M2
+**M4.1 In-process acceptance.** `tests/suite/task_array_million.rs` (a module of the portable suite binary) drives the M2
 state machine and three M3 executors with `FakeRunner` through 1,000,000 tasks
 with 1% first-attempt failures and one simulated node loss mid-run, and
 asserts: every index is accounted for exactly once in the final counts, the
 number of state transitions stays within the per-second bound, and the final
 state is within the size bound. It runs in a few seconds in a debug build, so
-it belongs in the portable suite, like `tests/gossip_10k.rs`.
+it belongs in the portable suite. (M2.3 already runs the leader half of this, with no executors, as a unit test.)
 
 **M4.2 Criterion benches.** See below.
 
@@ -624,9 +628,9 @@ k3s cluster of the same size, and publish both scripts.
 
 ### M2: leader state machine
 
-- [ ] M2.1 `TaskArrayState` transitions, fencing, requeue, cancel
-- [ ] M2.2 `plan_grants` policy with the partition property test
-- [ ] M2.3 size and write-count bounds
+- [x] M2.1 `TaskArrayState` transitions, fencing, requeue, cancel
+- [x] M2.2 `plan_grants` policy with the partition property test
+- [x] M2.3 size and write-count bounds
 
 ### M3: node executor
 
@@ -636,7 +640,7 @@ k3s cluster of the same size, and publish both scripts.
 
 ### M4: in-process proof
 
-- [ ] M4.1 `tests/task_array_million.rs` acceptance
+- [ ] M4.1 `tests/suite/task_array_million.rs` acceptance
 - [ ] M4.2 `benches/task_arrays.rs` and a `make bench-task-arrays` target
 
 ### M5: compatibility gate (owner decision first)
