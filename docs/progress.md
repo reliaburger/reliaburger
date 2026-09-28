@@ -40,6 +40,11 @@ Smaller fixes that CI runs turned up along the way:
 - Integration-agent volume roots are private to each fixture.
 - Two discovery routes missing from the authorisation audit matrix now declare
   System scope.
+- Standalone `relish stop` followed by `relish apply` of the same app no longer
+  rolls back with "service not found": the redeploy over the stopped replicas
+  first restores the service (same VIP) and ingress route the stop released
+  (`apply_after_stop_restores_the_service_and_ingress_route`). Cluster mode was
+  unaffected: its stop retires the replicas, so the next apply deploys fresh.
 
 ### Correctness and behavioural contracts
 
