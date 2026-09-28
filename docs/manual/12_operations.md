@@ -84,9 +84,8 @@ that version. `abort` refuses once a node has moved, and says which, because
 ending the upgrade then would leave the cluster on two versions.
 
 Rolling upgrades need matching protocol and state formats; `bun --compatibility`
-prints what a binary supports. Development builds' state isn't migrated. From
-0.1.0 on, releases add only fields old nodes tolerate without changing the
-formats; a release that does change them ships a migration.
+prints what a binary supports. Nothing is migrated before 1.0.0: a release
+that changes either format needs a fresh cluster.
 
 ## GitOps
 

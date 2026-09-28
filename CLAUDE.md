@@ -37,7 +37,7 @@ For book, manual or website prose, follow [docs/book/STYLE.md](docs/book/STYLE.m
 
 ### 1. Follow the Plan
 
-Every roadmap phase is done and 0.1.0 is released (YYYY-MM-DD). Current work is the post-0.1.0 backlog: read the status box at the top of [docs/progress.md](docs/progress.md), which links the open items (missing capabilities F01–F12, engineering follow-ups, known flakes), before starting. Releases after 0.1.0 ship one headline feature each, in the order in the "Releases after 0.1.0" section of [docs/roadmap.md](docs/roadmap.md#releases-after-010). New work goes through a dated plan in `docs/plans/`; the 0.1.0 release plans there are history. Releases follow [docs/releasing.md](docs/releasing.md).
+Every roadmap phase is done and 0.1.0 is released (YYYY-MM-DD). Current work is the post-0.1.0 backlog: read the status box at the top of [docs/progress.md](docs/progress.md), which links the open items (missing capabilities F01–F12, engineering follow-ups, known flakes), before starting. Releases after 0.1.0 follow the order in the "Releases after 0.1.0" section of [docs/roadmap.md](docs/roadmap.md#releases-after-010): patch releases 0.1.1–0.1.4 first, then one headline feature per minor release. New work goes through a dated plan in `docs/plans/`; the 0.1.0 release plans there are history. Releases follow [docs/releasing.md](docs/releasing.md).
 
 ### 2. Tests First
 
@@ -124,10 +124,8 @@ See [docs/testing.md](docs/testing.md) and [docs/design/test-harness.md](docs/de
 
 - Releases follow [docs/releasing.md](docs/releasing.md): `build.yml` → `stage.yml` → qualification with `scripts/release/qualify-*.sh` (including the V02 soak, `qualify-sustained.sh --tier fast|final`), recorded in `docs/qualification/` → `promote.yml`.
 - Only the maintainer tags and promotes. Agents never do.
-- Development-era (pre-0.1.0) state is refused, never migrated; start a fresh cluster.
-- From 0.1.0 on, bump `protocol` or `state` in `CURRENT` in `src/compatibility.rs` only for a change old nodes can't read. Nodes admit peers and open state only on an exact match, so a bump stops a released cluster rolling in place: every bump needs a designed migration in the same change ([compatibility after 0.1.0](docs/releasing.md#compatibility-after-010)).
-- An additive change doesn't bump. Additive means a new optional field in a self-describing (JSON/TOML) format that: reads with `#[serde(default)]` so old data still loads; writes an `Option` with `#[serde(skip_serializing_if = "Option::is_none")]`; sits in a struct without `#[serde(deny_unknown_fields)]` (check every struct on the path, since an old reader with it refuses the field); and is harmless for an old node to ignore or drop when it rewrites the record.
-- Everything else is incompatible: renaming, removing or retyping a field; adding an enum variant (including a `RaftRequest` variant, which an old follower can't decode); changing a default's meaning; and any change to a bincode-encoded struct (gossip, reporting frames, metric rollups, the Raft log's metadata and encrypted-entry envelope), because bincode is positional.
+- No backwards compatibility before 1.0.0 (maintainer decision, 28 September 2026). Every release below 1.0.0 is a development release: no migrations, no mixed-version or rolling compatibility across a format change, no feature gates, no additive-field rules.
+- Any incompatible wire or durable-state change bumps `protocol` or `state` in `CURRENT` in `src/compatibility.rs`. Nodes then refuse old peers and old state; start a fresh cluster ([cluster compatibility](docs/releasing.md#compatibility-before-100)).
 
 ## Commit Hygiene
 

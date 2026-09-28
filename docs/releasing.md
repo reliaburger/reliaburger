@@ -93,21 +93,17 @@ roll or roll back only when both generations match exactly. The agent verifies
 the signed executable and checks this contract before staging it. Joins and
 cluster transports also enforce compatibility; absent evidence is a refusal.
 
-### Compatibility after 0.1.0
+### Compatibility before 1.0.0
 
-A released cluster must upgrade in place, so a format change falls into one of
-two kinds:
-
-- **Additive: no bump.** A new optional field in a JSON or TOML record that old
-  nodes tolerate: it reads with `#[serde(default)]`, an `Option` is written with
-  `#[serde(skip_serializing_if = "Option::is_none")]`, no struct on its path has
-  `#[serde(deny_unknown_fields)]`, and an old node that ignores or drops the
-  field still behaves correctly.
-- **Incompatible: bump and migrate.** Anything old nodes can't read: renaming,
-  removing or retyping a field, a new enum variant, or any change to a
-  bincode-encoded struct (bincode is positional). Bump `protocol` or `state` in
-  `src/compatibility.rs`. Because generations must match exactly, the bump alone
-  would strand a released cluster, so it ships with a designed migration.
+Until 1.0.0 every release is a development release, and we don't keep
+backwards compatibility (maintainer decision, 28 September 2026). There are no
+migrations, no mixed-version clusters across a format change and no feature
+gates. Any incompatible wire or durable-state change bumps `protocol` or
+`state` in `src/compatibility.rs`; nodes then refuse old peers and old state,
+so an upgrade across that bump means starting a fresh cluster. Releases that
+don't bump still roll in place. The pre-1.0 rule for known harness artefacts in
+the V02 soak (step 4 of [staging a candidate](#staging-a-candidate))
+stays as it is.
 
 Leader-last upgrade ordering does not make an unknown Raft request safe during
 elections. Qualify the actual old/new binary pair before advertising it as
