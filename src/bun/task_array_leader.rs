@@ -258,6 +258,22 @@ pub fn silent_holders(
         .collect()
 }
 
+/// Holders that answered but say they can't run the array (its binary
+/// left their allowlist, or the ledger won't open). Their chunks would
+/// never finish, so they go back to the queue like a silent node's.
+pub fn refusing_holders(
+    record: &TaskArrayRecord,
+    answers: &[(NodeId, &ArrayProgress)],
+) -> Vec<NodeId> {
+    answers
+        .iter()
+        .filter(|(node, progress)| {
+            progress.refused.is_some() && record.state.held_by(node).is_some()
+        })
+        .map(|(node, _)| node.clone())
+        .collect()
+}
+
 /// What the leader loop remembers between ticks.
 struct LeaderMemory {
     /// When this node became leader (`None` while it isn't).
@@ -267,6 +283,9 @@ struct LeaderMemory {
     /// The `known` list each node last acknowledged, so an idle cluster
     /// stops syncing once every node has cleaned up.
     last_known: HashMap<NodeId, Vec<u64>>,
+    /// Nodes whose last sync failed, so a dead node is logged once, not
+    /// every tick.
+    failing: std::collections::HashSet<NodeId>,
 }
 
 /// Start the leader loop. It runs on every node and does nothing unless
@@ -279,6 +298,7 @@ pub(crate) fn spawn_leader_loop(state: ApiState) {
             since: None,
             last_heard: HashMap::new(),
             last_known: HashMap::new(),
+            failing: std::collections::HashSet::new(),
         };
         loop {
             tokio::select! {
@@ -320,6 +340,7 @@ async fn leader_tick(state: &ApiState, memory: &mut LeaderMemory) {
         memory.since = None;
         memory.last_heard.clear();
         memory.last_known.clear();
+        memory.failing.clear();
         return;
     }
     let now = Instant::now();
@@ -349,12 +370,13 @@ async fn leader_tick(state: &ApiState, memory: &mut LeaderMemory) {
         let Ok((node, answer)) = joined else { continue };
         match answer {
             Ok(response) => {
+                memory.failing.remove(&node);
                 memory.last_heard.insert(node.clone(), Instant::now());
                 memory.last_known.insert(node.clone(), known.clone());
                 answers.push((node, response));
             }
             Err(reason) => {
-                if arrays.has_active() {
+                if arrays.has_active() && memory.failing.insert(node.clone()) {
                     eprintln!("bun: task arrays: sync with {node} failed: {reason}");
                 }
             }
@@ -374,14 +396,18 @@ async fn leader_tick(state: &ApiState, memory: &mut LeaderMemory) {
                     .map(|progress| (node.clone(), progress))
             })
             .collect();
-        for node in silent_holders(
+        let mut lost = silent_holders(
             record,
             &memory.last_heard,
             since,
             now,
             state.task_arrays.silence_timeout,
-        ) {
-            eprintln!("bun: task array {batch_id}: {node} went quiet; requeueing its chunks");
+        );
+        lost.extend(refusing_holders(record, &for_array));
+        for node in lost {
+            eprintln!(
+                "bun: task array {batch_id}: {node} can't finish its chunks; requeueing them"
+            );
             let write = TaskArrayWrite::Requeue { batch_id, node };
             if let Err(error) = write_task_array(state, write).await {
                 eprintln!("bun: task array {batch_id}: requeue failed: {error}");
@@ -632,6 +658,27 @@ mod tests {
         // attempt 2, so "a"'s attempt-1 report is stale.
         let answer = progress(0, vec![done(0, 1, 10), done(1, 1, 10)]);
         assert_eq!(plan_sync(1, &record, &[(node("a"), &answer)]), None);
+    }
+
+    #[test]
+    fn a_holder_that_can_no_longer_run_the_array_is_requeued() {
+        let mut record = record(100, 10);
+        for (name, chunk) in [("a", 0), ("b", 1)] {
+            record
+                .state
+                .grant(&node(name), &IndexRangeSet::from_range(chunk..=chunk))
+                .unwrap();
+        }
+        let mut refusing = progress(0, vec![]);
+        refusing.refused = Some("not allowed".to_string());
+        let fine = progress(4, vec![]);
+        let also_refusing_but_empty = refusing.clone();
+        let answers = [
+            (node("a"), &refusing),
+            (node("b"), &fine),
+            (node("c"), &also_refusing_but_empty),
+        ];
+        assert_eq!(refusing_holders(&record, &answers), vec![node("a")]);
     }
 
     #[test]
