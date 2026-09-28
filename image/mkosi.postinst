@@ -12,8 +12,11 @@
 # need. QEMU's virt machine and the Mac lab hand the kernel its devicetree
 # or ACPI tables through the firmware.
 #
-# Runs in the tools tree, after the postinst scripts and before the UKI is
-# built. x86-64 kernels have no .linux section and are left alone.
+# A postinst script, not a finalize one: for Format=uki (the installer) mkosi
+# saves the kernel aside before the finalize scripts run. It runs in the tools
+# tree, before mkosi copies /boot/vmlinuz-<kver> to /usr/lib/modules/<kver>,
+# so it handles both places. x86-64 kernels have no .linux section and are
+# left alone.
 
 import os
 from pathlib import Path
@@ -22,7 +25,9 @@ import pefile
 
 root = Path(os.environ["BUILDROOT"])
 
-for kimg in sorted(root.glob("usr/lib/modules/*/vmlinuz")):
+for kimg in sorted([*root.glob("boot/vmlinuz-*"), *root.glob("usr/lib/modules/*/vmlinuz")]):
+    if kimg.is_symlink():
+        continue
     pe = pefile.PE(str(kimg), fast_load=True)
     inner = next((s for s in pe.sections if s.Name.rstrip(b"\0") == b".linux"), None)
     if inner is None:
