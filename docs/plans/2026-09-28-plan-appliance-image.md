@@ -29,6 +29,7 @@
   - throwaway Ed25519 signature over `SHA256SUMS`
   - 1-day artefacts
 - [x] x86_64 boot test: QEMU + OVMF under KVM on the hosted runner, pass only on bun's health marker on the serial console
+- [x] aarch64 boot test: QEMU + AAVMF under TCG on the hosted arm64 runner (no KVM there), same pass marker (added 28 Sep, after the stubble kernel slipped through)
 - [x] Iteration 2: `/usr` as EROFS with dm-verity (the A/B-ready layout, research §7.2) instead of a writable root
 - [x] Record sizes and timings here, and tick S1 in the spike plan
 - [ ] Deferred to S2 preparation, not S1: the installer UKI (streaming `/usr` to disk), the ISO, the iPXE binaries
@@ -102,6 +103,7 @@ vda6   64M                 _empty                          (slot B verity)
 - Fix: `image/mkosi.finalize` replaces any `usr/lib/modules/*/vmlinuz` that has a `.linux` section with that section's contents, before mkosi builds the UKI. Run against the real stubble `vmlinuz`, it produces the exact kernel that booted. The cost is stubble's devicetree matching, which only DT-only arm64 laptops need.
 - **Run 36449750312: green on both architectures.** The aarch64 build logged `Unwrapped usr/lib/modules/7.0.0-34-generic/vmlinuz: 17478144 bytes from .linux`; on x86_64 the script left the kernel alone, and the boot test reached healthy bun at 9.3 s. **The CI image, 2026.40.13, booted unmodified on the lab Mac (HVF, 2 GiB, 8 GB disk): `bun healthy` at 7.9 s**, with the same six-partition layout.
 - Oddity for later: `lsblk` reports the whole disk's FSTYPE as `iso9660`, on both architectures. The partitions are fine.
+- **The aarch64 boot test in CI.** The boot-test step now runs on both architectures. It uses KVM when `/dev/kvm` is there; otherwise it uses TCG with `-cpu max,pauth-impdef=on`, a 1200 s deadline and a 25-minute step timeout. A local TCG boot on the lab Mac took 65 s. **Run 36466419295: green; aarch64 under TCG reached `bun healthy` at 167 s kernel time, about 3 min after QEMU started; x86_64 under KVM at 15.6 s.**
 - Also: Homebrew's QEMU 11.1.1 has no `edk2-aarch64-vars.fd`. Its aarch64 firmware descriptor uses `edk2-arm-vars.fd` as the vars template, and the instructions below now use that too.
 
 ## Picking up S2 on the lab Mac (M1, 64 GB, from Monday 28 Sep)
