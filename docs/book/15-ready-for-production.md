@@ -2958,6 +2958,37 @@ retention boundary itself. In gossip,
 old watch still hides Dead and Left members while the roster shows them, and
 that both views lose them once they're reaped.
 
+The same table fixed a smaller annoyance. `relish nodes` listed gossip's live
+view, so a node that died didn't show up as `dead`. It just wasn't there, and
+you had to notice the gap. The watch that hid it can't change, for the same
+reason as before, but the known table already holds exactly the rows we
+wanted. So `nodes_handler` asks it for its `down()` members and passes them
+to the agent inside the `Nodes` command. The agent lists its live members
+first, then any down member gossip doesn't list any more. It gives both the
+same council and leader check against Raft, because a dead voter is still a
+voter, and an operator staring at a dead node wants to know that first.
+
+Handing the rows to the agent instead of appending them in the handler is
+deliberate: the agent is where the Raft metrics live, so that's where the
+council flags get decided, once, for every row. The destructuring in its
+loop is worth a second look:
+
+```rust
+(node.is_council, node.is_leader) = roles(&node.node_id, false, false);
+```
+
+That's a *destructuring assignment*: a tuple pattern on the left of a plain
+`=`, assigning both fields at once. Rust has had it since 1.59; before that
+you needed a `let` and two more lines.
+
+Showing dead nodes also meant finding who relied on them being hidden. Three
+callers did. `relish upgrade` builds its rollout from the listing and would
+have tried to upgrade a dead node (and refused the whole plan if it had no
+address). The test harness's node inventory would have tried to inspect one.
+Its route detection would have spent two timeouts probing one. Each now
+skips members for which `NodeStatus::is_down()` is true, which keeps their
+old behaviour exactly, and each has a test with a dead member in the listing.
+
 ## Walk the path you actually care about
 
 Say `web` can't reach `redis`. Checking Bun's own DNS and TCP access might tell

@@ -5374,13 +5374,47 @@ async fn exec_handler(
     }
 }
 
-/// List cluster nodes.
-async fn nodes_handler(State(state): State<ApiState>) -> Response {
-    match ask_agent(&state.cmd_tx, |response| AgentCommand::Nodes { response }).await {
+/// List cluster nodes: gossip's live members, then the ones this node
+/// remembers as dead.
+///
+/// Gossip's live view drops a member the moment it is declared dead, and the
+/// scheduler, council and Pickle rely on that. A listing is for people,
+/// though, and a node that vanished is harder to act on than one marked
+/// dead, so down members come from [`KnownMembers`] instead.
+async fn nodes_handler(
+    State(state): State<ApiState>,
+    known: Option<axum::Extension<KnownMembers>>,
+) -> Response {
+    let down = match known {
+        Some(known) => known
+            .down()
+            .await
+            .into_iter()
+            .map(|member| crate::bun::agent::NodeStatus {
+                node_id: member.info.node_id.0.clone(),
+                address: member.gossip_address.to_string(),
+                api_address: member.info.api_advertised.then_some(member.info.address),
+                state: member.state.to_string(),
+                incarnation: member.incarnation,
+                is_council: false,
+                is_leader: false,
+                labels: member.labels,
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    match ask_agent(&state.cmd_tx, |response| AgentCommand::Nodes {
+        down,
+        response,
+    })
+    .await
+    {
         Ok(mut nodes) => {
             if let Some(membership) = &state.membership {
                 let members = membership.read().await;
-                for node in &mut nodes {
+                // A down row already carries its last advertised address,
+                // and the live table has none for it.
+                for node in nodes.iter_mut().filter(|n| n.api_address.is_none()) {
                     node.api_address = members
                         .iter()
                         .find(|member| member.node_id.0 == node.node_id && member.api_advertised)
@@ -15431,7 +15465,7 @@ schedule = "* * * * *"
     async fn nodes_endpoint_advertises_only_resolved_peer_api_addresses() {
         let (tx, mut rx) = mpsc::channel(1);
         let worker = tokio::spawn(async move {
-            let Some(AgentCommand::Nodes { response }) = rx.recv().await else {
+            let Some(AgentCommand::Nodes { response, .. }) = rx.recv().await else {
                 panic!("expected membership request");
             };
             response
@@ -15499,6 +15533,71 @@ schedule = "* * * * *"
         // hand it back as the node's address and be refused.
         assert_eq!(nodes[1].api_address, None);
         assert_eq!(nodes[2].api_address, None);
+        worker.await.unwrap();
+    }
+
+    /// Gossip's live view drops a dead member; the listing hands the agent
+    /// the ones this node remembers, so `relish nodes` shows them as dead.
+    #[tokio::test]
+    async fn nodes_endpoint_lists_remembered_dead_members_as_dead() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let worker = tokio::spawn(async move {
+            let Some(AgentCommand::Nodes { down, response }) = rx.recv().await else {
+                panic!("expected membership request");
+            };
+            // The agent lists them after its live members; echo them back.
+            response.send(down).unwrap();
+        });
+        let known = KnownMembers::default();
+        let member = |name: &str, port: u16, state| RosterMember {
+            info: NodeMembershipInfo {
+                node_id: crate::meat::NodeId::new(name),
+                address: std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+                api_advertised: true,
+            },
+            gossip_address: std::net::SocketAddr::from(([127, 0, 0, 1], port - 3)),
+            state,
+            incarnation: 4,
+            labels: std::collections::BTreeMap::from([("zone".to_string(), "a".to_string())]),
+        };
+        use crate::mustard::state::NodeState::{Alive, Dead, Suspect};
+        known
+            .refresh(
+                vec![
+                    member("one", 19117, Alive),
+                    member("doubtful", 19217, Suspect),
+                    member("dead", 19317, Dead),
+                ],
+                &Default::default(),
+                std::time::Instant::now(),
+            )
+            .await;
+        let app = router(
+            tx, None, None, None, None, None, None, None, None, None, None, None, 9117, None,
+        )
+        .layer(axum::Extension(known));
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/cluster/nodes")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let nodes: Vec<crate::bun::agent::NodeStatus> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(nodes.len(), 1, "{nodes:?}");
+        assert_eq!(nodes[0].node_id, "dead");
+        assert_eq!(nodes[0].state, "dead");
+        assert_eq!(nodes[0].address, "127.0.0.1:19314");
+        assert_eq!(
+            nodes[0].api_address,
+            Some("127.0.0.1:19317".parse().unwrap())
+        );
+        assert_eq!(nodes[0].incarnation, 4);
+        assert_eq!(nodes[0].labels["zone"], "a");
         worker.await.unwrap();
     }
 

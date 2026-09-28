@@ -425,6 +425,10 @@ pub enum AgentCommand {
     },
     /// Get cluster node membership from the gossip layer.
     Nodes {
+        /// Members the API remembers as down. Gossip's live view no longer
+        /// lists them, but the listing must show them as dead rather than
+        /// drop them. The agent adds their council flags.
+        down: Vec<NodeStatus>,
         response: oneshot::Sender<Vec<NodeStatus>>,
     },
     /// Get council (Raft) status.
@@ -1599,6 +1603,15 @@ pub struct NodeStatus {
     pub is_leader: bool,
     /// Node labels (zone, region, etc.).
     pub labels: BTreeMap<String, String>,
+}
+
+impl NodeStatus {
+    /// Whether gossip has given up on this node: declared it dead, or seen it
+    /// leave. The listing shows such nodes so people can see them; callers
+    /// that want to talk to a node, or run work on it, skip them.
+    pub fn is_down(&self) -> bool {
+        matches!(self.state.as_str(), "dead" | "left")
+    }
 }
 
 /// Info about a single council member, as returned by the council API.
@@ -3887,7 +3900,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     /// Get cluster node membership from gossip, or empty if single-node.
-    fn get_cluster_nodes(&self) -> Vec<NodeStatus> {
+    ///
+    /// Lists gossip's live members (alive and suspect), then each of `down`
+    /// that gossip doesn't list any more, so a dead node shows as dead
+    /// instead of disappearing.
+    fn get_cluster_nodes(&self, down: Vec<NodeStatus>) -> Vec<NodeStatus> {
         let Some(handle) = &self.cluster else {
             return Vec::new();
         };
@@ -3913,21 +3930,25 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
 
         let have_metrics = handle.raft_metrics_rx.is_some();
+        // Raft metrics are authoritative when the council is wired;
+        // otherwise fall back to whatever the gossip snapshot reports. A
+        // dead voter is still a voter, so down members get the same check.
+        let roles = |name: &str, gossip_council: bool, gossip_leader: bool| {
+            if have_metrics {
+                (
+                    council_names.contains(name),
+                    leader_name.as_deref() == Some(name),
+                )
+            } else {
+                (gossip_council, gossip_leader)
+            }
+        };
         let membership = handle.membership_rx.borrow();
-        membership
+        let mut nodes: Vec<NodeStatus> = membership
             .iter()
             .map(|m| {
                 let name = m.node_id.to_string();
-                // Raft metrics are authoritative when the council is wired;
-                // otherwise fall back to whatever the gossip snapshot reports.
-                let (is_council, is_leader) = if have_metrics {
-                    (
-                        council_names.contains(&name),
-                        leader_name.as_deref() == Some(name.as_str()),
-                    )
-                } else {
-                    (m.is_council, m.is_leader)
-                };
+                let (is_council, is_leader) = roles(&name, m.is_council, m.is_leader);
                 NodeStatus {
                     node_id: name,
                     address: m.address.to_string(),
@@ -3939,7 +3960,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     labels: m.labels.clone(),
                 }
             })
-            .collect()
+            .collect();
+        for mut node in down {
+            if nodes.iter().any(|live| live.node_id == node.node_id) {
+                continue;
+            }
+            (node.is_council, node.is_leader) = roles(&node.node_id, false, false);
+            nodes.push(node);
+        }
+        nodes
     }
 
     /// Get Raft council status, or default if single-node/non-council.
@@ -4440,8 +4469,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     let _ = response.send(Err(error));
                 }
             },
-            AgentCommand::Nodes { response } => {
-                let nodes = self.get_cluster_nodes();
+            AgentCommand::Nodes { down, response } => {
+                let nodes = self.get_cluster_nodes(down);
                 let _ = response.send(nodes);
             }
             AgentCommand::Council { response } => {
@@ -15154,6 +15183,64 @@ mod tests {
             _volumes: volumes,
         };
         (agent, tx, shutdown, grill_handle)
+    }
+
+    /// Gossip's live view drops a dead member; the listing must still show
+    /// it, as dead, unless gossip lists it again.
+    #[tokio::test]
+    async fn cluster_nodes_list_down_members_gossip_no_longer_publishes() {
+        let (agent, _, _) = test_cluster_fault_agent().await;
+        let status = |name: &str, state: &str| NodeStatus {
+            node_id: name.to_string(),
+            address: "127.0.0.1:7946".to_string(),
+            api_address: None,
+            state: state.to_string(),
+            incarnation: 1,
+            is_council: true,
+            is_leader: true,
+            labels: Default::default(),
+        };
+        let nodes = agent.get_cluster_nodes(vec![status("gone", "dead")]);
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].node_id, "gone");
+        assert_eq!(nodes[0].state, "dead");
+        // Without Raft metrics the flags come from gossip, which has nothing
+        // to say about a member it no longer lists.
+        assert!(!nodes[0].is_council && !nodes[0].is_leader);
+    }
+
+    #[tokio::test]
+    async fn cluster_nodes_prefer_gossips_live_entry_over_a_remembered_one() {
+        let (_membership_tx, membership_rx) =
+            tokio::sync::watch::channel(vec![crate::mustard::membership::MembershipSnapshot {
+                node_id: crate::meat::NodeId::new("back"),
+                address: "127.0.0.1:7946".parse().unwrap(),
+                state: crate::mustard::state::NodeState::Alive,
+                incarnation: 2,
+                is_council: false,
+                is_leader: false,
+                labels: Default::default(),
+                first_seen: std::time::Instant::now(),
+                resources: None,
+            }]);
+        let (mut agent, _, _) = test_cluster_fault_agent().await;
+        if let Some(cluster) = agent.cluster.as_mut() {
+            cluster.membership_rx = membership_rx;
+        }
+        let remembered = NodeStatus {
+            node_id: "back".to_string(),
+            address: "127.0.0.1:7946".to_string(),
+            api_address: None,
+            state: "dead".to_string(),
+            incarnation: 1,
+            is_council: false,
+            is_leader: false,
+            labels: Default::default(),
+        };
+        let nodes = agent.get_cluster_nodes(vec![remembered]);
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].state, "alive");
+        assert_eq!(nodes[0].incarnation, 2);
     }
 
     async fn test_cluster_fault_agent() -> (

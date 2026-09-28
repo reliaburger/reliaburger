@@ -307,6 +307,7 @@ Fixes from the [static review in PR #258](https://github.com/reliaburger/reliabu
 Fixes for the 0.1.1 milestone:
 
 - [x] **Known members forget departed nodes.** `KnownMembers` (#244) kept every member's last address until Bun restarted. Gossip now also publishes a roster with Dead and Left members (`set_roster_watch`, the live-only watch is unchanged); the known table forgets a member gossip reports as Left or the CRL lists as retired, and any down member not heard from for `KNOWN_MEMBER_RETENTION` (24 h, Smoker's hard fault ceiling), while still keeping a reaped dead member's address for fault clears.
+- [x] **`relish nodes` shows dead nodes as dead.** `/v1/cluster/nodes` was built from gossip's live-only watch, so a dead node vanished. The handler now hands the agent the members `KnownMembers` remembers as down, and the agent lists them after the live ones with state `dead` and their Raft council flags. The watch the scheduler, council and Pickle read is unchanged; `relish upgrade`, the test context's node inventory and route detection skip down members (`NodeStatus::is_down`).
 
 ### Engineering follow-ups
 
