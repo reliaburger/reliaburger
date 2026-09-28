@@ -68,6 +68,7 @@ mod security_integration;
 mod server_idle_connections;
 mod service_endpoints;
 mod stop_confirmation;
+mod task_array_million;
 mod tls_connection_lifetime;
 mod uninstall;
 mod website;
