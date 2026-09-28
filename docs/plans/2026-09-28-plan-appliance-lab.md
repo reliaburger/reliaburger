@@ -17,8 +17,8 @@
 - [x] **S3, five VMs on one L2 network**: an address-only "home router", a separate ProxyDHCP and TFTP and HTTP server, and five aarch64 clients netbooting at once. Then the cluster is formed by hand (`relish init`, join tokens) and the tour runs.
 - [x] **S3, the x86_64 smoke run**: the virtual Wyse installs through the same path with real firmware PXE, and starts bun.
 - [x] **S4, good update**: a second CI version is staged by hand the way bun would (`os-stage`: Ed25519, SHA-256, `systemd-sysupdate` from a local directory) and rolled across the cluster. Boot counting blesses each node, and Raft, images and volumes stay intact.
-- [ ] **S4, bad update**: a deliberately broken version (bun won't start) falls back to the previous slot within three boots, with no hands.
-- [ ] **S4, bun upgrade on top**: `relish upgrade` still swaps bun's binary on the appliance.
+- [x] **S4, bad update**: a deliberately broken version (bun won't start) falls back to the previous slot within three boots, with no hands.
+- [ ] **S4, bun upgrade on top**: `relish upgrade` still swaps bun's binary on the appliance. The launcher that makes it possible is in (see the log); the end-to-end run waits for a release-signed bun newer than v0.1.0.
 - [ ] **S5, ten Dell Wyse 3040s**: the last step, on the hardware (spike plan, research §9.7).
 - [ ] **S6, write-up**: `docs/qualification/<date>-appliance-spike.md` and `<date>-wyse-3040.md`.
 
@@ -74,6 +74,15 @@
 - **Rolled across all five nodes** (followers first, the leader last). Each was back, blessed, about 20 s after its reboot, and the cluster never dropped below 5 alive. Raft continued (term 12, log 964 → 1008, 5 apps), and `wtf` showed 12 OK.
 - **Volumes:** the `keeper` app's volume on node-01 kept its data through the update. But while node-01 rebooted, the scheduler moved `keeper` to node-03 with a fresh volume. Managed volumes don't pin an app to its node; that's a bun question for Phase 3's drain-before-reboot, not an OS one.
 
+- **Bad update, node-05 (28 Sep, 21:31–21:47 UTC).** `os-stage` put the broken 2026.40.25 into the oldest slot (2026.40.22's), keeping the running 2026.40.23. Then:
+  - three counted boots of 2026.40.25 each ended with `reliaburger: bun not healthy after 300 s` and a reboot from the boot check;
+  - the UKI ran out of tries (`reliaburger-os_2026.40.25+0-3.efi`), and systemd-boot picked 2026.40.23 by itself;
+  - node-05 was `bun healthy` 7.6 s into that boot and back in the cluster (5/5, council healthy).
+  - **From the first try to the fallback: about 15 min 40 s, with no hands.** Nearly all of it is the boot check's 300 s timeout, three times. A shorter timeout on counted boots would bring it down.
+- **bun upgrade on top.** `relish upgrade start --binary` reached every node and was refused, as it should be, for lack of an operator countersignature (`[upgrades] external_signing_key`, docs/manual/12_operations.md). Two things stood out:
+  - **bun upgrades itself by writing `bun-vX.Y.Z` beside its own binary**, and on the appliance that was the read-only `/usr`. The `start` launcher now runs bun from `/var/lib/reliaburger/bin` and installs the image's bun there only when it's newer. Tested on Linux with stand-in binaries: first boot; the same version; a newer image; an older image; and a bun that upgraded itself past the image. Neither path moves bun backwards.
+  - **Every staging candidate is v0.1.0**, and `start` refuses the same version with different bytes. So the end-to-end run waits for the next release-signed bun. The lab's `node-toml.py` takes `OPERATOR_KEY` for it.
+
 ## Findings
 
 - **Stubble**: see S1's log. The unwrap has to be a *postinst* script, because for `Format=uki` mkosi saves the kernel aside before finalize scripts run. Without it, the aarch64 installer couldn't start (`Error 0x7f048281`).
@@ -109,6 +118,8 @@ For `relish netboot` (Phase 2b):
 ## Known gaps
 
 - `/etc` lives on the data partition, so a later image's `/etc` doesn't reach installed nodes (S1). The seed and SSH credentials land in `/etc` too.
+- bun's end-to-end upgrade on the appliance hasn't run yet (see S4).
+- The fallback takes about 16 minutes, because the boot check waits 300 s each try.
 - The lab's SSH (`openssh-server`, started only with an `ssh.authorized_keys.root` credential) exists so S4 can stage by hand. Phase 1 drops it, once bun stages OS updates itself.
 - Every spike build signs with its own throwaway key, so staging a later build needs that build's public key passed to `os-stage` explicitly.
 - Under Secure Boot, systemd-stub drops the command line iPXE passes, so the installer would need another way to find its server.
