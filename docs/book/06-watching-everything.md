@@ -704,6 +704,52 @@ every node an app ever ran on, is state the cluster would have to keep
 forever for the sake of a log query. `tail_after_an_app_moves_back_includes_the_nodes_it_ran_on_meanwhile`
 reproduces the soak with two stores and fails against the old node choice.
 
+### Two runs, one name
+
+The final soak tier found the next one, and it was the same shape again. The
+tail read `INCR 11630`, `INCR 11632`, `INCR 11631`, `INCR 11633`: one swap,
+no label, so it looked like a single client counting backwards. The status
+snapshots either side of it had the client on node 2 and then on node 3. A
+rollback walk had just restarted every node's Bun, and the scheduler moved
+the client in the middle of it. Same instance name, `default__soak-redis-client-0`,
+on both nodes.
+
+The labelling we added for rolling deploys keys on the instance name, so two
+runs of one name printed bare. And the merge put them in order by `sequence`,
+which is ingest time in nanoseconds *on the node that stored the line*. Each
+node's sequence rises strictly, so node 2's lines are in order and so are
+node 3's. Between the two, the order is only as good as two VMs' clocks plus
+up to 200 ms of capture polling each. The old run's last `INCR` and the new
+run's first one were well inside that. Nothing went backwards. Two processes
+wrote, and we sorted them by two clocks.
+
+Could we sort them properly? Not with timestamps. The capture file holds raw
+bytes with no emission time, and even an emission time would come from two
+different clocks. There is no single order between two processes on two
+machines to recover, only the counter itself. So the fix is to stop hiding
+that there were two. The cross-node merge now names the node on every entry:
+
+```rust
+let entry = LogEntry {
+    node: Some(source.node_id.clone()),
+    ..entry
+};
+```
+
+`..entry` is the struct update syntax from Chapter 1. Here it *moves* the
+other fields out of `entry`, strings and all, with no copying; that's fine
+because the loop owns `entry` and never touches it again. The field itself is `#[serde(default,
+skip_serializing_if = "Option::is_none")]`, so a node answering for itself
+sends exactly what it sent before, and the node-to-node format doesn't move.
+
+`relish logs` then labels by *run*, an `(instance, node)` pair, and adds the
+node only where the name alone is ambiguous: `[default__soak-redis-client-0@rb-2]`.
+Two replicas on two nodes keep their short `[instance]` labels. The soak
+checker now judges order within each labelled run, and "the view ends below
+what we saw before" against the newest line of any run.
+`one_instance_on_two_nodes_names_each_line_s_node` and
+`merged_entries_name_the_node_that_stored_them` fail without the change.
+
 ## When nothing looks like success
 
 Both hardening passes share a pattern, and later reviews kept finding more of it: a failure that comes back dressed as an empty, successful answer. A directory called `blocked.parquet` made the exporter and both retention loops report success. A peer that sent `200 OK` and then went quiet hung a log query. A node that answered `{}` convinced the diagnostic collector there were no alerts. None of these crash. They lie quietly, which is worse.
