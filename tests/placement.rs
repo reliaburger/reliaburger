@@ -193,6 +193,7 @@ async fn start_node_with(
         fault_injection: auth.is_some(),
         labels,
         keep_data_dir,
+        task_arrays: None,
     })
     .await;
 
