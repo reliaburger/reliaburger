@@ -1,0 +1,13 @@
+#!ipxe
+# The netboot server's boot script, fetched over TFTP by embed.ipxe.
+# Everything after it goes over HTTP from the same server: the installer UKI,
+# then (from inside the installer) the signed disk image. Serve each
+# architecture's artefacts under /<buildarch>/ with installer.efi pointing at
+# reliaburger-os-installer_<version>.efi.
+#
+# Arguments to a UKI replace its built-in command line (Secure Boot off), so
+# this passes the console too.
+iseq ${buildarch} arm64 && set console ttyAMA0 || set console ttyS0
+set base http://${server}:8080/${buildarch}
+echo reliaburger: chaining ${base}/installer.efi
+chain ${base}/installer.efi reliaburger.url=${base} console=tty0 console=${console},115200

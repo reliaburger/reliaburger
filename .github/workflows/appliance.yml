@@ -79,6 +79,20 @@ jobs:
           install -D -m 0755 "dl/relish-linux-$ARCH" image/bin-tree/usr/lib/reliaburger/bin/relish
           echo "### bun and relish from \`$tag\`" >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Throwaway signing key
+        # Spike only: a fresh Ed25519 key per run, so the signature proves the
+        # pipeline works and nothing else. The OS signing key comes later, in
+        # its own protected environment. It's made before the build so the
+        # installer UKI can carry the public half and check what it installs.
+        run: |
+          set -euo pipefail
+          openssl genpkey -algorithm ed25519 -out "$RUNNER_TEMP/spike.key"
+          openssl pkey -in "$RUNNER_TEMP/spike.key" -pubout -out "$RUNNER_TEMP/spike.pub.pem"
+          install -D -m 0644 "$RUNNER_TEMP/spike.pub.pem" \
+            image/mkosi.images/installer/mkosi.extra/usr/lib/reliaburger/os-signing-key.pub.pem
+          install -D -m 0644 "$RUNNER_TEMP/spike.pub.pem" \
+            image/bin-tree/usr/lib/reliaburger/os-signing-key.pub.pem
+
       - name: Build the image
         run: |
           set -euo pipefail
@@ -104,6 +118,40 @@ jobs:
             echo "Firmware: $(jq -r '.packages[] | select(.name | startswith("linux-firmware")) | .name' *.manifest 2>/dev/null | tr '\n' ' ')"
             du -sh ../mkosi.tools 2>/dev/null | sed 's/^/Tools tree: /' || true
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Sign
+        run: |
+          set -euo pipefail
+          cd image/mkosi.output
+          cp "$RUNNER_TEMP/spike.pub.pem" spike-signing-key.pub.pem
+          for sums in *.SHA256SUMS; do
+            openssl pkeyutl -sign -inkey "$RUNNER_TEMP/spike.key" -rawin -in "$sums" -out "$sums.sig"
+            openssl pkeyutl -verify -pubin -inkey spike-signing-key.pub.pem -rawin -in "$sums" -sigfile "$sums.sig"
+          done
+          rm -f "$RUNNER_TEMP/spike.key"
+
+      - name: Build iPXE
+        # Pinned and built here rather than downloaded (research §4.7), with
+        # image/netboot/embed.ipxe built in.
+        env:
+          IPXE_COMMIT: 12798ec29aa8a64d8675c4378b99f5fe28447afb # v2.0.0
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential liblzma-dev
+          git init -q "$RUNNER_TEMP/ipxe"
+          git -C "$RUNNER_TEMP/ipxe" fetch -q --depth 1 https://github.com/ipxe/ipxe "$IPXE_COMMIT"
+          git -C "$RUNNER_TEMP/ipxe" checkout -q FETCH_HEAD
+          case "$ARCH" in
+            x86_64) target=bin-x86_64-efi/ipxe.efi name=x86_64 ;;
+            aarch64) target=bin-arm64-efi/ipxe.efi name=arm64 ;;
+          esac
+          make -s -C "$RUNNER_TEMP/ipxe/src" -j"$(nproc)" "$target" \
+            EMBED="$GITHUB_WORKSPACE/image/netboot/embed.ipxe"
+          mkdir -p image/mkosi.output/netboot
+          cp "$RUNNER_TEMP/ipxe/src/$target" "image/mkosi.output/netboot/ipxe-$name.efi"
+          cp image/netboot/boot.ipxe image/mkosi.output/netboot/
+          ls -l image/mkosi.output/netboot
 
       - name: Boot test
         # x86-64 runs under KVM. Hosted arm64 runners have no /dev/kvm, so
@@ -160,19 +208,59 @@ jobs:
           grep "reliaburger:" "$log" >> "$GITHUB_STEP_SUMMARY" || true
           [ "$result" = pass ]
 
-      - name: Sign with a throwaway key
-        # Spike only: a fresh Ed25519 key per run, so the signature proves the
-        # pipeline works and nothing else. The OS signing key comes later, in
-        # its own protected environment.
+      - name: Netboot install test (x86-64, KVM)
+        # The S2 path on a blank 8 GB disk with 2 GiB: QEMU's user network
+        # plays DHCP and TFTP (iPXE, boot.ipxe), a web server on the runner
+        # serves the installer and the signed image, and the installer
+        # streams the image to disk and reboots. The disk comes first in the
+        # boot order, so the second boot starts the installed system.
+        if: matrix.arch == 'x86_64'
+        timeout-minutes: 20
         run: |
           set -euo pipefail
-          cd image/mkosi.output
-          openssl genpkey -algorithm ed25519 -out "$RUNNER_TEMP/spike.key"
-          openssl pkey -in "$RUNNER_TEMP/spike.key" -pubout -out spike-signing-key.pub.pem
-          sums=$(ls *.SHA256SUMS)
-          openssl pkeyutl -sign -inkey "$RUNNER_TEMP/spike.key" -rawin -in "$sums" -out "$sums.sig"
-          openssl pkeyutl -verify -pubin -inkey spike-signing-key.pub.pem -rawin -in "$sums" -sigfile "$sums.sig"
-          rm -f "$RUNNER_TEMP/spike.key"
+          out="$GITHUB_WORKSPACE/image/mkosi.output"
+          web="$RUNNER_TEMP/web" tftp="$RUNNER_TEMP/tftp"
+          mkdir -p "$web/x86_64" "$tftp"
+          cp "$out/netboot/ipxe-x86_64.efi" "$out/netboot/boot.ipxe" "$tftp/"
+          for f in "$out"/reliaburger-os_"$IMAGE_VERSION".{raw.zst,SHA256SUMS,SHA256SUMS.sig}; do
+            ln -s "$f" "$web/x86_64/"
+          done
+          ln -s "$out/reliaburger-os-installer_$IMAGE_VERSION.efi" "$web/x86_64/installer.efi"
+          (cd "$web" && exec python3 -m http.server 8080 >"$RUNNER_TEMP/http.log" 2>&1) &
+          http=$!
+          truncate -s 8G "$RUNNER_TEMP/blank.raw"
+          cp /usr/share/OVMF/OVMF_VARS_4M.fd "$RUNNER_TEMP/netboot-vars.fd"
+          log="$RUNNER_TEMP/netboot.log"
+          qemu-system-x86_64 -machine q35,accel=kvm -cpu host -smp 2 -m 2048 \
+            -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
+            -drive if=pflash,format=raw,file="$RUNNER_TEMP/netboot-vars.fd" \
+            -drive if=none,id=d0,format=raw,file="$RUNNER_TEMP/blank.raw" \
+            -device virtio-blk-pci,drive=d0,bootindex=1 \
+            -netdev user,id=n0,tftp="$tftp",bootfile=ipxe-x86_64.efi \
+            -device virtio-net-pci,netdev=n0,bootindex=2 \
+            -display none -serial "file:$log" &
+          qemu=$!
+          start=$(date +%s)
+          result=timeout
+          while [ $(( $(date +%s) - start )) -lt 900 ]; do
+            if grep -q "reliaburger: bun healthy" "$log" 2>/dev/null; then result=pass; break; fi
+            if grep -q -e "reliaburger-install: FAILED" -e "reliaburger: bun not healthy" "$log" 2>/dev/null; then result=fail; break; fi
+            if ! kill -0 "$qemu" 2>/dev/null; then result=exited; break; fi
+            sleep 5
+          done
+          elapsed=$(( $(date +%s) - start ))
+          kill "$qemu" "$http" 2>/dev/null || true
+          echo "--- serial console ---"
+          cat "$log" || true
+          echo "--- web server ---"
+          cat "$RUNNER_TEMP/http.log" || true
+          {
+            echo "### Netboot install test: $result after ${elapsed} s"
+            echo '```'
+            grep -a -e "reliaburger" "$log" | grep -v "reliaburger: journal:" || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          [ "$result" = pass ]
 
       - name: Upload the image
         uses: actions/upload-artifact@v4
@@ -186,6 +274,7 @@ jobs:
             image/mkosi.output/*.manifest
             image/mkosi.output/*.SHA256SUMS*
             image/mkosi.output/spike-signing-key.pub.pem
+            image/mkosi.output/netboot/
           if-no-files-found: error
           # zstd-compressed already; spike artefacts are for the next day's lab.
           compression-level: 0

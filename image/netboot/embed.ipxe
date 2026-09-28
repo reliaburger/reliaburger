@@ -1,0 +1,15 @@
+#!ipxe
+# Built into the vendored iPXE (ipxe-<arch>.efi). It gets an address from
+# the LAN's DHCP, then runs boot.ipxe from the server that answered the PXE
+# request: the ProxyDHCP server if there is one (relish netboot, or dnsmasq
+# in the lab), else plain next-server (QEMU's user network). Everything
+# site-specific lives in boot.ipxe, so one binary serves every site.
+:retry
+dhcp || goto wait
+isset ${proxydhcp/next-server} && set server ${proxydhcp/next-server} || set server ${next-server}
+echo reliaburger: iPXE ${buildarch} at ${ip}, boot server ${server}
+chain tftp://${server}/boot.ipxe || goto wait
+:wait
+echo reliaburger: no boot script yet, retrying in 5 s
+sleep 5
+goto retry

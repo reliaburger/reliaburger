@@ -1,0 +1,104 @@
+#!/bin/bash
+# Reliaburger OS netboot installer (spike S2, research §4.7).
+#
+# Fetches the signed SHA256SUMS for this installer's own version, checks its
+# Ed25519 signature, then streams the compressed disk image straight onto the
+# disk: curl | zstd | dd, hashing the download on the way. Nothing is staged
+# in RAM, so a 2 GB machine can install a 1.7 GB image.
+#
+# Kernel command line (iPXE passes it; see image/netboot/):
+#   reliaburger.url=<base URL>   where the image files are (required unless
+#                                booted by UEFI HTTP Boot, whose URL
+#                                systemd-stub records)
+#   reliaburger.disk=/dev/<name> install here instead of the largest fixed disk
+#   reliaburger.wipe=1           overwrite a disk that already has partitions
+set -euo pipefail
+
+say() { echo "reliaburger-install: $*"; }
+fail() {
+    say "FAILED: $*"
+    exit 1
+}
+
+arg() {
+    local word
+    for word in $(cat /proc/cmdline); do
+        case $word in "$1="*) echo "${word#*=}" ;; esac
+    done
+}
+
+started=$(date +%s)
+url=$(arg reliaburger.url)
+if [ -z "$url" ]; then
+    # UEFI HTTP Boot: systemd-stub (258+) records the URL it was loaded from.
+    var=/sys/firmware/efi/efivars/LoaderDeviceURL-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f
+    if [ -r "$var" ]; then
+        url=$(tail -c +5 "$var" | tr -d '\0')
+        url=${url%/*}
+    fi
+fi
+[ -n "$url" ] || fail "no image URL; boot with reliaburger.url=http://<server>/<path>"
+url=${url%/}
+
+. /usr/lib/os-release
+version=${IMAGE_VERSION:?}
+image="reliaburger-os_${version}.raw.zst"
+sums="reliaburger-os_${version}.SHA256SUMS"
+say "installer ${version}, fetching from ${url}"
+
+key=/usr/lib/reliaburger/os-signing-key.pub.pem
+[ -r "$key" ] || fail "no signing key in the installer"
+curl -fsS --retry 5 --retry-connrefused -o "/run/$sums" "$url/$sums" || fail "can't fetch $url/$sums"
+curl -fsS --retry 5 --retry-connrefused -o "/run/$sums.sig" "$url/$sums.sig" || fail "can't fetch $url/$sums.sig"
+openssl pkeyutl -verify -pubin -inkey "$key" -rawin -in "/run/$sums" -sigfile "/run/$sums.sig" >/dev/null \
+    || fail "bad signature on $sums"
+expected=$(awk -v f="$image" '{ n = $2; sub(/^\*/, "", n); if (n == f) print $1 }' "/run/$sums")
+[ -n "$expected" ] || fail "$image isn't listed in $sums"
+say "signature good; $image should hash to ${expected:0:16}…"
+
+disk=$(arg reliaburger.disk)
+if [ -z "$disk" ]; then
+    # The largest fixed, writable disk. eMMC boot partitions are read-only.
+    disk=$(lsblk -dnbpo NAME,TYPE,RM,RO,SIZE \
+        | awk '$2 == "disk" && $3 == 0 && $4 == 0 && $1 !~ /\/(zram|loop|ram)/ { print $5, $1 }' \
+        | sort -n | tail -n 1 | cut -d' ' -f2)
+fi
+[ -b "$disk" ] || fail "no disk to install to"
+size=$(blockdev --getsize64 "$disk")
+say "target $disk, $((size / 1000000)) MB"
+if [ -n "$(lsblk -nlo NAME "$disk" | tail -n +2)" ] || blkid -p "$disk" >/dev/null 2>&1; then
+    [ "$(arg reliaburger.wipe)" = 1 ] || fail "$disk isn't empty; boot with reliaburger.wipe=1 to overwrite it"
+    say "wiping $disk"
+    wipefs -a -q "$disk"
+fi
+
+# Hash the compressed stream as it passes; dd writes with O_DIRECT so the
+# page cache doesn't fill with the image either.
+fifo=/run/image.fifo
+rm -f "$fifo"
+mkfifo "$fifo"
+sha256sum <"$fifo" | cut -d' ' -f1 >/run/image.sha256 &
+hasher=$!
+say "streaming $image to $disk"
+curl -fsS --retry 5 --retry-connrefused "$url/$image" \
+    | tee "$fifo" \
+    | zstd -dc \
+    | dd of="$disk" bs=4M iflag=fullblock oflag=direct conv=fsync status=none \
+    || { wipefs -a -q "$disk" || true; fail "writing $image failed"; }
+wait "$hasher"
+actual=$(cat /run/image.sha256)
+if [ "$actual" != "$expected" ]; then
+    wipefs -a -q "$disk" || true
+    fail "$image hashed to $actual, not $expected; wiped $disk"
+fi
+
+# Move the backup GPT to the end of this disk. First boot's systemd-repart
+# then grows the data partition and adds slot B.
+sgdisk -e "$disk" >/dev/null
+sync
+
+peak=$(cat /sys/fs/cgroup/system.slice/reliaburger-install.service/memory.peak 2>/dev/null || echo 0)
+available=$(awk '/^MemAvailable:/ { print int($2 / 1024) }' /proc/meminfo)
+say "installed ${version} to ${disk} in $(($(date +%s) - started)) s; peak memory $((peak / 1048576)) MiB, ${available} MiB still available"
+say "rebooting into the installed system"
+systemctl reboot
