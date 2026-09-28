@@ -20822,6 +20822,40 @@ host = "remote.local"
     }
 
     #[tokio::test]
+    async fn redeploying_the_same_spec_over_a_stopped_replica_runs_one_again() {
+        // A retirement whose stop finished but whose address release is
+        // still waiting on other nodes leaves the replica stopped and owned,
+        // with its service still registered. When the leader hands the
+        // placement back, the placement reconciler redeploys the identical
+        // spec, and that must converge on a running replica.
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        grill.set_pid(std::process::id());
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        let stop = agent.begin_app_stop("web", "default").await.unwrap();
+        agent.app_exit_wait(&stop).await.unwrap();
+        for id in &stop.instances {
+            let instance = agent.supervisor.get_instance_mut(id).unwrap();
+            instance.state = instance
+                .state
+                .transition_to(ContainerState::Stopped)
+                .unwrap();
+        }
+        let running = |agent: &BunAgent<MockGrill>| {
+            agent
+                .supervisor
+                .list_instances()
+                .iter()
+                .filter(|instance| instance.state == ContainerState::Running)
+                .count()
+        };
+        assert_eq!(running(&agent), 0);
+
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+
+        assert_eq!(running(&agent), 1, "the redeploy left no running replica");
+    }
+
+    #[tokio::test]
     async fn redeploy_does_not_overwrite_a_stopped_or_failed_cleanup_owner() {
         for state in [ContainerState::Stopped, ContainerState::Failed] {
             let records = tempfile::tempdir().unwrap();
