@@ -177,6 +177,7 @@ impl Harness {
             None,
             None,
             Some(status_reader),
+            None,
         );
         let app = match options.auth_context {
             Some(auth) => app.layer(axum::middleware::from_fn(

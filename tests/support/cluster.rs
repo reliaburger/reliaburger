@@ -531,6 +531,7 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
             None,
             None,
             Some(status_reader.clone()),
+            None,
         )
     } else {
         api::router_with_upgrade(

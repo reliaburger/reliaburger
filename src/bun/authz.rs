@@ -284,6 +284,15 @@ pub const ROUTE_MATRIX: &[Route] = &[
     route(Post, "/v1/batch/run", System),
     route(Post, "/v1/batch/{id}/report", System),
     route(Get, "/v1/batch/{id}", AnyToken),
+    // Task arrays. `sync` and the `local` reads are the leader's calls to
+    // nodes; results and logs are also held to the array's scope.
+    route(Post, "/v1/batch/array", Deployer),
+    route(Post, "/v1/batch/array/sync", System),
+    route(Get, "/v1/batch/array/{id}/local/results", System),
+    route(Get, "/v1/batch/array/{id}/local/tasks/{index}/logs", System),
+    route(Post, "/v1/batch/{id}/cancel", Deployer),
+    route(Get, "/v1/batch/{id}/results", AnyToken),
+    route(Get, "/v1/batch/{id}/tasks/{index}/logs", AnyToken),
     route(Post, "/v1/build", Deployer),
     route(Post, "/v1/build/run", System),
     route(Post, "/v1/build/track", System),
@@ -363,6 +372,7 @@ mod tests {
             "/v1/cluster/trust-ack",
             "/v1/batch/run",
             "/v1/batch/{id}/report",
+            "/v1/batch/array/sync",
             "/v1/build/run",
             "/v1/build/track",
             "/v1/build/sign",

@@ -28,6 +28,8 @@ pub mod restart;
 mod schedules;
 pub mod snapshot_worker;
 pub mod supervisor;
+pub mod task_array_api;
+pub mod task_array_leader;
 pub mod task_array_node;
 pub mod task_executor;
 pub mod task_ledger;

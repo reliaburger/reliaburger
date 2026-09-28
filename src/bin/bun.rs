@@ -2783,6 +2783,21 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         Some(local_test_leases.clone()),
         jwt_verifier,
         Some(status_reader),
+        // Task arrays run host processes, gated by the same allowlist as
+        // process workloads, with a ledger under the data directory.
+        Some(Arc::new(
+            reliaburger::bun::task_array_leader::TaskArrayService::new(Some(Arc::new(
+                reliaburger::bun::task_array_node::TaskArrayNode::new(
+                    reliaburger::bun::task_array_node::TaskArrayNodeConfig::for_data_dir(
+                        &data_base,
+                        config.process_workloads.clone(),
+                    ),
+                    reliaburger::bun::task_array_node::NodeRunner::Process(
+                        reliaburger::bun::task_executor::ProcessRunner::default(),
+                    ),
+                ),
+            ))),
+        )),
     );
     let app = match &registry_forwarder {
         Some(forwarder) => app.layer(axum::Extension(
