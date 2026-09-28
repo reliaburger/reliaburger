@@ -83,6 +83,12 @@
   - **bun upgrades itself by writing `bun-vX.Y.Z` beside its own binary**, and on the appliance that was the read-only `/usr`. The `start` launcher now runs bun from `/var/lib/reliaburger/bin` and installs the image's bun there only when it's newer. Tested on Linux with stand-in binaries: first boot; the same version; a newer image; an older image; and a bun that upgraded itself past the image. Neither path moves bun backwards.
   - **Every staging candidate is v0.1.0**, and `start` refuses the same version with different bytes. So the end-to-end run waits for the next release-signed bun. The lab's `node-toml.py` takes `OPERATOR_KEY` for it.
 
+- **A second rolling update, to 2026.40.30 (run 36488707344), the newest image.** It rolled across all five nodes, followers first and the leader last:
+  - each node came back blessed, and the exhausted 2026.40.25 left node-05's ESP;
+  - every node's `BootOrder` starts with the installer's "Reliaburger OS" entry;
+  - **the launcher's first run moved bun to `/var/lib/reliaburger/bin/bun-v0.1.0`** (it logged "bun 0.1.0 from the image is now active");
+  - the cluster ended at term 18, log 2007, 5/5, and `wtf` showed 12 OK, 0 warnings.
+
 ## Findings
 
 - **Stubble**: see S1's log. The unwrap has to be a *postinst* script, because for `Format=uki` mkosi saves the kernel aside before finalize scripts run. Without it, the aarch64 installer couldn't start (`Error 0x7f048281`).
