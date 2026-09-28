@@ -150,6 +150,7 @@ async fn start_node_with(
         operator_token: auth.as_ref().map(|auth| auth.token.clone()),
         fault_injection: auth.is_some(),
         labels,
+        task_arrays: None,
     })
     .await;
 
