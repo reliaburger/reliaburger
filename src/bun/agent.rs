@@ -377,6 +377,15 @@ pub enum AgentCommand {
     Status {
         response: oneshot::Sender<Vec<InstanceStatus>>,
     },
+    /// Whether instances adopted after a restart or self-upgrade already run
+    /// exactly `spec` (replica count included), so the placement reconciler
+    /// can record a still-pending placement as applied instead of rolling it.
+    AdoptedPlacementMatches {
+        app_name: String,
+        namespace: String,
+        spec: Box<AppSpec>,
+        response: oneshot::Sender<bool>,
+    },
     /// Get the local desired application specs for standalone diagnostics.
     DesiredApps {
         response: oneshot::Sender<Vec<crate::bun::diagnostics::DesiredAppEvidence>>,
@@ -1694,6 +1703,7 @@ mod app_stop;
 mod consumer;
 mod startup_recovery;
 pub use consumer::ConsumerUpdate;
+mod adopted_placements;
 mod discovery_ownership;
 mod discovery_recovery;
 mod egress_ownership;
@@ -1973,6 +1983,9 @@ pub struct BunAgent<G: Grill> {
     /// Those tasks. A follower's CSR waits on the leader for up to ten
     /// seconds, which must not stall every other command.
     identity_signing_tasks: tokio::task::JoinSet<identity_signing::SignedIdentity>,
+    /// Apps adopted at startup and the spec their instances were launched
+    /// from, until this agent deploys them again.
+    adopted_apps: adopted_placements::AdoptedApps,
 }
 
 /// One instance's runtime view for a status answer.
@@ -2137,6 +2150,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             restart_rotation: RestartRotation::default(),
             identity_signings: identity_signing::IdentitySignings::new(),
             identity_signing_tasks: tokio::task::JoinSet::new(),
+            adopted_apps: adopted_placements::AdoptedApps::new(),
         }
     }
 
@@ -2265,6 +2279,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             restart_rotation: RestartRotation::default(),
             identity_signings: identity_signing::IdentitySignings::new(),
             identity_signing_tasks: tokio::task::JoinSet::new(),
+            adopted_apps: adopted_placements::AdoptedApps::new(),
         }
     }
 
@@ -3541,6 +3556,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 .entry(key.clone())
                 .or_default()
                 .push(instance_id.clone());
+            if !record.is_job {
+                self.note_adopted_instance(
+                    &key,
+                    &instance_id,
+                    record.app_spec.as_ref(),
+                    &record.image,
+                );
+            }
             if let Some(spec) = record.app_spec {
                 self.deployed_specs.insert(key, spec);
             }
@@ -4362,6 +4385,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     })
                     .collect();
                 let _ = response.send(targets);
+            }
+            AgentCommand::AdoptedPlacementMatches {
+                app_name,
+                namespace,
+                spec,
+                response,
+            } => {
+                let _ = response.send(self.adopted_instances_match(&app_name, &namespace, &spec));
             }
             AgentCommand::DesiredApps { response } => {
                 let mut apps = self
@@ -10616,6 +10647,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     crate::bun::deploy_operations::DeployTargetKind::App,
                 );
                 if result.is_ok() {
+                    self.forget_adopted_app(&app_name, &namespace);
                     self.deployed_specs.insert((app_name, namespace), *spec);
                 }
                 let _ = reply.send(result);
@@ -24346,5 +24378,125 @@ host = "remote.local"
         let marked: InstanceStatus =
             serde_json::from_value(serde_json::to_value(&status).unwrap()).unwrap();
         assert!(marked.runtime_unknown);
+    }
+
+    // --- adopted instances that already run their placement ---
+
+    /// PR #267's timeline: a Bun upgraded before its reconciler recorded the
+    /// writer's deploy as applied adopted the running writer, then found the
+    /// placement still pending and rolled it (surge-first, two writers on one
+    /// volume). The adopting agent must be able to say that its adopted
+    /// instances already run exactly that placement.
+    #[tokio::test]
+    async fn adopted_instances_that_run_their_placement_are_recognised() {
+        let directory = tempfile::tempdir().unwrap();
+        let records = directory.path().join("instances");
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        agent.set_records_dir(records.clone());
+        agent.set_volumes_dir(directory.path().join("volumes"));
+        grill.set_pid(std::process::id());
+        let config =
+            Config::parse("[app.web]\nimage = 'web:v1'\nport = 8080\nreplicas = 2\n").unwrap();
+        let placed = config.app["web"].clone();
+        expect_complete(&drain_deploy(&mut agent, config).await);
+        let ids: Vec<InstanceId> = agent
+            .supervisor
+            .list_instances()
+            .iter()
+            .map(|instance| instance.id.clone())
+            .collect();
+        assert_eq!(ids.len(), 2);
+        assert!(
+            !agent.adopted_instances_match("web", "default", &placed),
+            "instances this agent deployed itself are not adoption evidence"
+        );
+
+        let (mut replacement, _tx, _shutdown, runtime) = test_agent_with_grill();
+        replacement.set_records_dir(records);
+        replacement.set_volumes_dir(directory.path().join("volumes"));
+        runtime.set_pid(std::process::id());
+        for id in &ids {
+            runtime.set_adopt_result(id, true);
+        }
+        assert_eq!(replacement.adopt_recorded_instances().await.unwrap(), 2);
+        assert!(replacement.adopted_instances_match("web", "default", &placed));
+
+        let mut newer = placed.clone();
+        newer.image = Some("web:v2".into());
+        assert!(!replacement.adopted_instances_match("web", "default", &newer));
+        let mut bigger = placed.clone();
+        bigger.replicas = crate::config::Replicas::Fixed(3);
+        assert!(!replacement.adopted_instances_match("web", "default", &bigger));
+        assert!(!replacement.adopted_instances_match("api", "default", &placed));
+
+        // An instance that isn't running any more needs the deploy.
+        replacement
+            .supervisor
+            .get_instance_mut(&ids[0])
+            .unwrap()
+            .state = ContainerState::Unhealthy;
+        assert!(!replacement.adopted_instances_match("web", "default", &placed));
+        replacement
+            .supervisor
+            .get_instance_mut(&ids[0])
+            .unwrap()
+            .state = ContainerState::Running;
+        assert!(replacement.adopted_instances_match("web", "default", &placed));
+
+        // Once this agent deploys the app itself, adoption says nothing more.
+        let config =
+            Config::parse("[app.web]\nimage = 'web:v1'\nport = 8080\nreplicas = 2\n").unwrap();
+        expect_complete(&drain_deploy(&mut replacement, config).await);
+        assert!(!replacement.adopted_instances_match("web", "default", &placed));
+    }
+
+    /// Adopted instances whose records disagree about their spec prove
+    /// nothing, so the placement is deployed as before.
+    #[tokio::test]
+    async fn adopted_instances_with_disagreeing_records_are_not_converged() {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        let dir = tempfile::tempdir().unwrap();
+        let first = adoption_record("default__web-0", "web", false);
+        let mut second = adoption_record("default__web-1", "web", false);
+        second.replica_index = 1;
+        second.host_port = Some(30124);
+        second.app_spec.as_mut().unwrap().port = Some(9999);
+        crate::grill::records::write_record(dir.path(), &first).unwrap();
+        crate::grill::records::write_record(dir.path(), &second).unwrap();
+        agent.set_records_dir(dir.path().to_path_buf());
+        for id in ["default__web-0", "default__web-1"] {
+            grill.set_adopt_result(&InstanceId(id.into()), true);
+        }
+        assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 2);
+        let mut placed = first.app_spec.clone().unwrap();
+        placed.replicas = crate::config::Replicas::Fixed(2);
+        assert!(!agent.adopted_instances_match("web", "default", &placed));
+    }
+
+    /// The reconciler asks over the command channel.
+    #[tokio::test]
+    async fn adopted_placement_query_is_answered_on_the_command_channel() {
+        let (agent, tx, shutdown) = test_agent();
+        let task = tokio::spawn(async move {
+            let mut agent = agent;
+            agent.run().await
+        });
+        let (response, answer) = oneshot::channel();
+        tx.send(AgentCommand::AdoptedPlacementMatches {
+            app_name: "web".into(),
+            namespace: "default".into(),
+            spec: Box::new(toml::from_str("image = 'web:v1'").unwrap()),
+            response,
+        })
+        .await
+        .unwrap();
+        assert!(
+            !tokio::time::timeout(std::time::Duration::from_secs(5), answer)
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        shutdown.cancel();
+        task.await.unwrap();
     }
 }
