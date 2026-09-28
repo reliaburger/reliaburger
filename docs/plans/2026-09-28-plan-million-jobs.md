@@ -1,8 +1,10 @@
 # Plan: a million jobs (task arrays at scale)
 
-Status: in progress on `feat/million-jobs`, after 0.1.0. Nothing here blocks
-the release, and nothing on this branch changes a wire or durable format until
-the owner signs off the migration in [Compatibility](#compatibility-with-010).
+Status: in progress on `feat/million-jobs`, for **0.2.0** ("A million jobs").
+Nothing on this branch changes a wire or durable format yet. When the wiring
+(M5) does, it bumps the compatibility generations and 0.2.0 needs a fresh
+cluster: the maintainer decided on 28 September 2026 that there's no
+backwards compatibility before 1.0.0 (see [Compatibility](#compatibility)).
 
 This file is the single source of truth. It supersedes
 [`2026-09-25-plan-task-arrays.md`](2026-09-25-plan-task-arrays.md) (merged in
@@ -35,16 +37,18 @@ from `plans/million-jobs` unchanged), whose findings it keeps and whose
   wait until the soak frees the machine. Record them here when run.
 - Book: Chapter 12 section "A million jobs without a million records"
   (before "Lessons from the phase") covers M1-M4. `docs/progress.md` has an
-  "After 0.1.0: Million jobs" section; `docs/README.md` and
+  "0.2.0: Million jobs" section; `docs/README.md` and
   `docs/testing.md` list `make bench-task-arrays`.
 - **Next, in order:**
   1. Record `make bench-task-arrays` release numbers here once the soak has
      finished (it's CPU-heavy; don't run it while the soak is on).
   2. M0 on a quickstart VM after the soak: fork/exec rate of `/usr/bin/true`
      at 1x/2x/4x/8x vCPU concurrency, fsync latency, Raft commit rate.
-  3. Ask the maintainer for the M5 decision (see "M5: the finalisation
-     gate"). Nothing in M6 starts before that.
-  4. Small library follow-ups that don't need M5, if wanted meanwhile: the
+  3. M5 wiring. The compatibility decision is made (28 September 2026): no
+     finalisation gate; the wiring bumps `protocol` and `state` in
+     `src/compatibility.rs` and 0.2.0 needs a fresh cluster. Nothing blocks
+     M5 except the soak holding the machine.
+  4. Small library follow-ups, if wanted meanwhile: the
      mergeable latency histogram is done (`src/meat/latency_histogram.rs`);
      still open are recording start lag and run time into it from
      `TaskPool` (a `PoolCounters` field) and an `rb-task` demo binary under
@@ -55,8 +59,9 @@ from `plans/million-jobs` unchanged), whose findings it keeps and whose
   on) and leave the full suite to CI. No Lima VMs, quickstart clusters or
   `qualify-*.sh` until the soak finishes. Delete that target directory when
   the branch is done.
-- **Don't** wire anything into `RaftRequest`, `DesiredState`, `StateReport`,
-  `ReportingMessage` or `JobSpec` before M5 is decided. Library modules only.
+- **Don't** touch `StateReport` or `ReportingMessage` (bincode) at all;
+  progress travels over the sync route. `RaftRequest` and `DesiredState`
+  change in M5, in the same change as the compatibility bump.
 
 ## Contents
 
@@ -65,7 +70,7 @@ from `plans/million-jobs` unchanged), whose findings it keeps and whose
 3. [Why this is hard on Kubernetes](#why-this-is-hard-on-kubernetes)
 4. [Where we are today](#where-we-are-today)
 5. [Design](#design)
-6. [Compatibility with 0.1.0](#compatibility-with-010)
+6. [Compatibility](#compatibility)
 7. [Phases](#phases)
 8. [Benchmarks](#benchmarks)
 9. [Risks](#risks)
@@ -85,8 +90,10 @@ from `plans/million-jobs` unchanged), whose findings it keeps and whose
 4. **Honest numbers.** Every published figure comes from a benchmark in the
    repository that anyone can rerun, with the machine, variance and failure
    rate recorded next to it.
-5. **Additive to 0.1.0.** Released clusters upgrade in place. Every format
-   change is either additive or ships with the designed migration in M5.
+5. **A development release.** 0.2.0 is below 1.0.0, so it doesn't keep
+   compatibility with 0.1.x: the wiring bumps `protocol` and `state`, old
+   peers and old state are refused, and upgrading means a fresh cluster. No
+   migration, no feature gate.
 
 Non-goals for this plan: DAG workflows (that's Argo's job and a later plan),
 gang scheduling, GPU task arrays, cross-array dependencies, and exactly-once
@@ -250,7 +257,7 @@ Two facts about formats that shape the compatibility section:
 - Raft log entries and snapshots are **JSON** (`src/council/durable_log.rs`,
   `src/council/state_machine.rs`). The comment above `UpgradeUpdate` in
   `src/council/types.rs` still says "the log is bincode-encoded", which is
-  stale; fix it in M5.
+  stale; fix it in M5 (wiring).
 - The reporting tree (`StateReport`, `ReportingMessage`) is **bincode**
   (`src/reporting/transport.rs`), so it's positional: any new field or
   variant there is incompatible.
@@ -302,7 +309,7 @@ Two facts about formats that shape the compatibility section:
 ### Leader: chunk table and grants (library, M2)
 
 `TaskArrayState` is a deterministic state machine, serialisable to JSON, which
-becomes one entry in `DesiredState` in M6. It holds:
+becomes one entry in `DesiredState` in M5. It holds:
 
 - `queued: IndexRangeSet` of chunk ids not yet granted,
 - `grants: BTreeMap<NodeId, IndexRangeSet>` of chunks held per node,
@@ -381,7 +388,7 @@ follow-up, since at-least-once already allows it.
   128 `u64` buckets in microseconds, merged by addition, percentiles within
   25%, serialised sparsely). No new crate needed.
 
-### Leader and node talk once a second (wiring, M6)
+### Leader and node talk once a second (wiring, M5)
 
 One RPC per node per active array per second, leader to node, carrying
 everything: `POST /v1/batch/array/{id}/sync` (system principal only) with body
@@ -408,7 +415,7 @@ A node that doesn't answer sync for 30 s, or that gossip marks dead, gets
 `TaskArrayRequeue`. When it comes back, its stale completions are fenced by
 the attempt number.
 
-### Views, logs, metrics, results (M7)
+### Views, logs, metrics, results (M6)
 
 - `relish run --batch NAME --count N [--chunk K] [--max-attempts A]
   [--max-failed F] [--timeout S] --exec PATH -- ARGS...` submits an array.
@@ -443,66 +450,36 @@ the attempt number.
 | Pod garbage collection | ledger deleted once per array |
 | Log files per container | a head and tail in memory, sampled into Ketchup |
 
-## Compatibility with 0.1.0
+## Compatibility
 
-The policy is in `CLAUDE.md` and `docs/releasing.md` (draft PR #254): an
-optional JSON field old nodes can drop harmlessly is additive; a new enum
-variant, any change to a bincode struct, a rename or a removal is incompatible
-and needs a bump of `protocol` or `state` in `src/compatibility.rs` plus a
-designed migration.
+Decision (maintainer, 28 September 2026): there's no backwards
+compatibility before 1.0.0. 0.2.0 is a development release, so there's no
+finalisation gate and no migration. Any incompatible change bumps `protocol`
+or `state` in `src/compatibility.rs` (the policy is in `CLAUDE.md` and
+`docs/releasing.md`, draft PR #254), nodes refuse 0.1.x peers and 0.1.x
+state, and upgrading means a fresh cluster. The table below records what
+changes, so the bump is deliberate and the tests know where to look.
 
 ### Every format change, and how it's handled
 
-| Change | Where | Encoding | Kind | Handling |
-|---|---|---|---|---|
-| `IndexRangeSet`, `TaskArraySpec`, `TaskArrayState`, ledger | new library types | JSON / local file | none until wired | library only (M1-M4) |
-| `RaftRequest::TaskArrayRegister` | `src/council/types.rs` | JSON, externally tagged | **new variant: incompatible** | M5 finalisation gate |
-| `RaftRequest::TaskArraySync` | same | JSON | **new variant: incompatible** | M5 gate |
-| `RaftRequest::TaskArrayCancel` | same | JSON | **new variant: incompatible** | M5 gate |
-| `RaftRequest::TaskArrayRequeue` | same | JSON | **new variant: incompatible** | M5 gate |
-| `CouncilResponse::TaskArrayRegistered { batch_id }` | same | JSON | **new variant: incompatible** | M5 gate |
-| `DesiredState::task_arrays` | `src/council/types.rs` | JSON snapshot | new field with `#[serde(default)]`: old snapshots load, but an old node would *drop* live arrays from a new snapshot, so **incompatible in a mixed cluster** | M5 gate |
-| `DesiredState::cluster_features` (the gate itself) | same | JSON snapshot | new field, `#[serde(default)]` | see below |
-| `JobStatus`, `BatchRecord`, `BatchJobUpdate` | `src/meat/batch_tracker.rs` | JSON | **unchanged**; arrays never reuse them | none |
-| `BatchSummary` gains optional `array`, `rate`, `histograms`, `per_node` | `src/meat/batch_tracker.rs`, HTTP | JSON | additive (`Option`, `skip_serializing_if`, no `deny_unknown_fields` on the path) | none |
-| `POST /v1/batch/array`, `POST /v1/batch/array/{id}/sync`, `POST /v1/batch/{id}/cancel`, `GET /v1/batch/{id}/results`, `GET /v1/batch/{id}/tasks/{index}/logs` | `src/bun/api.rs` | JSON over HTTP | new routes: additive (an old node answers 404, which the leader treats as "can't run arrays") | none, but only called after the gate |
-| `JobSpec` | `src/config/job.rs` | TOML/JSON, `deny_unknown_fields` | **unchanged**; array fields live in a wrapper | none |
-| `StateReport`, `ReportingMessage` | `src/reporting/types.rs` | **bincode** | **unchanged**; progress travels over sync instead | none |
-| Mayo series `reliaburger_task_array_*` | metrics | Prometheus text | additive | none |
-| Ketchup `task_index` field | logs | Arrow/Parquet column | nullable column added to the schema: check whether the archive reader tolerates it before M7; if not, carry the index in the message instead | decide in M7 |
-| Node files under `<data>/task-arrays/` | local disk | new ledger format | new directory an old binary ignores | covered by the gate (see rollback) |
+| Change | Where | Encoding | Handling |
+|---|---|---|---|
+| `IndexRangeSet`, `TaskArraySpec`, `TaskArrayState`, ledger | new library types | JSON / local file | library only until M5 |
+| `RaftRequest::TaskArrayRegister`, `TaskArraySync`, `TaskArrayCancel`, `TaskArrayRequeue` | `src/council/types.rs` | JSON, externally tagged | new variants: **protocol and state bump** in M5 |
+| `CouncilResponse::TaskArrayRegistered { batch_id }` | same | JSON | same bump |
+| `DesiredState::task_arrays` | `src/council/types.rs` | JSON snapshot | same bump |
+| `JobStatus`, `BatchRecord`, `BatchJobUpdate` | `src/meat/batch_tracker.rs` | JSON | **unchanged**; arrays never reuse them |
+| `BatchSummary` gains optional `array`, `rate`, `histograms`, `per_node` | `src/meat/batch_tracker.rs`, HTTP | JSON | new optional fields; covered by the bump |
+| `POST /v1/batch/array`, `POST /v1/batch/array/{id}/sync`, `POST /v1/batch/{id}/cancel`, `GET /v1/batch/{id}/results`, `GET /v1/batch/{id}/tasks/{index}/logs` | `src/bun/api.rs` | JSON over HTTP | new routes, added to the `authz.rs` matrix |
+| `JobSpec` | `src/config/job.rs` | TOML/JSON, `deny_unknown_fields` | **unchanged**; array fields live in a wrapper |
+| `StateReport`, `ReportingMessage` | `src/reporting/types.rs` | **bincode** | **unchanged**; progress travels over sync instead |
+| Mayo series `reliaburger_task_array_*` | metrics | Prometheus text | new series |
+| Ketchup `task_index` field | logs | Arrow/Parquet column | nullable column: check whether the archive reader tolerates it before M6; if not, carry the index in the message instead |
+| Node files under `<data>/task-arrays/` | local disk | new ledger format | covered by the state bump |
 
-### M5: the finalisation gate (needs the owner's decision)
-
-The exact-match rule exists because an unknown Raft entry kills an old
-follower. But nothing is unknown until someone *writes* it. So:
-
-1. The release that brings task arrays (call it 0.2.0) teaches every node to
-   decode the new variants and fields, but the leader refuses to write any of
-   them until the cluster has **finalised** feature level 1.
-2. Finalisation is itself one new Raft entry,
-   `RaftRequest::FinaliseClusterFeatures { level }`, written only when every
-   voter and every live node reports a product version that understands that
-   level (from `/v1/version` and gossip). Until then `POST /v1/batch/array`
-   answers 409 with "finalise the cluster upgrade first".
-3. After finalisation, rolling back to 0.1.x is refused by the upgrade
-   manager, because 0.1.x can't read the new entries. Before finalisation,
-   rollback is safe, because nothing new was written.
-4. `relish upgrade` finalises automatically once a cluster-wide upgrade to
-   0.2.0 completes; `relish upgrade finalise` exists for manual control.
-
-This is the CockroachDB cluster-version and Ceph `require-osd-release`
-pattern. It needs one decision the plan can't make alone: whether 0.2.0 still
-bumps `protocol` and `state` (and so needs the compatibility contract to
-accept the previous generation during the upgrade window), or keeps them and
-relies on the gate. Recommendation: keep the generations for this change,
-add `feature_level` to the `/v1/version` contract as an additive optional
-field, and write the rule down in `docs/releasing.md` as the third kind of
-change ("gated: new entries written only after finalisation"). The fallback,
-a hard bump with a blue-green cluster migration, strands every 0.1.0 user
-and shouldn't be the answer for a feature.
-
-Until the owner signs this off, M6 and later don't start.
+Test fixtures that model a compatible peer keep taking their pair from
+`compatibility::CURRENT`, and M5 adds a test that a 0.1.x peer and 0.1.x
+state are refused.
 
 ## Phases
 
@@ -516,14 +493,14 @@ checklist in the same commit.
 | M2 | Leader state machine and grant policy (`TaskArrayState`, `plan_grants`), requeue and fencing | no | 3-4 days |
 | M3 | Node executor: runner seam, worker pool, retries, timeouts, cancellation, ledger with group commit, replay | no (process runner tests are local-only processes) | 1-1.5 weeks |
 | M4 | In-process benchmarks and the million-task acceptance test | no | 2-3 days |
-| M5 | The finalisation gate (owner decision first) | CI cluster suites | 1 week |
-| M6 | Wiring: Raft variants, API routes, leader sync loop, CLI submit, status, cancel | CI cluster suites | 1.5-2 weeks |
-| M7 | Views, sampled logs, results, Mayo metrics, TUI view, dashboard card | CI | 1-1.5 weeks |
-| M8 | Host processes on quickstart nodes (the old P1), with an allowlist of exactly one demo binary | Lima | 3-5 days |
-| M9 | Real-cluster benchmarks (quickstart, then 3 cloud VMs), the tour step, manual, book, whitepaper Q8 and scheduler-meat 5.2 rewrite | yes | 1 week |
+| M5 | Wiring: compatibility bump, Raft variants, API routes, leader sync loop, CLI submit, status, cancel | CI cluster suites | 1.5-2 weeks |
+| M6 | Views, sampled logs, results, Mayo metrics, TUI view, dashboard card | CI | 1-1.5 weeks |
+| M7 | Host processes on quickstart nodes (the old P1), with an allowlist of exactly one demo binary | Lima | 3-5 days |
+| M8 | Real-cluster benchmarks (quickstart, then 3 cloud VMs), the tour step, manual, book, whitepaper Q8 and scheduler-meat 5.2 rewrite | yes | 1 week |
 
-About seven to nine weeks for one engineer; M1-M4 (about three weeks) can
-happen now without touching any released format.
+About six to eight weeks for one engineer, a week less than before because
+there's no finalisation gate to build. M1-M4 (about three weeks) are done;
+M5 onwards is about four to five and a half weeks, plus M0.
 
 ### Tests-first steps for M1-M4
 
@@ -608,7 +585,7 @@ it belongs in the portable suite. (M2.3 already runs the leader half of this, wi
 Each prints tasks per second and bytes per task, so the headline can be
 predicted before any cluster exists.
 
-**Real clusters (M9, after the soak and after M6):** a
+**Real clusters (M8, after the soak and after M5):** a
 `relish bench batch-throughput` suite in `src/testkit/bench/suites.rs` that
 submits a 100k and a 1M array against a leased namespace, records wall time,
 rate over time, start-lag percentiles and the `--cost` block, and writes them
@@ -628,13 +605,13 @@ k3s cluster of the same size, and publish both scripts.
 - **At-least-once** is a change from the owner-helper model's adoption across
   restarts. It has to be stated plainly in the manual and in `relish run
   --batch --help`.
-- **The finalisation gate** is a new compatibility mechanism. If the owner
-  prefers a different migration, M6 waits; M1-M4 are unaffected.
+- **A fresh cluster for 0.2.0.** 0.1.x clusters can't roll to 0.2.0. That's
+  the pre-1.0 policy, and the release notes and manual must say so plainly.
 - **Security of host processes.** Process workloads have no mount isolation.
   The demo allowlists exactly one binary, never a shell, and says what it
   trades away.
 - **Straggler tail.** Without speculation, the last chunk sets the wall time.
-  Small chunks near the end (split the last few chunks) are a cheap fix if M9
+  Small chunks near the end (split the last few chunks) are a cheap fix if M8
   shows a long tail.
 - **Ketchup schema change** for `task_index` may not be additive for archived
   Parquet readers; the fallback is to carry the index in the message.
@@ -670,32 +647,27 @@ k3s cluster of the same size, and publish both scripts.
 - [x] M4.1 `tests/suite/task_array_million.rs` acceptance (100k in the portable suite; 1M passed locally in 30.6 s debug, 32,700 tasks/s with `FakeRunner`)
 - [x] M4.2 `benches/task_arrays.rs` and a `make bench-task-arrays` target (smoke-tested with `cargo test --bench task_arrays`; release numbers not yet recorded, see below)
 
-### M5: compatibility gate (owner decision first)
+### M5: wiring
 
-- [ ] owner decision recorded here
-- [ ] `FinaliseClusterFeatures`, `cluster_features`, version contract field
-- [ ] upgrade manager refuses rollback after finalisation
-- [ ] `docs/releasing.md` gains the "gated" kind of change
-
-### M6: wiring
-
-- [ ] Raft variants and `DesiredState::task_arrays`, behind the gate
+- [x] compatibility decision recorded (28 September 2026): no gate, bump and start fresh
+- [ ] bump `protocol` and `state` in `src/compatibility.rs`; test that 0.1.x peers and state are refused
+- [ ] Raft variants and `DesiredState::task_arrays`
 - [ ] `POST /v1/batch/array`, sync route, cancel route
 - [ ] leader sync loop with requeue on silence
 - [ ] `relish run --batch --count`, `relish batch cancel`
 
-### M7: views and data
+### M6: views and data
 
 - [ ] `batch-status --watch` and `--cost`
 - [ ] `relish batch logs --index`, `relish batch results`
 - [ ] Ketchup sampling, Mayo counters
 - [ ] TUI batch view, dashboard card
 
-### M8: host processes on quickstart nodes
+### M7: host processes on quickstart nodes
 
 - [ ] per-workload runtime choice or hybrid runtime, with the isolation note
 
-### M9: real numbers and docs
+### M8: real numbers and docs
 
 - [ ] `relish bench batch-throughput`
 - [ ] quickstart and cloud runs recorded under `docs/qualification/`
