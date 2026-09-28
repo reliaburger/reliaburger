@@ -76,6 +76,14 @@ const SHUTDOWN_GRACE_SECS: u64 = 5;
 /// before it escalates to SIGKILL (DEP6).
 const STOP_GRACE_SECS: u64 = 10;
 
+/// How long one health tick may keep starting pending restarts. A restart
+/// whose old runtime can't be cleaned up yet costs a few hundred
+/// milliseconds, and a node that lost every container has dozens of them.
+/// Walking them all in one tick held every queued command for seconds; now a
+/// tick stops starting new ones once this is spent, and the next tick picks
+/// up where it left off.
+const PENDING_RESTART_TICK_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// The longest one confirmed stop can take with the production grace, given
 /// the runtime's `stop_confirmation_timeout`: a drain of up to one grace, the
 /// stop request, the grace itself, then the force-kill and its exit check.
@@ -1943,6 +1951,33 @@ pub struct BunAgent<G: Grill> {
     /// Their exit waits, off the command loop so a workload that ignores
     /// SIGTERM can't stall every other command for its grace.
     stop_waits: tokio::task::JoinSet<Result<(), BunError>>,
+    /// Where the last budget-bounded restart tick stopped, so the next one
+    /// carries on from there instead of retrying the same few.
+    restart_rotation: RestartRotation,
+}
+
+/// The last instance each phase of `drive_pending_restarts` handled.
+#[derive(Debug, Default)]
+struct RestartRotation {
+    /// Failed restarts whose partial runtime is still being cleaned up.
+    cleanup: Option<InstanceId>,
+    /// Pending instances being started again.
+    launch: Option<InstanceId>,
+}
+
+/// Order `items` by instance id, starting just after `last`, so a tick that
+/// runs out of budget part-way through leaves the rest for the next tick.
+fn rotate_after<T>(
+    mut items: Vec<T>,
+    last: Option<&InstanceId>,
+    id: impl Fn(&T) -> &InstanceId,
+) -> Vec<T> {
+    items.sort_by(|a, b| id(a).0.cmp(&id(b).0));
+    if let Some(last) = last {
+        let start = items.partition_point(|item| id(item).0 <= last.0);
+        items.rotate_left(start);
+    }
+    items
 }
 
 impl<G: Grill + Clone + 'static> BunAgent<G> {
@@ -2072,6 +2107,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             shutdown_grace: std::time::Duration::from_secs(SHUTDOWN_GRACE_SECS),
             pending_stops: PendingStops::new(),
             stop_waits: tokio::task::JoinSet::new(),
+            restart_rotation: RestartRotation::default(),
         }
     }
 
@@ -2197,6 +2233,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             shutdown_grace: std::time::Duration::from_secs(SHUTDOWN_GRACE_SECS),
             pending_stops: PendingStops::new(),
             stop_waits: tokio::task::JoinSet::new(),
+            restart_rotation: RestartRotation::default(),
         }
     }
 
@@ -8301,7 +8338,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// When `maybe_restart` transitions an instance back to Pending,
     /// this method picks it up and drives it through the startup
     /// sequence again using the stored OCI spec.
+    ///
+    /// Each phase handles at least one instance per tick, then stops once
+    /// `PENDING_RESTART_TICK_BUDGET` is spent. `restart_rotation` remembers
+    /// where it stopped, so every instance gets its turn.
     async fn drive_pending_restarts(&mut self) {
+        let deadline = tokio::time::Instant::now() + PENDING_RESTART_TICK_BUDGET;
         // Partial startup can have changed the runtime even when its call
         // failed. Keep ownership until cleanup is observed; then apply the
         // same budget and backoff as any other failed execution.
@@ -8319,7 +8361,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             })
             .map(|instance| (instance.id.clone(), instance.state))
             .collect();
-        for (id, state) in retrying {
+        let retrying = rotate_after(retrying, self.restart_rotation.cleanup.as_ref(), |entry| {
+            &entry.0
+        });
+        for (index, (id, state)) in retrying.into_iter().enumerate() {
+            if index > 0 && tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            self.restart_rotation.cleanup = Some(id.clone());
             if state == ContainerState::Stopping {
                 match self.poll_instance_withdrawal(&id, self.stop_grace).await {
                     Ok(true) => {}
@@ -8411,8 +8460,19 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 })
             })
             .collect();
+        let pending_restarts = rotate_after(
+            pending_restarts,
+            self.restart_rotation.launch.as_ref(),
+            |entry| &entry.0,
+        );
 
-        for (id, oci_spec, app_name, namespace, host_port) in pending_restarts {
+        for (index, (id, oci_spec, app_name, namespace, host_port)) in
+            pending_restarts.into_iter().enumerate()
+        {
+            if index > 0 && tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            self.restart_rotation.launch = Some(id.clone());
             match self.poll_instance_withdrawal(&id, self.stop_grace).await {
                 Ok(true) => {}
                 Ok(false) => continue,
@@ -16553,6 +16613,96 @@ interval = 1
             kills_while_queued <= ids.len(),
             "{kills_while_queued} restart cleanups ran while 8 commands waited: \
              later health ticks overtook queued commands"
+        );
+    }
+
+    /// Put `count` replicas into a pending restart whose runtime cleanup
+    /// spends `per_restart` and then fails, as after `kill_containers`.
+    async fn slow_pending_restarts(
+        count: u32,
+        per_restart: std::time::Duration,
+    ) -> (TestAgent, MockGrill, Vec<InstanceId>) {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        let config = Config::parse(&format!(
+            "[app.web]\nimage = 'web:v1'\nport = 8080\nreplicas = {count}\n"
+        ))
+        .unwrap();
+        expect_complete(&drain_deploy(&mut agent, config).await);
+        let ids: Vec<InstanceId> = agent
+            .supervisor
+            .list_instances()
+            .iter()
+            .map(|instance| instance.id.clone())
+            .collect();
+        for id in &ids {
+            let instance = agent.supervisor.get_instance_mut(id).unwrap();
+            instance.state = ContainerState::Pending;
+            instance.restart_count = 1;
+        }
+        grill.set_kill_delay(Some(per_restart));
+        grill.set_fail_kill(true);
+        (agent, grill, ids)
+    }
+
+    fn kills_per_instance(grill: &MockGrill) -> std::collections::HashMap<InstanceId, usize> {
+        let mut kills = std::collections::HashMap::new();
+        for (operation, id) in grill.calls() {
+            if operation == "kill" {
+                *kills.entry(id).or_insert(0) += 1;
+            }
+        }
+        kills
+    }
+
+    /// PR #260's journal: every pending restart spends ~400 ms on cleanup it
+    /// can't finish yet, and one tick walked all of them. Eight of them made
+    /// one tick 3.2 s long, and every command queued behind it waited that
+    /// long. A tick now stops starting new restarts once its budget is spent.
+    #[tokio::test]
+    async fn one_tick_of_pending_restarts_stays_within_its_budget() {
+        const PER_RESTART: std::time::Duration = std::time::Duration::from_millis(400);
+        let (mut agent, grill, ids) = slow_pending_restarts(8, PER_RESTART).await;
+        let started = std::time::Instant::now();
+        agent.drive_pending_restarts().await;
+        let took = started.elapsed();
+        // The budget plus the one restart that was already running when it
+        // ran out; the old tick took 8 x 400 ms.
+        assert!(
+            took < PENDING_RESTART_TICK_BUDGET + 3 * PER_RESTART,
+            "one tick spent {took:?} on {} pending restarts",
+            ids.len()
+        );
+        let attempted: usize = kills_per_instance(&grill).values().sum();
+        assert!(
+            attempted < ids.len(),
+            "the tick attempted all {attempted} restarts"
+        );
+    }
+
+    /// A bounded tick must not keep retrying the same few restarts: the
+    /// next tick carries on where the last one stopped, so every pending
+    /// restart gets its turn.
+    #[tokio::test]
+    async fn bounded_ticks_rotate_through_every_pending_restart() {
+        const PER_RESTART: std::time::Duration = std::time::Duration::from_millis(300);
+        let (mut agent, grill, ids) = slow_pending_restarts(6, PER_RESTART).await;
+        // At least one restart per tick, so six ticks reach all six even on
+        // a slow machine.
+        for _ in 0..ids.len() {
+            agent.drive_pending_restarts().await;
+        }
+        let kills = kills_per_instance(&grill);
+        for id in &ids {
+            assert!(
+                kills.get(id).copied().unwrap_or(0) >= 1,
+                "{id} never got a restart attempt: {kills:?}"
+            );
+        }
+        let most = kills.values().copied().max().unwrap();
+        let least = kills.values().copied().min().unwrap();
+        assert!(
+            most - least <= 1,
+            "restart attempts were not shared fairly: {kills:?}"
         );
     }
 

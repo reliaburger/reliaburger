@@ -2888,6 +2888,70 @@ nothing, a worker that has never had an answer sends nothing at all, and
 neither does one whose agent loop has exited (its end of the channel is
 closed, so it's gone, not busy).
 
+### Shorter turns
+
+`biased;` and the re-sent snapshot make a long turn of the loop survivable.
+They don't make it short. Both investigations left a list of turns that could
+still run for seconds, and the next release took them one at a time.
+
+The first was the tick from #260 itself. `drive_pending_restarts` walked
+*every* pending restart on every tick, and each one that couldn't clean up yet
+cost about 400 ms. Three of them made a 1.2 s tick. Thirty would make a
+twelve-second one, and a command queued behind it waits all twelve. So the
+tick now has a budget:
+
+```rust
+const PENDING_RESTART_TICK_BUDGET: Duration = Duration::from_millis(500);
+
+let deadline = tokio::time::Instant::now() + PENDING_RESTART_TICK_BUDGET;
+for (index, (id, state)) in retrying.into_iter().enumerate() {
+    if index > 0 && tokio::time::Instant::now() >= deadline {
+        break;
+    }
+    self.restart_rotation.cleanup = Some(id.clone());
+    // ...
+}
+```
+
+`enumerate()` pairs each item with its position, like Python's `enumerate`.
+The `index > 0` guard means a tick always makes progress on at least one
+restart, however slow. A budget on its own would starve somebody, though.
+Collect the pending restarts in the same order every tick, stop after two,
+and the same two get retried forever while the rest wait. So the agent
+remembers the last instance each phase touched, and the next tick starts just
+after it:
+
+```rust
+fn rotate_after<T>(
+    mut items: Vec<T>,
+    last: Option<&InstanceId>,
+    id: impl Fn(&T) -> &InstanceId,
+) -> Vec<T> {
+    items.sort_by(|a, b| id(a).0.cmp(&id(b).0));
+    if let Some(last) = last {
+        let start = items.partition_point(|item| id(item).0 <= last.0);
+        items.rotate_left(start);
+    }
+    items
+}
+```
+
+`id: impl Fn(&T) -> &InstanceId` takes any closure that can pull an instance
+id out of an item, so both phases (which carry different tuples) share one
+helper. It's still a generic function, compiled once per closure type, with
+no function pointer or boxing involved. `partition_point` is a binary search
+on a sorted slice: it returns the index of the first item for which the
+predicate is false, here the first id after the one we stopped at.
+`rotate_left` then moves everything before that index to the back, in place.
+An instance that disappeared since the last tick doesn't matter: the search
+finds where it *would* be, and the walk carries on from there.
+
+Two tests pin it down. One puts eight replicas into pending restart, each
+spending 400 ms and failing, and checks that a single tick finishes well short
+of the 3.2 s the old walk took, without trying all eight. The other runs six
+ticks over six slow restarts and checks that each got its turn and that no
+instance got more than one attempt more than any other.
+
 ## Walk the path you actually care about
 
 Say `web` can't reach `redis`. Checking Bun's own DNS and TCP access might tell
