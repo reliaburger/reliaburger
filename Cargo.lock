@@ -5225,6 +5225,7 @@ dependencies = [
  "base64 0.22.1",
  "bincode",
  "clap",
+ "crc32fast",
  "criterion",
  "crossterm 0.28.1",
  "datafusion",
