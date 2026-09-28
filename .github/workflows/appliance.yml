@@ -84,7 +84,9 @@ jobs:
           echo "### bun and relish from \`$tag\`" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Break bun on purpose (spike S4)
-        if: inputs.broken_bun
+        # workflow_dispatch's broken_bun, or a commit adding image/spike-broken-bun
+        # (dispatch needs the workflow on main).
+        if: inputs.broken_bun || hashFiles('image/spike-broken-bun') != ''
         run: |
           set -euo pipefail
           install -D -m 0644 /dev/stdin image/bin-tree/usr/lib/systemd/system/reliaburger.service.d/50-spike-broken.conf <<'CONF'

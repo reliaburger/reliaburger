@@ -79,6 +79,22 @@ rm -f "$fifo"
 mkfifo "$fifo"
 sha256sum <"$fifo" | cut -d' ' -f1 >/run/image.sha256 &
 hasher=$!
+# Sample memory while streaming: the most anonymous memory and page cache
+# the installer's cgroup held, and the least memory the system had left.
+cgroup=/sys/fs/cgroup/system.slice/reliaburger-install.service
+(
+    anon=0 file=0 low=
+    while :; do
+        read -r a f < <(awk '$1 == "anon" { a = $2 } $1 == "file" { f = $2 } END { print a + 0, f + 0 }' "$cgroup/memory.stat")
+        m=$(awk '/^MemAvailable:/ { print $2 }' /proc/meminfo)
+        [ "$a" -gt "$anon" ] && anon=$a
+        [ "$f" -gt "$file" ] && file=$f
+        [ -z "$low" ] || [ "$m" -lt "$low" ] && low=$m
+        echo "$anon $file $low" >/run/memory.max
+        sleep 0.5
+    done
+) &
+sampler=$!
 say "streaming $image to $disk"
 curl -fsS --retry 5 --retry-connrefused "$url/$image" \
     | tee "$fifo" \
@@ -86,6 +102,7 @@ curl -fsS --retry 5 --retry-connrefused "$url/$image" \
     | dd of="$disk" bs=4M iflag=fullblock oflag=direct conv=fsync status=none \
     || { wipefs -a -q "$disk" || true; fail "writing $image failed"; }
 wait "$hasher"
+kill "$sampler" 2>/dev/null || true
 actual=$(cat /run/image.sha256)
 if [ "$actual" != "$expected" ]; then
     wipefs -a -q "$disk" || true
@@ -97,13 +114,9 @@ fi
 sgdisk -e "$disk" >/dev/null
 sync
 
-peak=$(cat /sys/fs/cgroup/system.slice/reliaburger-install.service/memory.peak 2>/dev/null || echo 0)
-available=$(awk '/^MemAvailable:/ { print int($2 / 1024) }' /proc/meminfo)
-say "installed ${version} to ${disk} in $(($(date +%s) - started)) s; peak memory $((peak / 1048576)) MiB, ${available} MiB still available"
-# What the peak was made of (anon is the pipeline's own buffers; file is
-# page cache, which the kernel can drop).
-awk '$1 == "anon" || $1 == "file" || $1 == "kernel" || $1 == "sock" { printf "%s %d MiB\n", $1, $2 / 1048576 }' \
-    /sys/fs/cgroup/system.slice/reliaburger-install.service/memory.stat 2>/dev/null \
-    | sed 's/^/reliaburger-install: memory: /' || true
+peak=$(cat "$cgroup/memory.peak" 2>/dev/null || echo 0)
+read -r anon file low </run/memory.max || anon=0 file=0 low=0
+say "installed ${version} to ${disk} in $(($(date +%s) - started)) s"
+say "memory: cgroup peak $((peak / 1048576)) MiB (at most $((anon / 1048576)) MiB anonymous, $((file / 1048576)) MiB page cache); MemAvailable never below $((low / 1024)) MiB"
 say "rebooting into the installed system"
 systemctl reboot
