@@ -105,22 +105,40 @@ jobs:
             du -sh ../mkosi.tools 2>/dev/null | sed 's/^/Tools tree: /' || true
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Boot test (x86-64, KVM)
-        if: matrix.arch == 'x86_64'
-        timeout-minutes: 15
+      - name: Boot test
+        # x86-64 runs under KVM. Hosted arm64 runners have no /dev/kvm, so
+        # aarch64 falls back to TCG: slower, but it catches an image that
+        # doesn't boot (like the 26.04 stubble kernel did) before the Mac lab.
+        timeout-minutes: 25
         run: |
           set -euo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y -qq qemu-system-x86 ovmf zstd
+          if [ "$ARCH" = x86_64 ]; then
+            sudo apt-get install -y -qq qemu-system-x86 ovmf zstd
+            qemu_bin=qemu-system-x86_64 machine=q35
+            code=/usr/share/OVMF/OVMF_CODE_4M.fd vars=/usr/share/OVMF/OVMF_VARS_4M.fd
+          else
+            sudo apt-get install -y -qq qemu-system-arm qemu-efi-aarch64 zstd
+            qemu_bin=qemu-system-aarch64 machine=virt
+            code=/usr/share/AAVMF/AAVMF_CODE.fd vars=/usr/share/AAVMF/AAVMF_VARS.fd
+          fi
+          if [ -w /dev/kvm ] || sudo chmod 666 /dev/kvm 2>/dev/null; then
+            accel=kvm cpu=host deadline=600
+          else
+            # pauth-impdef: QEMU's own pointer-auth algorithm is much faster
+            # to emulate than the architected one.
+            accel=tcg cpu=max,pauth-impdef=on deadline=1200
+          fi
+          echo "Booting with $qemu_bin, accel=$accel"
           zstd -q -d "image/mkosi.output/reliaburger-os_${IMAGE_VERSION}.raw.zst" -o "$RUNNER_TEMP/disk.raw"
           # An 8 GB disk, like the Wyse 3040: first boot adds slot B and grows
           # the data partition into the free space.
           truncate -s 8G "$RUNNER_TEMP/disk.raw"
-          cp /usr/share/OVMF/OVMF_VARS_4M.fd "$RUNNER_TEMP/vars.fd"
+          cp "$vars" "$RUNNER_TEMP/vars.fd"
           log="$RUNNER_TEMP/serial.log"
           # 2 GiB, like the Wyse 3040.
-          qemu-system-x86_64 -machine q35,accel=kvm -cpu host -smp 2 -m 2048 \
-            -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
+          "$qemu_bin" -machine "$machine,accel=$accel" -cpu "$cpu" -smp 2 -m 2048 \
+            -drive if=pflash,format=raw,readonly=on,file="$code" \
             -drive if=pflash,format=raw,file="$RUNNER_TEMP/vars.fd" \
             -drive if=virtio,format=raw,file="$RUNNER_TEMP/disk.raw" \
             -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
@@ -128,7 +146,7 @@ jobs:
           qemu=$!
           start=$(date +%s)
           result=timeout
-          while [ $(( $(date +%s) - start )) -lt 600 ]; do
+          while [ $(( $(date +%s) - start )) -lt "$deadline" ]; do
             if grep -q "reliaburger: bun healthy" "$log" 2>/dev/null; then result=pass; break; fi
             if grep -q "reliaburger: bun not healthy" "$log" 2>/dev/null; then result=fail; break; fi
             if ! kill -0 "$qemu" 2>/dev/null; then result=exited; break; fi
