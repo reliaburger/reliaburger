@@ -11,9 +11,9 @@ Awaiting maintainer review.
 - [x] 3. CRIU, runc and the ecosystem today (sourced)
 - [x] 4. GPU checkpointing and where the demand really is (sourced)
 - [x] 5. Design for Reliaburger
-- [ ] 6. Compatibility against the post-0.1.0 policy
-- [ ] 7. Security
-- [ ] 8. Observability and UX
+- [x] 6. Compatibility against the post-0.1.0 policy
+- [x] 7. Security
+- [x] 8. Observability and UX
 - [ ] 9. Demo
 - [ ] 10. Testing plan
 - [ ] 11. Effort and phasing
@@ -630,3 +630,123 @@ with managed volumes become migrations (checkpoint if the app opted in, cold
 otherwise), and anything ineligible is listed as blocking with the reason.
 `relish drain --stop-blocking` stops those instead, with their data left in
 place. The drain finishes when the node runs nothing but system services.
+
+## 6. Compatibility against the post-0.1.0 policy
+
+The policy (PR #254's `CLAUDE.md` and `docs/releasing.md`) has two kinds of
+change: additive (optional JSON/TOML fields old nodes tolerate, no bump) and
+incompatible (bump `protocol` or `state` and ship a migration). PR #266
+proposes a third, **gated**: every node learns to decode the new entries, but
+the leader writes none of them until the cluster has run
+`RaftRequest::FinaliseClusterFeatures { level }`, after which rollback to
+0.1.x is refused. Migration can't be done additively, so it should ride the
+same gate, at the same feature level as task arrays if both land in 0.2.0.
+One finalisation per release is plenty for operators.
+
+| Change | Kind under the policy | Handling |
+|---|---|---|
+| `RaftRequest::MigrationStart`, `MigrationAdvance`, `MigrationFinish` | New enum variants: incompatible | Gated. `relish migrate` answers 409 "finalise the cluster upgrade first" until finalised |
+| `RaftRequest::NodeCordon`, `NodeUncordon` | New variants: incompatible | Gated with the rest. The upgrade cordon stays as it is |
+| `CouncilResponse` variants for the above, if any | New variants: incompatible | Gated; prefer reusing `Ok`/`Applied`/`Refused` |
+| `DesiredState.migrations`, `DesiredState.cordoned_nodes` | New optional JSON fields; `DesiredState` has no `deny_unknown_fields` | Additive on paper, meaningful only after the gate. `#[serde(default)]`, skip when empty |
+| `[app.migration]` in `AppSpec` (the opt-in) | `AppSpec` has `deny_unknown_fields`: incompatible even as an `Option` | Gated: apply refuses the field until finalised, because an old follower would refuse the whole `AppSpec` entry |
+| `NodeAssignments.migrations` ("migrating in/out" instructions) | New optional field; no `deny_unknown_fields` | Additive, and only ever non-empty after the gate |
+| Node routes: prepare, payload, report | New HTTP routes | Additive; new entries in the `authz.rs` route matrix |
+| `OciSpec` annotations and time offsets, time namespace entry | `OciSpec` has no `deny_unknown_fields`; namespace type is a string | Additive with `#[serde(default, skip_serializing_if = ...)]`. Worth a test that an old binary reads back a new intent journal |
+| Node-local migration journal (payload, tombstones, transfer state) | A new file no old binary reads | Its own file, so `IntentConfiguration` and the owner records (both `deny_unknown_fields`) don't change |
+| `StateReport` and reporting frames | bincode: any change is incompatible | Not touched. Progress goes over the new node route |
+| Metrics, events | New names | Additive |
+| CRIU image format | Not ours | Record the source's CRIU version in the record; refuse checkpoint mode when the target's is older |
+
+If the maintainer rejects the gate, the fallback is a `protocol`/`state`
+bump with a designed migration, which strands every 0.1.0 cluster that
+can't do a blue-green move. For a feature that's opt-in and experimental,
+that's the wrong trade.
+
+## 7. Security
+
+- **A checkpoint is a memory dump.** It holds whatever the process holds:
+  secrets from `EnvValue::Secret`, TLS private keys, database passwords,
+  session tokens. Treat the payload like a secret: tmpfs for plaintext,
+  age-encrypted to a per-migration key the target holds only in memory,
+  node-id mTLS in transit, a digest committed in Raft, wiped when the
+  migration is terminal. It never goes to Pickle or object storage.
+- **It breaks an existing invariant.** Workload identity says "the private
+  key never leaves the node" (`src/cluster/workload_identity.rs`). A
+  restored process has the source instance's key in memory. The target
+  instance gets its own certificate as usual, and on `Completed` the leader
+  revokes the source instance's serial through the existing CRL
+  (`RevokeCertificate`). Apps that cache their identity must reload it from
+  the mounted file; we document that. Cold mode doesn't have this problem.
+- **Who can trigger it.** `relish migrate` needs a `Deployer` token scoped to
+  the app, like deploy and stop. `--mode checkpoint` additionally needs the
+  `exec` permission for that app, because reading a process's memory is at
+  least as powerful as exec'ing into it. `relish drain`, `uncordon` and
+  cancelling someone else's migration need `Admin`. No new
+  `PermissionAction` variant: the existing `deploy` and `exec` cover it, which
+  also keeps permission specs compatible.
+- **CRIU runs as root on both nodes.** Bun already runs rootful runc as root,
+  so there's no new privilege, but there is new attack surface: Google's
+  audit found a malicious task could hijack a root CRIU (LPC 2018, slide 31).
+  runc's restore doesn't support unprivileged CRIU. So checkpoint mode stays
+  opt-in per app, for workloads the operator trusts, and we pin a minimum
+  CRIU version and surface it in `relish wtf`.
+- **Seccomp and AppArmor.** The generated spec has neither today. CRIU
+  restores seccomp filters, and `runc restore --lsm-profile` exists for when
+  we add AppArmor. Nothing to do in 0.2.0 beyond a test that keeps the
+  checkpoint path honest when a profile appears.
+- **Egress.** A restored process must not run, even briefly, without its
+  egress policy. Section 5.3's ordering (spike S4) is a security requirement,
+  not a nicety.
+
+## 8. Observability and UX
+
+**Commands.**
+
+```text
+relish migrate default/cache --to node-3                 # cold
+relish migrate default/cache --to node-3 --mode checkpoint
+relish migrate default/cache --to node-3 --dry-run        # eligibility report
+relish migrate status [<migration-id>]
+relish migrate cancel <migration-id>
+relish drain node-2 [--timeout 30m] [--stop-blocking]
+relish drain status node-2
+relish uncordon node-2
+```
+
+The opt-in in the app file:
+
+```toml
+[app.cache.migration]
+mode = "checkpoint"   # "checkpoint", "cold" (default for managed volumes) or "never"
+```
+
+**Status** shows the phase, the mode (and whether it fell back, with CRIU's
+reason), bytes moved per kind, and the frozen time so far.
+
+**Events** (Bun's event log and `relish status`): requested, prepared, source
+stopped (dump duration, payload size), transferred, restored or cold-started,
+fell back (reason), aborted (reason), completed (downtime).
+
+**Metrics** (Mayo):
+
+- `reliaburger_migration_total{mode, outcome}`
+- `reliaburger_migration_downtime_seconds` (source frozen to target healthy)
+- `reliaburger_migration_payload_bytes{kind="memory|rootfs|volume"}`
+- `reliaburger_migration_phase_seconds{phase}`
+- `reliaburger_migration_fallback_total{reason}`
+
+**`relish wtf` checks:** CRIU missing or below the minimum on a runc node
+(`criu check`); an app opted into checkpoint that uses a host-path volume, a
+GPU or rootless runc; nodes with different CPU models hosting a
+checkpoint-enabled app; a migration past its deadline; orphaned payloads or
+tombstoned volumes past retention; a cordoned node that's been cordoned for
+days.
+
+**`relish lint`** rejects `mode = "checkpoint"` together with a host-path
+volume or a GPU.
+
+**Docs.** A manual chapter ("Moving workloads"), a `docs/design/` section in
+`deployments.md` (drain) and `agent-bun.md` (checkpoint), and a book section.
+The book should tell the honest story: why stop-and-copy, why we drop TCP,
+what CRIU refuses, and why the fallback is the real feature.
