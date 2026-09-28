@@ -645,7 +645,7 @@ Everything in the batch path so far treats a job as a *thing*: a spec in the req
 
 Kubernetes has the same problem in a different shape. An Indexed Job creates one Pod per index, and each Pod is several etcd writes over its life (create, bind, status updates, finalizer removal, deletion). The upstream scalability envelope stops at 150,000 Pods per cluster, so a million tasks run in waves. The usual escape hatch is a work queue: a few long-lived workers draining Redis. That scales beautifully, and the orchestrator no longer knows your tasks exist. Retries, logs and results become your code.
 
-We wanted the other thing: every task its own process, retried and tracked by the orchestrator, at a control-plane cost that doesn't grow with the task count. This section builds the pieces that make that possible as libraries. They're deliberately not wired into Raft or the API yet. Wiring them changes the Raft log and snapshot formats, so it bumps the compatibility generations, and 0.2.0 will need a fresh cluster; before 1.0.0 we don't migrate (the plan in `docs/plans/2026-09-28-plan-million-jobs.md` has the details). What we can do now is build them, test them hard and measure them in one process.
+We wanted the other thing: every task its own process, retried and tracked by the orchestrator, at a control-plane cost that doesn't grow with the task count. This section first builds the pieces as libraries, tested hard and measured in one process, and then wires them into Raft, the API and `relish`. Wiring changes the Raft log and snapshot formats, so it bumps the compatibility generations, and 0.2.0 needs a fresh cluster; before 1.0.0 we don't migrate (the plan in `docs/plans/2026-09-28-plan-million-jobs.md` has the details).
 
 ### Template plus count, ranges instead of records
 
@@ -714,9 +714,52 @@ A block cut short by a crash at the very end of the file is ignored: nobody was 
 
 ### Putting it together, in one process
 
-The acceptance test in the portable suite wires three simulated nodes (each a real pool with a fake runner and a real ledger on disk) to the real leader state and grant policy. One task in a hundred fails its first attempt and succeeds on retry. A third of the way through, node n3 is lost: its chunks go back to the queue at the next attempt, and its late reports are refused by the fence. At the end every index has exactly one accepted outcome, exactly one retry is counted per failing index, and the three ledgers between them hold a terminal record for all of them. The suite runs 100,000 tasks, which takes about three seconds in a debug build. With the full million it took 30.6 seconds on the laptop, about 32,700 tasks a second, and the leader changed its state in 422 ticks, each of which becomes one Raft entry once this is wired. Real processes will be far slower than a fake; the Criterion suite (`make bench-task-arrays`) measures the machine's fork/exec floor through the real runner, so we'll know by how much before promising anyone a number.
+The acceptance test in the portable suite wires three simulated nodes (each a real pool with a fake runner and a real ledger on disk) to the real leader state and grant policy. One task in a hundred fails its first attempt and succeeds on retry. A third of the way through, node n3 is lost: its chunks go back to the queue at the next attempt, and its late reports are refused by the fence. At the end every index has exactly one accepted outcome, exactly one retry is counted per failing index, and the three ledgers between them hold a terminal record for all of them. The suite runs 100,000 tasks, which takes about three seconds in a debug build. With the full million it took 30.6 seconds on the laptop, about 32,700 tasks a second, and the leader changed its state in 422 ticks. Real processes will be far slower than a fake; the Criterion suite (`make bench-task-arrays`) measures the machine's fork/exec floor through the real runner, so we'll know by how much before promising anyone a number.
 
-What we didn't do is as telling. No per-task Raft entries, obviously. No bitmap for the done set: a million-bit bitmap is 122 KiB whatever it holds, while ranges are eight bytes in the common case. No progress over the reporting tree: it's bincode, so a new field there is a protocol change, while a new HTTP route is additive, so the plan has the leader pull progress from nodes once a second instead. And no speculative duplicates of slow chunks yet. At-least-once would allow them, but we'd rather measure a tail before we optimise one.
+### Wiring it in: one Raft entry per array per tick
+
+Those 422 ticks become Raft entries once the pieces are wired, so the shape of the entry matters. We gave task arrays exactly one new `RaftRequest` variant:
+
+```rust
+/// Register, sync, cancel or requeue a task array.
+TaskArray(Box<crate::meat::task_array_store::TaskArrayWrite>),
+```
+
+`TaskArrayWrite` is its own enum with four variants (`Register`, `Sync`, `Cancel`, `Requeue`), and the rules for applying each one live beside the data in `meat::task_array_store`, where they're plain functions with plain unit tests. The state machine's part is six lines. Why the `Box`? A Rust enum is as large as its largest variant, because every value has to fit in the same slot. A `Sync` carries two vectors and a `Register` carries a whole `JobSpec`, and without the box every `RaftRequest` in the log (including the humble `Noop`) would pay for that space. `Box<T>` puts the payload on the heap and leaves a pointer behind. It's the same reason the other big variants in that enum are boxed.
+
+Arrays take their ids from the same counter as ordinary batches, so `relish batch-status 12` names one thing. The apply function borrows the counter as a closure:
+
+```rust
+pub fn apply(
+    &mut self,
+    write: &TaskArrayWrite,
+    allocate_id: impl FnOnce() -> u64,
+) -> Result<TaskArrayApplied, TaskArrayStoreError>
+```
+
+`FnOnce` is the loosest of Rust's three closure traits: the closure may be called at most once, and it's allowed to consume what it captured. That's exactly the promise we want to make. The id is taken only after every check has passed, so a refused registration never burns an id, and the call site says `|| batch_state.allocate_id()` without `TaskArrays` knowing anything about batches. In Go you'd pass a `func() uint64` and hope nobody calls it twice; here the type says so.
+
+The leader runs one loop, on every node, which does nothing unless the node leads. Once a second it reads the replicated arrays and sends each node its share: the chunks it holds, each with its grant attempt. The node's answer is its free slots and the chunks it has finished. For each running array the leader then writes a single `Sync` entry holding both the finished chunks and the next grants. To plan grants that account for the chunks being retired in the same entry, the leader clones the state, applies the results to the clone and plans against that. A node that finished a chunk gets its replacement in the same entry, and `apply` re-checks everything anyway. A holder that hasn't answered for 30 seconds gets a `Requeue`, and the fence from earlier makes its late reports harmless.
+
+The node is deliberately forgetful. It doesn't store its grants: every sync tells it what it holds, and it starts what it isn't running, cancels what it no longer holds, and keeps reporting a finished chunk until the leader stops listing it. That makes a restarted leader and a restarted node the same case as a normal tick. There was one trap. Finished results sat in a map keyed by chunk id, with the attempt stored beside the result. If the leader takes a chunk back and later re-grants it to the same node at the next attempt, the old run (cancelled, but still finishing) could land after the new one and overwrite it, and the chunk would never be reported again. Keying the map by `(chunk, attempt)` makes that impossible, rather than unlikely.
+
+Two smaller Rust points came out of the node. The first is that `TaskRunner` can't be used as a trait object. Its method returns `impl Future`, a type each implementation picks for itself, and `dyn TaskRunner` would need one type known up front. So the node holds an enum, `NodeRunner::Process` or `NodeRunner::Fake`, whose own `run` matches and forwards. With two implementations that's three lines, and the API state can hold one concrete node type. The second is that Clippy rejected our first version of "open the array if we haven't yet", a `contains_key` followed by `insert`, because it looks the key up twice. The `Entry` API does it once:
+
+```rust
+let run = match arrays.entry(assignment.batch_id) {
+    Entry::Occupied(entry) => entry.into_mut(),
+    Entry::Vacant(entry) => match self.open(assignment).await {
+        Ok(run) => entry.insert(run),
+        Err(error) => { /* answer with zero slots and the reason */ continue; }
+    },
+};
+```
+
+`entry` returns a handle to the slot, full or empty, and holding it keeps the map borrowed, so nothing else can change the map between the check and the insert.
+
+On the node, a restart replays the ledger and each held chunk runs only the tasks with no terminal record (`TaskPool::resume_chunk`). The binary has to be on the node's `[process_workloads]` allowlist, like any host process, and a node that can't run an array answers with zero slots and the reason, which `relish batch-status` prints. The integration test pushes 100,000 fake tasks through a real single-node council: the whole array cost 51 Raft entries.
+
+What we didn't do is as telling. No per-task Raft entries, obviously. No bitmap for the done set: a million-bit bitmap is 122 KiB whatever it holds, while ranges are eight bytes in the common case. No progress over the reporting tree: it's bincode, so a new field there would drag a binary format along, and a pull over HTTP puts the leader in charge of the cadence. No mount isolation for tasks yet, so nodes with it on sit arrays out rather than quietly running them unisolated. And no speculative duplicates of slow chunks. At-least-once would allow them, but we'd rather measure a tail before we optimise one.
 
 ## Lessons from the phase
 

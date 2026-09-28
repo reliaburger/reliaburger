@@ -655,12 +655,13 @@ k3s cluster of the same size, and publish both scripts.
 - [x] node side of the sync (`src/bun/task_array_node.rs`): runs held chunks through `TaskPool` with the ledger, fences by attempt, resumes from the ledger after a restart (`TaskPool::resume_chunk`), refuses binaries off the allowlist and nodes with `mount_isolation` (M7 decides), keeps failed tasks' output, deletes an array's files once the cluster stops listing it
 - [x] `POST /v1/batch/array`, `POST /v1/batch/array/sync`, `POST /v1/batch/{id}/cancel`, `GET /v1/batch/{id}` for arrays (`"kind": "array"`, per-node slots, counters and refusal reasons), `GET /v1/batch/{id}/results`, `GET /v1/batch/{id}/tasks/{index}/logs`, plus the two node-local reads (`src/bun/task_array_api.rs`, authz matrix rows, scope checks on submit, cancel, results and logs)
 - [x] leader sync loop with requeue on silence (`src/bun/task_array_leader.rs`: one `Sync` entry per array per tick, grants planned against the state with that tick's results applied; standalone nodes use an in-memory copy). Portable suite `tests/suite/task_arrays.rs`: 100,000 fake tasks through a single-node council in 51 Raft entries; real processes standalone and with failures, results and logs; cancel; refusal reasons
-- [ ] `relish run --batch --count`, `relish batch cancel`
+- [x] `relish run --batch --count` (with `--chunk`, `--max-attempts`, `--max-failed`, `--timeout`, `--concurrency`, `--env`, args after `--`; `--help` states at-least-once), `relish batch cancel`, arrays in `relish batch-status` (counts, chunks, failed indices, per-node slots or refusal); `relish batch FILE` keeps working beside the new subcommands
+- [ ] multi-node in-process cluster test (`tests/cluster_*`, gated by `RELIABURGER_CLUSTER_TESTS=1`): three wired nodes, 10k-100k tasks, one node killed mid-run and requeued after the silence timeout
 
 ### M6: views and data
 
 - [ ] `batch-status --watch` and `--cost`
-- [ ] `relish batch logs --index`, `relish batch results`
+- [x] `relish batch logs --index`, `relish batch results [--failed] [--limit]` (landed with M5: failed tasks' output kept per node; results merged from every node's ledger)
 - [ ] Ketchup sampling, Mayo counters
 - [ ] TUI batch view, dashboard card
 

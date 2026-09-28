@@ -3073,12 +3073,14 @@ and a handful of test cases whose assertions are too loose to catch the bug they
 ## 0.2.0: Million jobs (task arrays)
 
 Plan and full checklist: [2026-09-28-plan-million-jobs.md](plans/2026-09-28-plan-million-jobs.md)
-(draft PR #266, branch `feat/million-jobs`). Library-only so far; no wire or
-durable format has changed.
+(draft PR #266, branch `feat/million-jobs`). Wired into Raft, the API and
+`relish`; protocol 28 and state 45, so 0.2.0 needs a fresh cluster.
 
 - [x] **Data model** — `IndexRangeSet` (`src/meat/index_set.rs`), `TaskArraySpec`, chunk maths and `{index}` expansion (`src/meat/task_array.rs`).
 - [x] **Leader state and grant policy** — `TaskArrayState`, attempt fencing, requeue, cancel, `plan_grants` (`src/meat/task_array_state.rs`).
 - [x] **Node executor and ledger** — `TaskPool`, `ProcessRunner`, `FakeRunner` (`src/bun/task_executor.rs`); group-committed ledger with replay (`src/bun/task_ledger.rs`).
 - [x] **In-process proof** — `tests/suite/task_array_million.rs` and `benches/task_arrays.rs` (`make bench-task-arrays`).
 - [x] **Compatibility decision** — no finalisation gate (28 September 2026): the wiring bumps `protocol` and `state`, and 0.2.0 needs a fresh cluster.
-- [ ] **Wiring, views, quickstart host processes, real-cluster numbers (M5–M8).**
+- [x] **Wiring (M5)** — `RaftRequest::TaskArray` and `DesiredState::task_arrays` (`src/meat/task_array_store.rs`); the node executor behind the sync (`src/bun/task_array_node.rs`); the leader loop (`src/bun/task_array_leader.rs`); routes (`src/bun/task_array_api.rs`); `relish run --batch`, `relish batch cancel|results|logs`, arrays in `relish batch-status`. Portable suite `tests/suite/task_arrays.rs`.
+- [ ] **Multi-node in-process cluster test with a lost node (M5, gated `test-cluster`).**
+- [ ] **Views, quickstart host processes, real-cluster numbers (M6–M8).**
