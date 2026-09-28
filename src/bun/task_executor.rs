@@ -474,12 +474,31 @@ impl<R: TaskRunner> TaskPool<R> {
     /// On cancel, tasks not yet started count as not run and running ones
     /// are stopped.
     pub async fn run_chunk(&self, work: &ChunkWork, cancel: &CancellationToken) -> ChunkOutcome {
+        self.resume_chunk(work, Vec::new(), cancel).await
+    }
+
+    /// Finish a chunk some of whose tasks already ended in an earlier run
+    /// (read back from the ledger after a restart). Only the other tasks
+    /// run. The result counts every task in the chunk; `records` holds
+    /// only the new ones, since the earlier ones are already durable.
+    /// `finished` should hold terminal records (succeeded or failed) only.
+    pub async fn resume_chunk(
+        &self,
+        work: &ChunkWork,
+        finished: Vec<TaskRecord>,
+        cancel: &CancellationToken,
+    ) -> ChunkOutcome {
+        let mut done = IndexRangeSet::new();
+        for record in &finished {
+            done.insert(record.index);
+        }
         // A chunk outside the array has no tasks, and so an empty result.
         let indices: Vec<u32> = work
             .spec
             .chunk_range(work.chunk)
             .into_iter()
             .flatten()
+            .filter(|index| !done.contains(*index))
             .collect();
         let work = Arc::new(work.clone());
         let mut running = JoinSet::new();
@@ -514,8 +533,9 @@ impl<R: TaskRunner> TaskPool<R> {
             records.extend(done.ok());
         }
         records.sort_by_key(|record| record.index);
+        let in_chunk = |record: &&TaskRecord| work.spec.chunk_of(record.index) == Some(work.chunk);
         ChunkOutcome {
-            result: summarise(&work, records.as_slice()),
+            result: summarise(&work, finished.iter().filter(in_chunk).chain(&records)),
             records,
         }
     }
@@ -532,7 +552,7 @@ fn not_run(index: u32) -> TaskRecord {
     }
 }
 
-fn summarise(work: &ChunkWork, records: &[TaskRecord]) -> ChunkResult {
+fn summarise<'a>(work: &ChunkWork, records: impl Iterator<Item = &'a TaskRecord>) -> ChunkResult {
     let mut result = ChunkResult {
         chunk: work.chunk,
         attempt: work.grant_attempt,
@@ -862,6 +882,47 @@ mod tests {
         let indices: Vec<u32> = outcome.records.iter().map(|r| r.index).collect();
         assert_eq!(indices, (2000..2500).collect::<Vec<_>>());
         assert_eq!(runner.attempts(), 500);
+    }
+
+    #[tokio::test]
+    async fn resuming_a_chunk_runs_only_the_unfinished_tasks() {
+        let runner = Arc::new(FakeRunner::always_succeeds());
+        let pool = TaskPool::new(Arc::clone(&runner), fast(4));
+        let earlier = |index, outcome| TaskRecord {
+            index,
+            attempts: 1,
+            outcome,
+            exit_code: Some(i32::from(outcome == TaskFinal::Failed)),
+            run_ms: 1,
+            output: None,
+        };
+        let finished = vec![
+            earlier(100, TaskFinal::Succeeded),
+            earlier(101, TaskFinal::Failed),
+            earlier(150, TaskFinal::Succeeded),
+            // Outside the chunk: ignored rather than miscounted.
+            earlier(5, TaskFinal::Succeeded),
+        ];
+        let outcome = pool
+            .resume_chunk(&work(200, 100, 1), finished, &CancellationToken::new())
+            .await;
+        assert_eq!(runner.attempts(), 97);
+        assert_eq!(
+            outcome.records.len(),
+            97,
+            "only new records go to the ledger"
+        );
+        assert!(
+            outcome
+                .records
+                .iter()
+                .all(|r| ![100, 101, 150].contains(&r.index))
+        );
+        assert_eq!(outcome.result.succeeded, 99);
+        assert_eq!(
+            outcome.result.failed_indices,
+            IndexRangeSet::from_range(101..=101)
+        );
     }
 
     #[tokio::test]
