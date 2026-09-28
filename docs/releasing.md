@@ -311,6 +311,21 @@ the real `curl … | sh` install against it on every host we advertise.
    then a fresh final run. `--resume --evidence DIR` continues an interrupted
    run with its original tier.
 
+   Until 1.0, a final-tier run whose only failures are known harness
+   artefacts counts as passed (maintainer decision, 28 September 2026), if
+   each failure matches a documented artefact signature with evidence, the
+   run's snapshots are re-checked by replaying the fixed
+   `scripts/release/sustained_check.py`, nothing lost data or failed in the
+   product, and the record names each failure classified this way and why.
+   The known artefacts are `leak-rss` after a self-upgrade exec reused the pid
+   (fixed by #271: same pid, a sharp RSS drop at an upgrade walk just before
+   the warm sample, fds bounded) and a log-order swap when an instance moved
+   nodes under the same name (fixed by #272: one adjacent swap in an
+   unlabelled tail, the instance on different nodes in the status snapshots
+   either side). The [plan](plans/2026-09-25-v02-sustained.md#4-pass-and-fail)
+   keeps the list. Anything else still needs a new candidate, and from 1.0 on
+   only a clean final-tier run passes.
+
 5. **Record it.** Copy each host's record into
    `docs/qualification/DATE-staged-install-HOST.md`, alongside the run ID,
    attempt, commit and digest. Gates V03 and V04 in
