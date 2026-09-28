@@ -10,7 +10,7 @@ Awaiting maintainer review.
 - [x] 2. What the codebase does today (verified by reading the code)
 - [x] 3. CRIU, runc and the ecosystem today (sourced)
 - [x] 4. GPU checkpointing and where the demand really is (sourced)
-- [ ] 5. Design for Reliaburger
+- [x] 5. Design for Reliaburger
 - [ ] 6. Compatibility against the post-0.1.0 policy
 - [ ] 7. Security
 - [ ] 8. Observability and UX
@@ -387,3 +387,246 @@ don't have; Reliaburger's GPU support today is detection only
 So of the three, batch has the production evidence and tolerates
 stop-and-copy downtime. A stateful dev or game server makes the better
 *demo*, because you can watch it keep its state.
+
+## 5. Design for Reliaburger
+
+### 5.1 Scope for 0.2.0
+
+The maintainer's "checkpoint-on-drain" survives, with two changes: the drain
+has to be built, and the restart fallback has to be a *move*.
+
+**In:**
+
+- `relish drain <node>` and `relish uncordon <node>`: cordon the node (no new
+  placements), then empty it. Instances without managed volumes are
+  rescheduled the way a rolling deploy would, respecting `max_unavailable`
+  (the whitepaper's promise for drain). Instances with managed volumes are
+  *migrated*.
+- `relish migrate <namespace>/<app> --to <node> [--instance <id>]
+  [--mode checkpoint|cold]`: move one instance on purpose.
+- Two modes, one pipeline:
+  - **cold**: stop the source, copy its managed volumes, cold-start on the
+    target. Works for any rootful runc app. This is the default for drain.
+  - **checkpoint** (opt-in per app, experimental): the same, plus `runc
+    checkpoint` on the source, the CRIU image and the writable rootfs layer in
+    the payload, and `runc restore` on the target. If CRIU refuses at dump
+    time, the source is still running (CRIU resumes it on failure) and the
+    migration continues as **cold**. If restore fails on the target, it
+    cold-starts there with the volumes already moved.
+- Rootful runc only.
+
+**Out, explicitly:**
+
+- Iterative pre-dump, lazy pages, page server (0.3 or later, section 11).
+- Keeping established TCP connections. They're closed at dump time; the
+  instance gets a new address on the target; clients reconnect.
+- GPUs, host-path volumes, rootless runc, Apple Container, ProcessGrill:
+  `migrate` refuses them up front, and drain reports them as blocking.
+- Automatic triggers: rebalancing, spot/preemption notices, autoscaling.
+  Rebalancing is a scheduler policy question we shouldn't answer in the same
+  release as the mechanism.
+- Jobs. A job attempt has its own durable attempt ledger (`src/bun/jobs.rs`)
+  and the batch tracker in Raft, so moving one without consuming a retry is
+  its own design. It's the first follow-up, because batch is where the demand
+  evidence is (open question Q3).
+- Binary upgrades. They don't restart workloads (section 2).
+
+**Eligibility** (checked by the leader before anything happens, reported by
+`relish migrate --dry-run`):
+
+1. The app runs on runc, rootful, with no GPU and no host-path volume.
+2. The instance is the only instance of its app on the source, and the target
+   runs none. Managed volumes are per app per node, so moving one of two
+   instances would either strand the other's volume or merge two copies on the
+   target. Singletons are the target workload anyway.
+3. No rollout, stop, delete, upgrade, test lease or other migration is active
+   for the app or either node.
+4. The target is alive, ready, not cordoned, matches placement labels, has
+   the resources, and has disk (and tmpfs, for checkpoint mode) for the payload.
+5. Checkpoint mode only: the app opted in, both nodes report the same CPU
+   model and a CRIU at or above the pinned minimum, and the source's CRIU is
+   no newer than the target's.
+
+### 5.2 What travels
+
+| State | Where it lives on the source | Cold | Checkpoint |
+|---|---|---|---|
+| Managed volumes | `volumes/<ns>/<app>/...` (plain, loop ext4, Btrfs) | tar stream | tar stream |
+| Writable rootfs layer | `<bundle>/rootfs-upper` | not moved (a cold restart starts fresh today too) | tar stream (restored files reference it) |
+| Process memory, fds, namespaces | kernel | none | CRIU image |
+| Image layers | image store | target pulls through Pickle **before** the source stops | same |
+| Captured stdout/stderr | `output.stdout`/`output.stderr` | stays; Ketchup has already ingested it | stays, see 5.4 |
+| Network identity | `/23` per node | new address and netns on the target | same; netns is external to CRIU |
+| Workload certificate | per instance, key generated on the node | new instance, new certificate | new certificate; old one revoked (section 7) |
+
+The copy of each volume stays on the source, renamed out of the way
+(`volumes/.migrated/<migration-id>/...`), until the migration completes and a
+retention period passes. That's what makes the fallbacks below possible, and
+it's also the one-writer rule from PR #267 in another form: the source copy
+is never mounted again unless the migration resolves *back* to the source.
+
+A plain `tar` of a stopped volume is consistent for every backend, so 0.2.0
+doesn't need `btrfs send`. Btrfs incremental send (or repeated rsync passes)
+is how 0.3 cuts downtime: pre-sync while the app runs, then send only the
+last delta after the stop, as Incus 7.4 does.
+
+### 5.3 Identity and networking
+
+- **Instance identity.** Placements carry no instance identity, so the
+  target allocates a fresh local `InstanceId` as it would for any new
+  replica. A `MigrationId` links the two in events, logs and status. The
+  app's service name, DNS name and service VIP don't change.
+- **Discovery.** The source instance retires the normal way, so its routes
+  go through the existing withdrawal ledger and every consumer acknowledges
+  them before the address is reused. The target instance is published by the
+  leader once its health check passes. Nothing new is needed here, and that's
+  one of the reasons to keep addresses node-local.
+- **TCP.** Drop, don't hand off. `--tcp-established` needs the same IP on the
+  target, and our per-node `/23` pools make that a network redesign
+  (routed per-instance `/32`s, or an overlay). Google made the same call for
+  Borg. `runc checkpoint` has no `--tcp-close` flag, so we pass CRIU's
+  `tcp-close` through the `org.criu.config` annotation (a small CRIU config
+  file Reliaburger writes per checkpoint). Without it, CRIU refuses to dump a
+  process with an established connection.
+- **eBPF and firewall.** Onion's maps and the Sesame firewall live on the
+  host and key on container addresses and cgroup ids, so nothing about them is
+  inside the CRIU image. The target programs them for its new instance as
+  usual. The catch: Bun installs cgroup-keyed egress policy between `runc
+  create` and `runc start`, and `runc restore` has no such gap. The plan is
+  to pre-create the cgroup, install the policy for its id, then restore into
+  it (spike S4). If that can't be made reliable, checkpoint mode refuses apps
+  with an egress policy.
+- **Time.** Checkpoint-mode containers get a time namespace (OCI 1.1,
+  runc 1.2+) so CRIU can keep `CLOCK_MONOTONIC` continuous across hosts.
+
+### 5.4 The stdio problem
+
+runc only re-attaches pipe descriptors on restore. Our containers write
+stdout and stderr to regular files in the owner's directory, so CRIU would
+try to reopen the source's file paths on the target, where they don't exist
+(or have a different size, which fails file validation). Three ways out, in
+order of preference, to be settled by spike S2:
+
+1. **CRIU `inherit-fd` through `org.criu.config`.** If runc's `criu swrk`
+   child inherits runc's own stdout and stderr (which the owner points at the
+   *target's* capture files), a config line mapping the image's file paths to
+   those descriptors makes CRIU reuse them. Smallest change, if runc doesn't
+   close them first.
+2. **Pipes for checkpoint-mode containers.** Give the container pipes and
+   have the owner copy them into the capture files. runc then handles
+   restore for us. It changes the owner, which is some of the most
+   carefully fenced code in the tree, so it's the fallback.
+3. **Recreate the path.** Make the target's capture file path identical and
+   pre-size it. Fragile; last resort.
+
+### 5.5 Transfer
+
+- **Channel.** The target *pulls* the payload from the source over a new
+  node-to-node route on the Bun API (`System` principal, node-id mTLS, as the
+  other node routes). Pulling lets the target control disk use and resume a
+  broken transfer with a range request.
+- **Not Pickle.** Pickle already moves build contexts as blobs, so it's
+  tempting. But its store is catalogued, replicated, garbage-collected and
+  readable by any node that can pull. A process-memory dump must not land in
+  a registry, even briefly. Pickle's only job here is making sure the image
+  layers are on the target before the source stops.
+- **Format.** One stream: a tar with `criu/`, `rootfs-upper/` and
+  `volumes/<mount>/` entries, zstd-compressed (CRIU has no released
+  compression), then age-encrypted to a per-migration X25519 key the target
+  generates and holds only in memory. The source reports the stream's SHA-256
+  and length; the leader commits them; the target refuses a stream that
+  doesn't match. The `age`, `tar` and `zstd` crates are already in
+  `Cargo.lock`.
+- **At rest.** CRIU writes plaintext image files, so the source dumps into a
+  private tmpfs sized from the instance's memory limit. If the node doesn't
+  have that much free memory, checkpoint mode isn't eligible and the
+  migration runs cold. The encrypted stream may spool to disk on either side;
+  plaintext only exists in tmpfs, during dump and during restore.
+- **Space.** The leader checks both nodes' reported free space against the
+  instance's volume usage plus memory limit plus a margin before starting.
+  Bun's disk-pressure monitor refuses to accept a payload that would push the
+  data directory over its threshold.
+- **Cleanup.** Every payload file and tmpfs is named by migration id. On
+  start, Bun removes any whose migration is terminal or unknown to Raft; the
+  source's tombstoned volumes go after the retention period.
+- **Expected downtime.** Stop-and-copy downtime is dump + transfer + restore,
+  and transfer dominates: roughly the anonymous memory plus the volume size
+  over the link. A 256 MiB in-memory Redis should be seconds; a 10 GiB
+  volume is 90 seconds or more on 1 Gbit/s. That's why volume pre-sync, not
+  memory pre-dump, is the first 0.3 item.
+
+### 5.6 Control plane
+
+The leader orchestrates, as it does for everything else. A migration is a
+Raft record the leader advances; each node does its idempotent part when its
+placement poll shows an instruction, and reports back over a node route. The
+reporting frames are bincode and stay untouched.
+
+```text
+Requested ──► Prepared ──► SourceStopped ──► Transferred ──► Completed
+    │             │              │                 │
+    └──► Aborted ◄┘              └──► FellBack ◄───┘
+```
+
+- **Requested.** The leader checked eligibility and reserved the target's
+  resources. The migration holds the app: deploys, scaling and autoscale
+  wait.
+- **Prepared.** The target pulled the image, checked space and tmpfs, and
+  generated the transfer key. Its public half goes into the record.
+- **SourceStopped.** The one-way door. The source runs `runc checkpoint` (or
+  a plain stop in cold mode, or after a refused dump) under the instance's
+  owner, tombstones its volumes, and reports the intent generation as
+  `Retired` with the payload digest. The leader commits it and, *in the same
+  entry*, moves the placement from source to target. From here on the source
+  must never run the app again unless the record says so.
+- **Transferred.** The target has the whole payload and it matches the
+  digest.
+- **Completed.** The target restored (or cold-started) and passed its health
+  check. The leader updates `last_placed_nodes`, records the downtime, and
+  releases the app.
+- **FellBack.** Something failed after the one-way door. The record names
+  where the app ended up and why.
+- **Aborted.** Something failed before it. Nothing changed.
+
+Crash handling, step by step:
+
+| What fails | When | Result |
+|---|---|---|
+| Target unreachable, dies, or can't prepare | before `SourceStopped` | `Aborted`; the source never stopped |
+| CRIU refuses the dump | during stop | The process is still running; the migration switches to cold and stops it normally |
+| Source Bun crashes during the dump | during stop | The owner outlives Bun; on restart Bun reads the intent journal: still running means the dump failed (retry cold), retired means report it |
+| Source node dies | before `SourceStopped` | `Aborted`; the app waits for its volume home, exactly as node loss does today |
+| Source node dies | after `SourceStopped`, before `Transferred` | The payload isn't complete and the data is on the dead node: wait for it until the deadline, then `FellBack` to the source (the app stays homed there) |
+| Transfer fails or digest mismatches | after `SourceStopped` | Retry with backoff; then `FellBack` to the source: un-tombstone the volumes, move the placement back, restore from the local CRIU image if there is one, else cold start |
+| Restore fails on the target | after `Transferred` | Cold start on the target with the moved volumes (the maintainer's fallback); `Completed` with `mode = cold` and the reason |
+| Target dies after `SourceStopped` | any later phase | `FellBack` to the source, as above. The source copy is intact because it was only renamed |
+| Target Bun restarts mid-transfer | after `SourceStopped` | The in-memory transfer key is gone, so the payload can't be decrypted: the target cold-starts from a fresh volume transfer, never from half a payload |
+| Leader changes | any | The new leader reads the record and continues after its learning period; every step is keyed by migration id and the source's intent generation, so repeats are no-ops |
+| Both nodes die | after `SourceStopped` | The app stays down; `relish migrate cancel` resolves it to whichever node comes back with the data |
+
+Every phase has a deadline in the record, so nothing waits forever.
+
+**Interactions.**
+
+- *Deploys.* A deploy of a migrating app waits until the migration is
+  terminal. A migration of an app mid-rollout is refused.
+- *Stop and delete.* They win: before `SourceStopped` the migration aborts;
+  after it, the migration is cancelled to whichever node holds the data and
+  the stop applies there.
+- *The placement reconciler.* The target must not cold-start the replica it
+  was just assigned while the payload is in flight: its `NodeAssignments`
+  carry a "migrating in" instruction that holds the slot. The source gets
+  "migrating out", which turns its retirement into a checkpoint instead of a
+  plain stop. The applied-placements checkpoint records both, so an agent
+  restart doesn't mistake the held slot for a pending deploy (the #267
+  failure mode).
+- *Upgrades, leases, decommission.* No migration starts during a cluster
+  upgrade; `relish decommission-node` resolves any migration touching the
+  node; lease-owned apps can't be migrated.
+
+**How drain uses it.** `relish drain` commits a cordon, then works through
+the node's instances: stateless ones are rescheduled with surge, singletons
+with managed volumes become migrations (checkpoint if the app opted in, cold
+otherwise), and anything ineligible is listed as blocking with the reason.
+`relish drain --stop-blocking` stops those instead, with their data left in
+place. The drain finishes when the node runs nothing but system services.
