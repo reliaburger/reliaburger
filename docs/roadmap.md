@@ -819,7 +819,7 @@ feature gate ([compatibility before 1.0.0](releasing.md#compatibility-before-100
   Alongside it, the website gets a full CLI walkthrough (a second recorded
   tour that exercises every `relish` command) and a searchable command
   reference on the landing page that ctrl-F can find, generated from the CLI
-  (issue to follow).
+  ([#315](https://github.com/reliaburger/reliaburger/issues/315)).
 - **Later.** The fleet control plane
   ([#265](https://github.com/reliaburger/reliaburger/pull/265)), and GPU
   scheduling and warm starts (F01). The rest of the backlog (F02–F11, H05)
