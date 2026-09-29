@@ -581,6 +581,9 @@ pub async fn start(
         council_rx,
         shutdown.clone(),
     );
+    if let Some(tracker) = readiness.clone() {
+        worker = worker.with_readiness(tracker);
+    }
     spawn_supervised("cluster:report-worker", supervision.clone(), async move {
         worker.run().await
     });

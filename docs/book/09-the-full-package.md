@@ -539,6 +539,21 @@ One security fix rides along. Lettuce can require commits to be GPG-signed by a 
 
 The fix is one line — return whether any trusted fingerprint appears in the verify output, with no fall-through. A valid signature from an unlisted key is now `UntrustedKey`, and the commit is rejected. The two regression tests are the ones that should have existed from the start: a matching fingerprint is trusted, an unlisted one is not. It's a reminder that a security check which always returns "yes" is worse than no check, because it shows up green in the audit.
 
+The one-line fix had a second hole, which a later static review (B14) found. "Any trusted fingerprint appears in the output" is a substring search over everything `git verify-commit --raw` prints: the user id, the key ids, the dates. Git checks the signature against whatever keys the node's GnuPG keyring happens to hold, so an attacker whose key is in there only needs a user id like `Mallory (0123…4567)`, or a fingerprint that contains the configured one, and the check says yes. Now `is_key_trusted` reads structure instead of text. GnuPG's status protocol reports a good signature as one line, `[GNUPG:] VALIDSIG <signing-fpr> … <primary-fpr>`, and only those two fields are compared, for equality, ignoring case and spaces. SSH signatures get the same treatment with the `SHA256:` fingerprint at the end of `ssh-keygen`'s "Good signature" line, compared exactly because base64 is case-sensitive.
+
+The parser returns borrowed slices of the output, not copies:
+
+```rust
+enum Signer<'a> {
+    Gpg(&'a str),
+    Ssh(&'a str),
+}
+
+fn valid_signer_fingerprints(verify_output: &str) -> Vec<Signer<'_>> { … }
+```
+
+`'a` is a lifetime parameter: it says each `&str` inside a `Signer` points into some string that must outlive it. In the function signature `'_` asks the compiler to fill in the obvious lifetime, the one of `verify_output`. In C you'd be trusting yourself not to free the buffer while the pointers are live; in Go the garbage collector would keep it alive for you. Rust checks it at compile time, so a caller that drops the output while still holding the fingerprints doesn't build. The tests feed it fixture status output: a valid trusted signature, a trusted primary key signing with its subkey, an attacker whose fingerprint and user id both contain the trusted one, a `BADSIG`, and output with no `VALIDSIG` at all.
+
 ## Kubernetes migration
 
 Most teams don't start from scratch. They have existing Kubernetes manifests -- dozens of them, spread across namespaces, wired together with Services, Ingresses, HPAs, ConfigMaps. Asking those teams to rewrite everything in TOML by hand is a non-starter.

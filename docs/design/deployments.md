@@ -881,7 +881,7 @@ health_timeout = "60s"
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `strategy` | `"rolling"` or `"blue-green"` | `"rolling"` | Deploy strategy |
-| `max_surge` | integer | `1` | Maximum extra instances during rolling update. Higher values trade resources for speed. |
+| `max_surge` | integer | `1` | Maximum extra instances during rolling update. Higher values trade resources for speed. An app with a managed volume always rolls with `max_surge = 0` (and `max_unavailable` at least 1, blue-green included), since old and new instances would share the volume. |
 | `drain_timeout` | duration string | `"30s"` | How long to wait for in-flight connections to complete before force-stopping |
 | `health_timeout` | duration string | `"60s"` | How long to wait for a new instance's health check endpoint to return success |
 | `auto_rollback` | boolean | `true` | `true`: actively revert all upgraded instances on failure. `false`: halt and leave the mixed old/new state for the operator to decide. |

@@ -659,6 +659,18 @@ fn bin_packing_score(node: &NodeCapacity, request: &Resources) -> f64 {
 
 Higher utilisation after placement is better (the node is more "full"). An imbalance penalty discourages placing CPU-heavy workloads on memory-heavy nodes and vice versa, which would leave stranded resources.
 
+#### Apps with Managed Volumes
+
+A managed volume lives on one node, so placement follows the data. Desired state keeps `last_placed_nodes`: the nodes of the app's last non-empty scheduling decision. `relish stop` commits an empty decision, which leaves that record alone. When a fixed-replica app with a managed volume has no placement left to keep (it was stopped and is applied again), the leader puts its replicas back on those nodes before scoring anything:
+
+- A home node that is alive, ready and still matches the app's required labels gets the replica, reserved in the pass's cache.
+- A home node that is alive but can't take it right now makes the app wait: placing it elsewhere would start it on an empty volume. That covers no room, no fresh report (a new leader, or a report worker that stalled for longer than `stale_report_timeout_secs`), not ready, cordoned for an upgrade, and missing a capability the app needs.
+- A home node that gossip no longer has alive (or that was retired), or that no longer matches the labels, is dropped, and that replica goes through the normal pipeline. That's the documented loss of a local volume with its node, or the operator moving the app on purpose.
+
+The same rule keeps a *running* volume app where it is. For an app without a volume, a placement on a node that went stale, reported not ready or was cordoned is replaced elsewhere; for a fixed-replica app with a managed volume, the placement holds for as long as the node is alive. Moving it would restart it on an empty volume while its data sits on the node it left.
+
+`relish delete` forgets the record. Apps without a managed volume are placed by score as usual.
+
 #### Daemon Mode (`replicas = "*"`)
 
 When `replicas = "*"` is specified, Meat does not run the placement pipeline. Instead:

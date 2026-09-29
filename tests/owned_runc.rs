@@ -367,6 +367,76 @@ async fn runc_owned_completed_log_reader_cannot_block_a_replacement_generation()
     stream.await.unwrap();
 }
 
+/// V02 soak blocker (candidate 3fcb1fd): a restarted Bun follows every
+/// adopted container's capture from byte 0. The soak's log spammer had
+/// written about a million lines, and splitting them in one synchronous step
+/// held a runtime worker for minutes, which starved startup adoption until
+/// its 10 s deadline expired. The replay must hand the runtime back between
+/// bounded chunks. `#[tokio::test]` is single-threaded, so a stalled 1 ms
+/// timer is the runtime being held.
+#[tokio::test]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft"]
+async fn following_a_large_capture_after_a_restart_does_not_hold_the_runtime() {
+    const LINES: u64 = 200_000;
+    const LINE: &str = "spam the quick brown fox jumps over";
+    let root = tempfile::tempdir().unwrap();
+    let id = instance(root.path());
+    let first = runtime(root.path());
+    first
+        .create(
+            &id,
+            &spec(
+                root.path(),
+                &format!(
+                    "/bin/busybox yes '{LINE}' | /bin/busybox head -n {LINES}; \
+                     /bin/busybox touch /work/written; exec /bin/busybox sleep 60"
+                ),
+            ),
+        )
+        .await
+        .unwrap();
+    install_fixture(root.path(), &id);
+    first.start(&id).await.unwrap();
+    wait_file(&root.path().join("shared/written")).await;
+    drop(first);
+
+    // A fresh runtime handle, as after a Bun restart, re-follows from byte 0.
+    let restarted = runtime(root.path());
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(256);
+    let reader = restarted.clone();
+    let log_id = id.clone();
+    let stream = tokio::spawn(async move { reader.follow_logs(&log_id, sender).await });
+    let consumer = tokio::spawn(async move {
+        let mut last = None;
+        for _ in 0..LINES {
+            last = receiver.recv().await;
+        }
+        last
+    });
+    let mut longest_stall = Duration::ZERO;
+    let started = std::time::Instant::now();
+    while !consumer.is_finished() && started.elapsed() < Duration::from_secs(120) {
+        let tick = std::time::Instant::now();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        longest_stall = longest_stall.max(tick.elapsed());
+    }
+    let last = consumer.await.unwrap();
+    stream.abort();
+    restarted.kill(&id).await.unwrap();
+    assert_absent(root.path(), &id);
+
+    let last = last.expect("the replay ended before the whole capture arrived");
+    assert_eq!(last.line, LINE);
+    assert_eq!(
+        last.position.unwrap().end_offset,
+        LINES * (LINE.len() as u64 + 1)
+    );
+    assert!(
+        longest_stall < Duration::from_secs(1),
+        "replaying the capture held the runtime for {longest_stall:?}"
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft"]
 async fn generated_cgroup_path_matches_the_actual_container_before_its_first_instruction() {
@@ -878,4 +948,183 @@ async fn actual_host_reboot_preserves_holds_and_retires_original_execution() {
         }
         other => panic!("invalid reboot qualification phase {other}"),
     }
+}
+
+/// Kill every process in a stand-in for Bun's systemd unit cgroup the way
+/// `KillMode=control-group` does: SIGTERM, a grace period, then SIGKILL.
+async fn stop_unit_cgroup(unit: &Path) {
+    let members = || {
+        std::fs::read_to_string(unit.join("cgroup.procs"))
+            .unwrap()
+            .lines()
+            .map(|line| line.parse::<i32>().unwrap())
+            .collect::<Vec<_>>()
+    };
+    for pid in members() {
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid),
+            nix::sys::signal::Signal::SIGTERM,
+        );
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    std::fs::write(unit.join("cgroup.kill"), "1").unwrap();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while !members().is_empty() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    std::fs::remove_dir(unit).unwrap();
+}
+
+/// Issue #241: `systemctl stop` under the default `KillMode=control-group`
+/// kills Bun together with every runtime owner it started, while the
+/// container itself survives in its own cgroup. The restarted Bun must
+/// start: adoption either takes the container back or retires it, and a
+/// retained address stays held until its original reference is released.
+async fn restart_after_unit_cgroup_stop(retiring: bool) {
+    use reliaburger::grill::records::InstanceRecord;
+    use reliaburger::grill::runc_intent::NetworkReferenceState;
+    assert!(nix::unistd::geteuid().is_root());
+    let root = tempfile::tempdir().unwrap();
+    let id = instance(root.path());
+    let unit = Path::new("/sys/fs/cgroup").join(format!("{}-unit", id.0));
+    std::fs::create_dir(&unit).unwrap();
+    let mut caller = tokio::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "owned_runc_unit_stop_fixture",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("RELIABURGER_OWNED_RUNC_UNIT_FIXTURE", root.path())
+        .env("RELIABURGER_OWNED_RUNC_UNIT_CGROUP", &unit)
+        .env("RELIABURGER_OWNED_RUNC_UNIT_RETIRING", retiring.to_string())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    wait_file(&root.path().join("shared/unit-ready")).await;
+    let record: InstanceRecord =
+        serde_json::from_slice(&std::fs::read(root.path().join("shared/record.json")).unwrap())
+            .unwrap();
+    stop_unit_cgroup(&unit).await;
+    let _ = caller.wait().await;
+
+    let restarted = runtime(root.path());
+    let adopted = restarted.adopt(&id, &record).await;
+    let held = restarted
+        .launch_inventory()
+        .await
+        .unwrap()
+        .unwrap()
+        .into_iter()
+        .find(|launch| launch.instance_id == id)
+        .and_then(|launch| launch.network_reference);
+    let replacement_refused = restarted
+        .create(&id, &spec(root.path(), "exit 0"))
+        .await
+        .is_err();
+    // Clean up before asserting, so a failure leaves nothing behind.
+    if let Some(NetworkReferenceState::Held(reference)) = &held {
+        let _ = restarted.release_network_reference(reference).await;
+    }
+    let _ = restarted.kill(&id).await;
+    let final_state = restarted.state(&id).await;
+    let container_cgroup = Path::new("/sys/fs/cgroup").join(&id.0);
+    if container_cgroup.exists() {
+        let _ = std::fs::write(container_cgroup.join("cgroup.kill"), "1");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let _ = std::fs::remove_dir(&container_cgroup);
+    }
+
+    assert!(
+        adopted.is_ok(),
+        "restart after a unit-cgroup stop refused to start: {adopted:?}"
+    );
+    // Whatever adoption decided, discovery's address stays held until the
+    // original reference is released.
+    assert!(
+        matches!(held, Some(NetworkReferenceState::Held(_))),
+        "the retained address was dropped before its release: {held:?}"
+    );
+    assert!(
+        replacement_refused,
+        "a held address was handed to a replacement"
+    );
+    assert!(matches!(final_state, Ok(ContainerState::Stopped)));
+    assert_absent(root.path(), &id);
+}
+
+#[tokio::test]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft"]
+async fn restart_after_unit_cgroup_stop_recovers_a_running_generation() {
+    restart_after_unit_cgroup_stop(false).await;
+}
+
+#[tokio::test]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft"]
+async fn restart_after_unit_cgroup_stop_recovers_a_retiring_generation() {
+    restart_after_unit_cgroup_stop(true).await;
+}
+
+#[tokio::test]
+#[ignore = "subprocess fixture for a KillMode=control-group stop"]
+async fn owned_runc_unit_stop_fixture() {
+    use reliaburger::grill::records::{InstanceRecord, RuntimeKind};
+    let Some(root) = std::env::var_os("RELIABURGER_OWNED_RUNC_UNIT_FIXTURE") else {
+        return;
+    };
+    let unit =
+        std::path::PathBuf::from(std::env::var_os("RELIABURGER_OWNED_RUNC_UNIT_CGROUP").unwrap());
+    let retiring = std::env::var("RELIABURGER_OWNED_RUNC_UNIT_RETIRING").unwrap() == "true";
+    // Join the unit first, so every owner this process starts lands in it.
+    std::fs::write(unit.join("cgroup.procs"), std::process::id().to_string()).unwrap();
+    let root = std::path::PathBuf::from(root);
+    let id = instance(&root);
+    let runtime = runtime(&root);
+    // Like Bun, give the container its own cgroup outside the unit.
+    let mut specification = spec(&root, "exec /bin/busybox sleep 600");
+    specification.linux.cgroups_path = Some(format!("/{}", id.0));
+    runtime.create(&id, &specification).await.unwrap();
+    install_fixture(&root, &id);
+    runtime
+        .retain_network_reference(&id)
+        .await
+        .unwrap()
+        .unwrap();
+    runtime.start(&id).await.unwrap();
+    let pid = runtime.pid(&id).await.unwrap();
+    let record = InstanceRecord {
+        schema: 2,
+        instance_id: id.0.clone(),
+        namespace: "default".into(),
+        app_name: "owned-runc".into(),
+        replica_index: 0,
+        is_job: false,
+        image: "/empty-fixture".into(),
+        runtime: RuntimeKind::Runc,
+        pid,
+        pid_started_at: reliaburger::grill::records::process_start_time(pid).unwrap(),
+        runc_container_id: Some(id.0.clone()),
+        log_stem: runtime.log_stem(&id).await,
+        host_port: None,
+        app_spec: None,
+        oci_spec: specification,
+        rootless_network: None,
+    };
+    std::fs::write(
+        root.join("shared/record.json"),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+    if retiring {
+        // A rollout stopped the old generation; discovery still holds its
+        // address, so the intent stays Retiring.
+        runtime.kill(&id).await.unwrap();
+    }
+    std::fs::write(root.join("shared/unit-ready"), "ready").unwrap();
+    tokio::time::sleep(Duration::from_secs(600)).await;
 }

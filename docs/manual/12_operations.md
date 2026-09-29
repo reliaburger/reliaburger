@@ -111,7 +111,11 @@ The sync always reads every `.toml` file under `path`, subdirectories
 included. Credentials go in the URL; Bun strips them out of the process arguments and
 Git's config. With `require_signed_commits`, a commit that doesn't verify
 against `trusted_signing_keys` isn't applied, and an empty key list refuses
-everything. There's no `relish gitops` command: the web dashboard's GitOps
+everything. List full fingerprints: the 40-hex-digit GPG fingerprint of the
+signing key or its primary key (case and spaces don't matter), or an SSH
+key's `SHA256:…` fingerprint exactly as `ssh-keygen -lf` prints it. Git checks
+the signature against the node's own GnuPG keyring or
+`gpg.ssh.allowedSignersFile`, so install the public keys there. There's no `relish gitops` command: the web dashboard's GitOps
 page shows the last sync.
 
 To sync on push rather than on the next poll, point a GitHub, Gitea or GitLab

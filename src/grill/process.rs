@@ -756,21 +756,34 @@ impl super::Grill for ProcessGrill {
         );
 
         loop {
-            // New bytes since the last poll, from the file or the buffer.
-            let offset = usize::try_from(reader.read_offset()).unwrap_or(usize::MAX);
+            // New bytes since the last poll, from the file or the buffer, at
+            // most one bounded chunk at a time: a restarted Bun replays the
+            // whole capture, and one long synchronous step would hold a
+            // runtime worker for as long as it took.
             let new_data = if let Some(file) = reader.file() {
-                let contents = std::fs::read(file).unwrap_or_default();
-                contents.get(offset..).unwrap_or_default().to_vec()
+                crate::grill::capture::read_capture_chunk(file, reader.read_offset())
+                    .await
+                    .unwrap_or_default()
             } else {
+                let offset = usize::try_from(reader.read_offset()).unwrap_or(usize::MAX);
                 let buf = stdout_buf.lock().await;
-                buf.get(offset..).unwrap_or_default().to_vec()
+                let end = buf
+                    .len()
+                    .min(offset.saturating_add(crate::grill::capture::CAPTURE_CHUNK_BYTES));
+                buf.get(offset..end).unwrap_or_default().to_vec()
             };
 
             let no_new_data = new_data.is_empty();
+            let backlog = new_data.len() == crate::grill::capture::CAPTURE_CHUNK_BYTES;
             for line in reader.push(&new_data) {
                 if lines_tx.send(line).await.is_err() {
                     return;
                 }
+            }
+            if backlog {
+                // The in-memory buffer never awaits; hand the worker back.
+                tokio::task::yield_now().await;
+                continue;
             }
 
             // Check if the process has exited and no more data is coming
@@ -993,7 +1006,13 @@ mod tests {
     async fn stop_terminates_shell_descendants() {
         let dir = tempfile::tempdir().unwrap();
         let pid_file = dir.path().join("child.pid");
-        let script = format!("sleep 60 & echo $! > {}; wait", pid_file.display());
+        // Write the pid beside the file and rename it into place: `>` creates
+        // the file before `echo` fills it, and the poll below could read it
+        // empty in between.
+        let script = format!(
+            "sleep 60 & echo $! > {path}.tmp && mv {path}.tmp {path}; wait",
+            path = pid_file.display()
+        );
         let grill = ProcessGrill::new();
         let id = InstanceId("process-tree-0".to_string());
 
@@ -1008,8 +1027,11 @@ mod tests {
 
         let descendant_pid = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
-                if let Ok(contents) = std::fs::read_to_string(&pid_file) {
-                    break contents.trim().parse::<u32>().unwrap();
+                if let Ok(pid) = std::fs::read_to_string(&pid_file)
+                    .map_err(|_| ())
+                    .and_then(|contents| contents.trim().parse::<u32>().map_err(|_| ()))
+                {
+                    break pid;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
@@ -1263,6 +1285,66 @@ mod tests {
 
     fn printf_spec(output: &str) -> OciSpec {
         spec_with_args(vec!["printf".to_string(), output.to_string()])
+    }
+
+    /// V02 soak blocker (candidate 3fcb1fd): after a SIGKILL, Bun re-follows
+    /// every adopted instance's capture file from byte 0. The soak's log
+    /// spammer had written about a million lines in 80 minutes, and the
+    /// forwarder split them in one synchronous call on a runtime worker. On a
+    /// two-vCPU node that starved startup adoption for 11 minutes, until the
+    /// next instance's 10 s adoption deadline expired and Bun exited.
+    ///
+    /// Replaying a backlog must hand the runtime back between bounded chunks,
+    /// so a concurrent task (here a 1 ms timer, standing in for adoption)
+    /// keeps running on a single-threaded runtime.
+    #[tokio::test(flavor = "current_thread")]
+    async fn replaying_a_large_capture_backlog_does_not_hold_the_runtime() {
+        const LINE: &str = "spam the quick brown fox jumps\n";
+        const LINES: usize = 128 * 1024;
+        let dir = tempfile::tempdir().unwrap();
+        let grill = ProcessGrill::with_log_dir(dir.path().to_path_buf());
+        let id = InstanceId("spammer-0".to_string());
+        grill.create(&id, &sleep_spec("60")).await.unwrap();
+        grill.start(&id).await.unwrap();
+        let capture = dir.path().join("spammer-0.stdout");
+        std::fs::write(&capture, LINE.repeat(LINES)).unwrap();
+
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(256);
+        let follower = grill.clone();
+        let follow_id = id.clone();
+        let task = tokio::spawn(async move { follower.follow_logs(&follow_id, sender).await });
+        let consumer = tokio::spawn(async move {
+            let mut last = None;
+            for _ in 0..LINES {
+                last = receiver.recv().await;
+            }
+            last
+        });
+
+        let mut longest_stall = std::time::Duration::ZERO;
+        let replay_started = std::time::Instant::now();
+        while !consumer.is_finished() {
+            let tick = std::time::Instant::now();
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            longest_stall = longest_stall.max(tick.elapsed());
+            assert!(
+                replay_started.elapsed() < std::time::Duration::from_secs(60),
+                "the backlog was not replayed within 60 s"
+            );
+        }
+        let last = consumer.await.unwrap().expect("replay ended early");
+        task.abort();
+        grill.kill(&id).await.unwrap();
+
+        assert_eq!(
+            last.position.unwrap().end_offset,
+            (LINE.len() * LINES) as u64,
+            "every line of the backlog is replayed, in order"
+        );
+        assert!(
+            longest_stall < std::time::Duration::from_secs(1),
+            "replaying the backlog held the runtime for {longest_stall:?}"
+        );
     }
 
     /// V02 soak follow-up: after a graceful whole-cluster stop and start, a

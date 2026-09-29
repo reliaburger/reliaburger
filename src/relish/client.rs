@@ -135,21 +135,39 @@ fn render_log_entries(entries: &[crate::ketchup::types::LogEntry], options: &Log
         .iter()
         .filter(|entry| options.matches(&entry.line))
         .collect();
-    let instances: std::collections::BTreeSet<Option<&str>> = shown
+    // A run is one instance on one node. An instance that moves keeps its
+    // name, and the view interleaves its two runs by two nodes' clocks, so
+    // the label names the node wherever the name alone would hide the move.
+    let runs: std::collections::BTreeSet<(Option<&str>, Option<&str>)> = shown
         .iter()
-        .map(|entry| entry.instance.as_deref())
+        .map(|entry| (entry.instance.as_deref(), entry.node.as_deref()))
         .collect();
-    let label = instances.len() > 1;
+    let label = runs.len() > 1;
     let mut output = String::new();
     for entry in shown {
         if label {
-            output.push_str(&format!("[{}] ", entry.instance.as_deref().unwrap_or("-")));
+            output.push_str(&format!("[{}] ", run_label(entry, &runs)));
         }
         output.push_str(&entry.line);
         output.push('\n');
     }
     output.pop();
     output
+}
+
+/// `instance`, or `instance@node` when that instance name ran on more than
+/// one node in `runs`.
+fn run_label(
+    entry: &crate::ketchup::types::LogEntry,
+    runs: &std::collections::BTreeSet<(Option<&str>, Option<&str>)>,
+) -> String {
+    let instance = entry.instance.as_deref();
+    let name = instance.unwrap_or("-");
+    let moved = runs.iter().filter(|(other, _)| *other == instance).count() > 1;
+    match &entry.node {
+        Some(node) if moved => format!("{name}@{node}"),
+        _ => name.to_string(),
+    }
 }
 
 /// How long [`BunClient::release_test_lease`] waits for server-confirmed
@@ -164,7 +182,8 @@ pub fn lease_release_budget() -> std::time::Duration {
 /// How long [`BunClient::clear_fault`] keeps asking while the owning node
 /// answers 504 because the leader has not yet released a node fault's
 /// reservation. The leader releases it once it sees the healed node alive,
-/// which takes a gossip round or two; each attempt already waits 4 s.
+/// which takes a gossip round or two; each attempt already waits up to 4 s on
+/// the owning node (its agent's answer plus the release wait).
 pub const FAULT_CLEAR_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 /// Pause between those attempts.
 const FAULT_CLEAR_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(500);
@@ -1417,12 +1436,14 @@ impl BunClient {
     }
 
     /// Restore a snapshot over its live volume. The app must be
-    /// stopped first; a 409 means it isn't.
+    /// stopped first; a 409 means it isn't, or that several volumes
+    /// share the name and `volume` must pick one.
     pub async fn snapshot_restore(
         &self,
         app: &str,
         namespace: &str,
         name: &str,
+        volume: Option<&str>,
     ) -> Result<(), RelishError> {
         let url = format!(
             "{}/v1/snapshots/{}/{}/restore",
@@ -1431,7 +1452,7 @@ impl BunClient {
         let response = self
             .http()?
             .post(&url)
-            .json(&serde_json::json!({ "name": name }))
+            .json(&serde_json::json!({ "name": name, "volume": volume }))
             .send()
             .await
             .map_err(classify_error)?;
@@ -1444,23 +1465,24 @@ impl BunClient {
         Ok(())
     }
 
-    /// Delete a snapshot.
+    /// Delete a snapshot. `volume` picks between volumes that share
+    /// the name.
     pub async fn snapshot_delete(
         &self,
         app: &str,
         namespace: &str,
         name: &str,
+        volume: Option<&str>,
     ) -> Result<(), RelishError> {
         let url = format!(
             "{}/v1/snapshots/{}/{}/{}",
             self.base_url, namespace, app, name
         );
-        let response = self
-            .http()?
-            .delete(&url)
-            .send()
-            .await
-            .map_err(classify_error)?;
+        let mut request = self.http()?.delete(&url);
+        if let Some(volume) = volume {
+            request = request.query(&[("volume", volume)]);
+        }
+        let response = request.send().await.map_err(classify_error)?;
 
         let status = response.status().as_u16();
         if !response.status().is_success() {
@@ -2582,8 +2604,19 @@ mod tests {
             timestamp: sequence / 1_000_000_000,
             sequence,
             instance: Some(instance.to_string()),
+            node: None,
             stream: crate::ketchup::types::LogStream::Stdout,
             line: line.to_string(),
+        }
+    }
+
+    fn stored_on(
+        node: &str,
+        entry: crate::ketchup::types::LogEntry,
+    ) -> crate::ketchup::types::LogEntry {
+        crate::ketchup::types::LogEntry {
+            node: Some(node.to_string()),
+            ..entry
         }
     }
 
@@ -2612,6 +2645,49 @@ mod tests {
             "[soak-redis-client-0] INCR 3550\n\
              [soak-redis-client-1] INCR 3551\n\
              [soak-redis-client-0] INCR 3552"
+        );
+    }
+
+    /// V02 soak, 28 Sep 2026: an upgrade walk moved `soak-redis-client-0`
+    /// to another node under the same name. Both runs' lines looked like one
+    /// instance's, so ordering them by two nodes' clocks read as the client
+    /// going backwards. The same name on two nodes gets the node in its label.
+    #[tokio::test]
+    async fn one_instance_on_two_nodes_names_each_line_s_node() {
+        let output = render_queried_logs(vec![
+            stored_on("rb-2", queried(1, "soak-redis-client-0", "INCR 11630")),
+            stored_on("rb-3", queried(2, "soak-redis-client-0", "INCR 11632")),
+            stored_on("rb-2", queried(3, "soak-redis-client-0", "INCR 11631")),
+            stored_on("rb-3", queried(4, "soak-redis-client-0", "INCR 11633")),
+        ])
+        .await;
+        assert_eq!(
+            output,
+            "[soak-redis-client-0@rb-2] INCR 11630\n\
+             [soak-redis-client-0@rb-3] INCR 11632\n\
+             [soak-redis-client-0@rb-2] INCR 11631\n\
+             [soak-redis-client-0@rb-3] INCR 11633"
+        );
+    }
+
+    /// One instance on one node prints bare even though the cross-node query
+    /// names the node, and several instances keep their short labels.
+    #[tokio::test]
+    async fn the_node_stays_out_of_labels_it_does_not_disambiguate() {
+        let output = render_queried_logs(vec![
+            stored_on("rb-2", queried(1, "soak-redis-client-0", "INCR 1")),
+            stored_on("rb-2", queried(2, "soak-redis-client-0", "INCR 2")),
+        ])
+        .await;
+        assert_eq!(output, "INCR 1\nINCR 2");
+        let output = render_queried_logs(vec![
+            stored_on("rb-2", queried(1, "soak-redis-client-0", "INCR 3550")),
+            stored_on("rb-3", queried(2, "soak-redis-client-1", "INCR 3551")),
+        ])
+        .await;
+        assert_eq!(
+            output,
+            "[soak-redis-client-0] INCR 3550\n[soak-redis-client-1] INCR 3551"
         );
     }
 

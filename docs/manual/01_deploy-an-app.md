@@ -108,6 +108,12 @@ drain_timeout = "30s"     # default 30s
 auto_rollback = true      # default true
 ```
 
+An app with a managed volume always rolls stop-first: Bun stops the old
+instance before it starts the new one, whatever `strategy` and `max_surge`
+say, because both would write the same volume directory. Expect a moment
+of unavailability on every redeploy of such an app. Host-path volumes don't
+change the rollout.
+
 ```sh
 relish history web               # what shipped when
 relish rollback web              # back to the previous version

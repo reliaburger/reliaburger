@@ -704,6 +704,157 @@ every node an app ever ran on, is state the cluster would have to keep
 forever for the sake of a log query. `tail_after_an_app_moves_back_includes_the_nodes_it_ran_on_meanwhile`
 reproduces the soak with two stores and fails against the old node choice.
 
+### Two runs, one name
+
+The final soak tier found the next one, and it was the same shape again. The
+tail read `INCR 11630`, `INCR 11632`, `INCR 11631`, `INCR 11633`: one swap,
+no label, so it looked like a single client counting backwards. The status
+snapshots either side of it had the client on node 2 and then on node 3. A
+rollback walk had just restarted every node's Bun, and the scheduler moved
+the client in the middle of it. Same instance name, `default__soak-redis-client-0`,
+on both nodes.
+
+The labelling we added for rolling deploys keys on the instance name, so two
+runs of one name printed bare. And the merge put them in order by `sequence`,
+which is ingest time in nanoseconds *on the node that stored the line*. Each
+node's sequence rises strictly, so node 2's lines are in order and so are
+node 3's. Between the two, the order is only as good as two VMs' clocks plus
+up to 200 ms of capture polling each. The old run's last `INCR` and the new
+run's first one were well inside that. Nothing went backwards. Two processes
+wrote, and we sorted them by two clocks.
+
+Could we sort them properly? Not with timestamps. The capture file holds raw
+bytes with no emission time, and even an emission time would come from two
+different clocks. There is no single order between two processes on two
+machines to recover, only the counter itself. So the fix is to stop hiding
+that there were two. The cross-node merge now names the node on every entry:
+
+```rust
+let entry = LogEntry {
+    node: Some(source.node_id.clone()),
+    ..entry
+};
+```
+
+`..entry` is the struct update syntax from Chapter 1. Here it *moves* the
+other fields out of `entry`, strings and all, with no copying; that's fine
+because the loop owns `entry` and never touches it again. The field itself is `#[serde(default,
+skip_serializing_if = "Option::is_none")]`, so a node answering for itself
+sends exactly what it sent before, and the node-to-node format doesn't move.
+
+`relish logs` then labels by *run*, an `(instance, node)` pair, and adds the
+node only where the name alone is ambiguous: `[default__soak-redis-client-0@rb-2]`.
+Two replicas on two nodes keep their short `[instance]` labels. The soak
+checker now judges order within each labelled run, and "the view ends below
+what we saw before" against the newest line of any run.
+`one_instance_on_two_nodes_names_each_line_s_node` and
+`merged_entries_name_the_node_that_stored_them` fail without the change.
+
+### Eleven minutes of splitting lines
+
+Re-reading every capture file from byte 0 after a restart looked free: the
+store skips what it already holds. Then a release candidate's soak SIGKILLed
+the leader's Bun, systemd started a new one two seconds later, and it
+printed nothing for eleven minutes. At 21:00:25 it gave up with `cannot
+restore workload ownership: runtime adoption timed out for
+default__hello-0` and exited. systemd's summary line had the real clue:
+`Consumed 11min 24.238s CPU time` in 11 minutes 17 seconds of wall time.
+Something had kept a CPU busy the whole time while adoption waited.
+
+Adoption itself was innocent. As it adopts each instance, Bun spawns the
+log forwarder that follows its capture file from the start. One of the
+soak's workloads is a log spammer, 200 lines a second, and after 80 minutes
+its capture held about a million lines. The forwarder read the whole file
+into one buffer and handed it to `CaptureReader::push`, which did this:
+
+```rust
+while let Some(newline) = self.partial.iter().position(|byte| *byte == b'\n') {
+    let raw: Vec<u8> = self.partial.drain(..=newline).collect();
+    // ...
+}
+```
+
+`Vec::drain(..=newline)` removes the front of the vector, and a `Vec` keeps
+its elements contiguous, so every call shifts all the bytes behind it
+forward. One line costs the size of the rest of the buffer; a million lines
+cost a million times half of 56 MB. It's the same trap as `list.pop(0)` in
+a Python loop, and like the Python version it's invisible on the small
+inputs every unit test uses.
+
+That's the slow part. What made it fatal is where it ran. Tokio runs tasks
+on a small pool of worker threads, one per CPU by default, and a task only
+gives its thread back at an `.await`. `push` is an ordinary synchronous
+function, so for as long as it ran, its worker ran nothing else. The soak
+VMs have two vCPUs, so two workers. Tokio can steal queued work from a busy
+worker, but not all of it: the task a worker has just woken waits in a slot
+only that worker polls. The journals can't tell us exactly which task was
+stuck where, only that adoption's work and its 10 s deadline (a timer needs
+a free worker to notice it) got nowhere until the splitting was done. By
+then the deadline was eleven minutes old. The numbers fit: the unit test
+below, a 4 MiB backlog, stalls for 5.5 s with the old code, and the cost
+grows with bytes times lines, which puts the spammer's capture at around
+ten minutes.
+
+Why did earlier candidates survive the same fault? Scheduling and log
+volume. Two seconds after this failure, systemd's next Bun adopted all nine
+instances with the same files on disk, because this time the scheduling fell
+the other way. The bug arrived with the offsets change a few days earlier,
+and it needs a capture this big on the node being killed.
+
+The fix has two halves. `push` now walks the buffer once, remembering where
+the current line starts, and drains the finished lines in one go at the end:
+
+```rust
+let mut search_from = self.partial.len();
+self.partial.extend_from_slice(bytes);
+let mut line_start = 0;
+while let Some(found) = self.partial[search_from..]
+    .iter()
+    .position(|byte| *byte == b'\n')
+{
+    let newline = search_from + found;
+    // ... hand back `self.partial[line_start..newline]` ...
+    line_start = newline + 1;
+    search_from = line_start;
+}
+self.partial.drain(..line_start);
+```
+
+`self.partial[search_from..]` is a slice, a borrowed view into the vector
+with no copy, like a Go slice expression. Starting the search at the old
+length is safe because bytes already waiting are, by definition, the part
+of a line with no newline yet.
+
+The second half matters more: no forwarder reads a whole file any more.
+`read_capture_chunk` returns at most `CAPTURE_CHUNK_BYTES` (64 KiB) from a
+given offset, and both the runc and process runtimes loop on it, skipping
+their 200 ms poll interval while chunks come back full. Every chunk is a
+`tokio::fs` read, which is an `.await`, so between chunks the worker is free
+for everyone else. A hundred-megabyte backlog still takes a while to
+replay; it just can't take the node with it. The process runtime had a
+quieter version of the same problem: it called `std::fs::read` on the whole
+file every 200 ms, blocking I/O on a runtime thread, for as long as the
+workload lived.
+
+The tests measure the thing the soak felt. `replaying_a_large_capture_backlog_does_not_hold_the_runtime`
+writes a 4 MiB backlog, follows it on a single-threaded runtime, and times a
+1 ms sleep in a loop while the lines arrive; the old code held the runtime
+for 5.5 s in one go, the new one for a few milliseconds at most. The runc version,
+`following_a_large_capture_after_a_restart_does_not_hold_the_runtime`, has a
+real container print 200,000 lines and follows it from a fresh runtime
+handle, as a restarted Bun would. `a_backlog_of_short_lines_splits_in_linear_time`
+pins `push` itself.
+
+Should one stuck instance be able to stop a node at all? Adoption is
+fail-closed by design: an instance Bun can't prove it owns stops startup,
+because the alternative is a reconciler that doesn't see it and starts a
+second copy under the same name, port and address. Bounding each adoption
+and quarantining the stuck one is possible, but the quarantined instance
+would have to keep its name, port, lease and discovery address fenced, stay
+out of both "running" and "gone" in reports, and be retried. That's a
+design change with its own tests, and we've written it down for after
+0.1.0 rather than slip it in behind this fix.
+
 ## When nothing looks like success
 
 Both hardening passes share a pattern, and later reviews kept finding more of it: a failure that comes back dressed as an empty, successful answer. A directory called `blocked.parquet` made the exporter and both retention loops report success. A peer that sent `200 OK` and then went quiet hung a log query. A node that answered `{}` convinced the diagnostic collector there were no alerts. None of these crash. They lie quietly, which is worse.

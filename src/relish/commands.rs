@@ -139,10 +139,7 @@ async fn status_with_client(output: OutputFormat, client: &BunClient) -> Result<
                 );
                 for row in &statuses {
                     let s = &row.instance;
-                    let pid = s
-                        .pid
-                        .map(|p| p.to_string())
-                        .unwrap_or_else(|| "-".to_string());
+                    let pid = pid_cell(s);
                     println!(
                         "{:<24} {:<20} {:<15} {:<12} {:<10} {:<10} {:<6}",
                         row.node, s.id, s.app_name, s.namespace, s.state, pid, s.restart_count
@@ -479,6 +476,8 @@ async fn inspect_with_client(name: &str, client: &BunClient) -> Result<(), Relis
             println!("  Restarts:  {}", s.restart_count);
             if let Some(pid) = s.pid {
                 println!("  PID:       {pid}");
+            } else if s.runtime_unknown {
+                println!("  PID:       unknown (the runtime was busy)");
             }
             if let Some(port) = s.host_port {
                 println!("  Port:      {port}");
@@ -1429,6 +1428,16 @@ pub async fn top(output: OutputFormat) -> Result<(), RelishError> {
     Ok(())
 }
 
+/// An instance's PID for a table: `-` when it has none, `?` when the node's
+/// runtime didn't answer in time.
+fn pid_cell(status: &crate::bun::agent::InstanceStatus) -> String {
+    match status.pid {
+        Some(pid) => pid.to_string(),
+        None if status.runtime_unknown => "?".to_string(),
+        None => "-".to_string(),
+    }
+}
+
 /// The `relish top` table.
 fn render_top(rows: &[crate::bun::top::TopRow]) -> String {
     use std::fmt::Write as _;
@@ -1441,11 +1450,7 @@ fn render_top(rows: &[crate::bun::top::TopRow]) -> String {
         "NODE", "APP", "NAMESPACE", "STATE", "PID", "RESTARTS", "CPU", "MEMORY"
     );
     for row in rows {
-        let pid = row
-            .instance
-            .pid
-            .map(|pid| pid.to_string())
-            .unwrap_or_else(|| "-".to_string());
+        let pid = pid_cell(&row.instance);
         let cpu = row
             .cpu_percent
             .map(|cpu| format!("{cpu:.1}%"))
@@ -2207,17 +2212,31 @@ pub async fn snapshot_list(app: &str, namespace: &str) -> Result<(), RelishError
 }
 
 /// Restore a snapshot over its live volume (stop the app first).
-pub async fn snapshot_restore(app: &str, namespace: &str, name: &str) -> Result<(), RelishError> {
+/// `volume` picks between volumes that share the snapshot name.
+pub async fn snapshot_restore(
+    app: &str,
+    namespace: &str,
+    name: &str,
+    volume: Option<&str>,
+) -> Result<(), RelishError> {
     let client = BunClient::default_local();
-    client.snapshot_restore(app, namespace, name).await?;
+    client
+        .snapshot_restore(app, namespace, name, volume)
+        .await?;
     println!("restored {namespace}/{app} from snapshot {name}");
     Ok(())
 }
 
-/// Delete a snapshot.
-pub async fn snapshot_delete(app: &str, namespace: &str, name: &str) -> Result<(), RelishError> {
+/// Delete a snapshot. `volume` picks between volumes that share the
+/// snapshot name.
+pub async fn snapshot_delete(
+    app: &str,
+    namespace: &str,
+    name: &str,
+    volume: Option<&str>,
+) -> Result<(), RelishError> {
     let client = BunClient::default_local();
-    client.snapshot_delete(app, namespace, name).await?;
+    client.snapshot_delete(app, namespace, name, volume).await?;
     println!("deleted snapshot {name} of {namespace}/{app}");
     Ok(())
 }
@@ -2259,6 +2278,7 @@ mod tests {
                 host_port: None,
                 exit_code: None,
                 pid,
+                runtime_unknown: false,
             },
             cpu_percent: cpu,
             memory_bytes: memory,
@@ -2284,6 +2304,20 @@ mod tests {
             ),
             top_row("rb-3", "default__podinfo-0", None, None, None),
         ]));
+    }
+
+    #[test]
+    fn top_marks_a_pid_the_runtime_did_not_report_in_time() {
+        let mut busy = top_row("rb-2", "default__podinfo-1", None, None, None);
+        busy.instance.runtime_unknown = true;
+        let table = render_top(&[
+            top_row("rb-1", "default__podinfo-0", None, None, None),
+            busy,
+        ]);
+        let pid_column = |line: &str| line.split_whitespace().nth(4).map(str::to_string);
+        let lines: Vec<&str> = table.lines().collect();
+        assert_eq!(pid_column(lines[1]).as_deref(), Some("-"), "{table}");
+        assert_eq!(pid_column(lines[2]).as_deref(), Some("?"), "{table}");
     }
 
     #[test]
