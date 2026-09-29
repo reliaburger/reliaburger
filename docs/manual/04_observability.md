@@ -99,6 +99,8 @@ With `--name` you get one line per instance, a rate for counters and a
 sparkline; a histogram named by its base shows mean latency per instance.
 `up` is 1 while an instance's last scrape worked and 0 when it failed. The
 app's page in the web dashboard charts the same data, one line per instance.
+Axes and legends pick a readable unit (`12 MiB`, `300 µs`, `1.5k req/s`),
+and the legend shows each line's newest value until you hover over a point.
 
 There's no PromQL. You read metrics through `relish metrics`, the dashboards
 and the API. For something that isn't an app on the cluster, such as a node

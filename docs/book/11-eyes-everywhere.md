@@ -538,16 +538,82 @@ We split rendering into two layers:
 
 uPlot is a 10KB JavaScript library that renders time-series charts on a canvas element. It handles millions of data points at 60fps — massively overkill for our use case, but that means it'll never be the bottleneck.
 
-The server doesn't know about uPlot. It renders a `<div>` with a JSON `data-chart-config` attribute:
+The server doesn't know about uPlot. It renders a `<div>` with a JSON `data-chart-config` attribute: the endpoint to poll, a title, a unit, and how often and how far back to fetch.
+
+A small custom script (`brioche.js`) finds these elements on page load, creates uPlot instances, and periodically fetches data from the existing metrics API. The metrics endpoints already return JSON arrays of `{timestamp, value}` objects — no new backend work needed.
+
+### Units a human can read
+
+The first version put the raw numbers on the axis: `0.0003` next to the word "seconds", `10M` next to "bytes". On the dark panels the tick labels and legend were dark grey on navy, and the legend read `TIME: --` until you hovered over a point. You could read the charts. You just had to squint and do arithmetic.
+
+So each chart now carries a unit instead of an axis title. In Rust that's an enum, not a string:
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChartUnit {
+    Percent,
+    Bytes,
+    Seconds,
+    RequestsPerSecond,
+    Number,
+}
+```
+
+Every unit owns a *ladder*: bytes go B → KiB → MiB → GiB, seconds go ns → µs → ms → s. A value is shown in the largest step that doesn't exceed it, with three significant figures at most. So 1023 bytes is `1023 B` and 1024 is `1 KiB`; 999 µs stays `999 µs` and 0.001 s becomes `1 ms`. An axis picks one step for all its ticks, from the largest, so it reads `0.5 MiB, 1 MiB, 1.5 MiB` rather than mixing units.
+
+The ladders are constant arrays built with a `const fn`, a function the compiler can run at compile time (think of a C macro that type-checks):
+
+```rust
+const fn step(factor: f64, suffix: &'static str) -> UnitStep {
+    UnitStep { factor, suffix }
+}
+
+const SECONDS: [UnitStep; 4] = [
+    step(1e-9, " ns"),
+    step(1e-6, " µs"),
+    step(1e-3, " ms"),
+    step(1.0, " s"),
+];
+```
+
+`&'static str` is a string slice that lives for the whole program: string literals are baked into the binary, so the borrow checker knows they never go away. That's what lets `ChartUnit::steps()` hand out `&'static [UnitStep]` without anybody owning a copy.
+
+Now, the formatting has to happen in the browser, because uPlot picks tick positions as you resize. Brioche has no JavaScript test harness, and we didn't want Node in the portable test suite just for eight lines of arithmetic. So Rust owns the part that's easy to get wrong, the boundaries, and ships it to the browser. Instead of `#[derive(Serialize)]`, `ChartUnit` implements the trait by hand and serialises as its ladder:
+
+```rust
+impl Serialize for ChartUnit {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.steps().serialize(serializer)
+    }
+}
+```
+
+A derive would have written `"Seconds"`, and then `brioche.js` would need its own copy of every ladder. Writing the impl ourselves is the Rust way of saying "this type goes over the wire as something else". The config now looks like this:
 
 ```html
-<div data-chart-config='{"endpoint":"/v1/metrics/app/web/default?name=process_cpu_percent",
-                          "title":"CPU Usage","y_label":"%",
-                          "refresh_secs":10,"range_secs":3600}'>
+<div data-chart-config='{"endpoint":"/v1/metrics/app/web/default/chart?name=process_cpu_percent&kind=gauge",
+                          "title":"CPU Usage","unit":[{"factor":1.0,"suffix":"%"}],
+                          "refresh_secs":10,"range_secs":900}'>
 </div>
 ```
 
-A small custom script (`brioche.js`, about 100 lines) finds these elements on page load, creates uPlot instances, and periodically fetches data from the existing metrics API. The metrics endpoints already return JSON arrays of `{timestamp, value}` objects — no new backend work needed.
+`brioche.js` runs the same two rules as `ChartUnit::format` and `ChartUnit::format_axis` over whatever ladder it receives, and the unit tests in `src/brioche/units.rs` pin the boundaries: 1023/1024 B, 999 µs/1 ms, zero, and values far past the top step. The JavaScript mirror is the one piece the tests don't execute, which is why it stays small enough to read side by side with the Rust. For byte axes it also asks uPlot for tick spacings of 1, 2 and 5 times each step, so ticks land on whole mebibytes instead of every 2,000,000 bytes.
+
+The legend got two fixes. uPlot calls a series' `value` function with a null index when nobody is hovering; ours answers with the newest value (and `latest` for the time column) instead of `--`. And the dashboard's table styles were leaking into uPlot's legend, which is a table: uppercase, grey `th` cells. The legend now uses the theme's tokens.
+
+Those tokens live in `brioche.css`:
+
+```css
+:root {
+    --bg: #1a1a2e;
+    --panel: #16213e;
+    --fg: #e0e0e0;
+    --fg-muted: #b4bccb;
+    --chart-grid: #34416a;
+}
+```
+
+A canvas can't read CSS variables, so `brioche.js` reads them once with `getComputedStyle` and hands uPlot plain colours for the tick labels and gridlines. A test in `src/brioche/assets.rs` parses the embedded stylesheet, computes the WCAG contrast ratio of each text token against each background, and fails below 4.5:1 (AA for normal text). The muted grey now sits at about 8.3:1 on the chart panel (the old `#888` managed 4.5:1 by a whisker, and the legend was darker still). Gridlines aren't text, so they only have to show and stay fainter than the labels; the same test checks that too. Change a colour and the build tells you whether people can still read it.
 
 ### Vendored assets, no build pipeline
 
@@ -559,7 +625,7 @@ HTMX and uPlot ship as single minified JS files. We vendor them into `brioche/di
 struct BriocheAssets;
 ```
 
-At runtime, `GET /ui/static/htmx.min.js` serves the file from the binary's memory. No filesystem reads, no CDN dependency, no separate install step. Total JS payload: ~50KB (HTMX) + ~50KB (uPlot) + ~3KB (custom) — about 103KB uncompressed. For comparison, Grafana loads 2-5MB of JavaScript.
+At runtime, `GET /ui/static/htmx.min.js` serves the file from the binary's memory. No filesystem reads, no CDN dependency, no separate install step. Total JS payload: ~50KB (HTMX) + ~50KB (uPlot) + ~10KB (custom) — about 110KB uncompressed. For comparison, Grafana loads 2-5MB of JavaScript.
 
 ### App detail page
 
