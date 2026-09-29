@@ -82,6 +82,12 @@ impl CrlHandle {
         *guard = crl;
     }
 
+    /// Node identities the operator has permanently retired.
+    pub fn retired_node_ids(&self) -> std::collections::BTreeSet<String> {
+        let guard = self.inner.read().unwrap_or_else(|p| p.into_inner());
+        guard.retired_nodes.keys().cloned().collect()
+    }
+
     /// Check a certificate serial against the CRL.
     pub fn check(&self, serial: super::types::SerialNumber) -> Result<(), CertError> {
         let guard = self.inner.read().unwrap_or_else(|p| p.into_inner());
@@ -961,7 +967,12 @@ mod tests {
                 "released_placements": {"run1": 2}
             }
         });
+        assert!(handle.retired_node_ids().is_empty());
         handle.update(serde_json::from_value(json).unwrap());
+        assert_eq!(
+            handle.retired_node_ids(),
+            std::collections::BTreeSet::from(["retired-worker".to_string()])
+        );
         assert!(
             try_handshake(server.clone(), client).await.is_err(),
             "the retired identity must stop authenticating even without a serial revocation"

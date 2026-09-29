@@ -2890,6 +2890,107 @@ nothing, a worker that has never had an answer sends nothing at all, and
 neither does one whose agent loop has exited (its end of the channel is
 closed, so it's gone, not busy).
 
+### Remembering, with a limit
+
+The `KnownMembers` fix earlier in this chapter had a quiet flaw: it never
+forgot anything. Every node that ever joined kept its last address in the
+table until Bun restarted. That's fine for a node-killed peer, which is the
+whole point. It's less fine for a node that left on purpose, or one the
+operator decommissioned last week. Neither holds a fault anyone could clear,
+and a relay aimed at them just waits for a connection timeout.
+
+So when should a remembered member go? There are three answers, and the
+table needs all of them.
+
+A node that *left* announced it. Gossip marks it `Left`, holds that entry for
+a minute so everyone hears, then reaps it. But the refresher couldn't see any
+of that. It read the same watch the scheduler reads, and that watch publishes
+only members that aren't down. A member that left and a member that died
+vanished from it in exactly the same way. Rather than change what that watch
+means (the scheduler, the council and Pickle all treat "published" as "worth
+talking to"), gossip got a second one. `MembershipTable::roster()` returns
+every member, down ones included, until they're reaped, and
+`MustardNode::set_roster_watch` publishes it next to the old view. The
+refresher reads the roster. A `Left` entry is forgotten on sight.
+
+A node the operator *retired* is gone for good: its identity is on the CRL,
+and Chapter 4's mTLS verifiers already refuse it. Every node keeps a
+`CrlHandle` fresh from Raft, so the refresher asks it for
+`retired_node_ids()` and drops those too.
+
+Everything else gets a time limit, and the question is how long. The only
+reason to keep a dead node's address is to clear a fault on it. A fault can
+only be injected into a live node, and Smoker clamps every fault to 24 hours
+(`MAX_FAULT_DURATION_NS`). So a node that nobody has heard from in 24 hours
+can't be holding a fault anyone could still clear. That's the bound:
+
+```rust
+pub const KNOWN_MEMBER_RETENTION: std::time::Duration =
+    std::time::Duration::from_nanos(crate::smoker::types::MAX_FAULT_DURATION_NS);
+```
+
+We could have typed `from_secs(24 * 3600)` and been right today. Deriving it
+from Smoker's ceiling says *why* it's 24 hours, and if someone ever raises
+that ceiling, the table follows. `from_nanos` is a `const fn`, which is what
+lets it appear in a `const` at all: Rust evaluates constants at compile time,
+so only functions marked `const fn` can be called there.
+
+The clock the table measures from is "last heard alive or suspect", not "last
+seen in the roster". A dead member sits in the roster for another minute
+before gossip reaps it, and restarting the clock on every one of those
+refreshes would quietly stretch the limit. Each entry carries a `last_heard:
+Instant`, and `refresh` takes `now` as a parameter instead of calling
+`Instant::now()` itself. That makes the 24-hour tests instant: they pass
+`start + KNOWN_MEMBER_RETENTION` and one second past it, and check that the
+entry survives the first and not the second. The comparison uses
+`now.saturating_duration_since(last_heard)`, which returns zero rather than
+panicking if the two instants arrive out of order.
+
+One catch: a reaped member has already left the roster, so nothing gossip
+publishes will ever change when its 24 hours run out, or when it's retired.
+The refresher used to wake only on a new roster or directory. It now also
+ticks once a minute, which is plenty for a one-day limit.
+
+Five tests cover it: a dead member survives being reaped (the #244
+behaviour), a returning member's new address replaces the old one, a `Left`
+member is forgotten and doesn't come back as dead once gossip reaps it, a
+retired one is forgotten whether gossip still lists it or not, and the
+retention boundary itself. In gossip,
+`roster_watch_reports_down_members_the_active_watch_drops` checks that the
+old watch still hides Dead and Left members while the roster shows them, and
+that both views lose them once they're reaped.
+
+The same table fixed a smaller annoyance. `relish nodes` listed gossip's live
+view, so a node that died didn't show up as `dead`. It just wasn't there, and
+you had to notice the gap. The watch that hid it can't change, for the same
+reason as before, but the known table already holds exactly the rows we
+wanted. So `nodes_handler` asks it for its `down()` members and passes them
+to the agent inside the `Nodes` command. The agent lists its live members
+first, then any down member gossip doesn't list any more. It gives both the
+same council and leader check against Raft, because a dead voter is still a
+voter, and an operator staring at a dead node wants to know that first.
+
+Handing the rows to the agent instead of appending them in the handler is
+deliberate: the agent is where the Raft metrics live, so that's where the
+council flags get decided, once, for every row. The destructuring in its
+loop is worth a second look:
+
+```rust
+(node.is_council, node.is_leader) = roles(&node.node_id, false, false);
+```
+
+That's a *destructuring assignment*: a tuple pattern on the left of a plain
+`=`, assigning both fields at once. Rust has had it since 1.59; before that
+you needed a `let` and two more lines.
+
+Showing dead nodes also meant finding who relied on them being hidden. Three
+callers did. `relish upgrade` builds its rollout from the listing and would
+have tried to upgrade a dead node (and refused the whole plan if it had no
+address). The test harness's node inventory would have tried to inspect one.
+Its route detection would have spent two timeouts probing one. Each now
+skips members for which `NodeStatus::is_down()` is true, which keeps their
+old behaviour exactly, and each has a test with a dead member in the listing.
+
 ### Everyone below the line
 
 Moving the snapshot request up fixed the one branch we'd caught starving. It

@@ -917,9 +917,7 @@ pub async fn council_recover(
     // cluster by mistake.
     if !force {
         if let Ok(nodes) = BunClient::default_local().nodes().await {
-            let live_voter = nodes
-                .iter()
-                .find(|n| n.is_council && !matches!(n.state.as_str(), "dead" | "left"));
+            let live_voter = nodes.iter().find(|n| n.is_council && !n.is_down());
             if let Some(voter) = live_voter {
                 return Err(RelishError::Recovery(format!(
                     "a live council voter ({}) is still reachable; stop the cluster or pass --force",

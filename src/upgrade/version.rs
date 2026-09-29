@@ -94,6 +94,43 @@ pub fn compiled_version() -> BinaryVersion {
         .expect("CARGO_PKG_VERSION is valid semver")
 }
 
+/// The git commit this binary was built from, when the build knew it.
+///
+/// Release builds get it from `RELIABURGER_GIT_SHA` in the build workflow;
+/// `build.rs` asks `git` for a build from a checkout, and a build from a
+/// source tree without git history has none.
+pub fn build_commit() -> Option<&'static str> {
+    option_env!("RELIABURGER_GIT_SHA").filter(|sha| !sha.is_empty())
+}
+
+/// Characters of the commit shown next to a version, as `git log --oneline`
+/// shows them.
+const SHORT_COMMIT_LEN: usize = 7;
+
+/// A version as people read it: `0.1.0 (3fcb1fd)`, or just the version when
+/// the commit is unknown.
+///
+/// Two builds of the same release number can hold different code, so the
+/// commit is what tells them apart.
+pub fn describe(version: &dyn fmt::Display, commit: Option<&str>) -> String {
+    match commit {
+        Some(commit) => {
+            let short = commit.get(..SHORT_COMMIT_LEN).unwrap_or(commit);
+            format!("{version} ({short})")
+        }
+        None => version.to_string(),
+    }
+}
+
+/// This binary's `--version` text: the Cargo package version and the build
+/// commit.
+///
+/// A `LazyLock` builds the string on first use and keeps it for the life
+/// of the process. Because the lock is a `static`, `&VERSION_LINE` borrows
+/// for `'static`, which is the lifetime clap needs.
+pub static VERSION_LINE: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| describe(&env!("CARGO_PKG_VERSION"), build_commit()));
+
 /// Path of the version-override sidecar for a resolved executable path:
 /// the file name with `.version` appended (`bun-v0.2.0` -> `bun-v0.2.0.version`).
 ///
@@ -127,6 +164,28 @@ mod tests {
 
     fn v(s: &str) -> BinaryVersion {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn describe_adds_the_short_commit_when_known() {
+        let sha = "3fcb1fdd0c1a2b3c4d5e6f708192a3b4c5d6e7f8";
+        assert_eq!(describe(&"0.1.0", Some(sha)), "0.1.0 (3fcb1fd)");
+        assert_eq!(describe(&v("0.1.0"), Some(sha)), "v0.1.0 (3fcb1fd)");
+        assert_eq!(describe(&"0.1.0", Some("abc")), "0.1.0 (abc)");
+        assert_eq!(describe(&"0.1.0", None), "0.1.0");
+    }
+
+    #[test]
+    fn version_line_carries_the_build_commit() {
+        let expected = describe(&env!("CARGO_PKG_VERSION"), build_commit());
+        assert_eq!(*VERSION_LINE, expected);
+        // A build from a checkout knows it. One where git can't read the
+        // repository (a copied tree, a container user git distrusts) doesn't,
+        // and must still build.
+        if let Some(commit) = build_commit() {
+            assert!(commit.len() >= SHORT_COMMIT_LEN, "{commit}");
+            assert!(commit.chars().all(|c| c.is_ascii_hexdigit()), "{commit}");
+        }
     }
 
     #[test]
