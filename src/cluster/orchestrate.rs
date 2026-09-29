@@ -1586,6 +1586,9 @@ fn spawn_placement_reconciler_with_io_timeout(
         // waits before the same specification is tried again, instead of
         // being redeployed on every poll.
         let mut backoff = super::deploy_backoff::DeployBackoff::default();
+        // Placements already reported as waiting for their allocation, so
+        // the wait is logged once rather than every poll.
+        let mut awaiting: HashSet<(String, String)> = HashSet::new();
         let retirer = Retirer {
             node_name: &node_name,
             cmd_tx: &cmd_tx,
@@ -1674,6 +1677,22 @@ fn spawn_placement_reconciler_with_io_timeout(
                 {
                     continue; // already converged; don't redeploy
                 }
+                // The leader commits a placement and its service allocation in
+                // separate writes, so an answer can place an app whose
+                // allocation hasn't committed yet (#309). The agent would refuse
+                // to register the service; a later poll carries it.
+                if awaits_allocation(&assignments.endpoint_catalog, assignment) {
+                    if awaiting.insert(key.clone()) {
+                        eprintln!(
+                            "orchestrator: {}/{} is placed here but its service allocation \
+                             hasn't committed yet; deploying once it has",
+                            key.0, key.1
+                        );
+                    }
+                    continue;
+                }
+                awaiting.remove(&key);
+
                 if !backoff.may_attempt(&key, &fingerprint, std::time::Instant::now()) {
                     continue;
                 }
@@ -1782,8 +1801,25 @@ fn spawn_placement_reconciler_with_io_timeout(
             }
 
             backoff.retain(|key| seen.contains(key));
+            awaiting.retain(|key| seen.contains(key));
         }
     })
+}
+
+/// Whether `assignment` declares a port that `catalog` doesn't allocate yet,
+/// at that port. The agent registers a clustered service only at its
+/// committed allocation, so deploying before it arrives can only fail.
+fn awaits_allocation(
+    catalog: &crate::onion::catalog::EndpointCatalog,
+    assignment: &NodeAssignment,
+) -> bool {
+    let Some(port) = assignment.spec.port else {
+        return false;
+    };
+    let service = crate::onion::service_id::ServiceId::new(&assignment.namespace, &assignment.name);
+    catalog
+        .resolve(&service)
+        .is_none_or(|allocation| allocation.port != port)
 }
 
 /// The (name, namespace) of every app `assignments` places on this node.
@@ -2413,6 +2449,80 @@ mod tests {
         );
         assert_eq!(order.first().map(String::as_str), Some("retire departed"));
         assert!(retired.is_ok(), "the retirement was never recorded");
+    }
+
+    /// #309: the leader commits an app's placement and its catalogue
+    /// allocation in separate council writes. When the catalogue write stalls
+    /// or is refused ("endpoint publication generation changed") the node's
+    /// answer places the app but its catalogue doesn't name the service yet.
+    /// The agent then refuses the deploy with "local service requires its
+    /// committed cluster allocation" and the app backs off. The reconciler
+    /// now waits for the allocation instead of spending a deploy on it.
+    #[tokio::test]
+    async fn a_placement_waits_for_its_committed_allocation_before_deploying() {
+        const WEB: &str = "[app.web]\nimage = \"proc-grill:image-ignored\"\n\
+                           command = [\"sleep\", \"60\"]\nport = 8080";
+        let leader = ScriptedLeader::serve(NodeAssignments {
+            apps: vec![assigned("web", "default", WEB)],
+            ..Default::default()
+        })
+        .await;
+        let root = tempfile::tempdir().unwrap();
+        let (commands, mut received) = mpsc::channel(8);
+        let reconciler = reconciler_for_deadline_test(leader.address, root.path(), commands);
+        let deploys = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = deploys.clone();
+        let agent = tokio::spawn(async move {
+            while let Some(command) = received.recv().await {
+                let Some(command) = answer_housekeeping(command) else {
+                    continue;
+                };
+                if let AgentCommand::Deploy { events, .. } = command {
+                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let _ = events
+                        .send(ApplyEvent::Error {
+                            message: "cluster discovery publication failed: local service \
+                                      requires its committed cluster allocation"
+                                .into(),
+                        })
+                        .await;
+                }
+            }
+        });
+
+        // Two full reconcile cycles with the allocation still missing.
+        tokio::time::sleep(RECONCILE_INTERVAL * 2 + Duration::from_millis(500)).await;
+        let early = deploys.load(std::sync::atomic::Ordering::SeqCst);
+
+        let service = crate::onion::service_id::ServiceId::new("default", "web");
+        let catalog = crate::onion::catalog::EndpointCatalog::new()
+            .reconcile(vec![(service, 8080, vec![])])
+            .unwrap();
+        leader.assign(NodeAssignments {
+            apps: vec![assigned("web", "default", WEB)],
+            endpoint_generation: 1,
+            endpoint_catalog: catalog,
+            ..Default::default()
+        });
+        let deployed = tokio::time::timeout(RECONCILE_INTERVAL * 3, async {
+            while deploys.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        reconciler.abort();
+        let _ = reconciler.await;
+        agent.abort();
+        leader.server.abort();
+
+        assert_eq!(
+            early, 0,
+            "deployed before the catalogue allocated the service"
+        );
+        assert!(
+            deployed.is_ok(),
+            "never deployed once the allocation arrived"
+        );
     }
 
     /// A lease released while this node is still waiting on a deploy retires
