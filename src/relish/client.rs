@@ -1530,13 +1530,9 @@ impl BunClient {
             // already filtered.
             let output = render_log_entries(&result.entries, options);
 
-            // Show warnings if any nodes were unreachable
+            // Name every node that contributed nothing, and why.
             for warning in &result.warnings {
-                match warning {
-                    crate::ketchup::types::LogQueryWarning::NodeUnresponsive { node_id } => {
-                        eprintln!("warning: node {node_id} did not respond");
-                    }
-                }
+                eprintln!("warning: {warning}");
             }
 
             // If we got entries, return them

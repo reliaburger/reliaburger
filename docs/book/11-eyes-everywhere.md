@@ -388,17 +388,51 @@ There's a subtle detail with `tail`. If you ask for `?tail=10` and the app runs 
 
 ### Graceful degradation
 
-If a node is unreachable, the fan-out returns empty for that node. The response includes a `warnings` array listing which nodes didn't respond:
+If a node is unreachable, the fan-out returns empty for that node. The response includes a `warnings` array listing which nodes didn't answer, and why:
 
 ```json
 {
   "entries": [...],
   "node_count": 3,
-  "warnings": [{"NodeUnresponsive": {"node_id": "node-7"}}]
+  "warnings": [{"NodeFailed": {
+    "node_id": "node-7",
+    "reason": {"kind": "timed_out", "after_ms": 10000}
+  }}]
 }
 ```
 
 You get partial results rather than a hard failure. The caller decides whether that's acceptable.
+
+The first version of this warning was `NodeUnresponsive { node_id }`, and it taught us something. A user reported `warning: node wolf4 did not respond` and nothing else (issue #241). Did wolf4 time out? Refuse the TLS handshake? Answer 403? The fan-out knew. Each per-node task already produced an error string, and the handler threw it away when it built the warning. "Did not respond" was also wrong half the time: a node that answers HTTP 500 responded just fine.
+
+So the reason is now a type, not a string:
+
+```rust
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum NodeFailureReason {
+    NotInMembership,
+    TimedOut { after_ms: u64 },
+    Transport { detail: String },
+    HttpStatus { status: u16, body: String },
+    BadBody { detail: String },
+    Internal { detail: String },
+}
+```
+
+Each kind points somewhere different. `NotInMembership` is a gossip question: the app is placed there, but there's no live address to ask. `TimedOut` is a slow or stuck node. `Transport` is the network or the certificates. `HttpStatus` and `BadBody` are the node's own API. `#[serde(tag = "kind")]` makes serde write the variant name *inside* the object (`{"kind": "timed_out", ...}`) rather than wrapping it (`{"TimedOut": {...}}`), which reads better in JSON and is what most non-Rust clients expect. `rename_all = "snake_case"` turns `TimedOut` into `timed_out`.
+
+Two details make the reasons worth reading. First, reqwest's top-level error says "error sending request for url (...)"; the useful part ("connection refused", "invalid peer certificate: UnknownIssuer") sits further down the `source()` chain, so `error_chain` walks it and joins every level. Second, a non-2xx answer keeps the first 200 characters of its body, because the body is usually where the node says *why* it refused.
+
+`LogQueryWarning` implements `Display`, the trait behind `{}` in format strings (Go's `String()` method, Python's `__str__`). Both consumers use it, so `relish logs` and `relish wtf` can't drift apart:
+
+```text
+warning: no logs from node wolf4: timed out after 10s
+warning: no logs from node wolf4: request failed (connect or TLS): ...: invalid peer certificate: UnknownIssuer
+warning: no logs from node wolf4: answered HTTP 500: {"error":"..."}
+```
+
+The warning is part of the API response between `relish` and bun, not something nodes exchange with each other (they swap plain `Vec<LogEntry>`), so the protocol generation didn't need a bump. The tests give each kind its own expected sentence, and the fan-out tests check that a refused connection, a 500, a bad body and a stalled body each land in the right variant.
 
 ### Testing cross-node queries
 

@@ -84,7 +84,27 @@ that version. `abort` refuses once a node has moved, and says which, because
 ending the upgrade then would leave the cluster on two versions.
 
 Rolling upgrades need matching protocol and state formats; `bun --compatibility`
-prints what a binary supports. Development builds' state isn't migrated.
+prints what a binary supports. Before 1.0, nothing migrates state between
+formats.
+
+### When bun refuses its data directory
+
+Swap in a binary with a different state format and bun won't start. The first
+line says what it found and what it needs, so even a truncated journal line
+carries it:
+
+```text
+incompatible state format: found 43; this binary (reliaburger 0.1.1) needs 44. Pre-1.0 builds don't migrate state: …
+```
+
+A join between mismatched binaries fails the same way, starting
+`cannot join: incompatible cluster formats: found protocol 26, state 43; …`.
+The refusal is deliberate and leaves the data untouched. You have two ways on:
+run the release that wrote the data (`bun --compatibility` on a candidate
+tells you its pair), or move the data directory aside and recreate the
+cluster. Don't write a new `state-format.json` by hand; the stamp is the only
+thing standing between the new binary and data it can't read. The policy is
+in [docs/releasing.md](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#cluster-compatibility).
 
 ## GitOps
 

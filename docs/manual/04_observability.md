@@ -27,6 +27,19 @@ that moved nodes keeps its name, so its two runs show as
 wrote them. Lines from different runs are interleaved by their nodes' clocks,
 so near-simultaneous lines from two runs can appear in either order.
 
+A node that contributes nothing gets a `warning:` line on stderr naming it and
+the reason, and you still get every other node's lines:
+
+| Warning ends with | What to look at |
+|---|---|
+| `not in the membership table` | the app is placed there but gossip doesn't see the node; `relish nodes` |
+| `timed out after 10s` | the node is up but slow or stuck; its journal, `relish wtf` |
+| `request failed (connect or TLS): …` | network, firewall or certificates between the nodes |
+| `answered HTTP 403: …` (or another status) | the node refused or failed; the body says why |
+| `answered with an unreadable body: …` | the node answered with something other than log entries |
+
+`relish wtf` reports the same reasons in its log evidence.
+
 Retention and export are node config:
 
 ```toml

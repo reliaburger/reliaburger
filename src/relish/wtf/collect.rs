@@ -919,12 +919,7 @@ fn append_logs(
     builder: &mut EvidenceBuilder<LogObservation>,
 ) {
     for warning in result.warnings {
-        match warning {
-            crate::ketchup::types::LogQueryWarning::NodeUnresponsive { node_id } => builder
-                .unavailable(format!(
-                    "{app}/{namespace}: log source node {node_id} did not answer"
-                )),
-        }
+        builder.unavailable(format!("{app}/{namespace}: {warning}"));
     }
     builder
         .values
@@ -978,6 +973,30 @@ mod tests {
             is_leader: true,
             labels: BTreeMap::new(),
         }
+    }
+
+    /// #282: wtf's log evidence names why a node's lines are missing.
+    #[test]
+    fn log_evidence_keeps_the_reason_a_node_sent_no_logs() {
+        use crate::ketchup::types::{LogQueryWarning, NodeFailureReason};
+        let mut builder = EvidenceBuilder::default();
+        append_logs(
+            "web",
+            "default",
+            LogQueryResult {
+                entries: vec![],
+                node_count: 2,
+                warnings: vec![LogQueryWarning::NodeFailed {
+                    node_id: "wolf4".to_string(),
+                    reason: NodeFailureReason::TimedOut { after_ms: 10_000 },
+                }],
+            },
+            &mut builder,
+        );
+        assert_eq!(
+            builder.errors,
+            ["web/default: no logs from node wolf4: timed out after 10s"]
+        );
     }
 
     #[test]

@@ -578,6 +578,48 @@ pub struct Compatibility {
 
 Every boundary checks the pair. Raft requests carry both generations, gossip rejects a mismatch before touching membership, reporting frames carry a fixed header, and a joining node has to match before it reveals its one-time token. Absent evidence is a refusal.
 
+#### A refusal you can act on
+
+A refusal is only as good as its first line. The 0.1.0 version said `invalid or incompatible state format at /var/lib/reliaburger/data/state-format.json; preserve the data and use a compatible binary`. Correct, and nearly useless. It didn't say which format it found, which one it wanted, or what "a compatible binary" might be. And `journalctl` cuts long lines at the terminal's width, so the part a user saw was mostly a path. A user who'd swapped in a newer dev build (issue #241) had no way to tell what went wrong or what to do about it.
+
+So every refusal now leads with the pair, then the remedy, then a link to the policy:
+
+```text
+incompatible state format: found 43; this binary (reliaburger 0.1.1) needs 44. Pre-1.0 builds don't migrate state: run the reliaburger release that wrote /var/lib/reliaburger/data/state-format.json, or move the data aside and recreate the cluster. See https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#cluster-compatibility
+```
+
+A stamp from another generation used to share a variant with a corrupt one. They're different problems (one has an answer, the other doesn't), so the number now travels in its own variant:
+
+```rust
+#[error(
+    "incompatible state format: found {found}; this binary ({}) needs {expected}. \
+     Pre-1.0 builds don't migrate state: run the reliaburger release that wrote {}, \
+     or move the data aside and recreate the cluster. See {POLICY_URL}",
+    this_binary(),
+    .stamp.display()
+)]
+StateMismatch { stamp: PathBuf, found: u32, expected: u32 },
+```
+
+Two bits of `thiserror` syntax are new here. `{found}` names a field of the variant, as before. The arguments after the string are extra format arguments, like trailing arguments to C's `printf`. They can be any expression, and a leading dot (`.stamp`) means "this variant's field", so `.stamp.display()` calls a method on it. `{POLICY_URL}` isn't a field at all: Rust's format strings capture a name from the surrounding scope, and a module-level `const` counts. The backslash at the end of a line continues the string literal and swallows the next line's leading whitespace, so the message stays one line on screen and readable in the source.
+
+`this_binary()` names the release, plus the commit when the build recorded one:
+
+```rust
+fn this_binary() -> String {
+    match option_env!("RELIABURGER_GIT_SHA") {
+        Some(commit) => format!("reliaburger {} ({commit})", env!("CARGO_PKG_VERSION")),
+        None => format!("reliaburger {}", env!("CARGO_PKG_VERSION")),
+    }
+}
+```
+
+`env!` and `option_env!` read an environment variable *at compile time* and bake it into the binary, a bit like a `-DVERSION=...` flag to a C compiler. `env!` fails the build if the variable is missing; Cargo always sets `CARGO_PKG_VERSION`, so that's safe. The commit is only there when the release pipeline sets it, so `option_env!` hands back an `Option<&'static str>` instead.
+
+The join refusal gets the same treatment. It used to wrap the mismatch as `cluster member rejected the join: ...`, which blamed a member that never rejected anything: the joiner itself refused the member's formats after asking `/v1/version`. `JoinClientError::Incompatible` now carries the `CompatibilityError` through `#[from]`, so `?` converts it and the message starts `cannot join: incompatible cluster formats: found protocol 26, state 43; this binary (...) needs protocol 27, state 44`.
+
+The tests pin the order, not just the content. A helper takes everything before the first `". "` and checks that it holds both numbers and the version, so a future edit can't push the key facts past the point where the journal cuts the line.
+
 A candidate binary gets checked too, before it's staged. Run `bun --compatibility` and it prints the pair as JSON without loading config or starting a runtime. The upgrade manager verifies the release signature first, writes those verified bytes to a private temporary file, runs *that* copy with `--compatibility`, and caps the output at 4 KiB with a ten-second deadline. Why a copy? Checking the download path and executing it later would let the file change in between. `NamedTempFile::into_temp_path` hands us a path that deletes the file when dropped, and closes our writable descriptor first, because Linux refuses to execute a file that's open for writing (`ETXTBSY`, "text file busy"). Even then, the full test suite caught the occasional `ETXTBSY`: another thread forking at the wrong moment briefly inherits the descriptor. That's a [known race in process launching](https://github.com/rust-lang/rust/issues/114554), so the probe retries that one error within the same deadline. Retrying can't turn an incompatible binary into an accepted one.
 
 Tests cover mismatched gossip and Raft messages, refused development state, rejected joins, signed-but-incompatible executables and rollback refusal. Test fixtures that model a *compatible* peer take their pair from `compatibility::CURRENT` rather than hard-coding numbers. We learnt that one when a state bump turned ten unrelated tests red at the compatibility check instead of at the behaviour they were meant to test.

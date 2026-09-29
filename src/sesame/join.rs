@@ -121,6 +121,9 @@ pub enum JoinClientError {
     Transport(String),
     #[error("cluster member rejected the join: {0}")]
     Rejected(String),
+    /// The member advertises cluster formats this binary can't speak.
+    #[error("cannot join: {0}")]
+    Incompatible(#[from] crate::compatibility::CompatibilityError),
     #[error("malformed join bundle: {0}")]
     Malformed(String),
     #[error(
@@ -150,9 +153,7 @@ impl JoinBundle {
     /// with the key from its own CSR. A `validate_chain` guard rejects a
     /// bundle whose leaf does not chain to the returned CA chain.
     pub fn into_identity(self, private_key_der: Vec<u8>) -> Result<NodeIdentity, JoinClientError> {
-        self.compatibility
-            .require_current()
-            .map_err(|e| JoinClientError::Rejected(e.to_string()))?;
+        self.compatibility.require_current()?;
         let decode = |field: &str, s: &str| {
             BASE64
                 .decode(s)
@@ -203,9 +204,7 @@ pub struct CaCertificates {
 impl CaCertificates {
     /// Decode the Node and Root CA DER bytes.
     pub fn decode(&self) -> Result<(Vec<u8>, Vec<u8>), JoinClientError> {
-        self.compatibility
-            .require_current()
-            .map_err(|e| JoinClientError::Rejected(e.to_string()))?;
+        self.compatibility.require_current()?;
         let node_ca = BASE64
             .decode(&self.node_ca_b64)
             .map_err(|e| JoinClientError::Malformed(format!("node_ca: {e}")))?;
@@ -287,10 +286,7 @@ pub async fn request_join(
         .json()
         .await
         .map_err(|e| JoinClientError::Malformed(e.to_string()))?;
-    version
-        .compatibility
-        .require_current()
-        .map_err(|e| JoinClientError::Rejected(e.to_string()))?;
+    version.compatibility.require_current()?;
 
     // Generate our own keypair and CSR. The private key stays here (PKI4).
     let (csr_der, private_key_der) = ca::create_node_csr(node_id)
@@ -650,6 +646,30 @@ mod tests {
         let bundle = JoinBundle::from_result(&result);
         let err = bundle.into_identity(key).unwrap_err();
         assert!(matches!(err, JoinClientError::Malformed(_)));
+    }
+
+    /// #281: a joiner refusing a member's formats says so first, with both
+    /// pairs, rather than blaming the member for a rejection it never sent.
+    #[test]
+    fn join_refusal_leads_with_the_member_s_formats_and_this_binary_s() {
+        let (state, token, master_secret) = setup_with_known_key();
+        let (result, key) =
+            issue(&state, &token, "node-02", SerialNumber(6), &master_secret).unwrap();
+        let mut bundle = JoinBundle::from_result(&result);
+        let current = crate::compatibility::CURRENT;
+        bundle.compatibility.protocol = current.protocol - 1;
+
+        let err = bundle.into_identity(key).unwrap_err();
+        assert!(matches!(err, JoinClientError::Incompatible(_)));
+        let message = err.to_string();
+        let expected_lead = format!(
+            "cannot join: incompatible cluster formats: found protocol {}, state {}; this binary (reliaburger {}",
+            current.protocol - 1,
+            current.state,
+            env!("CARGO_PKG_VERSION"),
+        );
+        assert!(message.starts_with(&expected_lead), "{message}");
+        assert!(message.contains("recreate the cluster"), "{message}");
     }
 
     #[test]
