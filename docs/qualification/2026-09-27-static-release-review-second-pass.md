@@ -1,5 +1,23 @@
 # 0.1.0 static release review: second pass
 
+## Status after 0.1.0 (29 Sep 2026)
+
+Added when this report landed; the review below is unchanged and still describes its pinned commit. Open findings are in milestone 0.1.3.
+
+| Finding | Status |
+|---|---|
+| B11 | Fixed in [#262](https://github.com/reliaburger/reliaburger/pull/262) |
+| B12 | Fixed in [#262](https://github.com/reliaburger/reliaburger/pull/262) |
+| B13 | Open: [#295](https://github.com/reliaburger/reliaburger/issues/295) |
+| B14 | Fixed in [#261](https://github.com/reliaburger/reliaburger/pull/261) |
+| B15 | Fixed in [#261](https://github.com/reliaburger/reliaburger/pull/261) |
+| B16 | Open: [#305](https://github.com/reliaburger/reliaburger/issues/305) |
+| B17 | Fixed in [#261](https://github.com/reliaburger/reliaburger/pull/261) |
+| B18 | Open: [#298](https://github.com/reliaburger/reliaburger/issues/298) |
+| B19 | Open: [#296](https://github.com/reliaburger/reliaburger/issues/296) |
+| Ignored `crane` test without an owner | Open as T04: [#303](https://github.com/reliaburger/reliaburger/issues/303) |
+| Coverage breakdown, no-default runtime gate | Advisory; not filed as a separate issue |
+
 Reviewed commit: `0eb6071da897b836d27e19d277a9a8e69a96ccbb`, the observed `main` tip when this pass began. The [first report](2026-09-27-static-release-review.md) reviewed `0a5dfc696a757193e4173af1618c64586c02f0b9`. These are two fixed snapshots, not a claim about the eventual release candidate.
 
 **Coverage and test methods:** the [dedicated testing assessment](2026-09-27-testing-assessment.md) answers review questions 3 and 4 with a subsystem assessment, method inventory, concrete harness/CI findings and prioritised improvements.

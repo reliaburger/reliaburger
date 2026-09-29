@@ -1,5 +1,23 @@
 # 0.1.0 test coverage and testing-method assessment
 
+## Status after 0.1.0 (29 Sep 2026)
+
+Added when this report landed; the assessment below is unchanged and still describes its pinned commit. Open findings are in milestone 0.1.4.
+
+| Finding | Status |
+|---|---|
+| T01 | Open: [#301](https://github.com/reliaburger/reliaburger/issues/301) |
+| T02 | Open: [#301](https://github.com/reliaburger/reliaburger/issues/301) |
+| T03 | Open: [#302](https://github.com/reliaburger/reliaburger/issues/302) |
+| T04 | Open: [#303](https://github.com/reliaburger/reliaburger/issues/303) |
+| T05 | Open: [#303](https://github.com/reliaburger/reliaburger/issues/303) |
+| T06 | Open: [#304](https://github.com/reliaburger/reliaburger/issues/304) |
+| T07 | Open: [#304](https://github.com/reliaburger/reliaburger/issues/304) |
+| P1 security contracts and user data | Fixed B-findings and open issues are listed in the [first](2026-09-27-static-release-review.md) and [second](2026-09-27-static-release-review-second-pass.md) reports' status tables |
+| P2 memory autoscaling, drift and refusal tests | Memory: [#299](https://github.com/reliaburger/reliaburger/issues/299); drift: [#305](https://github.com/reliaburger/reliaburger/issues/305); refusal fixed in [#261](https://github.com/reliaburger/reliaburger/pull/261) |
+| P2 supported environment evidence | Tracked by V04: [#288](https://github.com/reliaburger/reliaburger/issues/288) |
+| P2 property, fuzz and mutation work; P3 performance baselines | Advisory; not filed as separate issues |
+
 Reviewed source: `0eb6071da897b836d27e19d277a9a8e69a96ccbb`, the same fixed snapshot as the [second code-review pass](2026-09-27-static-release-review-second-pass.md). This report answers the original review's questions **3 (quality of coverage)** and **4 (testing methods and improvements)** independently of the defect list.
 
 **Assessment:** Reliaburger has substantial tests of real processes, kernel behaviour, ownership recovery and failure handling. Its weakest evidence is concentrated around security-policy composition, GitOps trust/reconciliation, snapshot restore/export, browser behaviour and the machinery that decides whether qualification passed. The main improvement should be to strengthen those contracts and their assertions, rather than maximise the number of tests.

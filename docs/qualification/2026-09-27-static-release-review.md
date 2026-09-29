@@ -1,5 +1,34 @@
 # 0.1.0 static release review — 27 September 2026
 
+## Status after 0.1.0 (29 Sep 2026)
+
+Added when this report landed; the review below is unchanged and still describes its pinned commit. Issues use the maintainer's milestones: 0.1.3 for the B-findings, 0.1.4 for test quality.
+
+| Finding | Status |
+|---|---|
+| B01 | Fixed in [#263](https://github.com/reliaburger/reliaburger/pull/263) |
+| B02 | Fixed in [#263](https://github.com/reliaburger/reliaburger/pull/263) |
+| B03 | Open: [#291](https://github.com/reliaburger/reliaburger/issues/291) |
+| B04 | Open: [#291](https://github.com/reliaburger/reliaburger/issues/291) |
+| B05 | Open: [#292](https://github.com/reliaburger/reliaburger/issues/292) |
+| B06 | Zero retention with a schedule refused in [#263](https://github.com/reliaburger/reliaburger/pull/263); destination-aware receipt and prune-before-upload open: [#292](https://github.com/reliaburger/reliaburger/issues/292) |
+| B07 | Open, with the upload deadline: [#293](https://github.com/reliaburger/reliaburger/issues/293) |
+| B08 | Metric mapping fixed in [#191](https://github.com/reliaburger/reliaburger/pull/191), with a real-collector CPU test; `min = 0` and memory evidence open: [#299](https://github.com/reliaburger/reliaburger/issues/299) |
+| B09 | Fixed in `a55d0e42` (landed with [#178](https://github.com/reliaburger/reliaburger/pull/178)): buckets keep `le`, quantiles keep `quantile`, tests assert exact series |
+| B10 | Open: [#297](https://github.com/reliaburger/reliaburger/issues/297) |
+| Volume slug not injective | Open: [#294](https://github.com/reliaburger/reliaburger/issues/294) |
+| Snapshot metadata | Atomic durable write fixed in `a0109729` ([#199](https://github.com/reliaburger/reliaburger/pull/199)); listing that hides unreadable metadata open: [#294](https://github.com/reliaburger/reliaburger/issues/294) |
+| Restore quota question | Open question, tracked in [#291](https://github.com/reliaburger/reliaburger/issues/291) |
+| §2 F01–F12 | Already tracked as the completion plan's F-items (roadmap "Later"); no new issue |
+| §2 release-facing statements 1–5 | Open: [#300](https://github.com/reliaburger/reliaburger/issues/300) |
+| §3 Btrfs restore and Runc test selection | Fixed: the restore test was renamed so `test-linux` selects it (`ace9fade`); the Runc test went with the legacy Runc lifecycle (`4fc91ffd`) |
+| §3 synthetic autoscaling test | Fixed in [#191](https://github.com/reliaburger/reliaburger/pull/191) (real-collector test alongside the fixture) |
+| §3 histogram assertion | Fixed with B09 |
+| §3 snapshot safety cases | Covered by the tests in [#291](https://github.com/reliaburger/reliaburger/issues/291)–[#294](https://github.com/reliaburger/reliaburger/issues/294) |
+| §3 ignored-test inventory, local gate naming and evidence | Open: [#303](https://github.com/reliaburger/reliaburger/issues/303), [#304](https://github.com/reliaburger/reliaburger/issues/304) |
+| §3 host matrix, independent hosts | Tracked by V01 and V04: [#286](https://github.com/reliaburger/reliaburger/issues/286), [#288](https://github.com/reliaburger/reliaburger/issues/288) |
+| §3 coverage breakdown, cloud-store emulator, fuzzing and mutation testing | Advisory; not filed as separate issues |
+
 Reviewed commit: `0a5dfc696a757193e4173af1618c64586c02f0b9`, copied from `fix/tier-1-merge-blockers` into the isolated `release-010-analysis` worktree. This is a fixed-source review, not a verdict on changes the release task may subsequently make.
 
 **Second-pass update:** see the [additional review against main at `0eb6071d`](2026-09-27-static-release-review-second-pass.md) for nine further findings and changes since this snapshot. B08's metric mapping, B09's distribution conversion and the Btrfs restore test selection have since been addressed in source. The findings and recommendations below describe the original reviewed commit.
