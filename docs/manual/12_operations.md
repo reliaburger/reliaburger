@@ -20,6 +20,12 @@ relish upgrade abort                  # end a paused upgrade that moved no node
 relish upgrade rollback v0.1.0        # also replaces a paused upgrade
 ```
 
+To see what a node runs, ask it. `bun --version` and `relish --version` print
+the version and the commit it was built from, such as `bun 0.1.0 (3fcb1fd)`,
+and so does bun's first log line. Two builds of the same version can hold
+different code; the commit tells them apart. `GET /v1/version` has the full
+commit in `commit`, next to `version` and `binary_sha256`.
+
 It needs three things on every node:
 
 - **A supervisor that restarts bun whenever it exits**, such as systemd with

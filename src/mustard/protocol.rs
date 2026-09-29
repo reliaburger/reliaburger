@@ -50,6 +50,31 @@ type MembershipDigest = (
     BTreeMap<String, String>,
 );
 
+/// What a published snapshot changes by, sorted so the member table's
+/// hash order never looks like a change.
+///
+/// Labels and addresses change without a state or incarnation change (a node
+/// restarted with a new `[node.labels]`), so they're part of the digest too;
+/// otherwise that change is never published.
+fn membership_digest(snapshot: &[MembershipSnapshot]) -> Vec<MembershipDigest> {
+    let mut digest: Vec<MembershipDigest> = snapshot
+        .iter()
+        .map(|m| {
+            (
+                m.node_id.clone(),
+                m.state,
+                m.incarnation,
+                m.is_council,
+                m.is_leader,
+                m.address,
+                m.labels.clone(),
+            )
+        })
+        .collect();
+    digest.sort_by(|a, b| a.0.cmp(&b.0));
+    digest
+}
+
 /// A participant in the Mustard gossip protocol.
 ///
 /// Owns the membership table, dissemination queue, and transport.
@@ -73,6 +98,12 @@ pub struct MustardNode<T: MustardTransport> {
     /// Optional watch channel for publishing membership snapshots.
     /// Set when running inside the agent, None in standalone tests.
     membership_watch: Option<watch::Sender<Vec<MembershipSnapshot>>>,
+    /// Optional watch channel for publishing every member, down ones
+    /// included, until gossip reaps them. Reporting only: see
+    /// [`MembershipTable::roster`].
+    roster_watch: Option<watch::Sender<Vec<MembershipSnapshot>>>,
+    /// Digest of the last-published roster.
+    last_published_roster_digest: Vec<MembershipDigest>,
     /// Process-local proof that a peer has acknowledged our gossip.
     rejoin_watch: Option<watch::Sender<bool>>,
     /// Digest of the last-published membership. Used to publish on any content
@@ -158,6 +189,8 @@ impl<T: MustardTransport> MustardNode<T> {
             config,
             transport,
             membership_watch: None,
+            roster_watch: None,
+            last_published_roster_digest: Vec::new(),
             rejoin_watch: None,
             last_published_digest: Vec::new(),
             left: false,
@@ -394,6 +427,12 @@ impl<T: MustardTransport> MustardNode<T> {
         self.membership_watch = Some(tx);
     }
 
+    /// Set the roster watch channel, which also reports Dead and Left
+    /// members until they are reaped.
+    pub fn set_roster_watch(&mut self, tx: watch::Sender<Vec<MembershipSnapshot>>) {
+        self.roster_watch = Some(tx);
+    }
+
     /// Publish the current membership to the watch channel if its *content*
     /// changed. Comparing a digest (not just the member count) means state
     /// transitions like Alive→Suspect — which keep the count constant until the
@@ -407,28 +446,20 @@ impl<T: MustardTransport> MustardNode<T> {
             self.membership.set_roles(&roles);
         }
         let snapshot = self.membership.snapshot();
-        // Labels and addresses change without a state or incarnation change
-        // (a node restarted with a new `[node.labels]`), so they're part of
-        // the digest too; otherwise that change is never published.
-        let digest: Vec<MembershipDigest> = snapshot
-            .iter()
-            .map(|m| {
-                (
-                    m.node_id.clone(),
-                    m.state,
-                    m.incarnation,
-                    m.is_council,
-                    m.is_leader,
-                    m.address,
-                    m.labels.clone(),
-                )
-            })
-            .collect();
+        let digest = membership_digest(&snapshot);
         if digest != self.last_published_digest {
             if let Some(tx) = &self.membership_watch {
                 let _ = tx.send(snapshot);
             }
             self.last_published_digest = digest;
+        }
+        if let Some(tx) = &self.roster_watch {
+            let roster = self.membership.roster();
+            let digest = membership_digest(&roster);
+            if digest != self.last_published_roster_digest {
+                let _ = tx.send(roster);
+                self.last_published_roster_digest = digest;
+            }
         }
     }
 
@@ -1413,6 +1444,57 @@ mod tests {
                 .any(|m| m.node_id == NodeId::new("n2") && m.state == NodeState::Suspect),
             "state transition not published without a count change"
         );
+    }
+
+    /// The active watch drops a member the moment it goes down; the roster
+    /// keeps reporting it, with its state, until gossip reaps it. That is how
+    /// the API tells a crashed node from one that left on purpose.
+    #[tokio::test]
+    async fn roster_watch_reports_down_members_the_active_watch_drops() {
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        let mut node1 = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
+        let (active_tx, active_rx) = tokio::sync::watch::channel(Vec::new());
+        let (roster_tx, roster_rx) = tokio::sync::watch::channel(Vec::new());
+        node1.set_membership_watch(active_tx);
+        node1.set_roster_watch(roster_tx);
+        for (name, port) in [("dead", 2), ("gone", 3)] {
+            node1.membership.add_node(
+                NodeId::new(name),
+                addr(port),
+                1,
+                BTreeMap::new(),
+                Instant::now(),
+            );
+        }
+        node1.membership.declare_dead(&NodeId::new("dead"));
+        node1.membership.apply_update(
+            &MembershipUpdate {
+                node_id: NodeId::new("gone"),
+                address: addr(3),
+                state: NodeState::Left,
+                incarnation: 2,
+            },
+            Instant::now(),
+        );
+        node1.publish_membership();
+
+        let state = |rx: &tokio::sync::watch::Receiver<Vec<MembershipSnapshot>>, name: &str| {
+            rx.borrow()
+                .iter()
+                .find(|m| m.node_id == NodeId::new(name))
+                .map(|m| m.state)
+        };
+        assert_eq!(state(&active_rx, "dead"), None);
+        assert_eq!(state(&active_rx, "gone"), None);
+        assert_eq!(state(&roster_rx, "dead"), Some(NodeState::Dead));
+        assert_eq!(state(&roster_rx, "gone"), Some(NodeState::Left));
+        assert_eq!(state(&roster_rx, "n1"), Some(NodeState::Alive));
+
+        node1.membership.reap_dead();
+        node1.publish_membership();
+        assert_eq!(state(&roster_rx, "dead"), None);
+        assert_eq!(state(&roster_rx, "gone"), None);
     }
 
     #[tokio::test]

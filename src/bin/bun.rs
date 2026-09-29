@@ -26,7 +26,11 @@ use reliaburger::pickle::store::BlobStore;
 use reliaburger::pickle::types::ManifestCatalog;
 
 #[derive(Parser)]
-#[command(name = "bun", version, about = "Reliaburger node agent")]
+#[command(
+    name = "bun",
+    version = reliaburger::upgrade::version::VERSION_LINE.as_str(),
+    about = "Reliaburger node agent"
+)]
 struct Cli {
     /// Print supported protocol and state formats without opening runtime state.
     #[arg(long)]
@@ -710,7 +714,13 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     let exe_path = std::env::current_exe()
         .map_err(|e| anyhow::anyhow!("failed to resolve current executable path: {e}"))?;
     let running_version = reliaburger::upgrade::resolve_running_version(&exe_path);
-    println!("bun: reliaburger node agent {running_version}");
+    println!(
+        "bun: reliaburger node agent {}",
+        reliaburger::upgrade::version::describe(
+            &running_version,
+            reliaburger::upgrade::version::build_commit()
+        )
+    );
 
     // Load node config
     let config = if let Some(ref path) = cli.config {
@@ -1047,6 +1057,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             handle.raft_metrics_rx.clone(),
             cluster_runtime.aggregated_rx.clone(),
             cluster_runtime.directory_rx.clone(),
+            cluster_runtime.roster_rx.clone(),
         ));
         _cluster_runtime = Some(cluster_runtime);
         BunAgent::with_cluster(
@@ -1096,7 +1107,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
 
     // Batch scheduling (F1) reads capacities from the same aggregated
     // view the deploy scheduler uses; None standalone.
-    let api_aggregated_rx = orchestration.as_ref().map(|(_, _, rx, _)| rx.clone());
+    let api_aggregated_rx = orchestration.as_ref().map(|(_, _, rx, _, _)| rx.clone());
 
     // Report real schedulable capacity to the cluster (L6: StateReports
     // used to carry zeroes).
@@ -1286,7 +1297,8 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // L1 orchestration: the leader schedules desired apps into
     // placements, every node keeps a fresh peer-API table, and every
     // node reconciles its instances against its assignments.
-    if let Some((membership_rx, metrics_rx, aggregated_rx, directory_rx)) = orchestration {
+    if let Some((membership_rx, metrics_rx, aggregated_rx, directory_rx, roster_rx)) = orchestration
+    {
         upgrade_membership_rx = Some(membership_rx.clone());
         if let Some(council) = &api_council {
             capacity_admission = Some(reliaburger::cluster::orchestrate::spawn_leader_scheduler(
@@ -1317,9 +1329,13 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         let membership_table: Arc<RwLock<Vec<api::NodeMembershipInfo>>> =
             Arc::new(RwLock::new(Vec::new()));
         api_membership = Some(Arc::clone(&membership_table));
-        let known_members = api::KnownMembers(Arc::new(RwLock::new(Vec::new())));
+        let known_members = api::KnownMembers::default();
         api_known_members = Some(known_members.clone());
-        let mut refresher_rx = membership_rx;
+        // The refresher reads gossip's roster, not the live-only watch the
+        // scheduler uses: telling a member that left from one that died is
+        // what lets the known table forget the first and keep the second.
+        let mut refresher_rx = roster_rx;
+        let refresher_crl = crl_refresh.clone();
         // Each node advertises its real API endpoint over gossip (the
         // directory, 12b.2). Prefer that authoritative `api_address`: a
         // single host can run several nodes on distinct, independently
@@ -1329,16 +1345,18 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         let mut refresher_directory_rx = directory_rx.clone();
         let refresher_shutdown = shutdown.clone();
         tokio::spawn(async move {
+            // Expiry and retirement change nothing gossip publishes: a reaped
+            // member is already gone from the roster. Re-check on a slow tick.
+            let mut expiry = tokio::time::interval(std::time::Duration::from_secs(60));
             loop {
                 use reliaburger::mustard::state::NodeState;
-                let (snapshot, known): (Vec<_>, Vec<_>) = {
+                let roster: Vec<api::RosterMember> = {
                     let directory = refresher_directory_rx.borrow();
                     refresher_rx
                         .borrow()
                         .iter()
-                        .filter(|m| m.state != NodeState::Left)
-                        .map(|m| {
-                            let info = api::NodeMembershipInfo {
+                        .map(|m| api::RosterMember {
+                            info: api::NodeMembershipInfo {
                                 node_id: m.node_id.clone(),
                                 address: directory.api_address(
                                     &m.node_id,
@@ -1346,26 +1364,33 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                                     gossip_to_api_offset,
                                 ),
                                 api_advertised: directory.endpoints.contains_key(&m.node_id),
-                            };
-                            (m.state == NodeState::Alive, info)
+                            },
+                            gossip_address: m.address,
+                            state: m.state,
+                            incarnation: m.incarnation,
+                            labels: m.labels.clone(),
                         })
-                        .partition(|(alive, _)| *alive)
+                        .collect()
                 };
-                // Live members for fan-out; every known member for the relay
-                // and fault reversal, which must reach a node-killed peer.
-                // Gossip stops publishing a member once it is dead, so the
-                // known table remembers members that drop out of this view.
-                let snapshot: Vec<api::NodeMembershipInfo> =
-                    snapshot.into_iter().map(|(_, info)| info).collect();
-                let known: Vec<api::NodeMembershipInfo> = snapshot
+                // Live members for fan-out; every known member for the relay,
+                // fault reversal and the nodes listing, which must reach and
+                // report a node-killed peer.
+                let live: Vec<api::NodeMembershipInfo> = roster
                     .iter()
-                    .cloned()
-                    .chain(known.into_iter().map(|(_, info)| info))
+                    .filter(|member| member.state == NodeState::Alive)
+                    .map(|member| member.info.clone())
                     .collect();
-                *membership_table.write().await = snapshot;
-                known_members.refresh(known).await;
+                *membership_table.write().await = live;
+                let retired = refresher_crl
+                    .as_ref()
+                    .map(|crl| crl.retired_node_ids())
+                    .unwrap_or_default();
+                known_members
+                    .refresh(roster, &retired, std::time::Instant::now())
+                    .await;
                 tokio::select! {
                     _ = refresher_shutdown.cancelled() => break,
+                    _ = expiry.tick() => {}
                     changed = refresher_rx.changed() => {
                         if changed.is_err() {
                             break;
@@ -1670,8 +1695,11 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         "system",
         reliaburger::ketchup::types::LogStream::Stdout,
         &format!(
-            "reliaburger node agent v{} started",
-            env!("CARGO_PKG_VERSION")
+            "reliaburger node agent {} started",
+            reliaburger::upgrade::version::describe(
+                &reliaburger::upgrade::version::compiled_version(),
+                reliaburger::upgrade::version::build_commit()
+            )
         ),
     );
     log_store_inner.append(

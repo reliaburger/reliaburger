@@ -411,7 +411,7 @@ pub struct FaultRule {
 /// Hard ceiling on a fault's lifetime (O17): 24 hours. A chaos fault is a
 /// bounded experiment, not a permanent config change; clamping here guarantees
 /// even an absurd `--duration` still expires.
-const MAX_FAULT_DURATION_NS: u64 = 24 * 3600 * 1_000_000_000;
+pub const MAX_FAULT_DURATION_NS: u64 = 24 * 3600 * 1_000_000_000;
 
 impl FaultRule {
     /// Create a new fault rule with the given parameters.

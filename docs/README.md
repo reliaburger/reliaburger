@@ -467,10 +467,11 @@ cargo run --bin bun -- --listen 127.0.0.1:9217
 cargo run --bin bun -- --config node.toml
 ```
 
-The agent prints which runtime it selected on startup:
+The agent prints its version, the commit it was built from, and the runtime
+it selected on startup:
 
 ```
-bun: reliaburger node agent v0.1.0
+bun: reliaburger node agent v0.1.0 (3fcb1fd)
 bun: auto-detected runtime: process
 bun: API server listening on 127.0.0.1:9117
 ```
@@ -1080,7 +1081,7 @@ The bun agent exposes a local HTTP API on port 9117:
 | `POST` | `/v1/stop/{app}/{namespace}` | Stop an app |
 | `GET` | `/v1/logs/{app}/{namespace}` | Captured stdout/stderr (`?tail=N&follow=true`) |
 | `POST` | `/v1/exec/{app}/{namespace}` | Execute a command (JSON body: `{"command":["..."]}`) |
-| `GET` | `/v1/cluster/nodes` | List cluster nodes (gossip membership) |
+| `GET` | `/v1/cluster/nodes` | List cluster nodes (gossip membership, dead members included with state `dead`) |
 | `GET` | `/v1/cluster/council` | Council (Raft) status |
 | `POST` | `/v1/cluster/join` | Join with a single-use token, node ID, CSR and format compatibility |
 | `POST` | `/v1/cluster/renew` | Renew the authenticated TLS node’s CSR on the leader; requires the service token, current peer certificate and format compatibility |

@@ -320,6 +320,13 @@ Fixes from the [static review in PR #258](https://github.com/reliaburger/reliabu
 - [x] **B15** Treat a committed but refused GitOps write (`CouncilResponse::Refused`) as unapplied, so the sync doesn't advance `last_applied_commit` past it.
 - [x] **B17** List GitOps files with `ls-tree -z` so tab and non-ASCII paths aren't dropped, and fail the sync when a listed file can't be read, instead of deleting what it declared.
 
+Fixes for the 0.1.1 milestone:
+
+- [x] **Known members forget departed nodes.** `KnownMembers` (#244) kept every member's last address until Bun restarted. Gossip now also publishes a roster with Dead and Left members (`set_roster_watch`, the live-only watch is unchanged); the known table forgets a member gossip reports as Left or the CRL lists as retired, and any down member not heard from for `KNOWN_MEMBER_RETENTION` (24 h, Smoker's hard fault ceiling), while still keeping a reaped dead member's address for fault clears.
+- [x] **`relish nodes` shows dead nodes as dead.** `/v1/cluster/nodes` was built from gossip's live-only watch, so a dead node vanished. The handler now hands the agent the members `KnownMembers` remembers as down, and the agent lists them after the live ones with state `dead` and their Raft council flags. The watch the scheduler, council and Pickle read is unchanged; `relish upgrade`, the test context's node inventory and route detection skip down members (`NodeStatus::is_down`).
+- [x] **Commit hash in versions.** `bun --version`, `relish --version`, bun's startup line and its first log-store line printed only `0.1.0`, so different builds looked identical (issue #241). They now print `0.1.0 (3fcb1fd)` via `upgrade::version::describe`, and `/v1/version` has an additive `commit` field. Release builds take the commit from `RELIABURGER_GIT_SHA` as before; `build.rs` asks git for builds from a checkout and reruns when `HEAD` moves.
+- [x] **`build.yml` prints the candidate digest.** The qualified digest was only in the job summary, so reading it meant downloading the ~2 GB candidate artefact to hash `candidate.json`. The `candidate` job now echoes `Qualification manifest SHA-256: <digest>` in its log and uploads `candidate.json` alone as `candidate-manifest-<commit>-<attempt>` (1-day retention); `stage.yml` and promotion still verify every byte of the full candidate (`scripts/release/test_build_workflow.py`).
+
 ### Engineering follow-ups
 
 - [x] **H01** Reconcile scheduler/quota/scrape wiring, roadmap test locations, cleanup evidence and disabled-auth chaos policy with their callers; all-feature Rustdoc builds with warnings denied.
