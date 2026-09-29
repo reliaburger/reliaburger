@@ -15,24 +15,26 @@
     <header class="masthead">
       <a class="wordmark" href="./" aria-label="Reliaburger home"><span class="mark" aria-hidden="true">r/</span>reliaburger</a>
       <nav aria-label="Main navigation">
+        <a href="#install">Install</a>
         <a href="#tour">Try it</a>
-        <a href="#start">Run it</a>
+        <a href="#start">Build it</a>
         <a href="#docs">Read the docs</a>
         <a href="https://github.com/reliaburger/reliaburger">GitHub <span aria-hidden="true">↗</span></a>
       </nav>
     </header>
 
     <main id="main">
-      <section class="intro" aria-labelledby="title">
+      <section id="intro" class="intro" aria-labelledby="title">
         <div class="intro-copy">
-          <div class="eyebrow">RUST · APACHE 2.0 · IN DEVELOPMENT</div>
+          <div class="eyebrow">RUST · APACHE 2.0 · 0.1.0 PROTOTYPE</div>
           <h1 id="title">One binary.<br>A complete container platform. Zero assembly required.</h1>
           <p class="lede">Kubernetes gave us container orchestration, but gave every team an accidental 
             platform engineering department. Reliaburger gives you the full production platform — scheduling, 
             mTLS, ingress, registry, metrics, logs, GitOps, and chaos testing — compiled into a single, 
             lightning-fast Rust binary that runs anywhere in under five minutes.</p>
           <div class="intro-links">
-            <a class="primary-link" href="https://github.com/reliaburger/reliaburger">Read the source <span aria-hidden="true">↗</span></a>
+            <a class="primary-link" href="#install">Install 0.1.0 <span aria-hidden="true">↓</span></a>
+            <a href="https://github.com/reliaburger/reliaburger">Read the source <span aria-hidden="true">↗</span></a>
             <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/whitepaper.md">Read the whitepaper</a>
           </div>
         </div>
@@ -48,12 +50,34 @@
         </figure>
       </section>
 
+      <section id="install" class="section install" aria-labelledby="install-title">
+        <div class="section-heading">
+          <span class="section-number" aria-hidden="true">01 /</span>
+          <h2 id="install-title">Install it <a class="permalink" href="#install" aria-label="Link to the install section">#</a></h2>
+        </div>
+        <div class="install-grid">
+          <div class="terminal">
+            <div class="terminal-heading">INSTALL <span>sh</span></div>
+            <pre><code>curl -fsSL https://reliaburger.com/install.sh | sh</code></pre>
+          </div>
+          <div class="install-copy">
+            <p>One line installs <code>relish</code>, then builds a three-node cluster in Linux
+              VMs on your laptop, running real containers. It checks every download against a
+              pinned digest or the release’s signing key.</p>
+            <p>You’ll need macOS, or Linux with QEMU and KVM, plus about 8 GiB of free memory
+              and 15 GiB of disk. No Rust, no checkout.</p>
+            <p class="install-links"><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/quickstart.md">One node, CLI only, cleanup</a>
+              · <a href="install.sh">Read the bootstrap script</a>
+              · <a href="https://github.com/reliaburger/reliaburger/releases/tag/v0.1.0">Release notes <span aria-hidden="true">↗</span></a></p>
+          </div>
+        </div>
+      </section>
+
       <aside class="status" aria-label="Release status">
-        <strong>Working towards 0.1.0 (Prototype)</strong>
-        <p>Native release builds pass on Linux and macOS. The managed laptop installer
-          is undergoing qualification; the signed public release is still pending.
-          Five minutes remains a target.</p>
-        <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/plans/2026-09-16-v0.1.0-release-plan.md">Release plan <span aria-hidden="true">↗</span></a>
+        <strong>0.1.0 (Prototype)</strong>
+        <p>Released. Signed binaries for Linux and macOS, and the laptop installer above.
+          It’s a prototype: try it, break it, tell us what broke.</p>
+        <a href="https://github.com/reliaburger/reliaburger/releases/tag/v0.1.0">Release <span aria-hidden="true">↗</span></a>
       </aside>
 
       <aside class="status" aria-label="Release status">
@@ -73,16 +97,14 @@
              with the real relish CLI, so the page can't drift from the product. -->
         <details class="tour">
           <summary>
-            <span class="section-number" aria-hidden="true">01 /</span>
-            <h2 id="tour-title">Try it in five minutes</h2>
-            <span class="pending">Arrives with 0.1.0</span>
+            <span class="section-number" aria-hidden="true">02 /</span>
+            <h2 id="tour-title">Try it in five minutes <a class="permalink" href="#tour" aria-label="Link to the tour">#</a></h2>
           </summary>
           <div class="tour-body">
-            <p class="tour-note">This is the tour 0.1.0 has to pass before we publish it. Until the
-              signed release is out, the install line stops with a release-not-published message.
-              You’ll need macOS, or Linux with QEMU and KVM, plus about 8 GiB of free memory and
-              15 GiB of disk.</p>
-            <!-- The page's only script: assets/tour-player.js loads the vendored asciinema
+            <p class="tour-note">Install, then put the cluster through its paces: a real
+              Kubernetes app, a network fault, a killed replica and a lost node. Same
+              prerequisites as the install line.</p>
+            <!-- assets/tour-player.js loads the vendored asciinema
                  player (assets/asciinema/) and the recording from this site when the tour opens. -->
             <figure id="tour-recording" class="recording" data-cast="./assets/tour.cast" data-poster="npt:1:12">
               <div class="recording-screen"></div>
@@ -189,12 +211,13 @@
 
       <section id="start" class="section start" aria-labelledby="start-title">
         <div class="section-heading">
-          <span class="section-number" aria-hidden="true">02 /</span>
-          <h2 id="start-title">Run it from source</h2>
+          <span class="section-number" aria-hidden="true">03 /</span>
+          <h2 id="start-title">Or build it from source <a class="permalink" href="#start" aria-label="Link to the build-from-source section">#</a></h2>
         </div>
         <div class="start-grid">
           <div class="start-copy">
-            <p>Start with a local process. No container runtime required.</p>
+            <p>Hacking on Reliaburger itself? Start with a local process. No container
+              runtime required.</p>
             <p>You’ll need Rust and the build tools for your platform. This example runs
               <code>hello</code> under the built-in ProcessGrill runtime; it doesn’t create
               an isolated container or a multi-node cluster.</p>
@@ -222,8 +245,8 @@ target/debug/relish</code></pre>
 
       <section id="docs" class="section" aria-labelledby="docs-title">
         <div class="section-heading">
-          <span class="section-number" aria-hidden="true">03 /</span>
-          <h2 id="docs-title">Read before you deploy</h2>
+          <span class="section-number" aria-hidden="true">04 /</span>
+          <h2 id="docs-title">Read before you deploy <a class="permalink" href="#docs" aria-label="Link to the documentation section">#</a></h2>
           <span class="section-note">Documentation lives with the code.</span>
         </div>
         <div class="reading-list">
@@ -264,10 +287,10 @@ target/debug/relish</code></pre>
           GitHub sign-in is required. Artefacts expire; the Markdown version stays in the repository.</p>
       </section>
 
-      <section class="section" aria-labelledby="internals-title">
+      <section id="internals" class="section" aria-labelledby="internals-title">
         <div class="section-heading">
-          <span class="section-number" aria-hidden="true">04 /</span>
-          <h2 id="internals-title">Follow a subsystem</h2>
+          <span class="section-number" aria-hidden="true">05 /</span>
+          <h2 id="internals-title">Follow a subsystem <a class="permalink" href="#internals" aria-label="Link to the subsystems section">#</a></h2>
         </div>
         <p class="section-intro"><code>bun</code> runs on each node. <code>relish</code> talks to its API.
           The names are burger ingredients; the links are the design documents.</p>
@@ -287,10 +310,10 @@ target/debug/relish</code></pre>
         </dl>
       </section>
 
-      <section class="section contributing" aria-labelledby="contribute-title">
+      <section id="contributing" class="section contributing" aria-labelledby="contribute-title">
         <div>
           <div class="eyebrow">CODE, TESTS, DOCUMENTATION</div>
-          <h2 id="contribute-title">Find something that doesn’t work?</h2>
+          <h2 id="contribute-title">Find something that doesn’t work? <a class="permalink" href="#contributing" aria-label="Link to the contributing section">#</a></h2>
           <p>Open an issue with your OS, runtime, config and the steps to reproduce it.
             Implementation changes come with tests and a chapter in the book.</p>
         </div>
@@ -300,10 +323,12 @@ target/debug/relish</code></pre>
     <footer>
       <span>Reliaburger · by Miko Pawlikowski</span>
       <a href="https://github.com/reliaburger/reliaburger/blob/main/LICENSE">Apache 2.0</a>
-      <span class="footer-note">HTML and CSS. The one script plays the tour’s recording with a copy
-        of the asciinema player served from this site. No tracking, no third-party requests.</span>
+      <span class="footer-note">HTML and CSS. Two small scripts: one adds the copy buttons, one
+        plays the tour’s recording with a copy of the asciinema player served from this site.
+        No tracking, no third-party requests.</span>
     </footer>
   </div>
+  <script src="./assets/copy.js" defer></script>
   <script src="./assets/tour-player.js" defer></script>
 </body>
 </html>
