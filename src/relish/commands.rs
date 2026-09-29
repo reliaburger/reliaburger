@@ -456,36 +456,14 @@ async fn delete_with_client(
     Ok(())
 }
 
-/// Show detailed info about an app, node, or job.
+/// Show every instance of an app across the cluster, with its node.
 pub async fn inspect(name: &str) -> Result<(), RelishError> {
     inspect_with_client(name, &BunClient::default_local()).await
 }
 
 async fn inspect_with_client(name: &str, client: &BunClient) -> Result<(), RelishError> {
-    let statuses = client.status().await?;
-    let matching: Vec<_> = statuses.iter().filter(|s| s.app_name == name).collect();
-
-    if matching.is_empty() {
-        println!("no instances found for {name}");
-    } else {
-        for s in &matching {
-            println!("Instance: {}", s.id);
-            println!("  App:       {}", s.app_name);
-            println!("  Namespace: {}", s.namespace);
-            println!("  State:     {}", s.state);
-            println!("  Restarts:  {}", s.restart_count);
-            if let Some(pid) = s.pid {
-                println!("  PID:       {pid}");
-            } else if s.runtime_unknown {
-                println!("  PID:       unknown (the runtime was busy)");
-            }
-            if let Some(port) = s.host_port {
-                println!("  Port:      {port}");
-            }
-            println!();
-        }
-    }
-
+    let inspection = super::inspect::collect(client, name).await?;
+    print!("{}", super::inspect::render(&inspection));
     Ok(())
 }
 

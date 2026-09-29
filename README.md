@@ -81,7 +81,7 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 
 - `relish apply [PATH_OR_URL]`: Apply a Reliaburger TOML or Kubernetes YAML manifest
 - `relish status`: Show cluster and app status
-- `relish inspect <NAME>`: Show detailed info about an app, node, or job
+- `relish inspect <NAME>`: Show every instance of an app across the cluster, with its node
 - `relish exec <APP> [COMMAND]...`: Execute a command inside a running container
 - `relish deploy <PATH>`: Trigger a rolling deploy for an app
 - `relish cancel-deploy <OPERATION_ID>`: Cancel a node-local deploy and wait for its current work to finish
