@@ -370,6 +370,8 @@ that used to fail passes.
 
 | Test | First seen | Cause | Status |
 |---|---|---|---|
+| `wrapper::proxy::tests::a_lapsed_view_lease_serves_only_local_backends` (502 where it wanted `local`, `proxy.rs:1028`) | 28 Sep (local `cargo test --lib` while landing #277; its CI runs 36485561402 and 36506716343 passed) | Under investigation (#285) | Open |
+| `relish::quickstart::state::tests::reopening_an_operation_preserves_its_identity_and_owned_vm_names` (reopen refused, `state.rs:325`; `progress_is_persisted_before_the_next_step` failed with it once) | 28 Sep (local `cargo test --lib` and `cargo test --bin relish` while landing #277; its CI runs 36485561402 and 36506716343 passed) | Under investigation (#285) | Open |
 | `grill::process::tests::stop_terminates_shell_descendants` ("ParseIntError { kind: Empty }", portable Linux) | 27 Sep (CI on #261) | Harness: the shell's `echo $! > child.pid` creates the file before writing it, and the poll read it empty | Fixed: the script writes a temp file and renames it into place, and the poll retries until the pid parses |
 | `oci_crash::normal_clustered_bun_recovers_enrolled_consumer_before_adoption` | 23 Sep | Product: rollout finalisation dropped the service reservation retirement needs | Fixed (C3.1) |
 | `placement::concurrent_node_kills_and_leader_change_preserve_reserved_capacity` | 22 Sep | Product: a returning node spread stale suspicions; a clear didn't wait for re-admission | Fixed (C3.2) |
