@@ -42,10 +42,10 @@ RELIABURGER_HOME=~/.rbtour relish local destroy --yes
 `--record` runs the tour inside `asciinema rec` (110x32, idle time cut to two
 seconds) and then plays the setup step four times faster, because setup redraws
 its timers several times a second and idle trimming can't shorten it. The
-narration says both, and every wait prints how long it really took. Until the
-release is published, the recording shows `relish setup --quickstart
+narration says both, and every wait prints how long it really took. With
+`--setup`, the recording shows `relish setup --quickstart
 --development-binaries` where the tour says `curl … | sh`; the script says so on
-screen. It applies the demo URL when it answers, and
+screen. The published recording was made that way, before 0.1.0 was released. It applies the demo URL when it answers, and
 `examples/kubernetes/podinfo.yaml` (with a note) when it doesn't.
 `asciinema play docs/website/assets/tour.cast` plays the result in a terminal.
 
@@ -70,23 +70,22 @@ python3 -m http.server 8080 --bind 127.0.0.1 --directory docs/website
 Open `http://127.0.0.1:8080/`. Asset paths are relative so the page also works
 under a GitHub project-site path.
 
-GitHub is the source of truth for documentation. The whitepaper PDF link goes
-to the Build & Release workflow, whose `reliaburger-pdfs` artefact includes
-`reliaburger-whitepaper.pdf`. There was no latest published release available
-when this page was created. Once a release includes that asset, the link can
-point to `https://github.com/reliaburger/reliaburger/releases/latest/download/reliaburger-whitepaper.pdf`.
-Until then, do not advertise that download URL as working. Build artefacts
-require GitHub sign-in and have limited retention.
+GitHub is the source of truth for documentation. The whitepaper PDF link points
+at `https://github.com/reliaburger/reliaburger/releases/latest/download/reliaburger-whitepaper.pdf`:
+every promoted release carries the four PDFs, and promotion marks it latest.
+The Build & Release workflow's `reliaburger-pdfs` artefact has newer copies
+from `main`; artefacts require GitHub sign-in and have limited retention.
 
-Update the release-status paragraph, and remove the tour's "Arrives with 0.1.0"
-label, when the installer actually ships. The
+Update the release-status paragraph (version, date and release-notes link) when
+you promote a release. The
 source quickstart intentionally matches `examples/phase-1/proc-first-run.toml`.
 
 `install.sh` is a small HTTPS bootstrap for the versioned release installer.
 Both it and the generated installer are POSIX sh, so `curl … | sh` works where
 `sh` is dash or busybox, not only bash. `scripts/release/test_package.py` runs
 them under every POSIX shell it finds and under `shellcheck -s sh` when present.
-It intentionally fails with a release-not-published message until v0.1.0 exists.
-The page labels this path as pending; remove that label only after published
-candidate qualification passes. The generated installer itself lives in the
-GitHub release, with native CLI checksums supplied by release packaging.
+It installs `v0.1.0` unless `RELIABURGER_VERSION` names another release; bump
+that default when you promote a newer one. If the requested release isn't
+published, it fails with a message saying so. The generated installer itself
+lives in the GitHub release, with native CLI checksums supplied by release
+packaging.

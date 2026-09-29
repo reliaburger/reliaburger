@@ -37,7 +37,7 @@ For book, manual or website prose, follow [docs/book/STYLE.md](docs/book/STYLE.m
 
 ### 1. Follow the Plan
 
-Every roadmap phase is done. Current work is closing out the 0.1.0 release: read the status box at the top of [docs/progress.md](docs/progress.md) and the plan it links before starting. New work goes through a dated plan in `docs/plans/`.
+Every roadmap phase is done and 0.1.0 is released (29 September 2026). Current work is the post-0.1.0 backlog: read the status box at the top of [docs/progress.md](docs/progress.md), which links the open items (missing capabilities F01–F12, engineering follow-ups, known flakes), before starting. Releases after 0.1.0 follow the order in the "Releases after 0.1.0" section of [docs/roadmap.md](docs/roadmap.md#releases-after-010): patch releases 0.1.1–0.1.4 first, then one headline feature per minor release. New work goes through a dated plan in `docs/plans/`; the 0.1.0 release plans there are history. Releases follow [docs/releasing.md](docs/releasing.md).
 
 ### 2. Tests First
 
@@ -124,8 +124,8 @@ See [docs/testing.md](docs/testing.md) and [docs/design/test-harness.md](docs/de
 
 - Releases follow [docs/releasing.md](docs/releasing.md): `build.yml` → `stage.yml` → qualification with `scripts/release/qualify-*.sh` (including the V02 soak, `qualify-sustained.sh --tier fast|final`), recorded in `docs/qualification/` → `promote.yml`.
 - Only the maintainer tags and promotes. Agents never do.
-- Any change to a wire or durable-state format bumps `protocol` or `state` in `CURRENT` in `src/compatibility.rs`.
-- No legacy code, shims or migrations before 0.1.0. Old state is refused; start a fresh cluster.
+- No backwards compatibility before 1.0.0 (maintainer decision, 28 September 2026). Every release below 1.0.0 is a development release: no migrations, no mixed-version or rolling compatibility across a format change, no feature gates, no additive-field rules.
+- Any incompatible wire or durable-state change bumps `protocol` or `state` in `CURRENT` in `src/compatibility.rs`. Nodes then refuse old peers and old state; start a fresh cluster ([cluster compatibility](docs/releasing.md#compatibility-before-100)).
 
 ## Commit Hygiene
 

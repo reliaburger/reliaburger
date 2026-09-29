@@ -25,7 +25,7 @@
     <main id="main">
       <section class="intro" aria-labelledby="title">
         <div class="intro-copy">
-          <div class="eyebrow">RUST · APACHE 2.0 · IN DEVELOPMENT</div>
+          <div class="eyebrow">RUST · APACHE 2.0 · 0.1.0 PROTOTYPE</div>
           <h1 id="title">One binary.<br>A complete container platform. Zero assembly required.</h1>
           <p class="lede">Kubernetes gave us container orchestration, but gave every team an accidental 
             platform engineering department. Reliaburger gives you the full production platform — scheduling, 
@@ -49,11 +49,11 @@
       </section>
 
       <aside class="status" aria-label="Release status">
-        <strong>Working towards 0.1.0 (Prototype)</strong>
-        <p>Native release builds pass on Linux and macOS. The managed laptop installer
-          is undergoing qualification; the signed public release is still pending.
-          Five minutes remains a target.</p>
-        <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/plans/2026-09-16-v0.1.0-release-plan.md">Release plan <span aria-hidden="true">↗</span></a>
+        <strong>0.1.0 (Prototype)</strong>
+        <p>Released on 29 September 2026. Signed binaries for Linux and macOS, and a one-line
+          installer that builds a laptop cluster from them. Five minutes is the target;
+          the documentation lists what 0.1.0 doesn’t do yet.</p>
+        <a href="https://github.com/reliaburger/reliaburger/releases/tag/v0.1.0">Release notes <span aria-hidden="true">↗</span></a>
       </aside>
 
       <aside class="status" aria-label="Release status">
@@ -75,11 +75,9 @@
           <summary>
             <span class="section-number" aria-hidden="true">01 /</span>
             <h2 id="tour-title">Try it in five minutes</h2>
-            <span class="pending">Arrives with 0.1.0</span>
           </summary>
           <div class="tour-body">
-            <p class="tour-note">This is the tour 0.1.0 has to pass before we publish it. Until the
-              signed release is out, the install line stops with a release-not-published message.
+            <p class="tour-note">The install line fetches the signed 0.1.0 release.
               You’ll need macOS, or Linux with QEMU and KVM, plus about 8 GiB of free memory and
               15 GiB of disk.</p>
             <!-- The page's only script: assets/tour-player.js loads the vendored asciinema
@@ -91,7 +89,8 @@
                 <code>asciinema play tour.cast</code>, or follow the steps below.</p></noscript>
               <figcaption>
                 <span>The whole tour on a real laptop cluster, run by
-                  <a href="https://github.com/reliaburger/reliaburger/blob/main/scripts/demo/tour.sh">scripts/demo/tour.sh</a>.
+                  <a href="https://github.com/reliaburger/reliaburger/blob/main/scripts/demo/tour.sh">scripts/demo/tour.sh</a>
+                  before the release, with binaries built from the checkout.
                   Setup plays four times faster and idle time is cut to two seconds; every wait
                   says how long it really took.</span>
                 <span class="recording-speed" role="group" aria-label="Playback speed" hidden>speed
@@ -236,7 +235,7 @@ target/debug/relish</code></pre>
             <span class="filetype">DESIGN &amp; INTENT</span>
             <h3><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/whitepaper.md">The whitepaper <span aria-hidden="true">↗</span></a></h3>
             <p>The architecture, its trade-offs and the longer-term vision. Includes features still planned.</p>
-            <a class="secondary-link" href="https://github.com/reliaburger/reliaburger/actions/workflows/build.yml">PDF from build artefacts</a>
+            <a class="secondary-link" href="https://github.com/reliaburger/reliaburger/releases/latest/download/reliaburger-whitepaper.pdf">PDF from the latest release</a>
           </article>
           <article class="reading-item">
             <span class="filetype">IMPLEMENTATION</span>
@@ -255,13 +254,13 @@ target/debug/relish</code></pre>
           </article>
           <article class="reading-item">
             <span class="filetype">CURRENT STATE</span>
-            <h3><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/progress.md">Progress &amp; release work <span aria-hidden="true">↗</span></a></h3>
-            <p>What’s implemented, what needs verification and what’s next. Read alongside the <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/roadmap.md">roadmap</a>.</p>
+            <h3><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/progress.md">Progress &amp; backlog <span aria-hidden="true">↗</span></a></h3>
+            <p>What’s implemented, what 0.1.0 leaves out and what’s next. Read alongside the <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/roadmap.md">roadmap</a>.</p>
           </article>
         </div>
-        <p class="pdf-note">For the PDF: open a successful build, download <code>reliaburger-pdfs</code>
-          under <strong>Artifacts</strong>, then open <code>reliaburger-whitepaper.pdf</code>.
-          GitHub sign-in is required. Artefacts expire; the Markdown version stays in the repository.</p>
+        <p class="pdf-note">Every release carries PDFs of the whitepaper, the design docs, the roadmap
+          and the book. For a newer copy, open a successful build of <code>main</code> and download
+          <code>reliaburger-pdfs</code> under <strong>Artifacts</strong> (GitHub sign-in required).</p>
       </section>
 
       <section class="section" aria-labelledby="internals-title">

@@ -5,11 +5,12 @@ laptop, see the [quickstart guide](quickstart.md). For the architectural vision,
 see the [whitepaper](whitepaper.md); for implementation status, see
 [progress.md](progress.md).
 
-0.1.0 hasn't shipped yet. The source builds and runs today; the signed public
-installer arrives with the release. Release candidates follow a separate
-[build and promotion procedure](releasing.md#metadata-and-publication), and the
-[remaining work](plans/2026-09-22-v0.1.0-remaining-work.md) lists the acceptance
-gates still open.
+0.1.0 was released on 29 September 2026. Its signed binaries, guest images and
+installer are on the [GitHub release](https://github.com/reliaburger/reliaburger/releases/tag/v0.1.0),
+and `curl -fsSL https://reliaburger.com/install.sh | sh` installs it. Every
+release follows the same [build, staging and promotion procedure](releasing.md#metadata-and-publication).
+The limits below are the ones 0.1.0 ships with; [progress.md](progress.md) tracks
+the backlog after it.
 
 ## 0.1.0 scope and limits
 
@@ -39,6 +40,13 @@ gates still open.
   [compatibility policy](releasing.md#cluster-compatibility).
 - **One Bun per writable image store.** Registry startup claims exclusive
   ownership of the image store's upload directory.
+- **Multi-platform images don't run from Pickle.** A node pulling an OCI
+  image index or Docker manifest list from the built-in registry treats it as
+  a single image and fails to run it. That covers `docker buildx build
+  --platform linux/amd64,linux/arm64 --push` and `relish build` with more than
+  one platform (the default), which also stores only the builder's platform.
+  Push or build a single platform matching your nodes; see
+  [Images and volumes](manual/11_images-and-volumes.md#multi-platform-images).
 - **Test volumes have no snapshots.** Disposable test-volume snapshots aren't
   supported.
 
@@ -1352,5 +1360,5 @@ machines.
   record with a rule-of-three bound. It refuses the shared `reliaburger-test`
   VM.
 
-Passing them doesn't close the release gates in the
-[remaining-work table](plans/2026-09-22-v0.1.0-remaining-work.md).
+They're one part of a release's acceptance, not all of it; the
+[release runbook](releasing.md) lists the gates a candidate has to pass.

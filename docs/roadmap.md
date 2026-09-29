@@ -740,15 +740,82 @@ families and optional refactors remain explicitly separate from release gates.
 
 ## Release closure: 0.1.0
 
-The implementation and hardening work after Phase 15 is recorded in
-[progress.md](progress.md), including Phase 16's audit fixes. The next delivery
-is the [0.1.0 release plan](plans/2026-09-16-v0.1.0-release-plan.md), which closes
-these phases with signed release artefacts, a managed laptop cluster and measured
-acceptance on the downloaded product. It doesn't start a new architecture phase.
+**Released on 29 September 2026.** The implementation and hardening work after Phase 15
+is recorded in [progress.md](progress.md), including Phase 16's audit fixes. The
+[0.1.0 release plan](plans/2026-09-16-v0.1.0-release-plan.md) closed these phases
+with signed release artefacts, a managed laptop cluster and acceptance on the
+downloaded product, rather than starting a new architecture phase. Historical
+phase checkboxes are implementation evidence; the release's acceptance gates and
+their records are in [progress.md](progress.md#acceptance-and-release-gates).
 
-The release gates remain open until the actual candidate passes the portable,
-Linux runtime, multi-node and clean-install checks. Historical phase checkboxes
-are implementation evidence, not a substitute for those gates.
+Work after 0.1.0 follows the [release order](#releases-after-010) below, one
+headline feature per minor release, drawing on the backlog in [progress.md](progress.md)
+(the missing capabilities F01–F12 and the remaining engineering follow-ups) and
+the v2 list. Each piece starts with a dated plan in [plans/](plans/); later
+releases follow the same [release runbook](releasing.md).
+
+---
+
+## Releases after 0.1.0
+
+Patch releases (0.1.x) fix and harden without a headline. Each minor release
+after that ships one headline feature, with a single exit test that proves it.
+Each release still starts with a dated plan in [plans/](plans/). Until 1.0.0
+every release is a development release: an incompatible format change bumps the
+compatibility generation and needs a fresh cluster, with no migration and no
+feature gate ([compatibility before 1.0.0](releasing.md#compatibility-before-100)).
+
+- **0.1.1: soak follow-ups.** Most soak fixes planned for 0.1.1 went into 0.1.0
+  instead, because the final soak needed them: the report worker, the soak
+  checker, `instance@node` log labels, the retirement stall, stop followed by
+  apply, retire-before-deploy, bounded capture replay, the agent-loop order
+  and short agent-loop turns
+  ([#270](https://github.com/reliaburger/reliaburger/pull/270)–[#275](https://github.com/reliaburger/reliaburger/pull/275),
+  [#277](https://github.com/reliaburger/reliaburger/pull/277)–[#279](https://github.com/reliaburger/reliaburger/pull/279);
+  see the [release closure record](qualification/2026-09-27-v0.1.0-release-closure.md)).
+  0.1.1 has the rest ([#276](https://github.com/reliaburger/reliaburger/pull/276)):
+  `KnownMembers` forgetting departed nodes, `relish nodes` showing dead nodes
+  as dead, the commit hash in `bun --version`, and `build.yml` printing the
+  candidate digest.
+  Housekeeping: consolidate the planning documents (archive finished plans
+  under [plans/archive/](plans/archive/), collapse the completed sections of
+  [progress.md](progress.md) into a short history that links the
+  [qualification records](qualification/) and the release-closure record
+  ([#253](https://github.com/reliaburger/reliaburger/pull/253)), and keep one
+  current backlog), and the pre-1.0 compatibility policy above.
+- **0.1.2: images.** [#248](https://github.com/reliaburger/reliaburger/pull/248):
+  the Go demo build in the tour, multi-arch builds and pulls (which removes
+  0.1.0's multi-platform known limitation), platforms in `relish images`, a
+  build cache cap (100 GiB by default, 1 GiB on a laptop), Buildah storage
+  pruning and Buildah in the guest image. Plus the fix for an ingress host that
+  changes on redeploy.
+- **0.1.3: security and storage hardening.** The should-fix findings from the
+  static review ([#258](https://github.com/reliaburger/reliaburger/pull/258)):
+  snapshots (B03, B04, B05, B07) and the non-injective volume slug; GitOps
+  (B13, B16, B19); a permission matrix for log, metric and secret reads (B18);
+  an upload-body timeout; and autoscaler `min = 0`.
+- **0.1.4: observability and test quality.** Streamed metrics queries, so Mayo
+  and rollup sessions no longer load every Parquet file, and the testing
+  assessment (T01–T07).
+- **0.2.0: "A million jobs".** Task arrays keep compact state in Raft and
+  expand on each node, and finish a million tasks in minutes on three nodes
+  ([#266](https://github.com/reliaburger/reliaburger/pull/266)).
+- **0.3.0: "Bare metal in an hour".** The appliance OS (our own mkosi image on
+  Ubuntu 26.04), `relish netboot` and claiming machines over the LAN, weekly
+  signed OS builds with A/B updates, and the quickstart guest on Ubuntu 26.04.
+  The claim flow is designed so the fleet control plane can extend it later.
+  Exit test: ten Dell Wyse 3040s from power-on to a cluster. Research and
+  spikes: [#218](https://github.com/reliaburger/reliaburger/pull/218) and
+  [#259](https://github.com/reliaburger/reliaburger/pull/259).
+- **0.4.0: "Full container migration".** Drain and uncordon, cold moves that
+  carry volumes, CRIU checkpoint and restore, pre-dump iterations, lazy pages
+  and TCP handoff, for apps and jobs
+  ([#268](https://github.com/reliaburger/reliaburger/pull/268)).
+- **Later.** The fleet control plane
+  ([#265](https://github.com/reliaburger/reliaburger/pull/265)), and GPU
+  scheduling and warm starts (F01). The rest of the backlog (F02–F11, H05)
+  isn't headline material; those items land alongside whichever release they
+  fit.
 
 ---
 
