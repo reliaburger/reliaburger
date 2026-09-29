@@ -2995,6 +2995,172 @@ only the tick does; before, nothing happened for fifteen seconds. The #260 test
 still passes: eight queued commands are answered with at most the running
 tick's cleanups in between.
 
+### Shorter turns
+
+`biased;`, the re-sent snapshot and the tick's floor make a long turn of the
+loop survivable. They don't make it short. Both investigations left a list of turns that could
+still run for seconds, and the next release took them one at a time.
+
+The first was the tick from #260 itself. `drive_pending_restarts` walked
+*every* pending restart on every tick, and each one that couldn't clean up yet
+cost about 400 ms. Three of them made a 1.2 s tick. Thirty would make a
+twelve-second one, and a command queued behind it waits all twelve. So the
+tick now has a budget:
+
+```rust
+const PENDING_RESTART_TICK_BUDGET: Duration = Duration::from_millis(500);
+
+let deadline = tokio::time::Instant::now() + PENDING_RESTART_TICK_BUDGET;
+for (index, (id, state)) in retrying.into_iter().enumerate() {
+    if index > 0 && tokio::time::Instant::now() >= deadline {
+        break;
+    }
+    self.restart_rotation.cleanup = Some(id.clone());
+    // ...
+}
+```
+
+`enumerate()` pairs each item with its position, like Python's `enumerate`.
+The `index > 0` guard means a tick always makes progress on at least one
+restart, however slow. A budget on its own would starve somebody, though.
+Collect the pending restarts in the same order every tick, stop after two,
+and the same two get retried forever while the rest wait. So the agent
+remembers the last instance each phase touched, and the next tick starts just
+after it:
+
+```rust
+fn rotate_after<T>(
+    mut items: Vec<T>,
+    last: Option<&InstanceId>,
+    id: impl Fn(&T) -> &InstanceId,
+) -> Vec<T> {
+    items.sort_by(|a, b| id(a).0.cmp(&id(b).0));
+    if let Some(last) = last {
+        let start = items.partition_point(|item| id(item).0 <= last.0);
+        items.rotate_left(start);
+    }
+    items
+}
+```
+
+`id: impl Fn(&T) -> &InstanceId` takes any closure that can pull an instance
+id out of an item, so both phases (which carry different tuples) share one
+helper. It's still a generic function, compiled once per closure type, with
+no function pointer or boxing involved. `partition_point` is a binary search
+on a sorted slice: it returns the index of the first item for which the
+predicate is false, here the first id after the one we stopped at.
+`rotate_left` then moves everything before that index to the back, in place.
+An instance that disappeared since the last tick doesn't matter: the search
+finds where it *would* be, and the walk carries on from there.
+
+Two tests pin it down. One puts eight replicas into pending restart, each
+spending 400 ms and failing, and checks that a single tick finishes well short
+of the 3.2 s the old walk took, without trying all eight. The other runs six
+ticks over six slow restarts and checks that each got its turn and that no
+instance got more than one attempt more than any other.
+
+The second long turn was the one #270 named: signing a follower's workload
+certificate. Only the leader holds the Workload CA, so a follower sends its
+CSR over mTLS and waits up to ten seconds for the answer. That wait ran inline
+twice over, from the deploy worker's `ProvisionIdentity` request and from the
+rotation tick. A slow leader meant ten seconds of nobody else getting an
+answer from the node.
+
+We already had the shape of the fix. #237 moved stop waits off the loop by
+splitting a stop into the part that must happen on the loop, the part that
+only waits, and the part that records the result back on the loop. Signing
+splits the same way. The loop generates the CSR (the private key never leaves
+the node), then spawns the signing into a `JoinSet`:
+
+```rust
+let task = self
+    .identity_signing_tasks
+    .spawn(async move {
+        let result = tokio::time::timeout(WORKLOAD_SIGNING_TIMEOUT, request.sign())
+            .await
+            .unwrap_or_else(|_| Err("workload signing timed out".to_string()));
+        SignedIdentity { spiffe_uri, private_key_der, result }
+    })
+    .id();
+```
+
+`async move` makes the future take ownership of everything it uses: the
+`Arc` to the council, a clone of the leader transport, the CSR bytes. That's
+what lets it outlive the function that spawned it, and the compiler insists
+on it, because `spawn` requires a `'static` future: one that borrows nothing
+from the caller's stack. In Go you'd capture the variables and hope nobody
+changes them underneath the goroutine. Here the borrow checker won't compile a
+future that could see them change.
+
+A new `select!` branch collects finished signings with `join_next_with_id`,
+writes the certificate files and records the identity, all on the loop, as
+before. It sits next to the stop completions, above commands, and passes the
+same test: a signing is only in flight for a provision the loop already
+started, at most one per instance, so finished ones can't flood the loop. The deploy worker's reply travels with the signing and is answered
+only when it's done, so the worker still waits, just not *on* the loop. Two
+details came out of the split. The rotation tick runs every second and a
+signing can take ten, so a request for an instance that already has a signing
+in flight joins it rather than sending a second CSR. And a signature can now
+arrive after its instance has been retired; retirement deleted the identity
+directory, so writing the files would recreate it with nobody left to delete
+it. The loop checks the instance still exists before it writes anything.
+
+The tests stand up a follower with a "leader" that accepts the TCP connection
+and then says nothing. The deploy worker's identity request must return in
+under a second, with its reply still pending (it took the full ten before);
+the rotation tick likewise. A leader that hangs up at once checks the other
+end: two requests for one instance share one signing, and both get answered
+when it fails. The last test hands the loop two finished signatures, one for
+a live instance and one for a retired one, and checks that only the live one
+gets files.
+
+The third was status itself. Every `Status` command asks the runtime for each
+instance's pid and exit code, and runc answers both under the instance's
+lifecycle lock. A create that's pulling a slow image, or a stop waiting out
+its grace, holds that lock for seconds, and `get_status` waited on it with no
+deadline, one instance after another. One slow instance stalled the answer
+for all of them, and the loop with it.
+
+What should status say about an instance the runtime won't talk about yet?
+Not nothing: the agent still knows its app, state, port and restart count.
+Not "no pid" either, because that means something (the process has gone).
+So the answer carries what's known and says which part isn't:
+
+```rust
+/// The runtime didn't answer for this instance before the status
+/// deadline, so `pid` and `exit_code` are unknown rather than absent.
+#[serde(default, skip_serializing_if = "std::ops::Not::not")]
+pub runtime_unknown: bool,
+```
+
+The serde attributes keep the wire form backward compatible in both
+directions: an older peer's JSON without the field reads as `false`
+(`default`), and an unmarked status serialises exactly as before
+(`skip_serializing_if` takes a function path, and `std::ops::Not::not` is the
+`!` operator as a function). The CLI prints `?` in the PID column for a marked
+instance, next to the `-` that means "no process".
+
+The reads now share one deadline for the whole answer. They run eight at a
+time with `join_all`, which polls a batch of futures together and returns
+their results in order, each under `tokio::time::timeout_at(deadline, ...)`.
+`timeout_at` polls the inner future once before it checks the clock, so an
+instance that answers at once is never marked unknown just because an earlier
+batch used up the time.
+
+We first wrote this as a stream, `stream::iter(&instances).map(...).buffered(8)`,
+and got 380 errors saying ``implementation of `Send` is not general enough``.
+The closure passed to `map` takes a reference, which makes it generic over
+that reference's lifetime, and the compiler can't yet prove a future built
+from such a closure is `Send` for *every* lifetime, which `tokio::spawn`
+needs. Plain `for` loops that push futures into a `Vec` sidestep the question,
+and read just as well.
+
+Three tests cover it. One instance of three holds its lock for thirty seconds:
+status comes back well inside two seconds, with that instance marked, still
+`running`, and the other two with their pids. Six instances all holding their
+locks cost one deadline, not six. And the field round-trips, and stays out of
+the JSON when it's `false`.
+
 ## Walk the path you actually care about
 
 Say `web` can't reach `redis`. Checking Bun's own DNS and TCP access might tell

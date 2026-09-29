@@ -1300,6 +1300,30 @@ fn build_cluster_cache(
     cache
 }
 
+/// Ask the agent whether instances it adopted at startup already run `spec`.
+/// No answer in time counts as "no", which deploys as before.
+async fn adopted_instances_match(
+    cmd_tx: &mpsc::Sender<AgentCommand>,
+    key: &(String, String),
+    spec: &crate::config::app::AppSpec,
+    io_timeout: Duration,
+) -> bool {
+    let ask = async {
+        let (response, answer) = tokio::sync::oneshot::channel();
+        cmd_tx
+            .send(AgentCommand::AdoptedPlacementMatches {
+                app_name: key.0.clone(),
+                namespace: key.1.clone(),
+                spec: Box::new(spec.clone()),
+                response,
+            })
+            .await
+            .ok()?;
+        answer.await.ok()
+    };
+    matches!(tokio::time::timeout(io_timeout, ask).await, Ok(Some(true)))
+}
+
 /// Recheck convergence after restart without forgetting owned resources.
 /// Missing or incomplete runtime inventory returns an assignment to Pending.
 pub fn retain_live_assignments(
@@ -1651,6 +1675,27 @@ fn spawn_placement_reconciler_with_io_timeout(
                     continue; // already converged; don't redeploy
                 }
                 if !backoff.may_attempt(&key, &fingerprint, std::time::Instant::now()) {
+                    continue;
+                }
+                // A restart or self-upgrade between queueing a deploy and
+                // recording it applied leaves the entry pending while the
+                // adopted instances already run it. Rolling them again would
+                // replace every replica for nothing (and surge a second writer
+                // onto a volume app's data before #267).
+                if adopted_instances_match(&cmd_tx, &key, &spec, io_timeout).await {
+                    let mut next = applied.clone();
+                    next.insert(key.clone(), AssignmentState::Applied { fingerprint });
+                    match persist_placements(checkpoint_path.as_deref(), &next).await {
+                        Ok(()) => {
+                            applied = next;
+                            backoff.clear(&key);
+                            eprintln!(
+                                "orchestrator: adopted instances of {}/{} already run their placement; not redeploying",
+                                key.0, key.1
+                            );
+                        }
+                        Err(error) => eprintln!("orchestrator: cannot record convergence: {error}"),
+                    }
                     continue;
                 }
 
@@ -2696,6 +2741,7 @@ mod tests {
                             host_port: Some(30000),
                             exit_code: None,
                             pid: Some(1),
+                            runtime_unknown: false,
                         }]);
                     }
                     AgentCommand::SyncClusterConsumer { response, .. } => {
@@ -2889,6 +2935,9 @@ mod tests {
                             "duplicate deployment while original is pending"
                         );
                         deployment = Some(events);
+                    }
+                    AgentCommand::AdoptedPlacementMatches { response, .. } => {
+                        let _ = response.send(false);
                     }
                     _ => panic!("unexpected command"),
                 }
@@ -3226,6 +3275,126 @@ command = ["false"]
         );
     }
 
+    /// PR #267: a Bun upgraded between queueing the writer's deploy and
+    /// recording it applied came back to a pending placement whose instances
+    /// it had adopted, and rolled them anyway. When the agent says its adopted
+    /// instances already run the placement, the reconciler records it applied
+    /// and sends no deploy.
+    #[tokio::test]
+    async fn pending_placement_run_by_adopted_instances_is_recorded_without_a_redeploy() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let assignments = NodeAssignments {
+            apps: vec![NodeAssignment {
+                name: "writer".into(),
+                namespace: "default".into(),
+                replicas: 1,
+                spec: spec_from_toml(
+                    r#"[app.writer]
+image = "busybox:latest"
+"#,
+                ),
+            }],
+            ..NodeAssignments::default()
+        };
+        let router = axum::Router::new().route(
+            "/v1/placements/worker",
+            axum::routing::get(move || {
+                let assignments = assignments.clone();
+                async move { axum::Json(assignments) }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let (_metrics, metrics_rx) = watch::channel(openraft::RaftMetrics::new_initial(1));
+        let (_directory, directory_rx) = watch::channel(crate::mustard::directory::NodeDirectory {
+            leader: Some(crate::mustard::message::LeaderHint {
+                node_id: NodeId::new("leader"),
+                term: 1,
+                api_address: address,
+                reporting_address: address,
+            }),
+            ..Default::default()
+        });
+        let root = tempfile::tempdir().unwrap();
+        let checkpoint = crate::cluster::applied::checkpoint_path(root.path());
+        let key = ("writer".to_string(), "default".to_string());
+        crate::cluster::applied::save(
+            &checkpoint,
+            &AppliedMap::from([(key.clone(), AssignmentState::Pending)]),
+        )
+        .unwrap();
+        let (commands, mut received) = mpsc::channel(8);
+        let shutdown = CancellationToken::new();
+        let reconciler = spawn_placement_reconciler(
+            "worker".into(),
+            metrics_rx,
+            directory_rx,
+            0,
+            None,
+            commands,
+            shutdown.clone(),
+            crate::cluster::ClusterHttp::plaintext(),
+            Some(root.path().to_path_buf()),
+            crate::config::node::RuntimeSection::default().stop_confirmation_timeout(),
+        );
+        let running = crate::bun::agent::InstanceStatus {
+            id: "default__writer-0".into(),
+            app_name: "writer".into(),
+            namespace: "default".into(),
+            state: "running".into(),
+            restart_count: 0,
+            host_port: None,
+            exit_code: None,
+            pid: Some(42),
+            runtime_unknown: false,
+        };
+        let mut asked = Vec::new();
+        let mut deploys = 0;
+        let _ = tokio::time::timeout(Duration::from_millis(4500), async {
+            while let Some(command) = received.recv().await {
+                match command {
+                    AgentCommand::Status { response } => {
+                        let _ = response.send(vec![running.clone()]);
+                    }
+                    AgentCommand::SyncClusterConsumer { response, .. } => {
+                        let _ = response.send(Ok(crate::bun::agent::ConsumerUpdate {
+                            published: true,
+                            receipts: vec![],
+                        }));
+                    }
+                    AgentCommand::AdoptedPlacementMatches {
+                        app_name,
+                        spec,
+                        response,
+                        ..
+                    } => {
+                        asked.push((app_name, spec.replicas));
+                        let _ = response.send(true);
+                    }
+                    AgentCommand::Deploy { .. } => deploys += 1,
+                    _ => {}
+                }
+            }
+        })
+        .await;
+        shutdown.cancel();
+        reconciler.await.unwrap();
+        server.abort();
+        assert_eq!(
+            deploys, 0,
+            "adopted instances that run the placement were redeployed"
+        );
+        assert_eq!(
+            asked.first(),
+            Some(&("writer".to_string(), Replicas::Fixed(1)))
+        );
+        let saved = crate::cluster::applied::load(&checkpoint).unwrap();
+        assert!(
+            matches!(saved.get(&key), Some(AssignmentState::Applied { .. })),
+            "{saved:?}"
+        );
+    }
+
     #[tokio::test]
     async fn placement_ownership_is_durable_before_deployment_is_queued() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3491,6 +3660,7 @@ image = "busybox:latest"
                 host_port: None,
                 exit_code: None,
                 pid: Some(42),
+                runtime_unknown: false,
             },
             crate::bun::agent::InstanceStatus {
                 id: "stopped-0".into(),
@@ -3501,6 +3671,7 @@ image = "busybox:latest"
                 host_port: None,
                 exit_code: Some(0),
                 pid: None,
+                runtime_unknown: false,
             },
         ];
         retain_live_assignments(&mut applied, &statuses);

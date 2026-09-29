@@ -84,6 +84,23 @@ const SHUTDOWN_GRACE_SECS: u64 = 5;
 /// before it escalates to SIGKILL (DEP6).
 const STOP_GRACE_SECS: u64 = 10;
 
+/// How long a status answer waits for the runtime's pids and exit codes.
+/// runc answers both under the instance's lifecycle lock, which a slow create
+/// or stop can hold for seconds; status then reports what it knows and marks
+/// the rest `runtime_unknown`, rather than holding the agent loop.
+const STATUS_RUNTIME_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// At most this many instances' runtime reads run at once for one status.
+const STATUS_RUNTIME_READ_CONCURRENCY: usize = 8;
+
+/// How long one health tick may keep starting pending restarts. A restart
+/// whose old runtime can't be cleaned up yet costs a few hundred
+/// milliseconds, and a node that lost every container has dozens of them.
+/// Walking them all in one tick held every queued command for seconds; now a
+/// tick stops starting new ones once this is spent, and the next tick picks
+/// up where it left off.
+const PENDING_RESTART_TICK_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// The longest one confirmed stop can take with the production grace, given
 /// the runtime's `stop_confirmation_timeout`: a drain of up to one grace, the
 /// stop request, the grace itself, then the force-kill and its exit check.
@@ -367,6 +384,15 @@ pub enum AgentCommand {
     /// Get status of all instances.
     Status {
         response: oneshot::Sender<Vec<InstanceStatus>>,
+    },
+    /// Whether instances adopted after a restart or self-upgrade already run
+    /// exactly `spec` (replica count included), so the placement reconciler
+    /// can record a still-pending placement as applied instead of rolling it.
+    AdoptedPlacementMatches {
+        app_name: String,
+        namespace: String,
+        spec: Box<AppSpec>,
+        response: oneshot::Sender<bool>,
     },
     /// Get the local desired application specs for standalone diagnostics.
     DesiredApps {
@@ -1559,6 +1585,10 @@ pub struct InstanceStatus {
     pub exit_code: Option<i32>,
     /// OS process ID, if available.
     pub pid: Option<u32>,
+    /// The runtime didn't answer for this instance before the status
+    /// deadline, so `pid` and `exit_code` are unknown rather than absent.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub runtime_unknown: bool,
 }
 
 /// A workload status with the node that supplied it.
@@ -1681,9 +1711,11 @@ mod app_stop;
 mod consumer;
 mod startup_recovery;
 pub use consumer::ConsumerUpdate;
+mod adopted_placements;
 mod discovery_ownership;
 mod discovery_recovery;
 mod egress_ownership;
+mod identity_signing;
 mod producer_release;
 mod runtime_inventory;
 use app_stop::{AppStop, PendingStops, StopPurpose};
@@ -1951,6 +1983,49 @@ pub struct BunAgent<G: Grill> {
     /// Their exit waits, off the command loop so a workload that ignores
     /// SIGTERM can't stall every other command for its grace.
     stop_waits: tokio::task::JoinSet<Result<(), BunError>>,
+    /// Where the last budget-bounded restart tick stopped, so the next one
+    /// carries on from there instead of retrying the same few.
+    restart_rotation: RestartRotation,
+    /// Workload identity signings in flight, by the task running each.
+    identity_signings: identity_signing::IdentitySignings,
+    /// Those tasks. A follower's CSR waits on the leader for up to ten
+    /// seconds, which must not stall every other command.
+    identity_signing_tasks: tokio::task::JoinSet<identity_signing::SignedIdentity>,
+    /// Apps adopted at startup and the spec their instances were launched
+    /// from, until this agent deploys them again.
+    adopted_apps: adopted_placements::AdoptedApps,
+}
+
+/// One instance's runtime view for a status answer.
+struct RuntimeEvidence {
+    pid: Option<u32>,
+    exit_code: Option<i32>,
+    /// The runtime didn't answer before the status deadline.
+    unknown: bool,
+}
+
+/// The last instance each phase of `drive_pending_restarts` handled.
+#[derive(Debug, Default)]
+struct RestartRotation {
+    /// Failed restarts whose partial runtime is still being cleaned up.
+    cleanup: Option<InstanceId>,
+    /// Pending instances being started again.
+    launch: Option<InstanceId>,
+}
+
+/// Order `items` by instance id, starting just after `last`, so a tick that
+/// runs out of budget part-way through leaves the rest for the next tick.
+fn rotate_after<T>(
+    mut items: Vec<T>,
+    last: Option<&InstanceId>,
+    id: impl Fn(&T) -> &InstanceId,
+) -> Vec<T> {
+    items.sort_by(|a, b| id(a).0.cmp(&id(b).0));
+    if let Some(last) = last {
+        let start = items.partition_point(|item| id(item).0 <= last.0);
+        items.rotate_left(start);
+    }
+    items
 }
 
 impl<G: Grill + Clone + 'static> BunAgent<G> {
@@ -2080,6 +2155,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             shutdown_grace: std::time::Duration::from_secs(SHUTDOWN_GRACE_SECS),
             pending_stops: PendingStops::new(),
             stop_waits: tokio::task::JoinSet::new(),
+            restart_rotation: RestartRotation::default(),
+            identity_signings: identity_signing::IdentitySignings::new(),
+            identity_signing_tasks: tokio::task::JoinSet::new(),
+            adopted_apps: adopted_placements::AdoptedApps::new(),
         }
     }
 
@@ -2205,6 +2284,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             shutdown_grace: std::time::Duration::from_secs(SHUTDOWN_GRACE_SECS),
             pending_stops: PendingStops::new(),
             stop_waits: tokio::task::JoinSet::new(),
+            restart_rotation: RestartRotation::default(),
+            identity_signings: identity_signing::IdentitySignings::new(),
+            identity_signing_tasks: tokio::task::JoinSet::new(),
+            adopted_apps: adopted_placements::AdoptedApps::new(),
         }
     }
 
@@ -3481,6 +3564,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 .entry(key.clone())
                 .or_default()
                 .push(instance_id.clone());
+            if !record.is_job {
+                self.note_adopted_instance(
+                    &key,
+                    &instance_id,
+                    record.app_spec.as_ref(),
+                    &record.image,
+                );
+            }
             if let Some(spec) = record.app_spec {
                 self.deployed_specs.insert(key, spec);
             }
@@ -3640,10 +3731,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 //
                 // Only branches that can't flood sit above commands. The
                 // report worker asks for a snapshot once per interval. Stop
-                // completions come from stops already started, one each.
-                // Every deploy op comes from a deploy task that waits for its
-                // reply before sending the next, so no more of them wait than
-                // there are deploys and probes in flight. Commands come from
+                // completions come from stops already started, one each, and
+                // identity signings from provisions already started, at most
+                // one per instance. Every deploy op comes from a deploy task
+                // that waits for its reply before sending the next, so no more
+                // of them wait than there are deploys and probes in flight. Commands come from
                 // any number of callers taking turns; during a `relish test`
                 // pulse the channel is never empty, and below it a deploy's
                 // first step waited out its 300 s deadline.
@@ -3651,6 +3743,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     biased;
                     _ = self.shutdown.cancelled() => {
                         self.abandon_pending_stops();
+                        self.abandon_identity_signings();
                         self.shutdown_all().await;
                         break;
                     }
@@ -3660,6 +3753,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     Some(outcome) = self.stop_waits.join_next_with_id(),
                         if !self.stop_waits.is_empty() => {
                         self.complete_app_stop(outcome).await;
+                    }
+                    Some(outcome) = self.identity_signing_tasks.join_next_with_id(),
+                        if !self.identity_signing_tasks.is_empty() => {
+                        self.finish_identity_provision(outcome);
                     }
                     Some(op) = self.deploy_ops_rx.recv() => {
                         self.handle_deploy_op(op).await;
@@ -3700,7 +3797,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.reconcile_firewall().await;
         self.reresolve_egress().await;
         self.sweep_kernel_networking().await;
-        self.check_identity_rotation().await;
+        self.check_identity_rotation();
     }
 
     /// Enforce the current kernel boundary and publish this tick's capabilities.
@@ -4319,6 +4416,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     })
                     .collect();
                 let _ = response.send(targets);
+            }
+            AgentCommand::AdoptedPlacementMatches {
+                app_name,
+                namespace,
+                spec,
+                response,
+            } => {
+                let _ = response.send(self.adopted_instances_match(&app_name, &namespace, &spec));
             }
             AgentCommand::DesiredApps { response } => {
                 let mut apps = self
@@ -8331,7 +8436,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// When `maybe_restart` transitions an instance back to Pending,
     /// this method picks it up and drives it through the startup
     /// sequence again using the stored OCI spec.
+    ///
+    /// Each phase handles at least one instance per tick, then stops once
+    /// `PENDING_RESTART_TICK_BUDGET` is spent. `restart_rotation` remembers
+    /// where it stopped, so every instance gets its turn.
     async fn drive_pending_restarts(&mut self) {
+        let deadline = tokio::time::Instant::now() + PENDING_RESTART_TICK_BUDGET;
         // Partial startup can have changed the runtime even when its call
         // failed. Keep ownership until cleanup is observed; then apply the
         // same budget and backoff as any other failed execution.
@@ -8349,7 +8459,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             })
             .map(|instance| (instance.id.clone(), instance.state))
             .collect();
-        for (id, state) in retrying {
+        let retrying = rotate_after(retrying, self.restart_rotation.cleanup.as_ref(), |entry| {
+            &entry.0
+        });
+        for (index, (id, state)) in retrying.into_iter().enumerate() {
+            if index > 0 && tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            self.restart_rotation.cleanup = Some(id.clone());
             if state == ContainerState::Stopping {
                 match self.poll_instance_withdrawal(&id, self.stop_grace).await {
                     Ok(true) => {}
@@ -8441,8 +8558,19 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 })
             })
             .collect();
+        let pending_restarts = rotate_after(
+            pending_restarts,
+            self.restart_rotation.launch.as_ref(),
+            |entry| &entry.0,
+        );
 
-        for (id, oci_spec, app_name, namespace, host_port) in pending_restarts {
+        for (index, (id, oci_spec, app_name, namespace, host_port)) in
+            pending_restarts.into_iter().enumerate()
+        {
+            if index > 0 && tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            self.restart_rotation.launch = Some(id.clone());
             match self.poll_instance_withdrawal(&id, self.stop_grace).await {
                 Ok(true) => {}
                 Ok(false) => continue,
@@ -9325,139 +9453,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
     }
 
-    /// Provision workload identity for an instance after it passes health check.
-    ///
-    /// Generates a SPIFFE CSR, submits it to the council for signing,
-    /// builds the identity bundle, and writes cert/key/JWT to the
-    /// instance's identity mount. No-op in standalone mode.
-    async fn provision_identity(
-        &mut self,
-        app_name: &str,
-        namespace: &str,
-        instance_id: &crate::grill::InstanceId,
-        is_job: bool,
-        events: &mpsc::Sender<ApplyEvent>,
-    ) {
-        let Some(ref cluster) = self.cluster else {
-            return; // standalone mode — no council to sign CSRs
-        };
-        let Some(ref council) = cluster.council else {
-            return;
-        };
-
-        let workload_type = if is_job {
-            crate::sesame::types::WorkloadType::Job
-        } else {
-            crate::sesame::types::WorkloadType::App
-        };
-
-        let spiffe_uri =
-            workload_spiffe_uri(&self.trust_domain, namespace, app_name, workload_type);
-
-        // Generate CSR (keypair stays local)
-        let (csr_der, private_key_der) =
-            match crate::sesame::identity::create_workload_csr(&spiffe_uri) {
-                Ok(pair) => pair,
-                Err(e) => {
-                    let _ = events
-                        .send(ApplyEvent::Progress {
-                            message: format!("identity: CSR generation failed: {e}"),
-                        })
-                        .await;
-                    return;
-                }
-            };
-
-        // Only the leader can sign. A follower used to call its own council,
-        // fail, and start the container with no identity at all.
-        let result = if council.is_leader().await {
-            council
-                .sign_workload_csr(
-                    &csr_der,
-                    &spiffe_uri,
-                    crate::sesame::identity::CertUsage::Mtls,
-                    &self.trust_domain,
-                    "local",
-                    &instance_id.0,
-                )
-                .await
-                .map(|signed| crate::cluster::workload_identity::SignedWorkload {
-                    cert_der: signed.cert_der,
-                    workload_ca_cert_der: signed.workload_ca_cert_der,
-                    root_ca_cert_der: signed.root_ca_cert_der,
-                    jwt_token: signed.jwt_token,
-                })
-                .map_err(|error| error.to_string())
-        } else {
-            match &self.workload_csr_client {
-                Some(client) => client
-                    .sign(&instance_id.0, workload_type, &csr_der)
-                    .await
-                    .map_err(|error| error.to_string()),
-                None => Err("no leader transport for workload signing".to_string()),
-            }
-        };
-
-        match result {
-            Ok(csr_result) => {
-                let jwt = csr_result.jwt_token.unwrap_or_default();
-                let identity = crate::sesame::identity::build_identity_bundle(
-                    spiffe_uri,
-                    csr_result.cert_der,
-                    private_key_der,
-                    &csr_result.workload_ca_cert_der,
-                    &csr_result.root_ca_cert_der,
-                    jwt,
-                );
-
-                // Write to the instance's own identity mount (PKI7). The
-                // dir was prepared before the container was created; a
-                // rotation for an adopted instance may find it missing, so
-                // prepare (idempotently) here too.
-                let identity_dir = self.instance_identity_dir(instance_id);
-                if let Err(e) = crate::sesame::identity::prepare_identity_dir(&identity_dir) {
-                    let _ = events
-                        .send(ApplyEvent::Progress {
-                            message: format!("identity: failed to prepare directory: {e}"),
-                        })
-                        .await;
-                    return;
-                }
-                if let Err(e) = crate::sesame::identity::write_identity_files(
-                    &identity,
-                    &identity_dir,
-                    Self::workload_identity_owner(&identity_dir),
-                ) {
-                    let _ = events
-                        .send(ApplyEvent::Progress {
-                            message: format!("identity: failed to write files: {e}"),
-                        })
-                        .await;
-                    return;
-                }
-
-                // Store in supervisor
-                if let Some(inst) = self.supervisor.get_instance_mut(instance_id) {
-                    inst.identity = Some(identity);
-                    inst.identity_mount = Some(identity_dir);
-                }
-
-                let _ = events
-                    .send(ApplyEvent::Progress {
-                        message: format!("{} identity provisioned ✓", instance_id.0),
-                    })
-                    .await;
-            }
-            Err(e) => {
-                let _ = events
-                    .send(ApplyEvent::Progress {
-                        message: format!("identity: CSR signing failed: {e}"),
-                    })
-                    .await;
-            }
-        }
-    }
-
     /// Issue a certificate bundle for a joining node.
     ///
     /// Runs on an existing cluster member. Validates the token against the
@@ -9607,7 +9602,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// provision identities for running instances that don't have one —
     /// a failed CSR at deploy time, or an adopted instance whose
     /// directory predates the per-instance layout, heals here (D9).
-    async fn check_identity_rotation(&mut self) {
+    fn check_identity_rotation(&mut self) {
         let now = std::time::SystemTime::now();
         let mut needs_rotation = Vec::new();
 
@@ -9659,18 +9654,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
         }
 
-        // Re-provision identities that need rotation. `provision_identity` emits
-        // best-effort progress events, but a background rotation tick has no SSE
-        // consumer for them. The old code held a capacity-1 receiver it never
-        // read, so the *second* send inside the *first* provision blocked the
-        // agent loop forever (H2). Drop the receiver instead: each `send` now
-        // fails fast (channel closed) and is swallowed, while the actual
-        // CSR-signing and file writes proceed unchanged.
-        let (dummy_tx, dummy_rx) = mpsc::channel(1);
-        drop(dummy_rx);
+        // Only start the signings here: they finish on the loop when their
+        // tasks report back, and one already running for an instance is joined.
         for (id, app, ns, is_job) in needs_rotation {
-            self.provision_identity(&app, &ns, &id, is_job, &dummy_tx)
-                .await;
+            self.begin_identity_provision(&app, &ns, &id, is_job, None);
         }
     }
 
@@ -9689,35 +9676,85 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     /// Get status of all instances.
+    ///
+    /// Every instance's runtime reads share one deadline,
+    /// `STATUS_RUNTIME_READ_TIMEOUT`. An instance whose runtime hasn't
+    /// answered by then is reported with what the agent knows and
+    /// `runtime_unknown` set.
     async fn get_status(&self) -> Vec<InstanceStatus> {
-        let mut statuses = Vec::new();
-        for instance in self.supervisor.list_instances() {
-            // An instance still being created has neither, and asking would
-            // hold the agent loop until its image pull finishes (Z6.7).
-            let creating = instance.is_being_created();
-            let pid = if creating {
-                None
-            } else {
-                self.supervisor.grill().pid(&instance.id).await
-            };
-            let exit_code = match self.recorded_jobs.get(&instance.id.0).map(|job| &job.phase) {
-                Some(super::jobs::JobPhase::Exited { code }) => Some(*code),
-                Some(super::jobs::JobPhase::Unknown) => None,
-                _ if creating => None,
-                _ => self.supervisor.grill().exit_code(&instance.id).await,
-            };
-            statuses.push(InstanceStatus {
+        let deadline = tokio::time::Instant::now() + STATUS_RUNTIME_READ_TIMEOUT;
+        let instances = self.supervisor.list_instances();
+        let mut evidence = Vec::with_capacity(instances.len());
+        for batch in instances.chunks(STATUS_RUNTIME_READ_CONCURRENCY) {
+            let mut reads = Vec::with_capacity(batch.len());
+            for instance in batch {
+                reads.push(self.runtime_evidence(instance, deadline));
+            }
+            evidence.extend(futures_util::future::join_all(reads).await);
+        }
+        instances
+            .iter()
+            .zip(evidence)
+            .map(|(instance, evidence)| InstanceStatus {
                 id: instance.id.0.clone(),
                 app_name: instance.app_name.clone(),
                 namespace: instance.namespace.clone(),
                 state: self.job_state_label(instance),
                 restart_count: instance.restart_count,
                 host_port: instance.host_port,
-                exit_code,
-                pid,
-            });
+                exit_code: evidence.exit_code,
+                pid: evidence.pid,
+                runtime_unknown: evidence.unknown,
+            })
+            .collect()
+    }
+
+    /// Ask the runtime for one instance's pid and exit code, giving up at
+    /// `deadline`. A recorded job outcome needs no runtime read.
+    async fn runtime_evidence(
+        &self,
+        instance: &super::supervisor::WorkloadInstance,
+        deadline: tokio::time::Instant,
+    ) -> RuntimeEvidence {
+        // An instance still being created has neither, and asking would
+        // hold the agent loop until its image pull finishes (Z6.7).
+        let creating = instance.is_being_created();
+        let recorded_exit = match self.recorded_jobs.get(&instance.id.0).map(|job| &job.phase) {
+            Some(super::jobs::JobPhase::Exited { code }) => Some(Some(*code)),
+            Some(super::jobs::JobPhase::Unknown) => Some(None),
+            _ if creating => Some(None),
+            _ => None,
+        };
+        if creating {
+            return RuntimeEvidence {
+                pid: None,
+                exit_code: recorded_exit.flatten(),
+                unknown: false,
+            };
         }
-        statuses
+        let grill = self.supervisor.grill();
+        let read = async {
+            let pid = grill.pid(&instance.id).await;
+            let exit_code = match recorded_exit {
+                Some(code) => code,
+                None => grill.exit_code(&instance.id).await,
+            };
+            (pid, exit_code)
+        };
+        // `timeout_at` polls the read once even past the deadline, so an
+        // instance that answers at once is never marked unknown.
+        match tokio::time::timeout_at(deadline, read).await {
+            Ok((pid, exit_code)) => RuntimeEvidence {
+                pid,
+                exit_code,
+                unknown: false,
+            },
+            Err(_) => RuntimeEvidence {
+                pid: None,
+                exit_code: recorded_exit.flatten(),
+                unknown: true,
+            },
+        }
     }
 
     fn get_job_status(&self) -> Vec<JobStatus> {
@@ -10641,6 +10678,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     crate::bun::deploy_operations::DeployTargetKind::App,
                 );
                 if result.is_ok() {
+                    self.forget_adopted_app(&app_name, &namespace);
                     self.deployed_specs.insert((app_name, namespace), *spec);
                 }
                 let _ = reply.send(result);
@@ -10921,18 +10959,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 reply,
             } => {
                 // A no-op in standalone mode; a failure here is retried by the
-                // rotation loop rather than failing the deploy. The progress
-                // events it emits are dropped: the deploy already completed by
-                // the time identity provisioning runs. The sink is buffered
-                // wide enough (and provision emits only a handful of events),
-                // so provisioning never blocks on it; the drain then discards
-                // whatever it wrote.
-                let (sink, mut drain) = mpsc::channel(64);
-                self.provision_identity(&app_name, &namespace, &instance_id, is_job, &sink)
-                    .await;
-                drop(sink);
-                while drain.recv().await.is_some() {}
-                let _ = reply.send(());
+                // rotation loop rather than failing the deploy. The CSR runs
+                // off the loop, and the worker is answered when it finishes.
+                self.begin_identity_provision(
+                    &app_name,
+                    &namespace,
+                    &instance_id,
+                    is_job,
+                    Some(reply),
+                );
             }
             DeployOp::ReserveRollingInstance {
                 instance_id,
@@ -15256,6 +15291,10 @@ mod tests {
                     Some(op) = self.deploy_ops_rx.recv() => {
                         self.handle_deploy_op(op).await;
                     }
+                    Some(outcome) = self.identity_signing_tasks.join_next_with_id(),
+                        if !self.identity_signing_tasks.is_empty() => {
+                        self.finish_identity_provision(outcome);
+                    }
                     result = &mut task => {
                         let _ = result;
                         // Drain any ops queued right before the task finished.
@@ -16583,6 +16622,96 @@ interval = 1
             kills_while_queued <= ids.len(),
             "{kills_while_queued} restart cleanups ran while 8 commands waited: \
              later health ticks overtook queued commands"
+        );
+    }
+
+    /// Put `count` replicas into a pending restart whose runtime cleanup
+    /// spends `per_restart` and then fails, as after `kill_containers`.
+    async fn slow_pending_restarts(
+        count: u32,
+        per_restart: std::time::Duration,
+    ) -> (TestAgent, MockGrill, Vec<InstanceId>) {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        let config = Config::parse(&format!(
+            "[app.web]\nimage = 'web:v1'\nport = 8080\nreplicas = {count}\n"
+        ))
+        .unwrap();
+        expect_complete(&drain_deploy(&mut agent, config).await);
+        let ids: Vec<InstanceId> = agent
+            .supervisor
+            .list_instances()
+            .iter()
+            .map(|instance| instance.id.clone())
+            .collect();
+        for id in &ids {
+            let instance = agent.supervisor.get_instance_mut(id).unwrap();
+            instance.state = ContainerState::Pending;
+            instance.restart_count = 1;
+        }
+        grill.set_kill_delay(Some(per_restart));
+        grill.set_fail_kill(true);
+        (agent, grill, ids)
+    }
+
+    fn kills_per_instance(grill: &MockGrill) -> std::collections::HashMap<InstanceId, usize> {
+        let mut kills = std::collections::HashMap::new();
+        for (operation, id) in grill.calls() {
+            if operation == "kill" {
+                *kills.entry(id).or_insert(0) += 1;
+            }
+        }
+        kills
+    }
+
+    /// PR #260's journal: every pending restart spends ~400 ms on cleanup it
+    /// can't finish yet, and one tick walked all of them. Eight of them made
+    /// one tick 3.2 s long, and every command queued behind it waited that
+    /// long. A tick now stops starting new restarts once its budget is spent.
+    #[tokio::test]
+    async fn one_tick_of_pending_restarts_stays_within_its_budget() {
+        const PER_RESTART: std::time::Duration = std::time::Duration::from_millis(400);
+        let (mut agent, grill, ids) = slow_pending_restarts(8, PER_RESTART).await;
+        let started = std::time::Instant::now();
+        agent.drive_pending_restarts().await;
+        let took = started.elapsed();
+        // The budget plus the one restart that was already running when it
+        // ran out; the old tick took 8 x 400 ms.
+        assert!(
+            took < PENDING_RESTART_TICK_BUDGET + 3 * PER_RESTART,
+            "one tick spent {took:?} on {} pending restarts",
+            ids.len()
+        );
+        let attempted: usize = kills_per_instance(&grill).values().sum();
+        assert!(
+            attempted < ids.len(),
+            "the tick attempted all {attempted} restarts"
+        );
+    }
+
+    /// A bounded tick must not keep retrying the same few restarts: the
+    /// next tick carries on where the last one stopped, so every pending
+    /// restart gets its turn.
+    #[tokio::test]
+    async fn bounded_ticks_rotate_through_every_pending_restart() {
+        const PER_RESTART: std::time::Duration = std::time::Duration::from_millis(300);
+        let (mut agent, grill, ids) = slow_pending_restarts(6, PER_RESTART).await;
+        // At least one restart per tick, so six ticks reach all six even on
+        // a slow machine.
+        for _ in 0..ids.len() {
+            agent.drive_pending_restarts().await;
+        }
+        let kills = kills_per_instance(&grill);
+        for id in &ids {
+            assert!(
+                kills.get(id).copied().unwrap_or(0) >= 1,
+                "{id} never got a restart attempt: {kills:?}"
+            );
+        }
+        let most = kills.values().copied().max().unwrap();
+        let least = kills.values().copied().min().unwrap();
+        assert!(
+            most - least <= 1,
+            "restart attempts were not shared fairly: {kills:?}"
         );
     }
 
@@ -24134,5 +24263,406 @@ host = "remote.local"
             entry.backends[0].host_port,
             launches[0].spec.port_mapping.unwrap().host_port
         );
+    }
+
+    // --- workload identity signing off the command loop ---
+
+    /// A council that is not the leader, so signing goes to the leader transport.
+    async fn follower_council() -> Arc<CouncilNode> {
+        use crate::council::log_store::MemLogStore;
+        use crate::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
+        use crate::council::state_machine::CouncilStateMachine;
+        use crate::council::types::CouncilConfig;
+
+        let network = InMemoryRaftNetworkFactory::new(2, InMemoryRaftRouter::new());
+        let node = CouncilNode::new(
+            2,
+            CouncilConfig::default(),
+            network,
+            MemLogStore::new(),
+            CouncilStateMachine::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!node.is_leader().await);
+        Arc::new(node)
+    }
+
+    /// A leader transport whose "leader" accepts connections and then either
+    /// says nothing (`silent`) or hangs up at once.
+    async fn leader_transport(
+        silent: bool,
+    ) -> crate::cluster::workload_identity::WorkloadCsrClient {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                if silent {
+                    held.push(stream);
+                }
+            }
+        });
+        // A receiver keeps its last value after the sender goes.
+        let (_, metrics) = watch::channel(openraft::RaftMetrics::new_initial(2));
+        let directory = crate::mustard::directory::NodeDirectory {
+            leader: Some(crate::mustard::message::LeaderHint {
+                node_id: crate::meat::NodeId::new("leader"),
+                term: 0,
+                api_address: address,
+                reporting_address: address,
+            }),
+            ..Default::default()
+        };
+        let (_, directory) = watch::channel(directory);
+        crate::cluster::workload_identity::WorkloadCsrClient::new(
+            crate::cluster::ClusterHttp::secure(reqwest::Client::new()),
+            metrics,
+            directory,
+            0,
+        )
+    }
+
+    async fn follower_agent(silent_leader: bool) -> BunAgent<MockGrill> {
+        let mut agent = agent_with_council(follower_council().await);
+        agent.set_workload_csr_client(leader_transport(silent_leader).await);
+        agent
+    }
+
+    fn provision_op(instance: &str) -> (DeployOp, oneshot::Receiver<()>) {
+        let (reply, answered) = oneshot::channel();
+        let op = DeployOp::ProvisionIdentity {
+            app_name: "web".into(),
+            namespace: "default".into(),
+            instance_id: InstanceId(instance.into()),
+            is_job: false,
+            reply,
+        };
+        (op, answered)
+    }
+
+    /// PR #270's investigation: a follower's CSR goes to the leader with a
+    /// 10 s limit, and it ran inline from the deploy op, so a slow leader
+    /// held every queued command for up to 10 s. The loop now only starts
+    /// the signing; the deploy worker's reply comes when it has finished.
+    #[tokio::test]
+    async fn follower_csr_to_a_silent_leader_does_not_hold_the_command_loop() {
+        let mut agent = follower_agent(true).await;
+        let (op, mut answered) = provision_op("default__web-0");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            agent.handle_deploy_op(op),
+        )
+        .await
+        .expect("the identity CSR held the agent loop");
+        assert_eq!(agent.identity_signings.len(), 1);
+        assert!(
+            matches!(
+                answered.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ),
+            "the deploy worker was answered before its identity was signed"
+        );
+    }
+
+    /// The rotation tick provisions a missing identity the same way: it
+    /// starts the signing and moves on.
+    #[tokio::test]
+    async fn identity_rotation_does_not_wait_for_the_leader() {
+        // Deploy with no leader transport, so the deploy's own CSR fails
+        // fast; then the leader goes silent.
+        let mut agent = agent_with_council(follower_council().await);
+        let volumes = tempfile::tempdir().unwrap();
+        agent.set_volumes_dir(volumes.path().to_path_buf());
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        agent.set_workload_csr_client(leader_transport(true).await);
+        let id = agent.supervisor.list_instances()[0].id.clone();
+        agent.supervisor.get_instance_mut(&id).unwrap().identity = None;
+        agent.identity_retry_ticks = IDENTITY_RETRY_TICKS - 1;
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            agent.check_identity_rotation();
+        })
+        .await
+        .expect("the rotation tick waited for the leader");
+        assert_eq!(agent.identity_signings.len(), 1);
+    }
+
+    /// A deploy and the rotation tick asking for the same instance share one
+    /// CSR, and both are answered when it finishes, even when it fails.
+    #[tokio::test]
+    async fn concurrent_requests_for_one_identity_share_one_signing() {
+        let mut agent = follower_agent(false).await;
+        let (first, first_answered) = provision_op("default__web-0");
+        let (second, second_answered) = provision_op("default__web-0");
+        agent.handle_deploy_op(first).await;
+        agent.handle_deploy_op(second).await;
+        assert_eq!(agent.identity_signing_tasks.len(), 1);
+        let signing = agent.identity_signings.values().next().unwrap();
+        assert_eq!(signing.waiter_count(), 2);
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            agent.identity_signing_tasks.join_next_with_id(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        agent.finish_identity_provision(outcome);
+        for answered in [first_answered, second_answered] {
+            answered.await.expect("a waiter was dropped unanswered");
+        }
+        assert!(agent.identity_signings.is_empty());
+    }
+
+    /// A signed identity is written to the instance's mount and recorded;
+    /// one for an instance retired while its CSR was out is dropped, so it
+    /// can't recreate the directory retirement removed.
+    #[tokio::test]
+    async fn signed_identity_is_stored_only_for_a_live_instance() {
+        let (mut agent, _tx, _shutdown, _grill) = test_agent_with_grill();
+        let volumes = tempfile::tempdir().unwrap();
+        agent.set_volumes_dir(volumes.path().to_path_buf());
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        let live = agent.supervisor.list_instances()[0].id.clone();
+        agent.supervisor.get_instance_mut(&live).unwrap().identity = None;
+        let retired = InstanceId("default__web-9".into());
+
+        let issued = write_test_identity(volumes.path(), "scratch");
+        let signed = || {
+            super::identity_signing::SignedIdentity::for_test(
+                issued.spiffe_uri.clone(),
+                issued.private_key_der.clone(),
+                Ok(crate::cluster::workload_identity::SignedWorkload {
+                    cert_der: issued.certificate_der.clone(),
+                    workload_ca_cert_der: vec![1],
+                    root_ca_cert_der: vec![2],
+                    jwt_token: Some("jwt".into()),
+                }),
+            )
+        };
+        for id in [&live, &retired] {
+            let result = signed();
+            let task = agent
+                .identity_signing_tasks
+                .spawn(async move { result })
+                .id();
+            agent.identity_signings.insert(
+                task,
+                super::identity_signing::IdentitySigning::for_test(id.clone()),
+            );
+            let outcome = agent
+                .identity_signing_tasks
+                .join_next_with_id()
+                .await
+                .unwrap();
+            agent.finish_identity_provision(outcome);
+        }
+
+        let instance = agent.supervisor.get_instance(&live).unwrap();
+        assert_eq!(instance.identity.as_ref().unwrap().jwt_token, "jwt");
+        assert!(agent.instance_identity_dir(&live).exists());
+        assert!(
+            !agent.instance_identity_dir(&retired).exists(),
+            "a late signature recreated a retired instance's identity directory"
+        );
+    }
+
+    /// PR #270's investigation: runc answers `pid` and `exit_code` under the
+    /// instance's lifecycle lock, which a slow create or stop can hold for
+    /// seconds, and `get_status` waited on it with no deadline. Status now
+    /// answers anyway: what it knows, with the slow instance marked.
+    #[tokio::test]
+    async fn status_answers_promptly_when_one_instance_holds_its_runtime_lock() {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        let config =
+            Config::parse("[app.web]\nimage = 'web:v1'\nport = 8080\nreplicas = 3\n").unwrap();
+        expect_complete(&drain_deploy(&mut agent, config).await);
+        grill.set_pid(4242);
+        let slow = InstanceId("default__web-1".into());
+        grill.set_instance_pid_delay(&slow, std::time::Duration::from_secs(30));
+
+        let statuses = tokio::time::timeout(
+            STATUS_RUNTIME_READ_TIMEOUT + std::time::Duration::from_secs(2),
+            agent.get_status(),
+        )
+        .await
+        .expect("status waited for the busy instance");
+
+        assert_eq!(statuses.len(), 3);
+        for status in &statuses {
+            if status.id == slow.0 {
+                assert!(status.runtime_unknown, "{status:?}");
+                assert_eq!(status.pid, None);
+                assert_eq!(status.state, "running", "known state was dropped");
+            } else {
+                assert!(!status.runtime_unknown, "{status:?}");
+                assert_eq!(status.pid, Some(4242));
+            }
+        }
+    }
+
+    /// The deadline covers the whole answer, not each instance in turn:
+    /// several busy instances cost one deadline, not one each.
+    #[tokio::test]
+    async fn busy_instances_share_one_status_deadline() {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        let config =
+            Config::parse("[app.web]\nimage = 'web:v1'\nport = 8080\nreplicas = 6\n").unwrap();
+        expect_complete(&drain_deploy(&mut agent, config).await);
+        grill.set_pid_delay(Some(std::time::Duration::from_secs(30)));
+
+        let started = std::time::Instant::now();
+        let statuses = agent.get_status().await;
+        let took = started.elapsed();
+
+        assert!(
+            took < 2 * STATUS_RUNTIME_READ_TIMEOUT,
+            "six busy instances took {took:?}"
+        );
+        assert!(statuses.iter().all(|status| status.runtime_unknown));
+    }
+
+    /// A marked status still round-trips, and an unmarked one keeps its old
+    /// wire form.
+    #[test]
+    fn runtime_unknown_is_serialised_only_when_set() {
+        let mut status = InstanceStatus {
+            id: "default__web-0".into(),
+            app_name: "web".into(),
+            namespace: "default".into(),
+            state: "running".into(),
+            restart_count: 0,
+            host_port: None,
+            exit_code: None,
+            pid: Some(7),
+            runtime_unknown: false,
+        };
+        let plain = serde_json::to_value(&status).unwrap();
+        assert!(plain.get("runtime_unknown").is_none(), "{plain}");
+        status.runtime_unknown = true;
+        let marked: InstanceStatus =
+            serde_json::from_value(serde_json::to_value(&status).unwrap()).unwrap();
+        assert!(marked.runtime_unknown);
+    }
+
+    // --- adopted instances that already run their placement ---
+
+    /// PR #267's timeline: a Bun upgraded before its reconciler recorded the
+    /// writer's deploy as applied adopted the running writer, then found the
+    /// placement still pending and rolled it (surge-first, two writers on one
+    /// volume). The adopting agent must be able to say that its adopted
+    /// instances already run exactly that placement.
+    #[tokio::test]
+    async fn adopted_instances_that_run_their_placement_are_recognised() {
+        let directory = tempfile::tempdir().unwrap();
+        let records = directory.path().join("instances");
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        agent.set_records_dir(records.clone());
+        agent.set_volumes_dir(directory.path().join("volumes"));
+        grill.set_pid(std::process::id());
+        let config =
+            Config::parse("[app.web]\nimage = 'web:v1'\nport = 8080\nreplicas = 2\n").unwrap();
+        let placed = config.app["web"].clone();
+        expect_complete(&drain_deploy(&mut agent, config).await);
+        let ids: Vec<InstanceId> = agent
+            .supervisor
+            .list_instances()
+            .iter()
+            .map(|instance| instance.id.clone())
+            .collect();
+        assert_eq!(ids.len(), 2);
+        assert!(
+            !agent.adopted_instances_match("web", "default", &placed),
+            "instances this agent deployed itself are not adoption evidence"
+        );
+
+        let (mut replacement, _tx, _shutdown, runtime) = test_agent_with_grill();
+        replacement.set_records_dir(records);
+        replacement.set_volumes_dir(directory.path().join("volumes"));
+        runtime.set_pid(std::process::id());
+        for id in &ids {
+            runtime.set_adopt_result(id, true);
+        }
+        assert_eq!(replacement.adopt_recorded_instances().await.unwrap(), 2);
+        assert!(replacement.adopted_instances_match("web", "default", &placed));
+
+        let mut newer = placed.clone();
+        newer.image = Some("web:v2".into());
+        assert!(!replacement.adopted_instances_match("web", "default", &newer));
+        let mut bigger = placed.clone();
+        bigger.replicas = crate::config::Replicas::Fixed(3);
+        assert!(!replacement.adopted_instances_match("web", "default", &bigger));
+        assert!(!replacement.adopted_instances_match("api", "default", &placed));
+
+        // An instance that isn't running any more needs the deploy.
+        replacement
+            .supervisor
+            .get_instance_mut(&ids[0])
+            .unwrap()
+            .state = ContainerState::Unhealthy;
+        assert!(!replacement.adopted_instances_match("web", "default", &placed));
+        replacement
+            .supervisor
+            .get_instance_mut(&ids[0])
+            .unwrap()
+            .state = ContainerState::Running;
+        assert!(replacement.adopted_instances_match("web", "default", &placed));
+
+        // Once this agent deploys the app itself, adoption says nothing more.
+        let config =
+            Config::parse("[app.web]\nimage = 'web:v1'\nport = 8080\nreplicas = 2\n").unwrap();
+        expect_complete(&drain_deploy(&mut replacement, config).await);
+        assert!(!replacement.adopted_instances_match("web", "default", &placed));
+    }
+
+    /// Adopted instances whose records disagree about their spec prove
+    /// nothing, so the placement is deployed as before.
+    #[tokio::test]
+    async fn adopted_instances_with_disagreeing_records_are_not_converged() {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        let dir = tempfile::tempdir().unwrap();
+        let first = adoption_record("default__web-0", "web", false);
+        let mut second = adoption_record("default__web-1", "web", false);
+        second.replica_index = 1;
+        second.host_port = Some(30124);
+        second.app_spec.as_mut().unwrap().port = Some(9999);
+        crate::grill::records::write_record(dir.path(), &first).unwrap();
+        crate::grill::records::write_record(dir.path(), &second).unwrap();
+        agent.set_records_dir(dir.path().to_path_buf());
+        for id in ["default__web-0", "default__web-1"] {
+            grill.set_adopt_result(&InstanceId(id.into()), true);
+        }
+        assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 2);
+        let mut placed = first.app_spec.clone().unwrap();
+        placed.replicas = crate::config::Replicas::Fixed(2);
+        assert!(!agent.adopted_instances_match("web", "default", &placed));
+    }
+
+    /// The reconciler asks over the command channel.
+    #[tokio::test]
+    async fn adopted_placement_query_is_answered_on_the_command_channel() {
+        let (agent, tx, shutdown) = test_agent();
+        let task = tokio::spawn(async move {
+            let mut agent = agent;
+            agent.run().await
+        });
+        let (response, answer) = oneshot::channel();
+        tx.send(AgentCommand::AdoptedPlacementMatches {
+            app_name: "web".into(),
+            namespace: "default".into(),
+            spec: Box::new(toml::from_str("image = 'web:v1'").unwrap()),
+            response,
+        })
+        .await
+        .unwrap();
+        assert!(
+            !tokio::time::timeout(std::time::Duration::from_secs(5), answer)
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        shutdown.cancel();
+        task.await.unwrap();
     }
 }

@@ -479,6 +479,8 @@ Stop-first costs a moment of unavailability on every redeploy of a volume app. W
 
 The regression tests replay the grill's call log like the `max_surge` tests above: a volume app's redeploy must never have two instances live at once, a blue-green volume app must roll stop-first, and a host-path-only app keeps its surge. The soak's own check got fixed in the same change. Its `awk` stopped at the first line out of place and printed `LAST` from its `END` block, and `END` runs even after `exit`, so a file with one repeated line read as a file cut off at that line, below thousands of later ACKs. That looked like lost data for an hour. The check now reads the whole file and says which values are missing (lost data), which appear twice (two writers) and what the highest one is.
 
+Stop-first makes that redeploy safe. It was also unnecessary: the adopted writer already ran exactly what the placement asked for. Chapter 14 ("Adopted, and already done") shows how the reconciler now asks the agent about its adopted instances and records such a placement as applied without deploying it at all.
+
 ### "Healthy" has to mean the app answered
 
 One more audit finding, and it's the one that would have hurt most in production. The opening of this chapter promised "health-check each new instance before moving on". The live path's version of that promise was a poll on `grill.state == Running` — the *runtime's* view. The process came up, the container didn't crash, so: healthy, publish the backend, retire an old instance. At no point did anyone ask the app the question the operator configured: does `GET /healthz` return 200?
