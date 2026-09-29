@@ -5,7 +5,8 @@
 #   2. a filesystem labelled RBSEED (a USB stick), holding either
 #      seeds/<mac>.seed for one of this machine's NICs (one stick for the
 #      whole fleet, colons in the MAC written as dashes) or reliaburger.seed.
-# No seed is fine: bun then runs standalone.
+# No seed is fine: bun then runs standalone. A seed's authorized_keys (spike
+# only) becomes root's, and starts sshd for staging OS updates by hand.
 set -eu
 umask 077
 seed=
@@ -54,4 +55,11 @@ if [ -e /etc/reliaburger ]; then
     mv /etc/reliaburger "/etc/reliaburger.before-seed.$(date +%s)"
 fi
 mv "$new" /etc/reliaburger
+if [ -f /etc/reliaburger/authorized_keys ]; then
+    install -d -m 0700 /root/.ssh
+    install -m 0600 /etc/reliaburger/authorized_keys /root/.ssh/authorized_keys
+    # ssh.socket's condition was checked before this seed arrived.
+    systemctl --no-block start ssh.socket || true
+    echo "reliaburger: seed installed root's SSH key"
+fi
 echo "reliaburger: seed installed from $from: $(grep -m1 '^name' /etc/reliaburger/node.toml)"

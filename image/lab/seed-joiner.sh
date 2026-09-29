@@ -8,7 +8,7 @@
 set -euo pipefail; . "$(dirname "$0")/lab.env"
 n=${1:?usage: seed-joiner.sh <n> [count]}; count=${2:-5}; id=$(printf node-%02d "$n")
 c="$WORK/cluster"
-cargo build -q --manifest-path "$LAB/seed-admin/Cargo.toml" --bins
+cargo build -q --manifest-path "$LAB/../tools/seed-admin/Cargo.toml" --bins
 fp=$(openssl x509 -in "$c/init/identity/root-ca.crt" -outform DER | shasum -a 256 | cut -d' ' -f1)
 "$LAB/ssh.sh" bash -s "$id" "sha256:$fp" <<'REMOTE'
 set -euo pipefail
@@ -26,6 +26,6 @@ d=$(mktemp -d "$c/seeds/$id.XXXXXX")
 "$LAB/ssh.sh" "tar -C ~/lab/$id/ -czf - identity" | tar -xzf - -C "$d"
 cp "$c/init/lab-master.key" "$d/master.key"
 "$LAB/node-toml.py" "$n" "$count" > "$d/node.toml"
-"$LAB/seed-admin/target/debug/check-config" "$d/node.toml"
+"$LAB/../tools/seed-admin/target/debug/check-config" "$d/node.toml"
 COPYFILE_DISABLE=1 tar --format ustar -czf "$c/seeds/$id.tgz" -C "$d" .
 echo "work/cluster/seeds/$id.tgz: $(wc -c < "$c/seeds/$id.tgz" | tr -d ' ') bytes; identity: $(ls "$d/identity" | tr '\n' ' ')"

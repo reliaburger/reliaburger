@@ -14,7 +14,7 @@ The scripts keep their state (VM disks, logs, keys, seeds, downloaded artefacts)
 
 ```sh
 brew install qemu gh zstd mtools openssl@3 rustup
-rustup default stable        # for the seed-admin helper
+rustup default stable        # for the seed-admin helper (image/tools/seed-admin)
 gh auth login
 ```
 
@@ -91,6 +91,24 @@ A seed is a tarball of `node.toml`, the master key and the node's identity, and 
 Joiners enrol from the server: `relish join-token create`, then `relish join` pinned to the root CA's fingerprint. That's the manual path from `docs/linux-servers.md`, with the server standing in for the operator's laptop.
 
 `rbnode.sh run` also passes the lab's SSH key as the `ssh.authorized_keys.root` credential, the only thing that starts sshd on the appliance. So `ssh -F work/ssh_config root@192.168.105.101` works.
+
+### Or seed from a USB stick, as on real machines
+
+The manual's bare-metal chapter (`docs/manual/14_appliance.md`) seeds real
+machines from a stick labelled `RBSEED`. To try that path here, make seeds
+with `image/tools/seed-fleet.sh` (it runs on the Mac for `init`, and on the
+server for `join`, since only the server reaches the nodes), build a stick
+image, and plug it in with `STICK=`:
+
+```sh
+./make-seed-stick.sh work/stick.img 52:54:00:00:01:06=<fleet>/stick/seeds/52-54-00-00-01-06.seed
+STICK=work/stick.img ./rbnode.sh 6 run
+```
+
+The node's console then says `seed installed from the RBSEED stick`.
+`image/tools/netboot-server.sh` also runs on the server, inside the `nb`
+namespace, in place of the lab's own ProxyDHCP and HTTP services
+(`sudo systemctl stop l2lab-proxy l2lab-http` first).
 
 ## 5. The tour
 

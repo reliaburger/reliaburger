@@ -20,6 +20,8 @@ creds=(-smbios "type=11,value=io.systemd.credential:ssh.authorized_keys.root=$(c
 seed="$WORK/cluster/seeds/wyse-$(printf %02d "$n").tgz"
 [ -f "$seed" ] && creds+=(-smbios "type=11,value=io.systemd.credential.binary:reliaburger.seed=$(base64 < "$seed" | tr -d '\n')")
 : > "wyse$n.serial.log"
+# STICK=<image> plugs in a seed stick (make-seed-stick.sh) as USB storage.
+[ -n "${STICK:-}" ] && creds+=(-device qemu-xhci -device usb-storage,drive=stick,removable=on -drive "if=none,id=stick,format=raw,file=$STICK")
 qemu-system-x86_64 -name "wyse$n" -machine q35 -accel tcg,thread=multi -cpu Westmere -smp 4 -m 2048 \
     -drive if=pflash,format=raw,readonly=on,file=OVMF_CODE_4M.fd \
     -drive if=pflash,format=raw,file="wyse$n-vars.fd" \

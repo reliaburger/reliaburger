@@ -8,8 +8,8 @@ set -euo pipefail; . "$(dirname "$0")/lab.env"
 count=${1:-5}
 c="$WORK/cluster"
 [ -d "$c/init/identity" ] || { echo "run: work/relish init --cluster-name lab --node-id node-01 $c/init" >&2; exit 2; }
-cargo build -q --manifest-path "$LAB/seed-admin/Cargo.toml" --bins
-helpers="$LAB/seed-admin/target/debug"
+cargo build -q --manifest-path "$LAB/../tools/seed-admin/Cargo.toml" --bins
+helpers="$LAB/../tools/seed-admin/target/debug"
 mkdir -p "$c/seeds"
 d=$(mktemp -d "$c/seeds/node-01.XXXXXX")
 cp -R "$c/init/identity" "$d/identity"

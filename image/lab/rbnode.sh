@@ -43,6 +43,8 @@ run)
     seed="$WORK/cluster/seeds/node-$(printf %02d "$n").tgz"
     [ -f "$seed" ] && creds+=(-smbios "type=11,value=io.systemd.credential.binary:reliaburger.seed=$(base64 < "$seed" | tr -d '\n')")
     : > "rb$n.serial.log"
+    # STICK=<image> plugs in a seed stick (make-seed-stick.sh) as USB storage.
+    [ -n "${STICK:-}" ] && creds+=(-device qemu-xhci -device usb-storage,drive=stick,removable=on -drive "if=none,id=stick,format=raw,file=$STICK")
     qemu-system-aarch64 -name "rb$n" "${common[@]}" "${creds[@]}" -serial file:"rb$n.serial.log" \
         -pidfile "rb$n.pid" </dev/null >>qemu-stderr.log 2>&1 &
     sleep 1

@@ -133,6 +133,18 @@ mod tests {
     }
 
     #[test]
+    fn appliance_and_netboot_find_the_bare_metal_chapter() {
+        let chapters = assets::chapters();
+        let index = find_chapter(&chapters, "appliance").unwrap();
+        assert_eq!(chapters[index].file, "14_appliance.md");
+        assert_eq!(find_chapter(&chapters, "netboot").unwrap(), index);
+        // The preview walks through its two stand-in tools by name.
+        let markdown = &chapters[index].markdown;
+        assert!(markdown.contains("image/tools/netboot-server.sh"));
+        assert!(markdown.contains("image/tools/seed-fleet.sh"));
+    }
+
+    #[test]
     fn chapters_resolve_by_short_name_part_or_title() {
         let chapters = assets::chapters();
         let file = |query: &str| {

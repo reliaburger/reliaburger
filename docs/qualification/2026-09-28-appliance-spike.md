@@ -34,7 +34,7 @@ PASS for everything that can be proven without the hardware, apart from one item
 ## Results
 
 **S1: image in CI.**
-- The UKI is 55 MB (aarch64). The `/usr` slot image is 320–350 MB zstd.
+- The UKI is 55 MB on aarch64 in 2026.40.23, after the stubble unwrap (61.5 MB in S1's last run). The `/usr` slot image is 320–350 MB zstd.
 - The whole disk image is 400–460 MB zstd.
 - The installer UKI is 99 MB (aarch64) and 135 MB (x86_64).
 - x86_64 reaches `bun healthy` in 9–16 s under KVM, and aarch64 in 160–180 s under TCG.
