@@ -24,6 +24,22 @@ pub struct CapturePosition {
     pub end_offset: u64,
 }
 
+/// Where the log store has already read each capture file up to.
+///
+/// A restarted agent hands these to its log forwarders so they resume each
+/// capture file at the offset the store checkpointed, instead of reading
+/// (and discarding) everything before it again. A file with no entry starts
+/// at byte 0.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CaptureOffsets(pub std::collections::BTreeMap<std::path::PathBuf, u64>);
+
+impl CaptureOffsets {
+    /// The checkpointed offset for `file`, if the store holds lines from it.
+    pub fn get(&self, file: &std::path::Path) -> Option<u64> {
+        self.0.get(file).copied()
+    }
+}
+
 /// One line of workload output as a runtime captured it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapturedLine {

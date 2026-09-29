@@ -735,6 +735,7 @@ impl super::Grill for ProcessGrill {
         &self,
         instance: &InstanceId,
         lines_tx: tokio::sync::mpsc::Sender<crate::ketchup::types::CapturedLine>,
+        resume: &crate::ketchup::types::CaptureOffsets,
     ) {
         // Snapshot how this instance's logs are captured.
         let (stdout_buf, log_stem) = if let Some(control) = &self.control {
@@ -750,15 +751,23 @@ impl super::Grill for ProcessGrill {
             }
         };
 
-        let mut reader = crate::grill::capture::CaptureReader::new(
-            crate::ketchup::types::LogStream::Stdout,
-            log_stem.as_ref().map(|stem| log_file(stem, "stdout")),
-        );
+        let stream = crate::ketchup::types::LogStream::Stdout;
+        let mut reader = match &log_stem {
+            Some(stem) => {
+                crate::grill::capture::CaptureReader::resume(
+                    stream,
+                    log_file(stem, "stdout"),
+                    resume,
+                )
+                .await
+            }
+            None => crate::grill::capture::CaptureReader::new(stream, None),
+        };
 
         loop {
             // New bytes since the last poll, from the file or the buffer, at
-            // most one bounded chunk at a time: a restarted Bun replays the
-            // whole capture, and one long synchronous step would hold a
+            // most one bounded chunk at a time: a capture with no checkpoint
+            // replays from byte 0, and one long synchronous step would hold a
             // runtime worker for as long as it took.
             let new_data = if let Some(file) = reader.file() {
                 crate::grill::capture::read_capture_chunk(file, reader.read_offset())
@@ -1178,7 +1187,11 @@ mod tests {
         let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
         let follower = grill.clone();
         let follow_id = id.clone();
-        let task = tokio::spawn(async move { follower.follow_logs(&follow_id, sender).await });
+        let task = tokio::spawn(async move {
+            follower
+                .follow_logs(&follow_id, sender, &Default::default())
+                .await
+        });
         let line = tokio::time::timeout(std::time::Duration::from_secs(5), receiver.recv())
             .await
             .expect("no line followed")
@@ -1245,7 +1258,11 @@ mod tests {
         let (sender, mut receiver) = tokio::sync::mpsc::channel(64);
         let follower = grill.clone();
         let follow_id = id.clone();
-        let task = tokio::spawn(async move { follower.follow_logs(&follow_id, sender).await });
+        let task = tokio::spawn(async move {
+            follower
+                .follow_logs(&follow_id, sender, &Default::default())
+                .await
+        });
         let mut lines = Vec::new();
         while lines.len() < count {
             let line = tokio::time::timeout(std::time::Duration::from_secs(5), receiver.recv())
@@ -1283,6 +1300,88 @@ mod tests {
             .collect()
     }
 
+    /// Every line `follow_logs` produces for `id` when it resumes at
+    /// `resume`, until the capture goes quiet: what a forwarder reads.
+    async fn lines_read_resuming(
+        grill: &ProcessGrill,
+        id: &InstanceId,
+        resume: crate::ketchup::types::CaptureOffsets,
+    ) -> Vec<crate::ketchup::types::CapturedLine> {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(64);
+        let follower = grill.clone();
+        let follow_id = id.clone();
+        let task =
+            tokio::spawn(async move { follower.follow_logs(&follow_id, sender, &resume).await });
+        let mut lines = Vec::new();
+        while let Ok(Some(line)) =
+            tokio::time::timeout(std::time::Duration::from_millis(800), receiver.recv()).await
+        {
+            lines.push(line);
+        }
+        task.abort();
+        lines
+    }
+
+    /// #308: after a Bun restart, a forwarder resumes the capture file at the
+    /// store's checkpoint. Only the lines written since are read and
+    /// ingested; a truncated capture falls back to byte 0.
+    #[tokio::test]
+    async fn a_restarted_forwarder_reads_only_the_lines_past_the_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let grill = ProcessGrill::with_log_dir(dir.path().to_path_buf());
+        let id = InstanceId("client-0".to_string());
+        grill.create(&id, &sleep_spec("60")).await.unwrap();
+        grill.start(&id).await.unwrap();
+        let capture = dir.path().join("client-0.stdout");
+        std::fs::write(&capture, "ACK 1\nACK 2\nACK 3\n").unwrap();
+        let store_dir = tempfile::tempdir().unwrap();
+        let open_store =
+            || crate::ketchup::log_store::LogStore::new(store_dir.path().to_path_buf());
+
+        let mut store = open_store();
+        let first = lines_read_resuming(&grill, &id, store.capture_offsets()).await;
+        assert_eq!(first.len(), 3);
+        for line in first {
+            assert!(store.ingest(&client_record(&id, line)));
+        }
+        store.flush().await.unwrap();
+        drop(store);
+
+        // Bun restarts while the instance keeps writing.
+        let mut capture_file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&capture)
+            .unwrap();
+        std::io::Write::write_all(&mut capture_file, b"ACK 4\nACK 5\n").unwrap();
+        let mut store = open_store();
+        let resumed = lines_read_resuming(&grill, &id, store.capture_offsets()).await;
+        let read: Vec<&str> = resumed.iter().map(|line| line.line.as_str()).collect();
+        assert_eq!(read, ["ACK 4", "ACK 5"], "the forwarder re-read old lines");
+        for line in resumed {
+            assert!(store.ingest(&client_record(&id, line)));
+        }
+        store.flush().await.unwrap();
+        assert_eq!(
+            client_lines(&store).await,
+            ["ACK 1", "ACK 2", "ACK 3", "ACK 4", "ACK 5"]
+        );
+        drop(store);
+
+        // Truncated while Bun was down: everything in it is new.
+        std::fs::write(&capture, "ACK 6\n").unwrap();
+        let mut store = open_store();
+        let after_truncation = lines_read_resuming(&grill, &id, store.capture_offsets()).await;
+        let read: Vec<&str> = after_truncation
+            .iter()
+            .map(|line| line.line.as_str())
+            .collect();
+        assert_eq!(read, ["ACK 6"]);
+        for line in after_truncation {
+            assert!(store.ingest(&client_record(&id, line)));
+        }
+        grill.kill(&id).await.unwrap();
+    }
+
     fn printf_spec(output: &str) -> OciSpec {
         spec_with_args(vec!["printf".to_string(), output.to_string()])
     }
@@ -1312,7 +1411,11 @@ mod tests {
         let (sender, mut receiver) = tokio::sync::mpsc::channel(256);
         let follower = grill.clone();
         let follow_id = id.clone();
-        let task = tokio::spawn(async move { follower.follow_logs(&follow_id, sender).await });
+        let task = tokio::spawn(async move {
+            follower
+                .follow_logs(&follow_id, sender, &Default::default())
+                .await
+        });
         let consumer = tokio::spawn(async move {
             let mut last = None;
             for _ in 0..LINES {
