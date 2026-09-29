@@ -582,6 +582,8 @@ A candidate binary gets checked too, before it's staged. Run `bun --compatibilit
 
 Tests cover mismatched gossip and Raft messages, refused development state, rejected joins, signed-but-incompatible executables and rollback refusal. Test fixtures that model a *compatible* peer take their pair from `compatibility::CURRENT` rather than hard-coding numbers. We learnt that one when a state bump turned ten unrelated tests red at the compatibility check instead of at the behaviour they were meant to test.
 
+That fresh-cluster promise outlived 0.1.0. We sketched a stricter rule for after the release: bump a generation only for a change old nodes can't read, ship a migration with every bump, and let additive JSON fields through without one. Then we asked who it would serve. Before 1.0.0 every release is a development release, and every migration is code we'd have to test and then carry for a cluster you could simply rebuild. So the rule waits for 1.0.0. Until then, any incompatible change bumps its generation, nodes refuse old peers and old state, and you start a fresh cluster.
+
 ### Cordoning
 
 While a node swaps binaries, the scheduler shouldn't hand it new work. The mechanism is two small pieces: `ClusterUpgradeState::is_node_cordoned` says whether a node's record is in an actively-swapping phase (`Directed` or `Verifying` — a `Pending` node keeps taking work until its turn actually comes; cordoning the whole fleet at once would be a self-inflicted capacity outage), and `meat::filter::apply_upgrade_cordon` flips those nodes' `ready` flag in the scheduler's cache, which the existing filter already respects. No new filter logic — readiness was designed as the "don't place here" bit, and upgrades are just one more thing that clears it.

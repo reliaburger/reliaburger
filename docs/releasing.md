@@ -1,8 +1,16 @@
 # Cutting a release
 
-The [0.1.0 plan](plans/2026-09-16-v0.1.0-release-plan.md) defines the acceptance
-gates. A green build alone doesn't qualify the laptop quickstart or its timing.
-No public 0.1.0 release has been published by this work.
+0.1.0 went through this procedure and was promoted on 29 September 2026: one
+build, staged over HTTPS, qualified, then published unchanged. Its [release
+closure record](qualification/2026-09-27-v0.1.0-release-closure.md) lists the
+thirteen candidates it took and what each soak run found. The
+[0.1.0 plan](plans/2026-09-16-v0.1.0-release-plan.md) defined its acceptance
+gates (V01–V04 in [progress.md](progress.md#acceptance-and-release-gates)); a
+later release keeps them unless a dated plan changes them. A green build alone
+doesn't qualify the laptop quickstart or its timing.
+
+The commands below use 0.1.0's names (`v0.1.0`, `staging-v0.1.0-…`) as the
+worked example. Substitute the version you're releasing.
 
 ## What the workflow builds
 
@@ -87,10 +95,21 @@ roll or roll back only when both generations match exactly. The agent verifies
 the signed executable and checks this contract before staging it. Joins and
 cluster transports also enforce compatibility; absent evidence is a refusal.
 
-For a future incompatible wire or state change, bump the relevant generation
-and design migration separately. Leader-last upgrade ordering does not make an
-unknown Raft request safe during elections. Qualify the actual old/new binary
-pair before advertising it as supported.
+### Compatibility before 1.0.0
+
+Until 1.0.0 every release is a development release, and we don't keep
+backwards compatibility (maintainer decision, 28 September 2026). There are no
+migrations, no mixed-version clusters across a format change and no feature
+gates. Any incompatible wire or durable-state change bumps `protocol` or
+`state` in `src/compatibility.rs`; nodes then refuse old peers and old state,
+so an upgrade across that bump means starting a fresh cluster. Releases that
+don't bump still roll in place. The pre-1.0 rule for known harness artefacts in
+the V02 soak (step 4 of [staging a candidate](#staging-a-candidate))
+stays as it is.
+
+Leader-last upgrade ordering does not make an unknown Raft request safe during
+elections. Qualify the actual old/new binary pair before advertising it as
+supported.
 
 ## Signing identity
 
@@ -126,7 +145,7 @@ with their configured external key.
 ## Metadata and publication
 
 Candidate building and release publication are separate manual operations.
-After this workflow is on `main`, run:
+Run:
 
 ```sh
 gh workflow run build.yml --ref main
@@ -168,14 +187,12 @@ The digest input must come from the qualification record. Copying a fresh digest
 from unqualified downloads defeats the gate. Workflow verification establishes
 identity and byte preservation; it cannot establish that somebody actually ran
 the cold-install and recovery tests. Those remain operator acceptance criteria.
-The complete hosted candidate, staging and promotion paths have not yet been
-exercised. Actual pre-publication mirror delivery (see
-[Staging a candidate](#staging-a-candidate)) remains part of V03; downloading
-an Actions artefact alone does not qualify the public quickstart.
+Downloading an Actions artefact alone does not qualify the public quickstart;
+the candidate has to be delivered over HTTPS first (see
+[Staging a candidate](#staging-a-candidate)).
 
 GitHub documents the [default-branch requirement for manual workflows](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/manually-run-a-workflow)
 and the [release asset digest fields](https://docs.github.com/en/rest/releases/releases).
-This PR must land before those manual workflows can run.
 
 - `metadata.json` selects **Bun** by platform, preserving the existing schema
   and upgrade reader.
@@ -188,19 +205,19 @@ This PR must land before those manual workflows can run.
 
 The website and installer are separate static assets under `docs/website`,
 published by `static.yml`. GitHub Pages cannot select a different response for
-curl and a browser at `/`; the planned shell endpoint is `/install.sh`.
+curl and a browser at `/`; the shell endpoint is `/install.sh`. The bootstrap
+installs the version in its `RELIABURGER_VERSION` default (`v0.1.0` today), so
+bump that default in the same change that announces a newer release.
 
-Before tagging 0.1.0, complete the managed-cluster and clean-install gates in the
-release plan. Record timing from an empty cache, the actual artefact digests,
-host and guest versions, memory use, and the successful sample workload. Don't
-publish a five-minute claim from a source build or a warmed VM.
+Before tagging a release, complete the managed-cluster and clean-install
+gates. Record timing from an empty cache, the actual artefact digests, host and
+guest versions, memory use, and the successful sample workload. Don't publish a
+five-minute claim from a source build or a warmed VM.
 
 ## Staging a candidate
 
-Before promoting 0.1.0, publish the exact signed candidate to HTTPS and run
-the real `curl … | sh` install against it on every host we advertise. The
-workflows below need to be on `main`; the first real staging run happens once
-this lands.
+Before promoting a release, publish the exact signed candidate to HTTPS and run
+the real `curl … | sh` install against it on every host we advertise.
 
 1. **Build the candidate on main.**
 
@@ -296,6 +313,21 @@ this lands.
    runs found for 0.1.0, candidate by candidate, and the PR that fixed each
    failure.
 
+   Until 1.0, a final-tier run whose only failures are known harness
+   artefacts counts as passed (maintainer decision, 28 September 2026), if
+   each failure matches a documented artefact signature with evidence, the
+   run's snapshots are re-checked by replaying the fixed
+   `scripts/release/sustained_check.py`, nothing lost data or failed in the
+   product, and the record names each failure classified this way and why.
+   The known artefacts are `leak-rss` after a self-upgrade exec reused the pid
+   (fixed by #271: same pid, a sharp RSS drop at an upgrade walk just before
+   the warm sample, fds bounded) and a log-order swap when an instance moved
+   nodes under the same name (fixed by #272: one adjacent swap in an
+   unlabelled tail, the instance on different nodes in the status snapshots
+   either side). The [plan](plans/2026-09-25-v02-sustained.md#4-pass-and-fail)
+   keeps the list. Anything else still needs a new candidate, and from 1.0 on
+   only a clean final-tier run passes.
+
 5. **Record it.** Copy each host's record into
    `docs/qualification/DATE-staged-install-HOST.md`, alongside the run ID,
    attempt, commit and digest. Gates V03 and V04 in
@@ -312,6 +344,12 @@ this lands.
    staging tag can't be promoted: it doesn't match `v1.2.3`, `candidate.py`
    refuses it as a version, and `promote.yml` refuses any tag containing
    `staging`.
+
+8. **Update the docs** once the release is public: the release date in the
+   status boxes of [progress.md](progress.md) and the homepage
+   (`docs/website/index.html`), and the bootstrap's default version if it
+   changed. The website deploys from `main`, so merge that change after
+   promotion, not before.
 
 ## Soaking a candidate in CI
 
@@ -412,8 +450,7 @@ which complete file set is under qualification.
 
 Record the mirror URL and all downloaded hashes with the cold-run measurements.
 A staged run qualifies those signed bytes; final public URL/Pages checks still
-need their own evidence after publication. No candidate has been staged yet:
-`stage.yml` first runs once it is on `main`.
+need their own evidence after publication.
 
 ## Guest images and bootstrap installer
 
@@ -488,4 +525,4 @@ See [quickstart.md](quickstart.md) for the managed workflow. Before publishing,
 run it from the signed candidate with empty caches, including three-node and
 single-node runs, interruption/resume, stop/start and destroy. A run using
 `--development-binaries` is useful integration evidence but doesn't replace
-this gate. The installer and five-minute promise remain pending until it passes.
+this gate. Don't advertise a timing this gate hasn't measured.

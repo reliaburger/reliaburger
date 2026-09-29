@@ -7,15 +7,28 @@ have tracked defects or acceptance gates; those stay unchecked. Git history and 
 [archived plans](plans/archive/) hold the per-change evidence (regressions, test
 runs, CI results) that used to live here.
 
-> **0.1.0 status (22 September 2026):** the codebase completion backlog below is
-> done, including C34. What's left before release is the [PR #167 review
-> fixes](plans/2026-09-22-pr167-review-fixes.md) and the four acceptance gates
-> V01–V04; see [remaining work](plans/2026-09-22-v0.1.0-remaining-work.md). The
-> original [release-readiness review](plans/2026-09-16-v0.1.0-release-plan.md)
-> defines the supported scope and the clean-install and real-cluster gates.
-> The [0.1.0 release closure record](qualification/2026-09-27-v0.1.0-release-closure.md)
-> (25–29 September) lists every V02 soak run, the PRs from #196 to the
-> `v0.1.0` tag with each bug's cause and fix, and what's carried past 0.1.0.
+> **0.1.0 released on 29 September 2026.** The tag `v0.1.0` points at
+> candidate commit 7d7dfc0, promoted unchanged from the build it was qualified
+> on ([runbook](releasing.md)). The [0.1.0 release closure
+> record](qualification/2026-09-27-v0.1.0-release-closure.md) (25–29 September)
+> lists every V02 soak run and candidate, the PRs from #196 to the tag with each
+> bug's cause and fix, and what's carried past 0.1.0. The [release-readiness
+> review](plans/2026-09-16-v0.1.0-release-plan.md) and the [remaining
+> work](plans/2026-09-22-v0.1.0-remaining-work.md) plan are now history: they
+> record the supported scope and the [acceptance gates](#acceptance-and-release-gates),
+> with their evidence in [qualification/](qualification/). V01, the Intel macOS
+> and Linux rows of V04 and two V02 items were still open at release.
+>
+> **After 0.1.0:** the open items are the
+> [missing capabilities](#missing-capabilities-and-longer-term-scope) (F01–F12),
+> the one open [engineering follow-up](#engineering-follow-ups) (H05) and the
+> [known flakes](#known-flakes). The limits 0.1.0 ships with are in the
+> [documentation](README.md#010-scope-and-limits). The next releases follow
+> the [release order](roadmap.md#releases-after-010) in the roadmap: patch
+> releases 0.1.1–0.1.4 (soak follow-ups, images, hardening, observability), then one
+> headline feature per minor release, up to 0.4.0's full container migration.
+> Nothing before 1.0.0 is backwards compatible; an incompatible format change
+> needs a fresh cluster. New work starts with a dated plan in [plans/](plans/).
 
 ## Current completion backlog (17 September 2026)
 
@@ -341,7 +354,8 @@ Fixes from the [static review in PR #258](https://github.com/reliaburger/reliabu
 ### Acceptance and release gates
 
 A 0.1.0 release signing identity is committed and its private key is configured
-in repository Actions. Signed candidate qualification is still V03.
+in repository Actions. These are the acceptance gates for 0.1.0; their records
+are in [qualification/](qualification/).
 
 - [ ] **V01** (gate) Qualify the complete live three-node catalogue on independent Runc nodes.
 - [ ] **V02** (gate) Qualify sustained TLS, storage and upgrade recovery on the release candidate.
@@ -450,14 +464,14 @@ that used to fail passes.
 | V02 final-tier soak (candidate 3fcb1fd): after the harness SIGKILLed the leader's Bun (20:49:06 BST), the new Bun printed nothing for 11 min, then exited with `cannot restore workload ownership: runtime adoption timed out for default__hello-0` (21:00:25); node missing, ingress 000, upgrade walk failed. systemd: `Consumed 11min 24s CPU` in 11 min 17 s | 28 Sep (V02 soak, failures/1-7) | Product, old and newly exposed (from #224, 26 Sep): startup adoption spawns a log forwarder per adopted instance that re-reads its capture file from byte 0. The runc forwarder read the whole file into memory and `CaptureReader::push` drained each line from the front of the buffer, O(bytes x lines); the soak spammer's ~56 MB, ~1 M-line capture kept a runtime worker in one synchronous call for minutes. On the two-vCPU soak VMs adoption's own work and its 10 s timer could not run until it finished, so the deadline fired late and Bun exited. The next start (same files) adopted all nine in 2 s: scheduling luck. The process runtime also `std::fs::read` the whole file every 200 ms | Fixed: `push` is linear (one scan, one drain); both runtimes follow captures in `read_capture_chunk` steps of at most 64 KiB, each an `.await`, and skip the poll sleep while chunks come back full. `replaying_a_large_capture_backlog_does_not_hold_the_runtime` (process) and `following_a_large_capture_after_a_restart_does_not_hold_the_runtime` (runc, Lima `reliaburger-test`) held the runtime for 5.5 s and 20.9 s before; `a_backlog_of_short_lines_splits_in_linear_time` took 21.6 s before. Lima `owned_runc` 18/18 and `owned_network` 5/5 after. Still open (design, post-0.1.0): adoption is fail-closed, so one instance that can't be adopted stops the node; bounding and quarantining it needs its name, port, lease and address fenced and a report state that is neither running nor gone |
 | V02 final-tier soak (candidate 3fcb1fd): every `relish test` pulse after the leader-kill hang (20:29, 21:33, 22:42 UTC) timed out 8 of 15 cases "still waiting for identity-app to reach 1 running replica(s) cluster-wide; last saw 0 instance(s)"; applies committed, cleanup confirmed. Passed at 19:29 and again at 23:46 after a graceful whole-cluster restart | 29 Sep (V02 soak, failures/8, 10, 11) | Product (since #260, 27 Sep): the agent loop's `biased;` `select!` polled commands before deploy steps, stop completions and the health tick. After node 1's hang the soak apps sat on one node (10 instances, node 3; node 2 in the 21:33 pulse) and the bin-packer put every test workload there too. Four cases polling status without pause kept that node's command channel non-empty, so a deploy task's first `DeployOp` never ran: `orchestrator: deploy of ing-web/rbtest-… failed … did not reach a terminal event within 300s` (node 3, 20:34:26 UTC; node 2 21:38:22; node 3 22:47:10), and the next deploy ran all its steps within 2 s of the first case wave ending. `registry-web` sat in `health-wait` for 300 s (probes run from the starved tick). Not a lease, quota, capacity or leader-state fault: the leader changed three times across the failing pulses. #275 and #278 don't touch the loop, so candidate 12 hits it whenever the soak's apps pile onto the node the test workloads land on | Fixed: stop completions and deploy ops (bounded: one outstanding per stop or deploy task) sit above commands; the tick runs unconditionally once `HEALTH_TICK_STARVATION_BOUND` (5 s) passes without one (`deploy_steps_progress_while_status_queries_keep_the_queue_busy`, `health_tick_runs_while_status_queries_keep_the_queue_busy`, both failed before; #260's `queued_commands_are_answered_before_the_next_slow_health_tick` still passes). Still open: the retried "local service requires its committed cluster allocation" on the first deploy after a starved one; not yet re-run in a soak |
 
-## Current release checklist
+## 0.1.0 release checklist
 
 - [x] Commit the release scope and acceptance plan.
 - [x] Validate setup liveness and bounded subsystem readiness.
 - [x] Stream registry uploads and bound writers.
 - [x] Measure registry memory under concurrent pushes.
 - [x] Package self-contained Linux agents and native laptop CLIs.
-- [ ] Publish verifiable release metadata and signed artefacts.
+- [x] Publish verifiable release metadata and signed artefacts ([v0.1.0](https://github.com/reliaburger/reliaburger/releases/tag/v0.1.0), promote run 36624159253).
 - [x] Implement secure, resumable managed laptop clusters and installer.
 - [x] Fix registry/runtime cache compatibility, restart checkpoints and responsive health probing.
 - [x] Route ingress across nodes and report cluster-wide CLI status.
