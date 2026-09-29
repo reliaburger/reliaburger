@@ -1780,6 +1780,8 @@ How long should that deadline be? We first picked 30 seconds, and the V02 soak s
 
 So the number is no longer ours to pick. `lease_retirement_bound` in `src/cluster/orchestrate.rs` adds up what an owner does after a release (wait for its next placement poll, retire, acknowledge to the leader) from the same constants the reconciler uses. Relish's `lease_release_budget` is that bound with the default runtime configuration, and the case runner's teardown is that budget plus 30 seconds for reversing faults and checking the runtime independently. `pub fn` rather than `const` here isn't a style choice: `RuntimeSection::default()` builds a struct at run time, and Rust only lets a `const` call functions marked `const fn`, which `Default::default` isn't. If someone later lengthens the stop grace, the runner's patience grows with it instead of silently turning green runs into `unknown` ones.
 
+That bound still had a hole: it assumed nothing else held the owner's reconcile cycle, and a deploy did. So the reconciler now retires before it deploys, and keeps retiring while it waits on one (Chapter 7, "Retire first, deploy second"). The report changed too. It used to say "within 30 s" whatever the budget was; it now prints the budget it actually had.
+
 What if a worker will never come back? Waiting forever keeps the record honest but leaves the operator stuck. `relish decommission-node worker-a --workloads-stopped --reason "powered off"` is the escape hatch, and it's deliberately a *different* kind of evidence. Only an unscoped Admin can submit it. Raft records who said it, why and when, releases that node's outstanding placements, and permanently retires the node identity, so an old disk can't come back with an old certificate and resume work the cluster has already forgotten. Bun observing a process exit and an operator promising they've pulled the plug are both valid reasons to finish cleanup. They're not the same reason, and the audit record says which one it was.
 
 Tokens, jobs and faults needed their own owners too. A test token is minted inside the lease, scoped to its namespace, never Admin, and it expires no later than the lease does. Jobs in 0.1 run on the node that received them, so their leases live on that node (`scope = "node_jobs"`) and a local reaper retires both running jobs and cron registrations that haven't fired yet. Chaos faults get a receipt *before* the request goes out, because the server may accept a fault whose response never reaches us; an unresolved receipt makes cleanup `Unknown` rather than `NotRequired`.
@@ -2888,10 +2890,115 @@ nothing, a worker that has never had an answer sends nothing at all, and
 neither does one whose agent loop has exited (its end of the channel is
 closed, so it's gone, not busy).
 
+### Everyone below the line
+
+Moving the snapshot request up fixed the one branch we'd caught starving. It
+didn't fix the order. Candidate 11's final tier showed what else lived under
+the command channel.
+
+At 19:49 UTC the harness SIGKILLed the leader's Bun on node 1. That restart
+hung for eleven minutes (the capture-file replay from Chapter 6), and while
+node 1 was gone the leader moved its soak apps elsewhere. Node 3 ended up
+running ten of the fourteen. Nothing moved them back; nothing had to. Then
+every `relish test` pulse for the next two hours failed the same way: eight of
+fifteen cases timed out "still waiting for identity-app to reach 1 running
+replica(s) cluster-wide; last saw 0 instance(s)". The apply had committed. The
+leader had placed the apps. No instance ever appeared.
+
+The placement part is ordinary. Our scheduler bin-packs, so every test workload
+went to the fullest node, which was now node 3 (node 2 during one pulse, after
+a power-off shuffled things around). Node 3's journal (BST, an hour ahead of
+the UTC above) had the rest:
+
+```text
+21:34:26 orchestrator: deploy of ing-web/rbtest-…-06 failed (attempt 1),
+         retrying in 5s: the deploy did not reach a terminal event within 300s
+21:34:28 orchestrator: deploy of ing-listed/rbtest-…-08 failed (attempt 1), …
+21:39:40 orchestrator: deploy of vol-b/rbtest-…-10 failed (attempt 1),
+         retrying in 5s: the deploy did not reach a terminal event within 300s
+```
+
+A deploy runs on its own task, and every step that touches the agent's state
+(check the image signature, record the spec, create the instances) goes back to
+the loop as a `DeployOp` and waits for the reply. Those ops sat below the
+command channel in the `biased;` order. Four cases polled every node's status
+without a pause, node 3 read the runtime of ten instances for each answer, and
+the channel was never empty. Status kept answering, so the cases saw "0
+instances" rather than an error, while the deploy's first step waited all 300 s
+for a turn that never came. The tell is in the timestamps: the first wave of
+cases hit its deadline and stopped polling at 21:34:22, and two seconds later
+the next deploy on the same node had run every step up to publishing its
+service. (It then failed for want of the service's cluster address, and the
+reconciler retried it; that part is ordinary.) The health tick, at the very
+bottom, starved too: during one
+pulse `registry-web` did get an instance, and it sat in `health-wait` for the
+whole five minutes, because health probes run from the tick.
+
+Why did the pulses before 19:49 pass, and the one after 22:55 (a graceful
+restart of the whole cluster put node 1's apps back)? Load. The
+earlier pulses took 40 to 110 s per case, which already says the deploy steps
+were fighting for turns; they just won often enough. Ten instances on the node
+under test tipped them into never winning.
+
+The fix changes the order, not the budget:
+
+```rust
+tokio::select! {
+    biased;
+    _ = self.shutdown.cancelled() => { /* ... */ }
+    Some(req) = Self::recv_snapshot(&mut self.cluster) => { /* ... */ }
+    Some(outcome) = self.stop_waits.join_next_with_id(),
+        if !self.stop_waits.is_empty() => { /* ... */ }
+    Some(op) = self.deploy_ops_rx.recv() => { /* ... */ }
+    Some(cmd) = self.command_rx.recv() => { /* ... */ }
+    _ = health_interval.tick() => { self.run_health_tick().await; }
+}
+```
+
+The argument for putting a branch above commands is the one we got wrong the
+first time, so it's worth spelling out. A branch may sit above another only if
+it can't flood. Stop completions come from a `JoinSet` of stops already
+started, one each. Every deploy op comes from a deploy task that sends one and
+waits for its reply before sending the next, so there are never more of them
+waiting than deploys (plus health probes) in flight, and a command waits for at
+most that many short steps. Commands are the opposite: any number of API
+callers, the reconciler and the reporting paths all send them, and a dozen
+polite callers taking turns are a flood.
+
+The tick can't move up like that. It's always due again after a slow round, and
+that's exactly what #260 was about. So it gets a floor instead: if no tick has
+run for `HEALTH_TICK_STARVATION_BOUND` (five seconds), the loop runs one before
+it looks at the queues at all:
+
+```rust
+let starved = last_health_tick.elapsed() >= HEALTH_TICK_STARVATION_BOUND;
+if starved {
+    self.run_health_tick().await;
+    last_health_tick = tokio::time::Instant::now();
+    health_interval.reset();
+} else {
+    tokio::select! { /* as above */ }
+}
+```
+
+`tokio::time::Instant` rather than `std::time::Instant`: the tokio one follows
+tokio's clock, so a test that pauses time controls it too. `reset()` pushes the
+interval's next tick a full period away, so the forced tick doesn't get a
+second, back-to-back run from the interval. Commands still come before a tick
+that is merely due; they just can't hold it off for more than five seconds.
+
+Both tests start four callers that ask for status again the moment they get an
+answer, against a mock runtime that takes 20 ms per pid read. That's the pulse
+in miniature. In the first, a fresh deploy must complete within ten seconds; it
+never did before. In the second, a replica dies and must be restarted, which
+only the tick does; before, nothing happened for fifteen seconds. The #260 test
+still passes: eight queued commands are answered with at most the running
+tick's cleanups in between.
+
 ### Shorter turns
 
-`biased;` and the re-sent snapshot make a long turn of the loop survivable.
-They don't make it short. Both investigations left a list of turns that could
+`biased;`, the re-sent snapshot and the tick's floor make a long turn of the
+loop survivable. They don't make it short. Both investigations left a list of turns that could
 still run for seconds, and the next release took them one at a time.
 
 The first was the tick from #260 itself. `drive_pending_restarts` walked
@@ -2987,7 +3094,9 @@ future that could see them change.
 
 A new `select!` branch collects finished signings with `join_next_with_id`,
 writes the certificate files and records the identity, all on the loop, as
-before. The deploy worker's reply travels with the signing and is answered
+before. It sits next to the stop completions, above commands, and passes the
+same test: a signing is only in flight for a provision the loop already
+started, at most one per instance, so finished ones can't flood the loop. The deploy worker's reply travels with the signing and is answered
 only when it's done, so the worker still waits, just not *on* the loop. Two
 details came out of the split. The rotation tick runs every second and a
 signing can take ten, so a request for an instance that already has a signing
