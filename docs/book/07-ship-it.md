@@ -479,6 +479,8 @@ Stop-first costs a moment of unavailability on every redeploy of a volume app. W
 
 The regression tests replay the grill's call log like the `max_surge` tests above: a volume app's redeploy must never have two instances live at once, a blue-green volume app must roll stop-first, and a host-path-only app keeps its surge. The soak's own check got fixed in the same change. Its `awk` stopped at the first line out of place and printed `LAST` from its `END` block, and `END` runs even after `exit`, so a file with one repeated line read as a file cut off at that line, below thousands of later ACKs. That looked like lost data for an hour. The check now reads the whole file and says which values are missing (lost data), which appear twice (two writers) and what the highest one is.
 
+Stop-first makes that redeploy safe. It was also unnecessary: the adopted writer already ran exactly what the placement asked for. Chapter 14 ("Adopted, and already done") shows how the reconciler now asks the agent about its adopted instances and records such a placement as applied without deploying it at all.
+
 ### "Healthy" has to mean the app answered
 
 One more audit finding, and it's the one that would have hurt most in production. The opening of this chapter promised "health-check each new instance before moving on". The live path's version of that promise was a poll on `grill.state == Running` — the *runtime's* view. The process came up, the container didn't crash, so: healthy, publish the backend, retire an old instance. At no point did anyone ask the app the question the operator configured: does `GET /healthz` return 200?
@@ -1212,6 +1214,41 @@ Moving the wait off the loop opened gaps that the old serial code closed by acci
 The agent was only half the stall. On each cycle the node's placement reconciler sent `Retire` for every app it no longer owned, one at a time, and gave each ten seconds for queueing and reply. That's the same ten seconds as the stop grace, so a stubborn app's retirement *always* timed out on the first try, and five of them held up the reconciler (and every deploy queued behind it) for fifty seconds. The deadline now comes from the stop itself: `stop_completion_bound` adds up the worst case (a drain of up to one grace, the grace, and three runtime confirmation timeouts), and the reconciler adds its queueing allowance on top. A cycle's retirements go through `buffer_unordered(4)`, a stream adaptor that keeps up to four futures in flight and yields each result as it lands, so five stubborn retirements cost about one grace, not five. A test with a stand-in agent whose every stop takes a grace checks that three retirements finish inside two graces, each on its first attempt; one at a time they took 4.5 s for three 1.5 s stops.
 
 What didn't change is the guarantee that matters: a port, an address or a volume is released only after the runtime has confirmed the old process is gone. `Retire` still answers only after the exit, and the tests hold both ends of that. With a process-runtime workload running `sh -c "trap '' TERM; sleep 60"`, `Status` must answer in under a second while the stop waits, the stop must take at least the grace and end with the process gone, a retirement must keep its instance listed until the exit, and two stubborn stops must finish in under 1.8 graces (one after the other they can't take less than two). Each of those fails against the old loop. The overlap test, for example, reported `4.03s for two 2s graces`.
+
+### Retire first, deploy second
+
+Side-by-side retirements fixed the stops. They didn't fix the order. A reconcile cycle deployed first, one app at a time, and each deploy may wait up to five minutes for its terminal event. Only then did it retire the placements that had left the node. After a node went stale, or when a cluster powered back on, the surviving nodes had a wave of rescheduled replicas to start, and every retirement on those nodes queued behind the wave. The V02 soak saw it as test-lease cleanup: the owner was the leader, busy rolling out frontend replicas it had inherited from a killed worker, and the release outlived `lease_retirement_bound`, whose doc comment had to admit the gap ("a deploy it's still finishing runs first").
+
+Two changes close it. The cycle now retires before it deploys. A retirement only covers placements that are already gone from this node, so running it first costs no availability, and it frees ports, addresses and volumes for the deploys that follow. That handles what was due when the cycle started. For what becomes due *during* a long deploy, the reconciler already polled the leader on every tick while it waited (the producer can need this node's withdrawal receipt before it can finish). It used to throw that answer away. Now it retires whatever the fresh answer says has left.
+
+Retiring in the middle of a deploy raises the one-writer question from #267. What if the app that's deploying is the one the fresh answer withdraws? The retirement skips it: `retire_departed` takes the in-flight placement as `busy`, and it waits for the next cycle, after its deploy has finished. The agent would refuse the overlap anyway (a stop of an app that's deploying gets `WorkloadBusy`, a deploy of an app that's stopping gets "still stopping"), but the reconciler shouldn't lean on refusals it then has to retry. The other direction matters too. If a fresh answer withdraws an app the cycle hasn't reached yet, the cycle skips it rather than deploying it from the older answer. For a volume app that the leader has just moved elsewhere (#269), that stale deploy would have been a second writer on another node.
+
+The retirement code moved into a small struct that borrows what it needs from the reconciler:
+
+```rust
+struct Retirer<'a> {
+    node_name: &'a str,
+    cmd_tx: &'a mpsc::Sender<AgentCommand>,
+    client: &'a reqwest::Client,
+    // ...
+}
+
+impl Retirer<'_> {
+    async fn retire_departed(
+        &self,
+        applied: &mut AppliedMap,
+        leader_url: &str,
+        assignments: &NodeAssignments,
+        busy: Option<&(String, String)>,
+    ) -> Option<()> { /* ... */ }
+}
+```
+
+`<'a>` is a lifetime parameter. A struct that holds references has to say how long they're valid, and `'a` names "as long as the reconciler's own values", so the compiler rejects any `Retirer` that could outlive them. In C you'd just store the pointers and hope. In the `impl` we don't care which lifetime it is, so `'_` asks the compiler to fill it in. The map of owned placements is *not* in the struct. It's passed as `&mut AppliedMap` on each call, because the deploy loop changes it between calls, and Rust won't let one value hold a long-lived mutable borrow while another piece of code writes to the same map.
+
+There was one trap. While the reconciler retires, it isn't reading the deploy's event stream. The agent never lets a slow reader hold a deploy hostage: when the stream's buffer is full, it closes the stream, and the reconciler would then see a perfectly healthy deploy as "closed without an outcome". So the stream now drains on its own task. `tokio::spawn` returns a `JoinHandle`, which is itself a future that resolves to the task's result, so `select!` can wait on it exactly as it waited on the inline future before. On shutdown the reconciler calls `abort()` on it instead of leaving it to run out its five minutes.
+
+Four tests pin this down, each with a stand-in leader whose answer the test rewrites mid-flight. A retirement due at the start of a cycle must reach the agent before the cycle's deploy, which never finishes. A lease released while a deploy hangs must be retired and acknowledged well inside `lease_retirement_bound`. A volume app that leaves the node during its own deploy must be retired only after that deploy completes, and redeployed only after the retirement answers. A placement withdrawn during another app's deploy must never be deployed. Three of them failed against the old order; the fourth passes either way and fails as soon as the `busy` exclusion is removed.
 
 ## What we deferred
 

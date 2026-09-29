@@ -1780,6 +1780,8 @@ How long should that deadline be? We first picked 30 seconds, and the V02 soak s
 
 So the number is no longer ours to pick. `lease_retirement_bound` in `src/cluster/orchestrate.rs` adds up what an owner does after a release (wait for its next placement poll, retire, acknowledge to the leader) from the same constants the reconciler uses. Relish's `lease_release_budget` is that bound with the default runtime configuration, and the case runner's teardown is that budget plus 30 seconds for reversing faults and checking the runtime independently. `pub fn` rather than `const` here isn't a style choice: `RuntimeSection::default()` builds a struct at run time, and Rust only lets a `const` call functions marked `const fn`, which `Default::default` isn't. If someone later lengthens the stop grace, the runner's patience grows with it instead of silently turning green runs into `unknown` ones.
 
+That bound still had a hole: it assumed nothing else held the owner's reconcile cycle, and a deploy did. So the reconciler now retires before it deploys, and keeps retiring while it waits on one (Chapter 7, "Retire first, deploy second"). The report changed too. It used to say "within 30 s" whatever the budget was; it now prints the budget it actually had.
+
 What if a worker will never come back? Waiting forever keeps the record honest but leaves the operator stuck. `relish decommission-node worker-a --workloads-stopped --reason "powered off"` is the escape hatch, and it's deliberately a *different* kind of evidence. Only an unscoped Admin can submit it. Raft records who said it, why and when, releases that node's outstanding placements, and permanently retires the node identity, so an old disk can't come back with an old certificate and resume work the cluster has already forgotten. Bun observing a process exit and an operator promising they've pulled the plug are both valid reasons to finish cleanup. They're not the same reason, and the audit record says which one it was.
 
 Tokens, jobs and faults needed their own owners too. A test token is minted inside the lease, scoped to its namespace, never Admin, and it expires no later than the lease does. Jobs in 0.1 run on the node that received them, so their leases live on that node (`scope = "node_jobs"`) and a local reaper retires both running jobs and cron registrations that haven't fired yet. Chaos faults get a receipt *before* the request goes out, because the server may accept a fault whose response never reaches us; an unresolved receipt makes cleanup `Unknown` rather than `NotRequired`.
@@ -2887,6 +2889,277 @@ guard rails get tests too. After the two-minute grace the worker sends
 nothing, a worker that has never had an answer sends nothing at all, and
 neither does one whose agent loop has exited (its end of the channel is
 closed, so it's gone, not busy).
+
+### Everyone below the line
+
+Moving the snapshot request up fixed the one branch we'd caught starving. It
+didn't fix the order. Candidate 11's final tier showed what else lived under
+the command channel.
+
+At 19:49 UTC the harness SIGKILLed the leader's Bun on node 1. That restart
+hung for eleven minutes (the capture-file replay from Chapter 6), and while
+node 1 was gone the leader moved its soak apps elsewhere. Node 3 ended up
+running ten of the fourteen. Nothing moved them back; nothing had to. Then
+every `relish test` pulse for the next two hours failed the same way: eight of
+fifteen cases timed out "still waiting for identity-app to reach 1 running
+replica(s) cluster-wide; last saw 0 instance(s)". The apply had committed. The
+leader had placed the apps. No instance ever appeared.
+
+The placement part is ordinary. Our scheduler bin-packs, so every test workload
+went to the fullest node, which was now node 3 (node 2 during one pulse, after
+a power-off shuffled things around). Node 3's journal (BST, an hour ahead of
+the UTC above) had the rest:
+
+```text
+21:34:26 orchestrator: deploy of ing-web/rbtest-…-06 failed (attempt 1),
+         retrying in 5s: the deploy did not reach a terminal event within 300s
+21:34:28 orchestrator: deploy of ing-listed/rbtest-…-08 failed (attempt 1), …
+21:39:40 orchestrator: deploy of vol-b/rbtest-…-10 failed (attempt 1),
+         retrying in 5s: the deploy did not reach a terminal event within 300s
+```
+
+A deploy runs on its own task, and every step that touches the agent's state
+(check the image signature, record the spec, create the instances) goes back to
+the loop as a `DeployOp` and waits for the reply. Those ops sat below the
+command channel in the `biased;` order. Four cases polled every node's status
+without a pause, node 3 read the runtime of ten instances for each answer, and
+the channel was never empty. Status kept answering, so the cases saw "0
+instances" rather than an error, while the deploy's first step waited all 300 s
+for a turn that never came. The tell is in the timestamps: the first wave of
+cases hit its deadline and stopped polling at 21:34:22, and two seconds later
+the next deploy on the same node had run every step up to publishing its
+service. (It then failed for want of the service's cluster address, and the
+reconciler retried it; that part is ordinary.) The health tick, at the very
+bottom, starved too: during one
+pulse `registry-web` did get an instance, and it sat in `health-wait` for the
+whole five minutes, because health probes run from the tick.
+
+Why did the pulses before 19:49 pass, and the one after 22:55 (a graceful
+restart of the whole cluster put node 1's apps back)? Load. The
+earlier pulses took 40 to 110 s per case, which already says the deploy steps
+were fighting for turns; they just won often enough. Ten instances on the node
+under test tipped them into never winning.
+
+The fix changes the order, not the budget:
+
+```rust
+tokio::select! {
+    biased;
+    _ = self.shutdown.cancelled() => { /* ... */ }
+    Some(req) = Self::recv_snapshot(&mut self.cluster) => { /* ... */ }
+    Some(outcome) = self.stop_waits.join_next_with_id(),
+        if !self.stop_waits.is_empty() => { /* ... */ }
+    Some(op) = self.deploy_ops_rx.recv() => { /* ... */ }
+    Some(cmd) = self.command_rx.recv() => { /* ... */ }
+    _ = health_interval.tick() => { self.run_health_tick().await; }
+}
+```
+
+The argument for putting a branch above commands is the one we got wrong the
+first time, so it's worth spelling out. A branch may sit above another only if
+it can't flood. Stop completions come from a `JoinSet` of stops already
+started, one each. Every deploy op comes from a deploy task that sends one and
+waits for its reply before sending the next, so there are never more of them
+waiting than deploys (plus health probes) in flight, and a command waits for at
+most that many short steps. Commands are the opposite: any number of API
+callers, the reconciler and the reporting paths all send them, and a dozen
+polite callers taking turns are a flood.
+
+The tick can't move up like that. It's always due again after a slow round, and
+that's exactly what #260 was about. So it gets a floor instead: if no tick has
+run for `HEALTH_TICK_STARVATION_BOUND` (five seconds), the loop runs one before
+it looks at the queues at all:
+
+```rust
+let starved = last_health_tick.elapsed() >= HEALTH_TICK_STARVATION_BOUND;
+if starved {
+    self.run_health_tick().await;
+    last_health_tick = tokio::time::Instant::now();
+    health_interval.reset();
+} else {
+    tokio::select! { /* as above */ }
+}
+```
+
+`tokio::time::Instant` rather than `std::time::Instant`: the tokio one follows
+tokio's clock, so a test that pauses time controls it too. `reset()` pushes the
+interval's next tick a full period away, so the forced tick doesn't get a
+second, back-to-back run from the interval. Commands still come before a tick
+that is merely due; they just can't hold it off for more than five seconds.
+
+Both tests start four callers that ask for status again the moment they get an
+answer, against a mock runtime that takes 20 ms per pid read. That's the pulse
+in miniature. In the first, a fresh deploy must complete within ten seconds; it
+never did before. In the second, a replica dies and must be restarted, which
+only the tick does; before, nothing happened for fifteen seconds. The #260 test
+still passes: eight queued commands are answered with at most the running
+tick's cleanups in between.
+
+### Shorter turns
+
+`biased;`, the re-sent snapshot and the tick's floor make a long turn of the
+loop survivable. They don't make it short. Both investigations left a list of turns that could
+still run for seconds, and the next release took them one at a time.
+
+The first was the tick from #260 itself. `drive_pending_restarts` walked
+*every* pending restart on every tick, and each one that couldn't clean up yet
+cost about 400 ms. Three of them made a 1.2 s tick. Thirty would make a
+twelve-second one, and a command queued behind it waits all twelve. So the
+tick now has a budget:
+
+```rust
+const PENDING_RESTART_TICK_BUDGET: Duration = Duration::from_millis(500);
+
+let deadline = tokio::time::Instant::now() + PENDING_RESTART_TICK_BUDGET;
+for (index, (id, state)) in retrying.into_iter().enumerate() {
+    if index > 0 && tokio::time::Instant::now() >= deadline {
+        break;
+    }
+    self.restart_rotation.cleanup = Some(id.clone());
+    // ...
+}
+```
+
+`enumerate()` pairs each item with its position, like Python's `enumerate`.
+The `index > 0` guard means a tick always makes progress on at least one
+restart, however slow. A budget on its own would starve somebody, though.
+Collect the pending restarts in the same order every tick, stop after two,
+and the same two get retried forever while the rest wait. So the agent
+remembers the last instance each phase touched, and the next tick starts just
+after it:
+
+```rust
+fn rotate_after<T>(
+    mut items: Vec<T>,
+    last: Option<&InstanceId>,
+    id: impl Fn(&T) -> &InstanceId,
+) -> Vec<T> {
+    items.sort_by(|a, b| id(a).0.cmp(&id(b).0));
+    if let Some(last) = last {
+        let start = items.partition_point(|item| id(item).0 <= last.0);
+        items.rotate_left(start);
+    }
+    items
+}
+```
+
+`id: impl Fn(&T) -> &InstanceId` takes any closure that can pull an instance
+id out of an item, so both phases (which carry different tuples) share one
+helper. It's still a generic function, compiled once per closure type, with
+no function pointer or boxing involved. `partition_point` is a binary search
+on a sorted slice: it returns the index of the first item for which the
+predicate is false, here the first id after the one we stopped at.
+`rotate_left` then moves everything before that index to the back, in place.
+An instance that disappeared since the last tick doesn't matter: the search
+finds where it *would* be, and the walk carries on from there.
+
+Two tests pin it down. One puts eight replicas into pending restart, each
+spending 400 ms and failing, and checks that a single tick finishes well short
+of the 3.2 s the old walk took, without trying all eight. The other runs six
+ticks over six slow restarts and checks that each got its turn and that no
+instance got more than one attempt more than any other.
+
+The second long turn was the one #270 named: signing a follower's workload
+certificate. Only the leader holds the Workload CA, so a follower sends its
+CSR over mTLS and waits up to ten seconds for the answer. That wait ran inline
+twice over, from the deploy worker's `ProvisionIdentity` request and from the
+rotation tick. A slow leader meant ten seconds of nobody else getting an
+answer from the node.
+
+We already had the shape of the fix. #237 moved stop waits off the loop by
+splitting a stop into the part that must happen on the loop, the part that
+only waits, and the part that records the result back on the loop. Signing
+splits the same way. The loop generates the CSR (the private key never leaves
+the node), then spawns the signing into a `JoinSet`:
+
+```rust
+let task = self
+    .identity_signing_tasks
+    .spawn(async move {
+        let result = tokio::time::timeout(WORKLOAD_SIGNING_TIMEOUT, request.sign())
+            .await
+            .unwrap_or_else(|_| Err("workload signing timed out".to_string()));
+        SignedIdentity { spiffe_uri, private_key_der, result }
+    })
+    .id();
+```
+
+`async move` makes the future take ownership of everything it uses: the
+`Arc` to the council, a clone of the leader transport, the CSR bytes. That's
+what lets it outlive the function that spawned it, and the compiler insists
+on it, because `spawn` requires a `'static` future: one that borrows nothing
+from the caller's stack. In Go you'd capture the variables and hope nobody
+changes them underneath the goroutine. Here the borrow checker won't compile a
+future that could see them change.
+
+A new `select!` branch collects finished signings with `join_next_with_id`,
+writes the certificate files and records the identity, all on the loop, as
+before. It sits next to the stop completions, above commands, and passes the
+same test: a signing is only in flight for a provision the loop already
+started, at most one per instance, so finished ones can't flood the loop. The deploy worker's reply travels with the signing and is answered
+only when it's done, so the worker still waits, just not *on* the loop. Two
+details came out of the split. The rotation tick runs every second and a
+signing can take ten, so a request for an instance that already has a signing
+in flight joins it rather than sending a second CSR. And a signature can now
+arrive after its instance has been retired; retirement deleted the identity
+directory, so writing the files would recreate it with nobody left to delete
+it. The loop checks the instance still exists before it writes anything.
+
+The tests stand up a follower with a "leader" that accepts the TCP connection
+and then says nothing. The deploy worker's identity request must return in
+under a second, with its reply still pending (it took the full ten before);
+the rotation tick likewise. A leader that hangs up at once checks the other
+end: two requests for one instance share one signing, and both get answered
+when it fails. The last test hands the loop two finished signatures, one for
+a live instance and one for a retired one, and checks that only the live one
+gets files.
+
+The third was status itself. Every `Status` command asks the runtime for each
+instance's pid and exit code, and runc answers both under the instance's
+lifecycle lock. A create that's pulling a slow image, or a stop waiting out
+its grace, holds that lock for seconds, and `get_status` waited on it with no
+deadline, one instance after another. One slow instance stalled the answer
+for all of them, and the loop with it.
+
+What should status say about an instance the runtime won't talk about yet?
+Not nothing: the agent still knows its app, state, port and restart count.
+Not "no pid" either, because that means something (the process has gone).
+So the answer carries what's known and says which part isn't:
+
+```rust
+/// The runtime didn't answer for this instance before the status
+/// deadline, so `pid` and `exit_code` are unknown rather than absent.
+#[serde(default, skip_serializing_if = "std::ops::Not::not")]
+pub runtime_unknown: bool,
+```
+
+The serde attributes keep the wire form backward compatible in both
+directions: an older peer's JSON without the field reads as `false`
+(`default`), and an unmarked status serialises exactly as before
+(`skip_serializing_if` takes a function path, and `std::ops::Not::not` is the
+`!` operator as a function). The CLI prints `?` in the PID column for a marked
+instance, next to the `-` that means "no process".
+
+The reads now share one deadline for the whole answer. They run eight at a
+time with `join_all`, which polls a batch of futures together and returns
+their results in order, each under `tokio::time::timeout_at(deadline, ...)`.
+`timeout_at` polls the inner future once before it checks the clock, so an
+instance that answers at once is never marked unknown just because an earlier
+batch used up the time.
+
+We first wrote this as a stream, `stream::iter(&instances).map(...).buffered(8)`,
+and got 380 errors saying ``implementation of `Send` is not general enough``.
+The closure passed to `map` takes a reference, which makes it generic over
+that reference's lifetime, and the compiler can't yet prove a future built
+from such a closure is `Send` for *every* lifetime, which `tokio::spawn`
+needs. Plain `for` loops that push futures into a `Vec` sidestep the question,
+and read just as well.
+
+Three tests cover it. One instance of three holds its lock for thirty seconds:
+status comes back well inside two seconds, with that instance marked, still
+`running`, and the other two with their pids. Six instances all holding their
+locks cost one deadline, not six. And the field round-trips, and stays out of
+the JSON when it's `false`.
 
 ## Walk the path you actually care about
 

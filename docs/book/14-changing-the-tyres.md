@@ -1167,3 +1167,69 @@ ones missed #220. RSS in this soak mixes three things (a working set that
 grows with history, allocator high-water marks, leaks) and a two-hour image
 can't tell them apart. Descriptors don't have the first two problems, so
 they carry the leak signal and RSS keeps its coarse 25% ceiling.
+
+## Adopted, and already done
+
+A self-upgrade is supposed to be invisible to workloads: the new binary
+adopts every running instance and carries on. The V02 soak found a gap
+between "adopted" and "done". Its timeline is in chapter 7 ("One volume, one
+writer"): node 2 lost power mid-walk, the old binary came back and started
+the writer, and four seconds later the upgrade exec'd the new one. The
+placement reconciler records an assignment `Pending` before it deploys and
+`Applied` only once the deploy has finished, so the exec landed between the
+two. The new binary adopted the running writer, found its placement still
+pending, and deployed it again. The app already had an instance, so that was
+a rolling redeploy of a workload that was running exactly as placed.
+
+Chapter 7's fix stops that redeploy from overlapping two writers. This one
+stops it happening. Adoption reads each instance's record, and the record
+carries the spec the instance was launched from, so the new agent remembers,
+per app, which instances it adopted and from what:
+
+```rust
+pub(super) struct AdoptedApp {
+    /// The spec every adopted instance was launched from, or `None` when
+    /// their records disagree or don't say.
+    spec: Option<AppSpec>,
+    instances: HashSet<InstanceId>,
+}
+```
+
+Before the reconciler deploys anything, it asks the agent a yes-or-no
+question over the command channel: do your adopted instances already run
+this? The agent says yes only when the app's live instances are exactly the
+adopted ones, all `Running`, as many as the placement asks for, and launched
+from the placement's spec. Two small wrinkles. A signature check pins
+`web:v1` to `web@sha256:...` before launch, so a pinned launch matches its
+tag. And an instance's record can be rewritten later (a restart persists it
+again with whatever spec the agent holds by then), so the record's image has
+to agree with the instance's own recorded image before the spec counts as
+evidence. If the answer is yes, the reconciler writes `Applied` with the
+placement's fingerprint and moves on. If the agent doesn't answer in time,
+it deploys as before; a spurious redeploy is the old behaviour, not a new
+failure.
+
+The evidence is forgotten the moment this agent deploys the app itself.
+From then on the reconciler's own bookkeeping is the truth again, and
+adoption is ancient history.
+
+`AdoptedApp::spec` is an `Option` for a reason worth spelling out. When two
+adopted replicas' records disagree (one says port 8080, one says 9999),
+there's no single spec to compare against, so the field becomes `None` and
+the answer is always no. The type makes "we don't know" a distinct value
+instead of letting the first record win.
+
+### Tests
+
+`adopted_instances_that_run_their_placement_are_recognised` deploys two
+replicas with records on, starts a second agent over the same records, and
+checks the answer: yes for the same spec; no for a new image, a third
+replica, an unknown app or an instance that has turned unhealthy; and no
+again once the new agent has deployed the app itself. The first agent, which
+deployed the instances rather than adopting them, always says no.
+`adopted_instances_with_disagreeing_records_are_not_converged` covers the
+`None` case. On the reconciler's side,
+`pending_placement_run_by_adopted_instances_is_recorded_without_a_redeploy`
+starts from a checkpoint with the writer `Pending`, answers the question
+with yes, and checks that no deploy was sent and the checkpoint says
+`Applied`. Before the change it deployed.
