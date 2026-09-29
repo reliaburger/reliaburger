@@ -18,9 +18,9 @@ it heal. Five minutes is the target.
 
 ## Five minutes, zero to cluster
 
-0.1.0 is out (released on YYYY-MM-DD), and the one-line installer fetches its
-signed release. You'll need macOS, or Linux with QEMU and KVM, plus about 8 GiB
-of free memory and 15 GiB of disk.
+0.1.0 was released on 29 September 2026, and the one-line installer fetches
+its signed binaries. You'll need macOS, or Linux with QEMU and KVM, plus about
+8 GiB of free memory and 15 GiB of disk.
 
 ```sh
 # Install relish and build a three-node cluster in Linux VMs

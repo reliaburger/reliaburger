@@ -5,7 +5,7 @@ laptop, see the [quickstart guide](quickstart.md). For the architectural vision,
 see the [whitepaper](whitepaper.md); for implementation status, see
 [progress.md](progress.md).
 
-0.1.0 was released on YYYY-MM-DD. Its signed binaries, guest images and
+0.1.0 was released on 29 September 2026. Its signed binaries, guest images and
 installer are on the [GitHub release](https://github.com/reliaburger/reliaburger/releases/tag/v0.1.0),
 and `curl -fsSL https://reliaburger.com/install.sh | sh` installs it. Every
 release follows the same [build, staging and promotion procedure](releasing.md#metadata-and-publication).

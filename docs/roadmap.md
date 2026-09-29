@@ -740,7 +740,7 @@ families and optional refactors remain explicitly separate from release gates.
 
 ## Release closure: 0.1.0
 
-**Released on YYYY-MM-DD.** The implementation and hardening work after Phase 15
+**Released on 29 September 2026.** The implementation and hardening work after Phase 15
 is recorded in [progress.md](progress.md), including Phase 16's audit fixes. The
 [0.1.0 release plan](plans/2026-09-16-v0.1.0-release-plan.md) closed these phases
 with signed release artefacts, a managed laptop cluster and acceptance on the
@@ -765,21 +765,18 @@ every release is a development release: an incompatible format change bumps the
 compatibility generation and needs a fresh cluster, with no migration and no
 feature gate ([compatibility before 1.0.0](releasing.md#compatibility-before-100)).
 
-- **0.1.1: soak fixes.** Already on main: the report worker
-  ([#270](https://github.com/reliaburger/reliaburger/pull/270)), the soak
-  checker and `instance@node` log labels
-  ([#271](https://github.com/reliaburger/reliaburger/pull/271),
-  [#272](https://github.com/reliaburger/reliaburger/pull/272)), the retirement
-  stall ([#273](https://github.com/reliaburger/reliaburger/pull/273)) and
-  standalone stop followed by apply
-  ([#274](https://github.com/reliaburger/reliaburger/pull/274)); plus
-  retire-before-deploy
-  ([#275](https://github.com/reliaburger/reliaburger/pull/275)). Follow-ups: a
-  per-tick budget for pending restarts, the identity CSR off the agent loop, a
-  deadline on status runtime reads, no needless redeploy after an upgrade
-  adopts running instances, `KnownMembers` forgetting departed nodes,
-  `relish nodes` showing dead nodes as dead, the commit hash in
-  `bun --version`, and `build.yml` printing the candidate digest.
+- **0.1.1: soak follow-ups.** Most soak fixes planned for 0.1.1 went into 0.1.0
+  instead, because the final soak needed them: the report worker, the soak
+  checker, `instance@node` log labels, the retirement stall, stop followed by
+  apply, retire-before-deploy, bounded capture replay, the agent-loop order
+  and short agent-loop turns
+  ([#270](https://github.com/reliaburger/reliaburger/pull/270)–[#275](https://github.com/reliaburger/reliaburger/pull/275),
+  [#277](https://github.com/reliaburger/reliaburger/pull/277)–[#279](https://github.com/reliaburger/reliaburger/pull/279);
+  see the [release closure record](qualification/2026-09-27-v0.1.0-release-closure.md)).
+  0.1.1 has the rest ([#276](https://github.com/reliaburger/reliaburger/pull/276)):
+  `KnownMembers` forgetting departed nodes, `relish nodes` showing dead nodes
+  as dead, the commit hash in `bun --version`, and `build.yml` printing the
+  candidate digest.
   Housekeeping: consolidate the planning documents (archive finished plans
   under [plans/archive/](plans/archive/), collapse the completed sections of
   [progress.md](progress.md) into a short history that links the

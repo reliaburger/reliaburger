@@ -1,7 +1,9 @@
 # Cutting a release
 
-0.1.0 went through this procedure and was promoted on YYYY-MM-DD: one build,
-staged over HTTPS, qualified, then published unchanged. The
+0.1.0 went through this procedure and was promoted on 29 September 2026: one
+build, staged over HTTPS, qualified, then published unchanged. Its [release
+closure record](qualification/2026-09-27-v0.1.0-release-closure.md) lists the
+thirteen candidates it took and what each soak run found. The
 [0.1.0 plan](plans/2026-09-16-v0.1.0-release-plan.md) defined its acceptance
 gates (V01–V04 in [progress.md](progress.md#acceptance-and-release-gates)); a
 later release keeps them unless a dated plan changes them. A green build alone
@@ -207,9 +209,10 @@ curl and a browser at `/`; the shell endpoint is `/install.sh`. The bootstrap
 installs the version in its `RELIABURGER_VERSION` default (`v0.1.0` today), so
 bump that default in the same change that announces a newer release.
 
-Before tagging a release, complete the managed-cluster and clean-install gates. Record timing from an empty cache, the actual artefact digests,
-host and guest versions, memory use, and the successful sample workload. Don't
-publish a five-minute claim from a source build or a warmed VM.
+Before tagging a release, complete the managed-cluster and clean-install
+gates. Record timing from an empty cache, the actual artefact digests, host and
+guest versions, memory use, and the successful sample workload. Don't publish a
+five-minute claim from a source build or a warmed VM.
 
 ## Staging a candidate
 

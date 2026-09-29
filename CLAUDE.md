@@ -37,7 +37,7 @@ For book, manual or website prose, follow [docs/book/STYLE.md](docs/book/STYLE.m
 
 ### 1. Follow the Plan
 
-Every roadmap phase is done and 0.1.0 is released (YYYY-MM-DD). Current work is the post-0.1.0 backlog: read the status box at the top of [docs/progress.md](docs/progress.md), which links the open items (missing capabilities F01–F12, engineering follow-ups, known flakes), before starting. Releases after 0.1.0 follow the order in the "Releases after 0.1.0" section of [docs/roadmap.md](docs/roadmap.md#releases-after-010): patch releases 0.1.1–0.1.4 first, then one headline feature per minor release. New work goes through a dated plan in `docs/plans/`; the 0.1.0 release plans there are history. Releases follow [docs/releasing.md](docs/releasing.md).
+Every roadmap phase is done and 0.1.0 is released (29 September 2026). Current work is the post-0.1.0 backlog: read the status box at the top of [docs/progress.md](docs/progress.md), which links the open items (missing capabilities F01–F12, engineering follow-ups, known flakes), before starting. Releases after 0.1.0 follow the order in the "Releases after 0.1.0" section of [docs/roadmap.md](docs/roadmap.md#releases-after-010): patch releases 0.1.1–0.1.4 first, then one headline feature per minor release. New work goes through a dated plan in `docs/plans/`; the 0.1.0 release plans there are history. Releases follow [docs/releasing.md](docs/releasing.md).
 
 ### 2. Tests First
 

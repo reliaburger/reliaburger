@@ -1,8 +1,8 @@
 # A laptop cluster
 
-The managed quickstart installs the signed 0.1.0 release (released on
-YYYY-MM-DD) and builds a laptop cluster from it. Five minutes is the target;
-how long it takes depends on your connection and on what's already cached.
+The managed quickstart installs the signed 0.1.0 release (29 September 2026)
+and builds a laptop cluster from it. Five minutes is the target; how long it
+takes depends on your connection and on what's already cached.
 
 ## Install and boot
 
