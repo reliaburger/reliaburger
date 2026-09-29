@@ -277,7 +277,7 @@ Instances without a PID are skipped. There are no counters here, no restart/OOM/
 
 **Status: implemented (explicit targets); per-app auto-scrape planned.**
 
-`src/mayo/scrape.rs` provides `parse_prometheus_text`, `scrape_endpoint` (an HTTP GET with a 5s timeout), and `scrape_once`, which Bun's scrape loop calls every `scrape_interval_secs` over the `[[metrics.scrape_targets]]` list -- each target's samples are ingested tagged with its `job`. A target that fails contributes nothing rather than failing the sweep, and an empty target list spawns no loop. Still **planned -- not yet implemented**: per-app `metrics`/`metrics_interval` config, auto-detection of `/metrics` endpoints, `max_samples_per_scrape`, and a scrape-timeout counter.
+`src/mayo/scrape.rs` provides `parse_prometheus_text`, `scrape_endpoint` (an HTTP GET with a 5s timeout), and `scrape_once`, which Bun's scrape loop calls every `scrape_interval_secs` over the `[[metrics.scrape_targets]]` list -- each target's samples are ingested tagged with its `job`. A target that fails contributes nothing rather than failing the sweep, and an empty target list spawns no loop. Apps opt in with `metrics = {}` on the app spec (`port` defaults to the app's port, `path` to `/metrics`): the node running each instance scrapes it every `app_scrape_interval_secs` (node-wide, 10 by default), so the port needn't be published. Still **planned -- not yet implemented**: a per-app scrape interval, auto-detection of `/metrics` endpoints without the opt-in, `max_samples_per_scrape`, and a scrape-timeout counter.
 
 ### 5.3 Downsampling
 
@@ -285,9 +285,11 @@ Instances without a PID are skipped. There are no counters here, no restart/OOM/
 
 ### 5.4 Rollup Push to the Council
 
-Every `rollup_interval_secs` (default 60) the rollup worker (`src/mayo/rollup_worker.rs`) reads the local Mayo store, generates a `NodeRollup` of 1-minute (min, max, sum, count) aggregates, and sends it to its council parent as a `ReportingMessage::MetricsRollup` over the reporting transport (bincode-framed, **not** gRPC or a bespoke TCP call). On the first push after a parent change it can include an extended (backfill) window.
+Every `rollup_interval_secs` (default 60) the rollup worker (`src/mayo/rollup_worker.rs`) reads the local Mayo store, generates a `NodeRollup` of 1-minute (min, max, sum, count) aggregates, and sends it to its council parent as a `ReportingMessage::MetricsRollup` over the reporting transport (bincode-framed, **not** gRPC or a bespoke TCP call). Parents are assigned by an FNV-1a hash of the node ID over the sorted council list (`src/reporting/assignment.rs`), so every node computes the same tree without coordination.
 
-The council member stores received rollups in a rollup store and serves them at `/v1/metrics/rollup` and `/v1/metrics/cluster`. Aggregator reassignment backfill and the "data unavailable" gap annotation described in earlier drafts are **planned -- not yet implemented**; today a reassignment simply starts a fresh rollup history on the new parent.
+**Reassignment backfill: implemented.** When the council changes and a node's parent moves, the worker's next push is a backfill: the last five minutes as per-minute rollups (`RollupGenerator::generate_backfill`), each stamped with its own minute so the new parent's `(node, timestamp)` dedup makes re-sends idempotent. A failed send keeps the backfill request set and retries on the next tick; minutes older than the five-minute window stay only in the node's local store.
+
+The council member stores received rollups in a rollup store and serves them at `/v1/metrics/rollup` and `/v1/metrics/cluster`. The per-query "data unavailable" gap annotation for a reassignment from earlier drafts is **planned -- not yet implemented**: `QueryWarning::DataUnavailable` is emitted today only when two aggregators return conflicting values for the same node and minute (§5.5).
 
 ### 5.5 Query Fan-Out
 
@@ -448,7 +450,7 @@ The push interval is `metrics.rollup_interval_secs` (§6.1). The consistent-hash
 
 ### 7.2 Aggregator Council Member Failure
 
-The rollup worker keeps pushing to the last known parent and follows parent reassignment as membership changes. **The graceful-handoff details from earlier drafts -- consistent-hash reassignment, a 5-minute backfill on the new parent, and per-query gap annotations -- are Status: planned -- not yet implemented.** Today a reassignment simply starts fresh rollup history on the new parent.
+The rollup worker keeps pushing to the last known parent and follows parent reassignment as membership changes. On a reassignment it backfills the last five minutes to the new parent as per-minute rollups, retrying until they're admitted (§5.4), so the new parent's history has no gap as long as the handoff took less than five minutes. **Still planned -- not yet implemented:** consistent-hash assignment (today's modulo hash can move many nodes when the council changes size) and per-query annotations for gaps older than the backfill window.
 
 ### 7.3 Stale Rollups
 
