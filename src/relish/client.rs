@@ -28,6 +28,20 @@ pub struct TokenSummary {
     pub expires_at: Option<u64>,
 }
 
+/// The build a Bun agent reports on `/v1/version`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct AgentVersion {
+    /// Cargo version, as `BinaryVersion` displays it (`v0.1.1`).
+    pub version: String,
+    /// Commit the binary was built from, when the build knew it.
+    #[serde(default)]
+    pub commit: Option<String>,
+    /// SHA-256 of the running binary. Absent when the agent runs without
+    /// its self-upgrade manager, which is what hashes it.
+    #[serde(default)]
+    pub binary_sha256: Option<String>,
+}
+
 /// Client for the Bun agent HTTP API.
 #[derive(Clone)]
 pub struct BunClient {
@@ -1005,6 +1019,11 @@ impl BunClient {
             .await
             .map_err(classify_error)?;
         parse_typed_response(response).await
+    }
+
+    /// Fetch the build this agent runs (`GET /v1/version`).
+    pub async fn version(&self) -> Result<AgentVersion, RelishError> {
+        self.get_typed_json("/v1/version").await
     }
 
     /// Fetch desired application replicas and current scheduler coverage.

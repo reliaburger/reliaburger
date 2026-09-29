@@ -5438,8 +5438,8 @@ const MAX_RELAY_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 /// A path probe runs for up to 25 seconds on the target; allow for the hop.
 const RELAY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// The per-node reads `relish wtf`, `relish path` and `relish test` make, and
-/// nothing else. The relay is a reachability aid, not a general proxy.
+/// The per-node reads `relish wtf`, `relish inspect`, `relish path` and
+/// `relish test` make, and nothing else. The relay is a reachability aid, not a general proxy.
 fn relay_allows(method: &axum::http::Method, path: &str) -> bool {
     const READS: &[&str] = &[
         "v1/health",
@@ -5453,6 +5453,7 @@ fn relay_allows(method: &axum::http::Method, path: &str) -> bool {
         "v1/cluster/council",
         "v1/cluster/nodes",
         "v1/capabilities",
+        "v1/version",
     ];
     match *method {
         // `relish test` compares each node's own deploy history.
@@ -17532,6 +17533,13 @@ mod cluster_routing_tests {
             &axum::http::Method::POST,
             "v1/deploys/history/web"
         ));
+    }
+
+    #[test]
+    fn the_relay_forwards_each_nodes_version_for_wtf() {
+        let get = axum::http::Method::GET;
+        assert!(relay_allows(&get, "v1/version"));
+        assert!(!relay_allows(&axum::http::Method::POST, "v1/version"));
     }
 
     #[test]

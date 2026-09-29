@@ -68,7 +68,7 @@ relish lint app.toml             # validate only
 relish logs web -f               # stream logs from every node (--tail 20 for the last 20)
 relish exec web env              # run a command inside an instance, on whichever node runs it
 relish top                       # every workload on every node, with CPU and memory
-relish inspect web               # full detail
+relish inspect web               # every instance on every node, desired vs running
 relish stop web                  # scale to zero; `relish apply` starts it again
 relish delete web                # remove the app from the cluster
 ```
