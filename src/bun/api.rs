@@ -204,6 +204,9 @@ pub struct ApiState {
     pub build_signers: Arc<
         tokio::sync::Mutex<std::collections::HashMap<String, super::build_runner::BuildSigner>>,
     >,
+    /// Task arrays: this node's executor, the standalone store and the
+    /// leader's latest view of every node (0.2.0, million jobs).
+    pub task_arrays: Arc<super::task_array_leader::TaskArrayService>,
 }
 
 /// Build the API router.
@@ -254,6 +257,7 @@ pub fn router(
         super::readiness::ReadinessTracker::new(),
         None,
         None,
+        None,
     )
 }
 
@@ -293,6 +297,7 @@ pub fn router_with_upgrade(
     readiness: super::readiness::ReadinessTracker,
     local_test_leases: Option<crate::testkit::lease::LocalLeaseStore>,
     jwt_verifier: Option<crate::sesame::auth::WorkloadJwtVerifier>,
+    task_arrays: Option<Arc<super::task_array_leader::TaskArrayService>>,
 ) -> Router {
     let state = ApiState {
         cmd_tx,
@@ -332,9 +337,12 @@ pub fn router_with_upgrade(
         batch_watchers: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
         active_builds: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
         build_signers: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        task_arrays: task_arrays
+            .unwrap_or_else(|| Arc::new(super::task_array_leader::TaskArrayService::new(None))),
     };
 
     spawn_node_fault_reaper(state.clone());
+    super::task_array_leader::spawn_leader_loop(state.clone());
 
     let mut auth_state = crate::sesame::auth::AuthState::new(
         token_store.unwrap_or_else(crate::sesame::auth::new_token_store),
@@ -534,6 +542,34 @@ pub fn router_with_upgrade(
             post(super::batch::batch_report_handler),
         )
         .route("/v1/batch/{id}", get(super::batch::batch_status_handler))
+        .route(
+            "/v1/batch/array",
+            post(super::task_array_api::submit_handler),
+        )
+        .route(
+            "/v1/batch/array/sync",
+            post(super::task_array_api::sync_handler),
+        )
+        .route(
+            "/v1/batch/array/{id}/local/results",
+            get(super::task_array_api::local_results_handler),
+        )
+        .route(
+            "/v1/batch/array/{id}/local/tasks/{index}/logs",
+            get(super::task_array_api::local_logs_handler),
+        )
+        .route(
+            "/v1/batch/{id}/cancel",
+            post(super::task_array_api::cancel_handler),
+        )
+        .route(
+            "/v1/batch/{id}/results",
+            get(super::task_array_api::results_handler),
+        )
+        .route(
+            "/v1/batch/{id}/tasks/{index}/logs",
+            get(super::task_array_api::logs_handler),
+        )
         .route("/v1/build", post(super::build_runner::build_submit_handler))
         .route(
             "/v1/build/run",
@@ -10239,6 +10275,7 @@ mod tests {
             readiness,
             local_test_leases,
             None,
+            None,
         );
         (app, shutdown)
     }
@@ -10882,6 +10919,7 @@ mod tests {
             false,
             workload_fault_static_capabilities(),
             crate::bun::readiness::ReadinessTracker::new(),
+            None,
             None,
             None,
         );
@@ -11785,6 +11823,7 @@ schedule = "* * * * *"
                 false,
                 lease_static_capabilities(),
                 crate::bun::readiness::ReadinessTracker::new(),
+                None,
                 None,
                 None,
             );
@@ -13934,6 +13973,7 @@ schedule = "* * * * *"
             crate::bun::readiness::ReadinessTracker::new(),
             None,
             None,
+            None,
         );
         (app, shutdown, mayo_dir)
     }
@@ -15850,6 +15890,7 @@ schedule = "* * * * *"
             crate::bun::readiness::ReadinessTracker::new(),
             None,
             None,
+            None,
         );
         (app, webhook_rx, shutdown)
     }
@@ -16162,6 +16203,7 @@ schedule = "* * * * *"
             false,
             crate::bun::capabilities::StaticCapabilities::default(),
             crate::bun::readiness::ReadinessTracker::new(),
+            None,
             None,
             None,
         );
@@ -16649,6 +16691,7 @@ mod cluster_routing_tests {
                 false,
                 static_capabilities,
                 super::super::readiness::ReadinessTracker::new(),
+                None,
                 None,
                 None,
             )

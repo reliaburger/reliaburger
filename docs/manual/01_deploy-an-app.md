@@ -150,6 +150,42 @@ relish apply jobs.toml --rerun-jobs
 
 Cron doesn't catch up: firings missed while a node was down are skipped.
 
+## Task arrays
+
+When you need the same program run thousands (or a million) times, one per
+input, don't write a thousand jobs. Run a task array: one binary, a count, and
+`{index}` wherever the task's number goes.
+
+```sh
+relish run --batch render --count 100000 --exec /usr/local/bin/render -- --frame {index}
+relish batch-status 12 --wait
+```
+
+Each task gets its index in its arguments and in `RELIABURGER_TASK_INDEX`,
+plus `RELIABURGER_TASK_COUNT`, `RELIABURGER_TASK_ATTEMPT` and
+`RELIABURGER_BATCH_ID`. Tasks are host processes, so the binary has to be in
+every node's `[process_workloads] allowed_binaries`; a node that can't run it
+says why in `batch-status` and gets no work. Task arrays don't run under
+`mount_isolation` yet, so nodes with it on (the Linux default) sit them out.
+
+A failing task is retried (`--max-attempts`, three by default), and
+`--max-failed N` stops the whole array once more than N tasks have failed for
+good. Then:
+
+```sh
+relish batch results 12 --failed    # which tasks failed, with exit codes
+relish batch logs 12 --index 4071   # the first and last 2 KiB a failed task wrote
+relish batch cancel 12              # stop it: queued tasks never start
+```
+
+Only failed tasks keep their output. Results and output stay on the nodes for
+an hour after the array finishes (or until twenty newer arrays have finished).
+
+Tasks run **at least once**, not exactly once. If a node dies, the leader
+hands its unfinished work to other nodes after 30 seconds, and a task that
+finished just before the crash can run again. Make tasks safe to repeat:
+write to a temporary name and rename, or check whether the output exists.
+
 ## More shapes
 
 - Jobs: `examples/phase-1/proc-job-success.toml`,

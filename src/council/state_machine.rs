@@ -875,6 +875,27 @@ impl StateMachineInner {
                     });
                 }
             }
+            RaftRequest::TaskArray(write) => {
+                // Arrays share the batch id counter, so `batch-status ID`
+                // names one thing. Every rule lives in `TaskArrays::apply`;
+                // a refused write leaves the state untouched.
+                let batch_state = &mut self.state.batch_state;
+                match self
+                    .state
+                    .task_arrays
+                    .apply(write, || batch_state.allocate_id())
+                {
+                    Ok(crate::meat::task_array_store::TaskArrayApplied::Registered {
+                        batch_id,
+                    }) => return Some(CouncilResponse::TaskArrayRegistered { batch_id }),
+                    Ok(_) => {}
+                    Err(error) => {
+                        return Some(CouncilResponse::Refused {
+                            reason: error.to_string(),
+                        });
+                    }
+                }
+            }
             RaftRequest::BuildRegister { build } => {
                 let build_id = self.state.build_state.register(build.clone());
                 return Some(CouncilResponse::BuildRegistered { build_id });
@@ -5247,6 +5268,125 @@ mod tests {
             state: crate::bun::build_runner::BuildState::Running,
             created_at_epoch_secs: 1_000_000,
         }
+    }
+
+    fn task_array_register(count: u32) -> RaftRequest {
+        RaftRequest::TaskArray(Box::new(
+            crate::meat::task_array_store::TaskArrayWrite::Register {
+                name: "render".to_string(),
+                namespace: "default".to_string(),
+                template: Box::new(crate::config::job::JobSpec {
+                    image: None,
+                    command: None,
+                    schedule: None,
+                    run_before: Vec::new(),
+                    memory: None,
+                    cpu: None,
+                    env: Default::default(),
+                    namespace: None,
+                    exec: Some("/usr/bin/true".into()),
+                    script: None,
+                }),
+                spec: crate::meat::task_array::TaskArraySpec {
+                    chunk_size: 4,
+                    ..crate::meat::task_array::TaskArraySpec::with_count(count)
+                },
+                submitted_at_epoch_secs: 1_000_000,
+            },
+        ))
+    }
+
+    #[tokio::test]
+    async fn task_arrays_share_the_batch_id_counter() {
+        let mut sm = CouncilStateMachine::new();
+        let responses = sm
+            .apply(vec![
+                normal_entry(
+                    1,
+                    1,
+                    RaftRequest::BatchRegister {
+                        batch: batch_record("j1", "n1"),
+                    },
+                ),
+                normal_entry(1, 2, task_array_register(10)),
+                normal_entry(
+                    1,
+                    3,
+                    RaftRequest::BatchRegister {
+                        batch: batch_record("j2", "n1"),
+                    },
+                ),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(
+            responses[1],
+            CouncilResponse::TaskArrayRegistered { batch_id: 2 }
+        );
+        assert_eq!(
+            responses[2],
+            CouncilResponse::BatchRegistered { batch_id: 3 }
+        );
+        let state = sm.desired_state().await;
+        assert_eq!(state.task_arrays.get(2).unwrap().state.spec.count, 10);
+    }
+
+    #[tokio::test]
+    async fn refused_task_array_writes_leave_the_state_alone() {
+        let mut sm = CouncilStateMachine::new();
+        let responses = sm
+            .apply(vec![
+                normal_entry(1, 1, task_array_register(0)),
+                normal_entry(
+                    1,
+                    2,
+                    RaftRequest::TaskArray(Box::new(
+                        crate::meat::task_array_store::TaskArrayWrite::Cancel { batch_id: 9 },
+                    )),
+                ),
+            ])
+            .await
+            .unwrap();
+        assert!(matches!(responses[0], CouncilResponse::Refused { .. }));
+        assert!(matches!(responses[1], CouncilResponse::Refused { .. }));
+        let state = sm.desired_state().await;
+        assert!(state.task_arrays.ids().is_empty());
+        assert_eq!(state.batch_state.next_batch_id, 1, "no id was burnt");
+    }
+
+    #[tokio::test]
+    async fn task_array_progress_survives_a_snapshot() {
+        use crate::meat::index_set::IndexRangeSet;
+        use crate::meat::task_array_store::TaskArrayWrite;
+        let mut sm = CouncilStateMachine::new();
+        sm.apply(vec![
+            normal_entry(1, 1, task_array_register(10)),
+            normal_entry(
+                1,
+                2,
+                RaftRequest::TaskArray(Box::new(TaskArrayWrite::Sync {
+                    batch_id: 1,
+                    results: Vec::new(),
+                    grants: vec![(
+                        crate::meat::types::NodeId::new("n1"),
+                        IndexRangeSet::from_range(0..=1),
+                    )],
+                })),
+            ),
+        ])
+        .await
+        .unwrap();
+        let mut builder = sm.get_snapshot_builder().await;
+        let snapshot = builder.build_snapshot().await.unwrap();
+        let mut restored = CouncilStateMachine::new();
+        restored
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .unwrap();
+        let state = restored.desired_state().await;
+        let array = state.task_arrays.get(1).unwrap();
+        assert_eq!(array.state.summary().held, 8);
+        assert_eq!(state.batch_state.next_batch_id, 2);
     }
 
     #[tokio::test]

@@ -220,11 +220,18 @@ impl BatchDurableState {
     /// batches (using the new record's clock, which keeps the pruning
     /// deterministic across Raft replicas), and store the record.
     pub fn register(&mut self, record: BatchRecord) -> u64 {
+        let id = self.allocate_id();
+        self.prune_terminal(record.submitted_at_epoch_secs);
+        self.batches.push((id, record));
+        id
+    }
+
+    /// Take the next batch id. Task arrays share this counter, so an id
+    /// names either an ordinary batch or an array, never both.
+    pub fn allocate_id(&mut self) -> u64 {
         // Guard against a zero counter from a hand-built default.
         let id = self.next_batch_id.max(1);
         self.next_batch_id = id + 1;
-        self.prune_terminal(record.submitted_at_epoch_secs);
-        self.batches.push((id, record));
         id
     }
 
@@ -302,6 +309,12 @@ impl BatchTracker {
     /// Register a new batch record. Returns the assigned BatchId.
     pub fn register(&mut self, record: BatchRecord) -> BatchId {
         BatchId(self.state.register(record))
+    }
+
+    /// Take the next batch id without registering a batch (a standalone
+    /// task array takes its id here).
+    pub fn allocate_id(&mut self) -> u64 {
+        self.state.allocate_id()
     }
 
     /// Apply a job report, validating the transition.

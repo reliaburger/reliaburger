@@ -1,4 +1,4 @@
-.PHONY: build test test-cargo test-doc test-slow test-images test-linux test-rootless-runc test-cluster test-upgrade test-upgrade-node test-upgrade-cluster test-apple coverage check fmt lint audit clean pdf loc help bench bench-large pickle-test-macos ci ci-full observability-demo kubernetes-demo toml-demo readme-commands
+.PHONY: build test test-cargo test-doc test-slow test-images test-linux test-rootless-runc test-cluster test-upgrade test-upgrade-node test-upgrade-cluster test-apple coverage check fmt lint audit clean pdf loc help bench bench-large bench-task-arrays pickle-test-macos ci ci-full observability-demo kubernetes-demo toml-demo readme-commands
 
 CARGO = cargo
 NEXTEST_PROFILE ?= default
@@ -49,7 +49,7 @@ test-rootless-runc: ## Prove rootless runc networking and port adoption as a non
 	RELIABURGER_ROOTLESS_RUNC_TESTS=1 $(NEXTEST) --features ebpf --run-ignored=only -E 'binary(owned_rootless) | test(rootless_published_port_survives_bun_replacement) | test(normal_rootless_bun)'
 
 test-cluster: ## Run all real multi-node cluster acceptance suites
-	RELIABURGER_CLUSTER_TESTS=1 $(NEXTEST) --run-ignored=only -E 'binary(cluster_failover) | binary(cluster_gossip) | binary(council_self_healing) | binary(council_disaster_recovery) | binary(placement) '
+	RELIABURGER_CLUSTER_TESTS=1 $(NEXTEST) --run-ignored=only -E 'binary(cluster_failover) | binary(cluster_gossip) | binary(council_self_healing) | binary(council_disaster_recovery) | binary(placement) | binary(cluster_task_arrays) '
 
 test-upgrade: ## Run all real-binary self-upgrade acceptance tests
 	RELIABURGER_UPGRADE_TESTS=1 $(NEXTEST) --run-ignored=only -E 'binary(self_upgrade) | binary(self_upgrade_cluster)'
@@ -94,6 +94,9 @@ bench: ## Run reproducible transport and 5-250 node gossip benchmarks
 
 bench-large: ## Run reproducible 500 and 1000 node gossip benchmarks
 	$(CARGO) bench --bench gossip_large
+
+bench-task-arrays: ## Run in-process task-array benchmarks (leader cost, pool overhead, fork/exec floor)
+	$(CARGO) bench --bench task_arrays
 
 coverage: ## Run the portable suite once under line coverage and enforce the floor
 	$(CARGO) llvm-cov clean --workspace

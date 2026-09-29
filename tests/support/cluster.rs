@@ -269,6 +269,9 @@ pub struct WiredNodeOptions {
     pub fault_injection: bool,
     /// Node labels, for placement constraints.
     pub labels: BTreeMap<String, String>,
+    /// Task arrays: the executor and leader timings. `None` gives the API
+    /// the default service with no executor.
+    pub task_arrays: Option<Arc<reliaburger::bun::task_array_leader::TaskArrayService>>,
 }
 
 /// A running wired node and everything a test observes it through.
@@ -316,6 +319,7 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
         operator_token,
         fault_injection,
         labels,
+        task_arrays,
     } = options;
     let raft_port = gossip_port + 1;
     let reporting_port = gossip_port + 2;
@@ -517,6 +521,40 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
             readiness,
             None,
             None,
+            None,
+        )
+    } else if task_arrays.is_some() {
+        api::router_with_upgrade(
+            cmd_tx.clone(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(Arc::clone(&council)),
+            token_store.clone(),
+            service_identity,
+            None,
+            Some(Arc::clone(&membership_table)),
+            None,
+            None,
+            api_port,
+            None,
+            None,
+            None,
+            "default".to_string(),
+            Some(name.clone()),
+            900,
+            reliaburger::cluster::ClusterHttp::plaintext(),
+            5050,
+            "http",
+            256 * 1024 * 1024,
+            false,
+            reliaburger::bun::capabilities::StaticCapabilities::default(),
+            readiness,
+            None,
+            None,
+            task_arrays,
         )
     } else {
         api::router(

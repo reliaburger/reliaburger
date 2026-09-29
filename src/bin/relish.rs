@@ -346,10 +346,61 @@ enum Command {
         #[arg(long, default_value_t = 960)]
         timeout: u64,
     },
-    /// Submit a batch of jobs for high-throughput scheduling.
+    /// Submit a batch of jobs, or manage a task array.
+    #[command(args_conflicts_with_subcommands = true, arg_required_else_help = true)]
     Batch {
+        #[command(subcommand)]
+        action: Option<BatchAction>,
         /// Path to a TOML config file with [job.*] sections.
-        path: PathBuf,
+        path: Option<PathBuf>,
+    },
+    /// Run a task array: one host binary, many indexed tasks.
+    ///
+    /// Every task runs the same binary with `{index}` in its arguments
+    /// replaced by its own index, from 0 to COUNT-1, and gets
+    /// RELIABURGER_TASK_INDEX, RELIABURGER_TASK_COUNT,
+    /// RELIABURGER_TASK_ATTEMPT and RELIABURGER_BATCH_ID in its
+    /// environment. The binary must be in the nodes' [process_workloads]
+    /// allowed_binaries.
+    ///
+    /// Tasks run at least once, not exactly once: a task that finished
+    /// just before its node crashed can run again. Make tasks safe to
+    /// repeat.
+    Run {
+        /// Name for the array (required: task arrays are the only kind of
+        /// run so far).
+        #[arg(long = "batch", value_name = "NAME")]
+        batch: String,
+        /// Number of tasks.
+        #[arg(long)]
+        count: u32,
+        /// Host binary every task runs.
+        #[arg(long)]
+        exec: PathBuf,
+        /// Tasks per chunk: the unit the cluster hands to nodes.
+        #[arg(long, default_value_t = reliaburger::meat::task_array::DEFAULT_CHUNK_SIZE)]
+        chunk: u32,
+        /// Attempts per task before it counts as failed.
+        #[arg(long, default_value_t = reliaburger::meat::task_array::DEFAULT_MAX_ATTEMPTS)]
+        max_attempts: u8,
+        /// Stop the whole array once more than this many tasks have failed.
+        #[arg(long)]
+        max_failed: Option<u32>,
+        /// Per-attempt timeout, in seconds.
+        #[arg(long, default_value_t = reliaburger::meat::task_array::DEFAULT_TASK_TIMEOUT_SECS)]
+        timeout: u32,
+        /// Most tasks one node runs at once (default: its CPU count).
+        #[arg(long)]
+        concurrency: Option<u32>,
+        /// Namespace the array belongs to.
+        #[arg(short = 'n', long, default_value = "default")]
+        namespace: String,
+        /// An environment variable for every task (repeatable).
+        #[arg(long = "env", value_name = "KEY=VALUE")]
+        env: Vec<String>,
+        /// Arguments after `--`; `{index}` becomes the task's index.
+        #[arg(last = true)]
+        args: Vec<String>,
     },
     /// Show the progress of a submitted batch.
     #[command(name = "batch-status")]
@@ -751,6 +802,35 @@ fn parse_join_token_ttl(value: &str) -> Result<u64, String> {
         return Err("TTL must be between 1s and 1h".to_string());
     }
     Ok(seconds)
+}
+
+#[derive(Subcommand)]
+enum BatchAction {
+    /// Stop a task array: tasks that haven't started never will, running
+    /// ones get SIGTERM, then SIGKILL after 10 seconds.
+    Cancel {
+        /// Batch id from `relish run --batch`.
+        id: u64,
+    },
+    /// Show each task's outcome, read from the nodes' ledgers.
+    Results {
+        /// Batch id from `relish run --batch`.
+        id: u64,
+        /// Only the tasks that failed.
+        #[arg(long)]
+        failed: bool,
+        /// Most rows to show.
+        #[arg(long, default_value_t = reliaburger::bun::task_array_api::DEFAULT_RESULT_ROWS)]
+        limit: usize,
+    },
+    /// Print a failed task's output (the first and last 2 KiB).
+    Logs {
+        /// Batch id from `relish run --batch`.
+        id: u64,
+        /// The task's index.
+        #[arg(long)]
+        index: u32,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1580,7 +1660,50 @@ async fn main() -> ExitCode {
             registry_port,
             timeout,
         } => commands::build(path, registry_port, timeout).await,
-        Command::Batch { ref path } => commands::batch(path).await,
+        Command::Batch { action, path } => match (action, path) {
+            (Some(BatchAction::Cancel { id }), _) => commands::batch_cancel(id).await,
+            (Some(BatchAction::Results { id, failed, limit }), _) => {
+                commands::batch_results(id, failed, limit, cli.output).await
+            }
+            (Some(BatchAction::Logs { id, index }), _) => {
+                commands::batch_task_logs(id, index).await
+            }
+            (None, Some(path)) => commands::batch(&path).await,
+            (None, None) => Err(reliaburger::relish::RelishError::InvalidFlag {
+                flag: "file".to_string(),
+                reason: "give a [job.*] TOML file, or one of: cancel, results, logs".to_string(),
+            }),
+        },
+        Command::Run {
+            batch,
+            count,
+            exec,
+            chunk,
+            max_attempts,
+            max_failed,
+            timeout,
+            concurrency,
+            namespace,
+            env,
+            args,
+        } => {
+            commands::run_task_array(commands::TaskArrayRun {
+                name: batch,
+                namespace,
+                exec,
+                args,
+                env,
+                spec: reliaburger::meat::task_array::TaskArraySpec {
+                    count,
+                    chunk_size: chunk,
+                    max_attempts,
+                    max_failed_indexes: max_failed,
+                    task_timeout_secs: timeout,
+                    per_node_concurrency: concurrency,
+                },
+            })
+            .await
+        }
         Command::BatchStatus { id, wait, timeout } => {
             commands::batch_status(id, wait, timeout).await
         }
@@ -3282,7 +3405,102 @@ mod tests {
     #[test]
     fn parse_batch_command() {
         let cli = parse(&["relish", "batch", "jobs.toml"]).unwrap();
-        assert!(matches!(cli.command, Command::Batch { .. }));
+        match cli.command {
+            Command::Batch { action, path } => {
+                assert!(action.is_none());
+                assert_eq!(path, Some(PathBuf::from("jobs.toml")));
+            }
+            _ => panic!("expected Batch"),
+        }
+    }
+
+    #[test]
+    fn parse_batch_subcommands() {
+        let cli = parse(&["relish", "batch", "cancel", "7"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Batch {
+                action: Some(BatchAction::Cancel { id: 7 }),
+                path: None
+            }
+        ));
+        let cli = parse(&["relish", "batch", "results", "7", "--failed"]).unwrap();
+        match cli.command {
+            Command::Batch {
+                action: Some(BatchAction::Results { id, failed, limit }),
+                ..
+            } => {
+                assert_eq!((id, failed), (7, true));
+                assert_eq!(limit, reliaburger::bun::task_array_api::DEFAULT_RESULT_ROWS);
+            }
+            _ => panic!("expected batch results"),
+        }
+        let cli = parse(&["relish", "batch", "logs", "7", "--index", "42"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Batch {
+                action: Some(BatchAction::Logs { id: 7, index: 42 }),
+                ..
+            }
+        ));
+        assert!(
+            parse(&["relish", "batch", "logs", "7"]).is_err(),
+            "--index is required"
+        );
+    }
+
+    #[test]
+    fn parse_run_batch_with_arguments_after_the_separator() {
+        let cli = parse(&[
+            "relish",
+            "run",
+            "--batch",
+            "render",
+            "--count",
+            "1000000",
+            "--exec",
+            "/usr/local/bin/rb-task",
+            "--max-failed",
+            "10",
+            "--env",
+            "MODE=fast",
+            "--",
+            "--frame",
+            "{index}",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Run {
+                batch,
+                count,
+                exec,
+                chunk,
+                max_attempts,
+                max_failed,
+                timeout,
+                concurrency,
+                namespace,
+                env,
+                args,
+            } => {
+                assert_eq!(batch, "render");
+                assert_eq!(count, 1_000_000);
+                assert_eq!(exec, PathBuf::from("/usr/local/bin/rb-task"));
+                assert_eq!(chunk, 1024);
+                assert_eq!(max_attempts, 3);
+                assert_eq!(max_failed, Some(10));
+                assert_eq!(timeout, 600);
+                assert_eq!(concurrency, None);
+                assert_eq!(namespace, "default");
+                assert_eq!(env, vec!["MODE=fast"]);
+                assert_eq!(args, vec!["--frame", "{index}"]);
+            }
+            _ => panic!("expected Run"),
+        }
+        assert!(
+            parse(&["relish", "run", "--count", "3", "--exec", "/bin/true"]).is_err(),
+            "--batch is required"
+        );
     }
 
     #[test]
