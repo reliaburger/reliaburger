@@ -344,9 +344,7 @@ An axum router on port 9117:
 | GET | `/v1/cluster/nodes` | Gossip membership |
 | GET | `/v1/cluster/council` | Raft council status |
 | POST | `/v1/cluster/join` | Join a cluster |
-| POST | `/v1/chaos/partition` | Inject network partition |
-| POST | `/v1/chaos/heal` | Heal partitions |
-| GET | `/v1/chaos/status` | Chaos injection status |
+| GET | `/v1/chaos/status` | Node-experiment reservation |
 
 Handlers are thin. They construct an `AgentCommand`, send it over the `mpsc` channel, and await the `oneshot` response.
 
@@ -371,7 +369,7 @@ The command-line interface that humans interact with.
 
 - `app.rs` — `AppSpec`: image, command, replicas, port, health check config, cpu/memory/gpu ranges, placement constraints, deploy strategy.
 - `job.rs` — `JobSpec`: one-shot tasks.
-- `types.rs` — `Replicas` enum (`Fixed(u32)` or `DaemonSet`), `ResourceRange` (request + limit), `VolumeSpec`, `parse_resource_value()` for human-readable strings like "512Mi".
+- `types.rs` — `Replicas` enum (`Fixed(u32)` or `DaemonSet`), `ResourceRange` (request + limit), `VolumeSpec`, `parse_byte_size()` and `parse_cpu_millicores()` for human-readable strings like "512Mi" and "0.5".
 - `node.rs` — `NodeConfig`: the node-level config file with sections for node identity, cluster settings, storage, resources, networking, reporting tree, and reconstruction.
 - `namespace.rs` — Namespace-level quota configuration.
 - `validate.rs` — Config validation logic.

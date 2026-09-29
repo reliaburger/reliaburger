@@ -23,14 +23,32 @@ use crate::bun::agent::CouncilStatus;
 /// Without `--dry-run`, an unreachable agent is an error: the plan is
 /// still printed for reference, but the exit code is non-zero so
 /// scripts and CI cannot mistake "nothing happened" for a deploy.
-pub async fn apply(path: &Path, output: OutputFormat, dry_run: bool) -> Result<(), RelishError> {
-    apply_with_client(path, output, dry_run, &BunClient::default_local()).await
+///
+/// The manifest is Reliaburger TOML or Kubernetes YAML, from a file or an
+/// `https://` URL. Kubernetes YAML is imported in memory and its migration
+/// report printed to stderr before anything is applied.
+pub async fn apply(
+    source: &super::manifest::ManifestSource,
+    output: OutputFormat,
+    dry_run: bool,
+) -> Result<(), RelishError> {
+    apply_with_client(source, output, dry_run, &BunClient::default_local()).await
+}
+
+/// Read a manifest for `apply`, printing any migration report to stderr.
+async fn load_manifest(source: &super::manifest::ManifestSource) -> Result<Config, RelishError> {
+    let loaded = super::manifest::load(source).await?;
+    if let Some(report) = &loaded.migration_report {
+        eprint!("{report}");
+        eprintln!();
+    }
+    loaded.config.validate()?;
+    Ok(loaded.config)
 }
 
 /// Explicitly rerun a node-local job manifest, including unknown prior outcomes.
-pub async fn rerun_jobs(path: &Path) -> Result<(), RelishError> {
-    let config = Config::from_file(path)?;
-    config.validate()?;
+pub async fn rerun_jobs(source: &super::manifest::ManifestSource) -> Result<(), RelishError> {
+    let config = load_manifest(source).await?;
     let result = BunClient::default_local()
         .apply_rerunning_jobs(&config)
         .await?;
@@ -42,14 +60,26 @@ pub async fn rerun_jobs(path: &Path) -> Result<(), RelishError> {
     Ok(())
 }
 
+/// The last line of `relish apply`. A single node starts the instances
+/// before it answers and names them; a cluster commits the apps and lets
+/// the scheduler place them, so there are no instances to name yet.
+fn apply_summary(created: usize, instances: &[String]) -> String {
+    if instances.is_empty() {
+        format!(
+            "applied {created} app(s); the scheduler places them now (watch with `relish status`)"
+        )
+    } else {
+        format!("deployed {created} instance(s): {}", instances.join(", "))
+    }
+}
+
 async fn apply_with_client(
-    path: &Path,
+    source: &super::manifest::ManifestSource,
     output: OutputFormat,
     dry_run: bool,
     client: &BunClient,
 ) -> Result<(), RelishError> {
-    let config = Config::from_file(path)?;
-    config.validate()?;
+    let config = load_manifest(source).await?;
 
     if dry_run {
         // Diff against the live agent's current state when one answers, so
@@ -74,11 +104,7 @@ async fn apply_with_client(
         Ok(()) => {
             // Agent is alive — send the config (progress streams to stderr)
             let result = client.apply(&config).await?;
-            println!(
-                "deployed {} instance(s): {}",
-                result.created,
-                result.instances.join(", ")
-            );
+            println!("{}", apply_summary(result.created, &result.instances));
             Ok(())
         }
         Err(_) => {
@@ -113,10 +139,7 @@ async fn status_with_client(output: OutputFormat, client: &BunClient) -> Result<
                 );
                 for row in &statuses {
                     let s = &row.instance;
-                    let pid = s
-                        .pid
-                        .map(|p| p.to_string())
-                        .unwrap_or_else(|| "-".to_string());
+                    let pid = pid_cell(s);
                     println!(
                         "{:<24} {:<20} {:<15} {:<12} {:<10} {:<10} {:<6}",
                         row.node, s.id, s.app_name, s.namespace, s.state, pid, s.restart_count
@@ -393,7 +416,10 @@ async fn exec_with_client(
     command: &[String],
     client: &BunClient,
 ) -> Result<(), RelishError> {
-    let output = client.exec(app, namespace, command).await?;
+    // The entry node only runs its own instances; exec on the node that
+    // runs this app (through the entry node's relay on a laptop cluster).
+    let target = super::path_cmd::find_source_client(client, app, namespace).await?;
+    let output = target.exec(app, namespace, command).await?;
     if !output.is_empty() {
         print!("{output}");
     }
@@ -411,7 +437,22 @@ async fn stop_with_client(
     client: &BunClient,
 ) -> Result<(), RelishError> {
     client.stop(app, namespace).await?;
-    println!("stopped {app}");
+    println!("stopped {app}; `relish apply` starts it again");
+    Ok(())
+}
+
+/// Remove an app from the cluster.
+pub async fn delete(app: &str, namespace: &str) -> Result<(), RelishError> {
+    delete_with_client(app, namespace, &BunClient::default_local()).await
+}
+
+async fn delete_with_client(
+    app: &str,
+    namespace: &str,
+    client: &BunClient,
+) -> Result<(), RelishError> {
+    client.delete(app, namespace).await?;
+    println!("deleted {app}");
     Ok(())
 }
 
@@ -435,6 +476,8 @@ async fn inspect_with_client(name: &str, client: &BunClient) -> Result<(), Relis
             println!("  Restarts:  {}", s.restart_count);
             if let Some(pid) = s.pid {
                 println!("  PID:       {pid}");
+            } else if s.runtime_unknown {
+                println!("  PID:       unknown (the runtime was busy)");
             }
             if let Some(port) = s.host_port {
                 println!("  Port:      {port}");
@@ -705,29 +748,6 @@ async fn nodes_with_client(output: OutputFormat, client: &BunClient) -> Result<(
     }
 
     Ok(())
-}
-
-/// Run a chaos testing scenario or action.
-pub async fn chaos(action: &str, acknowledged: bool) -> Result<(), RelishError> {
-    let client = BunClient::default_local();
-    match action {
-        "council-partition" => super::chaos::council_partition(&client, acknowledged).await,
-        "worker-isolation" => super::chaos::worker_isolation(&client, acknowledged).await,
-        "status" => super::chaos::status(&client).await,
-        "heal" => super::chaos::heal(&client).await,
-        other => {
-            eprintln!("unknown chaos action: {other}");
-            eprintln!();
-            eprintln!("available actions:");
-            eprintln!("  use relish test --chaos for guarded recovery scenarios");
-            eprintln!("  status              show active fault injections");
-            eprintln!("  mutations and blanket heal are retired");
-            Err(RelishError::ApiError {
-                status: 0,
-                body: format!("unknown chaos action: {other}"),
-            })
-        }
-    }
 }
 
 /// Join an existing cluster: fetch a certificate from a member and persist it.
@@ -1382,43 +1402,25 @@ pub fn export_k8s(file: &Path) -> Result<(), RelishError> {
     Ok(())
 }
 
-/// Show the status of all running workloads — state, PID, restart count.
-///
-/// Named `top` by analogy, but it does not (yet) report live CPU/memory usage;
-/// the title and help say what it actually shows rather than promising resource
-/// figures it doesn't print (O19).
+/// Show every workload in the cluster with its node, state and latest CPU and
+/// memory. The figures are the last samples the node's metrics collector took
+/// (every few seconds), not a live meter; `-` means no sample yet.
 pub async fn top(output: OutputFormat) -> Result<(), RelishError> {
     let client = BunClient::default_local();
-    let statuses = client.status().await?;
+    let top = client.cluster_top().await?;
+    for warning in &top.warnings {
+        eprintln!("warning: {warning}");
+    }
 
     match output {
-        OutputFormat::Human => {
-            if statuses.is_empty() {
-                println!("no workloads running");
-                return Ok(());
-            }
-            println!(
-                "{:<20} {:<12} {:<10} {:<10} {:<10}",
-                "APP", "NAMESPACE", "STATE", "PID", "RESTARTS"
-            );
-            for s in &statuses {
-                let pid = s
-                    .pid
-                    .map(|p| p.to_string())
-                    .unwrap_or_else(|| "-".to_string());
-                println!(
-                    "{:<20} {:<12} {:<10} {:<10} {:<10}",
-                    s.app_name, s.namespace, s.state, pid, s.restart_count
-                );
-            }
-        }
+        OutputFormat::Human => print!("{}", render_top(&top.rows)),
         OutputFormat::Json => {
             let json =
-                serde_json::to_string_pretty(&statuses).map_err(RelishError::SerialiseJson)?;
+                serde_json::to_string_pretty(&top.rows).map_err(RelishError::SerialiseJson)?;
             println!("{json}");
         }
         OutputFormat::Yaml => {
-            let yaml = serde_yaml::to_string(&statuses).map_err(RelishError::SerialiseYaml)?;
+            let yaml = serde_yaml::to_string(&top.rows).map_err(RelishError::SerialiseYaml)?;
             print!("{yaml}");
         }
     }
@@ -1426,7 +1428,68 @@ pub async fn top(output: OutputFormat) -> Result<(), RelishError> {
     Ok(())
 }
 
-/// List images in the local Pickle registry.
+/// An instance's PID for a table: `-` when it has none, `?` when the node's
+/// runtime didn't answer in time.
+fn pid_cell(status: &crate::bun::agent::InstanceStatus) -> String {
+    match status.pid {
+        Some(pid) => pid.to_string(),
+        None if status.runtime_unknown => "?".to_string(),
+        None => "-".to_string(),
+    }
+}
+
+/// The `relish top` table.
+fn render_top(rows: &[crate::bun::top::TopRow]) -> String {
+    use std::fmt::Write as _;
+
+    if rows.is_empty() {
+        return "no workloads running\n".to_string();
+    }
+    let mut output = format!(
+        "{:<18} {:<20} {:<12} {:<10} {:<8} {:<9} {:>7} {:>10}\n",
+        "NODE", "APP", "NAMESPACE", "STATE", "PID", "RESTARTS", "CPU", "MEMORY"
+    );
+    for row in rows {
+        let pid = pid_cell(&row.instance);
+        let cpu = row
+            .cpu_percent
+            .map(|cpu| format!("{cpu:.1}%"))
+            .unwrap_or_else(|| "-".to_string());
+        let memory = row
+            .memory_bytes
+            .map(format_memory)
+            .unwrap_or_else(|| "-".to_string());
+        let _ = writeln!(
+            output,
+            "{:<18} {:<20} {:<12} {:<10} {:<8} {:<9} {:>7} {:>10}",
+            row.node,
+            row.instance.app_name,
+            row.instance.namespace,
+            row.instance.state,
+            pid,
+            row.instance.restart_count,
+            cpu,
+            memory
+        );
+    }
+    output
+}
+
+/// Bytes in binary units, one decimal place above a KiB.
+fn format_memory(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["KiB", "MiB", "GiB", "TiB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64 / 1024.0;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.1} {}", UNITS[unit])
+}
+
 /// Rotate or finalise the cluster's secret encryption key.
 pub async fn secret_rotate(finalize: bool) -> Result<(), RelishError> {
     let client = BunClient::default_local();
@@ -1435,12 +1498,97 @@ pub async fn secret_rotate(finalize: bool) -> Result<(), RelishError> {
     Ok(())
 }
 
-/// Sign an image in the Pickle registry and attach the signature via Raft.
-pub async fn sign(image: &str) -> Result<(), RelishError> {
+/// Sign a Pickle-hosted image with the operator's key and attach the
+/// signature. A tag is resolved to its manifest digest first, and the
+/// digest is what gets signed: a tag can move, a digest can't.
+pub async fn sign(image: &str, key_path: &Path) -> Result<(), RelishError> {
+    let key_text = fs::read_to_string(key_path)?;
+    let key = crate::pickle::signing::SigningKey::from_pem(&key_text)?;
+
     let client = BunClient::default_local();
-    let result = client.sign_image(image).await?;
+    let listing = client.images().await?;
+    let images: Vec<crate::pickle::types::ImageSummary> =
+        serde_json::from_value(listing["images"].clone()).map_err(|e| RelishError::ApiError {
+            status: 0,
+            body: format!("failed to parse images response: {e}"),
+        })?;
+    let digest = resolve_image_digest(image, &images)?;
+
+    let submission = key.sign(&digest)?;
+    let result = client.sign_image(&submission).await?;
     println!("{result}");
     Ok(())
+}
+
+/// Generate an image signing key at `out` (PKCS#8 PEM, owner-only
+/// permissions) and print the public key in the form
+/// `[images.trust_policy] keys` expects.
+pub fn sign_keygen(out: &Path) -> Result<(), RelishError> {
+    let key = crate::pickle::signing::SigningKey::generate()?;
+    write_private_key(out, &key.to_pem())?;
+    let public_key = key.public_key_base64();
+    println!("wrote image signing key to {}", out.display());
+    println!("public key: {public_key}");
+    println!();
+    println!("Trust it by adding this to every node's config:");
+    println!();
+    println!("[images.trust_policy]");
+    println!("require_signatures = true");
+    println!("keys = [\"{public_key}\"]");
+    Ok(())
+}
+
+/// Write a private key, refusing to overwrite and keeping it owner-only.
+fn write_private_key(path: &Path, pem: &str) -> Result<(), RelishError> {
+    use std::io::Write as _;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).map_err(|e| match e.kind() {
+        std::io::ErrorKind::AlreadyExists => RelishError::FileExists {
+            path: path.display().to_string(),
+        },
+        _ => RelishError::Io(e),
+    })?;
+    file.write_all(pem.as_bytes())?;
+    Ok(())
+}
+
+/// Resolve the image `relish sign` was given to the manifest digest to sign.
+///
+/// Accepts a tag reference (`myapp:v1`, `localhost:5050/team/app:v2`), a
+/// pinned reference (`myapp@sha256:…`) or a bare digest. The registry host
+/// is stripped the same way the deploy-time trust check strips it, so the
+/// digest signed here is the one a deploy of the same reference verifies.
+pub fn resolve_image_digest(
+    image: &str,
+    images: &[crate::pickle::types::ImageSummary],
+) -> Result<crate::pickle::types::Digest, RelishError> {
+    use crate::meat::scheduler::{canonical_repository, split_repo_tag};
+
+    let not_found = || RelishError::ImageNotInRegistry {
+        image: image.to_string(),
+    };
+    let found = if image.starts_with("sha256:") {
+        images.iter().find(|summary| summary.digest == image)
+    } else if let Some((name, digest)) = image.split_once('@') {
+        let repository = canonical_repository(name);
+        images
+            .iter()
+            .find(|summary| summary.repository == repository && summary.digest == digest)
+    } else {
+        let (name, tag) = split_repo_tag(image);
+        let repository = canonical_repository(name);
+        images
+            .iter()
+            .find(|summary| summary.repository == repository && summary.tags.contains(tag))
+    };
+    let summary = found.ok_or_else(not_found)?;
+    crate::pickle::types::Digest::new(&summary.digest).map_err(|_| not_found())
 }
 
 pub async fn images(output: OutputFormat) -> Result<(), RelishError> {
@@ -1781,10 +1929,11 @@ fn print_batch_summary(batch_id: u64, summary: &serde_json::Value) {
     );
 }
 
-/// Create a new API token (local operation — no agent needed).
+/// Create a new API token through the agent.
 ///
-/// Generates a token, hashes it with Argon2id, and prints the plaintext
-/// to stdout (shown once, never stored).
+/// The agent mints the token, stores its Argon2id hash in Raft, and
+/// returns the plaintext once; this prints it to stdout and never stores
+/// it. Needs a reachable agent and an admin credential.
 pub async fn token_create(
     name: &str,
     role_str: &str,
@@ -1839,14 +1988,25 @@ async fn token_create_with_client(
     Ok(())
 }
 
-/// Print the cluster's age public key from the init output directory.
+/// Print the cluster's age public key, for encrypting `ENC[AGE:...]` values.
 ///
-/// Reads the security bootstrap `relish init` wrote and extracts the
-/// cluster-wide age public key. This key can be used offline to encrypt
-/// secrets for `ENC[AGE:...]` config values.
-pub fn secret_pubkey(dir: &Path) -> Result<(), RelishError> {
-    println!("{}", resolve_secret_pubkey(dir)?);
+/// With no directory, asks the configured cluster (`GET
+/// /v1/secret/public-key`) for its active key, so a quickstart user, or
+/// anyone after a rotation, gets the key that will actually decrypt. With
+/// a directory, reads the security bootstrap `relish init` wrote there,
+/// which works offline.
+pub async fn secret_pubkey(dir: Option<&Path>) -> Result<(), RelishError> {
+    let key = match dir {
+        Some(dir) => resolve_secret_pubkey(dir)?,
+        None => fetch_secret_pubkey(&BunClient::default_local()).await?,
+    };
+    println!("{key}");
     Ok(())
+}
+
+/// Ask the cluster for its active age public key.
+async fn fetch_secret_pubkey(client: &BunClient) -> Result<String, RelishError> {
+    Ok(client.secret_public_key().await?.public_key)
 }
 
 /// Find the `*-security-bootstrap.json` in `dir` and return its cluster-wide
@@ -1901,27 +2061,71 @@ pub fn secret_encrypt(pubkey: &str, value: &str) -> Result<(), RelishError> {
 
 /// List API tokens from SecurityState via the agent.
 pub async fn token_list() -> Result<(), RelishError> {
-    let client = BunClient::default_local();
-    let result = client.token_list().await?;
-    let tokens = result["tokens"].as_array();
-    match tokens {
-        Some(toks) if toks.is_empty() => {
-            println!("no tokens");
-        }
-        Some(toks) => {
-            println!("{:<20} {:<12} {:<20}", "NAME", "ROLE", "CREATED");
-            for t in toks {
-                let name = t["name"].as_str().unwrap_or("?");
-                let role = t["role"].as_str().unwrap_or("?");
-                let created = t["created_at"].as_u64().unwrap_or(0);
-                println!("{:<20} {:<12} {:<20}", name, role, created);
-            }
-        }
-        None => {
-            println!("no tokens");
-        }
-    }
+    let tokens = BunClient::default_local().token_list().await?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    print!("{}", render_token_list(&tokens, now));
     Ok(())
+}
+
+/// The `relish token list` table: UTC creation and expiry times, with how
+/// long a live token has left.
+fn render_token_list(tokens: &[super::client::TokenSummary], now: u64) -> String {
+    use std::fmt::Write as _;
+    if tokens.is_empty() {
+        return "no tokens\n".to_string();
+    }
+    let mut out = format!(
+        "{:<20} {:<12} {:<21} {}\n",
+        "NAME", "ROLE", "CREATED", "EXPIRES"
+    );
+    for token in tokens {
+        let expires = match token.expires_at {
+            None => "never".to_string(),
+            Some(at) if at <= now => format!("{} (expired)", format_utc(at)),
+            Some(at) => format!("{} (in {})", format_utc(at), format_duration(at - now)),
+        };
+        // Writing to a String can't fail.
+        let _ = writeln!(
+            out,
+            "{:<20} {:<12} {:<21} {}",
+            token.name,
+            token.role,
+            format_utc(token.created_at),
+            expires
+        );
+    }
+    out
+}
+
+/// Unix seconds as `YYYY-MM-DD HH:MM UTC`; the raw number if out of range.
+fn format_utc(unix_seconds: u64) -> String {
+    let Ok(at) = i64::try_from(unix_seconds)
+        .map_err(|_| ())
+        .and_then(|seconds| time::OffsetDateTime::from_unix_timestamp(seconds).map_err(|_| ()))
+    else {
+        return unix_seconds.to_string();
+    };
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02} UTC",
+        at.year(),
+        u8::from(at.month()),
+        at.day(),
+        at.hour(),
+        at.minute()
+    )
+}
+
+/// A coarse remaining time: the largest whole unit (`29d`, `5h`, `12m`, `40s`).
+fn format_duration(seconds: u64) -> String {
+    match seconds {
+        s if s >= 86_400 => format!("{}d", s / 86_400),
+        s if s >= 3_600 => format!("{}h", s / 3_600),
+        s if s >= 60 => format!("{}m", s / 60),
+        s => format!("{s}s"),
+    }
 }
 
 /// Revoke an API token by name via the agent.
@@ -2008,17 +2212,31 @@ pub async fn snapshot_list(app: &str, namespace: &str) -> Result<(), RelishError
 }
 
 /// Restore a snapshot over its live volume (stop the app first).
-pub async fn snapshot_restore(app: &str, namespace: &str, name: &str) -> Result<(), RelishError> {
+/// `volume` picks between volumes that share the snapshot name.
+pub async fn snapshot_restore(
+    app: &str,
+    namespace: &str,
+    name: &str,
+    volume: Option<&str>,
+) -> Result<(), RelishError> {
     let client = BunClient::default_local();
-    client.snapshot_restore(app, namespace, name).await?;
+    client
+        .snapshot_restore(app, namespace, name, volume)
+        .await?;
     println!("restored {namespace}/{app} from snapshot {name}");
     Ok(())
 }
 
-/// Delete a snapshot.
-pub async fn snapshot_delete(app: &str, namespace: &str, name: &str) -> Result<(), RelishError> {
+/// Delete a snapshot. `volume` picks between volumes that share the
+/// snapshot name.
+pub async fn snapshot_delete(
+    app: &str,
+    namespace: &str,
+    name: &str,
+    volume: Option<&str>,
+) -> Result<(), RelishError> {
     let client = BunClient::default_local();
-    client.snapshot_delete(app, namespace, name).await?;
+    client.snapshot_delete(app, namespace, name, volume).await?;
     println!("deleted snapshot {name} of {namespace}/{app}");
     Ok(())
 }
@@ -2027,6 +2245,93 @@ pub async fn snapshot_delete(app: &str, namespace: &str, name: &str) -> Result<(
 mod tests {
     use super::*;
     use std::io::Write as _;
+
+    /// Z6.7: applying podinfo to the laptop cluster ended with
+    /// "deployed 4 instance(s):" and nothing after the colon.
+    #[test]
+    fn a_cluster_apply_says_the_apps_are_being_placed() {
+        assert_eq!(
+            apply_summary(4, &[]),
+            "applied 4 app(s); the scheduler places them now (watch with `relish status`)"
+        );
+        assert_eq!(
+            apply_summary(2, &["default__web-0".into(), "default__web-1".into()]),
+            "deployed 2 instance(s): default__web-0, default__web-1"
+        );
+    }
+
+    fn top_row(
+        node: &str,
+        id: &str,
+        pid: Option<u32>,
+        cpu: Option<f64>,
+        memory: Option<u64>,
+    ) -> crate::bun::top::TopRow {
+        crate::bun::top::TopRow {
+            node: node.to_string(),
+            instance: crate::bun::agent::InstanceStatus {
+                id: id.to_string(),
+                app_name: "podinfo".to_string(),
+                namespace: "default".to_string(),
+                state: "running".to_string(),
+                restart_count: u32::from(node == "rb-3"),
+                host_port: None,
+                exit_code: None,
+                pid,
+                runtime_unknown: false,
+            },
+            cpu_percent: cpu,
+            memory_bytes: memory,
+        }
+    }
+
+    #[test]
+    fn top_lists_every_node_with_cpu_and_memory() {
+        insta::assert_snapshot!(render_top(&[
+            top_row(
+                "rb-0123456789ab-1",
+                "default__podinfo-0",
+                Some(2311),
+                Some(3.4),
+                Some(24_117_248)
+            ),
+            top_row(
+                "rb-2",
+                "default__podinfo-0",
+                Some(2290),
+                Some(0.0),
+                Some(900)
+            ),
+            top_row("rb-3", "default__podinfo-0", None, None, None),
+        ]));
+    }
+
+    #[test]
+    fn top_marks_a_pid_the_runtime_did_not_report_in_time() {
+        let mut busy = top_row("rb-2", "default__podinfo-1", None, None, None);
+        busy.instance.runtime_unknown = true;
+        let table = render_top(&[
+            top_row("rb-1", "default__podinfo-0", None, None, None),
+            busy,
+        ]);
+        let pid_column = |line: &str| line.split_whitespace().nth(4).map(str::to_string);
+        let lines: Vec<&str> = table.lines().collect();
+        assert_eq!(pid_column(lines[1]).as_deref(), Some("-"), "{table}");
+        assert_eq!(pid_column(lines[2]).as_deref(), Some("?"), "{table}");
+    }
+
+    #[test]
+    fn top_says_so_when_nothing_runs() {
+        assert_eq!(render_top(&[]), "no workloads running\n");
+    }
+
+    #[test]
+    fn memory_uses_binary_units() {
+        assert_eq!(format_memory(512), "512 B");
+        assert_eq!(format_memory(1536), "1.5 KiB");
+        assert_eq!(format_memory(24_117_248), "23.0 MiB");
+        assert_eq!(format_memory(3 * 1024 * 1024 * 1024), "3.0 GiB");
+    }
 
     #[tokio::test]
     async fn join_token_file_rejects_exposed_empty_and_oversized_credentials() {
@@ -2072,11 +2377,90 @@ mod tests {
         assert!(key.starts_with("age1"), "got {key}");
     }
 
+    #[tokio::test]
+    async fn secret_pubkey_fetches_active_key_from_cluster() {
+        use axum::{Router, http::HeaderMap, routing::get};
+        let app = Router::new().route(
+            "/v1/secret/public-key",
+            get(|headers: HeaderMap| async move {
+                // The command must send the usual bearer token.
+                let authorised = headers.get("authorization").and_then(|v| v.to_str().ok())
+                    == Some("Bearer rbt_test");
+                if !authorised {
+                    return Err(axum::http::StatusCode::UNAUTHORIZED);
+                }
+                Ok(axum::Json(serde_json::json!({
+                    "public_key": "age1quickstartkey",
+                    "generation": 2,
+                })))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let base = format!("http://{address}");
+        let key = fetch_secret_pubkey(&BunClient::new_with_token(&base, Some("rbt_test"))).await;
+        let anonymous = fetch_secret_pubkey(&BunClient::new_with_token(&base, None)).await;
+        server.abort();
+        assert_eq!(key.unwrap(), "age1quickstartkey");
+        assert!(anonymous.is_err(), "an HTTP 401 must surface as an error");
+    }
+
+    #[tokio::test]
+    async fn secret_pubkey_errors_when_cluster_unreachable() {
+        assert!(fetch_secret_pubkey(&bogus_client()).await.is_err());
+    }
+
     #[test]
     fn secret_pubkey_errors_without_bootstrap_file() {
         let dir = tempfile::tempdir().unwrap();
         let result = resolve_secret_pubkey(dir.path());
         assert!(result.is_err(), "missing bootstrap must error");
+    }
+
+    #[test]
+    fn token_list_renders_human_times_and_expiry() {
+        use super::super::client::TokenSummary;
+        // 2026-09-25 12:00:00 UTC.
+        let now = 1_790_337_600;
+        let tokens = vec![
+            TokenSummary {
+                name: "ci-bot".to_string(),
+                role: "deployer".to_string(),
+                created_at: now - 86_400,
+                expires_at: Some(now + 30 * 86_400),
+            },
+            TokenSummary {
+                name: "admin".to_string(),
+                role: "admin".to_string(),
+                created_at: now - 3 * 86_400,
+                expires_at: None,
+            },
+            TokenSummary {
+                name: "old-reader".to_string(),
+                role: "read-only".to_string(),
+                created_at: now - 90 * 86_400,
+                expires_at: Some(now - 3_600),
+            },
+            TokenSummary {
+                name: "short".to_string(),
+                role: "read-only".to_string(),
+                created_at: now,
+                expires_at: Some(now + 5_400),
+            },
+        ];
+        insta::assert_snapshot!(render_token_list(&tokens, now), @r"
+        NAME                 ROLE         CREATED               EXPIRES
+        ci-bot               deployer     2026-09-24 12:00 UTC  2026-10-25 12:00 UTC (in 30d)
+        admin                admin        2026-09-22 12:00 UTC  never
+        old-reader           read-only    2026-06-27 12:00 UTC  2026-09-25 11:00 UTC (expired)
+        short                read-only    2026-09-25 12:00 UTC  2026-09-25 13:30 UTC (in 1h)
+        ");
+    }
+
+    #[test]
+    fn token_list_says_so_when_empty() {
+        assert_eq!(render_token_list(&[], 0), "no tokens\n");
     }
 
     #[tokio::test]
@@ -2092,6 +2476,38 @@ mod tests {
         f
     }
 
+    fn source(path: &Path) -> crate::relish::manifest::ManifestSource {
+        crate::relish::manifest::ManifestSource::File(path.to_path_buf())
+    }
+
+    /// Z1.4: Kubernetes YAML applies directly, through the importer.
+    #[cfg(feature = "kubernetes")]
+    #[tokio::test]
+    async fn apply_dry_run_accepts_kubernetes_yaml() {
+        let f = write_temp_config(
+            r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  template:
+    spec:
+      containers:
+      - name: web
+        image: nginx:1
+"#,
+        );
+        apply_with_client(
+            &source(f.path()),
+            OutputFormat::Human,
+            true,
+            &bogus_client(),
+        )
+        .await
+        .unwrap();
+    }
+
     /// X5 regression: an unreachable agent used to fall back to a
     /// dry-run plan and exit 0, making dead-agent deploys look green.
     #[tokio::test]
@@ -2103,9 +2519,14 @@ mod tests {
             port = 8080
         "#,
         );
-        let err = apply_with_client(f.path(), OutputFormat::Human, false, &bogus_client())
-            .await
-            .unwrap_err();
+        let err = apply_with_client(
+            &source(f.path()),
+            OutputFormat::Human,
+            false,
+            &bogus_client(),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, RelishError::AgentUnreachable), "got: {err:?}");
     }
 
@@ -2119,16 +2540,21 @@ mod tests {
         "#,
         );
         assert!(
-            apply_with_client(f.path(), OutputFormat::Human, true, &bogus_client())
-                .await
-                .is_ok()
+            apply_with_client(
+                &source(f.path()),
+                OutputFormat::Human,
+                true,
+                &bogus_client()
+            )
+            .await
+            .is_ok()
         );
     }
 
     #[tokio::test]
     async fn apply_with_missing_file_errors() {
         let result = apply_with_client(
-            Path::new("/nonexistent/config.toml"),
+            &source(Path::new("/nonexistent/config.toml")),
             OutputFormat::Human,
             false,
             &bogus_client(),
@@ -2145,7 +2571,13 @@ mod tests {
     #[tokio::test]
     async fn apply_with_invalid_toml_errors() {
         let f = write_temp_config("this is not valid toml [[[");
-        let result = apply_with_client(f.path(), OutputFormat::Human, false, &bogus_client()).await;
+        let result = apply_with_client(
+            &source(f.path()),
+            OutputFormat::Human,
+            false,
+            &bogus_client(),
+        )
+        .await;
         assert!(result.is_err());
     }
 
@@ -2157,7 +2589,13 @@ mod tests {
             replicas = 3
         "#,
         );
-        let result = apply_with_client(f.path(), OutputFormat::Human, false, &bogus_client()).await;
+        let result = apply_with_client(
+            &source(f.path()),
+            OutputFormat::Human,
+            false,
+            &bogus_client(),
+        )
+        .await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -2457,5 +2895,107 @@ mod tests {
     fn lint_missing_file() {
         let result = lint(Path::new("/nonexistent/config.toml"));
         assert!(result.is_err());
+    }
+
+    // --- relish sign ---
+
+    const MYAPP_V1: &str =
+        "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+    const MYAPP_V2: &str =
+        "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+    const TEAM_APP: &str =
+        "sha256:3333333333333333333333333333333333333333333333333333333333333333";
+
+    fn summary(
+        repository: &str,
+        digest: &str,
+        tags: &[&str],
+    ) -> crate::pickle::types::ImageSummary {
+        crate::pickle::types::ImageSummary {
+            repository: repository.to_string(),
+            digest: digest.to_string(),
+            tags: tags.iter().map(|t| t.to_string()).collect(),
+            layers: 1,
+            total_size: 100,
+        }
+    }
+
+    fn registry_listing() -> Vec<crate::pickle::types::ImageSummary> {
+        vec![
+            summary("myapp", MYAPP_V1, &["v1"]),
+            summary("myapp", MYAPP_V2, &["v2", "latest"]),
+            summary("team/app", TEAM_APP, &["v1"]),
+        ]
+    }
+
+    #[test]
+    fn sign_resolves_a_tag_to_its_manifest_digest() {
+        let digest = resolve_image_digest("myapp:v1", &registry_listing()).unwrap();
+        assert_eq!(digest.as_str(), MYAPP_V1);
+    }
+
+    #[test]
+    fn sign_resolves_an_untagged_reference_to_latest() {
+        let digest = resolve_image_digest("myapp", &registry_listing()).unwrap();
+        assert_eq!(digest.as_str(), MYAPP_V2);
+    }
+
+    #[test]
+    fn sign_strips_the_registry_host_like_the_deploy_check_does() {
+        let digest =
+            resolve_image_digest("localhost:5050/team/app:v1", &registry_listing()).unwrap();
+        assert_eq!(digest.as_str(), TEAM_APP);
+    }
+
+    #[test]
+    fn sign_accepts_a_pinned_reference_and_a_bare_digest() {
+        let pinned = format!("myapp@{MYAPP_V1}");
+        assert_eq!(
+            resolve_image_digest(&pinned, &registry_listing())
+                .unwrap()
+                .as_str(),
+            MYAPP_V1
+        );
+        assert_eq!(
+            resolve_image_digest(MYAPP_V2, &registry_listing())
+                .unwrap()
+                .as_str(),
+            MYAPP_V2
+        );
+    }
+
+    #[test]
+    fn sign_refuses_an_image_the_registry_does_not_hold() {
+        for image in [
+            "myapp:v9",
+            "nginx:latest",
+            "team/app@sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        ] {
+            let result = resolve_image_digest(image, &registry_listing());
+            assert!(
+                matches!(result, Err(RelishError::ImageNotInRegistry { .. })),
+                "{image}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sign_keygen_writes_an_owner_only_key_and_refuses_to_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("image-signing.pem");
+        sign_keygen(&path).unwrap();
+
+        let key = crate::pickle::signing::SigningKey::from_pem(&fs::read_to_string(&path).unwrap());
+        assert!(key.is_ok(), "the written key must load back: {key:?}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        assert!(matches!(
+            sign_keygen(&path),
+            Err(RelishError::FileExists { .. })
+        ));
     }
 }

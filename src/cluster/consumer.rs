@@ -43,6 +43,94 @@ async fn send_receipt(http: &ClusterHttp, leader: &str, generation: u64) -> io::
     .map_err(|_| io::Error::other("consumer receipt timed out; retry record retained"))?
 }
 
+/// Discharge endpoint consumers whose view lease has lapsed. Call it on the
+/// leader only; anywhere else the writes are refused.
+///
+/// A consumer lapses when this leader hasn't served it for `silence` (in
+/// production [`crate::onion::lease::CONSUMER_DISCHARGE_AFTER`]) and gossip
+/// doesn't list it in `alive`. Its own lease ran out before that, so it has
+/// stopped routing; the ledger can stop waiting for its receipts. Returns the
+/// consumers whose discharge committed in this call.
+pub async fn discharge_lapsed_consumers(
+    council: &crate::council::CouncilNode,
+    alive: &std::collections::HashSet<&str>,
+    silence: std::time::Duration,
+) -> Vec<String> {
+    use crate::council::{CouncilResponse, RaftRequest};
+    use std::time::Instant;
+
+    let term = council.current_term();
+    // A discharge whose outcome we never learnt (a timed-out write can still
+    // commit) keeps its consumer unserved until a barrier settles it.
+    let unsettled: Vec<String> = {
+        let mut contacts = council.consumer_contacts().lock().await;
+        contacts.observe_term(term, Instant::now());
+        contacts.discharging().cloned().collect()
+    };
+    if !unsettled.is_empty() {
+        let barrier =
+            tokio::time::timeout(DISCHARGE_WRITE_TIMEOUT, council.write(RaftRequest::Noop)).await;
+        if !matches!(barrier, Ok(Ok(_))) {
+            return Vec::new();
+        }
+        let mut contacts = council.consumer_contacts().lock().await;
+        for node in &unsettled {
+            contacts.finish_discharge(node);
+        }
+    }
+
+    let desired = council.desired_state().await;
+    let lapsed = {
+        let mut contacts = council.consumer_contacts().lock().await;
+        let now = Instant::now();
+        contacts.observe_term(term, now);
+        let lapsed = contacts.lapsed(&desired.endpoint_consumers, alive, now, silence);
+        for node in &lapsed {
+            contacts.begin_discharge(node);
+        }
+        lapsed
+    };
+
+    let mut discharged = Vec::new();
+    for node_id in lapsed {
+        let written = tokio::time::timeout(
+            DISCHARGE_WRITE_TIMEOUT,
+            council.write(RaftRequest::DischargeEndpointConsumer {
+                node_id: node_id.clone(),
+            }),
+        )
+        .await;
+        match written {
+            Ok(Ok(CouncilResponse::Refused { reason })) => {
+                eprintln!("scheduler: discharge of endpoint consumer {node_id} refused: {reason}");
+                council
+                    .consumer_contacts()
+                    .lock()
+                    .await
+                    .finish_discharge(&node_id);
+            }
+            Ok(Ok(_)) => {
+                eprintln!(
+                    "scheduler: endpoint consumer {node_id} silent past its view lease; \
+                     its withdrawal receipts are no longer awaited"
+                );
+                council
+                    .consumer_contacts()
+                    .lock()
+                    .await
+                    .finish_discharge(&node_id);
+                discharged.push(node_id);
+            }
+            // Unknown outcome: stay unserved until a barrier settles it.
+            _ => {}
+        }
+    }
+    discharged
+}
+
+/// Upper bound on one discharge or barrier write.
+const DISCHARGE_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -14,6 +14,10 @@ use serde::{Deserialize, Serialize};
 
 /// Top-level GitOps configuration, parsed from the `[gitops]` section
 /// of the cluster config TOML.
+///
+/// The sync always walks every subdirectory under `path` (`git ls-tree
+/// -r`); there is no shallow mode, and so no `recursive` key. An unknown
+/// key, including that one, is a parse error.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct GitOpsConfig {
@@ -37,19 +41,6 @@ pub struct GitOpsConfig {
     /// HMAC-SHA256 secret for webhook validation.
     #[serde(default)]
     pub webhook_secret: Option<String>,
-    /// **Ignored — the sync is always recursive** (O20).
-    ///
-    /// `list_files` shells out to `git ls-tree -r`, which descends
-    /// unconditionally, so this flag has never changed anything. That makes
-    /// `recursive = false` the misleading case: it promises a shallow sync of
-    /// the watched path and delivers a deep one.
-    ///
-    /// Kept (rather than removed) so existing configs still parse, and
-    /// [`GitOpsConfig::warnings`] tells anyone who set it `false` that it is
-    /// not honoured. Making the listing genuinely optional would be a feature,
-    /// not a docs fix, so it isn't attempted here.
-    #[serde(default)]
-    pub recursive: bool,
     /// Maximum webhook triggers per minute (default: 10).
     #[serde(default = "default_webhook_rate_limit")]
     pub webhook_rate_limit: u32,
@@ -72,24 +63,6 @@ impl GitOpsConfig {
     /// Get the poll interval as a Duration.
     pub fn poll_interval(&self) -> Duration {
         Duration::from_secs(self.poll_interval_secs)
-    }
-
-    /// Settings that parse but don't do what they say (O20).
-    ///
-    /// A silently-ignored knob is worse than a missing one: the operator has
-    /// been told their intent is respected. These are surfaced at startup
-    /// rather than corrected, because changing behaviour to match a
-    /// misleading default would be its own surprise.
-    pub fn warnings(&self) -> Vec<String> {
-        let mut warnings = Vec::new();
-        if !self.recursive {
-            warnings.push(
-                "[gitops] recursive = false is not honoured — the sync always \
-                 descends into subdirectories (git ls-tree -r)"
-                    .to_string(),
-            );
-        }
-        warnings
     }
 }
 
@@ -323,7 +296,6 @@ mod tests {
         assert_eq!(config.poll_interval_secs, 30);
         assert!(!config.require_signed_commits);
         assert!(config.webhook_secret.is_none());
-        assert!(!config.recursive);
         assert_eq!(config.webhook_rate_limit, 10);
     }
 
@@ -337,7 +309,6 @@ mod tests {
             require_signed_commits = true
             trusted_signing_keys = ["SHA256:abc123"]
             webhook_secret = "mysecret"
-            recursive = true
             webhook_rate_limit = 5
         "#;
         let config: GitOpsConfig = toml::from_str(toml).unwrap();
@@ -347,8 +318,18 @@ mod tests {
         assert!(config.require_signed_commits);
         assert_eq!(config.trusted_signing_keys, vec!["SHA256:abc123"]);
         assert_eq!(config.webhook_secret.as_deref(), Some("mysecret"));
-        assert!(config.recursive);
         assert_eq!(config.webhook_rate_limit, 5);
+    }
+
+    #[test]
+    fn gitops_config_rejects_recursive_key() {
+        // The sync always recurses; a `recursive` key is a leftover that
+        // must fail loudly rather than suggest a shallow mode exists.
+        for value in ["true", "false"] {
+            let toml = format!("repo = \"git@github.com:myorg/infra.git\"\nrecursive = {value}");
+            let error = toml::from_str::<GitOpsConfig>(&toml).unwrap_err();
+            assert!(error.to_string().contains("recursive"), "{error}");
+        }
     }
 
     #[test]

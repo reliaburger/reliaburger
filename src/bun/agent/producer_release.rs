@@ -1,10 +1,54 @@
 //! Retain runtime addresses, host ports and original records until committed remote release.
 
 use super::{BunAgent, BunError, DiscoveryOwnership, Grill, InstanceId};
+use crate::cluster::producer::ProducerRelease;
 use crate::onion::producer::ProducerReleaseConfirmation;
 
 impl<G: Grill + Clone + 'static> BunAgent<G> {
+    /// Keep a stopped, withdrawn old instance until the leader confirms that
+    /// every node has stopped routing to it. Its rollout carries on.
+    pub(super) fn defer_retirement(&mut self, id: &InstanceId) {
+        self.retain_stopped_instance(id);
+        if self.deferred_retirements.insert(id.clone()) {
+            eprintln!(
+                "bun: {} stopped; its addresses are released once every node confirms the withdrawal",
+                id.0
+            );
+        }
+    }
+
+    /// Release the addresses of instances a finished rollout left behind,
+    /// as soon as the leader confirms their withdrawal.
+    pub(super) async fn drive_deferred_retirements(&mut self) {
+        let deferred: Vec<InstanceId> = self.deferred_retirements.iter().cloned().collect();
+        for id in deferred {
+            if self.supervisor.get_instance(&id).is_none() {
+                self.deferred_retirements.remove(&id);
+                continue;
+            }
+            // The backend was withdrawn when the rollout stopped it; what's
+            // left is the release itself and the bookkeeping after it.
+            match self.retire_instance_artifacts(&id).await {
+                Ok(()) => {
+                    self.supervisor.retire_instance(&id).await;
+                    self.deferred_retirements.remove(&id);
+                    self.sync_firewall_ebpf().await;
+                    self.rebuild_routing_table().await;
+                }
+                Err(BunError::ProducerReleasePending { .. }) => {}
+                Err(error) => eprintln!("bun: releasing {} awaits retry: {error}", id.0),
+            }
+        }
+    }
     /// Configure enrolled leader transport. Durable discovery enables the release gate.
+    /// Forward workload CSRs through the leader when this node isn't it.
+    pub fn set_workload_csr_client(
+        &mut self,
+        client: crate::cluster::workload_identity::WorkloadCsrClient,
+    ) {
+        self.workload_csr_client = Some(client);
+    }
+
     pub fn set_producer_release_client(
         &mut self,
         client: crate::cluster::producer::ProducerReleaseClient,
@@ -33,19 +77,27 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 "discovery ownership is uncertain; producer release refused".into(),
             ));
         }
+        // Normally this node's own withdrawal receipt already proves it. But
+        // once the leader discharges this node, nobody waits for that receipt,
+        // and a lapsed view still routes to local backends: this check is
+        // what keeps a local address from being reused while it's routed.
+        if self.own_view_names(id) {
+            return Err(BunError::ProducerReleasePending {
+                instance_id: id.clone(),
+                reason: "this node's own view still routes to it",
+            });
+        }
         let instance = self.supervisor.get_instance(id);
         if instance.is_some_and(|instance| instance.host_port.is_none())
             && !self.network_references.contains_key(id)
         {
             return Ok(None);
         }
-        let launches = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            self.supervisor.grill().launch_inventory(),
-        )
-        .await
-        .map_err(|_| refuse("producer runtime inventory timed out".into()))??
-        .ok_or_else(|| refuse("producer runtime inventory is unavailable".into()))?;
+        let launches = self
+            .complete_runtime_inventory(super::LOOP_RUNTIME_INVENTORY_TIMEOUT, |reason| {
+                refuse(format!("producer {reason}"))
+            })
+            .await?;
         let mut originals = launches.iter().filter(|launch| launch.instance_id == *id);
         let original = originals
             .next()
@@ -111,9 +163,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         .map_err(|error| error.to_string())
                 }))
             });
+        let awaiting = |reason| BunError::ProducerReleasePending {
+            instance_id: id.clone(),
+            reason,
+        };
         // Only a fresh request waits; a retry just collects a finished answer.
         if requested && !pending.is_finished() {
-            return Err(refuse("producer release awaits leader confirmation".into()));
+            return Err(awaiting("producer release awaits leader confirmation"));
         }
         let outcome = tokio::select! {
             _ = self.shutdown.cancelled() => {
@@ -122,13 +178,18 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             outcome = tokio::time::timeout(PRODUCER_RELEASE_WAIT, &mut *pending) => outcome,
         };
         let Ok(joined) = outcome else {
-            return Err(refuse("producer release awaits leader confirmation".into()));
+            return Err(awaiting("producer release awaits leader confirmation"));
         };
         self.producer_releases.remove(&execution);
-        let confirmation = joined
+        match joined
             .map_err(|error| refuse(error.to_string()))?
-            .map_err(refuse)?;
-        Ok(Some(confirmation))
+            .map_err(refuse)?
+        {
+            ProducerRelease::Confirmed(confirmation) => Ok(Some(confirmation)),
+            ProducerRelease::Pending => Err(awaiting(
+                "other nodes have not yet confirmed the endpoint's withdrawal",
+            )),
+        }
     }
 }
 

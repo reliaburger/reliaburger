@@ -243,6 +243,8 @@ impl SuiteContext {
             capabilities: self.capabilities.clone(),
             timeout: self.timeout,
             deadline: self.deadline,
+            peer_route: crate::testkit::context::PeerRoute::Direct,
+            wait_note: Default::default(),
         }
     }
 }

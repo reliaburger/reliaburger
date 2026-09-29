@@ -10,6 +10,7 @@
 /// kernel for zero-latency, zero-copy connection steering.
 pub mod catalog;
 pub mod dns;
+pub mod lease;
 pub mod producer;
 pub mod service_id;
 pub mod service_map;

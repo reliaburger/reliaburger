@@ -26,7 +26,7 @@ path = "src/bin/testapp.rs"
 anyhow = "1"
 axum = { version = "0.8", features = ["ws"] }
 clap = { version = "4", features = ["derive"] }
-nix = { version = "0.29", features = ["signal", "process", "user", "sched", "net", "fs", "mount"] }
+nix = { version = "0.29", features = ["signal", "process", "user", "sched", "net", "fs", "dir", "mount"] }
 rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }
@@ -78,6 +78,7 @@ k8s-openapi = { version = "0.22", default-features = false, features = ["latest"
 hyper-util = { version = "0.1", features = ["tokio", "server-auto", "service"] }
 hyper = { version = "1", features = ["http1"] }
 tower = "0.5"
+socket2 = "0.6"
 pulldown-cmark = "0.13.4"
 nucleo-matcher = "0.3.1"
 hickory-proto = { version = "0.26.3", default-features = false, features = ["std"] }
@@ -99,6 +100,19 @@ syn = { version = "2", features = ["full", "visit"] }
 insta = { version = "1", features = ["json"] }
 proptest = "1"
 tower = { version = "0.5", features = ["util"] }
+
+# Every quickstart downloads two or three of these binaries, and every
+# self-upgrade ships Bun through the registry. Release builds already carry
+# no debug info; the symbol table was a quarter of each file, and one
+# codegen unit per crate lets LLVM deduplicate and inline across what used
+# to be sixteen pieces, a third of the machine code. Together they halve
+# the binaries. Panics still print their message and `file:line`, but a
+# `RUST_BACKTRACE` trace has no function names. Fat LTO saved little more
+# and made warm builds three times slower again. Measurements:
+# docs/qualification/2026-09-24-binary-size.md.
+[profile.release]
+strip = true
+codegen-units = 1
 
 [profile.dev]
 debug = "line-tables-only"
@@ -128,6 +142,21 @@ opt-level = 3
 [profile.test.package.block-buffer]
 opt-level = 3
 
+# API tokens are verified with Argon2id on every request. Unoptimised, one
+# verification costs most of a second, so the authorisation tests spent
+# their time hashing rather than testing. Same trade as the hash crates.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
+
+[profile.test.package.argon2]
+opt-level = 3
+
+[profile.test.package.blake2]
+opt-level = 3
+
 [[bench]]
 name = "gossip"
 harness = false
@@ -143,7 +172,7 @@ harness = false
 # that one upstream commit. Every arrow-rs crate comes from the same revision
 # so Cargo builds a single copy of the Arrow types. Remove the whole block
 # once DataFusion depends on a Parquet release that contains #10979; the
-# tests/parquet_safety.rs regressions must still pass on Linux.
+# tests/suite/parquet_safety.rs regressions must still pass on Linux.
 [patch.crates-io]
 arrow = { git = "https://github.com/reliaburger/arrow-rs", rev = "34ac1864f214da1648b05fbd1a2b6de4f2b4a952" }
 arrow-arith = { git = "https://github.com/reliaburger/arrow-rs", rev = "34ac1864f214da1648b05fbd1a2b6de4f2b4a952" }

@@ -29,10 +29,3 @@ target = "payment-service"
 value = "95%"
 start_after = "4m"
 duration = "2m"
-
-[[step]]
-description = "Payment service OOM"
-fault = "memory"
-target = "payment-service"
-value = "oom"
-start_after = "6m"

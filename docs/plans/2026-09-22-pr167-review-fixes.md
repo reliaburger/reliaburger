@@ -12,12 +12,15 @@ Tick an item only when its commit is on the branch and `make ci` passes.
 
 Each tier is its own PR, stacked on the previous one:
 
-| Tier | Branch | Base |
-| --- | --- | --- |
-| 1 | `fix/tier-1-merge-blockers` | `main` |
-| 2 | `fix/tier-2-release-fixes` | `fix/tier-1-merge-blockers` |
-| 3 | `fix/tier-3-docs` | `fix/tier-2-release-fixes` |
-| 4 | `fix/tier-4-size` | `fix/tier-3-docs` |
+| Tier | Branch | Base | PR |
+| --- | --- | --- | --- |
+| 1 | `fix/tier-1-merge-blockers` | `main` | #172 |
+| 2 | `fix/tier-2-release-fixes` | `fix/tier-1-merge-blockers` | #173 |
+| 4 | `fix/tier-4-size` | `fix/tier-2-release-fixes` | |
+| 3 | `fix/tier-3-docs` | `fix/tier-4-size` | |
+
+The docs tier comes last (decided 23 September 2026) so the book condensation
+describes the final code, including T4's single Runc lifecycle.
 
 Line numbers below were recorded at `9d8eb3d`; re-find each location before
 editing, since earlier fixes move them.
@@ -310,45 +313,66 @@ Smaller, mostly one commit each.
 
 CI and release:
 
-- [ ] **T2.1 ✔ `promote.yml` runs the tag's own scripts with a write token.**
+- [x] **T2.1 ✔ `promote.yml` runs the tag's own scripts with a write token.**
       `.github/workflows/promote.yml:42-44` checks out `refs/tags/<tag>` and
       runs that tree's `scripts/release/candidate.py` with `contents: write`.
       Anyone who can push a tag and dispatch the workflow bypasses branch
       protection. *Fix:* check out `main`, and read the tag's `Cargo.toml` with
       `git show`.
-- [ ] **T2.2 ✔ Reboot "qualification" tests pass vacuously in CI.**
+      *Done.* Promotion checks out `main`, validates the tag's shape, fetches it and reads
+      version/commit via `git show`/`git rev-parse`. `scripts/release/test_promote_workflow.py`
+      (run by `test-packaging`) fails on a tag checkout or `${{ inputs.* }}` inside `run:`.
+- [x] **T2.2 ✔ Reboot "qualification" tests pass vacuously in CI.**
       `tests/owned_runc.rs:680` and `tests/oci_crash.rs:1216` `return` when
       their env var is unset, and `qualify-oci-interruptions.sh` and
       `make test-linux` run them. *Fix:* `panic!` when the var is missing, and
       `--skip` them in the automated drivers. The real runs stay manual
       (Lima), which the docs should say plainly.
-- [ ] **T2.3 Quorum assertions were loosened.** `tests/placement.rs:~851` and
+      *Done.* Both fixtures now `.expect()` their directory variable; the interruption driver
+      `--skip`s them and `make test-linux` excludes them by filter. Linux run of the
+      panic path still pending (macOS only compiles these files).
+- [x] **T2.3 Quorum assertions were loosened.** `tests/placement.rs:~851` and
       `:1093-1103` now also accept capacity or leader-unknown refusals. Restore
       the quorum-specific assertion (set up capacity so the quorum check is the
       one that fires).
+      *Done.* Both tests wait until the first fault's voter has left the API membership
+      view, then `assert_quorum_refusal` requires 400 + "quorum risk". The first test now
+      isolates a follower fully (the old setup only ever hit the 409 reservation refusal).
 
 Execution (grill):
 
-- [ ] **T2.4 The subreaper owner doesn't reap orphans while the workload runs.**
+- [x] **T2.4 The subreaper owner doesn't reap orphans while the workload runs.**
       `waitpid(-1)` only runs in `retire_children`
       (`src/grill/process_owner.rs:~584`), so double-forking workloads pile up
       zombies. Reap in the main loop (`:327-355`).
-- [ ] **T2.5 macOS has no boot identity.** `current_boot_id()`
+      Done. Each tick peeks with `waitid(WNOWAIT)` and reaps exited orphans
+      by exact PID, leaving the root and exec helpers to their own waiters.
+- [x] **T2.5 macOS has no boot identity.** `current_boot_id()`
       (`src/grill/process_owner.rs:132-149`) returns `None` off Linux, so a
       reboot leaves `Running` records failing with NotFound forever. Use the
       `kern.bootsessionuuid` sysctl. Also: macOS `retire_children` checks only
       the process group, so `setsid` descendants survive.
-- [ ] **T2.6 Adoption compares start times exactly.**
+      Done. macOS reads `kern.bootsessionuuid`, both systems store lowercase
+      UUIDs, and schema-3 records require one everywhere. The `setsid` gap is
+      documented in chapter 8, not fixed.
+- [x] **T2.6 Adoption compares start times exactly.** Done: owned adoption
+      uses `records::process_matches` (±2 s), proven on Linux with a record
+      one second off.
       `src/grill/runc/owned.rs:786`. Use the ±2 s slack the rest of the code
       uses (NTP steps move `/proc/stat` btime).
-- [ ] **T2.7 A failed stop is silently ignored on restart egress refusal.**
+- [x] **T2.7 A failed stop is silently ignored on restart egress refusal.**
+      Done. A failed stop of the created replacement now takes the existing
+      `record_failed_restart` path (Stopping, retry pending) instead of
+      marking the instance Failed with its container abandoned.
       `src/bun/agent.rs:~7942` `let _ = …stop(&id).await`, then `Failed` with
       no retry, leaking the container and its network reference. Keep the
       instance owned and retry the stop.
-- [ ] **T2.8 An `io::Error::other` allocation runs inside `pre_exec`.**
+- [x] **T2.8 An `io::Error::other` allocation runs inside `pre_exec`.** Done:
+      the child returns `ESRCH` without allocating and the parent maps it back
+      to the message; privileged storage tests pass (4/4).
       `src/grill/volume/owned.rs:437`. Use `io::Error::last_os_error()`, and
       make the `// SAFETY:` comment true.
-- [ ] **T2.9 Flaky `job_recovery` test (seen locally).**
+- [x] **T2.9 Flaky `job_recovery` test (seen locally).**
       `completed_job_survives_bun_death_with_or_without_adoption_record` failed
       once under full-suite load with
       `StateUnavailable { reason: "Broken pipe (os error 32)" }` at
@@ -358,28 +382,58 @@ Execution (grill):
       Also watch `bun::api::tests::app_metrics_name_injection_cannot_bypass_predicate`:
       it hit `LEAK-FAIL` once under parallel load (the PR made
       `leak-timeout` fatal), then passed 6 times in isolation.
+      Done. The single-threaded owner drops a client slower than its 100 ms
+      read timeout, and `pid()` turned that into "no PID" (so jobs also
+      skipped their adoption record). `status` and `signal` now retry a live
+      owner (the lock proves it) up to ten times on a dropped connection.
+      Under a CPU hog, 30 runs each: `completed_job_survives...` 7 to 0
+      failures, `killed_exec_caller...` 2 to 0. The api leak test wasn't
+      investigated.
 
 Discovery and API:
 
-- [ ] **T2.10 The consumer publication list can hit its cap and wedge.**
+- [x] **T2.10 The consumer publication list can hit its cap and wedge.**
+      Resolved by T1.1, now pinned by a test. Views accumulate only while a
+      removed backend still holds captured requests, which its 30 s drain
+      deadline bounds; the test publishes 39 changes during one capture and
+      checks a single pass compacts them after release. Reaching 1,024 would
+      need over a thousand catalogue changes inside one drain window.
       `src/bun/agent/consumer.rs:236-239` pushes and persists before the
       withdrawal that shrinks the list; at `MAX_PUBLICATIONS` (1,024)
       `save_consumer` fails validation before reaching it. Collapse repeated
       unfinished publications, or withdraw before pushing. Related to T1.2.
-- [ ] **T2.11 Startup retirement may retry forever after partial success.**
+- [x] **T2.11 Startup retirement may retry forever after partial success.**
+      Investigated, no change. The runtime inventory keeps Retired intents and
+      owned cleanup returns early for them, so a partially completed retirement
+      re-matches and finishes on retry. "Execution changed" needs a successor
+      generation for the same instance, which can only be published after the
+      original is Retired; the remaining steps are keyed by instance ID, so
+      finishing them would touch the successor, and refusing is right. A
+      pending startup retirement also keeps a critical readiness subsystem
+      degraded and its port reserved, so the scheduler avoids placing one.
       `src/bun/startup_recovery.rs:75-85` requires the original launch to
       still exist unchanged, but `retire_instance_artifacts` isn't atomic.
       *Investigate first* (reviewer marked it plausible), then make each step
       idempotent against an already-completed earlier step.
-- [ ] **T2.12 Execution evidence can be dropped silently.**
+- [x] **T2.12 Execution evidence can be dropped silently.** Investigated, no
+      change. `launch_inventory` returns `Ok(None)` only for runtimes without
+      ownership, and durable discovery is only enabled with owned Runc, whose
+      inventory is always `Some`; T4.2 removes the unowned Runc path entirely.
+      The historical backend list is superseded by T1.1's retained consumer
+      views, which drain removed backends before forgetting them.
       `src/bun/discovery_ownership.rs:67-81`: `launch_inventory` returning
       `Ok(None)` records empty `executions`; `*previous = owner` overwrites the
       historical backend list the drain relies on. *Investigate first.*
-- [ ] **T2.13 Every mTLS request clones the whole cluster state.**
+- [x] **T2.13 Every mTLS request clones the whole cluster state.** Done. A
+      borrowing `read_desired` accessor backs `CouncilNode::is_node_retired`,
+      and an unreadable peer identity is now refused instead of passed.
       `refuse_retired_tls_peer` calls `council.security_state()`, which clones
       all of `DesiredState`. Add a borrowing accessor for the security part.
       Also make it fail closed when SAN parsing fails.
-- [ ] **T2.14 Blocking filesystem calls on async tasks.**
+- [x] **T2.14 Blocking filesystem calls on async tasks.** Done. The identity
+      sweep and rollback verification run in `spawn_blocking` (rollback now
+      reads the binary once); discovery recovery bounds its inventory read at
+      5 s. `io_device_major_minor` keeps its single `stat`.
       `sweep_orphaned_identity_dirs` (`src/bun/agent.rs:8590`), `:5360`,
       `prepare_rollback` in `src/upgrade/manager.rs`. Wrap in
       `spawn_blocking`. Add a timeout to `recover_discovery`'s
@@ -387,20 +441,32 @@ Discovery and API:
 
 Registry and storage:
 
-- [ ] **T2.15 Lease expiry trusts the proposing node's clock.**
+- [x] **T2.15 Lease expiry trusts the proposing node's clock.**
       `src/pickle/lease.rs:155-164`, `src/pickle/api.rs:367`,
       `src/pickle/copy.rs:74`. A slow clock lets a node write after expiry. Have
       the leader stamp the time, or refuse `observed_at` beyond a skew bound.
-- [ ] **T2.16 `revalidate_blob` reads multi-GB blobs into memory.**
+      *Done.* The leader stamps: `ClaimWriter`/`LeasedManifest` lost their timestamp and
+      `RegistryMutation::request(leader_now)` sets it (and overwrites copies'). Test
+      `slow_clock_lease_observations_are_refused_after_leader_expiry` proves the refusal.
+- [x] **T2.16 `revalidate_blob` reads multi-GB blobs into memory.**
       `src/pickle/store.rs:214-226`, called on every heal tick and p2p resolve.
       Stream the hash as `copy.rs:118` already does. Treat read errors as
       errors, not "not cached".
-- [ ] **T2.17 An explicit council refusal doesn't roll back the local
+      *Done.* `revalidate_blob` streams via a shared `sha256_file` (copy.rs uses it too) and
+      returns `Result<bool>`; only NotFound is a miss. Tests: a late-byte mismatch in a
+      multi-chunk blob is caught and removed; an unreadable blob path errors and survives.
+- [x] **T2.17 An explicit council refusal doesn't roll back the local
       catalogue.** `src/pickle/api.rs:316-378`. A push that loses the GC race
       leaves its digest tagged locally, so its layers never get collected. Roll
       back on `Refused`/`Stale`; keep local state only on timeout.
+      *Done.* `record_commit_owned` keeps the pre-commit catalogue and restores + persists it
+      on `Refused`, `RegistryPublicationStale` or a forwarded 409; other errors keep it.
+      `refused_publication_rolls_back_the_local_tag_but_uncertain_keeps_it` covers all three.
 
-- [ ] **T2.20 Export withdrawal-ledger occupancy as a Mayo metric.** T1.2
+- [x] **T2.20 Export withdrawal-ledger occupancy as a Mayo metric.** Done:
+      the leader loop records a process-wide gauge that the collection loop
+      exports as `discovery_withdrawal_ledger_occupancy_ratio` and
+      `discovery_withdrawal_pending_generations`; followers report zero. T1.2
       shipped the readiness signal and log. Mayo only records host metrics
       today (`src/mayo/collector.rs`), so a gauge needs a small path for
       Bun-internal metrics first.
@@ -412,13 +478,20 @@ Config:
 
 ## Tier 3: docs cleanup before merge
 
-- [ ] **T3.1 Condense the book.** 8.2k added lines across 14 chapters, about 300
+- [x] **T3.1 Condense the book.** 8.2k added lines across 14 chapters, about 300
       appended fix headings, one code block. Rewrite each chapter's additions as
       one or two narrative sections with real code listings. Explain or drop
       "obligation", "authority", "qualification", "fence". Remove the ~20
       development-only protocol/state version numbers (keep only the current
       compatibility policy in chapter 14). Remove the 7 links into
       `docs/plans/`. Follow the style guide in `CLAUDE.md`.
+      Done in 16 commits, one per chapter plus a chapter 8 fix. Against the
+      book before #167 the diff went from +8,072/−226 to +1,616/−351; the
+      book is 18,615 lines (was 25,196). Each chapter's fixes are now one or
+      two narrative sections with listings checked against this branch.
+      Development version numbers and `docs/plans/` links are gone, and
+      jargon is either defined once or dropped. Chapter 8 no longer
+      describes the long-deleted `tests/chaos_smoker.rs`.
 - [ ] **T3.2 Archive plans.** Move the session handoff (1,710 lines), the
       completion plan (2,338 lines), the C34 closure and the per-feature 09-19 /
       09-20 / 09-22 plans to `docs/plans/archive/`. Keep a one-page V01–V04
@@ -433,8 +506,11 @@ Config:
       section: rootless Runc is standalone only, container clusters are rootful
       Linux Runc/eBPF, declarative image workloads need root mode. Fix the
       "opt-in owned Runc" contradiction at `README.md:52` versus `:319`.
-- [ ] **T3.5 Decide on `docs/talks/`.** It arrived via PR #171 merged into this
+- [x] **T3.5 Decide on `docs/talks/`.** It arrived via PR #171 merged into this
       branch. Keep it, or move it to its own PR against `main`.
+      Kept. #171 landed on `main` as its own PR; it tracks five files (the
+      keynote deck generator, 1.3k lines). The untracked `node_modules` only
+      inflated `make loc`, which T4.8 fixed by counting tracked files.
 
 ## Tier 4: reduce code size
 
@@ -448,8 +524,10 @@ bigger size win is documentation (T3.1/T3.2, about 13k Markdown lines).
 Estimates come from a survey agent (22 September 2026); T4.1's reachability was
 spot-checked by hand.
 
-- [ ] **T4.1 Delete the legacy rootless Runc path (~400 prod, ~280 test
-      lines; low risk).** Since `b41cdd9`, rootless startup always takes the
+- [x] **T4.1 Delete the legacy rootless Runc path (~400 prod, ~280 test
+      lines; low risk).** Done with T4.2. The legacy slirp4netns handles,
+      state-dir, subuid/subgid readers and their tests are gone; rootless Runc
+      keeps its owned slirp4netns helper. Since `b41cdd9`, rootless startup always takes the
       owned path (`src/bin/bun.rs:925-947`), so `Slirp4netnsHandle`,
       `setup_slirp4netns`, `stop_recorded_owner`, `PendingSlirp` and
       `add_slirp4netns_port_forward` (`src/grill/rootless.rs:174-450`),
@@ -459,9 +537,15 @@ spot-checked by hand.
       *Unblocked by decision G:* this is legacy code, so it goes. Rootless
       clusters (deferred past 0.1.0) will build on the owned path; git history
       keeps the slirp4netns code if it's ever wanted.
-- [ ] **T4.2 Make every Linux Runc instance owned; drop
+- [x] **T4.2 Make every Linux Runc instance owned; drop
       `--experimental-owned-runc` (~600–700 prod, ~375 test lines; medium
-      risk).** Removes the legacy branch of each
+      risk).** Done. `RuncGrill::new` takes the owner executable,
+      every `Grill` method calls the owned implementation, `RuncEntry` and
+      `--experimental-owned-runc` are gone, and `detect_runtime` returns a
+      `DetectedRuntime` instead of building an unowned runtime. Legacy-only
+      tests were deleted; surviving Runc tests were ported (about 1,900 lines
+      removed). Linux: runc unit 6/6, owned_runc 13/13, owned_network 4/4,
+      oci_crash 8/8, rootless 8/8. Removes the legacy branch of each
       `if self.ownership.is_some()` in `src/grill/runc.rs:795-1466` plus
       legacy-only helpers (`:194-363`). Nothing in the owned path needs eBPF,
       but `durable_discovery` currently also gates cluster identity rules and
@@ -469,17 +553,30 @@ spot-checked by hand.
       runtime" from "durable discovery" first, and qualify rootful Runc without
       eBPF on the owned path. Also removes a less crash-safe mode. Needs a
       scope decision (F below).
-- [ ] **T4.3 `ask_agent` helper in `src/bun/api.rs` (~250–350 lines; low
+- [x] **T4.3 `ask_agent` helper in `src/bun/api.rs` (~250–350 lines; low
       risk).** The oneshot + `cmd_tx.send` + "agent unavailable" + await
       pattern repeats 36 times (e.g. `:853-858`, `:920-927`, `:988-1000`).
-- [ ] **T4.4 Shared private-record reader (~150–250 lines; low risk).** One
+      Done. 29 call sites use `ask_agent`; the 9 left have their own timeout
+      or distinct error text. `api.rs` −344 lines (+209/−553).
+- [x] **T4.4 Shared private-record reader (~150–250 lines; low risk).** One
       `read_private_json(path, limit)` for the O_NOFOLLOW → regular/private
       file → size → bounded read → parse pattern in `process_owner.rs`,
       `runc_intent.rs`, `discovery_owners.rs`, `egress_owners.rs`,
       `volume/owned.rs`, `network_leases.rs`, `command.rs`, `jobs.rs`,
       `schedules.rs`; dedupe `validate_file`/`validate_directory`. Keep the
       domain-specific `validate()`/`validate_transition()` as they are.
-- [ ] **T4.5 Remove dead functions (~130–200 lines; low risk).** No callers
+      Done. `src/durable.rs` holds `read_bounded`/`read_json`/
+      `read_json_if_exists` with an `Access` level (regular, owner-only,
+      exclusive 0600 single-link) plus the shared `validate_file`/
+      `validate_directory`. All nine loaders converted, plus
+      `cluster/applied.rs`; each keeps its own privacy level, NotFound
+      handling and error type (volume maps refusals to `Ownership`, command
+      maps oversize to `OutputTooLarge`). Left alone: `grill/records.rs`
+      (unbounded `BufReader` with per-path context), the eBPF ownership
+      manifest (mode 0600 without the link check, Linux-only), and
+      directory checks demanding exactly 0700. Production code −64 lines
+      (loaders −183, new module +119); +100 lines of tests for the reader.
+- [x] **T4.5 Remove dead functions (~130–200 lines; low risk).** No callers
       at all: `query_apps` (`ketchup/log_store.rs:605`),
       `spawn_council_reconciler` (`cluster/runtime.rs:973`),
       `derive_with_evidence` (`bun/capabilities.rs:361`), `query_sql_json`,
@@ -488,22 +585,59 @@ spot-checked by hand.
       `required_role`. Orphaned by this branch (tests only):
       `pull_manifest_layers` (`pickle/pull.rs:311`), `apply_update_locations`,
       `netns::add_port_mapping`. Re-grep before deleting.
-- [ ] **T4.6 Small helpers (~50–70 lines).** One `launch_inventory` with a
+      Done. Deleted all ten no-caller functions, plus `get_auth_context`
+      (its only caller was `check_route_role`) and the `add_port_mapping`
+      wrapper (its gated test now calls `add_port_mapping_with_commands`).
+      Kept `pull_manifest_layers` (a `tests/pickle_cluster.rs` test calls
+      it) and `apply_update_locations` (setup for ~16 GC, P2P and state
+      machine tests of live code). `src` −181 lines (+10/−191).
+- [x] **T4.6 Small helpers (~50–70 lines).** One `launch_inventory` with a
       single timeout (7 copies, 1 s/5 s/none; this also fixes the missing
       timeout in T2.14) and one drain-then-check helper (3 copies).
-- [ ] **T4.7 Shared test fixtures (~1.2–1.8k test lines; low risk).** The
+      Done. `runtime_inventory`/`complete_runtime_inventory` (5 s, or 1 s on
+      the agent loop's own turn) replace all 8 reads; startup adoption gains
+      the 5 s bound. `SharedDrains::drain_all` replaces 3 of 4 drain copies
+      (the consumer withdrawal interleaves withdraws with drains). Call sites
+      −60 lines, but helpers and their docs cost about as much: production
+      +38, tests +72 (src +203/−93).
+- [x] **T4.7 Shared test fixtures (~1.2–1.8k test lines; low risk).** The
       eBPF enable-and-load preamble repeats 15 times in `tests/ebpf.rs`;
       `NodeFaultAuth` setup 7 times; `spawn_gitops_sync` config 5 times; the
       `router(cmd_tx, None ×11, …)` + agent spawn 12–20 times in the
       `api.rs` test module. Table-driving saves little: only 5
       near-duplicate test pairs exist.
-- [ ] **T4.9 Sweep remaining legacy code (decision G).** Search for
+      Done except `api.rs` (being edited in a parallel session, so its router
+      fixture is still open). `load_ebpf()` replaces the gate-and-load
+      preamble at all 29 sites in `tests/ebpf.rs` (−142 lines, Linux-only,
+      mechanical); `NodeFaultAuth::admin(name)` the 7 token setups in
+      `tests/placement.rs` (−55); `repo_config(repo, poll)` the 5 configs in
+      `tests/gitops.rs` (−35). Total −232 test lines.
+- [x] **T4.9 Sweep remaining legacy code (decision G).** Search for
       "legacy", "compat", "deprecated", "migrate", `#[serde(default)]` on
       durable formats and version fallbacks. Delete paths that exist only for
       unreleased formats or superseded implementations, and their docs.
-- [ ] **T4.8 Make `make loc` honest.** Count tracked files (`git ls-files`)
+      Done in 17 commits. Chaos: `relish chaos` and the `/v1/chaos/partition`
+      and `/heal` endpoints are gone; council partitions are a node-targeted
+      `FaultType::CouncilPartition` on `/v1/fault` with the usual reservation,
+      fence and exact-id reversal; workload faults need a namespace; the OOM
+      flag, the partition cgroup field and the unkeyed eBPF cleanup are gone.
+      Runtime: one blob layout, no per-port DNAT sweep, canonical instance ids
+      only, a required process start time, schema-3 owner records and
+      schema-2 instance records only. State and wire: no layout-1 identity
+      import, DNS readiness inside the one capability report, no serde
+      defaults kept for pre-release snapshots, no reserved gossip timestamp
+      (protocol generation 20 → 22). What remains under "legacy" is refusal
+      checks and test fixtures. The sweep is +795/−2,440 lines.
+- [x] **T4.8 Make `make loc` honest.** Count tracked files (`git ls-files`)
       so `node_modules` Markdown under `docs/talks/` stops inflating `.md`, and
       treat `#[cfg(test)] mod x;` files as tests.
+      Done. `make loc` runs `scripts/loc.sh`, which counts only tracked
+      files and counts `#[cfg(test)] mod x;` files (today
+      `src/bun/job_lifecycle_tests.rs`, 349 lines) as tests without letting
+      the declaration flip the rest of its parent into the test tail. On
+      this tree `.rs (src)` drops 347 lines to 132,488 and `.rs (test)`
+      rises to 132,260; in a checkout with `target/` and `docs/talks`
+      `node_modules`, the old recipe reported 449k `.md` and 2.06M total.
 
 Not worth it: marking `ProcessGrill`'s unowned branches test-only (~450
 lines, but 40 test sites depend on them, so no lines are saved), and merging

@@ -318,6 +318,7 @@ impl ServiceMap {
                             node_ip: backend.node_ip,
                             host_port: backend.host_port,
                             healthy: backend.healthy,
+                            local: false,
                         });
                     }
                 }
@@ -341,6 +342,7 @@ impl ServiceMap {
                                 node_ip: b.node_ip,
                                 host_port: b.host_port,
                                 healthy: b.healthy,
+                                local: false,
                             })
                             .collect(),
                         firewall_allow_from: None,
@@ -365,7 +367,8 @@ impl ServiceMap {
 }
 
 /// Separate successive executions even when they share a node and host port.
-/// Unknown execution evidence retains the legacy key and is not retirement proof.
+/// Without execution evidence the key is the bare endpoint, which is not
+/// retirement proof.
 fn catalog_instance_id(backend: &super::catalog::CatalogBackend) -> String {
     let endpoint = format!(
         "{}:{}:{}",
@@ -401,6 +404,7 @@ mod tests {
             node_ip: Ipv4Addr::from(ip),
             host_port: port,
             healthy: true,
+            local: false,
         }
     }
 
@@ -1021,6 +1025,7 @@ mod tests {
                     node_ip: Ipv4Addr::new(10, 0, 0, 1),
                     host_port: 30001,
                     healthy: true,
+                    local: false,
                 },
             )
             .unwrap();

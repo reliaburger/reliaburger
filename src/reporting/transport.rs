@@ -252,15 +252,6 @@ impl TcpReportingTransport {
         Self::bind_tls(addr, shutdown, None, None).await
     }
 
-    /// Create a plaintext transport sharing a reversible node-fault gate.
-    pub async fn bind_with_node_gate(
-        addr: SocketAddr,
-        shutdown: tokio_util::sync::CancellationToken,
-        node_gate: crate::smoker::node_fault::NodeTransportGate,
-    ) -> Result<Self, ReportingError> {
-        Self::bind_tls_with_node_gate(addr, shutdown, None, None, node_gate).await
-    }
-
     /// Create a TCP reporting transport, optionally over mTLS.
     ///
     /// When `acceptor` is set the accept loop requires a client certificate;
@@ -840,8 +831,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_reporting_frame_never_reaches_the_inbox() {
-        let payload = bincode::serialize(&sample_msg("legacy")).unwrap();
+    async fn unversioned_reporting_frame_never_reaches_the_inbox() {
+        let payload = bincode::serialize(&sample_msg("unversioned")).unwrap();
         let mut frame = (payload.len() as u32).to_be_bytes().to_vec();
         frame.extend(payload);
         let (tx, mut rx) = mpsc::channel(1);

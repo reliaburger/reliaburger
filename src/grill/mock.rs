@@ -54,10 +54,19 @@ pub struct MockGrill {
     ignore_stop: Arc<Mutex<bool>>,
     ignore_kill: Arc<AtomicBool>,
     fail_kill: Arc<AtomicBool>,
+    fail_stop: Arc<AtomicBool>,
+    inventory_delay: Arc<Mutex<Option<std::time::Duration>>>,
+    /// Time each force-kill request takes, as `runc kill` does on a loaded host.
+    kill_delay: Arc<Mutex<Option<std::time::Duration>>>,
+    pid_delay: Arc<Mutex<Option<std::time::Duration>>>,
+    /// Per-instance pid delays, on top of `pid_delay`.
+    instance_pid_delays: Arc<Mutex<HashMap<InstanceId, std::time::Duration>>>,
     fail_create: Arc<AtomicBool>,
     fail_start: Arc<AtomicBool>,
     fail_state: Arc<AtomicBool>,
     inspection_failures: Arc<Mutex<std::collections::HashSet<InstanceId>>>,
+    /// Per-instance captured-output stems, as a file-capturing runtime reports.
+    log_stems: Arc<Mutex<HashMap<InstanceId, std::path::PathBuf>>>,
 }
 
 impl Default for MockGrill {
@@ -94,10 +103,16 @@ impl Default for MockGrill {
             ignore_stop: Arc::default(),
             ignore_kill: Arc::default(),
             fail_kill: Arc::default(),
+            fail_stop: Arc::default(),
+            inventory_delay: Arc::default(),
+            kill_delay: Arc::default(),
+            pid_delay: Arc::default(),
+            instance_pid_delays: Arc::default(),
             fail_create: Arc::default(),
             fail_start: Arc::default(),
             fail_state: Arc::default(),
             inspection_failures: Arc::default(),
+            log_stems: Arc::default(),
         }
     }
 }
@@ -108,6 +123,15 @@ impl MockGrill {
         Self::default()
     }
 
+    /// Report `stem` as the instance's captured-output base path
+    /// (`{stem}.stdout` / `{stem}.stderr`), as Runc's owner does.
+    pub fn set_log_stem(&self, instance: &InstanceId, stem: std::path::PathBuf) {
+        self.log_stems
+            .lock()
+            .unwrap()
+            .insert(instance.clone(), stem);
+    }
+
     /// Keep reporting the existing state after an acknowledged kill.
     pub fn set_ignore_kill(&self, value: bool) {
         self.ignore_kill.store(value, Ordering::SeqCst);
@@ -116,6 +140,11 @@ impl MockGrill {
     /// Make force-kill requests fail without changing runtime state.
     pub fn set_fail_kill(&self, value: bool) {
         self.fail_kill.store(value, Ordering::SeqCst);
+    }
+
+    /// Make graceful stop requests fail without changing runtime state.
+    pub fn set_fail_stop(&self, value: bool) {
+        self.fail_stop.store(value, Ordering::SeqCst);
     }
 
     /// Fail creation after recording the attempted runtime mutation.
@@ -323,6 +352,30 @@ impl MockGrill {
 }
 
 impl MockGrill {
+    /// Delay every launch inventory read, as a wedged runtime would.
+    pub fn set_inventory_delay(&self, delay: Option<std::time::Duration>) {
+        *self.inventory_delay.lock().unwrap() = delay;
+    }
+
+    /// Delay every pid read, as a runtime waiting on a busy lifecycle lock would.
+    pub fn set_pid_delay(&self, delay: Option<std::time::Duration>) {
+        *self.pid_delay.lock().unwrap() = delay;
+    }
+
+    /// Delay pid reads for one instance only, as runc does while that
+    /// instance's lifecycle lock is held.
+    pub fn set_instance_pid_delay(&self, instance: &InstanceId, delay: std::time::Duration) {
+        self.instance_pid_delays
+            .lock()
+            .unwrap()
+            .insert(instance.clone(), delay);
+    }
+
+    /// Delay every force-kill request, as a slow runtime on a loaded host would.
+    pub fn set_kill_delay(&self, delay: Option<std::time::Duration>) {
+        *self.kill_delay.lock().unwrap() = delay;
+    }
+
     /// Supply a complete original runtime inventory for recovery tests.
     pub async fn set_launch_inventory(&self, launches: Vec<super::RuntimeLaunch>) {
         *self.launch_inventory.lock().await = Some(launches);
@@ -359,6 +412,10 @@ impl MockGrill {
 
 impl super::Grill for MockGrill {
     async fn launch_inventory(&self) -> Result<Option<Vec<super::RuntimeLaunch>>, GrillError> {
+        let delay = *self.inventory_delay.lock().unwrap();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
         Ok(self.launch_inventory.lock().await.clone())
     }
 
@@ -476,6 +533,12 @@ impl super::Grill for MockGrill {
             .lock()
             .unwrap()
             .push(("stop".to_string(), instance.clone()));
+        if self.fail_stop.load(Ordering::SeqCst) {
+            return Err(GrillError::StopFailed {
+                instance: instance.clone(),
+                reason: "injected stop failure".into(),
+            });
+        }
         // A process that ignores SIGTERM stays as-is; the exit-aware stop path
         // must escalate to kill(). Otherwise reflect the stop in state (unless
         // a test pinned a specific state) so callers that poll for exit observe
@@ -499,6 +562,10 @@ impl super::Grill for MockGrill {
             self.kill_started.add_permits(1);
             let permit = self.kill_release.acquire().await.unwrap();
             permit.forget();
+        }
+        let delay = *self.kill_delay.lock().unwrap();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
         }
         if self.fail_kill.load(Ordering::SeqCst) {
             return Err(GrillError::StartFailed {
@@ -540,6 +607,10 @@ impl super::Grill for MockGrill {
         codes.get(instance).copied().flatten()
     }
 
+    async fn log_stem(&self, instance: &InstanceId) -> Option<std::path::PathBuf> {
+        self.log_stems.lock().unwrap().get(instance).cloned()
+    }
+
     async fn container_ip(&self, _instance: &InstanceId) -> Option<std::net::Ipv4Addr> {
         *self.container_ip.lock().unwrap()
     }
@@ -566,7 +637,17 @@ impl super::Grill for MockGrill {
             .and_then(|path| crate::sesame::egress::cgroup_id_of_path(path)))
     }
 
-    async fn pid(&self, _instance: &InstanceId) -> Option<u32> {
+    async fn pid(&self, instance: &InstanceId) -> Option<u32> {
+        let delay = self
+            .instance_pid_delays
+            .lock()
+            .unwrap()
+            .get(instance)
+            .copied()
+            .or(*self.pid_delay.lock().unwrap());
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
         *self.pid.lock().unwrap()
     }
 

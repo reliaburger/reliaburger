@@ -1071,7 +1071,7 @@ mod tests {
 
     #[tokio::test]
     async fn bound_verifier_rejects_a_leaf_without_a_node_id_san() {
-        // A node cert issued the legacy way (no node-id URI SAN) fails the
+        // A node cert without a node-id URI SAN fails the
         // binding check: absence is treated as mismatch under the bound mode.
         let hierarchy = test_hierarchy("test");
         let mut server_id = identity_from(&hierarchy, "node-01", 10);

@@ -20,6 +20,7 @@ pub mod context;
 pub mod deadline;
 pub mod lease;
 pub mod oci;
+pub mod pinned_images;
 pub(crate) mod probe;
 pub mod registry;
 pub mod report;

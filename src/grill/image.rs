@@ -8,6 +8,10 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
+use std::collections::BTreeMap;
+
+use oci_distribution::manifest::OciDescriptor;
+
 use super::oci_pull::retry_registry_read;
 
 /// A parsed OCI image reference.
@@ -42,6 +46,9 @@ pub enum ImageError {
 
     #[error("failed to unpack layer {digest}: {reason}")]
     UnpackFailed { digest: String, reason: String },
+
+    #[error("invalid image config {digest}: {reason}")]
+    InvalidConfig { digest: String, reason: String },
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
@@ -135,14 +142,119 @@ fn split_name_tag(s: &str) -> (&str, String) {
     }
 }
 
+/// Whether plain HTTP may reach `registry`. Remote registries stay on HTTPS;
+/// local development registries and test fixtures on the same host don't need
+/// a certificate merely to move bytes that are verified by digest anyway.
+pub(crate) fn is_loopback_registry(registry: &str) -> bool {
+    registry.starts_with("127.0.0.1:") || registry.starts_with("localhost:")
+}
+
+/// Registries that serve digest-pinned images on behalf of an upstream host,
+/// e.g. `public.ecr.aws` → `mirror.internal:5000`.
+///
+/// A digest names exact bytes and every pull verifies the whole digest chain,
+/// so a mirror can make a pull faster or fail it, but can never substitute
+/// content. Tag references always go to their own registry: a mirror could
+/// answer a mutable tag with a different image.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(
+    try_from = "BTreeMap<String, String>",
+    into = "BTreeMap<String, String>"
+)]
+pub struct ImageMirrors(BTreeMap<String, String>);
+
+impl TryFrom<BTreeMap<String, String>> for ImageMirrors {
+    type Error = ImageError;
+
+    fn try_from(mirrors: BTreeMap<String, String>) -> Result<Self, Self::Error> {
+        Self::new(mirrors)
+    }
+}
+
+impl From<ImageMirrors> for BTreeMap<String, String> {
+    fn from(mirrors: ImageMirrors) -> Self {
+        mirrors.0
+    }
+}
+
+impl ImageMirrors {
+    /// Validate `upstream host → mirror host[:port]` pairs.
+    pub fn new(mirrors: BTreeMap<String, String>) -> Result<Self, ImageError> {
+        for (upstream, mirror) in &mirrors {
+            for host in [upstream, mirror] {
+                let valid = !host.is_empty()
+                    && !host.contains(['/', '@', '?', '#'])
+                    && !host.chars().any(char::is_whitespace);
+                if !valid {
+                    return Err(ImageError::InvalidReference(format!(
+                        "image mirror {upstream:?} = {mirror:?} must map one registry \
+                         host[:port] to another, without a scheme or path"
+                    )));
+                }
+            }
+        }
+        Ok(Self(mirrors))
+    }
+
+    /// The same repository and digest on `image`'s mirror, if it has one
+    /// and `image` is pinned by digest.
+    pub fn mirror_for(&self, image: &ImageReference) -> Option<ImageReference> {
+        if !image.tag.starts_with("sha256:") {
+            return None;
+        }
+        let mirror = self.0.get(&image.registry)?;
+        Some(ImageReference {
+            registry: mirror.clone(),
+            repository: image.repository.clone(),
+            tag: image.tag.clone(),
+        })
+    }
+
+    /// Mirrors reached over plain HTTP (see [`is_loopback_registry`]).
+    pub(crate) fn loopback_hosts(&self) -> Vec<String> {
+        self.0
+            .values()
+            .filter(|mirror| is_loopback_registry(mirror))
+            .cloned()
+            .collect()
+    }
+
+    /// The configured `upstream → mirror` pairs.
+    pub fn as_map(&self) -> &BTreeMap<String, String> {
+        &self.0
+    }
+}
+
+/// An image's blobs, materialised in local storage.
+#[derive(Debug, Clone)]
+pub struct LocalImageBlobs {
+    /// Layer blobs, in manifest order (base first).
+    pub layers: Vec<PathBuf>,
+    /// The config blob.
+    pub config: PathBuf,
+    /// The config blob's digest, as the manifest names it.
+    pub config_digest: String,
+}
+
+/// An unpacked image: its root filesystem and the config that says how
+/// to run it.
+#[derive(Debug, Clone)]
+pub struct PulledImage {
+    /// The shared, read-only rootfs generation.
+    pub rootfs: PathBuf,
+    /// The image's `Entrypoint`, `Cmd`, `Env`, `WorkingDir` and `User`,
+    /// parsed from the digest-verified config blob.
+    pub config: super::image_config::ImageConfig,
+}
+
 /// A cluster-backed layer source consulted before any external
 /// registry (Phase 12 C2). Implemented over the Pickle catalog +
 /// P2P pulls; injected late because the cluster subsystems start
 /// after the runtime is selected.
 ///
 /// `fetch_cluster_image` returns:
-/// - `Ok(Some(layer_paths))` — the catalog knows `repository:tag`;
-///   all layer blobs are now local, in manifest order, at these paths.
+/// - `Ok(Some(blobs))` — the catalog knows `repository:tag`; its
+///   config and layer blobs are now local and digest-verified.
 /// - `Ok(None)` — not a cluster image; fall through to the external
 ///   registry.
 /// - `Err(reason)` — the catalog knows the image but its layers could
@@ -169,7 +281,7 @@ pub trait ClusterImageSource: Send + Sync {
 /// Boxed future returned by [`ClusterImageSource::fetch_cluster_image`]
 /// (the trait must be `dyn`-safe, so no `impl Future` here).
 pub type ClusterFetchFuture<'a> = std::pin::Pin<
-    Box<dyn std::future::Future<Output = Result<Option<Vec<PathBuf>>, String>> + Send + 'a>,
+    Box<dyn std::future::Future<Output = Result<Option<LocalImageBlobs>, String>> + Send + 'a>,
 >;
 
 /// Content-addressed image store on disk.
@@ -177,7 +289,7 @@ pub type ClusterFetchFuture<'a> = std::pin::Pin<
 /// Disk layout:
 /// ```text
 /// {store_root}/
-///   blobs/sha256/{digest}                    — raw layer blobs
+///   blobs/sha256/{digest}/data               — raw layer blobs
 ///   rootfs/{registry}/{repo}/{tag}/          — unpacked filesystem
 ///   manifests/{registry}/{repo}/{tag}.json   — cached manifests
 /// ```
@@ -193,16 +305,18 @@ pub struct ImageStore {
     /// container's rootfs; the completion marker makes subsequent pulls reuse
     /// the published tree instead.
     unpack_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    /// Added to every file's uid and gid at unpack time, so a user
+    /// namespace mapping container id 0 to this host id sees the image's
+    /// own ownership (see `grill::userns`). `None` keeps the unpacking
+    /// user as owner.
+    owner_shift: Option<u32>,
+    /// Registries tried before the origin for digest-pinned images.
+    mirrors: ImageMirrors,
 }
 
-/// Resolve shared registry/runtime storage, retaining older flat cache entries.
+/// The path of a blob in the storage shared by the registry and the runtime.
 pub(crate) fn cached_blob_path(root: &Path, digest: &str) -> PathBuf {
-    let legacy = root.join("blobs").join("sha256").join(digest);
-    if legacy.is_file() {
-        legacy
-    } else {
-        legacy.join("data")
-    }
+    root.join("blobs").join("sha256").join(digest).join("data")
 }
 
 impl ImageStore {
@@ -212,7 +326,23 @@ impl ImageStore {
             store_root,
             cluster_source: std::sync::Arc::new(std::sync::OnceLock::new()),
             unpack_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            owner_shift: None,
+            mirrors: ImageMirrors::default(),
         }
+    }
+
+    /// Try `mirrors` before an image's own registry for digest-pinned pulls.
+    pub fn with_mirrors(mut self, mirrors: ImageMirrors) -> Self {
+        self.mirrors = mirrors;
+        self
+    }
+
+    /// Unpack images with each file owned by `base` plus its uid and gid
+    /// in the layer, for containers in a user namespace mapping container
+    /// id 0 to host id `base`. Needs root.
+    pub fn with_owner_shift(mut self, base: u32) -> Self {
+        self.owner_shift = Some(base);
+        self
     }
 
     /// Directory containing this runtime's selected image storage.
@@ -252,13 +382,22 @@ impl ImageStore {
             return Ok(generation);
         }
         let target = generation.clone();
-        tokio::task::spawn_blocking(move || unpack_layers(&layer_paths, &target))
-            .await
-            .map_err(|e| ImageError::UnpackFailed {
-                digest: "join".to_string(),
-                reason: e.to_string(),
-            })??;
-        tokio::fs::write(&complete, b"complete\n").await?;
+        let owner_shift = self.owner_shift;
+        tokio::task::spawn_blocking(move || {
+            unpack_layers_with_owner(&layer_paths, &target, owner_shift)?;
+            // The marker is the only thing a later pull checks. Flush the
+            // unpacked tree before writing it: after a power cut the V02 soak
+            // found `.complete` present and `redis-server` empty, and every
+            // redeploy failed with "exec format error".
+            sync_filesystem(&target)?;
+            crate::sesame::identity::atomic_write(&complete, b"complete\n")?;
+            Ok::<(), ImageError>(())
+        })
+        .await
+        .map_err(|e| ImageError::UnpackFailed {
+            digest: "join".to_string(),
+            reason: e.to_string(),
+        })??;
         Ok(generation)
     }
 
@@ -272,33 +411,23 @@ impl ImageStore {
     pub fn rootfs_generation_path(&self, tag_rootfs: &Path, layer_paths: &[PathBuf]) -> PathBuf {
         let mut hasher = Sha256::new();
         for path in layer_paths {
-            // The blob filename is the layer's sha256 hex — immutable
-            // content identity. Hash the ordered set into one generation id.
-            let digest_path = if path.file_name().is_some_and(|name| name == "data") {
-                path.parent().unwrap_or(path)
-            } else {
-                path.as_path()
-            };
-            let name = digest_path
-                .file_name()
+            // Every blob sits at `{digest}/data`, so the parent directory's
+            // name is the layer's sha256 hex — immutable content identity.
+            // Hash the ordered set into one generation id.
+            let name = path
+                .parent()
+                .and_then(Path::file_name)
                 .unwrap_or_default()
                 .to_string_lossy();
             hasher.update(name.as_bytes());
             hasher.update(b"\n");
         }
         let generation = hex::encode(hasher.finalize());
-        tag_rootfs.join(format!("gen-{}", &generation[..16]))
-    }
-
-    /// Create a store using the default rootless location.
-    ///
-    /// Uses `~/.local/share/reliaburger/images/` via the `dirs` crate.
-    pub fn rootless_default() -> Self {
-        let base = dirs::data_local_dir()
-            .unwrap_or_else(|| PathBuf::from("/tmp/reliaburger-images"))
-            .join("reliaburger")
-            .join("images");
-        Self::new(base)
+        // Shifted and unshifted trees of the same layers differ on disk.
+        match self.owner_shift {
+            Some(base) => tag_rootfs.join(format!("gen-{}-owner-{base}", &generation[..16])),
+            None => tag_rootfs.join(format!("gen-{}", &generation[..16])),
+        }
     }
 
     /// Path to a cached blob by its SHA-256 digest.
@@ -330,11 +459,13 @@ impl ImageStore {
 
     /// Pull an image and unpack it into a rootfs directory.
     ///
-    /// Returns the path to the unpacked rootfs. Caches blobs and
+    /// Returns the unpacked rootfs and the image's config. Caches blobs and
     /// manifests on disk; subsequent pulls of the same image are fast.
-    pub async fn pull_and_unpack(&self, image: &str) -> Result<PathBuf, ImageError> {
+    pub async fn pull_and_unpack(&self, image: &str) -> Result<PulledImage, ImageError> {
         let image_ref = ImageReference::parse(image)?;
-        let oci_ref = image_ref.to_oci_reference()?;
+        // Refuse a reference the registry client can't express before any
+        // cluster or cache lookup acts on it.
+        image_ref.to_oci_reference()?;
 
         let rootfs = self.rootfs_path(&image_ref);
 
@@ -346,8 +477,8 @@ impl ImageStore {
         if let Some(source) = self.cluster_source.get() {
             for (repo, tag) in cluster_candidates(&image_ref) {
                 match source.fetch_cluster_image(&repo, &tag).await {
-                    Ok(Some(layer_paths)) => {
-                        return self.unpack_to(layer_paths, rootfs).await;
+                    Ok(Some(blobs)) => {
+                        return self.unpack_local(blobs, rootfs).await;
                     }
                     Ok(None) => continue,
                     // The catalog knows the image but its layers are
@@ -366,8 +497,8 @@ impl ImageStore {
             // fall through to the direct pull: the upstream identity is
             // the same either way, so degrading is safe (and logged).
             match source.fetch_pull_through(&image_ref).await {
-                Ok(Some(layer_paths)) => {
-                    return self.unpack_to(layer_paths, rootfs).await;
+                Ok(Some(blobs)) => {
+                    return self.unpack_local(blobs, rootfs).await;
                 }
                 Ok(None) => {}
                 Err(reason) => {
@@ -379,13 +510,45 @@ impl ImageStore {
             }
         }
 
+        // A digest-pinned image may come from a configured mirror first. The
+        // digest chain is verified either way, so a failing or dishonest
+        // mirror costs time, never integrity.
+        let (layers, config) = match self.mirrors.mirror_for(&image_ref) {
+            Some(mirror) => match self.fetch_external(&image_ref, &mirror).await {
+                Ok(fetched) => fetched,
+                Err(reason) => {
+                    eprintln!(
+                        "warning: mirror {} failed for {image}: {reason} — \
+                         falling back to {}",
+                        mirror.registry, image_ref.registry
+                    );
+                    self.fetch_external(&image_ref, &image_ref).await?
+                }
+            },
+            None => self.fetch_external(&image_ref, &image_ref).await?,
+        };
+        // Unpack layers into an immutable content-addressed generation
+        // (REG5), not the shared tag directory — a re-pull after a tag move
+        // gets a fresh generation and can't clobber a running container.
+        // Tar extraction is CPU-bound, so it runs on a blocking task.
+        let layer_paths: Vec<PathBuf> = layers.iter().map(|l| self.blob_path(&l.digest)).collect();
+        let rootfs = self.unpack_to(layer_paths, rootfs).await?;
+        Ok(PulledImage { rootfs, config })
+    }
+
+    /// Fetch `image`'s verified manifest, config and layer blobs from
+    /// `source`, which is either the image's own registry or its mirror.
+    /// Cache entries stay keyed by `image`, so both sources fill one cache.
+    async fn fetch_external(
+        &self,
+        image_ref: &ImageReference,
+        source: &ImageReference,
+    ) -> Result<(Vec<OciDescriptor>, super::image_config::ImageConfig), ImageError> {
         // Keep remote registries on HTTPS. Loopback is the one exception:
         // local development registries and the hermetic test fixture do not
         // need a certificate merely to move bytes within the same host.
-        let protocol = if image_ref.registry.starts_with("127.0.0.1:")
-            || image_ref.registry.starts_with("localhost:")
-        {
-            oci_distribution::client::ClientProtocol::HttpsExcept(vec![image_ref.registry.clone()])
+        let protocol = if is_loopback_registry(&source.registry) {
+            oci_distribution::client::ClientProtocol::HttpsExcept(vec![source.registry.clone()])
         } else {
             oci_distribution::client::ClientProtocol::Https
         };
@@ -399,20 +562,23 @@ impl ImageStore {
         let client = oci_distribution::Client::new(client_config);
         let auth = oci_distribution::secrets::RegistryAuth::Anonymous;
 
+        let oci_ref = source.to_oci_reference()?;
+
         // Verify the raw digest chain before publishing any cache metadata.
-        let verified = retry_registry_read(std::time::Duration::from_secs(30), || {
+        let verified = retry_registry_read(super::oci_pull::METADATA_READ, || {
             super::oci_pull::pull_verified_manifest(&client, &oci_ref, &auth)
         })
         .await
         .map_err(|e| ImageError::ManifestPull {
-            image: image_ref.full_reference(),
+            image: source.full_reference(),
             reason: e.to_string(),
         })?;
 
         let manifest = verified.manifest;
+        let config = parse_config(&verified.config_bytes, &manifest.config.digest)?;
 
         // Save the manifest for cache validation
-        let manifest_path = self.manifest_path(&image_ref);
+        let manifest_path = self.manifest_path(image_ref);
         if let Some(parent) = manifest_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -451,7 +617,7 @@ impl ImageStore {
                 tokio::fs::create_dir_all(parent).await?;
             }
 
-            let blob_data = retry_registry_read(std::time::Duration::from_secs(120), || async {
+            let blob_data = retry_registry_read(super::oci_pull::LAYER_READ, || async {
                 // A failed transfer may have written a prefix. Each attempt
                 // owns a fresh buffer; no partial bytes reach the cache.
                 let mut blob_data = Vec::new();
@@ -481,22 +647,68 @@ impl ImageStore {
             // valid cache hit (M3) — the `exists()` check above never
             // re-verifies a cached file. The digest was verified above, so a
             // completed rename only ever publishes a good blob.
-            let tmp = blob_path.with_extension("tmp");
-            tokio::fs::write(&tmp, &blob_data).await?;
-            tokio::fs::rename(&tmp, &blob_path).await?;
+            // The temp file is synced before the rename and the directory
+            // after it, so a power cut can't publish an empty blob either.
+            let published = blob_path.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::sesame::identity::atomic_write(&published, &blob_data)
+            })
+            .await
+            .map_err(|e| ImageError::UnpackFailed {
+                digest: digest.clone(),
+                reason: e.to_string(),
+            })??;
         }
-
-        // Unpack layers into an immutable content-addressed generation
-        // (REG5), not the shared tag directory — a re-pull after a tag move
-        // gets a fresh generation and can't clobber a running container.
-        // Tar extraction is CPU-bound, so it runs on a blocking task.
-        let layer_paths: Vec<PathBuf> = manifest
-            .layers
-            .iter()
-            .map(|l| self.blob_path(&l.digest))
-            .collect();
-        self.unpack_to(layer_paths, rootfs).await
+        Ok((manifest.layers, config))
     }
+
+    /// Unpack blobs the cluster already holds, re-checking the config
+    /// blob's digest: it decides what the container runs, and as whom.
+    async fn unpack_local(
+        &self,
+        blobs: LocalImageBlobs,
+        rootfs: PathBuf,
+    ) -> Result<PulledImage, ImageError> {
+        let bytes = tokio::fs::read(&blobs.config).await?;
+        let actual = format!("sha256:{}", sha256_hex(&bytes));
+        if actual != blobs.config_digest {
+            return Err(ImageError::DigestMismatch {
+                digest: blobs.config_digest.clone(),
+                expected: blobs.config_digest,
+                actual,
+            });
+        }
+        let config = parse_config(&bytes, &blobs.config_digest)?;
+        let rootfs = self.unpack_to(blobs.layers, rootfs).await?;
+        Ok(PulledImage { rootfs, config })
+    }
+}
+
+/// Flush every dirty page of the filesystem holding `path` to disk.
+#[cfg(target_os = "linux")]
+fn sync_filesystem(path: &Path) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    let directory = std::fs::File::open(path)?;
+    // `directory` stays open for the whole call, so the descriptor is valid.
+    nix::unistd::syncfs(directory.as_raw_fd()).map_err(std::io::Error::from)
+}
+
+/// Flush every dirty page to disk. macOS has no per-filesystem sync.
+#[cfg(not(target_os = "linux"))]
+fn sync_filesystem(_path: &Path) -> std::io::Result<()> {
+    nix::unistd::sync();
+    Ok(())
+}
+
+/// Parse a digest-verified config blob.
+fn parse_config(
+    bytes: &[u8],
+    digest: &str,
+) -> Result<super::image_config::ImageConfig, ImageError> {
+    super::image_config::ImageConfig::from_json(bytes).map_err(|e| ImageError::InvalidConfig {
+        digest: digest.to_string(),
+        reason: e.to_string(),
+    })
 }
 
 /// Repository/tag candidates to try against the Pickle catalog for a
@@ -554,6 +766,16 @@ fn safe_join(base: &Path, rel: &Path) -> Option<PathBuf> {
 /// - `.wh.<name>` — delete `<name>` from a lower layer
 /// - `.wh..wh..opq` — clear the entire directory (opaque whiteout)
 pub fn unpack_layers(layer_paths: &[PathBuf], rootfs: &Path) -> Result<(), ImageError> {
+    unpack_layers_with_owner(layer_paths, rootfs, None)
+}
+
+/// [`unpack_layers`], optionally shifting every entry's owner by
+/// `owner_shift` (the layer's uid 0 becomes host uid `owner_shift`).
+pub fn unpack_layers_with_owner(
+    layer_paths: &[PathBuf],
+    rootfs: &Path,
+    owner_shift: Option<u32>,
+) -> Result<(), ImageError> {
     // Clear and recreate rootfs
     if rootfs.exists() {
         std::fs::remove_dir_all(rootfs).map_err(|e| ImageError::UnpackFailed {
@@ -667,15 +889,87 @@ pub fn unpack_layers(layer_paths: &[PathBuf], rootfs: &Path) -> Result<(), Image
             }
 
             // Unpack the entry
-            entry
+            let unpacked = entry
                 .unpack_in(rootfs)
                 .map_err(|e| ImageError::UnpackFailed {
                     digest: digest.clone(),
                     reason: format!("failed to unpack {}: {e}", path.display()),
                 })?;
+            if let Some(base) = owner_shift
+                && unpacked
+            {
+                shift_owner(&entry, rootfs, &path, base).map_err(|reason| {
+                    ImageError::UnpackFailed {
+                        digest: digest.clone(),
+                        reason: format!("failed to set owner of {}: {reason}", path.display()),
+                    }
+                })?;
+            }
         }
     }
 
+    if let Some(base) = owner_shift {
+        own_implicit_directories(rootfs, base).map_err(|e| ImageError::UnpackFailed {
+            digest: "rootfs".to_string(),
+            reason: format!("failed to set owner of implicit directories: {e}"),
+        })?;
+    }
+    Ok(())
+}
+
+/// Hand everything the unpacker created on its own (the rootfs itself, and
+/// parent directories a layer never listed) to container root.
+///
+/// Every listed entry already has an owner at or above `base`, so anything
+/// below it was created by us, as host root.
+fn own_implicit_directories(rootfs: &Path, base: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let mut pending = vec![rootfs.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if metadata.uid() < base || metadata.gid() < base {
+            std::os::unix::fs::lchown(&path, Some(base), Some(base))?;
+        }
+        if metadata.is_dir() {
+            for entry in std::fs::read_dir(&path)? {
+                pending.push(entry?.path());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Give an unpacked entry its layer owner, shifted into the node's
+/// container id range.
+///
+/// `chown` clears set-id bits on regular files, so the mode is restored
+/// afterwards. Symlinks are re-owned without following them.
+fn shift_owner<R: std::io::Read>(
+    entry: &tar::Entry<'_, R>,
+    rootfs: &Path,
+    path: &Path,
+    base: u32,
+) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let header = entry.header();
+    let shifted = |id: u64| -> Result<u32, String> {
+        u32::try_from(id)
+            .ok()
+            .filter(|id| *id < super::userns::CONTAINER_ID_COUNT)
+            .map(|id| base + id)
+            .ok_or_else(|| format!("owner id {id} is outside the container range"))
+    };
+    let uid = shifted(header.uid().map_err(|e| e.to_string())?)?;
+    let gid = shifted(header.gid().map_err(|e| e.to_string())?)?;
+    let target = safe_join(rootfs, path).ok_or("unsafe path")?;
+    std::os::unix::fs::lchown(&target, Some(uid), Some(gid)).map_err(|e| e.to_string())?;
+    if header.entry_type() != tar::EntryType::Symlink {
+        let mode = header.mode().map_err(|e| e.to_string())?;
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode & 0o7777))
+            .map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 
@@ -802,7 +1096,7 @@ mod tests {
     // -- Store path construction -----------------------------------------------
 
     #[test]
-    fn registry_and_runtime_share_new_and_legacy_blobs() {
+    fn registry_and_runtime_share_blobs() {
         let root = tempfile::tempdir().unwrap();
         let image = ImageStore::new(root.path().to_path_buf());
         let registry = crate::pickle::store::BlobStore::new(root.path());
@@ -817,14 +1111,6 @@ mod tests {
             image.blob_path(digest.as_str()),
             registry.blob_path(&digest)
         );
-
-        let legacy = crate::pickle::store::compute_sha256(b"old layer");
-        let path = root.path().join("blobs/sha256").join(legacy.hex());
-        std::fs::write(&path, b"old layer").unwrap();
-        registry.write_blob(b"old layer", &legacy).unwrap();
-        assert_eq!(registry.read_blob(&legacy).unwrap(), b"old layer");
-        assert_eq!(image.blob_path(legacy.as_str()), path);
-        assert!(registry.list_blobs().unwrap().contains(&legacy));
     }
 
     #[test]
@@ -834,10 +1120,6 @@ mod tests {
         let first = store.rootfs_generation_path(root, &[PathBuf::from("/blobs/aaaa/data")]);
         let second = store.rootfs_generation_path(root, &[PathBuf::from("/blobs/bbbb/data")]);
         assert_ne!(first, second);
-        assert_eq!(
-            first,
-            store.rootfs_generation_path(root, &[PathBuf::from("/blobs/aaaa")])
-        );
     }
 
     #[test]
@@ -878,22 +1160,22 @@ mod tests {
         let gen_a = store.rootfs_generation_path(
             &tag_rootfs,
             &[
-                PathBuf::from("/b/sha256/aaaa"),
-                PathBuf::from("/b/sha256/bbbb"),
+                PathBuf::from("/b/sha256/aaaa/data"),
+                PathBuf::from("/b/sha256/bbbb/data"),
             ],
         );
         let gen_a_again = store.rootfs_generation_path(
             &tag_rootfs,
             &[
-                PathBuf::from("/b/sha256/aaaa"),
-                PathBuf::from("/b/sha256/bbbb"),
+                PathBuf::from("/b/sha256/aaaa/data"),
+                PathBuf::from("/b/sha256/bbbb/data"),
             ],
         );
         let gen_b = store.rootfs_generation_path(
             &tag_rootfs,
             &[
-                PathBuf::from("/b/sha256/cccc"),
-                PathBuf::from("/b/sha256/dddd"),
+                PathBuf::from("/b/sha256/cccc/data"),
+                PathBuf::from("/b/sha256/dddd/data"),
             ],
         );
 
@@ -1133,6 +1415,72 @@ mod tests {
         }
 
         tar.into_inner().unwrap().finish().unwrap();
+    }
+
+    /// D1: image ownership survives into the node's container id range, so
+    /// `redis` in the image owns `/data` inside the user namespace too.
+    #[test]
+    #[ignore = "requires root to chown into the container id range"]
+    fn owner_shift_maps_layer_owners_into_the_container_range() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        assert!(nix::unistd::geteuid().is_root(), "run as root");
+        let base = crate::grill::userns::HOST_ID_BASE;
+        let tmp = tempfile::tempdir().unwrap();
+        let layer = tmp.path().join("layer.tar.gz");
+        {
+            let file = std::fs::File::create(&layer).unwrap();
+            let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
+            let mut tar = tar::Builder::new(encoder);
+            let mut data = tar::Header::new_gnu();
+            data.set_entry_type(tar::EntryType::Directory);
+            data.set_size(0);
+            data.set_mode(0o750);
+            data.set_uid(999);
+            data.set_gid(1000);
+            data.set_cksum();
+            tar.append_data(&mut data, "data/", &[][..]).unwrap();
+            let mut tool = tar::Header::new_gnu();
+            tool.set_entry_type(tar::EntryType::Regular);
+            tool.set_size(2);
+            tool.set_mode(0o4755);
+            tool.set_uid(0);
+            tool.set_gid(0);
+            tool.set_cksum();
+            // No `usr/` or `usr/bin/` entries: the unpacker makes them.
+            tar.append_data(&mut tool, "usr/bin/tool", &b"#!"[..])
+                .unwrap();
+            tar.into_inner().unwrap().finish().unwrap();
+        }
+        let rootfs = tmp.path().join("rootfs");
+        unpack_layers_with_owner(&[layer], &rootfs, Some(base)).unwrap();
+
+        let data = std::fs::metadata(rootfs.join("data")).unwrap();
+        assert_eq!((data.uid(), data.gid()), (base + 999, base + 1000));
+        assert_eq!(data.permissions().mode() & 0o7777, 0o750);
+        let tool = std::fs::metadata(rootfs.join("usr/bin/tool")).unwrap();
+        assert_eq!((tool.uid(), tool.gid()), (base, base));
+        assert_eq!(
+            tool.permissions().mode() & 0o7777,
+            0o4755,
+            "chown must not strip the set-id bit"
+        );
+        for implicit in ["", "usr", "usr/bin"] {
+            let meta = std::fs::metadata(rootfs.join(implicit)).unwrap();
+            assert_eq!((meta.uid(), meta.gid()), (base, base), "{implicit:?}");
+        }
+    }
+
+    #[test]
+    fn owner_shift_gets_its_own_rootfs_generation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plain = ImageStore::new(tmp.path().to_path_buf());
+        let shifted = ImageStore::new(tmp.path().to_path_buf()).with_owner_shift(2_000_000_000);
+        let layers = [PathBuf::from("/blobs/aaaa/data")];
+        let root = Path::new("/rootfs/tag");
+        assert_ne!(
+            plain.rootfs_generation_path(root, &layers),
+            shifted.rootfs_generation_path(root, &layers)
+        );
     }
 
     fn create_test_layer_with_symlinks(
@@ -1375,9 +1723,8 @@ mod tests {
         let layer = std::fs::read(layer_path).unwrap();
         let layer_digest = format!("sha256:{}", sha256_hex(&layer));
 
-        let config =
-            br#"{"architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":[]}}"#
-                .to_vec();
+        let config = br#"{"architecture":"amd64","os":"linux","config":{"Entrypoint":["/bin/sh"],"Cmd":["-c","true"],"Env":["FIXTURE=1"],"WorkingDir":"/etc"},"rootfs":{"type":"layers","diff_ids":[]}}"#
+            .to_vec();
         let config_digest = format!("sha256:{}", sha256_hex(&config));
         let mut manifest = serde_json::to_vec(&serde_json::json!({
             "schemaVersion": 2,
@@ -1651,7 +1998,11 @@ mod tests {
                 .await;
         let directory = tempfile::tempdir().unwrap();
         let store = ImageStore::new(directory.path().to_path_buf());
-        let rootfs = store.pull_and_unpack(&fixture.reference).await.unwrap();
+        let rootfs = store
+            .pull_and_unpack(&fixture.reference)
+            .await
+            .unwrap()
+            .rootfs;
         assert_eq!(
             std::fs::read(rootfs.join("bin/sh")).unwrap(),
             b"fixture shell"
@@ -1736,8 +2087,25 @@ mod tests {
         assert_eq!(fixture.layer_requests.load(Ordering::SeqCst), 2);
     }
 
+    /// Let one stalled request hit its per-attempt ceiling in simulated time,
+    /// then return to real time so the retry reaches the real HTTP fixture.
+    async fn expire_stalled_attempt(
+        received: &tokio::sync::Notify,
+        budget: super::super::oci_pull::RegistryReadBudget,
+    ) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), received.notified())
+            .await
+            .unwrap();
+        // Pause only after the real HTTP server receives the request, so
+        // simulated time cannot race socket readiness during setup.
+        tokio::time::pause();
+        tokio::time::advance(budget.attempt + std::time::Duration::from_secs(1)).await;
+        tokio::time::resume();
+    }
+
     #[tokio::test]
-    async fn pull_through_registry_reads_keep_their_original_deadline() {
+    async fn pull_through_registry_retries_a_stalled_read() {
+        use super::super::oci_pull::{LAYER_READ, METADATA_READ};
         use crate::pickle::upstream::UpstreamRegistry;
         for mode in ["head", "manifest", "layer"] {
             let mut fault = registry_fault(
@@ -1756,7 +2124,7 @@ mod tests {
             } else {
                 None
             };
-            let mut read = tokio::spawn(async move {
+            let read = tokio::spawn(async move {
                 match mode {
                     "head" => upstream.head_manifest_digest(&reference).await.map(|_| ()),
                     "manifest" => upstream.fetch_manifest(&reference).await.map(|_| ()),
@@ -1766,29 +2134,23 @@ mod tests {
                         .map(|_| ()),
                 }
             });
-            tokio::time::timeout(std::time::Duration::from_secs(5), received.notified())
-                .await
-                .unwrap();
-            tokio::time::pause();
-            tokio::time::advance(std::time::Duration::from_secs(if mode == "layer" {
-                121
+            let budget = if mode == "layer" {
+                LAYER_READ
             } else {
-                31
-            }))
-            .await;
-            let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), &mut read).await;
-            tokio::time::resume();
-            if outcome.is_err() {
-                read.abort();
-            }
-            let error = outcome
-                .expect("upstream read exceeded its original budget")
+                METADATA_READ
+            };
+            expire_stalled_attempt(&received, budget).await;
+            tokio::time::timeout(std::time::Duration::from_secs(10), read)
+                .await
+                .expect("the retry never completed")
                 .unwrap()
-                .unwrap_err();
-            assert!(
-                error.to_string().contains("deadline exceeded"),
-                "{mode}: {error}"
-            );
+                .unwrap_or_else(|error| panic!("{mode}: {error}"));
+            let requests = if mode == "layer" {
+                &fixture.layer_requests
+            } else {
+                &fixture.manifest_requests
+            };
+            assert_eq!(requests.load(Ordering::SeqCst), 2, "{mode}");
         }
     }
 
@@ -1849,7 +2211,11 @@ mod tests {
             let fixture = start_registry_fixture_with_fault(Some(fault)).await;
             let tmp = tempfile::tempdir().unwrap();
             let store = ImageStore::new(tmp.path().to_path_buf());
-            let rootfs = store.pull_and_unpack(&fixture.reference).await.unwrap();
+            let rootfs = store
+                .pull_and_unpack(&fixture.reference)
+                .await
+                .unwrap()
+                .rootfs;
             assert_eq!(
                 std::fs::read(rootfs.join("bin/sh")).unwrap(),
                 b"fixture shell"
@@ -1905,7 +2271,11 @@ mod tests {
         .await;
         let tmp = tempfile::tempdir().unwrap();
         let store = ImageStore::new(tmp.path().to_path_buf());
-        let rootfs = store.pull_and_unpack(&fixture.reference).await.unwrap();
+        let rootfs = store
+            .pull_and_unpack(&fixture.reference)
+            .await
+            .unwrap()
+            .rootfs;
         assert!(rootfs.join("bin/sh").exists());
         assert_eq!(fixture.manifest_requests.load(Ordering::SeqCst), 3);
     }
@@ -1921,7 +2291,11 @@ mod tests {
         .await;
         let tmp = tempfile::tempdir().unwrap();
         let store = ImageStore::new(tmp.path().to_path_buf());
-        let rootfs = store.pull_and_unpack(&fixture.reference).await.unwrap();
+        let rootfs = store
+            .pull_and_unpack(&fixture.reference)
+            .await
+            .unwrap()
+            .rootfs;
         assert_eq!(
             std::fs::read(rootfs.join("bin/sh")).unwrap(),
             b"fixture shell"
@@ -1956,28 +2330,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registry_stalled_manifest_exhausts_the_original_deadline() {
-        let mut fault = registry_fault(false, StatusCode::SERVICE_UNAVAILABLE, "UNAVAILABLE", 1);
-        fault.delay = std::time::Duration::from_secs(60);
-        let received = fault.received.clone();
-        let fixture = start_registry_fixture_with_fault(Some(fault)).await;
-        let tmp = tempfile::tempdir().unwrap();
-        let store = ImageStore::new(tmp.path().to_path_buf());
-        let reference = fixture.reference.clone();
-        let pull = tokio::spawn(async move { store.pull_and_unpack(&reference).await });
-        tokio::time::timeout(std::time::Duration::from_secs(5), received.notified())
-            .await
-            .unwrap();
-        // Pause only after the real HTTP server receives the request, so
-        // simulated time cannot race socket readiness during setup.
-        tokio::time::pause();
-        tokio::time::advance(std::time::Duration::from_secs(30)).await;
-        let result = pull.await.unwrap();
-        tokio::time::resume();
-        assert!(
-            matches!(result, Err(ImageError::ManifestPull { reason, .. }) if reason.contains("deadline exceeded"))
-        );
-        assert_eq!(fixture.manifest_requests.load(Ordering::SeqCst), 1);
+    async fn registry_stalled_manifest_and_layer_reads_are_retried() {
+        use super::super::oci_pull::{LAYER_READ, METADATA_READ};
+        for target in [RegistryFaultTarget::Manifest, RegistryFaultTarget::Layer] {
+            let layer = matches!(target, RegistryFaultTarget::Layer);
+            let mut fault =
+                registry_fault(layer, StatusCode::SERVICE_UNAVAILABLE, "UNAVAILABLE", 1);
+            fault.delay = std::time::Duration::from_secs(3600);
+            let received = fault.received.clone();
+            let fixture = start_registry_fixture_with_fault(Some(fault)).await;
+            let tmp = tempfile::tempdir().unwrap();
+            let store = ImageStore::new(tmp.path().to_path_buf());
+            let reference = fixture.reference.clone();
+            let pull = tokio::spawn(async move { store.pull_and_unpack(&reference).await });
+            expire_stalled_attempt(&received, if layer { LAYER_READ } else { METADATA_READ }).await;
+            let rootfs = tokio::time::timeout(std::time::Duration::from_secs(10), pull)
+                .await
+                .expect("the retry never completed")
+                .unwrap()
+                .unwrap()
+                .rootfs;
+            assert_eq!(
+                std::fs::read(rootfs.join("bin/sh")).unwrap(),
+                b"fixture shell"
+            );
+            let (manifests, layers) = if layer { (1, 2) } else { (2, 1) };
+            assert_eq!(fixture.manifest_requests.load(Ordering::SeqCst), manifests);
+            assert_eq!(fixture.layer_requests.load(Ordering::SeqCst), layers);
+        }
     }
 
     #[tokio::test]
@@ -2001,9 +2381,15 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = ImageStore::new(tmp.path().to_path_buf());
 
-        let rootfs = store.pull_and_unpack(&fixture.reference).await.unwrap();
-        assert!(rootfs.join("bin/sh").exists());
-        assert!(rootfs.join("etc/os-release").exists());
+        let pulled = store.pull_and_unpack(&fixture.reference).await.unwrap();
+        assert!(pulled.rootfs.join("bin/sh").exists());
+        assert!(pulled.rootfs.join("etc/os-release").exists());
+        // The verified config blob comes back with the rootfs, so the
+        // runtime can honour the image's entrypoint, env and working dir.
+        assert_eq!(pulled.config.entrypoint, ["/bin/sh"]);
+        assert_eq!(pulled.config.cmd, ["-c", "true"]);
+        assert_eq!(pulled.config.env, ["FIXTURE=1"]);
+        assert_eq!(pulled.config.working_dir.as_deref(), Some("/etc"));
     }
 
     #[tokio::test]
@@ -2028,5 +2414,169 @@ mod tests {
 
         let result = store.pull_and_unpack(&missing).await;
         assert!(result.is_err());
+    }
+
+    /// A loopback address nothing listens on: any request to it is refused.
+    fn unreachable_registry() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().to_string()
+    }
+
+    /// `fixture`'s image under another registry host, and a mirror map
+    /// sending that host to `mirror`.
+    fn mirrored(fixture: &RegistryFixture, origin: &str, mirror: &str) -> (String, ImageMirrors) {
+        let (_, path) = fixture.reference.split_once('/').unwrap();
+        let mirrors =
+            ImageMirrors::new(BTreeMap::from([(origin.to_owned(), mirror.to_owned())])).unwrap();
+        (format!("{origin}/{path}"), mirrors)
+    }
+
+    fn registry_host(fixture: &RegistryFixture) -> &str {
+        fixture.reference.split_once('/').unwrap().0
+    }
+
+    #[test]
+    fn mirrors_apply_only_to_digest_pinned_references() {
+        let mirrors = ImageMirrors::new(BTreeMap::from([(
+            "public.ecr.aws".to_owned(),
+            "127.0.0.1:5099".to_owned(),
+        )]))
+        .unwrap();
+        let pinned = ImageReference::parse(&format!(
+            "public.ecr.aws/docker/library/busybox@sha256:{}",
+            "a".repeat(64)
+        ))
+        .unwrap();
+        let mirror = mirrors.mirror_for(&pinned).unwrap();
+        assert_eq!(mirror.registry, "127.0.0.1:5099");
+        assert_eq!(mirror.repository, pinned.repository);
+        assert_eq!(mirror.tag, pinned.tag);
+        let tagged = ImageReference::parse("public.ecr.aws/docker/library/busybox:1.37").unwrap();
+        assert_eq!(mirrors.mirror_for(&tagged), None);
+        let elsewhere =
+            ImageReference::parse(&format!("ghcr.io/org/app@sha256:{}", "a".repeat(64))).unwrap();
+        assert_eq!(mirrors.mirror_for(&elsewhere), None);
+        assert_eq!(mirrors.loopback_hosts(), ["127.0.0.1:5099"]);
+    }
+
+    #[test]
+    fn mirrors_refuse_schemes_paths_and_empty_hosts() {
+        for (upstream, mirror) in [
+            ("public.ecr.aws", "http://127.0.0.1:5099"),
+            ("public.ecr.aws", "mirror.internal/ecr"),
+            ("public.ecr.aws", ""),
+            ("", "mirror.internal"),
+            ("public.ecr.aws", "user@mirror.internal"),
+            ("public.ecr.aws", "mirror internal"),
+        ] {
+            let map = BTreeMap::from([(upstream.to_owned(), mirror.to_owned())]);
+            assert!(
+                ImageMirrors::new(map).is_err(),
+                "accepted {upstream:?} = {mirror:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_mirror_serves_digest_pinned_pulls_without_the_origin() {
+        let mirror = start_registry_fixture().await;
+        let (reference, mirrors) =
+            mirrored(&mirror, &unreachable_registry(), registry_host(&mirror));
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(tmp.path().to_path_buf()).with_mirrors(mirrors);
+        let rootfs = store.pull_and_unpack(&reference).await.unwrap().rootfs;
+        assert_eq!(
+            std::fs::read(rootfs.join("bin/sh")).unwrap(),
+            b"fixture shell"
+        );
+        assert_eq!(mirror.layer_requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_denying_or_dishonest_mirror_falls_back_to_the_verified_origin() {
+        for case in ["denied", "changed manifest", "changed configuration"] {
+            let mirror = match case {
+                "denied" => {
+                    start_registry_fixture_with_fault(Some(registry_fault(
+                        false,
+                        StatusCode::FORBIDDEN,
+                        "DENIED",
+                        usize::MAX,
+                    )))
+                    .await
+                }
+                "changed manifest" => {
+                    start_registry_fixture_with_options(
+                        None,
+                        Some(RegistryIntegrityCase::ChangedManifest),
+                    )
+                    .await
+                }
+                _ => {
+                    start_registry_fixture_with_options(
+                        None,
+                        Some(RegistryIntegrityCase::ChangedConfiguration),
+                    )
+                    .await
+                }
+            };
+            let origin = start_registry_fixture().await;
+            let (reference, mirrors) =
+                mirrored(&origin, registry_host(&origin), registry_host(&mirror));
+            assert_eq!(reference, origin.reference, "{case}");
+            let tmp = tempfile::tempdir().unwrap();
+            let store = ImageStore::new(tmp.path().to_path_buf()).with_mirrors(mirrors);
+            let pulled = store.pull_and_unpack(&reference).await.unwrap();
+            assert_eq!(
+                std::fs::read(pulled.rootfs.join("bin/sh")).unwrap(),
+                b"fixture shell",
+                "{case}"
+            );
+            assert_eq!(pulled.config.env, ["FIXTURE=1"], "{case}");
+            assert_eq!(mirror.manifest_requests.load(Ordering::SeqCst), 1, "{case}");
+            assert_eq!(mirror.layer_requests.load(Ordering::SeqCst), 0, "{case}");
+            assert_eq!(origin.manifest_requests.load(Ordering::SeqCst), 1, "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn pull_through_reads_digest_pinned_images_from_a_loopback_mirror() {
+        use crate::pickle::upstream::{OciUpstream, UpstreamRegistry};
+        let mirror = start_registry_fixture().await;
+        let (reference, mirrors) =
+            mirrored(&mirror, &unreachable_registry(), registry_host(&mirror));
+        // The HTTPS client still reaches a loopback mirror over plain HTTP.
+        let upstream = OciUpstream::new(Default::default()).with_mirrors(mirrors);
+        let reference = ImageReference::parse(&reference).unwrap();
+        let manifest = upstream.fetch_manifest(&reference).await.unwrap();
+        let bytes = upstream
+            .fetch_blob(&reference, &manifest.layers[0])
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::pickle::store::compute_sha256(&bytes),
+            manifest.layers[0].digest
+        );
+        assert_eq!(mirror.layer_requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn pull_through_falls_back_to_the_origin_when_the_mirror_lies() {
+        use crate::pickle::upstream::{OciUpstream, UpstreamRegistry};
+        let mirror =
+            start_registry_fixture_with_options(None, Some(RegistryIntegrityCase::ChangedManifest))
+                .await;
+        let origin = start_registry_fixture().await;
+        let (reference, mirrors) =
+            mirrored(&origin, registry_host(&origin), registry_host(&mirror));
+        let upstream = OciUpstream::insecure_http(Default::default()).with_mirrors(mirrors);
+        let reference = ImageReference::parse(&reference).unwrap();
+        let manifest = upstream.fetch_manifest(&reference).await.unwrap();
+        assert_eq!(
+            crate::pickle::store::compute_sha256(&manifest.manifest_bytes),
+            manifest.digest
+        );
+        assert_eq!(mirror.manifest_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(origin.manifest_requests.load(Ordering::SeqCst), 1);
     }
 }

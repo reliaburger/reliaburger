@@ -6,7 +6,6 @@
 //! whose aggregated view ends up holding both reports. De-risks the reporting
 //! transport ahead of wiring it into the cluster runtime.
 
-use std::net::SocketAddr;
 use std::time::Duration;
 
 use tokio::sync::{mpsc, watch};
@@ -21,9 +20,9 @@ use reliaburger::reporting::worker::{
     AgentSnapshot, CollectSnapshotRequest, InstanceSnapshot, ReportWorker,
 };
 
-fn local(port: u16) -> SocketAddr {
-    SocketAddr::from(([127, 0, 0, 1], port))
-}
+#[path = "support/cluster.rs"]
+mod cluster_support;
+use cluster_support::local;
 
 fn fast_config() -> ReportingTreeSection {
     ReportingTreeSection {

@@ -7,12 +7,15 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
+/// The markdown dialect both renderers parse: CommonMark plus tables.
+pub const MARKDOWN_OPTIONS: pulldown_cmark::Options = pulldown_cmark::Options::ENABLE_TABLES;
+
 /// Render markdown into styled terminal lines.
 pub fn markdown_to_lines(source: &str) -> Vec<Line<'static>> {
-    use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+    use pulldown_cmark::{Event, Parser, Tag, TagEnd};
 
     let mut builder = Builder::default();
-    for event in Parser::new_ext(source, Options::empty()) {
+    for event in Parser::new_ext(source, MARKDOWN_OPTIONS) {
         match event {
             Event::Start(Tag::Heading { level, .. }) => {
                 builder.flush();
@@ -87,6 +90,23 @@ pub fn markdown_to_lines(source: &str) -> Vec<Line<'static>> {
                 Style::default().fg(INLINE_CODE),
             )),
             Event::SoftBreak | Event::HardBreak => builder.flush(),
+            Event::Start(Tag::Table(_)) => {
+                builder.flush();
+                builder.blank_before_block();
+                builder.table = Some(Vec::new());
+            }
+            Event::Start(Tag::TableHead | Tag::TableRow) => builder.row.clear(),
+            Event::End(TagEnd::TableCell) => {
+                let cell = std::mem::take(&mut builder.current);
+                builder.row.push(cell);
+            }
+            Event::End(TagEnd::TableHead | TagEnd::TableRow) => {
+                let row = std::mem::take(&mut builder.row);
+                if let Some(table) = builder.table.as_mut() {
+                    table.push(row);
+                }
+            }
+            Event::End(TagEnd::Table) => builder.end_table(),
             Event::Rule => {
                 builder.flush();
                 builder
@@ -128,6 +148,10 @@ struct Builder {
     emphasis: bool,
     link: Option<String>,
     link_text: String,
+    /// Rows of the table being read, header first; `None` outside a table.
+    table: Option<Vec<Vec<Vec<Span<'static>>>>>,
+    /// Cells of the table row being read.
+    row: Vec<Vec<Span<'static>>>,
 }
 
 impl Builder {
@@ -181,6 +205,50 @@ impl Builder {
                 Style::default().fg(MUTED),
             ));
         }
+    }
+
+    /// Lay the finished table out in padded columns: a bold header, a rule,
+    /// then one line per row.
+    fn end_table(&mut self) {
+        let Some(rows) = self.table.take() else {
+            return;
+        };
+        let width = |cell: &[Span<'static>]| -> usize {
+            cell.iter().map(|span| span.content.chars().count()).sum()
+        };
+        let mut widths: Vec<usize> = Vec::new();
+        for row in &rows {
+            for (column, cell) in row.iter().enumerate() {
+                if widths.len() <= column {
+                    widths.push(0);
+                }
+                widths[column] = widths[column].max(width(cell));
+            }
+        }
+        for (index, row) in rows.into_iter().enumerate() {
+            let last = row.len().saturating_sub(1);
+            let mut spans = Vec::new();
+            for (column, cell) in row.into_iter().enumerate() {
+                let padding = widths[column].saturating_sub(width(&cell));
+                for span in cell {
+                    spans.push(if index == 0 {
+                        span.patch_style(Style::default().add_modifier(Modifier::BOLD))
+                    } else {
+                        span
+                    });
+                }
+                if column < last {
+                    spans.push(Span::raw(" ".repeat(padding + 2)));
+                }
+            }
+            self.lines.push(Line::from(spans));
+            if index == 0 {
+                let total = widths.iter().sum::<usize>() + 2 * widths.len().saturating_sub(1);
+                self.lines
+                    .push(Line::styled("─".repeat(total), Style::default().fg(MUTED)));
+            }
+        }
+        self.blank();
     }
 
     /// Emit the accumulated spans as one line (quote-prefixed if needed).
@@ -279,6 +347,29 @@ mod tests {
             .find(|line| line.contains("the book"))
             .expect("link present");
         assert!(line.contains("https://example.com/book"));
+    }
+
+    #[test]
+    fn tables_render_as_aligned_columns_under_a_bold_header() {
+        let lines = markdown_to_lines(
+            "| Flag | Meaning |\n|------|---------|\n| `--yes` | skip the question |\n| `-f` | follow |\n",
+        );
+        let text: Vec<String> = lines.iter().map(line_text).collect();
+        assert_eq!(
+            text,
+            [
+                "Flag   Meaning",
+                "────────────────────────",
+                "--yes  skip the question",
+                "-f     follow",
+            ]
+        );
+        assert!(
+            lines[0].spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
     }
 
     #[test]

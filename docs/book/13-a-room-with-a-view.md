@@ -193,6 +193,8 @@ The next thing a newcomer needs after a working node is somewhere to learn what 
 
 One markdown parse, two faces. pulldown-cmark turns each chapter into an event stream; a small builder folds those events into styled ratatui `Line`s for the terminal, and the same crate's `push_html` produces the single self-contained page behind `relish manual --web`. There is no second markdown dialect to drift out of sync.
 
+That promise is only as good as the options both sides pass to the parser, so they share one constant, `MARKDOWN_OPTIONS`, which turns on tables. The first version passed `Options::empty()` to each, and the manual's reference tables came out as raw pipes in the terminal and a single run-on paragraph in the browser. A `const` of type `pulldown_cmark::Options` works because the crate's flag type can be built at compile time; a Rust `const` is inlined wherever it's used, like a C `#define` that the compiler type-checks. In the terminal, the builder collects each row's cells as vectors of spans, then pads every column to its widest cell once the table ends. It has to wait for the end: the last row might hold the widest cell.
+
 The terminal face is a new, deliberately generic reader: a list pane, a content pane, and fuzzy search, over nothing more than "documents with titles and lines". It follows the reducer discipline from earlier in this chapter — `ReaderState::handle_key` is a pure function the tests drive with synthetic key events; the async loop just owns the terminal and the tick.
 
 Search here is fuzzy (the `nucleo` matcher, the engine behind the Helix editor's pickers), which looks like a contradiction: a few pages ago we declined a fuzzy-matching crate for the cluster search. Both decisions stand. Cluster search matches short, known names — apps called `web`, nodes called `node-03` — where substring matching is predictable and honest. The manual searches prose and file paths, where "clstr" should still find the cluster chapter. Same tool question, different data, different answer.
@@ -204,6 +206,18 @@ Once documents-in-the-binary machinery exists, a stranger idea becomes a small d
 The whole feature is one new module because the reader from the previous section doesn't care what it's showing. Each file becomes a document whose first line is its styled path, so one fuzzy query matches paths and contents alike. No new key bindings, no new search code, no markdown involved.
 
 The cost is binary size, and rust-embed softens it twice. Its `compression` feature compresses each embedded file in release builds (source code deflates well), and in debug builds it doesn't embed at all — assets load from disk at runtime, so `cargo test` iterations don't pay for a 5 MB copy of `src/` on every link. That split, incidentally, is why an embed-backed test can pass in debug and still deserve a release-build check in CI.
+
+## The command list writes itself
+
+The manual explains how to use relish, but people landing on the repository want something shorter first: what can this thing do? The README answered that with nothing, and `docs/README.md` answered it with a hand-kept table of nearly a hundred rows that had already started to disagree with `--help`. A third copy in the README would have made three places to forget.
+
+We already had one list that can't be wrong, because it *is* the parser. Chapter 1 showed how clap's derive turns the `Command` enum and its `///` comments into argument parsing and help text. The same derive also implements clap's `CommandFactory` trait for `Cli`, which adds an associated function (Rust's name for a function attached to a type rather than to a value, like a static method in Java or a `@classmethod` in Python): `Cli::command()` returns the whole command tree as data. `src/relish/command_reference.rs` walks it with `get_subcommands()`, `get_positionals()` and `get_about()`, skips anything marked `hide = true`, and writes a collapsible Markdown list: one line per command, its required flags and positional arguments, and the first line of its doc comment.
+
+The one thing clap doesn't know is how a human would group the commands. That lives in a small `GROUPS` table next to the renderer, each group linking to the manual chapter that goes deeper. `render` returns a `Result`, and forgetting to place a new command in a group is an error that names the command, not a silent omission.
+
+Keeping the README honest is a test in the relish binary. It renders the tree, splices it between the `<!-- relish-commands:start -->` and `<!-- relish-commands:end -->` markers, and fails if the file would change, telling you to run `make readme-commands`. That target runs the same test with `RELIABURGER_UPDATE_README` set, and the test writes the file instead of comparing it: the approach `insta` takes with `INSTA_UPDATE`, without a hidden subcommand shipping in every binary. The test carries `#[cfg(feature = "kubernetes")]`, conditional compilation that removes it from builds without the default feature, because `import` and `export` only exist there and the README describes the default build.
+
+We considered a hand-written section plus a test that every command appears in it. That catches a missing command, but not a stale description or a changed argument, and it still leaves someone typing the list. Generating it cost about as much code as checking it.
 
 ## What we learned
 
@@ -235,16 +249,23 @@ both log views at short and tall sizes and check the newest and oldest entries.
 
 ### Keep the node attached to every replica
 
-The terminal used to fetch the connected node's instances. An application whose
-only replica ran elsewhere disappeared from the list. The provider now requests
-cluster status and carries `ClusterInstanceStatus` through the message and state
-types. That wrapper keeps node identity beside the existing instance fields;
-renderers borrow the nested instance and the detail table displays its node.
-Applications still group by both name and namespace.
+The terminal used to list only the connected node's instances, so an app whose
+only replica ran elsewhere simply vanished. It now asks for cluster status and
+keeps each instance's node beside it:
 
-An HTTP fixture returns a remote-only replica only for the cluster request, and
-a second fixture returns an incomplete-cluster error. The UI preserves its last
-successful data on that error and displays the failure. Screen snapshots cover
-the node column and the explicit connected-node scope of logs and deployment
-history. Those views don't acquire cluster-wide coverage merely because the
-application list does.
+```rust
+pub struct ClusterInstanceStatus {
+    /// Node name, or `local` for a standalone agent.
+    pub node: String,
+    /// Node-local workload evidence.
+    #[serde(flatten)]
+    pub instance: InstanceStatus,
+}
+```
+
+`#[serde(flatten)]` keeps the JSON flat (the instance's fields sit next to
+`node`) while the Rust type stays nested, so renderers can borrow
+`&status.instance` and reuse their existing code. If the cluster answer is
+incomplete, the UI keeps its last good data and shows the error rather than a
+shorter list. Logs and deployment history still say plainly that they cover the
+connected node only; one cluster-wide view doesn't make the others cluster-wide.

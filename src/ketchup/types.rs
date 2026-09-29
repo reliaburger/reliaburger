@@ -9,7 +9,34 @@ pub enum LogStream {
     Stderr,
 }
 
-/// A container log line tagged with its source app/namespace/stream.
+/// Where a captured line ended in the runtime's capture file.
+///
+/// Capture files are append-only for as long as they exist, so the byte
+/// offset just past a line's newline names that line for good. The log store
+/// remembers the highest offset it has ingested from each file and skips any
+/// line at or below it, which is what stops a restarted agent re-ingesting
+/// output it already stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapturePosition {
+    /// The capture file the line was read from.
+    pub file: std::path::PathBuf,
+    /// Byte offset just past the line's terminating newline.
+    pub end_offset: u64,
+}
+
+/// One line of workload output as a runtime captured it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapturedLine {
+    /// Which stream produced the line.
+    pub stream: LogStream,
+    /// The line, without its newline.
+    pub line: String,
+    /// Where the line sits in its capture file. `None` when the runtime
+    /// captures to memory or to a stream with no stable offsets.
+    pub position: Option<CapturePosition>,
+}
+
+/// A container log line tagged with its source app, namespace and instance.
 ///
 /// Emitted by the agent's per-instance log forwarders and drained into the
 /// `LogStore` so container output is queryable via `/v1/logs/entries`.
@@ -17,8 +44,12 @@ pub enum LogStream {
 pub struct LogRecord {
     pub app: String,
     pub namespace: String,
+    /// The instance that wrote the line.
+    pub instance: String,
     pub stream: LogStream,
     pub line: String,
+    /// Where the line sits in its capture file, for exactly-once ingestion.
+    pub position: Option<CapturePosition>,
 }
 
 /// A single log entry.
@@ -26,6 +57,17 @@ pub struct LogRecord {
 pub struct LogEntry {
     /// Seconds since Unix epoch.
     pub timestamp: u64,
+    /// Ingest order on the node that stored the line: nanoseconds since the
+    /// Unix epoch, bumped so it rises strictly with every line. Sorting by it
+    /// gives emission order per instance, which one-second `timestamp`s can't.
+    pub sequence: u64,
+    /// The instance that wrote the line, when a workload wrote it.
+    pub instance: Option<String>,
+    /// The node that stored the line. A cross-node query fills it in; a
+    /// node answering for itself leaves it out. An instance that moves
+    /// keeps its name, so only the node tells its two runs apart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
     /// Which stream produced this line.
     pub stream: LogStream,
     /// The log line content.
@@ -78,6 +120,9 @@ pub enum KetchupError {
     NotFound { app: String, namespace: String },
     #[error("query rejected: {reason}")]
     QueryRejected { reason: String },
+    /// Another exporter holds this directory's export checkpoint lock.
+    #[error("export checkpoint is busy: another export is in flight")]
+    ExportBusy,
 }
 
 // ---------------------------------------------------------------------------
@@ -93,6 +138,9 @@ mod tests {
         let result = LogQueryResult {
             entries: vec![LogEntry {
                 timestamp: 1000,
+                sequence: 1,
+                instance: None,
+                node: None,
                 stream: LogStream::Stdout,
                 line: "hello".to_string(),
             }],
@@ -122,12 +170,18 @@ mod tests {
     fn log_entry_json_round_trip() {
         let entry = LogEntry {
             timestamp: 42,
+            sequence: 42_000_000_001,
+            instance: Some("web-0".to_string()),
+            node: Some("node-2".to_string()),
             stream: LogStream::Stderr,
             line: "error msg".to_string(),
         };
         let json = serde_json::to_string(&entry).unwrap();
         let decoded: LogEntry = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.timestamp, 42);
+        assert_eq!(decoded.sequence, 42_000_000_001);
+        assert_eq!(decoded.instance.as_deref(), Some("web-0"));
+        assert_eq!(decoded.node.as_deref(), Some("node-2"));
         assert_eq!(decoded.stream, LogStream::Stderr);
         assert_eq!(decoded.line, "error msg");
     }

@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::bun::agent::{CouncilStatus, NodeStatus};
+use crate::bun::agent::{CouncilStatus, InstanceStatus, NodeStatus};
 use crate::bun::capabilities::{ClusterCapabilityReport, CollectedNodeCapability};
 use crate::bun::deploy_operations::{
     DeployOperationPhase, DeployOperationSnapshot, DeployTargetKind,
@@ -17,8 +17,8 @@ use crate::relish::client::BunClient;
 use super::{
     AlertObservation, ApplicationEvidence, CertificateObservation, ClusterEvidence,
     CouncilObservation, CpuThrottleObservation, DeployObservation, DiskObservation, Evidence,
-    FaultObservation, LogObservation, NodeObservation, RegistryObservation, RestartObservation,
-    ServiceObservation, WtfInputs,
+    FaultObservation, LogObservation, NodeObservation, RegistryObservation, ReplicaObservation,
+    RestartObservation, ServiceObservation, WtfInputs,
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -38,6 +38,7 @@ struct NodeCollection {
     deploys: Result<DeployOperationSnapshot, String>,
     alerts: Result<Vec<crate::mayo::alert::AlertStatus>, String>,
     faults: Result<Vec<crate::smoker::types::FaultSummary>, String>,
+    instances: Result<Vec<InstanceStatus>, String>,
 }
 
 struct LocalEvidenceSet {
@@ -202,6 +203,7 @@ pub async fn collect(client: &BunClient, app: Option<&str>) -> Result<WtfInputs,
         collect_council_evidence(cluster_enabled, &collected, council_result, collected_at);
     let restarts = collect_restarts(&collected, collected_at);
     let deploys = collect_deploys(&collected, collected_at);
+    let replicas = collect_replicas(&desired_result, &collected, app, collected_at);
     let services = collect_services(desired_result, services_result, app, collected_at);
     let faults = collect_faults(&collected, collected_at);
     let alerts = collect_alerts(&collected, app, collected_at);
@@ -225,6 +227,7 @@ pub async fn collect(client: &BunClient, app: Option<&str>) -> Result<WtfInputs,
             restarts,
             deploys,
             services,
+            replicas,
             alerts,
             cpu_throttling: local.cpu_throttling,
             recent_logs,
@@ -245,16 +248,18 @@ async fn collect_node(endpoint: &NodeEndpoint) -> NodeCollection {
                 deploys: Err(reason.clone()),
                 alerts: Err(reason.clone()),
                 faults: Err(reason.clone()),
+                instances: Err(reason.clone()),
             };
         }
     };
-    let (health, diagnostics, events, deploys, alerts, faults) = tokio::join!(
+    let (health, diagnostics, events, deploys, alerts, faults, instances) = tokio::join!(
         bounded("health", client.health()),
         bounded("diagnostics", client.diagnostics(1)),
         bounded("events", client.events(EVENT_LIMIT)),
         bounded("deploy operations", client.deploy_operations()),
         bounded("alerts", client.alerts()),
         bounded("faults", client.list_faults()),
+        bounded("instances", client.status()),
     );
     NodeCollection {
         node_id,
@@ -264,6 +269,7 @@ async fn collect_node(endpoint: &NodeEndpoint) -> NodeCollection {
         deploys,
         alerts,
         faults,
+        instances,
     }
 }
 
@@ -300,8 +306,18 @@ fn capability_identity(report: Option<&ClusterCapabilityReport>) -> (String, boo
     )
 }
 
+/// A client for one node's per-node reads, routed through the entry node.
+///
+/// The CLI often can't dial a node's advertised address: on a laptop the
+/// guests sit behind Lima's user-mode network and only node 1's API is
+/// forwarded to the host. The entry node can reach every peer, so every
+/// per-node read goes through its relay, which carries the caller's own
+/// credential. One path for every topology beats guessing which addresses
+/// happen to be reachable.
 pub(crate) fn node_client(entry: &BunClient, node: &NodeStatus) -> Result<BunClient, String> {
-    entry.for_node(node).map_err(|error| error.to_string())
+    entry
+        .via_node(&node.node_id)
+        .map_err(|error| error.to_string())
 }
 
 fn leader_client<'a>(
@@ -548,6 +564,64 @@ fn collect_services(
         })
         .collect();
     Evidence::available(observed_at, services)
+}
+
+/// Desired replicas against what each node reports running. A node that
+/// doesn't answer runs nothing as far as anyone can tell, and says so.
+fn collect_replicas(
+    desired: &Result<Vec<crate::bun::diagnostics::DesiredAppEvidence>, String>,
+    collected: &[NodeCollection],
+    app_scope: Option<&str>,
+    observed_at: u64,
+) -> Evidence<Vec<ReplicaObservation>> {
+    let desired = match desired {
+        Ok(desired) => desired,
+        Err(error) => {
+            return Evidence::Unavailable {
+                reason: error.clone(),
+            };
+        }
+    };
+    let unanswered: Vec<String> = collected
+        .iter()
+        .filter(|node| node.instances.is_err())
+        .map(|node| node.node_id.clone())
+        .collect();
+    let replicas = desired
+        .iter()
+        .filter(|desired| app_scope.is_none_or(|app| desired.app == app))
+        .map(|desired| {
+            let mut running = BTreeMap::new();
+            for node in collected {
+                let Ok(instances) = &node.instances else {
+                    continue;
+                };
+                let count = instances
+                    .iter()
+                    .filter(|instance| {
+                        instance.app_name == desired.app
+                            && instance.namespace == desired.namespace
+                            && instance.state == "running"
+                    })
+                    .count();
+                if count > 0 {
+                    running.insert(
+                        node.node_id.clone(),
+                        u32::try_from(count).unwrap_or(u32::MAX),
+                    );
+                }
+            }
+            ReplicaObservation {
+                app: desired.app.clone(),
+                namespace: desired.namespace.clone(),
+                desired_replicas: desired.desired_replicas,
+                placed: desired.placements.clone(),
+                running,
+                unanswered: unanswered.clone(),
+            }
+        })
+        .collect();
+    Evidence::available(observed_at, replicas)
 }
 
 fn collect_faults(
@@ -907,19 +981,23 @@ mod tests {
     }
 
     #[test]
-    fn node_client_reuses_auth_and_scheme_with_each_ipv4_or_ipv6_api_port() {
-        let entry = BunClient::new_with_token("https://127.0.0.1:9443", Some("secret"));
+    fn node_clients_go_through_the_entry_node_never_the_advertised_address() {
+        let entry = BunClient::new_with_token("https://127.0.0.1:19117", Some("secret"));
 
-        let mut v4_node = node("10.0.0.8:7946");
-        v4_node.api_address = Some("10.0.0.8:19443".parse().unwrap());
-        let mut v6_node = node("[2001:db8::8]:7946");
-        v6_node.api_address = Some("[2001:db8::8]:29443".parse().unwrap());
-        let ipv4 = node_client(&entry, &v4_node).unwrap();
-        let ipv6 = node_client(&entry, &v6_node).unwrap();
+        let mut guest = node("192.168.104.3:7946");
+        guest.node_id = "rb-0123456789ab-2".to_string();
+        guest.api_address = Some("192.168.104.3:9117".parse().unwrap());
+        let relayed = node_client(&entry, &guest).unwrap();
+        assert_eq!(
+            relayed.base_url(),
+            "https://127.0.0.1:19117/v1/nodes/rb-0123456789ab-2/relay"
+        );
+        // A node with no advertised API address is still reachable.
+        assert!(node_client(&entry, &node("10.0.0.8:7946")).is_ok());
 
-        assert_eq!(ipv4.base_url(), "https://10.0.0.8:19443");
-        assert_eq!(ipv6.base_url(), "https://[2001:db8::8]:29443");
-        assert!(node_client(&entry, &node("10.0.0.8:7946")).is_err());
+        let mut hostile = node("10.0.0.9:7946");
+        hostile.node_id = "../v1/token/create?".to_string();
+        assert!(node_client(&entry, &hostile).is_err());
     }
 
     #[test]
@@ -930,6 +1008,7 @@ mod tests {
                 namespace: "default".to_string(),
                 desired_replicas: 2,
                 scheduled_replicas: 0,
+                placements: Default::default(),
                 service_port: Some(8080),
             }]),
             Ok(Vec::new()),
@@ -1001,6 +1080,7 @@ mod tests {
             deploys: Err("unused".to_string()),
             alerts: Err("unused".to_string()),
             faults: Err("unused".to_string()),
+            instances: Err("unused".to_string()),
         }];
 
         let evidence = collect_local_diagnostics(&collected, 10);
@@ -1037,6 +1117,7 @@ mod tests {
             deploys: Err("unused".into()),
             alerts: Ok(alerts.to_vec()),
             faults: Err("unused".into()),
+            instances: Err("unused".into()),
         });
         let evidence = collect_alerts(&collected, None, 10);
         let observed = evidence.value().unwrap();
@@ -1055,6 +1136,7 @@ mod tests {
             deploys: Err("unused".to_string()),
             alerts: Err("unused".to_string()),
             faults: Err("unused".to_string()),
+            instances: Err("unused".to_string()),
         }];
 
         let evidence = collect_restarts(&collected, 10);
@@ -1074,6 +1156,7 @@ mod tests {
             deploys: Err("unused".to_string()),
             alerts: Err("unused".to_string()),
             faults: Err("unused".to_string()),
+            instances: Err("unused".to_string()),
         }];
 
         let evidence = collect_restarts(&collected, 10);

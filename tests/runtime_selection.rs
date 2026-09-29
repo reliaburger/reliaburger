@@ -42,8 +42,8 @@ async fn automatic_selection_child() {
     if std::env::var_os("RELIABURGER_RUNTIME_SELECTION_CHILD").is_none() {
         return;
     }
-    assert!(matches!(
+    assert_eq!(
         reliaburger::grill::detect_runtime().await,
-        reliaburger::grill::AnyGrill::Process(_)
-    ));
+        reliaburger::grill::DetectedRuntime::Process
+    );
 }

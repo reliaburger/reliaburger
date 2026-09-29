@@ -1,0 +1,186 @@
+name: V02 soak
+
+# Release qualification: the V02 sustained soak (scripts/release/qualify-sustained.sh)
+# against a staged candidate, on a hosted Linux runner. The harness builds a
+# three-node quickstart cluster (three Lima QEMU VMs on KVM) with `curl | sh`
+# from the staging pre-release, injects faults on a schedule and writes a
+# Markdown record. Hosted jobs stop at 6 h, so this covers the compressed
+# schedule and full-schedule runs of up to about 4 h; the 8 h final tier needs
+# a long-running host. See docs/releasing.md, "Soaking a candidate in CI".
+#
+# No soak build is signed here, so the upgrade slots are skipped and the
+# record says so.
+on:
+  workflow_dispatch:
+    inputs:
+      staging_tag:
+        description: Staging pre-release tag (staging-v0.1.0-RUN-ATTEMPT) or its https base URL
+        required: true
+        type: string
+      qualified_digest:
+        description: SHA-256 of the candidate's candidate.json
+        required: true
+        type: string
+      duration:
+        description: Soak length after setup (40m, 2h); setup, one overrunning cycle and teardown must fit in 6 h
+        default: 90m
+        type: string
+      schedule:
+        description: Fault schedule (compressed = 10-minute cycle, full = hourly cycle)
+        default: compressed
+        type: choice
+        options: [compressed, full]
+
+concurrency:
+  group: v02-soak-${{ inputs.staging_tag }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  soak:
+    name: soak (${{ inputs.schedule }}, ${{ inputs.duration }})
+    # x86_64: 4 vCPUs, 16 GiB and /dev/kvm. The quickstart gives each of its
+    # three VMs 2 vCPUs and 2 GiB, and its preflight wants 8 GiB available.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    env:
+      STAGING_TAG: ${{ inputs.staging_tag }}
+      QUALIFIED_DIGEST: ${{ inputs.qualified_digest }}
+      SOAK_DURATION: ${{ inputs.duration }}
+      SOAK_SCHEDULE: ${{ inputs.schedule }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the inputs fit in one hosted job
+        run: |
+          case $SOAK_DURATION in
+              *[0-9]m) minutes=${SOAK_DURATION%m} ;;
+              *[0-9]h) minutes=$(( ${SOAK_DURATION%h} * 60 )) ;;
+              *) echo "::error::duration must look like 90m or 4h"; exit 1 ;;
+          esac
+          case $SOAK_SCHEDULE in
+              compressed) cycle=10 ;;
+              full) cycle=60 ;;
+              *) echo "::error::schedule must be compressed or full"; exit 1 ;;
+          esac
+          # Setup and baseline, a cycle that starts just before the end, then
+          # teardown and uploads, inside the 355-minute job limit.
+          budget=$(( 355 - 45 - cycle - 15 ))
+          if [ "$minutes" -gt "$budget" ]; then
+              echo "::error::a $SOAK_SCHEDULE soak of $SOAK_DURATION does not fit in a hosted job; the most is ${budget}m (use a long-running host for the final tier)"
+              exit 1
+          fi
+          if ! [[ $QUALIFIED_DIGEST =~ ^[0-9a-f]{64}$ ]]; then
+              echo "::error::qualified_digest must be a SHA-256 in lowercase hex"
+              exit 1
+          fi
+          case $STAGING_TAG in
+              https://*) base_url=${STAGING_TAG%/} ;;
+              staging-v*) base_url=https://github.com/$GITHUB_REPOSITORY/releases/download/$STAGING_TAG ;;
+              *) echo "::error::staging_tag must be a staging-v* tag or an https URL"; exit 1 ;;
+          esac
+          {
+              echo "BASE_URL=$base_url"
+              echo "EVIDENCE=$RUNNER_TEMP/soak-evidence"
+          } >> "$GITHUB_ENV"
+
+      - name: Enable KVM for the runner user
+        # Hosted runners have /dev/kvm but only root may open it; this is the
+        # udev rule GitHub documents for the Android emulator.
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+              | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+          python3 -c 'import os; os.close(os.open("/dev/kvm", os.O_RDWR)); print("/dev/kvm opens read-write")'
+          echo "CPUs: $(nproc)"
+          free -g
+          df -h / /tmp
+
+      - name: Install QEMU
+        # D7 in docs/plans/2026-09-23-zero-to-cluster.md: on Linux the
+        # quickstart runs Lima's QEMU driver and leaves QEMU to the user.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends qemu-system-x86 qemu-utils ovmf
+          qemu-system-x86_64 --version
+          qemu-img --version
+
+      - name: Soak
+        # A record that says FAIL fails this step (and the job); the later
+        # steps still publish it. When the harness gains `--tier fast|final`,
+        # a `tier` choice input passes straight through here, and the
+        # budget check above maps it to its duration and schedule.
+        run: |
+          scripts/release/qualify-sustained.sh \
+              --base-url "$BASE_URL" --qualified-digest "$QUALIFIED_DIGEST" \
+              --duration "$SOAK_DURATION" --schedule "$SOAK_SCHEDULE" \
+              --evidence "$EVIDENCE"
+
+      - name: Summarise
+        if: ${{ !cancelled() }}
+        run: |
+          if [ -f "$EVIDENCE/record.md" ]; then
+              # The job summary holds at most 1 MiB.
+              head -c 900000 "$EVIDENCE/record.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+              echo 'The harness stopped before it wrote a record; see the soak step and the evidence artefact.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [ -f "$EVIDENCE/bootstrap-record.md" ]; then
+              printf '\n<details><summary>Bootstrap (staged install) record</summary>\n\n' >> "$GITHUB_STEP_SUMMARY"
+              cat "$EVIDENCE/bootstrap-record.md" >> "$GITHUB_STEP_SUMMARY"
+              printf '\n</details>\n' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Collect Lima logs from a home left in place
+        if: ${{ failure() }}
+        run: |
+          mkdir -p "$EVIDENCE/lima-logs"
+          for log in /tmp/rbq.*/lima/*/*.log /tmp/rbq.*/lima/_networks/*/*.log; do
+              [ -f "$log" ] || continue
+              instance=${log%/*}
+              cp "$log" "$EVIDENCE/lima-logs/${instance##*/}-${log##*/}"
+          done
+
+      - name: Upload the evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          # The cluster token and the soak CA's keys stay behind.
+          path: |
+            ${{ env.EVIDENCE }}
+            !${{ env.EVIDENCE }}/.token
+            !${{ env.EVIDENCE }}/.auth-header
+            !${{ env.EVIDENCE }}/tls/**/*key*
+          include-hidden-files: false
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Upload the record
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-record-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.EVIDENCE }}/record.md
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Upload the failure bundles
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-failures-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.EVIDENCE }}/failures
+            ${{ env.EVIDENCE }}/lima-logs
+            ${{ env.EVIDENCE }}/bootstrap.log
+          retention-days: 30
+          if-no-files-found: warn

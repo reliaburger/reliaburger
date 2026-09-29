@@ -118,6 +118,14 @@ impl ReaderState {
         self.rebuild_search();
     }
 
+    /// Show document `index` with the content pane focused, so the arrow
+    /// keys scroll it straight away. `relish manual tour` lands here.
+    pub fn open_document(&mut self, index: usize) {
+        self.selected = index.min(self.docs.len().saturating_sub(1));
+        self.scroll = 0;
+        self.focus = Focus::Content;
+    }
+
     /// The keyboard reducer.
     pub fn handle_key(&mut self, key: KeyEvent) {
         if self.search.is_some() {
@@ -406,7 +414,12 @@ pub async fn run(
     if let Some(query) = initial_query {
         state.open_search(&query);
     }
+    run_state(state).await
+}
 
+/// Run the reader from a prepared state, e.g. one opened on a chapter with
+/// [`ReaderState::open_document`].
+pub async fn run_state(mut state: ReaderState) -> Result<(), RelishError> {
     let mut guard = TerminalGuard::new()?;
     let terminal = guard.terminal_mut();
     let mut input = EventStream::new();
@@ -556,6 +569,18 @@ mod tests {
         press(&mut state, KeyCode::Esc);
         assert!(state.search.is_none());
         assert_eq!(state.selected, 0);
+    }
+
+    #[test]
+    fn open_document_selects_it_and_focuses_the_content() {
+        let mut state = ReaderState::new(docs());
+        state.scroll = 3;
+        state.open_document(1);
+        assert_eq!(state.selected, 1);
+        assert_eq!(state.scroll, 0);
+        assert_eq!(state.focus, Focus::Content);
+        state.open_document(99);
+        assert_eq!(state.selected, state.docs.len() - 1);
     }
 
     #[test]

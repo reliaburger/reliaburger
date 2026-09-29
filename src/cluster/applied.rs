@@ -6,8 +6,7 @@
 //! verified. Corrupt or unreadable state refuses reconciliation.
 
 use std::collections::BTreeMap;
-use std::io::{Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -54,27 +53,14 @@ pub fn checkpoint_path(state_dir: &Path) -> PathBuf {
 /// Load ownership, refusing invalid or unreadable state. Only a missing file is
 /// empty. This performs blocking I/O; asynchronous callers use `spawn_blocking`.
 pub fn load(path: &Path) -> std::io::Result<AppliedMap> {
-    let file = match std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
-        .open(path)
-    {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(AppliedMap::new()),
-        Err(error) => return Err(error),
+    let Some(checkpoint) = crate::durable::read_json_if_exists::<AppliedCheckpoint>(
+        path,
+        MAX_CHECKPOINT_BYTES,
+        crate::durable::Access::Regular,
+    )?
+    else {
+        return Ok(AppliedMap::new());
     };
-    if !file.metadata()?.is_file() {
-        return Err(std::io::Error::other(
-            "placement checkpoint is not a regular file",
-        ));
-    }
-    let mut bytes = Vec::new();
-    file.take(MAX_CHECKPOINT_BYTES + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_CHECKPOINT_BYTES {
-        return Err(std::io::Error::other("placement checkpoint exceeds 64 MiB"));
-    }
-    let checkpoint: AppliedCheckpoint = serde_json::from_slice(&bytes)?;
     if checkpoint.schema != SCHEMA {
         return Err(std::io::Error::other(
             "unsupported placement checkpoint schema",
@@ -170,6 +156,7 @@ mod tests {
 
     #[test]
     fn checkpoint_replacement_is_private_and_preserves_the_previous_inode() {
+        use std::io::Read;
         use std::os::unix::fs::PermissionsExt;
         let root = tempfile::tempdir().unwrap();
         let path = checkpoint_path(root.path());

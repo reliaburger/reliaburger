@@ -407,7 +407,8 @@ impl DeployOperationHandle {
     }
 }
 
-fn targets(config: &Config) -> Vec<DeployTarget> {
+/// The apps and jobs a deploy of `config` targets, sorted.
+pub(crate) fn targets(config: &Config) -> Vec<DeployTarget> {
     let apps = config.app.iter().map(|(name, spec)| DeployTarget {
         kind: DeployTargetKind::App,
         name: name.clone(),

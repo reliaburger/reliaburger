@@ -26,9 +26,7 @@ use crate::meat::NodeId;
 use crate::mustard::membership::MembershipSnapshot;
 
 use super::transport::ReportingTransport;
-use super::types::{
-    DnsCapabilityReport, NodeCapabilityReport, NodeReadinessReport, ReportingMessage, StateReport,
-};
+use super::types::{NodeCapabilityReport, NodeReadinessReport, ReportingMessage, StateReport};
 
 /// How many stale windows an entry may age before it is evicted outright
 /// (as opposed to merely listed in `stale_nodes`).
@@ -47,8 +45,8 @@ pub struct AggregatedState {
     /// Nodes whose last report was *received* longer ago than
     /// `stale_report_timeout` (receive time, not sender wall clock).
     pub stale_nodes: Vec<NodeId>,
-    /// Latest additive capability evidence from new-enough nodes. Absence
-    /// means no schedulable security capabilities, never an optimistic guess.
+    /// Latest capability evidence from each node. Absence means no
+    /// schedulable security capabilities, never an optimistic guess.
     pub capabilities: HashMap<NodeId, NodeCapabilityReport>,
     /// Fresh critical-subsystem evidence. Absence means unready.
     pub readiness: HashMap<NodeId, NodeReadinessReport>,
@@ -64,18 +62,10 @@ struct ReportEntry {
 }
 
 /// Capability evidence uses the same receive-time and leadership-epoch rules
-/// as state reports, but travels in a separate backwards-compatible message.
+/// as state reports, with its own lease so a state report cannot keep stale
+/// capabilities alive during a partial reporting failure.
 struct CapabilityEntry {
     report: NodeCapabilityReport,
-    received_at: Instant,
-    epoch: u64,
-}
-
-/// DNS readiness travels in an additive H3 frame and therefore needs its own
-/// lease. A DNS heartbeat must not keep stale H2 egress evidence alive (or the
-/// reverse) during a partial reporting failure.
-struct DnsCapabilityEntry {
-    report: DnsCapabilityReport,
     received_at: Instant,
     epoch: u64,
 }
@@ -93,7 +83,6 @@ pub struct ReportAggregator<T: ReportingTransport> {
     transport: T,
     entries: HashMap<NodeId, ReportEntry>,
     capability_entries: HashMap<NodeId, CapabilityEntry>,
-    dns_capability_entries: HashMap<NodeId, DnsCapabilityEntry>,
     readiness_entries: HashMap<NodeId, ReadinessEntry>,
     watch_tx: watch::Sender<AggregatedState>,
     rollup_store: Option<Arc<RwLock<RollupStore>>>,
@@ -125,7 +114,6 @@ impl<T: ReportingTransport> ReportAggregator<T> {
             transport,
             entries: HashMap::new(),
             capability_entries: HashMap::new(),
-            dns_capability_entries: HashMap::new(),
             readiness_entries: HashMap::new(),
             watch_tx,
             rollup_store,
@@ -191,12 +179,6 @@ impl<T: ReportingTransport> ReportAggregator<T> {
                         Some((_, peer, ReportingMessage::CapabilityReport(report))) => {
                             if Self::report_identity_ok(&peer, &report.node_id) {
                                 self.store_capability(report);
-                                self.publish();
-                            }
-                        }
-                        Some((_, peer, ReportingMessage::DnsCapabilityReport(report))) => {
-                            if Self::report_identity_ok(&peer, &report.node_id) {
-                                self.store_dns_capability(report);
                                 self.publish();
                             }
                         }
@@ -306,17 +288,6 @@ impl<T: ReportingTransport> ReportAggregator<T> {
         );
     }
 
-    fn store_dns_capability(&mut self, report: DnsCapabilityReport) {
-        self.dns_capability_entries.insert(
-            report.node_id.clone(),
-            DnsCapabilityEntry {
-                report,
-                received_at: Instant::now(),
-                epoch: self.current_epoch(),
-            },
-        );
-    }
-
     fn store_readiness(&mut self, report: NodeReadinessReport) {
         self.readiness_entries.insert(
             report.node_id.clone(),
@@ -335,8 +306,6 @@ impl<T: ReportingTransport> ReportAggregator<T> {
         self.entries
             .retain(|_, entry| now.duration_since(entry.received_at) <= bound);
         self.capability_entries
-            .retain(|_, entry| now.duration_since(entry.received_at) <= bound);
-        self.dns_capability_entries
             .retain(|_, entry| now.duration_since(entry.received_at) <= bound);
         self.readiness_entries
             .retain(|_, entry| now.duration_since(entry.received_at) <= bound);
@@ -361,15 +330,11 @@ impl<T: ReportingTransport> ReportAggregator<T> {
         let capability_before = self.capability_entries.len();
         self.capability_entries
             .retain(|node_id, _| active.contains(node_id));
-        let dns_before = self.dns_capability_entries.len();
-        self.dns_capability_entries
-            .retain(|node_id, _| active.contains(node_id));
         let readiness_before = self.readiness_entries.len();
         self.readiness_entries
             .retain(|node_id, _| active.contains(node_id));
         self.entries.len() != before
             || self.capability_entries.len() != capability_before
-            || self.dns_capability_entries.len() != dns_before
             || self.readiness_entries.len() != readiness_before
     }
 
@@ -396,7 +361,7 @@ impl<T: ReportingTransport> ReportAggregator<T> {
             }
         }
 
-        let mut capabilities: HashMap<NodeId, NodeCapabilityReport> = self
+        let capabilities: HashMap<NodeId, NodeCapabilityReport> = self
             .capability_entries
             .iter()
             .filter(|(_, entry)| {
@@ -404,23 +369,6 @@ impl<T: ReportingTransport> ReportAggregator<T> {
             })
             .map(|(node_id, entry)| (node_id.clone(), entry.report.clone()))
             .collect();
-        for (node_id, entry) in &self.dns_capability_entries {
-            if entry.epoch != epoch || now.duration_since(entry.received_at) > stale_timeout {
-                continue;
-            }
-            capabilities
-                .entry(node_id.clone())
-                .or_insert_with(|| NodeCapabilityReport {
-                    node_id: node_id.clone(),
-                    capabilities: Default::default(),
-                    egress_enforcement: Vec::new(),
-                    egress_degraded: false,
-                    egress_affected_workloads: Vec::new(),
-                })
-                .capabilities
-                .dns = entry.report.capability;
-        }
-
         let readiness = self
             .readiness_entries
             .iter()
@@ -793,102 +741,6 @@ mod tests {
 
         tokio::time::advance(Duration::from_secs(31)).await;
         assert!(aggregator.build_aggregated_state().readiness.is_empty());
-    }
-
-    #[tokio::test]
-    async fn dns_extension_merges_without_changing_h2_capability_frame() {
-        let net = InMemoryReportingNetwork::new();
-        let council_transport = net.register(addr(1)).await;
-        let shutdown = CancellationToken::new();
-        let (mut aggregator, _watch_rx) =
-            ReportAggregator::new(council_transport, test_config(), shutdown, None, None, None);
-
-        aggregator.store_capability(capability("node-1"));
-        aggregator.store_dns_capability(DnsCapabilityReport {
-            node_id: NodeId::new("node-1"),
-            capability: crate::onion::dns::DnsCapability {
-                enabled: true,
-                ready: true,
-                ipv4: true,
-                ipv6: false,
-                workload_reachable: true,
-            },
-        });
-        // The next periodic H2-shaped frame must merge with the independent
-        // DNS extension rather than replacing it with the skipped-field default.
-        aggregator.store_capability(capability("node-1"));
-
-        let state = aggregator.build_aggregated_state();
-        let report = state.capabilities.get(&NodeId::new("node-1")).unwrap();
-        assert!(report.capabilities.egress.can_enforce_allowlist());
-        assert!(report.capabilities.dns.can_resolve_internal());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn dns_heartbeat_does_not_keep_egress_capability_fresh() {
-        let net = InMemoryReportingNetwork::new();
-        let council_transport = net.register(addr(1)).await;
-        let shutdown = CancellationToken::new();
-        let (mut aggregator, _watch_rx) =
-            ReportAggregator::new(council_transport, test_config(), shutdown, None, None, None);
-
-        aggregator.store_capability(capability("node-1"));
-        tokio::time::advance(Duration::from_secs(20)).await;
-        aggregator.store_dns_capability(DnsCapabilityReport {
-            node_id: NodeId::new("node-1"),
-            capability: crate::onion::dns::DnsCapability {
-                enabled: true,
-                ready: true,
-                ipv4: true,
-                ipv6: false,
-                workload_reachable: true,
-            },
-        });
-        tokio::time::advance(Duration::from_secs(11)).await;
-
-        let report = aggregator
-            .build_aggregated_state()
-            .capabilities
-            .remove(&NodeId::new("node-1"))
-            .unwrap();
-        assert_eq!(report.capabilities.egress, Default::default());
-        assert!(report.capabilities.dns.can_resolve_internal());
-    }
-
-    #[tokio::test]
-    async fn epoch_bump_invalidates_dns_extension_independently() {
-        let net = InMemoryReportingNetwork::new();
-        let council_transport = net.register(addr(1)).await;
-        let shutdown = CancellationToken::new();
-        let (epoch_tx, epoch_rx) = watch::channel(3u64);
-        let (mut aggregator, _watch_rx) = ReportAggregator::new(
-            council_transport,
-            test_config(),
-            shutdown,
-            None,
-            Some(epoch_rx),
-            None,
-        );
-
-        aggregator.store_dns_capability(DnsCapabilityReport {
-            node_id: NodeId::new("node-1"),
-            capability: crate::onion::dns::DnsCapability {
-                enabled: true,
-                ready: true,
-                ipv4: true,
-                ipv6: false,
-                workload_reachable: true,
-            },
-        });
-        assert!(
-            aggregator
-                .build_aggregated_state()
-                .capabilities
-                .contains_key(&NodeId::new("node-1"))
-        );
-
-        epoch_tx.send(4).unwrap();
-        assert!(aggregator.build_aggregated_state().capabilities.is_empty());
     }
 
     #[tokio::test(start_paused = true)]

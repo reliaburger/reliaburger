@@ -27,8 +27,8 @@ pub struct OciSpec {
     /// Host-port publication for the workload, when the app declares a
     /// port. Not part of the OCI runtime spec proper — runtimes with
     /// per-container networking (runc) read it to install the DNAT map
-    /// element alongside the network namespace. `#[serde(default)]`
-    /// keeps instance records written before this field readable.
+    /// element alongside the network namespace. `None` is omitted from
+    /// the serialised spec, so `#[serde(default)]` reads it back.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port_mapping: Option<PortMapping>,
 }
@@ -55,6 +55,48 @@ pub struct OciProcess {
     pub env: Vec<String>,
     pub cwd: String,
     pub user: OciUser,
+    /// Linux capability sets. `None` gives the process no capabilities.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<OciCapabilities>,
+    /// What the workload asked for before its image config fills the gaps.
+    ///
+    /// Not part of the OCI runtime spec. `Some` means `args`, `env`, `cwd`
+    /// and `user` are provisional: a runtime that unpacks the image itself
+    /// (runc) resolves them against the image's `Entrypoint`, `Cmd`, `Env`,
+    /// `WorkingDir` and `User` with Kubernetes rules, then drops this field
+    /// before writing `config.json`. `None` means the process is final.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overrides: Option<ProcessOverrides>,
+}
+
+/// The parts of a container's process an app may set, each replacing one
+/// piece of the image's own config (the Kubernetes rules).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessOverrides {
+    /// Replaces the image's `Entrypoint` (and drops its `Cmd`) when non-empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command: Vec<String>,
+    /// Replaces the image's `Cmd` when non-empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    /// Replaces the image's `WorkingDir`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_dir: Option<String>,
+    /// Replaces the uid from the image's `User`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<u32>,
+    /// Replaces the gid from the image's `User`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<u32>,
+}
+
+/// Linux capability sets for the container process, by OCI capability name
+/// (`CAP_CHOWN` and so on).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OciCapabilities {
+    pub bounding: Vec<String>,
+    pub effective: Vec<String>,
+    pub permitted: Vec<String>,
 }
 
 /// The user and group to run the container process as.
@@ -268,15 +310,20 @@ pub fn generate_oci_spec_with_decryptor(
         process: OciProcess {
             args,
             env,
-            cwd: "/".to_string(),
-            // Using nobody (65534) as the container user. A custom `burger`
-            // user would require creating it inside each container rootfs
-            // before exec, which adds complexity for no security benefit —
-            // 65534 is already unprivileged and widely recognised.
+            cwd: spec
+                .working_dir
+                .as_ref()
+                .map(|dir| dir.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "/".to_string()),
+            // Runtimes that can't read the image config (the process grill,
+            // Apple Container's CLI) run as nobody (65534). Runc replaces
+            // this with the image's `User`, inside a user namespace.
             user: OciUser {
-                uid: 65534,
-                gid: 65534,
+                uid: spec.run_as_user.unwrap_or(65534),
+                gid: spec.run_as_group.unwrap_or(65534),
             },
+            capabilities: None,
+            overrides: app_overrides(spec),
         },
         mounts,
         linux: OciLinux {
@@ -333,9 +380,9 @@ pub fn build_env_with_decryptor(
 
 /// Build the process arguments from an app spec.
 ///
-/// Returns the app's `command` field if set. When empty, ProcessGrill
-/// falls back to `sleep 86400`; real runtimes (runc, Apple Container)
-/// use the image's entrypoint instead.
+/// Returns the app's `command` followed by its `args`. When both are
+/// empty, ProcessGrill falls back to `sleep 86400`; runc resolves the
+/// image's `Entrypoint` and `Cmd` from [`OciProcess::overrides`] instead.
 fn build_args(app_name: &str, spec: &AppSpec) -> Vec<String> {
     let _ = app_name;
 
@@ -349,7 +396,27 @@ fn build_args(app_name: &str, spec: &AppSpec) -> Vec<String> {
         return vec!["/bin/sh".to_string(), "-c".to_string(), script.clone()];
     }
 
-    spec.command.clone()
+    spec.command.iter().chain(&spec.args).cloned().collect()
+}
+
+/// What an image-based app overrides in its image's config.
+///
+/// `None` for process workloads and for apps without an image: there is no
+/// image config for their process to be resolved against.
+fn app_overrides(spec: &AppSpec) -> Option<ProcessOverrides> {
+    if spec.image.is_none() || spec.exec.is_some() || spec.script.is_some() {
+        return None;
+    }
+    Some(ProcessOverrides {
+        command: spec.command.clone(),
+        args: spec.args.clone(),
+        working_dir: spec
+            .working_dir
+            .as_ref()
+            .map(|dir| dir.to_string_lossy().into_owned()),
+        user: spec.run_as_user,
+        group: spec.run_as_group,
+    })
 }
 
 fn build_mounts(
@@ -612,6 +679,13 @@ pub fn generate_job_oci_spec(
                 uid: 65534,
                 gid: 65534,
             },
+            capabilities: None,
+            overrides: (spec.image.is_some() && spec.exec.is_none() && spec.script.is_none()).then(
+                || ProcessOverrides {
+                    command: spec.command.clone().unwrap_or_default(),
+                    ..ProcessOverrides::default()
+                },
+            ),
         },
         mounts: standard_mounts(),
         linux: OciLinux {
@@ -654,6 +728,13 @@ pub fn generate_init_oci_spec(
                 uid: 65534,
                 gid: 65534,
             },
+            capabilities: None,
+            // An init container is its own container: it takes nothing from
+            // the app's process settings, only its own command.
+            overrides: image.map(|_| ProcessOverrides {
+                command: command.to_vec(),
+                ..ProcessOverrides::default()
+            }),
         },
         mounts: standard_mounts(),
         linux: OciLinux {
@@ -758,7 +839,7 @@ mod tests {
     }
 
     #[test]
-    fn port_mapping_survives_record_round_trip_and_old_records_default() {
+    fn port_mapping_survives_record_round_trip() {
         // New records carry the mapping through serde…
         let spec: AppSpec = toml::from_str(r#"image = "t:v1""#).unwrap();
         let mut oci = generate_oci_spec("web", "default", &spec, "web-0", None, "/cg", None, None);
@@ -770,11 +851,78 @@ mod tests {
         let back: OciSpec = serde_json::from_str(&json).unwrap();
         assert_eq!(back.port_mapping, oci.port_mapping);
 
-        // …and records written before the field existed still parse.
-        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
-        value.as_object_mut().unwrap().remove("port_mapping");
-        let old: OciSpec = serde_json::from_value(value).unwrap();
-        assert_eq!(old.port_mapping, None);
+        // …and so does its absence, which serde omits from the record.
+        oci.port_mapping = None;
+        let json = serde_json::to_string(&oci).unwrap();
+        assert!(!json.contains("port_mapping"));
+        let back: OciSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.port_mapping, None);
+    }
+
+    fn spec_for(toml_source: &str) -> OciSpec {
+        let app: AppSpec = toml::from_str(toml_source).unwrap();
+        generate_oci_spec("web", "default", &app, "web-0", None, "/cg", None, None)
+    }
+
+    #[test]
+    fn image_apps_carry_their_overrides_for_the_runtime() {
+        let oci = spec_for(
+            r#"
+            image = "nginx:1"
+            command = ["nginx"]
+            args = ["-g", "daemon off;"]
+            working_dir = "/srv"
+            run_as_user = 101
+            "#,
+        );
+        assert_eq!(
+            oci.process.overrides,
+            Some(ProcessOverrides {
+                command: vec!["nginx".into()],
+                args: vec!["-g".into(), "daemon off;".into()],
+                working_dir: Some("/srv".into()),
+                user: Some(101),
+                group: None,
+            })
+        );
+        // Runtimes that can't read the image config still see one argv.
+        assert_eq!(oci.process.args, ["nginx", "-g", "daemon off;"]);
+        assert_eq!(oci.process.cwd, "/srv");
+        assert_eq!(oci.process.user.uid, 101);
+    }
+
+    #[test]
+    fn an_image_app_without_command_leaves_the_process_to_its_image() {
+        let oci = spec_for(r#"image = "redis:8""#);
+        assert!(oci.process.args.is_empty());
+        assert_eq!(oci.process.overrides, Some(ProcessOverrides::default()));
+    }
+
+    #[test]
+    fn process_workloads_have_no_image_overrides() {
+        let oci = spec_for(r#"script = "echo hi""#);
+        assert_eq!(oci.process.overrides, None);
+        let oci = spec_for(r#"command = ["sleep", "1"]"#);
+        assert_eq!(oci.process.overrides, None);
+    }
+
+    #[test]
+    fn init_containers_and_jobs_resolve_against_their_image_too() {
+        let init = generate_init_oci_spec(
+            &["migrate".to_string()],
+            "default",
+            "web",
+            Some("web:v1"),
+            "/cg",
+            None,
+        );
+        assert_eq!(
+            init.process.overrides.unwrap().command,
+            vec!["migrate".to_string()]
+        );
+        let job: JobSpec = toml::from_str(r#"image = "tool:v1""#).unwrap();
+        let job = generate_job_oci_spec("tool", "default", &job, "/cg", None);
+        assert_eq!(job.process.overrides, Some(ProcessOverrides::default()));
     }
 
     #[test]

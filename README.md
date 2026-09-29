@@ -4,399 +4,362 @@
 
 # Reliaburger
 
-One binary. A whole container platform.
+Container orchestration in one binary.
 
-Reliaburger is a batteries-included container orchestrator written in Rust,
-for teams running 2-5,000 nodes who want containers in production without
-the PhD. The things you normally assemble from a dozen projects — scheduling,
-gossip clustering, Raft consensus, service discovery, ingress, mTLS PKI, an
-OCI image registry, metrics, logs, dashboards, GitOps, chaos testing, even
-rolling self-upgrade of the orchestrator itself — ship compiled into one
-`bun` agent and one `relish` CLI.
+Reliaburger is a container orchestrator written in Rust. Each node runs one
+agent, `bun`; you drive the cluster with one CLI, `relish`. Scheduling,
+clustering, service discovery, ingress, PKI, secrets, an image registry,
+metrics, logs, GitOps and fault injection are compiled into that agent. There's
+no control plane to assemble and no add-ons to install.
 
-No sidecars. No add-on shopping list. No YAML archaeology. You get:
+It runs your existing Kubernetes manifests. The tour below takes a laptop to
+a three-node cluster, runs a real Kubernetes app on it, breaks it and watches
+it heal. Five minutes is the target.
 
-- **A built-in guide.** `relish manual` provides searchable documentation
-  and runnable examples without a repo checkout or internet connection.
-- **A cluster that heals itself.** SWIM gossip membership, a self-healing
-  Raft council, automatic rescheduling, council disaster recovery, and
-  rolling binary upgrades where workloads survive the swap.
-- **Security that's on by default.** Generated clusters require mTLS;
-  joins are single-use-token, CSR-based; images can be signature-gated;
-  secrets are encrypted at rest, with
-  [public encryption keys available over the API](docs/README.md#encrypting-secrets-without-cluster-files).
-  Cluster-signed ingress leaves renew on demand
-  before expiry, and operator certificate files reload without a restart.
-  Node leaves renew automatically through the current leader, and every node
-  transport observes replacements. TLS connections have bounded lifetimes.
-  `relish test --filter workload-identity` checks a container's SPIFFE certificate
-  against the configured cluster CA, alongside JWKS and token-scope checks.
-- **Batteries you'd otherwise deploy separately.** Built-in registry with
-  P2P image distribution, time-series metrics with SQL, indexed logs,
-  ingress with TLS and draining, web + terminal dashboards, and a fault
-  injector for breaking things on purpose.
+## Five minutes, zero to cluster
 
-The full architectural vision lives in the [whitepaper](docs/whitepaper.md).
-Install and usage details are in the [documentation](docs/README.md), and
-implementation status in [progress.md](docs/progress.md).
-
-Durable cluster consumers journal catalogue and ingress exposure before publication,
-withdraw the previous view and wait for captured HTTP/WebSocket requests to finish.
-Recovery starts with empty views under the original enrolled identity. Ready cleanup
-receipts survive crashes and retry against the current authenticated leader until
-positively acknowledged. This conservative path can briefly interrupt routing during
-updates. Producer allocations remain held until committed consumer confirmation;
-permanent execution fences reject stale reports. Normal enrolled rootful startup and confirmed service VIP retirement are implemented;
-final release qualification remains open.
-
-The opt-in owned Runc path passes actual Bun crash/cancellation and abrupt VM
-reboot checks. Rolling replacements now run their initialisers before the main
-payload. Standalone durable discovery/kernel reboot recovery, enrolled clustered retirement
-and owned OCI upgrades/rollbacks are qualified. Final release acceptance remains open; see the [remaining work](docs/plans/2026-09-22-v0.1.0-remaining-work.md).
-
-0.1.0 requires a fresh cluster; development state is refused. Rolling upgrades
-require matching explicit formats (currently protocol 20 and state 39). See the
-[compatibility policy](docs/releasing.md#cluster-compatibility).
-Registry uploads belong to their exact creating credential. Recovery reclaims
-abandoned partial uploads after a crash and
-requires one Bun per writable image store; see the [startup contract](docs/README.md).
-Manifest pushes persist their local catalogue before acknowledgement and refuse
-filesystem failures. Publication and garbage collection serialise their final
-blob checks and deletion, with durable GC generations fencing delayed proposals. Clustered workers and followers forward writes to the
-authenticated leader. Repository reads and configured quota checks also require
-current authority; an unavailable leader returns 503 instead of an empty catalogue.
-`relish images` uses that committed cluster view too.
-Unconfirmed Raft commits return 503 for client retry;
-201 confirms catalogue acceptance, with blob replication potentially still pending.
-HTTP writes under `rbtest-…/` require their exact authenticated lease owner.
-Registry workers confirm upload and metadata retirement after workloads stop;
-only the owning application lease may depend on those images. Peer pulls retain
-upload ownership through cancellation and failed cleanup. Storage nodes now hash and conditionally confirm their own copies under the GC
-guard; the healer cannot replace stale holder lists. Physical registry recovery passes actual Bun death and three-node TLS
-leader-change tests on macOS/Linux.
-`relish test --filter image-registry` now stages a pinned runnable image under its
-server lease, deploys the exact digest and checks its HTTP response. The real
-Linux/runc catalogue passes all three cases with confirmed repository cleanup.
-A disconnected writer keeps cleanup pending until it returns and confirms
-retirement.
-OCI index selection targets Linux containers even when the client runs on macOS.
-Direct image pulls and Pickle verify pinned manifests, selected platform
-manifests and configuration bytes before accepting them into the cache.
-
-Lease-owned test volumes and generated configuration have durable provisioning
-records. Ordinary Stop and rescheduling keep their data; lease retirement removes
-it only after confirmed runtime cleanup. Failed unmounts keep cleanup pending.
-Host-source volumes and ordinary application data remain outside test ownership.
-Disposable test-volume snapshots are unsupported in 0.1.0.
-
-Restart also refuses unreadable ownership records or uncertain runtime adoption,
-preserving records and workload identities for recovery. Legacy aliases and
-inconsistent stored instance identities refuse startup without runtime mutation.
-Workload and namespace
-names must be lowercase DNS labels; invalid names are refused before deployment.
-Rollback and halt retain replacement ownership until runtime and artifact
-cleanup are confirmed. Cluster test leases also retain former placement owners
-through rescheduling and leader changes; an unavailable worker keeps cleanup
-pending until it confirms retirement. After stopping or fencing that machine, an
-administrator can use `relish decommission-node` to release its obligations and
-permanently retire its identity. Returning machines need fresh enrolment under a
-new name; see the [operator procedure](docs/README.md#decommissioning-a-node).
-Node-local cron registrations survive restart. Cron skips missed or uncertain
-firings after a crash; it does not promise catch-up or exactly-once job execution.
-Job attempts retain their retry budget across Bun replacement. Unknown outcomes
-require an explicit `relish apply jobs.toml --rerun-jobs`; ordinary apply cannot
-silently replay them. See the [job recovery policy](docs/README.md).
-
-## Quick start
-
-Source builds require Rust 1.97 or later; releases use Rust 1.98.0 and the
-committed lockfile.
+0.1.0 was released on 29 September 2026, and the one-line installer fetches
+its signed binaries. You'll need macOS, or Linux with QEMU and KVM, plus about
+8 GiB of free memory and 15 GiB of disk.
 
 ```sh
-cargo build --locked --bins
+# Install relish and build a three-node cluster in Linux VMs
+curl -fsSL https://reliaburger.com/install.sh | sh
 
-# Run the node agent — no container runtime needed for the first taste
+# Run a real Kubernetes app: podinfo's frontend, backend and Redis
+relish apply -f https://reliaburger.com/demo/podinfo.yaml
+relish status                        # three frontends, spread across the nodes
+open http://podinfo.localhost:18080  # through the built-in ingress
+
+# See every hop from frontend to Redis: DNS, VIP, eBPF map, firewall, TCP
+relish path frontend --to redis
+
+# podinfo's own Prometheus metrics, scraped from its pod annotations
+relish metrics frontend
+
+# Make Redis slow, but only for the frontends, for two minutes
+relish fault delay redis 300ms --from frontend --duration 2m --acknowledge
+relish path frontend --to redis --count 3
+relish dashboard                     # live charts in the browser
+
+# Break things and watch the cluster recover
+relish fault kill frontend --count 1 --acknowledge
+relish local stop node-3             # lose a whole machine
+relish status                        # three frontends again, on two nodes
+relish wtf                           # what's wrong and what to do about it
+
+# Clean up
+relish local destroy --yes
+relish uninstall
+```
+
+The [five-minute tour](docs/manual/08_five-minute-tour.md) explains each step,
+and the [laptop quickstart](docs/quickstart.md) covers prerequisites, retries
+and single-node setups.
+
+<!-- relish-commands:start -->
+<details>
+<summary><strong>Everything relish can do</strong></summary>
+
+Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--help` anywhere) lists every flag, and the [reference](docs/manual/13_reference.md) covers global flags, environment variables and exit codes. This list is generated from relish's own command definitions; run `make readme-commands` after changing them.
+
+**Set up and run a cluster** ([getting started](docs/manual/00_getting-started.md), [cluster basics](docs/manual/02_cluster-basics.md))
+
+- `relish setup`: Guided setup: detect or install bun, then write a starter config
+- `relish local <status|start|stop|destroy> [NODE]`: Manage a laptop cluster created by setup --quickstart
+- `relish init [DIR]`: Initialise a new cluster (generates CAs, age keypair, node identity)
+- `relish join --node-id <NODE_ID> <ADDR>`: Join an existing cluster
+- `relish join-token`: Manage short-lived node-enrolment tokens
+  - `relish join-token create --node-id <NODE_ID>`: Create a single-use token for enrolling one node
+- `relish nodes`: List cluster nodes and their gossip state
+- `relish council`: Show council (Raft) composition and status, or recover from full loss
+  - `relish council recover --data-dir <DATA_DIR>`: Recover a cluster whose entire council was lost
+- `relish decommission-node --workloads-stopped --reason <REASON> <NODE_ID>`: Permanently retire a stopped or fenced node; return requires fresh enrolment
+- `relish uninstall`: Remove the CLI, its PATH link, the managed Lima tools and the image cache
+
+**Deploy and manage apps** ([deploy an app](docs/manual/01_deploy-an-app.md))
+
+- `relish apply [PATH_OR_URL]`: Apply a Reliaburger TOML or Kubernetes YAML manifest
+- `relish status`: Show cluster and app status
+- `relish inspect <NAME>`: Show detailed info about an app, node, or job
+- `relish exec <APP> [COMMAND]...`: Execute a command inside a running container
+- `relish deploy <PATH>`: Trigger a rolling deploy for an app
+- `relish cancel-deploy <OPERATION_ID>`: Cancel a node-local deploy and wait for its current work to finish
+- `relish history <APP>`: Show deploy history for an app
+- `relish rollback <APP>`: Rollback an app to the previous version
+- `relish stop <APP>`: Scale an app to zero, keeping its configuration; `relish apply` starts it again
+- `relish delete <APP>`: Remove an app from the cluster and stop all its instances
+- `relish batch <PATH>`: Submit a batch of jobs for high-throughput scheduling
+- `relish batch-status <ID>`: Show the progress of a submitted batch
+
+**Work with config files** ([deploy an app](docs/manual/01_deploy-an-app.md), [coming from Kubernetes](docs/manual/09_kubernetes.md))
+
+- `relish lint <PATH>`: Validate a config file without deploying
+- `relish fmt <PATH>`: Format a TOML config file with canonical ordering
+- `relish compile <PATH>`: Compile configs into a single resolved output
+- `relish diff <PATH_A> [PATH_B]`: Show structural diff between two configs
+- `relish import --file <FILES>...`: Convert Kubernetes YAML manifests to Reliaburger TOML
+- `relish export --file <FILE>`: Export Reliaburger TOML to Kubernetes YAML manifests
+
+**Networking** ([networking and ingress](docs/manual/03_networking.md))
+
+- `relish resolve <NAME>`: Resolve a service name to its VIP and backends
+- `relish routes`: Show ingress routing table
+
+**Watch what's running** ([observability](docs/manual/04_observability.md))
+
+- `relish tui`: Launch the interactive terminal UI
+- `relish dashboard`: Open a read-only web dashboard through the current authenticated context
+- `relish top`: Show every workload on every node, with its latest CPU and memory
+- `relish metrics <APP>`: Show an app's own Prometheus metrics, scraped by the nodes running it
+- `relish logs <NAME>`: Stream logs from an app or job
+- `relish logs-export --dest <DEST>`: Export Parquet log files to a destination directory
+- `relish logs-search <SOURCE> <SQL>`: Search exported Parquet log archives with SQL
+
+**Diagnose and test** ([diagnostics](docs/manual/07_diagnostics.md))
+
+- `relish wtf`: Diagnose cluster health and correlate likely causes
+- `relish path --to <TO> <SOURCE>`: Walk the network path from a workload to a destination, hop by hop
+- `relish test`: Run the built-in integration test suite against the cluster
+- `relish bench`: Run reproducible performance benchmarks against the real data plane
+
+**Break things on purpose** ([chaos](docs/manual/05_chaos.md))
+
+- `relish fault`: Inject faults for chaos testing (Smoker)
+  - `relish fault delay <TARGET> <DELAY>`: Add latency to connections to a service
+  - `relish fault drop <TARGET> <PERCENTAGE>`: Fail a percentage of connections
+  - `relish fault dns <TARGET> <FAULT_TYPE>`: Return NXDOMAIN for DNS resolution
+  - `relish fault partition <TARGET>`: Block traffic between services
+  - `relish fault bandwidth <TARGET> <LIMIT>`: Throttle bandwidth to a service
+  - `relish fault cpu <TARGET> <PERCENTAGE>`: Consume CPU in a service's cgroup
+  - `relish fault memory <TARGET> <VALUE>`: Push memory usage toward a service's limit
+  - `relish fault disk-io <TARGET> <LIMIT>`: Throttle disk I/O for a service
+  - `relish fault kill <TARGET>`: Kill instances of a service (SIGKILL)
+  - `relish fault pause <TARGET>`: Freeze instances of a service (SIGSTOP)
+  - `relish fault resume <TARGET>`: Resume (unfreeze) previously paused instances of a service
+  - `relish fault node-drain <TARGET>`: Simulate graceful node departure
+  - `relish fault node-kill <TARGET>`: Simulate abrupt node failure
+  - `relish fault node-pressure <TARGET>`: Consume bounded CPU and memory capacity on one node
+  - `relish fault list`: List all active faults
+  - `relish fault clear [TARGET]`: Clear faults — all, by numeric id, or by service name
+  - `relish fault scenario <PATH>`: Run a scripted chaos scenario from a TOML file
+
+**Security and access** ([security and access](docs/manual/10_security.md))
+
+- `relish token`: Manage API tokens
+  - `relish token create --name <NAME>`: Create a new API token
+  - `relish token list`: List all API tokens
+  - `relish token revoke <NAME>`: Revoke an API token by name
+- `relish secret`: Manage secrets (encrypt values for use in app configs)
+  - `relish secret pubkey [DIR]`: Print the cluster's age public key (for `relish secret encrypt`)
+  - `relish secret encrypt --pubkey <PUBKEY> <VALUE>`: Encrypt a plaintext value for use in app config ENC[AGE:...] fields
+  - `relish secret rotate`: Rotate the secret encryption key (start or finalise)
+- `relish sign --key <KEY> <IMAGE>`: Sign a Pickle-hosted image with your own key so `require_signatures` admits it
+  - `relish sign keygen --out <OUT>`: Generate an image signing key and print the public key line for `[images.trust_policy] keys`
+
+**Images and volumes** ([images and volumes](docs/manual/11_images-and-volumes.md))
+
+- `relish images`: List images in the local Pickle registry
+- `relish build <PATH>`: Build an OCI image and push to Pickle
+- `relish snapshot`: Manage volume snapshots (Btrfs-backed volumes only)
+  - `relish snapshot create <APP>`: Snapshot an app's managed volumes
+  - `relish snapshot list <APP>`: List an app's snapshots, newest first
+  - `relish snapshot restore <APP> <NAME>`: Restore a snapshot over its live volume (stop the app first)
+  - `relish snapshot delete <APP> <NAME>`: Delete a snapshot
+
+**Upgrades** ([operations](docs/manual/12_operations.md))
+
+- `relish upgrade`: Roll a new bun binary across the cluster, or back
+  - `relish upgrade check`: Check for available updates
+  - `relish upgrade start [VERSION]`: Start a rolling upgrade (network: pass a version; air-gapped: pass --binary)
+  - `relish upgrade plan <VERSION>`: Preview the rolling order and estimated duration
+  - `relish upgrade status`: Show upgrade progress
+  - `relish upgrade rollback [VERSION]`: Roll back to a previous version (cluster: version required)
+  - `relish upgrade resume`: Resume a paused upgrade
+  - `relish upgrade abort`: End a paused upgrade in which no node has moved. When some nodes already swapped, use `rollback <version>` instead
+
+**Learn** ([under the hood](docs/manual/06_under-the-hood.md))
+
+- `relish manual [CHAPTER]`: Read the built-in manual (searchable TUI; --web for the browser)
+  - `relish manual examples`: Write the embedded example configs into a directory
+- `relish source [QUERY]`: Browse and fuzzy-search the source this binary was built from
+
+**Contributor tools** ([dev cluster](docs/README.md#dev-cluster))
+
+- `relish dev`: Manage a local dev cluster (Lima VMs)
+  - `relish dev create [NAME]`: Create a new dev cluster
+  - `relish dev status [NAME]`: Show dev cluster status
+  - `relish dev shell <NODE>`: Open a shell on a node
+  - `relish dev stop [NAME]`: Stop a dev cluster (VMs stay on disk)
+  - `relish dev start [NAME]`: Start a stopped dev cluster
+  - `relish dev destroy [NAME]`: Destroy a dev cluster (delete all VMs)
+  - `relish dev test [FILTER]`: Run tests in a Linux VM (all Linux-gated tests enabled)
+  - `relish dev disk`: Show disk usage in the test VM
+  - `relish dev clean`: Clean cargo build artefacts in the test VM
+  - `relish dev keygen --out <OUT>`: Generate an Ed25519 release signing keypair
+  - `relish dev sign-binary --key <KEY> <BINARY>`: Sign a binary, producing a detached .sig envelope
+  - `relish dev countersign-binary --external-key <EXTERNAL_KEY> <BINARY>`: Add your external signature to a release binary's .sig envelope, keeping the release signature as it is (no release key needed)
+
+</details>
+<!-- relish-commands:end -->
+
+## What's in the binary
+
+**Runs Kubernetes YAML.** `relish apply -f` takes Deployments, StatefulSets,
+DaemonSets, Services, Ingresses, ConfigMaps, Secrets, Jobs, CronJobs, HPAs and
+Namespaces. It converts them on the way in and tells you what it had to
+change. `relish import` writes the equivalent TOML if you'd rather keep that.
+
+**Clustering without etcd.** Nodes find each other and detect failure with SWIM
+gossip. A small Raft council, embedded in the agent, holds cluster state. Lose
+a node and the scheduler moves its workloads to the survivors.
+
+**Service discovery in the kernel.** Every app gets a stable virtual IP and,
+with DNS enabled, a `.internal` name. An eBPF connect hook sends each
+connection straight to a healthy backend, and per-app firewall rules decide
+who may connect at all.
+
+**Ingress with TLS.** Host-based HTTP and HTTPS routing, with certificates signed
+by the cluster's own ingress CA or files you provide. WebSockets and streaming
+pass through, and connections drain before an instance stops.
+
+**Security on by default.** A generated cluster requires mTLS between nodes.
+Nodes join with single-use tokens and certificate signing requests.
+Certificates renew themselves. Secrets live in your config encrypted to the
+cluster's public key. Workloads get SPIFFE certificates, API tokens carry
+roles and namespace scopes, and the registry can refuse unsigned images.
+
+**A registry on every node.** Pickle is an OCI registry built into the cluster.
+Push once and nodes pull layers from each other. It also caches upstream
+registries, and `relish build` builds images from your config straight into it.
+
+**Metrics, logs and alerts, nothing to install.** Each node scrapes its own
+workloads, including anything with `prometheus.io` annotations. Alert rules
+evaluate in the agent and call webhooks, optionally HMAC-signed. Logs are
+captured on each node, streamed cluster-wide with `relish logs -f`, and
+exported as Parquet to disk or object storage, where SQL can query them.
+
+**Chaos as a first-class command.** `relish fault` injects latency, dropped
+connections, DNS failures, partitions, CPU, memory and disk-I/O pressure,
+killed or frozen instances, and drained or failed nodes. Every fault has a
+duration and cleans up after itself. Injection needs `--acknowledge`, a
+Deployer credential and an operator opt-in on each node, and it's refused when
+it would take out every replica or put the council's quorum at risk.
+`relish test --chaos` runs scripted recovery scenarios.
+
+**Deploys and GitOps.** Health-gated rolling deploys with automatic rollback,
+blue-green switches, autoscaling on metrics, jobs, cron and batch. Point the
+cluster at a Git repository and the leader keeps it in sync, verifying commit
+signatures if you ask it to.
+
+**Self-upgrade.** `relish upgrade start` rolls a new `bun` across the cluster:
+workers first, then council members one at a time, leader last. The new binary
+adopts running workloads without restarting them, and a crash-looping upgrade
+reverts itself. Network upgrades need two Ed25519 signatures: the release's
+and your own.
+
+**Diagnostics built for incidents.** `relish wtf` correlates cluster health into
+one screen of problems and next steps. `relish path` walks the network path
+between two apps and labels each step observed, inferred or unavailable.
+`relish test` runs a live-cluster test catalogue, and `relish bench` measures
+the data plane.
+
+**Tested like it has to survive a bad day.** Beyond thousands of unit, property
+and snapshot tests, there are crash-recovery suites that kill the agent at every
+awkward moment, multi-node failover and council-loss tests, power-cut fixtures
+that pull the plug on a VM mid-write, a live-cluster test runner you can point
+at your own cluster (`relish test`), and a soak that installs the signed
+release the way you would and then breaks it for hours. CI never retries a
+failure. See [how Reliaburger is tested](docs/testing.md).
+
+**A terminal UI and a web dashboard.** Run `relish` with no arguments for the
+TUI; `relish dashboard` opens the web UI through your authenticated CLI session.
+
+**The manual ships in the binary.** `relish manual` is a searchable reader with
+runnable examples, and `relish source` fuzzy-searches the exact source tree the
+binary was built from. Neither needs a network.
+
+## What you don't install
+
+| On Kubernetes you'd add | In Reliaburger |
+|---|---|
+| etcd | Raft council inside `bun` |
+| kube-proxy, CoreDNS | eBPF service map and `.internal` DNS |
+| An ingress controller | Wrapper ingress |
+| Sealed Secrets | Secrets encrypted to the cluster key |
+| Harbor or another in-cluster registry | Pickle |
+| Prometheus, Alertmanager | Built-in scraping, alert rules and webhooks |
+| A log shipper and store | Built-in capture, streaming and Parquet export |
+| Argo CD or Flux | Built-in GitOps |
+| Chaos Mesh or Litmus | `relish fault` |
+| Grafana (for the basics) | TUI and web dashboard |
+
+Config is TOML. The [whitepaper](docs/whitepaper.md) explains the architecture
+and its trade-offs; the [design docs](docs/design/) cover each subsystem.
+
+## Limits in 0.1.0
+
+- **Clusters need rootful runc on Linux with eBPF.** macOS runs containers in
+  managed Linux VMs; native macOS `bun` runs plain processes only.
+- **Rootless runc is standalone only.** It gets host-port forwarding, but no eBPF
+  policy, workload DNS or resource limits.
+- **Ingress certificates don't come from ACME.** Use the cluster CA or supply
+  your own files.
+- **No PromQL.** Metrics are read through `relish metrics`, the dashboards and
+  the API.
+- **`fault bandwidth` is refused**, and `fault delay` needs runc containers.
+- **Kubernetes import covers the kinds listed above.** Anything else is reported,
+  not applied.
+- **Clusters start fresh.** Development-build state isn't migrated, and rolling
+  upgrades need matching protocol and state formats (see the
+  [compatibility policy](docs/releasing.md#cluster-compatibility)).
+- **Multi-platform images don't run from Pickle.** Nodes treat an image index
+  (a multi-platform `docker buildx` push, or `relish build`'s default of two
+  platforms) as a single image and fail to run it, and a multi-platform
+  `relish build` stores only the builder's platform. Push or build one platform
+  that matches your nodes; see
+  [Images and volumes](docs/manual/11_images-and-volumes.md#multi-platform-images).
+- **Cron doesn't catch up.** It skips firings missed during a crash, and a job
+  whose outcome is unknown waits for `relish apply <file> --rerun-jobs`.
+
+The [documentation](docs/README.md#010-scope-and-limits) has the full list.
+[progress.md](docs/progress.md) tracks what's done and the backlog after
+0.1.0.
+
+## Run it from source
+
+You'll need Rust 1.97 or later. This runs a process workload with no container
+runtime, on macOS or Linux:
+
+```sh
+git clone https://github.com/reliaburger/reliaburger
+cd reliaburger
+cargo build --locked --bins
 target/debug/bun --runtime process
 
-# In another terminal: deploy, inspect, explore
+# In another terminal
 target/debug/relish apply examples/phase-1/proc-first-run.toml
 target/debug/relish status
-target/debug/relish            # interactive terminal dashboard
-open http://localhost:9117/    # web dashboard
+target/debug/relish            # terminal UI
+open http://127.0.0.1:9117/    # web dashboard
 ```
 
-Process launches and completed job outcomes survive Bun replacement through
-private durable owners. Application deployment acknowledges success only after
-its recovery metadata is written; storage failures are deployment errors.
-Process exec commands also have owners: Bun death retires them while preserving
-the main workload, and application cleanup waits for their confirmed retirement.
-
-Process mode supports foreground workloads: the main process stays under Bun's
-supervision, and its children must remain in the supervised process group.
-Use an application's foreground option; shell wrappers should `exec` the server
-or wait for their children. Daemonising or detached workloads must use the Linux
-container mode instead. See the [runtime contract](docs/README.md#processgrill-built-in-fallback).
-
-With runc installed on Linux, the same flow runs real OCI images — and `relish init cluster` generates the PKI and mTLS
-config for a secure multi-node cluster. The [documentation](docs/README.md)
-has the full secure-cluster walkthrough. Runc bundles and state follow the node's
-configured data directory, and its cache uses the selected images directory.
-On macOS, use the [managed Linux VM quickstart](docs/quickstart.md) for containers.
-Direct Apple Container is disabled for 0.1.0 pending daemon-command recovery.
-Rootful Linux networking retains address
-ownership across restarts and refuses subnet exhaustion. Runc retirement keeps
-resource ownership when OCI deletion, rootfs unmount or network cleanup fails,
-and retries before reporting Stopped. Normal Stop/Retire also preserve ownership
-when identity-directory or adoption-record removal fails. Rolling and blue-green
-deployments refuse completion if runtime exit is uncertain and keep both
-generations available for cleanup. Rollout finalisation also retains ownership
-when identity or adoption-record removal fails, so cleanup can be retried.
-Explicit Stop and per-instance rollout retirement now confirm kernel backend
-withdrawal before stopping the runtime. Refusal retains the original destination
-and its address. Natural-exit address holds and standalone discovery recovery are qualified.
-Service retirement now confirms removal of grants to its exact allocated VIP before
-releasing that destination. Refusal retains the service and its cleanup owner;
-unrelated destination grants remain untouched. Enrolled rootful cluster retirement is qualified; final release acceptance remains open.
-Failed final kernel backend publication now reports a deployment error and retains
-the running workload’s ownership for cleanup or retry.
-Retirement also fences automatic restarts before signalling the old runtime.
-Deployment ingress drains count requests from route selection, including failover
-candidates. A deadline cancels HTTP/WebSocket work; completion waits for actual
-request release. Automatic restarts refresh the confirmed DNS/ingress address and
-keep health-checked replacements unhealthy until a successful probe.
-Rollout identities advance past adopted generations after Bun replacement. With rootful Linux DNS
-enabled, short
-service names resolve in the calling workload's namespace. Host tools use explicit
-names such as `redis.payments.internal`; unknown sources cannot inherit a node's
-namespace.
-
-A blocked local rollout can be cancelled with `relish cancel-deploy <operation-id>`.
-The command waits for owned work to finish before you submit the correction;
-cluster users should also update the desired configuration. See the
-[deployment guide](docs/README.md).
-
-## The manual is in the binary
-
-Reliaburger documents itself. `relish manual` opens the reference as a
-searchable terminal reader — chapters, runnable examples, fuzzy search —
-with no repo checkout and no internet:
-
-```sh
-relish manual              # read it in the terminal (/ to search)
-relish manual --web        # the same manual as one page in your browser
-relish manual examples     # drop the runnable example configs right here
-```
-
-<!-- asciinema: `relish manual` demo cast goes here -->
-
-The source ships too. `relish source ebpf` opens a fuzzy search over the
-exact `src/` tree the binary was compiled from. The platform carries its own
-reference, examples and implementation wherever the binary goes.
+For real containers and secure multi-node clusters, read the
+[documentation](docs/README.md) or run `relish manual`. Every CLI command is
+listed under *Everything relish can do* above.
 
 ## The book
 
-This repository is also a book. *Building Reliaburger* walks through how
-every subsystem was designed and built — teaching Rust and distributed
-systems along the way, aimed at programmers coming from C, Python or Go:
-
-0. [Preface](docs/book/00-preface.md)
-1. [Hello, Container](docs/book/01-hello-container.md)
-2. [Finding Friends](docs/book/02-finding-friends.md)
-3. [Talking to Each Other](docs/book/03-talking-to-each-other.md)
-4. [Trust No One](docs/book/04-trust-no-one.md)
-5. [Where the Images Live](docs/book/05-where-the-images-live.md)
-6. [Watching Everything](docs/book/06-watching-everything.md)
-7. [Ship It](docs/book/07-ship-it.md)
-8. [Breaking Things on Purpose](docs/book/08-breaking-things-on-purpose.md)
-9. [The Full Package](docs/book/09-the-full-package.md)
-10. [Locking It Down](docs/book/10-locking-it-down.md)
-11. [Eyes Everywhere](docs/book/11-eyes-everywhere.md)
-12. [Squeezing Every Drop](docs/book/12-squeezing-every-drop.md) *(in progress)*
-13. [A Room with a View](docs/book/13-a-room-with-a-view.md)
-14. [Changing the Tyres at Full Speed](docs/book/14-changing-the-tyres.md)
-15. [Ready for Production](docs/book/15-ready-for-production.md) *(in progress)*
-- [Appendix: Rust for C, Python, and Go Programmers](docs/book/16-appendix-rust.md)
-
-## What's inside
-
-Thirteen burger-named subsystems in one binary — Grill (runtimes), Mustard
-(gossip), Council (Raft), Meat (scheduler), Onion (discovery/DNS/eBPF),
-Wrapper (ingress), Sesame (security), Pickle (registry), Mayo (metrics),
-Ketchup (logs), Lettuce (GitOps), Smoker (chaos), Brioche (dashboard). The component tour and
-repo layout live in the manual (`relish manual`, "Under the hood") and the
-[design docs](docs/design/).
-
-```mermaid
-flowchart TB
-  operator[Operator] --> relish[Relish CLI / TUI]
-  traffic[Users and external traffic] --> wrapper[Wrapper ingress]
-
-  subgraph cluster[Reliaburger cluster]
-    direction TB
-    mustard[Mustard gossip membership]
-    council[Council Raft consensus]
-    meat[Meat scheduler]
-
-    subgraph nodes[Homogeneous Bun nodes]
-      direction LR
-      bun1[Bun node]
-      bun2[Bun node]
-      bun3[Bun node]
-    end
-
-    mustard -. membership .-> bun1
-    mustard -. membership .-> bun2
-    mustard -. membership .-> bun3
-    council <--> bun1
-    council <--> bun2
-    council <--> bun3
-    meat --> bun1
-    meat --> bun2
-    meat --> bun3
-
-    bun1 --> services1[Grill, Onion, Sesame, Pickle, Mayo, Ketchup, Lettuce]
-    bun2 --> services2[Grill, Onion, Sesame, Pickle, Mayo, Ketchup, Lettuce]
-    bun3 --> services3[Grill, Onion, Sesame, Pickle, Mayo, Ketchup, Lettuce]
-  end
-
-  relish -->|API requests| bun1
-  wrapper -->|route to healthy apps| bun2
-  bun1 <-->|service discovery and workload traffic| bun2
-  bun2 <-->|service discovery and workload traffic| bun3
-  brioche[Brioche web dashboard] -->|reads cluster state| bun1
-  smoker[Smoker chaos testing] -->|fault injection| bun3
-```
-
-## Try it
-
-The managed quickstart records localhost ingress and authenticated registry
-forwards. See the [port options](docs/quickstart.md#resume-stop-and-remove).
-
-Use the source-based quick start above while we prepare the first release.
-From a checkout, install cargo-nextest 0.9.145 or newer (see
-[build prerequisites](docs/README.md#building)), then run the portable tests and
-check the examples:
-
-```sh
-make test                    # run the portable nextest suite
-make audit                   # check dependency advisories
-make examples                # validate and dry-run every example config
-```
-
-With a running, configured cluster and `relish` on your PATH:
-
-```sh
-relish status
-relish wtf                   # diagnose the live cluster
-relish test --profile development
-```
-
-The managed laptop flow is now available in the source and undergoing VM
-qualification. Once the signed release and website are published, the install
-path will be:
-
-```sh
-curl -fsSL https://reliaburger.com/install.sh | bash
-export PATH="$HOME/.reliaburger/bin:$PATH"
-relish nodes
-relish status
-relish logs hello
-relish dashboard             # Ctrl-C stops the browser connection
-# Open http://localhost:18080/
-relish local stop
-relish local start
-relish local destroy --yes   # permanently remove the cluster's VMs and data
-```
-
-See the [laptop quickstart](docs/quickstart.md) for prerequisites, single-node
-setup, retries and development qualification. The public release is still pending.
-
-See the [diagnostics guide](docs/manual/07_diagnostics.md) for test prerequisites,
-profiles and interpreting results. Capacity benchmarks require live scheduler
-admission and observed running workloads; missing evidence fails the measurement.
-
-## Getting to 0.1.0
-
-Node startup now verifies the agent response, version and critical subsystem
-readiness before setup reports success. Managed setup also checks the council
-and the sample app through ingress; end-to-end qualification is still in progress.
-
-The core platform is implemented. We're preparing a release that takes a
-laptop to three healthy Linux nodes and a working sample app, with no Rust
-build or repo checkout. **Under five minutes is the target; the public
-installer and that timing guarantee aren't available yet.**
-
-The [0.1.0 release plan](docs/plans/2026-09-16-v0.1.0-release-plan.md)
-sets out the remaining work, in order:
-
-1. **Establish the release baseline.** Reconcile the older TODO lists,
-   define supported platforms and run the complete test matrix.
-2. **Finish correctness fixes.** Make readiness checks trustworthy, bound
-   registry upload memory and close the remaining consequential bugs.
-3. **Package and sign the release.** Publish Linux binaries, native macOS
-   CLI binaries, eBPF assets and matching release metadata.
-4. **Make laptop clusters reliable.** Use prebuilt assets and managed Linux
-   VMs, with secure enrolment, resumable setup and access from the host CLI
-   and browser.
-5. **Add the installer and first-run flow.** Install, start the cluster and
-   deploy a sample app, with clear progress, errors and cleanup commands.
-6. **Prove the downloadable release works.** Test clean installations,
-   restart and recovery, and measure the full three-node start with empty
-   caches before publishing the five-minute claim.
-
-The [candidate and promotion workflow](docs/releasing.md#metadata-and-publication)
-preserves signed assets and publishes only the qualified bytes. Hosted candidate
-creation and cold-install acceptance are still pending.
-
-Each step includes tests and updates to the documentation and book. Detailed
-acceptance gates and deferred features live in the release plan; implementation
-history remains in [progress.md](docs/progress.md).
-
-The [17 September codebase audit and completion plan](docs/plans/2026-09-17-codebase-completion-plan.md)
-reconciles the older TODOs, records remaining correctness gaps and separates
-release acceptance from deferred capabilities. The current checklist lives in
-[progress.md](docs/progress.md).
-
-
-Normal Linux Runc startup selects durable ownership for rootful nodes with
-`[ebpf] enabled = true`, including enrolled clusters, and for standalone rootless
-nodes. Rootful policy recovery requires an eBPF-enabled binary and bpffs at
-`/sys/fs/bpf`. Cluster recovery binds consumers to their enrolled node ID and root
-CA and requires the cluster service key. Changing runtime or enforcement mode
-cannot bypass existing ownership; uncertain recovery prevents readiness.
-
-Before publication, Bun records the original execution, service allocation and
-kernel policy. Retirement preserves these records until runtime exit, local
-withdrawal and required remote confirmations succeed. Receipts survive crashes
-and retry against the current authenticated leader. Repeated local withdrawal is
-idempotent; an absent local backend does not authorise address reuse. DNS and
-ingress updates wait for confirmed kernel publication, and captured requests
-must release their guards before consumer withdrawal completes.
-
-Actual Linux qualification covers standalone host reboot, enrolled clustered
-publication/adoption/retirement, rootless forwarding recovery, signed upgrades,
-explicit rollback and failed-candidate automatic revert. Three enrolled OCI nodes
-also preserve the original workload and kernel ownership through six controlled
-binary swaps and final remote cleanup. C34 ownership and cleanup qualification is complete, including actual Bun death
-before automatic-restart adoption. Hosted CI and all four binary builds pass at
-`6c64fed`. Full independent-host acceptance, sustained qualification and the signed
-cold-install matrix remain release gates. Rootless
-support in 0.1.0 is standalone host-port forwarding, without eBPF policy or
-workload DNS. Bun refuses `--cluster` when Runc runs without root, including
-automatic runtime selection. Use rootful Linux Runc/eBPF for container clusters;
-on macOS, `relish setup --quickstart` provisions the managed Linux VM.
-
-Log exports now preserve content generations, scope receipts to the destination,
-and serialise durable checkpoint updates across agent and offline exports. Source
-and checkpoint errors stop the export and prevent disk-pressure pruning.
-
-Cluster-wide credential management and permission/quota declarations require
-an unscoped Admin. App and job manifests enforce the caller's scope and configured
-permissions before applying changes; see the [user guide](docs/README.md).
+This repository is also a book. [*Building Reliaburger*](docs/book/00-preface.md)
+walks through how we designed and built each subsystem, teaching Rust and
+distributed systems to programmers who know C, Python or Go. The chapters are
+in [docs/book/](docs/book/).
 
 ## Contributing
 
-See the [contributing guide](./CONTRIBUTING.md) for more on that.
+Bug reports and pull requests are welcome. Read the
+[contributing guide](CONTRIBUTING.md) first: changes come with tests and a
+matching update to the book.
 
 ## Licence
 

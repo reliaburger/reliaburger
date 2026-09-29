@@ -4,7 +4,7 @@ Thanks for helping build Reliaburger. This repository is both a working `Rust` p
 
 ## Before You Start
 
-Read the project [documentation](docs/README.md), [roadmap](docs/roadmap.md), and [implementation progress](docs/progress.md) before starting substantial work. The roadmap is organised into phases, and we generally work through those phases in order.
+Read the project [documentation](docs/README.md), [roadmap](docs/roadmap.md), and [implementation progress](docs/progress.md) before starting substantial work. Every roadmap phase is done and 0.1.0 is released; the open work is the post-0.1.0 backlog linked from the status box at the top of `docs/progress.md`.
 
 For a new feature or a change to public behaviour:
 
@@ -36,14 +36,13 @@ Use the narrowest relevant test while developing, then run the portable checks b
 ```sh
 make test                 # portable nextest suite
 make test-doc             # `Rust` documentation tests
-make test-no-default      # portable suite without default features
 make fmt-check            # formatting check
-make lint                 # Clippy with warnings as errors
+make lint                 # Clippy, all features and none, warnings as errors
 ```
 
 `make ci` runs the standard portable CI checks together. Use the specialised targets for ignored acceptance suites when your environment supports them: `make test-linux`, `make test-cluster`, `make test-upgrade`, and `make test-apple`.
 
-Tests should describe behaviour in their names, cover failure and boundary cases, and avoid relying on timing or external services unless the test is an explicit integration or acceptance test. Unit tests belong beside the code; cross-subsystem tests belong in `tests/`.
+Tests should describe behaviour in their names, cover failure and boundary cases, and avoid relying on timing or external services unless the test is an explicit integration or acceptance test. Unit tests belong beside the code; cross-subsystem tests belong in `tests/suite/` as a module of the single portable integration binary. Add a separate `tests/*.rs` binary only for gated, heavy or process-isolated suites (see `docs/design/test-harness.md`).
 
 ## `Rust` And Code Style
 
@@ -60,7 +59,7 @@ Run `make fmt` locally after editing Rust. Do not introduce unrelated formatting
 
 ## Documentation And The Book
 
-Documentation is part of the feature. Update the relevant design document, `docs/progress.md`, user documentation, or book chapter when a change affectsarchitecture, behaviour, configuration, commands, or the current roadmap.
+Documentation is part of the feature. Update the relevant design document, `docs/progress.md`, user documentation, or book chapter when a change affects architecture, behaviour, configuration, commands, or the current roadmap.
 
 Book chapters are written for programmers who may know C, Python, or Go but not Rust. When adding `Rust` syntax to a chapter for the first time explain it in plain language. Include the design reasoning, tests, trade-offs, and lessons learned rather than documenting only the finished code.
 
@@ -68,8 +67,10 @@ New example configurations go under the appropriate `examples/phase-N/` director
 `container-*`, `apple-*`, or `runc-*`. Validate examples with:
 
 ```sh
-make examples
+cargo nextest run --test examples
 ```
+
+`make test` runs it too.
 
 ## Pull Requests
 

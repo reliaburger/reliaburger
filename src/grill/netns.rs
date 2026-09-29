@@ -414,6 +414,25 @@ pub async fn setup_container_network_with_commands(
     )
     .await?;
 
+    // The namespace belongs to the node's user namespace, not the
+    // container's, so container root has no CAP_NET_BIND_SERVICE here.
+    // Let any container user bind any port and open ICMP echo sockets, as
+    // Docker does: the namespace holds only this container, so there's no
+    // one to impersonate on port 80.
+    for sysctl in [
+        "net.ipv4.ip_unprivileged_port_start=0",
+        "net.ipv4.ping_group_range=0 2147483647",
+    ] {
+        run_cmd(
+            executor,
+            "ip",
+            &["netns", "exec", &ns_name, "sysctl", "-w", sysctl],
+            instance_id,
+            "open low ports to the container user",
+        )
+        .await?;
+    }
+
     // Peers are behind other veth pairs, not on this link. Reach the gateway
     // directly and send every other destination through the host.
     run_cmd(
@@ -449,6 +468,14 @@ pub async fn setup_container_network_with_commands(
         "enable IP forwarding",
     )
     .await?;
+
+    // 11. Let that forwarded traffic past a host firewall's FORWARD policy
+    allow_container_forwarding()
+        .await
+        .map_err(|reason| NetnsError::SetupFailed {
+            instance: instance_id.0.clone(),
+            reason,
+        })?;
 
     Ok(ContainerNetwork {
         namespace_path: ns_path,
@@ -541,19 +568,11 @@ pub async fn adopt_container_network(
     }))
 }
 
-/// Add a port mapping from a host port to a container port.
+/// Publish a host port to a container port through the caller's
+/// generation-bound command executor.
 ///
-/// In root mode, adds an nftables DNAT rule. In rootless mode, spawns
+/// In root mode, adds an nftables DNAT map element. In rootless mode, spawns
 /// a tokio TCP proxy task.
-pub async fn add_port_mapping(
-    network: &ContainerNetwork,
-    host_port: u16,
-    container_port: u16,
-) -> Result<PortMapHandle, NetnsError> {
-    add_port_mapping_with_commands(&DirectCommandExecutor, network, host_port, container_port).await
-}
-
-/// Publish a port through the caller's generation-bound command executor.
 pub async fn add_port_mapping_with_commands(
     executor: &impl RuntimeCommandExecutor,
     network: &ContainerNetwork,
@@ -639,12 +658,6 @@ pub async fn add_port_mapping_with_commands(
     }
 }
 
-/// Remove any surviving owned DNAT entries before an address is reusable.
-/// This also recovers mappings installed before a cancelled setup published its handle.
-pub(crate) async fn retire_address_forwarding(address: Ipv4Addr) -> Result<(), String> {
-    retire_address_forwarding_with_commands(&DirectCommandExecutor, address).await
-}
-
 /// Retire an owned address's forwarding after the executor has fenced prior mutators.
 pub async fn retire_address_forwarding_with_commands(
     executor: &impl RuntimeCommandExecutor,
@@ -726,6 +739,69 @@ pub async fn teardown_container_network_with_commands(
 }
 
 // ---------------------------------------------------------------------------
+// Host firewall
+// ---------------------------------------------------------------------------
+
+/// The iptables FORWARD rules that let container traffic through a host
+/// whose FORWARD policy is DROP. Every host veth is named `veth-…`, and
+/// `veth-+` is iptables' prefix match for them.
+///
+/// Anything a container sends is accepted: to another container on this
+/// node, or out through the masquerade. Traffic towards a container is
+/// accepted only as a reply, or when a published port's DNAT sent it there,
+/// so the rest of the network can't route into container addresses.
+const FORWARD_ACCEPT_RULES: [&[&str]; 2] = [
+    &["-i", "veth-+", "-j", "ACCEPT"],
+    &[
+        "-o",
+        "veth-+",
+        "-m",
+        "conntrack",
+        "--ctstate",
+        "RELATED,ESTABLISHED,DNAT",
+        "-j",
+        "ACCEPT",
+    ],
+];
+
+/// Make sure the host's iptables FORWARD chain accepts container traffic.
+///
+/// Docker and ufw both set the FORWARD policy to DROP. Our nftables tables
+/// can't overrule that: an accept in one table only passes the packet on to
+/// the next table at the same hook, while a drop anywhere is final. So the
+/// accept has to sit in the chain that drops, ahead of its policy. Hosts
+/// without iptables have no such chain, and nothing to do.
+///
+/// The rules are node-wide, idempotent and harmless with no containers
+/// running, so they're checked on every setup (a firewall reload may have
+/// removed them) and never retired. That's also why they run outside the
+/// instance's own command journal.
+async fn allow_container_forwarding() -> Result<(), String> {
+    for rule in FORWARD_ACCEPT_RULES {
+        let mut check = vec!["-w", "-C", "FORWARD"];
+        check.extend_from_slice(rule);
+        let present = match DirectCommandExecutor.output("iptables", &check).await {
+            Ok(output) => output.exit_code == Some(0),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(format!("check iptables FORWARD rules: {error}")),
+        };
+        if present {
+            continue;
+        }
+        let mut insert = vec!["-w", "-I", "FORWARD", "1"];
+        insert.extend_from_slice(rule);
+        run_cmd_raw_with(
+            &DirectCommandExecutor,
+            "iptables",
+            &insert,
+            "accept container traffic in the iptables FORWARD chain",
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // nftables helpers
 // ---------------------------------------------------------------------------
 
@@ -798,36 +874,17 @@ async fn ensure_nft_table(executor: &impl RuntimeCommandExecutor) -> Result<(), 
     // The named port map (`add map` is idempotent, like table/chain).
     run_nft(executor, &portmap::portmap_definition()).await?;
 
-    // The single lookup rule that consults the map, guarded the same
-    // way — and a one-time sweep of legacy per-port DNAT rules left by
-    // the pre-map scheme, which would otherwise match ahead of it.
+    // The single lookup rule that consults the map, guarded the same way.
     let prerouting = list_chain(executor, "prerouting").await?;
     if !prerouting.contains("@portmap") {
         run_nft(executor, &portmap::map_rule()).await?;
-    }
-    for handle in portmap::legacy_rule_handles(&prerouting) {
-        run_cmd_raw_with(
-            executor,
-            "nft",
-            &[
-                "delete",
-                "rule",
-                "ip",
-                "reliaburger",
-                "prerouting",
-                "handle",
-                &handle.to_string(),
-            ],
-            "sweep legacy dnat rule",
-        )
-        .await?;
     }
 
     Ok(())
 }
 
 /// List a chain with rule handles (`nft -a list chain`). Used to guard
-/// one-shot rules and to sweep legacy per-port DNAT rules.
+/// one-shot rules.
 async fn list_chain(executor: &impl RuntimeCommandExecutor, chain: &str) -> Result<String, String> {
     let output = executor
         .output("nft", &["-a", "list", "chain", "ip", "reliaburger", chain])
@@ -1201,6 +1258,55 @@ mod tests {
             .expect("failed to tear down");
     }
 
+    /// Docker and ufw set the iptables FORWARD policy to DROP. Container to
+    /// container traffic crosses that hook, so the node must accept its own
+    /// veths' traffic there, or every call between apps times out.
+    #[tokio::test]
+    #[ignore = "requires Linux root and RELIABURGER_NETNS_TESTS=1"]
+    async fn container_network_accepts_its_forwarded_traffic_in_iptables() {
+        assert!(
+            netns_tests_enabled(),
+            "set RELIABURGER_NETNS_TESTS=1 after provisioning Linux network tools and root access"
+        );
+
+        let id = InstanceId("netns-forward-0".to_string());
+        let _ = run_cmd_raw(
+            "ip",
+            &["link", "del", &host_veth_name(&id)],
+            "pre-cleanup veth",
+        )
+        .await;
+        let _ = run_cmd_raw(
+            "ip",
+            &["netns", "del", "rb-netns-forward-0"],
+            "pre-cleanup netns",
+        )
+        .await;
+
+        let network = setup_container_network(&id, 97, 0, false)
+            .await
+            .expect("failed to set up container network");
+
+        for rule in FORWARD_ACCEPT_RULES {
+            let mut check = vec!["-w", "-C", "FORWARD"];
+            check.extend_from_slice(rule);
+            let present = tokio::process::Command::new("iptables")
+                .args(&check)
+                .output()
+                .await
+                .expect("iptables runs");
+            assert!(
+                present.status.success(),
+                "missing FORWARD rule {rule:?}: {}",
+                String::from_utf8_lossy(&present.stderr)
+            );
+        }
+
+        teardown_container_network(&network)
+            .await
+            .expect("failed to tear down");
+    }
+
     #[tokio::test]
     #[ignore = "requires Linux root and RELIABURGER_NETNS_TESTS=1"]
     async fn port_mapping_nftables() {
@@ -1228,7 +1334,7 @@ mod tests {
             .await
             .expect("failed to set up container network");
 
-        let handle = add_port_mapping(&network, 18080, 80)
+        let handle = add_port_mapping_with_commands(&DirectCommandExecutor, &network, 18080, 80)
             .await
             .expect("failed to add port mapping");
 
@@ -1254,7 +1360,11 @@ mod tests {
             "shutdown should delete the element: {listing}"
         );
         // Simulate cancellation before the mapping handle reaches its owner.
-        drop(add_port_mapping(&network, 18081, 80).await.unwrap());
+        drop(
+            add_port_mapping_with_commands(&DirectCommandExecutor, &network, 18081, 80)
+                .await
+                .unwrap(),
+        );
         let other = portmap::PortMapEntry {
             host_port: 18082,
             container_ip: container_ip(98, 1),
@@ -1264,7 +1374,7 @@ mod tests {
             .run(&portmap::element_add(&other))
             .await
             .unwrap();
-        retire_address_forwarding(network.container_ip)
+        retire_address_forwarding_with_commands(&DirectCommandExecutor, network.container_ip)
             .await
             .unwrap();
         let listing = list_map_elements().await;

@@ -36,7 +36,7 @@ Sesame is not a separate binary or sidecar. It is compiled into the single `reli
 | **Meat** (scheduler) | Provides the scheduling state that council uses to validate CSRs -- a worker node can only obtain a certificate for a workload that Meat has scheduled onto that node. |
 | **Mustard** (gossip) | Propagates the `cluster_nodes` IP set used by nftables perimeter rules. Membership changes trigger Bun to reconcile firewall state. |
 | **Onion** (eBPF service discovery) | Hosts the `connect()` interception point where eBPF firewall checks are enforced. The `firewall_map` BPF map is loaded alongside Onion's existing service map. |
-| **Wrapper** (ingress) | Reconstructs Ingress CA material on council-enabled ingress nodes and issues per-SNI leaves for `tls = "cluster"` routes. Automatic renewal remains follow-up work. |
+| **Wrapper** (ingress) | Reconstructs Ingress CA material on council-enabled ingress nodes and issues per-SNI leaves for `tls = "cluster"` routes (90 days by default). A cached leaf is reissued on the first handshake after its midpoint, measured from the issuing instant. |
 | **Lettuce** (GitOps) | Delivers app configurations containing `ENC[AGE:...]` secret values and `firewall`/`egress` blocks to Bun for processing. |
 
 ---
@@ -287,7 +287,7 @@ pub struct NodeCertificate {
 
     /// Certificate validity period.
     pub not_before: SystemTime,
-    pub not_after: SystemTime,  // default: 1 year from issuance
+    pub not_after: SystemTime,  // default: 1 year from issuance (see §6.1.1)
 
     /// The Node CA generation that signed this certificate.
     pub ca_generation: u64,
@@ -593,8 +593,8 @@ pub struct NftablesState {
     /// IP addresses of all cluster nodes (from Mustard gossip).
     pub cluster_nodes: HashSet<IpAddr>,
 
-    /// Admin CIDR ranges allowed to access management ports.
-    pub admin_cidrs: Vec<IpNet>,
+    /// Operator CIDR ranges allowed to reach the API port (only that port).
+    pub operator_cidrs: Vec<IpNet>,
 
     /// Per-app egress sets (app name -> resolved destinations).
     pub egress_sets: HashMap<String, Vec<ResolvedEgressEntry>>,
@@ -878,6 +878,17 @@ A built-in default TTL (the "90 days" the config sketch mentions) is planned but
 not applied today, so a token created without `--ttl-days` is effectively
 permanent until explicitly revoked.
 
+**Scope enforcement (shipped):** `--apps` and `--namespaces` restrict a token
+on every route that names an app and namespace (`authorize_scoped`), filter
+cluster-wide listings such as `/v1/status` and `/v1/images` to the scope, and
+refuse routes that need cluster-wide authority (`require_unscoped`). The Pickle
+registry applies the same scope to repositories: a scoped token may push and
+(on a routable listener) pull only repositories named `<namespace>/<app>` whose
+namespace and app it covers, over Bearer and Basic alike; bare names such as
+`api` are refused to it, and `/v1/build` destinations meet the same rule. The
+internal service token and unscoped tokens are unaffected. See
+`registry-pickle.md` §1.2 for the exact rule.
+
 **Bootstrap boundary (shipped):** An empty user-token store leaves protected
 API routes open long enough to create the first cluster token. Bun contains
 that window to an IP-literal loopback listener (`127.0.0.0/8` or `::1`). It
@@ -936,7 +947,7 @@ The `relish` CLI uses the age public key to encrypt. No cluster access required.
 2. Store the new keypair in Raft, marking the old keypair as `read_only = true`. Starting a second rotation while one is un-finalised is refused (idempotent retries of the same rotation, deduped on the generation number, are accepted).
 3. The cluster now accepts ciphertexts encrypted with either key; new encryption always uses the newest non-read-only generation.
 4. The operator (or CI) re-encrypts all secrets with the new public key and commits to git. Each applied `AppSpec` records which generation seals its encrypted values (`SecurityState.secret_seals`, keyed `namespace/app/ENV_KEY`) — age ciphertext does not disclose its recipient, so write time is the only moment this is knowable.
-5. Once all `ENC[AGE:...]` values use the new key, the operator runs `relish secret rotate --finalize` to delete the old keypair. Finalise verifies the seal records first: any secret still sealed under an older generation — or with no record at all (legacy state) — refuses the retirement and is named in the error, so the key that can decrypt it is never deleted early.
+5. Once all `ENC[AGE:...]` values use the new key, the operator runs `relish secret rotate --finalize` to delete the old keypair. Finalise verifies the seal records first: any secret still sealed under an older generation — or with no record at all — refuses the retirement and is named in the error, so the key that can decrypt it is never deleted early.
 
 ### 5.6 Raft Log Encryption
 
@@ -1019,6 +1030,38 @@ When Bun processes an app's `[app.NAME.egress]` block:
 7. Every one-second agent tick verifies the live hooks and each protected cgroup's enforcement flag. It repairs a missing flag once and verifies the result. Hook loss, an unreadable map or failed repair stops the affected workload, records the affected app and makes the node unready until all four hooks recover. The slower kernel-truth sweep (`[ebpf] sweep_interval_secs`, default 60) still scrubs stale state and rebuilds all entries.
 8. `allow_franchise` remains unimplemented. Bun refuses it explicitly rather than starting a workload with unrestricted cross-cluster egress.
 
+### 5.10 Image Signing Trust Roots
+
+`[images.trust_policy] require_signatures` admits a Pickle-hosted image only
+when its attached signature verifies under one of two trust roots:
+
+- **The cluster root CA** (keyless). The per-namespace build signer
+  (`spiffe://…/job/build-signer`, a code-signing leaf from the Workload CA)
+  signs what `relish build` pushes. No configuration: the chain, validity,
+  code-signing EKU, SPIFFE identity and CRL are all checked against state the
+  council already holds.
+- **Operator keys** (`trust_policy.keys`). Base64 uncompressed ECDSA P-256
+  public keys in each node's config file. `relish sign IMAGE --key PATH`
+  resolves IMAGE to its manifest digest, signs the digest locally, and sends
+  `{digest, public_key, signature}` to `POST /v1/identity/sign` (unscoped
+  Admin). The agent checks only that the signature verifies under the key it
+  carries, then writes `AttachSignature`; trust is decided at deploy time.
+  `relish sign keygen --out PATH` makes a PKCS#8 PEM key (mode 0600, never
+  overwrites) and prints the public key line; any unencrypted PKCS#8 P-256
+  key from `openssl genpkey` works too.
+
+Why the operator holds the external key rather than the cluster: if the
+cluster held a signing key behind `/v1/identity/sign`, any Admin API token
+could make any image trusted. With the key on the operator's machine and the
+public half in node config, making an image trusted takes the private key and
+write access to node config; a stolen API token can only attach signatures
+nobody trusts. (The first `relish sign` signed with a key the agent generated
+per call and discarded, so no policy could ever list it; that path is gone.)
+
+The manifest carries a single signature slot, so a later `relish sign`
+replaces an earlier signature (including a build signer's). Signatures bind
+digests, never tags: re-pushing a tag leaves the new digest unsigned.
+
 ---
 
 ## 6. Configuration
@@ -1054,6 +1097,65 @@ intermediate_ca_lifetime = "5y"
 # Default: "ecdsa-p256".
 ca_algorithm = "ecdsa-p256"
 ```
+
+The block above is the design sketch. What ships in 0.1.0 is narrower: the
+lifetimes are compiled constants in `src/sesame/ca.rs` (`NODE_LEAF_LIFETIME`
+one year, `INGRESS_LEAF_LIFETIME` 90 days, workload identity one hour in
+`src/sesame/identity.rs`, root CA 10 years, intermediates 5 years), and the
+only node-config knob is a development-only override for the two leaf classes.
+
+#### 6.1.1 Soak override: `leaf_lifetime_override_secs`
+
+```toml
+[testing]
+safety_class = "development"
+
+[security]
+leaf_lifetime_override_secs = 3600
+```
+
+**Why it exists.** A node leaf renews at six months, so a 24-hour soak would
+exercise node renewal zero times. Qualifying renewal under restarts, leader
+changes and power cuts needs dozens of renewals per node per day. The override
+shortens the node leaf and the cluster-issued ingress leaf to the given number
+of seconds; at 3600 a node renews roughly every 27 minutes (half of the
+3,900-second signed window, which includes the 300-second backdate).
+
+**Why development only.** A short leaf turns every leader outage longer than
+half the lifetime into a fleet-wide expiry, which then needs operator
+re-enrolment. That's the right trade in a soak and the wrong one anywhere else,
+so `NodeConfig::validate` refuses the key unless `[testing] safety_class` is
+`development` (an absent section is `unknown`, which is refused). The value
+must be between 600 seconds (`MIN_LEAF_LIFETIME_OVERRIDE`) and 90 days: it
+shortens both leaf classes, so it can't exceed the shorter default without
+lengthening ingress leaves. Workload identity and the CA lifetimes aren't
+affected. Bun refuses to start on a violation, naming the key.
+
+**Where it takes effect.** The lifetime is decided where the leaf is signed:
+
+| Leaf | Signed by | Whose value applies |
+|------|-----------|---------------------|
+| Node leaf, renewal | council leader (`POST /v1/cluster/renew`, `issue_renewal`) | the leader's |
+| Node leaf, join | the member handling the join (`handle_join_issue`) | that member's |
+| Node leaf, `relish init` | `relish` on the operator's machine | always one year |
+| Ingress leaf | each ingress node for itself (`IngressCertResolver`) | that node's |
+
+**When nodes disagree.** The issuer's value always sets the signed lifetime;
+operators should give every node the same value. The renewal worker also treats
+its own override as a ceiling (`NodeRenewalWorker::with_leaf_lifetime_ceiling`):
+it renews no later than the midpoint of a ceiling-length leaf (for 3600,
+1,650 seconds after issue), whatever the signed lifetime. That covers the two
+awkward cases:
+
+- A node that gains the override while holding a one-year leaf (including the
+  first node's `relish init` leaf) renews within half the override instead of
+  in six months, and gets a short leaf from a leader that also carries it.
+- A node with the override behind a leader without it gets a one-year leaf
+  back. It renews again half a ceiling later, not on the next one-second tick,
+  so a mismatch costs one extra renewal per half-override and never a loop.
+
+A node without the override behind a leader with it simply receives short
+leaves and renews at their midpoint as usual.
 
 ### 6.2 Node Authentication
 
@@ -1110,11 +1212,34 @@ secret_key = true    # generate a separate age keypair for this namespace (plann
 # an [egress] block.
 # Options: "deny" (default, recommended), "allow" (escape hatch for migration).
 default_egress = "deny"
-
-# Admin CIDR ranges allowed to access management ports.
-# These are added to the admin_cidrs nftables set.
-admin_cidrs = ["10.0.0.0/8", "192.168.1.0/24"]
 ```
+
+```toml
+[security]
+# Operator networks allowed through the perimeter to this node's API port
+# (`bun --listen`, default 9117) and to no other port. Implemented.
+operator_cidrs = ["10.0.0.0/8", "192.168.1.0/24", "2001:db8:1::/48"]
+```
+
+`operator_cidrs` sits in `[security]` beside `bootstrap_peers`, the other
+perimeter allowlist, and is node-local (it is not replicated through Raft or
+gossip). The two lists differ on purpose: a bootstrap peer is a future cluster
+member and may reach the API and the gossip, Raft and reporting ports; an
+operator network reaches the API port only, because no human client speaks the
+cluster protocols. The Pickle registry port is not in the perimeter's drop set
+(it relies on its own TLS and authentication), so the list does not mention it.
+
+Validation happens at config load (`NodeConfig::validate`), so Bun refuses to
+start rather than silently keeping the operator locked out. Entries are IPv4 or
+IPv6 CIDRs, or bare addresses (a single host). A `/0` in either family is
+refused with no override: opening the API to every address is never what the
+setting is for. A CIDR with host bits set (`192.168.0.17/24`) is refused with
+the intended network in the error. Only the parsed, re-serialised form reaches
+`nft -f`. The default is empty, which renders no operator rule at all, so the
+laptop quickstart (whose API forward arrives on the node's loopback) is
+unaffected. Token and mTLS authentication on the API are unchanged; this is a
+packet-filter setting only. The list is read at startup; changing it means
+restarting Bun.
 
 ```toml
 # Per-app egress allowlist.
@@ -1445,7 +1570,7 @@ Decrypted values are held in memory and injected as env vars. There is no per-re
 
 ### 10.3 Firewall Verification
 
-- **nftables perimeter test:** From outside the cluster, attempt to connect to management ports and app ports. Verify that connections are rejected unless originating from `admin_cidrs` or cluster nodes.
+- **nftables perimeter test:** From outside the cluster, attempt to connect to management ports and app ports. Verify that connections are rejected unless originating from cluster nodes, `bootstrap_peers`, or (API port only) `operator_cidrs`. Implemented for `operator_cidrs` as `operator_cidr_reaches_the_api_port_but_not_cluster_ports` in `tests/owned_network.rs`, which applies the real ruleset in a throwaway network namespace.
 - **eBPF firewall test:** Deploy two apps in the same namespace with `allow_from` restrictions. Verify that unauthorized apps receive `EPERM`. Verify that authorised apps connect successfully. Verify that apps in different namespaces cannot communicate without explicit cross-namespace rules.
 - **Egress allowlist test:** Deploy an app with an `egress` block. Verify that TCP and UDP connections to allowed IPv4/IPv6 destinations succeed and connections to disallowed destinations are dropped. Verify DNS resolution refresh by changing the DNS record and confirming the eBPF maps update.
 - **`relish firewall test` integration:** Verify that the `--from` / `--to` diagnostic command accurately reports whether a connection would be permitted.

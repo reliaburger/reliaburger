@@ -10,12 +10,23 @@ use futures_util::StreamExt;
 use rustls::pki_types::{CertificateDer, pem::PemObject};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-use crate::bun::agent::{
-    ApplyEvent, ApplyResult, ChaosState, CouncilStatus, InstanceStatus, NodeStatus,
-};
+use crate::bun::agent::{ApplyEvent, ApplyResult, CouncilStatus, InstanceStatus, NodeStatus};
 use crate::config::Config;
 
 use super::RelishError;
+
+/// One API token as `GET /v1/token/list` describes it; never the secret.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct TokenSummary {
+    /// Token name, as given to `relish token create`.
+    pub name: String,
+    /// Role the token grants.
+    pub role: String,
+    /// Creation time, Unix seconds.
+    pub created_at: u64,
+    /// Expiry, Unix seconds; `None` for a token that never expires.
+    pub expires_at: Option<u64>,
+}
 
 /// Client for the Bun agent HTTP API.
 #[derive(Clone)]
@@ -45,6 +56,16 @@ pub struct LogsExportOutcome {
     /// False when the files landed but the export checkpoint could not be
     /// persisted — a later export may re-ship the same files.
     pub checkpoint_saved: bool,
+}
+
+/// Print one event of a followed log stream: lines to stdout (after the
+/// client-side filters), warnings to stderr.
+fn print_followed_event(event: &crate::ketchup::sse::SseEvent, options: &LogOptions) {
+    if event.event.as_deref() == Some(crate::ketchup::sse::WARNING_EVENT) {
+        eprintln!("warning: {}", event.data);
+    } else if options.matches(&event.data) {
+        println!("{}", event.data);
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -102,6 +123,70 @@ impl LogOptions {
         true
     }
 }
+
+/// Render queried log entries as lines, oldest first.
+///
+/// When the lines come from more than one instance, each line starts with
+/// `[instance] `. During a rolling deploy or after a restart an old and a new
+/// instance both appear in a tail, and unlabelled their output reads as one
+/// app skipping values.
+fn render_log_entries(entries: &[crate::ketchup::types::LogEntry], options: &LogOptions) -> String {
+    let shown: Vec<&crate::ketchup::types::LogEntry> = entries
+        .iter()
+        .filter(|entry| options.matches(&entry.line))
+        .collect();
+    // A run is one instance on one node. An instance that moves keeps its
+    // name, and the view interleaves its two runs by two nodes' clocks, so
+    // the label names the node wherever the name alone would hide the move.
+    let runs: std::collections::BTreeSet<(Option<&str>, Option<&str>)> = shown
+        .iter()
+        .map(|entry| (entry.instance.as_deref(), entry.node.as_deref()))
+        .collect();
+    let label = runs.len() > 1;
+    let mut output = String::new();
+    for entry in shown {
+        if label {
+            output.push_str(&format!("[{}] ", run_label(entry, &runs)));
+        }
+        output.push_str(&entry.line);
+        output.push('\n');
+    }
+    output.pop();
+    output
+}
+
+/// `instance`, or `instance@node` when that instance name ran on more than
+/// one node in `runs`.
+fn run_label(
+    entry: &crate::ketchup::types::LogEntry,
+    runs: &std::collections::BTreeSet<(Option<&str>, Option<&str>)>,
+) -> String {
+    let instance = entry.instance.as_deref();
+    let name = instance.unwrap_or("-");
+    let moved = runs.iter().filter(|(other, _)| *other == instance).count() > 1;
+    match &entry.node {
+        Some(node) if moved => format!("{name}@{node}"),
+        _ => name.to_string(),
+    }
+}
+
+/// How long [`BunClient::release_test_lease`] waits for server-confirmed
+/// cleanup: the product's own bound for an owner to retire a released lease's
+/// resources, with the default runtime configuration.
+pub fn lease_release_budget() -> std::time::Duration {
+    crate::cluster::orchestrate::lease_retirement_bound(
+        crate::config::node::RuntimeSection::default().stop_confirmation_timeout(),
+    )
+}
+
+/// How long [`BunClient::clear_fault`] keeps asking while the owning node
+/// answers 504 because the leader has not yet released a node fault's
+/// reservation. The leader releases it once it sees the healed node alive,
+/// which takes a gossip round or two; each attempt already waits up to 4 s on
+/// the owning node (its agent's answer plus the release wait).
+pub const FAULT_CLEAR_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+/// Pause between those attempts.
+const FAULT_CLEAR_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Classify a reqwest send error as either a timeout or a connection failure.
 fn classify_error(e: reqwest::Error) -> RelishError {
@@ -411,6 +496,27 @@ impl BunClient {
         Ok(self.with_base_url(&endpoint))
     }
 
+    /// Address one node through this entry node's relay
+    /// (`/v1/nodes/{node}/relay/...`), with this client's credential.
+    ///
+    /// The entry node reaches its peers on the cluster network even when the
+    /// caller can't, as on a laptop behind Lima's user-mode network. The
+    /// relay forwards only the per-node reads `wtf` and `path` need, and the
+    /// target repeats every check against the caller's own credential.
+    pub fn via_node(&self, node_id: &str) -> Result<Self, RelishError> {
+        let valid = !node_id.is_empty()
+            && node_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte));
+        if !valid {
+            return Err(RelishError::ApiError {
+                status: 0,
+                body: format!("node name {node_id:?} can't be used in a relay path"),
+            });
+        }
+        Ok(self.with_base_url(&format!("{}/v1/nodes/{node_id}/relay", self.base_url)))
+    }
+
     /// Use another bearer credential with this connection's existing trust roots and forwards.
     pub fn with_token(&self, token: &str) -> Self {
         let mut client = Self::build(&self.base_url, Some(token), self.ca_pem.as_deref());
@@ -482,7 +588,19 @@ impl BunClient {
     /// precedence over the ordinary localhost default.
     pub fn default_local() -> Self {
         if let Some(endpoint) = resolve_endpoint() {
-            return Self::new(&endpoint);
+            let client = Self::new(&endpoint);
+            // An explicit endpoint picks the node; the managed context's host
+            // forwards still describe how this host reaches the cluster's
+            // registry and ingress, when it is the same cluster.
+            let forwards = super::local_context::default_path()
+                .and_then(|path| super::local_context::LocalContext::load(&path))
+                .ok()
+                .flatten()
+                .and_then(|context| context.forwards_for_ca(client.ca_pem.as_deref()));
+            return match forwards {
+                Some(forwards) => client.with_service_endpoints(forwards),
+                None => client,
+            };
         }
         let context = super::local_context::default_path()
             .and_then(|path| super::local_context::LocalContext::load(&path));
@@ -840,6 +958,20 @@ impl BunClient {
         Ok(report)
     }
 
+    /// The registry origin this managed connection declares (a quickstart
+    /// host forward such as `https://127.0.0.1:15050`), if any.
+    pub fn declared_registry(&self) -> Option<&str> {
+        self.service_endpoints.as_ref()?.registry.as_deref()
+    }
+
+    /// The node's own capability report, *without* substituting this
+    /// connection's declared forwards: the listeners as the node sees them.
+    pub async fn capabilities_as_reported(
+        &self,
+    ) -> Result<crate::bun::capabilities::ClusterCapabilities, RelishError> {
+        self.get_typed_json("/v1/capabilities").await
+    }
+
     /// Fetch an authenticated, bounded collection from current cluster peers.
     pub async fn cluster_capabilities(
         &self,
@@ -859,15 +991,15 @@ impl BunClient {
         .await
     }
 
-    /// Run the fixed server-side connectivity trace on the node hosting the
-    /// source workload.
-    pub async fn trace(
+    /// Run the fixed server-side path probe on the node hosting the source
+    /// workload.
+    pub async fn probe_path(
         &self,
         request: &crate::onion::trace::TraceRequest,
     ) -> Result<crate::onion::trace::TraceResult, RelishError> {
         let response = self
             .http()?
-            .post(format!("{}/v1/trace", self.base_url))
+            .post(format!("{}/v1/path", self.base_url))
             .json(request)
             .send()
             .await
@@ -1027,11 +1159,12 @@ impl BunClient {
         parse_typed_response(response).await
     }
 
-    /// Release a lease and wait up to 30 seconds for server-confirmed cleanup.
-    /// An accepted request keeps polling durable ownership until it disappears.
-    /// Transient leader unavailability retries within the same overall deadline.
+    /// Release a lease and wait up to [`lease_release_budget`] for
+    /// server-confirmed cleanup. An accepted request keeps polling durable
+    /// ownership until it disappears. Transient leader unavailability retries
+    /// within the same overall deadline.
     pub async fn release_test_lease(&self, lease_id: &str) -> Result<(), RelishError> {
-        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        tokio::time::timeout(lease_release_budget(), async {
             let url = format!("{}/v1/test/leases/{lease_id}", self.base_url);
             let response = loop {
                 let response = self
@@ -1089,6 +1222,32 @@ impl BunClient {
     ) -> Result<crate::mayo::rollup::MetricsQueryResult, RelishError> {
         self.get_typed_json(&format!("/v1/metrics/app/{app}/{namespace}"))
             .await
+    }
+
+    /// Fetch one app's metrics from `start` (unix seconds) on, optionally
+    /// one metric by name and only the newest `per_series` samples of each
+    /// series. The node answering fans out to every node running the app.
+    pub async fn app_metrics_since(
+        &self,
+        app: &str,
+        namespace: &str,
+        name: Option<&str>,
+        start: u64,
+        per_series: Option<u32>,
+    ) -> Result<crate::mayo::rollup::MetricsQueryResult, RelishError> {
+        let mut query = url::form_urlencoded::Serializer::new(String::new());
+        query.append_pair("start", &start.to_string());
+        if let Some(name) = name {
+            query.append_pair("name", name);
+        }
+        if let Some(per_series) = per_series {
+            query.append_pair("per_series", &per_series.to_string());
+        }
+        self.get_typed_json(&format!(
+            "/v1/metrics/app/{app}/{namespace}?{}",
+            query.finish()
+        ))
+        .await
     }
 
     async fn get_typed_json<T: serde::de::DeserializeOwned>(
@@ -1208,6 +1367,25 @@ impl BunClient {
         Ok(())
     }
 
+    /// Remove an app from the cluster (`POST /v1/delete/{app}/{namespace}`).
+    pub async fn delete(&self, app: &str, namespace: &str) -> Result<(), RelishError> {
+        let url = format!("{}/v1/delete/{}/{}", self.base_url, app, namespace);
+        let response = self
+            .http()?
+            .post(&url)
+            .send()
+            .await
+            .map_err(classify_error)?;
+
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(RelishError::ApiError { status, body });
+        }
+
+        Ok(())
+    }
+
     /// Snapshot an app's managed volumes; returns the created
     /// snapshots' metadata.
     pub async fn snapshot_create(
@@ -1258,12 +1436,14 @@ impl BunClient {
     }
 
     /// Restore a snapshot over its live volume. The app must be
-    /// stopped first; a 409 means it isn't.
+    /// stopped first; a 409 means it isn't, or that several volumes
+    /// share the name and `volume` must pick one.
     pub async fn snapshot_restore(
         &self,
         app: &str,
         namespace: &str,
         name: &str,
+        volume: Option<&str>,
     ) -> Result<(), RelishError> {
         let url = format!(
             "{}/v1/snapshots/{}/{}/restore",
@@ -1272,7 +1452,7 @@ impl BunClient {
         let response = self
             .http()?
             .post(&url)
-            .json(&serde_json::json!({ "name": name }))
+            .json(&serde_json::json!({ "name": name, "volume": volume }))
             .send()
             .await
             .map_err(classify_error)?;
@@ -1285,23 +1465,24 @@ impl BunClient {
         Ok(())
     }
 
-    /// Delete a snapshot.
+    /// Delete a snapshot. `volume` picks between volumes that share
+    /// the name.
     pub async fn snapshot_delete(
         &self,
         app: &str,
         namespace: &str,
         name: &str,
+        volume: Option<&str>,
     ) -> Result<(), RelishError> {
         let url = format!(
             "{}/v1/snapshots/{}/{}/{}",
             self.base_url, namespace, app, name
         );
-        let response = self
-            .http()?
-            .delete(&url)
-            .send()
-            .await
-            .map_err(classify_error)?;
+        let mut request = self.http()?.delete(&url);
+        if let Some(volume) = volume {
+            request = request.query(&[("volume", volume)]);
+        }
+        let response = request.send().await.map_err(classify_error)?;
 
         let status = response.status().as_u16();
         if !response.status().is_success() {
@@ -1323,8 +1504,8 @@ impl BunClient {
         options: &LogOptions,
     ) -> Result<String, RelishError> {
         if options.follow {
-            // Follow mode uses the SSE endpoint (local only). The SSE
-            // path does not filter server-side, so filters apply here.
+            // Follow mode uses the SSE endpoint, which fans out across the
+            // cluster but does not filter server-side, so filters apply here.
             return self.logs_follow(app, namespace, options).await;
         }
 
@@ -1340,34 +1521,22 @@ impl BunClient {
             .send()
             .await
             && response.status().is_success()
-            && let Ok(result) = response.json::<serde_json::Value>().await
+            && let Ok(result) = response
+                .json::<crate::ketchup::types::LogQueryResult>()
+                .await
         {
-            let mut output = String::new();
-            if let Some(entries) = result["entries"].as_array() {
-                for entry in entries {
-                    let line = entry["line"].as_str().unwrap_or("");
-                    // Filters also apply client-side: json_field has no
-                    // server-side equivalent, and grep re-checking is
-                    // harmless when the server already filtered.
-                    if options.matches(line) {
-                        output.push_str(line);
-                        output.push('\n');
-                    }
-                }
-            }
+            // Filters also apply client-side: json_field has no server-side
+            // equivalent, and grep re-checking is harmless when the server
+            // already filtered.
+            let output = render_log_entries(&result.entries, options);
 
             // Show warnings if any nodes were unreachable
-            if let Some(warnings) = result["warnings"].as_array() {
-                for w in warnings {
-                    if let Some(node_id) = w.get("NodeUnresponsive") {
-                        let id = node_id["node_id"].as_str().unwrap_or("unknown");
-                        eprintln!("warning: node {id} did not respond");
+            for warning in &result.warnings {
+                match warning {
+                    crate::ketchup::types::LogQueryWarning::NodeUnresponsive { node_id } => {
+                        eprintln!("warning: node {node_id} did not respond");
                     }
                 }
-            }
-
-            if output.ends_with('\n') {
-                output.pop();
             }
 
             // If we got entries, return them
@@ -1414,7 +1583,10 @@ impl BunClient {
         Ok(filtered.join("\n"))
     }
 
-    /// Follow logs via SSE stream (local node only).
+    /// Follow logs via the SSE stream. On a cluster the node follows every
+    /// node that runs the app and prefixes each line with `[node instance]`;
+    /// a node dropping out arrives as a warning on stderr and the stream
+    /// carries on.
     async fn logs_follow(
         &self,
         app: &str,
@@ -1440,34 +1612,15 @@ impl BunClient {
         }
 
         let mut stream = response.bytes_stream();
-        let mut buffer = Vec::new();
-
+        let mut decoder = crate::ketchup::sse::SseDecoder::default();
         while let Some(chunk) = stream.next().await {
             let bytes = chunk.map_err(classify_error)?;
-            buffer.extend_from_slice(&bytes);
-
-            while let Some(event_end) = buffer.windows(2).position(|pair| pair == b"\n\n") {
-                let event_text = String::from_utf8_lossy(&buffer[..event_end]).into_owned();
-                buffer.drain(..event_end + 2);
-
-                for line in event_text.lines() {
-                    if let Some(data) = line.strip_prefix("data:") {
-                        let data = data.trim();
-                        if options.matches(data) {
-                            println!("{data}");
-                        }
-                    }
-                }
+            for event in decoder.push(&bytes) {
+                print_followed_event(&event, options);
             }
         }
-
-        for line in String::from_utf8_lossy(&buffer).lines() {
-            if let Some(data) = line.strip_prefix("data:") {
-                let data = data.trim();
-                if options.matches(data) {
-                    println!("{data}");
-                }
-            }
+        if let Some(event) = decoder.finish() {
+            print_followed_event(&event, options);
         }
 
         Ok(String::new())
@@ -1582,88 +1735,6 @@ impl BunClient {
         Ok(council)
     }
 
-    /// Inject a network partition (chaos testing).
-    pub async fn inject_partition(
-        &self,
-        peers: &[String],
-        duration_secs: u64,
-        acknowledged: bool,
-    ) -> Result<crate::smoker::types::FaultSummary, RelishError> {
-        let url = format!("{}/v1/chaos/partition", self.base_url);
-        let response = self
-            .http()?
-            .post(&url)
-            .json(&serde_json::json!({
-                "peers": peers,
-                "duration_secs": duration_secs,
-                "acknowledged": acknowledged,
-            }))
-            .send()
-            .await
-            .map_err(classify_error)?;
-
-        let status = response.status().as_u16();
-        if !response.status().is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(RelishError::ApiError { status, body });
-        }
-
-        let json: serde_json::Value = response.json().await.map_err(|e| RelishError::ApiError {
-            status: 0,
-            body: format!("failed to parse response: {e}"),
-        })?;
-        serde_json::from_value(json["fault"].clone()).map_err(|error| RelishError::ApiError {
-            status: 0,
-            body: format!("partition response omitted its owned fault: {error}"),
-        })
-    }
-
-    /// Remove all network partitions (chaos testing).
-    pub async fn heal_partition(&self) -> Result<String, RelishError> {
-        let url = format!("{}/v1/chaos/heal", self.base_url);
-        let response = self
-            .http()?
-            .post(&url)
-            .send()
-            .await
-            .map_err(classify_error)?;
-
-        let status = response.status().as_u16();
-        if !response.status().is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(RelishError::ApiError { status, body });
-        }
-
-        let json: serde_json::Value = response.json().await.map_err(|e| RelishError::ApiError {
-            status: 0,
-            body: format!("failed to parse response: {e}"),
-        })?;
-        Ok(json["message"].as_str().unwrap_or("ok").to_string())
-    }
-
-    /// Query chaos status.
-    pub async fn chaos_status(&self) -> Result<ChaosState, RelishError> {
-        let url = format!("{}/v1/chaos/status", self.base_url);
-        let response = self
-            .http()?
-            .get(&url)
-            .send()
-            .await
-            .map_err(classify_error)?;
-
-        let status = response.status().as_u16();
-        if !response.status().is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(RelishError::ApiError { status, body });
-        }
-
-        let state: ChaosState = response.json().await.map_err(|e| RelishError::ApiError {
-            status: 0,
-            body: format!("failed to parse response: {e}"),
-        })?;
-        Ok(state)
-    }
-
     /// Inject a fault (Smoker API).
     pub async fn inject_fault(
         &self,
@@ -1690,8 +1761,46 @@ impl BunClient {
         })
     }
 
-    /// Clear a specific fault by ID.
+    /// Clear one fault by id, on `node` when given.
+    ///
+    /// Reversing a node fault is immediate, but the owning node then waits a
+    /// few seconds for the leader to release the fault's cluster reservation
+    /// and answers 504 "retry the clear" if it hasn't yet. A clear is
+    /// idempotent (the node keeps the reservation until it is released), so
+    /// this asks again for up to [`FAULT_CLEAR_RETRY_BUDGET`] before handing
+    /// the 504 back.
     pub async fn clear_fault(
+        &self,
+        id: u64,
+        node: Option<&str>,
+        acknowledged: bool,
+    ) -> Result<String, RelishError> {
+        self.clear_fault_within(id, node, acknowledged, FAULT_CLEAR_RETRY_BUDGET)
+            .await
+    }
+
+    /// [`Self::clear_fault`], retrying a 504 for at most `budget`.
+    pub(crate) async fn clear_fault_within(
+        &self,
+        id: u64,
+        node: Option<&str>,
+        acknowledged: bool,
+        budget: std::time::Duration,
+    ) -> Result<String, RelishError> {
+        let deadline = tokio::time::Instant::now() + budget;
+        loop {
+            match self.clear_fault_once(id, node, acknowledged).await {
+                Err(RelishError::ApiError { status: 504, .. })
+                    if tokio::time::Instant::now() + FAULT_CLEAR_RETRY_PAUSE < deadline =>
+                {
+                    tokio::time::sleep(FAULT_CLEAR_RETRY_PAUSE).await;
+                }
+                result => return result,
+            }
+        }
+    }
+
+    async fn clear_fault_once(
         &self,
         id: u64,
         node: Option<&str>,
@@ -1798,6 +1907,18 @@ impl BunClient {
             status: 0,
             body: format!("failed to parse response: {e}"),
         })
+    }
+
+    /// Every node's workloads with their latest CPU and memory samples.
+    pub async fn cluster_top(&self) -> Result<crate::bun::top::ClusterTop, RelishError> {
+        self.get_typed_json("/v1/top?cluster=true").await
+    }
+
+    /// List every node's active faults, each tagged with its node.
+    pub async fn list_cluster_faults(
+        &self,
+    ) -> Result<crate::bun::api::ClusterFaultList, RelishError> {
+        self.get_typed_json("/v1/fault?cluster=true").await
     }
 
     /// Resolve a service name to its VIP and backends.
@@ -1953,26 +2074,16 @@ impl BunClient {
         response.json().await.map_err(classify_error)
     }
 
-    /// List API tokens from SecurityState.
-    pub async fn token_list(&self) -> Result<serde_json::Value, RelishError> {
-        let url = format!("{}/v1/token/list", self.base_url);
-        let response = self
-            .http()?
-            .get(&url)
-            .send()
-            .await
-            .map_err(classify_error)?;
-
-        let status = response.status().as_u16();
-        if !response.status().is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(RelishError::ApiError { status, body });
+    /// List API tokens from SecurityState (names, roles and times only).
+    pub async fn token_list(&self) -> Result<Vec<TokenSummary>, RelishError> {
+        #[derive(serde::Deserialize)]
+        struct TokenList {
+            tokens: Vec<TokenSummary>,
         }
-
-        response.json().await.map_err(|e| RelishError::ApiError {
-            status: 0,
-            body: format!("failed to parse token list: {e}"),
-        })
+        Ok(self
+            .get_typed_json::<TokenList>("/v1/token/list")
+            .await?
+            .tokens)
     }
 
     /// Create an API token via the agent (persisted in Raft). Returns the
@@ -2130,13 +2241,16 @@ impl BunClient {
             .to_string())
     }
 
-    /// Sign an image manifest and attach the signature via Raft.
-    pub async fn sign_image(&self, image: &str) -> Result<String, RelishError> {
+    /// Submit a locally made image signature for the cluster to attach.
+    pub async fn sign_image(
+        &self,
+        submission: &crate::pickle::signing::SignatureSubmission,
+    ) -> Result<String, RelishError> {
         let url = format!("{}/v1/identity/sign", self.base_url);
         let response = self
             .http()?
             .post(&url)
-            .json(&serde_json::json!({ "digest": image }))
+            .json(submission)
             .send()
             .await
             .map_err(classify_error)?;
@@ -2230,13 +2344,15 @@ impl BunClient {
         self.get_json("/v1/upgrade/cluster").await
     }
 
-    /// Apply a node-level upgrade directive.
+    /// Apply a node-level upgrade directive. The response's `status` is
+    /// `upgrading`, or `already_running` when the node runs exactly this
+    /// binary already.
     pub async fn upgrade_apply(
         &self,
         directive: &crate::upgrade::types::UpgradeDirective,
-    ) -> Result<(), RelishError> {
+    ) -> Result<serde_json::Value, RelishError> {
         let body = serde_json::to_string(directive).map_err(RelishError::SerialiseJson)?;
-        self.post_json("/v1/upgrade/apply", body).await.map(|_| ())
+        self.post_json("/v1/upgrade/apply", body).await
     }
 
     /// Start a cluster-wide rolling upgrade (leader only).
@@ -2273,6 +2389,13 @@ impl BunClient {
         self.post_json("/v1/upgrade/resume", String::new())
             .await
             .map(|_| ())
+    }
+
+    /// End a paused cluster upgrade in which no node moved (leader only).
+    /// Returns the aborted run's id.
+    pub async fn upgrade_abort(&self) -> Result<String, RelishError> {
+        let response = self.post_json("/v1/upgrade/abort", String::new()).await?;
+        Ok(response["upgrade_id"].as_str().unwrap_or("?").to_string())
     }
 
     async fn get_json(&self, path: &str) -> Result<serde_json::Value, RelishError> {
@@ -2328,6 +2451,78 @@ mod tests {
         );
     }
 
+    /// Serve `DELETE /v1/fault/{id}` answering 504 "not yet released" to the
+    /// first `pending` calls, then 200. Returns the base URL and call count.
+    async fn serve_fault_clear(pending: usize) -> (String, Arc<Mutex<usize>>) {
+        use axum::{Router, http::StatusCode, routing::delete};
+        let calls = Arc::new(Mutex::new(0usize));
+        let seen = Arc::clone(&calls);
+        let app = Router::new().route(
+            "/v1/fault/{id}",
+            delete(move || {
+                let seen = Arc::clone(&seen);
+                async move {
+                    let call = {
+                        let mut calls = seen.lock().unwrap();
+                        *calls += 1;
+                        *calls
+                    };
+                    if call <= pending {
+                        (
+                            StatusCode::GATEWAY_TIMEOUT,
+                            axum::Json(serde_json::json!({
+                                "error": "fault 1 is reversed on this node, but the cluster has \
+                                          not yet released its reservation; retry the clear \
+                                          before injecting again"
+                            })),
+                        )
+                    } else {
+                        (
+                            StatusCode::OK,
+                            axum::Json(serde_json::json!({ "message": "cleared fault 1" })),
+                        )
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{address}"), calls)
+    }
+
+    /// The server reverses the fault, then answers 504 while the leader has
+    /// not yet released the node-fault reservation and asks for a retry. A
+    /// clear is idempotent, so the client asks again rather than failing.
+    #[tokio::test]
+    async fn fault_clear_retries_until_the_reservation_is_released() {
+        let (base, calls) = serve_fault_clear(2).await;
+        let client = BunClient::new_with_token(&base, None);
+        let message = client.clear_fault(1, Some("node-2"), false).await.unwrap();
+        assert_eq!(message, "cleared fault 1");
+        assert_eq!(*calls.lock().unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn fault_clear_gives_up_on_a_reservation_that_is_never_released() {
+        let (base, calls) = serve_fault_clear(usize::MAX).await;
+        let client = BunClient::new_with_token(&base, None);
+        let error = client
+            .clear_fault_within(
+                1,
+                Some("node-2"),
+                false,
+                std::time::Duration::from_millis(300),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, RelishError::ApiError { status: 504, body } if body.contains("retry the clear")),
+            "{error:?}"
+        );
+        assert!(*calls.lock().unwrap() >= 1);
+    }
+
     #[tokio::test]
     async fn malformed_bearer_is_an_error_instead_of_an_anonymous_request() {
         let client = BunClient::new_with_token("http://127.0.0.1:9", Some("bad\nheader"));
@@ -2374,6 +2569,126 @@ mod tests {
         for error in [applied, rolled_back] {
             assert!(matches!(error, RelishError::ApiError { body, .. } if body == message));
         }
+    }
+
+    /// Serve one canned `/v1/logs/query` answer and return what `relish logs`
+    /// prints for it.
+    async fn render_queried_logs(entries: Vec<crate::ketchup::types::LogEntry>) -> String {
+        use axum::{Json, Router, routing::get};
+        let result = crate::ketchup::types::LogQueryResult {
+            entries,
+            node_count: 1,
+            warnings: vec![],
+        };
+        let app = Router::new().route(
+            "/v1/logs/query/{app}/{namespace}",
+            get(move || {
+                let result = result.clone();
+                async move { Json(result) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = BunClient::new_with_token(&format!("http://{address}"), None);
+        let output = client
+            .logs("soak-redis-client", "default", &LogOptions::default())
+            .await
+            .unwrap();
+        server.abort();
+        output
+    }
+
+    fn queried(sequence: u64, instance: &str, line: &str) -> crate::ketchup::types::LogEntry {
+        crate::ketchup::types::LogEntry {
+            timestamp: sequence / 1_000_000_000,
+            sequence,
+            instance: Some(instance.to_string()),
+            node: None,
+            stream: crate::ketchup::types::LogStream::Stdout,
+            line: line.to_string(),
+        }
+    }
+
+    fn stored_on(
+        node: &str,
+        entry: crate::ketchup::types::LogEntry,
+    ) -> crate::ketchup::types::LogEntry {
+        crate::ketchup::types::LogEntry {
+            node: Some(node.to_string()),
+            ..entry
+        }
+    }
+
+    #[tokio::test]
+    async fn logs_from_one_instance_print_bare() {
+        let output = render_queried_logs(vec![
+            queried(1, "soak-redis-client-0", "INCR 1"),
+            queried(2, "soak-redis-client-0", "INCR 2"),
+        ])
+        .await;
+        assert_eq!(output, "INCR 1\nINCR 2");
+    }
+
+    /// V02 soak: during a rolling deploy two instances INCR the same counter,
+    /// and an unlabelled tail read as one client stepping by two.
+    #[tokio::test]
+    async fn logs_from_several_instances_name_each_line_s_instance() {
+        let output = render_queried_logs(vec![
+            queried(1, "soak-redis-client-0", "INCR 3550"),
+            queried(2, "soak-redis-client-1", "INCR 3551"),
+            queried(3, "soak-redis-client-0", "INCR 3552"),
+        ])
+        .await;
+        assert_eq!(
+            output,
+            "[soak-redis-client-0] INCR 3550\n\
+             [soak-redis-client-1] INCR 3551\n\
+             [soak-redis-client-0] INCR 3552"
+        );
+    }
+
+    /// V02 soak, 28 Sep 2026: an upgrade walk moved `soak-redis-client-0`
+    /// to another node under the same name. Both runs' lines looked like one
+    /// instance's, so ordering them by two nodes' clocks read as the client
+    /// going backwards. The same name on two nodes gets the node in its label.
+    #[tokio::test]
+    async fn one_instance_on_two_nodes_names_each_line_s_node() {
+        let output = render_queried_logs(vec![
+            stored_on("rb-2", queried(1, "soak-redis-client-0", "INCR 11630")),
+            stored_on("rb-3", queried(2, "soak-redis-client-0", "INCR 11632")),
+            stored_on("rb-2", queried(3, "soak-redis-client-0", "INCR 11631")),
+            stored_on("rb-3", queried(4, "soak-redis-client-0", "INCR 11633")),
+        ])
+        .await;
+        assert_eq!(
+            output,
+            "[soak-redis-client-0@rb-2] INCR 11630\n\
+             [soak-redis-client-0@rb-3] INCR 11632\n\
+             [soak-redis-client-0@rb-2] INCR 11631\n\
+             [soak-redis-client-0@rb-3] INCR 11633"
+        );
+    }
+
+    /// One instance on one node prints bare even though the cross-node query
+    /// names the node, and several instances keep their short labels.
+    #[tokio::test]
+    async fn the_node_stays_out_of_labels_it_does_not_disambiguate() {
+        let output = render_queried_logs(vec![
+            stored_on("rb-2", queried(1, "soak-redis-client-0", "INCR 1")),
+            stored_on("rb-2", queried(2, "soak-redis-client-0", "INCR 2")),
+        ])
+        .await;
+        assert_eq!(output, "INCR 1\nINCR 2");
+        let output = render_queried_logs(vec![
+            stored_on("rb-2", queried(1, "soak-redis-client-0", "INCR 3550")),
+            stored_on("rb-3", queried(2, "soak-redis-client-1", "INCR 3551")),
+        ])
+        .await;
+        assert_eq!(
+            output,
+            "[soak-redis-client-0] INCR 3550\n[soak-redis-client-1] INCR 3551"
+        );
     }
 
     #[tokio::test]
@@ -2710,13 +3025,75 @@ mod tests {
             .await
             .unwrap();
         tokio::time::pause();
-        tokio::time::advance(std::time::Duration::from_secs(31)).await;
+        tokio::time::advance(lease_release_budget() + std::time::Duration::from_secs(1)).await;
         let result = cleanup.await.unwrap();
         server.abort();
         let _ = server.await;
         assert!(
             matches!(result, Err(RelishError::RequestTimeout)),
             "{result:?}"
+        );
+    }
+
+    /// V02 soak: an owner that was still retiring 30 s after the release made
+    /// cleanup `unknown`, although the product allows a retirement longer
+    /// than that. The wait now lasts as long as the product's own bound.
+    #[tokio::test]
+    async fn lease_cleanup_keeps_waiting_while_owners_are_within_their_retirement_bound() {
+        use std::sync::Arc;
+        let polled = Arc::new(tokio::sync::Notify::new());
+        let handler_polled = polled.clone();
+        let router = axum::Router::new().route(
+            "/v1/test/leases/fixture",
+            axum::routing::any(move |method: axum::http::Method| {
+                let polled = handler_polled.clone();
+                async move {
+                    if method == axum::http::Method::DELETE {
+                        return axum::http::StatusCode::ACCEPTED;
+                    }
+                    polled.notify_one();
+                    axum::http::StatusCode::OK
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = BunClient::new_with_token(&format!("http://{address}"), None);
+        // Driven on this task rather than spawned, so the paused clock below
+        // advances only when this task has nothing else to do.
+        let cleanup = client.release_test_lease("fixture");
+        tokio::pin!(cleanup);
+        tokio::select! {
+            result = &mut cleanup => panic!("cleanup ended before its first poll: {result:?}"),
+            _ = polled.notified() => {}
+        }
+        // A paused clock jumps to the earliest pending timer whenever the
+        // runtime waits on I/O. Sleeping here makes 31 s that earliest timer,
+        // so the release's own deadline can only fire first if it's shorter.
+        tokio::time::pause();
+        tokio::select! {
+            result = &mut cleanup => panic!(
+                "gave up on an owner still inside the product's retirement bound: {result:?}"
+            ),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(31)) => {}
+        }
+        let result = cleanup.await;
+        server.abort();
+        let _ = server.await;
+        assert!(
+            matches!(result, Err(RelishError::RequestTimeout)),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn lease_release_budget_is_the_products_retirement_bound() {
+        let confirmation =
+            crate::config::node::RuntimeSection::default().stop_confirmation_timeout();
+        assert_eq!(
+            lease_release_budget(),
+            crate::cluster::orchestrate::lease_retirement_bound(confirmation)
         );
     }
 

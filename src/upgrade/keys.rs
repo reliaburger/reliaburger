@@ -15,7 +15,7 @@ use super::signing::{PublicKey, parse_public_key};
 /// The matching private keys live outside the repository (see the release
 /// process notes in docs/README.md). Verified by `embedded_keys_parse`.
 pub const EMBEDDED_RELEASE_KEYS: &[&str] =
-    &["ed25519:NCfgKCWG8/h7N57f3EEtle0NS/nJPr6QxBOtMnfvHDI="];
+    &["ed25519:zSUgsFfmv0WohbjRJE7FJf/xgLIgMuK7AbnDgOdduRM="];
 
 /// The release keys this binary trusts.
 ///

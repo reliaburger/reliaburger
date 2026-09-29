@@ -15,7 +15,7 @@ use reliaburger::bun::agent::BunAgent;
 use reliaburger::bun::api;
 use reliaburger::config::node::NodeConfig;
 use reliaburger::grill::port::PortAllocator;
-use reliaburger::grill::{AnyGrill, ProcessGrill, detect_runtime};
+use reliaburger::grill::{AnyGrill, DetectedRuntime, ProcessGrill, detect_runtime};
 use reliaburger::ketchup::log_store::LogStore;
 use reliaburger::mayo::alert::AlertEvaluator;
 use reliaburger::mayo::collector::SystemCollector;
@@ -44,10 +44,6 @@ struct Cli {
     #[arg(long, default_value = "auto")]
     runtime: String,
 
-    /// Standalone qualification of durable OCI ownership; not production activation.
-    #[arg(long, hide = true)]
-    experimental_owned_runc: bool,
-
     /// Join/form a cluster using the `[cluster]` config (gossip membership).
     /// Without this flag, bun runs as a single node, as before.
     /// Container clusters require rootful Linux Runc; rootless Runc is standalone only.
@@ -69,9 +65,9 @@ enum Command {
         directory: PathBuf,
         /// Exact generation selected before launching the helper.
         #[arg(long)]
-        generation: Option<String>,
+        generation: String,
         /// Reparent the durable owner before acknowledging the launcher.
-        #[arg(long, requires = "generation")]
+        #[arg(long)]
         detach: bool,
     },
     /// Internal workload activation gate; never executes before durable ownership.
@@ -318,65 +314,6 @@ fn load_node_identity(
         .transpose()
 }
 
-/// Serve an axum router over TLS, handshaking each connection in its own task
-/// (a slow handshaker never blocks the accept loop). Mirrors the wrapper's
-/// ingress TLS loop; runs until `shutdown` is cancelled.
-async fn serve_api_over_tls(
-    listener: tokio::net::TcpListener,
-    acceptor: tokio_rustls::TlsAcceptor,
-    router: axum::Router,
-    shutdown: tokio_util::sync::CancellationToken,
-) {
-    use tower::Service;
-    let mut make_service = router.into_make_service();
-    loop {
-        tokio::select! {
-            _ = shutdown.cancelled() => return,
-            accepted = listener.accept() => {
-                let Ok((tcp, _peer)) = accepted else { continue };
-                let acceptor = acceptor.clone();
-                let connection_shutdown = shutdown.clone();
-                let service = match make_service.call(()).await {
-                    Ok(service) => service,
-                    Err(infallible) => match infallible {},
-                };
-                tokio::spawn(async move {
-                    use reliaburger::sesame::connection::{
-                        LifetimeLimitedIo, MAX_TLS_CONNECTION_LIFETIME, TLS_CONNECTION_DRAIN_GRACE,
-                    };
-                    let Ok(Ok(tls)) = tokio::time::timeout(
-                        std::time::Duration::from_secs(10), acceptor.accept(tcp),
-                    ).await else { return };
-                    let service = match tls.get_ref().1.peer_certificates()
-                        .and_then(|certificates| certificates.first()) {
-                        Some(certificate) => service.layer(axum::Extension(
-                            reliaburger::sesame::renewal::TlsPeerCertificate(certificate.clone()),
-                        )),
-                        None => service,
-                    };
-                    let tls = LifetimeLimitedIo::new(tls, MAX_TLS_CONNECTION_LIFETIME);
-                    let hyper_service = hyper_util::service::TowerToHyperService::new(service);
-                    let builder = hyper_util::server::conn::auto::Builder::new(
-                        hyper_util::rt::TokioExecutor::new(),
-                    );
-                    let connection = builder.serve_connection_with_upgrades(
-                        hyper_util::rt::TokioIo::new(tls), hyper_service,
-                    );
-                    tokio::pin!(connection);
-                    let drain_after = MAX_TLS_CONNECTION_LIFETIME.saturating_sub(TLS_CONNECTION_DRAIN_GRACE);
-                    tokio::select! {
-                        _ = &mut connection => return,
-                        _ = connection_shutdown.cancelled() => {},
-                        _ = tokio::time::sleep(drain_after) => {},
-                    }
-                    connection.as_mut().graceful_shutdown();
-                    let _ = tokio::time::timeout(TLS_CONNECTION_DRAIN_GRACE, connection).await;
-                });
-            }
-        }
-    }
-}
-
 /// Enforce the `require_mtls` mode matrix before the cluster starts.
 ///
 /// With `require_mtls` set and no identity on disk, the node cannot speak the
@@ -436,15 +373,15 @@ fn enforce_cluster_transport_security(
 /// Schedulable node capacity: system totals minus the `[resources]`
 /// reservation. Read once at startup.
 fn node_capacity(config: &NodeConfig) -> (u32, u32) {
-    use reliaburger::config::types::parse_resource_value;
+    use reliaburger::config::types::{parse_byte_size, parse_cpu_millicores};
 
     let system = sysinfo::System::new_all();
     let total_cpu_millicores = (system.cpus().len() as u64) * 1000;
     let total_memory_mb = system.total_memory() / (1024 * 1024);
 
-    let reserved_cpu = parse_resource_value(&config.resources.reserved_cpu).unwrap_or(0);
+    let reserved_cpu = parse_cpu_millicores(&config.resources.reserved_cpu).unwrap_or(0);
     let reserved_memory_mb =
-        parse_resource_value(&config.resources.reserved_memory).unwrap_or(0) / (1024 * 1024);
+        parse_byte_size(&config.resources.reserved_memory).unwrap_or(0) / (1024 * 1024);
 
     (
         total_cpu_millicores.saturating_sub(reserved_cpu) as u32,
@@ -479,7 +416,10 @@ async fn reserve_api_socket(listen: &str) -> anyhow::Result<tokio::net::TcpSocke
         } else {
             tokio::net::TcpSocket::new_v6()?
         };
-        socket.set_reuseaddr(true)?;
+        // Reuse lets a restart rebind a fixed port past TIME_WAIT. With port
+        // zero it also lets Linux pick an ephemeral port another reuse socket
+        // holds, and the later listen() fails with EADDRINUSE.
+        socket.set_reuseaddr(address.port() != 0)?;
         match socket.bind(address) {
             Ok(()) => return Ok(socket),
             Err(error) => last_error = error,
@@ -541,9 +481,14 @@ fn refuse_open_non_loopback_bind(listen: &str) -> anyhow::Result<()> {
 /// Ingress CA or the wrapping IKM is unavailable, or reconstruction fails. A
 /// warning is logged so the operator knows `tls = "cluster"` routes are not
 /// yet cluster-signed.
+///
+/// `lifetime` is this node's ingress leaf lifetime: 90 days unless
+/// `[security] leaf_lifetime_override_secs` shortens it. Each node mints its
+/// own ingress leaves, so its own config decides.
 async fn build_ingress_cert_resolver(
     council: &std::sync::Arc<reliaburger::council::CouncilNode>,
     routing_table: std::sync::Arc<tokio::sync::RwLock<reliaburger::wrapper::routing::RoutingTable>>,
+    lifetime: std::time::Duration,
 ) -> Option<std::sync::Arc<dyn rustls::server::ResolvesServerCert>> {
     use reliaburger::sesame::types::CaRole;
 
@@ -562,7 +507,6 @@ async fn build_ingress_cert_resolver(
     };
     let (default_cert, default_key) =
         reliaburger::wrapper::tls::generate_self_signed_cert().ok()?;
-    let lifetime = std::time::Duration::from_secs(90 * 24 * 3600);
     match reliaburger::wrapper::tls::IngressCertResolver::new(
         keypair,
         params,
@@ -620,19 +564,13 @@ fn main() -> anyhow::Result<()> {
             detach,
         }) => {
             if *detach {
-                let generation = generation
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("detached owner requires a generation"))?;
                 return reliaburger::grill::process_owner::launch_detached_owner(
                     directory, generation,
                 )
                 .map_err(Into::into);
             }
-            return reliaburger::grill::process_owner::run_owner_generation(
-                directory,
-                generation.as_deref(),
-            )
-            .map_err(Into::into);
+            return reliaburger::grill::process_owner::run_owner_generation(directory, generation)
+                .map_err(Into::into);
         }
         Some(Command::ProcessExecutionGate { directory }) => {
             return reliaburger::grill::process_owner::run_execution_gate(directory)
@@ -919,7 +857,13 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     }
 
     // Select runtime
-    let runtime = select_runtime(&cli.runtime, &instances_dir, &pickle_dir).await?;
+    let runtime = select_runtime(
+        &cli.runtime,
+        &instances_dir,
+        &pickle_dir,
+        &config.images.mirrors,
+    )
+    .await?;
     #[cfg(target_os = "linux")]
     let (durable_discovery, durable_kernel) = match &runtime {
         AnyGrill::Runc(runtime) if runtime.is_rootless() => {
@@ -944,20 +888,6 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             "durable ownership requires its original runtime and enforcement mode; refusing a mode change"
         );
     }
-    let runtime = if cli.experimental_owned_runc || durable_discovery {
-        if cli.experimental_owned_runc && cli.cluster && !durable_discovery {
-            anyhow::bail!("owned Runc qualification requires a supported durable cluster profile");
-        }
-        match runtime {
-            #[cfg(target_os = "linux")]
-            AnyGrill::Runc(runtime) => {
-                AnyGrill::Runc(runtime.with_owner(std::env::current_exe()?)?)
-            }
-            _ => anyhow::bail!("owned Runc qualification requires the Linux runc runtime"),
-        }
-    } else {
-        runtime
-    };
     // DNS is a workload capability, not a best-effort side task. Select the
     // runtime first so we can derive its reachable resolver address, then bind
     // both sockets before starting the agent, reporting readiness or adopting
@@ -1056,6 +986,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     let mut registry_cluster_advertise = None;
     // Peer API addresses for cross-node fan-out and apply forwarding.
     let mut api_membership: Option<Arc<RwLock<Vec<api::NodeMembershipInfo>>>> = None;
+    let mut api_known_members: Option<api::KnownMembers> = None;
     // Handles the orchestration tasks need, captured before the
     // ClusterHandle moves into the agent (spawned further down, once
     // the service token exists).
@@ -1186,8 +1117,11 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         ],
         api_port,
         config.security.bootstrap_peers.clone(),
+        config.security.operator_cidrs.clone(),
     );
     agent.set_smoker_config(config.smoker.to_smoker_config());
+    agent.set_node_leaf_lifetime(config.security.node_leaf_lifetime());
+    agent.set_stop_confirmation_timeout(config.runtime.stop_confirmation_timeout());
     let node_pressure_available = agent.configure_node_pressure(
         reliaburger::smoker::node_pressure::NodePressureLimits {
             max_cpu_percentage: config.testing.max_node_pressure_cpu_percent,
@@ -1383,6 +1317,8 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         let membership_table: Arc<RwLock<Vec<api::NodeMembershipInfo>>> =
             Arc::new(RwLock::new(Vec::new()));
         api_membership = Some(Arc::clone(&membership_table));
+        let known_members = api::KnownMembers(Arc::new(RwLock::new(Vec::new())));
+        api_known_members = Some(known_members.clone());
         let mut refresher_rx = membership_rx;
         // Each node advertises its real API endpoint over gossip (the
         // directory, 12b.2). Prefer that authoritative `api_address`: a
@@ -1394,23 +1330,40 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         let refresher_shutdown = shutdown.clone();
         tokio::spawn(async move {
             loop {
-                let snapshot: Vec<api::NodeMembershipInfo> = {
+                use reliaburger::mustard::state::NodeState;
+                let (snapshot, known): (Vec<_>, Vec<_>) = {
                     let directory = refresher_directory_rx.borrow();
                     refresher_rx
                         .borrow()
                         .iter()
-                        .filter(|m| m.state == reliaburger::mustard::state::NodeState::Alive)
-                        .map(|m| api::NodeMembershipInfo {
-                            node_id: m.node_id.clone(),
-                            address: directory.api_address(
-                                &m.node_id,
-                                m.address,
-                                gossip_to_api_offset,
-                            ),
+                        .filter(|m| m.state != NodeState::Left)
+                        .map(|m| {
+                            let info = api::NodeMembershipInfo {
+                                node_id: m.node_id.clone(),
+                                address: directory.api_address(
+                                    &m.node_id,
+                                    m.address,
+                                    gossip_to_api_offset,
+                                ),
+                                api_advertised: directory.endpoints.contains_key(&m.node_id),
+                            };
+                            (m.state == NodeState::Alive, info)
                         })
-                        .collect()
+                        .partition(|(alive, _)| *alive)
                 };
+                // Live members for fan-out; every known member for the relay
+                // and fault reversal, which must reach a node-killed peer.
+                // Gossip stops publishing a member once it is dead, so the
+                // known table remembers members that drop out of this view.
+                let snapshot: Vec<api::NodeMembershipInfo> =
+                    snapshot.into_iter().map(|(_, info)| info).collect();
+                let known: Vec<api::NodeMembershipInfo> = snapshot
+                    .iter()
+                    .cloned()
+                    .chain(known.into_iter().map(|(_, info)| info))
+                    .collect();
                 *membership_table.write().await = snapshot;
+                known_members.refresh(known).await;
                 tokio::select! {
                     _ = refresher_shutdown.cancelled() => break,
                     changed = refresher_rx.changed() => {
@@ -1428,6 +1381,14 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         });
 
         if let Some(metrics_rx) = metrics_rx {
+            agent.set_workload_csr_client(
+                reliaburger::cluster::workload_identity::WorkloadCsrClient::new(
+                    cluster_http.clone().with_bearer(service_token.clone()),
+                    metrics_rx.clone(),
+                    directory_rx.clone(),
+                    api_port as i32 - config.cluster.raft_port as i32,
+                ),
+            );
             agent.set_producer_release_client(
                 reliaburger::cluster::producer::ProducerReleaseClient::new(
                     cluster_http.clone().with_bearer(service_token.clone()),
@@ -1446,6 +1407,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                 shutdown.clone(),
                 cluster_http.clone(),
                 Some(data_base.clone()),
+                config.runtime.stop_confirmation_timeout(),
             );
         }
     }
@@ -1635,7 +1597,14 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         // wrapping IKM to unwrap the Ingress CA key). A disk cert still wins.
         let ingress_resolver: Option<std::sync::Arc<dyn rustls::server::ResolvesServerCert>> =
             match &api_council {
-                Some(council) => build_ingress_cert_resolver(council, routing_table.clone()).await,
+                Some(council) => {
+                    build_ingress_cert_resolver(
+                        council,
+                        routing_table.clone(),
+                        config.security.ingress_leaf_lifetime(),
+                    )
+                    .await
+                }
                 None => None,
             };
         ingress_cluster_tls_ready = ingress_resolver.is_some();
@@ -1644,6 +1613,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             routing_table,
             Some(drains),
             ingress_resolver,
+            Some(agent.view_lease_handle()),
             ingress_shutdown,
         )
         .await
@@ -1718,15 +1688,13 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // explicitly just before flushing.
     let mut feeder_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
-    // Drain container log lines from the agent into the LogStore.
+    // Drain container log lines from the agent into the LogStore. The store
+    // skips lines it already holds, which a forwarder re-reads after a restart.
     {
         let drain_store = Arc::clone(&log_store);
         feeder_handles.push(tokio::spawn(async move {
             while let Some(rec) = log_rx.recv().await {
-                drain_store
-                    .write()
-                    .await
-                    .append(&rec.app, &rec.namespace, rec.stream, &rec.line);
+                drain_store.write().await.ingest(&rec);
             }
         }));
     }
@@ -1739,6 +1707,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     let collection_interval = config.metrics.collection_interval_secs.max(1);
     let collection_shutdown = shutdown.clone();
     let collection_cmd_tx = cmd_tx.clone();
+    let collection_node = node_name.clone();
     feeder_handles.push(tokio::spawn(async move {
         let mut collector = SystemCollector::new();
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(collection_interval));
@@ -1755,20 +1724,13 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                     // with a PID, labelled `namespace/app`. Without this only
                     // node-level metrics existed, so the autoscaler and the
                     // per-app dashboards had no signal. The labelling itself
-                    // lives in `collect_instance_metrics` so it's unit-tested.
-                    let (status_tx, status_rx) = tokio::sync::oneshot::channel();
-                    if collection_cmd_tx
-                        .send(reliaburger::bun::agent::AgentCommand::Status { response: status_tx })
-                        .await
-                        .is_ok()
-                        && let Ok(statuses) = status_rx.await
-                    {
-                        let instances: Vec<(Option<u32>, &str, &str)> = statuses
-                            .iter()
-                            .map(|s| (s.pid, s.namespace.as_str(), s.app_name.as_str()))
-                            .collect();
-                        samples.extend(collector.collect_instance_metrics(&instances));
-                    }
+                    // lives in `collect_instance_metrics` so it's unit-tested,
+                    // and the cluster tests drive this same call.
+                    samples.extend(
+                        collector
+                            .collect_agent_instance_metrics(&collection_cmd_tx, &collection_node)
+                            .await,
+                    );
 
                     // Ingress metrics (E): fold the wrapper's process-global
                     // request counters into the same time series.
@@ -1786,6 +1748,16 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                         samples.push(reliaburger::mayo::collector::CollectedMetric {
                             key: reliaburger::mayo::types::MetricKey::simple(name),
                             value: value as f64,
+                        });
+                    }
+
+                    // The leader's withdrawal ledger (zero on followers).
+                    for (name, value) in
+                        reliaburger::cluster::orchestrate::withdrawal_ledger_gauge().samples()
+                    {
+                        samples.push(reliaburger::mayo::collector::CollectedMetric {
+                            key: reliaburger::mayo::types::MetricKey::simple(name),
+                            value,
                         });
                     }
 
@@ -1810,6 +1782,59 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             }
         }
     }));
+
+    // Scrape this node's own instances of apps that declare `metrics` (Z6.5).
+    // The loop asks the agent for targets over the command channel and does
+    // the HTTP work itself, so a slow or hung app never stalls the agent.
+    // Each request is bounded by half the interval (at most 5 s), so a sweep
+    // finishes before the next one is due.
+    {
+        let scrape_mayo = Arc::clone(&mayo_store);
+        let interval =
+            std::time::Duration::from_secs(config.metrics.app_scrape_interval_secs.max(1));
+        let timeout = (interval / 2).clamp(
+            std::time::Duration::from_millis(500),
+            std::time::Duration::from_secs(5),
+        );
+        let scrape_shutdown = shutdown.clone();
+        let scrape_cmd_tx = cmd_tx.clone();
+        let scrape_node = node_name.clone();
+        feeder_handles.push(tokio::spawn(async move {
+            let client = reqwest::Client::builder()
+                .timeout(timeout)
+                .build()
+                .unwrap_or_default();
+            let mut tick = tokio::time::interval(interval);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = scrape_shutdown.cancelled() => break,
+                    _ = tick.tick() => {
+                        let (response, targets) = tokio::sync::oneshot::channel();
+                        if scrape_cmd_tx
+                            .send(reliaburger::bun::agent::AgentCommand::ScrapeTargets { response })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        let Ok(targets) = targets.await else { continue };
+                        if targets.is_empty() {
+                            continue;
+                        }
+                        reliaburger::mayo::scrape::scrape_app_targets(
+                            &scrape_mayo,
+                            &client,
+                            &targets,
+                            &scrape_node,
+                            timeout,
+                        )
+                        .await;
+                    }
+                }
+            }
+        }));
+    }
 
     // Spawn Prometheus scrape task (E). Only when targets are configured —
     // an empty list means scraping is disabled and no loop is spawned.
@@ -1953,6 +1978,10 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                             Ok(result) if result.files_exported > 0 => {
                                 println!("bun: exported {} log file(s) to {}", result.files_exported, export_dest);
                             }
+                            // Disk-pressure relief (or a manual export) holds the
+                            // checkpoint and is shipping these same files; the
+                            // next tick picks up anything it missed.
+                            Err(reliaburger::ketchup::types::KetchupError::ExportBusy) => {}
                             Err(e) => eprintln!("bun: log export error: {e}"),
                             _ => {}
                         }
@@ -2151,11 +2180,6 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     let mut gitops_webhook_validator = None;
     let gitops_webhook_tx =
         if let (Some(gitops), Some(council)) = (config.gitops.clone(), api_council.clone()) {
-            // O20: surface settings that parse but aren't honoured, rather
-            // than letting the operator believe they took effect.
-            for warning in gitops.warnings() {
-                eprintln!("bun: WARNING: {warning}");
-            }
             let (webhook_tx, webhook_rx) = mpsc::channel::<()>(16);
             if let Some(secret) = gitops.webhook_secret.as_deref() {
                 gitops_webhook_validator = Some(std::sync::Arc::new(tokio::sync::Mutex::new(
@@ -2318,6 +2342,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         },
         node_pressure: node_pressure_available,
         registry_signatures_required: config.images.trust_policy.require_signatures,
+        image_mirrors: config.images.mirrors.clone(),
         diagnostics: reliaburger::bun::diagnostics::DiagnosticStaticEvidence {
             storage_paths: diagnostic_storage_paths,
             node_certificate: None,
@@ -2341,6 +2366,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         None => None,
     };
 
+    let leader_directory = registry_directory.clone().map(api::LeaderDirectory);
     let registry_forwarder = if let Some(directory) = registry_directory {
         let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
         if let Some(identity) = &api_identity {
@@ -2414,10 +2440,22 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         Some(admission) => app.layer(axum::Extension(admission)),
         None => app,
     };
+    let app = match api_known_members {
+        Some(known) => app.layer(axum::Extension(known)),
+        None => app,
+    };
+    let app = match leader_directory {
+        Some(directory) => app.layer(axum::Extension(directory)),
+        None => app,
+    };
     let app = match &api_identity {
         Some(identity) => app.layer(axum::Extension(identity.clone())),
         None => app,
     };
+    // The leader signs renewals with its own configured lifetime.
+    let app = app.layer(axum::Extension(
+        reliaburger::sesame::renewal::NodeLeafLifetime(config.security.node_leaf_lifetime()),
+    ));
     let app = match (
         &api_identity,
         &api_council,
@@ -2431,6 +2469,12 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                 token,
             )
             .map_err(|error| anyhow::anyhow!("failed to prepare node renewal: {error}"))?;
+            let worker = match config.security.leaf_lifetime_override_secs {
+                Some(seconds) => {
+                    worker.with_leaf_lifetime_ceiling(std::time::Duration::from_secs(seconds))
+                }
+                None => worker,
+            };
             let mut local_api = listener.local_addr()?;
             if local_api.ip().is_unspecified() {
                 local_api.set_ip(if local_api.is_ipv6() {
@@ -2480,17 +2524,26 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         move |ready| async move {
             ready.ready();
 
+            let timeouts = reliaburger::sesame::connection::ConnectionTimeouts::PRODUCTION;
             match api_acceptor {
                 Some(acceptor) => {
-                    serve_api_over_tls(listener, acceptor, app, server_shutdown).await
+                    reliaburger::sesame::connection::serve_router_over_tls(
+                        listener,
+                        acceptor,
+                        app,
+                        timeouts,
+                        server_shutdown,
+                    )
+                    .await
                 }
                 None => {
-                    axum::serve(listener, app)
-                        .with_graceful_shutdown(async move {
-                            server_shutdown.cancelled().await;
-                        })
-                        .await
-                        .ok();
+                    reliaburger::sesame::connection::serve_router_plain(
+                        listener,
+                        app,
+                        timeouts,
+                        server_shutdown,
+                    )
+                    .await
                 }
             }
         },
@@ -2566,7 +2619,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // and leave per-repository unlimited unless configured.
     let registry_quota = reliaburger::pickle::registry_auth::QuotaConfig {
         per_repository_bytes: 0,
-        total_bytes: reliaburger::config::types::parse_resource_value(&config.images.max_storage)
+        total_bytes: reliaburger::config::types::parse_byte_size(&config.images.max_storage)
             .unwrap_or(0),
     };
     let upload_sessions = reliaburger::pickle::registry_auth::UploadSessions::new(
@@ -2633,7 +2686,8 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                 concurrency: config.images.p2p_concurrency,
                 client: registry_client.clone(),
                 upstream: Some(std::sync::Arc::new(
-                    reliaburger::pickle::upstream::OciUpstream::new(credentials),
+                    reliaburger::pickle::upstream::OciUpstream::new(credentials)
+                        .with_mirrors(config.images.mirrors.clone()),
                 )),
                 pull_through: config.images.pull_through,
                 cache_recheck_secs: config.images.cache_recheck_secs,
@@ -2787,17 +2841,26 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         move |ready| async move {
             ready.ready();
 
+            let timeouts = reliaburger::sesame::connection::ConnectionTimeouts::PRODUCTION;
             match pickle_acceptor {
                 Some(acceptor) => {
-                    serve_api_over_tls(pickle_listener, acceptor, pickle_app, pickle_shutdown).await
+                    reliaburger::sesame::connection::serve_router_over_tls(
+                        pickle_listener,
+                        acceptor,
+                        pickle_app,
+                        timeouts,
+                        pickle_shutdown,
+                    )
+                    .await
                 }
                 None => {
-                    axum::serve(pickle_listener, pickle_app)
-                        .with_graceful_shutdown(async move {
-                            pickle_shutdown.cancelled().await;
-                        })
-                        .await
-                        .ok();
+                    reliaburger::sesame::connection::serve_router_plain(
+                        pickle_listener,
+                        pickle_app,
+                        timeouts,
+                        pickle_shutdown,
+                    )
+                    .await
                 }
             }
         },
@@ -3008,27 +3071,26 @@ async fn select_runtime(
     name: &str,
     instances_dir: &std::path::Path,
     image_directory: &std::path::Path,
+    mirrors: &reliaburger::grill::ImageMirrors,
 ) -> anyhow::Result<AnyGrill> {
     #[cfg(not(target_os = "linux"))]
-    let _ = image_directory;
+    let _ = (image_directory, mirrors);
     match name {
         "auto" => {
-            let runtime = detect_runtime().await;
-            // The process fallback uses durable owners so launches remain
+            // Both runtimes use durable owners, so launches remain
             // discoverable even before agent adoption is recorded.
-            let runtime = match runtime {
-                AnyGrill::Process(_) => AnyGrill::Process(ProcessGrill::with_owner(
+            let runtime = match detect_runtime().await {
+                DetectedRuntime::Process => AnyGrill::Process(ProcessGrill::with_owner(
                     instances_dir.to_path_buf(),
                     std::env::current_exe()?,
                 )),
                 #[cfg(target_os = "linux")]
-                AnyGrill::Runc(detected) => AnyGrill::Runc(create_runc_runtime(
+                DetectedRuntime::Runc { rootless } => AnyGrill::Runc(create_runc_runtime(
                     instances_dir,
                     image_directory,
-                    detected.is_rootless(),
-                )),
-                #[cfg(target_os = "macos")]
-                AnyGrill::Apple(_) => anyhow::bail!(APPLE_RUNTIME_DEFERRED),
+                    rootless,
+                    mirrors,
+                )?),
             };
             let kind = match &runtime {
                 AnyGrill::Process(_) => "process",
@@ -3053,7 +3115,7 @@ async fn select_runtime(
             let mode = if is_rootless { "rootless" } else { "root" };
             println!("bun: using runc runtime ({mode})");
 
-            let grill = create_runc_runtime(instances_dir, image_directory, is_rootless);
+            let grill = create_runc_runtime(instances_dir, image_directory, is_rootless, mirrors)?;
             Ok(AnyGrill::Runc(grill))
         }
         "apple" => anyhow::bail!(APPLE_RUNTIME_DEFERRED),
@@ -3066,16 +3128,19 @@ fn create_runc_runtime(
     instances_dir: &std::path::Path,
     image_directory: &std::path::Path,
     rootless: bool,
-) -> reliaburger::grill::runc::RuncGrill {
+    mirrors: &reliaburger::grill::ImageMirrors,
+) -> anyhow::Result<reliaburger::grill::runc::RuncGrill> {
     // Runtime ownership must follow the node's actual storage directories,
     // including configured paths and explicit storage fallback selection.
     let runtime_directory = instances_dir.join("runc");
-    reliaburger::grill::runc::RuncGrill::new(
+    Ok(reliaburger::grill::runc::RuncGrill::new(
         runtime_directory.join("bundles"),
-        reliaburger::grill::ImageStore::new(image_directory.to_path_buf()),
+        reliaburger::grill::ImageStore::new(image_directory.to_path_buf())
+            .with_mirrors(mirrors.clone()),
         rootless,
         runtime_directory.join("state"),
-    )
+        std::env::current_exe()?,
+    )?)
 }
 
 async fn runtime_version(runtime: &str) -> Option<String> {
@@ -3246,9 +3311,30 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[tokio::test]
+    async fn ephemeral_api_port_is_reserved_without_address_reuse() {
+        let socket = reserve_api_socket("127.0.0.1:0").await.unwrap();
+        assert!(!socket.reuseaddr().unwrap());
+        assert_ne!(socket.local_addr().unwrap().port(), 0);
+        socket.listen(1).unwrap();
+    }
+
+    #[tokio::test]
+    async fn fixed_api_port_is_reserved_with_address_reuse_for_restarts() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let socket = reserve_api_socket(&format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
+        assert!(socket.reuseaddr().unwrap());
+    }
+
+    #[tokio::test]
     async fn apple_selection_explains_the_linux_vm_release_profile() {
         let root = tempfile::tempdir().unwrap();
-        let error = select_runtime("apple", root.path(), root.path())
+        let error = select_runtime("apple", root.path(), root.path(), &Default::default())
             .await
             .err()
             .expect("direct Apple Container must be unavailable for 0.1.0");
@@ -3266,6 +3352,7 @@ mod tests {
             "runc",
             &root.path().join("instances"),
             &root.path().join("custom-images"),
+            &Default::default(),
         )
         .await
         .unwrap();
@@ -3289,8 +3376,13 @@ mod tests {
         let mut paths = Vec::new();
         for node in ["first", "second"] {
             let instances = root.path().join(node).join("instances");
-            let runtime =
-                create_runc_runtime(&instances, &root.path().join(node).join("images"), true);
+            let runtime = create_runc_runtime(
+                &instances,
+                &root.path().join(node).join("images"),
+                true,
+                &Default::default(),
+            )
+            .unwrap();
             let spec: reliaburger::grill::oci::OciSpec = serde_json::from_value(serde_json::json!({
                 "root": {"path": "/", "readonly": true},
                 "process": {"args": [node], "env": [], "cwd": "/", "user": {"uid": 0, "gid": 0}},
@@ -3379,7 +3471,9 @@ mod tests {
             reliaburger::grill::ImageStore::new(temp.path().join("images")),
             false,
             temp.path().join("state"),
-        );
+            std::env::current_exe().unwrap(),
+        )
+        .unwrap();
         let expected = grill.dns_gateway_address().unwrap();
 
         let (_, nameserver, freebind) =
@@ -3398,7 +3492,9 @@ mod tests {
             reliaburger::grill::ImageStore::new(temp.path().join("images")),
             false,
             temp.path().join("state"),
-        );
+            std::env::current_exe().unwrap(),
+        )
+        .unwrap();
 
         let error = configure_workload_dns(AnyGrill::Runc(grill), "127.0.0.53:53".parse().unwrap())
             .err()
@@ -3684,10 +3780,11 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let shutdown = tokio_util::sync::CancellationToken::new();
         let mut tasks = tokio::task::JoinSet::new();
-        tasks.spawn(serve_api_over_tls(
+        tasks.spawn(reliaburger::sesame::connection::serve_router_over_tls(
             listener,
             tokio_rustls::TlsAcceptor::from(config),
             router,
+            reliaburger::sesame::connection::ConnectionTimeouts::PRODUCTION,
             shutdown.clone(),
         ));
         let mut roots = rustls::RootCertStore::empty();
@@ -3791,10 +3888,11 @@ mod tests {
         let url = format!("https://{}/peer", listener.local_addr().unwrap());
         let shutdown = tokio_util::sync::CancellationToken::new();
         let mut tasks = tokio::task::JoinSet::new();
-        tasks.spawn(serve_api_over_tls(
+        tasks.spawn(reliaburger::sesame::connection::serve_router_over_tls(
             listener,
             tokio_rustls::TlsAcceptor::from(config),
             router,
+            reliaburger::sesame::connection::ConnectionTimeouts::PRODUCTION,
             shutdown.clone(),
         ));
         let http = mtls::build_cluster_http_client(&client, mtls::CrlHandle::default()).unwrap();

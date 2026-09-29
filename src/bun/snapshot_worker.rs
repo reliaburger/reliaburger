@@ -31,7 +31,7 @@ impl SnapshotUploader {
     pub fn from_url(upload_url: &str) -> Result<Self, String> {
         let parsed = url::Url::parse(upload_url)
             .map_err(|e| format!("invalid upload_url {upload_url}: {e}"))?;
-        let (store, prefix) = object_store::parse_url(&parsed)
+        let (store, prefix) = crate::object_storage::open(&parsed)
             .map_err(|e| format!("unsupported upload_url {upload_url}: {e}"))?;
         Ok(Self { store, prefix })
     }
@@ -124,7 +124,12 @@ pub async fn snapshot_tick(
                 };
 
                 for doomed in prune_plan(&metas, retain) {
-                    match snapshots.delete(&namespace, &app, &doomed.name) {
+                    match snapshots.delete(
+                        &namespace,
+                        &app,
+                        &doomed.name,
+                        Some(&doomed.volume_path),
+                    ) {
                         Ok(()) => report.pruned += 1,
                         Err(e) => report
                             .errors
@@ -379,6 +384,32 @@ mod tests {
         assert_eq!(report.created, 0);
     }
 
+    /// B02: a multi-volume snapshot gives every volume the same name. The
+    /// sweep used to delete by name alone, so pruning `/data`'s old `100`
+    /// could resolve to `/wal`'s `100`, its newest retained backup.
+    #[tokio::test]
+    async fn sweep_prunes_by_volume_and_name() {
+        let volumes_dir = tempfile::tempdir().unwrap();
+        for (volume, name, secs) in [
+            ("/data", "100", 100u64),
+            ("/data", "300", 300),
+            ("/wal", "100", 100),
+        ] {
+            fake_snapshot(volumes_dir.path(), &meta("db", volume, name, secs));
+        }
+
+        let report = snapshot_tick(volumes_dir.path(), 1, None, SystemTime::UNIX_EPOCH).await;
+        // Fake snapshots aren't subvolumes, so the one planned delete fails;
+        // its error names the path it aimed at.
+        assert_eq!(report.errors.len(), 1, "errors: {:?}", report.errors);
+        let target = Path::new("default").join("db").join("data").join("100");
+        assert!(
+            report.errors[0].contains(&target.to_string_lossy().into_owned()),
+            "prune aimed at the wrong snapshot: {}",
+            report.errors[0]
+        );
+    }
+
     /// A sweep over an app whose volumes can't snapshot (Plain backend
     /// on macOS/dev) reports errors without aborting.
     #[tokio::test]
@@ -393,5 +424,16 @@ mod tests {
         assert_eq!(report.created, 0);
         assert_eq!(report.errors.len(), 1);
         assert!(report.errors[0].contains("not a btrfs subvolume"));
+    }
+
+    /// The `uploaded` flag stops later ticks re-uploading, so the archive must
+    /// be durable before the flag is written.
+    #[test]
+    fn local_upload_destination_syncs_before_the_checkpoint() {
+        let dest = tempfile::tempdir().unwrap();
+        let uploader =
+            SnapshotUploader::from_url(&format!("file://{}", dest.path().display())).unwrap();
+        let store = format!("{:?}", uploader.store);
+        assert!(store.contains("fsync: true"), "{store}");
     }
 }

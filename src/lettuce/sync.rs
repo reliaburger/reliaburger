@@ -511,7 +511,6 @@ mod tests {
             require_signed_commits: false,
             trusted_signing_keys: vec![],
             webhook_secret: None,
-            recursive: false,
             webhook_rate_limit: 10,
         };
 
@@ -598,7 +597,6 @@ mod tests {
             require_signed_commits: false,
             trusted_signing_keys: vec![],
             webhook_secret: None,
-            recursive: false,
             webhook_rate_limit: 10,
         };
 

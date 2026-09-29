@@ -26,7 +26,7 @@ pub fn build_page(chapters: &[Chapter]) -> String {
         let mut body = String::new();
         pulldown_cmark::html::push_html(
             &mut body,
-            pulldown_cmark::Parser::new_ext(&chapter.markdown, pulldown_cmark::Options::empty()),
+            pulldown_cmark::Parser::new_ext(&chapter.markdown, super::render::MARKDOWN_OPTIONS),
         );
         writeln!(sections, "<section id=\"{anchor}\">\n{body}</section>").unwrap();
     }
@@ -56,7 +56,7 @@ nav a{text-decoration:none;color:#b35c1e}\
 #filter{width:100%;padding:.5rem .75rem;font-size:1rem;border:1px solid #ccc;\
 border-radius:8px;box-sizing:border-box}\
 section{border-bottom:1px dashed #ddd;padding-bottom:1rem}\
-a{color:#b35c1e}table{border-collapse:collapse}\
+a{color:#b35c1e}table{border-collapse:collapse;display:block;overflow-x:auto}\
 td,th{border:1px solid #ddd;padding:.25rem .5rem}";
 
 const FILTER_JS: &str = "\

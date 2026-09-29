@@ -20,6 +20,10 @@ use crate::config::error::ConfigError;
 /// entry-bomb archive cannot exhaust inodes or directory entries.
 pub const MAX_CONTEXT_ENTRIES: usize = 65_536;
 
+/// The scratch repository `relish build` uploads its context tarball to.
+/// It only ever holds bare blobs: nothing tags or publishes a manifest here.
+pub const BUILD_CONTEXT_REPOSITORY: &str = "_buildcontext";
+
 /// Default Pickle registry port.
 ///
 /// X1 regression note: this used to be 9117 — the *Bun API* port,
@@ -257,12 +261,13 @@ fn buildah_push_args(local_tag: &str, tls_verify: bool) -> Vec<String> {
 /// image layout directory (`oci:{dir}:{tag}`) instead of pushing to a
 /// `docker://` registry (B1).
 ///
-/// Pickle authorises registry writes with the internal service token presented
-/// as a *bearer*; `buildah push` can only offer `--creds` (HTTP Basic), which
-/// Pickle does not accept and never challenges for — so a clustered `docker://`
-/// push simply 401s. The clustered runner uses this command to write a local
-/// layout, then uploads it to the registry through the bearer-carrying client.
-/// A local layout export needs no TLS and no credentials.
+/// Pickle authorises the runner's registry writes with the internal service
+/// token. `buildah push` can only offer it through `--creds` (HTTP Basic),
+/// which Pickle refuses on a plaintext listener and which would put the
+/// service token on buildah's command line, readable by anything that can list
+/// processes. So the clustered runner uses this command to write a local
+/// layout, then uploads it through the registry client that carries the token
+/// as a bearer header. A local layout export needs no TLS and no credentials.
 pub fn buildah_push_to_oci_args(local_tag: &str, oci_layout_dir: &str, tag: &str) -> Vec<String> {
     vec![
         "buildah".to_string(),
@@ -284,7 +289,7 @@ pub fn buildah_push_to_oci_args(local_tag: &str, oci_layout_dir: &str, tag: &str
 pub fn context_download_url(scheme: &str, pickle_port: u16, digest: &str) -> String {
     // Uses the OCI blob GET endpoint. The "name" is _buildcontext
     // (a reserved namespace that doesn't clash with real images).
-    format!("{scheme}://localhost:{pickle_port}/v2/_buildcontext/blobs/{digest}")
+    format!("{scheme}://localhost:{pickle_port}/v2/{BUILD_CONTEXT_REPOSITORY}/blobs/{digest}")
 }
 
 /// Build the URL to download a context blob from a specific node's
@@ -292,14 +297,16 @@ pub fn context_download_url(scheme: &str, pickle_port: u16, digest: &str) -> Str
 /// builder to fetch the context from the entry node — the address is
 /// derived from cluster membership, never from the request body (JOB2).
 pub fn context_download_url_at(scheme: &str, address: &str, digest: &str) -> String {
-    format!("{scheme}://{address}/v2/_buildcontext/blobs/{digest}")
+    format!("{scheme}://{address}/v2/{BUILD_CONTEXT_REPOSITORY}/blobs/{digest}")
 }
 
 /// Build the URL to upload a context blob to Pickle.
 ///
 /// The CLI uploads the tarred context here before scheduling the build.
 pub fn context_upload_url(scheme: &str, pickle_port: u16, digest: &str) -> String {
-    format!("{scheme}://localhost:{pickle_port}/v2/_buildcontext/blobs/uploads/?digest={digest}")
+    format!(
+        "{scheme}://localhost:{pickle_port}/v2/{BUILD_CONTEXT_REPOSITORY}/blobs/uploads/?digest={digest}"
+    )
 }
 
 /// Build the URL to upload a context blob to a specific node's Pickle
@@ -309,18 +316,18 @@ pub fn context_upload_url(scheme: &str, pickle_port: u16, digest: &str) -> Strin
 /// — the delegator copies the blob across before the run request. The
 /// address derives from cluster membership, never from request data.
 pub fn context_upload_url_at(scheme: &str, address: &str, digest: &str) -> String {
-    format!("{scheme}://{address}/v2/_buildcontext/blobs/uploads/?digest={digest}")
+    format!("{scheme}://{address}/v2/{BUILD_CONTEXT_REPOSITORY}/blobs/uploads/?digest={digest}")
 }
 
 // ---------------------------------------------------------------------------
 // OCI image-layout upload (B1)
 //
-// A clustered `buildah push` to `docker://` cannot authenticate — Pickle
-// authorises writes by the internal service token as a *bearer*, and buildah
-// only offers `--creds` (HTTP Basic), which Pickle never accepts and never
-// challenges for. So the runner exports the image to a local OCI layout and
-// uploads it to the local registry through the bearer-carrying registry
-// client. These helpers build the registry URLs and read the layout's index.
+// A clustered `buildah push` to `docker://` could only authenticate with
+// `--creds` (HTTP Basic): refused on a plaintext registry, and over TLS it
+// would expose the service token in buildah's argv. So the runner exports the
+// image to a local OCI layout and uploads it to the local registry through
+// the bearer-carrying registry client. These helpers build the registry URLs
+// and read the layout's index.
 // ---------------------------------------------------------------------------
 
 /// The monolithic-blob upload URL for the local registry: a single `POST`
@@ -390,20 +397,17 @@ pub fn parse_oci_index(index_json: &[u8]) -> Result<OciLayoutTop, BuildError> {
     })
 }
 
-/// The namespace and image name a `pickle://` destination targets.
+/// The registry repository a `pickle://` destination pushes to.
 ///
-/// A bare `pickle://name:tag` targets the `default` namespace; a
-/// `pickle://ns/name:tag` targets namespace `ns`. The namespace is taken from
-/// the destination itself — never from a self-declared build field — so it can
-/// be checked against the authenticated caller's token scope before the build
-/// runs. Used by the build submit handler to bind an image push to its owner.
-pub fn destination_scope(spec: &BuildSpec) -> Result<(String, String), BuildError> {
-    let dest = parse_pickle_destination(&spec.destination)?;
-    let (namespace, image) = match dest.name.split_once('/') {
-        Some((ns, image)) => (ns.to_string(), image.to_string()),
-        None => ("default".to_string(), dest.name.clone()),
-    };
-    Ok((namespace, image))
+/// `pickle://team-a/api:v1` pushes to repository `team-a/api`. The build
+/// submit handler holds this name to the caller's token scope with the same
+/// rule a direct `docker push` meets
+/// ([`crate::pickle::registry_auth::check_repository_scope`]), taken from the
+/// destination itself and never from a self-declared build field, because
+/// the runner pushes the finished image with the node's unscoped service
+/// token.
+pub fn destination_repository(spec: &BuildSpec) -> Result<String, BuildError> {
+    Ok(parse_pickle_destination(&spec.destination)?.name)
 }
 
 /// Check that a build's namespace is allowed to push to the destination.
@@ -946,65 +950,55 @@ mod tests {
     // --- destination scope / push authorisation (Phase 16 B) ---
 
     #[test]
-    fn destination_scope_uses_default_for_bare_names() {
-        let spec = spec_with_destination("pickle://victim-app:v1");
-        assert_eq!(
-            destination_scope(&spec).unwrap(),
-            ("default".to_string(), "victim-app".to_string())
-        );
-    }
-
-    #[test]
-    fn destination_scope_reads_namespace_prefix() {
+    fn destination_repository_is_the_destination_name_without_its_tag() {
         let spec = spec_with_destination("pickle://team-b/api:v1");
-        assert_eq!(
-            destination_scope(&spec).unwrap(),
-            ("team-b".to_string(), "api".to_string())
-        );
+        assert_eq!(destination_repository(&spec).unwrap(), "team-b/api");
+        let spec = spec_with_destination("pickle://victim-app:v1");
+        assert_eq!(destination_repository(&spec).unwrap(), "victim-app");
     }
 
-    #[test]
-    fn scoped_token_cannot_push_across_namespaces_or_to_bare_names() {
-        use crate::sesame::auth::{AuthContext, authorize_scoped};
-        // A Deployer scoped to `team-a` only. `spec_with_destination` leaves the
-        // build's own `namespace` field None, so this proves the gate reads the
-        // destination, not a self-declared field.
-        let ctx = AuthContext {
+    fn deployer(namespaces: Option<Vec<String>>) -> crate::sesame::auth::AuthContext {
+        crate::sesame::auth::AuthContext {
             token_name: "ci".into(),
             principal_id: "ci-1".into(),
             role: crate::sesame::types::ApiRole::Deployer,
             scoped_apps: None,
-            scoped_namespaces: Some(vec!["team-a".into()]),
-        };
+            scoped_namespaces: namespaces,
+        }
+    }
 
-        // Pushing into another namespace's repository is refused.
-        let (ns, image) =
-            destination_scope(&spec_with_destination("pickle://team-b/api:v1")).unwrap();
-        assert!(authorize_scoped(Some(&ctx), &image, &ns).is_err());
+    fn may_build(ctx: &crate::sesame::auth::AuthContext, destination: &str) -> bool {
+        use crate::pickle::registry_auth::{RepositoryAccess, check_repository_scope};
+        let repository = destination_repository(&spec_with_destination(destination)).unwrap();
+        check_repository_scope(Some(ctx), &repository, RepositoryAccess::WriteManifest).is_ok()
+    }
 
-        // A bare name resolves to `default` — the old bypass — and is refused too.
-        let (ns, image) = destination_scope(&spec_with_destination("pickle://victim:v1")).unwrap();
-        assert!(authorize_scoped(Some(&ctx), &image, &ns).is_err());
+    #[test]
+    fn scoped_token_cannot_push_across_namespaces_or_to_bare_names() {
+        // A Deployer scoped to `team-a` only. `spec_with_destination` leaves the
+        // build's own `namespace` field None, so this proves the gate reads the
+        // destination, not a self-declared field.
+        let ctx = deployer(Some(vec!["team-a".into()]));
+        assert!(!may_build(&ctx, "pickle://team-b/api:v1"));
+        // A bare name names no namespace, so no scoped token may build it.
+        assert!(!may_build(&ctx, "pickle://victim:v1"));
+        assert!(may_build(&ctx, "pickle://team-a/api:v1"));
+    }
 
-        // The caller's own namespace is allowed.
-        let (ns, image) =
-            destination_scope(&spec_with_destination("pickle://team-a/api:v1")).unwrap();
-        assert!(authorize_scoped(Some(&ctx), &image, &ns).is_ok());
+    /// A build and a `docker push` meet one rule: a bare name used to count
+    /// as `default` here while the registry refused it outright.
+    #[test]
+    fn a_default_scoped_token_must_name_the_default_namespace() {
+        let ctx = deployer(Some(vec!["default".into()]));
+        assert!(!may_build(&ctx, "pickle://web:v1"));
+        assert!(may_build(&ctx, "pickle://default/web:v1"));
     }
 
     #[test]
     fn unscoped_token_pushes_anywhere() {
-        use crate::sesame::auth::{AuthContext, authorize_scoped};
-        let ctx = AuthContext {
-            token_name: "admin".into(),
-            principal_id: "admin-1".into(),
-            role: crate::sesame::types::ApiRole::Deployer,
-            scoped_apps: None,
-            scoped_namespaces: None,
-        };
-        let (ns, image) =
-            destination_scope(&spec_with_destination("pickle://anything/api:v1")).unwrap();
-        assert!(authorize_scoped(Some(&ctx), &image, &ns).is_ok());
+        let ctx = deployer(None);
+        assert!(may_build(&ctx, "pickle://anything/api:v1"));
+        assert!(may_build(&ctx, "pickle://bare:v1"));
     }
 
     // --- multi-platform ---
@@ -1199,14 +1193,16 @@ mod tests {
         let mut archive = Vec::new();
         {
             let mut builder = tar::Builder::new(&mut archive);
-            for i in 0..=MAX_CONTEXT_ENTRIES {
+            // Every entry counts towards the cap, whatever it creates. The
+            // same directory repeated keeps the real cap without creating
+            // 65,537 files, which took over half a minute on APFS.
+            for _ in 0..=MAX_CONTEXT_ENTRIES {
                 let mut header = tar::Header::new_gnu();
+                header.set_entry_type(tar::EntryType::Directory);
                 header.set_size(0);
-                header.set_mode(0o644);
+                header.set_mode(0o755);
                 header.set_cksum();
-                builder
-                    .append_data(&mut header, format!("f{i}"), &b""[..])
-                    .unwrap();
+                builder.append_data(&mut header, "d", &b""[..]).unwrap();
             }
             builder.finish().unwrap();
         }

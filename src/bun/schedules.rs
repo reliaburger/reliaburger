@@ -1,6 +1,5 @@
 //! Durable registrations and firing claims for node-local cron jobs.
 
-use std::io::Read;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -32,34 +31,14 @@ struct Checkpoint {
 
 /// Read the complete checkpoint. Only a missing file means no registrations.
 pub(super) fn load(directory: &Path) -> std::io::Result<Vec<RecordedSchedule>> {
-    let path = directory.join(CHECKPOINT_FILE);
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
-    }
-    let file = match options.open(&path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(error),
+    let Some(checkpoint) = crate::durable::read_json_if_exists::<Checkpoint>(
+        &directory.join(CHECKPOINT_FILE),
+        MAX_CHECKPOINT_BYTES,
+        crate::durable::Access::Regular,
+    )?
+    else {
+        return Ok(Vec::new());
     };
-    let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.len() > MAX_CHECKPOINT_BYTES {
-        return Err(std::io::Error::other(
-            "invalid scheduled-job checkpoint file",
-        ));
-    }
-    let mut bytes = Vec::new();
-    file.take(MAX_CHECKPOINT_BYTES + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_CHECKPOINT_BYTES {
-        return Err(std::io::Error::other(
-            "scheduled-job checkpoint is too large",
-        ));
-    }
-    let checkpoint: Checkpoint = serde_json::from_slice(&bytes)?;
     if checkpoint.schema != 1 {
         return Err(std::io::Error::other(
             "unsupported scheduled-job checkpoint schema",

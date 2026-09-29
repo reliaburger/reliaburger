@@ -74,7 +74,8 @@ struct IdentityMeta {
 }
 
 /// The complete identity is one private atomic replacement, never a mixture
-/// of separately replaced PEM files. PEM files remain compatibility exports.
+/// of separately replaced PEM files. The PEM files are exports for operators
+/// and tools such as `relish --ca-cert`.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct IdentityBundle {
@@ -134,6 +135,8 @@ const META_FILE: &str = "meta.json";
 /// mid-install (some files written, marker not) is detected rather than a
 /// half-installed identity being used.
 const COMMIT_MARKER_FILE: &str = "bundle.committed";
+/// The commit marker's contents: the snapshot layout version.
+const LAYOUT_MARKER: &[u8] = b"2\n";
 
 /// The identity directory under a node's data directory.
 pub fn identity_dir(data_dir: &Path) -> PathBuf {
@@ -149,8 +152,8 @@ pub fn identity_dir(data_dir: &Path) -> PathBuf {
 /// A complete private snapshot is the source of truth (PKI9). Initial install
 /// writes its layout marker last. Replacement retains the previous snapshot
 /// and marker until the new snapshot is durable; failed export writes leave the
-/// old identity loadable. Legacy layout 1 is validated and snapshotted before
-/// touching its exports. Readers never fall back from a broken layout 2 snapshot.
+/// old identity loadable. Readers never fall back from a broken snapshot to the
+/// PEM exports.
 pub fn save(dir: &Path, identity: &NodeIdentity) -> Result<(), IdentityStoreError> {
     let identity = validate_identity(identity.clone())?;
     std::fs::create_dir_all(dir)?;
@@ -161,12 +164,7 @@ pub fn save(dir: &Path, identity: &NodeIdentity) -> Result<(), IdentityStoreErro
         Err(error) => return Err(error.into()),
     };
     match marker.as_deref() {
-        Some(b"1\n") => {
-            let previous = load(dir)?.ok_or(IdentityStoreError::PartialBundle)?;
-            write_snapshot(dir, &previous)?;
-            atomic_write(&marker_path, b"2\n")?;
-        }
-        Some(b"2\n") => {
+        Some(LAYOUT_MARKER) => {
             if !dir.join(BUNDLE_FILE).is_file() {
                 return Err(inconsistent("committed identity snapshot is missing"));
             }
@@ -205,7 +203,7 @@ pub fn save(dir: &Path, identity: &NodeIdentity) -> Result<(), IdentityStoreErro
     write_snapshot(dir, &identity)?;
     if marker.is_none() {
         // A fresh install is visible only after its complete snapshot exists.
-        atomic_write(&marker_path, b"2\n")?;
+        atomic_write(&marker_path, LAYOUT_MARKER)?;
     }
 
     Ok(())
@@ -217,11 +215,9 @@ pub fn save(dir: &Path, identity: &NodeIdentity) -> Result<(), IdentityStoreErro
 /// Any known identity file without the commit marker is an incomplete install,
 /// never an invitation to fall back to plaintext or enrolment-pending mode.
 ///
-/// A partial installation is refused. Layout 2 reads only the complete private
+/// A partial installation is refused. Reads use only the complete private
 /// snapshot, so interrupted PEM export replacement cannot tear a live identity.
-/// Layout 1 remains readable for deliberate import into the atomic layout.
 pub fn load(dir: &Path) -> Result<Option<NodeIdentity>, IdentityStoreError> {
-    let meta_path = dir.join(META_FILE);
     let marker = match std::fs::read(dir.join(COMMIT_MARKER_FILE)) {
         Ok(marker) => marker,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -232,56 +228,27 @@ pub fn load(dir: &Path) -> Result<Option<NodeIdentity>, IdentityStoreError> {
         }
         Err(error) => return Err(error.into()),
     };
-    match marker.as_slice() {
-        b"2\n" => {
-            let file = std::fs::File::open(dir.join(BUNDLE_FILE))?;
-            use std::io::Read;
-            let mut bytes = Vec::new();
-            file.take(1024 * 1024 + 1).read_to_end(&mut bytes)?;
-            if bytes.len() > 1024 * 1024 {
-                return Err(inconsistent("identity snapshot exceeds 1 MiB"));
-            }
-            let bundle: IdentityBundle = serde_json::from_slice(&bytes).map_err(|error| {
-                IdentityStoreError::ParseFailed {
-                    file: BUNDLE_FILE.into(),
-                    // Serde type errors can quote input; this file contains a key.
-                    reason: format!(
-                        "invalid identity JSON at line {} column {}",
-                        error.line(),
-                        error.column()
-                    ),
-                }
-            })?;
-            return bundle.into_identity().map(Some);
-        }
-        b"1\n" => {}
-        _ => return Err(inconsistent("unsupported identity layout")),
+    if marker != LAYOUT_MARKER {
+        return Err(inconsistent("unsupported identity layout"));
     }
-
-    let meta_json = std::fs::read_to_string(&meta_path)?;
-    let meta: IdentityMeta =
-        serde_json::from_str(&meta_json).map_err(|e| IdentityStoreError::ParseFailed {
-            file: META_FILE.to_string(),
-            reason: e.to_string(),
+    let file = std::fs::File::open(dir.join(BUNDLE_FILE))?;
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    file.take(1024 * 1024 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > 1024 * 1024 {
+        return Err(inconsistent("identity snapshot exceeds 1 MiB"));
+    }
+    let bundle: IdentityBundle =
+        serde_json::from_slice(&bytes).map_err(|error| IdentityStoreError::ParseFailed {
+            file: BUNDLE_FILE.into(),
+            // Serde type errors can quote input; this file contains a key.
+            reason: format!(
+                "invalid identity JSON at line {} column {}",
+                error.line(),
+                error.column()
+            ),
         })?;
-
-    let certificate_der = read_pem(dir, NODE_CERT_FILE)?;
-    let private_key_der = read_pem(dir, NODE_KEY_FILE)?;
-    let node_ca_der = read_pem(dir, NODE_CA_FILE)?;
-    let root_ca_der = read_pem(dir, ROOT_CA_FILE)?;
-
-    validate_identity(NodeIdentity {
-        node_id: meta.node_id,
-        certificate_der,
-        private_key_der,
-        serial: meta.serial,
-        ca_generation: meta.ca_generation,
-        node_ca_der,
-        root_ca_der,
-        not_before: meta.not_before,
-        not_after: meta.not_after,
-    })
-    .map(Some)
+    bundle.into_identity().map(Some)
 }
 
 fn has_identity_files(dir: &Path) -> bool {
@@ -390,15 +357,6 @@ pub fn root_ca_fingerprint(der: &[u8]) -> String {
     format!("sha256:{}", hex::encode(digest.as_ref()))
 }
 
-fn read_pem(dir: &Path, file: &str) -> Result<Vec<u8>, IdentityStoreError> {
-    let content = std::fs::read_to_string(dir.join(file))?;
-    let parsed = ::pem::parse(&content).map_err(|e| IdentityStoreError::ParseFailed {
-        file: file.to_string(),
-        reason: e.to_string(),
-    })?;
-    Ok(parsed.contents().to_vec())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -481,16 +439,15 @@ mod tests {
     }
 
     #[test]
-    fn load_refuses_a_legacy_bundle_missing_a_file_even_with_a_marker() {
-        // A marker present but a file gone is still a broken bundle; the
-        // missing PEM read errors out rather than yielding a partial identity.
+    fn load_refuses_an_unknown_layout_marker() {
         let dir = tempfile::tempdir().unwrap();
         save(dir.path(), &test_identity()).unwrap();
         std::fs::write(dir.path().join(COMMIT_MARKER_FILE), b"1\n").unwrap();
-        std::fs::remove_file(dir.path().join(BUNDLE_FILE)).unwrap();
-        std::fs::remove_file(dir.path().join(NODE_CERT_FILE)).unwrap();
 
-        assert!(load(dir.path()).is_err());
+        assert!(matches!(
+            load(dir.path()),
+            Err(IdentityStoreError::InconsistentBundle { .. })
+        ));
     }
 
     #[test]
@@ -622,29 +579,6 @@ mod tests {
         );
         std::fs::remove_file(path).unwrap();
         assert!(load(dir.path()).is_err());
-    }
-
-    #[test]
-    fn validated_legacy_identity_is_imported_before_replacement() {
-        let dir = tempfile::tempdir().unwrap();
-        let identity = test_identity();
-        save(dir.path(), &identity).unwrap();
-        std::fs::remove_file(dir.path().join(BUNDLE_FILE)).unwrap();
-        std::fs::write(dir.path().join(COMMIT_MARKER_FILE), b"1\n").unwrap();
-        assert_eq!(
-            load(dir.path()).unwrap().unwrap().certificate_der,
-            identity.certificate_der
-        );
-        save(dir.path(), &identity).unwrap();
-        assert_eq!(
-            std::fs::read(dir.path().join(COMMIT_MARKER_FILE)).unwrap(),
-            b"2\n"
-        );
-        assert!(dir.path().join(BUNDLE_FILE).is_file());
-        assert_eq!(
-            load(dir.path()).unwrap().unwrap().certificate_der,
-            identity.certificate_der
-        );
     }
 
     #[test]

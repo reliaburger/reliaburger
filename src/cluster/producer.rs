@@ -7,6 +7,16 @@ use crate::onion::producer::ProducerReleaseConfirmation;
 use std::io;
 use tokio::sync::watch;
 
+/// The leader's answer to a producer release request.
+#[derive(Debug)]
+pub enum ProducerRelease {
+    /// Every consumer confirmed the withdrawal; the producer may release its addresses.
+    Confirmed(ProducerReleaseConfirmation),
+    /// The leader fenced the execution but still waits for consumers'
+    /// withdrawal receipts (HTTP 202). Asking again shortly is the next step.
+    Pending,
+}
+
 /// Transport and live leader information for producer release requests.
 #[derive(Clone)]
 pub struct ProducerReleaseClient {
@@ -40,7 +50,7 @@ impl ProducerReleaseClient {
         &self,
         node_id: &str,
         execution: &RuntimeExecution,
-    ) -> io::Result<ProducerReleaseConfirmation> {
+    ) -> io::Result<ProducerRelease> {
         let secure = self.http.scheme() == "https";
         #[cfg(test)]
         let secure = secure || self.allow_plaintext;
@@ -68,6 +78,10 @@ impl ProducerReleaseClient {
                 request = request.bearer_auth(token);
             }
             let mut response = request.send().await.map_err(io::Error::other)?;
+            if response.url().as_str() == url && response.status() == reqwest::StatusCode::ACCEPTED
+            {
+                return Ok(ProducerRelease::Pending);
+            }
             if response.url().as_str() != url || response.status() != reqwest::StatusCode::OK {
                 return Err(io::Error::other(format!(
                     "producer release is unconfirmed ({})",
@@ -88,7 +102,7 @@ impl ProducerReleaseClient {
                     "producer confirmation belongs to another identity or execution",
                 ));
             }
-            Ok(confirmation)
+            Ok(ProducerRelease::Confirmed(confirmation))
         })
         .await
         .map_err(|_| io::Error::other("producer release timed out; original ownership retained"))?
@@ -163,14 +177,10 @@ mod tests {
         let original = execution();
         let valid = serde_json::json!({"node_id": "producer", "execution": original}).to_string();
         let (client, task) = fixture(StatusCode::OK, valid.clone()).await;
-        assert_eq!(
-            client
-                .confirm("producer", &original)
-                .await
-                .unwrap()
-                .execution,
-            original
-        );
+        assert!(matches!(
+            client.confirm("producer", &original).await.unwrap(),
+            ProducerRelease::Confirmed(confirmation) if confirmation.execution == original
+        ));
         assert!(client.confirm("another", &original).await.is_err());
         let mut newer = original.clone();
         newer.generation = "b".repeat(64).try_into().unwrap();
@@ -180,8 +190,15 @@ mod tests {
         assert!(plaintext.confirm("producer", &original).await.is_err());
         task.abort();
         let _ = task.await;
+        // Fenced, but consumers haven't all confirmed the withdrawal yet.
+        let (client, task) = fixture(StatusCode::ACCEPTED, valid).await;
+        assert!(matches!(
+            client.confirm("producer", &original).await.unwrap(),
+            ProducerRelease::Pending
+        ));
+        task.abort();
+        let _ = task.await;
         for (status, body) in [
-            (StatusCode::ACCEPTED, valid),
             (StatusCode::NO_CONTENT, String::new()),
             (StatusCode::OK, "{}".into()),
             (StatusCode::OK, "x".repeat(17_000)),

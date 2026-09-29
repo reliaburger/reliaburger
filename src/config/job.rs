@@ -26,10 +26,18 @@ pub struct JobSpec {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub run_before: Vec<String>,
     /// Memory request-limit range.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        with = "super::types::memory_range",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub memory: Option<ResourceRange>,
     /// CPU request-limit range.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        with = "super::types::cpu_range",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub cpu: Option<ResourceRange>,
     /// Environment variables (plain or encrypted).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]

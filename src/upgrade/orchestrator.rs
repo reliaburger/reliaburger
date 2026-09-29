@@ -18,14 +18,41 @@
 use std::time::{Duration, SystemTime};
 
 use super::types::{
-    BinarySource, ClusterUpgradePhase, ClusterUpgradeState, NodeRole, NodeUpgradePhase,
-    NodeUpgradeRecord, UpgradeDirection, UpgradeDirective,
+    BinarySource, ClusterUpgradePhase, ClusterUpgradeState, DirectiveRetry, NodeRole,
+    NodeUpgradePhase, NodeUpgradeRecord, UpgradeDirection, UpgradeDirective,
 };
 use super::version::BinaryVersion;
 
 /// A node stuck in Directed/Verifying longer than this is marked failed
 /// (covers directives lost to nodes that died mid-swap).
 pub const NODE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// How long the orchestrator keeps re-sending a directive that fails
+/// transiently (the node or the registry it fetches from is briefly
+/// unreachable) before it pauses the run. Two minutes covers a bun
+/// restarting under systemd with room to spare.
+pub const DIRECTIVE_RETRY_WINDOW: Duration = Duration::from_secs(120);
+
+/// The wait after the first transient failure; it doubles per attempt.
+const DIRECTIVE_RETRY_INITIAL_BACKOFF: Duration = Duration::from_secs(3);
+
+/// The longest wait between two attempts.
+const DIRECTIVE_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+/// Why a node didn't take a directive.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum DirectiveError {
+    /// Not right now: the node was unreachable, or answered 5xx, 408 or
+    /// 429 (a node whose binary registry is down answers 503). Retried
+    /// within [`DIRECTIVE_RETRY_WINDOW`].
+    #[error("{0}")]
+    Transient(String),
+    /// No: the node refused the directive itself (a signature that doesn't
+    /// verify, a missing external key, a version it won't install, a blob
+    /// the registry doesn't hold). Pauses the run at once.
+    #[error("{0}")]
+    Refused(String),
+}
 
 /// What a node reports when polled.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +62,11 @@ pub struct NodeProbe {
     pub upgrade_in_flight: bool,
     /// Upgrade ids the node attempted and reverted.
     pub failed_upgrade_ids: Vec<String>,
+    /// Hex SHA-256 of the binary the node runs, when it reports one.
+    pub binary_sha256: Option<String>,
+    /// Whether the node has an external key to verify network upgrades
+    /// with. A node that doesn't say can't: every 0.1.0 node reports it.
+    pub accepts_network_upgrades: bool,
 }
 
 /// Effects the orchestrator performs on nodes. Mocked in unit tests; the
@@ -48,14 +80,14 @@ pub trait NodeControl: Send + Sync {
         &self,
         address: &str,
         directive: &UpgradeDirective,
-    ) -> impl std::future::Future<Output = Result<(), String>> + Send;
+    ) -> impl std::future::Future<Output = Result<(), DirectiveError>> + Send;
 
     /// POST a rollback directive to the node.
     fn direct_rollback(
         &self,
         address: &str,
         version: &BinaryVersion,
-    ) -> impl std::future::Future<Output = Result<(), String>> + Send;
+    ) -> impl std::future::Future<Output = Result<(), DirectiveError>> + Send;
 }
 
 /// Inputs the driver supplies each tick.
@@ -96,7 +128,9 @@ pub async fn step<C: NodeControl>(
     context: &StepContext,
 ) -> ClusterUpgradeState {
     match state.phase.clone() {
-        ClusterUpgradePhase::Completed | ClusterUpgradePhase::Paused { .. } => state,
+        ClusterUpgradePhase::Completed
+        | ClusterUpgradePhase::Paused { .. }
+        | ClusterUpgradePhase::Aborted { .. } => state,
 
         ClusterUpgradePhase::Preparing => {
             // The binary was verified and pushed to Pickle by whoever
@@ -202,6 +236,7 @@ async fn poll_and_drive_group<C: NodeControl>(
     let target = state.target_version.clone();
     let direction = state.direction;
     let state_upgrade_id = state.upgrade_id.clone();
+    let state_sha256 = state.binary_sha256.clone();
     let directive = build_directive(state);
     let budget = if role == NodeRole::Worker {
         state.parallel.max(1) as usize
@@ -261,6 +296,31 @@ async fn poll_and_drive_group<C: NodeControl>(
         }
 
         if probe.version == target && probe.healthy && !probe.upgrade_in_flight {
+            // The target *version* is not proof of the target *binary*: a
+            // node that already ran a same-numbered build with other bytes
+            // would otherwise be called Healthy without a swap. Start-time
+            // checks refuse that up front; this catches a node that changed
+            // underneath the walk.
+            if direction == UpgradeDirection::Upgrade
+                && !probe
+                    .binary_sha256
+                    .as_deref()
+                    .is_some_and(|sha| sha.eq_ignore_ascii_case(&state_sha256))
+            {
+                set_phase(
+                    record,
+                    NodeUpgradePhase::Failed {
+                        reason: format!(
+                            "node {} runs {target} but not this binary (sha256 {}); \
+                             a same-version upgrade cannot swap it",
+                            record.node_id,
+                            probe.binary_sha256.as_deref().unwrap_or("unknown")
+                        ),
+                    },
+                    context.now,
+                );
+                continue;
+            }
             // HTTP-healthy at the target is necessary but not sufficient: a
             // node that came back up but never rejoined the gossip mesh is
             // isolated (its workloads take no traffic, its votes don't
@@ -356,6 +416,18 @@ async fn poll_and_drive_group<C: NodeControl>(
         if record.phase != NodeUpgradePhase::Pending {
             continue;
         }
+        // A node riding out a transient failure keeps its place in the
+        // rolling order (and its slot) while it waits for its next attempt:
+        // skipping ahead would upgrade the next council member while this
+        // one is still owed its turn.
+        slots -= 1;
+        if record
+            .directive_retry
+            .as_ref()
+            .is_some_and(|retry| !retry_due(retry, context.now))
+        {
+            continue;
+        }
         let sent = match direction {
             UpgradeDirection::Upgrade => control.direct_upgrade(&record.address, &directive).await,
             UpgradeDirection::Rollback => control.direct_rollback(&record.address, &target).await,
@@ -364,9 +436,11 @@ async fn poll_and_drive_group<C: NodeControl>(
             Ok(()) => {
                 set_phase(record, NodeUpgradePhase::Directed, context.now);
                 directed_this_tick.push(record.node_id.clone());
-                slots -= 1;
             }
-            Err(reason) => {
+            Err(DirectiveError::Transient(reason)) => {
+                record_transient_failure(record, reason, context.now);
+            }
+            Err(DirectiveError::Refused(reason)) => {
                 set_phase(
                     record,
                     NodeUpgradePhase::Failed {
@@ -374,6 +448,9 @@ async fn poll_and_drive_group<C: NodeControl>(
                     },
                     context.now,
                 );
+                // Same rule as pass 1: nothing else in this group starts
+                // once one node has failed.
+                break;
             }
         }
     }
@@ -404,12 +481,69 @@ fn build_directive(state: &ClusterUpgradeState) -> UpgradeDirective {
             registry_address: state.registry_address.clone(),
         },
         network_provenance: true,
+        allow_downgrade: state.allow_downgrade,
     }
 }
 
 fn set_phase(record: &mut NodeUpgradeRecord, phase: NodeUpgradePhase, now: SystemTime) {
     record.phase = phase;
     record.since = Some(now);
+    // Every phase set here leaves Pending, so any retry bookkeeping is over.
+    record.directive_retry = None;
+}
+
+/// The wait before attempt `attempts + 1`: the initial backoff doubled per
+/// failed attempt, capped.
+fn retry_backoff(attempts: u32) -> Duration {
+    let doublings = attempts.saturating_sub(1).min(16);
+    DIRECTIVE_RETRY_INITIAL_BACKOFF
+        .saturating_mul(1 << doublings)
+        .min(DIRECTIVE_RETRY_MAX_BACKOFF)
+}
+
+/// Has the backoff since the last transient failure elapsed?
+fn retry_due(retry: &DirectiveRetry, now: SystemTime) -> bool {
+    match now.duration_since(retry.last_failed_at) {
+        Ok(waited) => waited >= retry_backoff(retry.attempts),
+        // The failure is "in the future": a new leader whose clock runs
+        // behind the old one's. Don't let skew hold the slot; try now.
+        Err(_) => true,
+    }
+}
+
+/// Note a transient directive failure. The node stays Pending, to be
+/// re-sent once its backoff passes, until [`DIRECTIVE_RETRY_WINDOW`] has
+/// gone by since the first failure; a failure after that marks it Failed.
+fn record_transient_failure(record: &mut NodeUpgradeRecord, reason: String, now: SystemTime) {
+    let (attempts, first_failed_at) = match &record.directive_retry {
+        Some(retry) => (retry.attempts + 1, retry.first_failed_at),
+        None => (1, now),
+    };
+    let elapsed = now.duration_since(first_failed_at).unwrap_or_default();
+    if elapsed >= DIRECTIVE_RETRY_WINDOW {
+        set_phase(
+            record,
+            NodeUpgradePhase::Failed {
+                reason: format!(
+                    "directive to {} still failing after {attempts} attempts over {}s: {reason}",
+                    record.node_id,
+                    elapsed.as_secs()
+                ),
+            },
+            now,
+        );
+        return;
+    }
+    eprintln!(
+        "bun: directive to {} not delivered (attempt {attempts}), retrying: {reason}",
+        record.node_id
+    );
+    record.directive_retry = Some(DirectiveRetry {
+        attempts,
+        first_failed_at,
+        last_failed_at: now,
+        last_error: reason,
+    });
 }
 
 fn check_timeout(record: &mut NodeUpgradeRecord, now: SystemTime) {
@@ -468,6 +602,8 @@ pub fn resume(mut state: ClusterUpgradeState) -> ClusterUpgradeState {
             record.phase = NodeUpgradePhase::Pending;
             record.since = None;
         }
+        // A resumed run gets a fresh retry window.
+        record.directive_retry = None;
     }
     state.phase = if !group_done(&state, NodeRole::Worker) {
         ClusterUpgradePhase::UpgradingWorkers
@@ -477,6 +613,82 @@ pub fn resume(mut state: ClusterUpgradeState) -> ClusterUpgradeState {
         ClusterUpgradePhase::TransferringLeadership
     };
     state
+}
+
+/// End a paused upgrade without finishing it (`relish upgrade abort`).
+///
+/// Only a paused run can be aborted, and only when no node has moved: a
+/// node that reached the target (`Healthy`) or was told to swap and may
+/// still be doing so (`Directed`, `Verifying`) would be left on another
+/// version with nothing tracking it. Those runs need a cluster rollback,
+/// which walks every node back and replaces the paused run. Failed,
+/// rolled-back and never-directed nodes are all on their old binary, so
+/// dropping the plan leaves the cluster exactly where it started.
+///
+/// Returns the state marked [`ClusterUpgradePhase::Aborted`], ready to
+/// persist and archive.
+pub fn abort(
+    state: ClusterUpgradeState,
+    reason: &str,
+) -> Result<ClusterUpgradeState, super::UpgradeError> {
+    if !matches!(state.phase, ClusterUpgradePhase::Paused { .. }) {
+        return Err(super::UpgradeError::AbortNotPaused {
+            phase: phase_name(&state.phase).to_string(),
+        });
+    }
+    let moved: Vec<String> = state
+        .nodes
+        .iter()
+        .filter(|record| {
+            matches!(
+                record.phase,
+                NodeUpgradePhase::Healthy
+                    | NodeUpgradePhase::Directed
+                    | NodeUpgradePhase::Verifying
+            )
+        })
+        .map(|record| format!("node {}", record.node_id))
+        .collect();
+    if !moved.is_empty() {
+        return Err(super::UpgradeError::AbortWouldStrandNodes {
+            nodes: moved.join(", "),
+            target: state.target_version.clone(),
+        });
+    }
+    supersede(state, reason)
+}
+
+/// Mark a paused run as replaced by another operation (a cluster rollback).
+///
+/// Unlike [`abort`] this doesn't care which nodes moved: the replacement
+/// walks every node to its own target, so nothing is stranded. Only a
+/// paused run may be replaced.
+pub fn supersede(
+    mut state: ClusterUpgradeState,
+    reason: &str,
+) -> Result<ClusterUpgradeState, super::UpgradeError> {
+    let ClusterUpgradePhase::Paused { reason: paused } = &state.phase else {
+        return Err(super::UpgradeError::AbortNotPaused {
+            phase: phase_name(&state.phase).to_string(),
+        });
+    };
+    state.phase = ClusterUpgradePhase::Aborted {
+        reason: format!("{reason} (it was paused: {paused})"),
+    };
+    Ok(state)
+}
+
+fn phase_name(phase: &ClusterUpgradePhase) -> &'static str {
+    match phase {
+        ClusterUpgradePhase::Preparing => "preparing",
+        ClusterUpgradePhase::UpgradingWorkers => "upgrading workers",
+        ClusterUpgradePhase::UpgradingCouncil => "upgrading the council",
+        ClusterUpgradePhase::TransferringLeadership => "transferring leadership",
+        ClusterUpgradePhase::UpgradingLeader => "upgrading the leader",
+        ClusterUpgradePhase::Completed => "completed",
+        ClusterUpgradePhase::Paused { .. } => "paused",
+        ClusterUpgradePhase::Aborted { .. } => "aborted",
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -545,11 +757,16 @@ impl NodeControl for HttpNodeControl {
             Ok(response) if response.status().is_success()
         );
 
+        let binary_sha256 = value["binary_sha256"].as_str().map(String::from);
+        let accepts_network_upgrades = value["accepts_network_upgrades"].as_bool().unwrap_or(false);
+
         Some(NodeProbe {
             version,
             healthy,
             upgrade_in_flight,
             failed_upgrade_ids,
+            binary_sha256,
+            accepts_network_upgrades,
         })
     }
 
@@ -557,44 +774,50 @@ impl NodeControl for HttpNodeControl {
         &self,
         address: &str,
         directive: &UpgradeDirective,
-    ) -> Result<(), String> {
-        let response = self
-            .with_auth(
-                self.http
-                    .client()
-                    .post(self.http.url(address, "/v1/upgrade/apply"))
-                    .json(directive),
-            )
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-        if response.status().is_success() {
-            Ok(())
-        } else {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            Err(format!("{status}: {body}"))
-        }
+    ) -> Result<(), DirectiveError> {
+        let request = self.with_auth(
+            self.http
+                .client()
+                .post(self.http.url(address, "/v1/upgrade/apply"))
+                .json(directive),
+        );
+        send_directive(request).await
     }
 
-    async fn direct_rollback(&self, address: &str, version: &BinaryVersion) -> Result<(), String> {
-        let response = self
-            .with_auth(
-                self.http
-                    .client()
-                    .post(self.http.url(address, "/v1/upgrade/rollback"))
-                    .json(&serde_json::json!({ "version": version })),
-            )
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-        if response.status().is_success() {
-            Ok(())
-        } else {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            Err(format!("{status}: {body}"))
-        }
+    async fn direct_rollback(
+        &self,
+        address: &str,
+        version: &BinaryVersion,
+    ) -> Result<(), DirectiveError> {
+        let request = self.with_auth(
+            self.http
+                .client()
+                .post(self.http.url(address, "/v1/upgrade/rollback"))
+                .json(&serde_json::json!({ "version": version })),
+        );
+        send_directive(request).await
+    }
+}
+
+/// Send a directive and classify the answer. Failing to reach the node at
+/// all is transient (it may be restarting); so is a status that means "not
+/// right now" (see [`super::is_transient_status`]). Any other non-success
+/// is the node refusing the directive.
+async fn send_directive(request: reqwest::RequestBuilder) -> Result<(), DirectiveError> {
+    let response = request
+        .send()
+        .await
+        .map_err(|e| DirectiveError::Transient(e.to_string()))?;
+    let status = response.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let body = response.text().await.unwrap_or_default();
+    let reason = format!("{status}: {body}");
+    if super::is_transient_status(status) {
+        Err(DirectiveError::Transient(reason))
+    } else {
+        Err(DirectiveError::Refused(reason))
     }
 }
 
@@ -698,11 +921,16 @@ pub async fn run_orchestrator(
         };
         if matches!(
             upgrade.phase,
-            ClusterUpgradePhase::Paused { .. } | ClusterUpgradePhase::Completed
+            ClusterUpgradePhase::Paused { .. }
+                | ClusterUpgradePhase::Completed
+                | ClusterUpgradePhase::Aborted { .. }
         ) {
-            // Completed states are normally cleared below; this handles a
-            // leader that crashed between phases.
-            if upgrade.phase == ClusterUpgradePhase::Completed {
+            // Completed and aborted states are normally cleared by whoever
+            // ended them; this handles a leader that crashed in between.
+            if matches!(
+                upgrade.phase,
+                ClusterUpgradePhase::Completed | ClusterUpgradePhase::Aborted { .. }
+            ) {
                 let _ = council
                     .write(RaftRequest::UpgradeClear {
                         upgrade_id: upgrade.upgrade_id.clone(),
@@ -789,6 +1017,9 @@ mod tests {
         nodes: Mutex<HashMap<String, NodeProbe>>,
         directives: Mutex<Vec<String>>,
         rollbacks: Mutex<Vec<String>>,
+        /// Scripted directive answers per address, consumed in order; an
+        /// address with none left accepts.
+        answers: Mutex<HashMap<String, std::collections::VecDeque<DirectiveError>>>,
     }
 
     impl MockControl {
@@ -800,6 +1031,8 @@ mod tests {
                     healthy,
                     upgrade_in_flight: in_flight,
                     failed_upgrade_ids: Vec::new(),
+                    binary_sha256: Some(fixture_sha256(version).to_string()),
+                    accepts_network_upgrades: true,
                 },
             );
         }
@@ -812,12 +1045,35 @@ mod tests {
                     healthy: true,
                     upgrade_in_flight: false,
                     failed_upgrade_ids: vec![failed_id.to_string()],
+                    binary_sha256: Some(fixture_sha256(version).to_string()),
+                    accepts_network_upgrades: true,
                 },
             );
         }
 
         fn directed(&self) -> Vec<String> {
             self.directives.lock().unwrap().clone()
+        }
+
+        /// Make the next directives to `address` fail with `errors`, in order.
+        fn fail_directives(&self, address: &str, errors: Vec<DirectiveError>) {
+            self.answers
+                .lock()
+                .unwrap()
+                .insert(address.to_string(), errors.into());
+        }
+
+        fn answer(&self, address: &str) -> Result<(), DirectiveError> {
+            match self
+                .answers
+                .lock()
+                .unwrap()
+                .get_mut(address)
+                .and_then(|queue| queue.pop_front())
+            {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
         }
     }
 
@@ -830,18 +1086,18 @@ mod tests {
             &self,
             address: &str,
             _directive: &UpgradeDirective,
-        ) -> Result<(), String> {
+        ) -> Result<(), DirectiveError> {
             self.directives.lock().unwrap().push(address.to_string());
-            Ok(())
+            self.answer(address)
         }
 
         async fn direct_rollback(
             &self,
             address: &str,
             _version: &BinaryVersion,
-        ) -> Result<(), String> {
+        ) -> Result<(), DirectiveError> {
             self.rollbacks.lock().unwrap().push(address.to_string());
-            Ok(())
+            self.answer(address)
         }
     }
 
@@ -853,6 +1109,7 @@ mod tests {
             from_version: None,
             phase,
             since: None,
+            directive_retry: None,
         }
     }
 
@@ -867,8 +1124,58 @@ mod tests {
             direction: UpgradeDirection::Upgrade,
             phase: ClusterUpgradePhase::UpgradingWorkers,
             registry_address: "leader:5050".to_string(),
+            allow_downgrade: false,
             nodes,
         }
+    }
+
+    /// The digest a mock node reports: the candidate's ("abc", see
+    /// `cluster_state`) on the target version, something else otherwise.
+    fn fixture_sha256(version: &str) -> &'static str {
+        if version == "0.2.0" { "abc" } else { "old" }
+    }
+
+    #[tokio::test]
+    async fn pending_node_on_the_target_version_with_other_bytes_fails_not_healthy() {
+        let control = MockControl::default();
+        control.set("addr-w1", "0.2.0", true, false);
+        control
+            .nodes
+            .lock()
+            .unwrap()
+            .get_mut("addr-w1")
+            .unwrap()
+            .binary_sha256 = Some("different".to_string());
+        let state = cluster_state(
+            vec![record("w1", NodeRole::Worker, NodeUpgradePhase::Pending)],
+            1,
+        );
+
+        let state = step(state, &control, &context()).await;
+
+        match &state.nodes[0].phase {
+            NodeUpgradePhase::Failed { reason } => {
+                assert!(reason.contains("not this binary"), "{reason}")
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert!(matches!(state.phase, ClusterUpgradePhase::Paused { .. }));
+        assert!(control.directives.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pending_node_already_on_the_exact_candidate_is_healthy_without_a_directive() {
+        let control = MockControl::default();
+        control.set("addr-w1", "0.2.0", true, false);
+        let state = cluster_state(
+            vec![record("w1", NodeRole::Worker, NodeUpgradePhase::Pending)],
+            1,
+        );
+
+        let state = step(state, &control, &context()).await;
+
+        assert_eq!(state.nodes[0].phase, NodeUpgradePhase::Healthy);
+        assert!(control.directives.lock().unwrap().is_empty());
     }
 
     /// A context in which every node the tests use is gossip-alive, so the
@@ -1435,5 +1742,377 @@ mod tests {
         assert_eq!(state.nodes[1].phase, NodeUpgradePhase::Pending);
         // The healthy node is untouched.
         assert_eq!(state.nodes[0].phase, NodeUpgradePhase::Healthy);
+    }
+
+    /// Serve `/v1/version` with `body` and `/v1/health` as ok, and probe it.
+    async fn probe_version_body(body: serde_json::Value) -> NodeProbe {
+        let router = axum::Router::new()
+            .route(
+                "/v1/version",
+                axum::routing::get(move || {
+                    let body = body.clone();
+                    async move { axum::Json(body) }
+                }),
+            )
+            .route(
+                "/v1/health",
+                axum::routing::get(|| async { axum::Json(serde_json::json!({"status": "ok"})) }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let probe = HttpNodeControl::new(None).probe(&address).await.unwrap();
+        server.abort();
+        probe
+    }
+
+    #[tokio::test]
+    async fn a_node_that_does_not_report_network_readiness_cannot_accept_one() {
+        let silent = probe_version_body(serde_json::json!({"version": "v0.1.0"})).await;
+        assert!(!silent.accepts_network_upgrades);
+        let ready = probe_version_body(serde_json::json!({
+            "version": "v0.1.0",
+            "accepts_network_upgrades": true,
+        }))
+        .await;
+        assert!(ready.accepts_network_upgrades);
+    }
+
+    fn paused(nodes: Vec<NodeUpgradeRecord>) -> ClusterUpgradeState {
+        let mut state = cluster_state(nodes, 1);
+        state.phase = ClusterUpgradePhase::Paused {
+            reason: "directive to w1 refused: 409".to_string(),
+        };
+        state
+    }
+
+    #[test]
+    fn abort_ends_a_paused_run_in_which_no_node_moved() {
+        let state = paused(vec![
+            record(
+                "w1",
+                NodeRole::Worker,
+                NodeUpgradePhase::Failed {
+                    reason: "refused".to_string(),
+                },
+            ),
+            record("c1", NodeRole::Council, NodeUpgradePhase::Pending),
+            record("leader", NodeRole::Leader, NodeUpgradePhase::Pending),
+        ]);
+
+        let aborted = abort(state, "aborted by the operator").unwrap();
+
+        let ClusterUpgradePhase::Aborted { reason } = &aborted.phase else {
+            panic!("expected Aborted, got {:?}", aborted.phase);
+        };
+        assert!(reason.contains("aborted by the operator"), "{reason}");
+        assert!(reason.contains("directive to w1 refused"), "{reason}");
+    }
+
+    #[test]
+    fn abort_refuses_a_run_that_already_moved_a_node() {
+        for moved in [
+            NodeUpgradePhase::Healthy,
+            NodeUpgradePhase::Directed,
+            NodeUpgradePhase::Verifying,
+        ] {
+            let state = paused(vec![
+                record("w1", NodeRole::Worker, moved.clone()),
+                record("c1", NodeRole::Council, NodeUpgradePhase::Pending),
+            ]);
+            let err = abort(state, "aborted").unwrap_err();
+            assert!(
+                matches!(err, super::super::UpgradeError::AbortWouldStrandNodes { ref nodes, .. } if nodes == "node w1"),
+                "{moved:?}: {err}"
+            );
+            assert!(err.to_string().contains("relish upgrade rollback"));
+        }
+    }
+
+    #[test]
+    fn abort_refuses_a_run_that_is_not_paused() {
+        let state = cluster_state(
+            vec![record("w1", NodeRole::Worker, NodeUpgradePhase::Pending)],
+            1,
+        );
+        let err = abort(state, "aborted").unwrap_err();
+        assert!(
+            matches!(err, super::super::UpgradeError::AbortNotPaused { .. }),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn supersede_replaces_a_paused_run_even_with_moved_nodes() {
+        let state = paused(vec![record(
+            "w1",
+            NodeRole::Worker,
+            NodeUpgradePhase::Healthy,
+        )]);
+        let replaced = supersede(state, "replaced by a rollback to v0.1.0").unwrap();
+        assert!(matches!(
+            replaced.phase,
+            ClusterUpgradePhase::Aborted { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn step_leaves_an_aborted_run_alone() {
+        let control = MockControl::default();
+        control.set("addr-w1", "0.1.0", true, false);
+        let mut state = cluster_state(
+            vec![record("w1", NodeRole::Worker, NodeUpgradePhase::Pending)],
+            1,
+        );
+        state.phase = ClusterUpgradePhase::Aborted {
+            reason: "aborted".to_string(),
+        };
+        let next = step(state.clone(), &control, &context_alive(["leader"])).await;
+        assert_eq!(next, state);
+        assert!(control.directed().is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Directive retries: transient failures are ridden out, refusals pause
+    // -----------------------------------------------------------------------
+
+    fn context_at(now: SystemTime) -> StepContext {
+        StepContext { now, ..context() }
+    }
+
+    fn transient(reason: &str) -> DirectiveError {
+        DirectiveError::Transient(reason.to_string())
+    }
+
+    /// The V02 soak failure: the leader's bun restarted, and its first tick
+    /// directed a worker before its own registry was serving. The worker's
+    /// fetch failed, and that one blip paused the whole run.
+    #[tokio::test]
+    async fn transient_directive_failure_keeps_the_node_pending_and_retries() {
+        let control = MockControl::default();
+        control.set("addr-w1", "0.1.0", true, false);
+        control.fail_directives(
+            "addr-w1",
+            vec![
+                transient("503: registry down"),
+                transient("503: registry down"),
+            ],
+        );
+        let state = cluster_state(
+            vec![record("w1", NodeRole::Worker, NodeUpgradePhase::Pending)],
+            1,
+        );
+        let start = SystemTime::now();
+
+        let state = step(state, &control, &context_at(start)).await;
+        assert_eq!(state.phase, ClusterUpgradePhase::UpgradingWorkers);
+        assert_eq!(state.nodes[0].phase, NodeUpgradePhase::Pending);
+        let retry = state.nodes[0].directive_retry.as_ref().unwrap();
+        assert_eq!(retry.attempts, 1);
+        assert!(retry.last_error.contains("registry down"));
+
+        // Inside the first backoff: no new attempt.
+        let state = step(state, &control, &context_at(start + Duration::from_secs(1))).await;
+        assert_eq!(control.directed().len(), 1);
+
+        // After it: attempt two, still transient, still Pending.
+        let state = step(state, &control, &context_at(start + Duration::from_secs(3))).await;
+        assert_eq!(control.directed().len(), 2);
+        assert_eq!(state.nodes[0].directive_retry.as_ref().unwrap().attempts, 2);
+
+        // The backoff doubled: 3 s later is too soon, 6 s later is due.
+        let state = step(state, &control, &context_at(start + Duration::from_secs(6))).await;
+        assert_eq!(control.directed().len(), 2);
+        let state = step(state, &control, &context_at(start + Duration::from_secs(9))).await;
+        assert_eq!(control.directed().len(), 3);
+        assert_eq!(state.nodes[0].phase, NodeUpgradePhase::Directed);
+        assert_eq!(state.nodes[0].directive_retry, None);
+        assert_eq!(state.phase, ClusterUpgradePhase::UpgradingWorkers);
+    }
+
+    #[tokio::test]
+    async fn transient_failures_past_the_retry_window_pause_the_run() {
+        let control = MockControl::default();
+        control.set("addr-w1", "0.1.0", true, false);
+        control.fail_directives(
+            "addr-w1",
+            (0..100)
+                .map(|_| transient("error sending request"))
+                .collect(),
+        );
+        let mut state = cluster_state(
+            vec![record("w1", NodeRole::Worker, NodeUpgradePhase::Pending)],
+            1,
+        );
+        let start = SystemTime::now();
+
+        // One tick every three seconds, just as the driver runs them.
+        let mut elapsed = Duration::ZERO;
+        while elapsed < DIRECTIVE_RETRY_WINDOW {
+            state = step(state, &control, &context_at(start + elapsed)).await;
+            assert_eq!(
+                state.phase,
+                ClusterUpgradePhase::UpgradingWorkers,
+                "paused early, at {elapsed:?}"
+            );
+            elapsed += Duration::from_secs(3);
+        }
+        let attempts = control.directed().len();
+        assert!(
+            (4..=10).contains(&attempts),
+            "backoff should space attempts out, got {attempts}"
+        );
+
+        // The next due attempt past the window fails the node for good.
+        let deadline = start + DIRECTIVE_RETRY_WINDOW + DIRECTIVE_RETRY_MAX_BACKOFF;
+        let state = step(state, &control, &context_at(deadline)).await;
+        match &state.phase {
+            ClusterUpgradePhase::Paused { reason } => {
+                assert!(reason.contains("still failing"), "{reason}");
+                assert!(reason.contains("error sending request"), "{reason}");
+            }
+            other => panic!("expected Paused, got {other:?}"),
+        }
+        assert_eq!(state.nodes[0].directive_retry, None);
+    }
+
+    #[tokio::test]
+    async fn refused_directive_pauses_at_once_and_starts_no_sibling() {
+        let control = MockControl::default();
+        control.set("addr-w1", "0.1.0", true, false);
+        control.set("addr-w2", "0.1.0", true, false);
+        control.fail_directives(
+            "addr-w1",
+            vec![DirectiveError::Refused(
+                "409 Conflict: embedded signature does not verify".to_string(),
+            )],
+        );
+        let state = cluster_state(
+            vec![
+                record("w1", NodeRole::Worker, NodeUpgradePhase::Pending),
+                record("w2", NodeRole::Worker, NodeUpgradePhase::Pending),
+            ],
+            2,
+        );
+
+        let state = step(state, &control, &context()).await;
+
+        match &state.phase {
+            ClusterUpgradePhase::Paused { reason } => {
+                assert!(reason.contains("directive to w1 refused"), "{reason}");
+                assert!(reason.contains("signature"), "{reason}");
+            }
+            other => panic!("expected Paused, got {other:?}"),
+        }
+        assert_eq!(control.directed(), vec!["addr-w1".to_string()]);
+        assert_eq!(state.nodes[1].phase, NodeUpgradePhase::Pending);
+    }
+
+    /// A council member waiting out a transient failure keeps its turn: the
+    /// next member doesn't upgrade while the council is owed one.
+    #[tokio::test]
+    async fn a_node_retrying_holds_its_place_in_the_rolling_order() {
+        let control = MockControl::default();
+        control.set("addr-c1", "0.1.0", true, false);
+        control.set("addr-c2", "0.1.0", true, false);
+        control.fail_directives("addr-c1", vec![transient("connection refused")]);
+        let mut state = cluster_state(
+            vec![
+                record("c1", NodeRole::Council, NodeUpgradePhase::Pending),
+                record("c2", NodeRole::Council, NodeUpgradePhase::Pending),
+            ],
+            1,
+        );
+        state.phase = ClusterUpgradePhase::UpgradingCouncil;
+        let start = SystemTime::now();
+
+        let state = step(state, &control, &context_at(start)).await;
+        let state = step(state, &control, &context_at(start + Duration::from_secs(1))).await;
+        assert_eq!(control.directed(), vec!["addr-c1".to_string()]);
+        assert_eq!(state.nodes[1].phase, NodeUpgradePhase::Pending);
+
+        let state = step(state, &control, &context_at(start + Duration::from_secs(3))).await;
+        assert_eq!(state.nodes[0].phase, NodeUpgradePhase::Directed);
+        assert_eq!(state.nodes[1].phase, NodeUpgradePhase::Pending);
+    }
+
+    #[test]
+    fn resume_gives_a_fresh_retry_window() {
+        let mut state = paused(vec![record(
+            "w1",
+            NodeRole::Worker,
+            NodeUpgradePhase::Pending,
+        )]);
+        let now = SystemTime::now();
+        state.nodes[0].directive_retry = Some(DirectiveRetry {
+            attempts: 3,
+            first_failed_at: now,
+            last_failed_at: now,
+            last_error: "503".to_string(),
+        });
+        let resumed = resume(state);
+        assert_eq!(resumed.nodes[0].directive_retry, None);
+    }
+
+    /// Serve one canned HTTP response on a local port, returning its address.
+    async fn answer_once(response: &'static str) -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 16 * 1024];
+            let _ = socket.read(&mut buf).await;
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+        address
+    }
+
+    fn directive() -> UpgradeDirective {
+        build_directive(&cluster_state(Vec::new(), 1))
+    }
+
+    #[tokio::test]
+    async fn a_node_answering_503_is_a_transient_failure() {
+        let address = answer_once(
+            "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 25\r\nconnection: close\r\n\r\n{\"error\":\"registry down\"}",
+        )
+        .await;
+        let result = HttpNodeControl::new(None)
+            .direct_upgrade(&address, &directive())
+            .await;
+        match result {
+            Err(DirectiveError::Transient(reason)) => {
+                assert!(reason.contains("registry down"), "{reason}")
+            }
+            other => panic!("expected a transient failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_node_answering_409_refuses_the_directive() {
+        let address = answer_once(
+            "HTTP/1.1 409 Conflict\r\ncontent-length: 20\r\nconnection: close\r\n\r\n{\"error\":\"bad sig\"}\n",
+        )
+        .await;
+        let result = HttpNodeControl::new(None)
+            .direct_upgrade(&address, &directive())
+            .await;
+        assert!(
+            matches!(result, Err(DirectiveError::Refused(_))),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_node_is_a_transient_failure() {
+        // Port 1 is reserved and never listening.
+        let result = HttpNodeControl::new(None)
+            .direct_upgrade("127.0.0.1:1", &directive())
+            .await;
+        assert!(
+            matches!(result, Err(DirectiveError::Transient(_))),
+            "{result:?}"
+        );
     }
 }

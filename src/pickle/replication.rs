@@ -421,13 +421,13 @@ pub async fn heal_tick(
             let holders = catalog.layer_holders(digest.as_str());
             let store = state.store.clone();
             let check = digest.clone();
-            match tokio::task::spawn_blocking(move || {
-                store.has_blob(&check) && store.revalidate_blob(&check)
-            })
-            .await
-            {
-                Ok(true) => continue,
-                Ok(false) => {}
+            match tokio::task::spawn_blocking(move || store.revalidate_blob(&check)).await {
+                Ok(Ok(true)) => continue,
+                Ok(Ok(false)) => {}
+                Ok(Err(error)) => {
+                    pulled = Err(error);
+                    break;
+                }
                 Err(error) => {
                     pulled = Err(PickleError::ReplicationFailed(format!(
                         "cache verification failed: {error}"

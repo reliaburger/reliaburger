@@ -67,6 +67,19 @@ pub struct WorkloadInstance {
     pub identity_mount: Option<std::path::PathBuf>,
 }
 
+impl WorkloadInstance {
+    /// Whether the runtime may be creating this instance right now: pulling
+    /// its image, building its network. It has no process yet, and asking
+    /// the runtime about it waits until the create finishes, which for a
+    /// first image pull takes tens of seconds.
+    pub fn is_being_created(&self) -> bool {
+        matches!(
+            self.state,
+            ContainerState::Pending | ContainerState::Preparing
+        )
+    }
+}
+
 /// What the runtime on this node can actually enforce.
 ///
 /// The supervisor refuses a workload up front when the node can't honour
@@ -852,7 +865,12 @@ mod tests {
             firewall: None,
             egress: None,
             autoscale: None,
+            metrics: None,
             namespace: None,
+            args: Vec::new(),
+            working_dir: None,
+            run_as_user: None,
+            run_as_group: None,
         }
     }
 
@@ -1607,8 +1625,9 @@ mod tests {
             dns: Default::default(),
         });
         let mut spec = basic_app_spec(None);
-        spec.memory =
-            Some(crate::config::types::ResourceRange::parse("128Mi-512Mi").expect("valid range"));
+        spec.memory = Some(
+            crate::config::types::ResourceRange::parse_memory("128Mi-512Mi").expect("valid range"),
+        );
         let err = sup
             .deploy_app("limited", "default", &spec, Instant::now())
             .await
@@ -1627,7 +1646,8 @@ mod tests {
         // process runtime kind.
         let mut sup = test_supervisor();
         let mut spec = basic_app_spec(None);
-        spec.memory = Some(crate::config::types::ResourceRange::parse("128Mi-512Mi").unwrap());
+        spec.memory =
+            Some(crate::config::types::ResourceRange::parse_memory("128Mi-512Mi").unwrap());
         let err = sup
             .deploy_app("limited", "default", &spec, Instant::now())
             .await
@@ -1644,7 +1664,8 @@ mod tests {
         let port_allocator = PortAllocator::new(30000, 31000);
         let mut sup = WorkloadSupervisor::new(grill, port_allocator);
         let mut spec = basic_app_spec(None);
-        spec.memory = Some(crate::config::types::ResourceRange::parse("128Mi-512Mi").unwrap());
+        spec.memory =
+            Some(crate::config::types::ResourceRange::parse_memory("128Mi-512Mi").unwrap());
         let ids = sup
             .deploy_app("limited", "default", &spec, Instant::now())
             .await

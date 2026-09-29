@@ -50,6 +50,8 @@ pub struct CouncilNode {
     state_machine: CouncilStateMachine,
     /// Order grant proposals against membership transitions on this leader.
     node_fault_membership: tokio::sync::Mutex<()>,
+    /// When this node, as leader, last served each endpoint consumer.
+    consumer_contacts: tokio::sync::Mutex<crate::onion::lease::ConsumerContacts>,
     /// Master secret for unwrapping CA private keys (in-memory only).
     wrapping_ikm: Option<[u8; 32]>,
 }
@@ -95,6 +97,9 @@ impl CouncilNode {
             raft_id,
             state_machine,
             node_fault_membership: tokio::sync::Mutex::new(()),
+            consumer_contacts: tokio::sync::Mutex::new(crate::onion::lease::ConsumerContacts::new(
+                std::time::Instant::now(),
+            )),
             wrapping_ikm,
         })
     }
@@ -132,7 +137,7 @@ impl CouncilNode {
             Err(e) => match e {
                 openraft::error::RaftError::APIError(ClientWriteError::ForwardToLeader(fwd)) => {
                     Err(CouncilError::ForwardToLeader {
-                        leader: fwd.leader_id,
+                        leader: fwd.leader_node.map(|node| node.name),
                     })
                 }
                 other => Err(CouncilError::WriteFailed(other.to_string())),
@@ -148,6 +153,18 @@ impl CouncilNode {
     /// Return `true` if this node is the current leader.
     pub async fn is_leader(&self) -> bool {
         self.raft.ensure_linearizable().await.is_ok()
+    }
+
+    /// The leader's volatile record of when it last served each endpoint
+    /// consumer. Serving a consumer and discharging one both take this lock,
+    /// so a discharge can never race a poll that renews the same lease.
+    pub fn consumer_contacts(&self) -> &tokio::sync::Mutex<crate::onion::lease::ConsumerContacts> {
+        &self.consumer_contacts
+    }
+
+    /// The Raft term this node currently knows.
+    pub fn current_term(&self) -> u64 {
+        self.raft.metrics().borrow().current_term
     }
 
     /// Subscribe to Raft metrics changes.
@@ -293,6 +310,14 @@ impl CouncilNode {
     /// [`Self::security_state_linearizable`].
     pub async fn security_state(&self) -> crate::sesame::types::SecurityState {
         self.state_machine.desired_state().await.security_state
+    }
+
+    /// Whether an operator has permanently retired this node identity.
+    /// Cheap enough to call on every request: it borrows, never clones.
+    pub async fn is_node_retired(&self, node_id: &str) -> bool {
+        self.state_machine
+            .read_desired(|state| state.security_state.crl.retired_nodes.contains_key(node_id))
+            .await
     }
 
     /// Read the security state only if this node can prove the read is current.
@@ -1213,6 +1238,18 @@ mod tests {
             "expected ForwardToLeader, got {:?}",
             result
         );
+        // The message names the leader as operators know it, not by its
+        // internal Raft id ("leader is node Some(5870141345109727948)").
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            format!("not the leader (the leader is node-{leader_id})")
+        );
+    }
+
+    #[test]
+    fn forward_error_without_a_known_leader_says_so() {
+        let error = CouncilError::ForwardToLeader { leader: None };
+        assert_eq!(error.to_string(), "not the leader, and no leader is known");
     }
 
     // -----------------------------------------------------------------------
@@ -1314,6 +1351,75 @@ mod tests {
                 i + 1
             );
         }
+    }
+
+    #[tokio::test]
+    async fn isolated_member_misses_writes_until_healed() {
+        let (nodes, router) = create_cluster(3).await;
+        init_cluster(&nodes).await;
+        wait_for_leader(&nodes, Duration::from_secs(5))
+            .await
+            .expect("leader should be elected");
+
+        // Cut node 3 off from nodes 1 and 2 in both directions.
+        for majority in [1u64, 2] {
+            router.partition(3, majority).await;
+        }
+
+        // The majority keeps, or re-elects, a leader of its own.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let majority_leader = loop {
+            let mut found = None;
+            for node in &nodes[..2] {
+                if let Some(leader) = node.current_leader().await
+                    && leader != 3
+                {
+                    found = Some(leader);
+                }
+            }
+            if let Some(leader) = found
+                && nodes[(leader - 1) as usize]
+                    .write(RaftRequest::ConfigSet {
+                        key: "during_isolation".to_string(),
+                        value: "committed".to_string(),
+                    })
+                    .await
+                    .is_ok()
+            {
+                break leader;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the majority never accepted a write"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert_ne!(majority_leader, 3);
+
+        assert!(
+            wait_for_all_states(&nodes[..2], Duration::from_secs(5), |state| {
+                state.config.contains_key("during_isolation")
+            })
+            .await,
+            "the majority did not apply its own write"
+        );
+        assert!(
+            !nodes[2]
+                .desired_state()
+                .await
+                .config
+                .contains_key("during_isolation"),
+            "the isolated node received a write through the partition"
+        );
+
+        router.heal().await;
+        assert!(
+            wait_for_all_states(&nodes, Duration::from_secs(10), |state| {
+                state.config.get("during_isolation").map(String::as_str) == Some("committed")
+            })
+            .await,
+            "the isolated node did not catch up after the partition healed"
+        );
     }
 
     // -----------------------------------------------------------------------

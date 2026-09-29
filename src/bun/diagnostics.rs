@@ -182,6 +182,9 @@ pub struct DesiredAppEvidence {
     pub desired_replicas: u32,
     /// Placements currently recorded by the scheduler.
     pub scheduled_replicas: u32,
+    /// Those placements per node. Empty on a standalone node.
+    #[serde(default)]
+    pub placements: BTreeMap<String, u32>,
     /// Declared service port. `None` means this app is not a service.
     pub service_port: Option<u16>,
 }

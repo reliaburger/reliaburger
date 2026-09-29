@@ -7,4 +7,5 @@ pub mod export;
 pub mod log_store;
 pub mod query;
 pub mod remote_query;
+pub mod sse;
 pub mod types;

@@ -336,7 +336,6 @@ pub struct AgeKeypair {
     pub generation: u64,
     /// Whether this key is read-only (old generation, kept for decryption
     /// of not-yet-re-encrypted secrets during rotation).
-    #[serde(default)]
     pub read_only: bool,
 }
 
@@ -386,10 +385,7 @@ pub struct JoinToken {
     /// The node id this token may enrol (PKI4/M4). A join request must carry
     /// exactly this id, and the issued cert's SPIFFE SAN is built from it, so a
     /// token minted for `node-05` cannot be used to obtain a `node-01`
-    /// certificate. `#[serde(default)]` (empty) so a token persisted before
-    /// this field existed loads as bound-to-nothing — it matches no real node
-    /// id and is therefore refused, failing closed rather than open.
-    #[serde(default)]
+    /// certificate.
     pub node_id: String,
 }
 
@@ -401,7 +397,6 @@ pub struct JoinToken {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Crl {
     /// Permanent identity retirements, retained across certificate rotation.
-    #[serde(default)]
     pub retired_nodes:
         std::collections::BTreeMap<String, crate::cluster::retirement::NodeRetirement>,
     /// Revoked certificate entries.
@@ -441,10 +436,8 @@ pub struct CrlEntry {
     /// forever is how a long-lived cluster's CRL — replicated in every Raft
     /// snapshot and re-read on every TLS handshake — grows without bound (O5).
     ///
-    /// `None` for entries written before this field existed, and for callers
-    /// that don't know the certificate's validity; those are never pruned,
-    /// which is the safe direction to be wrong.
-    #[serde(default)]
+    /// `None` when the caller doesn't know the certificate's validity; those
+    /// entries are never pruned, which is the safe direction to be wrong.
     pub expires_at: Option<SystemTime>,
 }
 
@@ -466,16 +459,12 @@ pub struct SecurityState {
     /// Next serial number to assign.
     pub next_serial: u64,
     /// OIDC signing configuration for workload identity JWTs.
-    #[serde(default)]
     pub oidc_signing_config: Option<OidcSigningConfig>,
     /// Certificate revocation list.
-    #[serde(default)]
     pub crl: Crl,
     /// Sealing generation per stored encrypted secret, keyed by
-    /// `namespace/app/ENV_KEY` (PKI8). Legacy state persisted before
-    /// this field existed loads with it empty — those secrets count as
-    /// "unknown generation" and block finalise until re-encrypted.
-    #[serde(default)]
+    /// `namespace/app/ENV_KEY` (PKI8). An encrypted secret with no entry
+    /// counts as "unknown generation" and blocks finalise until re-encrypted.
     pub secret_seals: std::collections::BTreeMap<String, SecretSeal>,
 }
 

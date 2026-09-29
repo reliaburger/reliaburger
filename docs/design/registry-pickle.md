@@ -15,7 +15,7 @@ Core capabilities:
 - **Asynchronous, eventual replication.** A push stores the blobs locally, commits the manifest to Raft, and returns `201 Created` with an `oci-replication: pending` header. It does **not** block on replication. A leader-only heal loop (running roughly every 60s) then copies layers to peer nodes until the configured `redundancy` is met. `redundancy` counts the pushing node itself, so the default of 2 means two total copies — the pusher plus one peer. A freshly pushed image is therefore not guaranteed to survive the immediate loss of the pushing node until the heal loop has run at least once.
 - **P2P layer distribution.** OCI images are composed of content-addressed layers. Pickle downloads different layers from different peer nodes simultaneously (BitTorrent-like fan-out), bounding load on any single node and decreasing total deployment time as cluster size increases.
 - **Pull-through cache.** For images from external registries (Docker Hub, GHCR, ECR), Pickle acts as a transparent pull-through cache. The first node to need an external image pulls it from upstream; every subsequent node pulls from the peer cache.
-- **OCI Distribution API.** Any OCI-compatible tool works: `docker push`, `crane push`, `buildah push`, etc.
+- **OCI Distribution API.** Stock OCI clients push and pull over the standard `/v2/` API. What a client needs depends on the listener (see §1.2): `relish build` and peer replication send an API token as a bearer; `docker`, `crane` and other Basic-auth clients log in with an API token as the password, over TLS only.
 - **Integrated image signing.** Keyless signing via workload identity (Sigstore/cosign compatible), with optional enforcement that unsigned images are unschedulable.
 - **Build job integration.** Build jobs push directly to Pickle via the `pickle://` URI scheme through a scoped Unix socket, eliminating the need for Docker-in-Docker or external CI registries.
 
@@ -37,6 +37,79 @@ on loopback by default.
 state, redundancy target, active membership count and under-replicated layer count. Phase
 15 diagnostics must use those live fields. They must not infer redundancy from configuration
 or turn an impossible target into a green skip.
+
+### 1.2 Client authentication
+
+Pickle has one authorisation path: a Reliaburger API token (or, for peers, the internal
+service token), checked for at least the `Deployer` role on writes and for any valid token
+on routable reads. Clients reach it in one of two envelopes:
+
+- **Bearer.** `Authorization: Bearer <token>`. `relish`, the build runner and peer
+  replication use it. Accepted over TLS and plaintext.
+- **HTTP Basic.** `Authorization: Basic base64(<anything>:<token>)`, which is what
+  `docker login`/`docker push`, `crane`, `podman`, `skopeo` and `oras` send. The password
+  is the API token; the username is ignored. Accepted **only on a TLS connection**: the
+  TLS listener tags each request, and a Basic header on an untagged (plaintext) request is
+  refused with 401 even when the token is good. A Basic credential over TLS is rewritten
+  to the equivalent bearer before any handler runs, so role, repository and lease checks
+  are the bearer path's, unchanged.
+
+Every 401 from a TLS listener carries `WWW-Authenticate: Basic realm="reliaburger"`, which
+is what makes docker offer its stored credential. Plaintext 401s carry no challenge.
+Pickle does not implement the Docker token service (`WWW-Authenticate: Bearer realm=…`):
+every client above speaks Basic, and a token service would add a second credential type
+with nothing to gain over the API token it would be exchanged for.
+
+**Token scope.** A token created with `--apps` or `--namespaces` is also held to its
+scope, on every write (blob upload start, chunk and completion, manifest `PUT`, and the
+internal copy confirmation) and on every routable read (manifest and blob `GET`/`HEAD`,
+tag listing), over Bearer and Basic alike. The rule
+(`pickle::registry_auth::check_repository_scope`):
+
+- A repository's namespace is its first path segment and its app is everything after
+  the first `/`: `team-a/web` is app `web` in `team-a`, `team-a/web/debug` is app
+  `web/debug`. The token's `TokenScope::allows(app, namespace)` must accept that pair.
+- Names that don't place a repository in a namespace are refused to scoped tokens with
+  403 `DENIED`: bare names (`web`, `reliaburger-bun`), names with an empty, `.` or `..`
+  segment, and the pull-through cache's reserved `cache/…`. `library/redis` is not special:
+  it is app `redis` in namespace `library`.
+- The one exception: a scoped token may upload *blobs* (never a manifest, never a read)
+  to the two blob-only scratch repositories. `relish build` sends the caller's source
+  tarball to `_buildcontext` before `/v1/build` checks the destination's scope, and
+  `relish upgrade` sends the new binary to `reliaburger-bun` before `/v1/upgrade/start`
+  checks for an admin. A content-addressed blob with no tag grants nothing.
+- Blobs are stored once and shared by digest, so a scoped reader's blob `GET` must also be
+  for a blob the named repository's catalogue references; `team-a/web/blobs/<digest of a
+  team-b layer>` answers 404. A blob `HEAD` (which a push sends before uploading) skips that
+  lookup and reveals only whether the digest exists.
+- Unscoped tokens (Admin, Deployer and ReadOnly), the internal service token (replication,
+  peer pulls, the build runner's push, upgrade binary fetches) and the standalone bootstrap
+  window are unaffected.
+- On the loopback listener reads are open to anyone, so no read scope applies there; a
+  scoped token could simply be left off.
+
+`/v1/build` applies the same function to a `pickle://` destination (the runner pushes with
+the service token, so the submit handler is the only gate), and `/v1/images` lists only
+the repositories the caller may read. Before this, a namespace-scoped Deployer could push
+to any repository through `docker push`, and a bare build destination counted as
+`default`.
+
+What works where, in 0.1.0:
+
+| Listener | Bearer clients (`relish build`) | Basic clients (docker, crane) |
+|----------|--------------------------------|-------------------------------|
+| Standalone, loopback, no API token yet | open (bootstrap window) | anonymous push works; Basic refused |
+| Standalone, loopback, tokens exist | token | refused: plaintext |
+| Cluster with node identity (TLS, routable) | token | `docker login` / `crane auth login` with a token |
+| Cluster without node identity (plaintext) | token | refused: plaintext |
+
+Node certificates name the node (its node id), not an IP address or `localhost`, so a
+client that verifies hostnames (docker, crane) must reach the registry by the node's name
+and trust the cluster root CA. On the laptop quickstart that means an `/etc/hosts` entry
+for node 1's name pointing at `127.0.0.1` and the port forward on `15050`. A loopback-only
+TLS listener answers anonymous `GET /v2/` with 200, so docker (which only offers
+credentials after a challenge on that probe) can't push to one; clustered listeners are
+routable, so this only affects hand-built configurations.
 
 ---
 
@@ -82,7 +155,7 @@ Push is a local, synchronous commit followed by asynchronous replication. The
 receiving node never blocks on peers.
 
 ```
-Client (docker push / crane push / build job)
+Client (docker push / crane push over TLS, relish build)
   │
   ▼
 [1] OCI Distribution API endpoint on receiving node (Bun HTTP server)
@@ -649,7 +722,15 @@ When an image reference includes a registry hostname (e.g., `docker.io/redis:7-a
 
 2. **Subsequent requests.** Other nodes resolve the image from Raft state and pull layers from peers. The upstream registry is never contacted again until the cached manifest expires or is explicitly refreshed.
 
-3. **Tag re-resolution.** For mutable tags (e.g., `redis:7-alpine`), Pickle periodically re-checks the upstream registry for manifest changes (configurable interval, default 1 hour). If the upstream digest has changed, the new manifest and any new layers are pulled and cached.
+3. **Digest mirrors.** `[images] mirrors` maps an upstream host to a mirror
+   (`{ "public.ecr.aws" = "mirror.internal:5000" }`). For a digest-pinned
+   reference, the pull-through cache and Bun's direct pull read from the mirror
+   first and fall back to the upstream on any failure. The digest chain is
+   verified either way, so the mirror is untrusted. Tag references always go to
+   their own registry, because a mirror could answer a mutable tag with a
+   different image. Loopback mirrors use plain HTTP.
+
+4. **Tag re-resolution.** For mutable tags (e.g., `redis:7-alpine`), Pickle periodically re-checks the upstream registry for manifest changes (configurable interval, default 1 hour). If the upstream digest has changed, the new manifest and any new layers are pulled and cached.
 
 ```rust
 /// Pull-through cache resolution for an external image reference.
@@ -761,22 +842,35 @@ There is no Fulcio-style ephemeral-key/OIDC exchange and no external signing key
 
 **External key signing:**
 
-For images pushed from external CI systems:
+For images pushed from external CI systems, signed with an operator-held
+key (not cosign: the signed message is the digest string, not cosign's
+simple-signing payload, and signatures live in the Raft catalogue rather
+than as OCI referrer artifacts):
 
 ```
-[1] Developer signs the image with their own cosign key:
-    cosign sign --key <private-key> mycluster:5000/myapp:v1.4.2
-
-[2] The signature is recorded against the manifest in the Raft
-    catalogue (not stored as a separate OCI referrer artifact).
-
-[3] On schedule, Meat verifies the signature against the ECDSA P-256
-    public keys registered in cluster configuration (base64-encoded):
+[1] Operator creates a key once and lists its public half on every node:
+    relish sign keygen --out ci-signing.pem
     [images.trust_policy]
-    keys = ["<base64 ECDSA P-256 public key>"]
+    keys = ["<base64 uncompressed ECDSA P-256 public key>"]
 
-[4] If verification succeeds, the image is schedulable.
+[2] After each push, relish resolves the tag to its manifest digest via
+    GET /v1/images and signs the digest locally:
+    relish sign mycluster:5050/myapp:v1.4.2 --key ci-signing.pem
+
+[3] relish POSTs {digest, public_key, signature} to /v1/identity/sign
+    (unscoped Admin). The agent checks the signature verifies under that
+    public key and writes AttachSignature; the state machine refuses a
+    digest the catalogue doesn't hold. The private key never leaves the
+    operator's machine.
+
+[4] At deploy, the gate verifies the signature and checks the public key
+    is in the node's trust_policy.keys, then pins the deploy to the
+    verified digest.
 ```
+
+Trust lives in node config rather than in the API on purpose: an Admin API
+token can attach a signature, but only a key listed in each node's config
+file makes it count. See Sesame §5.10.
 
 **Enforcement:**
 
@@ -897,6 +991,9 @@ external_registries = [
   { host = "docker.io", username = "myorg", password_secret = "DOCKERHUB_TOKEN" },
 ]
 
+# Mirrors for digest-pinned images (§5.4). Tried first, upstream on failure.
+mirrors = { "public.ecr.aws" = "mirror.internal:5000" }
+
 # Image trust policy. Require all Pickle-hosted images to be signed before
 # Meat will schedule them. Unsigned images are accepted into Pickle but
 # remain unschedulable. Default: false.
@@ -935,7 +1032,7 @@ pub struct PickleConfig {
     pub trust_policy: TrustPolicySection,
     // Note: the shipped `ImagesSection` also carries registry_port,
     // registry_bind, p2p_concurrency, pull_through, cache_recheck_secs,
-    // build_timeout_secs, and max_context_bytes. There is no push_sync,
+    // build_timeout_secs, max_context_bytes and mirrors. There is no push_sync,
     // pre_pull, or gc_retain_tags field.
 }
 
@@ -1257,7 +1354,7 @@ Traditional container registries (Docker Hub, GitHub Container Registry, Amazon 
 
 **Reference:** [OCI Distribution Spec](https://github.com/opencontainers/distribution-spec)
 
-Pickle implements the OCI Distribution Specification for API compatibility. Any tool that speaks this protocol (docker, crane, buildah, podman, skopeo, oras) works with Pickle without modification.
+Pickle implements the push and pull subset of the OCI Distribution Specification (blob `HEAD`/`GET`, monolithic and chunked uploads, manifest `HEAD`/`GET`/`PUT`, tag listing). Tools that speak it (docker, crane, buildah, podman, skopeo, oras) work without modification, subject to the authentication rules in §1.2: Basic-auth clients need a TLS listener and an API token. `crane` is exercised end to end by `tests/suite/registry_standard_clients.rs`. Not implemented: manifest and blob `DELETE`, cross-repository mounts (a `mount` request falls back to an ordinary upload, as the spec allows), the referrers API and the catalogue endpoint.
 
 ---
 

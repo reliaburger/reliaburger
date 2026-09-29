@@ -17,7 +17,7 @@ Because Brioche is embedded in Bun via Rust's `include_bytes!` / `rust-embed` me
 Three pages ship today, plus a login page:
 
 - **Cluster overview** (route `/`) -- total resource usage, node health map, app list, active alerts (rendered as a dashboard fragment)
-- **App detail** (route `/ui/app/{app}/{namespace}`) -- CPU/memory charts, instance status, deploy history, environment variables, current image
+- **App detail** (route `/ui/app/{app}/{namespace}`) -- CPU/memory charts with one line per instance, plus requests/s and mean-latency charts when the app's own metrics are scraped, instance status, deploy history, environment variables, current image
 - **Node detail** (route `/ui/node/{name}`) -- resource utilisation, running apps, disk usage, GPU status
 
 The **GitOps status** page (`/ui/gitops`) now ships (§5.5). The following pages remain **planned — not yet implemented** as standalone views:
@@ -137,7 +137,7 @@ Brioche runs on every node, but the data it displays comes from the cluster API.
 - **Static asset requests** (`/`, `/apps`, CSS, JS, fonts): Served directly from the embedded assets on the local node. No network hop.
 - **API read requests** (`GET /v1/*`): The local Bun forwards to the nearest council member if the local node is not a council member. Council members serve from local Raft state.
 - **API write requests** (`POST /v1/*`, `PUT`, `DELETE`): Forwarded to the current leader, which commits via Raft before responding.
-- **Metrics queries** (`GET /v1/metrics/cluster`, `GET /v1/metrics/app/{app}/{namespace}`): fan out across council members and merge results. The per-name `GET /v1/metrics` reads the local store.
+- **Metrics queries** (`GET /v1/metrics/cluster`, `GET /v1/metrics/app/{app}/{namespace}`): fan out across council members or the nodes running the app and merge results. The per-name `GET /v1/metrics` reads the local store. `GET /v1/metrics/app/{app}/{namespace}/chart?name=- **Metrics queries** (`GET /v1/metrics/cluster`, `GET /v1/metrics/app/{app}/{namespace}`): fan out across council members and merge results. The per-name `GET /v1/metrics` reads the local store.kind=gauge|rate|mean` returns one app metric as `{timestamps, series: [{label, values}]}`, one series per instance, counters as per-second rates and histograms as means, which is what the app page draws.
 - **Log streaming** (`GET /v1/logs/{app}/{namespace}?follow=true`, `WS /v1/ws/logs/{app}/{namespace}`): streams from the receiving node's local agent only. Cross-node merge of live follow is not implemented.
 
 ### 3.4 Frontend Technology
@@ -975,7 +975,7 @@ Accessed via `/apps/:name`. The primary operational view for understanding a sin
    - Error rate (5xx/sec from Wrapper metrics)
    - Time range selector: 15m, 1h, 6h, 24h, 7d, 30d, custom
 
-   Charts are initialised via a JSON config block rendered into the page, and uPlot fetches data from `/v1/metrics?name=<metric>` (optionally `&app=&namespace=`). The chart refresh interval is 10 seconds for the active time range.
+   Charts are initialised via a JSON config block rendered into the page. App charts fetch the aligned per-instance series from `/v1/metrics/app/{app}/{namespace}/chart`; node charts read raw rows from `/v1/metrics?name=<metric>`, which `brioche.js` groups by label set. The chart refresh interval is 10 seconds for the active time range.
 
 3. **Instance Table:**
 
@@ -1233,7 +1233,8 @@ Brioche uses the same API token authentication as the Relish CLI (Section 11 of 
 **Session-cookie details:**
 
 - The cookie carries a random session id that maps, server-side, to the API token held in memory — the token itself is never placed in the cookie, so there is no per-node HKDF encryption to reason about. (Adding the `Secure` attribute, so the cookie is only sent over HTTPS, is a hardening follow-up; it is not set today.)
-- The session is dropped when it expires or on logout, and the user is redirected to the login page.
+- A session lasts at most 12 hours and never longer than the token it was created from (the cookie's `Max-Age` matches). It records the token's principal id (a digest of the token hash), and every request checks that exact token is still in the store and unexpired, so revoking or expiring the token ends its sessions and a new token issued under the same name doesn't revive them.
+- The session is dropped when it expires, when its token is revoked or expires, or on logout, and the user is redirected to the login page.
 - Logout (`POST /ui/logout`) clears the cookie.
 
 **OIDC flow (planned — not yet implemented):**

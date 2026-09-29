@@ -34,7 +34,7 @@ pub struct CgroupNamespaceEntry {
     pub namespace_id: u32,
 }
 
-/// Live kernel values used by `relish trace` to mirror the connect hook's
+/// Live kernel values used by `relish path` to mirror the connect hook's
 /// namespace decision without pretending declared policy is kernel truth.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LiveFirewallState {
@@ -422,6 +422,7 @@ mod tests {
                 node_ip: Ipv4Addr::new(10, 0, 1, 1),
                 host_port: 30000,
                 healthy: true,
+                local: false,
             }],
             firewall_allow_from: allow_from,
         }

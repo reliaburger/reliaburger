@@ -30,19 +30,27 @@ use super::report::{
     TestProfile, TestReport, UnknownKind,
 };
 
-/// How long teardown gets before the runner records that cleanup is unknown.
-/// A hung agent must not wedge the whole run, but lack of cleanup evidence
-/// must not disappear behind a green case result either.
-const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+/// Teardown time beyond the lease release: reversing owned faults and
+/// checking independently that the runtime holds nothing of the case's.
+const TEARDOWN_MARGIN: Duration = Duration::from_secs(30);
+
+/// How long teardown gets before the runner records that cleanup is unknown:
+/// the lease release's own budget, which is the product's bound for an owner
+/// to retire what the lease held, plus [`TEARDOWN_MARGIN`]. A hung agent must
+/// not wedge the whole run, but lack of cleanup evidence must not disappear
+/// behind a green case result either.
+fn teardown_timeout() -> Duration {
+    crate::relish::client::lease_release_budget() + TEARDOWN_MARGIN
+}
 
 /// Resource ownership mode. Production command wiring always requires server
-/// leases; the legacy variant exists only for runner unit tests whose tiny
-/// mock servers predate the lease API.
+/// leases; the unleased variant exists only for runner unit tests whose tiny
+/// mock servers don't implement the lease API.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum LeaseOwnership {
     Required,
     #[cfg(test)]
-    LegacyNamespaceCleanup,
+    UnleasedForUnitTests,
 }
 
 /// Everything a run needs beyond the cases themselves.
@@ -65,6 +73,8 @@ pub struct RunConfig {
     /// per-case isolation against a live cluster.
     pub fixed_namespace: Option<String>,
     pub(crate) lease_ownership: LeaseOwnership,
+    /// How cases reach peer nodes (see [`PeerRoute::detect`]).
+    pub peer_route: crate::testkit::context::PeerRoute,
 }
 
 /// Invalid runner input, rejected before tasks, leases or requests are created.
@@ -150,6 +160,7 @@ pub async fn run(cases: Vec<TestCase>, config: RunConfig) -> Result<TestReport, 
         let name = case.name.to_string();
         let group = case.group;
         let lease_ownership = config.lease_ownership;
+        let peer_route = config.peer_route;
 
         let handle = set.spawn(async move {
             // Acquire *inside* the task, not before spawning: the semaphore is
@@ -166,6 +177,7 @@ pub async fn run(cases: Vec<TestCase>, config: RunConfig) -> Result<TestReport, 
                 timeout,
                 profile,
                 lease_ownership,
+                peer_route,
             )
             .await;
             Indexed { index, result }
@@ -221,6 +233,8 @@ pub async fn run(cases: Vec<TestCase>, config: RunConfig) -> Result<TestReport, 
 }
 
 /// Run one case: skip-check, timed execution, then unconditional teardown.
+// Each argument is one per-run setting the case context is built from.
+#[allow(clippy::too_many_arguments)]
 async fn run_one(
     case: &TestCase,
     client: BunClient,
@@ -229,6 +243,7 @@ async fn run_one(
     timeout: Duration,
     profile: TestProfile,
     lease_ownership: LeaseOwnership,
+    peer_route: crate::testkit::context::PeerRoute,
 ) -> TestCaseResult {
     let start = Instant::now();
     let started_at = now_rfc3339();
@@ -362,7 +377,7 @@ async fn run_one(
 
     let (namespace, lease_id) = match lease_ownership {
         LeaseOwnership::Required => {
-            let lifetime = timeout.saturating_add(TEARDOWN_TIMEOUT);
+            let lifetime = timeout.saturating_add(teardown_timeout());
             let ttl_seconds = lifetime
                 .as_secs()
                 .saturating_add(u64::from(lifetime.subsec_nanos() != 0));
@@ -439,7 +454,7 @@ async fn run_one(
             }
         }
         #[cfg(test)]
-        LeaseOwnership::LegacyNamespaceCleanup => (namespace, None),
+        LeaseOwnership::UnleasedForUnitTests => (namespace, None),
     };
 
     let context = TestContext {
@@ -450,6 +465,8 @@ async fn run_one(
         capabilities: capabilities.clone(),
         timeout,
         deadline,
+        peer_route,
+        wait_note: Default::default(),
     };
 
     // The case body gets its own task so a panic is data and the outer owner
@@ -472,11 +489,20 @@ async fn run_one(
             // lease has been released.
             body.abort();
             let _ = body.await;
-            TestOutcome::timed_out("case", deadline.budget_ms())
+            let mut outcome = TestOutcome::timed_out("case", deadline.budget_ms());
+            // The case's own wait gives up on this same deadline, usually a
+            // moment too late to return its message. It left a note instead.
+            if let (Some(note), TestOutcome::Unknown { reason, .. }) =
+                (context.wait_note.take().await, &mut outcome)
+            {
+                reason.push_str("; it was still ");
+                reason.push_str(&note);
+            }
+            outcome
         }
     };
 
-    let cleanup_deadline = Deadline::after(TEARDOWN_TIMEOUT).expect("non-zero cleanup timeout");
+    let cleanup_deadline = Deadline::after(teardown_timeout()).expect("non-zero cleanup timeout");
     let cleanup = context.teardown(cleanup_deadline).await;
     let finished_at = now_rfc3339();
     let evidence = matches!(outcome, TestOutcome::Pass)
@@ -617,7 +643,8 @@ mod tests {
             chaos: false,
             profile: TestProfile::Development,
             fixed_namespace: None,
-            lease_ownership: LeaseOwnership::LegacyNamespaceCleanup,
+            lease_ownership: LeaseOwnership::UnleasedForUnitTests,
+            peer_route: crate::testkit::context::PeerRoute::Direct,
         }
     }
 
@@ -895,6 +922,39 @@ mod tests {
         ));
     }
 
+    /// V02 soak: C2's own wait knew it was stuck on three running replicas,
+    /// but the runner's deadline fired first and the report said only
+    /// "exceeded its deadline". A timeout now carries what the case's last
+    /// wait was waiting for, without the body outliving its deadline.
+    #[tokio::test]
+    async fn a_timed_out_case_reports_what_its_last_wait_was_waiting_for() {
+        async fn stuck(ctx: TestContext) -> Result<(), String> {
+            // Stand in for the runner winning the race with the wait's own
+            // error: the body never gets to return it.
+            let _ = ctx
+                .wait_for_cluster("web", "3 running replica(s)", |_| false)
+                .await;
+            std::future::pending().await
+        }
+        let cases = vec![case("stuck", &[], testkit_case!(stuck))];
+        let mut cfg = config(dead_client(), full_capabilities(), 4);
+        cfg.timeout = Duration::from_millis(300);
+
+        let report = run(cases, cfg).await.unwrap();
+
+        match &report.results[0].outcome {
+            TestOutcome::Unknown { kind, reason } => {
+                assert_eq!(*kind, UnknownKind::TimedOut);
+                assert!(reason.contains("exceeded its 300 ms deadline"), "{reason}");
+                assert!(
+                    reason.contains("waiting for web to reach 3 running replica(s) cluster-wide"),
+                    "{reason}"
+                );
+            }
+            other => panic!("expected a timeout, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn a_panicking_case_becomes_unknown_and_still_reaches_cleanup() {
         async fn boom(_ctx: TestContext) -> Result<(), String> {
@@ -1053,6 +1113,8 @@ mod tests {
             target_node: request.target_node,
             remaining_secs: request.duration.as_secs(),
             injected_by: "runner-test".to_string(),
+            node: None,
+            routed: Vec::new(),
         })
     }
 
@@ -1139,12 +1201,14 @@ mod tests {
         );
         let mut observed = records.lock().await.clone();
         observed.sort();
+        // The sub-second case timeout rounds the lease up by one second.
+        let ttl = teardown_timeout().as_secs() + 1;
         assert_eq!(
             observed,
             vec![
-                "create:rbtest-fixed-00:31".to_string(),
-                "create:rbtest-fixed-01:31".to_string(),
-                "create:rbtest-fixed-02:31".to_string(),
+                format!("create:rbtest-fixed-00:{ttl}"),
+                format!("create:rbtest-fixed-01:{ttl}"),
+                format!("create:rbtest-fixed-02:{ttl}"),
                 "release:lease-1".to_string(),
                 "release:lease-2".to_string(),
                 "release:lease-3".to_string(),
@@ -1230,6 +1294,15 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    /// V02 soak: teardown gave the lease release 30 s, less than one owner's
+    /// retirement may take, so a passing case reported cleanup `unknown`.
+    #[test]
+    fn teardown_outlasts_the_lease_release_budget() {
+        let release = crate::relish::client::lease_release_budget();
+        assert!(teardown_timeout() > release, "{:?}", teardown_timeout());
+        assert!(release > Duration::from_secs(30), "{release:?}");
     }
 
     #[tokio::test]
@@ -1350,6 +1423,7 @@ mod tests {
             host_port: None,
             exit_code: None,
             pid: None,
+            runtime_unknown: false,
         }
     }
 

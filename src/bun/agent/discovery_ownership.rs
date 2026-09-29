@@ -50,7 +50,43 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 }
 
+/// How the durable journal accounts for a runtime address hold the agent
+/// has no in-memory record of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum JournalReference {
+    /// The journal records exactly this hold.
+    Recorded,
+    /// The journal is authoritative and names no hold for this instance.
+    Unrecorded,
+    /// Ownership is disabled, uncertain, or records a different hold.
+    Unknown,
+}
+
 impl<G: Grill + Clone + 'static> BunAgent<G> {
+    /// Classify a runtime hold against the durable discovery journal. A
+    /// launch is only allowed after its hold is recorded, so an unrecorded
+    /// hold belongs to an instance that never started.
+    pub(super) fn journal_reference(
+        &self,
+        held: &crate::grill::runc_intent::NetworkReference,
+    ) -> JournalReference {
+        let (DiscoveryOwnership::Ready(journal) | DiscoveryOwnership::Recovered(journal)) =
+            &self.discovery_ownership
+        else {
+            return JournalReference::Unknown;
+        };
+        match journal
+            .inventory()
+            .references
+            .iter()
+            .find(|owner| owner.reference.instance_id == held.instance_id)
+        {
+            None => JournalReference::Unrecorded,
+            Some(owner) if owner.reference == *held => JournalReference::Recorded,
+            Some(_) => JournalReference::Unknown,
+        }
+    }
+
     /// Preserve attempted publications before any kernel or userspace acknowledgement.
     pub(super) async fn persist_discovery_publication(
         &mut self,
@@ -61,12 +97,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         if matches!(self.discovery_ownership, DiscoveryOwnership::Disabled) {
             return Ok(());
         }
-        let launches = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            self.supervisor.grill().launch_inventory(),
-        )
-        .await
-        .map_err(|_| BunError::AdoptionState("publication runtime inventory timed out".into()))??;
+        let launches = self
+            .runtime_inventory(super::RUNTIME_INVENTORY_TIMEOUT, |reason| {
+                BunError::AdoptionState(format!("publication {reason}"))
+            })
+            .await?;
         self.update_discovery_inventory(id, |next| {
             // Absence from the candidate is not withdrawal proof. Preserve
             // earlier allocations until their confirmed retirement removes them.
@@ -307,23 +342,20 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
         // Include historical candidates: private metadata loss cannot prove that
         // a request which already captured an endpoint released it.
-        let backends = original.entry.backends.clone();
-        for backend in &backends {
-            self.drains
-                .start_drain(&crate::wrapper::draining::DrainCommand {
-                    app_name: service.name.clone(),
-                    instance_id: backend.instance_id.clone(),
-                    timeout: std::time::Duration::ZERO,
-                })
-                .await;
-        }
-        self.drains.check_completions().await;
-        for backend in &backends {
-            if self.drains.is_draining(&backend.instance_id).await {
-                return Err(refuse(
-                    "captured ingress requests still require confirmed release",
-                ));
-            }
+        let drains: Vec<_> = original
+            .entry
+            .backends
+            .iter()
+            .map(|backend| crate::wrapper::draining::DrainCommand {
+                app_name: service.name.clone(),
+                instance_id: backend.instance_id.clone(),
+                timeout: std::time::Duration::ZERO,
+            })
+            .collect();
+        if !self.drains.drain_all(&drains).await {
+            return Err(refuse(
+                "captured ingress requests still require confirmed release",
+            ));
         }
         self.update_discovery_inventory(service, |next| {
             for owner in &mut next.services {

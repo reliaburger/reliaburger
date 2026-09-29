@@ -43,10 +43,8 @@ pub const CHECKPOINT_FILENAME: &str = "_export_checkpoint.json";
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ExportCheckpoint {
     /// Durable ids (`{filename}@{hash}`) that have already been exported.
-    #[serde(default)]
     pub exported_files: HashSet<String>,
     /// Hash of the destination URL and node prefix these acknowledgements cover.
-    #[serde(default)]
     pub scope: Option<String>,
 }
 
@@ -127,7 +125,9 @@ fn parse_destination(
     destination: &str,
 ) -> Result<(Box<dyn object_store::ObjectStore>, object_store::path::Path), KetchupError> {
     let url = destination_url(destination)?;
-    object_store::parse_url(&url).map_err(|e| {
+    // The checkpoint licenses pruning the source, so an upload must be durable
+    // before it's acknowledged; `object_storage::open` syncs local writes.
+    crate::object_storage::open(&url).map_err(|e| {
         KetchupError::Io(std::io::Error::other(format!(
             "unsupported destination: {e}"
         )))
@@ -145,7 +145,7 @@ fn export_scope(destination: &str, node_id: &str) -> Result<String, KetchupError
 
 fn destination_url(destination: &str) -> Result<url::Url, KetchupError> {
     // A bare filesystem path has no scheme; normalise it to a file:// URL so
-    // `object_store::parse_url` picks the LocalFileSystem backend. Existing
+    // `object_storage::open` picks the LocalFileSystem backend. Existing
     // configs and tests pass plain temp-dir paths, so this stays compatible.
     let url = if destination.contains("://") {
         url::Url::parse(destination)
@@ -166,7 +166,9 @@ fn destination_url(destination: &str) -> Result<url::Url, KetchupError> {
 /// Ships any `.parquet` files in `source_dir` whose durable id isn't yet in
 /// the checkpoint to `{destination}/{node_id}/{sha256}-{filename}`, then records
 /// each id. `destination` may be a local path, `file://…`, `s3://…` or
-/// `gs://…`. The source must exist. A competing exporter returns a busy error.
+/// `gs://…`. The source must exist. While another exporter holds the checkpoint
+/// this returns [`KetchupError::ExportBusy`] without touching anything; that
+/// exporter is shipping the same files, so callers can skip or retry.
 /// The supplied snapshot is replaced only after uploads and checkpoint persistence
 /// succeed; callers must not separately save it over the authoritative file.
 pub async fn export_logs(
@@ -185,28 +187,30 @@ pub async fn export_logs(
             options.mode(0o600);
         }
         let lock = options.open(directory.join("_export_checkpoint.lock"))?;
-        lock.try_lock().map_err(|error| {
-            std::io::Error::other(format!("export checkpoint is busy: {error}"))
-        })?;
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => return Err(KetchupError::ExportBusy),
+            Err(std::fs::TryLockError::Error(error)) => return Err(KetchupError::Io(error)),
+        }
         let path = directory.join(CHECKPOINT_FILENAME);
         let current = match std::fs::read(&path) {
             Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| {
-                std::io::Error::other(format!(
+                KetchupError::Io(std::io::Error::other(format!(
                     "invalid export checkpoint {}: {error}",
                     path.display()
-                ))
+                )))
             })?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 ExportCheckpoint::default()
             }
             Err(error) => {
-                return Err(std::io::Error::other(format!(
+                return Err(KetchupError::Io(std::io::Error::other(format!(
                     "read export checkpoint {}: {error}",
                     path.display()
-                )));
+                ))));
             }
         };
-        Ok::<_, std::io::Error>((lock, current))
+        Ok::<_, KetchupError>((lock, current))
     })
     .await
     .map_err(|error| KetchupError::Io(std::io::Error::other(error.to_string())))??;
@@ -240,7 +244,7 @@ async fn export_logs_locked(
     let node_prefix = prefix.join(node_id);
     let scope = export_scope(destination, node_id)?;
     if checkpoint.scope.as_ref() != Some(&scope) {
-        // Legacy or differently scoped acknowledgements cannot justify skipping
+        // Unscoped or differently scoped acknowledgements cannot justify skipping
         // an upload or pruning its source. Immutable object names make retries safe.
         checkpoint.exported_files.clear();
         checkpoint.scope = Some(scope);
@@ -494,6 +498,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn competing_export_is_reported_as_busy_not_as_io_failure() {
+        let source = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        std::fs::write(source.path().join("logs_000000.parquet"), b"data").unwrap();
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(source.path().join("_export_checkpoint.lock"))
+            .unwrap();
+        holder.try_lock().unwrap();
+
+        let mut checkpoint = ExportCheckpoint::default();
+        let result = export_logs(
+            source.path(),
+            dest.path().to_str().unwrap(),
+            "node-1",
+            &mut checkpoint,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(KetchupError::ExportBusy)),
+            "{result:?}"
+        );
+        assert!(exported_files(dest.path()).is_empty());
+    }
+
+    #[tokio::test]
     async fn export_empty_source_produces_no_files() {
         let source = tempfile::tempdir().unwrap();
         let dest = tempfile::tempdir().unwrap();
@@ -620,6 +654,24 @@ mod tests {
         assert_eq!(r2.files_exported, 1);
 
         assert_eq!(exported_files(dest.path()).len(), 2);
+    }
+
+    /// Pruning trusts the checkpoint, so a local destination must hold the
+    /// bytes durably before the checkpoint says so. `object_store` only syncs
+    /// local writes when asked, and the fsync itself can't be observed short of
+    /// a power cut (`tests/power_cut.rs` does that), so check the configuration.
+    #[test]
+    fn local_destinations_sync_uploads_before_acknowledging() {
+        let destination = tempfile::tempdir().unwrap();
+        let bare = destination.path().to_str().unwrap().to_string();
+        let url = format!("file://{bare}");
+        for destination in [bare, url] {
+            let (store, _) = parse_destination(&destination).unwrap();
+            assert!(
+                format!("{store:?}").contains("fsync: true"),
+                "{destination} acknowledges unsynced uploads: {store:?}"
+            );
+        }
     }
 
     #[test]

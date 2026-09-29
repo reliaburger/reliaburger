@@ -33,7 +33,7 @@ fn launcher_pid(directory: &Path) -> io::Result<u32> {
     let OwnerPhase::Running { pid } = record.phase else {
         return Err(io::Error::other("rootless launcher is not running"));
     };
-    let path = process_owner::socket_path(directory, &record);
+    let path = process_owner::socket_path(&record);
     process_owner::validate_socket_directory(
         path.parent()
             .ok_or_else(|| io::Error::other("missing owner socket directory"))?,

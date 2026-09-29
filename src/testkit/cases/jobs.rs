@@ -144,6 +144,8 @@ mod tests {
             capabilities: crate::bun::capabilities::ClusterCapabilities::default(),
             timeout,
             deadline: crate::testkit::deadline::Deadline::after(timeout).unwrap(),
+            peer_route: crate::testkit::context::PeerRoute::Direct,
+            wait_note: Default::default(),
         };
         let result = tokio::time::timeout(
             Duration::from_secs(2),
@@ -208,11 +210,16 @@ mod tests {
                     let reads = Arc::clone(&reads);
                     async move {
                         let entries = if reads.fetch_add(1, Ordering::SeqCst) >= publish_after {
-                            serde_json::json!([{"line":"hello-from-job"}])
+                            serde_json::json!([{
+                                "timestamp": 1, "sequence": 1, "instance": "logged-0",
+                                "stream": "Stdout", "line": "hello-from-job",
+                            }])
                         } else {
                             serde_json::json!([])
                         };
-                        axum::Json(serde_json::json!({"entries":entries}))
+                        axum::Json(serde_json::json!({
+                            "entries": entries, "node_count": 1, "warnings": [],
+                        }))
                     }
                 }),
             );
@@ -233,6 +240,8 @@ mod tests {
             capabilities: crate::bun::capabilities::ClusterCapabilities::default(),
             timeout,
             deadline: crate::testkit::deadline::Deadline::after(timeout).unwrap(),
+            peer_route: crate::testkit::context::PeerRoute::Direct,
+            wait_note: Default::default(),
         };
         let result = tokio::time::timeout(
             Duration::from_secs(2),

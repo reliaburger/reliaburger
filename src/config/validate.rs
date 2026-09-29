@@ -6,7 +6,7 @@ use super::Config;
 /// meaningful context.
 use super::error::ConfigError;
 use super::node::NodeConfig;
-use super::types::parse_resource_value;
+use super::types::{parse_byte_size, parse_cpu_millicores};
 
 /// Whether a workload or namespace is a non-empty lowercase DNS label.
 pub(crate) fn valid_workload_label(value: &str) -> bool {
@@ -134,14 +134,14 @@ fn validate_namespace(name: &str, ns: &super::namespace::NamespaceSpec) -> Resul
     // Resource budgets must parse as non-negative resource values. A
     // negative or overflowing CPU/memory budget is a typo, not a quota.
     if let Some(cpu) = &ns.cpu {
-        parse_resource_value(cpu).map_err(|_| ConfigError::Validation {
+        parse_cpu_millicores(cpu).map_err(|_| ConfigError::Validation {
             field: "cpu".to_string(),
             context: format!("namespace {name:?}"),
             reason: format!("invalid resource value {cpu:?}"),
         })?;
     }
     if let Some(memory) = &ns.memory {
-        parse_resource_value(memory).map_err(|_| ConfigError::Validation {
+        parse_byte_size(memory).map_err(|_| ConfigError::Validation {
             field: "memory".to_string(),
             context: format!("namespace {name:?}"),
             reason: format!("invalid resource value {memory:?}"),
@@ -254,6 +254,27 @@ fn validate_app(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError
         });
     }
 
+    // `args` and `working_dir` describe a container's process against its
+    // image config; a process workload has no image to resolve them against.
+    if (app.exec.is_some() || app.script.is_some())
+        && (!app.args.is_empty() || app.working_dir.is_some())
+    {
+        return Err(ConfigError::Validation {
+            field: "args/working_dir".to_string(),
+            context: format!("app {name:?}"),
+            reason: "args and working_dir apply to image workloads, not exec or script".to_string(),
+        });
+    }
+    if let Some(dir) = &app.working_dir
+        && !dir.is_absolute()
+    {
+        return Err(ConfigError::Validation {
+            field: "working_dir".to_string(),
+            context: format!("app {name:?}"),
+            reason: format!("{:?} must be absolute", dir.display()),
+        });
+    }
+
     // Port range
     if let Some(port) = app.port
         && port == 0
@@ -262,6 +283,30 @@ fn validate_app(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError
             name: name.to_string(),
             port,
         });
+    }
+
+    // Metrics: the scrape needs a port (its own or the app's) and a path.
+    if let Some(metrics) = &app.metrics {
+        let metrics_error = |reason: String| ConfigError::Validation {
+            field: "metrics".to_string(),
+            context: format!("app {name:?}"),
+            reason,
+        };
+        match metrics.port.or(app.port) {
+            None => {
+                return Err(metrics_error(
+                    "no port to scrape: set metrics.port or the app's port".to_string(),
+                ));
+            }
+            Some(0) => return Err(metrics_error("port must not be 0".to_string())),
+            Some(_) => {}
+        }
+        if !metrics.path.starts_with('/') || metrics.path.contains(char::is_whitespace) {
+            return Err(metrics_error(format!(
+                "path {:?} must start with '/' and contain no whitespace",
+                metrics.path
+            )));
+        }
     }
 
     // Config files: exactly one of content/source
@@ -327,9 +372,11 @@ fn validate_app(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError
 
     // Autoscale block: bounds, windows and threshold are validated up front
     // so a bad `[autoscale]` fails the deploy instead of silently clamping
-    // at runtime (DEP8).
+    // at runtime (DEP8). An unsupported metric, or one the app has no request
+    // for, is refused here too: it would otherwise never scale.
     if let Some(autoscale) = &app.autoscale
-        && let Err(e) = crate::meat::autoscaler::AutoscaleConfig::from_spec(autoscale)
+        && let Err(e) =
+            crate::meat::autoscaler::AutoscaleConfig::from_spec(autoscale, app.cpu, app.memory)
     {
         return Err(ConfigError::Validation {
             field: "autoscale".to_string(),
@@ -380,6 +427,37 @@ fn validate_job(name: &str, job: &super::job::JobSpec) -> Result<(), ConfigError
 }
 
 impl NodeConfig {
+    /// `[security] leaf_lifetime_override_secs` exists to qualify renewal in a
+    /// soak run. It must never reach a cluster whose class is production or
+    /// undeclared, and it may only shorten both leaf classes it touches.
+    fn validate_leaf_lifetime_override(&self) -> Result<(), ConfigError> {
+        use crate::sesame::ca::{INGRESS_LEAF_LIFETIME, MIN_LEAF_LIFETIME_OVERRIDE};
+        use crate::testkit::safety::ClusterSafetyClass;
+        let Some(seconds) = self.security.leaf_lifetime_override_secs else {
+            return Ok(());
+        };
+        let refuse = |reason: String| ConfigError::Validation {
+            field: "security.leaf_lifetime_override_secs".to_string(),
+            context: "node config".to_string(),
+            reason,
+        };
+        if self.testing.safety_class != ClusterSafetyClass::Development {
+            return Err(refuse(
+                "is a development-only soak setting; it requires \
+                 [testing] safety_class = \"development\""
+                    .to_string(),
+            ));
+        }
+        let minimum = MIN_LEAF_LIFETIME_OVERRIDE.as_secs();
+        let maximum = INGRESS_LEAF_LIFETIME.as_secs();
+        if !(minimum..=maximum).contains(&seconds) {
+            return Err(refuse(format!(
+                "must be between {minimum} and {maximum} seconds, got {seconds}"
+            )));
+        }
+        Ok(())
+    }
+
     /// Validate the parsed node configuration.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.reporting_tree.max_events_per_report
@@ -456,6 +534,40 @@ impl NodeConfig {
             });
         }
 
+        // Each sweep prunes before it uploads, so retaining zero would delete
+        // every snapshot the moment it was taken, before it ever left the node.
+        let snapshots = &self.storage.snapshots;
+        if snapshots.interval_secs > 0 && snapshots.retain == 0 {
+            return Err(ConfigError::Validation {
+                field: "storage.snapshots.retain".into(),
+                context: "node config".into(),
+                reason: "must retain at least one snapshot when interval_secs is set".into(),
+            });
+        }
+
+        // A zero deadline would fail every stop before the runtime answered,
+        // leaving every workload owned and unstoppable.
+        if self.runtime.stop_confirmation_timeout_secs == 0 {
+            return Err(ConfigError::Validation {
+                field: "runtime.stop_confirmation_timeout_secs".into(),
+                context: "node config".into(),
+                reason: "must be greater than zero".into(),
+            });
+        }
+
+        self.validate_leaf_lifetime_override()?;
+
+        // A bad operator CIDR would otherwise surface only as a warning when
+        // the firewall reconciles, leaving the operator locked out with no
+        // clear cause.
+        for value in &self.security.operator_cidrs {
+            crate::firewall::rules::parse_cidr(value).map_err(|error| ConfigError::Validation {
+                field: "security.operator_cidrs".to_string(),
+                context: "node config".to_string(),
+                reason: error.to_string(),
+            })?;
+        }
+
         self.testing
             .validate()
             .map_err(|error| ConfigError::Validation {
@@ -481,29 +593,27 @@ impl NodeConfig {
         }
 
         // Reserved resources must parse
-        parse_resource_value(&self.resources.reserved_cpu).map_err(|_| {
+        parse_cpu_millicores(&self.resources.reserved_cpu).map_err(|_| {
             ConfigError::Validation {
                 field: "resources.reserved_cpu".to_string(),
                 context: "node config".to_string(),
                 reason: format!("invalid resource value {:?}", self.resources.reserved_cpu),
             }
         })?;
-        parse_resource_value(&self.resources.reserved_memory).map_err(|_| {
-            ConfigError::Validation {
-                field: "resources.reserved_memory".to_string(),
-                context: "node config".to_string(),
-                reason: format!(
-                    "invalid resource value {:?}",
-                    self.resources.reserved_memory
-                ),
-            }
+        parse_byte_size(&self.resources.reserved_memory).map_err(|_| ConfigError::Validation {
+            field: "resources.reserved_memory".to_string(),
+            context: "node config".to_string(),
+            reason: format!(
+                "invalid resource value {:?}",
+                self.resources.reserved_memory
+            ),
         })?;
 
         // The registry storage cap must parse (M23): the binary reads it with
         // `unwrap_or(0)`, and 0 means "unlimited", so a typo like "10GBB" would
         // silently disable the cap. Fail here instead. `0` (explicit unlimited)
         // parses fine.
-        parse_resource_value(&self.images.max_storage).map_err(|_| ConfigError::Validation {
+        parse_byte_size(&self.images.max_storage).map_err(|_| ConfigError::Validation {
             field: "images.max_storage".to_string(),
             context: "node config".to_string(),
             reason: format!("invalid resource value {:?}", self.images.max_storage),
@@ -521,6 +631,10 @@ impl NodeConfig {
             (
                 "metrics.rollup_interval_secs",
                 self.metrics.rollup_interval_secs,
+            ),
+            (
+                "metrics.app_scrape_interval_secs",
+                self.metrics.app_scrape_interval_secs,
             ),
             ("logs.export_interval_secs", self.logs.export_interval_secs),
         ] {
@@ -554,6 +668,47 @@ mod tests {
         toml::from_str(r#"image = "test:v1""#).unwrap()
     }
 
+    fn app_with_metrics(extra: &str) -> AppSpec {
+        toml::from_str(&format!("image = \"test:v1\"\n{extra}")).unwrap()
+    }
+
+    #[test]
+    fn metrics_on_the_app_port_is_valid() {
+        let config = config_with_app("web", app_with_metrics("port = 8080\nmetrics = {}"));
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn metrics_without_any_port_is_rejected() {
+        let config = config_with_app("web", app_with_metrics("metrics = {}"));
+        let err = config.validate().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Validation { ref field, ref reason, .. }
+                if field == "metrics" && reason.contains("no port")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn metrics_port_zero_is_rejected() {
+        let config = config_with_app("web", app_with_metrics("metrics = { port = 0 }"));
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn metrics_path_must_be_absolute() {
+        let config = config_with_app(
+            "web",
+            app_with_metrics("metrics = { port = 9797, path = \"metrics\" }"),
+        );
+        let err = config.validate().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Validation { ref reason, .. }
+                if reason.contains("start with '/'")),
+            "{err:?}"
+        );
+    }
+
     #[test]
     fn node_config_defaults_are_valid() {
         // H1: the whole-config validator now runs at startup, so the shipped
@@ -571,6 +726,18 @@ mod tests {
             matches!(err, ConfigError::Validation { ref field, .. }
                 if field == "metrics.collection_interval_secs"),
             "expected a collection-interval validation error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn node_config_rejects_a_zero_stop_confirmation_timeout() {
+        let mut node = crate::config::NodeConfig::default();
+        node.runtime.stop_confirmation_timeout_secs = 0;
+        let err = node.validate().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Validation { ref field, .. }
+                if field == "runtime.stop_confirmation_timeout_secs"),
+            "expected a stop-confirmation validation error, got {err:?}"
         );
     }
 
@@ -749,10 +916,55 @@ mod tests {
     }
 
     #[test]
+    fn image_process_fields_parse_and_validate() {
+        let app: AppSpec = toml::from_str(
+            r#"
+            image = "ghcr.io/stefanprodan/podinfo:6.15.0"
+            args = ["--port=9898"]
+            working_dir = "/home/app"
+            run_as_user = 100
+            run_as_group = 101
+            "#,
+        )
+        .unwrap();
+        assert_eq!(app.args, ["--port=9898"]);
+        assert_eq!(app.run_as_user, Some(100));
+        config_with_app("podinfo", app).validate().unwrap();
+    }
+
+    #[test]
+    fn relative_working_dir_rejected() {
+        let mut app = minimal_app();
+        app.working_dir = Some(PathBuf::from("home/app"));
+        let err = config_with_app("test", app).validate().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Validation { ref field, .. } if field == "working_dir"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn args_on_a_process_workload_rejected() {
+        let app: AppSpec = toml::from_str(
+            r#"
+            script = "echo hi"
+            args = ["--verbose"]
+            "#,
+        )
+        .unwrap();
+        let err = config_with_app("test", app).validate().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Validation { ref field, .. } if field == "args/working_dir"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
     fn validate_autoscale_min_greater_than_max_rejected() {
         let app: AppSpec = toml::from_str(
             r#"
             image = "web:v1"
+            cpu = "100m-500m"
             [autoscale]
             metric = "cpu"
             target = "70%"
@@ -764,8 +976,62 @@ mod tests {
         let config = config_with_app("web", app);
         let err = config.validate().unwrap_err();
         assert!(
-            matches!(err, ConfigError::Validation { ref field, .. } if field == "autoscale"),
+            matches!(err, ConfigError::Validation { ref field, ref reason, .. }
+                if field == "autoscale" && reason.contains("must not exceed")),
             "min>max autoscale must be rejected at validation: {err:?}"
+        );
+    }
+
+    fn autoscaled_app(resources: &str, metric: &str) -> AppSpec {
+        toml::from_str(&format!(
+            r#"
+            image = "web:v1"
+            {resources}
+            [autoscale]
+            metric = "{metric}"
+            target = "50%"
+            min = 1
+            max = 5
+        "#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn validate_autoscale_accepts_cpu_and_memory_with_requests() {
+        let cpu = autoscaled_app(r#"cpu = "250m-1000m""#, "cpu");
+        config_with_app("web", cpu).validate().unwrap();
+        let memory = autoscaled_app(r#"memory = "128Mi-512Mi""#, "memory");
+        config_with_app("web", memory).validate().unwrap();
+    }
+
+    #[test]
+    fn validate_autoscale_rejects_an_unsupported_metric() {
+        let app = autoscaled_app(r#"cpu = "250m""#, "requests_per_second");
+        let err = config_with_app("web", app).validate().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Validation { ref field, ref reason, .. }
+                if field == "autoscale" && reason.contains("not supported")),
+            "an unknown metric must fail validation, not silently never scale: {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_autoscale_accepts_cpu_without_a_request() {
+        // Measured against one core; ProcessGrill apps can't declare cpu.
+        let app = autoscaled_app("", "cpu");
+        config_with_app("web", app).validate().unwrap();
+    }
+
+    #[test]
+    fn validate_autoscale_rejects_memory_without_a_memory_request() {
+        // CPU is requested, but the block scales on memory.
+        let app = autoscaled_app(r#"cpu = "250m""#, "memory");
+        let err = config_with_app("web", app).validate().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Validation { ref field, ref reason, .. }
+                if field == "autoscale" && reason.contains("needs a non-zero memory request")),
+            "{err:?}"
         );
     }
 
@@ -777,6 +1043,22 @@ mod tests {
             nc.validate(),
             Err(ConfigError::NonAbsolutePath { .. })
         ));
+    }
+
+    #[test]
+    fn scheduled_snapshots_must_retain_at_least_one() {
+        let mut nc = NodeConfig::default();
+        nc.storage.snapshots.interval_secs = 3600;
+        nc.storage.snapshots.retain = 0;
+        let error = nc.validate().unwrap_err().to_string();
+        assert!(error.contains("storage.snapshots.retain"), "{error}");
+
+        // Disabled schedules don't prune, so zero is harmless there.
+        nc.storage.snapshots.interval_secs = 0;
+        assert!(nc.validate().is_ok());
+        nc.storage.snapshots.interval_secs = 3600;
+        nc.storage.snapshots.retain = 1;
+        assert!(nc.validate().is_ok());
     }
 
     #[test]
@@ -803,6 +1085,155 @@ mod tests {
         );
         config.reporting_tree.max_events_per_report = 100;
         assert!(config.validate().is_ok());
+    }
+
+    fn development_with_leaf_override(seconds: u64) -> NodeConfig {
+        let mut config = NodeConfig::default();
+        config.testing.safety_class = crate::testkit::safety::ClusterSafetyClass::Development;
+        config.security.leaf_lifetime_override_secs = Some(seconds);
+        config
+    }
+
+    fn assert_leaf_override_refused(config: &NodeConfig, reason_contains: &str) {
+        let error = config.validate().unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                ConfigError::Validation { field, reason, .. }
+                    if field == "security.leaf_lifetime_override_secs"
+                        && reason.contains(reason_contains)
+            ),
+            "{error:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("security.leaf_lifetime_override_secs")
+        );
+    }
+
+    #[test]
+    fn operator_cidrs_default_to_empty() {
+        let config = NodeConfig::parse("").unwrap();
+        assert!(config.security.operator_cidrs.is_empty());
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn operator_cidrs_accept_v4_v6_and_bare_addresses() {
+        let config = NodeConfig::parse(
+            "[security]\noperator_cidrs = [\"192.168.0.0/24\", \"10.1.2.3/32\", \"2001:db8::/32\", \"10.1.2.4\"]\n",
+        )
+        .unwrap();
+        assert_eq!(config.security.operator_cidrs.len(), 4);
+        config.validate().unwrap();
+    }
+
+    fn assert_operator_cidr_refused(value: &str, reason_contains: &str) {
+        let mut config = NodeConfig::default();
+        config.security.operator_cidrs = vec!["10.0.0.0/8".to_string(), value.to_string()];
+        let error = config.validate().unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                ConfigError::Validation { field, reason, .. }
+                    if field == "security.operator_cidrs" && reason.contains(reason_contains)
+            ),
+            "{value}: {error:?}"
+        );
+        assert!(error.to_string().contains(value), "{error}");
+    }
+
+    #[test]
+    fn malformed_operator_cidrs_are_refused_at_load() {
+        assert_operator_cidr_refused("not-a-cidr", "expected address");
+        assert_operator_cidr_refused("10.0.0.0/33", "out of range");
+        assert_operator_cidr_refused("10.0.0.0/8; accept", "invalid prefix length");
+        assert_operator_cidr_refused("192.168.0.17/24", "did you mean 192.168.0.0/24");
+    }
+
+    #[test]
+    fn operator_cidrs_refuse_the_whole_internet() {
+        assert_operator_cidr_refused("0.0.0.0/0", "/0 prefix");
+        assert_operator_cidr_refused("::/0", "/0 prefix");
+    }
+
+    #[test]
+    fn leaf_lifetime_override_is_accepted_on_a_development_node() {
+        let config = development_with_leaf_override(3600);
+        config.validate().unwrap();
+        assert_eq!(
+            config.security.node_leaf_lifetime(),
+            std::time::Duration::from_secs(3600)
+        );
+        assert_eq!(
+            config.security.ingress_leaf_lifetime(),
+            std::time::Duration::from_secs(3600)
+        );
+        development_with_leaf_override(600).validate().unwrap();
+        development_with_leaf_override(90 * 24 * 3600)
+            .validate()
+            .unwrap();
+    }
+
+    #[test]
+    fn leaf_lifetime_override_below_ten_minutes_is_refused() {
+        assert_leaf_override_refused(&development_with_leaf_override(599), "between 600");
+        assert_leaf_override_refused(&development_with_leaf_override(0), "between 600");
+    }
+
+    #[test]
+    fn leaf_lifetime_override_above_the_ingress_default_is_refused() {
+        // The knob shortens both leaf classes, so it can't exceed the shorter
+        // (90-day ingress) default: that would lengthen ingress leaves.
+        assert_leaf_override_refused(
+            &development_with_leaf_override(90 * 24 * 3600 + 1),
+            "and 7776000 seconds",
+        );
+        assert_leaf_override_refused(
+            &development_with_leaf_override(365 * 24 * 3600),
+            "and 7776000 seconds",
+        );
+    }
+
+    #[test]
+    fn leaf_lifetime_override_is_refused_outside_development() {
+        use crate::testkit::safety::ClusterSafetyClass;
+        for class in [
+            ClusterSafetyClass::Unknown,
+            ClusterSafetyClass::Staging,
+            ClusterSafetyClass::Production,
+        ] {
+            let mut config = development_with_leaf_override(3600);
+            config.testing.safety_class = class;
+            assert_leaf_override_refused(&config, "development-only");
+        }
+        // An absent `[testing]` section is Unknown, never development.
+        let parsed = NodeConfig::parse("[security]\nleaf_lifetime_override_secs = 3600\n").unwrap();
+        assert_leaf_override_refused(&parsed, "safety_class = \"development\"");
+    }
+
+    #[test]
+    fn absent_leaf_lifetime_override_keeps_the_compiled_defaults() {
+        let config = NodeConfig::parse("").unwrap();
+        assert_eq!(config.security.leaf_lifetime_override_secs, None);
+        config.validate().unwrap();
+        assert_eq!(
+            config.security.node_leaf_lifetime(),
+            crate::sesame::ca::NODE_LEAF_LIFETIME
+        );
+        assert_eq!(
+            config.security.ingress_leaf_lifetime(),
+            crate::sesame::ca::INGRESS_LEAF_LIFETIME
+        );
+        assert_eq!(
+            crate::sesame::ca::NODE_LEAF_LIFETIME,
+            std::time::Duration::from_secs(365 * 24 * 3600)
+        );
+        assert_eq!(
+            crate::sesame::ca::INGRESS_LEAF_LIFETIME,
+            std::time::Duration::from_secs(90 * 24 * 3600)
+        );
     }
 
     #[test]

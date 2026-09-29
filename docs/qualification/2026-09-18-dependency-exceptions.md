@@ -37,7 +37,7 @@ cargo tree --locked --all-features -i proc-macro-error --depth 4
 cargo tree --locked --all-features -i paste --depth 2
 cargo tree --locked --all-features -i bincode --depth 3
 cargo tree --locked --all-features --target all -i rkyv
-cargo test --test dependency_audit
+cargo test --test suite dependency_audit::
 ```
 
 The audit-gate regression fails before the Makefile change: an active rkyv

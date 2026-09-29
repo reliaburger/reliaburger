@@ -91,7 +91,6 @@ pub async fn unmount_bundle(bundle: PathBuf) -> Result<(), RootfsError> {
 }
 
 /// Whether `path` is an exact mountpoint in the current mount namespace.
-#[cfg(test)]
 pub fn is_mountpoint(path: &Path) -> bool {
     let Ok(target) = std::fs::canonicalize(path) else {
         return false;
@@ -143,6 +142,10 @@ fn mount_private_sync(lower: &Path, bundle: &Path) -> Result<MountedRootfs, Root
             source,
         })?;
     }
+    // The overlay's `/` takes its owner and mode from the upper directory.
+    // Copy the image's, so container root (a user-namespaced host id) owns
+    // its own `/` rather than seeing it belong to an unmapped host root.
+    copy_owner_and_mode(&lower, &upper)?;
     atomic_write(&marker, lower_bytes)?;
 
     let options = format!(
@@ -167,6 +170,21 @@ fn mount_private_sync(lower: &Path, bundle: &Path) -> Result<MountedRootfs, Root
         mountpoint,
         armed: true,
     })
+}
+
+fn copy_owner_and_mode(from: &Path, to: &Path) -> Result<(), RootfsError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let io = |path: &Path| {
+        let path = path.to_path_buf();
+        move |source| RootfsError::Io { path, source }
+    };
+    let metadata = std::fs::metadata(from).map_err(io(from))?;
+    std::os::unix::fs::chown(to, Some(metadata.uid()), Some(metadata.gid())).map_err(io(to))?;
+    std::fs::set_permissions(
+        to,
+        std::fs::Permissions::from_mode(metadata.mode() & 0o7777),
+    )
+    .map_err(io(to))
 }
 
 fn absolute_path(path: &Path) -> Result<PathBuf, RootfsError> {
@@ -239,7 +257,6 @@ fn unmount_strict(path: &Path) -> Result<(), RootfsError> {
     }
 }
 
-#[cfg(test)]
 fn decode_mountinfo_path(encoded: &str) -> PathBuf {
     let bytes = encoded.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());

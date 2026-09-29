@@ -1273,6 +1273,7 @@ mod tests {
         let members = vec![NodeMembershipInfo {
             node_id: node,
             address: std::net::SocketAddr::from(([10, 0, 0, 1], 9117)),
+            api_advertised: true,
         }];
         let capacities = capacities_from_reports(&members, &aggregated);
 
@@ -1292,6 +1293,7 @@ mod tests {
         let members = vec![NodeMembershipInfo {
             node_id: node,
             address: std::net::SocketAddr::from(([10, 0, 0, 2], 9117)),
+            api_advertised: true,
         }];
         assert!(capacities_from_reports(&members, &aggregated).is_empty());
     }
@@ -1321,6 +1323,7 @@ mod tests {
             host_port: None,
             exit_code: exit,
             pid: None,
+            runtime_unknown: false,
         };
         assert_eq!(
             job_outcome(&[status("stopped", Some(0))], "j", "default"),

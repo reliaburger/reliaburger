@@ -10,12 +10,14 @@ use std::path::Path;
 use std::time::Duration;
 
 use super::*;
+use crate::grill::capture::{CAPTURE_CHUNK_BYTES, CaptureReader, read_capture_chunk};
 use crate::grill::command::{
     ClaimedCommandExecutor, CommandOutput, CommandState, RuntimeCommandExecutor,
 };
 use crate::grill::runc_intent::{
     IntentConfiguration, IntentGeneration, IntentJournal, IntentPhase, RuntimeRole,
 };
+use crate::ketchup::types::{CapturedLine, LogStream};
 
 /// Shared exclusive claims and the executable that starts independent owners.
 #[derive(Clone)]
@@ -23,6 +25,16 @@ pub(super) struct Ownership {
     executable: PathBuf,
     contexts: Arc<Mutex<HashMap<InstanceId, ClaimedCommandExecutor>>>,
     inventory_reader: crate::grill::inventory::InventoryReader,
+}
+
+impl Ownership {
+    pub(super) fn new(executable: PathBuf) -> Self {
+        Self {
+            executable,
+            contexts: Arc::new(Mutex::new(HashMap::new())),
+            inventory_reader: Default::default(),
+        }
+    }
 }
 
 fn failure(instance: &InstanceId, error: impl std::fmt::Display) -> GrillError {
@@ -33,26 +45,6 @@ fn failure(instance: &InstanceId, error: impl std::fmt::Display) -> GrillError {
 }
 
 impl RuncGrill {
-    /// Enable durable OCI ownership using Bun's independent command owners.
-    /// Configure this before creating workloads.
-    pub fn with_owner(mut self, executable: PathBuf) -> io::Result<Self> {
-        if self.ownership.is_some() {
-            return Err(io::Error::other(
-                "durable ownership requires an unconfigured runtime",
-            ));
-        }
-        self.bundle_base = std::path::absolute(&self.bundle_base)?;
-        self.state_dir = std::path::absolute(&self.state_dir)?;
-        self.network_leases =
-            super::super::network_leases::NetworkLeases::new(self.bundle_base.clone());
-        self.ownership = Some(Ownership {
-            executable,
-            contexts: Arc::new(Mutex::new(HashMap::new())),
-            inventory_reader: Default::default(),
-        });
-        Ok(self)
-    }
-
     /// Retain the original rootful address before a publisher exposes it.
     pub(super) async fn owned_retain_network_reference(
         &self,
@@ -110,9 +102,7 @@ impl RuncGrill {
     }
 
     fn ownership(&self) -> io::Result<&Ownership> {
-        self.ownership
-            .as_ref()
-            .ok_or_else(|| io::Error::other("runtime ownership is not configured"))
+        Ok(&self.ownership)
     }
 
     fn intent_configuration(&self) -> io::Result<IntentConfiguration> {
@@ -510,10 +500,6 @@ impl RuncGrill {
         if held.is_some() {
             // Commands and host resources are gone. Keep the allocation and
             // sealed original intent until discovery confirms its own retirement.
-            if let Some(entry) = self.entries.lock().await.get_mut(id) {
-                entry.state = ContainerState::Stopped;
-                entry.exit_code = exit_code;
-            }
             return Ok(());
         }
         if let Some(index) = index {
@@ -523,10 +509,6 @@ impl RuncGrill {
         }
         cleanup.finish(exit_code).await?;
         self.ownership()?.contexts.lock().await.remove(id);
-        if let Some(entry) = self.entries.lock().await.get_mut(id) {
-            entry.state = ContainerState::Stopped;
-            entry.exit_code = exit_code;
-        }
         Ok(())
     }
 
@@ -771,10 +753,13 @@ impl RuncGrill {
             if matches!(intent.phase, IntentPhase::Retired { .. }) {
                 return Ok(false);
             }
-            if intent.phase != IntentPhase::Owned {
-                return Err(io::Error::other(
-                    "runtime retirement requires recovery before adoption",
-                ));
+            if intent.phase == IntentPhase::Retiring {
+                // A sealed generation never runs again. Its host resources are
+                // gone or go now; a retained discovery address stays held until
+                // the caller's confirmed withdrawal releases it. Refusing here
+                // left the agent unable to start at all.
+                runtime.owned_cleanup(&id, &context).await?;
+                return Ok(false);
             }
             let Some(CommandState::Running { pid: launcher_pid }) =
                 context.role_state(RuntimeRole::Launcher).await?
@@ -782,9 +767,10 @@ impl RuncGrill {
                 runtime.owned_cleanup(&id, &context).await?;
                 return Ok(false);
             };
+            // Same ±2 s tolerance as every other adoption: /proc start times
+            // are derived from boot time, which moves with NTP steps.
             if adoption.pid != launcher_pid
-                || crate::grill::records::process_start_time(launcher_pid)
-                    != Some(adoption.pid_started_at)
+                || !crate::grill::records::process_matches(launcher_pid, adoption.pid_started_at)
             {
                 return Err(io::Error::other(
                     "adoption process identity conflicts with runtime owner",
@@ -891,7 +877,7 @@ impl RuncGrill {
     pub(super) async fn owned_follow_logs(
         &self,
         instance: &InstanceId,
-        sender: tokio::sync::mpsc::Sender<String>,
+        sender: tokio::sync::mpsc::Sender<CapturedLine>,
     ) {
         let source = self
             .owned_operation(instance, |_runtime, _id, context| async move {
@@ -906,31 +892,35 @@ impl RuncGrill {
             return;
         };
         let mut terminal = context.is_none();
-        let mut offsets = [0u64; 2];
-        let mut partial = [String::new(), String::new()];
+        let mut readers = [(LogStream::Stdout, "stdout"), (LogStream::Stderr, "stderr")].map(
+            |(stream, extension)| CaptureReader::new(stream, Some(stem.with_extension(extension))),
+        );
         loop {
-            for (index, extension) in ["stdout", "stderr"].iter().enumerate() {
-                if let Ok(bytes) =
-                    read_from_offset(&stem.with_extension(extension), offsets[index]).await
-                {
-                    offsets[index] += bytes.len() as u64;
-                    partial[index].push_str(&String::from_utf8_lossy(&bytes));
-                    while let Some(newline) = partial[index].find('\n') {
-                        let line: String = partial[index].drain(..=newline).collect();
-                        if sender
-                            .send(line.trim_end_matches('\n').to_owned())
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
+            // A restarted Bun replays the whole capture from byte 0. Bounded
+            // chunks, each read behind an `.await`, keep that replay from
+            // holding a runtime worker (it once starved startup adoption).
+            let mut backlog = false;
+            for reader in &mut readers {
+                let Some(file) = reader.file().map(std::path::Path::to_path_buf) else {
+                    continue;
+                };
+                let Ok(bytes) = read_capture_chunk(&file, reader.read_offset()).await else {
+                    continue;
+                };
+                backlog |= bytes.len() == CAPTURE_CHUNK_BYTES;
+                for line in reader.push(&bytes) {
+                    if sender.send(line).await.is_err() {
+                        return;
                     }
                 }
             }
+            if backlog {
+                continue;
+            }
             if terminal || sender.is_closed() {
-                for line in &mut partial {
-                    if !line.is_empty() {
-                        let _ = sender.send(std::mem::take(line)).await;
+                for reader in &mut readers {
+                    if let Some(line) = reader.finish() {
+                        let _ = sender.send(line).await;
                     }
                 }
                 return;

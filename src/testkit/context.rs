@@ -37,6 +37,69 @@ pub const BUN_BINARY_PATH: &str = "/usr/local/bin/bun";
 /// on repeated acceptance runs.
 pub const PINNED_TEST_WORKLOAD_IMAGE: &str = "public.ecr.aws/docker/library/busybox@sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028";
 
+/// Shell prefix that makes a container fixture's PID 1 exit on SIGTERM.
+///
+/// The kernel drops any signal PID 1 has no handler for, and neither
+/// `busybox sleep` nor `busybox httpd` installs one. Run bare, each fixture
+/// sat out Bun's full stop grace (ten seconds) on every lease cleanup.
+pub(crate) const SIGTERM_TRAP: &str = "trap 'kill $! 2>/dev/null; exit 0' TERM; ";
+
+/// Wrap `script` for `/bin/sh -c` so a SIGTERM stops it at once.
+///
+/// The script's last command runs in the background under a waiting shell,
+/// because a trapped signal interrupts `wait` but not a foreground child.
+/// The result has no `"` or `\`, so it embeds in a TOML basic string as is.
+fn exit_on_sigterm(script: &str) -> String {
+    format!("{SIGTERM_TRAP}{script} & wait")
+}
+
+/// How the runner reaches a peer node's own API.
+///
+/// Some reads are node-local (`/v1/status` lists only that node's
+/// instances), so cases fan out to every node. From inside the cluster each
+/// node's advertised API address works. From a laptop behind a quickstart's
+/// port forwards it doesn't: the host reaches node 1's forwarded port and
+/// nothing else, so peers go through the entry node's relay instead.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PeerRoute {
+    /// Each node at its advertised API endpoint.
+    #[default]
+    Direct,
+    /// Each peer through the entry node's `/v1/nodes/{node}/relay`.
+    Relay,
+}
+
+impl PeerRoute {
+    /// Pick the route once per run, by asking each peer's `/v1/health` both
+    /// ways.
+    ///
+    /// Direct unless some peer fails directly but answers through the relay.
+    /// A peer that answers neither way is down, which says nothing about the
+    /// route. A cluster the caller can reach stays direct: one hop, and it
+    /// still reaches a node that gossip has forgotten.
+    pub async fn detect(client: &BunClient, entry_node: &str) -> Self {
+        let Ok(nodes) = client.nodes().await else {
+            return Self::Direct;
+        };
+        for node in nodes.iter().filter(|node| node.node_id != entry_node) {
+            if answers_health(client.for_node(node)).await {
+                continue;
+            }
+            if answers_health(client.via_node(&node.node_id)).await {
+                return Self::Relay;
+            }
+        }
+        Self::Direct
+    }
+}
+
+async fn answers_health(client: Result<BunClient, crate::relish::RelishError>) -> bool {
+    match client {
+        Ok(client) => client.health().await.is_ok(),
+        Err(_) => false,
+    }
+}
+
 /// One test case's handle on the cluster.
 #[derive(Clone)]
 pub struct TestContext {
@@ -56,6 +119,36 @@ pub struct TestContext {
     pub timeout: Duration,
     /// One absolute case deadline. Poll helpers must not start fresh budgets.
     pub deadline: Deadline,
+    /// How [`Self::node_clients`] reaches peer nodes.
+    pub peer_route: PeerRoute,
+    /// What the case's current wait is waiting for, for a timeout report.
+    pub(crate) wait_note: WaitNote,
+}
+
+/// What a case's poll helper is waiting for and what it last saw.
+///
+/// A helper gives up on the same deadline the runner enforces, so the runner
+/// usually cancels the body before the helper's own message comes back. The
+/// helper writes that message here on every poll instead, and the runner adds
+/// it to the timeout. Clones share one note.
+#[derive(Clone, Default)]
+pub(crate) struct WaitNote(std::sync::Arc<tokio::sync::Mutex<Option<String>>>);
+
+impl WaitNote {
+    /// Replace the note with the current wait's state.
+    pub(crate) async fn record(&self, note: String) {
+        *self.0.lock().await = Some(note);
+    }
+
+    /// Forget the note once its wait is over.
+    pub(crate) async fn clear(&self) {
+        *self.0.lock().await = None;
+    }
+
+    /// The note left by a wait that never finished, if any.
+    pub(crate) async fn take(&self) -> Option<String> {
+        self.0.lock().await.take()
+    }
 }
 
 impl TestContext {
@@ -157,6 +250,19 @@ impl TestContext {
     /// Fault owner shared with the runner's unconditional teardown path.
     pub fn chaos(&self) -> &crate::testkit::chaos::ChaosGuard {
         &self.chaos_guard
+    }
+
+    /// The client that injects and later reverses a node fault aimed at the
+    /// node `node_client` reaches.
+    ///
+    /// Directly, that is the target's own API. Through the relay it is the
+    /// entry node: the relay forwards no fault requests, but Bun routes a
+    /// node fault, and its reversal, to the `target_node` it names.
+    pub fn fault_owner(&self, node_client: BunClient) -> BunClient {
+        match self.peer_route {
+            PeerRoute::Direct => node_client,
+            PeerRoute::Relay => self.client.clone(),
+        }
     }
 
     /// Wait until `app` has at least `replicas` instances in the `running`
@@ -272,8 +378,9 @@ impl TestContext {
         format!(
             "[app.{app}]\n\
              image = \"{PINNED_TEST_WORKLOAD_IMAGE}\"\n\
-             command = [\"/bin/busybox\", \"sleep\", \"infinity\"]\n\
+             command = [\"/bin/sh\", \"-c\", \"{script}\"]\n\
              namespace = \"{ns}\"\n",
+            script = exit_on_sigterm("/bin/busybox sleep infinity"),
             ns = self.namespace,
         )
     }
@@ -289,7 +396,7 @@ impl TestContext {
         format!(
             "[app.{app}]\n\
              image = \"{PINNED_TEST_WORKLOAD_IMAGE}\"\n\
-             command = [\"/bin/sh\", \"-c\", \"/bin/busybox mkdir -p /tmp/reliaburger-test-http; printf 'reliaburger-test' > /tmp/reliaburger-test-http/hostname; exec /bin/busybox httpd -f -p {port} -h /tmp/reliaburger-test-http\"]\n\
+             command = [\"/bin/sh\", \"-c\", \"{script}\"]\n\
              port = {port}\n\
              replicas = {replicas}\n\
              namespace = \"{ns}\"\n\
@@ -300,6 +407,7 @@ impl TestContext {
              timeout = 2\n\
              threshold_unhealthy = 3\n\
              threshold_healthy = 1\n",
+            script = container_http_script(port, 0),
             ns = self.namespace,
         )
     }
@@ -313,9 +421,11 @@ impl TestContext {
     /// A `BunClient` for every node in the cluster, paired with its node id.
     ///
     /// `/v1/status` is node-local, so a case that reasons about cluster-wide
-    /// placement fans out with this. Each node must supply its own resolved API
-    /// endpoint. Missing evidence fails collection; it never guesses a port or
-    /// silently omits a node. The entry client's credentials and CA are reused.
+    /// placement fans out with this. The entry node is the connection the run
+    /// already has. Peers go by [`Self::peer_route`]: directly, where each must
+    /// supply its own resolved API endpoint, or through the entry node's relay.
+    /// Missing evidence fails collection; it never guesses a port or silently
+    /// omits a node. The entry client's credentials and CA are reused.
     pub async fn node_clients(&self) -> Result<Vec<(String, BunClient)>, String> {
         if self
             .lease_id
@@ -335,10 +445,15 @@ impl TestContext {
         nodes
             .into_iter()
             .map(|node| {
-                let client = self
-                    .client
-                    .for_node(&node)
-                    .map_err(|error| error.to_string())?;
+                let client = if node.node_id == self.capabilities.node_id {
+                    Ok(self.client.clone())
+                } else {
+                    match self.peer_route {
+                        PeerRoute::Direct => self.client.for_node(&node),
+                        PeerRoute::Relay => self.client.via_node(&node.node_id),
+                    }
+                }
+                .map_err(|error| error.to_string())?;
                 Ok((node.node_id, client))
             })
             .collect()
@@ -410,21 +525,23 @@ impl TestContext {
                 Ok(instances) => {
                     last = instances;
                     if predicate(&last) {
+                        self.wait_note.clear().await;
                         return Ok(());
                     }
                     None
                 }
                 Err(error) => Some(error),
             };
+            let seen: Vec<&str> = last.iter().map(|i| i.state.as_str()).collect();
+            let waiting = format!(
+                "waiting for {app} to reach {what} cluster-wide; \
+                 last saw {} instance(s): {seen:?}; last query error: {last_error:?}",
+                last.len()
+            );
             if self.deadline.remaining().is_zero() {
-                let seen: Vec<&str> = last.iter().map(|i| i.state.as_str()).collect();
-                return Err(format!(
-                    "timed out after {:?} waiting for {app} to reach {what} cluster-wide; \
-                     last saw {} instance(s): {seen:?}; last query error: {last_error:?}",
-                    self.timeout,
-                    last.len()
-                ));
+                return Err(format!("timed out after {:?} {waiting}", self.timeout));
             }
+            self.wait_note.record(waiting).await;
             tokio::time::sleep(Duration::from_millis(500).min(self.deadline.remaining())).await;
         }
     }
@@ -555,21 +672,22 @@ impl TestContext {
                     })
                     .collect();
                 if predicate(&last) {
+                    self.wait_note.clear().await;
                     return Ok(());
                 }
             }
+            let seen: Vec<(&str, &str)> = last
+                .iter()
+                .map(|instance| (instance.app_name.as_str(), instance.state.as_str()))
+                .collect();
+            let waiting = format!(
+                "waiting for {app} to reach {what}; last saw {} instance(s): {seen:?}",
+                last.len()
+            );
             if self.deadline.remaining().is_zero() {
-                let seen: Vec<(&str, &str)> = last
-                    .iter()
-                    .map(|instance| (instance.app_name.as_str(), instance.state.as_str()))
-                    .collect();
-                return Err(format!(
-                    "timed out after {:?} waiting for {app} to reach {what}; \
-                     last saw {} instance(s): {seen:?}",
-                    self.timeout,
-                    last.len()
-                ));
+                return Err(format!("timed out after {:?} {waiting}", self.timeout));
             }
+            self.wait_note.record(waiting).await;
             tokio::time::sleep(poll.min(self.deadline.remaining())).await;
         }
     }
@@ -579,8 +697,8 @@ impl TestContext {
     /// The runner calls this after pass, fail, panic or timeout. Production
     /// cleanup uses the server's lease ownership record and checks runtime
     /// absence independently. An unreachable owner or expired cleanup deadline
-    /// returns unknown, not a guarantee that resources are gone. The legacy
-    /// lease-free test path also checks [`is_test_namespace`](Self::is_test_namespace).
+    /// returns unknown, not a guarantee that resources are gone. The
+    /// lease-free unit-test path also checks [`is_test_namespace`](Self::is_test_namespace).
     pub async fn teardown(&self, deadline: Deadline) -> CleanupOutcome {
         let faults = self.chaos_guard.cleanup(deadline).await;
         let resources = self.teardown_resources(deadline).await;
@@ -599,10 +717,16 @@ impl TestContext {
                     // durable ownership evidence, but runtime absence still
                     // needs the independent check below.
                 }
-                Ok(Err(crate::relish::RelishError::AgentUnreachable))
-                | Ok(Err(crate::relish::RelishError::RequestTimeout)) => {
+                Ok(Err(crate::relish::RelishError::AgentUnreachable)) => {
                     return CleanupOutcome::Unknown {
                         reason: "could not reach the lease owner to confirm cleanup".to_string(),
+                    };
+                }
+                // Reached it, but the lease was still held when the release's
+                // own budget ran out: not the same as unreachable.
+                Ok(Err(crate::relish::RelishError::RequestTimeout)) => {
+                    return CleanupOutcome::Unknown {
+                        reason: unconfirmed_release_reason(),
                     };
                 }
                 Ok(Err(error)) => {
@@ -715,6 +839,15 @@ impl TestContext {
     }
 }
 
+/// Why cleanup is unknown when the lease owner was reached but the release
+/// ran out of its budget, naming the budget it actually had.
+fn unconfirmed_release_reason() -> String {
+    format!(
+        "the lease owner did not confirm cleanup within {} s",
+        crate::relish::client::lease_release_budget().as_secs()
+    )
+}
+
 fn merge_cleanup(left: CleanupOutcome, right: CleanupOutcome) -> CleanupOutcome {
     use CleanupOutcome::{Confirmed, Failed, NotRequired, Unknown};
 
@@ -735,6 +868,31 @@ fn merge_cleanup(left: CleanupOutcome, right: CleanupOutcome) -> CleanupOutcome 
 /// A stable, per-app port in the ephemeral range, so two apps in one case
 /// don't collide. Deterministic (an FNV-1a hash of the name) so a case's
 /// spec is reproducible between runs.
+/// The shell script behind every HTTP container fixture, for `/bin/sh -c`.
+///
+/// It writes the `/hostname` file its health check asks for and serves only
+/// that directory, naming BusyBox by absolute path. The pinned image has no
+/// `PATH` and no `/etc/hostname`, so a fixture that leans on either never turns
+/// healthy on a real container runtime. `startup_delay_secs` holds the server
+/// back, for cases that need a deploy to stay in flight for a while.
+pub(crate) fn container_http_script(port: u16, startup_delay_secs: u32) -> String {
+    let delay = if startup_delay_secs == 0 {
+        String::new()
+    } else {
+        format!("/bin/busybox sleep {startup_delay_secs}; ")
+    };
+    // No `exec`: httpd runs under the trapping shell, so PID 1 exits on
+    // SIGTERM instead of sitting out the stop grace.
+    exit_on_sigterm(&format!(
+        "{delay}/bin/busybox mkdir -p {HTTP_ROOT}; \
+         printf 'reliaburger-test' > {HTTP_ROOT}/hostname; \
+         /bin/busybox httpd -f -p {port} -h {HTTP_ROOT}"
+    ))
+}
+
+/// The directory [`container_http_script`] creates and serves.
+const HTTP_ROOT: &str = "/tmp/reliaburger-test-http";
+
 fn testapp_port(app: &str) -> u16 {
     let mut hash: u32 = 2_166_136_261;
     for byte in app.bytes() {
@@ -751,6 +909,18 @@ mod tests {
     use super::*;
     use crate::config::Config;
 
+    /// V02: the report said "within 30 s" long after the release budget
+    /// became the product's retirement bound (72 s by default).
+    #[test]
+    fn an_unconfirmed_release_reports_the_budget_it_actually_had() {
+        let budget = crate::relish::client::lease_release_budget().as_secs();
+        assert_ne!(budget, 30);
+        assert_eq!(
+            unconfirmed_release_reason(),
+            format!("the lease owner did not confirm cleanup within {budget} s")
+        );
+    }
+
     fn context(namespace: &str) -> TestContext {
         TestContext {
             client: BunClient::new_with_token("http://127.0.0.1:9117", None),
@@ -760,6 +930,8 @@ mod tests {
             capabilities: ClusterCapabilities::default(),
             timeout: Duration::from_millis(200),
             deadline: Deadline::after(Duration::from_millis(200)).unwrap(),
+            peer_route: PeerRoute::Direct,
+            wait_note: Default::default(),
         }
     }
 
@@ -782,6 +954,139 @@ mod tests {
         assert_eq!(clients.len(), 2);
         assert_eq!(clients[0].1.base_url(), "http://127.0.0.1:19117");
         assert_eq!(clients[1].1.base_url(), "http://[::1]:29117");
+    }
+
+    /// Two nodes as the entry node lists them. `one` is the entry node; both
+    /// advertise API addresses the caller may or may not reach.
+    fn two_nodes(entry_api: &str, peer_api: &str) -> serde_json::Value {
+        serde_json::json!([
+            {"node_id":"one", "address":"10.0.0.1:7946", "api_address":entry_api,
+             "state":"alive", "incarnation":1, "is_council":true, "is_leader":true, "labels":{}},
+            {"node_id":"two", "address":"10.0.0.2:7946", "api_address":peer_api,
+             "state":"alive", "incarnation":1, "is_council":true, "is_leader":false, "labels":{}}
+        ])
+    }
+
+    /// A loopback port nothing listens on.
+    async fn closed_port() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.local_addr().unwrap()
+    }
+
+    /// Serve `router` on a fresh loopback port.
+    async fn serve(router: axum::Router) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        (base, server)
+    }
+
+    /// An entry node that lists `nodes` and relays `health` and `status` for
+    /// node `two` only, as the real relay would for a reachable peer.
+    fn entry_router(nodes: serde_json::Value, relay_answers: bool) -> axum::Router {
+        use axum::{extract::Path, http::StatusCode, response::IntoResponse, routing::get};
+        axum::Router::new()
+            .route(
+                "/v1/cluster/nodes",
+                get(move || {
+                    let nodes = nodes.clone();
+                    async move { axum::Json(nodes) }
+                }),
+            )
+            .route(
+                "/v1/nodes/{node}/relay/{*path}",
+                get(
+                    move |Path((node, path)): Path<(String, String)>| async move {
+                        if !relay_answers || node != "two" {
+                            return StatusCode::BAD_GATEWAY.into_response();
+                        }
+                        match path.as_str() {
+                            "v1/health" => {
+                                axum::Json(serde_json::json!({"status": "ok"})).into_response()
+                            }
+                            "v1/status" => axum::Json(serde_json::json!([])).into_response(),
+                            _ => StatusCode::NOT_FOUND.into_response(),
+                        }
+                    },
+                ),
+            )
+    }
+
+    #[tokio::test]
+    async fn relayed_peers_go_through_the_entry_node_and_the_entry_node_uses_its_own_connection() {
+        // Neither advertised address is reachable, as from a laptop: the
+        // guests' own API ports mean nothing on the host.
+        let unreachable = closed_port().await.to_string();
+        let (base, server) = serve(entry_router(two_nodes(&unreachable, &unreachable), true)).await;
+        let mut context = context("rbtest-relay");
+        context.client = BunClient::new(&base);
+        context.capabilities.node_id = "one".to_string();
+        context.peer_route = PeerRoute::Relay;
+
+        let clients = context.node_clients().await.unwrap();
+        assert_eq!(clients[0].0, "one");
+        assert_eq!(clients[0].1.base_url(), base);
+        assert_eq!(clients[1].0, "two");
+        assert_eq!(
+            clients[1].1.base_url(),
+            format!("{base}/v1/nodes/two/relay")
+        );
+        // The per-node read the cleanup check makes arrives through the relay.
+        assert!(clients[1].1.status().await.unwrap().is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn direct_route_still_uses_the_entry_connection_for_the_entry_node() {
+        let unreachable = closed_port().await.to_string();
+        let (base, server) = serve(entry_router(
+            two_nodes(&unreachable, "127.0.0.1:29117"),
+            true,
+        ))
+        .await;
+        let mut context = context("rbtest-direct");
+        context.client = BunClient::new(&base);
+        context.capabilities.node_id = "one".to_string();
+
+        let clients = context.node_clients().await.unwrap();
+        server.abort();
+        assert_eq!(clients[0].1.base_url(), base);
+        assert_eq!(clients[1].1.base_url(), "http://127.0.0.1:29117");
+    }
+
+    #[tokio::test]
+    async fn peer_route_is_relay_when_a_peer_answers_only_through_the_entry_node() {
+        let unreachable = closed_port().await.to_string();
+        let (base, server) = serve(entry_router(two_nodes(&unreachable, &unreachable), true)).await;
+        let route = PeerRoute::detect(&BunClient::new(&base), "one").await;
+        server.abort();
+        assert_eq!(route, PeerRoute::Relay);
+    }
+
+    #[tokio::test]
+    async fn peer_route_stays_direct_when_every_peer_answers_directly() {
+        let (peer, peer_server) = serve(axum::Router::new().route(
+            "/v1/health",
+            axum::routing::get(|| async { axum::Json(serde_json::json!({"status": "ok"})) }),
+        ))
+        .await;
+        let peer = peer.trim_start_matches("http://").to_string();
+        let unreachable = closed_port().await.to_string();
+        let (base, server) = serve(entry_router(two_nodes(&unreachable, &peer), true)).await;
+        let route = PeerRoute::detect(&BunClient::new(&base), "one").await;
+        server.abort();
+        peer_server.abort();
+        assert_eq!(route, PeerRoute::Direct);
+    }
+
+    #[tokio::test]
+    async fn a_peer_down_both_ways_says_nothing_about_the_route() {
+        let unreachable = closed_port().await.to_string();
+        let (base, server) =
+            serve(entry_router(two_nodes(&unreachable, &unreachable), false)).await;
+        let route = PeerRoute::detect(&BunClient::new(&base), "one").await;
+        server.abort();
+        assert_eq!(route, PeerRoute::Direct);
     }
 
     #[tokio::test]
@@ -1247,9 +1552,59 @@ mod tests {
         let idle = Config::parse(&ctx.container_idle_spec("box")).unwrap();
         let box_app = idle.app.get("box").expect("app box");
         assert_eq!(box_app.namespace.as_deref(), Some("rbtest-abc-00"));
-        assert!(box_app.command.iter().any(|a| a == "sleep"));
+        assert!(box_app.command[2].contains("/bin/busybox sleep infinity"));
         assert!(box_app.health.is_none());
         assert!(std::path::Path::new(&box_app.command[0]).is_absolute());
+    }
+
+    /// A container's PID 1 ignores any signal it has no handler for, so a bare
+    /// `busybox sleep` or `httpd` sat out Bun's whole stop grace on every
+    /// lease cleanup, holding the node's agent loop for ten seconds each.
+    #[test]
+    fn container_fixtures_trap_sigterm_as_pid_one() {
+        let ctx = context("rbtest-abc-00");
+        let specs = [
+            ("web", ctx.container_http_spec("web", 1)),
+            ("box", ctx.container_idle_spec("box")),
+        ];
+        for (app, spec) in specs {
+            let config = Config::parse(&spec).unwrap();
+            let command = &config.app[app].command;
+            assert_eq!(command[..2], ["/bin/sh", "-c"], "{app}: {command:?}");
+            assert!(command[2].starts_with(SIGTERM_TRAP), "{app}: {command:?}");
+            assert!(command[2].ends_with("& wait"), "{app}: {command:?}");
+        }
+    }
+
+    /// The trap wrapper, run by the host's `sh`: TERM ends it at once with
+    /// status 0 while its long-running child is still going.
+    #[tokio::test]
+    async fn sigterm_wrapper_exits_promptly_while_its_child_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let ready = dir.path().join("ready");
+        let script = exit_on_sigterm(&format!("touch {}; sleep 30", ready.display()));
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .args(["-c", &script])
+            .spawn()
+            .unwrap();
+        let started = std::time::Instant::now();
+        while !ready.exists() {
+            assert!(started.elapsed() < Duration::from_secs(20), "never ready");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let pid = child.id().unwrap().to_string();
+        let killed = tokio::process::Command::new("kill")
+            .args(["-TERM", &pid])
+            .status()
+            .await
+            .unwrap();
+        assert!(killed.success());
+
+        let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
+            .await
+            .expect("the wrapper ignored SIGTERM")
+            .unwrap();
+        assert_eq!(status.code(), Some(0));
     }
 
     #[test]

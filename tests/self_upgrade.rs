@@ -280,6 +280,7 @@ command = ["{testapp}", "--mode", "healthy", "--port", "{port}"]
             external_signature: Some(signing::sign(&self.external_pkcs8, &bytes).unwrap()),
             source: BinarySource::LocalFile { path },
             network_provenance: false,
+            allow_downgrade: false,
         }
     }
 
@@ -334,10 +335,80 @@ command = ["{testapp}", "--mode", "healthy", "--port", "{port}"]
                 .send()
                 .await;
         }
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // Give the stop a moment to retire the workloads the normal way; the
+        // reaper below catches whatever it didn't.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !self.deployed_apps.is_empty() && tokio::time::Instant::now() < deadline {
+            let Some(statuses) = self.statuses().await else {
+                break;
+            };
+            if statuses.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
         let _ = self.stop_tx.send(true);
         if let Some(supervisor) = self.supervisor.take() {
             let _ = supervisor.await;
+        }
+        reap_workloads(self._root.path());
+        let leftover = processes_under(self._root.path());
+        assert!(
+            leftover.is_empty(),
+            "workload processes outlived the harness: {leftover:?}"
+        );
+    }
+
+    /// Every instance the node reports, if it answers.
+    async fn statuses(&self) -> Option<Vec<serde_json::Value>> {
+        let response = self.client.get(self.url("/v1/status")).send().await.ok()?;
+        response.json().await.ok()
+    }
+}
+
+/// Workloads run under detached process owners so they survive Bun's exec.
+/// That also means they survive the test: killing Bun (or a panic that drops
+/// the supervisor) leaves them serving on their fixed ports, and the next run
+/// finds its port taken. So the harness reaps them on every path.
+impl Drop for RealNodeHarness {
+    fn drop(&mut self) {
+        reap_workloads(self._root.path());
+    }
+}
+
+/// Pids of processes whose command line names `root` (the process owners,
+/// whose `--directory` lives under the harness's data directory).
+fn processes_under(root: &Path) -> Vec<u32> {
+    let Ok(output) = std::process::Command::new("pgrep")
+        .arg("-f")
+        .arg(root)
+        .output()
+    else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse().ok())
+        .collect()
+}
+
+/// SIGKILL every process owner under `root` and the workloads it runs.
+///
+/// The children are listed before their owner dies (they'd be re-parented and
+/// lost), and the owner dies before them (so it can't restart one).
+fn reap_workloads(root: &Path) {
+    for owner in processes_under(root) {
+        let children = std::process::Command::new("pgrep")
+            .args(["-P", &owner.to_string()])
+            .output()
+            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+            .unwrap_or_default();
+        let mut pids = vec![owner.to_string()];
+        pids.extend(children.split_whitespace().map(str::to_string));
+        for pid in pids {
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", &pid])
+                .status();
         }
     }
 }
@@ -586,6 +657,52 @@ async fn upgrade_rejects_bad_external_signature() {
     assert_eq!(harness.version().await.as_deref(), Some("v0.1.0"));
     let target = std::fs::read_link(harness.bin_dir.join("bun")).unwrap();
     assert_eq!(target, Path::new("bun-v0.1.0"));
+    assert!(!harness.data_dir.join("upgrade/marker.json").exists());
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires RELIABURGER_UPGRADE_TESTS=1 and real bun processes"]
+async fn same_version_upgrade_never_swaps_silently() {
+    assert!(
+        upgrade_tests_enabled(),
+        "set RELIABURGER_UPGRADE_TESTS=1 before running ignored upgrade tests"
+    );
+    let _serial = SERIAL.lock().await;
+    let harness = RealNodeHarness::start().await;
+    let running = std::fs::read(harness.bin_dir.join("bun-v0.1.0")).unwrap();
+
+    // The running bytes again: nothing to do, reported as such.
+    let response = harness
+        .client
+        .post(harness.url("/v1/upgrade/apply"))
+        .json(&harness.directive("v0.1.0", "same-bytes"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["status"], "already_running", "{body}");
+
+    // A different build under the running version: refused, untouched.
+    let rebuilt_path = harness.data_dir.join("rebuilt-bun");
+    let mut rebuilt = running.clone();
+    rebuilt.extend_from_slice(b"\n# a different build of v0.1.0\n");
+    std::fs::write(&rebuilt_path, &rebuilt).unwrap();
+    let mut directive = harness.directive("v0.1.0", "same-version");
+    directive.binary_sha256 = signing::sha256_hex(&rebuilt);
+    directive.embedded_signature = signing::sign(&harness.release_pkcs8, &rebuilt).unwrap();
+    directive.external_signature = Some(signing::sign(&harness.external_pkcs8, &rebuilt).unwrap());
+    directive.source = BinarySource::LocalFile { path: rebuilt_path };
+    assert_eq!(harness.post_upgrade(&directive).await, 409);
+
+    assert_eq!(harness.version().await.as_deref(), Some("v0.1.0"));
+    assert_eq!(
+        std::fs::read(harness.bin_dir.join("bun-v0.1.0")).unwrap(),
+        running,
+        "the running version's bytes must be untouched"
+    );
     assert!(!harness.data_dir.join("upgrade/marker.json").exists());
 
     harness.shutdown().await;

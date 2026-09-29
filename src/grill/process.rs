@@ -37,11 +37,9 @@ use super::{GrillError, InstanceId};
 struct ProcessEntry {
     spec: OciSpec,
     child: Option<tokio::process::Child>,
-    /// Pid of an adopted process (started by a previous bun). Mutually
-    /// exclusive with `child`: adopted processes have no handle, only a pid.
-    adopted_pid: Option<u32>,
-    /// Start time of the adopted pid, to detect pid reuse (M23).
-    adopted_pid_started_at: Option<u64>,
+    /// A process started by a previous bun. Mutually exclusive with
+    /// `child`: adopted processes have no handle, only a pid.
+    adopted: Option<AdoptedProcess>,
     state: ContainerState,
     stdout_buf: Arc<Mutex<Vec<u8>>>,
     stderr_buf: Arc<Mutex<Vec<u8>>>,
@@ -51,6 +49,14 @@ struct ProcessEntry {
     /// In-memory workloads have no adoption path, so dropping their last
     /// owner must not leave the process tree behind.
     cleanup_on_drop: bool,
+}
+
+/// The recorded identity of an adopted process.
+#[derive(Debug, Clone, Copy)]
+struct AdoptedProcess {
+    pid: u32,
+    /// Start time of the pid, to detect pid reuse (M23).
+    started_at: u64,
 }
 
 impl Drop for ProcessEntry {
@@ -68,13 +74,11 @@ impl Drop for ProcessEntry {
             let pid = nix::unistd::Pid::from_raw(pid as i32);
             let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
             let _ = child.start_kill();
-        } else if let Some(pid) = self.adopted_pid
-            && self
-                .adopted_pid_started_at
-                .is_some_and(|started| records::process_matches(pid, started))
+        } else if let Some(adopted) = self.adopted
+            && records::process_matches(adopted.pid, adopted.started_at)
         {
             let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(pid as i32),
+                nix::unistd::Pid::from_raw(adopted.pid as i32),
                 nix::sys::signal::Signal::SIGKILL,
             );
         }
@@ -88,14 +92,11 @@ fn signal_adopted_process(
     entry: &ProcessEntry,
     signal: nix::sys::signal::Signal,
 ) -> std::io::Result<bool> {
-    let Some(pid) = entry.adopted_pid else {
+    let Some(adopted) = entry.adopted else {
         return Ok(false);
     };
-    let nix_pid = nix::unistd::Pid::from_raw(pid as i32);
-    let owned = entry
-        .adopted_pid_started_at
-        .is_some_and(|started| records::process_matches(pid, started));
-    if !owned {
+    let nix_pid = nix::unistd::Pid::from_raw(adopted.pid as i32);
+    if !records::process_matches(adopted.pid, adopted.started_at) {
         if nix::sys::signal::kill(nix_pid, None) == Err(nix::errno::Errno::ESRCH) {
             return Ok(false);
         }
@@ -194,6 +195,16 @@ impl ProcessGrill {
         }
     }
 
+    /// Owner-backed lifecycle operations that are still running, including
+    /// ones whose caller dropped its future: cancellation never cancels a
+    /// queued mutation. Zero means none can still change owner state. Always
+    /// zero without an owner.
+    pub fn owner_operations_in_flight(&self) -> usize {
+        self.control
+            .as_ref()
+            .map_or(0, ProcessControl::operations_in_flight)
+    }
+
     /// Get captured stdout for an instance.
     pub async fn stdout(&self, instance: &InstanceId) -> Result<Vec<u8>, GrillError> {
         self.read_stream(instance, true).await
@@ -275,8 +286,7 @@ impl super::Grill for ProcessGrill {
             ProcessEntry {
                 spec: spec.clone(),
                 child: None,
-                adopted_pid: None,
-                adopted_pid_started_at: None,
+                adopted: None,
                 state: ContainerState::Pending,
                 stdout_buf: Arc::new(Mutex::new(Vec::new())),
                 stderr_buf: Arc::new(Mutex::new(Vec::new())),
@@ -305,7 +315,7 @@ impl super::Grill for ProcessGrill {
                 instance: instance.clone(),
             })?;
 
-        if entry.child.is_some() || entry.adopted_pid.is_some() {
+        if entry.child.is_some() || entry.adopted.is_some() {
             return Err(GrillError::StartFailed {
                 instance: instance.clone(),
                 reason: "already started".to_string(),
@@ -450,7 +460,7 @@ impl super::Grill for ProcessGrill {
         if let Some(pid) = entry.child.as_ref().and_then(|child| child.id()) {
             signal_child_group(pid, nix::sys::signal::Signal::SIGTERM).map_err(error)?;
             entry.state = ContainerState::Stopping;
-        } else if entry.adopted_pid.is_some() {
+        } else if entry.adopted.is_some() {
             entry.state = if signal_adopted_process(entry, nix::sys::signal::Signal::SIGTERM)
                 .map_err(error)?
             {
@@ -503,7 +513,7 @@ impl super::Grill for ProcessGrill {
                 .map_err(error)?;
             entry.exit_code = status.code();
             entry.state = ContainerState::Stopped;
-        } else if entry.adopted_pid.is_some() {
+        } else if entry.adopted.is_some() {
             entry.state = if signal_adopted_process(entry, nix::sys::signal::Signal::SIGKILL)
                 .map_err(error)?
             {
@@ -543,12 +553,12 @@ impl super::Grill for ProcessGrill {
                 instance: instance.clone(),
                 reason: error.to_string(),
             })?;
-        } else if let Some(pid) = entry.adopted_pid {
+        } else if let Some(adopted) = entry.adopted {
             // Adopted process: no handle, poll (and reap) by pid. This
             // doubles as the zombie reaper — the supervisor polls state
             // regularly, so exited adoptees get waitpid'd here.
             if entry.state != ContainerState::Stopped {
-                let (running, exit_code) = poll_adopted_process(pid, entry.adopted_pid_started_at)
+                let (running, exit_code) = poll_adopted_process(adopted.pid, adopted.started_at)
                     .map_err(|error| GrillError::StateUnavailable {
                         instance: instance.clone(),
                         reason: error.to_string(),
@@ -586,11 +596,7 @@ impl super::Grill for ProcessGrill {
                 .status(instance)
                 .await
                 .map_err(|error| owner_error(instance, error))?;
-            if owner
-                .launch
-                .as_ref()
-                .is_none_or(|launch| launch.spec != record.oci_spec)
-            {
+            if owner.launch.spec != record.oci_spec {
                 return Err(owner_error(
                     instance,
                     "process launch conflicts with adoption record",
@@ -606,7 +612,7 @@ impl super::Grill for ProcessGrill {
             };
         }
         let (running, _) =
-            poll_adopted_process(record.pid, Some(record.pid_started_at)).map_err(|error| {
+            poll_adopted_process(record.pid, record.pid_started_at).map_err(|error| {
                 GrillError::StateUnavailable {
                     instance: instance.clone(),
                     reason: error.to_string(),
@@ -621,8 +627,10 @@ impl super::Grill for ProcessGrill {
             ProcessEntry {
                 spec: record.oci_spec.clone(),
                 child: None,
-                adopted_pid: Some(record.pid),
-                adopted_pid_started_at: Some(record.pid_started_at),
+                adopted: Some(AdoptedProcess {
+                    pid: record.pid,
+                    started_at: record.pid_started_at,
+                }),
                 state: ContainerState::Running,
                 stdout_buf: Arc::new(Mutex::new(Vec::new())),
                 stderr_buf: Arc::new(Mutex::new(Vec::new())),
@@ -647,7 +655,7 @@ impl super::Grill for ProcessGrill {
             .child
             .as_ref()
             .and_then(|c| c.id())
-            .or(entry.adopted_pid)
+            .or(entry.adopted.map(|adopted| adopted.pid))
     }
 
     async fn log_stem(&self, instance: &InstanceId) -> Option<PathBuf> {
@@ -726,7 +734,7 @@ impl super::Grill for ProcessGrill {
     async fn follow_logs(
         &self,
         instance: &InstanceId,
-        lines_tx: tokio::sync::mpsc::Sender<String>,
+        lines_tx: tokio::sync::mpsc::Sender<crate::ketchup::types::CapturedLine>,
     ) {
         // Snapshot how this instance's logs are captured.
         let (stdout_buf, log_stem) = if let Some(control) = &self.control {
@@ -742,71 +750,61 @@ impl super::Grill for ProcessGrill {
             }
         };
 
-        let mut offset = 0usize;
-        let mut partial_line = String::new();
+        let mut reader = crate::grill::capture::CaptureReader::new(
+            crate::ketchup::types::LogStream::Stdout,
+            log_stem.as_ref().map(|stem| log_file(stem, "stdout")),
+        );
 
         loop {
-            // New bytes since the last poll, from the file or the buffer.
-            let new_data = if let Some(stem) = &log_stem {
-                let contents = std::fs::read(log_file(stem, "stdout")).unwrap_or_default();
-                if offset < contents.len() {
-                    let data = contents[offset..].to_vec();
-                    offset = contents.len();
-                    Some(data)
-                } else {
-                    None
-                }
+            // New bytes since the last poll, from the file or the buffer, at
+            // most one bounded chunk at a time: a restarted Bun replays the
+            // whole capture, and one long synchronous step would hold a
+            // runtime worker for as long as it took.
+            let new_data = if let Some(file) = reader.file() {
+                crate::grill::capture::read_capture_chunk(file, reader.read_offset())
+                    .await
+                    .unwrap_or_default()
             } else {
+                let offset = usize::try_from(reader.read_offset()).unwrap_or(usize::MAX);
                 let buf = stdout_buf.lock().await;
-                if offset < buf.len() {
-                    let data = buf[offset..].to_vec();
-                    offset = buf.len();
-                    Some(data)
-                } else {
-                    None
-                }
+                let end = buf
+                    .len()
+                    .min(offset.saturating_add(crate::grill::capture::CAPTURE_CHUNK_BYTES));
+                buf.get(offset..end).unwrap_or_default().to_vec()
             };
 
-            let no_new_data = new_data.is_none();
-            if let Some(data) = new_data {
-                partial_line.push_str(&String::from_utf8_lossy(&data));
-
-                // Send all complete lines
-                while let Some(newline_pos) = partial_line.find('\n') {
-                    let line = partial_line[..newline_pos].to_string();
-                    partial_line = partial_line[newline_pos + 1..].to_string();
-                    if lines_tx.send(line).await.is_err() {
-                        return;
-                    }
+            let no_new_data = new_data.is_empty();
+            let backlog = new_data.len() == crate::grill::capture::CAPTURE_CHUNK_BYTES;
+            for line in reader.push(&new_data) {
+                if lines_tx.send(line).await.is_err() {
+                    return;
                 }
+            }
+            if backlog {
+                // The in-memory buffer never awaits; hand the worker back.
+                tokio::task::yield_now().await;
+                continue;
             }
 
             // Check if the process has exited and no more data is coming
-            if self.control.is_some() {
+            let exited = if self.control.is_some() {
                 match self.state(instance).await {
-                    Ok(ContainerState::Stopped) if no_new_data => {
-                        if !partial_line.is_empty() {
-                            let _ = lines_tx.send(std::mem::take(&mut partial_line)).await;
-                        }
-                        return;
-                    }
+                    Ok(ContainerState::Stopped) => true,
                     Err(_) => return,
-                    _ => {}
+                    _ => false,
                 }
             } else {
                 let procs = self.processes.lock().await;
-                if let Some(entry) = procs.get(instance) {
-                    let exited = entry.state == ContainerState::Stopped
-                        || entry.state == ContainerState::Stopping;
-                    if exited && no_new_data {
-                        if !partial_line.is_empty() {
-                            let _ = lines_tx.send(std::mem::take(&mut partial_line)).await;
-                        }
-                        return;
-                    }
-                } else {
+                let Some(entry) = procs.get(instance) else {
                     return;
+                };
+                entry.state == ContainerState::Stopped || entry.state == ContainerState::Stopping
+            };
+            if exited && no_new_data {
+                if let Some(line) = reader.finish() {
+                    let _ = lines_tx.send(line).await;
                 }
+                return;
             }
 
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -833,6 +831,8 @@ mod tests {
                 env: vec!["TEST_VAR=hello".to_string()],
                 cwd: "/".to_string(),
                 user: OciUser { uid: 0, gid: 0 },
+                capabilities: None,
+                overrides: None,
             },
             mounts: vec![],
             linux: OciLinux {
@@ -868,7 +868,7 @@ mod tests {
 
     fn record_for(instance: &InstanceId, pid: u32, started_at: u64) -> InstanceRecord {
         InstanceRecord {
-            schema: 1,
+            schema: 2,
             instance_id: instance.0.clone(),
             namespace: "default".to_string(),
             app_name: "test".to_string(),
@@ -1006,7 +1006,13 @@ mod tests {
     async fn stop_terminates_shell_descendants() {
         let dir = tempfile::tempdir().unwrap();
         let pid_file = dir.path().join("child.pid");
-        let script = format!("sleep 60 & echo $! > {}; wait", pid_file.display());
+        // Write the pid beside the file and rename it into place: `>` creates
+        // the file before `echo` fills it, and the poll below could read it
+        // empty in between.
+        let script = format!(
+            "sleep 60 & echo $! > {path}.tmp && mv {path}.tmp {path}; wait",
+            path = pid_file.display()
+        );
         let grill = ProcessGrill::new();
         let id = InstanceId("process-tree-0".to_string());
 
@@ -1021,8 +1027,11 @@ mod tests {
 
         let descendant_pid = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
-                if let Ok(contents) = std::fs::read_to_string(&pid_file) {
-                    break contents.trim().parse::<u32>().unwrap();
+                if let Ok(pid) = std::fs::read_to_string(&pid_file)
+                    .map_err(|_| ())
+                    .and_then(|contents| contents.trim().parse::<u32>().map_err(|_| ()))
+                {
+                    break pid;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
@@ -1160,6 +1169,266 @@ mod tests {
         assert!(dir.path().join("test-0.stdout").is_file());
     }
 
+    /// Read the first line `follow_logs` produces for `id`, as a fresh
+    /// forwarder would after an agent restart.
+    async fn first_followed_line(
+        grill: &ProcessGrill,
+        id: &InstanceId,
+    ) -> crate::ketchup::types::CapturedLine {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
+        let follower = grill.clone();
+        let follow_id = id.clone();
+        let task = tokio::spawn(async move { follower.follow_logs(&follow_id, sender).await });
+        let line = tokio::time::timeout(std::time::Duration::from_secs(5), receiver.recv())
+            .await
+            .expect("no line followed")
+            .expect("follow ended without a line");
+        drop(receiver);
+        task.abort();
+        line
+    }
+
+    /// V02 soak regression: every agent restart re-follows adopted
+    /// instances from the start of their capture files. The replayed lines
+    /// must carry the same positions, so the log store recognises them and
+    /// doesn't store the instance's whole history again as new lines.
+    #[tokio::test]
+    async fn refollowing_a_capture_file_replays_the_same_positions_and_the_store_keeps_one_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let grill = ProcessGrill::with_log_dir(dir.path().to_path_buf());
+        let id = InstanceId("test-0".to_string());
+        grill.create(&id, &echo_spec("ACK 1")).await.unwrap();
+        grill.start(&id).await.unwrap();
+
+        let before_restart = first_followed_line(&grill, &id).await;
+        let after_restart = first_followed_line(&grill, &id).await;
+        assert_eq!(before_restart.line, "ACK 1");
+        assert_eq!(
+            before_restart.position,
+            Some(crate::ketchup::types::CapturePosition {
+                file: dir.path().join("test-0.stdout"),
+                end_offset: "ACK 1\n".len() as u64,
+            })
+        );
+        assert_eq!(after_restart, before_restart);
+
+        let store_dir = tempfile::tempdir().unwrap();
+        let record =
+            |captured: crate::ketchup::types::CapturedLine| crate::ketchup::types::LogRecord {
+                app: "echo".to_string(),
+                namespace: "default".to_string(),
+                instance: id.0.clone(),
+                stream: captured.stream,
+                line: captured.line,
+                position: captured.position,
+            };
+        let mut store = crate::ketchup::log_store::LogStore::new(store_dir.path().to_path_buf());
+        assert!(store.ingest(&record(before_restart)));
+        store.flush().await.unwrap();
+        let mut store = crate::ketchup::log_store::LogStore::new(store_dir.path().to_path_buf());
+        assert!(!store.ingest(&record(after_restart)));
+        let stored = store
+            .query("echo", "default", None, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(stored.len(), 1);
+        grill.kill(&id).await.unwrap();
+    }
+
+    /// Read the first `count` lines `follow_logs` produces for `id`, as a
+    /// fresh forwarder would.
+    async fn followed_lines(
+        grill: &ProcessGrill,
+        id: &InstanceId,
+        count: usize,
+    ) -> Vec<crate::ketchup::types::CapturedLine> {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(64);
+        let follower = grill.clone();
+        let follow_id = id.clone();
+        let task = tokio::spawn(async move { follower.follow_logs(&follow_id, sender).await });
+        let mut lines = Vec::new();
+        while lines.len() < count {
+            let line = tokio::time::timeout(std::time::Duration::from_secs(5), receiver.recv())
+                .await
+                .expect("follow stalled")
+                .expect("follow ended early");
+            lines.push(line);
+        }
+        drop(receiver);
+        task.abort();
+        lines
+    }
+
+    fn client_record(
+        instance: &InstanceId,
+        captured: crate::ketchup::types::CapturedLine,
+    ) -> crate::ketchup::types::LogRecord {
+        crate::ketchup::types::LogRecord {
+            app: "client".to_string(),
+            namespace: "default".to_string(),
+            instance: instance.0.clone(),
+            stream: captured.stream,
+            line: captured.line,
+            position: captured.position,
+        }
+    }
+
+    async fn client_lines(store: &crate::ketchup::log_store::LogStore) -> Vec<String> {
+        store
+            .query("client", "default", None, None, None, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.line)
+            .collect()
+    }
+
+    fn printf_spec(output: &str) -> OciSpec {
+        spec_with_args(vec!["printf".to_string(), output.to_string()])
+    }
+
+    /// V02 soak blocker (candidate 3fcb1fd): after a SIGKILL, Bun re-follows
+    /// every adopted instance's capture file from byte 0. The soak's log
+    /// spammer had written about a million lines in 80 minutes, and the
+    /// forwarder split them in one synchronous call on a runtime worker. On a
+    /// two-vCPU node that starved startup adoption for 11 minutes, until the
+    /// next instance's 10 s adoption deadline expired and Bun exited.
+    ///
+    /// Replaying a backlog must hand the runtime back between bounded chunks,
+    /// so a concurrent task (here a 1 ms timer, standing in for adoption)
+    /// keeps running on a single-threaded runtime.
+    #[tokio::test(flavor = "current_thread")]
+    async fn replaying_a_large_capture_backlog_does_not_hold_the_runtime() {
+        const LINE: &str = "spam the quick brown fox jumps\n";
+        const LINES: usize = 128 * 1024;
+        let dir = tempfile::tempdir().unwrap();
+        let grill = ProcessGrill::with_log_dir(dir.path().to_path_buf());
+        let id = InstanceId("spammer-0".to_string());
+        grill.create(&id, &sleep_spec("60")).await.unwrap();
+        grill.start(&id).await.unwrap();
+        let capture = dir.path().join("spammer-0.stdout");
+        std::fs::write(&capture, LINE.repeat(LINES)).unwrap();
+
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(256);
+        let follower = grill.clone();
+        let follow_id = id.clone();
+        let task = tokio::spawn(async move { follower.follow_logs(&follow_id, sender).await });
+        let consumer = tokio::spawn(async move {
+            let mut last = None;
+            for _ in 0..LINES {
+                last = receiver.recv().await;
+            }
+            last
+        });
+
+        let mut longest_stall = std::time::Duration::ZERO;
+        let replay_started = std::time::Instant::now();
+        while !consumer.is_finished() {
+            let tick = std::time::Instant::now();
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            longest_stall = longest_stall.max(tick.elapsed());
+            assert!(
+                replay_started.elapsed() < std::time::Duration::from_secs(60),
+                "the backlog was not replayed within 60 s"
+            );
+        }
+        let last = consumer.await.unwrap().expect("replay ended early");
+        task.abort();
+        grill.kill(&id).await.unwrap();
+
+        assert_eq!(
+            last.position.unwrap().end_offset,
+            (LINE.len() * LINES) as u64,
+            "every line of the backlog is replayed, in order"
+        );
+        assert!(
+            longest_stall < std::time::Duration::from_secs(1),
+            "replaying the backlog held the runtime for {longest_stall:?}"
+        );
+    }
+
+    /// V02 soak follow-up: after a graceful whole-cluster stop and start, a
+    /// retired instance's capture file is still on disk next to its
+    /// replacement's. Re-following both after the restart must not store the
+    /// retired instance's lines again as the newest.
+    #[tokio::test]
+    async fn graceful_restart_does_not_reingest_a_retired_instances_capture_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_dir = tempfile::tempdir().unwrap();
+        let grill = ProcessGrill::with_log_dir(dir.path().to_path_buf());
+        let retired = InstanceId("client-old".to_string());
+        let current = InstanceId("client-new".to_string());
+        grill
+            .create(&retired, &printf_spec("INCR 1\\nINCR 2\\nINCR 3\\n"))
+            .await
+            .unwrap();
+        grill.start(&retired).await.unwrap();
+        let mut store = crate::ketchup::log_store::LogStore::new(store_dir.path().to_path_buf());
+        for line in followed_lines(&grill, &retired, 3).await {
+            assert!(store.ingest(&client_record(&retired, line)));
+        }
+        grill.kill(&retired).await.unwrap();
+        grill
+            .create(&current, &printf_spec("INCR 4\\n"))
+            .await
+            .unwrap();
+        grill.start(&current).await.unwrap();
+        for line in followed_lines(&grill, &current, 1).await {
+            assert!(store.ingest(&client_record(&current, line)));
+        }
+        let shared = std::sync::Arc::new(tokio::sync::RwLock::new(store));
+        crate::ketchup::log_store::flush_shared(&shared)
+            .await
+            .unwrap();
+        drop(shared);
+
+        // Bun comes back and follows every capture file it finds from byte 0.
+        let mut store = crate::ketchup::log_store::LogStore::new(store_dir.path().to_path_buf());
+        for (id, count) in [(&retired, 3), (&current, 1)] {
+            for line in followed_lines(&grill, id, count).await {
+                assert!(!store.ingest(&client_record(id, line)), "{id} re-ingested");
+            }
+        }
+        assert_eq!(
+            client_lines(&store).await,
+            vec!["INCR 1", "INCR 2", "INCR 3", "INCR 4"]
+        );
+        grill.kill(&current).await.unwrap();
+    }
+
+    /// A graceful stop between two periodic flushes: the lines exist only in
+    /// the buffer. The shutdown flush must persist them and their offsets, so
+    /// the restart neither loses nor duplicates them.
+    #[tokio::test]
+    async fn graceful_stop_keeps_lines_that_were_only_buffered() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_dir = tempfile::tempdir().unwrap();
+        let grill = ProcessGrill::with_log_dir(dir.path().to_path_buf());
+        let id = InstanceId("client-0".to_string());
+        grill
+            .create(&id, &printf_spec("INCR 1\\nINCR 2\\n"))
+            .await
+            .unwrap();
+        grill.start(&id).await.unwrap();
+        let mut store = crate::ketchup::log_store::LogStore::new(store_dir.path().to_path_buf());
+        for line in followed_lines(&grill, &id, 2).await {
+            store.ingest(&client_record(&id, line));
+        }
+        assert_eq!(store.buffer_len(), 2, "nothing flushed before the stop");
+        let shared = std::sync::Arc::new(tokio::sync::RwLock::new(store));
+        crate::ketchup::log_store::flush_shared(&shared)
+            .await
+            .unwrap();
+        drop(shared);
+
+        let mut store = crate::ketchup::log_store::LogStore::new(store_dir.path().to_path_buf());
+        for line in followed_lines(&grill, &id, 2).await {
+            assert!(!store.ingest(&client_record(&id, line)));
+        }
+        assert_eq!(client_lines(&store).await, vec!["INCR 1", "INCR 2"]);
+        grill.kill(&id).await.unwrap();
+    }
+
     #[tokio::test]
     async fn adopts_live_process_and_reports_running() {
         // A process spawned outside the grill entirely stands in for a
@@ -1235,7 +1504,10 @@ mod tests {
             .await
             .get_mut(&id)
             .unwrap()
-            .adopted_pid_started_at = Some(started_at + 3600);
+            .adopted
+            .as_mut()
+            .unwrap()
+            .started_at = started_at + 3600;
         let refused = match operation {
             "stop" => grill.stop(&id).await.is_err(),
             "kill" => grill.kill(&id).await.is_err(),

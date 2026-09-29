@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::council::node::CouncilNode;
-use crate::council::types::{DesiredState, RaftRequest};
+use crate::council::types::{CouncilResponse, DesiredState, RaftRequest};
 
 use super::diff::{ChangePayload, ResourceChange};
 use super::git::GitRepo;
@@ -385,8 +385,8 @@ fn now_millis() -> u64 {
 /// Apply a sync's changes to Raft, stopping at the first failure.
 ///
 /// Returns `Ok(count)` with the number of writes committed when every
-/// change applied, or `Err(resource_id)` naming the change that failed.
-/// The caller must advance `last_applied_commit` only on `Ok` — that's
+/// change applied, or `Err(resource_id)` naming the change that failed or
+/// that the state machine refused. The caller must advance `last_applied_commit` only on `Ok` — that's
 /// the D12 atomicity guarantee: a half-applied sync leaves the commit
 /// unadvanced so the next tick re-applies the whole (idempotent) set.
 pub async fn apply_changes(
@@ -398,9 +398,18 @@ pub async fn apply_changes(
         let Some(request) = change_to_request(change) else {
             continue; // jobs/builds: not reconciled desired state
         };
-        if let Err(e) = council.write(request).await {
-            eprintln!("gitops: failed to apply {}: {e}", change_id(change));
-            return Err(change_id(change).to_string());
+        // A committed entry the state machine refused left desired state
+        // unchanged, so it's as unapplied as a failed write (B15).
+        match council.write(request).await {
+            Ok(CouncilResponse::Refused { reason }) => {
+                eprintln!("gitops: {} refused: {reason}", change_id(change));
+                return Err(change_id(change).to_string());
+            }
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("gitops: failed to apply {}: {e}", change_id(change));
+                return Err(change_id(change).to_string());
+            }
         }
         applied += 1;
     }

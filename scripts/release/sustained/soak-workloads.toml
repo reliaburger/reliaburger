@@ -1,0 +1,97 @@
+# Workloads for the V02 sustained soak (scripts/release/qualify-sustained.sh).
+#
+# The writer and the soak Redis keep their data on managed volumes. Placement
+# isn't volume-aware, so each is pinned by a node label the harness adds to
+# node.toml: `soak-volume = "writer"` on node 2 and `"redis"` on node 3. An app
+# that moved would start on an empty volume and look like data loss.
+#
+# Every app gets a workload identity; soak-identity runs one instance per node
+# so the harness can read a certificate on each node through `relish exec`.
+# The harness bumps SOAK_GENERATION to drive a rolling deploy.
+#
+# Images are the pinned ones from src/testkit/pinned_images.rs.
+
+# Appends 1, 2, 3, ... to /data/seq about ten times a second, syncs, then logs
+# `ACK n`. On start it drops a torn last line (a power cut mid-append) and
+# carries on from the last whole one, so the file must always hold 1..N with
+# N at least the highest ACK ever logged.
+[app.soak-writer]
+image = "public.ecr.aws/docker/library/busybox@sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028"
+command = ["/bin/sh", "-c", '''
+trap 'exit 0' TERM
+f=/data/seq
+touch "$f"
+lines=$(wc -l < "$f")
+head -n "$lines" "$f" > "$f.tmp" && mv "$f.tmp" "$f" && sync
+n=$(tail -n 1 "$f")
+echo "RESUME ${n:-0} after $lines lines"
+n=${n:-0}
+while true; do
+  n=$((n + 1))
+  echo "$n" >> "$f"
+  sync
+  echo "ACK $n"
+  sleep 0.1
+done
+''']
+
+[[app.soak-writer.volumes]]
+path = "/data"
+size = "256Mi"
+
+[app.soak-writer.placement]
+required = ["soak-volume=writer"]
+
+# Redis with an append-only file synced on every write. `command` skips the
+# image's entrypoint, which drops to the redis user; on the 0.1.0 candidate
+# that user can't write the managed volume (see the V02 plan's findings).
+[app.soak-redis]
+image = "public.ecr.aws/docker/library/redis@sha256:234c902a2db49461a129e2d4aeff85b28cf20187ed274a67f6e50995fa713c7b"
+command = ["redis-server", "--dir", "/data", "--appendonly", "yes", "--appendfsync", "always"]
+port = 6379
+
+[[app.soak-redis.volumes]]
+path = "/data"
+size = "256Mi"
+
+[app.soak-redis.placement]
+required = ["soak-volume=redis"]
+
+# INCR once a second, logging `INCR n`. The counter must never go backwards.
+[app.soak-redis-client]
+image = "public.ecr.aws/docker/library/redis@sha256:234c902a2db49461a129e2d4aeff85b28cf20187ed274a67f6e50995fa713c7b"
+command = ["/bin/sh", "-c", '''
+trap 'exit 0' TERM
+while true; do
+  v=$(redis-cli -h soak-redis -p 6379 INCR soak:counter 2>&1)
+  case $v in
+    ''|*[!0-9]*) echo "ERR $v" ;;
+    *) echo "INCR $v" ;;
+  esac
+  sleep 1
+done
+''']
+
+# About 200 log lines a second, to keep Ketchup's exporter and pruning busy.
+[app.soak-spammer]
+image = "public.ecr.aws/docker/library/busybox@sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028"
+command = ["/bin/sh", "-c", '''
+trap 'exit 0' TERM
+i=0
+while true; do
+  j=0
+  while [ $j -lt 20 ]; do
+    i=$((i + 1))
+    echo "spam $i the quick brown fox jumps over the lazy dog"
+    j=$((j + 1))
+  done
+  sleep 0.1
+done
+''']
+
+# One instance per node, idle, so each node has a workload certificate to read.
+[app.soak-identity]
+image = "public.ecr.aws/docker/library/busybox@sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028"
+command = ["/bin/sh", "-c", "trap 'exit 0' TERM; while true; do sleep 1; done"]
+replicas = "*"
+env = { SOAK_GENERATION = "0" }

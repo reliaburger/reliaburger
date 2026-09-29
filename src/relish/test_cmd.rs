@@ -97,6 +97,8 @@ async fn run_with_client(
         confirm_chaos(&capabilities, &cases, args.yes)?;
     }
 
+    let peer_route = testkit::context::PeerRoute::detect(client, &capabilities.node_id).await;
+
     let report = testkit::run(
         cases,
         RunConfig {
@@ -110,6 +112,7 @@ async fn run_with_client(
             profile,
             fixed_namespace: args.namespace.clone(),
             lease_ownership: testkit::runner::LeaseOwnership::Required,
+            peer_route,
         },
     )
     .await

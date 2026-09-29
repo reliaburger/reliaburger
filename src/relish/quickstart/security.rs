@@ -196,7 +196,7 @@ mod tests {
                 version: "v0.1.0".parse().unwrap(),
                 api_port: 19117,
                 ingress_port: 18080,
-                registry_port: Some(15050),
+                registry_port: 15050,
             },
         )
         .unwrap()

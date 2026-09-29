@@ -1,0 +1,9 @@
+---
+source: src/relish/fault.rs
+expression: "render_fault_list(&[summary(1, \"node-1\", \"web\"), node_fault])"
+---
+ID     TYPE                   NODE            TARGET                 INSTANCE        REMAINING  INJECTED BY
+1      kill                   node-1          web                    -               0s         ops
+4      node-kill              node-2          node-2                 -               0s         ops
+
+2 active fault(s)

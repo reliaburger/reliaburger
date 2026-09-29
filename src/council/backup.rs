@@ -190,7 +190,7 @@ impl BackupStore {
             reason: e.to_string(),
         })?;
         let (store, prefix) =
-            object_store::parse_url(&parsed).map_err(|e| BackupError::InvalidUrl {
+            crate::object_storage::open(&parsed).map_err(|e| BackupError::InvalidUrl {
                 url: url.to_string(),
                 reason: e.to_string(),
             })?;
@@ -492,5 +492,15 @@ mod tests {
         let dest = tempfile::tempdir().unwrap();
         let store = BackupStore::from_url(&format!("file://{}", dest.path().display())).unwrap();
         assert!(store.latest().await.unwrap().is_none());
+    }
+
+    /// Pruning deletes older backups on the strength of the new one, so the
+    /// new one must be durable first.
+    #[test]
+    fn local_backup_destination_syncs_before_pruning() {
+        let dest = tempfile::tempdir().unwrap();
+        let store = BackupStore::from_url(&format!("file://{}", dest.path().display())).unwrap();
+        let store = format!("{:?}", store.store);
+        assert!(store.contains("fsync: true"), "{store}");
     }
 }

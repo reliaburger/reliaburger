@@ -6,6 +6,7 @@ import tempfile
 import unittest
 
 from candidate import candidate_names, record_candidate, verify_candidate, verify_run, verify_uploaded_assets
+from package import GUEST_METADATA
 
 
 class CandidateTests(unittest.TestCase):
@@ -13,11 +14,16 @@ class CandidateTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.directory = Path(self.temp.name)
-        self.images = {"fixture": {"asset": "guest.img", "sha256": hashlib.sha256(b"guest").hexdigest()}}
+        source = {"file": "ubuntu.img", "url": "https://images.example/ubuntu.img", "sha256": "5" * 64}
+        self.pins = {"packages": ["runc"], "images": {"fixture": {"asset": "guest.qcow2", "source": source}}}
+        metadata = {"schema": 1, "version": "v0.1.0", "images": {"fixture": {
+            "asset": "guest.qcow2", "sha256": hashlib.sha256(b"guest").hexdigest(), "size": 5,
+            "signature": "c2ln", "source": {"url": source["url"], "sha256": source["sha256"]}}}}
         self.identity = dict(version="v0.1.0", repository="reliaburger/reliaburger",
                              commit="a" * 40, run_id=123, run_attempt=2)
-        for name in candidate_names(self.images):
-            (self.directory / name).write_bytes(b"guest" if name == "guest.img" else name.encode())
+        contents = {"guest.qcow2": b"guest", GUEST_METADATA: json.dumps(metadata).encode()}
+        for name in candidate_names(self.pins):
+            (self.directory / name).write_bytes(contents.get(name, name.encode()))
         self.run = dict(id=123, run_attempt=2, head_sha="a" * 40, head_branch="main",
                         event="workflow_dispatch", path=".github/workflows/build.yml",
                         status="completed", conclusion="success",
@@ -25,10 +31,10 @@ class CandidateTests(unittest.TestCase):
                         head_repository={"full_name": "reliaburger/reliaburger"})
 
     def record(self):
-        return record_candidate(self.directory, self.images, **self.identity)
+        return record_candidate(self.directory, self.pins, **self.identity)
 
     def verify(self, digest):
-        return verify_candidate(self.directory, self.images, digest, **self.identity)
+        return verify_candidate(self.directory, self.pins, digest, **self.identity)
 
     def test_complete_candidate_round_trips_without_changing_any_assets(self):
         before = {p.name: p.read_bytes() for p in self.directory.iterdir()}
@@ -42,7 +48,7 @@ class CandidateTests(unittest.TestCase):
 
     def test_any_changed_missing_or_extra_asset_refuses_promotion(self):
         digest = self.record()
-        for name in sorted(candidate_names(self.images)):
+        for name in sorted(candidate_names(self.pins)):
             with self.subTest(name=name):
                 path = self.directory / name
                 original = path.read_bytes()
@@ -71,16 +77,29 @@ class CandidateTests(unittest.TestCase):
             with self.subTest(key=key):
                 expected = dict(self.identity, **{key: value})
                 with self.assertRaises(ValueError):
-                    verify_candidate(self.directory, self.images, digest, **expected)
+                    verify_candidate(self.directory, self.pins, digest, **expected)
 
     def test_incomplete_or_unpinned_candidate_is_not_recorded(self):
-        path = self.directory / "guest.img"
+        path = self.directory / "guest.qcow2"
         path.write_bytes(b"wrong image")
         with self.assertRaises(ValueError):
             self.record()
         self.assertFalse((self.directory / "candidate.json").exists())
         path.write_bytes(b"guest")
         (self.directory / "metadata.json").unlink()
+        with self.assertRaises(ValueError):
+            self.record()
+        self.assertFalse((self.directory / "candidate.json").exists())
+
+    def test_guest_image_built_from_another_source_is_not_recorded(self):
+        path = self.directory / GUEST_METADATA
+        metadata = json.loads(path.read_text())
+        metadata["images"]["fixture"]["source"]["sha256"] = "6" * 64
+        path.write_text(json.dumps(metadata))
+        with self.assertRaises(ValueError):
+            self.record()
+        del metadata["images"]["fixture"]
+        path.write_text(json.dumps(metadata))
         with self.assertRaises(ValueError):
             self.record()
         self.assertFalse((self.directory / "candidate.json").exists())
@@ -120,9 +139,10 @@ class CandidateTests(unittest.TestCase):
         assets = [{"name": path.name, "size": path.stat().st_size,
                    "digest": "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest(),
                    "state": "uploaded"} for path in self.directory.iterdir()]
-        release = dict(tag_name="v0.1.0", draft=True, assets=assets)
+        release = dict(tag_name="v0.1.0", draft=True, prerelease=False, assets=assets)
         verify_uploaded_assets(release, document, digest, (self.directory / "candidate.json").stat().st_size)
-        for change in [dict(tag_name="v0.2.0"), dict(draft=False), dict(assets=assets[:-1]),
+        for change in [dict(tag_name="v0.2.0"), dict(draft=False), dict(prerelease=True),
+                       dict(assets=assets[:-1]),
                        dict(assets=assets + assets[:1]),
                        dict(assets=[dict(assets[0], digest="sha256:" + "0" * 64)] + assets[1:]),
                        dict(assets=[dict(assets[0], state="new")] + assets[1:]),
@@ -135,7 +155,7 @@ class CandidateTests(unittest.TestCase):
         for key, value in [("version", "../main"), ("commit", "main"),
                            ("repository", "../project"), ("run_id", 0), ("run_attempt", True)]:
             with self.subTest(key=key), self.assertRaises(ValueError):
-                record_candidate(self.directory, self.images, **dict(self.identity, **{key: value}))
+                record_candidate(self.directory, self.pins, **dict(self.identity, **{key: value}))
         self.assertFalse((self.directory / "candidate.json").exists())
 
 

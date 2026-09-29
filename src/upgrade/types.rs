@@ -28,10 +28,12 @@ pub struct UpgradeDirective {
     /// the artefact and stages it as a `LocalFile`, but it is still a network
     /// upgrade and must require the operator's external signature. Verification
     /// treats the upgrade as network when this is set OR the source is network.
-    /// `#[serde(default)]` so directives from older peers still parse (as
-    /// non-network, matching their old behaviour).
-    #[serde(default)]
     pub network_provenance: bool,
+    /// The operator explicitly allowed a target older than the running
+    /// version (`relish upgrade start --allow-downgrade`). Without it the
+    /// node refuses a downgrade.
+    #[serde(default)]
+    pub allow_downgrade: bool,
 }
 
 /// Where the node obtains the binary bytes.
@@ -109,6 +111,10 @@ pub struct ClusterUpgradeState {
     /// Empty for rollbacks (the binary is already on every node's disk).
     #[serde(default)]
     pub registry_address: String,
+    /// Carried into every node's directive: the operator allowed a target
+    /// older than what the nodes run.
+    #[serde(default)]
+    pub allow_downgrade: bool,
     /// Fixed at start from gossip membership; the rolling order walks it.
     pub nodes: Vec<NodeUpgradeRecord>,
 }
@@ -150,6 +156,13 @@ pub enum ClusterUpgradePhase {
     Paused {
         reason: String,
     },
+    /// Ended by the operator from `Paused` without finishing
+    /// (`relish upgrade abort`, or a cluster rollback that replaced it).
+    /// Terminal: the orchestrator archives it to history. Appended last
+    /// because the Raft log encodes enum variants by index.
+    Aborted {
+        reason: String,
+    },
 }
 
 /// A node's role at plan time (decides its position in the rolling order).
@@ -173,6 +186,24 @@ pub struct NodeUpgradeRecord {
     /// When the node entered its current phase (drives stuck-node timeouts).
     #[serde(default)]
     pub since: Option<std::time::SystemTime>,
+    /// A still-`Pending` node whose directive hit a transient failure (its
+    /// registry or API briefly unreachable). The orchestrator re-sends until
+    /// the retry window runs out; `None` once delivered or failed for good.
+    #[serde(default)]
+    pub directive_retry: Option<DirectiveRetry>,
+}
+
+/// Transient directive failures the orchestrator is riding out for one node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectiveRetry {
+    /// Attempts so far, all of which failed transiently.
+    pub attempts: u32,
+    /// When the first attempt failed: the retry window counts from here.
+    pub first_failed_at: std::time::SystemTime,
+    /// When the latest attempt failed: the backoff counts from here.
+    pub last_failed_at: std::time::SystemTime,
+    /// What the latest attempt said, for status output and the pause reason.
+    pub last_error: String,
 }
 
 /// Per-node phase within the cluster upgrade.

@@ -27,9 +27,9 @@ use reliaburger::sesame::identity_store::NodeIdentity;
 use reliaburger::sesame::mtls::CrlHandle;
 use reliaburger::sesame::types::SerialNumber;
 
-fn local(port: u16) -> SocketAddr {
-    SocketAddr::from(([127, 0, 0, 1], port))
-}
+#[path = "support/cluster.rs"]
+mod cluster_support;
+use cluster_support::local;
 
 struct CancelOnDrop(CancellationToken);
 
@@ -305,18 +305,11 @@ fn thinks_it_is_leader(h: &ClusterHandle) -> bool {
     m.current_leader == Some(m.id)
 }
 
-/// Poll `cond` every 200ms until it returns true or the timeout elapses.
-async fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        if cond() {
-            return true;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return false;
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
+/// How often `wait_until` re-checks its condition in this binary.
+const POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+async fn wait_until(timeout: Duration, cond: impl FnMut() -> bool) -> bool {
+    cluster_support::wait_until(timeout, POLL_INTERVAL, cond).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -928,6 +921,7 @@ async fn node_renewal_retries_directly_after_leader_failure_and_persists_the_new
         members.push(reliaburger::bun::api::NodeMembershipInfo {
             node_id: reliaburger::meat::NodeId::new(names[index]),
             address,
+            api_advertised: true,
         });
     }
     let local_api = members[worker_index].address;

@@ -394,6 +394,11 @@ fn export_app(
             "health",
             "livenessProbe/readinessProbe",
         ),
+        (
+            app.metrics.is_some(),
+            "metrics",
+            "prometheus.io/* pod annotations",
+        ),
         (!app.volumes.is_empty(), "volumes", "volumes + volumeMounts"),
         (!app.init.is_empty(), "init", "initContainers"),
         (!app.config_file.is_empty(), "config_file", "ConfigMap"),

@@ -14,13 +14,12 @@ use super::error::ConfigError;
 // Resource value parsing
 // ---------------------------------------------------------------------------
 
-/// Parse a resource string like "128Mi", "500m", "1Gi", or a bare number.
+/// Parse a byte size like "128Mi", "1Gi", or a bare number of bytes.
 ///
-/// Returns the value in base units:
-/// - Memory suffixes (Ki, Mi, Gi, Ti) return bytes
-/// - CPU suffix (m) returns millicores
-/// - Bare numbers return the raw integer
-pub fn parse_resource_value(s: &str) -> Result<u64, ConfigError> {
+/// Used for memory, volume sizes and storage caps. Binary suffixes
+/// (`Ki`, `Mi`, `Gi`, `Ti`) are powers of 1024; a bare number is bytes,
+/// the same as in Kubernetes.
+pub fn parse_byte_size(s: &str) -> Result<u64, ConfigError> {
     let s = s.trim();
     if s.is_empty() {
         return Err(ConfigError::InvalidResourceValue {
@@ -29,8 +28,7 @@ pub fn parse_resource_value(s: &str) -> Result<u64, ConfigError> {
         });
     }
 
-    // Try binary suffixes (memory): Ti, Gi, Mi, Ki
-    // Order matters — check longer suffixes first
+    // Try binary suffixes: Ti, Gi, Mi, Ki
     if let Some(num) = s.strip_suffix("Ti") {
         return parse_num(num, 1024 * 1024 * 1024 * 1024, s);
     }
@@ -44,17 +42,60 @@ pub fn parse_resource_value(s: &str) -> Result<u64, ConfigError> {
         return parse_num(num, 1024, s);
     }
 
-    // CPU suffix: millicores
+    s.parse::<u64>()
+        .map_err(|_| ConfigError::InvalidResourceValue {
+            value: s.to_string(),
+            reason: "expected a number of bytes with optional suffix (Ki, Mi, Gi, Ti)".to_string(),
+        })
+}
+
+/// Parse a CPU quantity into millicores.
+///
+/// Follows the Kubernetes convention: a bare number is whole cores
+/// (`"2"` is 2000 millicores, `"0.5"` is 500), and the `m` suffix is
+/// millicores (`"250m"`). Anything finer than one millicore is rejected
+/// rather than silently rounded.
+pub fn parse_cpu_millicores(s: &str) -> Result<u64, ConfigError> {
+    let s = s.trim();
+    let invalid = |reason: &str| ConfigError::InvalidResourceValue {
+        value: s.to_string(),
+        reason: reason.to_string(),
+    };
+    if s.is_empty() {
+        return Err(invalid("empty string"));
+    }
     if let Some(num) = s.strip_suffix('m') {
         return parse_num(num, 1, s);
     }
 
-    // Bare number
-    s.parse::<u64>()
-        .map_err(|_| ConfigError::InvalidResourceValue {
-            value: s.to_string(),
-            reason: "expected a number with optional suffix (Ki, Mi, Gi, Ti, m)".to_string(),
-        })
+    // Cores, possibly with a fractional part. Parsed by hand rather than
+    // through f64 so "0.1" is exactly 100 millicores, not 99.999...
+    let (whole, fraction) = s.split_once('.').unwrap_or((s, ""));
+    let all_digits = |part: &str| part.bytes().all(|b| b.is_ascii_digit());
+    if (whole.is_empty() && fraction.is_empty()) || !all_digits(whole) || !all_digits(fraction) {
+        return Err(invalid(
+            "expected cores (\"2\", \"0.5\") or millicores (\"500m\")",
+        ));
+    }
+    if fraction.len() > 3 {
+        return Err(invalid("finer than one millicore"));
+    }
+    let whole_millicores = if whole.is_empty() {
+        0
+    } else {
+        parse_num(whole, 1000, s)?
+    };
+    let fraction_millicores = if fraction.is_empty() {
+        0
+    } else {
+        // Right-pad to three digits: ".5" is 500 millicores, ".05" is 50.
+        format!("{fraction:0<3}")
+            .parse::<u64>()
+            .map_err(|_| invalid("invalid fractional cores"))?
+    };
+    whole_millicores
+        .checked_add(fraction_millicores)
+        .ok_or_else(|| invalid("value overflows 64-bit millicore count"))
 }
 
 fn parse_num(num_str: &str, multiplier: u64, original: &str) -> Result<u64, ConfigError> {
@@ -70,7 +111,7 @@ fn parse_num(num_str: &str, multiplier: u64, original: &str) -> Result<u64, Conf
     n.checked_mul(multiplier)
         .ok_or_else(|| ConfigError::InvalidResourceValue {
             value: original.to_string(),
-            reason: "value overflows 64-bit byte count".to_string(),
+            reason: "value overflows 64-bit count".to_string(),
         })
 }
 
@@ -81,7 +122,10 @@ fn parse_num(num_str: &str, multiplier: u64, original: &str) -> Result<u64, Conf
 /// A request-limit pair for CPU or memory resources.
 ///
 /// Parsed from strings like `"128Mi-512Mi"` (request 128Mi, limit 512Mi)
-/// or `"256Mi"` (request and limit are equal).
+/// or `"256Mi"` (request and limit are equal). CPU values are stored in
+/// millicores, memory in bytes. The same struct serves both, so the unit
+/// lives in the parser: config fields pick [`cpu_range`] or
+/// [`memory_range`] with `#[serde(with = ...)]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResourceRange {
     pub request: u64,
@@ -89,49 +133,110 @@ pub struct ResourceRange {
 }
 
 impl ResourceRange {
-    /// Parse a resource range from a string.
-    pub fn parse(s: &str) -> Result<Self, ConfigError> {
-        if let Some((req_str, lim_str)) = s.split_once('-') {
-            let request = parse_resource_value(req_str)?;
-            let limit = parse_resource_value(lim_str)?;
-            if request > limit {
-                return Err(ConfigError::InvalidResourceRange {
-                    value: s.to_string(),
-                    reason: format!("request ({req_str}) exceeds limit ({lim_str})"),
-                });
-            }
-            Ok(Self { request, limit })
-        } else {
-            let value = parse_resource_value(s)?;
-            Ok(Self {
+    /// Parse a CPU range such as `"0.5-2"` or `"100m-500m"` into millicores.
+    pub fn parse_cpu(s: &str) -> Result<Self, ConfigError> {
+        Self::parse_with(s, parse_cpu_millicores)
+    }
+
+    /// Parse a memory range such as `"128Mi-512Mi"` into bytes.
+    pub fn parse_memory(s: &str) -> Result<Self, ConfigError> {
+        Self::parse_with(s, parse_byte_size)
+    }
+
+    fn parse_with(
+        s: &str,
+        parse_value: fn(&str) -> Result<u64, ConfigError>,
+    ) -> Result<Self, ConfigError> {
+        let Some((req_str, lim_str)) = s.split_once('-') else {
+            let value = parse_value(s)?;
+            return Ok(Self {
                 request: value,
                 limit: value,
-            })
+            });
+        };
+        let request = parse_value(req_str)?;
+        let limit = parse_value(lim_str)?;
+        if request > limit {
+            return Err(ConfigError::InvalidResourceRange {
+                value: s.to_string(),
+                reason: format!("request ({req_str}) exceeds limit ({lim_str})"),
+            });
         }
+        Ok(Self { request, limit })
     }
-}
 
-impl fmt::Display for ResourceRange {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    /// Render a CPU range as millicores, e.g. `"100m-500m"` or `"2000m"`.
+    pub fn to_cpu_string(&self) -> String {
+        self.render("m")
+    }
+
+    /// Render a memory range as bytes, e.g. `"134217728-536870912"`.
+    pub fn to_memory_string(&self) -> String {
+        self.render("")
+    }
+
+    /// Render the range with a unit suffix, collapsing equal halves.
+    fn render(&self, suffix: &str) -> String {
         if self.request == self.limit {
-            write!(f, "{}", self.request)
+            format!("{}{suffix}", self.request)
         } else {
-            write!(f, "{}-{}", self.request, self.limit)
+            format!("{}{suffix}-{}{suffix}", self.request, self.limit)
         }
     }
 }
 
-impl Serialize for ResourceRange {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        // Serialize back to the original string format
-        serializer.serialize_str(&self.to_string())
+/// Serde adapter for an optional CPU range: bare numbers are cores.
+///
+/// Serialises as millicores with the `m` suffix, so a value always
+/// round-trips (writing a bare `"500"` back would read as 500 cores).
+pub mod cpu_range {
+    use super::ResourceRange;
+    use serde::{Deserialize, Deserializer, Serializer, de};
+
+    /// Write the range as millicores, e.g. `"100m-500m"`.
+    pub fn serialize<S: Serializer>(
+        value: &Option<ResourceRange>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match value {
+            Some(range) => serializer.serialize_str(&range.to_cpu_string()),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    /// Read a CPU range string; see [`ResourceRange::parse_cpu`].
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<ResourceRange>, D::Error> {
+        Option::<String>::deserialize(deserializer)?
+            .map(|s| ResourceRange::parse_cpu(&s).map_err(de::Error::custom))
+            .transpose()
     }
 }
 
-impl<'de> Deserialize<'de> for ResourceRange {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let s = String::deserialize(deserializer)?;
-        ResourceRange::parse(&s).map_err(de::Error::custom)
+/// Serde adapter for an optional memory range: bare numbers are bytes.
+pub mod memory_range {
+    use super::ResourceRange;
+    use serde::{Deserialize, Deserializer, Serializer, de};
+
+    /// Write the range as bytes, e.g. `"134217728-536870912"`.
+    pub fn serialize<S: Serializer>(
+        value: &Option<ResourceRange>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match value {
+            Some(range) => serializer.serialize_str(&range.to_memory_string()),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    /// Read a memory range string; see [`ResourceRange::parse_memory`].
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<ResourceRange>, D::Error> {
+        Option::<String>::deserialize(deserializer)?
+            .map(|s| ResourceRange::parse_memory(&s).map_err(de::Error::custom))
+            .transpose()
     }
 }
 
@@ -318,63 +423,103 @@ pub struct VolumeSpec {
 mod tests {
     use super::*;
 
-    // -- parse_resource_value -------------------------------------------------
+    // -- parse_byte_size ------------------------------------------------------
 
     #[test]
-    fn parse_resource_value_ki() {
-        assert_eq!(parse_resource_value("1Ki").unwrap(), 1024);
+    fn parse_byte_size_ki() {
+        assert_eq!(parse_byte_size("1Ki").unwrap(), 1024);
     }
 
     #[test]
-    fn parse_resource_value_mi() {
-        assert_eq!(parse_resource_value("1Mi").unwrap(), 1_048_576);
+    fn parse_byte_size_mi() {
+        assert_eq!(parse_byte_size("1Mi").unwrap(), 1_048_576);
     }
 
     #[test]
-    fn parse_resource_value_gi() {
-        assert_eq!(parse_resource_value("1Gi").unwrap(), 1_073_741_824);
+    fn parse_byte_size_gi() {
+        assert_eq!(parse_byte_size("1Gi").unwrap(), 1_073_741_824);
     }
 
     #[test]
-    fn parse_resource_value_ti() {
-        assert_eq!(parse_resource_value("1Ti").unwrap(), 1_099_511_627_776);
+    fn parse_byte_size_ti() {
+        assert_eq!(parse_byte_size("1Ti").unwrap(), 1_099_511_627_776);
     }
 
     #[test]
-    fn parse_resource_value_millicores() {
-        assert_eq!(parse_resource_value("500m").unwrap(), 500);
+    fn parse_byte_size_bare_number_is_bytes() {
+        assert_eq!(parse_byte_size("1024").unwrap(), 1024);
     }
 
     #[test]
-    fn parse_resource_value_bare_number() {
-        assert_eq!(parse_resource_value("1024").unwrap(), 1024);
+    fn parse_byte_size_rejects_millicore_suffix() {
+        // `m` is a CPU unit; "500m" of memory is a mistake, not 500 bytes.
+        assert!(parse_byte_size("500m").is_err());
     }
 
     #[test]
-    fn parse_resource_value_empty_string_rejected() {
-        assert!(parse_resource_value("").is_err());
+    fn parse_byte_size_empty_string_rejected() {
+        assert!(parse_byte_size("").is_err());
     }
 
     #[test]
-    fn parse_resource_value_invalid_suffix_rejected() {
-        assert!(parse_resource_value("100X").is_err());
+    fn parse_byte_size_invalid_suffix_rejected() {
+        assert!(parse_byte_size("100X").is_err());
     }
 
     #[test]
-    fn parse_resource_value_overflow_rejected() {
+    fn parse_byte_size_overflow_rejected() {
         // A number that overflows u64 once multiplied by the suffix must be
         // a validation error, not a wrapped small value (DEP9).
-        let err = parse_resource_value("99999999999999999999Gi");
+        let err = parse_byte_size("99999999999999999999Gi");
         assert!(matches!(err, Err(ConfigError::InvalidResourceValue { .. })));
         // Also the bare-parse overflow (number itself too large for u64).
-        assert!(parse_resource_value("99999999999999999999999").is_err());
+        assert!(parse_byte_size("99999999999999999999999").is_err());
+    }
+
+    // -- parse_cpu_millicores -------------------------------------------------
+
+    #[test]
+    fn parse_cpu_bare_integer_is_cores() {
+        assert_eq!(parse_cpu_millicores("2").unwrap(), 2000);
+    }
+
+    #[test]
+    fn parse_cpu_decimal_cores() {
+        assert_eq!(parse_cpu_millicores("0.5").unwrap(), 500);
+        assert_eq!(parse_cpu_millicores(".25").unwrap(), 250);
+        assert_eq!(parse_cpu_millicores("1.5").unwrap(), 1500);
+        assert_eq!(parse_cpu_millicores("0.001").unwrap(), 1);
+        assert_eq!(parse_cpu_millicores("2.").unwrap(), 2000);
+    }
+
+    #[test]
+    fn parse_cpu_millicore_suffix() {
+        assert_eq!(parse_cpu_millicores("500m").unwrap(), 500);
+    }
+
+    #[test]
+    fn parse_cpu_rejects_sub_millicore_precision() {
+        assert!(parse_cpu_millicores("0.0005").is_err());
+    }
+
+    #[test]
+    fn parse_cpu_rejects_garbage() {
+        for bad in ["", ".", "-1", "1Gi", "abc", "1.2.3", "0.5m", "1e3"] {
+            assert!(parse_cpu_millicores(bad).is_err(), "{bad:?} should fail");
+        }
+    }
+
+    #[test]
+    fn parse_cpu_overflow_rejected() {
+        assert!(parse_cpu_millicores("99999999999999999999").is_err());
+        assert!(parse_cpu_millicores("18446744073709551615").is_err());
     }
 
     // -- ResourceRange --------------------------------------------------------
 
     #[test]
     fn parse_resource_range_cpu_with_range() {
-        let rr = ResourceRange::parse("100m-500m").unwrap();
+        let rr = ResourceRange::parse_cpu("100m-500m").unwrap();
         assert_eq!(
             rr,
             ResourceRange {
@@ -385,8 +530,20 @@ mod tests {
     }
 
     #[test]
+    fn parse_resource_range_cpu_cores_range() {
+        let rr = ResourceRange::parse_cpu("0.5-2").unwrap();
+        assert_eq!(
+            rr,
+            ResourceRange {
+                request: 500,
+                limit: 2000
+            }
+        );
+    }
+
+    #[test]
     fn parse_resource_range_memory_with_range() {
-        let rr = ResourceRange::parse("128Mi-512Mi").unwrap();
+        let rr = ResourceRange::parse_memory("128Mi-512Mi").unwrap();
         assert_eq!(
             rr,
             ResourceRange {
@@ -398,7 +555,7 @@ mod tests {
 
     #[test]
     fn parse_resource_range_single_value() {
-        let rr = ResourceRange::parse("256Mi").unwrap();
+        let rr = ResourceRange::parse_memory("256Mi").unwrap();
         let expected = 256 * 1024 * 1024;
         assert_eq!(
             rr,
@@ -410,8 +567,20 @@ mod tests {
     }
 
     #[test]
-    fn parse_resource_range_bare_number() {
-        let rr = ResourceRange::parse("1000").unwrap();
+    fn parse_resource_range_bare_cpu_number_is_cores() {
+        let rr = ResourceRange::parse_cpu("2").unwrap();
+        assert_eq!(
+            rr,
+            ResourceRange {
+                request: 2000,
+                limit: 2000
+            }
+        );
+    }
+
+    #[test]
+    fn parse_resource_range_bare_memory_number_is_bytes() {
+        let rr = ResourceRange::parse_memory("1000").unwrap();
         assert_eq!(
             rr,
             ResourceRange {
@@ -423,35 +592,85 @@ mod tests {
 
     #[test]
     fn parse_resource_range_invalid_suffix_rejected() {
-        assert!(ResourceRange::parse("100X-200X").is_err());
+        assert!(ResourceRange::parse_memory("100X-200X").is_err());
+        assert!(ResourceRange::parse_cpu("100X-200X").is_err());
     }
 
     #[test]
     fn parse_resource_range_request_exceeds_limit_rejected() {
-        assert!(ResourceRange::parse("500m-100m").is_err());
+        assert!(ResourceRange::parse_cpu("500m-100m").is_err());
+        assert!(ResourceRange::parse_cpu("2-1").is_err());
     }
 
     #[test]
     fn parse_resource_range_empty_string_rejected() {
-        assert!(ResourceRange::parse("").is_err());
+        assert!(ResourceRange::parse_cpu("").is_err());
+        assert!(ResourceRange::parse_memory("").is_err());
     }
 
     // -- ResourceRange serde round-trip ---------------------------------------
 
+    #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    struct Resources {
+        #[serde(default, with = "cpu_range", skip_serializing_if = "Option::is_none")]
+        cpu: Option<ResourceRange>,
+        #[serde(
+            default,
+            with = "memory_range",
+            skip_serializing_if = "Option::is_none"
+        )]
+        memory: Option<ResourceRange>,
+    }
+
     #[test]
     fn resource_range_deserialise_from_toml() {
-        #[derive(Deserialize)]
-        struct Wrapper {
-            cpu: ResourceRange,
-        }
-        let w: Wrapper = toml::from_str(r#"cpu = "100m-500m""#).unwrap();
+        let r: Resources = toml::from_str(
+            r#"
+            cpu = "100m-500m"
+            memory = "128Mi"
+            "#,
+        )
+        .unwrap();
         assert_eq!(
-            w.cpu,
-            ResourceRange {
+            r.cpu,
+            Some(ResourceRange {
                 request: 100,
                 limit: 500
+            })
+        );
+        assert_eq!(r.memory.map(|m| m.limit), Some(128 * 1024 * 1024));
+    }
+
+    #[test]
+    fn resource_range_missing_fields_are_none() {
+        let r: Resources = toml::from_str("").unwrap();
+        assert_eq!(
+            r,
+            Resources {
+                cpu: None,
+                memory: None
             }
         );
+    }
+
+    #[test]
+    fn cpu_range_serialises_with_millicore_suffix_and_round_trips() {
+        // A bare "500" would read back as 500 cores, so the adapter must
+        // always write the `m` suffix.
+        let original = Resources {
+            cpu: Some(ResourceRange {
+                request: 500,
+                limit: 2000,
+            }),
+            memory: Some(ResourceRange {
+                request: 1024,
+                limit: 1024,
+            }),
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        assert_eq!(json, r#"{"cpu":"500m-2000m","memory":"1024"}"#);
+        let decoded: Resources = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, original);
     }
 
     // -- Replicas -------------------------------------------------------------

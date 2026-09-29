@@ -24,8 +24,7 @@ pub struct LocalContext {
     pub token: String,
     /// Absolute path to the cluster's public CA certificate.
     pub ca_cert: PathBuf,
-    /// Explicit host forwards; absent legacy metadata never implies guest reachability.
-    #[serde(default)]
+    /// Explicit host forwards; an absent origin never implies guest reachability.
     pub service_endpoints: crate::bun::capabilities::ServiceEndpoints,
 }
 
@@ -117,6 +116,26 @@ impl LocalContext {
         .map(|client| client.with_service_endpoints(self.service_endpoints.clone()))
     }
 
+    /// This context's host forwards, for a connection pinned to the same
+    /// cluster CA.
+    ///
+    /// `--endpoint` bypasses the context's credentials so an operator can
+    /// talk to any node, say node 2 through its own API forward. The
+    /// registry and ingress forwards are still how this host reaches that
+    /// cluster, and without them relish falls back to the node's own
+    /// listener address, which means nothing outside the VM. The CA is the
+    /// identity check: a connection that trusts the same root CA talks to
+    /// the same cluster. Anything else (no CA, another CA, an unreadable
+    /// file) gets no forwards.
+    pub fn forwards_for_ca(
+        &self,
+        connection_ca_pem: Option<&[u8]>,
+    ) -> Option<crate::bun::capabilities::ServiceEndpoints> {
+        let connection_ca_pem = connection_ca_pem?;
+        let context_ca_pem = std::fs::read(&self.ca_cert).ok()?;
+        (context_ca_pem == connection_ca_pem).then(|| self.service_endpoints.clone())
+    }
+
     fn validate(&self) -> Result<(), RelishError> {
         if self.schema != 1
             || self.owner.is_empty()
@@ -145,8 +164,7 @@ pub fn default_path() -> Result<PathBuf, RelishError> {
 }
 
 fn lock_context(path: &Path) -> Result<std::fs::File, RelishError> {
-    // Keep the lock inode in place: deleting it would let a concurrent
-    // writer lock a different inode for the same context path.
+    let lock_path = path.with_extension("lock");
     let mut options = std::fs::OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
     #[cfg(unix)]
@@ -154,10 +172,55 @@ fn lock_context(path: &Path) -> Result<std::fs::File, RelishError> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let lock = options.open(path.with_extension("lock"))?;
+    let lock = options.open(&lock_path)?;
     lock.try_lock()
         .map_err(|error| RelishError::InitFailed(format!("local context is busy: {error}")))?;
+    // `relish uninstall` deletes the lock file (under the lock) once no
+    // context is left. A writer that opened the file just before that
+    // unlink now holds a lock nobody else can see, while a newer writer
+    // could lock a fresh file at the same path. Refuse unless the file we
+    // locked is still the one the path names.
+    if !still_linked(&lock, &lock_path)? {
+        return Err(RelishError::InitFailed(
+            "local context is busy: its lock file was removed; retry".to_string(),
+        ));
+    }
     Ok(lock)
+}
+
+#[cfg(unix)]
+fn still_linked(lock: &std::fs::File, lock_path: &Path) -> Result<bool, RelishError> {
+    use std::os::unix::fs::MetadataExt;
+    let held = lock.metadata()?;
+    match std::fs::symlink_metadata(lock_path) {
+        Ok(current) => Ok(current.dev() == held.dev() && current.ino() == held.ino()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(not(unix))]
+fn still_linked(_lock: &std::fs::File, _lock_path: &Path) -> Result<bool, RelishError> {
+    Ok(true)
+}
+
+/// Delete the context's lock file once no context remains beside it.
+///
+/// Returns `true` if the lock file was removed. The unlink happens while
+/// holding the lock, and every locker re-checks that its file is still
+/// linked, so no two writers can end up on different lock files. Leaves
+/// everything alone (and returns `false`) while a context file exists.
+pub fn remove_unused_lock(path: &Path) -> Result<bool, RelishError> {
+    let lock_path = path.with_extension("lock");
+    if std::fs::symlink_metadata(&lock_path).is_err() {
+        return Ok(false);
+    }
+    let _lock = lock_context(path)?;
+    if std::fs::symlink_metadata(path).is_ok() {
+        return Ok(false);
+    }
+    std::fs::remove_file(&lock_path)?;
+    Ok(true)
 }
 
 /// Managed local state root; an explicit override must be an absolute path.
@@ -192,6 +255,49 @@ mod tests {
         LocalContext::remove_owned(&path, "one").unwrap();
         assert!(!path.exists());
         LocalContext::remove_owned(&path, "one").unwrap();
+    }
+
+    #[test]
+    fn unused_lock_is_removed_but_a_live_context_keeps_it() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("context.json");
+        let lock = root.path().join("context.lock");
+        context(root.path(), "one").save(&path).unwrap();
+        assert!(lock.exists(), "saving creates the lock beside the context");
+
+        assert!(!remove_unused_lock(&path).unwrap());
+        assert!(lock.exists(), "a saved context keeps its lock");
+
+        LocalContext::remove_owned(&path, "one").unwrap();
+        assert!(remove_unused_lock(&path).unwrap());
+        assert!(!lock.exists());
+        assert!(!remove_unused_lock(&path).unwrap(), "already gone");
+    }
+
+    #[test]
+    fn unused_lock_is_left_while_another_process_holds_it() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("context.json");
+        let _held = lock_context(&path).unwrap();
+        assert!(remove_unused_lock(&path).is_err());
+        assert!(root.path().join("context.lock").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_lock_file_unlinked_or_replaced_is_detected() {
+        let root = tempfile::tempdir().unwrap();
+        let lock_path = root.path().join("context.lock");
+        // A writer that opened the lock file before uninstall unlinked it.
+        std::fs::write(&lock_path, "").unwrap();
+        let stale = std::fs::File::open(&lock_path).unwrap();
+        std::fs::remove_file(&lock_path).unwrap();
+        assert!(!still_linked(&stale, &lock_path).unwrap());
+        // A fresh file at the same path is a different inode.
+        std::fs::write(&lock_path, "").unwrap();
+        assert!(!still_linked(&stale, &lock_path).unwrap());
+        let fresh = std::fs::File::open(&lock_path).unwrap();
+        assert!(still_linked(&fresh, &lock_path).unwrap());
     }
 
     fn context(root: &std::path::Path, owner: &str) -> LocalContext {
@@ -279,5 +385,26 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn forwards_apply_only_to_a_connection_pinned_to_the_same_ca() {
+        let root = tempfile::tempdir().unwrap();
+        let ca_cert = root.path().join("root-ca.crt");
+        std::fs::write(&ca_cert, b"cluster ca").unwrap();
+        let mut context = context(root.path(), "cluster-a");
+        context.ca_cert = ca_cert;
+        context.service_endpoints.registry = Some("https://127.0.0.1:15050".to_string());
+
+        let forwards = context.forwards_for_ca(Some(b"cluster ca")).unwrap();
+        assert_eq!(
+            forwards.registry.as_deref(),
+            Some("https://127.0.0.1:15050")
+        );
+        assert!(context.forwards_for_ca(Some(b"another ca")).is_none());
+        assert!(context.forwards_for_ca(None).is_none());
+
+        context.ca_cert = root.path().join("missing.crt");
+        assert!(context.forwards_for_ca(Some(b"cluster ca")).is_none());
     }
 }

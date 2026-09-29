@@ -43,13 +43,13 @@ The `relish exec` command requires the Bun agent running on the target node. Bun
 
 The `exec --debug`, `exec --privileged` and `exec --node` variants (debug containers, firewall bypass, host-level execution) are **not yet implemented**.
 
-### Onion (resolve, trace)
+### Onion (resolve, path)
 
-The `relish resolve` and `relish trace` commands inspect Onion's userspace and,
+The `relish resolve` and `relish path` commands inspect Onion's userspace and,
 where attached, kernel state:
 
 - `resolve` queries the userspace service map to show virtual IPs, real backends, health status, and node placement for a given service name.
-- `trace` runs a real DNS query and TCP connect inside the source workload, then reads the userspace service map and any attached eBPF backend and cgroup-firewall maps.
+- `path` walks the network path from a source workload to a destination, hop by hop. It runs a real DNS query and TCP connect inside the source workload, then reads the userspace service map and any attached eBPF backend and cgroup-firewall maps.
 
 Relish first finds the node hosting the source instance. That Bun agent owns
 the network locality and live map handles needed to make the observations.
@@ -93,7 +93,7 @@ The `relish routes` command queries the Wrapper ingress proxy for the current ro
 |  |          Command Executors                  |                  |
 |  |                                             |                  |
 |  |  StatusCmd, ApplyCmd, DeployCmd, LogsCmd,   |                  |
-|  |  TraceCmd, InspectCmd, WtfCmd, DiffCmd,     |                  |
+|  |  PathCmd, InspectCmd, WtfCmd, DiffCmd,      |                  |
 |  |  ExecCmd, TopCmd, HistoryCmd, ...           |                  |
 |  +---------------------+----------------------+                  |
 |                         |                                         |
@@ -626,6 +626,7 @@ relish --help                       # Print help and exit
 # Core operations
 relish status                       # Per-instance status table (app, state, PID, restarts)
 relish apply <path>                 # Apply a TOML config file or directory
+relish apply -f <path-or-https-url> # Same; also takes Kubernetes YAML (imported in memory)
 relish apply <path> --dry-run       # Print the plan, contact no agent (always exits 0)
 relish deploy <path>                # Health-gated rolling deploy from a config file
 relish deploy <path> --dry-run      # Print the plan without deploying
@@ -651,7 +652,7 @@ relish logs <app> --json-field <k=v> # Structured JSON field match
 relish logs <app> --namespace <ns>  # App namespace (default "default")
 relish logs-export --dest <dir>     # Export Parquet log files
 relish logs-search <dir> <sql>      # SQL over an exported Parquet archive
-relish trace <src> --to <dst>       # DNS / service-map / firewall / TCP evidence probe
+relish path <src> --to <dst>       # DNS / service-map / firewall / TCP evidence probe
 relish inspect <app>                # Per-instance detail for an app
 relish resolve <name>               # Resolve a service to its VIP and backends
 relish routes                       # Show the ingress routing table
@@ -659,6 +660,7 @@ relish top                          # Workload table: state, PID, restarts (no l
 relish wtf                          # Correlated cluster health diagnosis
 relish wtf --app <app>              # Scope to one app
 relish wtf --watch                  # Re-run every 30s until Ctrl-C
+relish wtf --watch --interval 5     # Re-run every 5s instead
 
 # Forensics
 relish history <app>                # Deploy history for an app
@@ -678,7 +680,7 @@ relish join --token <token> --node-id <id> <api-addr>  # Enrol a node identity
 relish join --token <t> --node-id <id> <addr> --ca-fingerprint sha256:... [--identity-dir <dir>]
 
 # Secrets
-relish secret pubkey [dir]          # Print the cluster age public key
+relish secret pubkey [dir]          # Print the cluster age public key (API, or offline from dir)
 relish secret encrypt --pubkey <key> <value> # Encrypt a value for ENC[AGE:...] fields
 relish secret rotate                # Start secret-key rotation
 relish secret rotate --finalize     # Finalise rotation (drop the old read-only keypair)
@@ -696,13 +698,14 @@ relish join-token create --node-id <id> [--ttl 15m]   # One single-use node-enro
 # Volume snapshots (Btrfs-backed)
 relish snapshot create <app> [--volume <path>] [--name <name>] [-n <ns>]
 relish snapshot list <app> [-n <ns>]
-relish snapshot restore <app> <name> [-n <ns>]
-relish snapshot delete <app> <name> [-n <ns>]
+relish snapshot restore <app> <name> [--volume <path>] [-n <ns>]
+relish snapshot delete <app> <name> [--volume <path>] [-n <ns>]
 
 # Image registry (Pickle)
 relish images                       # List images in the local registry
 relish build <path>                 # Build [build.*] images and push to Pickle
-relish sign <image>                 # Sign an image and attach the signature
+relish sign <image> --key <path>    # Sign an image's digest with your key
+relish sign keygen --out <path>     # Generate a signing key, print its public key
 
 # Jobs / batch
 relish batch <path>                 # Submit [job.*] sections as a batch
@@ -713,12 +716,15 @@ relish upgrade check                # Check for available updates
 relish upgrade start <version>      # Start rolling cluster upgrade
 relish upgrade start --binary <path> # Upgrade from local binary (air-gapped)
 relish upgrade start <version> --parallel <n> # Parallel worker upgrades
+relish upgrade start --binary <path> --allow-downgrade # Allow an older target
+relish upgrade start --binary <path> --registry <host:port> # Push/fetch registry override
 relish upgrade plan <version>       # Preview upgrade order and duration
 relish upgrade plan <version> --cluster-size <n> # Estimate for large clusters
 relish upgrade status               # Show upgrade progress
 relish upgrade rollback             # Roll back to previous version
 relish upgrade rollback <version>   # Roll back to specific version
 relish upgrade resume               # Resume a paused upgrade
+relish upgrade abort                # End a paused upgrade that moved no node
 
 # Fault injection (Smoker)
 relish fault delay <app> <duration> --acknowledge       # Reserved; rejected until TC ships
@@ -781,6 +787,7 @@ relish dev disk                             # Disk usage in the test VM
 relish dev clean                            # Clean build artefacts in the test VM
 relish dev keygen --out <dir>               # Generate a release signing keypair
 relish dev sign-binary --key <key> <binary> # Sign a binary (.sig envelope)
+relish dev countersign-binary --external-key <key> <binary>  # Add the operator signature
 
 # Manual, source, setup
 relish manual                               # Read the built-in manual (TUI)
@@ -805,7 +812,7 @@ shipped CLI. **Status: planned — not yet implemented.**
 - `relish plan <path>` — use `relish apply <path> --dry-run`.
 - `relish events` — event streaming exists only as a TUI/dashboard view, not a CLI command.
 - `relish route <hostname>` — only `relish routes` (no argument) exists.
-- `relish firewall <app>` / `relish firewall test` — no firewall-inspection command; use `relish trace`.
+- `relish firewall <app>` / `relish firewall test` — no firewall-inspection command; use `relish path`.
 - `relish identity <app>` — no workload-identity command.
 - `relish ca status | rotate | revoke` — no CA-management command.
 - `relish pickle gc` — no registry garbage-collection command.
@@ -826,10 +833,10 @@ contract does not need another migration when the TC data path lands. Today the
 server rejects both: the loaded cgroup connect hook can refuse a connection but
 cannot sleep or pace packets. Service partition is different. Bun resolves the
 named source app to its live cgroup ids, writes exact source/VIP/port keys into
-the connect map, and refuses the request when eBPF is unavailable. The numeric
-cgroup id in the wire type is server-owned and clients must leave it as zero.
-`memory oom` is also refused because a kill cannot be reversed; use a Kill
-fault when the experiment needs to exercise restart after abrupt termination.
+the connect map, and refuses the request when eBPF is unavailable. Clients can't
+name a cgroup id at all. There's no `memory oom` form because a kill can't be
+reversed; use a Kill fault when the experiment needs to exercise restart after
+abrupt termination.
 
 ### Detailed Command Behaviour
 
@@ -858,6 +865,14 @@ confirmation prompt and no `--yes` flag. Exits 0 on success, 1 on failure.
 With `--dry-run`, it prints the apply plan and contacts no agent — always
 exiting 0, even when no agent is running. The plan uses `ApplyPlan`'s display
 (see `relish deploy` below for the format).
+
+The manifest can be given positionally or with `-f`/`--file` (the kubectl
+spelling), as a local path or an `https://` URL. Plain `http://` is refused.
+Downloads are limited to 1 MiB and 30 seconds, and redirects must stay on
+HTTPS. A document with top-level `apiVersion:` and `kind:` lines is Kubernetes
+YAML: `relish apply` runs the `relish import` conversion in memory, prints the
+migration report to stderr, validates the result and applies it. Anything else
+is parsed as Reliaburger TOML.
 
 **`relish deploy <path>`**
 
@@ -960,25 +975,28 @@ dashboard), not as a CLI command. There is no `relish events` subcommand or its
 `--app` / `--node` / `--type` / `--since` / `--until` / `--severity` filters.
 Use `relish history <app>` for an app's audit trail.
 
-**`relish trace <app> --to <app|host>`**
+**`relish path <app> --to <app|host> [--count N]`**
 
 End-to-end connectivity diagnosis. Relish finds a running source instance and
-calls `POST /v1/trace` on that node. Bun runs only fixed probe scripts; request
+calls `POST /v1/path` on that node. Bun runs only fixed probe scripts; request
 values become positional arguments and never shell syntax. The source image
 must provide a POSIX `sh`, `nslookup` and `nc` for every observation to run.
-The response contains four steps:
+The response (schema version 2) contains five steps:
 
-1. **DNS query:** Runs `nslookup` inside the source workload. For an internal service it queries `<app>.<namespace>.internal` and checks that the answer contains the live VIP.
-2. **Service and eBPF state:** Reads the userspace service map. On Linux with Onion attached, it also reads the live `backend_map` and requires a healthy kernel backend. Otherwise the userspace result is explicitly `inferred`.
+1. **DNS query:** Runs `nslookup` inside the source workload. For an internal service it queries `<app>.<namespace>.internal` and checks that the answer contains the live VIP. The details keep only the answer and resolver (or the lines explaining a failure).
+2. **Service and eBPF state:** Reads the userspace service map, lists the backends and names the one the VIP sends connects to (or says it round-robins over several). On Linux with Onion attached, it also reads the live `backend_map`, lists the kernel's backends and requires a healthy one. Otherwise the userspace result is explicitly `inferred`.
 3. **Firewall state:** On Linux with the firewall hooks attached, resolves the source PID to its cgroup and evaluates the live namespace and firewall maps using the same rule as the connect hook. Without those maps the result is `Unknown`, never an invented pass.
-4. **TCP probe:** Runs `nc` inside the source workload against the service VIP and selected port and reports observed latency.
+4. **Active faults:** The `relish fault` experiments on this node that act on this source's calls to this destination (destination-wide, or `--from` this source), with id, parameters and time left, plus live evidence where readable: the `fault_connect_map` entries for (VIP, port, source cgroup) and (VIP, port, 0), and the netem delay on the source's `eth0`. Partition, NXDOMAIN and 100% drop fail; delay and partial drop are `Degraded`.
+5. **TCP probe:** Runs `nc -z` inside the source workload against the service VIP and port, `--count` times (1-10), and times each connect inside the container (`date +%s%N`, falling back to `/proc/uptime` at 10 ms when `date` lacks nanoseconds). All succeeding passes, some is `Degraded`, none fails. `latency_ms` is the median successful connect.
 
 Every step labels its evidence `observed`, `inferred` or `unavailable` and its
-verdict `Pass`, `Fail` or `Unknown`. `Fail` wins the overall result; incomplete
-evidence cannot become green. Exit statuses are 0, 1 and 2 respectively.
+verdict `Pass`, `Fail`, `Degraded` or `Unknown`. `Fail` wins the overall
+result, then `Degraded`, then `Unknown`; incomplete evidence cannot become
+green. Exit statuses are 0 for Pass, 1 for Fail and 2 for Degraded or Unknown.
 Workload probes run on a spawned, bounded task so an eight-second probe timeout
-can't stall Bun's command loop. Bun permits at most eight concurrent traces per
-node and returns HTTP 429 for the ninth instead of accumulating an unbounded
+(longer for a counted TCP probe, and the API waits up to 45 seconds) can't
+stall Bun's command loop. Bun permits at most eight concurrent path probes
+per node and returns HTTP 429 for the ninth instead of accumulating an unbounded
 queue of workload processes. Agent shutdown cancels in-flight probes and
 releases their permits immediately.
 
@@ -1014,7 +1032,7 @@ redis.internal → 127.128.0.3
 **`relish firewall <app>` / `relish firewall test`** — **Status: planned — not yet implemented.**
 
 There is no firewall-inspection command. To observe firewall evidence for a
-specific source→destination path, use `relish trace <src> --to <dst>`, whose
+specific source→destination path, use `relish path <src> --to <dst>`, whose
 firewall step reads the live cgroup namespace and firewall maps on Linux.
 
 **`relish top`**
@@ -1331,8 +1349,8 @@ server-owned workload lease, and records every injected fault by exact
 target-local id, owning node and direct client. Teardown clears those exact
 faults newest first, then releases the workload lease. It takes the same path
 after failure, timeout or panic; any unconfirmed reversal makes cleanup
-`Unknown`. Blanket `fault clear` and `chaos heal` aren't used as ownership
-substitutes.
+`Unknown`. Blanket `fault clear` isn't used as an ownership
+substitute.
 
 Node drain and kill use an Admin with the server's `alter_node_state` grant
 and explicit acknowledgement to withdraw scheduler readiness or
@@ -1454,10 +1472,13 @@ Each correlated group becomes one `[app.*]` block. Uncorrelated resources are co
 |---|---|
 | `spec.replicas` | `replicas` |
 | `spec.template.spec.containers[0].image` | `image` |
-| `spec.template.spec.containers[0].ports[0].containerPort` | `port` |
+| `containers[0].command` / `containers[0].args` | `command` / `args` (kept separate; Kubernetes rules at run time) |
+| `containers[0].workingDir` | `working_dir` |
+| `securityContext.runAsUser` / `runAsGroup` (container, else pod) | `run_as_user` / `run_as_group` |
+| Service `targetPort` (named or numeric), else `containers[0].ports[0].containerPort` | `port`; a differing Service `port`, extra Service ports and unrouted container ports are **warned** |
 | `resources.requests.cpu` / `resources.limits.cpu` | `cpu = "request-limit"` |
 | `resources.requests.memory` / `resources.limits.memory` | `memory = "request-limit"` |
-| `readinessProbe.httpGet.path` | `[app.*.health] path` |
+| `readinessProbe.httpGet` | `[app.*.health] path` (and `port` when it isn't the app's); `exec`/`tcpSocket`/`grpc` probes are **warned** |
 | `env[]` and `envFrom[]` | `[app.*.env]` |
 | `nodeSelector` | `[app.*.placement] required` |
 | `tolerations` | **Warning** (no equivalent) |
@@ -1696,7 +1717,7 @@ tests/
     test_fmt.rs             # relish fmt idempotency
     test_logs.rs            # relish logs streaming, filtering
     test_events.rs          # relish events filtering, time ranges
-    test_trace.rs           # relish trace step-by-step output
+    test_path.rs            # relish path step-by-step output
     test_inspect.rs         # relish inspect resource types
     test_wtf.rs             # relish wtf correlation logic
     test_exec.rs            # relish exec, debug containers
@@ -1804,7 +1825,7 @@ Reference: [kubectl design](https://kubernetes.io/docs/reference/kubectl/)
 
 **What we borrow:** The `apply` and `exec` interaction model. Operators familiar with `kubectl apply` and `kubectl exec` will find `relish apply` and `relish exec` immediately familiar.
 
-**What we do differently:** Everything else. `relish plan` replaces the blind `apply` workflow. `relish wtf` replaces the manual runbook-based diagnosis. `relish trace` replaces the multi-tool connectivity debugging ritual. Events don't expire after 1 hour. There are no plugins to install.
+**What we do differently:** Everything else. `relish plan` replaces the blind `apply` workflow. `relish wtf` replaces the manual runbook-based diagnosis. `relish path` replaces the multi-tool connectivity debugging ritual. Events don't expire after 1 hour. There are no plugins to install.
 
 ### k9s (Kubernetes TUI)
 
@@ -1842,7 +1863,7 @@ Nomad's CLI provides `nomad plan` (change preview), `nomad alloc status` (alloca
 
 **What we borrow:** The single-binary philosophy and the plan command.
 
-**What we do differently:** Built-in TUI, integrated log/event streaming, `trace`, `wtf`, debug containers.
+**What we do differently:** Built-in TUI, integrated log/event streaming, `path`, `wtf`, debug containers.
 
 ### lazydocker
 

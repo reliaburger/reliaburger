@@ -33,6 +33,7 @@ pub struct NodeConfig {
     pub ebpf: EbpfSection,
     pub upgrades: UpgradeSection,
     pub smoker: SmokerSection,
+    pub runtime: RuntimeSection,
     /// Server-owned permissions and limits for Phase 15 diagnostics.
     pub testing: crate::testkit::safety::ClusterTestPolicy,
 }
@@ -86,6 +87,35 @@ impl SmokerSection {
             default_duration: std::time::Duration::from_secs(self.default_duration_secs),
             max_duration: std::time::Duration::from_secs(self.max_duration_secs),
         }
+    }
+}
+
+/// Container runtime command limits (`[runtime]`).
+///
+/// Bun never reports a workload stopped until the runtime confirms its exit.
+/// `stop_confirmation_timeout_secs` bounds each step of that proof: the
+/// runtime accepting a graceful stop request, accepting a force-kill request,
+/// and reporting the exit after a kill. It is separate from an app's drain
+/// grace, which is how long the workload itself gets to finish.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RuntimeSection {
+    /// Seconds each stop or kill confirmation step may take. Default 10.
+    pub stop_confirmation_timeout_secs: u64,
+}
+
+impl Default for RuntimeSection {
+    fn default() -> Self {
+        Self {
+            stop_confirmation_timeout_secs: 10,
+        }
+    }
+}
+
+impl RuntimeSection {
+    /// The per-step deadline for confirming a stop or force-kill.
+    pub fn stop_confirmation_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.stop_confirmation_timeout_secs)
     }
 }
 
@@ -156,7 +186,7 @@ impl DnsSection {
 /// eBPF data-path configuration (Onion service resolution, Smoker
 /// network faults, Sesame egress allowlists).
 ///
-/// Disabled by default: loading eBPF programs needs root, a 5.7+ kernel
+/// Disabled by default: loading eBPF programs needs root, a 5.8+ kernel
 /// and cgroup v2, and it is Linux-only. Builds with the `ebpf` feature embed
 /// the matching object, so packaged binaries need no build directory.
 /// `program_dir` explicitly overrides the embedded object for development.
@@ -287,6 +317,13 @@ pub struct SecuritySection {
     /// Known joining peers allowed through the perimeter to management and cluster
     /// ports before membership exists. Does not change protocol authentication.
     pub bootstrap_peers: Vec<std::net::IpAddr>,
+    /// Operator networks allowed through the perimeter firewall to this node's
+    /// API port (`--listen`, default 9117) and to no other port. IPv4 or IPv6
+    /// CIDRs, or bare addresses for a single host. `/0` and CIDRs with host
+    /// bits set are rejected at load. Empty by default: only cluster members,
+    /// bootstrap peers and loopback reach the API. API authentication is
+    /// unchanged; this only affects the packet filter.
+    pub operator_cidrs: Vec<String>,
 
     /// Acknowledge running cluster transports (gossip, Raft, reporting) in
     /// the clear on a routable address. Without `require_mtls`, a clustered
@@ -297,6 +334,35 @@ pub struct SecuritySection {
     /// don't need it; `relish init --development-plaintext` and `relish dev`
     /// set it for their deliberately-insecure local clusters.
     pub allow_insecure_cluster: bool,
+
+    /// Development-only: shorten the node leaf and cluster-issued ingress leaf
+    /// lifetimes to this many seconds, so a soak run sees many renewals a day
+    /// instead of one every six months. Accepted only with
+    /// `[testing] safety_class = "development"`, and only between 600 seconds
+    /// and the 90-day ingress default. It applies where the leaf is signed:
+    /// the council leader for node renewals, the signing member for joins,
+    /// each node for its own ingress leaves.
+    pub leaf_lifetime_override_secs: Option<u64>,
+}
+
+impl SecuritySection {
+    /// Lifetime of node leaves this member signs (joins and renewals).
+    pub fn node_leaf_lifetime(&self) -> std::time::Duration {
+        self.shortened(crate::sesame::ca::NODE_LEAF_LIFETIME)
+    }
+
+    /// Lifetime of the cluster-issued ingress leaves this node mints.
+    pub fn ingress_leaf_lifetime(&self) -> std::time::Duration {
+        self.shortened(crate::sesame::ca::INGRESS_LEAF_LIFETIME)
+    }
+
+    /// The override never lengthens a compiled default, even if validation
+    /// was skipped.
+    fn shortened(&self, default: std::time::Duration) -> std::time::Duration {
+        self.leaf_lifetime_override_secs.map_or(default, |secs| {
+            default.min(std::time::Duration::from_secs(secs))
+        })
+    }
 }
 
 /// Self-upgrade configuration (Phase 14).
@@ -451,7 +517,8 @@ impl Default for StorageSection {
 pub struct SnapshotsSection {
     /// Seconds between snapshot sweeps. `0` disables the loop.
     pub interval_secs: u64,
-    /// Snapshots retained per volume; older ones are pruned.
+    /// Snapshots retained per volume; older ones are pruned. Must be at
+    /// least 1 when `interval_secs` is set.
     pub retain: usize,
     /// Optional object-store destination for snapshot archives
     /// (`file://`, `s3://`, `gs://`). Credentials come from the
@@ -652,6 +719,13 @@ pub struct ImagesSection {
     pub max_context_bytes: u64,
     /// Image trust policy (signature requirements).
     pub trust_policy: TrustPolicySection,
+    /// Registries that serve digest-pinned images on behalf of an upstream
+    /// host, e.g. `{ "public.ecr.aws" = "mirror.internal:5000" }`. Bun and
+    /// the pull-through cache try the mirror first and fall back to the
+    /// upstream if it fails. Every pull verifies the digest chain, so a
+    /// mirror can't substitute content; tag references never use it.
+    /// Loopback mirrors (`127.0.0.1:…`, `localhost:…`) speak plain HTTP.
+    pub mirrors: crate::grill::image::ImageMirrors,
 }
 
 /// Credentials for one upstream registry host.
@@ -709,6 +783,7 @@ impl Default for ImagesSection {
             build_timeout_secs: 900,
             max_context_bytes: 256 * 1024 * 1024,
             trust_policy: TrustPolicySection::default(),
+            mirrors: crate::grill::image::ImageMirrors::default(),
         }
     }
 }
@@ -721,15 +796,24 @@ pub struct MetricsSection {
     pub collection_interval_secs: u64,
     /// Days to retain metric data before pruning.
     pub retention_days: u32,
-    /// How often to scrape Prometheus /metrics endpoints (seconds).
+    /// How often to scrape the static `scrape_targets` (seconds).
     pub scrape_interval_secs: u64,
-    /// Prometheus `/metrics` endpoints to scrape on `scrape_interval_secs`.
+    /// Fixed Prometheus `/metrics` endpoints to scrape on
+    /// `scrape_interval_secs`, for anything that isn't an app on this
+    /// cluster. Apps opt in with `metrics = {...}` on the app spec instead.
     ///
-    /// Empty (the default) disables scraping entirely — there is no per-app
-    /// scrape opt-in on the app spec, so operators declare targets here. Each
-    /// target's `job` becomes the `app` label on its samples, so per-app
-    /// dashboards and `/v1/metrics/app/...` queries can filter on it.
+    /// Empty (the default) spawns no loop for them. Each target's `job`
+    /// becomes the `app` label on its samples, so per-app dashboards and
+    /// `/v1/metrics/app/...` queries can filter on it.
     pub scrape_targets: Vec<ScrapeTarget>,
+    /// How often this node scrapes its own instances of apps that declare
+    /// `metrics` (seconds).
+    ///
+    /// Ten seconds matches `collection_interval_secs`, so an app's own
+    /// metrics and its CPU and memory share a resolution: fifteen minutes is
+    /// ninety points, enough for a sparkline and a steady per-second rate,
+    /// for one small HTTP request per instance per tick.
+    pub app_scrape_interval_secs: u64,
     /// Enable built-in alert evaluation.
     pub alerts_enabled: bool,
     /// Object store URL for metric persistence. Empty = local filesystem.
@@ -753,6 +837,7 @@ impl Default for MetricsSection {
             retention_days: 7,
             scrape_interval_secs: 30,
             scrape_targets: Vec::new(),
+            app_scrape_interval_secs: 10,
             alerts_enabled: true,
             object_store_url: String::new(),
             rollup_interval_secs: 60,
@@ -869,12 +954,57 @@ mod tests {
     use super::*;
 
     #[test]
+    fn image_mirrors_parse_and_refuse_urls() {
+        let config =
+            NodeConfig::parse("[images]\nmirrors = { 'public.ecr.aws' = '127.0.0.1:5099' }\n")
+                .unwrap();
+        assert_eq!(
+            config.images.mirrors.as_map().get("public.ecr.aws"),
+            Some(&"127.0.0.1:5099".to_string())
+        );
+        assert!(
+            NodeConfig::parse("")
+                .unwrap()
+                .images
+                .mirrors
+                .as_map()
+                .is_empty()
+        );
+        let error = NodeConfig::parse(
+            "[images]\nmirrors = { 'public.ecr.aws' = 'https://mirror.internal' }\n",
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("without a scheme or path"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn node_config_rejects_ignored_release_endpoint() {
         let error = NodeConfig::parse(
             "[upgrades]\nrelease_url = 'https://example.invalid/metadata.json'\n",
         )
         .unwrap_err();
         assert!(error.to_string().contains("release_url"));
+    }
+
+    #[test]
+    fn runtime_stop_confirmation_defaults_to_ten_seconds() {
+        let config = NodeConfig::parse("").unwrap();
+        assert_eq!(
+            config.runtime.stop_confirmation_timeout(),
+            std::time::Duration::from_secs(10)
+        );
+    }
+
+    #[test]
+    fn runtime_stop_confirmation_parses_from_toml() {
+        let config = NodeConfig::parse("[runtime]\nstop_confirmation_timeout_secs = 30\n").unwrap();
+        assert_eq!(
+            config.runtime.stop_confirmation_timeout(),
+            std::time::Duration::from_secs(30)
+        );
     }
 
     #[test]
@@ -1133,6 +1263,7 @@ mod tests {
         assert_eq!(nc.metrics.collection_interval_secs, 10);
         assert_eq!(nc.metrics.retention_days, 7);
         assert_eq!(nc.metrics.scrape_interval_secs, 30);
+        assert_eq!(nc.metrics.app_scrape_interval_secs, 10);
         assert!(nc.metrics.alerts_enabled);
         assert!(nc.metrics.object_store_url.is_empty());
     }

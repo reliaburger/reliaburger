@@ -68,7 +68,7 @@ fn check_quorum_risk(request: &FaultRequest, context: &SafetyContext) -> Option<
     // failure and transport partitions can remove a voter from quorum.
     let targets_node = matches!(
         request.fault_type,
-        FaultType::NodeKill { .. } | FaultType::CouncilPartition
+        FaultType::NodeKill { .. } | FaultType::CouncilPartition { .. }
     );
     if !targets_node {
         return None;
@@ -101,7 +101,7 @@ fn check_replica_minimum(
 ) -> Option<SafetyViolation> {
     let kills_instances = matches!(
         request.fault_type,
-        FaultType::Kill { .. } | FaultType::Pause | FaultType::MemoryPressure { oom: true, .. }
+        FaultType::Kill { .. } | FaultType::Pause
     );
     if !kills_instances {
         return None;
@@ -119,7 +119,11 @@ fn check_replica_minimum(
                 *count
             }
         }
-        _ => context.target_service_replicas, // Pause/OOM affects all targeted
+        // A pause scoped to one instance freezes just that one. Otherwise it
+        // freezes every instance it can reach; a node-scoped pause could be
+        // fewer, but the rail doesn't know how many, so it assumes all.
+        _ if request.target_instance.is_some() => 1,
+        _ => context.target_service_replicas,
     };
 
     let already_faulted = context.target_service_faulted_replicas;
@@ -329,7 +333,6 @@ mod tests {
         let req = FaultRequest {
             fault_type: FaultType::Partition {
                 source_app: Some("web".to_string()),
-                source_cgroup_id: 0,
             },
             target_service: "payments".to_string(),
             namespace: None,
@@ -415,17 +418,17 @@ mod tests {
         assert!(!check.approved);
     }
 
-    #[test]
-    fn replica_minimum_applies_to_oom() {
-        let ctx = default_context();
-        let req = FaultRequest {
-            fault_type: FaultType::MemoryPressure {
-                percentage: 0,
-                oom: true,
-            },
+    fn instance_pause(replicas: u32, faulted: u32) -> (FaultRequest, SafetyContext) {
+        let context = SafetyContext {
+            target_service_replicas: replicas,
+            target_service_faulted_replicas: faulted,
+            ..default_context()
+        };
+        let request = FaultRequest {
+            fault_type: FaultType::Pause,
             target_service: "web".into(),
             namespace: None,
-            target_instance: None,
+            target_instance: Some("default__web-0".into()),
             target_node: None,
             duration: Duration::from_secs(30),
             injected_by: "test".into(),
@@ -434,8 +437,25 @@ mod tests {
             override_safety: false,
             acknowledged: false,
         };
-        let check = evaluate_safety(&req, &ctx);
-        assert!(!check.approved);
+        (request, context)
+    }
+
+    #[test]
+    fn replica_minimum_allows_pausing_one_instance_of_several() {
+        let (request, context) = instance_pause(3, 0);
+        assert!(evaluate_safety(&request, &context).approved);
+    }
+
+    #[test]
+    fn replica_minimum_rejects_pausing_the_only_instance() {
+        let (request, context) = instance_pause(1, 0);
+        assert!(!evaluate_safety(&request, &context).approved);
+    }
+
+    #[test]
+    fn replica_minimum_rejects_pausing_the_last_unpaused_instance() {
+        let (request, context) = instance_pause(3, 2);
+        assert!(!evaluate_safety(&request, &context).approved);
     }
 
     #[test]
@@ -445,6 +465,7 @@ mod tests {
             fault_type: FaultType::Delay {
                 delay_ns: 200_000_000,
                 jitter_ns: 0,
+                source_app: None,
             },
             target_service: "web".into(),
             namespace: None,
@@ -591,6 +612,7 @@ mod tests {
             fault_type: FaultType::Delay {
                 delay_ns: 200_000_000,
                 jitter_ns: 0,
+                source_app: None,
             },
             target_service: "redis".into(),
             namespace: None,

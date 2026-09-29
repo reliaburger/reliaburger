@@ -630,7 +630,16 @@ fn answer_internal(
 
     let sources = config.source_namespaces.borrow();
     let Some(service_id) = service_id_for(stripped, sources.namespace(src)) else {
-        return build_status_response(query, RCODE_REFUSED);
+        // A name with more labels than `<app>.<namespace>` can't exist, and
+        // saying so lets a resolver walking its search list try the next
+        // suffix (`redis.default` → `redis.default.<ns>.internal` first).
+        // A short name from an unidentified source stays REFUSED.
+        let rcode = if stripped.contains('.') {
+            RCODE_NXDOMAIN
+        } else {
+            RCODE_REFUSED
+        };
+        return build_status_response(query, rcode);
     };
 
     // Retain the namespace chosen above when checking fault ownership.
@@ -648,6 +657,23 @@ fn answer_internal(
         (Some(_), _) => build_status_response(query, RCODE_NOTIMP),
         (None, _) => build_status_response(query, RCODE_NXDOMAIN),
     }
+}
+
+/// The `/etc/resolv.conf` a container in `namespace` gets.
+///
+/// The search list makes Kubernetes-style names work: `redis` tries
+/// `redis.<namespace>.internal` and then `redis.internal`, and
+/// `redis.default` tries `redis.default.<namespace>.internal` (NXDOMAIN)
+/// and then `redis.default.internal`. `ndots:2` sends names with fewer than
+/// two dots through the list first, so those short forms never leak to the
+/// upstream resolver; `api.example.com` still goes straight out. Kubernetes
+/// uses `ndots:5`, which costs every external lookup several misses.
+pub fn container_resolv_conf(nameserver: Ipv4Addr, namespace: Option<&str>) -> String {
+    let search = match namespace {
+        Some(namespace) => format!("{namespace}.internal internal"),
+        None => "internal".to_string(),
+    };
+    format!("nameserver {nameserver}\nsearch {search}\noptions ndots:2\n")
 }
 
 /// Resolve qualified names directly and short names only with a source identity.
@@ -1028,6 +1054,47 @@ mod tests {
             assert_eq!(response[3] & 0xf, 0);
             assert_eq!(&response[response.len() - 4..], &vip.0.octets());
         }
+    }
+
+    #[test]
+    fn container_resolv_conf_searches_its_namespace_then_the_cluster() {
+        let nameserver = Ipv4Addr::new(10, 0, 0, 1);
+        assert_eq!(
+            container_resolv_conf(nameserver, Some("payments")),
+            "nameserver 10.0.0.1\nsearch payments.internal internal\noptions ndots:2\n"
+        );
+        assert_eq!(
+            container_resolv_conf(nameserver, None),
+            "nameserver 10.0.0.1\nsearch internal\noptions ndots:2\n"
+        );
+    }
+
+    /// Z1.2: a resolver walking the container's search list asks for
+    /// `redis.default.<ns>.internal` before `redis.default.internal`. That
+    /// name can't exist, and only NXDOMAIN makes glibc and musl move on to
+    /// the next suffix; REFUSED stops the search.
+    #[test]
+    fn names_with_too_many_labels_are_nxdomain_so_search_lists_continue() {
+        let mut map = ServiceMap::new();
+        map.register_app("redis", "default", 6379, None).unwrap();
+        let (_tx, rx) = watch::channel(map);
+        let mut config = test_config();
+        config.source_namespaces = watch::channel(DnsSourceNamespaces::from_bindings([(
+            "10.3.0.2".parse().unwrap(),
+            "default".into(),
+        )]))
+        .1;
+        let query = build_dns_query("redis.default.default.internal");
+        let response = answer_internal(
+            &config,
+            &rx,
+            &no_dns_faults(),
+            &query,
+            "redis.default.default",
+            QTYPE_A,
+            "10.3.0.2".parse().unwrap(),
+        );
+        assert_eq!(response[3] & 0x0f, RCODE_NXDOMAIN);
     }
 
     #[test]

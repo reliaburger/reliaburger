@@ -194,25 +194,6 @@ impl ChaosGuard {
         Ok(summary)
     }
 
-    /// Inject a council partition and retain its additive legacy-API fault id.
-    pub async fn inject_partition(
-        &self,
-        owner: BunClient,
-        owner_node: &str,
-        peers: &[String],
-        duration_seconds: u64,
-    ) -> Result<FaultSummary, String> {
-        let operation = self
-            .begin_injection(owner.clone(), Some(owner_node.to_string()))
-            .await;
-        let summary = owner
-            .inject_partition(peers, duration_seconds, true)
-            .await
-            .map_err(|error| format!("council partition failed: {error}"))?;
-        self.complete_injection(&operation, &summary).await;
-        Ok(summary)
-    }
-
     async fn begin_injection(&self, owner: BunClient, owner_node: Option<String>) -> Arc<()> {
         let operation = Arc::new(());
         self.faults.lock().await.push(OwnedFault {
@@ -225,17 +206,27 @@ impl ChaosGuard {
     }
 
     async fn complete_injection(&self, operation: &Arc<()>, summary: &FaultSummary) {
-        if let Some(fault) = self
-            .faults
-            .lock()
-            .await
+        let mut faults = self.faults.lock().await;
+        let Some(fault) = faults
             .iter_mut()
             .find(|fault| Arc::ptr_eq(&fault.operation, operation))
-        {
-            fault.id = Some(summary.id);
-            if summary.target_node.is_some() {
-                fault.owner_node.clone_from(&summary.target_node);
-            }
+        else {
+            return;
+        };
+        fault.id = Some(summary.id);
+        if summary.target_node.is_some() {
+            fault.owner_node.clone_from(&summary.target_node);
+        }
+        // A workload fault routed to several nodes created one fault on each;
+        // every one of them is this guard's to reverse.
+        let owner = fault.owner.clone();
+        for routed in &summary.routed {
+            faults.push(OwnedFault {
+                operation: Arc::new(()),
+                id: Some(routed.id),
+                owner: owner.clone(),
+                owner_node: routed.node.clone().or_else(|| routed.target_node.clone()),
+            });
         }
     }
 
@@ -484,7 +475,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let notification = Arc::clone(&accepted);
         let app = Router::new().route(
-            "/v1/chaos/partition",
+            "/v1/fault",
             axum::routing::post(move || {
                 let notification = Arc::clone(&notification);
                 async move {
@@ -499,13 +490,23 @@ mod tests {
         let guard = ChaosGuard::default();
         let task_guard = guard.clone();
         let injection = tokio::spawn(async move {
+            let request = FaultRequest {
+                fault_type: crate::smoker::types::FaultType::CouncilPartition {
+                    peers: vec!["node-b".to_string()],
+                },
+                target_service: String::new(),
+                namespace: None,
+                target_instance: None,
+                target_node: Some("node-a".to_string()),
+                duration: std::time::Duration::from_secs(30),
+                injected_by: String::new(),
+                reason: None,
+                include_leader: true,
+                override_safety: false,
+                acknowledged: true,
+            };
             task_guard
-                .inject_partition(
-                    BunClient::new(&format!("http://{address}")),
-                    "node-a",
-                    &["node-b".to_string()],
-                    30,
-                )
+                .inject_fault(BunClient::new(&format!("http://{address}")), &request)
                 .await
         });
         tokio::time::timeout(std::time::Duration::from_secs(2), accepted.notified())
@@ -573,6 +574,8 @@ mod tests {
                     target_node: Some("node-a".into()),
                     remaining_secs: 30,
                     injected_by: "test".into(),
+                    node: None,
+                    routed: Vec::new(),
                 },
             )
             .await;
@@ -638,6 +641,8 @@ mod tests {
                         target_node: Some("node-a".to_string()),
                         remaining_secs: 30,
                         injected_by: "test".to_string(),
+                        node: None,
+                        routed: Vec::new(),
                     },
                 )
                 .await;

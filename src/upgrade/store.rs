@@ -53,6 +53,13 @@ impl BinaryStore {
     /// The binary is written to a temporary file, fsynced, made executable,
     /// and renamed into place, so a crash mid-write never leaves a truncated
     /// file under a versioned name. Does NOT touch the symlink.
+    ///
+    /// The store is keyed by version, so a version name must always mean
+    /// the same bytes. Staging bytes identical to what is already stored
+    /// leaves the binary alone (it may be the one running right now);
+    /// staging *different* bytes under an existing version is refused with
+    /// [`UpgradeError::VersionContentConflict`] rather than silently
+    /// replacing a rollback target or pretending a swap happened.
     pub fn stage(
         &self,
         version: &BinaryVersion,
@@ -62,6 +69,24 @@ impl BinaryStore {
         std::fs::create_dir_all(&self.binary_dir)?;
 
         let final_path = self.binary_path(version);
+        match std::fs::read(&final_path) {
+            Ok(stored) => {
+                let stored = super::signing::sha256_hex(&stored);
+                let incoming = super::signing::sha256_hex(bytes);
+                if stored != incoming {
+                    return Err(UpgradeError::VersionContentConflict {
+                        version: version.clone(),
+                        stored,
+                        incoming,
+                    });
+                }
+                envelope.store(&self.envelope_path(version))?;
+                self.sync_dir()?;
+                return Ok(final_path);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
         let tmp_path = self.binary_dir.join(format!(
             ".{}.tmp-{}",
             version.file_name(&self.stem),
@@ -235,6 +260,39 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o755);
         }
+    }
+
+    #[test]
+    fn stage_refuses_different_bytes_under_an_existing_version() {
+        let (_dir, store) = store();
+        let path = store
+            .stage(&v("0.2.0"), b"first build", &envelope())
+            .unwrap();
+
+        let err = store
+            .stage(&v("0.2.0"), b"second build", &envelope())
+            .unwrap_err();
+
+        assert!(
+            matches!(err, UpgradeError::VersionContentConflict { .. }),
+            "{err}"
+        );
+        // The stored bytes are untouched.
+        assert_eq!(std::fs::read(&path).unwrap(), b"first build");
+    }
+
+    #[test]
+    fn stage_accepts_identical_bytes_again_and_refreshes_the_envelope() {
+        let (_dir, store) = store();
+        store.stage(&v("0.2.0"), b"same", &envelope()).unwrap();
+        let mut signed = envelope();
+        signed.external = Some("BB==".to_string());
+
+        let path = store.stage(&v("0.2.0"), b"same", &signed).unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"same");
+        let stored = SignatureEnvelope::load(&store.envelope_path(&v("0.2.0"))).unwrap();
+        assert_eq!(stored.external.as_deref(), Some("BB=="));
     }
 
     #[test]

@@ -65,16 +65,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 Some(_) => {}
             }
         }
+        // A wedged runtime must not hold startup forever.
         let launches = self
-            .supervisor
-            .grill()
-            .launch_inventory()
-            .await?
-            .ok_or_else(|| {
-                BunError::AdoptionState(
-                    "discovery recovery requires complete runtime inventory".into(),
-                )
-            })?;
+            .complete_runtime_inventory(super::RUNTIME_INVENTORY_TIMEOUT, |reason| {
+                BunError::AdoptionState(format!("discovery recovery {reason}"))
+            })
+            .await?;
         let inventory = match &consumer {
             Some(identity) => journal.reconcile_consumer_runtime_inventory(&launches, identity),
             None => journal.reconcile_runtime_inventory(&launches),

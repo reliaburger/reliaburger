@@ -197,16 +197,6 @@ pub fn restore_memory_high(cgroup_path: &Path, saved: &str) -> Result<(), Resour
     Ok(())
 }
 
-/// Read the current memory usage of a cgroup in bytes.
-#[cfg(target_os = "linux")]
-pub fn read_cgroup_memory_current(cgroup_path: &Path) -> Result<u64, ResourceFaultError> {
-    let current_path = cgroup_path.join("memory.current");
-    let content = std::fs::read_to_string(&current_path)?;
-    content.trim().parse::<u64>().map_err(|e| {
-        ResourceFaultError::CgroupError(format!("failed to parse memory.current: {e}"))
-    })
-}
-
 /// Read the memory limit of a cgroup in bytes.
 #[cfg(target_os = "linux")]
 pub fn read_cgroup_memory_max(cgroup_path: &Path) -> Result<u64, ResourceFaultError> {

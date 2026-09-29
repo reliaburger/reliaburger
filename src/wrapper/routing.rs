@@ -40,6 +40,28 @@ pub struct Backend {
     /// and [`healthy`](Self::healthy) hold, so an instance that is healthy
     /// cluster-wide but unreachable locally is skipped.
     pub locally_healthy: bool,
+    /// Whether the backend runs on this node (see [`BackendScope`]).
+    pub local: bool,
+}
+
+/// Which backends a request may reach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendScope {
+    /// Any routable backend, on any node.
+    Cluster,
+    /// Only backends on this node. Once the view lease lapses, another node
+    /// may already have reused a remote backend's address; only this node
+    /// can reuse the address of one of its own.
+    LocalOnly,
+}
+
+impl BackendScope {
+    fn admits(self, backend: &Backend) -> bool {
+        match self {
+            BackendScope::Cluster => true,
+            BackendScope::LocalOnly => backend.local,
+        }
+    }
 }
 
 /// A route for a specific path prefix within a host.
@@ -102,19 +124,19 @@ impl PathRoute {
         Some(healthy[idx])
     }
 
-    /// Select up to `max` distinct routable backends for one request, in
-    /// round-robin order.
+    /// Select up to `max` distinct routable backends within `scope` for one
+    /// request, in round-robin order.
     ///
     /// The first entry is the primary; the rest are failover candidates the
     /// proxy tries in order if the primary's connection fails. Returns fewer
     /// than `max` when the pool is smaller, and an empty vector when nothing is
     /// routable. Each backend appears at most once, so a failover always moves
     /// to a *different* instance rather than retrying the one that just failed.
-    pub fn select_backends(&self, max: usize) -> Vec<(String, SocketAddr)> {
+    pub fn select_backends(&self, max: usize, scope: BackendScope) -> Vec<(String, SocketAddr)> {
         let healthy: Vec<&Backend> = self
             .backends
             .iter()
-            .filter(|b| Self::is_routable(b))
+            .filter(|b| Self::is_routable(b) && scope.admits(b))
             .collect();
         if healthy.is_empty() || max == 0 {
             return Vec::new();
@@ -407,6 +429,7 @@ fn build_path_route(
             // Trust the service map on a fresh rebuild; the active probe loop
             // re-evaluates local reachability from here.
             locally_healthy: true,
+            local: b.local,
         })
         .collect();
 
@@ -652,6 +675,7 @@ mod tests {
                 node_ip: Ipv4Addr::new(10, 0, 2, 2),
                 host_port: 30001,
                 healthy: true,
+                local: false,
             },
         )
         .unwrap();
@@ -662,6 +686,7 @@ mod tests {
                 node_ip: Ipv4Addr::new(10, 0, 4, 2),
                 host_port: 30002,
                 healthy: true,
+                local: false,
             },
         )
         .unwrap();
@@ -818,6 +843,7 @@ mod tests {
                 node_ip: Ipv4Addr::new(10, 0, 2, 2),
                 host_port: 30001,
                 healthy: true,
+                local: false,
             },
         )
         .unwrap();
@@ -828,6 +854,7 @@ mod tests {
                 node_ip: Ipv4Addr::new(10, 0, 4, 2),
                 host_port: 30002,
                 healthy: false,
+                local: false,
             },
         )
         .unwrap();
@@ -868,6 +895,7 @@ mod tests {
                 node_ip: Ipv4Addr::new(10, 0, 2, 2),
                 host_port: 30001,
                 healthy: false,
+                local: false,
             },
         )
         .unwrap();
@@ -921,6 +949,7 @@ mod tests {
                 node_ip: Ipv4Addr::new(10, 0, 2, 2),
                 host_port: 30001,
                 healthy: true,
+                local: false,
             },
         )
         .unwrap();
@@ -931,6 +960,7 @@ mod tests {
                 node_ip: Ipv4Addr::new(10, 0, 9, 9),
                 host_port: 40001,
                 healthy: true,
+                local: false,
             },
         )
         .unwrap();
@@ -1261,12 +1291,36 @@ mod tests {
 
         // Two healthy backends, so a request gets a primary plus one distinct
         // failover candidate — never the same instance twice.
-        let picks = route.select_backends(3);
+        let picks = route.select_backends(3, BackendScope::Cluster);
         assert_eq!(picks.len(), 2);
         assert_ne!(picks[0].0, picks[1].0);
 
         // Zero max yields nothing.
-        assert!(route.select_backends(0).is_empty());
+        assert!(route.select_backends(0, BackendScope::Cluster).is_empty());
+    }
+
+    #[test]
+    fn a_local_only_selection_never_picks_a_remote_backend() {
+        let (mut map, configs) = setup_map_and_configs();
+        let web = ServiceId::new("default", "web");
+        let mut entry = map.resolve(&web).unwrap().clone();
+        entry.backends[1].local = true;
+        map = ServiceMap::from_snapshot(&[entry]).unwrap();
+        let mut table = RoutingTable::new();
+        table.rebuild(&map, &configs).unwrap();
+        let route = table.lookup("myapp.com", "/").unwrap();
+        let local = route.backends[1].instance_id.clone();
+
+        for _ in 0..10 {
+            let picks = route.select_backends(3, BackendScope::LocalOnly);
+            assert_eq!(picks.len(), 1);
+            assert_eq!(picks[0].0, local);
+        }
+        // A local backend that fails its probes leaves nothing to route to.
+        table.set_local_health(&local, false);
+        let route = table.lookup("myapp.com", "/").unwrap();
+        assert!(route.select_backends(3, BackendScope::LocalOnly).is_empty());
+        assert_eq!(route.select_backends(3, BackendScope::Cluster).len(), 1);
     }
 
     #[test]

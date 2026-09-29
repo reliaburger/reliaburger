@@ -15,6 +15,7 @@
 pub mod applied;
 pub mod capacity;
 pub mod consumer;
+pub mod deploy_backoff;
 pub mod directory;
 pub mod http;
 pub mod identity;
@@ -22,5 +23,6 @@ pub mod orchestrate;
 pub mod producer;
 pub mod retirement;
 pub mod runtime;
+pub mod workload_identity;
 
 pub use http::ClusterHttp;

@@ -19,11 +19,9 @@
 //! so it is now a test too: see `every_per_app_route_checks_the_callers_scope`
 //! below. A route pattern naming `{app}` must call `authorize_scoped`.
 
-use crate::sesame::types::ApiRole;
-
 /// The principal class a route requires.
 ///
-/// This is coarser than `ApiRole`: it also covers routes that need *no*
+/// This is coarser than [`crate::sesame::types::ApiRole`]: it also covers routes that need *no*
 /// token (`Public`), any authenticated caller regardless of role
 /// (`AnyToken`), and the internal cluster node identity (`System`, the
 /// service-token principal that [`crate::sesame::auth::require_system`]
@@ -41,20 +39,6 @@ pub enum RoutePrincipal {
     /// The internal system principal — a cluster node presenting the
     /// service token. Node-to-node routes only.
     System,
-}
-
-impl RoutePrincipal {
-    /// The user role this principal maps to, when it maps to one.
-    ///
-    /// `Public`/`AnyToken` have no minimum role (any or none), and
-    /// `System` is not a user role at all, so those return `None`.
-    pub fn required_role(self) -> Option<ApiRole> {
-        match self {
-            RoutePrincipal::Deployer => Some(ApiRole::Deployer),
-            RoutePrincipal::Admin => Some(ApiRole::Admin),
-            RoutePrincipal::Public | RoutePrincipal::AnyToken | RoutePrincipal::System => None,
-        }
-    }
 }
 
 /// HTTP method a matrix entry applies to. Kept as a tiny enum rather
@@ -126,7 +110,9 @@ pub const ROUTE_MATRIX: &[Route] = &[
     route(Get, "/v1/ws/events", AnyToken),
     route(Get, "/v1/ws/logs/{app}/{namespace}", AnyToken),
     route(Get, "/v1/status/{app}/{namespace}", AnyToken),
+    route(Get, "/v1/top", AnyToken),
     route(Post, "/v1/stop/{app}/{namespace}", Deployer),
+    route(Post, "/v1/delete/{app}/{namespace}", Deployer),
     route(Get, "/v1/logs/{app}/{namespace}", AnyToken),
     route(Get, "/v1/logs/entries/{app}/{namespace}", AnyToken),
     route(Get, "/v1/logs/query/{app}/{namespace}", AnyToken),
@@ -134,32 +120,38 @@ pub const ROUTE_MATRIX: &[Route] = &[
     // Cluster + upgrade.
     // Renewal additionally requires the existing node TLS peer certificate.
     route(Post, "/v1/cluster/renew", System),
+    route(Post, "/v1/cluster/workload-csr", System),
     route(Post, "/v1/registry/propose", System),
     route(Post, "/v1/registry/query", System),
     route(Get, "/v1/capabilities", AnyToken),
     route(Get, "/v1/capabilities/cluster", AnyToken),
     route(Get, "/v1/diagnostics", AnyToken),
     route(Get, "/v1/diagnostics/apps", AnyToken),
-    route(Post, "/v1/trace", AnyToken),
+    route(Post, "/v1/path", AnyToken),
     route(Post, "/v1/test/leases", Deployer),
     route(Get, "/v1/test/leases/{id}", AnyToken),
     route(Post, "/v1/test/leases/{id}/renew", Deployer),
     route(Delete, "/v1/test/leases/{id}", Deployer),
     route(Get, "/v1/cluster/nodes", AnyToken),
+    // The relay only authenticates; the target node applies the forwarded
+    // route's own requirement to the caller's credential.
+    route(Get, "/v1/nodes/{node}/relay/{*path}", AnyToken),
+    route(Post, "/v1/nodes/{node}/relay/{*path}", AnyToken),
     route(Get, "/v1/cluster/council", AnyToken),
+    // Upgrades and elections act on the whole cluster: the handlers also
+    // refuse a scoped Admin (`authorize_cluster_admin`).
     route(Post, "/v1/upgrade/apply", Admin),
     route(Get, "/v1/upgrade/status", AnyToken),
     route(Post, "/v1/upgrade/rollback", Admin),
     route(Post, "/v1/upgrade/start", Admin),
     route(Get, "/v1/upgrade/cluster", AnyToken),
     route(Post, "/v1/upgrade/resume", Admin),
+    route(Post, "/v1/upgrade/abort", Admin),
     route(Post, "/v1/upgrade/cluster-rollback", Admin),
     route(Post, "/v1/cluster/elect", Admin),
     // Chaos.
-    route(Post, "/v1/chaos/partition", Admin),
     route(Post, "/v1/chaos/reserve", System),
     route(Post, "/v1/chaos/fence", System),
-    route(Post, "/v1/chaos/heal", Admin),
     route(Get, "/v1/chaos/status", AnyToken),
     // Snapshots. Reads need any token, mutations a Deployer; both are
     // additionally held to the token's app/namespace scope in the handlers.
@@ -186,6 +178,7 @@ pub const ROUTE_MATRIX: &[Route] = &[
     route(Get, "/v1/metrics/rollup/owned", AnyToken),
     route(Get, "/v1/metrics/cluster", AnyToken),
     route(Get, "/v1/metrics/app/{app}/{namespace}", AnyToken),
+    route(Get, "/v1/metrics/app/{app}/{namespace}/chart", AnyToken),
     route(Get, "/v1/alerts", AnyToken),
     route(Get, "/v1/logs/sql", AnyToken),
     route(Post, "/v1/logs/export", Admin),
@@ -470,6 +463,28 @@ mod tests {
             body.contains("require_unscoped"),
             "/v1/logs/sql must refuse scoped tokens — it cannot filter arbitrary SQL by tenant"
         );
+    }
+
+    /// Upgrades, rollbacks and elections change every node, so a token
+    /// scoped to some apps or namespaces must not reach them.
+    #[test]
+    fn cluster_wide_upgrade_and_election_routes_refuse_scoped_tokens() {
+        let source = include_str!("api.rs");
+        for handler in [
+            "upgrade_apply_handler",
+            "upgrade_rollback_handler",
+            "upgrade_start_handler",
+            "upgrade_resume_handler",
+            "upgrade_abort_handler",
+            "upgrade_cluster_rollback_handler",
+            "cluster_elect_handler",
+        ] {
+            let body = handler_body(source, handler).expect(handler);
+            assert!(
+                body.contains("authorize_cluster_admin"),
+                "{handler} must require an unscoped Admin"
+            );
+        }
     }
 
     /// Every route the router mounts must be present in the matrix. This

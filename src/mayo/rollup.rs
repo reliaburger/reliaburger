@@ -74,6 +74,10 @@ pub struct MetricsQuery {
     pub end: u64,
     /// Filter by app label. `None` means all apps.
     pub app: Option<String>,
+    /// Keep only the newest N samples of each series. `None` keeps the
+    /// whole window (up to the row limit, newest first).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_series: Option<u32>,
 }
 
 /// Warning annotation on query results.
@@ -234,6 +238,7 @@ mod tests {
             start: 1000,
             end: 2000,
             app: Some("web".to_string()),
+            per_series: Some(2),
         };
         let json = serde_json::to_string(&query).unwrap();
         let decoded: MetricsQuery = serde_json::from_str(&json).unwrap();
@@ -247,6 +252,7 @@ mod tests {
             start: 0,
             end: 9999,
             app: None,
+            per_series: None,
         };
         let json = serde_json::to_string(&query).unwrap();
         let decoded: MetricsQuery = serde_json::from_str(&json).unwrap();

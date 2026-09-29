@@ -1,20 +1,24 @@
 //! Cross-node log query coordination.
 //!
 //! When an app runs on multiple nodes, the leader fans out the log query
-//! to each node's `/v1/logs/entries` API and merges the results by
-//! timestamp. Two failure modes the first version got wrong (OBS6):
+//! to each node's `/v1/logs/entries` API and merges the results in ingest
+//! order. Failure modes earlier versions got wrong:
 //!
-//! - **Silent failures.** A node that was unreachable, returned non-2xx,
-//!   sent unparseable JSON, or whose task panicked was folded into an empty
-//!   success, so "no logs" and "half the cluster is down" looked identical.
-//!   Fan-out now reports which nodes failed alongside the entries it did
-//!   collect (a partial result).
-//! - **Adjacency-only dedup.** Merging deduped only *adjacent* equal
-//!   `(timestamp, line)` pairs after the sort, which both dropped distinct
-//!   events that happened to share a timestamp and kept duplicates that a
-//!   third line sorted between. Dedup is now keyed on a stable identity —
-//!   `(node, timestamp, stream, line)` — so the same event reported twice
-//!   collapses while genuinely distinct events from two replicas survive.
+//! - **Silent failures (OBS6).** A node that was unreachable, returned
+//!   non-2xx, sent unparseable JSON, or whose task panicked was folded into
+//!   an empty success, so "no logs" and "half the cluster is down" looked
+//!   identical. Fan-out now reports which nodes failed alongside the entries
+//!   it did collect (a partial result).
+//! - **Content-based dedup (OBS6, V02).** Merging first deduped adjacent
+//!   `(timestamp, line)` pairs, then any `(node, timestamp, stream, line)`.
+//!   Both collapse a line an app really did print twice in one second. Each
+//!   node now stamps every row with a unique, rising `sequence`, so dedup is
+//!   keyed on `(node, sequence)`: the same row reported twice collapses and
+//!   nothing else does.
+//! - **One-second ordering (V02).** Sorting on the one-second timestamp left
+//!   rows within a second in whatever order they arrived. Rows now sort on
+//!   `sequence` (nanoseconds, rising strictly per node), so each instance's
+//!   lines come back in the order it wrote them.
 
 use std::collections::HashSet;
 
@@ -22,7 +26,7 @@ use super::types::{KetchupError, LogEntry, LogQuery};
 
 /// One node's contribution to a fan-out: its id and the entries it returned.
 pub struct NodeLogs {
-    /// Stable node identity, used as the dedup key alongside the event fields.
+    /// Stable node identity, used as the dedup key alongside the row's sequence.
     pub node_id: String,
     /// Entries this node returned.
     pub entries: Vec<LogEntry>,
@@ -49,36 +53,67 @@ pub struct FanOutResult {
     pub failures: Vec<NodeFailure>,
 }
 
-/// Merge and sort entries from multiple nodes by timestamp, deduplicating by
-/// stable `(node, timestamp, stream, line)` identity.
+/// Which nodes a cluster-wide log query asks, and which it can't reach.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryTargets {
+    /// `(node id, API address)` for every node to ask.
+    pub reachable: Vec<(String, String)>,
+    /// Nodes the query should ask but that have no live membership entry.
+    pub unreachable: Vec<String>,
+}
+
+/// Pick the nodes a log query fans out to: every live member.
 ///
-/// The same event reported twice by one node collapses to one row. Two
-/// replicas that each logged an identical line at the same instant are
-/// *distinct* events (different `node_id`) and both survive.
+/// A node stores the lines of the instances it ran, and keeps them after the
+/// app moves on. So an app's history is spread over every node it ever ran
+/// on, which placement (where it runs *now*) doesn't record. Asking only the
+/// placed nodes returned whatever those nodes last stored as "the tail",
+/// however old. A node that never ran the app answers with nothing.
+///
+/// `placed` is where the scheduler runs the app now; a placed node missing
+/// from `members` (every live member as `(node id, API address)`) is
+/// reported unreachable, because its lines are certainly wanted.
+pub fn query_targets(placed: &[String], members: &[(String, String)]) -> QueryTargets {
+    QueryTargets {
+        reachable: members.to_vec(),
+        unreachable: placed
+            .iter()
+            .filter(|node| !members.iter().any(|(id, _)| id == *node))
+            .cloned()
+            .collect(),
+    }
+}
+
+/// Merge entries from multiple nodes in ingest order, deduplicating by
+/// `(node, sequence)`.
+///
+/// Each node's sequence rises strictly, so a node's own rows keep their
+/// order. Rows from different nodes interleave by their nanosecond
+/// sequences, with the node id breaking an exact tie so the result is
+/// deterministic. That interleaving is only as good as the nodes' clocks
+/// and ingest delays, so it orders one node's lines, not two nodes' lines
+/// against each other; each entry names its node so a reader can tell the
+/// two apart.
 pub fn merge_node_logs(sources: Vec<NodeLogs>) -> Vec<LogEntry> {
-    let mut seen: HashSet<(String, u64, &'static str, String)> = HashSet::new();
-    let mut merged: Vec<LogEntry> = Vec::new();
+    let mut seen: HashSet<(String, u64)> = HashSet::new();
+    let mut merged: Vec<(String, LogEntry)> = Vec::new();
 
     for source in sources {
         for entry in source.entries {
-            let stream_tag = match entry.stream {
-                super::types::LogStream::Stdout => "O",
-                super::types::LogStream::Stderr => "E",
-            };
-            let key = (
-                source.node_id.clone(),
-                entry.timestamp,
-                stream_tag,
-                entry.line.clone(),
-            );
-            if seen.insert(key) {
-                merged.push(entry);
+            if seen.insert((source.node_id.clone(), entry.sequence)) {
+                let entry = LogEntry {
+                    node: Some(source.node_id.clone()),
+                    ..entry
+                };
+                merged.push((source.node_id.clone(), entry));
             }
         }
     }
 
-    merged.sort_by_key(|e| e.timestamp);
-    merged
+    merged.sort_by(|(left_node, left), (right_node, right)| {
+        (left.sequence, left_node).cmp(&(right.sequence, right_node))
+    });
+    merged.into_iter().map(|(_, entry)| entry).collect()
 }
 
 /// Build `{base}/v1/logs/entries/{app}/{namespace}` with the app and
@@ -197,9 +232,12 @@ mod tests {
     use super::*;
     use crate::ketchup::types::LogStream;
 
-    fn entry(ts: u64, line: &str) -> LogEntry {
+    fn entry(sequence: u64, line: &str) -> LogEntry {
         LogEntry {
-            timestamp: ts,
+            timestamp: sequence,
+            sequence,
+            instance: None,
+            node: None,
             stream: LogStream::Stdout,
             line: line.to_string(),
         }
@@ -293,6 +331,49 @@ mod tests {
             .unwrap();
     }
 
+    fn members(ids: &[&str]) -> Vec<(String, String)> {
+        ids.iter()
+            .map(|id| (id.to_string(), format!("https://{id}:9117")))
+            .collect()
+    }
+
+    fn reachable_ids(targets: &QueryTargets) -> Vec<&str> {
+        targets
+            .reachable
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .collect()
+    }
+
+    /// V02 soak: soak-redis-client ran on node 1, then node 3, then node 2
+    /// for half an hour. After a whole-cluster restart it was placed on node
+    /// 1 again, the query asked node 1 alone, and node 1's newest stored lines
+    /// were half an hour old. Every live member holds some of an app's
+    /// history, so every live member is asked.
+    #[test]
+    fn a_query_asks_every_live_member_not_just_where_the_app_runs_now() {
+        let targets = query_targets(&["n1".to_string()], &members(&["n1", "n2", "n3"]));
+        assert_eq!(reachable_ids(&targets), vec!["n1", "n2", "n3"]);
+        assert!(targets.unreachable.is_empty());
+    }
+
+    /// Right after a restart nothing may be placed yet; the history is still
+    /// on disk and the query still answers from it.
+    #[test]
+    fn an_unplaced_app_is_still_queried_everywhere() {
+        let targets = query_targets(&[], &members(&["n1", "n2"]));
+        assert_eq!(reachable_ids(&targets), vec!["n1", "n2"]);
+    }
+
+    /// A placed node gossip no longer lists can't be asked, and the answer
+    /// says so rather than looking complete.
+    #[test]
+    fn a_placed_node_missing_from_membership_is_reported_unreachable() {
+        let targets = query_targets(&["n4".to_string()], &members(&["n1"]));
+        assert_eq!(reachable_ids(&targets), vec!["n1"]);
+        assert_eq!(targets.unreachable, vec!["n4".to_string()]);
+    }
+
     #[test]
     fn merge_empty_sources() {
         assert!(merge_node_logs(vec![]).is_empty());
@@ -302,8 +383,8 @@ mod tests {
     fn merge_single_source_sorted() {
         let result = merge_node_logs(vec![node("n1", vec![entry(2, "b"), entry(1, "a")])]);
         assert_eq!(result.len(), 2);
-        assert_eq!(result[0].timestamp, 1);
-        assert_eq!(result[1].timestamp, 2);
+        assert_eq!(result[0].sequence, 1);
+        assert_eq!(result[1].sequence, 2);
     }
 
     #[test]
@@ -313,27 +394,50 @@ mod tests {
             node("n2", vec![entry(2, "b"), entry(4, "d")]),
         ]);
         assert_eq!(result.len(), 4);
-        let timestamps: Vec<u64> = result.iter().map(|e| e.timestamp).collect();
-        assert_eq!(timestamps, vec![1, 2, 3, 4]);
+        let sequences: Vec<u64> = result.iter().map(|e| e.sequence).collect();
+        assert_eq!(sequences, vec![1, 2, 3, 4]);
     }
 
-    /// The same event reported twice by ONE node collapses to a single row —
-    /// even when a different line at the same timestamp sorts between the two
-    /// duplicates (the case adjacency-only dedup missed).
+    /// V02 soak regression: ten lines a second share one `timestamp`. The
+    /// merge must keep them in the order the node sequenced them, not in
+    /// whatever order they arrived.
     #[test]
-    fn separated_duplicates_from_one_node_dedup() {
+    fn lines_sharing_a_second_come_back_in_sequence_order() {
+        let mut shuffled: Vec<LogEntry> = (0..10)
+            .map(|i| LogEntry {
+                timestamp: 1_790_368_624,
+                sequence: 1_790_368_624_000_000_000 + i * 100_000_000,
+                instance: Some("soak-writer-0".to_string()),
+                node: None,
+                stream: LogStream::Stdout,
+                line: format!("ACK {}", 968 + i),
+            })
+            .collect();
+        shuffled.swap(1, 6);
+        shuffled.swap(3, 7);
+
+        let lines: Vec<String> = merge_node_logs(vec![node("n2", shuffled)])
+            .into_iter()
+            .map(|entry| entry.line)
+            .collect();
+        let expected: Vec<String> = (968..978).map(|n| format!("ACK {n}")).collect();
+        assert_eq!(lines, expected);
+    }
+
+    /// An app that prints the same line twice in one second printed two
+    /// lines; content-based dedup used to collapse them into one.
+    #[test]
+    fn repeated_identical_lines_from_one_node_both_survive() {
         let result = merge_node_logs(vec![node(
             "n1",
-            vec![entry(1, "dup"), entry(1, "other"), entry(1, "dup")],
+            vec![entry(1, "dup"), entry(2, "other"), entry(3, "dup")],
         )]);
-        // "dup" appears once; "other" survives.
-        let dups = result.iter().filter(|e| e.line == "dup").count();
-        assert_eq!(dups, 1, "duplicate event from one node not collapsed");
-        assert_eq!(result.len(), 2);
+        let lines: Vec<&str> = result.iter().map(|e| e.line.as_str()).collect();
+        assert_eq!(lines, vec!["dup", "other", "dup"]);
     }
 
     /// The M4 case: two replicas each report the SAME line at the SAME
-    /// timestamp. These are DISTINCT events (one per replica) and both must
+    /// instant. These are DISTINCT events (one per replica) and both must
     /// survive, because the dedup key includes the node identity.
     #[test]
     fn identical_lines_from_two_replicas_both_survive() {
@@ -348,6 +452,41 @@ mod tests {
         );
     }
 
+    /// Two nodes whose sequences tie exactly come back in node order, so the
+    /// same query always renders the same way.
+    #[test]
+    fn exact_sequence_ties_break_on_node_id() {
+        let result = merge_node_logs(vec![
+            node("n2", vec![entry(5, "from n2")]),
+            node("n1", vec![entry(5, "from n1")]),
+        ]);
+        let lines: Vec<&str> = result.iter().map(|e| e.line.as_str()).collect();
+        assert_eq!(lines, vec!["from n1", "from n2"]);
+    }
+
+    /// V02 soak, 28 Sep 2026: an upgrade walk moved `soak-redis-client-0`
+    /// from one node to another under the same name, and the merged tail
+    /// showed `INCR 11632` before `INCR 11631` with nothing to say two runs
+    /// on two clocks wrote them. Every merged line names its node.
+    #[test]
+    fn merged_entries_name_the_node_that_stored_them() {
+        let result = merge_node_logs(vec![
+            node("node-2", vec![entry(20, "INCR 11631")]),
+            node("node-3", vec![entry(10, "INCR 11632")]),
+        ]);
+        let stored: Vec<(Option<&str>, &str)> = result
+            .iter()
+            .map(|e| (e.node.as_deref(), e.line.as_str()))
+            .collect();
+        assert_eq!(
+            stored,
+            vec![
+                (Some("node-3"), "INCR 11632"),
+                (Some("node-2"), "INCR 11631")
+            ]
+        );
+    }
+
     /// A node whose response is duplicated across the wire (retransmit) still
     /// dedups within that node.
     #[test]
@@ -357,18 +496,6 @@ mod tests {
             node("n1", vec![entry(1, "x")]),
         ]);
         assert_eq!(result.len(), 1);
-    }
-
-    #[test]
-    fn stdout_and_stderr_at_same_timestamp_are_distinct() {
-        let out = entry(1, "same");
-        let err = LogEntry {
-            timestamp: 1,
-            stream: LogStream::Stderr,
-            line: "same".to_string(),
-        };
-        let result = merge_node_logs(vec![node("n1", vec![out, err])]);
-        assert_eq!(result.len(), 2, "different streams must not dedup together");
     }
 
     #[test]

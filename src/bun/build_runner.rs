@@ -667,9 +667,9 @@ pub async fn transfer_context_to_builder(
 /// Upload a buildah-exported OCI image layout to the local registry, presenting
 /// `bearer` (the internal service token) as the write credential (B1).
 ///
-/// `buildah push` cannot authenticate against Pickle — Pickle takes the
-/// service token as a *bearer* and buildah only offers HTTP Basic `--creds`,
-/// which Pickle never accepts and never challenges for. So the push writes a
+/// `buildah push` could only present the service token as HTTP Basic
+/// `--creds`, which Pickle refuses over plaintext and which would expose the
+/// token in buildah's command line over TLS. So the push writes a
 /// local OCI layout and this function uploads it: every blob under
 /// `blobs/sha256/` goes up as a monolithic blob (covering the config, the
 /// layers, and — for a multi-platform build — the sub-manifests), then the top
@@ -1200,13 +1200,17 @@ pub async fn build_submit_handler(
     // so a Deployer token scoped to namespace `a` cannot push an image into
     // namespace `b`'s repository. An unscoped token still pushes anywhere. This
     // runs before the council existence check so the scope gate applies in both
-    // single-node and clustered mode.
-    match crate::pickle::build::destination_scope(&request.spec) {
-        Ok((namespace, image)) => {
-            if let Err(resp) =
-                crate::sesame::auth::authorize_scoped(auth.as_deref(), &image, &namespace)
-            {
-                return resp;
+    // single-node and clustered mode. It is the registry's own repository
+    // rule, so `relish build` and `docker push` agree on what a scoped token
+    // may write (a bare name, which names no namespace, is refused to both).
+    match crate::pickle::build::destination_repository(&request.spec) {
+        Ok(repository) => {
+            if let Err(denied) = crate::pickle::registry_auth::check_repository_scope(
+                auth.as_deref(),
+                &repository,
+                crate::pickle::registry_auth::RepositoryAccess::WriteManifest,
+            ) {
+                return (StatusCode::FORBIDDEN, denied.to_string()).into_response();
             }
         }
         Err(e) => {
@@ -2012,10 +2016,12 @@ mod tests {
             super::super::api::NodeMembershipInfo {
                 node_id: plain,
                 address: std::net::SocketAddr::from(([10, 0, 0, 1], 9117)),
+                api_advertised: true,
             },
             super::super::api::NodeMembershipInfo {
                 node_id: builder.clone(),
                 address: std::net::SocketAddr::from(([10, 0, 0, 2], 9117)),
+                api_advertised: true,
             },
         ];
 

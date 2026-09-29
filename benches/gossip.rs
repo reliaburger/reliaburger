@@ -28,6 +28,7 @@ fn fast_config() -> GossipConfig {
         suspicion_timeout: std::time::Duration::from_millis(100),
         indirect_probe_count: 2,
         cleanup_timeout: std::time::Duration::from_secs(60),
+        push_pull_interval: std::time::Duration::from_millis(500),
     }
 }
 
@@ -155,7 +156,6 @@ fn bench_dissemination_queue(c: &mut Criterion) {
                             NodeState::Alive
                         },
                         incarnation: 1,
-                        lamport: i as u64,
                     },
                     100,
                 );

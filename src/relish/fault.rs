@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use super::RelishError;
 use super::client::BunClient;
-use crate::smoker::types::{FaultRequest, FaultType};
+use crate::smoker::types::{FaultRequest, FaultSummary, FaultType};
 
 /// Default fault duration when --duration is omitted.
 const DEFAULT_DURATION: Duration = Duration::from_secs(600); // 10 minutes
@@ -167,8 +167,8 @@ fn make_request(
         target_instance: targeting.instance.clone(),
         target_node: targeting.node.clone(),
         duration,
-        // Compatibility wire field only. Bun replaces it with the
-        // authenticated token name before recording the fault.
+        // Bun replaces this with the authenticated token name before
+        // recording the fault.
         injected_by: String::new(),
         reason: targeting.reason.clone(),
         include_leader: false,
@@ -182,6 +182,7 @@ pub async fn delay(
     target: &str,
     delay_str: &str,
     jitter: Option<&str>,
+    from: Option<&str>,
     duration: &Option<String>,
     targeting: &FaultTargeting,
 ) -> Result<(), RelishError> {
@@ -194,6 +195,7 @@ pub async fn delay(
         FaultType::Delay {
             delay_ns,
             jitter_ns,
+            source_app: from.map(str::to_string),
         },
         target.into(),
         get_duration(duration)?,
@@ -252,7 +254,6 @@ pub async fn partition(
     let request = make_request(
         FaultType::Partition {
             source_app: from.map(|s| s.to_string()),
-            source_cgroup_id: 0,
         },
         target.into(),
         get_duration(duration)?,
@@ -303,13 +304,10 @@ pub async fn memory(
     duration: &Option<String>,
     targeting: &FaultTargeting,
 ) -> Result<(), RelishError> {
-    let (percentage, oom) = if value.trim().eq_ignore_ascii_case("oom") {
-        (0, true)
-    } else {
-        (parse_percentage(value)?, false)
-    };
     let request = make_request(
-        FaultType::MemoryPressure { percentage, oom },
+        FaultType::MemoryPressure {
+            percentage: parse_percentage(value)?,
+        },
         target.into(),
         get_duration(duration)?,
         targeting,
@@ -463,40 +461,78 @@ pub async fn node_pressure(
     inject_and_print(&request).await
 }
 
-/// List all active faults.
+/// List every node's active faults.
 pub async fn list() -> Result<(), RelishError> {
     let client = BunClient::default_local();
-    let faults = client.list_faults().await?;
+    let listing = client.list_cluster_faults().await?;
+    for warning in &listing.warnings {
+        eprintln!("warning: {warning}");
+    }
+    print!("{}", render_fault_list(&listing.faults));
+    Ok(())
+}
+
+/// The `relish fault list` table.
+fn render_fault_list(faults: &[FaultSummary]) -> String {
+    use std::fmt::Write as _;
 
     if faults.is_empty() {
-        println!("No active faults");
-        return Ok(());
+        return "No active faults\n".to_string();
     }
-
-    println!(
-        "{:<6} {:<22} {:<15} {:<15} {:<10} INJECTED BY",
-        "ID", "TYPE", "TARGET", "INSTANCE", "REMAINING"
+    let mut output = format!(
+        "{:<6} {:<22} {:<15} {:<22} {:<15} {:<10} INJECTED BY\n",
+        "ID", "TYPE", "NODE", "TARGET", "INSTANCE", "REMAINING"
     );
-    for f in &faults {
-        println!(
-            "{:<6} {:<22} {:<15} {:<15} {:<10} {}",
-            f.id,
-            f.fault_type,
-            f.target_node.as_deref().unwrap_or(&f.target_service),
-            f.target_instance.as_deref().unwrap_or("-"),
-            format!("{}s", f.remaining_secs),
-            f.injected_by,
+    for fault in faults {
+        // Node faults have no service; their target is the node itself.
+        let target = if fault.target_service.is_empty() {
+            fault.target_node.as_deref().unwrap_or("-")
+        } else {
+            &fault.target_service
+        };
+        let _ = writeln!(
+            output,
+            "{:<6} {:<22} {:<15} {:<22} {:<15} {:<10} {}",
+            fault.id,
+            fault.fault_type,
+            fault.node.as_deref().unwrap_or("-"),
+            target,
+            fault.target_instance.as_deref().unwrap_or("-"),
+            format!("{}s", fault.remaining_secs),
+            fault.injected_by,
         );
     }
-    println!();
-    println!("{} active fault(s)", faults.len());
-    Ok(())
+    let _ = writeln!(output, "\n{} active fault(s)", faults.len());
+    output
+}
+
+/// Which node holds fault `id`. Fault ids are per node, so the same number can
+/// exist on two nodes; then the operator has to say which with `--node`.
+fn owner_of_fault(id: u64, faults: &[FaultSummary]) -> Result<Option<String>, RelishError> {
+    let owners: Vec<&str> = faults
+        .iter()
+        .filter(|fault| fault.id == id)
+        .filter_map(|fault| fault.node.as_deref())
+        .collect();
+    match owners.as_slice() {
+        [] => Ok(None),
+        [owner] => Ok(Some((*owner).to_string())),
+        _ => Err(RelishError::ApiError {
+            status: 0,
+            body: format!(
+                "fault id {id} exists on {}; pick one with --node",
+                owners.join(", ")
+            ),
+        }),
+    }
 }
 
 /// Clear faults — all, by numeric id, or by app name.
 ///
 /// A bare number is a fault id; anything else is a service name (its first
 /// caller for the registry's `clear_by_service`). No argument clears all.
+/// Without `--node`, a fault id is looked up in the cluster-wide listing so a
+/// fault routed to another node is cleared where it lives.
 pub async fn clear(
     target: Option<String>,
     namespace: Option<&str>,
@@ -507,7 +543,17 @@ pub async fn clear(
     let msg = match target {
         None => client.clear_all_faults().await?,
         Some(arg) => match arg.parse::<u64>() {
-            Ok(id) => client.clear_fault(id, node, acknowledged).await?,
+            Ok(id) if node.is_some() => client.clear_fault(id, node, acknowledged).await?,
+            Ok(id) => {
+                let owner = match client.list_cluster_faults().await {
+                    Ok(listing) => owner_of_fault(id, &listing.faults)?,
+                    // A standalone agent has no cluster listing; its ids are local.
+                    Err(_) => None,
+                };
+                client
+                    .clear_fault(id, owner.as_deref(), acknowledged)
+                    .await?
+            }
             Err(_) if node.is_some() => {
                 return Err(RelishError::ApiError {
                     status: 0,
@@ -588,16 +634,90 @@ pub async fn scenario(
 async fn inject_and_print(request: &FaultRequest) -> Result<(), RelishError> {
     let client = BunClient::default_local();
     let summary = client.inject_fault(request).await?;
-    println!(
-        "Fault injected: {} on {} (id: {}, expires in {}s)",
-        summary.fault_type, summary.target_service, summary.id, summary.remaining_secs,
-    );
+    print!("{}", render_injection(&summary));
     Ok(())
+}
+
+/// One line per fault a request created; a routed workload fault can create
+/// one on each node that runs a target.
+fn render_injection(summary: &FaultSummary) -> String {
+    std::iter::once(summary)
+        .chain(&summary.routed)
+        .map(|fault| {
+            let target = if fault.target_service.is_empty() {
+                fault.target_node.as_deref().unwrap_or("-")
+            } else {
+                &fault.target_service
+            };
+            let place = fault
+                .node
+                .as_deref()
+                .map(|node| format!(" on node {node}"))
+                .unwrap_or_default();
+            format!(
+                "Fault injected: {} on {target}{place} (id: {}, expires in {}s)\n",
+                fault.fault_type, fault.id, fault.remaining_secs,
+            )
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn summary(id: u64, node: &str, service: &str) -> FaultSummary {
+        FaultSummary {
+            id,
+            fault_type: "kill".to_string(),
+            target_service: service.to_string(),
+            target_instance: None,
+            target_node: Some(node.to_string()),
+            remaining_secs: 0,
+            injected_by: "ops".to_string(),
+            node: Some(node.to_string()),
+            routed: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_fault_id_is_cleared_on_the_node_that_holds_it() {
+        let faults = [summary(1, "node-1", "web"), summary(2, "node-3", "web")];
+        assert_eq!(
+            owner_of_fault(2, &faults).unwrap().as_deref(),
+            Some("node-3")
+        );
+        assert_eq!(owner_of_fault(9, &faults).unwrap(), None);
+    }
+
+    #[test]
+    fn an_id_held_by_two_nodes_needs_an_explicit_node() {
+        let faults = [summary(1, "node-1", "web"), summary(1, "node-2", "web")];
+        let error = owner_of_fault(1, &faults).unwrap_err().to_string();
+        assert!(error.contains("node-1, node-2"), "{error}");
+        assert!(error.contains("--node"), "{error}");
+    }
+
+    #[test]
+    fn fault_list_shows_the_holding_node_and_the_target() {
+        let mut node_fault = summary(4, "node-2", "");
+        node_fault.fault_type = "node-kill".to_string();
+        insta::assert_snapshot!(render_fault_list(&[
+            summary(1, "node-1", "web"),
+            node_fault
+        ]));
+    }
+
+    #[test]
+    fn a_routed_injection_prints_every_fault_it_created() {
+        let mut first = summary(1, "node-1", "web");
+        first.routed = vec![summary(3, "node-2", "web")];
+        assert_eq!(
+            render_injection(&first),
+            "Fault injected: kill on web on node node-1 (id: 1, expires in 0s)\n\
+             Fault injected: kill on web on node node-2 (id: 3, expires in 0s)\n"
+        );
+    }
 
     #[test]
     fn duration_grammar_keeps_unitless_seconds_without_expanding_units() {

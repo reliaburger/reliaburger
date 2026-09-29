@@ -9,7 +9,7 @@ use crate::config::Config;
 use crate::relish::client::BunClient;
 use crate::smoker::types::{FaultRequest, FaultSummary, FaultType};
 use crate::testkit::TestContext;
-use crate::testkit::context::PINNED_TEST_WORKLOAD_IMAGE;
+use crate::testkit::context::{PINNED_TEST_WORKLOAD_IMAGE, container_http_script};
 use crate::testkit::registry::{TestCase, unknown};
 use crate::testkit::report::{CleanupOutcome, TestGroup};
 
@@ -23,15 +23,11 @@ fn fault_duration(timeout: Duration) -> Duration {
 
 fn container_spec(context: &TestContext, app: &str, replicas: u32, delayed: bool) -> String {
     let port = context.container_port(app);
-    let command = if delayed {
-        format!("[\"sh\", \"-c\", \"sleep 3; exec httpd -f -p {port} -h /etc\"]")
-    } else {
-        format!("[\"httpd\", \"-f\", \"-p\", \"{port}\", \"-h\", \"/etc\"]")
-    };
+    let script = container_http_script(port, if delayed { 3 } else { 0 });
     format!(
         "[app.{app}]\n\
          image = \"{PINNED_TEST_WORKLOAD_IMAGE}\"\n\
-         command = {command}\n\
+         command = [\"/bin/sh\", \"-c\", \"{script}\"]\n\
          port = {port}\n\
          replicas = {replicas}\n\
          namespace = \"{namespace}\"\n\
@@ -85,10 +81,13 @@ fn node_request(
 
 async fn inject_node_fault(
     context: &TestContext,
-    owner: BunClient,
+    target_client: BunClient,
     request: FaultRequest,
 ) -> Result<FaultSummary, String> {
-    context.chaos().inject_fault(owner, &request).await
+    context
+        .chaos()
+        .inject_fault(context.fault_owner(target_client), &request)
+        .await
 }
 
 async fn clear_owned_faults(context: &TestContext) -> Result<(), String> {
@@ -108,6 +107,7 @@ async fn wait_for_leader(
             && let Some(leader) = status.leader
             && different_from.is_none_or(|old| old != leader)
         {
+            context.wait_note.clear().await;
             return Ok(leader);
         }
         if context.deadline.remaining().is_zero() {
@@ -116,6 +116,11 @@ async fn wait_for_leader(
                 None => "no council leader was observed before deadline".to_string(),
             });
         }
+        let waiting = match different_from {
+            Some(old) => format!("waiting for a council leader other than {old}"),
+            None => "waiting for a council leader".to_string(),
+        };
+        context.wait_note.record(waiting).await;
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
@@ -134,6 +139,7 @@ async fn wait_for_node_state(
                 .find(|node| node.node_id == node_id)
                 .map(|node| node.state.clone());
             if last.as_deref().is_some_and(|state| wanted.contains(&state)) {
+                context.wait_note.clear().await;
                 return Ok(());
             }
         }
@@ -142,6 +148,12 @@ async fn wait_for_node_state(
                 "node {node_id} did not reach one of {wanted:?}; last state was {last:?}"
             ));
         }
+        context
+            .wait_note
+            .record(format!(
+                "waiting for node {node_id} to reach one of {wanted:?}; last state was {last:?}"
+            ))
+            .await;
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
@@ -313,15 +325,18 @@ async fn minority_partition_degrades_and_heals(context: TestContext) -> Result<(
         ));
     }
 
-    context
-        .chaos()
-        .inject_partition(
-            target_client,
+    inject_node_fault(
+        &context,
+        target_client,
+        node_request(
+            &context,
+            FaultType::CouncilPartition { peers },
             &target,
-            &peers,
-            fault_duration(context.timeout).as_secs(),
-        )
-        .await?;
+            true,
+            "phase15 C3 minority partition",
+        ),
+    )
+    .await?;
     let canary = "chaos-c3-majority";
     apply_with_client(
         &context,
@@ -617,6 +632,167 @@ pub fn all() -> Vec<TestCase> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::context::SIGTERM_TRAP;
+
+    /// From a laptop the target's own API is out of reach, and the relay
+    /// refuses fault requests. The node-kill must go to the entry node, which
+    /// routes it (and the reversal) to the target it names.
+    #[tokio::test]
+    async fn relayed_node_faults_are_injected_and_reversed_through_the_entry_node() {
+        use axum::extract::{Query, State};
+        use axum::routing::{delete, post};
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        type Seen = Arc<Mutex<Vec<String>>>;
+        async fn inject(
+            State(seen): State<Seen>,
+            axum::Json(request): axum::Json<FaultRequest>,
+        ) -> axum::Json<FaultSummary> {
+            let target = request.target_node.clone().unwrap_or_default();
+            seen.lock().await.push(format!("inject {target}"));
+            axum::Json(FaultSummary {
+                id: 7,
+                fault_type: "node-kill".to_string(),
+                target_service: String::new(),
+                target_instance: None,
+                target_node: request.target_node,
+                remaining_secs: 30,
+                injected_by: "test".to_string(),
+                node: None,
+                routed: Vec::new(),
+            })
+        }
+        async fn clear(
+            State(seen): State<Seen>,
+            axum::extract::Path(id): axum::extract::Path<u64>,
+            Query(query): Query<std::collections::HashMap<String, String>>,
+        ) -> axum::Json<serde_json::Value> {
+            let node = query.get("node").cloned().unwrap_or_default();
+            seen.lock().await.push(format!("clear {id} {node}"));
+            axum::Json(serde_json::json!({ "message": "cleared" }))
+        }
+
+        let seen: Seen = Arc::default();
+        let entry = axum::Router::new()
+            .route("/v1/fault", post(inject))
+            .route("/v1/fault/{id}", delete(clear))
+            .with_state(Arc::clone(&seen));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, entry).await.unwrap() });
+
+        let timeout = Duration::from_secs(5);
+        let context = TestContext {
+            client: BunClient::new_with_token(&base, None),
+            namespace: "rbtest-chaos-00".to_string(),
+            lease_id: None,
+            chaos_guard: crate::testkit::chaos::ChaosGuard::default(),
+            capabilities: crate::bun::capabilities::ClusterCapabilities::default(),
+            timeout,
+            deadline: crate::testkit::deadline::Deadline::after(timeout).unwrap(),
+            peer_route: crate::testkit::context::PeerRoute::Relay,
+            wait_note: Default::default(),
+        };
+        let relayed_worker = context.client.via_node("worker-2").unwrap();
+
+        inject_node_fault(
+            &context,
+            relayed_worker,
+            node_request(
+                &context,
+                FaultType::NodeKill {
+                    kill_containers: true,
+                },
+                "worker-2",
+                false,
+                "relay test",
+            ),
+        )
+        .await
+        .unwrap();
+        clear_owned_faults(&context).await.unwrap();
+        server.abort();
+
+        assert_eq!(
+            *seen.lock().await,
+            vec![
+                "inject worker-2".to_string(),
+                "clear 7 worker-2".to_string()
+            ]
+        );
+    }
+
+    fn offline_context() -> TestContext {
+        let timeout = Duration::from_secs(5);
+        TestContext {
+            client: BunClient::new_with_token("http://127.0.0.1:9", None),
+            namespace: "rbtest-chaos-00".to_string(),
+            lease_id: None,
+            chaos_guard: crate::testkit::chaos::ChaosGuard::default(),
+            capabilities: crate::bun::capabilities::ClusterCapabilities::default(),
+            timeout,
+            deadline: crate::testkit::deadline::Deadline::after(timeout).unwrap(),
+            peer_route: crate::testkit::context::PeerRoute::Relay,
+            wait_note: Default::default(),
+        }
+    }
+
+    /// A workload answers its health check only from a file it wrote itself,
+    /// and names every external program by absolute path. The pinned BusyBox image
+    /// has no `/etc/hostname` and no `PATH`, so anything else never turns
+    /// healthy on a real container runtime.
+    fn assert_self_served(spec: &str, app: &str) {
+        let config = Config::parse(spec).unwrap();
+        let app_spec = &config.app[app];
+        let health = app_spec.health.as_ref().expect("a health check");
+        assert_eq!(
+            &app_spec.command[..2],
+            ["/bin/sh", "-c"],
+            "{:?}",
+            app_spec.command
+        );
+        let wrapped = &app_spec.command[2];
+        let script = wrapped
+            .strip_prefix(SIGTERM_TRAP)
+            .and_then(|body| body.strip_suffix(" & wait"))
+            .unwrap_or_else(|| panic!("{wrapped:?} doesn't exit on SIGTERM"));
+        let root = script
+            .rsplit(" -h ")
+            .next()
+            .expect("httpd serves a named directory")
+            .trim();
+        assert!(
+            script.contains(&format!("> {root}{}", health.path)),
+            "{script:?} never writes the {} it is health-checked on",
+            health.path
+        );
+        for step in script.split(';') {
+            let program = step
+                .split_whitespace()
+                .find(|word| *word != "exec")
+                .expect("no empty steps");
+            // `printf` is built into BusyBox's shell and needs no PATH.
+            assert!(
+                program.starts_with('/') || program == "printf",
+                "{program:?} relies on the image's PATH in {script:?}"
+            );
+        }
+    }
+
+    /// V02 soak: C2 waited all 600 s for three running replicas because its
+    /// httpd served `/etc`, which has no `hostname` in the pinned image.
+    #[test]
+    fn chaos_workloads_answer_their_health_check_without_image_defaults() {
+        let context = offline_context();
+        for delayed in [false, true] {
+            assert_self_served(
+                &container_spec(&context, "chaos-c2-reschedule", 3, delayed),
+                "chaos-c2-reschedule",
+            );
+        }
+        assert_self_served(&context.container_http_spec("web", 1), "web");
+    }
 
     #[test]
     fn fault_expiry_outlives_the_case_deadline() {

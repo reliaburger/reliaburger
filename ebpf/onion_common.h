@@ -49,7 +49,7 @@ struct backend_endpoint {
     __u32 host_ip;    /* network byte order */
     __u16 host_port;  /* network byte order */
     __u8  healthy;    /* 1 = healthy, 0 = unhealthy */
-    __u8  _pad;
+    __u8  local;      /* 1 = runs on this node; routable after the lease lapses */
 };
 
 struct backend_value {
@@ -58,6 +58,22 @@ struct backend_value {
     __u32 app_id;
     __u32 namespace_id;
     struct backend_endpoint backends[MAX_BACKENDS];
+};
+
+/* ---------- view_lease_map ---------------------------------------------- */
+
+/* One entry, key VIEW_LEASE_KEY. A clustered node's permission to route with
+ * the cluster view it last published. Bun renews it whenever the leader
+ * answers a placement poll; once it lapses, the connect hook routes only to
+ * backends on this node, even if Bun itself has died. No entry means a
+ * standalone node, which has nothing to fence. */
+
+#define VIEW_LEASE_KEY 0
+
+struct view_lease_value {
+    __u64 expires_ns;  /* CLOCK_BOOTTIME, as bpf_ktime_get_boot_ns() */
+    __u32 enforced;    /* 1 = route only locally once expired */
+    __u32 _pad;
 };
 
 /* ---------- firewall_map ------------------------------------------------ */

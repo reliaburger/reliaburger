@@ -86,6 +86,7 @@ pub fn step_to_fault_request(
             FaultType::Delay {
                 delay_ns,
                 jitter_ns,
+                source_app: None,
             }
         }
         "drop" => {
@@ -93,10 +94,7 @@ pub fn step_to_fault_request(
             FaultType::Drop { probability }
         }
         "dns" => FaultType::DnsNxdomain,
-        "partition" => FaultType::Partition {
-            source_app: None,
-            source_cgroup_id: 0,
-        },
+        "partition" => FaultType::Partition { source_app: None },
         "bandwidth" => {
             let bytes_per_sec = crate::relish::fault::parse_bandwidth(&step.value)?;
             FaultType::Bandwidth { bytes_per_sec }
@@ -108,20 +106,9 @@ pub fn step_to_fault_request(
                 cores: None,
             }
         }
-        "memory" => {
-            if step.value.trim().eq_ignore_ascii_case("oom") {
-                FaultType::MemoryPressure {
-                    percentage: 0,
-                    oom: true,
-                }
-            } else {
-                let percentage = crate::relish::fault::parse_percentage(&step.value)?;
-                FaultType::MemoryPressure {
-                    percentage,
-                    oom: false,
-                }
-            }
-        }
+        "memory" => FaultType::MemoryPressure {
+            percentage: crate::relish::fault::parse_percentage(&step.value)?,
+        },
         "disk-io" => {
             let bytes_per_sec = crate::relish::fault::parse_bandwidth(&step.value)?;
             FaultType::DiskIoThrottle {
@@ -154,14 +141,13 @@ pub fn step_to_fault_request(
     Ok(FaultRequest {
         fault_type,
         target_service: step.target.clone(),
-        // Scenario files target a service by bare name across namespaces
-        // (legacy match); a namespace-qualified scenario is future work.
+        // Scenario steps name a bare service; the API places it in `default`.
         namespace: None,
         target_instance: None,
         target_node: None,
         duration,
-        // Compatibility wire field only. Bun attributes the request from the
-        // authenticated context, never from client-controlled JSON.
+        // Bun attributes the request from the authenticated context, never
+        // from client-controlled JSON.
         injected_by: String::new(),
         reason: Some(step.description.clone()),
         include_leader: false,
@@ -299,7 +285,8 @@ mod tests {
             req.fault_type,
             FaultType::Delay {
                 delay_ns: 200_000_000,
-                jitter_ns: 50_000_000
+                jitter_ns: 50_000_000,
+                source_app: None
             }
         ));
         assert_eq!(req.target_service, "redis");
@@ -321,24 +308,6 @@ mod tests {
         assert!(matches!(
             req.fault_type,
             FaultType::Drop { probability: 25 }
-        ));
-    }
-
-    #[test]
-    fn step_to_fault_request_memory_oom() {
-        let step = ScenarioStep {
-            description: "OOM".into(),
-            fault: "memory".into(),
-            target: "payment".into(),
-            value: "oom".into(),
-            jitter: None,
-            duration: None,
-            start_after: None,
-        };
-        let req = step_to_fault_request(&step, 1.0).unwrap();
-        assert!(matches!(
-            req.fault_type,
-            FaultType::MemoryPressure { oom: true, .. }
         ));
     }
 

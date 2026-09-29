@@ -16,7 +16,7 @@ use serde::Deserialize;
 use tokio::sync::RwLock;
 
 use super::lease::{RegistryWriteAccess, RepositoryReadGuard};
-use super::registry_auth::{QuotaConfig, UploadSessions, WriteDenied};
+use super::registry_auth::{QuotaConfig, RepositoryAccess, UploadSessions, WriteDenied};
 use super::store::{BlobStore, compute_sha256};
 use super::types::{Digest, ImageManifest, LayerDescriptor, ManifestCatalog, ManifestCommit};
 use crate::sesame::auth::AuthState;
@@ -81,7 +81,8 @@ impl PickleState {
             .map(str::to_string)
     }
 
-    /// Authenticate a writer and preserve the identity used for upload ownership.
+    /// Authenticate a writer of `repository`, hold it to its token scope, and
+    /// preserve the identity used for upload ownership.
     /// `None` means anonymous standalone mode; errors carry the HTTP refusal.
     // `Response` is large but it IS the HTTP reply to send on failure —
     // boxing it would tax every call site for a value that lives one frame.
@@ -89,6 +90,8 @@ impl PickleState {
     async fn authorise_write(
         &self,
         headers: &HeaderMap,
+        repository: &str,
+        access: RepositoryAccess,
     ) -> Result<Option<crate::sesame::auth::AuthContext>, Response> {
         let Some(auth) = &self.auth else {
             return Ok(None);
@@ -101,7 +104,10 @@ impl PickleState {
         )
         .await
         {
-            Ok(principal) => Ok(principal),
+            Ok(principal) => {
+                scope_refusal(principal.as_ref(), repository, access)?;
+                Ok(principal)
+            }
             Err(WriteDenied::Unauthenticated) => Err(oci_error(
                 StatusCode::UNAUTHORIZED,
                 "UNAUTHORIZED",
@@ -139,20 +145,27 @@ impl PickleState {
     }
 
     /// Authorise a registry read (O1). A no-op unless the registry is bound
-    /// somewhere a stranger could reach it.
+    /// somewhere a stranger could reach it, and then the reader's principal,
+    /// for the caller to hold to its token scope.
+    ///
+    /// Where reads are open (loopback) there is no principal and no scope to
+    /// apply: a scoped token could simply be left off the request.
     // `Response` is large but it IS the HTTP reply to send on failure —
     // boxing it would tax every call site for a value that lives one frame.
     #[allow(clippy::result_large_err)]
-    async fn authorise_read(&self, headers: &HeaderMap) -> Result<(), Response> {
+    async fn authorise_read(
+        &self,
+        headers: &HeaderMap,
+    ) -> Result<Option<crate::sesame::auth::AuthContext>, Response> {
         if !self.require_read_auth {
-            return Ok(());
+            return Ok(None);
         }
         let Some(auth) = &self.auth else {
-            return Ok(());
+            return Ok(None);
         };
         let bearer = Self::bearer(headers);
         match super::registry_auth::authorise_read(auth, bearer.as_deref()).await {
-            Ok(()) => Ok(()),
+            Ok(principal) => Ok(Some(principal)),
             Err(_) => Err(oci_error(
                 StatusCode::UNAUTHORIZED,
                 "UNAUTHORIZED",
@@ -212,6 +225,18 @@ impl PickleState {
             )),
         }
     }
+}
+
+/// The 403 for a principal whose token scope doesn't cover `repository`.
+// `Response` is large but it IS the HTTP reply to send on failure.
+#[allow(clippy::result_large_err)]
+fn scope_refusal(
+    principal: Option<&crate::sesame::auth::AuthContext>,
+    repository: &str,
+    access: RepositoryAccess,
+) -> Result<(), Response> {
+    super::registry_auth::check_repository_scope(principal, repository, access)
+        .map_err(|denied| oci_error(StatusCode::FORBIDDEN, "DENIED", denied.to_string()))
 }
 
 /// Hash-and-store a blob off the async runtime (REG4).
@@ -328,7 +353,9 @@ async fn record_commit_owned(
     let store = Arc::clone(&state.store);
     let persist = state.persist_path.clone();
     let local_commit = commit.clone();
-    let _catalog = tokio::task::spawn_blocking(move || {
+    // The blocking task hands back the write guard, held through the proposal,
+    // and the catalogue as it was before this publication for rollback.
+    let (mut catalog, previous) = tokio::task::spawn_blocking(move || {
         let _writer = transaction_writer;
         let _operation = local_operation;
         if let Some(lease_id) = lease_id
@@ -348,13 +375,14 @@ async fn record_commit_owned(
                 return Err(PickleError::MissingLayer(digest.clone()));
             }
         }
+        let previous = catalog.clone();
         let mut next = catalog.clone();
         next.apply_manifest_commit(&local_commit);
-        if let Some(path) = persist {
-            next.persist_to(&path)?;
+        if let Some(path) = &persist {
+            next.persist_to(path)?;
         }
         *catalog = next;
-        Ok(catalog)
+        Ok((catalog, previous))
     })
     .await
     .map_err(|error| PickleError::CatalogPersist(error.to_string()))??;
@@ -362,20 +390,43 @@ async fn record_commit_owned(
     let mutation = match &access.lease_id {
         Some(lease_id) => super::authority::RegistryMutation::LeasedManifest {
             lease_id: lease_id.clone(),
-            observed_at_unix_ms: crate::testkit::lease::now_unix_millis(),
             commit: Box::new(commit),
         },
         None => super::authority::RegistryMutation::Manifest(Box::new(commit)),
     };
-    match state.propose(mutation).await? {
-        None
-        | Some(
-            crate::council::CouncilResponse::Ok | crate::council::CouncilResponse::Applied { .. },
-        ) => {}
-        Some(response) => super::lease::require_acceptance(response)?,
-    }
-
-    Ok(())
+    // Only an explicit council answer proves the publication didn't commit.
+    // A timeout or transport failure is uncertain, so local state stays for a
+    // retry to settle.
+    let refusal = match state.propose(mutation).await {
+        Ok(
+            None
+            | Some(
+                crate::council::CouncilResponse::Ok
+                | crate::council::CouncilResponse::Applied { .. },
+            ),
+        ) => return Ok(()),
+        Ok(Some(
+            response @ (crate::council::CouncilResponse::Refused { .. }
+            | crate::council::CouncilResponse::RegistryPublicationStale),
+        )) => response,
+        // The forwarder decodes a leader's 409 refusal into `LeaseDenied`.
+        Err(PickleError::LeaseDenied(reason)) => {
+            crate::council::CouncilResponse::Refused { reason }
+        }
+        Ok(Some(response)) => return super::lease::require_acceptance(response),
+        Err(error) => return Err(error),
+    };
+    let persist = state.persist_path.clone();
+    tokio::task::spawn_blocking(move || {
+        if let Some(path) = &persist {
+            previous.persist_to(path)?;
+        }
+        *catalog = previous;
+        Ok::<_, PickleError>(())
+    })
+    .await
+    .map_err(|error| PickleError::CatalogPersist(error.to_string()))??;
+    super::lease::require_acceptance(refusal)
 }
 
 impl PickleState {
@@ -407,7 +458,9 @@ impl PickleState {
         };
         tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            council.write(mutation.request()),
+            // A follower's council refuses with ForwardToLeader, so only a
+            // leader's own clock is ever stamped here.
+            council.write(mutation.request(crate::testkit::lease::now_unix_millis())),
         )
         .await
         .map_err(|_| {
@@ -532,7 +585,110 @@ pub fn router(state: PickleState) -> Router {
                 }
             },
         ))
+        .layer(axum::middleware::from_fn(standard_client_credentials))
         .with_state(state)
+}
+
+/// The challenge a TLS registry sends with every 401, so `docker login`,
+/// `docker push` and `crane` know to offer the credential they hold.
+const BASIC_CHALLENGE: &str = r#"Basic realm="reliaburger""#;
+
+/// What an `Authorization: Basic …` header carried, if it was one.
+enum BasicCredential {
+    /// No header, or a scheme other than Basic (a bearer is left alone).
+    Absent,
+    /// The password half of `username:password`: a Reliaburger API token.
+    Token(String),
+    /// A Basic header that doesn't decode to `username:password`.
+    Malformed,
+}
+
+/// Read an HTTP Basic credential. The username is ignored: stock clients
+/// insist on one, but the token alone identifies the principal, so it
+/// carries no authority and checking it would only add a way to get it wrong.
+fn basic_credential(headers: &HeaderMap) -> BasicCredential {
+    use base64::Engine;
+    let Some(value) = headers.get(axum::http::header::AUTHORIZATION) else {
+        return BasicCredential::Absent;
+    };
+    let Some((scheme, encoded)) = value.to_str().ok().and_then(|v| v.split_once(' ')) else {
+        return BasicCredential::Absent;
+    };
+    // RFC 9110 makes the scheme name case-insensitive.
+    if !scheme.eq_ignore_ascii_case("basic") {
+        return BasicCredential::Absent;
+    }
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded.trim())
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok());
+    match decoded.as_deref().and_then(|pair| pair.split_once(':')) {
+        Some((_username, password)) if !password.is_empty() => {
+            BasicCredential::Token(password.to_string())
+        }
+        _ => BasicCredential::Malformed,
+    }
+}
+
+/// Let stock OCI clients authenticate the way they know how (HTTP Basic),
+/// without giving the registry a second authorisation path.
+///
+/// Over TLS, a Basic credential whose password is an API token is rewritten
+/// to the equivalent `Bearer` header before any handler sees it, so every
+/// role, repository and lease check below runs exactly as it does for relish
+/// and peer replication. Over plaintext, Basic is refused outright, even with
+/// a good token and even where the read would be open: accepting it would
+/// teach clients that sending the token in the clear works. TLS 401s carry a
+/// `WWW-Authenticate: Basic` challenge; plaintext ones never do.
+async fn standard_client_credentials(
+    mut request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let over_tls = request
+        .extensions()
+        .get::<crate::sesame::connection::TlsTransport>()
+        .is_some();
+    let credential = basic_credential(request.headers());
+    if !over_tls && !matches!(credential, BasicCredential::Absent) {
+        return oci_error(
+            StatusCode::UNAUTHORIZED,
+            "UNAUTHORIZED",
+            "HTTP Basic credentials are only accepted over TLS".to_string(),
+        );
+    }
+    match credential {
+        BasicCredential::Absent => {}
+        BasicCredential::Token(token) => {
+            let Ok(bearer) = axum::http::HeaderValue::from_str(&format!("Bearer {token}")) else {
+                return basic_challenge(malformed_basic());
+            };
+            request
+                .headers_mut()
+                .insert(axum::http::header::AUTHORIZATION, bearer);
+        }
+        BasicCredential::Malformed => return basic_challenge(malformed_basic()),
+    }
+    let response = next.run(request).await;
+    if over_tls && response.status() == StatusCode::UNAUTHORIZED {
+        return basic_challenge(response);
+    }
+    response
+}
+
+fn malformed_basic() -> Response {
+    oci_error(
+        StatusCode::UNAUTHORIZED,
+        "UNAUTHORIZED",
+        "malformed HTTP Basic credentials".to_string(),
+    )
+}
+
+fn basic_challenge(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        axum::http::header::WWW_AUTHENTICATE,
+        axum::http::HeaderValue::from_static(BASIC_CHALLENGE),
+    );
+    response
 }
 
 /// The parsed shape of an OCI `/v2/{name}/…` request.
@@ -625,14 +781,17 @@ async fn dispatch_v2(
     // O1: writes authorise per handler (they have different role bars and
     // quota checks); reads are uniform, so one gate covers every GET/HEAD.
     if matches!(method, Method::GET | Method::HEAD)
-        && let Err(response) = state.authorise_read(&headers).await
+        && let Err(response) = authorise_repository_read(&state, &method, &route, &headers).await
     {
         return response;
     }
 
     match (method, route) {
         (Method::POST, V2Route::Copy { name, digest }) => {
-            let principal = match state.authorise_write(&headers).await {
+            let principal = match state
+                .authorise_write(&headers, &name, RepositoryAccess::WriteManifest)
+                .await
+            {
                 Ok(principal) => principal,
                 Err(response) => return response,
             };
@@ -678,7 +837,11 @@ async fn dispatch_v2(
             blob_upload_complete(&state, &name, &upload_id, &digest, &headers, body).await
         }
         (Method::PUT, V2Route::Manifest { name, reference }) => {
-            if let Err(response) = state.authorise_write(&headers).await {
+            // Refuse before reading the body; `manifest_put` checks again.
+            if let Err(response) = state
+                .authorise_write(&headers, &name, RepositoryAccess::WriteManifest)
+                .await
+            {
                 return response;
             }
             match tokio::time::timeout(
@@ -695,8 +858,65 @@ async fn dispatch_v2(
         (Method::GET, V2Route::Manifest { name, reference }) => {
             manifest_get(&state, &name, &reference).await
         }
+        (Method::HEAD, V2Route::Manifest { name, reference }) => {
+            manifest_head(&state, &name, &reference).await
+        }
         (Method::GET, V2Route::Tags { name }) => tags_list(&state, &name).await,
         _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
+    }
+}
+
+impl V2Route {
+    /// The repository the request names.
+    fn repository(&self) -> &str {
+        match self {
+            V2Route::Copy { name, .. }
+            | V2Route::Blob { name, .. }
+            | V2Route::UploadInitiate { name }
+            | V2Route::UploadSession { name, .. }
+            | V2Route::Manifest { name, .. }
+            | V2Route::Tags { name } => name,
+        }
+    }
+}
+
+/// Authenticate a GET/HEAD and hold it to the reader's token scope, the way
+/// `/v1/status` and the other API reads are.
+///
+/// A scoped reader may only name repositories in its scope. Blobs are stored
+/// once by digest and shared by every repository, so a scoped reader's blob
+/// GET must also be for a blob the named repository's catalogue references;
+/// otherwise `team-a/web/blobs/<team-b's layer digest>` would hand over
+/// another namespace's layer. A HEAD answers only "does this digest exist",
+/// which is what a push asks before uploading, so it skips that lookup.
+// `Response` is large but it IS the HTTP reply to send on failure.
+#[allow(clippy::result_large_err)]
+async fn authorise_repository_read(
+    state: &PickleState,
+    method: &axum::http::Method,
+    route: &V2Route,
+    headers: &HeaderMap,
+) -> Result<(), Response> {
+    let reader = state.authorise_read(headers).await?;
+    scope_refusal(reader.as_ref(), route.repository(), RepositoryAccess::Read)?;
+    let V2Route::Blob { name, digest } = route else {
+        return Ok(());
+    };
+    if method != axum::http::Method::GET || !super::registry_auth::is_scoped(reader.as_ref()) {
+        return Ok(());
+    }
+    let catalog = state
+        .catalog_snapshot(name)
+        .await
+        .map_err(registry_write_error)?;
+    if catalog.referenced_digest_set().contains(digest.as_str()) {
+        Ok(())
+    } else {
+        Err(oci_error(
+            StatusCode::NOT_FOUND,
+            "BLOB_UNKNOWN",
+            format!("repository {name} references no blob {digest}"),
+        ))
     }
 }
 
@@ -707,7 +927,8 @@ async fn dispatch_v2(
 /// `GET /v2/` — OCI version check. Returns 200 OK.
 async fn v2_check(State(state): State<PickleState>, headers: HeaderMap) -> Response {
     // The OCI version probe is how a client discovers whether it needs
-    // credentials, so it answers 401 like every other read when it must.
+    // credentials, so it answers 401 like every other read when it must. It
+    // names no repository, so there's no scope to check.
     if let Err(response) = state.authorise_read(&headers).await {
         return response;
     }
@@ -804,7 +1025,10 @@ async fn blob_upload_initiate(
     body: axum::body::Body,
 ) -> Response {
     // Registry writes require a principal once auth is configured (REG4).
-    let principal = match state.authorise_write(headers_in).await {
+    let principal = match state
+        .authorise_write(headers_in, name, RepositoryAccess::WriteBlob)
+        .await
+    {
         Ok(principal) => principal,
         Err(response) => return response,
     };
@@ -863,7 +1087,10 @@ async fn blob_upload_patch(
     headers_in: &HeaderMap,
     body: axum::body::Body,
 ) -> Response {
-    let principal = match state.authorise_write(headers_in).await {
+    let principal = match state
+        .authorise_write(headers_in, name, RepositoryAccess::WriteBlob)
+        .await
+    {
         Ok(principal) => principal,
         Err(response) => return response,
     };
@@ -998,7 +1225,10 @@ async fn blob_upload_complete(
     headers_in: &HeaderMap,
     body: axum::body::Body,
 ) -> Response {
-    let principal = match state.authorise_write(headers_in).await {
+    let principal = match state
+        .authorise_write(headers_in, name, RepositoryAccess::WriteBlob)
+        .await
+    {
         Ok(principal) => principal,
         Err(response) => return response,
     };
@@ -1234,7 +1464,10 @@ async fn manifest_put(
     headers: &HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    let principal = match state.authorise_write(headers).await {
+    let principal = match state
+        .authorise_write(headers, name, RepositoryAccess::WriteManifest)
+        .await
+    {
         Ok(principal) => principal,
         Err(response) => return response,
     };
@@ -1480,6 +1713,25 @@ async fn manifest_get(state: &PickleState, name: &str, reference: &str) -> Respo
         .header("docker-content-digest", digest.as_str())
         .body(axum::body::Body::from(data))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// `HEAD /v2/{name}/manifests/{reference}` — does a manifest exist?
+///
+/// The GET's status and headers with the body dropped. `crane` and
+/// containerd ask this before every manifest push and pull, and treat any
+/// answer but 200 or 404 as fatal, so a registry without it can't take a push
+/// from them at all.
+async fn manifest_head(state: &PickleState, name: &str, reference: &str) -> Response {
+    let (mut parts, body) = manifest_get(state, name, reference).await.into_parts();
+    if parts.status == StatusCode::OK
+        && let Some(length) = axum::body::HttpBody::size_hint(&body).exact()
+    {
+        parts.headers.insert(
+            axum::http::header::CONTENT_LENGTH,
+            axum::http::HeaderValue::from(length),
+        );
+    }
+    Response::from_parts(parts, axum::body::Body::empty())
 }
 
 /// Detect the correct content-type for a manifest blob.
@@ -1767,12 +2019,13 @@ mod tests {
                     .await
                     .is_err()
             );
-            assert_eq!(
-                std::fs::read_dir(directory.path().join("uploads"))
-                    .unwrap()
-                    .count(),
-                0
-            );
+            // A directory squatting on the blob path can't be read, so the
+            // pull now refuses at cache verification, before any upload
+            // exists; either way no temporary file may survive.
+            let uploads = std::fs::read_dir(directory.path().join("uploads"))
+                .map(Iterator::count)
+                .unwrap_or(0);
+            assert_eq!(uploads, 0);
             assert!(
                 state
                     .sessions
@@ -2533,7 +2786,10 @@ mod tests {
         let headers = lease_request("POST", "/", &owner, Some("run1"), vec![])
             .headers()
             .clone();
-        let principal = state.authorise_write(&headers).await.unwrap();
+        let principal = state
+            .authorise_write(&headers, "rbtest-run1/web", RepositoryAccess::WriteManifest)
+            .await
+            .unwrap();
         let access = state
             .authorise_repository("rbtest-run1/web", &headers, principal.as_ref())
             .await
@@ -2569,7 +2825,10 @@ mod tests {
         let headers = lease_request("POST", "/", &owner, Some("run1"), vec![])
             .headers()
             .clone();
-        let principal = state.authorise_write(&headers).await.unwrap();
+        let principal = state
+            .authorise_write(&headers, "rbtest-run1/a", RepositoryAccess::WriteBlob)
+            .await
+            .unwrap();
         let busy = state
             .authorise_repository("rbtest-run1/a", &headers, principal.as_ref())
             .await
@@ -3005,6 +3264,130 @@ mod tests {
         let _ = server.await;
     }
 
+    /// A fake registry leader that answers GC-generation queries with 0 and
+    /// every publication with `reply`.
+    async fn serve_registry_leader(
+        reply: fn() -> Response,
+    ) -> (
+        super::super::authority::RegistryForwarder,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use super::super::authority::{
+            REGISTRY_PROPOSAL_PATH, REGISTRY_QUERY_PATH, RegistryForwarder, RegistryQueryResponse,
+        };
+        let app = Router::new()
+            .route(
+                REGISTRY_QUERY_PATH,
+                axum::routing::post(|| async { Json(RegistryQueryResponse::GcGeneration(0)) }),
+            )
+            .route(
+                REGISTRY_PROPOSAL_PATH,
+                axum::routing::post(move || async move { reply() }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (_tx, rx) = tokio::sync::watch::channel(crate::mustard::directory::NodeDirectory {
+            leader: Some(crate::mustard::message::LeaderHint {
+                node_id: crate::meat::NodeId::new("leader"),
+                term: 1,
+                api_address: address,
+                reporting_address: address,
+            }),
+            ..Default::default()
+        });
+        let forwarder = RegistryForwarder::new(
+            crate::cluster::ClusterHttp::plaintext().with_bearer(Some("internal".into())),
+            rx,
+        );
+        (forwarder, server)
+    }
+
+    /// A publication the council explicitly refuses (or declares stale) must
+    /// leave the local tag where it was; otherwise the node keeps serving a
+    /// digest the cluster never accepted and GC never collects its layers.
+    /// A lost or failed reply is uncertain: the council may have committed,
+    /// so the local catalogue keeps the publication for a retry to settle.
+    #[tokio::test]
+    async fn refused_publication_rolls_back_the_local_tag_but_uncertain_keeps_it() {
+        let refused: fn() -> Response = || {
+            (
+                StatusCode::CONFLICT,
+                Json(crate::council::CouncilResponse::Refused {
+                    reason: "publication lost the collection race".into(),
+                }),
+            )
+                .into_response()
+        };
+        let stale: fn() -> Response =
+            || Json(crate::council::CouncilResponse::RegistryPublicationStale).into_response();
+        let uncertain: fn() -> Response = || StatusCode::SERVICE_UNAVAILABLE.into_response();
+        for (reply, rolled_back) in [(refused, true), (stale, true), (uncertain, false)] {
+            let (mut state, directory) = test_state();
+            let persisted = directory.path().join("catalog.json");
+            state.persist_path = Some(persisted.clone());
+            let manifest = |bytes: &[u8]| {
+                let digest = compute_sha256(bytes);
+                state.store.write_blob(bytes, &digest).unwrap();
+                ImageManifest {
+                    repository: "ordinary".into(),
+                    digest: digest.clone(),
+                    tags: Default::default(),
+                    config: LayerDescriptor {
+                        digest,
+                        size: bytes.len() as u64,
+                        media_type: "config".into(),
+                    },
+                    layers: vec![],
+                    total_size: bytes.len() as u64,
+                    pushed_by: state.node_raft_id,
+                    pushed_at: std::time::SystemTime::now(),
+                    signature: None,
+                }
+            };
+            let original = manifest(b"original");
+            let replacement = manifest(b"replacement");
+            record_commit(&state, original.clone(), "latest".into())
+                .await
+                .unwrap();
+
+            let (forwarder, server) = serve_registry_leader(reply).await;
+            state.forwarder = Some(forwarder);
+            assert!(
+                record_commit(&state, replacement.clone(), "latest".into())
+                    .await
+                    .is_err()
+            );
+
+            let expected = if rolled_back {
+                &original.digest
+            } else {
+                &replacement.digest
+            };
+            let local = state.catalog.read().await.clone();
+            let on_disk = ManifestCatalog::load_from(&persisted).unwrap();
+            for catalog in [&local, &on_disk] {
+                assert_eq!(
+                    &catalog
+                        .get_manifest_by_tag("ordinary", "latest")
+                        .unwrap()
+                        .digest,
+                    expected
+                );
+                assert_eq!(
+                    catalog
+                        .get_repository_manifest("ordinary", replacement.digest.as_str())
+                        .is_some(),
+                    !rolled_back
+                );
+            }
+            server.abort();
+            let _ = server.await;
+        }
+    }
+
     #[tokio::test]
     async fn gc_owns_the_catalogue_before_arbitration_and_through_caller_cancellation() {
         use super::super::authority::{
@@ -3379,6 +3762,581 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
+    // --- Standard clients: HTTP Basic over TLS -----------------------------
+
+    /// A routable registry holding one Deployer and one ReadOnly token.
+    /// Returns `(state, dir, deployer, reader)`.
+    async fn standard_client_state() -> (PickleState, tempfile::TempDir, String, String) {
+        use crate::sesame::types::{ApiRole, TokenScope};
+        let (mut state, dir) = test_state();
+        let deployer = crate::sesame::token::create_token(
+            "ci",
+            ApiRole::Deployer,
+            TokenScope::default(),
+            None,
+        )
+        .unwrap();
+        let reader = crate::sesame::token::create_token(
+            "puller",
+            ApiRole::ReadOnly,
+            TokenScope::default(),
+            None,
+        )
+        .unwrap();
+        let tokens = crate::sesame::auth::new_token_store();
+        tokens.write().await.push(deployer.token);
+        tokens.write().await.push(reader.token);
+        state.auth = Some(crate::sesame::auth::AuthState::new(tokens, None));
+        state.require_read_auth = true;
+        state.allow_unauthenticated_bootstrap = false;
+        (state, dir, deployer.plaintext, reader.plaintext)
+    }
+
+    fn basic(username: &str, password: &str) -> String {
+        use base64::Engine;
+        let encoded =
+            base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"));
+        format!("Basic {encoded}")
+    }
+
+    /// Build a request, optionally as if it arrived on a TLS connection.
+    fn client_request(
+        method: &str,
+        uri: &str,
+        authorization: Option<&str>,
+        over_tls: bool,
+    ) -> axum::http::Request<Body> {
+        let mut builder = axum::http::Request::builder().method(method).uri(uri);
+        if let Some(value) = authorization {
+            builder = builder.header("authorization", value);
+        }
+        let mut request = builder.body(Body::empty()).unwrap();
+        if over_tls {
+            request
+                .extensions_mut()
+                .insert(crate::sesame::connection::TlsTransport);
+        }
+        request
+    }
+
+    fn challenge(response: &Response) -> Option<String> {
+        response
+            .headers()
+            .get("www-authenticate")
+            .map(|value| value.to_str().unwrap().to_string())
+    }
+
+    /// `docker login` probes `GET /v2/` with the stored credential; a
+    /// Deployer token as the Basic password must answer 200.
+    #[tokio::test]
+    async fn docker_login_probe_with_a_basic_token_over_tls_succeeds() {
+        let (state, _dir, deployer, _reader) = standard_client_state().await;
+        let app = test_router(state);
+        let auth = basic("anyone", &deployer);
+        let response = app
+            .oneshot(client_request("GET", "/v2/", Some(&auth), true))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// Without a challenge, docker never offers the credentials it holds.
+    /// An anonymous probe over TLS must say `Basic`.
+    #[tokio::test]
+    async fn anonymous_probe_over_tls_is_challenged_for_basic_credentials() {
+        let (state, _dir, _deployer, _reader) = standard_client_state().await;
+        let app = test_router(state);
+        let response = app
+            .oneshot(client_request("GET", "/v2/", None, true))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            challenge(&response).as_deref(),
+            Some(r#"Basic realm="reliaburger""#)
+        );
+    }
+
+    #[tokio::test]
+    async fn deployer_token_as_basic_password_over_tls_may_push() {
+        let (state, _dir, deployer, _reader) = standard_client_state().await;
+        let app = test_router(state);
+        let auth = basic("ci", &deployer);
+        let response = app
+            .oneshot(client_request(
+                "POST",
+                "/v2/team/api/blobs/uploads/",
+                Some(&auth),
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+
+    /// The role bar is the bearer path's, unchanged: a ReadOnly token may pull
+    /// but not push, whichever envelope it arrives in.
+    #[tokio::test]
+    async fn readonly_token_as_basic_password_is_forbidden_to_push() {
+        let (state, _dir, _deployer, reader) = standard_client_state().await;
+        let app = test_router(state);
+        let auth = basic("puller", &reader);
+        let response = app
+            .clone()
+            .oneshot(client_request(
+                "POST",
+                "/v2/team/api/blobs/uploads/",
+                Some(&auth),
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let response = app
+            .oneshot(client_request(
+                "GET",
+                "/v2/team/api/tags/list",
+                Some(&auth),
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_ne!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn unknown_token_as_basic_password_is_unauthorised_and_rechallenged() {
+        let (state, _dir, _deployer, _reader) = standard_client_state().await;
+        let app = test_router(state);
+        let auth = basic("ci", "rbrg_not_a_real_token");
+        let response = app
+            .oneshot(client_request(
+                "POST",
+                "/v2/team/api/blobs/uploads/",
+                Some(&auth),
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(challenge(&response).is_some_and(|value| value.starts_with("Basic ")));
+    }
+
+    #[tokio::test]
+    async fn malformed_basic_credentials_are_unauthorised() {
+        let (state, _dir, _deployer, _reader) = standard_client_state().await;
+        let app = test_router(state);
+        for header in ["Basic !!!not-base64", "Basic bm9jb2xvbg=="] {
+            let response = app
+                .clone()
+                .oneshot(client_request("GET", "/v2/", Some(header), true))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{header}");
+        }
+    }
+
+    /// Basic credentials in the clear are refused even when the token is
+    /// good, and even for a read the loopback listener would serve anyone.
+    #[tokio::test]
+    async fn basic_credentials_over_plaintext_are_refused_even_with_a_valid_token() {
+        let (mut state, _dir, deployer, _reader) = standard_client_state().await;
+        state.require_read_auth = false;
+        let app = test_router(state);
+        let auth = basic("ci", &deployer);
+        for (method, uri) in [("GET", "/v2/"), ("POST", "/v2/team/api/blobs/uploads/")] {
+            let response = app
+                .clone()
+                .oneshot(client_request(method, uri, Some(&auth), false))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {uri}"
+            );
+            assert!(challenge(&response).is_none(), "{method} {uri}");
+            let body = String::from_utf8(body_bytes(response).await).unwrap();
+            assert!(body.contains("only accepted over TLS"), "{body}");
+        }
+    }
+
+    /// A plaintext listener never invites Basic: advertising it would ask
+    /// clients to send their token in the clear.
+    #[tokio::test]
+    async fn plaintext_refusals_carry_no_basic_challenge() {
+        let (state, _dir, _deployer, _reader) = standard_client_state().await;
+        let app = test_router(state);
+        let response = app
+            .oneshot(client_request("GET", "/v2/", None, false))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(challenge(&response).is_none());
+    }
+
+    /// Bearer clients (relish, peer replication) are untouched by the
+    /// Basic support, over either transport.
+    #[tokio::test]
+    async fn bearer_tokens_keep_working_over_both_transports() {
+        let (state, _dir, deployer, _reader) = standard_client_state().await;
+        let app = test_router(state);
+        let auth = format!("Bearer {deployer}");
+        for over_tls in [false, true] {
+            let response = app
+                .clone()
+                .oneshot(client_request(
+                    "POST",
+                    "/v2/team/api/blobs/uploads/",
+                    Some(&auth),
+                    over_tls,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::ACCEPTED, "tls={over_tls}");
+        }
+    }
+
+    // --- Token scope on repositories ---------------------------------------
+
+    /// Plaintext tokens for [`scoped_state`].
+    struct ScopedTokens {
+        /// Deployer scoped to namespace `team-a`.
+        team_a_deployer: String,
+        /// Deployer with no scope.
+        deployer: String,
+        /// ReadOnly scoped to namespace `team-a`.
+        team_a_reader: String,
+        /// ReadOnly with no scope.
+        reader: String,
+    }
+
+    const SERVICE_TOKEN: &str = "rbrg_service_token_for_tests";
+
+    /// A routable registry with scoped and unscoped tokens and a service token.
+    async fn scoped_state() -> (PickleState, tempfile::TempDir, ScopedTokens) {
+        use crate::sesame::types::{ApiRole, TokenScope};
+        let (mut state, dir) = test_state();
+        let team_a = || TokenScope {
+            apps: None,
+            namespaces: Some(vec!["team-a".into()]),
+        };
+        let tokens = crate::sesame::auth::new_token_store();
+        let create = async |name: &str, role: ApiRole, scope: TokenScope| {
+            let created = crate::sesame::token::create_token(name, role, scope, None).unwrap();
+            tokens.write().await.push(created.token);
+            created.plaintext
+        };
+        let plaintext = ScopedTokens {
+            team_a_deployer: create("team-a-ci", ApiRole::Deployer, team_a()).await,
+            deployer: create("ci", ApiRole::Deployer, TokenScope::default()).await,
+            team_a_reader: create("team-a-puller", ApiRole::ReadOnly, team_a()).await,
+            reader: create("puller", ApiRole::ReadOnly, TokenScope::default()).await,
+        };
+        state.auth = Some(crate::sesame::auth::AuthState::new(
+            tokens,
+            Some(SERVICE_TOKEN.to_string()),
+        ));
+        state.require_read_auth = true;
+        state.allow_unauthenticated_bootstrap = false;
+        (state, dir, plaintext)
+    }
+
+    fn with_body(
+        mut request: axum::http::Request<Body>,
+        body: Vec<u8>,
+    ) -> axum::http::Request<Body> {
+        *request.body_mut() = Body::from(body);
+        request
+    }
+
+    /// Push `config` as a blob and a config-only manifest tagged `v1` into
+    /// `repository`, returning the manifest PUT's status.
+    async fn push_image(
+        app: &Router,
+        repository: &str,
+        authorization: &str,
+        over_tls: bool,
+        config: &[u8],
+    ) -> StatusCode {
+        let digest = compute_sha256(config);
+        let blob = app
+            .clone()
+            .oneshot(with_body(
+                client_request(
+                    "POST",
+                    &format!("/v2/{repository}/blobs/uploads/?digest={}", digest.as_str()),
+                    Some(authorization),
+                    over_tls,
+                ),
+                config.to_vec(),
+            ))
+            .await
+            .unwrap();
+        if !blob.status().is_success() {
+            return blob.status();
+        }
+        app.clone()
+            .oneshot(with_body(
+                client_request(
+                    "PUT",
+                    &format!("/v2/{repository}/manifests/v1"),
+                    Some(authorization),
+                    over_tls,
+                ),
+                manifest_body(&digest, config.len()),
+            ))
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// The bug: a Deployer scoped to one namespace could push to any
+    /// repository. Now it pushes only under `<its namespace>/…`, whichever
+    /// envelope carries the token.
+    #[tokio::test]
+    async fn namespace_scoped_deployer_pushes_only_into_its_namespace() {
+        let (state, _dir, tokens) = scoped_state().await;
+        let app = test_router(state);
+        let envelopes = [
+            (format!("Bearer {}", tokens.team_a_deployer), false),
+            (format!("Bearer {}", tokens.team_a_deployer), true),
+            (basic("team-a-ci", &tokens.team_a_deployer), true),
+        ];
+        for (index, (authorization, over_tls)) in envelopes.iter().enumerate() {
+            let config = format!("{{\"envelope\":{index}}}").into_bytes();
+            assert_eq!(
+                push_image(&app, "team-a/web", authorization, *over_tls, &config).await,
+                StatusCode::CREATED,
+                "own namespace, envelope {index}"
+            );
+            for elsewhere in ["team-b/web", "web", "library/redis", "team-a//web"] {
+                let response = app
+                    .clone()
+                    .oneshot(client_request(
+                        "POST",
+                        &format!("/v2/{elsewhere}/blobs/uploads/"),
+                        Some(authorization),
+                        *over_tls,
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    StatusCode::FORBIDDEN,
+                    "{elsewhere}, envelope {index}"
+                );
+                let body: serde_json::Value =
+                    serde_json::from_slice(&body_bytes(response).await).unwrap();
+                assert_eq!(body["errors"][0]["code"], "DENIED", "{body}");
+                assert_eq!(
+                    push_image(&app, elsewhere, authorization, *over_tls, &config).await,
+                    StatusCode::FORBIDDEN,
+                    "{elsewhere} manifest, envelope {index}"
+                );
+            }
+        }
+    }
+
+    /// A manifest PUT, PATCH and completion are each checked on their own,
+    /// not only the upload's first POST.
+    #[tokio::test]
+    async fn every_write_verb_is_held_to_the_scope() {
+        let (state, _dir, tokens) = scoped_state().await;
+        let app = test_router(state);
+        let authorization = format!("Bearer {}", tokens.team_a_deployer);
+        let config = b"{}".to_vec();
+        let digest = compute_sha256(&config);
+        for (method, uri) in [
+            (
+                "PATCH",
+                "/v2/team-b/web/blobs/uploads/some-upload".to_string(),
+            ),
+            (
+                "PUT",
+                format!(
+                    "/v2/team-b/web/blobs/uploads/some-upload?digest={}",
+                    digest.as_str()
+                ),
+            ),
+            ("PUT", "/v2/team-b/web/manifests/v1".to_string()),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(with_body(
+                    client_request(method, &uri, Some(&authorization), false),
+                    manifest_body(&digest, config.len()),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method} {uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn unscoped_deployer_still_pushes_anywhere() {
+        let (state, _dir, tokens) = scoped_state().await;
+        let app = test_router(state);
+        for (over_tls, authorization) in [
+            (false, format!("Bearer {}", tokens.deployer)),
+            (true, basic("ci", &tokens.deployer)),
+        ] {
+            for repository in ["team-b/web", "web", "library/redis"] {
+                let config = format!("{{\"tls\":{over_tls}}}").into_bytes();
+                assert_eq!(
+                    push_image(&app, repository, &authorization, over_tls, &config).await,
+                    StatusCode::CREATED,
+                    "{repository} tls={over_tls}"
+                );
+            }
+        }
+    }
+
+    /// Replication, the build runner and upgrade pushes present the service
+    /// token. It is the system principal, which no user scope applies to.
+    #[tokio::test]
+    async fn the_service_token_still_writes_every_repository() {
+        let (state, _dir, _tokens) = scoped_state().await;
+        let app = test_router(state);
+        let authorization = format!("Bearer {SERVICE_TOKEN}");
+        let bytes = b"the new bun binary".to_vec();
+        let digest = compute_sha256(&bytes);
+        for repository in [crate::upgrade::BINARY_BLOB_REPO, "team-b/web", "web"] {
+            let response = app
+                .clone()
+                .oneshot(with_body(
+                    client_request(
+                        "POST",
+                        &format!("/v2/{repository}/blobs/uploads/?digest={}", digest.as_str()),
+                        Some(&authorization),
+                        false,
+                    ),
+                    bytes.clone(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CREATED, "{repository}");
+        }
+    }
+
+    /// `relish build` uploads the caller's context before `/v1/build`
+    /// checks the destination, so a scoped Deployer must still get it in.
+    #[tokio::test]
+    async fn scoped_deployer_may_upload_a_build_context() {
+        let (state, _dir, tokens) = scoped_state().await;
+        let app = test_router(state);
+        let context = b"a tarred build context".to_vec();
+        let url = format!(
+            "/v2/{}/blobs/uploads/?digest={}",
+            super::super::build::BUILD_CONTEXT_REPOSITORY,
+            compute_sha256(&context).as_str()
+        );
+        let authorization = format!("Bearer {}", tokens.team_a_deployer);
+        let response = app
+            .oneshot(with_body(
+                client_request("POST", &url, Some(&authorization), false),
+                context,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    /// Pulls are held to the same scope as `/v1/status`: a scoped reader
+    /// sees its namespace's repositories and no one else's.
+    #[tokio::test]
+    async fn namespace_scoped_reader_pulls_only_its_namespace() {
+        let (state, _dir, tokens) = scoped_state().await;
+        let app = test_router(state);
+        let push = format!("Bearer {}", tokens.deployer);
+        let own = b"{\"own\":true}".to_vec();
+        let other = b"{\"own\":false}".to_vec();
+        assert_eq!(
+            push_image(&app, "team-a/web", &push, false, &own).await,
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            push_image(&app, "team-b/web", &push, false, &other).await,
+            StatusCode::CREATED
+        );
+
+        for authorization in [
+            format!("Bearer {}", tokens.team_a_reader),
+            basic("team-a-puller", &tokens.team_a_reader),
+        ] {
+            let get = |uri: String| {
+                let app = app.clone();
+                let authorization = authorization.clone();
+                async move {
+                    app.oneshot(client_request("GET", &uri, Some(&authorization), true))
+                        .await
+                        .unwrap()
+                        .status()
+                }
+            };
+            let own_blob = compute_sha256(&own);
+            let other_blob = compute_sha256(&other);
+            assert_eq!(get("/v2/".into()).await, StatusCode::OK);
+            assert_eq!(
+                get("/v2/team-a/web/manifests/v1".into()).await,
+                StatusCode::OK
+            );
+            assert_eq!(get("/v2/team-a/web/tags/list".into()).await, StatusCode::OK);
+            assert_eq!(
+                get(format!("/v2/team-a/web/blobs/{}", own_blob.as_str())).await,
+                StatusCode::OK
+            );
+            for uri in [
+                "/v2/team-b/web/manifests/v1".to_string(),
+                "/v2/team-b/web/tags/list".to_string(),
+                format!("/v2/team-b/web/blobs/{}", other_blob.as_str()),
+                "/v2/web/tags/list".to_string(),
+            ] {
+                assert_eq!(get(uri.clone()).await, StatusCode::FORBIDDEN, "{uri}");
+            }
+            // Blobs are shared by digest, so naming an in-scope repository
+            // must not unlock another namespace's layer.
+            assert_eq!(
+                get(format!("/v2/team-a/web/blobs/{}", other_blob.as_str())).await,
+                StatusCode::NOT_FOUND
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unscoped_reader_still_pulls_everything() {
+        let (state, _dir, tokens) = scoped_state().await;
+        let app = test_router(state);
+        let config = b"{\"bare\":true}".to_vec();
+        assert_eq!(
+            push_image(
+                &app,
+                "web",
+                &format!("Bearer {}", tokens.deployer),
+                false,
+                &config
+            )
+            .await,
+            StatusCode::CREATED
+        );
+        let authorization = format!("Bearer {}", tokens.reader);
+        for uri in [
+            "/v2/web/manifests/v1".to_string(),
+            format!(
+                "/v2/team-b/other/blobs/{}",
+                compute_sha256(&config).as_str()
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(client_request("GET", &uri, Some(&authorization), false))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        }
+    }
+
     async fn body_bytes(response: Response) -> Vec<u8> {
         response
             .into_body()
@@ -3554,8 +4512,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+        let manifest_digest = resp.headers()["docker-content-digest"].clone();
         let manifest_body = body_bytes(resp).await;
         assert!(!manifest_body.is_empty());
+
+        // `crane` and containerd HEAD a manifest before pushing or pulling
+        // it; a 405 here aborts the whole push.
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("HEAD")
+                    .uri("/v2/myapp/manifests/latest")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()["docker-content-digest"], manifest_digest);
+        assert_eq!(
+            resp.headers()["content-length"],
+            manifest_body.len().to_string().as_str()
+        );
+        assert!(body_bytes(resp).await.is_empty());
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("HEAD")
+                    .uri("/v2/myapp/manifests/missing")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
         // Pull layer blob back
         let resp = app

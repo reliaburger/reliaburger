@@ -17,8 +17,9 @@ use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use super::rate_limit::{RateLimitResult, ShardedRateLimiter};
-use super::routing::RoutingTable;
+use super::routing::{BackendScope, RoutingTable};
 use super::types::{WrapperConfig, WrapperError};
+use crate::sesame::connection::ConnectionTimeouts;
 
 /// Shared state for the proxy handlers.
 pub struct ProxyState {
@@ -38,6 +39,10 @@ pub struct ProxyState {
     /// each forwarded request so Bun waits for it to reach zero before
     /// killing the container (DEP5).
     pub drains: Option<super::draining::SharedDrains>,
+    /// On a cluster node, how long it may keep routing with its last view of
+    /// the cluster. A lapsed lease routes only to this node's own backends:
+    /// the remote addresses in that view may already belong to something else.
+    pub view_lease: Option<Arc<crate::onion::lease::ViewLease>>,
 }
 
 /// Largest number of backends the proxy will try for one request: the primary
@@ -124,6 +129,7 @@ pub struct BoundProxy {
     /// pile up tasks (ING2).
     handshake_limit: Arc<Semaphore>,
     handshake_timeout: std::time::Duration,
+    connection_timeouts: ConnectionTimeouts,
     state: Arc<ProxyState>,
     shutdown: CancellationToken,
 }
@@ -152,7 +158,7 @@ pub async fn bind_proxy_with_drains(
     drains: Option<super::draining::SharedDrains>,
     shutdown: CancellationToken,
 ) -> Result<BoundProxy, WrapperError> {
-    bind_proxy_with_tls(config, routing_table, drains, None, shutdown).await
+    bind_proxy_with_tls(config, routing_table, drains, None, None, shutdown).await
 }
 
 /// Bind the listeners, optionally resolving TLS certificates per SNI from the
@@ -167,6 +173,7 @@ pub async fn bind_proxy_with_tls(
     routing_table: Arc<RwLock<RoutingTable>>,
     drains: Option<super::draining::SharedDrains>,
     cert_resolver: Option<Arc<dyn rustls::server::ResolvesServerCert>>,
+    view_lease: Option<Arc<crate::onion::lease::ViewLease>>,
     shutdown: CancellationToken,
 ) -> Result<BoundProxy, WrapperError> {
     let client = reqwest::Client::builder()
@@ -182,6 +189,7 @@ pub async fn bind_proxy_with_tls(
         rate_limiter: ShardedRateLimiter::new(),
         max_request_body_bytes: config.max_request_body_bytes,
         drains,
+        view_lease,
     });
 
     let http_listener = bind(config.http_port).await?;
@@ -234,6 +242,7 @@ pub async fn bind_proxy_with_tls(
         file_cert_resolver,
         handshake_limit: Arc::new(Semaphore::new(config.max_tls_handshakes)),
         handshake_timeout: config.tls_handshake_timeout,
+        connection_timeouts: ConnectionTimeouts::PRODUCTION,
         state,
         shutdown,
     })
@@ -256,6 +265,15 @@ fn local_addr(listener: &TcpListener) -> Result<SocketAddr, WrapperError> {
 }
 
 impl BoundProxy {
+    /// Replace the idle, stall and keepalive deadlines applied to accepted
+    /// connections. Tests shrink them to milliseconds; production keeps
+    /// [`ConnectionTimeouts::PRODUCTION`]. The TLS handshake deadline stays
+    /// `WrapperConfig::tls_handshake_timeout`.
+    pub fn with_connection_timeouts(mut self, timeouts: ConnectionTimeouts) -> Self {
+        self.connection_timeouts = timeouts;
+        self
+    }
+
     /// Serve both listeners until the shutdown token fires.
     pub async fn serve(self) -> Result<(), WrapperError> {
         // The two listeners share one handler but tag requests with the
@@ -271,18 +289,15 @@ impl BoundProxy {
             .layer(axum::Extension(ServedOverTls(true)))
             .with_state(Arc::clone(&self.state));
 
-        let http = {
-            let app = http_router.into_make_service_with_connect_info::<SocketAddr>();
-            let shutdown = self.shutdown.clone();
-            let listener = self.http_listener;
-            async move {
-                axum::serve(listener, app)
-                    .with_graceful_shutdown(async move {
-                        shutdown.cancelled().await;
-                    })
-                    .await
-                    .map_err(|e| WrapperError::ProxyFailed(e.to_string()))
-            }
+        let http = async {
+            crate::sesame::connection::serve_router_plain(
+                self.http_listener,
+                http_router,
+                self.connection_timeouts,
+                self.shutdown.clone(),
+            )
+            .await;
+            Ok::<(), WrapperError>(())
         };
 
         let https = serve_tls(
@@ -290,7 +305,10 @@ impl BoundProxy {
             self.tls_acceptor,
             https_router,
             self.handshake_limit,
-            self.handshake_timeout,
+            ConnectionTimeouts {
+                tls_handshake: self.handshake_timeout,
+                ..self.connection_timeouts
+            },
             self.shutdown.clone(),
         );
 
@@ -317,13 +335,9 @@ async fn serve_tls(
     acceptor: tokio_rustls::TlsAcceptor,
     router: axum::Router,
     handshake_limit: Arc<Semaphore>,
-    handshake_timeout: std::time::Duration,
+    timeouts: ConnectionTimeouts,
     shutdown: CancellationToken,
 ) -> Result<(), WrapperError> {
-    use tower::Service;
-
-    let mut make_service = router.into_make_service_with_connect_info::<SocketAddr>();
-
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => return Ok(()),
@@ -343,17 +357,17 @@ async fn serve_tls(
                     Err(_) => continue,
                 };
 
-                let service = match make_service.call(remote).await {
-                    Ok(service) => service,
-                    Err(infallible) => match infallible {},
-                };
+                let _ = crate::sesame::connection::configure_accepted_socket(&tcp, &timeouts);
+                let router = router
+                    .clone()
+                    .layer(axum::Extension(axum::extract::ConnectInfo(remote)));
                 let acceptor = acceptor.clone();
                 let connection_shutdown = shutdown.clone();
                 tokio::spawn(async move {
                     // Hold the handshake permit only until the handshake
                     // resolves; the request itself is bounded separately.
                     let handshake = tokio::time::timeout(
-                        handshake_timeout,
+                        timeouts.tls_handshake,
                         acceptor.accept(tcp),
                     ).await;
                     drop(permit);
@@ -363,25 +377,17 @@ async fn serve_tls(
                         _ => return,
                     };
                     use crate::sesame::connection::{
-                        LifetimeLimitedIo, MAX_TLS_CONNECTION_LIFETIME, TLS_CONNECTION_DRAIN_GRACE,
+                        LifetimeLimitedIo, MAX_TLS_CONNECTION_LIFETIME, serve_http_connection,
                     };
                     let tls_stream = LifetimeLimitedIo::new(tls_stream, MAX_TLS_CONNECTION_LIFETIME);
-                    let hyper_service = hyper_util::service::TowerToHyperService::new(service);
-                    let builder = hyper_util::server::conn::auto::Builder::new(
-                        hyper_util::rt::TokioExecutor::new(),
-                    );
-                    let connection = builder.serve_connection_with_upgrades(
-                        hyper_util::rt::TokioIo::new(tls_stream), hyper_service,
-                    );
-                    tokio::pin!(connection);
-                    let drain_after = MAX_TLS_CONNECTION_LIFETIME.saturating_sub(TLS_CONNECTION_DRAIN_GRACE);
-                    tokio::select! {
-                        _ = &mut connection => return,
-                        _ = connection_shutdown.cancelled() => {},
-                        _ = tokio::time::sleep(drain_after) => {},
-                    }
-                    connection.as_mut().graceful_shutdown();
-                    let _ = tokio::time::timeout(TLS_CONNECTION_DRAIN_GRACE, connection).await;
+                    serve_http_connection(
+                        tls_stream,
+                        router,
+                        timeouts,
+                        Some(MAX_TLS_CONNECTION_LIFETIME),
+                        connection_shutdown,
+                    )
+                    .await;
                 });
             }
         }
@@ -450,6 +456,18 @@ async fn do_proxy(
 
     let path = req.uri().path().to_string();
 
+    // Once the view lease lapses, other nodes may have reused any remote
+    // address in the table; only this node's own backends stay routable.
+    let scope = if state
+        .view_lease
+        .as_ref()
+        .is_some_and(|lease| !lease.is_valid())
+    {
+        BackendScope::LocalOnly
+    } else {
+        BackendScope::Cluster
+    };
+
     // Capture request ownership before releasing the routing read lock.
     // Withdrawal takes the write lock before starting a drain, so it cannot
     // miss a handler that has already copied an endpoint (including failover).
@@ -459,7 +477,8 @@ async fn do_proxy(
             Some(r) => r,
             None => return StatusCode::NOT_FOUND.into_response(),
         };
-        let candidates = route.select_backends(if is_ws { 1 } else { MAX_UPSTREAM_ATTEMPTS });
+        let candidates =
+            route.select_backends(if is_ws { 1 } else { MAX_UPSTREAM_ATTEMPTS }, scope);
         let (guard, tokens) = match &state.drains {
             Some(drains) => {
                 let instance_ids: Vec<_> = candidates.iter().map(|(id, _)| id.clone()).collect();
@@ -518,10 +537,12 @@ async fn do_proxy(
     }
 
     // The primary backend, plus failover candidates behind it. An empty list
-    // means nothing is routable, so 502.
-    let backend = match candidates.first() {
-        Some((_id, addr)) => *addr,
-        None => return StatusCode::BAD_GATEWAY.into_response(),
+    // means nothing is routable, so 502, unless only the lapsed lease is
+    // holding remote backends back: that's temporary, so 503.
+    let backend = match (candidates.first(), scope) {
+        (Some((_id, addr)), _) => *addr,
+        (None, BackendScope::LocalOnly) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        (None, BackendScope::Cluster) => return StatusCode::BAD_GATEWAY.into_response(),
     };
 
     // WebSocket: delegate to the upgrade handler (no body buffering). The
@@ -898,6 +919,121 @@ mod tests {
         assert_eq!(location, "https://myapp.com/dashboard?tab=1");
     }
 
+    /// Z6.7: once a cluster node's view lease lapses, the leader may discharge
+    /// it and let other nodes reuse the remote addresses its routes still
+    /// name. Wrapper keeps serving from this node's own backends, whose
+    /// addresses only this node can reuse, and refuses a route with none.
+    #[tokio::test]
+    async fn a_lapsed_view_lease_serves_only_local_backends() {
+        use crate::onion::types::BackendInstance;
+        use std::net::Ipv4Addr;
+
+        async fn answering(body: &'static str) -> u16 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt;
+                while let Ok((mut sock, _)) = listener.accept().await {
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(response.as_bytes()).await;
+                }
+            });
+            port
+        }
+        let (here, there) = (answering("local").await, answering("remote").await);
+        let backend = |instance_id: &str, host_port, local| BackendInstance {
+            instance_id: instance_id.to_string(),
+            node_ip: Ipv4Addr::LOCALHOST,
+            host_port,
+            healthy: true,
+            local,
+        };
+        let mut service_map = crate::onion::service_map::ServiceMap::new();
+        let mut ingress = std::collections::HashMap::new();
+        for (app, backends) in [
+            (
+                "web",
+                vec![
+                    backend("default__web-0", here, true),
+                    backend("node-2:10.0.0.2:30001", there, false),
+                ],
+            ),
+            ("api", vec![backend("node-2:10.0.0.2:30002", there, false)]),
+        ] {
+            service_map.register_app(app, "default", 80, None).unwrap();
+            for backend in backends {
+                service_map
+                    .add_backend(
+                        &crate::onion::service_id::ServiceId::new("default", app),
+                        backend,
+                    )
+                    .unwrap();
+            }
+            ingress.insert(
+                ("default".to_string(), app.to_string()),
+                crate::config::app::IngressSpec {
+                    host: format!("{app}.test"),
+                    path: None,
+                    tls: None,
+                    websocket: None,
+                    rate_limit_rps: None,
+                    rate_limit_burst: None,
+                },
+            );
+        }
+        let mut table = RoutingTable::new();
+        table.rebuild(&service_map, &ingress).unwrap();
+        let lease = Arc::new(crate::onion::lease::ViewLease::default());
+        lease.enforce();
+        lease.renew(crate::onion::lease::boot_clock_ns());
+        let shutdown = CancellationToken::new();
+        let bound = bind_proxy_with_tls(
+            WrapperConfig {
+                http_port: 0,
+                https_port: 0,
+                ..WrapperConfig::default()
+            },
+            Arc::new(RwLock::new(table)),
+            None,
+            None,
+            Some(lease.clone()),
+            shutdown.clone(),
+        )
+        .await
+        .unwrap();
+        let url = format!("http://127.0.0.1:{}/", bound.http_addr.port());
+        tokio::spawn(async move {
+            bound.serve().await.ok();
+        });
+        let client = reqwest::Client::new();
+        let get = |host: &'static str| {
+            let request = client.get(&url).header("host", host);
+            async move {
+                let response = request.send().await.unwrap();
+                (response.status(), response.text().await.unwrap())
+            }
+        };
+        let mut answers = std::collections::BTreeSet::new();
+        for _ in 0..4 {
+            answers.insert(get("web.test").await.1);
+        }
+        assert_eq!(answers.len(), 2, "a current lease spreads across nodes");
+        assert_eq!(get("api.test").await.0, StatusCode::OK);
+
+        lease.expire();
+        for _ in 0..4 {
+            assert_eq!(get("web.test").await, (StatusCode::OK, "local".to_string()));
+        }
+        assert_eq!(get("api.test").await.0, StatusCode::SERVICE_UNAVAILABLE);
+
+        lease.renew(crate::onion::lease::boot_clock_ns());
+        assert_eq!(get("api.test").await.0, StatusCode::OK);
+        shutdown.cancel();
+    }
+
     /// ING5: a client that supplies its own `X-Forwarded-For`/`-Proto` has
     /// them replaced with the proxy's view, so a backend can't be lied to.
     /// A backend echoes the headers it received; the proxy must show the real
@@ -938,6 +1074,7 @@ mod tests {
                     node_ip: Ipv4Addr::LOCALHOST,
                     host_port: backend_port,
                     healthy: true,
+                    local: false,
                 },
             )
             .unwrap();
@@ -1038,6 +1175,7 @@ mod tests {
                     node_ip: Ipv4Addr::LOCALHOST,
                     host_port: backend_port,
                     healthy: true,
+                    local: false,
                 },
             )
             .unwrap();
@@ -1154,6 +1292,7 @@ mod tests {
                     node_ip: Ipv4Addr::LOCALHOST,
                     host_port: backend_port,
                     healthy: true,
+                    local: false,
                 },
             )
             .unwrap();
@@ -1263,6 +1402,7 @@ mod tests {
                     node_ip: Ipv4Addr::LOCALHOST,
                     host_port: dead_port,
                     healthy: true,
+                    local: false,
                 },
             )
             .unwrap();
@@ -1274,6 +1414,7 @@ mod tests {
                     node_ip: Ipv4Addr::LOCALHOST,
                     host_port: live_port,
                     healthy: true,
+                    local: false,
                 },
             )
             .unwrap();
@@ -1354,6 +1495,7 @@ mod tests {
                     node_ip: Ipv4Addr::LOCALHOST,
                     host_port: backend_port,
                     healthy: true,
+                    local: false,
                 },
             )
             .unwrap();
@@ -1448,6 +1590,7 @@ mod tests {
                     node_ip: Ipv4Addr::LOCALHOST,
                     host_port: backend_port,
                     healthy: true,
+                    local: false,
                 },
             )
             .unwrap();
@@ -1538,6 +1681,7 @@ mod tests {
                     node_ip: std::net::Ipv4Addr::LOCALHOST,
                     host_port: port,
                     healthy: true,
+                    local: false,
                 },
             )
             .unwrap();
@@ -1645,6 +1789,7 @@ mod tests {
                     node_ip: Ipv4Addr::LOCALHOST,
                     host_port: backend_port,
                     healthy: true,
+                    local: false,
                 },
             )
             .unwrap();
@@ -1814,6 +1959,7 @@ mod tests {
                     node_ip: Ipv4Addr::LOCALHOST,
                     host_port: backend_port,
                     healthy: true,
+                    local: false,
                 },
             )
             .unwrap();
@@ -2008,6 +2154,7 @@ mod tests {
                         node_ip: Ipv4Addr::LOCALHOST,
                         host_port: port,
                         healthy: true,
+                        local: false,
                     },
                 )
                 .unwrap();
@@ -2162,6 +2309,7 @@ mod tests {
                         node_ip: Ipv4Addr::LOCALHOST,
                         host_port: 0,
                         healthy: true,
+                        local: false,
                     },
                 )
                 .unwrap();
@@ -2174,6 +2322,7 @@ mod tests {
                     node_ip: Ipv4Addr::LOCALHOST,
                     host_port: backend_port,
                     healthy: true,
+                    local: false,
                 },
             )
             .unwrap();

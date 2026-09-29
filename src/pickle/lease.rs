@@ -160,7 +160,6 @@ impl PickleState {
                 repository: repository.into(),
                 node_id: self.node_raft_id,
                 owner_id: owner.map(str::to_owned),
-                observed_at_unix_ms: now,
             })
             .await?;
         if let Some(response) = response {

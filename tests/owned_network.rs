@@ -347,3 +347,172 @@ async fn same_node_containers_have_independent_host_and_peer_routes() {
     }
     exercise.unwrap();
 }
+
+/// Deletes the test's network namespaces (and with them the veth pair).
+struct NamespaceCleanup(Vec<String>);
+
+impl Drop for NamespaceCleanup {
+    fn drop(&mut self) {
+        for name in &self.0 {
+            let _ = std::process::Command::new("ip")
+                .args(["netns", "del", name])
+                .status();
+        }
+    }
+}
+
+fn ip(args: &[&str]) {
+    let status = std::process::Command::new("ip")
+        .args(args)
+        .status()
+        .unwrap();
+    assert!(status.success(), "ip {args:?} failed");
+}
+
+/// Run `work` on a thread that has joined the named network namespace, so
+/// every socket it creates lives there.
+fn in_namespace<T: Send + 'static>(name: &str, work: impl FnOnce() -> T + Send + 'static) -> T {
+    let file = std::fs::File::open(format!("/run/netns/{name}")).unwrap();
+    std::thread::spawn(move || {
+        nix::sched::setns(file, nix::sched::CloneFlags::CLONE_NEWNET).unwrap();
+        work()
+    })
+    .join()
+    .unwrap()
+}
+
+/// Whether a TCP connect from `source` to `server:port` completes within a
+/// short deadline. A dropped SYN shows up as a timeout.
+fn connects_from(source: std::net::Ipv4Addr, server: std::net::Ipv4Addr, port: u16) -> bool {
+    use std::net::SocketAddrV4;
+    use std::os::fd::AsRawFd;
+
+    use nix::sys::socket::{
+        AddressFamily, SockFlag, SockType, SockaddrIn, bind, connect, setsockopt, socket, sockopt,
+    };
+    use nix::sys::time::{TimeVal, TimeValLike};
+
+    let fd = socket(
+        AddressFamily::Inet,
+        SockType::Stream,
+        SockFlag::SOCK_CLOEXEC,
+        None,
+    )
+    .unwrap();
+    bind(
+        fd.as_raw_fd(),
+        &SockaddrIn::from(SocketAddrV4::new(source, 0)),
+    )
+    .unwrap();
+    // On Linux a blocking connect honours SO_SNDTIMEO.
+    setsockopt(&fd, sockopt::SendTimeout, &TimeVal::milliseconds(1500)).unwrap();
+    connect(
+        fd.as_raw_fd(),
+        &SockaddrIn::from(SocketAddrV4::new(server, port)),
+    )
+    .is_ok()
+}
+
+/// `[security] operator_cidrs` admits the operator's address to the API port
+/// and nothing else, as the kernel actually filters it: the perimeter
+/// ruleset is applied inside a throwaway namespace, never the host's.
+#[test]
+#[ignore = "requires root, ip and nft; applies the perimeter ruleset inside isolated namespaces"]
+fn operator_cidr_reaches_the_api_port_but_not_cluster_ports() {
+    use reliaburger::firewall::rules::{ClusterNodes, PerimeterConfig, generate_ruleset};
+    use std::io::Write;
+    use std::net::Ipv4Addr;
+
+    assert!(nix::unistd::geteuid().is_root());
+    let pid = std::process::id();
+    let server_ns = format!("rbop-srv-{pid}");
+    let client_ns = format!("rbop-cli-{pid}");
+    let _cleanup = NamespaceCleanup(vec![server_ns.clone(), client_ns.clone()]);
+    let server_link = format!("rbops{pid}");
+    let client_link = format!("rbopc{pid}");
+
+    ip(&["netns", "add", &server_ns]);
+    ip(&["netns", "add", &client_ns]);
+    ip(&[
+        "link",
+        "add",
+        &server_link,
+        "netns",
+        &server_ns,
+        "type",
+        "veth",
+        "peer",
+        "name",
+        &client_link,
+        "netns",
+        &client_ns,
+    ]);
+    ip(&[
+        "-n",
+        &server_ns,
+        "addr",
+        "add",
+        "198.18.77.1/24",
+        "dev",
+        &server_link,
+    ]);
+    ip(&["-n", &server_ns, "link", "set", &server_link, "up"]);
+    ip(&["-n", &server_ns, "link", "set", "lo", "up"]);
+    ip(&[
+        "-n",
+        &client_ns,
+        "addr",
+        "add",
+        "198.18.77.2/24",
+        "dev",
+        &client_link,
+    ]);
+    ip(&[
+        "-n",
+        &client_ns,
+        "addr",
+        "add",
+        "198.18.77.3/24",
+        "dev",
+        &client_link,
+    ]);
+    ip(&["-n", &client_ns, "link", "set", &client_link, "up"]);
+
+    let config = PerimeterConfig {
+        enabled: true,
+        operator_cidrs: vec!["198.18.77.2/32".to_string()],
+        ..PerimeterConfig::default()
+    };
+    let ruleset = generate_ruleset(&config, &ClusterNodes::new()).unwrap();
+    let mut nft = std::process::Command::new("ip")
+        .args(["netns", "exec", &server_ns, "nft", "-f", "-"])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    nft.stdin
+        .take()
+        .unwrap()
+        .write_all(ruleset.as_bytes())
+        .unwrap();
+    assert!(nft.wait().unwrap().success(), "nft rejected:\n{ruleset}");
+
+    let server = Ipv4Addr::new(198, 18, 77, 1);
+    let _listeners = in_namespace(&server_ns, move || {
+        [9117, 9443].map(|port| std::net::TcpListener::bind((server, port)).unwrap())
+    });
+
+    let operator = Ipv4Addr::new(198, 18, 77, 2);
+    let outsider = Ipv4Addr::new(198, 18, 77, 3);
+    let results = in_namespace(&client_ns, move || {
+        (
+            connects_from(operator, server, 9117),
+            connects_from(operator, server, 9443),
+            connects_from(outsider, server, 9117),
+        )
+    });
+    assert_eq!(
+        results,
+        (true, false, false),
+        "(operator→API, operator→Raft, outsider→API)"
+    );
+}

@@ -4,8 +4,8 @@ pub mod bench_cmd;
 /// Separates CLI logic from the binary so it can be tested as a library.
 /// The binary (`src/bin/relish.rs`) handles argument parsing and exit codes;
 /// this module handles everything else.
-pub mod chaos;
 pub mod client;
+pub mod command_reference;
 pub mod commands;
 pub mod compile;
 pub mod dashboard;
@@ -13,6 +13,7 @@ pub mod dev;
 pub mod diff;
 pub mod fault;
 pub mod fmt;
+pub mod install;
 #[cfg(feature = "kubernetes")]
 #[allow(
     clippy::collapsible_if,
@@ -28,8 +29,11 @@ pub mod k8s_export;
 )]
 pub mod k8s_import;
 pub mod local_context;
+pub mod manifest;
 pub mod manual;
+pub mod metrics_cmd;
 pub mod output;
+pub mod path_cmd;
 pub mod plan;
 pub mod quickstart;
 pub mod reader;
@@ -38,8 +42,8 @@ pub mod setup;
 pub mod source;
 pub mod test_cmd;
 mod tls;
-pub mod trace_cmd;
 pub mod tui;
+pub mod uninstall;
 pub mod upgrade;
 pub mod wtf;
 pub mod wtf_cmd;
@@ -52,7 +56,7 @@ use crate::config::ConfigError;
 /// The result of a diagnostic-style command whose *exit code* carries meaning
 /// beyond "did the tool itself error".
 ///
-/// `relish test`, `wtf`, `bench` and `trace` need to say three different
+/// `relish test`, `wtf`, `bench` and `path` need to say three different
 /// things a plain `Result<(), _>` cannot. An `Ok(())` collapses to exit 0 and
 /// an `Err` to exit 1 — but "the suite ran and everything passed" and "the
 /// suite ran and something failed" are both `Ok` as far as the *tool* is
@@ -82,13 +86,6 @@ impl CommandOutcome {
 /// Errors from Relish CLI operations.
 #[derive(Debug, thiserror::Error)]
 pub enum RelishError {
-    /// A legacy command was removed because its ownership contract was unsafe.
-    #[error("{command} is retired; use {replacement}")]
-    RetiredCommand {
-        command: String,
-        replacement: String,
-    },
-
     /// Configuration parse or validation failure.
     #[error("{0}")]
     Config(#[from] ConfigError),
@@ -159,9 +156,23 @@ pub enum RelishError {
     #[error("format failed: {0}")]
     FormatFailed(String),
 
+    /// A manifest URL could not be downloaded.
+    #[error("failed to fetch manifest {url}: {reason}")]
+    ManifestFetch { url: String, reason: String },
+
     /// IO error.
     #[error("{0}")]
     Io(#[from] std::io::Error),
+
+    /// `relish sign` was given an image the Pickle registry doesn't hold.
+    #[error(
+        "{image} is not in the cluster's Pickle registry (push it first; relish sign signs Pickle-hosted images only)"
+    )]
+    ImageNotInRegistry { image: String },
+
+    /// Image signing key error (generation, parsing, signing).
+    #[error("{0}")]
+    ImageSigning(#[from] crate::pickle::signing::SigningError),
 
     /// Upgrade tooling error (key generation, signing).
     #[error("{0}")]
@@ -175,4 +186,12 @@ pub enum RelishError {
     /// Council disaster recovery failed (12b.2 D21/CP12).
     #[error("council recover failed: {0}")]
     Recovery(String),
+
+    /// `relish uninstall` refused or could not remove something.
+    #[error("{0}")]
+    Uninstall(#[from] uninstall::UninstallError),
+
+    /// `relish manual CHAPTER` named no single chapter.
+    #[error("{0}")]
+    Manual(#[from] manual::ManualError),
 }

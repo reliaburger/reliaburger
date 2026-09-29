@@ -16,9 +16,9 @@ use crate::meat::NodeId;
 use super::assignment::assign_parent;
 use super::transport::ReportingTransport;
 use super::types::{
-    AppResourceUsage, DnsCapabilityReport, EgressAffectedWorkload, EgressEnforcementEvidence,
-    EgressEnforcementStatus, NodeCapabilityReport, NodeReadinessReport, ReportHealthStatus,
-    ReportingMessage, ResourceUsage, RunningApp, StateReport,
+    AppResourceUsage, EgressAffectedWorkload, EgressEnforcementEvidence, EgressEnforcementStatus,
+    NodeCapabilityReport, NodeReadinessReport, ReportHealthStatus, ReportingMessage, ResourceUsage,
+    RunningApp, StateReport,
 };
 
 /// Snapshot of a single workload instance, provided by the agent.
@@ -75,6 +75,24 @@ pub struct AgentSnapshot {
     pub egress_affected_workloads: Vec<EgressAffectedWorkload>,
 }
 
+/// How many stale windows (`stale_report_timeout_secs`) a busy agent loop
+/// may go unanswered while the worker keeps re-sending the state the loop
+/// last observed. Past this the worker stops reporting, so a wedged loop
+/// still fences the node.
+const BUSY_LOOP_STALE_WINDOWS: u32 = 4;
+
+/// How long the worker waits for the agent loop to answer a snapshot request.
+const SNAPSHOT_DEADLINE: Duration = Duration::from_secs(2);
+
+/// The last snapshot the agent loop answered, and when.
+struct ObservedSnapshot {
+    snapshot: AgentSnapshot,
+    /// Monotonic, for ageing out a wedged loop.
+    observed_at: tokio::time::Instant,
+    /// Wall clock, carried as the report's timestamp when re-sent.
+    observed_wall: SystemTime,
+}
+
 /// Request sent to the agent to collect a state snapshot.
 ///
 /// The agent handles this in its event loop and responds with an
@@ -98,6 +116,11 @@ pub struct ReportWorker<T: ReportingTransport> {
     /// Whether `buildah` is on PATH, probed once at construction and
     /// carried in every report (build routing, Phase 12 F2).
     has_buildah: bool,
+    /// Live readiness evidence, read directly so a busy agent loop can't
+    /// hold it back. `None` falls back to the snapshot's copy.
+    readiness: Option<crate::bun::readiness::ReadinessTracker>,
+    /// What the agent loop last reported, re-sent while the loop is busy.
+    last_observed: Option<ObservedSnapshot>,
 }
 
 impl<T: ReportingTransport> ReportWorker<T> {
@@ -128,7 +151,16 @@ impl<T: ReportingTransport> ReportWorker<T> {
             council_rx,
             shutdown,
             has_buildah,
+            readiness: None,
+            last_observed: None,
         }
+    }
+
+    /// Read readiness evidence straight from the node's tracker instead of
+    /// only through the agent loop.
+    pub fn with_readiness(mut self, readiness: crate::bun::readiness::ReadinessTracker) -> Self {
+        self.readiness = Some(readiness);
+        self
     }
 
     /// Run the worker event loop until shutdown.
@@ -196,45 +228,73 @@ impl<T: ReportingTransport> ReportWorker<T> {
             .map(|(_, addr)| *addr)
     }
 
-    async fn send_report_until_shutdown(&self) {
+    async fn send_report_until_shutdown(&mut self) {
+        let shutdown = self.shutdown.clone();
         tokio::select! {
-            _ = self.shutdown.cancelled() => {},
+            _ = shutdown.cancelled() => {},
             _ = self.send_report() => {},
         }
     }
 
     /// Collect state and send a report to the parent.
-    async fn send_report(&self) {
+    ///
+    /// A report proves two things: the node is alive, and here is what it
+    /// runs. Only the second needs the agent loop. When the loop is too busy
+    /// to answer in time, the worker re-sends the state the loop last
+    /// observed. The leader learns nothing new, but it doesn't mistake a
+    /// busy node for a dead one and move its apps away. A loop that stays
+    /// silent for `BUSY_LOOP_STALE_WINDOWS` stale windows is treated as
+    /// wedged, and the worker stops reporting.
+    async fn send_report(&mut self) {
         let parent = match self.parent_address {
             Some(addr) => addr,
             None => return, // no council — nothing to report to
         };
 
-        let snapshot = match self.collect_snapshot().await {
-            Some(s) => s,
-            None => {
-                eprintln!("report worker: snapshot collection failed or timed out");
-                return;
+        let (snapshot, observed_wall) = match self.collect_snapshot().await {
+            Some(snapshot) => {
+                let observed_wall = SystemTime::now();
+                self.last_observed = Some(ObservedSnapshot {
+                    snapshot: snapshot.clone(),
+                    observed_at: tokio::time::Instant::now(),
+                    observed_wall,
+                });
+                (snapshot, observed_wall)
             }
+            None => match self.recent_observation() {
+                Some(observed) => {
+                    eprintln!(
+                        "report worker: agent loop did not answer within {}s; \
+                         re-sending the state it observed {}s ago",
+                        SNAPSHOT_DEADLINE.as_secs(),
+                        observed.observed_at.elapsed().as_secs()
+                    );
+                    (observed.snapshot.clone(), observed.observed_wall)
+                }
+                None => {
+                    eprintln!(
+                        "report worker: snapshot collection failed or timed out, \
+                         and no recent observation to re-send"
+                    );
+                    return;
+                }
+            },
         };
 
         let capability_report = self.build_capability_report(&snapshot);
-        let dns_report = DnsCapabilityReport {
-            node_id: self.node_id.clone(),
-            capability: snapshot.capabilities.dns,
+        let evidence = match &self.readiness {
+            Some(tracker) => Some(tracker.snapshot().await),
+            None => snapshot.readiness.clone(),
         };
-        let readiness_report = snapshot
-            .readiness
-            .clone()
-            .map(|evidence| NodeReadinessReport {
-                node_id: self.node_id.clone(),
-                evidence,
-            });
-        let report = self.build_report(snapshot);
+        let readiness_report = evidence.map(|evidence| NodeReadinessReport {
+            node_id: self.node_id.clone(),
+            evidence,
+        });
+        let mut report = self.build_report(snapshot);
+        report.timestamp = observed_wall;
         let mut messages = vec![
             ReportingMessage::Report(report),
             ReportingMessage::CapabilityReport(capability_report),
-            ReportingMessage::DnsCapabilityReport(dns_report),
         ];
         if let Some(report) = readiness_report {
             messages.push(ReportingMessage::NodeReadinessReport(report));
@@ -248,13 +308,26 @@ impl<T: ReportingTransport> ReportWorker<T> {
         }
     }
 
+    /// The last loop-answered snapshot, if it is young enough to re-send.
+    /// An agent loop that has exited is gone, not busy: nothing to re-send.
+    fn recent_observation(&self) -> Option<&ObservedSnapshot> {
+        if self.snapshot_tx.is_closed() {
+            return None;
+        }
+        let grace =
+            Duration::from_secs(self.config.stale_report_timeout_secs) * BUSY_LOOP_STALE_WINDOWS;
+        self.last_observed
+            .as_ref()
+            .filter(|observed| observed.observed_at.elapsed() <= grace)
+    }
+
     /// Request a snapshot from the agent via the command channel.
     async fn collect_snapshot(&self) -> Option<AgentSnapshot> {
         let (tx, rx) = oneshot::channel();
         let request = CollectSnapshotRequest { response: tx };
 
         // Queue admission and the response share one deadline.
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(SNAPSHOT_DEADLINE, async {
             self.snapshot_tx.send(request).await.ok()?;
             rx.await.ok()
         })
@@ -331,9 +404,7 @@ impl<T: ReportingTransport> ReportWorker<T> {
         }
     }
 
-    /// Build the additive capability message. An old peer may reject this
-    /// separate extension frame, but it still accepts the preceding legacy
-    /// `StateReport` frame.
+    /// Build the capability message sent after each `StateReport`.
     fn build_capability_report(&self, snapshot: &AgentSnapshot) -> NodeCapabilityReport {
         NodeCapabilityReport {
             node_id: self.node_id.clone(),
@@ -386,6 +457,49 @@ mod tests {
         }
     }
 
+    /// The state a fake agent reports: one healthy `web` instance.
+    fn fake_snapshot() -> AgentSnapshot {
+        AgentSnapshot {
+            capabilities: crate::meat::cluster_state::NodeCapabilities {
+                dns: crate::onion::dns::DnsCapability {
+                    enabled: true,
+                    ready: true,
+                    ipv4: true,
+                    ipv6: false,
+                    workload_reachable: true,
+                },
+                ..Default::default()
+            },
+            readiness: Some(crate::bun::readiness::NodeReadinessEvidence {
+                ready: true,
+                observed_at_unix_ms: 1,
+                subsystems: Vec::new(),
+            }),
+            egress_degraded: true,
+            egress_affected_workloads: vec![EgressAffectedWorkload {
+                app_name: "web".to_string(),
+                namespace: "default".to_string(),
+            }],
+            instances: vec![InstanceSnapshot {
+                execution: None,
+                app_name: "web".to_string(),
+                namespace: "default".to_string(),
+                instance_id: 0,
+                image: "nginx:latest".to_string(),
+                port: Some(8080),
+                container_state: ContainerState::Running,
+                consecutive_unhealthy: 0,
+                uptime: Duration::from_secs(120),
+                cpu_request_millicores: 250,
+                memory_request_mb: 128,
+                egress_enforcement: Default::default(),
+            }],
+            allocated_ports: vec![8080],
+            capacity_cpu_millicores: 7500,
+            capacity_memory_mb: 15_872,
+        }
+    }
+
     /// Helper: spawn a fake agent that responds to snapshot requests.
     fn spawn_fake_agent(
         mut rx: mpsc::Receiver<CollectSnapshotRequest>,
@@ -397,46 +511,7 @@ mod tests {
                     _ = shutdown.cancelled() => break,
                     req = rx.recv() => {
                         if let Some(req) = req {
-                            let snapshot = AgentSnapshot {
-                                capabilities: crate::meat::cluster_state::NodeCapabilities {
-                                    dns: crate::onion::dns::DnsCapability {
-                                        enabled: true,
-                                        ready: true,
-                                        ipv4: true,
-                                        ipv6: false,
-                                        workload_reachable: true,
-                                    },
-                                    ..Default::default()
-                                },
-                                readiness: Some(crate::bun::readiness::NodeReadinessEvidence {
-                                    ready: true,
-                                    observed_at_unix_ms: 1,
-                                    subsystems: Vec::new(),
-                                }),
-                                egress_degraded: true,
-                                egress_affected_workloads: vec![EgressAffectedWorkload {
-                                    app_name: "web".to_string(),
-                                    namespace: "default".to_string(),
-                                }],
-                                instances: vec![InstanceSnapshot {
-                                    execution: None,
-                                    app_name: "web".to_string(),
-                                    namespace: "default".to_string(),
-                                    instance_id: 0,
-                                    image: "nginx:latest".to_string(),
-                                    port: Some(8080),
-                                    container_state: ContainerState::Running,
-                                    consecutive_unhealthy: 0,
-                                    uptime: Duration::from_secs(120),
-                                    cpu_request_millicores: 250,
-                                    memory_request_mb: 128,
-                                    egress_enforcement: Default::default(),
-                                }],
-                                allocated_ports: vec![8080],
-                                capacity_cpu_millicores: 7500,
-                                capacity_memory_mb: 15_872,
-                            };
-                            let _ = req.response.send(snapshot);
+                            let _ = req.response.send(fake_snapshot());
                         } else {
                             break;
                         }
@@ -473,6 +548,157 @@ mod tests {
             .await
             .expect("worker remained stuck admitting a snapshot request")
             .unwrap();
+    }
+
+    /// Answer the next snapshot request, as a free agent loop would.
+    async fn answer_one(rx: &mut mpsc::Receiver<CollectSnapshotRequest>) {
+        let request = rx.recv().await.unwrap();
+        let _ = request.response.send(fake_snapshot());
+    }
+
+    fn stall_config() -> ReportingTreeSection {
+        ReportingTreeSection {
+            report_interval_secs: 5,
+            max_events_per_report: 100,
+            stale_report_timeout_secs: 30,
+        }
+    }
+
+    async fn received_reports(
+        transport: &crate::reporting::transport::InMemoryReportingTransport,
+    ) -> Vec<ReportingMessage> {
+        let mut messages = Vec::new();
+        while let Ok(Some((_, _, message))) =
+            tokio::time::timeout(Duration::from_millis(10), transport.recv()).await
+        {
+            messages.push(message);
+        }
+        messages
+    }
+
+    /// V02 final tier: the agent loop was busy for over a minute during the
+    /// `relish test` pulse, every snapshot request missed its deadline, and
+    /// the leader marked a healthy node stale and moved its apps away. A
+    /// busy loop must not silence the node: the worker re-sends what the
+    /// loop last observed, and fresh readiness from the tracker.
+    #[tokio::test(start_paused = true)]
+    async fn busy_agent_loop_still_sends_the_last_observed_state() {
+        let net = InMemoryReportingNetwork::new();
+        let transport = net.register(addr(1)).await;
+        let council = net.register(addr(2)).await;
+        let (snapshot_tx, mut snapshot_rx) = mpsc::channel(16);
+        let (_council_tx, council_rx) = watch::channel(vec![(NodeId::new("c1"), addr(2))]);
+        let readiness = crate::bun::readiness::ReadinessTracker::new();
+        readiness.register("agent", true).await;
+        readiness.ready("agent").await;
+        let mut worker = ReportWorker::new(
+            NodeId::new("w1"),
+            transport,
+            stall_config(),
+            snapshot_tx,
+            council_rx,
+            CancellationToken::new(),
+        )
+        .with_readiness(readiness);
+
+        tokio::join!(worker.send_report(), answer_one(&mut snapshot_rx));
+        assert_eq!(received_reports(&council).await.len(), 3);
+
+        // The loop is now stuck: requests queue up and nobody answers.
+        for _ in 0..8 {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            worker.send_report().await;
+            let messages = received_reports(&council).await;
+            let Some(ReportingMessage::Report(report)) = messages.first() else {
+                panic!("a busy agent loop silenced the node: {messages:?}");
+            };
+            assert_eq!(report.running_apps.len(), 1);
+            assert_eq!(report.running_apps[0].app_name, "web");
+            let readiness = messages
+                .iter()
+                .find_map(|message| match message {
+                    ReportingMessage::NodeReadinessReport(report) => Some(report),
+                    _ => None,
+                })
+                .expect("readiness must keep flowing");
+            assert!(readiness.evidence.ready);
+            // Fresh from the tracker, not the snapshot's copy (stamped 1).
+            assert!(readiness.evidence.observed_at_unix_ms > 1);
+        }
+    }
+
+    /// A loop that never answers again is wedged, not busy. After the grace
+    /// the worker stops reporting, so the leader still fences the node.
+    #[tokio::test(start_paused = true)]
+    async fn wedged_agent_loop_stops_reports_after_the_grace() {
+        let net = InMemoryReportingNetwork::new();
+        let transport = net.register(addr(1)).await;
+        let council = net.register(addr(2)).await;
+        let (snapshot_tx, mut snapshot_rx) = mpsc::channel(64);
+        let (_council_tx, council_rx) = watch::channel(vec![(NodeId::new("c1"), addr(2))]);
+        let mut worker = ReportWorker::new(
+            NodeId::new("w1"),
+            transport,
+            stall_config(),
+            snapshot_tx,
+            council_rx,
+            CancellationToken::new(),
+        );
+        tokio::join!(worker.send_report(), answer_one(&mut snapshot_rx));
+        assert_eq!(received_reports(&council).await.len(), 3);
+
+        // Four stale windows of 30 s: 120 s of grace.
+        tokio::time::sleep(Duration::from_secs(121)).await;
+        worker.send_report().await;
+        assert!(
+            received_reports(&council).await.is_empty(),
+            "a wedged loop kept the node looking alive"
+        );
+    }
+
+    /// An agent loop that has exited isn't busy. Its last state must not
+    /// keep the node looking alive.
+    #[tokio::test(start_paused = true)]
+    async fn exited_agent_loop_is_not_covered_for() {
+        let net = InMemoryReportingNetwork::new();
+        let transport = net.register(addr(1)).await;
+        let council = net.register(addr(2)).await;
+        let (snapshot_tx, mut snapshot_rx) = mpsc::channel(16);
+        let (_council_tx, council_rx) = watch::channel(vec![(NodeId::new("c1"), addr(2))]);
+        let mut worker = ReportWorker::new(
+            NodeId::new("w1"),
+            transport,
+            stall_config(),
+            snapshot_tx,
+            council_rx,
+            CancellationToken::new(),
+        );
+        tokio::join!(worker.send_report(), answer_one(&mut snapshot_rx));
+        assert_eq!(received_reports(&council).await.len(), 3);
+        drop(snapshot_rx);
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        worker.send_report().await;
+        assert!(received_reports(&council).await.is_empty());
+    }
+
+    /// With no observation at all there is nothing honest to send.
+    #[tokio::test(start_paused = true)]
+    async fn silent_agent_loop_sends_nothing_before_its_first_answer() {
+        let net = InMemoryReportingNetwork::new();
+        let transport = net.register(addr(1)).await;
+        let council = net.register(addr(2)).await;
+        let (snapshot_tx, _snapshot_rx) = mpsc::channel(16);
+        let (_council_tx, council_rx) = watch::channel(vec![(NodeId::new("c1"), addr(2))]);
+        let mut worker = ReportWorker::new(
+            NodeId::new("w1"),
+            transport,
+            stall_config(),
+            snapshot_tx,
+            council_rx,
+            CancellationToken::new(),
+        );
+        worker.send_report().await;
+        assert!(received_reports(&council).await.is_empty());
     }
 
     #[tokio::test]
@@ -538,16 +764,7 @@ mod tests {
                 namespace: "default".to_string(),
             }]
         );
-
-        let (_, _, msg) = tokio::time::timeout(Duration::from_secs(1), council_transport.recv())
-            .await
-            .expect("should receive DNS capability after egress capability")
-            .unwrap();
-        let ReportingMessage::DnsCapabilityReport(dns) = msg else {
-            panic!("expected DnsCapabilityReport");
-        };
-        assert_eq!(dns.node_id, NodeId::new("w1"));
-        assert!(dns.capability.can_resolve_internal());
+        assert!(capability.capabilities.dns.can_resolve_internal());
 
         let (_, _, msg) = tokio::time::timeout(Duration::from_secs(1), council_transport.recv())
             .await

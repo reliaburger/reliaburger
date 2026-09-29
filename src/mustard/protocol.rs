@@ -4,9 +4,14 @@
 /// 1. Picks a random alive peer to probe.
 /// 2. Sends a PING (with piggybacked membership updates).
 /// 3. Waits for an ACK within `probe_timeout`.
-/// 4. If no ACK, sends PING-REQ to `indirect_probe_count` random peers.
-/// 5. If still no ACK, marks the target as Suspect.
+/// 4. If no ACK, sends PING-REQ to up to `indirect_probe_count` random peers.
+/// 5. Waits one more `probe_timeout` for a relayed or late direct ACK
+///    (even when no relay exists), then marks the target as Suspect.
 /// 6. Promotes expired suspects to Dead.
+///
+/// Every `push_pull_interval` (and on the first cycle, so a joining node
+/// syncs straight away) it also exchanges its membership table with one
+/// random live peer: anti-entropy for whatever piggybacking missed.
 ///
 /// The `MustardNode` struct owns the membership table, dissemination
 /// queue, and transport, and drives the protocol as an async task.
@@ -14,6 +19,8 @@ use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
 use std::time::Instant;
 
+use rand::SeedableRng;
+use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use tokio_util::sync::CancellationToken;
 
@@ -26,10 +33,22 @@ use super::directory::NodeDirectory;
 use super::dissemination::DisseminationQueue;
 use super::membership::{MembershipSnapshot, MembershipTable};
 use super::message::{
-    DirectoryExtension, GossipMessage, GossipPayload, LeaderHint, MembershipUpdate,
+    DirectoryExtension, GossipMessage, GossipPayload, LeaderHint, MAX_PIGGYBACK_UPDATES,
+    MAX_SYNC_ENTRIES, MembershipUpdate,
 };
 use super::state::NodeState;
 use super::transport::MustardTransport;
+
+/// What a published membership snapshot is compared by.
+type MembershipDigest = (
+    NodeId,
+    NodeState,
+    u64,
+    bool,
+    bool,
+    SocketAddr,
+    BTreeMap<String, String>,
+);
 
 /// A participant in the Mustard gossip protocol.
 ///
@@ -58,7 +77,7 @@ pub struct MustardNode<T: MustardTransport> {
     rejoin_watch: Option<watch::Sender<bool>>,
     /// Digest of the last-published membership. Used to publish on any content
     /// change (state/incarnation/council/leader), not just a count change.
-    last_published_digest: Vec<(NodeId, NodeState, u64, bool, bool)>,
+    last_published_digest: Vec<MembershipDigest>,
     /// Whether this node has announced its own departure.
     ///
     /// Once it has, a `Left` about us echoing back off a peer is our own
@@ -98,6 +117,19 @@ pub struct MustardNode<T: MustardTransport> {
     directory: NodeDirectory,
     /// Optional watch channel publishing the directory on change.
     directory_watch: Option<watch::Sender<NodeDirectory>>,
+    /// The Smoker node-kill switch shared with this node's transports.
+    /// While it is closed this node is "dead": it forms no opinions about
+    /// its peers, so it has no stale suspicions to spread once it reopens.
+    node_gate: crate::smoker::node_fault::NodeTransportGate,
+    /// Source of randomness for probe-target and relay selection. Seeded
+    /// from the OS in production; tests can pin it to replay one schedule.
+    rng: StdRng,
+    /// When the next anti-entropy push-pull is due. Starts at creation, so
+    /// the first cycle with a live peer syncs: that is the join sync.
+    next_push_pull: Instant,
+    /// Where the next outgoing window of the membership table starts, for
+    /// tables larger than one exchange carries (`MAX_SYNC_ENTRIES`).
+    sync_cursor: usize,
 }
 
 impl<T: MustardTransport> MustardNode<T> {
@@ -138,7 +170,17 @@ impl<T: MustardTransport> MustardNode<T> {
             council_roles_rx: None,
             directory: NodeDirectory::default(),
             directory_watch: None,
+            node_gate: crate::smoker::node_fault::NodeTransportGate::new(),
+            rng: StdRng::from_entropy(),
+            next_push_pull: Instant::now(),
+            sync_cursor: 0,
         }
+    }
+
+    /// Share the Smoker node-kill switch that also gates this node's
+    /// transports, so failure detection pauses while the node plays dead.
+    pub fn set_node_gate(&mut self, gate: crate::smoker::node_fault::NodeTransportGate) {
+        self.node_gate = gate;
     }
 
     /// Advertise this node's control-plane endpoints (API and reporting
@@ -340,7 +382,6 @@ impl<T: MustardTransport> MustardNode<T> {
                     address: member.address,
                     state: member.state,
                     incarnation: member.incarnation,
-                    lamport: 0,
                 },
             );
             updates.truncate(super::message::MAX_PIGGYBACK_UPDATES);
@@ -366,7 +407,10 @@ impl<T: MustardTransport> MustardNode<T> {
             self.membership.set_roles(&roles);
         }
         let snapshot = self.membership.snapshot();
-        let digest: Vec<(NodeId, NodeState, u64, bool, bool)> = snapshot
+        // Labels and addresses change without a state or incarnation change
+        // (a node restarted with a new `[node.labels]`), so they're part of
+        // the digest too; otherwise that change is never published.
+        let digest: Vec<MembershipDigest> = snapshot
             .iter()
             .map(|m| {
                 (
@@ -375,6 +419,8 @@ impl<T: MustardTransport> MustardNode<T> {
                     m.incarnation,
                     m.is_council,
                     m.is_leader,
+                    m.address,
+                    m.labels.clone(),
                 )
             })
             .collect();
@@ -414,7 +460,6 @@ impl<T: MustardTransport> MustardNode<T> {
                 address: self.address,
                 state: NodeState::Left,
                 incarnation: self.incarnation,
-                lamport: 0,
             },
             self.membership.len(),
         );
@@ -474,6 +519,12 @@ impl<T: MustardTransport> MustardNode<T> {
     /// probing), and promotes expired suspects to dead. Exposed publicly
     /// so tests can drive the protocol step-by-step.
     pub async fn run_one_cycle(&mut self) {
+        // A node-kill fault makes this node play dead. A dead process runs
+        // no failure detector, and every probe would fail anyway, so any
+        // verdict reached now would be about the gate, not the peer.
+        if self.node_gate.is_quiesced() {
+            return;
+        }
         // An explicit departure retires a contact; a failure does not. Inspect
         // Left before reaping, while that distinction still exists.
         self.rejoin_contacts.retain(|(node, _)| {
@@ -490,6 +541,12 @@ impl<T: MustardTransport> MustardNode<T> {
             self.publish_directory();
         }
         self.ping_rejoin_contact().await;
+
+        // An isolated node stays due, so it syncs with the first peer it
+        // finds rather than a whole interval later.
+        if now >= self.next_push_pull && self.push_pull().await {
+            self.next_push_pull = now + self.config.push_pull_interval;
+        }
 
         let target = self.pick_probe_target();
         let Some((target_id, target_addr)) = target else {
@@ -535,18 +592,21 @@ impl<T: MustardTransport> MustardNode<T> {
                 .await;
         }
 
-        // Wait for indirect ACK
-        if !relays.is_empty() {
-            let got_indirect = self
-                .wait_for_ack(&target_id, self.config.probe_timeout)
-                .await;
-            if got_indirect {
-                return;
-            }
+        // Wait for an indirect ACK, or a late direct one. Wait even with no
+        // relays: in a three-node cluster that has lost one member, the lost
+        // member is the only possible relay, and suspecting the healthy peer
+        // after a single `probe_timeout` would halve the evidence every other
+        // probe gets. One slow ACK on a loaded host was enough.
+        let got_late_or_indirect = self
+            .wait_for_ack(&target_id, self.config.probe_timeout)
+            .await;
+        if got_late_or_indirect {
+            return;
         }
 
-        // No ACK at all — mark as suspect
-        if self.membership.suspect(&target_id) {
+        // No ACK at all — mark as suspect, unless the gate closed while we
+        // waited: then the silence is ours, not the target's.
+        if !self.node_gate.is_quiesced() && self.membership.suspect(&target_id) {
             self.dissemination.enqueue(
                 MembershipUpdate {
                     node_id: target_id.clone(),
@@ -558,7 +618,6 @@ impl<T: MustardTransport> MustardNode<T> {
                     // peers (detection stops propagating) or wrongly overrides
                     // fresher Alive state.
                     incarnation: self.membership_incarnation_of(&target_id),
-                    lamport: 0,
                 },
                 self.membership.len(),
             );
@@ -627,7 +686,6 @@ impl<T: MustardTransport> MustardNode<T> {
                     address: from,
                     state: NodeState::Alive,
                     incarnation: message.incarnation,
-                    lamport: 0,
                 },
                 self.membership.len(),
             );
@@ -727,6 +785,14 @@ impl<T: MustardTransport> MustardNode<T> {
                     }
                 }
             }
+            GossipPayload::Sync { wants_reply, .. } => {
+                // The entries were merged above like any piggybacked update.
+                // Answer a request with our own table; never answer a reply,
+                // or two nodes would bounce their tables back and forth.
+                if *wants_reply {
+                    self.send_membership(from, false).await;
+                }
+            }
             GossipPayload::Ack { relayed, .. } => {
                 if !relayed
                     && message.sender != self.node_id
@@ -763,7 +829,6 @@ impl<T: MustardTransport> MustardNode<T> {
             address: self.address,
             state: NodeState::Alive,
             incarnation: self.incarnation,
-            lamport: 0,
         };
         // Apply the refutation to our own record too, not just the outbound
         // queue (O9). The claim we're refuting was applied a moment ago, so
@@ -772,6 +837,82 @@ impl<T: MustardTransport> MustardNode<T> {
         // still holds it Suspect, Dead or Left.
         self.membership.apply_update(&update, Instant::now());
         self.dissemination.enqueue(update, self.membership.len());
+    }
+
+    /// Start an anti-entropy exchange with one random live peer.
+    ///
+    /// Pushes our membership table (or the next window of it, see
+    /// `membership_window`) and asks the peer to push its own back.
+    /// Both sides merge under the ordinary SWIM precedence, so a stale entry
+    /// can't resurrect a dead node or undo a refutation. Returns `false` when
+    /// there is no live peer to sync with.
+    pub async fn push_pull(&mut self) -> bool {
+        let mut candidates: Vec<_> = self
+            .membership
+            .alive_members()
+            .into_iter()
+            .filter(|m| m.node_id != self.node_id)
+            .map(|m| (m.node_id.clone(), m.address))
+            .collect();
+        candidates.sort_unstable();
+        let Some((_, address)) = candidates.choose(&mut self.rng).cloned() else {
+            return false;
+        };
+        self.send_membership(address, true).await;
+        true
+    }
+
+    /// Send our membership table to `target` as a burst of `Sync` datagrams.
+    /// Only the first datagram carries `wants_reply`, so the peer answers once.
+    ///
+    /// Sync datagrams go out unstamped: the directory extension can take
+    /// ~700 bytes with a full label set, and every probe already carries it,
+    /// so the whole UDP budget goes to membership entries instead.
+    async fn send_membership(&mut self, target: SocketAddr, wants_reply: bool) {
+        let window = self.membership_window();
+        for (index, entries) in window.chunks(MAX_PIGGYBACK_UPDATES).enumerate() {
+            let sync = GossipMessage::new(
+                self.node_id.clone(),
+                self.incarnation,
+                GossipPayload::Sync {
+                    entries: entries.to_vec(),
+                    wants_reply: wants_reply && index == 0,
+                },
+            );
+            let _ = self.transport.send(target, &sync).await;
+        }
+    }
+
+    /// The membership entries for one exchange: the whole table when it fits
+    /// in [`MAX_SYNC_ENTRIES`], otherwise the next window of that many,
+    /// rotating through the table (sorted by node id) one exchange at a time.
+    ///
+    /// Every entry goes, whatever its state. A peer that missed a `Dead` or
+    /// `Left` needs to hear it as much as one that missed a join.
+    fn membership_window(&mut self) -> Vec<MembershipUpdate> {
+        let mut entries: Vec<MembershipUpdate> = self
+            .membership
+            .iter()
+            .map(|m| MembershipUpdate {
+                node_id: m.node_id.clone(),
+                address: m.address,
+                state: m.state,
+                incarnation: m.incarnation,
+            })
+            .collect();
+        if entries.len() <= MAX_SYNC_ENTRIES {
+            return entries;
+        }
+        entries.sort_unstable_by(|a, b| a.node_id.cmp(&b.node_id));
+        let start = self.sync_cursor % entries.len();
+        self.sync_cursor = start + MAX_SYNC_ENTRIES;
+        entries
+            .iter()
+            .cycle()
+            .skip(start)
+            .take(MAX_SYNC_ENTRIES)
+            .cloned()
+            .collect()
     }
 
     /// Promote suspects whose suspicion timeout has expired to Dead.
@@ -802,7 +943,6 @@ impl<T: MustardTransport> MustardNode<T> {
                         address: node_addr,
                         state: NodeState::Dead,
                         incarnation: inc,
-                        lamport: 0,
                     },
                     self.membership.len(),
                 );
@@ -811,38 +951,43 @@ impl<T: MustardTransport> MustardNode<T> {
     }
 
     /// Pick a random alive peer to probe (not ourselves).
-    pub fn pick_probe_target(&self) -> Option<(NodeId, SocketAddr)> {
-        let candidates: Vec<_> = self
+    pub fn pick_probe_target(&mut self) -> Option<(NodeId, SocketAddr)> {
+        let mut candidates: Vec<_> = self
             .membership
             .active_members()
             .into_iter()
             .filter(|m| m.node_id != self.node_id)
             .collect();
+        // The table is a HashMap, whose order differs per process; sorting
+        // makes the choice depend only on the RNG, so a seeded RNG replays.
+        candidates.sort_unstable_by(|a, b| a.node_id.cmp(&b.node_id));
 
-        if candidates.is_empty() {
-            return None;
-        }
-
-        let mut rng = rand::thread_rng();
-        let target = candidates.choose(&mut rng).unwrap();
+        let target = candidates.choose(&mut self.rng)?;
         Some((target.node_id.clone(), target.address))
     }
 
     /// Pick random relay nodes for indirect probing (not ourselves, not the target).
-    fn pick_relays(&self, target: &NodeId) -> Vec<SocketAddr> {
-        let candidates: Vec<_> = self
+    fn pick_relays(&mut self, target: &NodeId) -> Vec<SocketAddr> {
+        let mut candidates: Vec<_> = self
             .membership
             .alive_members()
             .into_iter()
             .filter(|m| m.node_id != self.node_id && m.node_id != *target)
             .collect();
+        candidates.sort_unstable_by(|a, b| a.node_id.cmp(&b.node_id));
 
-        let mut rng = rand::thread_rng();
         let count = self.config.indirect_probe_count.min(candidates.len());
         candidates
-            .choose_multiple(&mut rng, count)
+            .choose_multiple(&mut self.rng, count)
             .map(|m| m.address)
             .collect()
+    }
+
+    /// Replace the OS-seeded RNG with a fixed seed, so a test replays
+    /// exactly one probe schedule.
+    #[cfg(test)]
+    fn seed_rng(&mut self, seed: u64) {
+        self.rng = StdRng::seed_from_u64(seed);
     }
 
     /// Wait for an ACK from (or about) the target within the timeout.
@@ -946,7 +1091,7 @@ impl<T: MustardTransport> MustardNode<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mustard::transport::InMemoryNetwork;
+    use crate::mustard::transport::{InMemoryNetwork, InMemoryTransport};
     use std::time::Duration;
 
     fn addr(port: u16) -> SocketAddr {
@@ -960,6 +1105,7 @@ mod tests {
             suspicion_timeout: Duration::from_millis(100),
             indirect_probe_count: 2,
             cleanup_timeout: Duration::from_millis(200),
+            push_pull_interval: Duration::from_millis(500),
         }
     }
 
@@ -989,7 +1135,6 @@ mod tests {
                 address: member.address,
                 state: NodeState::Left,
                 incarnation: member.incarnation,
-                lamport: 1,
             })
             .collect::<Vec<_>>()
         {
@@ -1099,7 +1244,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn ping_receives_ack() {
         let net = InMemoryNetwork::new();
         let t1 = net.register(addr(1)).await;
@@ -1119,16 +1264,8 @@ mod tests {
             "seed membership is not rejoin evidence"
         );
 
-        // Spawn n2 to handle incoming messages
-        let shutdown = CancellationToken::new();
-        let shutdown2 = shutdown.clone();
-        let handle = tokio::spawn(async move {
-            node2.run(shutdown2).await;
-            node2
-        });
-
         // n1 runs one probe cycle — should ping n2 and get ACK
-        node1.run_one_cycle().await;
+        probe_answered_by(&mut node1, answer(&mut node2)).await;
 
         assert!(
             *rejoin_rx.borrow(),
@@ -1138,9 +1275,6 @@ mod tests {
         // n2 should still be alive (not suspected)
         let n2_state = node1.membership.get(&NodeId::new("n2")).unwrap().state;
         assert_eq!(n2_state, NodeState::Alive);
-
-        shutdown.cancel();
-        let _ = handle.await;
     }
 
     #[tokio::test]
@@ -1169,6 +1303,52 @@ mod tests {
         assert!(
             !*rejoin_rx.borrow(),
             "unreachable membership cannot prove rejoin"
+        );
+    }
+
+    #[tokio::test]
+    async fn quiesced_node_forms_no_opinions_about_its_peers() {
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        // n2 is unreachable, exactly as every peer is while n1's node-kill
+        // gate drops all of its datagrams.
+        let gate = crate::smoker::node_fault::NodeTransportGate::new();
+        let mut node1 = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
+        node1.set_node_gate(gate.clone());
+        node1.membership.add_node(
+            NodeId::new("n2"),
+            addr(2),
+            1,
+            BTreeMap::new(),
+            Instant::now(),
+        );
+
+        gate.quiesce();
+        for _ in 0..3 {
+            node1.run_one_cycle().await;
+            tokio::time::sleep(fast_config().suspicion_timeout).await;
+        }
+
+        // A killed node runs no failure detector. Suspicions formed while it
+        // was cut off would spread after the gate reopens and knock healthy
+        // peers out of everyone's live membership.
+        let n2 = node1.membership.get(&NodeId::new("n2")).unwrap();
+        assert_eq!(n2.state, NodeState::Alive);
+        assert!(
+            node1
+                .dissemination
+                .select_updates()
+                .iter()
+                .all(|update| update.node_id != NodeId::new("n2")),
+            "no rumour about n2 may be queued while n1 is quiesced"
+        );
+
+        gate.restore();
+        node1.run_one_cycle().await;
+        assert_eq!(
+            node1.membership.get(&NodeId::new("n2")).unwrap().state,
+            NodeState::Suspect,
+            "failure detection resumes once the gate reopens"
         );
     }
 
@@ -1312,7 +1492,6 @@ mod tests {
                     address: addr(2),
                     state: NodeState::Suspect,
                     incarnation: 1,
-                    lamport: 1,
                 }],
             },
         );
@@ -1349,7 +1528,6 @@ mod tests {
                     address: addr(2),
                     state: NodeState::Dead,
                     incarnation: 1,
-                    lamport: 1,
                 }],
             },
         );
@@ -1385,7 +1563,6 @@ mod tests {
                 address: addr(3),
                 state: NodeState::Alive,
                 incarnation: 1,
-                lamport: 1,
             },
             3,
         );
@@ -1405,7 +1582,7 @@ mod tests {
         assert!(node2.membership.get(&NodeId::new("n3")).is_some());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn ping_timeout_triggers_ping_req() {
         // 3 nodes: A, B, C. Partition A↔B. When A probes B, the direct
         // PING times out. A should then send a PingReq to C (the only
@@ -1445,17 +1622,10 @@ mod tests {
         // Partition A↔B so direct PING is dropped
         net.partition(addr(1), addr(2)).await;
 
-        // Spawn C so it responds to A's pings and PingReqs
-        let shutdown = CancellationToken::new();
-        let shutdown_c = shutdown.clone();
-        let handle_c = tokio::spawn(async move {
-            node_c.run(shutdown_c).await;
-            node_c
-        });
-
-        // Run cycles until A picks B and marks it Suspect
+        // Run cycles until A picks B and marks it Suspect, with C answering
+        // A's pings and PingReqs on the same task.
         for _ in 0..20 {
-            node_a.run_one_cycle().await;
+            probe_answered_by(&mut node_a, answer(&mut node_c)).await;
             if node_a
                 .membership
                 .get(&NodeId::new("b"))
@@ -1464,9 +1634,6 @@ mod tests {
                 break;
             }
         }
-
-        shutdown.cancel();
-        let _node_c = handle_c.await.unwrap();
 
         // A should have marked B as Suspect
         assert_eq!(
@@ -1491,7 +1658,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn ping_req_relay_forwards_to_target_and_requester() {
         // When C receives a PingReq from A asking to probe B, C should:
         // 1. Send a Ping to B
@@ -1519,21 +1686,14 @@ mod tests {
         );
         ta.send(addr(3), &ping_req).await.unwrap();
 
-        // C processes the PingReq — spawns a Ping to B and waits for ACK.
-        // We need B to respond, so spawn B's handler concurrently.
-        let shutdown = CancellationToken::new();
-        let shutdown_b = shutdown.clone();
-        let handle_b = tokio::spawn(async move {
-            node_b.run(shutdown_b).await;
-            node_b
-        });
-
-        // C handles the PingReq (will send Ping to B, wait for ACK, forward to A)
+        // C handles the PingReq (will send Ping to B, wait for ACK, forward
+        // to A) while B answers on the same task.
         let (from, msg) = node_c.transport.recv().await.unwrap();
-        node_c.handle_message(from, msg).await;
-
-        shutdown.cancel();
-        let _node_b = handle_b.await.unwrap();
+        tokio::select! {
+            biased;
+            () = answer(&mut node_b) => {}
+            () = node_c.handle_message(from, msg) => {}
+        }
 
         // A should have received a forwarded ACK with sender=B
         let mut saw_forwarded_ack = false;
@@ -1548,7 +1708,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn indirect_probe_success_prevents_suspect() {
         // A↔B partitioned, but A↔C and B↔C are fine. When A probes B,
         // the direct PING fails, but C relays successfully. B should
@@ -1571,30 +1731,18 @@ mod tests {
         node_a.add_seed(NodeId::new("b"), addr(2));
         node_a.add_seed(NodeId::new("c"), addr(3));
 
-        // Spawn B and C so they can handle messages while A runs its probe cycle.
-        // A's run_one_cycle will: PING B (dropped), timeout, PingReq to C,
-        // C probes B (succeeds), C forwards ACK to A, A receives it.
-        let shutdown = CancellationToken::new();
-        let shutdown_b = shutdown.clone();
-        let shutdown_c = shutdown.clone();
-        let handle_b = tokio::spawn(async move {
-            node_b.run(shutdown_b).await;
-            node_b
-        });
-        let handle_c = tokio::spawn(async move {
-            node_c.run(shutdown_c).await;
-            node_c
-        });
-
+        // B and C answer while A runs its probe cycles. A's cycle will:
+        // PING B (dropped), timeout, PingReq to C, C probes B (succeeds),
+        // C forwards ACK to A, A receives it.
+        //
         // Run cycles until A probes B. If A picks C, the cycle succeeds
         // normally. We keep going until A has probed B at least once.
         for _ in 0..20 {
-            node_a.run_one_cycle().await;
+            let peers = async {
+                tokio::join!(answer(&mut node_b), answer(&mut node_c));
+            };
+            probe_answered_by(&mut node_a, peers).await;
         }
-
-        shutdown.cancel();
-        let _ = handle_b.await;
-        let _ = handle_c.await;
 
         // B should still be Alive (indirect probe via C saved it)
         let b_state = node_a.membership.get(&NodeId::new("b")).unwrap().state;
@@ -1605,16 +1753,124 @@ mod tests {
         );
     }
 
+    /// Answer everything that reaches `node` for as long as it is polled.
+    async fn answer(node: &mut MustardNode<InMemoryTransport>) {
+        while let Some((from, message)) = node.transport.recv().await {
+            node.handle_message(from, message).await;
+        }
+    }
+
+    /// Run one probe cycle on `prober` while `peers` answer on the same task.
+    ///
+    /// Spawned peer `run` loops let a loaded host starve them past the
+    /// prober's 20 ms probe window. Here `biased` polls the peers first, so
+    /// every message already delivered is answered before the prober looks
+    /// again, and under paused time the clock only moves once both sides are
+    /// idle.
+    async fn probe_answered_by(
+        prober: &mut MustardNode<InMemoryTransport>,
+        peers: impl std::future::Future<Output = ()>,
+    ) {
+        tokio::select! {
+            biased;
+            () = peers => {}
+            () = prober.run_one_cycle() => {}
+        }
+    }
+
+    /// Probe `b` from `a` once, with `b` answering the PING after `delay`.
+    /// Neither node has a relay for the other, like a three-node cluster
+    /// that has already lost one member. Paused time and no spawned task
+    /// make the ACK's lateness exact.
+    async fn probe_without_relays(delay: Duration) -> NodeState {
+        let net = InMemoryNetwork::new();
+        let ta = net.register(addr(1)).await;
+        let tb = net.register(addr(2)).await;
+        let mut a = MustardNode::new(NodeId::new("a"), addr(1), fast_config(), ta);
+        let mut b = MustardNode::new(NodeId::new("b"), addr(2), fast_config(), tb);
+        a.add_seed(NodeId::new("b"), addr(2));
+        a.next_push_pull = Instant::now() + Duration::from_secs(3600);
+
+        let b_answers = async {
+            let (from, ping) = b.transport.recv().await.expect("a pings b");
+            tokio::time::sleep(delay).await;
+            b.handle_message(from, ping).await;
+        };
+        tokio::join!(a.run_one_cycle(), b_answers);
+        a.membership.get(&NodeId::new("b")).unwrap().state
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn late_ack_without_relays_keeps_the_target_alive() {
+        let late = fast_config().probe_timeout * 3 / 2;
+        assert_eq!(probe_without_relays(late).await, NodeState::Alive);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silence_past_both_probe_windows_without_relays_suspects_the_target() {
+        let too_late = fast_config().probe_timeout * 5 / 2;
+        assert_eq!(probe_without_relays(too_late).await, NodeState::Suspect);
+    }
+
+    /// Rounds between anti-entropy exchanges in the manual simulations: the
+    /// default 10 s `push_pull_interval` over the default 500 ms probe period.
+    const PUSH_PULL_EVERY_ROUNDS: usize = 20;
+
     #[tokio::test]
     async fn gossip_convergence_five_nodes() {
-        // 5 nodes in a ring topology (each knows the next).
-        // After enough cycles, all nodes should know about all others.
+        // 5 nodes in a ring topology (each knows the next). After enough
+        // rounds, every node should know about every other.
         //
         // We manually drive PING/ACK exchanges rather than spawning
         // concurrent tasks (tokio::spawn + start_paused is unreliable
-        // under parallel test load; see tokio #3709). And we use
-        // try_recv() to drain messages without involving timers, so
-        // the test is fully deterministic modulo random target selection.
+        // under parallel test load; see tokio #3709), and use try_recv()
+        // to drain messages without timers.
+        //
+        // Before anti-entropy, 73 schedules in 100,000 stranded a member for
+        // good: every update about it spent its bounded re-broadcasts before
+        // reaching some node, the queues drained, and no later round helped.
+        // With push-pull all 100,000 converged by round 23, three rounds
+        // after the first exchange. So this runs 2,000 fresh schedules every
+        // time, from an OS-random base, and allows two exchanges' worth of
+        // rounds; a failure prints the seed that replays it.
+        let base: u64 = rand::random();
+        for offset in 0..2_000u64 {
+            let seed = base.wrapping_add(offset);
+            let rounds = converge_five_node_ring(seed, Some(PUSH_PULL_EVERY_ROUNDS)).await;
+            assert!(
+                rounds.is_some_and(|round| round < 2 * PUSH_PULL_EVERY_ROUNDS),
+                "seed {seed}: five-node ring took {rounds:?} rounds to converge"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stranding_schedule_is_rescued_by_push_pull() {
+        // Seed 830 is the first of the 73 schedules in 0..100,000 that
+        // stranded a member permanently with piggybacking alone. The
+        // simulation leaves the first exchange until round 20, so up to then
+        // this replays the stranding schedule exactly, and push-pull has to
+        // do the rescue.
+        assert_eq!(
+            converge_five_node_ring(830, None).await,
+            None,
+            "seed 830 no longer strands without anti-entropy; pick another stranding seed"
+        );
+        let rounds = converge_five_node_ring(830, Some(PUSH_PULL_EVERY_ROUNDS)).await;
+        assert!(
+            rounds.is_some_and(|round| round >= PUSH_PULL_EVERY_ROUNDS),
+            "push-pull did not rescue the stranded member: {rounds:?}"
+        );
+    }
+
+    /// Drive a seeded five-node ring until every node sees five active
+    /// members. Returns the round it converged in, or `None` after 100.
+    ///
+    /// With `push_pull_every = Some(n)`, every node also starts an
+    /// anti-entropy exchange on rounds n, 2n, 3n, … Round 0 is left to
+    /// piggybacking so a schedule replays identically up to the first
+    /// exchange, whichever way it is run.
+    async fn converge_five_node_ring(seed: u64, push_pull_every: Option<usize>) -> Option<usize> {
         let net = InMemoryNetwork::new();
         let config = fast_config();
 
@@ -1625,7 +1881,8 @@ mod tests {
             let a = addr(100 + i);
             addresses.push(a);
             let t = net.register(a).await;
-            let node = MustardNode::new(NodeId::new(format!("n{i}")), a, config.clone(), t);
+            let mut node = MustardNode::new(NodeId::new(format!("n{i}")), a, config.clone(), t);
+            node.seed_rng(seed.wrapping_mul(5).wrapping_add(u64::from(i)));
             nodes.push(node);
         }
 
@@ -1638,12 +1895,14 @@ mod tests {
         }
 
         // Simulate gossip rounds. Each round:
-        // 1. Every node picks a random peer and sends a PING
+        // 1. Every node picks a random peer and sends a PING (and, when an
+        //    exchange is due, a push-pull request to another random peer)
         // 2. Every node drains its inbox (processing PINGs → sending
-        //    ACKs, applying piggybacked updates)
-        // 3. Every node drains again (picking up the ACKs)
-        for _ in 0..100 {
-            // Phase 1: each node sends a PING to a random peer
+        //    ACKs, sync requests → sending its table, applying entries)
+        // 3. Every node drains again (picking up the ACKs and sync replies)
+        for round in 0..100 {
+            let push_pull_due =
+                push_pull_every.is_some_and(|every| round > 0 && round % every == 0);
             for node in &mut nodes {
                 if let Some((_target_id, target_addr)) = node.pick_probe_target() {
                     let updates = node.dissemination.select_updates();
@@ -1654,9 +1913,11 @@ mod tests {
                     );
                     let _ = node.transport.send(target_addr, &ping).await;
                 }
+                if push_pull_due {
+                    node.push_pull().await;
+                }
             }
 
-            // Phase 2+3: drain messages twice (PINGs then ACKs)
             for _ in 0..2 {
                 for node in &mut nodes {
                     while let Some((from, msg)) = node.transport.try_recv() {
@@ -1664,22 +1925,249 @@ mod tests {
                     }
                 }
             }
-        }
 
-        // Every node should know about all 5 members
-        for node in &nodes {
-            let alive_count = node.membership.active_members().len();
-            assert_eq!(
-                alive_count, 5,
-                "node {} sees {} active members, expected 5",
-                node.node_id, alive_count
+            if nodes
+                .iter()
+                .all(|node| node.membership.active_members().len() == 5)
+            {
+                return Some(round);
+            }
+        }
+        None
+    }
+
+    // -- anti-entropy push-pull (C6.5) ----------------------------------------
+
+    fn entry(node: &str, port: u16, state: NodeState, incarnation: u64) -> MembershipUpdate {
+        MembershipUpdate {
+            node_id: NodeId::new(node),
+            address: addr(port),
+            state,
+            incarnation,
+        }
+    }
+
+    fn sync_from(sender: &str, entries: Vec<MembershipUpdate>, wants_reply: bool) -> GossipMessage {
+        GossipMessage::new(
+            NodeId::new(sender),
+            1,
+            GossipPayload::Sync {
+                entries,
+                wants_reply,
+            },
+        )
+    }
+
+    fn state_of<T: MustardTransport>(node: &MustardNode<T>, id: &str) -> Option<(NodeState, u64)> {
+        node.membership
+            .get(&NodeId::new(id))
+            .map(|member| (member.state, member.incarnation))
+    }
+
+    /// Answer everything that reaches `node` for `duration`. Returns how many
+    /// push-pull requests arrived.
+    async fn serve(node: &mut MustardNode<InMemoryTransport>, duration: Duration) -> usize {
+        let deadline = tokio::time::Instant::now() + duration;
+        let mut requests = 0;
+        while tokio::time::Instant::now() < deadline {
+            let Some((from, message)) = node.transport.try_recv() else {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                continue;
+            };
+            if matches!(
+                message.payload,
+                GossipPayload::Sync {
+                    wants_reply: true,
+                    ..
+                }
+            ) {
+                requests += 1;
+            }
+            node.handle_message(from, message).await;
+        }
+        requests
+    }
+
+    #[tokio::test]
+    async fn push_pull_cannot_resurrect_a_dead_node() {
+        let net = InMemoryNetwork::new();
+        let t = net.register(addr(1)).await;
+        let mut node = MustardNode::new(NodeId::new("observer"), addr(1), fast_config(), t);
+        node.membership.add_node(
+            NodeId::new("m"),
+            addr(3),
+            3,
+            BTreeMap::new(),
+            Instant::now(),
+        );
+        node.membership.declare_dead(&NodeId::new("m"));
+
+        // A peer that never heard of the death still holds m Alive, at the
+        // same or an older incarnation. Neither may bring m back.
+        let stale = vec![
+            entry("m", 3, NodeState::Alive, 3),
+            entry("m", 3, NodeState::Alive, 2),
+        ];
+        node.handle_message(addr(2), sync_from("peer", stale, false))
+            .await;
+
+        assert_eq!(state_of(&node, "m"), Some((NodeState::Dead, 3)));
+    }
+
+    #[tokio::test]
+    async fn push_pull_cannot_override_a_refutation() {
+        let net = InMemoryNetwork::new();
+        let t = net.register(addr(1)).await;
+        let mut node = MustardNode::new(NodeId::new("observer"), addr(1), fast_config(), t);
+        // m refuted a suspicion by moving to incarnation 5.
+        node.membership.add_node(
+            NodeId::new("m"),
+            addr(3),
+            5,
+            BTreeMap::new(),
+            Instant::now(),
+        );
+
+        let stale = vec![
+            entry("m", 3, NodeState::Suspect, 4),
+            entry("m", 3, NodeState::Dead, 4),
+        ];
+        node.handle_message(addr(2), sync_from("peer", stale, false))
+            .await;
+
+        assert_eq!(state_of(&node, "m"), Some((NodeState::Alive, 5)));
+    }
+
+    #[tokio::test]
+    async fn push_pull_does_not_introduce_a_member_we_only_hear_is_down() {
+        let net = InMemoryNetwork::new();
+        let t = net.register(addr(1)).await;
+        let mut node = MustardNode::new(NodeId::new("observer"), addr(1), fast_config(), t);
+
+        let down = vec![
+            entry("gone", 3, NodeState::Dead, 1),
+            entry("left", 4, NodeState::Left, 1),
+        ];
+        node.handle_message(addr(2), sync_from("peer", down, false))
+            .await;
+
+        assert_eq!(state_of(&node, "gone"), None);
+        assert_eq!(state_of(&node, "left"), None);
+    }
+
+    #[tokio::test]
+    async fn push_pull_claim_about_ourselves_is_refuted() {
+        let net = InMemoryNetwork::new();
+        let t = net.register(addr(1)).await;
+        let mut node = MustardNode::new(NodeId::new("observer"), addr(1), fast_config(), t);
+
+        let claim = vec![entry("observer", 1, NodeState::Suspect, 1)];
+        node.handle_message(addr(2), sync_from("peer", claim, false))
+            .await;
+
+        assert_eq!(node.incarnation, 2);
+        assert_eq!(state_of(&node, "observer"), Some((NodeState::Alive, 2)));
+    }
+
+    #[tokio::test]
+    async fn push_pull_request_is_answered_once_with_the_whole_table() {
+        let net = InMemoryNetwork::new();
+        let t = net.register(addr(1)).await;
+        let requester = net.register(addr(2)).await;
+        let mut node = MustardNode::new(NodeId::new("observer"), addr(1), fast_config(), t);
+        // Twenty others plus the observer and requester: three datagrams.
+        for i in 0..20u16 {
+            node.membership.add_node(
+                NodeId::new(format!("m{i}")),
+                addr(10 + i),
+                1,
+                BTreeMap::new(),
+                Instant::now(),
             );
         }
+
+        node.handle_message(addr(2), sync_from("requester", vec![], true))
+            .await;
+
+        let mut datagrams = 0;
+        let mut seen = std::collections::HashSet::new();
+        while let Some((_, reply)) = requester.try_recv() {
+            let GossipPayload::Sync {
+                entries,
+                wants_reply,
+            } = reply.payload
+            else {
+                panic!("expected only sync datagrams, got {:?}", reply.payload);
+            };
+            assert!(!wants_reply, "a reply must never ask for a reply");
+            assert!(entries.len() <= MAX_PIGGYBACK_UPDATES);
+            datagrams += 1;
+            seen.extend(entries.into_iter().map(|entry| entry.node_id));
+        }
+        assert_eq!(datagrams, 3);
+        assert_eq!(seen.len(), node.membership.len());
+
+        // A reply is merged, never answered, or two nodes would bounce
+        // their tables back and forth forever.
+        node.handle_message(addr(2), sync_from("requester", vec![], false))
+            .await;
+        assert!(requester.try_recv().is_none());
+    }
+
+    #[tokio::test]
+    async fn joining_node_learns_the_whole_cluster_on_its_first_cycle() {
+        let net = InMemoryNetwork::new();
+        let joiner_transport = net.register(addr(1)).await;
+        let seed_transport = net.register(addr(2)).await;
+        let mut seed =
+            MustardNode::new(NodeId::new("seed"), addr(2), fast_config(), seed_transport);
+        // The seed learnt these long ago: its dissemination queue has
+        // nothing left to say about them, so only a full sync can teach
+        // the joiner.
+        for (i, name) in ["a", "b", "c"].into_iter().enumerate() {
+            seed.membership.add_node(
+                NodeId::new(name),
+                addr(10 + i as u16),
+                1,
+                BTreeMap::new(),
+                Instant::now(),
+            );
+        }
+        assert!(seed.dissemination.is_empty());
+
+        let mut joiner = MustardNode::new(
+            NodeId::new("joiner"),
+            addr(1),
+            fast_config(),
+            joiner_transport,
+        );
+        joiner.add_seed(NodeId::new("seed"), addr(2));
+
+        let ((), requests) = tokio::join!(
+            joiner.run_one_cycle(),
+            serve(&mut seed, Duration::from_millis(100))
+        );
+        assert_eq!(requests, 1, "the first cycle must start a push-pull");
+        for name in ["seed", "a", "b", "c"] {
+            assert_eq!(
+                state_of(&joiner, name).map(|(state, _)| state),
+                Some(NodeState::Alive),
+                "joiner did not learn {name} from the join sync"
+            );
+        }
+        assert!(state_of(&seed, "joiner").is_some());
+
+        // The next exchange waits for `push_pull_interval`.
+        let ((), requests) = tokio::join!(
+            joiner.run_one_cycle(),
+            serve(&mut seed, Duration::from_millis(100))
+        );
+        assert_eq!(requests, 0, "push-pull ran again before its interval");
     }
 
     // -- directory extension propagation (12b.2) ------------------------------
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn ack_carries_advertised_endpoints_to_the_prober() {
         let net = InMemoryNetwork::new();
         let t1 = net.register(addr(1)).await;
@@ -1690,17 +2178,8 @@ mod tests {
         node2.set_advertised_endpoints(9117, 9445, BTreeMap::new());
         node1.add_seed(NodeId::new("n2"), addr(2));
 
-        let shutdown = CancellationToken::new();
-        let shutdown2 = shutdown.clone();
-        let handle = tokio::spawn(async move {
-            node2.run(shutdown2).await;
-            node2
-        });
-
         // n1 probes n2; n2's ACK carries its directory extension.
-        node1.run_one_cycle().await;
-        shutdown.cancel();
-        let _ = handle.await;
+        probe_answered_by(&mut node1, answer(&mut node2)).await;
 
         let endpoints = node1
             .directory()
@@ -1853,7 +2332,7 @@ mod tests {
         assert!(rx.borrow().endpoints.contains_key(&NodeId::new("n2")));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn advertised_disk_pressure_reaches_a_remote_member_via_gossip() {
         // n2 advertises disk pressure; n1 probes it and must record n2 in its
         // directory's `disk_pressured` set — the wire path the leader's
@@ -1869,16 +2348,7 @@ mod tests {
         node2.set_disk_pressured_watch(pressure_rx);
         node1.add_seed(NodeId::new("n2"), addr(2));
 
-        let shutdown = CancellationToken::new();
-        let shutdown2 = shutdown.clone();
-        let handle = tokio::spawn(async move {
-            node2.run(shutdown2).await;
-            node2
-        });
-
-        node1.run_one_cycle().await;
-        shutdown.cancel();
-        let _ = handle.await;
+        probe_answered_by(&mut node1, answer(&mut node2)).await;
         drop(pressure_tx);
 
         assert!(
@@ -1890,7 +2360,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn advertised_labels_reach_a_remote_member_via_gossip() {
         // n2 advertises a zone label; n1 probes it and must learn that
         // label on n2's membership record — the wire path that makes
@@ -1908,16 +2378,7 @@ mod tests {
         );
         node1.add_seed(NodeId::new("n2"), addr(2));
 
-        let shutdown = CancellationToken::new();
-        let shutdown2 = shutdown.clone();
-        let handle = tokio::spawn(async move {
-            node2.run(shutdown2).await;
-            node2
-        });
-
-        node1.run_one_cycle().await;
-        shutdown.cancel();
-        let _ = handle.await;
+        probe_answered_by(&mut node1, answer(&mut node2)).await;
 
         let member = node1
             .membership
@@ -1937,6 +2398,50 @@ mod tests {
                 .and_then(|l| l.get("zone"))
                 .map(String::as_str),
             Some("us-east")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_relabelled_member_is_republished_without_a_state_change() {
+        // V02 soak bug 5: a node restarted with new labels (same state,
+        // same incarnation) and `relish nodes` kept its old ones for good,
+        // because the snapshot digest ignored labels.
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        let t2 = net.register(addr(2)).await;
+        let mut node1 = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
+        let mut node2 = MustardNode::new(NodeId::new("n2"), addr(2), fast_config(), t2);
+        let (tx, rx) = watch::channel(Vec::new());
+        node1.set_membership_watch(tx);
+        let zone = |labels: BTreeMap<String, String>| {
+            BTreeMap::from([("zone".to_string(), labels["zone"].clone())])
+        };
+        node2.set_advertised_endpoints(
+            9117,
+            9445,
+            zone(BTreeMap::from([("zone".into(), "us-east".into())])),
+        );
+        node1.add_seed(NodeId::new("n2"), addr(2));
+        probe_answered_by(&mut node1, answer(&mut node2)).await;
+        node1.publish_membership();
+
+        node2.set_advertised_endpoints(
+            9117,
+            9445,
+            zone(BTreeMap::from([("zone".into(), "us-west".into())])),
+        );
+        probe_answered_by(&mut node1, answer(&mut node2)).await;
+        node1.publish_membership();
+
+        let published = rx.borrow().clone();
+        let n2 = published
+            .iter()
+            .find(|member| member.node_id == NodeId::new("n2"))
+            .expect("n2 published");
+        assert_eq!(
+            n2.labels.get("zone").map(String::as_str),
+            Some("us-west"),
+            "the snapshot kept n2's old labels"
         );
     }
 
@@ -2070,7 +2575,6 @@ mod tests {
                     address: addr(1),
                     state: NodeState::Dead,
                     incarnation: 50,
-                    lamport: 1,
                 }],
             },
         );
@@ -2108,7 +2612,6 @@ mod tests {
                     address: addr(1),
                     state: NodeState::Suspect,
                     incarnation: 4,
-                    lamport: 1,
                 }],
             },
         );
@@ -2146,7 +2649,6 @@ mod tests {
                     address: addr(1),
                     state: NodeState::Left,
                     incarnation: 1,
-                    lamport: 1,
                 }],
             },
         );
@@ -2188,7 +2690,6 @@ mod tests {
                     address: addr(1),
                     state: NodeState::Left,
                     incarnation: node.incarnation,
-                    lamport: 9,
                 }],
             },
         );
