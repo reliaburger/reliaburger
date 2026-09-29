@@ -2,9 +2,9 @@ use std::collections::BTreeMap;
 
 use super::WTF_SCHEMA_VERSION;
 use super::model::{
-    ApplicationEvidence, ClusterEvidence, CorrelatedEvent, DeployObservation, Evidence,
-    LogObservation, RestartObservation, WtfFinding, WtfInputs, WtfOk, WtfReport, WtfSummary,
-    WtfUnknown,
+    ApplicationEvidence, BuildObservation, ClusterEvidence, CorrelatedEvent, DeployObservation,
+    Evidence, LogObservation, RestartObservation, WtfFinding, WtfInputs, WtfOk, WtfReport,
+    WtfSummary, WtfUnknown,
 };
 
 const CRASHLOOP_WINDOW_SECONDS: u64 = 15 * 60;
@@ -33,6 +33,7 @@ pub fn diagnose(inputs: &WtfInputs) -> WtfReport {
     if inputs.app.is_none() {
         record_cluster_unknowns(&inputs.cluster, &mut report);
         check_nodes(inputs, &mut report);
+        check_builds(inputs, &mut report);
         check_council(inputs, &mut report);
         check_faults(inputs, &mut report);
         check_disks(inputs, &mut report);
@@ -72,6 +73,7 @@ fn finding_order(left: &WtfFinding, right: &WtfFinding) -> std::cmp::Ordering {
 
 fn record_cluster_unknowns(evidence: &ClusterEvidence, report: &mut WtfReport) {
     record_unknown("nodes", &evidence.nodes, "cluster", report);
+    record_unknown("builds", &evidence.builds, "cluster", report);
     record_unknown("council", &evidence.council, "cluster", report);
     record_unknown("faults", &evidence.faults, "cluster", report);
     record_unknown("disks", &evidence.disks, "cluster", report);
@@ -150,6 +152,93 @@ fn check_nodes(inputs: &WtfInputs, report: &mut WtfReport) {
             description: format!("all {} nodes alive and answering", nodes.len()),
         });
     }
+}
+
+/// How many hex digits of a binary's SHA-256 a report line shows.
+const SHORT_SHA256_LEN: usize = 12;
+
+/// What makes two nodes' builds the same.
+///
+/// The commit names the code. The binary's SHA-256 only decides when a build
+/// doesn't know its commit, because one commit built for arm64 and for x86_64
+/// hashes differently, and a mixed-architecture cluster isn't skewed.
+fn build_identity(build: &BuildObservation) -> (&str, Option<&str>) {
+    (
+        build.version.as_str(),
+        build.commit.as_deref().or(build.binary_sha256.as_deref()),
+    )
+}
+
+fn describe_build(build: &BuildObservation) -> String {
+    let mut line = format!(
+        "bun {}",
+        crate::upgrade::version::describe(&build.version, build.commit.as_deref())
+    );
+    if let Some(sha256) = &build.binary_sha256 {
+        let short = sha256.get(..SHORT_SHA256_LEN).unwrap_or(sha256);
+        line.push_str(&format!(", sha256 {short}"));
+    }
+    line
+}
+
+fn check_builds(inputs: &WtfInputs, report: &mut WtfReport) {
+    let Some(builds) = inputs.cluster.builds.value() else {
+        return;
+    };
+    let mut groups: BTreeMap<(&str, Option<&str>), Vec<&BuildObservation>> = BTreeMap::new();
+    for build in builds {
+        groups.entry(build_identity(build)).or_default().push(build);
+    }
+    let details: Vec<String> = builds
+        .iter()
+        .map(|build| format!("{}: {}", build.node_id, describe_build(build)))
+        .collect();
+    let Some(largest) = groups.values().map(Vec::len).max() else {
+        return;
+    };
+    if groups.len() == 1 {
+        let description = match builds.as_slice() {
+            [only] => format!("{} runs {}", only.node_id, describe_build(only)),
+            [first, ..] => format!("all {} nodes run {}", builds.len(), describe_build(first)),
+            [] => return,
+        };
+        report.ok.push(WtfOk {
+            id: "builds".to_string(),
+            description,
+        });
+        return;
+    }
+
+    let mut majorities = groups
+        .iter()
+        .filter(|(_, group)| group.len() == largest)
+        .map(|(identity, _)| *identity);
+    let title = match (majorities.next(), majorities.next()) {
+        // One build clearly wins, so the rest are the odd ones out.
+        (Some(majority), None) => {
+            let odd: Vec<&str> = builds
+                .iter()
+                .filter(|build| build_identity(build) != majority)
+                .map(|build| build.node_id.as_str())
+                .collect();
+            let verb = if odd.len() == 1 { "runs" } else { "run" };
+            format!(
+                "{} {verb} a different bun build from the other {largest} nodes",
+                odd.join(", ")
+            )
+        }
+        // A tie: no build is "the" build, so name them all.
+        _ => format!("nodes run {} different bun builds", groups.len()),
+    };
+    report.warnings.push(WtfFinding {
+        id: "version-skew".to_string(),
+        title,
+        details,
+        suggestion: "bring every node to one build with `relish upgrade`, then re-run `relish wtf`"
+            .to_string(),
+        correlated_events: Vec::new(),
+        affected_resource: "cluster".to_string(),
+    });
 }
 
 fn check_council(inputs: &WtfInputs, report: &mut WtfReport) {
@@ -888,6 +977,12 @@ mod tests {
                     membership_state: "Alive".to_string(),
                     agent_reachable: true,
                 }]),
+                builds: available(vec![build(
+                    "node-1",
+                    "v0.1.1",
+                    Some(COMMIT_A),
+                    Some("aaaa"),
+                )]),
                 council: available(CouncilObservation {
                     enabled: true,
                     member_count: 1,
@@ -1502,5 +1597,121 @@ mod tests {
             timestamp,
             reason: "process exited".to_string(),
         }
+    }
+
+    const COMMIT_A: &str = "3fcb1fd0000000000000000000000000000000aa";
+    const COMMIT_B: &str = "9e1d2c30000000000000000000000000000000bb";
+
+    fn build(
+        node_id: &str,
+        version: &str,
+        commit: Option<&str>,
+        binary_sha256: Option<&str>,
+    ) -> BuildObservation {
+        BuildObservation {
+            node_id: node_id.to_string(),
+            version: version.to_string(),
+            commit: commit.map(str::to_string),
+            binary_sha256: binary_sha256.map(str::to_string),
+        }
+    }
+
+    fn with_builds(builds: Vec<BuildObservation>) -> WtfReport {
+        let mut inputs = healthy_inputs();
+        inputs.cluster.builds = available(builds);
+        diagnose(&inputs)
+    }
+
+    #[test]
+    fn a_uniform_cluster_reports_its_one_build_as_ok() {
+        let report = with_builds(vec![
+            build("node-1", "v0.1.1", Some(COMMIT_A), Some("aaaa1111bbbb2222")),
+            build("node-2", "v0.1.1", Some(COMMIT_A), Some("aaaa1111bbbb2222")),
+            build("node-3", "v0.1.1", Some(COMMIT_A), Some("aaaa1111bbbb2222")),
+        ]);
+
+        assert!(report.warnings.iter().all(|w| w.id != "version-skew"));
+        let ok = report.ok.iter().find(|ok| ok.id == "builds").unwrap();
+        assert_eq!(
+            ok.description,
+            "all 3 nodes run bun v0.1.1 (3fcb1fd), sha256 aaaa1111bbbb"
+        );
+    }
+
+    #[test]
+    fn a_node_on_an_older_build_is_named_in_a_skew_warning() {
+        let report = with_builds(vec![
+            build("node-1", "v0.1.1", Some(COMMIT_A), Some("aaaa")),
+            build("node-2", "v0.1.1", Some(COMMIT_A), Some("aaaa")),
+            build("node-3", "v0.1.1", Some(COMMIT_B), Some("bbbb")),
+        ]);
+
+        let skew = report
+            .warnings
+            .iter()
+            .find(|w| w.id == "version-skew")
+            .expect("skew warning");
+        assert_eq!(
+            skew.title,
+            "node-3 runs a different bun build from the other 2 nodes"
+        );
+        assert_eq!(
+            skew.details,
+            [
+                "node-1: bun v0.1.1 (3fcb1fd), sha256 aaaa",
+                "node-2: bun v0.1.1 (3fcb1fd), sha256 aaaa",
+                "node-3: bun v0.1.1 (9e1d2c3), sha256 bbbb",
+            ]
+        );
+        assert!(report.ok.iter().all(|ok| ok.id != "builds"));
+    }
+
+    #[test]
+    fn a_different_version_is_skew_even_without_commits() {
+        let report = with_builds(vec![
+            build("node-1", "v0.1.1", None, None),
+            build("node-2", "v0.1.0", None, None),
+            build("node-3", "v0.1.1", None, None),
+        ]);
+
+        let skew = report.warnings.iter().find(|w| w.id == "version-skew");
+        assert_eq!(
+            skew.unwrap().title,
+            "node-2 runs a different bun build from the other 2 nodes"
+        );
+    }
+
+    #[test]
+    fn one_commit_built_for_two_architectures_is_not_skew() {
+        let report = with_builds(vec![
+            build("node-1", "v0.1.1", Some(COMMIT_A), Some("arm64-hash")),
+            build("node-2", "v0.1.1", Some(COMMIT_A), Some("x86_64-hash")),
+        ]);
+
+        assert!(report.warnings.iter().all(|w| w.id != "version-skew"));
+        assert!(report.ok.iter().any(|ok| ok.id == "builds"));
+    }
+
+    #[test]
+    fn builds_without_a_commit_are_told_apart_by_their_hash() {
+        let report = with_builds(vec![
+            build("node-1", "v0.1.1", None, Some("aaaa")),
+            build("node-2", "v0.1.1", None, Some("bbbb")),
+        ]);
+
+        let skew = report.warnings.iter().find(|w| w.id == "version-skew");
+        assert_eq!(skew.unwrap().title, "nodes run 2 different bun builds");
+    }
+
+    #[test]
+    fn unreadable_builds_are_unknown_not_ok() {
+        let mut inputs = healthy_inputs();
+        inputs.cluster.builds = Evidence::Unavailable {
+            reason: "node node-1: version: timed out".to_string(),
+        };
+        let report = diagnose(&inputs);
+
+        assert!(report.unknown.iter().any(|u| u.source == "builds"));
+        assert!(report.ok.iter().all(|ok| ok.id != "builds"));
     }
 }

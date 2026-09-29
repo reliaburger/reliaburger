@@ -5246,7 +5246,7 @@ async fn logs_cross_node_handler(
         let mut warnings: Vec<LogQueryWarning> = targets
             .unreachable
             .into_iter()
-            .map(|node_id| LogQueryWarning::NodeUnresponsive { node_id })
+            .map(LogQueryWarning::from)
             .collect();
 
         let node_count = nodes.len() + warnings.len();
@@ -5264,13 +5264,10 @@ async fn logs_cross_node_handler(
         {
             Ok(result) => {
                 let mut entries = result.entries;
-                // Each node that failed the fan-out becomes a warning, so the
-                // caller sees "some replicas were down", not a silent empty.
-                for failure in result.failures {
-                    warnings.push(LogQueryWarning::NodeUnresponsive {
-                        node_id: failure.node_id,
-                    });
-                }
+                // Each node that failed the fan-out becomes a warning that
+                // keeps its cause, so the caller sees "wolf4 timed out after
+                // 10s", not a silent empty or a bare "did not respond" (#282).
+                warnings.extend(result.failures.into_iter().map(LogQueryWarning::from));
                 // Apply tail after merge (fan_out already merge-sorted)
                 if let Some(tail) = query.tail
                     && entries.len() > tail
@@ -5438,8 +5435,8 @@ const MAX_RELAY_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 /// A path probe runs for up to 25 seconds on the target; allow for the hop.
 const RELAY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// The per-node reads `relish wtf`, `relish path` and `relish test` make, and
-/// nothing else. The relay is a reachability aid, not a general proxy.
+/// The per-node reads `relish wtf`, `relish inspect`, `relish path` and
+/// `relish test` make, and nothing else. The relay is a reachability aid, not a general proxy.
 fn relay_allows(method: &axum::http::Method, path: &str) -> bool {
     const READS: &[&str] = &[
         "v1/health",
@@ -5453,6 +5450,7 @@ fn relay_allows(method: &axum::http::Method, path: &str) -> bool {
         "v1/cluster/council",
         "v1/cluster/nodes",
         "v1/capabilities",
+        "v1/version",
     ];
     match *method {
         // `relish test` compares each node's own deploy history.
@@ -8185,14 +8183,14 @@ async fn node_detail_handler(State(state): State<ApiState>, Path(name): Path<Str
             ChartConfig {
                 endpoint: "/v1/metrics?name=node_cpu_usage_percent".to_string(),
                 title: "CPU Usage".to_string(),
-                y_label: "%".to_string(),
+                unit: crate::brioche::units::ChartUnit::Percent,
                 refresh_secs: 10,
                 range_secs: 3600,
             },
             ChartConfig {
                 endpoint: "/v1/metrics?name=node_memory_used_bytes".to_string(),
                 title: "Memory Usage".to_string(),
-                y_label: "bytes".to_string(),
+                unit: crate::brioche::units::ChartUnit::Bytes,
                 refresh_secs: 10,
                 range_secs: 3600,
             },
@@ -17532,6 +17530,13 @@ mod cluster_routing_tests {
             &axum::http::Method::POST,
             "v1/deploys/history/web"
         ));
+    }
+
+    #[test]
+    fn the_relay_forwards_each_nodes_version_for_wtf() {
+        let get = axum::http::Method::GET;
+        assert!(relay_allows(&get, "v1/version"));
+        assert!(!relay_allows(&axum::http::Method::POST, "v1/version"));
     }
 
     #[test]
