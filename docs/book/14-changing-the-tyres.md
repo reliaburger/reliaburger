@@ -585,7 +585,7 @@ A refusal is only as good as its first line. The 0.1.0 version said `invalid or 
 So every refusal now leads with the pair, then the remedy, then a link to the policy:
 
 ```text
-incompatible state format: found 43; this binary (reliaburger 0.1.1) needs 44. Pre-1.0 builds don't migrate state: run the reliaburger release that wrote /var/lib/reliaburger/data/state-format.json, or move the data aside and recreate the cluster. See https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#cluster-compatibility
+incompatible state format: found 43; this binary (reliaburger v0.1.1 (3fcb1fd)) needs 44. Pre-1.0 builds don't migrate state: run the reliaburger release that wrote /var/lib/reliaburger/data/state-format.json, or move the data aside and recreate the cluster. See https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#compatibility-before-100
 ```
 
 A stamp from another generation used to share a variant with a corrupt one. They're different problems (one has an answer, the other doesn't), so the number now travels in its own variant:
@@ -603,18 +603,7 @@ StateMismatch { stamp: PathBuf, found: u32, expected: u32 },
 
 Two bits of `thiserror` syntax are new here. `{found}` names a field of the variant, as before. The arguments after the string are extra format arguments, like trailing arguments to C's `printf`. They can be any expression, and a leading dot (`.stamp`) means "this variant's field", so `.stamp.display()` calls a method on it. `{POLICY_URL}` isn't a field at all: Rust's format strings capture a name from the surrounding scope, and a module-level `const` counts. The backslash at the end of a line continues the string literal and swallows the next line's leading whitespace, so the message stays one line on screen and readable in the source.
 
-`this_binary()` names the release, plus the commit when the build recorded one:
-
-```rust
-fn this_binary() -> String {
-    match option_env!("RELIABURGER_GIT_SHA") {
-        Some(commit) => format!("reliaburger {} ({commit})", env!("CARGO_PKG_VERSION")),
-        None => format!("reliaburger {}", env!("CARGO_PKG_VERSION")),
-    }
-}
-```
-
-`env!` and `option_env!` read an environment variable *at compile time* and bake it into the binary, a bit like a `-DVERSION=...` flag to a C compiler. `env!` fails the build if the variable is missing; Cargo always sets `CARGO_PKG_VERSION`, so that's safe. The commit is only there when the release pipeline sets it, so `option_env!` hands back an `Option<&'static str>` instead.
+`this_binary()` names the release and, when the build knew it, the commit, reusing the same `describe` that `relish version` prints (`v0.1.1 (3fcb1fd)`). Two dev builds can share a version number and still hold different code, so the commit is what tells a user which one refused.
 
 The join refusal gets the same treatment. It used to wrap the mismatch as `cluster member rejected the join: ...`, which blamed a member that never rejected anything: the joiner itself refused the member's formats after asking `/v1/version`. `JoinClientError::Incompatible` now carries the `CompatibilityError` through `#[from]`, so `?` converts it and the message starts `cannot join: incompatible cluster formats: found protocol 26, state 43; this binary (...) needs protocol 27, state 44`.
 
@@ -623,6 +612,8 @@ The tests pin the order, not just the content. A helper takes everything before 
 A candidate binary gets checked too, before it's staged. Run `bun --compatibility` and it prints the pair as JSON without loading config or starting a runtime. The upgrade manager verifies the release signature first, writes those verified bytes to a private temporary file, runs *that* copy with `--compatibility`, and caps the output at 4 KiB with a ten-second deadline. Why a copy? Checking the download path and executing it later would let the file change in between. `NamedTempFile::into_temp_path` hands us a path that deletes the file when dropped, and closes our writable descriptor first, because Linux refuses to execute a file that's open for writing (`ETXTBSY`, "text file busy"). Even then, the full test suite caught the occasional `ETXTBSY`: another thread forking at the wrong moment briefly inherits the descriptor. That's a [known race in process launching](https://github.com/rust-lang/rust/issues/114554), so the probe retries that one error within the same deadline. Retrying can't turn an incompatible binary into an accepted one.
 
 Tests cover mismatched gossip and Raft messages, refused development state, rejected joins, signed-but-incompatible executables and rollback refusal. Test fixtures that model a *compatible* peer take their pair from `compatibility::CURRENT` rather than hard-coding numbers. We learnt that one when a state bump turned ten unrelated tests red at the compatibility check instead of at the behaviour they were meant to test.
+
+That fresh-cluster promise outlived 0.1.0. We sketched a stricter rule for after the release: bump a generation only for a change old nodes can't read, ship a migration with every bump, and let additive JSON fields through without one. Then we asked who it would serve. Before 1.0.0 every release is a development release, and every migration is code we'd have to test and then carry for a cluster you could simply rebuild. So the rule waits for 1.0.0. Until then, any incompatible change bumps its generation, nodes refuse old peers and old state, and you start a fresh cluster.
 
 ### Cordoning
 
@@ -1207,6 +1198,101 @@ ones missed #220. RSS in this soak mixes three things (a working set that
 grows with history, allocator high-water marks, leaks) and a two-hour image
 can't tell them apart. Descriptors don't have the first two problems, so
 they carry the leak signal and RSS keeps its coarse 25% ceiling.
+
+
+## Which build is this?
+
+Issue #241 was a three-node Ubuntu cluster whose Bun crash-looped after a
+restart, with an error a fix from the week before had removed. The likely
+answer was that two nodes still ran an older build. Proving it was harder
+than it should have been, because every build said the same thing:
+
+```text
+$ bun --version
+bun 0.1.0
+```
+
+That was true and useless. Every release candidate, and every local build,
+was 0.1.0, and nothing on the node said which one it had. The way to check
+was to hash the binary and compare it with each candidate's published
+checksums. `/v1/version` reports that same `binary_sha256`, which identifies
+the bytes exactly, but a SHA-256 doesn't tell a human which code it holds. A
+commit does.
+
+The release workflow already knew it. `build.yml` sets
+`RELIABURGER_GIT_SHA` to the commit it builds, and the capabilities report
+(the build fingerprint in `/v1/capabilities`) already read it with `option_env!`.
+That macro is `env!`'s forgiving sibling: it reads an environment variable
+*at compile time* and gives you `Option<&'static str>`, `None` if it wasn't
+set, instead of failing the build. Nothing printed it, though, and a build
+from a checkout didn't have it at all.
+
+So there are two changes. `build.rs` fills the gap for local builds: when the
+variable isn't set, it runs `git rev-parse HEAD` and hands the result to
+rustc with `cargo:rustc-env=RELIABURGER_GIT_SHA=...`, which makes it visible
+to `option_env!` exactly as if the workflow had set it. A tree with no git, or
+one git refuses to read, just goes without; that's `None`, not an error. The
+script also has to tell Cargo when to run again, or the first commit it saw
+would be baked in forever. It watches `HEAD`, the branch file `HEAD` points
+to and `packed-refs`, each through `git rev-parse --git-path` so a worktree
+(which keeps its own `HEAD` but shares refs with the main checkout) gets the
+right files. A path that doesn't exist isn't watched, because Cargo treats a
+missing watched path as changed and would rerun the script on every build.
+
+The other change is one place that formats a version for people:
+
+```rust
+pub fn describe(version: &dyn fmt::Display, commit: Option<&str>) -> String {
+    match commit {
+        Some(commit) => {
+            let short = commit.get(..SHORT_COMMIT_LEN).unwrap_or(commit);
+            format!("{version} ({short})")
+        }
+        None => version.to_string(),
+    }
+}
+```
+
+`&dyn fmt::Display` is a *trait object*: a reference to any value that
+implements `Display`, with the method looked up at run time through a small
+table (like an interface value in Go). It lets the same function take the
+Cargo version string and a `BinaryVersion`, which displays with a leading
+`v`. `commit.get(..7)` is the non-panicking way to slice a string: indexing
+with `&commit[..7]` panics if the string is shorter, while `get` returns an
+`Option`.
+
+clap's `--version` wants a `&'static str`, a string that lives for the whole
+program. A `format!` result doesn't, so the version line lives in a
+`LazyLock`:
+
+```rust
+pub static VERSION_LINE: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| describe(&env!("CARGO_PKG_VERSION"), build_commit()));
+```
+
+`LazyLock` runs its closure the first time anyone reads it and keeps the
+answer. Because the lock itself is a `static`, borrowing the `String` inside
+it borrows for `'static`, so `VERSION_LINE.as_str()` is exactly what
+`#[command(version = ...)]` needs. Now both binaries say:
+
+```text
+$ bun --version
+bun 0.1.0 (3fcb1fd)
+```
+
+Bun's startup line goes through `describe` too, as does the line it writes
+into its own log store, and `/v1/version` gains a `commit` field with the
+full SHA (or `null`). The field is additive: the orchestrator and the soak
+harness read `version` and `binary_sha256` as before and ignore it.
+
+The tests don't insist that a commit exists, because a CI container that
+mounts the tree as another user can make git refuse it, and that build must
+still pass. `describe_adds_the_short_commit_when_known` pins the formatting,
+`version_line_carries_the_build_commit` checks the line and, when there is a
+commit, that it looks like one. `relish_cli`'s `--version` test runs the real
+binary and expects `relish 0.1.0 (<commit>)` whenever the build knew the
+commit, and `version_endpoint_reports_the_build_commit` does the same for
+the API.
 
 ## Adopted, and already done
 

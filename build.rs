@@ -13,10 +13,56 @@ fn main() {
         println!("cargo:rustc-env=RELIABURGER_TARGET={target}");
     }
     println!("cargo:rerun-if-env-changed=RELIABURGER_GIT_SHA");
+    // Release builds name their commit in RELIABURGER_GIT_SHA, which rustc
+    // sees directly. Anything else built from a checkout asks git, so two
+    // local builds of the same version still say which code they hold.
+    let release_commit = std::env::var("RELIABURGER_GIT_SHA").is_ok_and(|sha| !sha.is_empty());
+    if !release_commit && let Some(commit) = checkout_commit() {
+        println!("cargo:rustc-env=RELIABURGER_GIT_SHA={commit}");
+    }
 
     // Select the target OS: the build script itself runs on the host.
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") && cfg!(feature = "ebpf") {
         compile_ebpf();
+    }
+}
+
+/// The checkout's HEAD commit, or `None` when git can't say (no git, not a
+/// checkout, or a repository git refuses to read).
+///
+/// Also tells Cargo to rerun this script when HEAD moves: when HEAD itself
+/// changes (a checkout) and when the branch it names gets a new commit.
+fn checkout_commit() -> Option<String> {
+    let git = |args: &[&str]| -> Option<String> {
+        let output = Command::new("git").args(args).output().ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let text = String::from_utf8(output.stdout).ok()?;
+        Some(text.trim().to_string())
+    };
+    let commit = git(&["rev-parse", "HEAD"])?;
+    // A worktree keeps its own HEAD but shares refs with the main checkout.
+    if let Some(head) = git(&["rev-parse", "--git-path", "HEAD"]) {
+        rerun_if_exists(Path::new(&head));
+    }
+    if let Some(branch) = git(&["symbolic-ref", "-q", "HEAD"])
+        && let Some(reference) = git(&["rev-parse", "--git-path", &branch])
+    {
+        rerun_if_exists(Path::new(&reference));
+    }
+    if let Some(packed) = git(&["rev-parse", "--git-path", "packed-refs"]) {
+        rerun_if_exists(Path::new(&packed));
+    }
+    let is_hex = !commit.is_empty() && commit.chars().all(|c| c.is_ascii_hexdigit());
+    is_hex.then_some(commit)
+}
+
+/// Watch a file only if it exists: Cargo reruns the script on every build
+/// for a watched path that's missing.
+fn rerun_if_exists(path: &Path) {
+    if path.exists() {
+        println!("cargo:rerun-if-changed={}", path.display());
     }
 }
 

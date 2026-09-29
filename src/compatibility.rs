@@ -28,16 +28,16 @@ pub const CURRENT: Compatibility = Compatibility {
 pub const STATE_STAMP: &str = "state-format.json";
 
 /// Where the compatibility policy every refusal points to lives.
-pub const POLICY_URL: &str =
-    "https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#cluster-compatibility";
+pub const POLICY_URL: &str = "https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#compatibility-before-100";
 
-/// This binary as a refusal names it: `reliaburger 0.1.1`, plus the commit
-/// when the build recorded one.
+/// This binary as a refusal names it: `reliaburger v0.1.1 (3fcb1fd)`, or
+/// just the version when the build didn't know its commit.
 fn this_binary() -> String {
-    match option_env!("RELIABURGER_GIT_SHA") {
-        Some(commit) => format!("reliaburger {} ({commit})", env!("CARGO_PKG_VERSION")),
-        None => format!("reliaburger {}", env!("CARGO_PKG_VERSION")),
-    }
+    use crate::upgrade::version::{build_commit, compiled_version, describe};
+    format!(
+        "reliaburger {}",
+        describe(&compiled_version(), build_commit())
+    )
 }
 
 /// A format cannot be safely admitted or opened.

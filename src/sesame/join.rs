@@ -663,7 +663,7 @@ mod tests {
         assert!(matches!(err, JoinClientError::Incompatible(_)));
         let message = err.to_string();
         let expected_lead = format!(
-            "cannot join: incompatible cluster formats: found protocol {}, state {}; this binary (reliaburger {}",
+            "cannot join: incompatible cluster formats: found protocol {}, state {}; this binary (reliaburger v{}",
             current.protocol - 1,
             current.state,
             env!("CARGO_PKG_VERSION"),
