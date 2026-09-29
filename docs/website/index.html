@@ -75,9 +75,10 @@
 
       <aside class="status" aria-label="Release status">
         <strong>0.1.0 (Prototype)</strong>
-        <p>Released. Signed binaries for Linux and macOS, and the laptop installer above.
-          It’s a prototype: try it, break it, tell us what broke.</p>
-        <a href="https://github.com/reliaburger/reliaburger/releases/tag/v0.1.0">Release <span aria-hidden="true">↗</span></a>
+        <p>Released on 29 September 2026. Signed binaries for Linux and macOS, and a one-line
+          installer that builds a laptop cluster from them. Five minutes is the target;
+          the documentation lists what 0.1.0 doesn’t do yet.</p>
+        <a href="https://github.com/reliaburger/reliaburger/releases/tag/v0.1.0">Release notes <span aria-hidden="true">↗</span></a>
       </aside>
 
       <aside class="status" aria-label="Release status">
@@ -113,7 +114,8 @@
                 <code>asciinema play tour.cast</code>, or follow the steps below.</p></noscript>
               <figcaption>
                 <span>The whole tour on a real laptop cluster, run by
-                  <a href="https://github.com/reliaburger/reliaburger/blob/main/scripts/demo/tour.sh">scripts/demo/tour.sh</a>.
+                  <a href="https://github.com/reliaburger/reliaburger/blob/main/scripts/demo/tour.sh">scripts/demo/tour.sh</a>
+                  before the release, with binaries built from the checkout.
                   Setup plays four times faster and idle time is cut to two seconds; every wait
                   says how long it really took.</span>
                 <span class="recording-speed" role="group" aria-label="Playback speed" hidden>speed
@@ -259,7 +261,7 @@ target/debug/relish</code></pre>
             <span class="filetype">DESIGN &amp; INTENT</span>
             <h3><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/whitepaper.md">The whitepaper <span aria-hidden="true">↗</span></a></h3>
             <p>The architecture, its trade-offs and the longer-term vision. Includes features still planned.</p>
-            <a class="secondary-link" href="https://github.com/reliaburger/reliaburger/actions/workflows/build.yml">PDF from build artefacts</a>
+            <a class="secondary-link" href="https://github.com/reliaburger/reliaburger/releases/latest/download/reliaburger-whitepaper.pdf">PDF from the latest release</a>
           </article>
           <article class="reading-item">
             <span class="filetype">IMPLEMENTATION</span>
@@ -278,13 +280,13 @@ target/debug/relish</code></pre>
           </article>
           <article class="reading-item">
             <span class="filetype">CURRENT STATE</span>
-            <h3><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/progress.md">Progress &amp; release work <span aria-hidden="true">↗</span></a></h3>
-            <p>What’s implemented, what needs verification and what’s next. Read alongside the <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/roadmap.md">roadmap</a>.</p>
+            <h3><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/progress.md">Progress &amp; backlog <span aria-hidden="true">↗</span></a></h3>
+            <p>What’s implemented, what 0.1.0 leaves out and what’s next. Read alongside the <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/roadmap.md">roadmap</a>.</p>
           </article>
         </div>
-        <p class="pdf-note">For the PDF: open a successful build, download <code>reliaburger-pdfs</code>
-          under <strong>Artifacts</strong>, then open <code>reliaburger-whitepaper.pdf</code>.
-          GitHub sign-in is required. Artefacts expire; the Markdown version stays in the repository.</p>
+        <p class="pdf-note">Every release carries PDFs of the whitepaper, the design docs, the roadmap
+          and the book. For a newer copy, open a successful build of <code>main</code> and download
+          <code>reliaburger-pdfs</code> under <strong>Artifacts</strong> (GitHub sign-in required).</p>
       </section>
 
       <section id="internals" class="section" aria-labelledby="internals-title">

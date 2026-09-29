@@ -16,7 +16,7 @@
 #       Run the tour. Without --setup it needs a running quickstart cluster
 #       and starts at `relish apply`. With --setup it first builds one with
 #       `relish setup --quickstart --development-binaries DEV_BINARIES_DIR`,
-#       which is what the install line runs once the release is published.
+#       the same setup the install line runs, with binaries from this checkout.
 #   scripts/demo/tour.sh --record CAST [--setup DEV_BINARIES_DIR]
 #       Record the run with asciinema into CAST (110x32, idle time cut to
 #       2 s), then play the setup step SETUP_SPEEDUP (4) times faster. Setup
@@ -263,8 +263,8 @@ while IFS= read -r command <&3; do
                 printf '\n'
             else
                 say "Step 1, the install line, installs relish and runs \`relish setup --quickstart\`."
-                say "The signed release isn't published yet, so this runs the same setup with"
-                say "binaries built from this checkout. The times on the right are real."
+                say "This recording runs the same setup with binaries built from this checkout."
+                say "The times on the right are real."
                 if [[ -n "${RECORDING}" ]]; then
                     say "This step plays ${SETUP_SPEEDUP}× faster than it ran."
                 fi
