@@ -251,6 +251,7 @@ mod tests {
                     restart_count: 0,
                     host_port: Some(8080),
                     pid: Some(1234),
+                    runtime_unknown: false,
                 },
                 InstanceStatus {
                     exit_code: None,
@@ -261,6 +262,7 @@ mod tests {
                     restart_count: 0,
                     host_port: Some(8081),
                     pid: Some(1235),
+                    runtime_unknown: false,
                 },
             ],
             env: vec![
