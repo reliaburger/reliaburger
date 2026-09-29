@@ -5246,7 +5246,7 @@ async fn logs_cross_node_handler(
         let mut warnings: Vec<LogQueryWarning> = targets
             .unreachable
             .into_iter()
-            .map(|node_id| LogQueryWarning::NodeUnresponsive { node_id })
+            .map(LogQueryWarning::from)
             .collect();
 
         let node_count = nodes.len() + warnings.len();
@@ -5264,13 +5264,10 @@ async fn logs_cross_node_handler(
         {
             Ok(result) => {
                 let mut entries = result.entries;
-                // Each node that failed the fan-out becomes a warning, so the
-                // caller sees "some replicas were down", not a silent empty.
-                for failure in result.failures {
-                    warnings.push(LogQueryWarning::NodeUnresponsive {
-                        node_id: failure.node_id,
-                    });
-                }
+                // Each node that failed the fan-out becomes a warning that
+                // keeps its cause, so the caller sees "wolf4 timed out after
+                // 10s", not a silent empty or a bare "did not respond" (#282).
+                warnings.extend(result.failures.into_iter().map(LogQueryWarning::from));
                 // Apply tail after merge (fan_out already merge-sorted)
                 if let Some(tail) = query.tail
                     && entries.len() > tail
