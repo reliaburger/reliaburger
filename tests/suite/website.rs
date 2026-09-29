@@ -302,3 +302,24 @@ fn command_snippets_are_copyable_and_still_selectable_without_script() {
     let css = read("docs/website/style.css");
     assert!(!css.contains("user-select: none"));
 }
+
+/// Every release carries the PDFs, so the page links the stable "latest"
+/// release assets rather than sending people to CI artefacts (#280).
+#[test]
+fn the_pdfs_come_from_the_latest_release() {
+    let page = read("docs/website/index.html");
+    for pdf in [
+        "reliaburger-whitepaper.pdf",
+        "building-reliaburger.pdf",
+        "reliaburger-design-docs.pdf",
+        "reliaburger-roadmap.pdf",
+    ] {
+        let url =
+            format!("https://github.com/reliaburger/reliaburger/releases/latest/download/{pdf}");
+        assert!(page.contains(&url), "no link to {url}");
+    }
+    assert!(
+        !page.contains("<strong>Artifacts</strong>"),
+        "the page still sends people to CI artefacts for the PDFs"
+    );
+}

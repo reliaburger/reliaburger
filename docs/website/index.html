@@ -35,7 +35,10 @@
           <div class="intro-links">
             <a class="primary-link" href="#install">Install 0.1.0 <span aria-hidden="true">↓</span></a>
             <a href="https://github.com/reliaburger/reliaburger">Read the source <span aria-hidden="true">↗</span></a>
-            <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/whitepaper.md">Read the whitepaper</a>
+            <span class="link-pair"><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/whitepaper.md">Read the whitepaper</a>
+              <a class="pdf-link" href="https://github.com/reliaburger/reliaburger/releases/latest/download/reliaburger-whitepaper.pdf" aria-label="The whitepaper as a PDF">PDF</a></span>
+            <span class="link-pair"><a href="https://github.com/reliaburger/reliaburger/tree/main/docs/book">Read the book</a>
+              <a class="pdf-link" href="https://github.com/reliaburger/reliaburger/releases/latest/download/building-reliaburger.pdf" aria-label="The book as a PDF">PDF</a></span>
           </div>
         </div>
         <!-- Decorative burger loop. The source has a plain white background; mix-blend-mode: multiply on .burger
@@ -267,11 +270,13 @@ target/debug/relish</code></pre>
             <span class="filetype">IMPLEMENTATION</span>
             <h3><a href="https://github.com/reliaburger/reliaburger/tree/main/docs/design">Component design docs <span aria-hidden="true">↗</span></a></h3>
             <p>Protocols, data structures, failure modes and decisions for each subsystem.</p>
+            <a class="secondary-link" href="https://github.com/reliaburger/reliaburger/releases/latest/download/reliaburger-design-docs.pdf">PDF from the latest release</a>
           </article>
           <article class="reading-item">
             <span class="filetype">WALKTHROUGH</span>
             <h3><a href="https://github.com/reliaburger/reliaburger/tree/main/docs/book">Building Reliaburger <span aria-hidden="true">↗</span></a></h3>
             <p>The companion book: build the orchestrator while learning Rust and distributed systems. For programmers coming from C, Python or Go.</p>
+            <a class="secondary-link" href="https://github.com/reliaburger/reliaburger/releases/latest/download/building-reliaburger.pdf">PDF from the latest release</a>
           </article>
           <article class="reading-item">
             <span class="filetype">REFERENCE</span>
@@ -284,9 +289,12 @@ target/debug/relish</code></pre>
             <p>What’s implemented, what 0.1.0 leaves out and what’s next. Read alongside the <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/roadmap.md">roadmap</a>.</p>
           </article>
         </div>
-        <p class="pdf-note">Every release carries PDFs of the whitepaper, the design docs, the roadmap
-          and the book. For a newer copy, open a successful build of <code>main</code> and download
-          <code>reliaburger-pdfs</code> under <strong>Artifacts</strong> (GitHub sign-in required).</p>
+        <p class="pdf-note">Every release carries PDFs, and these links always fetch the latest:
+          <a href="https://github.com/reliaburger/reliaburger/releases/latest/download/reliaburger-whitepaper.pdf">whitepaper</a>,
+          <a href="https://github.com/reliaburger/reliaburger/releases/latest/download/reliaburger-design-docs.pdf">design docs</a>,
+          <a href="https://github.com/reliaburger/reliaburger/releases/latest/download/building-reliaburger.pdf">the book</a> and
+          <a href="https://github.com/reliaburger/reliaburger/releases/latest/download/reliaburger-roadmap.pdf">roadmap</a>. The Markdown on GitHub
+          follows <code>main</code>, so it can be newer.</p>
       </section>
 
       <section id="internals" class="section" aria-labelledby="internals-title">

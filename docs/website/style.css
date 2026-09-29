@@ -38,6 +38,9 @@ nav a:hover { text-decoration: underline; }
 h1 { font-size: clamp(2.4rem, 5.1vw, 3.7rem); line-height: 1.12; letter-spacing: -.055em; font-weight: 650; margin: 0 0 26px; }
 .lede { max-width: 720px; font-size: 1.2rem; line-height: 1.6; color: var(--muted); }
 .intro-links { display: flex; align-items: center; flex-wrap: wrap; gap: 28px; margin-top: 28px; font-size: .9375rem; }
+.link-pair { display: inline-flex; align-items: center; gap: 10px; }
+.pdf-link { font: 500 .75rem/1 var(--mono); letter-spacing: .07em; text-decoration: none; border: 1px solid var(--ink); border-radius: 2px; padding: 5px 7px; }
+.pdf-link:hover { border-color: var(--accent); }
 .primary-link { display: inline-flex; align-items: center; justify-content: space-between; gap: 28px; background: var(--ink); color: #fff; padding: 11px 18px; text-decoration: none; border: 1px solid var(--ink); }
 .primary-link:hover { background: #303c32; color: #fff; }
 .status { display: grid; grid-template-columns: 190px 1fr auto; gap: 22px; padding: 23px 0 23px 20px; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); border-left: 3px solid var(--accent); align-items: start; font-size: .875rem; }
@@ -156,7 +159,7 @@ footer { display: flex; flex-wrap: wrap; gap: 12px 24px; margin-top: 20px; paddi
 @media (max-width: 600px) {
   .page { padding: 0 22px; }
   .masthead { align-items: start; flex-direction: column; gap: 12px; padding: 22px 0 14px; }
-  nav { gap: 24px; }
+  nav { gap: 0 18px; }
   .intro { padding-top: 42px; }
   h1 { font-size: 2.4rem; }
   .lede { font-size: 1.0625rem; }
