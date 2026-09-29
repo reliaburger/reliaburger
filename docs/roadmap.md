@@ -816,6 +816,10 @@ feature gate ([compatibility before 1.0.0](releasing.md#compatibility-before-100
   the first-use Rust explanations and the lessons, and fold material that was
   bolted onto earlier chapters later back into place
   ([#311](https://github.com/reliaburger/reliaburger/issues/311)).
+  Alongside it, the website gets a full CLI walkthrough (a second recorded
+  tour that exercises every `relish` command) and a searchable command
+  reference on the landing page that ctrl-F can find, generated from the CLI
+  (issue to follow).
 - **Later.** The fleet control plane
   ([#265](https://github.com/reliaburger/reliaburger/pull/265)), and GPU
   scheduling and warm starts (F01). The rest of the backlog (F02–F11, H05)
