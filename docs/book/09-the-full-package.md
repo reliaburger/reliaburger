@@ -897,6 +897,39 @@ until a write finishes, even if its awaiting task is cancelled. The tests cover
 exclusive writers, stable identity and names, changed parameters, invalid
 ownership, private bootstrap files and damaged bundles.
 
+Dropping an operation releases its lock, and that turned out to need one more
+line than we thought. `File::try_lock` is `flock` underneath, and an `flock`
+belongs to the open file *description*, the kernel object that every duplicate
+of a descriptor shares. When any thread spawns a child process, the child starts
+with a copy of every descriptor and only closes the close-on-exec ones when it
+calls `exec`. For that brief moment the child holds our lock too, so
+closing our own descriptor doesn't release it. Under plain `cargo test`, where
+hundreds of tests share one process and some of them spawn helpers, the test
+that drops an operation and reopens it straight away was refused every so
+often with "another operation is using cluster". A loop of 100 reopens with two
+threads spawning `true` in the background was refused 69 times.
+
+So the lock is now a small type of its own whose `Drop` (the destructor we met
+in Chapter 1) unlocks before the file closes:
+
+```rust
+struct OperationLock(std::fs::File);
+
+impl Drop for OperationLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+```
+
+`self.0` is the tuple struct's only field, the file. `let _ =` throws the
+`Result` away on purpose: there's nothing useful to do with a failed unlock
+inside a destructor, and closing the descriptor a moment later releases the
+lock anyway. `flock(LOCK_UN)` acts on the description, so it frees the lock
+for every copy at once, including the one in a half-spawned child. The
+relish CLI never reopens an operation in the same process, so users never saw
+this, but the fix makes "dropping releases the lock" true without a caveat.
+
 ### Download before you trust, verify before you replace
 
 The installer needs a guest image and prebuilt binaries. A partial download

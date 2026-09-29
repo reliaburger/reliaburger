@@ -119,7 +119,25 @@ pub struct Operation {
     pub directory: PathBuf,
     /// Current checkpoints; call `save` after a completed external step.
     pub state: ClusterState,
-    _lock: std::sync::Arc<std::fs::File>,
+    _lock: std::sync::Arc<OperationLock>,
+}
+
+/// The `flock` on an operation's `operation.lock`, released when dropped.
+///
+/// A `flock` belongs to the open file description, not to the descriptor, and
+/// a child process that another thread is spawning holds a copy of every
+/// descriptor until its `exec` closes it. Closing our descriptor alone would
+/// leave the lock held by that copy for a moment, so a reopen straight after a
+/// drop could be refused (#285). Unlocking explicitly releases it for every
+/// copy at once.
+struct OperationLock(std::fs::File);
+
+impl Drop for OperationLock {
+    fn drop(&mut self) {
+        // Nothing useful can be done with a failed unlock: closing the
+        // descriptor straight after still releases the lock eventually.
+        let _ = self.0.unlock();
+    }
 }
 
 impl Operation {
@@ -155,7 +173,7 @@ impl Operation {
         let operation = Self {
             directory,
             state,
-            _lock: std::sync::Arc::new(lock),
+            _lock: std::sync::Arc::new(OperationLock(lock)),
         };
         operation.save()?;
         Ok(operation)
@@ -173,7 +191,7 @@ impl Operation {
         Ok(Self {
             directory,
             state,
-            _lock: std::sync::Arc::new(lock),
+            _lock: std::sync::Arc::new(OperationLock(lock)),
         })
     }
 
@@ -404,5 +422,39 @@ mod tests {
         ] {
             assert!(Operation::open(root.path(), &invalid).is_err());
         }
+    }
+
+    /// #285: while another thread spawns a child, the child briefly shares
+    /// every open descriptor, including the lock. Dropping an operation must
+    /// still release its lock at once, or the reopen right after is refused.
+    #[test]
+    fn a_dropped_operation_reopens_while_other_threads_spawn_processes() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let root = tempfile::tempdir().unwrap();
+        let spawning = Arc::new(AtomicBool::new(true));
+        let spawners: Vec<_> = (0..2)
+            .map(|_| {
+                let spawning = Arc::clone(&spawning);
+                std::thread::spawn(move || {
+                    while spawning.load(Ordering::Relaxed) {
+                        let _ = std::process::Command::new("true")
+                            .stdin(std::process::Stdio::null())
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .status();
+                    }
+                })
+            })
+            .collect();
+        let refused = (0..100)
+            .filter(|_| Operation::open(root.path(), &spec()).is_err())
+            .count();
+        spawning.store(false, Ordering::Relaxed);
+        for spawner in spawners {
+            spawner.join().unwrap();
+        }
+        assert_eq!(refused, 0, "reopens refused by a lock nobody holds");
     }
 }
