@@ -889,6 +889,31 @@ namespace and app it covers, over Bearer and Basic alike; bare names such as
 internal service token and unscoped tokens are unaffected. See
 `registry-pickle.md` §1.2 for the exact rule.
 
+**Permission specs (shipped):** A `[permission.<token-name>]` block
+(`config::PermissionSpec`, replicated as `DesiredState.permissions`) is an
+additional allow-list on top of role and scope. It can narrow a token but never
+widen it. A token with no spec is governed by role and scope alone, and the
+internal system principal (node-to-node fan-out) is never gated. A browser
+session carries its token's name, so it rides the same spec. The route matrix in
+`src/bun/authz.rs` records, per route, the action a spec must grant
+(`Route::permission`):
+
+| Gate | Check | Routes |
+|------|-------|--------|
+| `App(action)` | `authorize_permission` on the path's app and namespace | logs (SSE, entries, cross-node query, WebSocket) → `logs`; app metrics and charts → `metrics`; delete, rollback → `deploy`; stop → `scale`; exec → `exec` |
+| `Body(action)` | the same, per app the body names | apply (`deploy`, plus `host-exec` for host commands), deploy cancel (`deploy`) |
+| `Cluster(action)` | `authorize_cluster_permission`: the action with `apps = ["*"]` and no `namespaces` | `/v1/logs/sql` → `logs`; `/v1/metrics*` store, rollups and cluster queries, `/v1/alerts`, the alerts fragment → `metrics`; secret rotation → `secret-write`; tokens, join tokens, upgrades, elections, decommission, image signing, log export, `[permission]`/`[namespace]` declarations and test-lease overrides → `admin` |
+| `Filtered(action)` | the route answers without the parts the spec doesn't grant | `/v1/top` rows → `metrics` per app; dashboard alert panel → cluster `metrics`; app page charts → `metrics` on that app |
+
+`admin` is a super-grant covering every other action. `secret-read` gates no
+route, because no API route returns decrypted secret material: the agent
+decrypts `ENC[...]` values straight into the instance environment. Two tests
+keep the matrix honest: `every_gated_route_checks_its_permission_action`
+statically finds each gated handler's check, and the table test in
+`src/bun/api_permission_tests.rs` drives a real request per gated route and per
+principal (every role, grant shape, session, scope, system and bootstrap),
+asserting 403 exactly where the spec doesn't grant the action.
+
 **Bootstrap boundary (shipped):** An empty user-token store leaves protected
 API routes open long enough to create the first cluster token. Bun contains
 that window to an IP-literal loopback listener (`127.0.0.0/8` or `::1`). It
