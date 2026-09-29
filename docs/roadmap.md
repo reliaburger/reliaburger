@@ -811,6 +811,11 @@ feature gate ([compatibility before 1.0.0](releasing.md#compatibility-before-100
   carry volumes, CRIU checkpoint and restore, pre-dump iterations, lazy pages
   and TCP handoff, for apps and jobs
   ([#268](https://github.com/reliaburger/reliaburger/pull/268)).
+- **After 0.4.0: the book edit.** Distil "Building Reliaburger" so it reads
+  properly from beginning to end: cut the fluff, keep the design narrative,
+  the first-use Rust explanations and the lessons, and fold material that was
+  bolted onto earlier chapters later back into place
+  ([#311](https://github.com/reliaburger/reliaburger/issues/311)).
 - **Later.** The fleet control plane
   ([#265](https://github.com/reliaburger/reliaburger/pull/265)), and GPU
   scheduling and warm starts (F01). The rest of the backlog (F02–F11, H05)
