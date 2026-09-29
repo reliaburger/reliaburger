@@ -112,7 +112,7 @@ mod tests {
             charts: vec![ChartConfig {
                 endpoint: "/v1/metrics?name=node_cpu_usage_percent".to_string(),
                 title: "CPU Usage".to_string(),
-                y_label: "%".to_string(),
+                unit: crate::brioche::units::ChartUnit::Percent,
                 refresh_secs: 10,
                 range_secs: 3600,
             }],

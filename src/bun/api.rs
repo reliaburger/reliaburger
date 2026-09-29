@@ -8046,14 +8046,14 @@ async fn node_detail_handler(State(state): State<ApiState>, Path(name): Path<Str
             ChartConfig {
                 endpoint: "/v1/metrics?name=node_cpu_usage_percent".to_string(),
                 title: "CPU Usage".to_string(),
-                y_label: "%".to_string(),
+                unit: crate::brioche::units::ChartUnit::Percent,
                 refresh_secs: 10,
                 range_secs: 3600,
             },
             ChartConfig {
                 endpoint: "/v1/metrics?name=node_memory_used_bytes".to_string(),
                 title: "Memory Usage".to_string(),
-                y_label: "bytes".to_string(),
+                unit: crate::brioche::units::ChartUnit::Bytes,
                 refresh_secs: 10,
                 range_secs: 3600,
             },
