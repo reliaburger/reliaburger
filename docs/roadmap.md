@@ -742,7 +742,7 @@ families and optional refactors remain explicitly separate from release gates.
 
 **Released on 29 September 2026.** The implementation and hardening work after Phase 15
 is recorded in [progress.md](progress.md), including Phase 16's audit fixes. The
-[0.1.0 release plan](plans/2026-09-16-v0.1.0-release-plan.md) closed these phases
+[0.1.0 release plan](plans/archive/2026-09-16-v0.1.0-release-plan.md) closed these phases
 with signed release artefacts, a managed laptop cluster and acceptance on the
 downloaded product, rather than starting a new architecture phase. Historical
 phase checkboxes are implementation evidence; the release's acceptance gates and
@@ -765,38 +765,38 @@ every release is a development release: an incompatible format change bumps the
 compatibility generation and needs a fresh cluster, with no migration and no
 feature gate ([compatibility before 1.0.0](releasing.md#compatibility-before-100)).
 
-- **0.1.1: soak follow-ups.** Most soak fixes planned for 0.1.1 went into 0.1.0
-  instead, because the final soak needed them: the report worker, the soak
-  checker, `instance@node` log labels, the retirement stall, stop followed by
-  apply, retire-before-deploy, bounded capture replay, the agent-loop order
-  and short agent-loop turns
-  ([#270](https://github.com/reliaburger/reliaburger/pull/270)–[#275](https://github.com/reliaburger/reliaburger/pull/275),
-  [#277](https://github.com/reliaburger/reliaburger/pull/277)–[#279](https://github.com/reliaburger/reliaburger/pull/279);
-  see the [release closure record](qualification/2026-09-27-v0.1.0-release-closure.md)).
-  0.1.1 has the rest ([#276](https://github.com/reliaburger/reliaburger/pull/276)):
-  `KnownMembers` forgetting departed nodes, `relish nodes` showing dead nodes
-  as dead, the commit hash in `bun --version`, and `build.yml` printing the
-  candidate digest.
-  Housekeeping: consolidate the planning documents (archive finished plans
-  under [plans/archive/](plans/archive/), collapse the completed sections of
-  [progress.md](progress.md) into a short history that links the
-  [qualification records](qualification/) and the release-closure record
-  ([#253](https://github.com/reliaburger/reliaburger/pull/253)), and keep one
-  current backlog), and the pre-1.0 compatibility policy above.
-- **0.1.2: images.** [#248](https://github.com/reliaburger/reliaburger/pull/248):
-  the Go demo build in the tour, multi-arch builds and pulls (which removes
-  0.1.0's multi-platform known limitation), platforms in `relish images`, a
-  build cache cap (100 GiB by default, 1 GiB on a laptop), Buildah storage
-  pruning and Buildah in the guest image. Plus the fix for an ingress host that
-  changes on redeploy.
-- **0.1.3: security and storage hardening.** The should-fix findings from the
-  static review ([#258](https://github.com/reliaburger/reliaburger/pull/258)):
-  snapshots (B03, B04, B05, B07) and the non-injective volume slug; GitOps
-  (B13, B16, B19); a permission matrix for log, metric and secret reads (B18);
-  an upload-body timeout; and autoscaler `min = 0`.
-- **0.1.4: observability and test quality.** Streamed metrics queries, so Mayo
-  and rollup sessions no longer load every Parquet file, and the testing
-  assessment (T01–T07).
+- **0.1.1: every known bug fix.** A full release is expensive, so 0.1.1
+  takes every bug we know about. Most soak fixes went into 0.1.0 itself,
+  because the final soak needed them
+  ([#270](https://github.com/reliaburger/reliaburger/pull/270)–[#275](https://github.com/reliaburger/reliaburger/pull/275), [#277](https://github.com/reliaburger/reliaburger/pull/277)–[#279](https://github.com/reliaburger/reliaburger/pull/279); see the
+  [release closure record](qualification/2026-09-27-v0.1.0-release-closure.md)).
+  The rest:
+  - the soak follow-ups in [#276](https://github.com/reliaburger/reliaburger/pull/276) (merged): departed nodes forgotten, dead
+    nodes listed as dead, the commit in versions, the candidate digest in the
+    build log;
+  - early-user fixes from [#241](https://github.com/reliaburger/reliaburger/issues/241): [#281](https://github.com/reliaburger/reliaburger/issues/281), [#282](https://github.com/reliaburger/reliaburger/issues/282), [#283](https://github.com/reliaburger/reliaburger/issues/283), [#284](https://github.com/reliaburger/reliaburger/issues/284);
+  - the static review's defects ([#258](https://github.com/reliaburger/reliaburger/pull/258)): snapshots ([#291](https://github.com/reliaburger/reliaburger/issues/291)–[#294](https://github.com/reliaburger/reliaburger/issues/294)),
+    GitOps ([#295](https://github.com/reliaburger/reliaburger/issues/295)–[#297](https://github.com/reliaburger/reliaburger/issues/297), [#305](https://github.com/reliaburger/reliaburger/issues/305)), the permission matrix for read
+    routes ([#298](https://github.com/reliaburger/reliaburger/issues/298)), autoscaler `min = 0` ([#299](https://github.com/reliaburger/reliaburger/issues/299)) and docs that contradict
+    0.1.0 ([#300](https://github.com/reliaburger/reliaburger/issues/300));
+  - tests that can't fail ([#301](https://github.com/reliaburger/reliaburger/issues/301), [#302](https://github.com/reliaburger/reliaburger/issues/302)) and the flakes ([#285](https://github.com/reliaburger/reliaburger/issues/285));
+  - further known bugs: a changed ingress host ignored on redeploy ([#307](https://github.com/reliaburger/reliaburger/issues/307)),
+    log forwarders not resuming from the checkpoint ([#308](https://github.com/reliaburger/reliaburger/issues/308)), the unexplained
+    allocation error after a starved deploy ([#309](https://github.com/reliaburger/reliaburger/issues/309)) and Mayo memory growth
+    over a long soak ([#310](https://github.com/reliaburger/reliaburger/issues/310));
+  - UI polish ([#280](https://github.com/reliaburger/reliaburger/issues/280));
+  - housekeeping: the plans that led to 0.1.0 archived under
+    [plans/archive/](plans/archive/), the finished 0.1.0 work in
+    [progress.md](progress.md) collapsed into a short summary, and the pre-1.0
+    compatibility policy above.
+- **0.1.2: images.** [#248](https://github.com/reliaburger/reliaburger/pull/248): the Go demo build in the tour, multi-arch
+  builds and pulls (which removes 0.1.0's multi-platform known limitation),
+  platforms in `relish images`, a build cache cap (100 GiB by default, 1 GiB on
+  a laptop), Buildah storage pruning and Buildah in the guest image.
+- **0.1.3: observability and test quality.** Streamed metrics queries, so Mayo
+  and rollup sessions no longer load every Parquet file; an owner for every
+  ignored test and tested CI job selection ([#303](https://github.com/reliaburger/reliaburger/issues/303)); JUnit evidence for every
+  suite ([#304](https://github.com/reliaburger/reliaburger/issues/304)).
 - **0.2.0: "A million jobs".** Task arrays keep compact state in Raft and
   expand on each node, and finish a million tasks in minutes on three nodes
   ([#266](https://github.com/reliaburger/reliaburger/pull/266)).

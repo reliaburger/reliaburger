@@ -1,6 +1,6 @@
 # Phase 15 follow-up plan — review of PR #151 (`codex/phase15-correctness-2026-07-28`)
 
-> Historical checklist. The [17 September completion plan](archive/2026-09-17-codebase-completion-plan.md#reconciliation-with-the-earlier-plans)
+> Historical checklist. The [17 September completion plan](2026-09-17-codebase-completion-plan.md#reconciliation-with-the-earlier-plans)
 > reconciles every section with the current code and tracks the remaining work.
 > Do not interpret the unchecked boxes below as a current implementation count.
 
@@ -18,7 +18,7 @@ Pickle auth, trust domains, rootless networking, deploy state and ingress TLS.
 The safety architecture held up under review: operation grants, target-side
 re-authorisation, principal-bound audit and refusal-not-green-skip all have real
 code paths and tests. The remaining phase gate is the three-real-node acceptance
-runbook (`docs/plans/2026-07-06-plan-chaos.md` §9).
+runbook (`docs/plans/archive/2026-07-06-plan-chaos.md` §9).
 
 The review found four CI failures (all root-caused below), three
 branch-introduced regressions that break real clusters (builds, self-upgrade and
@@ -64,7 +64,7 @@ CI on main starts failing.
   less work in a debug build).
 - [ ] Update the matching walkthrough in `docs/book/15-ready-for-production.md`.
 - Verify: `make ci`, then `RELIABURGER_NODE_PRESSURE_TESTS=1` via `make test-linux`
-  in the Lima VM (recipe in memory / `docs/plans/2026-07-18-plan-codebase-review-follow-up.md`).
+  in the Lima VM (recipe in memory / `docs/plans/archive/2026-07-18-plan-codebase-review-follow-up.md`).
 
 ### A2. Authenticate the self-upgrade cluster harness
 The fail-closed clustered write policy is deliberate; fix the tests, not the server.
@@ -393,7 +393,7 @@ never run *any* chaos scenario.
   `rkyv` RUSTSEC-2026-0235 and the maintenance notices (bincode,
   rustls-pemfile, paste, proc-macro-error); extend or fix each; update
   `.cargo/audit.toml`, the `make audit` expiry date and the table in
-  `docs/plans/2026-07-18-plan-codebase-review-follow-up.md:71–75`.
+  `docs/plans/archive/2026-07-18-plan-codebase-review-follow-up.md:71–75`.
 
 ---
 
@@ -406,7 +406,7 @@ never run *any* chaos scenario.
   (This is exactly the test that would have caught C1.)
 
 ### H2. Execute the three-node acceptance runbook (human in the loop)
-- [ ] Amend `docs/plans/2026-07-06-plan-chaos.md` §9 first: state which
+- [ ] Amend `docs/plans/archive/2026-07-06-plan-chaos.md` §9 first: state which
   `--profile` each run uses (`full-runc` on Linux nodes, `full-apple` on macOS)
   and that C4 needs rootful cgroup v2.
 - [ ] Run §9 on three independent nodes/VMs; record date, cluster size and

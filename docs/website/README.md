@@ -6,7 +6,7 @@ with the GitHub Pages workflow (`.github/workflows/static.yml`); workflow and
 custom-domain configuration are managed separately.
 
 JavaScript: one script, for one thing (decision D2 in
-`docs/plans/2026-09-23-zero-to-cluster.md`). `assets/tour-player.js` plays the
+`docs/plans/archive/2026-09-23-zero-to-cluster.md`). `assets/tour-player.js` plays the
 tour's recording, `assets/tour.cast`, with a vendored copy of the asciinema
 player in `assets/asciinema/`. It loads the player and the recording from this
 site, and only when someone opens the tour; nothing is fetched from anywhere

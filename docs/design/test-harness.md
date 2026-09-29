@@ -71,7 +71,7 @@ Direct Apple Container is disabled for 0.1.0. Its manual development tests remai
 separate because hosted macOS runners cannot provide its nested virtualisation.
 The supported runtime gates run on pull requests, and release tags must pass the
 same reusable validation workflow before publication. Managed macOS laptop
-acceptance uses Linux VMs (see V04 in the release checklist).
+acceptance uses Linux VMs (see V04 in the [acceptance gates](../progress.md#acceptance-and-release-gates)).
 
 Pull requests stacked on another branch skip the acceptance suites (wall-clock,
 cluster, upgrade and privileged Linux) unless labelled `full-ci`; they run once the

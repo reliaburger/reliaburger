@@ -12,7 +12,7 @@ substantial, though: archive exports can lose older generations, several safety
 and recovery paths have ownership gaps, and a full catalogue still contains
 unconditional unknown results. Green source CI does not close those gaps.
 
-This is the current completion backlog. [progress.md](../progress.md) owns its
+This is the current completion backlog. [progress.md](../../progress.md) owns its
 checkboxes; this document supplies evidence, ordering and acceptance criteria.
 The [release plan](2026-09-16-v0.1.0-release-plan.md) still owns packaging and the
 supported 0.1.0 contract. Dated reviews remain historical evidence, not competing
@@ -34,7 +34,7 @@ premature port exhaustion. Other C items are source-confirmed gaps or unresolved
 behavioural requirements from earlier reviews; their proposed regressions still
 need to be written and run. H items include investigation and optional refactoring;
 F items are missing capabilities, not evidence of failures in supported behaviour.
-[Audit evidence and reproducible probes](../qualification/2026-09-17-code-audit.md)
+[Audit evidence and reproducible probes](../../qualification/2026-09-17-code-audit.md)
 record those distinctions and the hosted checks inspected.
 
 There are **88 tracked work packages**: 59 correctness/contract items, 12
@@ -2137,7 +2137,7 @@ Franchise, Windows/WSL, TPM/external-CA integration and multi-cluster federation
 
 **Priority:** gate. **Wave:** 7. **Book chapters:** 15.
 
-Evidence: `docs/plans/2026-07-06-plan-chaos.md:acceptance runbook`; `docs/qualification`.
+Evidence: `docs/plans/archive/2026-07-06-plan-chaos.md:acceptance runbook`; `docs/qualification`.
 
 Live setup/ingress and source integration tests passed; the full real catalogue/chaos/bench/wtf/trace matrix has not.
 
@@ -2147,7 +2147,7 @@ Live setup/ingress and source integration tests passed; the full real catalogue/
 
 **Priority:** gate. **Wave:** 7. **Book chapters:** 04, 05, 14, 15.
 
-Evidence: `docs/plans/2026-09-16-v0.1.0-release-plan.md:release gates`.
+Evidence: `docs/plans/archive/2026-09-16-v0.1.0-release-plan.md:release gates`.
 
 A short successful setup does not establish renewal, retention, mixed-version recovery or partial-rollout durability.
 
@@ -2223,7 +2223,7 @@ risk, not a fixed dependency. The September release review removes
 parser directly. The advisory gate failed before migration with that exception
 removed. Twelve TLS unit tests, 17 client tests, seven ingress tests, three
 operator file-reload tests and strict Linux/macOS Clippy pass. `make audit`
-passes with four exceptions. The [18 September review](../qualification/2026-09-18-dependency-exceptions.md)
+passes with four exceptions. The [18 September review](../../qualification/2026-09-18-dependency-exceptions.md)
 records each remaining dependency path, risk and migration option, retaining
 the 18 November expiry. The audit now checks that rkyv remains inactive across
 all root features and targets, and refuses failed inspection. The failing-first

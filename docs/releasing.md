@@ -4,7 +4,7 @@
 build, staged over HTTPS, qualified, then published unchanged. Its [release
 closure record](qualification/2026-09-27-v0.1.0-release-closure.md) lists the
 thirteen candidates it took and what each soak run found. The
-[0.1.0 plan](plans/2026-09-16-v0.1.0-release-plan.md) defined its acceptance
+[0.1.0 plan](plans/archive/2026-09-16-v0.1.0-release-plan.md) defined its acceptance
 gates (V01–V04 in [progress.md](progress.md#acceptance-and-release-gates)); a
 later release keeps them unless a dated plan changes them. A green build alone
 doesn't qualify the laptop quickstart or its timing.
