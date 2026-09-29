@@ -14,8 +14,8 @@ runs, CI results) that used to live here.
 > original [release-readiness review](plans/2026-09-16-v0.1.0-release-plan.md)
 > defines the supported scope and the clean-install and real-cluster gates.
 > The [0.1.0 release closure record](qualification/2026-09-27-v0.1.0-release-closure.md)
-> (25–27 September) lists every V02 soak run, the PRs from #196 onwards with
-> each bug's cause and fix, and what's carried past 0.1.0.
+> (25–29 September) lists every V02 soak run, the PRs from #196 to the
+> `v0.1.0` tag with each bug's cause and fix, and what's carried past 0.1.0.
 
 ## Current completion backlog (17 September 2026)
 
@@ -353,13 +353,15 @@ in repository Actions. Signed candidate qualification is still V03.
   - [x] Open every object store (exports, metrics, snapshot upload, council backups) through one helper that syncs `file://` writes, and add a council-backup power-cut fixture (every retained backup was empty after a cut before the fix).
   - [x] Write the snapshot uploader's `uploaded` metadata atomically and durably (it used a plain `std::fs::write`).
   - [x] Stop a deploy that arrives before its committed allocation from wedging every retry on a runtime address hold nothing tracks.
+  - [x] Soak the final candidate: the fast tier and the 8-hour final tier were both clean on 7d7dfc0, the build `v0.1.0` was promoted from ([fast](qualification/2026-09-29-v02-fast-tier-7d7dfc0.md), [final](qualification/2026-09-29-sustained-v02.md), [candidates 1–13](qualification/2026-09-27-v0.1.0-release-closure.md)).
   - [ ] Qualify the snapshot uploader under power cuts (needs Btrfs volumes).
   - [ ] Run the `v02-loops` Actions lane and record its bounds.
-- [ ] **V03** (gate) Publish and install the exact signed candidate.
+- [x] **V03** (gate) Publish and install the exact signed candidate.
   - [x] Preserve a complete signed candidate with source/run identity and per-file hashes; promote only the qualified bytes without rebuilding.
   - [x] Add explicit HTTPS candidate mirrors to both installers and managed setup without bypassing checksums or signatures.
   - [x] Stage a verified candidate as a pre-release that promotion refuses, and script the real `curl | sh` qualification against it ([runbook](releasing.md#staging-a-candidate)).
   - [x] Qualify hosted candidate creation, staged HTTPS delivery and actual signed installation before promotion ([Apple silicon, 25 Sep](qualification/2026-09-25-staged-install-apple-silicon.md): candidate run 36078958881, two cold installs passed).
+  - [x] Publish the qualified candidate: 7d7dfc0 (candidate run 36508614419, attempt 1) was staged, passed two staged cold installs on 29 September (282 s, 178 s) and was promoted unchanged as `v0.1.0` by promote run 36624159253 ([record](qualification/2026-09-27-v0.1.0-release-closure.md#how-it-ended)).
 - [ ] **V04** (gate) Measure repeated cold installs on the advertised host matrix.
   - [x] Apple silicon: two cold installs, 125–126 s from the first `curl` to a ready three-node cluster ([record](qualification/2026-09-25-staged-install-apple-silicon.md)).
   - [ ] Intel macOS, Linux x86_64 and Linux arm64.
