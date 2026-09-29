@@ -11,7 +11,11 @@ use reliaburger::relish::OutputFormat;
 use reliaburger::relish::commands;
 
 #[derive(Parser)]
-#[command(name = "relish", version, about = "Reliaburger CLI")]
+#[command(
+    name = "relish",
+    version = reliaburger::upgrade::version::VERSION_LINE.as_str(),
+    about = "Reliaburger CLI"
+)]
 struct Cli {
     /// Output format: human, json, or yaml.
     #[arg(long, default_value = "human", global = true)]

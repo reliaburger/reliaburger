@@ -582,6 +582,8 @@ A candidate binary gets checked too, before it's staged. Run `bun --compatibilit
 
 Tests cover mismatched gossip and Raft messages, refused development state, rejected joins, signed-but-incompatible executables and rollback refusal. Test fixtures that model a *compatible* peer take their pair from `compatibility::CURRENT` rather than hard-coding numbers. We learnt that one when a state bump turned ten unrelated tests red at the compatibility check instead of at the behaviour they were meant to test.
 
+That fresh-cluster promise outlived 0.1.0. We sketched a stricter rule for after the release: bump a generation only for a change old nodes can't read, ship a migration with every bump, and let additive JSON fields through without one. Then we asked who it would serve. Before 1.0.0 every release is a development release, and every migration is code we'd have to test and then carry for a cluster you could simply rebuild. So the rule waits for 1.0.0. Until then, any incompatible change bumps its generation, nodes refuse old peers and old state, and you start a fresh cluster.
+
 ### Cordoning
 
 While a node swaps binaries, the scheduler shouldn't hand it new work. The mechanism is two small pieces: `ClusterUpgradeState::is_node_cordoned` says whether a node's record is in an actively-swapping phase (`Directed` or `Verifying` — a `Pending` node keeps taking work until its turn actually comes; cordoning the whole fleet at once would be a self-inflicted capacity outage), and `meat::filter::apply_upgrade_cordon` flips those nodes' `ready` flag in the scheduler's cache, which the existing filter already respects. No new filter logic — readiness was designed as the "don't place here" bit, and upgrades are just one more thing that clears it.
@@ -1165,6 +1167,101 @@ ones missed #220. RSS in this soak mixes three things (a working set that
 grows with history, allocator high-water marks, leaks) and a two-hour image
 can't tell them apart. Descriptors don't have the first two problems, so
 they carry the leak signal and RSS keeps its coarse 25% ceiling.
+
+
+## Which build is this?
+
+Issue #241 was a three-node Ubuntu cluster whose Bun crash-looped after a
+restart, with an error a fix from the week before had removed. The likely
+answer was that two nodes still ran an older build. Proving it was harder
+than it should have been, because every build said the same thing:
+
+```text
+$ bun --version
+bun 0.1.0
+```
+
+That was true and useless. Every release candidate, and every local build,
+was 0.1.0, and nothing on the node said which one it had. The way to check
+was to hash the binary and compare it with each candidate's published
+checksums. `/v1/version` reports that same `binary_sha256`, which identifies
+the bytes exactly, but a SHA-256 doesn't tell a human which code it holds. A
+commit does.
+
+The release workflow already knew it. `build.yml` sets
+`RELIABURGER_GIT_SHA` to the commit it builds, and the capabilities report
+(the build fingerprint in `/v1/capabilities`) already read it with `option_env!`.
+That macro is `env!`'s forgiving sibling: it reads an environment variable
+*at compile time* and gives you `Option<&'static str>`, `None` if it wasn't
+set, instead of failing the build. Nothing printed it, though, and a build
+from a checkout didn't have it at all.
+
+So there are two changes. `build.rs` fills the gap for local builds: when the
+variable isn't set, it runs `git rev-parse HEAD` and hands the result to
+rustc with `cargo:rustc-env=RELIABURGER_GIT_SHA=...`, which makes it visible
+to `option_env!` exactly as if the workflow had set it. A tree with no git, or
+one git refuses to read, just goes without; that's `None`, not an error. The
+script also has to tell Cargo when to run again, or the first commit it saw
+would be baked in forever. It watches `HEAD`, the branch file `HEAD` points
+to and `packed-refs`, each through `git rev-parse --git-path` so a worktree
+(which keeps its own `HEAD` but shares refs with the main checkout) gets the
+right files. A path that doesn't exist isn't watched, because Cargo treats a
+missing watched path as changed and would rerun the script on every build.
+
+The other change is one place that formats a version for people:
+
+```rust
+pub fn describe(version: &dyn fmt::Display, commit: Option<&str>) -> String {
+    match commit {
+        Some(commit) => {
+            let short = commit.get(..SHORT_COMMIT_LEN).unwrap_or(commit);
+            format!("{version} ({short})")
+        }
+        None => version.to_string(),
+    }
+}
+```
+
+`&dyn fmt::Display` is a *trait object*: a reference to any value that
+implements `Display`, with the method looked up at run time through a small
+table (like an interface value in Go). It lets the same function take the
+Cargo version string and a `BinaryVersion`, which displays with a leading
+`v`. `commit.get(..7)` is the non-panicking way to slice a string: indexing
+with `&commit[..7]` panics if the string is shorter, while `get` returns an
+`Option`.
+
+clap's `--version` wants a `&'static str`, a string that lives for the whole
+program. A `format!` result doesn't, so the version line lives in a
+`LazyLock`:
+
+```rust
+pub static VERSION_LINE: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| describe(&env!("CARGO_PKG_VERSION"), build_commit()));
+```
+
+`LazyLock` runs its closure the first time anyone reads it and keeps the
+answer. Because the lock itself is a `static`, borrowing the `String` inside
+it borrows for `'static`, so `VERSION_LINE.as_str()` is exactly what
+`#[command(version = ...)]` needs. Now both binaries say:
+
+```text
+$ bun --version
+bun 0.1.0 (3fcb1fd)
+```
+
+Bun's startup line goes through `describe` too, as does the line it writes
+into its own log store, and `/v1/version` gains a `commit` field with the
+full SHA (or `null`). The field is additive: the orchestrator and the soak
+harness read `version` and `binary_sha256` as before and ignore it.
+
+The tests don't insist that a commit exists, because a CI container that
+mounts the tree as another user can make git refuse it, and that build must
+still pass. `describe_adds_the_short_commit_when_known` pins the formatting,
+`version_line_carries_the_build_commit` checks the line and, when there is a
+commit, that it looks like one. `relish_cli`'s `--version` test runs the real
+binary and expects `relish 0.1.0 (<commit>)` whenever the build knew the
+commit, and `version_endpoint_reports_the_build_commit` does the same for
+the API.
 
 ## Adopted, and already done
 

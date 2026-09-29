@@ -220,7 +220,10 @@ async fn agent_nodes_returns_membership() {
     // Query nodes
     let (resp_tx, resp_rx) = oneshot::channel();
     cmd_tx
-        .send(AgentCommand::Nodes { response: resp_tx })
+        .send(AgentCommand::Nodes {
+            down: Vec::new(),
+            response: resp_tx,
+        })
         .await
         .unwrap();
     let nodes = resp_rx.await.unwrap();

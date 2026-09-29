@@ -1480,6 +1480,22 @@ The tag was the interesting decision. `v0.1.0-staging.123` reads nicely and is v
 
 Re-running the workflow is safe. If the pre-release is published, it only re-checks GitHub's stored digests against the record. If an earlier run died with an unpublished draft (nobody can have installed from that), it deletes the draft and starts again. If the published bytes differ, it stops and touches nothing, because somebody might be halfway through qualifying them. Then `scripts/release/qualify-staged-install.sh` runs the real pipeline on each laptop in the matrix, in a throwaway `RELIABURGER_HOME`, and writes down the timings and every downloaded digest.
 
+One small friction took a while to notice. The digest qualification keeps is
+the SHA-256 of `candidate.json`, and the build put it in exactly one place:
+the job summary, which is a page for a browser, not something `gh` prints.
+So whoever ran the qualification from a terminal (usually an agent) did the
+obvious thing and downloaded the whole candidate, about 2 GB of binaries and
+guest images, to hash one small JSON file. Now the `candidate` job also
+`echo`es `Qualification manifest SHA-256: <digest>` into its log, where
+`gh run view --log | grep` finds it, and uploads `candidate.json` alone as a
+second artefact, `candidate-manifest-<commit>-<attempt>`, kept for a day.
+Neither is trusted more than the summary was. They come from the same run,
+and `stage.yml` and promotion still download the full candidate and check
+every byte against the digest the operator hands them.
+`scripts/release/test_build_workflow.py` reads `build.yml` and checks all
+three: the log line, the one-day manifest artefact, and the 90-day full
+candidate that still carries the real weight.
+
 ### `| sh`, not `| bash`
 
 The homepage tells you to pipe the installer to `sh`. Our first installer said `bash` on its first line and used `[[ … =~ … ]]` to validate the version and the mirror URL, so `curl … | sh` failed on Ubuntu and Debian, where `sh` is dash, and in any container image with busybox. Bash's features were convenient. They weren't necessary.

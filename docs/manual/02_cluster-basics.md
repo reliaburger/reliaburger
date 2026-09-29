@@ -77,6 +77,12 @@ relish nodes      # gossip membership and node state
 relish council    # Raft voters and the current leader
 ```
 
+`relish nodes` shows every member's gossip state: `alive`, `suspect` (missed
+its probes, not yet declared dead) or `dead`. A dead node stays listed for up
+to a day after it was last heard from, so you can see what went missing. It
+drops off sooner if it comes back, leaves the cluster on purpose, or you
+retire it with `relish decommission-node`.
+
 The council heals itself: lose a voter and the reconciler promotes a caught-up
 node in its place. If every voter is lost, `relish council recover` rebuilds
 the council from a stopped survivor's snapshot or a sealed backup (see
