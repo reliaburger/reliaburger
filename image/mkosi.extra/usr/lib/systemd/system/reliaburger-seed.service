@@ -1,13 +1,13 @@
-# Spike S3: install /etc/reliaburger from the reliaburger.seed credential,
-# a tarball of node.toml, master.key, identity/ and, on the first node,
-# security-bootstrap.json. The lab passes it with QEMU's -smbios type=11 (or
-# fw_cfg). It runs once, while node.toml is absent. The claim flow replaces
-# this in Phase 2 (research §4.2).
+# Install /etc/reliaburger from a seed: a tarball of node.toml, master.key,
+# identity/ and, on the first node, security-bootstrap.json. It comes from
+# the reliaburger.seed credential (the lab passes it with QEMU's
+# -smbios type=11) or from a USB stick labelled RBSEED (real machines,
+# research §4.2's seed mode). It runs while node.toml is absent; without a
+# seed, bun runs standalone. The claim flow replaces this in Phase 2.
 [Unit]
-Description=Reliaburger spike seed
+Description=Reliaburger seed
 Before=reliaburger.service
 ConditionPathExists=!/etc/reliaburger/node.toml
-ConditionCredential=reliaburger.seed
 
 [Service]
 Type=oneshot

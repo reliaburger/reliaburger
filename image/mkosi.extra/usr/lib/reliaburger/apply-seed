@@ -1,10 +1,57 @@
 #!/bin/sh
-# Unpacks the reliaburger.seed credential into /etc/reliaburger (spike S3;
-# see reliaburger-seed.service).
+# Unpacks a seed into /etc/reliaburger (see reliaburger-seed.service).
+# Sources, in order:
+#   1. the reliaburger.seed credential;
+#   2. a filesystem labelled RBSEED (a USB stick), holding either
+#      seeds/<mac>.seed for one of this machine's NICs (one stick for the
+#      whole fleet, colons in the MAC written as dashes) or reliaburger.seed.
+# No seed is fine: bun then runs standalone.
 set -eu
 umask 077
-install -d -m 0700 /etc/reliaburger
-tar -xzf "$CREDENTIALS_DIRECTORY/reliaburger.seed" -C /etc/reliaburger --no-same-owner
-chown -R root:root /etc/reliaburger
-chmod -R go-rwx /etc/reliaburger
-echo "reliaburger: seed installed: $(grep -m1 '^name' /etc/reliaburger/node.toml)"
+seed=
+if [ -n "${CREDENTIALS_DIRECTORY:-}" ] && [ -f "$CREDENTIALS_DIRECTORY/reliaburger.seed" ]; then
+    seed=$CREDENTIALS_DIRECTORY/reliaburger.seed
+    from="the reliaburger.seed credential"
+else
+    # USB sticks can take a few seconds to appear. This wait is also what an
+    # unseeded node pays on each boot, until it has a seed.
+    stick=/dev/disk/by-label/RBSEED
+    for _ in $(seq 1 10); do
+        [ -e "$stick" ] && break
+        sleep 1
+    done
+    if [ -e "$stick" ]; then
+        mnt=/run/reliaburger-seed-stick
+        install -d -m 0700 "$mnt"
+        mount -o ro "$stick" "$mnt"
+        trap 'umount "$mnt"' EXIT
+        for mac in $(cat /sys/class/net/*/address 2>/dev/null | sort -u); do
+            if [ -f "$mnt/seeds/$(echo "$mac" | tr : -).seed" ]; then
+                seed=$mnt/seeds/$(echo "$mac" | tr : -).seed
+                from="the RBSEED stick (for $mac)"
+                break
+            fi
+        done
+        if [ -z "$seed" ] && [ -f "$mnt/reliaburger.seed" ]; then
+            seed=$mnt/reliaburger.seed
+            from="the RBSEED stick"
+        fi
+        [ -n "$seed" ] || echo "reliaburger: RBSEED stick has no seed for this machine's MACs"
+    fi
+fi
+if [ -z "$seed" ]; then
+    echo "reliaburger: no seed; bun runs standalone"
+    exit 0
+fi
+# Unpack beside the target and move it into place, so a bad tarball never
+# leaves a half-written node.toml that would stop the next seed.
+new=$(mktemp -d /etc/.reliaburger.XXXXXX)
+tar -xzf "$seed" -C "$new" --no-same-owner
+[ -f "$new/node.toml" ] || { rm -rf "$new"; echo "reliaburger: seed from $from has no node.toml"; exit 1; }
+chown -R root:root "$new"
+chmod -R go-rwx "$new"
+if [ -e /etc/reliaburger ]; then
+    mv /etc/reliaburger "/etc/reliaburger.before-seed.$(date +%s)"
+fi
+mv "$new" /etc/reliaburger
+echo "reliaburger: seed installed from $from: $(grep -m1 '^name' /etc/reliaburger/node.toml)"

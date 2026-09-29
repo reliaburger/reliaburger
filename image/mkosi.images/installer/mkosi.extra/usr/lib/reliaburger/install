@@ -158,5 +158,10 @@ peak=$(cat "$cgroup/memory.peak" 2>/dev/null || echo 0)
 read -r anon file low </run/memory.max || anon=0 file=0 low=0
 say "installed ${version} to ${disk} in $(($(date +%s) - started)) s"
 say "memory: cgroup peak $((peak / 1048576)) MiB (at most $((anon / 1048576)) MiB anonymous, $((file / 1048576)) MiB page cache); MemAvailable never below $((low / 1024)) MiB"
+# The MACs are what a seed stick's seeds/<mac>.seed files are named after.
+for link in /sys/class/net/*; do
+    [ "$(cat "$link/type" 2>/dev/null)" = 1 ] || continue
+    say "this machine: $(basename "$link") $(cat "$link/address") $(ip -4 -br addr show dev "$(basename "$link")" | awk '{ print $3 }')"
+done
 say "rebooting into the installed system"
 systemctl reboot
