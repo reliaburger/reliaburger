@@ -69,6 +69,14 @@ struct ScheduledJob {
 /// promptly, infrequent enough not to hammer an unreachable council.
 const IDENTITY_RETRY_TICKS: u32 = 30;
 
+/// How often the agent loop runs its periodic health tick when nothing else
+/// is waiting.
+const HEALTH_TICK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The longest a steady stream of commands may hold off the health tick.
+/// Probes, restarts and retirements stall for as long as it waits.
+const HEALTH_TICK_STARVATION_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Grace period between SIGTERM and SIGKILL during shutdown.
 const SHUTDOWN_GRACE_SECS: u64 = 5;
 
@@ -3599,7 +3607,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     async fn run_loop(&mut self, ready: Option<super::readiness::ReadySignal>) {
-        let mut health_interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        let mut health_interval = tokio::time::interval(HEALTH_TICK_INTERVAL);
+        let mut last_health_tick = tokio::time::Instant::now();
 
         if let Some(readiness) = self.readiness.clone() {
             let (capabilities, _) = self.live_egress_report_state().await;
@@ -3611,58 +3620,57 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
 
         loop {
-            // Branches are polled in order, so the periodic tick runs only when
-            // nothing else is waiting. A tick can take seconds (every pending
-            // restart retries its runtime cleanup), and ticks that fall behind
-            // are due at once. Polled in random order, each queued command had
-            // to win a coin toss against the next slow tick; callers timed out,
-            // the consumer view that would let restarts finish never landed,
-            // and the node stopped answering. Now a command waits for at most
-            // the tick already running.
-            //
-            // Snapshot requests come before commands. The report worker asks
-            // once per interval and gives up after two seconds; queued behind
-            // a steady stream of commands, it missed that deadline for over a
-            // minute, and the leader moved apps off a healthy node. Reports
-            // are rare and bounded, so they can't starve commands.
-            tokio::select! {
-                biased;
-                _ = self.shutdown.cancelled() => {
-                    self.abandon_pending_stops();
-                    self.shutdown_all().await;
-                    break;
-                }
-                Some(req) = Self::recv_snapshot(&mut self.cluster) => {
-                    self.handle_snapshot_request(req).await;
-                }
-                Some(cmd) = self.command_rx.recv() => {
-                    self.handle_command(cmd).await;
-                }
-                Some(outcome) = self.stop_waits.join_next_with_id(),
-                    if !self.stop_waits.is_empty() => {
-                    self.complete_app_stop(outcome).await;
-                }
-                Some(op) = self.deploy_ops_rx.recv() => {
-                    self.handle_deploy_op(op).await;
-                }
-                _ = health_interval.tick() => {
-                    self.reopen_uncertain_discovery().await;
-                    if let Err(error) = self.fence_lapsed_view().await {
-                        eprintln!("bun: withdrawing the lapsed cluster view awaits retry: {error}");
+            // Commands come before a tick that is merely due (#260), but a
+            // steady stream of them must not hold the tick off for good:
+            // health probes, restarts and retirements all run from it.
+            if last_health_tick.elapsed() >= HEALTH_TICK_STARVATION_BOUND {
+                self.run_health_tick().await;
+                last_health_tick = tokio::time::Instant::now();
+                health_interval.reset();
+            } else {
+                // Branches are polled in order, so the periodic tick runs only
+                // when nothing else is waiting. A tick can take seconds (every
+                // pending restart retries its runtime cleanup), and ticks that
+                // fall behind are due at once. Polled in random order, each
+                // queued command had to win a coin toss against the next slow
+                // tick; callers timed out, the consumer view that would let
+                // restarts finish never landed, and the node stopped
+                // answering. Now a command waits for at most the tick already
+                // running.
+                //
+                // Only branches that can't flood sit above commands. The
+                // report worker asks for a snapshot once per interval. Stop
+                // completions come from stops already started, one each.
+                // Every deploy op comes from a deploy task that waits for its
+                // reply before sending the next, so no more of them wait than
+                // there are deploys and probes in flight. Commands come from
+                // any number of callers taking turns; during a `relish test`
+                // pulse the channel is never empty, and below it a deploy's
+                // first step waited out its 300 s deadline.
+                tokio::select! {
+                    biased;
+                    _ = self.shutdown.cancelled() => {
+                        self.abandon_pending_stops();
+                        self.shutdown_all().await;
+                        break;
                     }
-                    self.drive_startup_retirements().await;
-                    self.drive_deferred_retirements().await;
-                    self.refresh_egress_readiness().await;
-                    self.run_health_checks().await;
-                    self.check_jobs().await;
-                    self.fire_due_jobs().await;
-                    self.check_apps().await;
-                    self.drive_pending_restarts().await;
-                    self.expire_faults().await;
-                    self.reconcile_firewall().await;
-                    self.reresolve_egress().await;
-                    self.sweep_kernel_networking().await;
-                    self.check_identity_rotation().await;
+                    Some(req) = Self::recv_snapshot(&mut self.cluster) => {
+                        self.handle_snapshot_request(req).await;
+                    }
+                    Some(outcome) = self.stop_waits.join_next_with_id(),
+                        if !self.stop_waits.is_empty() => {
+                        self.complete_app_stop(outcome).await;
+                    }
+                    Some(op) = self.deploy_ops_rx.recv() => {
+                        self.handle_deploy_op(op).await;
+                    }
+                    Some(cmd) = self.command_rx.recv() => {
+                        self.handle_command(cmd).await;
+                    }
+                    _ = health_interval.tick() => {
+                        self.run_health_tick().await;
+                        last_health_tick = tokio::time::Instant::now();
+                    }
                 }
             }
             // Local changes only mark the consumer view stale, so a burst of
@@ -3671,6 +3679,28 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 eprintln!("bun: consumer view refresh awaits retry: {error}");
             }
         }
+    }
+
+    /// The loop's periodic work: health probes, restarts, retirements, jobs,
+    /// fault expiry, firewall reconciliation and identity rotation.
+    async fn run_health_tick(&mut self) {
+        self.reopen_uncertain_discovery().await;
+        if let Err(error) = self.fence_lapsed_view().await {
+            eprintln!("bun: withdrawing the lapsed cluster view awaits retry: {error}");
+        }
+        self.drive_startup_retirements().await;
+        self.drive_deferred_retirements().await;
+        self.refresh_egress_readiness().await;
+        self.run_health_checks().await;
+        self.check_jobs().await;
+        self.fire_due_jobs().await;
+        self.check_apps().await;
+        self.drive_pending_restarts().await;
+        self.expire_faults().await;
+        self.reconcile_firewall().await;
+        self.reresolve_egress().await;
+        self.sweep_kernel_networking().await;
+        self.check_identity_rotation().await;
     }
 
     /// Enforce the current kernel boundary and publish this tick's capabilities.
@@ -16553,6 +16583,141 @@ interval = 1
             kills_while_queued <= ids.len(),
             "{kills_while_queued} restart cleanups ran while 8 commands waited: \
              later health ticks overtook queued commands"
+        );
+    }
+
+    /// Callers that ask for status again as soon as they get an answer, the
+    /// way `relish test` cases poll every node while they wait for a replica.
+    /// Together they keep the agent's command queue from ever emptying.
+    fn spawn_status_pollers(
+        tx: &mpsc::Sender<AgentCommand>,
+        count: usize,
+        stop: &CancellationToken,
+    ) -> Vec<tokio::task::JoinHandle<()>> {
+        (0..count)
+            .map(|_| {
+                let tx = tx.clone();
+                let stop = stop.clone();
+                tokio::spawn(async move {
+                    while !stop.is_cancelled() {
+                        let (response, reply) = oneshot::channel();
+                        if tx.send(AgentCommand::Status { response }).await.is_err() {
+                            break;
+                        }
+                        let _ = reply.await;
+                    }
+                })
+            })
+            .collect()
+    }
+
+    async fn stop_agent_and_pollers(
+        shutdown: CancellationToken,
+        pollers_stop: CancellationToken,
+        pollers: Vec<tokio::task::JoinHandle<()>>,
+        mut task: tokio::task::JoinHandle<()>,
+    ) {
+        pollers_stop.cancel();
+        shutdown.cancel();
+        for poller in pollers {
+            poller.abort();
+        }
+        if tokio::time::timeout(std::time::Duration::from_secs(10), &mut task)
+            .await
+            .is_err()
+        {
+            task.abort();
+        }
+    }
+
+    /// V02 soak, candidate 11: after the leader's bun was killed, the soak's
+    /// apps piled onto one node and the bin-packer put every `relish test`
+    /// workload there too. The cases polled that node's status without pause,
+    /// so a command always waited. The loop served commands before deploy
+    /// steps, so the deploy worker's first step never ran: no instance
+    /// appeared for 300 s, pulse after pulse, while status kept answering.
+    #[tokio::test]
+    async fn deploy_steps_progress_while_status_queries_keep_the_queue_busy() {
+        let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+        let resident =
+            Config::parse("[app.resident]\nimage = 'resident:v1'\nreplicas = 2\n").unwrap();
+        expect_complete(&drain_deploy(&mut agent, resident).await);
+        // Every status answer reads each instance's runtime.
+        grill.set_pid_delay(Some(std::time::Duration::from_millis(20)));
+        let task = tokio::spawn(async move { agent.run().await });
+        let pollers_stop = CancellationToken::new();
+        let pollers = spawn_status_pollers(&tx, 4, &pollers_stop);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let (events, mut received) = mpsc::channel(64);
+        tx.send(AgentCommand::Deploy {
+            config: Config::parse("[app.fresh]\nimage = 'fresh:v1'\n").unwrap(),
+            events,
+        })
+        .await
+        .unwrap();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while let Some(event) = received.recv().await {
+                match event {
+                    ApplyEvent::Complete { .. } => return Ok(()),
+                    ApplyEvent::Error { message } => return Err(message),
+                    _ => {}
+                }
+            }
+            Err("the deploy's event stream closed without an outcome".to_string())
+        })
+        .await;
+        stop_agent_and_pollers(shutdown, pollers_stop, pollers, task).await;
+
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(message)) => panic!("the deploy failed: {message}"),
+            Err(_) => panic!(
+                "the deploy made no progress in 10 s while status queries kept \
+                 the command queue busy: its steps were starved"
+            ),
+        }
+    }
+
+    /// The same flood must not stop the health tick either. In the soak a
+    /// test workload sat in health-wait for the whole case deadline: its
+    /// probes run from the tick, and the tick only ran when no command
+    /// waited. Restarts, retirements and health checks all live there.
+    #[tokio::test]
+    async fn health_tick_runs_while_status_queries_keep_the_queue_busy() {
+        let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+        let config = Config::parse("[app.web]\nimage = 'web:v1'\n").unwrap();
+        expect_complete(&drain_deploy(&mut agent, config).await);
+        grill.set_pid_delay(Some(std::time::Duration::from_millis(20)));
+        let task = tokio::spawn(async move { agent.run().await });
+        let pollers_stop = CancellationToken::new();
+        let pollers = spawn_status_pollers(&tx, 4, &pollers_stop);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // A replica dies. Only the health tick notices and restarts it.
+        let starts = |grill: &MockGrill| {
+            grill
+                .calls()
+                .iter()
+                .filter(|(operation, _)| operation == "start")
+                .count()
+        };
+        let starts_before = starts(&grill);
+        let id = InstanceId("default__web-0".to_string());
+        grill.set_state(&id, ContainerState::Stopped);
+        grill.set_exit_code(&id, Some(1));
+        let restarted = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            while starts(&grill) == starts_before {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        stop_agent_and_pollers(shutdown, pollers_stop, pollers, task).await;
+
+        assert!(
+            restarted.is_ok(),
+            "no health tick ran for 15 s while status queries kept the command \
+             queue busy: the dead replica was never restarted"
         );
     }
 
