@@ -92,7 +92,7 @@ jobs:
           2>&1 | tee loop.log
       - name: Summarise
         if: ${{ !cancelled() }}
-        run: python3 scripts/release/loop_summary.py --lane "${{ matrix.target }} (${{ matrix.os }})" --junit target/nextest/ci/junit.xml --log loop.log --output summary.md
+        run: python3 scripts/release/loop_summary.py --lane "${{ matrix.target }} (${{ matrix.os }})" --junit target/nextest/ci/junit.xml --log loop.log --candidate "$GITHUB_SHA" --output summary.md
       - uses: actions/upload-artifact@v4
         if: ${{ !cancelled() }}
         with:
@@ -132,7 +132,7 @@ jobs:
           2>&1 | tee loop.log
       - name: Summarise
         if: ${{ !cancelled() }}
-        run: python3 scripts/release/loop_summary.py --lane "${{ matrix.binary }} (ubuntu-latest)" --junit target/nextest/ci/junit.xml --log loop.log --output summary.md
+        run: python3 scripts/release/loop_summary.py --lane "${{ matrix.binary }} (ubuntu-latest)" --junit target/nextest/ci/junit.xml --log loop.log --candidate "$GITHUB_SHA" --output summary.md
       - uses: actions/upload-artifact@v4
         if: ${{ !cancelled() }}
         with:
@@ -209,7 +209,7 @@ jobs:
           2>&1 | tee loop.log
       - name: Summarise
         if: ${{ !cancelled() }}
-        run: python3 scripts/release/loop_summary.py --lane "${{ matrix.case }} (${{ matrix.os }})" --junit target/nextest/ci/junit.xml --log loop.log --output summary.md
+        run: python3 scripts/release/loop_summary.py --lane "${{ matrix.case }} (${{ matrix.os }})" --junit target/nextest/ci/junit.xml --log loop.log --candidate "$GITHUB_SHA" --expected-iterations "$LOOP_COUNT" --output summary.md
       - uses: actions/upload-artifact@v4
         if: ${{ !cancelled() }}
         with:
@@ -234,9 +234,16 @@ jobs:
         with:
           pattern: loop-*
           path: loops
-      - run: python3 scripts/release/loop_summary.py --combine loops --output v02-loops-summary.md
+      # Exits non-zero unless every lane in the manifest passed for this
+      # commit; the next two steps still publish the table.
+      - run: >-
+          python3 scripts/release/loop_summary.py --combine loops
+          --manifest scripts/release/v02-loop-lanes.json --candidate "$GITHUB_SHA"
+          --output v02-loops-summary.md
       - run: cat v02-loops-summary.md >> "$GITHUB_STEP_SUMMARY"
+        if: ${{ !cancelled() }}
       - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
         with:
           name: v02-loops-summary
           path: v02-loops-summary.md

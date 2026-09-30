@@ -305,7 +305,8 @@ pub struct AutoscaleConfig {
     pub request: f64,
     /// Target utilisation of the request as a fraction (0.70 for "70%").
     pub target: f64,
-    /// Minimum replica count. Autoscaler will never scale below this.
+    /// Minimum replica count, at least 1 (no scale-to-zero). Autoscaler
+    /// will never scale below this.
     pub min: u32,
     /// Maximum replica count. Autoscaler will never scale above this.
     pub max: u32,
@@ -808,6 +809,7 @@ Utilisation follows the Kubernetes HPA convention: the average per-replica use d
 - **CPU with no CPU request** is measured against one whole core. ProcessGrill and rootless nodes refuse apps that declare `cpu` (they can't enforce the limit), so refusing here would make CPU autoscaling impossible on them.
 - **Memory with no memory request** fails config validation: there's no natural unit to fall back on.
 - **Any other `metric`** fails config validation. Custom (scraped) metrics are not supported.
+- **`min = 0`** fails config validation. Scale-to-zero needs a wake-up signal that exists while no replica runs (requests queued at the ingress, say), and both metrics are sampled from running instances: an app at zero replicas reports nothing to scale back up on. `min` must be at least 1; `relish stop` parks an app at zero by hand.
 - **Limits.** The collector samples each instance's main process (children aren't counted), and only runtimes that report a host PID produce per-app metrics: ProcessGrill and runc do; direct Apple Container (VM-isolated, disabled in 0.1.0) doesn't, so its apps can't autoscale. Rollups cover the previous complete minute, so the first signal reaches the leader 60–120 s after load changes.
 
 #### Algorithm
