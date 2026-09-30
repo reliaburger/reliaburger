@@ -22,6 +22,27 @@ run it.
 
 `make ci` runs the portable set locally, the same way CI does.
 
+## The agent loop's turn budget
+
+Each node's agent runs one loop that owns all of the node's state, one turn at
+a time. A turn that waits on something slow holds every caller, and that one
+shape caused most of the 0.1.0 and 0.1.1 soak failures
+([review](plans/2026-09-30-agent-loop-review.md), #351). Three things keep
+turns short:
+
+| Piece | What it does | Where |
+|---|---|---|
+| Turn meter | Times every turn by branch, exports `bun_agent_loop_turn_seconds{branch}` through Mayo, logs any turn over 250 ms with the command or deploy op it ran. Tests read the worst turn, including one still running | [`src/bun/loop_meter.rs`](../src/bun/loop_meter.rs) |
+| Starvation harness | One scenario per inline await from the review: a `MockGrill` whose calls can each be slowed (`set_call_delay`), a council whose writes hang, a log client that never reads, and test-only stalls for awaits no mock stands behind (the disk, `nft`). Each scenario queues a status command during the slow work and fails unless it's answered, and the worst turn ends, within 1 s | [`src/bun/agent/tests/loop_harness.rs`](../src/bun/agent/tests/loop_harness.rs) |
+| Inline-await rule | Parses the agent's source with `syn`, walks every method a turn can reach from `run_loop`, and fails on an await with neither a `tokio::time::timeout` nor a `// LOOP-INLINE: <why>` comment | [`src/bun/agent/tests/loop_rule.rs`](../src/bun/agent/tests/loop_rule.rs) |
+
+All three run in `make test`. A harness scenario that fails today is ignored
+with the stage of #351 that fixes it (`#[ignore = "stage 2 of #351"]`); the
+fix un-ignores it in the same change. Run them all with
+`cargo nextest run --run-ignored all -E 'test(loop_harness)'`. A new inline
+await either gets a deadline, moves into a task, or gets a tag a reviewer can
+argue with.
+
 ## Real systems, gated
 
 These need root, Linux, several processes or minutes of wall time, so they're

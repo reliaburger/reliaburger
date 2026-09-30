@@ -5245,6 +5245,7 @@ dependencies = [
  "oci-distribution",
  "openraft",
  "pem",
+ "proc-macro2",
  "prometheus-parse",
  "proptest",
  "pulldown-cmark",

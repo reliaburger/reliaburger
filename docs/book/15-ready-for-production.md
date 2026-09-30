@@ -3272,6 +3272,121 @@ status comes back well inside two seconds, with that instance marked, still
 locks cost one deadline, not six. And the field round-trips, and stays out of
 the JSON when it's `false`.
 
+### A rule you can test
+
+Look back over this story. Ten incidents, and every fix that held made a turn
+shorter; every reorder of the `select!` fixed one starvation and uncovered the
+next. The review we wrote after 0.1.1
+([`docs/plans/2026-09-30-agent-loop-review.md`](../plans/2026-09-30-agent-loop-review.md))
+weighed splitting the loop into actors against giving each instance its own
+task, and we chose neither, for now. The single owner is why "withdraw the
+backend before the runtime can reuse its address" is one line of code rather
+than a protocol between two tasks. What we needed wasn't a new shape. It was a
+way to notice, before a soak did, that somebody had put a slow `await` in the
+wrong place. So "every turn is short" became three things you can run (#351).
+
+The first is a number. Every turn is timed from the moment its branch fires
+until the consumer view it may have marked stale is republished, and lands in
+a histogram labelled by branch:
+
+```rust
+struct BranchHistogram {
+    buckets: [AtomicU64; BUCKET_BOUNDS.len()],
+    sum_nanos: AtomicU64,
+    count: AtomicU64,
+}
+
+impl BranchHistogram {
+    const fn new() -> Self {
+        Self {
+            buckets: [const { AtomicU64::new(0) }; BUCKET_BOUNDS.len()],
+            // ...
+        }
+    }
+}
+```
+
+`[x; N]` builds an array by copying `x` N times, which needs `x` to be
+`Copy`, and an atomic isn't (two copies of one counter would defeat the
+point). `const { ... }` is an *inline const*: a block the compiler evaluates at
+build time, and an array can repeat a constant expression whether or not its
+type is `Copy`. The loop increments with `Ordering::Relaxed`, as Wrapper's
+round-robin counter does, because nobody needs the buckets to agree with each
+other to the nanosecond, only to add up. The metrics collector holds the same
+meter through an `Arc` and writes it into Mayo every interval as
+`bun_agent_loop_turn_seconds_bucket{branch, le}`, plus `_sum` and `_count`,
+the way Prometheus histograms look. Reading it is the usual game: the ratio
+of `le="1"` to `le="+Inf"` for `branch="command"` is the share of command
+turns that fit the 1 s budget. Any turn over 250 ms is also logged with the
+command or deploy op that ran it, so the soak journal says `turn took 2514 ms
+in command (inject_fault)` rather than "status timed out".
+
+The second is a harness that provokes the slow turns on purpose. The review
+listed every await the loop still made inline, and each gets a scenario:
+make that one await slow, start the work that reaches it, queue a status
+command, and require an answer within a second, with the meter's worst turn
+under a second too. Three fakes make the awaits slow. `MockGrill` takes a
+delay per kind of call (`set_call_delay(MockCall::State, ...)`); the council
+gets a test hook whose writes never return, as they don't on a leader that
+has lost its quorum; and a log follower gets a channel that nobody reads. The
+disk and `nft` have no mock behind them, so the agent carries a test-only
+`LoopStall` at those awaits:
+
+```rust
+#[cfg(test)]
+self.loop_stalls.hold(LoopStall::Persist).await;
+tokio::task::spawn_blocking(move || crate::grill::records::write_record(&dir, &record))
+```
+
+`#[cfg(test)]` works on a single statement, not just on items, so the stall
+simply doesn't exist in a release build. A scenario whose await never
+returns (a council without quorum) would never *finish* its turn, and a meter
+that only records finished turns would call it a clean run. So under
+`cfg(test)` the meter also remembers the turn in progress, and the worst turn
+it reports counts that one's age so far.
+
+Most scenarios fail today, which is the point: thirteen of the seventeen, from
+`check_apps` reading ten instance states one at a time to a follow's tail
+waiting on a client that stopped reading. They're `#[ignore]`d with the stage
+of #351 that will fix them, and the fix un-ignores them. Four pass and stay
+on: status with every pid read hung (the shared 500 ms deadline holds), a
+council status over a busy desired state, a two-thousand-service catalogue,
+and a slow disk. That last one mattered for a decision: we let fsync'd
+persists stay inline rather than answer callers before their state is
+durable, as long as a disk that takes 150 ms per write still leaves every
+turn of a deploy, a job and a restart under the budget. It does, because no
+turn persists more than once.
+
+The third is a rule, and a test that reads the code for it. Clippy can't know
+that `self.supervisor.grill().state(&id).await` might take seconds while
+`self.routing_table.read().await` won't. So the loop's module doc states the
+rule (no await on a turn without a deadline or a stated reason), and every
+await that stays inline carries its reason where a reviewer will see it:
+
+```rust
+// LOOP-INLINE: stage 2 of #351: check_apps reads bounded and in parallel
+let grill_state = match self.supervisor.grill().state(&id).await {
+```
+
+The test parses `agent.rs` and its submodules with `syn`, as the router
+coverage test in Chapter 10 does. It starts at `run_loop`, follows every
+`self.method(..).await` into that method's body, and treats any other await
+as a leaf that needs either a `tokio::time::timeout` around it or a
+`// LOOP-INLINE:` comment with something after the colon. `syn`'s `Visit`
+trait has a default method for every kind of syntax node, each of which just
+walks the children; the checker overrides the few it cares about. Overriding
+`visit_expr_async` with an empty body is how it skips `async` blocks, whose
+code runs wherever they're spawned, not on the loop. Except when a block is
+awaited in place (`async { ... }.await`, a common way to scope `?`), which the
+first version skipped too, and so missed the runtime read an execution fence
+ran inside one. The test that checks the checker now has that case in it.
+
+The first run found 125 awaits with neither. A third were in-memory locks and
+now say so (`in-memory lock, no I/O`), seven are the persists we decided to
+keep, a couple of dozen have one-line reasons of their own, and fifty name the
+stage that moves them. Grep for `LOOP-INLINE: stage`
+and you have the remaining work, in the code, next to the line it's about.
+
 ### Two commands, two answers
 
 Issue #241 had one more complaint in it. With three replicas of `hello`

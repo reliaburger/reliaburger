@@ -352,6 +352,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 timeout: std::time::Duration::ZERO,
             })
             .collect();
+        // LOOP-INLINE: in-memory lock, no I/O
         if !self.drains.drain_all(&drains).await {
             return Err(refuse(
                 "captured ingress requests still require confirmed release",
@@ -469,6 +470,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         else {
             return Err(failure("discovery ownership changed during update".into()));
         };
+        // LOOP-INLINE: fsync'd persist (#351 decision 2); the slow-disk scenario bounds it
         match journal.persist(next).await {
             Ok(journal) => {
                 self.discovery_ownership = if recovered {
@@ -484,7 +486,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 // before any kernel or userspace effect, so either is safe.
                 self.discovery_reopen = Some((directory, recovered));
                 if let Some(readiness) = &self.readiness {
+                    // LOOP-INLINE: in-memory lock, no I/O
                     readiness.register(DISCOVERY_JOURNAL_SUBSYSTEM, true).await;
+                    // LOOP-INLINE: in-memory lock, no I/O
                     readiness
                         .degraded(DISCOVERY_JOURNAL_SUBSYSTEM, error.to_string())
                         .await;
@@ -504,6 +508,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let Some((directory, recovered)) = self.discovery_reopen.clone() else {
             return;
         };
+        // LOOP-INLINE: reopens the journal on disk, like a persist
         match DiscoveryJournal::open_async(&directory).await {
             Ok(journal) => {
                 self.discovery_ownership = if recovered {
@@ -513,11 +518,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 };
                 self.discovery_reopen = None;
                 if let Some(readiness) = &self.readiness {
+                    // LOOP-INLINE: in-memory lock, no I/O
                     readiness.ready(DISCOVERY_JOURNAL_SUBSYSTEM).await;
                 }
             }
             Err(error) => {
                 if let Some(readiness) = &self.readiness {
+                    // LOOP-INLINE: in-memory lock, no I/O
                     readiness
                         .degraded(DISCOVERY_JOURNAL_SUBSYSTEM, error.to_string())
                         .await;

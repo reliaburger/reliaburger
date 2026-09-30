@@ -209,7 +209,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
             let mut candidate = self.service_map.clone();
             for (id, port, has_health) in instances {
+                // LOOP-INLINE: stage 3 of #351: an unbounded runtime call
                 let ip = self.supervisor.grill().container_ip(&id).await;
+                // LOOP-INLINE: stage 3 of #351: an unbounded runtime call
                 if ip.is_none()
                     && !self
                         .supervisor
