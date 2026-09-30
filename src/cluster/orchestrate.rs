@@ -5443,6 +5443,57 @@ image = "busybox:latest"
         );
     }
 
+    /// Pins the 0.1.0 quota contract the whitepaper (Q13) and the Meat design
+    /// doc describe: an over-quota app passes validation and `relish apply`
+    /// writes it to desired state, but the leader's scheduling pass never
+    /// places it. The rejection is only a line in the leader's log.
+    #[test]
+    fn over_quota_apply_is_accepted_but_never_placed() {
+        let config = crate::config::Config::parse(
+            r#"
+            [namespace.prod]
+            cpu = "1000m"
+
+            [app.greedy]
+            image = "x:1"
+            namespace = "prod"
+            replicas = 2
+            cpu = "800m"
+        "#,
+        )
+        .unwrap();
+        config
+            .validate_against(&[])
+            .expect("apply-time validation doesn't check the budget");
+
+        let mut desired = DesiredState::default();
+        for write in crate::council::apply::config_to_desired_writes(&config) {
+            match write {
+                crate::council::types::RaftRequest::NamespaceSpec { name, spec } => {
+                    desired.namespaces.insert(name, *spec);
+                }
+                crate::council::types::RaftRequest::AppSpec { app_id, spec } => {
+                    desired.apps.insert(app_id, *spec);
+                }
+                other => panic!("unexpected write for this config: {other:?}"),
+            }
+        }
+        assert!(
+            desired.apps.contains_key(&AppId::new("greedy", "prod")),
+            "apply writes the over-quota app to desired state"
+        );
+
+        let mut cache = ClusterStateCache::new();
+        cache.set_node(sched_node("big", 10000, BTreeMap::new()));
+        let mut quotas = crate::meat::quota::ledger_from_namespaces(&desired.namespaces);
+        let alive = HashSet::from([NodeId::new("big")]);
+        let decisions = plan_scheduling_pass(&mut cache, &desired, &alive, &mut quotas);
+        assert!(
+            decisions.is_empty(),
+            "the scheduling pass leaves the over-quota app unplaced: {decisions:?}"
+        );
+    }
+
     /// A namespace with headroom admits the app.
     #[test]
     fn desired_state_namespace_quota_admits_app_that_fits() {

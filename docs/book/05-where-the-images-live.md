@@ -364,6 +364,8 @@ The July 2026 review found most of this chapter's machinery had no production ca
 
 The same pass fixed `relish build` (X1), whose context upload had been pointed at port 9117 — the Bun *API* port, which has no `/v2` routes — since the day it was written. It now uploads to the actual registry port, and `/v1/build` genuinely runs `buildah bud` and pushes the result back through the registry (or says plainly that it needs `buildah`, instead of returning an unconditional 501).
 
+"The actual registry port" turned out to be one more assumption. On a quickstart laptop nothing listens on `localhost:5050`: the managed context forwards the registry to `127.0.0.1:15050`, and `relish upgrade` already knew to use it. `relish build` didn't, so the tour's first build failed before it started. The fix makes `--registry-port` an `Option<u16>` instead of a `u16` with a clap default, because "the user didn't say" is information the old type threw away. A default of 5050 looks exactly like someone typing `--registry-port 5050`. With `None` in hand, `cli_context_upload_url` can `match` on the pair `(registry_port, declared_registry)`: an explicit port wins, then the managed context's forward, then the old default for relish running on a node.
+
 ## Making the registry durable (and safe to expose)
 
 The wiring pass connected the registry to the cluster, but a later review pointed at a harder question: is any of it actually *durable*, and is it safe to run outside a trusted network? The answer, honestly, was no on both counts. A push could tear on a crash, two nodes could serve different views of the same catalogue, and the listener spoke plain HTTP with no authentication at all. Six fixes closed the gap.

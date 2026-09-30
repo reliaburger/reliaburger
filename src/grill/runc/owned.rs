@@ -878,6 +878,7 @@ impl RuncGrill {
         &self,
         instance: &InstanceId,
         sender: tokio::sync::mpsc::Sender<CapturedLine>,
+        resume: &crate::ketchup::types::CaptureOffsets,
     ) {
         let source = self
             .owned_operation(instance, |_runtime, _id, context| async move {
@@ -892,11 +893,12 @@ impl RuncGrill {
             return;
         };
         let mut terminal = context.is_none();
-        let mut readers = [(LogStream::Stdout, "stdout"), (LogStream::Stderr, "stderr")].map(
-            |(stream, extension)| CaptureReader::new(stream, Some(stem.with_extension(extension))),
-        );
+        let mut readers = [
+            CaptureReader::resume(LogStream::Stdout, stem.with_extension("stdout"), resume).await,
+            CaptureReader::resume(LogStream::Stderr, stem.with_extension("stderr"), resume).await,
+        ];
         loop {
-            // A restarted Bun replays the whole capture from byte 0. Bounded
+            // A capture with no checkpoint replays from byte 0. Bounded
             // chunks, each read behind an `.await`, keep that replay from
             // holding a runtime worker (it once starved startup adoption).
             let mut backlog = false;

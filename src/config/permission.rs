@@ -80,6 +80,20 @@ impl PermissionSpec {
             Some(namespaces) => namespaces.iter().any(|n| n == namespace),
         }
     }
+
+    /// Whether this spec grants `action` across the **whole cluster**: every
+    /// app (`apps` contains `*`) in every namespace (`namespaces` omitted).
+    ///
+    /// Routes that read or change cluster-wide state (raw log SQL, the metric
+    /// store, token management, upgrades) have no single app to check, so a
+    /// grant confined to some apps or namespaces can't cover them.
+    pub fn allows_cluster_wide(&self, action: PermissionAction) -> bool {
+        let action_ok = self
+            .actions
+            .iter()
+            .any(|a| a == action.as_str() || a == PermissionAction::Admin.as_str());
+        action_ok && self.namespaces.is_none() && self.apps.iter().any(|a| a == "*")
+    }
 }
 
 #[cfg(test)]
@@ -138,6 +152,35 @@ mod tests {
         };
         assert!(spec.allows(PermissionAction::Deploy, "anything", "anywhere"));
         assert!(spec.allows(PermissionAction::SecretWrite, "x", "y"));
+    }
+
+    #[test]
+    fn a_cluster_wide_grant_needs_every_app_and_every_namespace() {
+        let everywhere = PermissionSpec {
+            actions: vec!["logs".to_string()],
+            apps: vec!["*".to_string()],
+            namespaces: None,
+        };
+        assert!(everywhere.allows_cluster_wide(PermissionAction::Logs));
+        assert!(!everywhere.allows_cluster_wide(PermissionAction::Metrics));
+
+        let one_app = PermissionSpec {
+            apps: vec!["web".to_string()],
+            ..everywhere.clone()
+        };
+        assert!(!one_app.allows_cluster_wide(PermissionAction::Logs));
+
+        let one_namespace = PermissionSpec {
+            namespaces: Some(vec!["prod".to_string()]),
+            ..everywhere.clone()
+        };
+        assert!(!one_namespace.allows_cluster_wide(PermissionAction::Logs));
+
+        let admin = PermissionSpec {
+            actions: vec!["admin".to_string()],
+            ..everywhere
+        };
+        assert!(admin.allows_cluster_wide(PermissionAction::SecretWrite));
     }
 
     #[test]
