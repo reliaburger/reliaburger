@@ -146,7 +146,9 @@ relish inspect frontend
 ```
 
 Now lose a whole machine. About a minute later there are three running
-frontends again, on the nodes that are left. Nobody had to notice first.
+frontends again, spread over the two nodes that are left: each keeps the one it
+had, and one of them starts a replacement for node-3's. Nobody had to notice
+first.
 `relish inspect` asks every node for its instances, lists each one, running or
 stopped, with the node it's on, and names the node that didn't answer.
 

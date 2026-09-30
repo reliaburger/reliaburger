@@ -204,7 +204,8 @@
                 <pre><code data-tour>relish local stop node-3</code>
 <code data-tour>relish inspect frontend</code></pre>
                 <p>Now lose a whole machine. About a minute later there are three running frontends
-                  again, on the nodes that are left. Nobody had to notice first. <code>inspect</code>
+                  again, spread over the two nodes that are left: each keeps the one it had, and one
+                  of them starts a replacement. Nobody had to notice first. <code>inspect</code>
                   asks every node, lists each instance, running or stopped, with the node it’s on,
                   and names the node that didn’t answer.</p>
               </li>

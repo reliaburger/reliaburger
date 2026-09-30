@@ -1,12 +1,12 @@
 /// Phase 2: Score.
 ///
-/// Ranks candidate nodes on a 0–150 scale. Higher is better.
-/// The score is a weighted sum of several dimensions:
-/// - Spread (60): penalise nodes already running the same app
+/// Ranks candidate nodes. Spread comes first: a node running fewer replicas
+/// of the app always outranks one running more. Among nodes that run the
+/// same number, a weighted score on a 0–90 scale decides (higher is better):
 /// - Bin-packing (50): prefer fuller nodes to maximise density
 /// - Preferred labels (20): prefer nodes matching soft constraints
-/// - Stability (5): prefer longer-running nodes
 /// - Image locality (15): prefer nodes with cached images
+/// - Stability (5): prefer longer-running nodes
 use std::collections::BTreeMap;
 
 use super::cluster_state::ClusterStateCache;
@@ -14,23 +14,21 @@ use super::types::{AppId, NodeId, Resources};
 
 /// Score weights.
 ///
-/// H8 regression note: spread used to be 10 against bin-pack's 50, so
-/// the bin-packer put every replica of an app on the same node.
-/// Replicas exist to survive a node failure; packing them together
-/// defeats the point. Spread contributes 0 or its full weight (a node
-/// either runs the app or it doesn't), while bin-pack contributes at
-/// most 50 — so spread's weight must EXCEED 50 for a same-app-free
-/// node to always outrank a fuller node that already runs the app.
-/// Among nodes that don't run the app (or all do), bin-pack still
-/// decides as before.
+/// Spread isn't a weight. It used to be one: first 10 against bin-pack's
+/// 50, which put every replica of an app on the same node (H8), then 60,
+/// scored 0 or 100 on whether the node ran the app at all. That still let
+/// bin-packing choose between two nodes that both ran it, so losing a node
+/// could stack its replicas on the busier survivor (#346). Replicas exist to
+/// survive a node failure, so the replica count is the first sort key and no
+/// weighting can outvote it.
 const WEIGHT_BIN_PACK: u32 = 50;
 const WEIGHT_PREFERRED: u32 = 20;
 const WEIGHT_IMAGE: u32 = 15;
-const WEIGHT_SPREAD: u32 = 60;
 const WEIGHT_STABILITY: u32 = 5;
 
-/// Score all candidate nodes and return them sorted by score (descending),
-/// then by NodeId (ascending) for deterministic tiebreak.
+/// Score all candidate nodes and return them best first: fewest replicas of
+/// `app_id`, then highest score, then lowest `NodeId` for a deterministic
+/// tiebreak.
 pub fn score_nodes(
     candidates: &[NodeId],
     app_id: &AppId,
@@ -39,24 +37,25 @@ pub fn score_nodes(
     cluster: &ClusterStateCache,
     image: Option<&str>,
 ) -> Vec<(NodeId, u32)> {
-    let mut scored: Vec<(NodeId, u32)> = candidates
+    let mut scored: Vec<(NodeId, u32, u32)> = candidates
         .iter()
         .filter_map(|node_id| {
-            cluster.get_node(node_id)?;
-            let score = compute_score(node_id, app_id, resources, preferred_labels, cluster, image);
-            Some((node_id.clone(), score))
+            let replicas = cluster.get_node(node_id)?.replicas_of(app_id);
+            let score = compute_score(node_id, resources, preferred_labels, cluster, image);
+            Some((node_id.clone(), replicas, score))
         })
         .collect();
 
-    // Sort by score descending, then node_id ascending for tiebreak
-    scored.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    scored.sort_by(|a, b| a.1.cmp(&b.1).then(b.2.cmp(&a.2)).then(a.0.cmp(&b.0)));
     scored
+        .into_iter()
+        .map(|(node_id, _, score)| (node_id, score))
+        .collect()
 }
 
 /// Compute the weighted score for a single node.
 fn compute_score(
     node_id: &NodeId,
-    app_id: &AppId,
     resources: &Resources,
     preferred_labels: &BTreeMap<String, String>,
     cluster: &ClusterStateCache,
@@ -86,13 +85,6 @@ fn compute_score(
         (matches * 100 / preferred_labels.len()) as u32
     };
 
-    // Spread: penalise if other replicas of the same app are on this node.
-    let spread = if node.running_apps.contains(app_id) {
-        0
-    } else {
-        100
-    };
-
     // Stability: prefer nodes with longer uptime. Linear ramp from
     // 0 (just joined) to 100 (24+ hours). Freshly joined nodes may
     // still be catching up on state reconstruction or image pulls.
@@ -114,7 +106,6 @@ fn compute_score(
     let total = bin_pack * WEIGHT_BIN_PACK
         + preferred * WEIGHT_PREFERRED
         + image_locality * WEIGHT_IMAGE
-        + spread * WEIGHT_SPREAD
         + stability * WEIGHT_STABILITY;
 
     total / 100
@@ -144,7 +135,7 @@ mod tests {
             labels,
             ready: true,
             capabilities: Default::default(),
-            running_apps: HashSet::new(),
+            app_replicas: Default::default(),
             uptime_secs: 86400, // 24h — full stability score
             cached_images: HashSet::new(),
         }
@@ -205,7 +196,7 @@ mod tests {
         let app = AppId::new("web", "prod");
 
         let mut has_app = node_state("has-app", 1000, 500, BTreeMap::new());
-        has_app.running_apps.insert(app.clone());
+        has_app.app_replicas.insert(app.clone(), 1);
         cluster.set_node(has_app);
 
         cluster.set_node(node_state("no-app", 1000, 500, BTreeMap::new()));
@@ -215,8 +206,41 @@ mod tests {
 
         let scored = score_nodes(&candidates, &app, &res, &BTreeMap::new(), &cluster, None);
 
-        // "no-app" should score higher (spread bonus)
         assert_eq!(scored[0].0, NodeId::new("no-app"));
+    }
+
+    /// #346: two survivors both run the app. The one with fewer replicas
+    /// wins, however much fuller the other is.
+    #[test]
+    fn fewer_replicas_outrank_a_fuller_node() {
+        let mut cluster = ClusterStateCache::new();
+        let app = AppId::new("web", "prod");
+
+        let mut busy = node_state("busy", 1000, 890, labels(&[("zone", "a")]));
+        busy.app_replicas.insert(app.clone(), 2);
+        busy.cached_images.insert("web:v1".to_string());
+        cluster.set_node(busy);
+        let mut idle = node_state("idle", 1000, 0, BTreeMap::new());
+        idle.app_replicas.insert(app.clone(), 1);
+        idle.uptime_secs = 0;
+        cluster.set_node(idle);
+
+        let candidates = vec![NodeId::new("busy"), NodeId::new("idle")];
+        let res = Resources::new(100, 100, 0);
+        let scored = score_nodes(
+            &candidates,
+            &app,
+            &res,
+            &labels(&[("zone", "a")]),
+            &cluster,
+            Some("web:v1"),
+        );
+
+        assert_eq!(scored[0].0, NodeId::new("idle"));
+        assert!(
+            scored[0].1 < scored[1].1,
+            "the busy node scores higher on every weight: {scored:?}"
+        );
     }
 
     #[test]

@@ -34,8 +34,8 @@ pub struct SchedulerNodeState {
     pub ready: bool,
     /// Live enforcement capabilities reported by the node.
     pub capabilities: NodeCapabilities,
-    /// Apps currently running on this node (for spread scoring).
-    pub running_apps: HashSet<AppId>,
+    /// How many replicas of each app this node runs (for spread).
+    pub app_replicas: HashMap<AppId, u32>,
     /// How long this node has been alive, in seconds. Used for stability
     /// scoring — prefer nodes with longer uptime over freshly joined ones.
     pub uptime_secs: u64,
@@ -61,6 +61,11 @@ impl SchedulerNodeState {
         required
             .iter()
             .all(|(k, v)| self.labels.get(k).is_some_and(|lv| lv == v))
+    }
+
+    /// How many replicas of `app_id` this node runs.
+    pub fn replicas_of(&self, app_id: &AppId) -> u32 {
+        self.app_replicas.get(app_id).copied().unwrap_or(0)
     }
 
     /// Count how many of the preferred labels this node matches.
@@ -108,20 +113,37 @@ impl ClusterStateCache {
 
     /// Reserve resources on a node after a placement decision.
     ///
-    /// Adds `resources` to the node's `allocated` total and records
-    /// the app as running on that node.
+    /// Adds `resources` to the node's `allocated` total and counts one
+    /// more replica of the app on that node.
     pub fn reserve(&mut self, node_id: &NodeId, app_id: &AppId, resources: &Resources) {
         if let Some(node) = self.nodes.get_mut(node_id) {
             node.allocated = node.allocated.saturating_add(resources);
-            node.running_apps.insert(app_id.clone());
+            *node.app_replicas.entry(app_id.clone()).or_default() += 1;
         }
     }
 
-    /// Release resources on a node.
+    /// Release resources on a node, and one replica of the app.
     pub fn release(&mut self, node_id: &NodeId, app_id: &AppId, resources: &Resources) {
         if let Some(node) = self.nodes.get_mut(node_id) {
             node.allocated = node.allocated.saturating_sub(resources);
-            node.running_apps.remove(app_id);
+            if let Some(count) = node.app_replicas.get_mut(app_id) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    node.app_replicas.remove(app_id);
+                }
+            }
+        }
+    }
+
+    /// Say how many replicas of `app_id` a node runs, whatever its report
+    /// said. Resources are untouched: a report already counts what runs.
+    pub fn set_replicas(&mut self, node_id: &NodeId, app_id: &AppId, count: u32) {
+        if let Some(node) = self.nodes.get_mut(node_id) {
+            if count == 0 {
+                node.app_replicas.remove(app_id);
+            } else {
+                node.app_replicas.insert(app_id.clone(), count);
+            }
         }
     }
 
@@ -153,7 +175,7 @@ mod tests {
             labels: BTreeMap::new(),
             ready: true,
             capabilities: NodeCapabilities::default(),
-            running_apps: HashSet::new(),
+            app_replicas: HashMap::new(),
             uptime_secs: 3600,
             cached_images: HashSet::new(),
         }
@@ -171,7 +193,7 @@ mod tests {
         let n1 = cache.get_node(&NodeId::new("n1")).unwrap();
         assert_eq!(n1.available().cpu_millicores, 500);
         assert_eq!(n1.available().memory_bytes, 512);
-        assert!(n1.running_apps.contains(&app));
+        assert_eq!(n1.replicas_of(&app), 1);
     }
 
     #[test]
@@ -186,7 +208,29 @@ mod tests {
 
         let n1 = cache.get_node(&NodeId::new("n1")).unwrap();
         assert_eq!(n1.available().cpu_millicores, 1000);
-        assert!(!n1.running_apps.contains(&app));
+        assert_eq!(n1.replicas_of(&app), 0);
+    }
+
+    #[test]
+    fn reserve_and_release_count_replicas_of_an_app() {
+        let mut cache = ClusterStateCache::new();
+        cache.set_node(node_state("n1", 1000, 1024));
+        let node = NodeId::new("n1");
+        let app = AppId::new("web", "prod");
+        let res = Resources::new(100, 0, 0);
+
+        cache.reserve(&node, &app, &res);
+        cache.reserve(&node, &app, &res);
+        assert_eq!(cache.get_node(&node).unwrap().replicas_of(&app), 2);
+
+        cache.release(&node, &app, &res);
+        assert_eq!(cache.get_node(&node).unwrap().replicas_of(&app), 1);
+
+        cache.set_replicas(&node, &app, 3);
+        assert_eq!(cache.get_node(&node).unwrap().replicas_of(&app), 3);
+        assert_eq!(cache.get_node(&node).unwrap().allocated.cpu_millicores, 100);
+        cache.set_replicas(&node, &app, 0);
+        assert!(cache.get_node(&node).unwrap().app_replicas.is_empty());
     }
 
     #[test]
