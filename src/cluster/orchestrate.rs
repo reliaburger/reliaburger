@@ -9,7 +9,7 @@
 //! leadership changes self-heal — there is no per-instance RPC whose
 //! failure needs bespoke bookkeeping.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -430,10 +430,12 @@ pub fn spawn_leader_scheduler(
             let mut quotas = crate::meat::quota::ledger_from_namespaces(&desired.namespaces);
 
             let unheard = unheard_nodes(&alive, &reports);
+            let suspect = nodes_in_state(&members, NodeState::Suspect);
             let decisions = plan_scheduling_pass_with_dns(
                 &mut cache,
                 &desired,
                 &alive,
+                &suspect,
                 &mut quotas,
                 dns_required,
                 &unheard,
@@ -490,11 +492,12 @@ pub fn spawn_leader_scheduler(
                 // Raft write: a node that died between planning and commit
                 // (or between two commits in this pass) must not receive the
                 // placement. `members`/`reports` were snapshotted at the top
-                // of the tick; membership can move under a slow write.
+                // of the tick; membership can move under a slow write. A
+                // suspect node still holds the placements it kept.
                 let live: HashSet<NodeId> = membership_rx
                     .borrow()
                     .iter()
-                    .filter(|m| m.state == NodeState::Alive)
+                    .filter(|m| matches!(m.state, NodeState::Alive | NodeState::Suspect))
                     .map(|m| m.node_id.clone())
                     .collect();
                 if !decision
@@ -545,7 +548,15 @@ fn plan_scheduling_pass(
     alive: &HashSet<NodeId>,
     quotas: &mut crate::meat::quota::QuotaLedger,
 ) -> Vec<crate::meat::types::SchedulingDecision> {
-    plan_scheduling_pass_with_dns(cache, desired, alive, quotas, false, &HashSet::new())
+    plan_scheduling_pass_with_dns(
+        cache,
+        desired,
+        alive,
+        &HashSet::new(),
+        quotas,
+        false,
+        &HashSet::new(),
+    )
 }
 
 /// Plan a pass with the cluster's configured DNS requirement.
@@ -557,6 +568,7 @@ fn plan_scheduling_pass_with_dns(
     cache: &mut ClusterStateCache,
     desired: &crate::council::types::DesiredState,
     alive: &HashSet<NodeId>,
+    suspect: &HashSet<NodeId>,
     quotas: &mut crate::meat::quota::QuotaLedger,
     dns_required: bool,
     unheard: &HashSet<NodeId>,
@@ -617,9 +629,9 @@ fn plan_scheduling_pass_with_dns(
             .get(app_id)
             .map(|placements| {
                 placements.len() == want
-                    && placements
-                        .iter()
-                        .all(|p| placement_holds(p, spec, cache, alive, unheard, dns_required))
+                    && placements.iter().all(|p| {
+                        placement_holds(p, spec, cache, alive, suspect, unheard, dns_required)
+                    })
             })
             .unwrap_or(false);
         planned.push((app_id, spec, override_replicas, want, converged));
@@ -679,7 +691,9 @@ fn plan_scheduling_pass_with_dns(
                 .map(|placements| {
                     placements
                         .iter()
-                        .filter(|p| placement_holds(p, spec, cache, alive, unheard, dns_required))
+                        .filter(|p| {
+                            placement_holds(p, spec, cache, alive, suspect, unheard, dns_required)
+                        })
                         .take(want)
                         .cloned()
                         .collect()
@@ -693,6 +707,7 @@ fn plan_scheduling_pass_with_dns(
             let home = VolumeHome {
                 cache,
                 alive,
+                suspect,
                 unheard,
                 dns_required,
             };
@@ -716,6 +731,12 @@ fn plan_scheduling_pass_with_dns(
                 continue;
             }
             effective_spec.replicas = Replicas::Fixed(missing as u32);
+        }
+        // Spread the rest against what's kept, not against what the nodes
+        // last reported: a report can lag a new leader, or still list a
+        // replica on its way out.
+        if matches!(effective_spec.replicas, Replicas::Fixed(_)) {
+            count_kept_replicas(cache, app_id, &kept);
         }
         // The scheduler owns its cache, so hand it the shared one and take
         // it back afterwards (Rust move semantics — no shared &mut alias).
@@ -744,6 +765,19 @@ fn plan_scheduling_pass_with_dns(
         }
     }
     decisions
+}
+
+/// Record in `cache` exactly the replicas of `app_id` that `kept` places on
+/// each node, so the scheduler spreads what it adds around them.
+fn count_kept_replicas(
+    cache: &mut ClusterStateCache,
+    app_id: &crate::meat::types::AppId,
+    kept: &[crate::meat::types::Placement],
+) {
+    for node_id in cache.node_ids() {
+        let count = kept.iter().filter(|p| p.node_id == node_id).count();
+        cache.set_replicas(&node_id, app_id, u32::try_from(count).unwrap_or(u32::MAX));
+    }
 }
 
 /// What returning an app to the nodes that hold its volumes came to.
@@ -785,6 +819,7 @@ impl std::fmt::Display for HomeWait {
 struct VolumeHome<'a> {
     cache: &'a mut ClusterStateCache,
     alive: &'a HashSet<NodeId>,
+    suspect: &'a HashSet<NodeId>,
     unheard: &'a HashSet<NodeId>,
     dns_required: bool,
 }
@@ -794,7 +829,7 @@ impl VolumeHome<'_> {
     /// if it has a managed volume.
     ///
     /// Only two things release a home: the node leaving the cluster (gossip
-    /// no longer has it alive), which is the documented loss of a local
+    /// no longer has it alive or suspect), which is the documented loss of a local
     /// volume with its node, and the node no longer matching the app's
     /// required labels, which is the operator moving the app on purpose.
     /// Anything else (a stale or missing report, not ready, cordoned for an
@@ -817,13 +852,16 @@ impl VolumeHome<'_> {
             .unwrap_or_default();
         let mut homes = Vec::new();
         for node_id in last_nodes.iter().take(want) {
-            if !self.alive.contains(node_id) {
-                continue;
-            }
             let wait = |reason| HomeOutcome::Wait {
                 node: node_id.clone(),
                 reason,
             };
+            if self.suspect.contains(node_id) {
+                return wait(HomeWait::Unreported);
+            }
+            if !self.alive.contains(node_id) {
+                continue;
+            }
             let Some(node) = self.cache.get_node(node_id) else {
                 return wait(HomeWait::Unreported);
             };
@@ -871,9 +909,16 @@ fn placement_holds(
     spec: &AppSpec,
     cache: &ClusterStateCache,
     alive: &HashSet<NodeId>,
+    suspect: &HashSet<NodeId>,
     unheard: &HashSet<NodeId>,
     dns_required: bool,
 ) -> bool {
+    // Suspicion is gossip's "missed a probe", not "gone": SWIM gives the
+    // node its suspicion timeout to refute it. Moving its replicas now would
+    // stop healthy ones for a late ack (#346).
+    if suspect.contains(&placement.node_id) {
+        return true;
+    }
     if !alive.contains(&placement.node_id) {
         return false;
     }
@@ -903,6 +948,15 @@ fn node_can_run(
     node.ready
         && (!requires_egress || node.capabilities.egress.can_enforce_allowlist())
         && (!dns_required || node.capabilities.dns.can_resolve_internal())
+}
+
+/// The members gossip currently puts in `state`.
+fn nodes_in_state(members: &[MembershipSnapshot], state: NodeState) -> HashSet<NodeId> {
+    members
+        .iter()
+        .filter(|member| member.state == state)
+        .map(|member| member.node_id.clone())
+        .collect()
 }
 
 /// Live nodes whose state report is fresh but whose readiness or capability
@@ -1263,11 +1317,16 @@ fn build_cluster_cache(
             continue; // capacity unset
         }
 
-        let running_apps = report
-            .running_apps
-            .iter()
-            .map(|a| crate::meat::types::AppId::new(&a.app_name, &a.namespace))
-            .collect();
+        // One entry per running instance, so this counts replicas.
+        let mut app_replicas = HashMap::new();
+        for app in &report.running_apps {
+            *app_replicas
+                .entry(crate::meat::types::AppId::new(
+                    &app.app_name,
+                    &app.namespace,
+                ))
+                .or_default() += 1;
+        }
 
         cache.set_node(SchedulerNodeState {
             node_id: member.node_id.clone(),
@@ -1290,7 +1349,7 @@ fn build_cluster_cache(
             capabilities: capability_report
                 .map(|capability| capability.capabilities)
                 .unwrap_or_default(),
-            running_apps,
+            app_replicas,
             uptime_secs: member.first_seen.elapsed().as_secs(),
             // Nothing reports cached images yet; locality scoring is
             // inert rather than fed guesses.
@@ -4551,7 +4610,7 @@ image = "busybox:latest"
             labels,
             ready: true,
             capabilities: Default::default(),
-            running_apps: Default::default(),
+            app_replicas: Default::default(),
             uptime_secs: 86400,
             cached_images: Default::default(),
         }
@@ -4753,6 +4812,7 @@ image = "busybox:latest"
             &mut cache,
             &desired,
             &alive,
+            &HashSet::new(),
             &mut QuotaLedger::default(),
             false,
             &unheard,
@@ -4872,6 +4932,147 @@ image = "busybox:latest"
         assert!(["n1", "n2"].contains(&nodes[2]), "{nodes:?}");
     }
 
+    /// A survivor's load outside this app, so the bin-packer prefers it.
+    fn busier_node(name: &str, used_cpu: u64) -> SchedulerNodeState {
+        let mut node = sched_node(name, 4000, BTreeMap::new());
+        node.allocated = Resources::new(used_cpu, 0, 0);
+        node
+    }
+
+    /// How many of a decision's placements land on each node.
+    fn per_node(decision: &crate::meat::types::SchedulingDecision) -> BTreeMap<&str, usize> {
+        let mut counts = BTreeMap::new();
+        for node in nodes_of(decision) {
+            *counts.entry(node).or_default() += 1;
+        }
+        counts
+    }
+
+    /// #346: a node running two of four replicas dies. Both survivors run
+    /// the app and one is busier, so the bin-packer used to put both
+    /// replacements there: three on one node, one on the other.
+    #[test]
+    fn replacements_spread_over_the_survivors_with_fewest_replicas() {
+        let app = AppId::new("frontend", "default");
+        let mut desired = DesiredState::default();
+        desired.apps.insert(app.clone(), app_spec(100, 4));
+        desired
+            .scheduling
+            .insert(app.clone(), placed_on(&["n1", "n1", "n2", "n3"]));
+        let mut cache = ClusterStateCache::new();
+        cache.set_node(busier_node("n2", 2000));
+        cache.set_node(sched_node("n3", 4000, BTreeMap::new()));
+        // Both survivors report their replica.
+        for name in ["n2", "n3"] {
+            cache.reserve(&NodeId::new(name), &app, &Resources::new(100, 0, 0));
+        }
+        let alive = HashSet::from([NodeId::new("n2"), NodeId::new("n3")]);
+
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+
+        let nodes = nodes_of(&decisions[0]);
+        assert_eq!(nodes[..2], ["n2", "n3"], "survivors keep their replicas");
+        assert_eq!(
+            per_node(&decisions[0]),
+            BTreeMap::from([("n2", 2), ("n3", 2)]),
+            "{nodes:?}"
+        );
+    }
+
+    /// #346: the survivors' kept placements count towards spread even before
+    /// their reports list the app (a new leader, or a report in transit).
+    #[test]
+    fn kept_placements_count_towards_spread_before_reports_list_them() {
+        let app = AppId::new("frontend", "default");
+        let mut desired = DesiredState::default();
+        desired.apps.insert(app.clone(), app_spec(100, 4));
+        desired
+            .scheduling
+            .insert(app.clone(), placed_on(&["n1", "n2", "n2", "n3"]));
+        let mut cache = ClusterStateCache::new();
+        cache.set_node(busier_node("n2", 2000));
+        cache.set_node(sched_node("n3", 4000, BTreeMap::new()));
+        let alive = HashSet::from([NodeId::new("n2"), NodeId::new("n3")]);
+
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+
+        assert_eq!(
+            per_node(&decisions[0]),
+            BTreeMap::from([("n2", 2), ("n3", 2)]),
+            "{:?}",
+            nodes_of(&decisions[0])
+        );
+    }
+
+    /// Spread gives way to resources: a survivor with no room left doesn't
+    /// take a replacement, so the other one takes both.
+    #[test]
+    fn replacements_stack_only_when_the_other_survivor_is_full() {
+        let app = AppId::new("frontend", "default");
+        let mut desired = DesiredState::default();
+        desired.apps.insert(app.clone(), app_spec(100, 4));
+        desired
+            .scheduling
+            .insert(app.clone(), placed_on(&["n1", "n1", "n2", "n3"]));
+        let mut cache = ClusterStateCache::new();
+        cache.set_node(sched_node("n2", 4000, BTreeMap::new()));
+        cache.set_node(busier_node("n3", 3950));
+        let alive = HashSet::from([NodeId::new("n2"), NodeId::new("n3")]);
+
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+
+        assert_eq!(nodes_of(&decisions[0]), ["n2", "n3", "n2", "n2"]);
+    }
+
+    /// #346: one of three nodes dies while gossip only suspects another
+    /// survivor (a probe answered late on a loaded laptop). Suspicion isn't
+    /// death: the suspect keeps its replica, the dead node's replica moves to
+    /// a live survivor, and nothing else changes.
+    #[test]
+    fn a_suspect_node_keeps_its_replicas() {
+        let app = AppId::new("frontend", "default");
+        let mut desired = DesiredState::default();
+        desired.apps.insert(app.clone(), app_spec(100, 3));
+        desired
+            .scheduling
+            .insert(app.clone(), placed_on(&["n1", "n2", "n3"]));
+        // A suspect node isn't in the scheduler's cache: only live nodes are.
+        let mut cache = ClusterStateCache::new();
+        cache.set_node(sched_node("n1", 4000, BTreeMap::new()));
+        let alive = HashSet::from([NodeId::new("n1")]);
+        let suspect = HashSet::from([NodeId::new("n2")]);
+
+        let decisions = plan_scheduling_pass_with_dns(
+            &mut cache,
+            &desired,
+            &alive,
+            &suspect,
+            &mut QuotaLedger::default(),
+            false,
+            &HashSet::new(),
+        );
+
+        assert_eq!(nodes_of(&decisions[0]), ["n1", "n2", "n1"]);
+
+        // With every placement on a live or suspect node, nothing moves.
+        desired
+            .scheduling
+            .insert(app.clone(), placed_on(&["n1", "n2", "n1"]));
+        let decisions = plan_scheduling_pass_with_dns(
+            &mut cache,
+            &desired,
+            &alive,
+            &suspect,
+            &mut QuotaLedger::default(),
+            false,
+            &HashSet::new(),
+        );
+        assert!(decisions.is_empty(), "{decisions:?}");
+    }
+
     /// A new leader that hasn't heard from a live node yet leaves that
     /// node's replicas alone.
     #[test]
@@ -4928,6 +5129,7 @@ image = "busybox:latest"
             &mut cache_with_n2_unready(),
             &desired,
             &alive,
+            &HashSet::new(),
             &mut QuotaLedger::default(),
             false,
             &unheard,
@@ -4940,6 +5142,7 @@ image = "busybox:latest"
             &mut cache_with_n2_unready(),
             &desired,
             &alive,
+            &HashSet::new(),
             &mut QuotaLedger::default(),
             false,
             &HashSet::new(),
@@ -5342,6 +5545,7 @@ image = "busybox:latest"
             &mut cache,
             &desired,
             &alive,
+            &HashSet::new(),
             &mut QuotaLedger::default(),
             true,
             &HashSet::new(),
@@ -5370,6 +5574,7 @@ image = "busybox:latest"
             &mut cache,
             &desired,
             &alive,
+            &HashSet::new(),
             &mut QuotaLedger::default(),
             true,
             &HashSet::new(),

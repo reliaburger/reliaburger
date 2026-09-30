@@ -1363,10 +1363,11 @@ async fn start_spread_web_cluster(
     [n1, n2, n3]
 }
 
-/// Z6.7: losing the leader node of three must bring the app back to three
-/// replicas on the survivors, without moving the replica on the survivor that
-/// doesn't need a second one and without churning generations of
-/// replacements. `relish wtf` flags the gap while it lasts.
+/// Z6.7, #346: losing the leader node of three must bring the app back to
+/// three replicas on the survivors without touching either survivor's
+/// replica, spread so neither runs all three, and without churning
+/// generations of replacements or leaving stopped instances behind.
+/// `relish wtf` flags the gap while it lasts.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 #[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
 async fn losing_the_leader_node_places_only_its_replica_on_the_survivors() {
@@ -1430,18 +1431,41 @@ async fn losing_the_leader_node_places_only_its_replica_on_the_survivors() {
         "new replicas kept starting after three ran: {settled:?} then {later:?}"
     );
     assert_eq!(live_web_instances(&survivors).await, 3);
-    // Every survivor still runs web, and one of them didn't restart at all:
-    // only the missing replica was placed.
-    let mut untouched = 0;
+    // Every survivor still runs its own replica, untouched: only the
+    // missing replica was placed, beside them (#346).
     for node in &survivors {
-        let (pid, _) = web_process(node)
+        let running: Vec<u32> = node
+            .client
+            .status()
             .await
-            .unwrap_or_else(|| panic!("{} lost its replica", node.name));
-        if before[&node.name] == pid {
-            untouched += 1;
+            .unwrap()
+            .into_iter()
+            .filter(|status| status.app_name == "web" && status.state == "running")
+            .filter_map(|status| status.pid)
+            .collect();
+        assert!(
+            running.contains(&before[&node.name]),
+            "{}'s replica was replaced: it ran pid {} and now runs {running:?}",
+            node.name,
+            before[&node.name]
+        );
+        assert!(
+            running.len() <= 2,
+            "{} runs {} of three replicas",
+            node.name,
+            running.len()
+        );
+    }
+    // Nothing was stopped, so nothing stopped is left behind.
+    let mut leftovers = Vec::new();
+    for node in &survivors {
+        for status in node.client.status().await.unwrap() {
+            if status.app_name == "web" && status.state != "running" {
+                leftovers.push(format!("{}/{} {}", node.name, status.id, status.state));
+            }
         }
     }
-    assert!(untouched >= 1, "every survivor's replica was replaced");
+    assert!(leftovers.is_empty(), "{leftovers:?}");
     let report = reliaburger::relish::wtf::diagnose(
         &reliaburger::relish::wtf::collect(&entry.client, None)
             .await

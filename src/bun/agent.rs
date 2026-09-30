@@ -683,6 +683,22 @@ enum DeployOp {
         namespace: String,
         reply: oneshot::Sender<Vec<InstanceId>>,
     },
+    /// How many replicas a deploy adds beside the running ones, when it
+    /// only raises the replica count. Asked before the spec is stored.
+    ReplicasToAddInPlace {
+        app_name: String,
+        namespace: String,
+        spec: Box<AppSpec>,
+        reply: oneshot::Sender<Option<u32>>,
+    },
+    /// Create Pending instances for the replicas a scale-up adds.
+    AddAppReplicas {
+        app_name: String,
+        namespace: String,
+        spec: Box<AppSpec>,
+        count: u32,
+        reply: oneshot::Sender<Result<Vec<InstanceId>, BunError>>,
+    },
     /// Reserve and return the next rolling-redeploy generation counter.
     NextDeployGen {
         app_name: String,
@@ -993,6 +1009,47 @@ impl DeployOps {
                 app_name: app_name.to_string(),
                 namespace: namespace.to_string(),
                 spec: Box::new(spec.clone()),
+                reply,
+            },
+            Err(BunError::DeployFailed {
+                app_name: app_name.into(),
+                reason: "agent shutting down".into(),
+            }),
+        )
+        .await
+    }
+
+    async fn replicas_to_add_in_place(
+        &self,
+        app_name: &str,
+        namespace: &str,
+        spec: &AppSpec,
+    ) -> Option<u32> {
+        self.call(
+            |reply| DeployOp::ReplicasToAddInPlace {
+                app_name: app_name.to_string(),
+                namespace: namespace.to_string(),
+                spec: Box::new(spec.clone()),
+                reply,
+            },
+            None,
+        )
+        .await
+    }
+
+    async fn add_app_replicas(
+        &self,
+        app_name: &str,
+        namespace: &str,
+        spec: &AppSpec,
+        count: u32,
+    ) -> Result<Vec<InstanceId>, BunError> {
+        self.call(
+            |reply| DeployOp::AddAppReplicas {
+                app_name: app_name.to_string(),
+                namespace: namespace.to_string(),
+                spec: Box::new(spec.clone()),
+                count,
                 reply,
             },
             Err(BunError::DeployFailed {
@@ -1731,6 +1788,7 @@ mod egress_ownership;
 mod identity_signing;
 mod producer_release;
 mod runtime_inventory;
+mod scale_in_place;
 use app_stop::{AppStop, PendingStops, StopPurpose};
 use discovery_ownership::{DiscoveryOwnership, JournalReference};
 use runtime_inventory::{LOOP_RUNTIME_INVENTORY_TIMEOUT, RUNTIME_INVENTORY_TIMEOUT};
@@ -10891,6 +10949,27 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     .collect();
                 let _ = reply.send(ids);
             }
+            DeployOp::ReplicasToAddInPlace {
+                app_name,
+                namespace,
+                spec,
+                reply,
+            } => {
+                let _ = reply.send(self.replicas_to_add_in_place(&app_name, &namespace, &spec));
+            }
+            DeployOp::AddAppReplicas {
+                app_name,
+                namespace,
+                spec,
+                count,
+                reply,
+            } => {
+                let result = self
+                    .supervisor
+                    .add_app_replicas(&app_name, &namespace, &spec, count, Instant::now())
+                    .await;
+                let _ = reply.send(result);
+            }
             DeployOp::NextDeployGen { app_name, reply } => {
                 // Adoption restores owners, not the previous process's counter.
                 // Use the structured app name to distinguish an ordinary app
@@ -11519,6 +11598,11 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 }
             };
 
+            // Asked before the new spec replaces the one the replicas run.
+            let in_place = self
+                .ops
+                .replicas_to_add_in_place(app_name, namespace, spec)
+                .await;
             if let Err(error) = self
                 .ops
                 .store_deployed_spec(app_name, namespace, spec)
@@ -11533,6 +11617,24 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             }
 
             let existing = self.ops.list_existing_owned(app_name, namespace).await;
+
+            if let Some(count) = in_place.filter(|_| !existing.is_empty()) {
+                if self
+                    .add_replicas_in_place(app_name, namespace, spec, count, &events)
+                    .await
+                    .is_break()
+                {
+                    return;
+                }
+                all_ids.extend(
+                    self.ops
+                        .list_existing_owned(app_name, namespace)
+                        .await
+                        .iter()
+                        .map(|id| id.0.clone()),
+                );
+                continue;
+            }
 
             if !existing.is_empty() {
                 // A standalone `relish stop` keeps its stopped replicas owned
@@ -12006,6 +12108,90 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             }
         }
         Ok(())
+    }
+
+    /// Start `count` more replicas beside the ones an app already runs, the
+    /// way a fresh deploy starts its replicas. The running ones aren't
+    /// touched. Returns `Break` when the caller must stop the whole deploy.
+    async fn add_replicas_in_place(
+        &self,
+        app_name: &str,
+        namespace: &str,
+        spec: &AppSpec,
+        count: u32,
+        events: &mpsc::Sender<ApplyEvent>,
+    ) -> std::ops::ControlFlow<()> {
+        let _ = events
+            .send(ApplyEvent::Progress {
+                message: format!(
+                    "adding {count} replica(s) of {app_name} beside the running ones (replicas: {})",
+                    spec.replicas
+                ),
+            })
+            .await;
+        let ids = match self
+            .ops
+            .add_app_replicas(app_name, namespace, spec, count)
+            .await
+        {
+            Ok(ids) => ids,
+            Err(error) => {
+                let _ = events
+                    .send(ApplyEvent::Error {
+                        message: error.to_string(),
+                    })
+                    .await;
+                return std::ops::ControlFlow::Break(());
+            }
+        };
+        for id in &ids {
+            let _ = events
+                .send(ApplyEvent::Progress {
+                    message: format!("creating instance {}", id.0),
+                })
+                .await;
+            // A replica that fails leaves the app short of its count, and not
+            // every replica running, so the reconciler's retry rolls it.
+            if let Err(error) = self
+                .drive_fresh_instance(id, app_name, namespace, spec)
+                .await
+            {
+                let _ = events
+                    .send(ApplyEvent::Error {
+                        message: error.to_string(),
+                    })
+                    .await;
+                return std::ops::ControlFlow::Break(());
+            }
+            self.ops
+                .provision_identity(app_name, namespace, id, false)
+                .await;
+            let _ = events
+                .send(ApplyEvent::InstanceCreated {
+                    id: id.0.clone(),
+                    app: app_name.to_string(),
+                })
+                .await;
+        }
+        self.ops
+            .push_deploy_history(crate::meat::deploy_types::DeployHistoryEntry {
+                id: crate::meat::deploy_types::DeployId(
+                    SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                ),
+                app_id: crate::meat::types::AppId::new(app_name, namespace),
+                image: spec.image.clone().unwrap_or_default(),
+                result: crate::meat::deploy_types::DeployResult::Completed,
+                created_at: SystemTime::now(),
+                completed_at: SystemTime::now(),
+                steps_completed: ids.len(),
+                steps_total: ids.len(),
+                spec: Some(Box::new(spec.clone())),
+            })
+            .await;
+        std::ops::ControlFlow::Continue(())
     }
 
     /// Rolling redeploy: start generation-tagged new instances, health check
@@ -21923,6 +22109,74 @@ host = "remote.local"
         expect_complete(&drain_deploy(&mut agent, basic_config()).await);
 
         assert_eq!(running(&agent), 1, "the redeploy left no running replica");
+    }
+
+    fn web_with_replicas(replicas: u32) -> Config {
+        let mut config = basic_config();
+        config.app.get_mut("web").unwrap().replicas = crate::config::Replicas::Fixed(replicas);
+        config
+    }
+
+    fn live_web_ids(agent: &BunAgent<MockGrill>) -> Vec<String> {
+        let mut ids: Vec<String> = agent
+            .supervisor
+            .list_instances()
+            .iter()
+            .filter(|instance| instance.state == ContainerState::Running)
+            .map(|instance| instance.id.0.clone())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// #346: when a node dies, a survivor's share of an app grows by one.
+    /// The placement reconciler deploys the same spec with a higher replica
+    /// count, and that used to roll every replica on the node: the healthy
+    /// ones stopped, a new generation started, and the stopped ones lingered
+    /// until the dead node's view lease ran out. Only the new replica should
+    /// start.
+    #[tokio::test]
+    async fn raising_the_replica_count_starts_only_the_new_replicas() {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        grill.set_pid(std::process::id());
+        expect_complete(&drain_deploy(&mut agent, web_with_replicas(1)).await);
+        let before = live_web_ids(&agent);
+        assert_eq!(before.len(), 1);
+
+        expect_complete(&drain_deploy(&mut agent, web_with_replicas(3)).await);
+
+        let after = live_web_ids(&agent);
+        assert_eq!(after.len(), 3, "{after:?}");
+        assert!(
+            after.contains(&before[0]),
+            "the serving replica was replaced"
+        );
+        assert_eq!(
+            agent.supervisor.list_instances().len(),
+            3,
+            "nothing stopped is left behind"
+        );
+        let stopped: Vec<_> = grill
+            .calls()
+            .into_iter()
+            .filter(|(call, id)| (call == "stop" || call == "kill") && id.0 == before[0])
+            .collect();
+        assert!(stopped.is_empty(), "{stopped:?}");
+        let backends = agent
+            .service_map
+            .resolve(&crate::onion::service_id::ServiceId::new("default", "web"))
+            .map(|entry| entry.backends.len())
+            .unwrap_or(0);
+        assert_eq!(backends, 3, "every replica serves");
+
+        // A changed spec still rolls.
+        let mut changed = web_with_replicas(3);
+        changed.app.get_mut("web").unwrap().image = Some("myapp:v2".into());
+        expect_complete(&drain_deploy(&mut agent, changed).await);
+        assert!(
+            live_web_ids(&agent).iter().all(|id| !after.contains(id)),
+            "a new image must replace every replica"
+        );
     }
 
     #[tokio::test]

@@ -103,15 +103,16 @@ Meat uses a four-phase placement pipeline for App scheduling:
 - Namespace quota would not be exceeded by this placement.
 - For process workloads: node has the required binary in its allowlist.
 
-**Phase 2: Score.** Rank remaining candidate nodes (0-100 scale, higher is better).
+**Phase 2: Score.** Rank remaining candidate nodes. Spread comes first: a node running fewer replicas of the App always ranks above one running more, which provides failure-domain diversity. Among nodes running the same number, a weighted score (0-90, higher is better) decides:
 
 - **Bin-packing score (weight 50):** Prefer nodes with the least remaining allocatable resources after placing this workload. This maximizes density.
 - **Preferred label score (weight 20):** Nodes matching `preferred` labels receive a bonus.
 - **Image locality score (weight 15):** Nodes that already have the required image cached score higher (full marks if the image is present, zero otherwise).
-- **Spread score (weight 60):** Penalize nodes that already run other replicas of the same App. This provides failure-domain diversity. The weight deliberately exceeds bin-packing's 50, so a spread-clean node always outscores a fuller node running the same app.
 - **Node stability score (weight 5):** Prefer nodes with longer uptime, scaled from the node's reported uptime (full marks at 24h).
 
-**Phase 3: Select.** Pick the highest-scoring node. Ties are broken by node ID (deterministic). For multi-replica placements, Meat runs the pipeline iteratively, updating the cluster state cache after each placement to reflect the newly committed resources.
+Spread was once a weight (60, scored on whether a node ran the App at all). That beat bin-packing only against a node with no replica: once every candidate ran one, the busier node took every replacement (#346). The replica count is now the first sort key, so no weight can outvote it.
+
+**Phase 3: Select.** Pick the first node: fewest replicas, then highest score. Remaining ties are broken by node ID (deterministic). For multi-replica placements, Meat runs the pipeline iteratively, updating the cluster state cache after each placement to reflect the newly committed resources.
 
 **Phase 4: Commit.** Write the scheduling decision to the Raft log. Once committed, the decision is replicated to council members and the assignment is sent to the target Bun agent via the reporting tree.
 
@@ -611,12 +612,12 @@ When an App spec with `replicas = 3` is submitted:
 1. The API validates the spec (schema, permissions) before committing it; Meat checks the namespace quota in its scheduling pass (§5.6).
 2. For each replica (0..3), Meat runs the four-phase placement pipeline:
    - **Filter:** Eliminate nodes that lack resources, do not match `required` labels, or are not ready.
-   - **Score:** Rank candidates using the weighted scoring model (bin-packing 50, preferred labels 20, image locality 15, spread 60, stability 5).
+   - **Score:** Rank candidates by fewest replicas of the App, then by the weighted score (bin-packing 50, preferred labels 20, image locality 15, stability 5).
    - **Select:** Pick the highest-scoring node.
    - **Commit:** Reserve resources on the selected node in the cluster state cache, then commit the `SchedulingDecision` to the Raft log.
 3. After all replicas are committed, the decisions are disseminated to target Bun agents.
 
-The iterative per-replica approach (rather than computing all placements at once) ensures that the spread penalty accumulates correctly -- the second replica of an App scores a given node lower if the first replica was already placed there.
+The iterative per-replica approach (rather than computing all placements at once) ensures that spread accumulates correctly: the second replica of an App ranks a given node lower if the first replica was already placed there.
 
 #### Required Labels (Hard Constraints)
 
@@ -989,7 +990,8 @@ The `default` namespace has no quotas unless explicitly configured, which is app
 > `[defaults.app.deploy]`) configuration namespace described in this section does
 > not exist yet. The scheduler's behaviour is currently baked into constants:
 > the reconcile tick is a hardcoded 2 seconds, the scoring weights are `const`s
-> in `meat::score` (bin-pack 50, preferred 20, image 15, spread 60, stability 5),
+> in `meat::score` (bin-pack 50, preferred 20, image 15, stability 5; spread is
+> the first sort key, not a weight),
 > and there is no runtime knob to change any of them. Treat the tables below as
 > the intended configuration surface, not as keys you can set today. (The
 > per-node reconstruction knobs under `[reconstruction]` — e.g.
@@ -1014,7 +1016,6 @@ All scheduler-related configuration is set in the cluster-level configuration (a
 | `scheduler.scoring.bin_packing_weight` | `50` | Weight for the bin-packing score (0-100). |
 | `scheduler.scoring.preferred_label_weight` | `20` | Weight for preferred label matching (0-100). |
 | `scheduler.scoring.image_locality_weight` | `15` | Weight for image cache locality (0-100). |
-| `scheduler.scoring.spread_weight` | `10` | Weight for anti-affinity spread (0-100). |
 | `scheduler.scoring.stability_weight` | `5` | Weight for node uptime/stability (0-100). |
 
 ### Batch Jobs
@@ -1114,7 +1115,19 @@ All scheduler-related configuration is set in the cluster-level configuration (a
 
 If `auto_rollback = true` and the health check of the in-progress step was pending when the leader failed, the new leader restarts the health check timer from zero (conservative approach -- it does not assume the previous leader's timer was accurate).
 
-### 7.5 Cascading Node Failures
+### 7.5 Losing One Node
+
+**Scenario:** One node of three dies while an App runs one replica on each.
+
+**Response:** Meat moves as little as it can.
+
+1. Only a placement on a node gossip no longer lists as `Alive` or `Suspect` is lost, or one on a node that reported itself not ready, not capable, or went stale. A `Suspect` node missed a probe and has the suspicion timeout to refute it; in a three-node cluster that just lost a member there is no third node to relay an indirect probe, so a loaded survivor can be suspected for a late ack. Its placements hold until gossip declares it dead (#346). A live node whose readiness report hasn't reached a new leader yet keeps its placements too (§7.2).
+2. Every placement that holds stays where it is. Meat places only the missing replicas.
+3. Before placing them, the pass sets each node's replica count for the App from the kept placements (reports can lag a new leader), so spread sends each replacement to the eligible survivor running the fewest replicas. No node ends up with more than `ceil(replicas / eligible nodes)` unless the others lack room.
+4. The survivor that gains a replica receives the same spec with a higher count. Its agent starts only the added replica beside the running ones; it rolls its replicas only when the spec changed in any other way, or when not every replica is running.
+5. When the lost node returns, nothing moves back: the App is converged, and rebalancing would restart healthy replicas.
+
+### 7.6 Cascading Node Failures
 
 **Scenario:** Multiple nodes fail simultaneously (rack failure, network partition).
 
@@ -1421,7 +1434,7 @@ V1 supports whole-device GPU allocation only (`gpu = 1`, `gpu = 2`). Fractional 
 
 ### 13.4 Spread Strategy as First-Class Alternative
 
-Currently, bin-packing is the primary strategy and spread is a scoring component. Some workloads (latency-sensitive services) benefit from a spread-first strategy that distributes replicas across as many nodes as possible, even if this reduces density. Should Meat support a per-App `strategy = "spread"` that inverts the scoring weights? **Current decision: under consideration. The current spread weight (60) already exceeds bin-packing's 50, so a spread-clean node wins by default; a dedicated spread mode would go further and also reduce bin-packing weight.**
+Currently, bin-packing is the primary strategy and spread is a scoring component. Some workloads (latency-sensitive services) benefit from a spread-first strategy that distributes replicas across as many nodes as possible, even if this reduces density. Should Meat support a per-App `strategy = "spread"` that inverts the scoring weights? **Current decision: under consideration. Spread is already the first sort key, so replicas land on the nodes running fewest of them; a dedicated spread mode would go further and prefer emptier nodes over fuller ones as well.**
 
 ### 13.5 Topology-Aware Scheduling
 

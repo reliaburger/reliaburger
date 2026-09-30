@@ -823,9 +823,9 @@ max = 10            # never scale above 10 replicas
 4. Clamp `desired` to `[min, max]`.
 5. If `desired != current_replicas` and the cooldown period has elapsed since the last scale event, initiate a scale operation.
 
-**Scale-up** starts new instances using the same placement logic as a deploy (Meat picks nodes, Bun starts containers, health checks run, Wrapper/Onion add to pools). Scale-up doesn't drain or stop any existing instances.
+**Scale-up** starts new instances using the same placement logic as a deploy (Meat picks nodes, Bun starts containers, health checks run, Wrapper/Onion add to pools). Scale-up doesn't drain or stop any existing instances: a node whose share grows receives the same spec with a higher count, and its agent starts only the added replicas beside the running ones (#346).
 
-**Scale-down** removes excess instances using the drain protocol (remove from routing, wait for drain, stop). Instances are removed from least-loaded nodes first.
+**Scale-down** removes excess instances using the drain protocol (remove from routing, wait for drain, stop). Meat keeps the first placements and drops the rest. A node whose share shrinks still rolls its replicas at the lower count rather than stopping only the surplus.
 
 **GitOps interaction (Lettuce):**
 
