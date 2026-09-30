@@ -1500,6 +1500,12 @@ async fn test_lease_get_handler(
         if let Err(response) = crate::sesame::auth::require_unscoped(Some(auth)) {
             return response;
         }
+        if let Err(response) =
+            enforce_cluster_permission(&state, Some(auth), crate::config::PermissionAction::Admin)
+                .await
+        {
+            return response;
+        }
     }
     Json(lease).into_response()
 }
@@ -1610,6 +1616,12 @@ async fn test_lease_release_handler(
         Some(auth.principal_id.as_str())
     } else if auth.role == crate::sesame::types::ApiRole::Admin {
         if let Err(response) = crate::sesame::auth::require_unscoped(Some(auth)) {
+            return response;
+        }
+        if let Err(response) =
+            enforce_cluster_permission(&state, Some(auth), crate::config::PermissionAction::Admin)
+                .await
+        {
             return response;
         }
         None
@@ -1896,13 +1908,19 @@ async fn version_handler(State(state): State<ApiState>) -> impl IntoResponse {
 /// on every node and every tenant, so an Admin token scoped to some apps or
 /// namespaces is refused (403) like on the other cluster-wide routes. The
 /// service token (the orchestrator directing nodes) passes.
+///
+/// A principal with a `[permission]` spec also needs `admin` granted across
+/// the whole cluster (B18), so a spec can take cluster administration away
+/// from an Admin token without revoking it.
 // `Response` is large but it IS the HTTP reply to send on failure.
 #[allow(clippy::result_large_err)]
-fn authorize_cluster_admin(
+async fn authorize_cluster_admin(
+    state: &ApiState,
     auth: Option<&crate::sesame::auth::AuthContext>,
 ) -> Result<(), Response> {
     crate::sesame::auth::authorize(auth, crate::sesame::types::ApiRole::Admin)?;
-    crate::sesame::auth::require_unscoped(auth)
+    crate::sesame::auth::require_unscoped(auth)?;
+    enforce_cluster_permission(state, auth, crate::config::PermissionAction::Admin).await
 }
 
 /// Apply a node-level upgrade directive (admin). Responds 202 once the
@@ -1912,7 +1930,7 @@ async fn upgrade_apply_handler(
     State(state): State<ApiState>,
     body: String,
 ) -> Response {
-    if let Err(resp) = authorize_cluster_admin(auth.as_deref()) {
+    if let Err(resp) = authorize_cluster_admin(&state, auth.as_deref()).await {
         return resp;
     }
     let directive: crate::upgrade::types::UpgradeDirective = match serde_json::from_str(&body) {
@@ -1995,7 +2013,7 @@ async fn upgrade_rollback_handler(
     State(state): State<ApiState>,
     body: String,
 ) -> Response {
-    if let Err(resp) = authorize_cluster_admin(auth.as_deref()) {
+    if let Err(resp) = authorize_cluster_admin(&state, auth.as_deref()).await {
         return resp;
     }
     #[derive(serde::Deserialize, Default)]
@@ -2200,7 +2218,7 @@ async fn upgrade_start_handler(
     headers: HeaderMap,
     body: String,
 ) -> Response {
-    if let Err(resp) = authorize_cluster_admin(auth.as_deref()) {
+    if let Err(resp) = authorize_cluster_admin(&state, auth.as_deref()).await {
         return resp;
     }
     #[derive(serde::Deserialize)]
@@ -2581,7 +2599,7 @@ async fn upgrade_resume_handler(
     directory: Option<axum::Extension<LeaderDirectory>>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(resp) = authorize_cluster_admin(auth.as_deref()) {
+    if let Err(resp) = authorize_cluster_admin(&state, auth.as_deref()).await {
         return resp;
     }
     let Some(council) = &state.council else {
@@ -2650,7 +2668,7 @@ async fn upgrade_abort_handler(
     directory: Option<axum::Extension<LeaderDirectory>>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(resp) = authorize_cluster_admin(auth.as_deref()) {
+    if let Err(resp) = authorize_cluster_admin(&state, auth.as_deref()).await {
         return resp;
     }
     let Some(council) = &state.council else {
@@ -2709,7 +2727,7 @@ async fn upgrade_cluster_rollback_handler(
     headers: HeaderMap,
     body: String,
 ) -> Response {
-    if let Err(resp) = authorize_cluster_admin(auth.as_deref()) {
+    if let Err(resp) = authorize_cluster_admin(&state, auth.as_deref()).await {
         return resp;
     }
     #[derive(serde::Deserialize)]
@@ -2837,7 +2855,7 @@ async fn cluster_elect_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
 ) -> Response {
-    if let Err(resp) = authorize_cluster_admin(auth.as_deref()) {
+    if let Err(resp) = authorize_cluster_admin(&state, auth.as_deref()).await {
         return resp;
     }
     let Some(council) = &state.council else {
@@ -2873,11 +2891,32 @@ async fn enforce_permission(
     app: &str,
     namespace: &str,
 ) -> Result<(), Response> {
-    let permissions = match &state.council {
+    let permissions = permission_map(state).await;
+    crate::sesame::auth::authorize_permission(auth, action, app, namespace, &permissions)
+}
+
+/// Enforce a principal's `[permission]` spec for a cluster-wide action: one
+/// that names no single app, so only a grant for every app in every
+/// namespace covers it. See [`crate::sesame::auth::authorize_cluster_permission`].
+#[allow(clippy::result_large_err)]
+async fn enforce_cluster_permission(
+    state: &ApiState,
+    auth: Option<&crate::sesame::auth::AuthContext>,
+    action: crate::config::PermissionAction,
+) -> Result<(), Response> {
+    let permissions = permission_map(state).await;
+    crate::sesame::auth::authorize_cluster_permission(auth, action, &permissions)
+}
+
+/// The replicated `[permission]` map, keyed by token name. Empty without a
+/// council (single-node mode, where permissions can't be configured).
+async fn permission_map(
+    state: &ApiState,
+) -> std::collections::BTreeMap<String, crate::config::PermissionSpec> {
+    match &state.council {
         Some(council) => council.desired_state().await.permissions,
         None => std::collections::BTreeMap::new(),
-    };
-    crate::sesame::auth::authorize_permission(auth, action, app, namespace, &permissions)
+    }
 }
 
 /// Deploy workloads, streaming progress via SSE.
@@ -3102,6 +3141,15 @@ async fn apply_handler(
         if let Err(response) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
             return response;
         }
+        if let Err(response) = enforce_cluster_permission(
+            &state,
+            auth.as_deref(),
+            crate::config::PermissionAction::Admin,
+        )
+        .await
+        {
+            return response;
+        }
     }
 
     let images = config
@@ -3121,10 +3169,7 @@ async fn apply_handler(
     // Check every workload before any Raft write or agent command. A job in
     // a mixed manifest must not bypass admission after its apps have committed.
     // Host execution includes both explicit binaries and inline scripts.
-    let permissions = match &state.council {
-        Some(council) => council.desired_state().await.permissions,
-        None => std::collections::BTreeMap::new(),
-    };
+    let permissions = permission_map(&state).await;
     let targets = config
         .app
         .iter()
@@ -3603,6 +3648,11 @@ async fn node_decommission_handler(
         return response;
     }
     if let Err(response) = crate::sesame::auth::require_unscoped(Some(auth)) {
+        return response;
+    }
+    if let Err(response) =
+        enforce_cluster_permission(&state, Some(auth), crate::config::PermissionAction::Admin).await
+    {
         return response;
     }
     if let Err(error) = request.validate() {
@@ -4334,8 +4384,19 @@ async fn top_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
 ) -> Response {
     let auth = auth.as_deref();
+    // CPU and memory are metrics, so a `[permission]` spec must grant
+    // `metrics` on a row's app for the caller to see it (B18).
+    let permissions = permission_map(&state).await;
     let visible = |row: &crate::bun::top::TopRow| {
-        crate::sesame::auth::authorize_scoped(auth, &row.instance.app_name, &row.instance.namespace)
+        let (app, namespace) = (&row.instance.app_name, &row.instance.namespace);
+        crate::sesame::auth::authorize_scoped(auth, app, namespace).is_ok()
+            && crate::sesame::auth::authorize_permission(
+                auth,
+                crate::config::PermissionAction::Metrics,
+                app,
+                namespace,
+                &permissions,
+            )
             .is_ok()
     };
     let mut rows = match local_top_rows(&state).await {
@@ -4774,6 +4835,17 @@ async fn logs_handler(
     if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
         return resp;
     }
+    if let Err(resp) = enforce_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Logs,
+        &app,
+        &namespace,
+    )
+    .await
+    {
+        return resp;
+    }
     let follow = query.follow.unwrap_or(false);
 
     if follow {
@@ -5113,6 +5185,17 @@ async fn ws_logs_handler(
     if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
         return resp;
     }
+    if let Err(resp) = enforce_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Logs,
+        &app,
+        &namespace,
+    )
+    .await
+    {
+        return resp;
+    }
     upgrade
         .on_upgrade(move |socket| ws_logs_session(socket, state.cmd_tx, app, namespace, query.tail))
         .into_response()
@@ -5163,6 +5246,17 @@ async fn logs_entries_handler(
     if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
         return resp;
     }
+    if let Err(resp) = enforce_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Logs,
+        &app,
+        &namespace,
+    )
+    .await
+    {
+        return resp;
+    }
     let Some(log_store) = &state.log_store else {
         return Json(Vec::<LogEntry>::new()).into_response();
     };
@@ -5202,6 +5296,17 @@ async fn logs_cross_node_handler(
     use crate::meat::types::AppId;
 
     if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
+        return resp;
+    }
+    if let Err(resp) = enforce_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Logs,
+        &app,
+        &namespace,
+    )
+    .await
+    {
         return resp;
     }
 
@@ -7789,6 +7894,15 @@ async fn metrics_query_handler(
     if let Err(resp) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
         return resp;
     }
+    if let Err(resp) = enforce_cluster_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Metrics,
+    )
+    .await
+    {
+        return resp;
+    }
     let Some(mayo) = &state.mayo else {
         return Json(serde_json::json!({"error": "metrics not enabled"})).into_response();
     };
@@ -7877,6 +7991,15 @@ async fn metrics_summary_handler(
     if let Err(resp) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
         return resp;
     }
+    if let Err(resp) = enforce_cluster_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Metrics,
+    )
+    .await
+    {
+        return resp;
+    }
     let Some(mayo) = &state.mayo else {
         return Json(serde_json::json!([])).into_response();
     };
@@ -7956,23 +8079,8 @@ async fn gather_dashboard_apps(state: &ApiState) -> Result<Vec<DashboardApp>, St
 async fn gather_dashboard_data(state: &ApiState) -> Result<DashboardData, String> {
     let apps = gather_dashboard_apps(state).await?;
 
-    let (alert_count, alerts) = if let Some(ref evaluator) = state.alerts {
-        let eval = evaluator.read().await;
-        let firing = eval.firing_alerts();
-        let count = firing.len();
-        let alert_rows = firing
-            .iter()
-            .map(|a| crate::brioche::dashboard::DashboardAlert {
-                labels: a.labels.clone(),
-                name: a.rule_name.clone(),
-                severity: format!("{:?}", a.severity),
-                description: a.description.clone(),
-            })
-            .collect();
-        (count, alert_rows)
-    } else {
-        (0, vec![])
-    };
+    let alerts = firing_dashboard_alerts(state).await;
+    let alert_count = alerts.len();
 
     let nodes = gather_dashboard_nodes(state).await;
     // The node count follows the real membership when we have it. A
@@ -8033,11 +8141,29 @@ fn html_response(html: String) -> Response {
 }
 
 /// `GET /` — serve the Brioche cluster overview dashboard.
-async fn dashboard_handler(State(state): State<ApiState>) -> Response {
-    match gather_dashboard_data(&state).await {
-        Ok(data) => html_response(render_dashboard(&data)),
-        Err(error) => unavailable_response(error),
+///
+/// The alert panel follows `/v1/alerts`: a principal whose `[permission]`
+/// spec doesn't grant `metrics` across the cluster sees the page without it.
+async fn dashboard_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+) -> Response {
+    let mut data = match gather_dashboard_data(&state).await {
+        Ok(data) => data,
+        Err(error) => return unavailable_response(error),
+    };
+    if enforce_cluster_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Metrics,
+    )
+    .await
+    .is_err()
+    {
+        data.alerts.clear();
+        data.alert_count = 0;
     }
+    html_response(render_dashboard(&data))
 }
 
 /// Names of the metrics an app's instances reported in the last five
@@ -8128,11 +8254,24 @@ async fn app_detail_handler(
         vec![]
     };
 
-    let charts = crate::brioche::app_detail::app_charts(
+    // Each chart polls the app's metric endpoint, which refuses a principal
+    // without `metrics` on this app; leave them out rather than draw errors.
+    let charts = match enforce_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Metrics,
         &app,
         &namespace,
-        &scraped_metric_names(&state, &app, &namespace).await,
-    );
+    )
+    .await
+    {
+        Ok(()) => crate::brioche::app_detail::app_charts(
+            &app,
+            &namespace,
+            &scraped_metric_names(&state, &app, &namespace).await,
+        ),
+        Err(_) => Vec::new(),
+    };
 
     let data = AppDetailData {
         app_name: app,
@@ -8230,22 +8369,42 @@ async fn fragment_nodes_handler(State(state): State<ApiState>) -> Response {
 }
 
 /// `GET /ui/fragment/alerts` — alerts table HTML fragment for HTMX swap.
-async fn fragment_alerts_handler(State(state): State<ApiState>) -> Response {
-    let alerts = if let Some(ref evaluator) = state.alerts {
-        let eval = evaluator.read().await;
-        eval.firing_alerts()
-            .iter()
-            .map(|a| crate::brioche::dashboard::DashboardAlert {
-                labels: a.labels.clone(),
-                name: a.rule_name.clone(),
-                severity: format!("{:?}", a.severity),
-                description: a.description.clone(),
-            })
-            .collect()
-    } else {
-        vec![]
-    };
+async fn fragment_alerts_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+) -> Response {
+    if let Err(resp) = enforce_cluster_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Metrics,
+    )
+    .await
+    {
+        return resp;
+    }
+    let alerts = firing_dashboard_alerts(&state).await;
     html_response(fragments::render_alerts_table_fragment(&alerts))
+}
+
+/// The firing alerts, shaped for the dashboard's alert table.
+async fn firing_dashboard_alerts(
+    state: &ApiState,
+) -> Vec<crate::brioche::dashboard::DashboardAlert> {
+    let Some(evaluator) = &state.alerts else {
+        return Vec::new();
+    };
+    evaluator
+        .read()
+        .await
+        .firing_alerts()
+        .iter()
+        .map(|a| crate::brioche::dashboard::DashboardAlert {
+            labels: a.labels.clone(),
+            name: a.rule_name.clone(),
+            severity: format!("{:?}", a.severity),
+            description: a.description.clone(),
+        })
+        .collect()
 }
 
 /// `GET /ui/fragment/app/{app}/{namespace}/instances` — instance table fragment.
@@ -8313,6 +8472,15 @@ async fn logs_sql_handler(
     if let Err(resp) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
         return resp;
     }
+    if let Err(resp) = enforce_cluster_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Logs,
+    )
+    .await
+    {
+        return resp;
+    }
     let Some(log_store) = &state.log_store else {
         return Json(serde_json::json!({"error": "log store not enabled"})).into_response();
     };
@@ -8367,6 +8535,15 @@ async fn logs_export_handler(
     {
         return resp;
     }
+    if let Err(resp) = enforce_cluster_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Admin,
+    )
+    .await
+    {
+        return resp;
+    }
     let Some(log_store) = &state.log_store else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -8405,14 +8582,30 @@ async fn logs_export_handler(
 }
 
 /// `GET /v1/alerts` — list all alert statuses.
-async fn alerts_handler(State(state): State<ApiState>) -> impl IntoResponse {
+///
+/// Alerts are rules evaluated over the whole metric store, so a principal
+/// with a `[permission]` spec needs `metrics` across the cluster (B18).
+async fn alerts_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+) -> Response {
+    if let Err(resp) = enforce_cluster_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Metrics,
+    )
+    .await
+    {
+        return resp;
+    }
     let Some(alerts) = &state.alerts else {
-        return Json(crate::mayo::alert::AlertsResponse { alerts: Vec::new() });
+        return Json(crate::mayo::alert::AlertsResponse { alerts: Vec::new() }).into_response();
     };
     let evaluator = alerts.read().await;
     Json(crate::mayo::alert::AlertsResponse {
         alerts: evaluator.all_statuses(),
     })
+    .into_response()
 }
 
 /// `GET /v1/metrics/keys` — list all distinct metric names.
@@ -8421,6 +8614,15 @@ async fn metrics_keys_handler(
     State(state): State<ApiState>,
 ) -> Response {
     if let Err(resp) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
+        return resp;
+    }
+    if let Err(resp) = enforce_cluster_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Metrics,
+    )
+    .await
+    {
         return resp;
     }
     let Some(mayo) = &state.mayo else {
@@ -8448,6 +8650,15 @@ async fn metrics_rollup_handler(
     Query(params): Query<MetricsQueryParams>,
 ) -> Response {
     if let Err(resp) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
+        return resp;
+    }
+    if let Err(resp) = enforce_cluster_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Metrics,
+    )
+    .await
+    {
         return resp;
     }
     let Some(rollup_store) = &state.rollup_store else {
@@ -8503,6 +8714,15 @@ async fn metrics_owned_rollup_handler(
     Query(params): Query<MetricsQueryParams>,
 ) -> Response {
     if let Err(response) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
+        return response;
+    }
+    if let Err(response) = enforce_cluster_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Metrics,
+    )
+    .await
+    {
         return response;
     }
     let Some(store) = &state.rollup_store else {
@@ -8574,6 +8794,15 @@ async fn metrics_cluster_handler(
     Query(params): Query<MetricsQueryParams>,
 ) -> Response {
     if let Err(resp) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
+        return resp;
+    }
+    if let Err(resp) = enforce_cluster_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Metrics,
+    )
+    .await
+    {
         return resp;
     }
     let start = params.start.unwrap_or(0);
@@ -8757,6 +8986,17 @@ async fn metrics_app_handler(
     if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
         return resp;
     }
+    if let Err(resp) = enforce_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Metrics,
+        &app,
+        &namespace,
+    )
+    .await
+    {
+        return resp;
+    }
     let (start, end) = app_query_window(params.start, params.end);
     match app_metric_rows(
         &state,
@@ -8807,6 +9047,17 @@ async fn metrics_app_chart_handler(
     use crate::mayo::series::{self, ChartKind};
 
     if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
+        return resp;
+    }
+    if let Err(resp) = enforce_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Metrics,
+        &app,
+        &namespace,
+    )
+    .await
+    {
         return resp;
     }
     let (start, end) = app_query_window(params.start, params.end);
@@ -8879,10 +9130,7 @@ async fn deploy_cancel_handler(
         )
             .into_response();
     };
-    let permissions = match &state.council {
-        Some(council) => council.desired_state().await.permissions,
-        None => std::collections::BTreeMap::new(),
-    };
+    let permissions = permission_map(&state).await;
     for target in &operation.targets {
         if let Err(response) =
             crate::sesame::auth::authorize_scoped(auth.as_deref(), &target.name, &target.namespace)
@@ -9041,6 +9289,17 @@ async fn rollback_handler(
         return resp;
     }
     if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
+        return resp;
+    }
+    if let Err(resp) = enforce_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Deploy,
+        &app,
+        &namespace,
+    )
+    .await
+    {
         return resp;
     }
     let Some(history) = &state.deploy_history else {
@@ -9332,6 +9591,15 @@ async fn identity_sign_handler(
     if let Err(response) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
         return response;
     }
+    if let Err(response) = enforce_cluster_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Admin,
+    )
+    .await
+    {
+        return response;
+    }
     let submission: crate::pickle::signing::SignatureSubmission = match serde_json::from_str(&body)
     {
         Ok(r) => r,
@@ -9381,6 +9649,15 @@ async fn token_list_handler(
     if let Err(response) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
         return response;
     }
+    if let Err(response) = enforce_cluster_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Admin,
+    )
+    .await
+    {
+        return response;
+    }
     let Some(ref council) = state.council else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -9418,6 +9695,15 @@ async fn token_revoke_handler(
         return resp;
     }
     if let Err(response) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
+        return response;
+    }
+    if let Err(response) = enforce_cluster_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Admin,
+    )
+    .await
+    {
         return response;
     }
     #[derive(serde::Deserialize)]
@@ -9484,6 +9770,15 @@ async fn token_create_handler(
         return resp;
     }
     if let Err(response) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
+        return response;
+    }
+    if let Err(response) = enforce_cluster_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Admin,
+    )
+    .await
+    {
         return response;
     }
     #[derive(serde::Deserialize, serde::Serialize)]
@@ -9687,6 +9982,15 @@ async fn join_token_create_handler(
     if let Err(response) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
         return response;
     }
+    if let Err(response) = enforce_cluster_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Admin,
+    )
+    .await
+    {
+        return response;
+    }
 
     fn default_ttl_seconds() -> u64 {
         crate::sesame::join::DEFAULT_JOIN_TOKEN_TTL.as_secs()
@@ -9834,6 +10138,15 @@ async fn secret_rotate_handler(
     if let Err(response) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
         return response;
     }
+    if let Err(response) = enforce_cluster_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::SecretWrite,
+    )
+    .await
+    {
+        return response;
+    }
     #[derive(serde::Deserialize)]
     struct RotateRequest {
         #[serde(default)]
@@ -9952,6 +10265,10 @@ async fn secret_rotate_handler(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "api_permission_tests.rs"]
+mod permission_tests;
 
 #[cfg(test)]
 mod tests {
@@ -10181,7 +10498,7 @@ mod tests {
     /// Build a single-node council, initialised as leader and seeded with a
     /// real `SecurityState` (four CAs, an age keypair, an OIDC config). `tag`
     /// disambiguates the temp dir so concurrent tests don't collide.
-    async fn seeded_council(tag: &str) -> Arc<crate::council::CouncilNode> {
+    pub(super) async fn seeded_council(tag: &str) -> Arc<crate::council::CouncilNode> {
         use std::collections::BTreeMap;
 
         use crate::council::log_store::MemLogStore;

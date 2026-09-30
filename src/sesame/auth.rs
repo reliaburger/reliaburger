@@ -591,6 +591,44 @@ pub fn authorize_permission(
     }
 }
 
+/// Enforce a principal's `[permission]` spec on a **cluster-wide** action.
+///
+/// The per-app twin of this is [`authorize_permission`]. Some routes name no
+/// app (raw log SQL, the metric store, token management, upgrades), so the
+/// only grant that can cover them is one for every app in every namespace
+/// (see [`crate::config::PermissionSpec::allows_cluster_wide`]). The bypasses
+/// match [`authorize_permission`]: pre-init, the system principal, and a
+/// principal with no spec all pass, so permissions stay opt-in.
+#[allow(clippy::result_large_err)]
+pub fn authorize_cluster_permission(
+    ctx: Option<&AuthContext>,
+    action: crate::config::PermissionAction,
+    permissions: &std::collections::BTreeMap<String, crate::config::PermissionSpec>,
+) -> Result<(), Response> {
+    let Some(ctx) = ctx else {
+        return Ok(());
+    };
+    if ctx.token_name == SYSTEM_PRINCIPAL {
+        return Ok(());
+    }
+    let Some(spec) = permissions.get(&ctx.token_name) else {
+        return Ok(());
+    };
+    if spec.allows_cluster_wide(action) {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::FORBIDDEN,
+            format!(
+                "permission for {:?} does not grant {} across the cluster",
+                ctx.token_name,
+                action.as_str()
+            ),
+        )
+            .into_response())
+    }
+}
+
 /// Require a token whose scope covers the **whole cluster**.
 ///
 /// Some endpoints take no app or namespace to check a scope against —
@@ -1218,6 +1256,56 @@ mod tests {
                 PermissionAction::Exec,
                 "web",
                 "prod",
+                &permissions
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn authorize_cluster_permission_needs_a_grant_for_every_app() {
+        use crate::config::{PermissionAction, PermissionSpec};
+        let ctx = AuthContext {
+            token_name: "ops".to_string(),
+            principal_id: "token:ops".to_string(),
+            role: ApiRole::Admin,
+            scoped_apps: None,
+            scoped_namespaces: None,
+        };
+        let mut permissions = std::collections::BTreeMap::new();
+        // No spec: role and scope alone decide.
+        assert!(
+            authorize_cluster_permission(Some(&ctx), PermissionAction::Admin, &permissions).is_ok()
+        );
+
+        permissions.insert(
+            "ops".to_string(),
+            PermissionSpec {
+                actions: vec!["logs".to_string()],
+                apps: vec!["web".to_string()],
+                namespaces: None,
+            },
+        );
+        // Logs on one app doesn't cover the whole cluster, and never admin.
+        assert!(
+            authorize_cluster_permission(Some(&ctx), PermissionAction::Logs, &permissions).is_err()
+        );
+        assert!(
+            authorize_cluster_permission(Some(&ctx), PermissionAction::Admin, &permissions)
+                .is_err()
+        );
+
+        permissions.get_mut("ops").unwrap().apps = vec!["*".to_string()];
+        assert!(
+            authorize_cluster_permission(Some(&ctx), PermissionAction::Logs, &permissions).is_ok()
+        );
+
+        // Pre-init and the system principal are never gated.
+        assert!(authorize_cluster_permission(None, PermissionAction::Admin, &permissions).is_ok());
+        assert!(
+            authorize_cluster_permission(
+                Some(&system_context()),
+                PermissionAction::Admin,
                 &permissions
             )
             .is_ok()
