@@ -17,35 +17,133 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use bun_process::{
-    assert_success, reserve_address, reserve_ports, run_relish, spawn_bun_with_runtime_port_retry,
-    wait_for_relish,
+    BunProcess, assert_success, reserve_address, reserve_ports, run_relish,
+    spawn_bun_with_runtime_port_retry, wait_for_relish,
 };
 use reliaburger::relish::client::BunClient;
 use reliaburger::testkit::pinned_images::PINNED_TEST_WORKLOAD_IMAGE;
 
-/// Removes the runc containers Bun leaves behind, including while a failed
-/// assertion unwinds. Best-effort: nothing here may panic.
+/// The autoscaled app. Cleanup removes every instance named after it.
+const APP: &str = "grower";
+
+/// Stops Bun and removes everything it leaves on the host, including while a
+/// failed assertion unwinds: the replicas' runc containers, network
+/// namespaces, host veths (and so their host routes) and cgroups. A leftover
+/// host route makes the next test that draws the same container address
+/// fail with "File exists". Best-effort: nothing here may panic.
 struct Cleanup {
-    runc_state: PathBuf,
+    root: PathBuf,
+    bun: Option<BunProcess>,
 }
 
 impl Drop for Cleanup {
     fn drop(&mut self) {
-        let Ok(listed) = std::process::Command::new("runc")
-            .arg("--root")
-            .arg(&self.runc_state)
-            .args(["list", "--quiet"])
-            .output()
+        drop(self.bun.take());
+        kill_root_processes(&self.root);
+        delete_runc_containers(&self.root.join("data/instances/runc/state"));
+        remove_network(&format!("default__{APP}"));
+        remove_cgroups(Path::new("/sys/fs/cgroup/reliaburger/default"), APP);
+    }
+}
+
+/// SIGKILL every process whose command line names a path under the root:
+/// Bun and the detached owners it launched.
+fn kill_root_processes(root: &Path) {
+    use nix::sys::signal::{Signal, kill, killpg};
+    use nix::unistd::{Pid, getpgid, getpgrp};
+    use std::os::unix::ffi::OsStrExt;
+    let mut needle = root.as_os_str().as_bytes().to_vec();
+    needle.push(b'/');
+    for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<i32>().ok())
         else {
-            return;
+            continue;
         };
-        for id in String::from_utf8_lossy(&listed.stdout).lines() {
-            let _ = std::process::Command::new("runc")
-                .arg("--root")
-                .arg(&self.runc_state)
-                .args(["delete", "--force", id])
-                .output();
+        let Ok(command) = std::fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        if !command.windows(needle.len()).any(|part| part == needle) {
+            continue;
         }
+        let pid = Pid::from_raw(pid);
+        match getpgid(Some(pid)) {
+            Ok(group) if group != getpgrp() => {
+                let _ = killpg(group, Signal::SIGKILL);
+            }
+            _ => {
+                let _ = kill(pid, Signal::SIGKILL);
+            }
+        }
+    }
+    std::thread::sleep(Duration::from_millis(500));
+}
+
+fn delete_runc_containers(state: &Path) {
+    let Ok(listed) = std::process::Command::new("runc")
+        .arg("--root")
+        .arg(state)
+        .args(["list", "--quiet"])
+        .output()
+    else {
+        return;
+    };
+    for id in String::from_utf8_lossy(&listed.stdout).lines() {
+        let _ = std::process::Command::new("runc")
+            .arg("--root")
+            .arg(state)
+            .args(["delete", "--force", id])
+            .output();
+    }
+}
+
+/// Delete the namespaces and host veths of every instance whose id starts
+/// with `prefix`.
+fn remove_network(prefix: &str) {
+    use reliaburger::grill::{InstanceId, netns};
+    for entry in std::fs::read_dir("/run/netns")
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let namespace = entry.file_name().to_string_lossy().into_owned();
+        let Some(instance) = namespace.strip_prefix("rb-") else {
+            continue;
+        };
+        if !instance.starts_with(prefix) {
+            continue;
+        }
+        let veth = netns::host_veth_name(&InstanceId(instance.to_owned()));
+        let _ = std::process::Command::new("ip")
+            .args(["link", "del", &veth])
+            .output();
+        let _ = std::process::Command::new("ip")
+            .args(["netns", "del", &namespace])
+            .output();
+    }
+}
+
+/// Kill and remove, bottom-up, every cgroup under `parent` named after `app`.
+fn remove_cgroups(parent: &Path, app: &str) {
+    for entry in std::fs::read_dir(parent).into_iter().flatten().flatten() {
+        if entry.file_name().to_string_lossy().starts_with(app) {
+            remove_cgroup_tree(&entry.path());
+        }
+    }
+}
+
+fn remove_cgroup_tree(path: &Path) {
+    let _ = std::fs::write(path.join("cgroup.kill"), "1");
+    for child in std::fs::read_dir(path).into_iter().flatten().flatten() {
+        if child.file_type().is_ok_and(|kind| kind.is_dir()) {
+            remove_cgroup_tree(&child.path());
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while std::fs::remove_dir(path).is_err() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
@@ -79,8 +177,10 @@ async fn runc_autoscaler_scales_up_on_real_memory_growth() {
         "run this acceptance as root (make test-linux does)"
     );
     let root = tempfile::tempdir().unwrap();
-    let _cleanup = Cleanup {
-        runc_state: root.path().join("data/instances/runc/state"),
+    // Declared after `root`, so it runs before the directory is removed.
+    let mut cleanup = Cleanup {
+        root: root.path().to_path_buf(),
+        bun: None,
     };
     let cluster_dir = root.path().join("cluster");
     assert_success(
@@ -108,7 +208,7 @@ async fn runc_autoscaler_scales_up_on_real_memory_growth() {
     // Sample every second so the first complete rollup minute is dense.
     node.metrics.collection_interval_secs = 1;
     node.metrics.rollup_interval_secs = 10;
-    let (mut bun, address) = spawn_bun_with_runtime_port_retry(true, "runc", || {
+    let (bun, address) = spawn_bun_with_runtime_port_retry(true, "runc", || {
         let [gossip, raft, reporting] = reserve_ports();
         node.cluster.gossip_port = gossip;
         node.cluster.raft_port = raft;
@@ -120,11 +220,12 @@ async fn runc_autoscaler_scales_up_on_real_memory_growth() {
             root.path().join("memory-autoscale-bun.log"),
         )
     });
+    let bun = cleanup.bun.insert(bun);
     let endpoint = format!("https://{address}");
     let ca = cluster_dir.join("identity/root-ca.crt");
     let ca_arg = ca.to_str().unwrap();
     wait_for_relish(
-        &mut bun,
+        bun,
         &["--endpoint", &endpoint, "--ca-cert", ca_arg, "status"],
     );
     let token = run_relish(&[
@@ -149,13 +250,13 @@ async fn runc_autoscaler_scales_up_on_real_memory_growth() {
     // substitution. The loop keeps the shell, and the string, alive.
     let manifest = reliaburger::config::Config::parse(&format!(
         r#"
-        [app.grower]
+        [app.{APP}]
         image = "{PINNED_TEST_WORKLOAD_IMAGE}"
         command = ["sh", "-c", "x=$(yes | head -c 50331648); while :; do sleep 5; done"]
         replicas = 1
         memory = "16Mi-256Mi"
 
-        [app.grower.autoscale]
+        [app.{APP}.autoscale]
         metric = "memory"
         target = "50%"
         min = 1
@@ -173,7 +274,7 @@ async fn runc_autoscaler_scales_up_on_real_memory_growth() {
     );
 
     let placed = Instant::now() + Duration::from_secs(180);
-    while running_replicas(&client, "grower").await < 1 {
+    while running_replicas(&client, APP).await < 1 {
         bun.assert_running();
         assert!(
             Instant::now() < placed,
@@ -184,7 +285,7 @@ async fn runc_autoscaler_scales_up_on_real_memory_growth() {
     }
 
     let deadline = Instant::now() + Duration::from_secs(240);
-    while running_replicas(&client, "grower").await < 2 {
+    while running_replicas(&client, APP).await < 2 {
         bun.assert_running();
         assert!(
             Instant::now() < deadline,
@@ -195,7 +296,7 @@ async fn runc_autoscaler_scales_up_on_real_memory_growth() {
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
 
-    let _ = tokio::time::timeout(Duration::from_secs(30), client.delete("grower", "default")).await;
+    let _ = tokio::time::timeout(Duration::from_secs(30), client.delete(APP, "default")).await;
 }
 
 fn log(path: &Path) -> String {
