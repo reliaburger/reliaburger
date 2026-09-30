@@ -99,11 +99,13 @@ socket (#333). Rerunning the same command resumed and finished:
   (`Buildah storage holds 1217778640 bytes, over the 1073741824 byte cache cap;
   removing every cached image`), so the next burger build was cold again.
   Working as designed, but any second base image on a quickstart node costs
-  the demo its warm cache.
+  the demo its warm cache. **Decision (maintainer, 30 September):** the
+  quickstart cap is now 2 GiB, so a second base image fits beside the Go one.
 - `relish build` still prints `push: buildah push … docker://localhost:5050/…`.
   That line is display-only; the node exports to an OCI layout (with
   `manifest push --all` for several platforms) and uploads it. It was already
-  inaccurate on main.
+  inaccurate on main. **Decision (maintainer, 30 September):** `relish build`
+  no longer prints it.
 - Restarting all three agents at once left every app on node 1 (nothing
   rebalances afterwards). Expected today, but surprising to watch.
 - Manual chapter 11 said `relish images -o json`; the flag is `--output json`. Fixed on #248.

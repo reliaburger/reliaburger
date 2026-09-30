@@ -88,7 +88,7 @@ platforms quickly.
 A node builds one image at a time, in its own Buildah storage under
 `<storage.data>/buildah`. After every build it removes the build's containers
 and images and keeps base images for the next build, up to
-`[images] build_cache_max_bytes` (100 GiB by default, 1 GiB on a quickstart
+`[images] build_cache_max_bytes` (100 GiB by default, 2 GiB on a quickstart
 node; `0` keeps nothing). Past that, it removes every cached image.
 
 A `RUN` step that uses the network gets Buildah's own bridge (`podman0`,

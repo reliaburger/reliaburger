@@ -935,7 +935,7 @@ cache_recheck_secs = 3600    # how long a cached mutable tag is trusted
 p2p_concurrency = 4          # parallel layer fetches per image pull
 build_timeout_secs = 900     # ceiling per buildah stage
 max_context_bytes = 268435456 # 256 MiB cap on an extracted build context
-build_cache_max_bytes = 107374182400 # Buildah base-image cache kept between builds (100 GiB; quickstart nodes use 1 GiB)
+build_cache_max_bytes = 107374182400 # Buildah base-image cache kept between builds (100 GiB; quickstart nodes use 2 GiB)
 
 # Digest-pinned images try a mirror first and fall back to the upstream.
 # Tag references never use a mirror; loopback mirrors speak plain HTTP.
