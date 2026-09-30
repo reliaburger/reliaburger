@@ -1433,10 +1433,10 @@ mod tests {
         }
     }
 
-    /// `LayerDescriptor::platform` is additive, so there's no format bump: a
-    /// catalogue written before it existed still loads, and lists images.
+    /// An index whose entries name no platform (OCI makes `platform`
+    /// optional) is still one image, with its platforms listed as `unknown`.
     #[test]
-    fn a_catalogue_written_without_platforms_loads_and_lists_its_images() {
+    fn an_index_without_entry_platforms_lists_them_as_unknown() {
         let mut catalog = ManifestCatalog::default();
         commit_multi_platform(&mut catalog, "burger", "v1");
         catalog.apply_manifest_commit(&ManifestCommit {
@@ -1457,8 +1457,6 @@ mod tests {
         let mut images = loaded.images();
         images.sort_by(|a, b| a.repository.cmp(&b.repository));
         assert_eq!(images.len(), 2);
-        // An index an older node accepted has no platform names to show,
-        // but it is still one image with two platforms.
         let names: Vec<&str> = images[0]
             .platforms
             .iter()
@@ -1467,43 +1465,6 @@ mod tests {
         assert_eq!(names, vec!["unknown", "unknown"]);
         assert!(images[1].platforms.is_empty());
         assert_eq!(images[1].layers, 2);
-    }
-
-    /// What an older node sees: its structs have no `platform` or
-    /// `platforms`, and none of them denies unknown fields (only the
-    /// registry request envelopes do, and serde doesn't apply that to
-    /// nested structs). So new data parses there, the new fields ignored.
-    #[test]
-    fn data_written_with_platforms_parses_with_the_structs_older_nodes_use() {
-        #[derive(Deserialize)]
-        #[allow(dead_code)]
-        struct OldLayerDescriptor {
-            digest: Digest,
-            size: u64,
-            media_type: String,
-        }
-        #[derive(Deserialize)]
-        #[allow(dead_code)]
-        struct OldImageSummary {
-            repository: String,
-            digest: String,
-            tags: BTreeSet<String>,
-            layers: usize,
-            total_size: u64,
-        }
-
-        let mut catalog = ManifestCatalog::default();
-        commit_multi_platform(&mut catalog, "burger", "v1");
-        let index = catalog.get_manifest_by_tag("burger", "v1").unwrap();
-        let entry = serde_json::to_string(&index.layers[0]).unwrap();
-        assert!(entry.contains("\"platform\""), "{entry}");
-        let old: OldLayerDescriptor = serde_json::from_str(&entry).unwrap();
-        assert_eq!(old.digest, index.layers[0].digest);
-
-        let summaries = serde_json::to_string(&catalog.images()).unwrap();
-        assert!(summaries.contains("\"platforms\""), "{summaries}");
-        let old: Vec<OldImageSummary> = serde_json::from_str(&summaries).unwrap();
-        assert_eq!(old.len(), 1);
     }
 
     #[test]

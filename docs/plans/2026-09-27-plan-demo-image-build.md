@@ -95,7 +95,7 @@ After every build (success or failure), under a node-wide build lock:
 2. `buildah manifest rm <list>` (multi-platform) or `buildah rmi --force <tag>`;
 3. `buildah rmi --prune` (the unnamed per-platform and stage images);
 4. if the storage root is still over `[images] build_cache_max_bytes`
-   (default 100 GiB, 1 GiB on quickstart nodes; 0 keeps nothing),
+   (default 100 GiB, 2 GiB on quickstart nodes; 0 keeps nothing),
    `buildah rmi --all --force`.
 
 Named base images (the `FROM` images) stay cached below the cap, so a warm
@@ -187,8 +187,8 @@ this).
       catalogue at `PUT` (`LayerDescriptor::platform`), `ImageSummary` gains
       `platforms` (omitted when empty), platform manifests with only digest
       "tags" get no row, and `relish sign` still resolves a platform digest.
-      No compatibility bump (maintainer decision): the field is optional and
-      additive. Old catalogues load (entries show `unknown` platforms), and
+      No compatibility bump at first (maintainer decision, reversed on 30
+      September: see step 13): the field is optional and additive. Old catalogues load (entries show `unknown` platforms), and
       old nodes ignore the new fields, because `deny_unknown_fields` is only on
       the registry request envelopes and serde doesn't apply it to nested
       structs. `CURRENT` stays at main's protocol 27, state 44. Tests:
@@ -211,7 +211,8 @@ this).
       Tests: `pickle::types` listing tests, the index `PUT` test, an `insta`
       snapshot of the table, `relish sign` resolution.
 - [x] 10. `[images] build_cache_max_bytes` defaults to 100 GiB; the quickstart
-      `node.toml` (`relish/quickstart/provision.rs`) sets 1 GiB. Tests for
+      `node.toml` (`relish/quickstart/provision.rs`) sets 2 GiB (1 GiB until the
+      maintainer raised it on 30 September). Tests for
       both; manual 11 and 13, `docs/README.md`, design doc, book.
 - [x] 11. Decision recorded: builds on one node queue behind the build lock,
       and that's fine as is (maintainer, 27 September).
@@ -220,6 +221,22 @@ this).
       rename it if the tour takes longer than five minutes.
 
 CI for steps 9–11 is green with `full-ci` on 54bba46e.
+
+### Round 3: maintainer decisions (30 September)
+
+- [x] 13. Compatibility bump after all, per the pre-1.0 rule that any wire or
+      state format change bumps: `CURRENT` goes from main's protocol 27,
+      state 46 to protocol 28, state 47. The test that parsed new output with
+      the old structs is gone; the one for an index without entry platforms
+      stays, since OCI makes `platform` optional.
+- [x] 14. The quickstart build cache cap is 2 GiB, up from 1 GiB, so a second
+      base image doesn't cost the demo its warm cache. The node default stays
+      100 GiB.
+- [x] 15. `relish build` no longer prints a `push:` line: the node never ran
+      it (it exports an OCI layout and uploads it).
+- [x] 16. `origin/main` merged after 0.1.1, with #332's follower signing:
+      `sign_published_image` sends every published manifest digest (the
+      index and each platform manifest) through `request_build_signatures`.
 
 Note: 0.1.0 lists "multi-platform images in the built-in registry aren't
 supported yet" as a known limitation (release-docs PR, not this one). The
@@ -241,10 +258,11 @@ multi-arch pull fix here ships after 0.1.0.
 
 All answered by the maintainer on 27 September:
 
-- Cache cap: 100 GiB default, 1 GiB on quickstart nodes (step 10).
+- Cache cap: 100 GiB default, 2 GiB on quickstart nodes (step 10).
 - `relish images`: one row per multi-platform image, with its platforms
   (step 9).
 - Builds queue per node: fine as is (step 11).
 - "Five-minute" tour: keep the name; time it after 0.1.0 (step 12).
 
-The format bump first proposed in step 9 was dropped: the change is additive.
+The format bump first proposed in step 9 was dropped as additive, then
+reinstated by the pre-1.0 rule (step 13).
