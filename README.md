@@ -31,6 +31,13 @@ relish apply -f https://reliaburger.com/demo/podinfo.yaml
 relish status                        # three frontends, spread across the nodes
 open http://podinfo.localhost:18080  # through the built-in ingress
 
+# Build a small Go app on the cluster (Buildah on a node, into the built-in
+# registry, signed), then run it next to podinfo
+curl -fsSL https://reliaburger.com/demo/burger.tar.gz | tar xz
+relish build burger/burger.toml
+relish apply burger/burger.toml
+curl http://burger.localhost:18080/order   # calls podinfo's backend by name
+
 # See every hop from frontend to Redis: DNS, VIP, eBPF map, firewall, TCP
 relish path frontend --to redis
 
@@ -298,7 +305,7 @@ binary was built from. Neither needs a network.
 Config is TOML. The [whitepaper](docs/whitepaper.md) explains the architecture
 and its trade-offs; the [design docs](docs/design/) cover each subsystem.
 
-## Limits in 0.1.1
+## Limits in 0.1.2
 
 - **Clusters need rootful runc on Linux with eBPF.** macOS runs containers in
   managed Linux VMs; native macOS `bun` runs plain processes only.
@@ -314,12 +321,6 @@ and its trade-offs; the [design docs](docs/design/) cover each subsystem.
 - **Clusters start fresh.** Development-build state isn't migrated, and rolling
   upgrades need matching protocol and state formats (see the
   [compatibility policy](docs/releasing.md#cluster-compatibility)).
-- **Multi-platform images don't run from Pickle.** Nodes treat an image index
-  (a multi-platform `docker buildx` push, or `relish build`'s default of two
-  platforms) as a single image and fail to run it, and a multi-platform
-  `relish build` stores only the builder's platform. Push or build one platform
-  that matches your nodes; see
-  [Images and volumes](docs/manual/11_images-and-volumes.md#multi-platform-images).
 - **Cron doesn't catch up.** It skips firings missed during a crash, and a job
   whose outcome is unknown waits for `relish apply <file> --rerun-jobs`.
 

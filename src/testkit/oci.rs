@@ -399,12 +399,14 @@ mod tests {
                 digest: ImageDigest::new(&fixture.config_digest).unwrap(),
                 size: fixture.config.len() as u64,
                 media_type: String::new(),
+                platform: None,
             },
             config_bytes: fixture.config,
             layers: vec![LayerDescriptor {
                 digest: ImageDigest::new(&fixture.layer_digest).unwrap(),
                 size: fixture.layer.len() as u64,
                 media_type: String::new(),
+                platform: None,
             }],
         };
         let image = crate::grill::image::ImageReference::parse(&format!(

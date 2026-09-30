@@ -17,7 +17,7 @@
 use std::sync::Arc;
 
 use reliaburger::pickle::build::{
-    digest_of, oci_blob_upload_url, oci_manifest_put_url, parse_oci_index,
+    digest_of, oci_blob_upload_url, oci_manifest_put_url, parse_oci_index, upload_oci_layout,
 };
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
@@ -158,49 +158,23 @@ async fn a_routable_push_needs_the_service_token_bearer() {
         "a bearer-less push must be refused on a routable cluster"
     );
 
-    // 2. With the service-token bearer: upload every blob, then PUT the top
-    //    manifest by tag — the runner's `upload_oci_layout` path.
-    let blobs_dir = layout.path().join("blobs").join("sha256");
-    for entry in std::fs::read_dir(&blobs_dir).unwrap() {
-        let path = entry.unwrap().path();
-        let hex = path.file_name().unwrap().to_str().unwrap().to_string();
-        let digest = format!("sha256:{hex}");
-        let body = std::fs::read(&path).unwrap();
-        let url = oci_blob_upload_url("http", port, repo, &digest);
-        let resp = client
-            .post(&url)
-            .bearer_auth(SERVICE_TOKEN)
-            .body(body)
-            .send()
-            .await
-            .unwrap();
-        assert!(
-            resp.status().is_success(),
-            "blob {digest} upload failed: {}",
-            resp.status()
-        );
-    }
-
+    // 2. With the service-token bearer: the runner's own upload (every blob,
+    //    then the top manifest by tag).
+    let published = upload_oci_layout(
+        &client,
+        "http",
+        port,
+        repo,
+        "v1",
+        layout.path(),
+        Some(SERVICE_TOKEN),
+    )
+    .await
+    .unwrap();
+    assert_eq!(published.top.digest, top.digest);
+    assert!(published.platform_manifests.is_empty());
     let top_hex = top.digest.strip_prefix("sha256:").unwrap();
-    let manifest_bytes = std::fs::read(blobs_dir.join(top_hex)).unwrap();
-    let put = client
-        .put(oci_manifest_put_url("http", port, repo, "v1"))
-        .bearer_auth(SERVICE_TOKEN)
-        .header(
-            "content-type",
-            top.media_type
-                .as_deref()
-                .unwrap_or("application/vnd.oci.image.manifest.v1+json"),
-        )
-        .body(manifest_bytes.clone())
-        .send()
-        .await
-        .unwrap();
-    assert!(
-        put.status().is_success(),
-        "authenticated manifest PUT failed: {}",
-        put.status()
-    );
+    let manifest_bytes = std::fs::read(layout.path().join("blobs/sha256").join(top_hex)).unwrap();
 
     // 3. The pushed image is now pullable by tag (with a principal).
     let pull = client
@@ -220,6 +194,124 @@ async fn a_routable_push_needs_the_service_token_bearer() {
         &manifest_bytes[..],
         "the registry returned different manifest bytes than were pushed"
     );
+
+    shutdown.cancel();
+}
+
+/// Write a two-platform OCI layout (`linux/amd64` and `linux/arm64`), the
+/// shape `buildah manifest push --all <list> oci:<dir>:<tag>` produces: one
+/// index in `index.json`, and each platform's manifest, config and layer as
+/// blobs. Returns the index digest and the platform manifests' digests.
+fn write_multi_platform_layout(dir: &std::path::Path) -> (String, Vec<String>) {
+    let blobs = dir.join("blobs").join("sha256");
+    std::fs::create_dir_all(&blobs).unwrap();
+    let write_blob = |bytes: &[u8]| {
+        let digest = digest_of(bytes);
+        std::fs::write(blobs.join(digest.strip_prefix("sha256:").unwrap()), bytes).unwrap();
+        digest
+    };
+
+    let mut entries = Vec::new();
+    let mut platform_digests = Vec::new();
+    for architecture in ["amd64", "arm64"] {
+        let config = format!(r#"{{"architecture":"{architecture}","os":"linux"}}"#).into_bytes();
+        let layer = format!("the {architecture} layer").into_bytes();
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": write_blob(&config),
+                "size": config.len(),
+            },
+            "layers": [{
+                "mediaType": "application/vnd.oci.image.layer.v1.tar",
+                "digest": write_blob(&layer),
+                "size": layer.len(),
+            }],
+        }))
+        .unwrap();
+        let digest = write_blob(&manifest);
+        entries.push(serde_json::json!({
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "digest": digest,
+            "size": manifest.len(),
+            "platform": { "os": "linux", "architecture": architecture },
+        }));
+        platform_digests.push(digest);
+    }
+    let index = serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.index.v1+json",
+        "manifests": entries,
+    }))
+    .unwrap();
+    let index_digest = write_blob(&index);
+    let top = serde_json::json!({
+        "schemaVersion": 2,
+        "manifests": [{
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "digest": index_digest,
+            "size": index.len(),
+        }],
+    });
+    std::fs::write(dir.join("index.json"), serde_json::to_vec(&top).unwrap()).unwrap();
+    std::fs::write(dir.join("oci-layout"), br#"{"imageLayoutVersion":"1.0.0"}"#).unwrap();
+    (index_digest, platform_digests)
+}
+
+/// A multi-platform build stores every platform: each platform manifest is
+/// published by digest before the index goes up under the tag, so the tag
+/// resolves to the index and each platform resolves by its digest.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_multi_platform_layout_publishes_every_platform() {
+    let (port, shutdown, _dir) = start_authenticated_registry().await;
+    let layout = tempfile::tempdir().unwrap();
+    let (index_digest, platform_digests) = write_multi_platform_layout(layout.path());
+    let client = reqwest::Client::new();
+    let repo = "team-a/burger";
+
+    let published = upload_oci_layout(
+        &client,
+        "http",
+        port,
+        repo,
+        "v1",
+        layout.path(),
+        Some(SERVICE_TOKEN),
+    )
+    .await
+    .unwrap();
+    assert_eq!(published.top.digest, index_digest);
+    let platforms: Vec<&str> = published
+        .platform_manifests
+        .iter()
+        .map(|m| m.platform.as_str())
+        .collect();
+    assert_eq!(platforms, vec!["linux/amd64", "linux/arm64"]);
+    assert_eq!(published.manifest_digests().len(), 3);
+
+    let get = |reference: String| {
+        client
+            .get(oci_manifest_put_url("http", port, repo, &reference))
+            .bearer_auth(SERVICE_TOKEN)
+            .send()
+    };
+    let by_tag = get("v1".to_string()).await.unwrap();
+    assert!(by_tag.status().is_success(), "tag: {}", by_tag.status());
+    assert_eq!(
+        by_tag.headers()["docker-content-digest"].to_str().unwrap(),
+        index_digest,
+        "the tag must name the index, not one platform"
+    );
+    for digest in &platform_digests {
+        let by_digest = get(digest.clone()).await.unwrap();
+        assert!(
+            by_digest.status().is_success(),
+            "platform manifest {digest} must be pullable by digest: {}",
+            by_digest.status()
+        );
+    }
 
     shutdown.cancel();
 }

@@ -589,6 +589,7 @@ mod tests {
                         ),
                         size: 1024,
                         media_type: "application/vnd.oci.image.config.v1+json".to_string(),
+                        platform: None,
                     },
                     layers: vec![],
                     repository: "myapp".to_string(),

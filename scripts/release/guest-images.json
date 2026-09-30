@@ -1,5 +1,5 @@
 {
-  "packages": ["runc", "uidmap", "btrfs-progs", "nftables", "iptables", "iproute2"],
+  "packages": ["runc", "uidmap", "btrfs-progs", "nftables", "iptables", "iproute2", "buildah"],
   "images": {
     "aarch64": {
       "asset": "reliaburger-guest-ubuntu-24.04-20260911-aarch64.qcow2",

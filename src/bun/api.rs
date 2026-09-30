@@ -272,8 +272,13 @@ pub struct ApiState {
     /// Async build tracker (Phase 12 F2). Node-local: builds live
     /// where they were submitted; delegated builds proxy status reads.
     pub build_registry: Arc<tokio::sync::Mutex<super::build_runner::BuildRegistry>>,
-    /// `[images] build_timeout_secs` — ceiling per buildah stage.
-    pub build_timeout_secs: u64,
+    /// How this node runs image builds: the per-stage timeout, its own
+    /// Buildah storage and the cache cap.
+    pub build: super::build_runner::BuildSettings,
+    /// Held for the whole Buildah part of a build (build, export, prune).
+    /// The runner prunes Buildah storage after every build, which would race
+    /// another build using the same storage, so builds on one node queue.
+    pub build_lock: Arc<tokio::sync::Mutex<()>>,
     /// `[images] registry_port` — the local Pickle registry the build
     /// runner fetches context from and pushes to. Server-owned: never
     /// taken from a build request body (JOB2).
@@ -349,7 +354,7 @@ pub fn router(
         None,
         "default".to_string(),
         None,
-        900,
+        crate::bun::build_runner::BuildSettings::with_timeout(900),
         crate::cluster::ClusterHttp::plaintext(),
         5050,
         "http",
@@ -388,7 +393,7 @@ pub fn router_with_upgrade(
     >,
     trust_domain: String,
     node_name: Option<String>,
-    build_timeout_secs: u64,
+    build: super::build_runner::BuildSettings,
     cluster_http: crate::cluster::ClusterHttp,
     registry_port: u16,
     registry_scheme: &'static str,
@@ -428,7 +433,8 @@ pub fn router_with_upgrade(
         build_registry: Arc::new(tokio::sync::Mutex::new(
             super::build_runner::BuildRegistry::default(),
         )),
-        build_timeout_secs,
+        build,
+        build_lock: Arc::new(tokio::sync::Mutex::new(())),
         registry_port,
         registry_scheme,
         static_capabilities: Arc::new(static_capabilities),
@@ -10784,7 +10790,7 @@ mod tests {
             None,
             "default".to_string(),
             None,
-            900,
+            crate::bun::build_runner::BuildSettings::with_timeout(900),
             crate::cluster::ClusterHttp::plaintext(),
             5050,
             "http",
@@ -11429,7 +11435,7 @@ mod tests {
             None,
             "default".to_string(),
             Some("node-2".to_string()),
-            900,
+            crate::bun::build_runner::BuildSettings::with_timeout(900),
             crate::cluster::ClusterHttp::plaintext(),
             5050,
             "http",
@@ -12332,7 +12338,7 @@ schedule = "* * * * *"
                 None,
                 "default".to_string(),
                 None,
-                900,
+                crate::bun::build_runner::BuildSettings::with_timeout(900),
                 crate::cluster::ClusterHttp::plaintext(),
                 5050,
                 "http",
@@ -14479,7 +14485,7 @@ schedule = "* * * * *"
             None,
             "default".to_string(),
             None,
-            900,
+            crate::bun::build_runner::BuildSettings::with_timeout(900),
             crate::cluster::ClusterHttp::plaintext(),
             5050,
             "http",
@@ -15643,6 +15649,7 @@ schedule = "* * * * *"
                         digest,
                         size: 2,
                         media_type: "application/vnd.oci.image.config.v1+json".into(),
+                        platform: None,
                     },
                     layers: Vec::new(),
                     repository: repository.to_string(),
@@ -16487,7 +16494,7 @@ schedule = "* * * * *"
             None,
             "default".to_string(),
             None,
-            900,
+            crate::bun::build_runner::BuildSettings::with_timeout(900),
             crate::cluster::ClusterHttp::plaintext(),
             5050,
             "http",
@@ -16801,7 +16808,7 @@ schedule = "* * * * *"
             None,
             "default".to_string(),
             None,
-            900,
+            crate::bun::build_runner::BuildSettings::with_timeout(900),
             crate::cluster::ClusterHttp::plaintext(),
             5050,
             "http",
@@ -17295,7 +17302,7 @@ mod cluster_routing_tests {
                 None,
                 "default".to_string(),
                 Some(name.to_string()),
-                900,
+                crate::bun::build_runner::BuildSettings::with_timeout(900),
                 crate::cluster::ClusterHttp::plaintext(),
                 5050,
                 "http",

@@ -952,6 +952,112 @@ The honest limits for 0.1.0 are in the manual and design doc. Basic-auth clients
 
 Opening the door to docker also showed us who else could walk through it. The Basic middleware makes every client take the bearer path, and the bearer path checked the token's role but never its scope, so a Deployer scoped to one namespace could push to any repository. Repositories now map to namespaces (`team-a/web` belongs to `team-a`), and a scoped token can only push and pull inside its own. Chapter 10 has the rule and the awkward cases, like what a bare `web` belongs to.
 
+## A burger in the five-minute tour
+
+For a long time the tour ran podinfo and nothing of yours. Pulling somebody else's image proves the runtime works. It doesn't prove the thing this chapter is about: that you can go from source to a running, signed image without Docker on your laptop or an account anywhere. So the tour now builds `examples/demo/burger`, a Go service of about 130 lines that takes a burger order and asks podinfo's backend, by its service name, which kitchen cooked it:
+
+```sh
+curl -fsSL https://reliaburger.com/demo/burger.tar.gz | tar xz
+relish build burger/burger.toml
+relish apply burger/burger.toml
+curl http://burger.localhost:18080/order
+```
+
+Three things had to change for those four lines to work on a laptop cluster.
+
+The quickstart's VMs had no Buildah. The guest image now carries it, and with it the Ubuntu packages it depends on: containers-common, the CNI plugins and netavark. That's about 75 MiB installed, most of it the CNI plugins, which a build that never touches the network doesn't need. We took them anyway. Leaving out a hard dependency with `dpkg --force` would save a few megabytes and cost us a package manager that no longer trusts its own state.
+
+`relish build` uploaded the context to `localhost:5050`. On a node that's the registry. On a laptop it's nothing at all, because the quickstart forwards the registry to `127.0.0.1:15050`. The CLI already knew that: the managed context records every host forward, and `relish upgrade` has used it since chapter 14. So the build now asks for the declared forward when you don't name a port:
+
+```rust
+match (registry_port, declared_registry) {
+    (Some(port), _) => context_upload_url(scheme, port, digest),
+    (None, Some(origin)) => match origin.trim_end_matches('/').split_once("://") {
+        Some((declared_scheme, address)) => {
+            context_upload_url_at(declared_scheme, address, digest)
+        }
+        None => context_upload_url_at(scheme, origin.trim_end_matches('/'), digest),
+    },
+    (None, None) => context_upload_url(scheme, DEFAULT_PICKLE_PORT, digest),
+}
+```
+
+Matching on a tuple, `(a, b)`, checks both values at once, and `_` means "any value, and I don't care which". The first arm reads "an explicit port wins, whatever the context says". Go would need a small `if` ladder here. The `match` also has to cover every combination, so a fourth case can't slip through unhandled. The forward and the API forward lead to the same VM, so the node that receives the build request finds its context in its own registry.
+
+And the Dockerfile had to be quick for two platforms. Builds target `linux/amd64` and `linux/arm64` by default. The usual way to build for an architecture you aren't running on is to emulate it with QEMU's user-mode binfmt handlers, and that makes a compiler several times slower. The burger's Dockerfile never runs a foreign instruction:
+
+```dockerfile
+FROM --platform=$BUILDPLATFORM public.ecr.aws/docker/library/golang:1.27.1-alpine@sha256:8a59… AS build
+ARG TARGETARCH
+RUN --network=none CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH go build -o /out/burger .
+
+FROM scratch
+COPY --from=build /out/burger /burger
+```
+
+`$BUILDPLATFORM` is the builder's own platform, so the Go stage always runs natively. `$TARGETARCH` is the platform being built, and Go's compiler cross-compiles to it without help. The final stage is `scratch`, an empty image with nothing to execute, so the foreign platform only ever gets files copied into it. Go makes this unusually easy. A C program would need a cross toolchain per target, and Rust a linker and a target standard library for each.
+
+We measured it with the node's own Buildah invocation (vfs storage, both platforms) in a 4-vCPU Ubuntu 24.04 VM on an Apple M2 Max: 27 to 35 s from cold, almost all of it pulling the 72 MB Go image, then 17 s once that's cached. The same build for arm64 alone took 32 s cold and 8 s warm. Once the base image is there, the second platform costs about ten seconds, which isn't worth a `platform` override in a demo. The base image is pinned by digest and comes from the ECR mirror of Docker Hub's official image, for the same reason podinfo's Redis does: no anonymous pull limits.
+
+Measuring turned up a problem. Buildah keeps a two-platform build as a manifest list, and the runner exported it with `buildah push`, which picks the builder's own platform out of the list. So Pickle received a single-architecture image under a spec that asked for two. On a quickstart that's harmless, since every node shares the host's architecture. On a mixed cluster, nodes of the other architecture would pull an image they can't run.
+
+### Every platform, all the way to the node
+
+The export was the easy part: `buildah manifest push --all` writes the index and every platform's image into the OCI layout. What Pickle does with that layout needed more thought.
+
+A registry stores an index like any other manifest, but the index only names its platform manifests by digest. For a node to fetch the arm64 image, that manifest has to exist in the repository on its own, pullable as `burger@sha256:…`. So the upload now runs in three steps: every blob, then each platform manifest `PUT` under its own digest, then the index `PUT` under the tag. Pickle's manifest validation already refused an index whose platform manifests weren't there, so the order isn't a choice.
+
+Then the runner checks what it exported against what the spec asked for. A two-platform build whose layout holds one image now fails with the platforms it's missing, rather than quietly storing half of what it promised. That check would have caught the original bug on the first run.
+
+`relish build` was still describing the old world, though. Before submitting a job it printed the `buildah bud` line the node runs and then a `push:` line, `buildah push … docker://localhost:5050/burger:v1`, that no node had run since the runner switched to exporting a layout and uploading it itself, because `buildah push` has no way to present the service token Pickle wants for writes. The field behind it, `BuildahJob::push_cmd`, existed only for that `println!`, along with the `--tls-verify` flag we so carefully made honest a few sections back. So both went. The printing moved into a small `build_plan_lines` function that returns the lines instead of writing them, which gives the test something to look at: `build_plan_shows_the_destination_and_build_but_no_push`. A command's output is part of its interface, and a line that describes something the system doesn't do is a bug, even when every test is green.
+
+The first end-to-end run on a laptop cluster found one more wrinkle, and it wasn't ours. The burger's Go stage runs `FROM --platform=$BUILDPLATFORM`, so on an Apple silicon laptop it's an arm64 image with the variant `v8`. Buildah 1.33, the version Ubuntu 24.04 ships, copies that variant onto every platform it builds, amd64 included, and the index ends up saying `linux/amd64/v8`. There is no such thing. Our own nodes ignore variants when they pull, but `relish images` printed the nonsense, and a Docker or containerd client on an amd64 machine would find no manifest to match. So before reading the layout, the runner drops any variant an entry's architecture doesn't have (`amd64` has `v1` to `v4`, 32-bit `arm` has `v5` to `v8`, `arm64` has `v8` and `v9`) and writes the index back under its new digest. It leaves the platform manifests alone. Their digests are what the index names and what the runner signs, and a Docker client picks a platform from the index, not from the image config inside it.
+
+The pull side had a matching hole. Pickle's catalogue records an index with its own blob as the "config" and its platform manifests as the "layers". That's the right shape for garbage collection and replication, which only care about which blobs an entry pins. It's the wrong shape to unpack. A node pulling a multi-arch image by tag would have untarred JSON manifests as filesystem layers, and this was true of multi-arch images pushed with `docker push` too. Now `ClusterSource` checks `manifest.is_index()`, fetches the index, picks the `linux/<arch>` entry for the node it runs on, and fetches that image instead.
+
+How do you prove a node of the *other* architecture gets its own image when every machine you own is Apple silicon? Lima on an M-series Mac runs arm64 guests only, so the laptop cluster could show the arm64 half and nothing else. The portable suite pulls a synthetic two-platform image as `amd64` and as `aarch64`, and refuses it for `riscv64`, but those images hold text, not programs. The real check lives in CI, because GitHub's Linux runners are x86_64. `a_two_platform_build_runs_the_nodes_own_platform_under_runc`, in the privileged Linux job, builds with a Dockerfile that is only `FROM scratch`, `ARG TARGETARCH` and `COPY $TARGETARCH/ /`. The host's directory holds a static busybox and a file naming its platform; the other directory holds only its name. Buildah builds both platforms without an emulator, because nothing runs during the build. The test checks that the index lists `linux/amd64` and `linux/arm64`, points a `RuncGrill` at an `ImageStore` whose cluster source shares the registry's blobs and catalogue (the way Bun wires them), runs `mixed:v1`, and execs `/busybox cat /platform` in it. If the node picked the wrong entry, there'd be no busybox to run. On the runner the answer must be `amd64`; on an arm64 host the same test expects `arm64`. With the laptop tour, where arm64 nodes pulled and ran the burger, each half of a mixed cluster has run for real, though not yet both in one cluster.
+
+Signing needed a decision. A deploy verifies the manifest its tag names and pins the app to that digest, so that a tag moved between verification and pull changes nothing. For a multi-arch image, the tag names the index. The index's bytes list each platform manifest by digest, and every blob Pickle stores is checked against its digest, so a valid signature over the index covers whichever platform a node ends up pulling. We sign each platform manifest as well. It costs one Raft entry per platform, and it means an app pinned to one platform's digest verifies too.
+
+The listing needed one more fix. A multi-arch push leaves three catalogue entries: the index under its tag, and two platform manifests whose "tags" are their own digests, because that's how a push by digest is recorded. `relish images` showed all three as separate images, and nothing in the catalogue said which platform each was for: that lives in the index blob, and the node answering a listing may not hold it. So the registry now records each index entry's platform in the catalogue as it accepts the index, in a new `platform: Option<String>` on `LayerDescriptor`. The listing folds platform manifests into their index's row and prints the platforms instead.
+
+```rust
+#[serde(default, skip_serializing_if = "Option::is_none")]
+pub platform: Option<String>,
+```
+
+`skip_serializing_if` names a function serde calls before writing the field; when it returns `true` the field is left out, so a plain image's layers don't all carry `"platform": null`. `default` is its partner on the way back in: a missing field becomes `None` instead of an error. An index entry can lack a platform legitimately, because OCI makes it optional, and the listing then says `unknown`.
+
+Should the field bump the compatibility generations? Our first answer was no. The change looked additive: those two attributes let a new node read an old catalogue, and an old node would ignore the new field, since `#[serde(deny_unknown_fields)]` sits only on the registry request envelopes and serde doesn't apply it to the structs inside them. We had a test that parsed new output with copies of the old structs to prove it. Then we asked what that argument costs. It holds only while every path is self-describing JSON, and it has to be re-checked, path by path, every time someone adds a field. Before 1.0 the rule is simpler: any change to what goes on the wire or into durable state bumps the generation, and an upgrade across it means a fresh cluster. So `compatibility::CURRENT` moved to protocol 28, state 47, and the old-structs test went, because there are no older nodes left to talk to.
+
+### Cleaning up after Buildah
+
+A cold build of the burger left about 900 MB in `/var/lib/containers`, on a quickstart disk of 10 GiB. Buildah keeps everything it touched: the Go base image, a working container per stage, an image per platform, the manifest list. Nothing removed any of it.
+
+The obvious fix, `buildah rmi --all` after each build, is also the dangerous one. `/var/lib/containers/storage` is Buildah's default, shared with podman and anything else on the host that uses the same libraries. An operator's own images live there. So the runner now gives Buildah storage of its own, `--root <storage.data>/buildah/root`, and prunes only that.
+
+After every build, whether it worked or not, the runner removes its working containers, the build's manifest list or image, and every image that has no name (the per-platform images and multi-stage intermediates). Base images have names (`golang:1.27.1-alpine`), so they survive, and the next build of the same app starts warm. If what's left is still over `[images] build_cache_max_bytes`, the whole cache goes. The default is 100 GiB, sized for a build server's disk. A quickstart node's 10 GiB disk can't spare that, so `relish setup --quickstart` writes 2 GiB into its `node.toml`. The Go base image takes about 880 MiB on disk in vfs. We started with a 1 GiB cap, and the end-to-end run showed why that was too tight: one networked `RUN` step pulled busybox, the storage crossed the cap, and the next burger build started cold. At 2 GiB a second base image fits beside the Go one, and the demo stays warm.
+
+Pruning `--all` containers is only safe if no other build is using the storage, so builds on one node now take turns:
+
+```rust
+let exported = {
+    let _build_lock = state.build_lock.lock().await;
+    let exported = run_buildah_stages(&job, &ctx_dir, &oci_dir, &state.build).await;
+    prune_build_storage(&job, &ctx_dir, &state.build).await;
+    exported
+};
+exported?;
+```
+
+A block in braces is an expression in Rust: its value is its last line, here the result of the build. `state.build_lock` is a `tokio::sync::Mutex<()>`, a mutex that guards no data, only a stretch of code. Locking it returns a guard, and the lock is released when the guard is dropped, which happens at the closing brace. Go would write `mu.Lock(); defer mu.Unlock()`, but `defer` waits for the whole function to return, and we want the upload after the block to run without the lock. The name matters: `_build_lock` is a variable that lives to the end of the block, while `let _ = …lock().await` would drop the guard on the spot and lock nothing at all. The `?` comes after the block, so a failed build still gets pruned before its error goes up.
+
+Queuing costs little. Builds are rare, each stage still has its timeout, and the alternative was working out which of Buildah's unnamed images belong to which concurrent build.
+
+### Builds that use the network
+
+A `RUN` step that fetches packages makes Buildah (netavark, on Ubuntu 24.04) create a `podman0` bridge on `10.88.0.0/16` with firewall rules of its own. We read our nftables code to see whether the two collide. They don't, in the ways that matter. The perimeter firewall lives in its own tables, filters only the `input` hook with an `accept` policy, and deletes only its own tables when it reloads. Container networking masquerades `10.0.0.0/8`, which covers Buildah's range too, and a second masquerade is harmless. A build step that tries to reach the node's API or registry comes from `10.88.x.x`, which the perimeter treats as a stranger. One node in 256 draws a container subnet inside `10.88.0.0/16`, but every Reliaburger container has its own `/32` route, so traffic still finds it. So we left Buildah's network alone, and the manual suggests `RUN --network=none` for steps that don't need it, as the burger's Dockerfile does.
+
 ## Tests
 
 Pickle is almost entirely testable in-process. A blob store is a directory, the OCI API is an axum router, and the catalog is a `Vec` — none of that needs the internet or another node. So the default suite spins up a Pickle server in the test, pushes a manifest and its blobs, then pulls them back, all without leaving the process.
@@ -965,6 +1071,7 @@ The 104 tests in `src/pickle/` cover:
 - **OCI API** — `full_push_pull_round_trip` drives the real `/v2/` handlers end to end against an in-process server; plus the not-found paths (`blob_head_not_found`, `manifest_get_not_found`) that must return the right status codes. The manifest-validation contract gets a rejection matrix: invalid JSON, missing or unknown media type, size mismatch, malformed descriptor digest, missing referenced blob, and a happy path asserting the GET returns byte-identical bytes.
 - **Standard clients** — a Deployer token as a Basic password over TLS pushes (`deployer_token_as_basic_password_over_tls_may_push`), a ReadOnly one is forbidden, an unknown one gets a 401 with a fresh `Basic` challenge, and a valid token over plaintext is still refused (`basic_credentials_over_plaintext_are_refused_even_with_a_valid_token`). `tests/suite/registry_standard_clients.rs` repeats the push through the real TLS listener, and its ignored `crane` test runs with `cargo nextest run --test suite --run-ignored=only -E 'test(crane)'` on a machine with crane installed.
 - **Garbage collection** — the safety rails get a test each: `gc_protects_sole_copy`, `gc_protects_active_deployment_images`, `gc_protects_tagged_manifest_layers`, `gc_protects_within_retention_window`, and the positive case `gc_collects_unreferenced_blob`. These are the tests that let you trust GC won't eat your last copy of a layer. `gc_never_nominates_a_catalogued_manifests_own_blob` pins the REG1 fix, and `tests/suite/pickle_integrity.rs` runs the full push → GC → peer-pull acceptance sequence against real in-process registries.
+- **Multi-platform builds** — fake OCI layouts written by the tests drive `read_oci_layout` (an index lists every platform; a missing, platformless or nested entry is refused) and `check_exported_platforms` (`an_export_missing_a_requested_platform_fails` is the original bug), and `drop_foreign_platform_variants` (`a_builder_stage_variant_is_dropped_from_the_foreign_architecture` is the Buildah one). `registry_routable_push::a_multi_platform_layout_publishes_every_platform` uploads a two-platform layout to a real registry and pulls each platform by digest, and `pickle_cluster::a_multi_platform_image_pulls_the_nodes_own_platform` pulls the same image as an amd64 node and as an arm64 one. The gated `buildah_build_lands_in_the_catalog` runs the real Buildah on CI's privileged Linux job and checks the index, both platform manifests, and that no containers or images stay behind.
 
 ### Hermetic protocol tests, provisioned runtime tests
 

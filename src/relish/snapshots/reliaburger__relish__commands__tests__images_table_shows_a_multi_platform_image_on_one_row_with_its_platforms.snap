@@ -1,0 +1,9 @@
+---
+source: src/relish/commands.rs
+expression: format_images_table(&images)
+---
+REPOSITORY                     TAG             PLATFORMS                      LAYERS         SIZE
+myapp                          v1              -                                   1        100 B
+myapp                          latest, v2      -                                   1        100 B
+team/app                       v1              -                                   1        100 B
+burger                         v1              linux/amd64, linux/arm64            -       9.4 MB

@@ -342,8 +342,9 @@ mod tests {
     #[test]
     fn guest_image_pins_name_every_package_a_node_checks_for() {
         let packages = guest_image_pins().unwrap().packages;
-        // `wait_for_guest` checks runc, btrfs and nft; Bun needs newuidmap.
-        for package in ["runc", "uidmap", "btrfs-progs", "nftables"] {
+        // `wait_for_guest` checks runc, btrfs and nft; Bun needs newuidmap;
+        // `relish build` (and the five-minute tour) needs Buildah on a node.
+        for package in ["runc", "uidmap", "btrfs-progs", "nftables", "buildah"] {
             assert!(packages.iter().any(|name| name == package), "{package}");
         }
     }

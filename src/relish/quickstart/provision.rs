@@ -105,9 +105,16 @@ pub fn node_config(
     config.dns.enabled = true;
     config.dns.listen = format!("{address}:53");
     config.ingress.enabled = true;
+    // A laptop VM has a 10 GiB disk; the node default assumes a server's.
+    config.images.build_cache_max_bytes = LAPTOP_BUILD_CACHE_MAX_BYTES;
     config.testing = laptop_test_policy();
     Ok(toml::to_string_pretty(&config)?)
 }
+
+/// The Buildah base-image cache a quickstart node keeps between builds:
+/// room for the tour's Go image (about 880 MiB on disk) and a second base
+/// image beside it, still small for a 10 GiB disk.
+pub const LAPTOP_BUILD_CACHE_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// The fault policy every quickstart node serves (decision D3).
 ///
@@ -305,6 +312,7 @@ mod tests {
         assert!(node.dns.enabled);
         assert_eq!(node.dns.listen, "192.168.104.2:53");
         assert!(node.ingress.enabled);
+        assert_eq!(node.images.build_cache_max_bytes, 2 * 1024 * 1024 * 1024);
         let peer = node_config(
             "laptop",
             "rb-laptop-123-2",

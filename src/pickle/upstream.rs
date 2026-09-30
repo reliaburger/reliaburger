@@ -327,6 +327,7 @@ impl OciUpstream {
             })?,
             size: config_bytes.len() as u64,
             media_type: manifest.config.media_type.clone(),
+            platform: None,
         };
         let layers = manifest
             .layers
@@ -338,6 +339,7 @@ impl OciUpstream {
                     })?,
                     size: layer.size as u64,
                     media_type: layer.media_type.clone(),
+                    platform: None,
                 })
             })
             .collect::<Result<Vec<_>, PickleError>>()?;
@@ -419,6 +421,7 @@ mod tests {
             digest: digest(i),
             size,
             media_type: "application/vnd.oci.image.layer.v1.tar+gzip".to_string(),
+            platform: None,
         }
     }
 

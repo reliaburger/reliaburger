@@ -131,7 +131,7 @@ impl Harness {
             aggregated_rx,
             "default".to_string(),
             options.node_name,
-            900,
+            reliaburger::bun::build_runner::BuildSettings::with_timeout(900),
             reliaburger::cluster::ClusterHttp::plaintext(),
             5050,
             "http",

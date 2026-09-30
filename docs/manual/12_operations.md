@@ -88,7 +88,7 @@ format can't join the cluster, so `start` fails with both pairs and nothing is
 recorded:
 
 ```text
-refusing to upgrade to v0.2.0: incompatible binary: found protocol 28, state 47; this cluster (reliaburger v0.1.2 (…)) needs protocol 27, state 46. …
+refusing to upgrade to v0.2.0: incompatible binary: found protocol 29, state 48; this cluster (reliaburger v0.1.2 (…)) needs protocol 28, state 47. …
 ```
 
 A cluster `rollback` never downloads anything: each node goes back to a binary
@@ -116,6 +116,9 @@ prints what a binary supports. Nothing is migrated before 1.0.0: a release
 that changes either format needs a fresh cluster. 0.1.1 is one: it moved the
 state format from 44 to 46, so a 0.1.0 cluster refuses it and stays on 0.1.0
 ([upgrading from 0.1.0](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#upgrading-from-010)).
+0.1.2 is another: it moved the protocol to 28 and the state format to 47, so a
+0.1.1 cluster refuses it too
+([upgrading from 0.1.1](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#upgrading-from-011)).
 
 A laptop cluster says the same thing when you rerun the quickstart installer
 from a newer release over it. Its saved record names the release that set it

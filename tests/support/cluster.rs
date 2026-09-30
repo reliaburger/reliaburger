@@ -507,7 +507,7 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
             None,
             "default".to_string(),
             Some(name.clone()),
-            900,
+            reliaburger::bun::build_runner::BuildSettings::with_timeout(900),
             reliaburger::cluster::ClusterHttp::plaintext(),
             5050,
             "http",

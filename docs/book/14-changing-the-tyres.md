@@ -1405,7 +1405,7 @@ IncompatibleFormats {
 },
 ```
 
-and its message leads with them, like every other compatibility refusal in §14.8: `incompatible binary: found protocol 28, state 47; this cluster (reliaburger v0.1.2 (…)) needs protocol 27, state 46`, followed by the remedy and the policy link. Keeping the pairs typed rather than baked into a string lets a test match on `found` and `expected` directly instead of grepping prose.
+and its message leads with them, like every other compatibility refusal in §14.8: `incompatible binary: found protocol 29, state 48; this cluster (reliaburger v0.1.2 (…)) needs protocol 28, state 47`, followed by the remedy and the policy link. Keeping the pairs typed rather than baked into a string lets a test match on `found` and `expected` directly instead of grepping prose.
 
 The check runs last among the start gates, after the cheap probes, because it's the expensive one: a fetch, a hash and a process spawn. It sits under a twenty-second `tokio::time::timeout`, since a follower that forwarded the call gives up after thirty.
 

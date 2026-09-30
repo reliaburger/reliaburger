@@ -1,8 +1,9 @@
 # Five-minute tour
 
 The same tour as the homepage's "Try it in five minutes": install, run a real
-Kubernetes app on a three-node laptop cluster, walk its network path, measure
-it, break it and watch it heal. Open it any time with `relish manual tour`.
+Kubernetes app on a three-node laptop cluster, build and run an app of your
+own next to it, walk its network path, measure it, break it and watch it
+heal. Open it any time with `relish manual tour`.
 
 It needs macOS, or Linux with QEMU and KVM, plus about 8 GiB of free memory and
 15 GiB of disk. The one-line install fetches the signed 0.1.1 release.
@@ -41,6 +42,38 @@ each node. The scheduler spread them, not you.
 Now open <http://podinfo.localhost:18080> in a browser. The request comes in
 through the built-in ingress; reload and the hostname changes as each replica
 answers.
+
+## Build your own
+
+```sh
+curl -fsSL https://reliaburger.com/demo/burger.tar.gz | tar xz
+relish build burger/burger.toml
+```
+
+That's a small Go web service, its test and a Dockerfile, in `./burger`. It's
+`examples/demo/burger` in `relish manual examples` too. `relish build` reads
+the `[build.burger]` section, tars the directory and uploads it to the
+cluster's registry, Pickle, through the quickstart's forward. A node then
+builds the Dockerfile with Buildah, pushes the result into Pickle as
+`burger:v1` and signs it with the cluster's build key. No Docker on your
+laptop, no registry account, no `docker login`. The first build pulls the Go
+toolchain image, so give it a minute; after that it takes seconds.
+
+Builds target `linux/amd64` and `linux/arm64` by default. The Dockerfile
+cross-compiles: its Go stage runs on the builder's own architecture and tells
+the compiler which one to target, so neither platform needs an emulator.
+
+```sh
+relish apply burger/burger.toml
+curl http://burger.localhost:18080/order
+```
+
+Two replicas of `burger:v1`. That's a bare name: nodes pull it from Pickle,
+and because it's signed it would deploy even on a cluster that requires
+signatures. Each order names the podinfo backend that "cooked" it: the burger
+service calls `http://backend:9898/` by service name, exactly as it would in a
+Kubernetes pod. Run the `curl` a few times and the cashier changes as the
+ingress takes turns between the two replicas.
 
 ## See the whole path
 

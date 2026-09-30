@@ -26,6 +26,7 @@ Every node must meet the following minimum specification:
 - **BPF filesystem**: `bpffs` mounted at `/sys/fs/bpf`.
 - **Resources**: At least 2 CPU cores, 2 GiB RAM, and 10 GiB available disk space per node.
 - **Required packages**: `runc`, `uidmap`, `iptables`, `iproute2`, `nftables`, `btrfs-progs`, and `curl`.
+- **Optional**: `buildah` on at least one node, for `relish build`. Nodes without it hand builds to one that has it.
 
 Install the required packages on all three nodes:
 

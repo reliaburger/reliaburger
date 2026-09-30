@@ -548,6 +548,7 @@ fn manifest_with_holders(
             digest: config_digest.clone(),
             size: 24,
             media_type: "application/vnd.oci.image.config.v1+json".to_string(),
+            platform: None,
         },
         layers: layer_digests
             .iter()
@@ -556,6 +557,7 @@ fn manifest_with_holders(
                 digest: d.clone(),
                 size: *size,
                 media_type: "application/vnd.oci.image.layer.v1.tar+gzip".to_string(),
+                platform: None,
             })
             .collect(),
         repository: repo.to_string(),
@@ -1015,5 +1017,153 @@ async fn heal_tick_respects_per_tick_cap() {
         outcome.confirmed_images.len(),
         1,
         "cap of 1 means one manifest per tick"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Multi-platform images
+// ---------------------------------------------------------------------------
+
+/// Push a two-platform image (`linux/amd64`, `linux/arm64`) the way the build
+/// runner does: blobs, each platform manifest by digest, then the index under
+/// `tag`. Returns each platform's config digest, amd64 first.
+async fn push_multi_platform_image(registry: &Registry, repo: &str, tag: &str) -> Vec<Digest> {
+    let client = reqwest::Client::new();
+    let base_url = registry.base_url();
+
+    let mut entries = Vec::new();
+    let mut configs = Vec::new();
+    for architecture in ["amd64", "arm64"] {
+        let config = format!(r#"{{"architecture":"{architecture}","os":"linux"}}"#).into_bytes();
+        let layer = format!("{repo} layer for {architecture}").into_bytes();
+        let config_digest = compute_sha256(&config);
+        let layer_digest = compute_sha256(&layer);
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": config_digest.as_str(),
+                "size": config.len(),
+            },
+            "layers": [{
+                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                "digest": layer_digest.as_str(),
+                "size": layer.len(),
+            }],
+        }))
+        .unwrap();
+        for (digest, bytes) in [(&config_digest, config), (&layer_digest, layer)] {
+            let response = client
+                .post(format!(
+                    "{base_url}/v2/{repo}/blobs/uploads/?digest={}",
+                    digest.as_str()
+                ))
+                .body(bytes)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), 201, "blob upload failed");
+        }
+        let manifest_digest = compute_sha256(&manifest);
+        entries.push(serde_json::json!({
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "digest": manifest_digest.as_str(),
+            "size": manifest.len(),
+            "platform": { "os": "linux", "architecture": architecture },
+        }));
+        let response = client
+            .put(format!(
+                "{base_url}/v2/{repo}/manifests/{}",
+                manifest_digest.as_str()
+            ))
+            .body(manifest)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status().as_u16(),
+            201,
+            "platform manifest put failed"
+        );
+        configs.push(config_digest);
+    }
+    let index = serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.index.v1+json",
+        "manifests": entries,
+    }))
+    .unwrap();
+    let response = client
+        .put(format!("{base_url}/v2/{repo}/manifests/{tag}"))
+        .body(index)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 201, "index put failed");
+    configs
+}
+
+/// A multi-platform image resolves to the node's own platform: the tag names
+/// the index, and each architecture gets its own config and layer, fetched
+/// from a peer that holds them.
+#[tokio::test]
+async fn a_multi_platform_image_pulls_the_nodes_own_platform() {
+    let holder = Registry::start(1, false).await;
+    let configs = push_multi_platform_image(&holder, "burger", "v1").await;
+    let catalog = holder.state.catalog.read().await.clone();
+    assert!(
+        catalog
+            .get_manifest_by_tag("burger", "v1")
+            .unwrap()
+            .is_index()
+    );
+
+    let peers = vec![Peer {
+        node_id: 1,
+        base_url: holder.base_url(),
+    }];
+    for (architecture, config) in [("amd64", &configs[0]), ("aarch64", &configs[1])] {
+        let puller = Registry::start(3, false).await;
+        *puller.state.catalog.write().await = catalog.clone();
+        let source = cluster_source_for(&puller);
+        let blobs = source
+            .ensure_image_local_for_architecture("burger", "v1", &peers, architecture)
+            .await
+            .unwrap()
+            .expect("the catalogue knows the image");
+        assert_eq!(
+            blobs.config_digest,
+            config.as_str(),
+            "{architecture} must get its own platform's config"
+        );
+        assert_eq!(
+            blobs.layers.len(),
+            1,
+            "one layer, not the platform manifests"
+        );
+        for path in blobs.layers.iter().chain([&blobs.config]) {
+            assert!(path.exists(), "{} was not fetched", path.display());
+        }
+    }
+}
+
+/// A node whose architecture the index doesn't offer gets an error naming it,
+/// not the wrong image.
+#[tokio::test]
+async fn a_multi_platform_image_without_the_nodes_platform_is_refused() {
+    let holder = Registry::start(1, false).await;
+    push_multi_platform_image(&holder, "burger", "v1").await;
+    let source = cluster_source_for(&holder);
+    let err = source
+        .ensure_image_local_for_architecture("burger", "v1", &[], "riscv64")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            reliaburger::pickle::types::PickleError::NoPlatformManifest { .. }
+        ),
+        "{err}"
     );
 }

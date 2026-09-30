@@ -9,7 +9,7 @@ see the [whitepaper](whitepaper.md); for status and what's next, see the
 installer are on the [GitHub release](https://github.com/reliaburger/reliaburger/releases/tag/v0.1.1),
 and `curl -fsSL https://reliaburger.com/install.sh | sh` installs it. Every
 release follows the same [build, staging and promotion procedure](releasing.md#metadata-and-publication).
-The limits below are the ones 0.1.1 ships with; the [roadmap](roadmap.md) tracks
+The limits below are the ones 0.1.2 ships with; the [roadmap](roadmap.md) tracks
 what comes after it.
 
 ## Scope and limits
@@ -40,12 +40,9 @@ what comes after it.
   [compatibility policy](releasing.md#cluster-compatibility).
 - **One Bun per writable image store.** Registry startup claims exclusive
   ownership of the image store's upload directory.
-- **Multi-platform images don't run from Pickle.** A node pulling an OCI
-  image index or Docker manifest list from the built-in registry treats it as
-  a single image and fails to run it. That covers `docker buildx build
-  --platform linux/amd64,linux/arm64 --push` and `relish build` with more than
-  one platform (the default), which also stores only the builder's platform.
-  Push or build a single platform matching your nodes; see
+- **The pull-through cache holds one platform per tag.** It stores the
+  platform of the node that first pulls an upstream multi-platform image, so on
+  a cluster that mixes architectures, push such images to Pickle instead; see
   [Images and volumes](manual/11_images-and-volumes.md#multi-platform-images).
 - **Test volumes have no snapshots.** Disposable test-volume snapshots aren't
   supported.
@@ -823,6 +820,18 @@ relish apply -f examples/kubernetes/podinfo.yaml
 curl -H 'Host: podinfo.localhost' http://127.0.0.1:18080/
 ```
 
+`examples/demo/burger` is the five-minute tour's home-built app: a small Go
+service (standard library only), its test and a cross-compiling Dockerfile.
+`relish build` has a node with Buildah build it into Pickle (the quickstart's
+VMs have Buildah), and each `/order` names the podinfo backend it reached by
+service name, so apply podinfo first:
+
+```bash
+relish build examples/demo/burger/burger.toml
+relish apply examples/demo/burger/burger.toml
+curl -H 'Host: burger.localhost' http://127.0.0.1:18080/order
+```
+
 ### Internal DNS on rootful runc
 
 The `.internal` responder is opt-in and currently supports rootful runc on
@@ -927,6 +936,7 @@ cache_recheck_secs = 3600    # how long a cached mutable tag is trusted
 p2p_concurrency = 4          # parallel layer fetches per image pull
 build_timeout_secs = 900     # ceiling per buildah stage
 max_context_bytes = 268435456 # 256 MiB cap on an extracted build context
+build_cache_max_bytes = 107374182400 # Buildah base-image cache kept between builds (100 GiB; quickstart nodes use 2 GiB)
 
 # Digest-pinned images try a mirror first and fall back to the upstream.
 # Tag references never use a mirror; loopback mirrors speak plain HTTP.

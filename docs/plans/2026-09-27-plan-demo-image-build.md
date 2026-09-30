@@ -1,0 +1,285 @@
+# Demo image build: multi-arch export, Buildah pruning, network notes
+
+27 September 2026. Follow-up work on draft PR #248 (`feat/demo-image-build`),
+which adds the Go demo app (`examples/demo/burger`), `relish build` through the
+quickstart registry forward, Buildah in the guest image, and a build step in
+staged-install qualification. The maintainer asked us to "build multi-arch,
+prune the buildah storage, and use your best judgement on the rest".
+
+**Targets the first release after 0.1.0. Don't merge before 0.1.0 ships.**
+
+## Constraints for whoever picks this up
+
+- A release soak may be running on the maintainer's Mac. Don't start, stop or
+  use any Lima VM or quickstart cluster, and don't run `qualify-*.sh` locally.
+- Keep local builds light (`CARGO_BUILD_JOBS=2`, a separate
+  `CARGO_TARGET_DIR`), run focused tests locally and let CI do the rest
+  (`full-ci` label; `gh pr checks 248`).
+- Commit and push after every step. Never amend or squash.
+- The local branch in this worktree is `pr248-multiarch`; it pushes to
+  `origin feat/demo-image-build` (`git push origin pr248-multiarch:feat/demo-image-build`),
+  because another worktree has `feat/demo-image-build` checked out.
+
+## Goals
+
+1. **Multi-arch.** A build with several platforms (default `linux/amd64` +
+   `linux/arm64`) stores every platform in Pickle, not only the builder's own,
+   and a node pulls the platform matching its own architecture by bare name.
+2. **Prune Buildah storage.** A node no longer keeps about 900 MB per cold
+   build. The build's own containers and images go after every build, success
+   or failure; base images stay cached only up to a size cap.
+3. **Best judgement on the rest:** netavark/nftables interaction, `go test` for
+   the demo in CI, the asciicast.
+4. Docs: manual `11_images-and-volumes`, book chapter 5, design docs, progress
+   register, PR body.
+
+## Design decisions
+
+### D1. Export the whole manifest list
+
+`buildah push <list> oci:dir:tag` exports only the builder's native platform
+(confirmed in a VM by the previous session). A multi-platform build now runs
+`buildah manifest push --all <list> oci:dir:tag`, which writes the index and
+every platform's manifest, config and layers into the OCI layout. A
+single-platform build keeps `buildah push`.
+
+### D2. Upload order: blobs, platform manifests by digest, index by tag
+
+`upload_oci_layout` moves from `bun::build_runner` into `pickle::build` (so the
+portable suite can drive it against a real Pickle router) and learns indexes:
+
+1. every blob in `blobs/sha256/` goes up as a monolithic blob (as before);
+2. when the top manifest is an index, each platform manifest is `PUT` by its
+   digest (`/v2/<repo>/manifests/sha256:…`), so it becomes a catalogue entry
+   in the same repository (a pull by digest resolves, GC pins its layers);
+3. the top manifest (index or single manifest) is `PUT` under the tag.
+
+A nested index (an index inside the index) is refused. For a multi-platform
+build, the runner checks the exported platforms against the requested ones,
+so a regression back to a single-platform export fails the build instead of
+quietly storing one architecture.
+
+### D3. Sign the index and every platform manifest
+
+Deploy-time verification (`verify_image_signature`) looks up the tag the app
+names, which now resolves to the index, verifies its signature, and pins the
+deploy to `name@<index digest>`. The index bytes name each platform manifest by
+digest and Pickle's store is content-addressed (`write_blob` verifies digests),
+so the index signature covers the platform manifest a node pulls. We also sign
+each platform manifest, so a reference pinned to one platform's digest
+(`name@sha256:<arm64 manifest>`) verifies too. That costs one extra Raft
+`AttachSignature` per platform. Under `require_signatures`, any signing
+failure fails the build (JOB7 unchanged).
+
+### D4. Pull: resolve the index to this node's platform
+
+`ClusterSource::ensure_image_local_with_peers` used to treat an index entry like
+an image: the sub-manifests became "layers" and the index blob became the
+"config", so a multi-arch image in Pickle couldn't run (this also affected
+multi-arch images pushed by `docker push`). Now, when the catalogue entry is an
+index, it materialises the index blob, picks the `linux/<arch>` entry for this
+node (`std::env::consts::ARCH`, normalised the way external pulls do), looks
+that manifest up by digest in the same repository and materialises it. No
+match is an honest error naming the architecture.
+
+### D5. A Reliaburger-owned Buildah storage root, pruned after every build
+
+Buildah used the host default root (`/var/lib/containers/storage`), shared
+with anything else on the host (an operator's podman). Pruning there could
+delete someone else's images, so builds now run with
+`--root <storage.data>/buildah/root --runroot <storage.data>/buildah/run`.
+
+After every build (success or failure), under a node-wide build lock:
+
+1. `buildah rm --all` (build containers);
+2. `buildah manifest rm <list>` (multi-platform) or `buildah rmi --force <tag>`;
+3. `buildah rmi --prune` (the unnamed per-platform and stage images);
+4. if the storage root is still over `[images] build_cache_max_bytes`
+   (default 100 GiB, 2 GiB on quickstart nodes; 0 keeps nothing),
+   `buildah rmi --all --force`.
+
+Named base images (the `FROM` images) stay cached below the cap, so a warm
+build stays warm. The demo's Go base image is about 750 MB in vfs, under the
+cap. Cleanup failures are logged and never fail a build.
+
+The lock makes builds on one node run one at a time. Before, concurrent builds
+shared the storage and nothing pruned it; with pruning, one build's cleanup
+would race another's build. Builds are rare, and the per-stage timeout still
+applies, so queuing is the simplest safe choice.
+
+### D6. Netavark and Reliaburger's nftables coexist (documented, not changed)
+
+A `RUN` step that uses the network makes Buildah (netavark on Ubuntu 24.04)
+create a `podman0` bridge on `10.88.0.0/16` with its own iptables-nft rules.
+Reading the code:
+
+- the perimeter firewall (`src/firewall/rules.rs`) uses its own tables
+  (`ip[6] reliaburger_fw`), an `input` hook with policy `accept`, and only ever
+  deletes its own tables, so it neither removes netavark's rules nor drops
+  forwarded build traffic;
+- container networking (`src/grill/netns.rs`) uses its own `ip reliaburger`
+  NAT table and masquerades `10.0.0.0/8`, which also covers `10.88.0.0/16`
+  (a second masquerade is harmless);
+- Reliaburger gives every container a `/32` host route, so a node whose
+  container `/23` happens to fall inside `10.88.0.0/16` (1 node in 256) still
+  routes its containers correctly; the only clash is a build container and an
+  app container getting the same address on that node, which is rare and
+  short-lived;
+- a build container reaching the node's own Bun API or registry ports comes
+  from `10.88.x.x`, which the perimeter treats as a stranger and drops.
+
+So we leave the default network in place and document it. `RUN --network=none`
+stays the recommendation for steps that don't need the network (the demo does
+this).
+
+### D7. Small calls
+
+- CI runs `go vet` and `go test` for `examples/demo/burger` in a small job
+  gated on the same change filter as the code jobs.
+- The `relish build` registry-forward fix stays as it is.
+- `assets/tour.cast` can't be re-recorded without a VM: left as an open item.
+
+## Steps
+
+- [x] 0. Plan (this file).
+- [x] 1. Multi-arch export + index-aware upload in `pickle::build`, runner
+      switched over, platform check, signing of index + platform manifests.
+      Unit tests with fake OCI layouts; portable-suite test uploading a
+      two-platform layout to a real Pickle router
+      (`registry_routable_push::a_multi_platform_layout_publishes_every_platform`).
+- [x] 2. Index-aware cluster pull (`ClusterSource`), unit + portable tests
+      (`pickle_cluster::a_multi_platform_image_pulls_the_nodes_own_platform`,
+      `…_without_the_nodes_platform_is_refused`; `p2p::tests::platform_selection_*`).
+- [x] 3. Dedicated Buildah storage root, build lock, cleanup commands,
+      `[images] build_cache_max_bytes`. Unit tests for commands and the cap.
+      (Landed in the same commit as step 1: the runner rewrite covers both.
+      `BuildSettings` replaced the `build_timeout_secs` argument of
+      `router_with_upgrade`.)
+- [x] 4. Gated real-Buildah tests (`tests/build.rs`, CI privileged Linux job
+      runs them under `make test-linux`): two-platform build lands as an index
+      with two catalogued platform manifests; signed build signs all three;
+      storage pruned (no containers or images left in the test's own root).
+      Needs the `full-ci` label on this stacked PR to run.
+- [x] 5. CI: `demo app` job in `ci.yml` (`go vet` + `go test`, gated on `code`).
+- [x] 6. Docs: manual 11 (platforms, pruning, network), book ch. 5 (new
+      subsections replacing the "problem we haven't fixed" paragraph, plus test
+      notes), `registry-pickle.md` (§3.3 pull flow, new §5.8.1, config note),
+      `docs/README.md` config sample, progress register (UX track entry).
+      Main was merged into the branch (merge commit; one conflict in
+      `docs/linux-servers.md`, resolved to main's package list plus the PR's
+      Buildah line).
+- [x] 7. PR body updated (still a draft); CI green with `full-ci` on 44486883
+      (portable Linux/macOS, privileged Linux with the gated Buildah tests,
+      multi-node cluster, acceptance, demo app, build/guest-image jobs).
+- [x] 8. The VM checks below, on 30 September: the tour end to end, signing,
+      bare-name pulls, the ingress route, `backend` from the container, a
+      networked `RUN` beside the perimeter firewall and the cache under the
+      1 GiB cap all passed ([record](../qualification/2026-09-30-demo-image-build-tour.md)).
+      It found #331 (a follower's build can't be signed; fixed in #332) and a
+      Buildah 1.33 variant leak (`linux/amd64/v8`, fixed here). A
+      mixed-architecture pull couldn't be arranged on Apple silicon, and
+      `tour.cast` is re-recorded separately (#280).
+
+### Round 2: maintainer answers (27 September)
+
+- [x] 9. `relish images` shows a multi-platform image as one row with its
+      platforms. The registry records each index entry's platform in the
+      catalogue at `PUT` (`LayerDescriptor::platform`), `ImageSummary` gains
+      `platforms` (omitted when empty), platform manifests with only digest
+      "tags" get no row, and `relish sign` still resolves a platform digest.
+      No compatibility bump at first (maintainer decision, reversed on 30
+      September: see step 13): the field is optional and additive. Old catalogues load (entries show `unknown` platforms), and
+      old nodes ignore the new fields, because `deny_unknown_fields` is only on
+      the registry request envelopes and serde doesn't apply it to nested
+      structs. `CURRENT` stays at main's protocol 27, state 44. Tests:
+      `a_catalogue_written_without_platforms_loads_and_lists_its_images`,
+      `data_written_with_platforms_parses_with_the_structs_older_nodes_use`.
+      Encoding audit (additive only holds for self-describing formats), all
+      JSON: Raft log entries `src/council/durable_log.rs:133` (bincode only
+      wraps the unchanged `EncryptedEntry` ciphertext envelope, :140); Raft RPCs
+      incl. AppendEntries `src/council/network.rs:273` (decode) / :729
+      (encode); snapshots `src/council/state_machine.rs:1998` and :2154;
+      sealed backups `src/council/backup.rs:171`, :305; Pickle's on-disk
+      catalogue `src/pickle/types.rs:719`; registry proposals
+      `src/pickle/authority.rs:373`; registry query answers
+      (`ImageSummary`) `src/bun/api.rs:5762`. The bincode paths (gossip
+      `src/mustard/message.rs`, reporting `src/reporting/types.rs` and
+      `transport.rs`, rollups `src/mayo/rollup.rs`) carry none of the changed
+      types. New enum variants (`PickleError::NoPlatformManifest`,
+      `BuildError::MissingPlatforms`) aren't serialised; no `RaftRequest` or
+      `RegistryMutation` variant was added.
+      Tests: `pickle::types` listing tests, the index `PUT` test, an `insta`
+      snapshot of the table, `relish sign` resolution.
+- [x] 10. `[images] build_cache_max_bytes` defaults to 100 GiB; the quickstart
+      `node.toml` (`relish/quickstart/provision.rs`) sets 2 GiB (1 GiB until the
+      maintainer raised it on 30 September). Tests for
+      both; manual 11 and 13, `docs/README.md`, design doc, book.
+- [x] 11. Decision recorded: builds on one node queue behind the build lock,
+      and that's fine as is (maintainer, 27 September).
+- [ ] 12. After 0.1.0, time the tour on a real quickstart from `curl … | sh`
+      to the first `/order` reply. Keep the "five-minute" name for now;
+      rename it if the tour takes longer than five minutes.
+
+CI for steps 9–11 is green with `full-ci` on 54bba46e.
+
+### Round 3: maintainer decisions (30 September)
+
+- [x] 13. Compatibility bump after all, per the pre-1.0 rule that any wire or
+      state format change bumps: `CURRENT` goes from main's protocol 27,
+      state 46 to protocol 28, state 47. The test that parsed new output with
+      the old structs is gone; the one for an index without entry platforms
+      stays, since OCI makes `platform` optional.
+- [x] 14. The quickstart build cache cap is 2 GiB, up from 1 GiB, so a second
+      base image doesn't cost the demo its warm cache. The node default stays
+      100 GiB.
+- [x] 15. `relish build` no longer prints a `push:` line: the node never ran
+      it (it exports an OCI layout and uploads it).
+- [x] 16. `origin/main` merged after 0.1.1, with #332's follower signing:
+      `sign_published_image` sends every published manifest digest (the
+      index and each platform manifest) through `request_build_signatures`.
+
+### Round 4: shipping in 0.1.2 (30 September)
+
+- [x] 17. `origin/main` merged with #349 (spread on node loss) and #350
+      (refusing impossible upgrades). Main stayed at protocol 27 / state 46,
+      so this branch keeps 28 / 47; the upgrade-refusal examples and
+      `docs/releasing.md` now say 0.1.2 needs 28 / 47 and a 0.1.1 cluster
+      must be recreated.
+- [x] 18. The amd64 half of a mixed cluster runs in CI:
+      `tests/build.rs::a_two_platform_build_runs_the_nodes_own_platform_under_runc`
+      (privileged Linux job, x86_64) builds two platforms with Buildah, checks
+      the index, and runs the host's platform from Pickle under runc; only the
+      host's platform has a runnable binary. The arm64 half ran in the laptop
+      tour. Both in one cluster is still unrun.
+- [x] 19. The multi-platform limitation is gone from the README,
+      `docs/README.md` and manual chapter 11. The pull-through cache's
+      one-platform-per-tag behaviour is listed as a limit instead.
+
+Note: 0.1.0 lists "multi-platform images in the built-in registry aren't
+supported yet" as a known limitation (release-docs PR, not this one). The
+multi-arch pull fix here ships after 0.1.0.
+
+## Needs a VM later (don't do it during the soak)
+
+- Run the tour end to end on a quickstart (`relish build burger/burger.toml`,
+  apply, `curl …/order`) and check `buildah --root /var/lib/reliaburger/data/buildah/root images`
+  after the build: only the Go base image should remain.
+- On a two-architecture cluster, check that each node pulls its own platform
+  (each half is covered on its own: step 18 and the tour).
+- A build with a networked `RUN` step on a node with the perimeter firewall
+  on: confirm the step reaches the internet and `nft list ruleset` still shows
+  both Reliaburger's and netavark's tables afterwards.
+- Re-record `assets/tour.cast` with `scripts/demo/tour.sh`.
+
+## Open questions
+
+All answered by the maintainer on 27 September:
+
+- Cache cap: 100 GiB default, 2 GiB on quickstart nodes (step 10).
+- `relish images`: one row per multi-platform image, with its platforms
+  (step 9).
+- Builds queue per node: fine as is (step 11).
+- "Five-minute" tour: keep the name; time it after 0.1.0 (step 12).
+
+The format bump first proposed in step 9 was dropped as additive, then
+reinstated by the pre-1.0 rule (step 13).

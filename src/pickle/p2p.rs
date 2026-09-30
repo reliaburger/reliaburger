@@ -261,6 +261,22 @@ impl ClusterSource {
         tag: &str,
         peers: &[Peer],
     ) -> Result<Option<LocalImageBlobs>, PickleError> {
+        self.ensure_image_local_for_architecture(repository, tag, peers, std::env::consts::ARCH)
+            .await
+    }
+
+    /// [`Self::ensure_image_local_with_peers`] for a given container
+    /// architecture (`amd64`/`x86_64` or `arm64`/`aarch64`). When the
+    /// reference names a multi-platform image (an image index), the
+    /// `linux/<architecture>` image is the one materialised; tests pick the
+    /// architecture to exercise both sides of an index.
+    pub async fn ensure_image_local_for_architecture(
+        &self,
+        repository: &str,
+        tag: &str,
+        peers: &[Peer],
+        architecture: &str,
+    ) -> Result<Option<LocalImageBlobs>, PickleError> {
         let catalog = self.state.catalog_snapshot(repository).await?;
         // A digest in the tag position (`repo@sha256:…` references put
         // it there) resolves content-addressed, so the bytes verified
@@ -272,18 +288,64 @@ impl ClusterSource {
                 .cloned(),
             Err(_) => catalog.get_manifest_by_tag(repository, tag).cloned(),
         };
-        let Some(manifest) = manifest else {
+        let Some(mut manifest) = manifest else {
             return Ok(None);
         };
 
+        // A multi-platform image: materialise the index (and the platform
+        // manifests it pins), then pick this node's platform. The index bytes
+        // name the platform manifest by digest and every blob is
+        // digest-verified, so a signature over the index covers the image
+        // pulled here.
+        if manifest.is_index() {
+            self.materialise(repository, &manifest, &catalog, peers)
+                .await?;
+            let store = self.state.store.clone();
+            let index_digest = manifest.digest.clone();
+            let index_bytes = tokio::task::spawn_blocking(move || store.read_blob(&index_digest))
+                .await
+                .map_err(|error| {
+                    PickleError::ReplicationFailed(format!(
+                        "reading the image index failed: {error}"
+                    ))
+                })??;
+            let platform_digest = select_platform_manifest(&index_bytes, architecture)?;
+            manifest = catalog
+                .get_repository_manifest(repository, platform_digest.as_str())
+                .cloned()
+                .ok_or_else(|| PickleError::ManifestNotFound {
+                    repository: repository.to_string(),
+                    tag: platform_digest.as_str().to_string(),
+                })?;
+            if manifest.is_index() {
+                return Err(PickleError::ReplicationFailed(format!(
+                    "image index {} names another index for linux/{architecture}",
+                    manifest.digest
+                )));
+            }
+        }
+
+        self.materialise(repository, &manifest, &catalog, peers)
+            .await?;
+        Ok(Some(local_blobs(&self.state.store, &manifest)))
+    }
+
+    /// Make every blob a catalogue entry pins local (its own manifest blob
+    /// included, REG1), fetching the missing ones from peers in parallel,
+    /// then record this node as a holder.
+    async fn materialise(
+        &self,
+        repository: &str,
+        manifest: &super::types::ImageManifest,
+        catalog: &ManifestCatalog,
+        peers: &[Peer],
+    ) -> Result<(), PickleError> {
         // Cached bytes still need a durable repository owner before use.
         let access = self
             .state
             .admit_repository_write(repository, None, None, true)
             .await?;
 
-        // Fetch everything the tag pins — the manifest blob included
-        // (REG1), so this node can serve the manifest GET afterwards.
         let digests: Vec<Digest> = manifest.referenced_digests().into_iter().cloned().collect();
         let store = self.state.store.clone();
         let candidates = digests.clone();
@@ -303,7 +365,7 @@ impl ClusterSource {
             PickleError::ReplicationFailed(format!("cache verification failed: {error}"))
         })??;
 
-        let plan = plan_downloads(&digests, &local, &catalog, peers, self.state.node_raft_id);
+        let plan = plan_downloads(&digests, &local, catalog, peers, self.state.node_raft_id);
         if !plan.unavailable.is_empty() {
             let missing: Vec<String> = plan.unavailable.iter().map(|d| d.to_string()).collect();
             return Err(PickleError::ReplicationFailed(format!(
@@ -315,7 +377,7 @@ impl ClusterSource {
         pull_layers_parallel(
             plan,
             repository,
-            &catalog,
+            catalog,
             peers,
             &self.state,
             &access,
@@ -328,8 +390,55 @@ impl ClusterSource {
         self.state
             .confirm_image_copy_with_access(repository, &manifest.digest, Some(access))
             .await?;
-        Ok(Some(local_blobs(&self.state.store, &manifest)))
+        Ok(())
     }
+}
+
+/// The platform manifest an image index offers for `linux/<architecture>`.
+///
+/// `architecture` takes either spelling (`x86_64`/`amd64`, `aarch64`/`arm64`),
+/// as external pulls do. A platform variant (`arm64/v8`) doesn't matter: the
+/// first `linux/<architecture>` entry wins.
+pub fn select_platform_manifest(
+    index_bytes: &[u8],
+    architecture: &str,
+) -> Result<Digest, PickleError> {
+    #[derive(serde::Deserialize)]
+    struct Platform {
+        os: String,
+        architecture: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct Entry {
+        digest: String,
+        platform: Option<Platform>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Index {
+        manifests: Vec<Entry>,
+    }
+
+    let wanted = crate::grill::oci_pull::linux_architecture(architecture).map_err(|_| {
+        PickleError::NoPlatformManifest {
+            architecture: architecture.to_string(),
+        }
+    })?;
+    let index: Index = serde_json::from_slice(index_bytes).map_err(|error| {
+        PickleError::ReplicationFailed(format!("image index is not valid json: {error}"))
+    })?;
+    let entry = index
+        .manifests
+        .into_iter()
+        .find(|entry| {
+            entry
+                .platform
+                .as_ref()
+                .is_some_and(|p| p.os == "linux" && p.architecture == wanted)
+        })
+        .ok_or_else(|| PickleError::NoPlatformManifest {
+            architecture: wanted.to_string(),
+        })?;
+    Digest::new(&entry.digest)
 }
 
 impl ClusterSource {
@@ -533,6 +642,58 @@ mod tests {
                 .collect(),
         });
         catalog
+    }
+
+    fn index_of(entries: &[(&str, &str, u64)]) -> Vec<u8> {
+        let manifests: Vec<serde_json::Value> = entries
+            .iter()
+            .map(|(os, architecture, i)| {
+                serde_json::json!({
+                    "digest": digest(*i).as_str(),
+                    "size": 1,
+                    "platform": { "os": os, "architecture": architecture },
+                })
+            })
+            .collect();
+        serde_json::to_vec(&serde_json::json!({ "schemaVersion": 2, "manifests": manifests }))
+            .unwrap()
+    }
+
+    #[test]
+    fn platform_selection_picks_the_matching_architecture_in_either_spelling() {
+        let index = index_of(&[("linux", "amd64", 1), ("linux", "arm64", 2)]);
+        assert_eq!(
+            select_platform_manifest(&index, "amd64").unwrap(),
+            digest(1)
+        );
+        assert_eq!(
+            select_platform_manifest(&index, "x86_64").unwrap(),
+            digest(1)
+        );
+        assert_eq!(
+            select_platform_manifest(&index, "aarch64").unwrap(),
+            digest(2)
+        );
+    }
+
+    #[test]
+    fn platform_selection_ignores_other_operating_systems() {
+        let index = index_of(&[("windows", "amd64", 1), ("linux", "amd64", 2)]);
+        assert_eq!(
+            select_platform_manifest(&index, "amd64").unwrap(),
+            digest(2)
+        );
+    }
+
+    #[test]
+    fn platform_selection_refuses_a_missing_or_unknown_architecture() {
+        let index = index_of(&[("linux", "amd64", 1)]);
+        for architecture in ["arm64", "riscv64"] {
+            assert!(matches!(
+                select_platform_manifest(&index, architecture),
+                Err(PickleError::NoPlatformManifest { .. })
+            ));
+        }
     }
 
     #[test]

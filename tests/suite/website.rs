@@ -212,6 +212,137 @@ fn the_demo_manifest_is_published_from_the_tested_example() {
     }
 }
 
+const BURGER_URL: &str = "https://reliaburger.com/demo/burger.tar.gz";
+const BURGER_SOURCE: &str = "examples/demo/burger";
+const BURGER_PACK: &str = "tar -czf docs/website/demo/burger.tar.gz -C examples/demo burger";
+/// What the served tarball carries: the demo app's source and nothing else.
+/// `burger` itself is `go build`'s output, ignored by version control, so a
+/// local build doesn't fail this.
+const BURGER_FILES: &[&str] = &[
+    "Dockerfile",
+    "burger.toml",
+    "go.mod",
+    "main.go",
+    "main_test.go",
+];
+
+fn burger_files_on_disk() -> Vec<String> {
+    let mut files: Vec<String> = std::fs::read_dir(repository().join(BURGER_SOURCE))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name != "burger")
+        .collect();
+    files.sort();
+    files
+}
+
+/// The tour's build step downloads `demo/burger.tar.gz`. Like the podinfo
+/// manifest, it isn't committed: the Pages workflow packs it from
+/// `examples/demo/burger` at deploy time, so the site serves the directory CI
+/// dry-runs (`tests/examples.rs`) and `relish manual examples` ships.
+#[test]
+fn the_demo_app_is_published_from_the_tested_example() {
+    assert!(read("docs/website/index.html").contains(BURGER_URL));
+    assert!(read("docs/manual/08_five-minute-tour.md").contains(BURGER_URL));
+    let workflow = read(".github/workflows/static.yml");
+    assert!(
+        workflow.contains(BURGER_PACK),
+        "the Pages workflow must pack {BURGER_SOURCE} as demo/burger.tar.gz"
+    );
+    assert_eq!(burger_files_on_disk(), BURGER_FILES);
+
+    let config = reliaburger::config::Config::from_file(
+        &repository().join(BURGER_SOURCE).join("burger.toml"),
+    )
+    .unwrap();
+    let build = &config.build["burger"];
+    assert_eq!(build.context, Path::new("."));
+    assert_eq!(build.destination, "pickle://burger:v1");
+    // The app runs what the build pushed, by the bare name nodes resolve
+    // through Pickle.
+    assert_eq!(config.app["burger"].image.as_deref(), Some("burger:v1"));
+}
+
+/// The workflow's `tar` line, run for real: unpacked, the tarball is a
+/// `burger/` directory holding the example's files byte for byte, which is
+/// what `curl … | tar xz` followed by `relish build burger/burger.toml` needs.
+#[test]
+fn the_packed_demo_app_unpacks_to_the_example_directory() {
+    let scratch = tempfile::tempdir().unwrap();
+    let tarball = scratch.path().join("burger.tar.gz");
+    let arguments: Vec<String> = BURGER_PACK
+        .split_whitespace()
+        .skip(1)
+        .map(|argument| {
+            if argument == "docs/website/demo/burger.tar.gz" {
+                tarball.display().to_string()
+            } else {
+                argument.to_string()
+            }
+        })
+        .collect();
+    let status = Command::new("tar")
+        .args(&arguments)
+        .current_dir(repository())
+        // macOS's bsdtar would otherwise add `._*` resource-fork entries.
+        .env("COPYFILE_DISABLE", "1")
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(
+        std::fs::File::open(&tarball).unwrap(),
+    ));
+    let mut unpacked = Vec::new();
+    for entry in archive.entries().unwrap() {
+        let mut entry = entry.unwrap();
+        let path = entry.path().unwrap().into_owned();
+        assert!(
+            path.starts_with("burger"),
+            "{} is outside burger/",
+            path.display()
+        );
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
+        let name = path.file_name().unwrap().to_str().unwrap().to_string();
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut entry, &mut bytes).unwrap();
+        let source = std::fs::read(repository().join(BURGER_SOURCE).join(&name)).unwrap();
+        assert_eq!(bytes, source, "{name} differs from the example");
+        unpacked.push(name);
+    }
+    unpacked.retain(|name| name != "burger");
+    unpacked.sort();
+    assert_eq!(unpacked, BURGER_FILES);
+}
+
+/// The README's quick start is a shortened tour: every `relish` line in it
+/// must be one the tour runs (and so one the tests above parse), and it shows
+/// the build step too.
+#[test]
+fn readme_quick_start_is_part_of_the_tour() {
+    let readme = read("README.md");
+    let start = readme
+        .find(INSTALL_LINE)
+        .expect("README lost the install line");
+    let end = start + readme[start..].find("```").unwrap();
+    let lines: Vec<String> = readme[start..end]
+        .lines()
+        .map(|line| line.split(" #").next().unwrap().trim().to_string())
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect();
+    let tour = relish_lines(&homepage_commands());
+    for line in relish_lines(&lines) {
+        assert!(
+            tour.contains(&line),
+            "README runs {line:?}, which the tour doesn't"
+        );
+    }
+    assert!(lines.iter().any(|line| line.contains(BURGER_URL)));
+    assert!(lines.contains(&"relish build burger/burger.toml".to_string()));
+}
+
 /// The `id` of every `<section>` on the homepage, in page order.
 fn section_ids(page: &str) -> Vec<Option<String>> {
     page.match_indices("<section")

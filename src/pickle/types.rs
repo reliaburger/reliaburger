@@ -94,6 +94,11 @@ pub struct LayerDescriptor {
     pub size: u64,
     /// OCI media type (e.g. `application/vnd.oci.image.layer.v1.tar+gzip`).
     pub media_type: String,
+    /// For a platform manifest listed by an image index, the platform the
+    /// index says it is for (`os/architecture`, plus `/variant` when given).
+    /// `None` for configs, layers, and index entries that name no platform.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -158,6 +163,14 @@ impl ImageManifest {
             }
         }
         digests
+    }
+
+    /// Whether this entry is an image index (a multi-platform image) rather
+    /// than one platform's image. The registry records an index with its own
+    /// blob as the config descriptor and its platform manifests as "layers",
+    /// so it can't be unpacked as it stands: a pull first picks a platform.
+    pub fn is_index(&self) -> bool {
+        self.config.digest == self.digest
     }
 }
 
@@ -237,7 +250,26 @@ pub struct ImageSummary {
     pub tags: BTreeSet<String>,
     /// Number of filesystem layers.
     pub layers: usize,
-    /// Logical manifest content size in bytes.
+    /// Logical manifest content size in bytes. For a multi-platform image,
+    /// the sum of its platforms' sizes.
+    pub total_size: u64,
+    /// For a multi-platform image (an image index), one entry per platform
+    /// it offers, in index order. Empty for a single-platform image.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub platforms: Vec<PlatformSummary>,
+}
+
+/// One platform of a multi-platform image in an image listing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlatformSummary {
+    /// `os/architecture` (plus `/variant`), or `unknown` when the index names
+    /// no platform for this entry.
+    pub platform: String,
+    /// Digest of the platform's image manifest.
+    pub digest: String,
+    /// Number of filesystem layers in the platform's image.
+    pub layers: usize,
+    /// Logical size of the platform's image in bytes.
     pub total_size: u64,
 }
 
@@ -315,17 +347,75 @@ impl ManifestCatalog {
     }
 
     /// Describe committed images without exposing internal ownership records.
+    ///
+    /// A multi-platform image is one row: the index, with its platforms
+    /// listed under it. The platform manifests a push publishes by digest
+    /// (so nodes can pull them) don't get rows of their own, unless someone
+    /// gave one a real tag.
     pub fn images(&self) -> Vec<ImageSummary> {
+        let platform_manifest = |repository: &str, digest: &str| {
+            self.manifests.iter().any(|(_, manifest)| {
+                manifest.repository == repository
+                    && manifest.is_index()
+                    && manifest
+                        .layers
+                        .iter()
+                        .any(|entry| entry.digest.as_str() == digest)
+            })
+        };
         self.manifests
             .iter()
-            .map(|(digest, manifest)| ImageSummary {
+            .filter(|(digest, manifest)| {
+                // Pushing by digest records the digest as the "tag".
+                let only_digest_tags = manifest.tags.iter().all(|tag| tag.starts_with("sha256:"));
+                !(only_digest_tags && platform_manifest(&manifest.repository, digest))
+            })
+            .map(|(digest, manifest)| self.summarise(digest, manifest))
+            .collect()
+    }
+
+    fn summarise(&self, digest: &str, manifest: &ImageManifest) -> ImageSummary {
+        let tags = manifest
+            .tags
+            .iter()
+            .filter(|tag| !tag.starts_with("sha256:"))
+            .cloned()
+            .collect();
+        if !manifest.is_index() {
+            return ImageSummary {
                 repository: manifest.repository.clone(),
-                digest: digest.clone(),
-                tags: manifest.tags.clone(),
+                digest: digest.to_string(),
+                tags,
                 layers: manifest.layers.len(),
                 total_size: manifest.total_size,
+                platforms: Vec::new(),
+            };
+        }
+        let platforms: Vec<PlatformSummary> = manifest
+            .layers
+            .iter()
+            .map(|entry| {
+                let image =
+                    self.get_repository_manifest(&manifest.repository, entry.digest.as_str());
+                PlatformSummary {
+                    platform: entry
+                        .platform
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    digest: entry.digest.as_str().to_string(),
+                    layers: image.map_or(0, |image| image.layers.len()),
+                    total_size: image.map_or(0, |image| image.total_size),
+                }
             })
-            .collect()
+            .collect();
+        ImageSummary {
+            repository: manifest.repository.clone(),
+            digest: digest.to_string(),
+            tags,
+            layers: 0,
+            total_size: platforms.iter().map(|p| p.total_size).sum(),
+            platforms,
+        }
     }
 
     /// Project one repository without exposing unrelated manifests, tags or holders.
@@ -766,6 +856,9 @@ pub enum PickleError {
     ManifestNotFound { repository: String, tag: String },
     #[error("missing layer: {0}")]
     MissingLayer(Digest),
+    /// A multi-platform image offers nothing this node can run.
+    #[error("image index has no manifest for linux/{architecture}")]
+    NoPlatformManifest { architecture: String },
     #[error("upload session not found: {0}")]
     UploadNotFound(String),
     #[error("invalid upload id: {0}")]
@@ -1129,6 +1222,7 @@ mod tests {
             digest: test_digest(suffix),
             size,
             media_type: "application/vnd.oci.image.layer.v1.tar+gzip".to_string(),
+            platform: None,
         }
     }
 
@@ -1211,6 +1305,181 @@ mod tests {
         }
     }
 
+    /// Commit a two-platform image the way a multi-arch push does: each
+    /// platform manifest by digest, then the index under `tag`.
+    fn commit_multi_platform(catalog: &mut ManifestCatalog, repository: &str, tag: &str) {
+        let mut entries = Vec::new();
+        for (suffix, platform, size) in [("a1", "linux/amd64", 100), ("a2", "linux/arm64/v8", 200)]
+        {
+            let mut image = test_manifest(repository, suffix);
+            image.layers.truncate(1);
+            image.total_size = size;
+            entries.push(LayerDescriptor {
+                digest: image.digest.clone(),
+                size: 10,
+                media_type: "application/vnd.oci.image.manifest.v1+json".to_string(),
+                platform: Some(platform.to_string()),
+            });
+            catalog.apply_manifest_commit(&ManifestCommit {
+                observed_gc_generation: 0,
+                tag: image.digest.as_str().to_string(),
+                manifest: image,
+                holder_nodes: BTreeSet::from([1]),
+            });
+        }
+        let digest = test_digest("1d");
+        catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
+            manifest: ImageManifest {
+                config: LayerDescriptor {
+                    digest: digest.clone(),
+                    size: 300,
+                    media_type: "application/vnd.oci.image.index.v1+json".to_string(),
+                    platform: None,
+                },
+                digest,
+                layers: entries,
+                repository: repository.to_string(),
+                tags: BTreeSet::new(),
+                total_size: 320,
+                pushed_at: SystemTime::UNIX_EPOCH,
+                pushed_by: 1,
+                signature: None,
+            },
+            tag: tag.to_string(),
+            holder_nodes: BTreeSet::from([1]),
+        });
+    }
+
+    #[test]
+    fn a_multi_platform_image_is_one_listing_row_with_its_platforms() {
+        let mut catalog = ManifestCatalog::default();
+        commit_multi_platform(&mut catalog, "burger", "v1");
+        catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
+            manifest: test_manifest("podinfo", "b1"),
+            tag: "6.5".into(),
+            holder_nodes: BTreeSet::from([1]),
+        });
+
+        let mut images = catalog.images();
+        images.sort_by(|a, b| a.repository.cmp(&b.repository));
+        assert_eq!(
+            images.len(),
+            2,
+            "platform manifests get no rows: {images:?}"
+        );
+
+        let burger = &images[0];
+        assert_eq!(burger.digest, test_digest("1d").as_str());
+        assert_eq!(burger.tags, BTreeSet::from(["v1".to_string()]));
+        let platforms: Vec<(&str, &str, usize, u64)> = burger
+            .platforms
+            .iter()
+            .map(|p| {
+                (
+                    p.platform.as_str(),
+                    p.digest.as_str(),
+                    p.layers,
+                    p.total_size,
+                )
+            })
+            .collect();
+        assert_eq!(
+            platforms,
+            vec![
+                ("linux/amd64", test_digest("a1").as_str(), 1, 100),
+                ("linux/arm64/v8", test_digest("a2").as_str(), 1, 200),
+            ]
+        );
+        assert_eq!(burger.total_size, 300, "the platforms' sizes, summed");
+
+        let podinfo = &images[1];
+        assert!(podinfo.platforms.is_empty());
+        assert_eq!(podinfo.layers, 2);
+    }
+
+    #[test]
+    fn a_platform_manifest_with_a_real_tag_keeps_its_own_row() {
+        let mut catalog = ManifestCatalog::default();
+        commit_multi_platform(&mut catalog, "burger", "v1");
+        catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
+            manifest: catalog
+                .get_repository_manifest("burger", test_digest("a2").as_str())
+                .cloned()
+                .unwrap(),
+            tag: "v1-arm64".into(),
+            holder_nodes: BTreeSet::from([1]),
+        });
+        let images = catalog.images();
+        let tagged = images
+            .iter()
+            .find(|image| image.digest == test_digest("a2").as_str())
+            .expect("a tagged platform manifest is listed");
+        assert_eq!(tagged.tags, BTreeSet::from(["v1-arm64".to_string()]));
+    }
+
+    /// Remove every `key` from a JSON tree, producing what a binary from
+    /// before the field existed would have written.
+    fn strip_key(value: &mut serde_json::Value, key: &str) {
+        match value {
+            serde_json::Value::Object(map) => {
+                map.remove(key);
+                map.values_mut().for_each(|v| strip_key(v, key));
+            }
+            serde_json::Value::Array(items) => items.iter_mut().for_each(|v| strip_key(v, key)),
+            _ => {}
+        }
+    }
+
+    /// An index whose entries name no platform (OCI makes `platform`
+    /// optional) is still one image, with its platforms listed as `unknown`.
+    #[test]
+    fn an_index_without_entry_platforms_lists_them_as_unknown() {
+        let mut catalog = ManifestCatalog::default();
+        commit_multi_platform(&mut catalog, "burger", "v1");
+        catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
+            manifest: test_manifest("podinfo", "b1"),
+            tag: "6.5".into(),
+            holder_nodes: BTreeSet::from([1]),
+        });
+        let mut old = serde_json::to_value(&catalog).unwrap();
+        strip_key(&mut old, "platform");
+        assert!(!old.to_string().contains("\"platform\""));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("catalog.json");
+        std::fs::write(&path, old.to_string()).unwrap();
+        let loaded = ManifestCatalog::load_from(&path).unwrap();
+
+        let mut images = loaded.images();
+        images.sort_by(|a, b| a.repository.cmp(&b.repository));
+        assert_eq!(images.len(), 2);
+        let names: Vec<&str> = images[0]
+            .platforms
+            .iter()
+            .map(|p| p.platform.as_str())
+            .collect();
+        assert_eq!(names, vec!["unknown", "unknown"]);
+        assert!(images[1].platforms.is_empty());
+        assert_eq!(images[1].layers, 2);
+    }
+
+    #[test]
+    fn an_image_summary_without_platforms_omits_the_field() {
+        let mut catalog = ManifestCatalog::default();
+        catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
+            manifest: test_manifest("podinfo", "b1"),
+            tag: "6.5".into(),
+            holder_nodes: BTreeSet::from([1]),
+        });
+        let json = serde_json::to_value(&catalog.images()[0]).unwrap();
+        assert!(json.get("platforms").is_none(), "{json}");
+    }
+
     #[test]
     fn repository_views_preserve_shared_holders_without_other_repository_metadata() {
         let mut catalog = ManifestCatalog::default();
@@ -1285,6 +1554,7 @@ mod tests {
             digest: m.digest.clone(),
             size: 100,
             media_type: "application/vnd.oci.image.index.v1+json".to_string(),
+            platform: None,
         };
         m.layers.clear();
         assert_eq!(m.referenced_digests(), vec![&m.digest]);
