@@ -649,6 +649,10 @@ pub fn router_with_upgrade(
             post(super::build_runner::build_track_handler),
         )
         .route(
+            "/v1/build/sign",
+            post(super::build_runner::build_sign_handler),
+        )
+        .route(
             "/v1/build/{id}",
             get(super::build_runner::build_status_handler),
         )

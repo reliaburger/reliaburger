@@ -277,7 +277,7 @@ pub const ROUTE_MATRIX: &[Route] = &[
     route(Post, "/v1/test/leases/retired", System),
     gated(Post, "/v1/nodes/decommission", Admin, Cluster(ADMIN)),
     route(Get, "/v1/images", AnyToken),
-    // Batch + build. `run`/`report`/`track` are node-to-node (System).
+    // Batch + build. `run`/`report`/`track`/`sign` are node-to-node (System).
     route(Post, "/v1/batch", Deployer),
     route(Post, "/v1/batch/run", System),
     route(Post, "/v1/batch/{id}/report", System),
@@ -285,6 +285,7 @@ pub const ROUTE_MATRIX: &[Route] = &[
     route(Post, "/v1/build", Deployer),
     route(Post, "/v1/build/run", System),
     route(Post, "/v1/build/track", System),
+    route(Post, "/v1/build/sign", System),
     route(Get, "/v1/build/{id}", AnyToken),
     // GitOps + identity + tokens + secrets.
     route(Post, "/v1/gitops/webhook", AnyToken),
@@ -353,6 +354,7 @@ mod tests {
             "/v1/batch/{id}/report",
             "/v1/build/run",
             "/v1/build/track",
+            "/v1/build/sign",
         ] {
             assert_eq!(
                 required_principal(Method::Post, path),
