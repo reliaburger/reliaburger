@@ -791,9 +791,9 @@ feature gate ([compatibility before 1.0.0](releasing.md#compatibility-before-100
   changes on redeploy.
 - **0.1.3: security and storage hardening.** The should-fix findings from the
   static review ([#258](https://github.com/reliaburger/reliaburger/pull/258)):
-  snapshots (B03, B04, B05, B07) and the non-injective volume slug; GitOps
-  (B13, B16, B19); a permission matrix for log, metric and secret reads (B18);
-  an upload-body timeout; and autoscaler `min = 0`.
+  GitOps (B13, B16, B19); a permission matrix for log, metric and secret
+  reads (B18); and autoscaler `min = 0`. (The snapshot findings B03–B07, the
+  non-injective volume slug and the snapshot upload deadline moved into 0.1.1.)
 - **0.1.4: observability and test quality.** Streamed metrics queries, so Mayo
   and rollup sessions no longer load every Parquet file, and the testing
   assessment (T01–T07).

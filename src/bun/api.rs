@@ -6015,15 +6015,18 @@ struct SnapshotDeleteQuery {
     volume: Option<String>,
 }
 
-/// Map snapshot failures to honest status codes: a running app or an
-/// ambiguous name is a conflict, missing things are 404, a non-btrfs
-/// volume or an out-of-scope input is the client's problem, anything
-/// else is ours.
+/// Map snapshot failures to honest status codes: a running app, an
+/// ambiguous name or volumes another operation owns is a conflict, missing
+/// things are 404, a non-btrfs volume or an out-of-scope input is the
+/// client's problem, anything else is ours.
 fn snapshot_error_response(error: &crate::bun::BunError) -> Response {
     use crate::grill::snapshot::SnapshotError;
     let status = match error {
         crate::bun::BunError::Snapshot(
-            SnapshotError::AppRunning { .. } | SnapshotError::Ambiguous { .. },
+            SnapshotError::AppRunning { .. }
+            | SnapshotError::Ambiguous { .. }
+            | SnapshotError::Busy { .. }
+            | SnapshotError::RestoreInProgress { .. },
         ) => StatusCode::CONFLICT,
         crate::bun::BunError::Snapshot(
             SnapshotError::NotFound { .. } | SnapshotError::NoVolumes { .. },

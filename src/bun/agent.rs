@@ -1793,6 +1793,11 @@ pub struct BunAgent<G: Grill> {
     /// Hard per-node concurrency bound for workload connectivity traces.
     trace_slots: std::sync::Arc<tokio::sync::Semaphore>,
     volumes_dir: PathBuf,
+    /// Which apps' volumes a snapshot operation owns right now.
+    volume_maintenance: crate::bun::volume_maintenance::VolumeMaintenance,
+    /// Test hook: an accepted restore waits here before touching the disk.
+    #[cfg(test)]
+    restore_pause: Option<std::sync::Arc<std::sync::Barrier>>,
     cluster: Option<ClusterHandle>,
     /// Immutable cluster identity used as every workload SPIFFE trust domain.
     trust_domain: String,
@@ -2080,6 +2085,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             egress_observation_count: std::sync::atomic::AtomicUsize::new(0),
             trace_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TRACES)),
             volumes_dir: crate::config::node::StorageSection::default().volumes,
+            volume_maintenance: Default::default(),
+            #[cfg(test)]
+            restore_pause: None,
             cluster: None,
             trust_domain: "default".to_string(),
             fault_registry: crate::smoker::registry::FaultRegistry::new(),
@@ -2198,6 +2206,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             egress_observation_count: std::sync::atomic::AtomicUsize::new(0),
             trace_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TRACES)),
             volumes_dir: crate::config::node::StorageSection::default().volumes,
+            volume_maintenance: Default::default(),
+            #[cfg(test)]
+            restore_pause: None,
             cluster: Some(cluster),
             trust_domain,
             fault_registry: crate::smoker::registry::FaultRegistry::new(),
@@ -4150,6 +4161,34 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
     }
 
+    /// Reserve an app's volumes for a snapshot operation.
+    fn reserve_volumes(
+        &mut self,
+        namespace: &str,
+        app: &str,
+        operation: crate::bun::volume_maintenance::VolumeOperation,
+    ) -> Option<crate::bun::volume_maintenance::VolumeLease> {
+        self.volume_maintenance.reserve(namespace, app, operation)
+    }
+
+    fn volumes_busy(namespace: &str, app: &str) -> BunError {
+        crate::grill::snapshot::SnapshotError::Busy {
+            namespace: namespace.to_string(),
+            app: app.to_string(),
+        }
+        .into()
+    }
+
+    /// The first app in `config` whose volumes a restore owns.
+    fn restoring_target(&self, config: &Config) -> Option<(String, String)> {
+        config.app.iter().find_map(|(name, spec)| {
+            let namespace = spec.namespace.as_deref().unwrap_or("default");
+            self.volume_maintenance
+                .restoring(namespace, name)
+                .then(|| (namespace.to_string(), name.clone()))
+        })
+    }
+
     fn validate_deploy_names(&self, config: &Config) -> Result<(), String> {
         use crate::bun::deploy_operations::DeployTargetKind;
         config
@@ -4221,6 +4260,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             let message = format!(
                 "workload {}/{} is still stopping; retry once its exit is confirmed",
                 target.namespace, target.name
+            );
+            let _ = events.send(ApplyEvent::Error { message }).await;
+            return;
+        }
+        if let Some((namespace, app)) = self.restoring_target(&config) {
+            let message = format!(
+                "volumes of {namespace}/{app} are being restored from a snapshot; retry once the restore finishes"
             );
             let _ = events.send(ApplyEvent::Error { message }).await;
             return;
@@ -4628,9 +4674,18 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 name,
                 response,
             } => {
+                let Some(lease) = self.reserve_volumes(
+                    &namespace,
+                    &app_name,
+                    crate::bun::volume_maintenance::VolumeOperation::Snapshot,
+                ) else {
+                    let _ = response.send(Err(Self::volumes_busy(&namespace, &app_name)));
+                    return;
+                };
                 // btrfs subprocess + fs walks off the command loop (M7).
                 let volumes_dir = self.volumes_dir.clone();
                 tokio::task::spawn_blocking(move || {
+                    let _lease = lease;
                     let result = crate::grill::snapshot::SnapshotManager::new(&volumes_dir)
                         .create_for_app(
                             &namespace,
@@ -4663,11 +4718,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 response,
             } => {
                 // The running-instance check needs supervisor state, so it stays
-                // on the loop; the btrfs restore itself runs off it (M7).
+                // on the loop; the btrfs restore itself runs off it (M7). An
+                // instance waiting to be restarted counts as running.
                 let running = self.supervisor.list_instances().into_iter().any(|i| {
                     i.app_name == app_name
                         && i.namespace == namespace
-                        && !matches!(i.state, ContainerState::Stopped | ContainerState::Failed)
+                        && (i.retry_pending
+                            || !matches!(i.state, ContainerState::Stopped | ContainerState::Failed))
                 });
                 if running {
                     let _ = response.send(Err(crate::grill::snapshot::SnapshotError::AppRunning {
@@ -4675,15 +4732,33 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         app: app_name.clone(),
                     }
                     .into()));
-                } else {
-                    let volumes_dir = self.volumes_dir.clone();
-                    tokio::task::spawn_blocking(move || {
-                        let result = crate::grill::snapshot::SnapshotManager::new(&volumes_dir)
-                            .restore(&namespace, &app_name, &name, volume.as_deref())
-                            .map_err(BunError::from);
-                        let _ = response.send(result);
-                    });
+                    return;
                 }
+                // Reserve before dispatching, with no await in between: from
+                // here until the task drops the lease, deploys, restarts and
+                // other snapshot operations on this app are refused (B03).
+                let Some(lease) = self.reserve_volumes(
+                    &namespace,
+                    &app_name,
+                    crate::bun::volume_maintenance::VolumeOperation::Restore,
+                ) else {
+                    let _ = response.send(Err(Self::volumes_busy(&namespace, &app_name)));
+                    return;
+                };
+                let volumes_dir = self.volumes_dir.clone();
+                #[cfg(test)]
+                let pause = self.restore_pause.clone();
+                tokio::task::spawn_blocking(move || {
+                    let _lease = lease;
+                    #[cfg(test)]
+                    if let Some(pause) = pause {
+                        pause.wait();
+                    }
+                    let result = crate::grill::snapshot::SnapshotManager::new(&volumes_dir)
+                        .restore(&namespace, &app_name, &name, volume.as_deref())
+                        .map_err(BunError::from);
+                    let _ = response.send(result);
+                });
             }
             AgentCommand::SnapshotDelete {
                 namespace,
@@ -4692,8 +4767,17 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 volume,
                 response,
             } => {
+                let Some(lease) = self.reserve_volumes(
+                    &namespace,
+                    &app_name,
+                    crate::bun::volume_maintenance::VolumeOperation::Snapshot,
+                ) else {
+                    let _ = response.send(Err(Self::volumes_busy(&namespace, &app_name)));
+                    return;
+                };
                 let volumes_dir = self.volumes_dir.clone();
                 tokio::task::spawn_blocking(move || {
+                    let _lease = lease;
                     let manager = crate::grill::snapshot::SnapshotManager::new(&volumes_dir);
                     let _ = response.send(
                         manager
@@ -8485,6 +8569,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         instance.state,
                         ContainerState::Stopping | ContainerState::Stopped
                     )
+                    // Deferred, not dropped: it restarts once the restore ends.
+                    && !self
+                        .volume_maintenance
+                        .restoring(&instance.namespace, &instance.app_name)
             })
             .map(|instance| (instance.id.clone(), instance.state))
             .collect();
@@ -8893,6 +8981,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         namespace: &str,
         spec: &AppSpec,
     ) -> Result<(), BunError> {
+        // A deploy accepted before the restore still can't mount the volume
+        // while the restore is swapping it.
+        if self.volume_maintenance.restoring(namespace, app_name) {
+            return Err(BunError::DeployFailed {
+                app_name: app_name.into(),
+                reason: format!(
+                    "volumes of {namespace}/{app_name} are being restored from a snapshot"
+                ),
+            });
+        }
         let manager = crate::grill::volume::VolumeManager::new(self.volumes_dir.clone());
         let namespace = namespace.to_string();
         let app = app_name.to_string();
@@ -16103,6 +16201,122 @@ mod tests {
             "expected AppRunning, got {result:?}"
         );
 
+        shutdown.cancel();
+        let _ = handle.await;
+    }
+
+    /// B03: once a restore is accepted, it owns the app's volumes until it
+    /// resolves. A deploy and a second restore sent while it's paused are
+    /// refused and never touch the volume directory; after the first
+    /// restore resolves, the deploy goes through.
+    #[tokio::test]
+    async fn an_accepted_restore_owns_the_volumes_until_it_resolves() {
+        let volumes_dir = tempfile::tempdir().unwrap();
+        let (mut agent, tx, shutdown) = test_agent();
+        agent.set_volumes_dir(volumes_dir.path().to_path_buf());
+        let pause = std::sync::Arc::new(std::sync::Barrier::new(2));
+        agent.restore_pause = Some(pause.clone());
+        let handle = tokio::spawn(async move {
+            agent.run().await;
+        });
+
+        let restore = |name: &str| {
+            let (resp_tx, resp_rx) = oneshot::channel();
+            let command = AgentCommand::SnapshotRestore {
+                namespace: "default".to_string(),
+                app_name: "web".to_string(),
+                name: name.to_string(),
+                volume: None,
+                response: resp_tx,
+            };
+            (command, resp_rx)
+        };
+        let (first, first_rx) = restore("before-upgrade");
+        tx.send(first).await.unwrap();
+
+        let config = Config::parse(
+            r#"
+            [app.web]
+            image = "myapp:v1"
+
+            [[app.web.volumes]]
+            path = "/data"
+        "#,
+        )
+        .unwrap();
+        let events = send_deploy(&tx, config.clone()).await;
+        match events.last() {
+            Some(ApplyEvent::Error { message }) => {
+                assert!(message.contains("being restored"), "{message}")
+            }
+            other => panic!("a deploy during a restore was not refused: {other:?}"),
+        }
+        let (second, second_rx) = restore("other");
+        tx.send(second).await.unwrap();
+        assert!(
+            matches!(
+                second_rx.await.unwrap(),
+                Err(BunError::Snapshot(
+                    crate::grill::snapshot::SnapshotError::Busy { .. }
+                ))
+            ),
+            "a second restore must wait for the first"
+        );
+        assert!(
+            !volumes_dir.path().join("default").exists(),
+            "nothing may touch the volume while the restore owns it"
+        );
+
+        // Let the first restore run. There's no snapshot to restore, so it
+        // fails, and in failing gives up its ownership.
+        tokio::task::spawn_blocking(move || pause.wait())
+            .await
+            .unwrap();
+        assert!(first_rx.await.unwrap().is_err());
+
+        let events = send_deploy(&tx, config).await;
+        let (created, _) = expect_complete(&events);
+        assert_eq!(created, 1);
+        assert!(volumes_dir.path().join("default/web/data").is_dir());
+
+        shutdown.cancel();
+        let _ = handle.await;
+    }
+
+    /// B03: a caller that gives up on an accepted restore doesn't end its
+    /// ownership; the restore still holds the volumes until it resolves.
+    #[tokio::test]
+    async fn a_restore_keeps_its_volumes_after_the_caller_goes_away() {
+        let volumes_dir = tempfile::tempdir().unwrap();
+        let (mut agent, tx, shutdown) = test_agent();
+        agent.set_volumes_dir(volumes_dir.path().to_path_buf());
+        let pause = std::sync::Arc::new(std::sync::Barrier::new(2));
+        agent.restore_pause = Some(pause.clone());
+        let handle = tokio::spawn(async move {
+            agent.run().await;
+        });
+
+        let (resp_tx, resp_rx) = oneshot::channel();
+        tx.send(AgentCommand::SnapshotRestore {
+            namespace: "default".to_string(),
+            app_name: "web".to_string(),
+            name: "before-upgrade".to_string(),
+            volume: None,
+            response: resp_tx,
+        })
+        .await
+        .unwrap();
+        drop(resp_rx);
+
+        let events = send_deploy(&tx, basic_config()).await;
+        assert!(
+            matches!(events.last(), Some(ApplyEvent::Error { .. })),
+            "{events:?}"
+        );
+
+        tokio::task::spawn_blocking(move || pause.wait())
+            .await
+            .unwrap();
         shutdown.cancel();
         let _ = handle.await;
     }
