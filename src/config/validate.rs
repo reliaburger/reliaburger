@@ -534,14 +534,22 @@ impl NodeConfig {
             });
         }
 
-        // Each sweep prunes before it uploads, so retaining zero would delete
-        // every snapshot the moment it was taken, before it ever left the node.
+        // Retaining zero would delete every snapshot the moment it was
+        // taken (or, with an upload destination, the moment it shipped).
         let snapshots = &self.storage.snapshots;
         if snapshots.interval_secs > 0 && snapshots.retain == 0 {
             return Err(ConfigError::Validation {
                 field: "storage.snapshots.retain".into(),
                 context: "node config".into(),
                 reason: "must retain at least one snapshot when interval_secs is set".into(),
+            });
+        }
+        // A zero deadline would abandon every export before it started.
+        if snapshots.upload_url.is_some() && snapshots.upload_timeout_secs == 0 {
+            return Err(ConfigError::Validation {
+                field: "storage.snapshots.upload_timeout_secs".into(),
+                context: "node config".into(),
+                reason: "must be greater than zero when upload_url is set".into(),
             });
         }
 
@@ -1080,6 +1088,17 @@ mod tests {
         assert!(nc.validate().is_ok());
         nc.storage.snapshots.interval_secs = 3600;
         nc.storage.snapshots.retain = 1;
+        assert!(nc.validate().is_ok());
+    }
+
+    #[test]
+    fn snapshot_uploads_need_a_nonzero_deadline() {
+        let mut nc = NodeConfig::default();
+        nc.storage.snapshots.upload_url = Some("file:///backups".into());
+        nc.storage.snapshots.upload_timeout_secs = 0;
+        let error = nc.validate().unwrap_err().to_string();
+        assert!(error.contains("upload_timeout_secs"), "{error}");
+        nc.storage.snapshots.upload_timeout_secs = 60;
         assert!(nc.validate().is_ok());
     }
 

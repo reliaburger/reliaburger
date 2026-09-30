@@ -27,6 +27,7 @@ pub mod snapshot_worker;
 pub mod supervisor;
 pub mod testapp;
 pub mod top;
+pub mod volume_maintenance;
 
 pub use gpu::{GpuDetector, GpuInfo, NvidiaGpuDetector, StubGpuDetector};
 pub use health::{HealthCheckConfig, HealthChecker, HealthCounters, HealthStatus, evaluate_result};

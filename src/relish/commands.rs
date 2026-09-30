@@ -2171,17 +2171,29 @@ pub async fn snapshot_list(app: &str, namespace: &str) -> Result<(), RelishError
         println!("no snapshots for {namespace}/{app}");
         return Ok(());
     }
-    println!("{:<24} {:<12} {:>12}  UPLOADED", "NAME", "VOLUME", "SIZE");
+    println!(
+        "{:<24} {:<12} {:>12}  EXPORTED TO",
+        "NAME", "VOLUME", "SIZE"
+    );
     for meta in list {
+        let destinations: Vec<&str> = meta["exports"]
+            .as_array()
+            .map(|exports| {
+                exports
+                    .iter()
+                    .filter_map(|receipt| receipt["destination"].as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
         println!(
             "{:<24} {:<12} {:>12}  {}",
             meta["name"].as_str().unwrap_or("?"),
             meta["volume_path"].as_str().unwrap_or("?"),
             meta["size_bytes"].as_u64().unwrap_or(0),
-            if meta["uploaded"].as_bool().unwrap_or(false) {
-                "yes"
+            if destinations.is_empty() {
+                "-".to_string()
             } else {
-                "no"
+                destinations.join(", ")
             },
         );
     }

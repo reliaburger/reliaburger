@@ -3835,8 +3835,8 @@ sets of runs.
 Could an ordinary test have caught this? Not honestly. Every file was fine
 until the kernel went away, and no amount of killing processes reproduces
 that. The snapshot uploader still needs its own fixture: it needs Btrfs
-volumes, and the metadata that marks a snapshot as uploaded is itself written
-without a sync.
+volumes. Its export receipts are written atomically and durably now, and an
+upload is only receipted once the destination has confirmed the archive.
 
 ## Lessons learned: audit the evidence too
 

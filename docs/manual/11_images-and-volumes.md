@@ -172,6 +172,19 @@ relish apply db.toml     # start it again
 Restore overwrites the live volume, so stop the app first. On other
 filesystems, snapshot commands fail with an error saying so.
 
+While a restore runs it owns the app's volumes: `relish apply` for that app,
+automatic restarts, and any other snapshot command for it get a "retry
+shortly" refusal (a 409) until the restore finishes. The restored volume keeps
+the original's `size` quota. If Bun dies mid-restore, it finishes or rolls back
+the swap when it starts again, so the app sees either its old data or the
+restored data, never a missing volume. When it can't tell which copy is right,
+it keeps every copy (`<volume>.restore-staged`, `<volume>.restore-old`), logs
+`needs manual recovery`, and refuses to mount that volume until you move the
+right copy into place and delete the `<volume>.restore.json` journal.
+
+`relish snapshot list` reports an error, rather than a shorter list, when
+snapshot metadata can't be read.
+
 `--volume` must be one of the app's own managed volumes, named by its
 container mount path. A custom `--name` is 1 to 128 characters from
 `A-Z a-z 0-9 . _ -` and can't start with a dot. Anything else is refused with
@@ -190,7 +203,25 @@ For scheduled snapshots, optionally uploaded as archives to object storage:
 interval_secs = 86400                 # 0 (the default) disables it
 retain = 7                            # newest N per volume; at least 1 when scheduled
 upload_url = "s3://backups/volumes"   # optional; file:// and gs:// too
+upload_timeout_secs = 3600            # deadline for archiving, then for uploading, each snapshot
 ```
 
 Object-storage credentials come from each backend's standard environment
 variables.
+
+Each sweep takes new snapshots, uploads every snapshot the destination hasn't
+confirmed, then prunes past `retain`. A snapshot that hasn't reached the
+destination is never pruned: if the store is down for longer than the
+retention window, snapshots pile up on the node (Bun logs how many it's
+keeping) and ship once the store is back. Change `upload_url` and the new
+destination receives every retained snapshot. `relish snapshot list` shows
+which destinations hold each one.
+
+Archives are streamed to a spool file in `<volumes>/.snapshot-spool` and
+uploaded in 8 MiB parts, so a large volume doesn't need its size in memory.
+The spool never takes the volumes filesystem below 5% free. Objects land under
+`<prefix>/<namespace>/<app>/<node>/<volume>/`: the archive is
+`archives/sha256-<digest>.tar.gz`, and a JSON manifest in `manifests/` names
+the snapshot, its volume, node and creation time. Two nodes running the same
+app never overwrite each other's archives, and neither does reusing a
+snapshot name.

@@ -18,12 +18,14 @@ pub struct Compatibility {
 /// Supported formats, including the per-node `directive_retry` record in a
 /// cluster upgrade, the 503 a node answers a directive with when the
 /// binary's registry is unavailable (the orchestrator retries it), and the
-/// nodes each app last ran on (`DesiredState::last_placed_nodes`), and the
+/// nodes each app last ran on (`DesiredState::last_placed_nodes`), the
 /// log store's ingest checkpoint, which records each capture file's device
-/// and inode beside its offset.
+/// and inode beside its offset, and the volume snapshot layout (reversible
+/// volume slugs, per-destination export receipts, restore journals and
+/// volume quotas in the sidecar).
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 27,
-    state: 45,
+    state: 46,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.

@@ -224,6 +224,16 @@ jobs:
           sudo -E env PATH="$PATH" NEXTEST_PROFILE=ci make test-linux
           TEST_IMAGE_CACHE="$RUNNER_TEMP/test-images"
           LINUX_EXCLUDE='& not binary(owned_runc) & not binary(owned_network)'
+      - name: Retain the provisioned Linux test report
+        # Names every test this job ran, so a gated test that silently stops
+        # being selected shows up as missing here.
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-privileged-linux
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: warn
+          retention-days: 14
 
   build-tests:
     # Compile the portable test binaries once. The acceptance jobs download

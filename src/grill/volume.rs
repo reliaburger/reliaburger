@@ -22,6 +22,10 @@ pub enum VolumeError {
     InvalidSize(String),
     #[error("mount path {0:?} escapes the volumes directory")]
     PathTraversal(String),
+    /// A snapshot restore of this volume was interrupted and hasn't been
+    /// recovered yet, so the live name may not hold a complete volume.
+    #[error("volume {0} has an interrupted snapshot restore awaiting recovery")]
+    RestorePending(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -100,6 +104,12 @@ impl VolumeManager {
             .join(app_name)
             .join(relative_path);
 
+        // Until recovery settles which copy owns the live name, handing the
+        // path to a container could mount nothing, or the wrong data.
+        if super::snapshot::restore_journal_path(&host_path).exists() {
+            return Err(VolumeError::RestorePending(host_path.display().to_string()));
+        }
+
         if let Some(backend) = self.backend_of(&host_path) {
             // A loop mount doesn't survive a reboot. Without this the app
             // would write into the bare mountpoint on the root filesystem,
@@ -158,7 +168,10 @@ impl VolumeManager {
             }
         }
 
-        self.write_backend(&host_path, backend)?;
+        // Only a Btrfs qgroup lives on the subvolume itself; a restore swaps
+        // in a new subvolume and must set the same limit again.
+        let quota = size_bytes.filter(|_| backend == super::btrfs::VolumeBackend::BtrfsSubvolume);
+        self.write_backend(&host_path, backend, quota)?;
         Ok(host_path)
     }
 
@@ -254,10 +267,16 @@ impl VolumeManager {
         read_sidecar(host_path).map(|sidecar| sidecar.backend)
     }
 
+    /// The Btrfs qgroup limit a provisioned volume was created with, if any.
+    pub fn quota_of(&self, host_path: &Path) -> Option<u64> {
+        read_sidecar(host_path).and_then(|sidecar| sidecar.quota_bytes)
+    }
+
     fn write_backend(
         &self,
         host_path: &Path,
         backend: super::btrfs::VolumeBackend,
+        quota_bytes: Option<u64>,
     ) -> Result<(), VolumeError> {
         write_sidecar(
             host_path,
@@ -265,6 +284,7 @@ impl VolumeManager {
                 schema: 1,
                 backend,
                 owner: None,
+                quota_bytes,
             },
         )
     }
@@ -429,6 +449,10 @@ struct VolumeSidecar {
     /// Who the volume was last handed to; `None` until its first mount.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     owner: Option<VolumeOwner>,
+    /// Btrfs qgroup limit set on the subvolume; `None` when unlimited or
+    /// when the backend enforces size some other way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    quota_bytes: Option<u64>,
 }
 
 fn read_sidecar(host_path: &Path) -> Option<VolumeSidecar> {

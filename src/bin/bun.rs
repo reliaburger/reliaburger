@@ -1168,11 +1168,25 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // left the config key dead (review M21's second half).
     agent.set_volumes_dir(config.storage.volumes.clone());
 
+    // Settle any snapshot restore a previous Bun died in the middle of,
+    // before anything can snapshot, mount or adopt those volumes. A volume
+    // recovery can't settle keeps its journal, so it refuses to mount.
+    let recovery_dir = config.storage.volumes.clone();
+    let unsettled = tokio::task::spawn_blocking(move || {
+        reliaburger::grill::snapshot::SnapshotManager::new(recovery_dir).recover_restores()
+    })
+    .await
+    .context("snapshot restore recovery task")?;
+    for error in unsettled {
+        eprintln!("bun: {error}");
+    }
+
     // Scheduled volume snapshots ([storage.snapshots], Phase 12 E3).
     if config.storage.snapshots.interval_secs > 0 {
         tokio::spawn(reliaburger::bun::snapshot_worker::run_snapshot_loop(
             config.storage.volumes.clone(),
             config.storage.snapshots.clone(),
+            node_name.clone(),
             shutdown.clone(),
         ));
     }
