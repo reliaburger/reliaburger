@@ -421,7 +421,7 @@ mod tests {
             labels,
             ready: true,
             capabilities: Default::default(),
-            running_apps: HashSet::new(),
+            app_replicas: Default::default(),
             uptime_secs: 86400,
             cached_images: HashSet::new(),
         }

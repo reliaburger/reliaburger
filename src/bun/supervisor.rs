@@ -425,6 +425,60 @@ impl<G: Grill> WorkloadSupervisor<G> {
         spec: &AppSpec,
         now: Instant,
     ) -> Result<Vec<InstanceId>, BunError> {
+        let replica_count = match spec.replicas {
+            Replicas::Fixed(n) => n,
+            Replicas::DaemonSet => 1,
+        };
+        let indices: Vec<u32> = (0..replica_count).collect();
+        let instance_ids = self
+            .create_app_instances(app_name, namespace, spec, &indices, now)
+            .await?;
+        self.app_instances.insert(
+            (app_name.to_string(), namespace.to_string()),
+            instance_ids.clone(),
+        );
+        Ok(instance_ids)
+    }
+
+    /// Add `count` Pending replicas to an app that already runs, beside its
+    /// existing ones, for a deploy that only raises the replica count. They
+    /// take the lowest ordinals no owned instance uses.
+    pub async fn add_app_replicas(
+        &mut self,
+        app_name: &str,
+        namespace: &str,
+        spec: &AppSpec,
+        count: u32,
+        now: Instant,
+    ) -> Result<Vec<InstanceId>, BunError> {
+        let indices: Vec<u32> = (0..u32::MAX)
+            .filter(|index| {
+                let id =
+                    crate::grill::InstanceIdentity::new(namespace, app_name, *index).instance_id();
+                !self.instances.contains_key(&id)
+            })
+            .take(count as usize)
+            .collect();
+        let added = self
+            .create_app_instances(app_name, namespace, spec, &indices, now)
+            .await?;
+        self.app_instances
+            .entry((app_name.to_string(), namespace.to_string()))
+            .or_default()
+            .extend(added.iter().cloned());
+        Ok(added)
+    }
+
+    /// Admit an app and create one Pending instance per ordinal in
+    /// `indices`, all or none. The caller records them in `app_instances`.
+    async fn create_app_instances(
+        &mut self,
+        app_name: &str,
+        namespace: &str,
+        spec: &AppSpec,
+        indices: &[u32],
+        now: Instant,
+    ) -> Result<Vec<InstanceId>, BunError> {
         // Refuse anything this node can't honour before we allocate a thing:
         // an un-allowlisted host binary/script, a GPU we don't have, or a
         // resource limit rootless can't enforce.
@@ -435,14 +489,9 @@ impl<G: Grill> WorkloadSupervisor<G> {
         )?;
         self.admit_app(app_name, spec)?;
 
-        let replica_count = match spec.replicas {
-            Replicas::Fixed(n) => n,
-            Replicas::DaemonSet => 1,
-        };
-
         // Preflight the whole fleet before reserving a port for any replica.
-        for index in 0..replica_count {
-            let id = crate::grill::InstanceIdentity::new(namespace, app_name, index).instance_id();
+        for index in indices {
+            let id = crate::grill::InstanceIdentity::new(namespace, app_name, *index).instance_id();
             self.admit_instance_identity(&id, app_name, namespace)?;
         }
 
@@ -452,9 +501,9 @@ impl<G: Grill> WorkloadSupervisor<G> {
         // already inserted into `self.instances` and their ports allocated —
         // but `app_instances` was only written after the loop, so `remove_app`
         // couldn't find them and their ports leaked until agent restart.
-        let mut prepared: Vec<WorkloadInstance> = Vec::with_capacity(replica_count as usize);
+        let mut prepared: Vec<WorkloadInstance> = Vec::with_capacity(indices.len());
         let mut allocated_ports: Vec<u16> = Vec::new();
-        for i in 0..replica_count {
+        for &i in indices {
             let instance_id =
                 crate::grill::InstanceIdentity::new(namespace, app_name, i).instance_id();
 
@@ -530,11 +579,6 @@ impl<G: Grill> WorkloadSupervisor<G> {
             self.instances.insert(instance_id.clone(), instance);
             instance_ids.push(instance_id);
         }
-
-        self.app_instances.insert(
-            (app_name.to_string(), namespace.to_string()),
-            instance_ids.clone(),
-        );
 
         Ok(instance_ids)
     }
