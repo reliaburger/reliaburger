@@ -837,6 +837,20 @@ any refusal. They'd have passed with the rail deleted. Now they insist on the
 rail's own `quorum risk` message. A test that accepts any "no" only proves that
 *something* said no.
 
+The reservation carries the membership the leader read when it proposed, and
+the state machine refuses it, before touching the ledger, if that membership is
+joint or has moved on by the time the entry applies. Counting the quorum budget
+against a configuration that's half-way between two voter sets would be
+guesswork. That refusal bit our own node-kill acceptance test on the 0.1.1
+release build. The test waited for "three voters" in openraft's metrics, which
+is the same trap Chapter 2 describes: the metrics show a membership as soon as
+it's appended, and a joint config mid-promotion already lists all three. It sent
+the kill a moment too early and the leader said no, exactly as designed. The
+fixture now waits until every node has applied the same uniform three-voter
+config, and retries that one refusal (and only that one, word for word) for a
+bounded 30 seconds in case the self-healing loop moves membership again in
+between. Anything else still fails the test.
+
 ## Process workloads
 
 Not everything runs in a container. Monitoring agents, log shippers, custom exporters — these are host binaries that need to run alongside your containerised apps. Until now, you'd manage them separately with systemd or supervisord. Process workloads make them first-class citizens.

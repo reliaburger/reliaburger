@@ -915,6 +915,121 @@ fn assert_quorum_refusal<T: std::fmt::Debug>(result: &Result<T, reliaburger::rel
     );
 }
 
+/// The council leader's own refusal when a node fault arrives mid membership
+/// change (a joint config, or a new config appended since the proposal read it).
+const UNSTABLE_COUNCIL_REFUSAL: &str =
+    "node fault safety requires a stable current council membership";
+
+/// Whether `error` is exactly the council's pre-reservation refusal for an
+/// unsettled membership, either straight from the leader (409) or forwarded
+/// by a follower (503 wrapping the leader's 409). The state machine refuses
+/// before touching the reservation ledger, so retrying it is safe. Nothing
+/// else is retryable here.
+fn is_unstable_council_refusal(error: &reliaburger::relish::RelishError) -> bool {
+    let reliaburger::relish::RelishError::ApiError { status, body } = error else {
+        return false;
+    };
+    match status {
+        409 => body == UNSTABLE_COUNCIL_REFUSAL,
+        503 => {
+            *body
+                == format!(
+                    "node fault coordination refused (409 Conflict): {UNSTABLE_COUNCIL_REFUSAL}"
+                )
+        }
+        _ => false,
+    }
+}
+
+#[test]
+fn only_the_exact_unstable_council_refusal_is_retryable() {
+    use reliaburger::relish::RelishError;
+    let api = |status, body: &str| RelishError::ApiError {
+        status,
+        body: body.to_string(),
+    };
+    // The body the 0.1.1 release build saw (run 36679644071).
+    assert!(is_unstable_council_refusal(&api(
+        503,
+        "node fault coordination refused (409 Conflict): node fault safety requires a stable current council membership",
+    )));
+    assert!(is_unstable_council_refusal(&api(
+        409,
+        UNSTABLE_COUNCIL_REFUSAL
+    )));
+    for unrelated in [
+        api(409, "node fault would risk council quorum"),
+        api(
+            503,
+            "node fault coordination refused (409 Conflict): node fault would risk council quorum",
+        ),
+        api(503, "node fault safety requires a known council leader"),
+        api(
+            503,
+            "node fault coordination timed out; ownership remains reserved",
+        ),
+        api(500, UNSTABLE_COUNCIL_REFUSAL),
+        api(
+            503,
+            "node fault coordination refused (500 Internal Server Error): node fault safety requires a stable current council membership",
+        ),
+    ] {
+        assert!(
+            !is_unstable_council_refusal(&unrelated),
+            "{unrelated:?} must not be retried"
+        );
+    }
+}
+
+/// Whether every node has applied the same uniform council config of
+/// `voters` voters. Counting voters alone isn't enough: openraft's metrics
+/// show a membership as soon as it's appended, and a joint config
+/// mid-promotion already lists every voter. The leader refuses node faults
+/// until that change has settled.
+fn council_membership_settled(nodes: &[&Node], voters: usize) -> bool {
+    let mut agreed = None;
+    for node in nodes {
+        let Some(council) = node.handle.council.as_ref() else {
+            return false;
+        };
+        let metrics = council.metrics().borrow().clone();
+        let membership = metrics.membership_config.membership();
+        let Some(log_id) = *metrics.membership_config.log_id() else {
+            return false;
+        };
+        if membership.get_joint_config().len() != 1
+            || membership.voter_ids().count() != voters
+            || metrics.last_applied.is_none_or(|applied| applied < log_id)
+            || agreed.is_some_and(|agreed| agreed != log_id)
+        {
+            return false;
+        }
+        agreed = Some(log_id);
+    }
+    true
+}
+
+/// Inject a node fault, retrying (bounded) only on the leader's exact
+/// "stable current council membership" refusal. Any other error is
+/// returned to the caller untouched.
+async fn inject_node_fault_once_council_settles(
+    sender: &Node,
+    request: &reliaburger::smoker::types::FaultRequest,
+) -> Result<reliaburger::smoker::types::FaultSummary, reliaburger::relish::RelishError> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        match sender.client.inject_fault(request).await {
+            Err(error)
+                if is_unstable_council_refusal(&error)
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(POLL_INTERVAL).await;
+            }
+            result => return result,
+        }
+    }
+}
+
 /// Wait until `observer`'s API membership table (what the fault safety
 /// rails read) no longer lists `target`.
 async fn wait_until_api_view_drops(observer: &Node, target: &str, timeout: Duration) -> bool {
@@ -1076,21 +1191,13 @@ async fn authenticated_node_kill_fails_and_restores_a_real_cluster_member() {
     .await;
     assert!(converged, "cluster never fully converged to Alive");
     let voters_ready = wait_until(Duration::from_secs(60), || {
-        nodes.iter().all(|node| {
-            node.handle.council.as_ref().is_some_and(|council| {
-                council
-                    .metrics()
-                    .borrow()
-                    .membership_config
-                    .membership()
-                    .voter_ids()
-                    .count()
-                    == 3
-            })
-        })
+        council_membership_settled(&nodes, 3)
     })
     .await;
-    assert!(voters_ready, "council never grew to three voters");
+    assert!(
+        voters_ready,
+        "council never settled on a uniform three-voter membership"
+    );
 
     let source = nodes
         .iter()
@@ -1117,9 +1224,10 @@ async fn authenticated_node_kill_fails_and_restores_a_real_cluster_member() {
         override_safety: false,
         acknowledged: true,
     };
-    let summary = source
-        .client
-        .inject_fault(&request)
+    // The self-healing loop may still change membership between our check and
+    // the leader's own proposal; the leader then refuses before reserving
+    // anything. Retry exactly that refusal and nothing else.
+    let summary = inject_node_fault_once_council_settles(source, &request)
         .await
         .expect("authorised node fault should reach its target");
 
@@ -1366,23 +1474,17 @@ async fn a_killed_worker_has_its_replica_rescheduled_on_the_survivors() {
 
     let shutdown = CancellationToken::new();
     let nodes = start_spread_web_cluster("kw", 20441, &shutdown).await;
-    // The quorum rail admits one affected voter only once three vote.
+    // The quorum rail admits one affected voter only once three vote, and the
+    // leader refuses node faults until that membership has settled.
+    let council: Vec<&Node> = nodes.iter().collect();
     let voters_ready = wait_until(Duration::from_secs(60), || {
-        nodes.iter().all(|node| {
-            node.handle.council.as_ref().is_some_and(|council| {
-                council
-                    .metrics()
-                    .borrow()
-                    .membership_config
-                    .membership()
-                    .voter_ids()
-                    .count()
-                    == 3
-            })
-        })
+        council_membership_settled(&council, 3)
     })
     .await;
-    assert!(voters_ready, "council never grew to three voters");
+    assert!(
+        voters_ready,
+        "council never settled on a uniform three-voter membership"
+    );
     let leader = nodes
         .iter()
         .find(|node| *node.thinks_leader.borrow())
@@ -1398,9 +1500,9 @@ async fn a_killed_worker_has_its_replica_rescheduled_on_the_survivors() {
         .filter(|node| node.name != target.name)
         .collect();
 
-    let summary = entry
-        .client
-        .inject_fault(&FaultRequest {
+    let summary = inject_node_fault_once_council_settles(
+        entry,
+        &FaultRequest {
             fault_type: FaultType::NodeKill {
                 kill_containers: true,
             },
@@ -1414,9 +1516,10 @@ async fn a_killed_worker_has_its_replica_rescheduled_on_the_survivors() {
             include_leader: false,
             override_safety: false,
             acknowledged: true,
-        })
-        .await
-        .expect("a worker node kill is admitted");
+        },
+    )
+    .await
+    .expect("a worker node kill is admitted");
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
     loop {
