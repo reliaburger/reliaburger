@@ -5,7 +5,8 @@ build, staged over HTTPS, qualified, then published unchanged. Its [release
 closure record](qualification/2026-09-27-v0.1.0-release-closure.md) lists the
 thirteen candidates it took and what each soak run found. The
 [0.1.0 plan](plans/archive/2026-09-16-v0.1.0-release-plan.md) defined its acceptance
-gates (V01–V04 in [progress.md](progress.md#acceptance-and-release-gates)); a
+gates (V01–V04 in the [frozen checklist](plans/archive/progress-to-0.1.0.md#acceptance-and-release-gates),
+with the ones still open under [known gaps](roadmap.md#known-gaps)); a
 later release keeps them unless a dated plan changes them. A green build alone
 doesn't qualify the laptop quickstart or its timing.
 
@@ -365,8 +366,8 @@ the real `curl … | sh` install against it on every host we advertise.
 
 5. **Record it.** Copy each host's record into
    `docs/qualification/DATE-staged-install-HOST.md`, alongside the run ID,
-   attempt, commit and digest. Gates V03 and V04 in
-   [progress.md](progress.md) point at these records.
+   attempt, commit and digest, and link them from the release's milestone or
+   gate issue (V04 is [#288](https://github.com/reliaburger/reliaburger/issues/288)).
 
 6. **Clean up the staging pre-releases.** Delete them before promotion so the
    release page and the release notes' "previous tag" don't pick them up:
@@ -381,7 +382,7 @@ the real `curl … | sh` install against it on every host we advertise.
    `staging`.
 
 8. **Update the docs** once the release is public: the release date in the
-   status boxes of [progress.md](progress.md) and the homepage
+   [roadmap](roadmap.md) (tick the release) and the homepage
    (`docs/website/index.html`), and the bootstrap's default version if it
    changed. The website deploys from `main`, so merge that change after
    promotion, not before.

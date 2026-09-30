@@ -12,7 +12,7 @@ substantial, though: archive exports can lose older generations, several safety
 and recovery paths have ownership gaps, and a full catalogue still contains
 unconditional unknown results. Green source CI does not close those gaps.
 
-This is the current completion backlog. [progress.md](../../progress.md) owns its
+This is the current completion backlog. [progress.md](progress-to-0.1.0.md) owns its
 checkboxes; this document supplies evidence, ordering and acceptance criteria.
 The [release plan](2026-09-16-v0.1.0-release-plan.md) still owns packaging and the
 supported 0.1.0 contract. Dated reviews remain historical evidence, not competing

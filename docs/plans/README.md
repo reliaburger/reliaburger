@@ -3,9 +3,8 @@
 New work starts here, as a dated plan (`YYYY-MM-DD-<topic>.md`) that says what
 we'll build, in what order, and which tests prove it. When a plan's work has
 shipped or been superseded, it moves to [archive/](archive/) unchanged. The
-backlog itself lives in [progress.md](../progress.md) and the GitHub
-milestones; the order of releases is in the
-[roadmap](../roadmap.md#releases-after-010).
+status and the order of releases are in the [roadmap](../roadmap.md), and
+the detail is in the GitHub milestones and issues.
 
 ## Live
 

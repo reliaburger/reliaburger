@@ -1,42 +1,328 @@
 # Implementation Progress
 
-Single source of truth for what's done and what's next. Check off an item only when it compiles, passes tests, and is committed. See [roadmap.md](roadmap.md) for full details on each phase.
+> **Frozen.** This is the pre-0.1.0 implementation checklist, as it stood when 0.1.0 was released (with the first 0.1.1 fixes), and it isn't updated any more. Status now lives in the [roadmap](../../roadmap.md) and in GitHub milestones and issues.
+
+Single source of truth for what's done and what's next. Check off an item only when it compiles, passes tests, and is committed. See [roadmap.md](roadmap-to-0.1.0.md) for full details on each phase.
 
 Done means implemented, tested and committed. An implemented subsystem can still
 have tracked defects or acceptance gates; those stay unchecked. Git history and the
-[archived plans](plans/archive/) hold the per-change evidence (regressions, test
+[archived plans](./) hold the per-change evidence (regressions, test
 runs, CI results) that used to live here.
 
 > **0.1.0 released on 29 September 2026.** The tag `v0.1.0` points at
 > candidate commit 7d7dfc0, promoted unchanged from the build it was qualified
-> on ([runbook](releasing.md)). The [0.1.0 release closure
-> record](qualification/2026-09-27-v0.1.0-release-closure.md) (25–29 September)
+> on ([runbook](../../releasing.md)). The [0.1.0 release closure
+> record](../../qualification/2026-09-27-v0.1.0-release-closure.md) (25–29 September)
 > lists every V02 soak run and candidate, the PRs from #196 to the tag with each
-> bug's cause and fix, and what's carried past 0.1.0. What shipped is summarised
-> under [Released in 0.1.0](#released-in-010); the plans that got us there are
-> [archived](plans/archive/).
+> bug's cause and fix, and what's carried past 0.1.0. The [release-readiness
+> review](2026-09-16-v0.1.0-release-plan.md) and the [remaining
+> work](2026-09-22-v0.1.0-remaining-work.md) plan are now history: they
+> record the supported scope and the [acceptance gates](#acceptance-and-release-gates),
+> with their evidence in [qualification/](../../qualification/). V01, the Intel macOS
+> and Linux rows of V04 and two V02 items were still open at release.
 >
-> **After 0.1.0:** the open items are below: the
+> **After 0.1.0:** the open items are the
 > [missing capabilities](#missing-capabilities-and-longer-term-scope) (F01–F12),
-> the one open [engineering follow-up](#engineering-follow-ups) (H05), the
-> [acceptance gates](#acceptance-and-release-gates) 0.1.0 shipped without (V01,
-> the rest of V04 and two V02 items) and the [known flakes](#known-flakes). The
-> limits 0.1.0 ships with are in the
-> [documentation](README.md#010-scope-and-limits). The next releases follow
-> the [release order](roadmap.md#releases-after-010) in the roadmap: patch
-> releases first (0.1.1 every known bug fix, 0.1.2 images, 0.1.3 observability
-> and test quality), then one headline feature per minor release, up to
-> 0.4.0's full container migration.
+> the one open [engineering follow-up](#engineering-follow-ups) (H05) and the
+> [known flakes](#known-flakes). The limits 0.1.0 ships with are in the
+> [documentation](../../README.md#010-scope-and-limits). The next releases follow
+> the [release order](roadmap-to-0.1.0.md#releases-after-010) in the roadmap: patch
+> releases 0.1.1–0.1.4 (soak follow-ups, images, hardening, observability), then one
+> headline feature per minor release, up to 0.4.0's full container migration.
 > Nothing before 1.0.0 is backwards compatible; an incompatible format change
-> needs a fresh cluster. New work starts with a dated plan in [plans/](plans/).
+> needs a fresh cluster. New work starts with a dated plan in [plans/](../).
 
-## Open after 0.1.0
+## Current completion backlog (17 September 2026)
 
-### 0.1.1
+The [codebase completion plan](2026-09-17-codebase-completion-plan.md)
+records the evidence, priority, dependency order, completion test and book chapter
+for every item below. IDs are scoped to that plan, not the older C1/M1 review IDs.
+The [audit record](../../qualification/2026-09-17-code-audit.md) separates local defect
+reproductions from inspected source and previous acceptance evidence.
 
-Every known bug goes into 0.1.1 (the [release order](roadmap.md#releases-after-010)
-links each issue; the [0.1.1 milestone](https://github.com/reliaburger/reliaburger/milestone/1)
-is the live list). Done so far:
+The work packages distinguish release correctness, optional refactors and future
+capabilities. Correctness fixes need explicit release dispositions. Older unchecked
+groups below point into this ledger.
+
+Smaller fixes that CI runs turned up along the way:
+
+- Bootstrap and endpoint fixtures bind port zero and read Bun's reported API
+  address instead of reserving a port up front.
+- The real `bun --compatibility` query compares its typed response with `CURRENT`.
+- Live egress monitoring defers missing-binding checks while a workload is
+  Pending or Preparing, so pre-start policy installation isn't mistaken for
+  policy loss.
+- Automatic DNS port allocation retries when UDP picks a port TCP already holds;
+  explicit port conflicts still refuse.
+- The request-ID echo fixture uses axum and joins both server tasks.
+- Integration-agent volume roots are private to each fixture.
+- Two discovery routes missing from the authorisation audit matrix now declare
+  System scope.
+- Standalone `relish stop` followed by `relish apply` of the same app no longer
+  rolls back with "service not found": the redeploy over the stopped replicas
+  first restores the service (same VIP) and ingress route the stop released
+  (`apply_after_stop_restores_the_service_and_ingress_route`). Cluster mode was
+  unaffected: its stop retires the replicas, so the next apply deploys fresh.
+
+### Correctness and behavioural contracts
+
+- [x] **C01** Preserve every exported log generation with full content-hash object names. Legacy archive objects stay untouched (migration duplicates are documented in chapter 6).
+- [x] **C02** Scope export acknowledgements and pruning proof to the destination URL and node prefix.
+- [x] **C03** Serialise all exporters with a cross-process lock, reload before export, and atomically persist a private checkpoint with file/directory sync before acknowledgement or pruning. Physical crash qualification belongs to V02.
+- [x] **C04** Report directory, entry and file-read failures with context; reject non-regular/invalid-name candidates and skip only concurrent NotFound reads.
+- [x] **C05** Persist replacement launch details before health publication, including private durable records, rollback record/port cleanup and Apple launcher provenance. Runtime crash-injection qualification belongs to V02.
+- [x] **C06** Reserve one durable cluster-wide node-experiment slot through Raft, bound to the exact request, process identity and an increasing sequence. Expiry starts fencing and confirmed reversal (never automatic release), membership changes wait behind a committed barrier, and stale activation or release refuses.
+- [x] **C07** Require explicit matching protocol/state generations for joining, gossip, Raft, reporting and signed upgrade/rollback preflight. Fresh state is stamped durably; development data, snapshots and backups are refused without migration.
+- [x] **C08** Publish readiness only after each owner explicitly acknowledges acquired resources; catch startup panics and fence signals by attempt.
+- [x] **C09** Refuse busy cleanup immediately with a retryable conflict, leaving the lease intact while the reaper visits other expired leases.
+- [x] **C10** Record pending fault ownership before sending, retain unknown receipts after lost responses, and remove receipts only after confirmed exact-ID reversal.
+- [x] **C11** Persist leases with private unique files and file/directory sync; retain transaction ownership across caller cancellation and fence mutations after uncertain persistence. Physical crash and filesystem-sync qualification belong to V02.
+- [x] **C12** Sweep existing owned pressure cgroups before the disabled-policy refusal, without enabling new faults.
+- [x] **C13** Use one whole-second issuance instant and checked lifetime arithmetic for CA, node and general leaf certificates; derive stored CA validity from signing parameters.
+- [x] **C14** Renew and hot-reload every served certificate class. Sustained certificate/storage qualification belongs to V02.
+  - [x] Serve the ingress leaf with its original root-signed intermediate.
+  - [x] Renew cached ingress leaves at their X.509 validity midpoint, recover after idle expiry and bound leaves by issuer validity.
+  - [x] Reload operator certificate/key files once per second as validated pairs; keep the previous pair only while it's valid.
+  - [x] Disable ingress session resumption so reconnects validate the current certificate.
+  - [x] Retire API/registry/ingress TLS connections within one hour, with 30 seconds for HTTP draining and a deadline that survives WebSocket upgrades.
+  - [x] Persist node identities as private atomic snapshots with key/chain/node/serial validation and signed validity dates.
+  - [x] Provide a shared live node credential handle that validates and persists replacements before publishing them to existing TLS configurations.
+  - [x] Wire the live handle into Bun's API/registry, Raft/reporting clients and servers, internal HTTPS clients and diagnostics.
+  - [x] Bound locally issued and CSR-signed node leaves by the real issuer validity, including Node CAs reconstructed from cluster state; refuse expired and future issuers.
+  - [x] Add leader-only node CSR renewal that requires both the service principal and the actual TLS peer leaf, with quorum-backed identity, expiry and revocation checks.
+  - [x] Start automatic renewal at the signed lifetime midpoint, persist before publishing, report live worker health and retry directly through leader changes.
+- [x] **C15** Replace the process counter with positive 20-byte certificate serials carrying 158 bits of operating-system randomness. Issuance refuses on randomness failure; ingress serials stay outside the 64-bit node revocation contract.
+- [x] **C16** Return contextual errors for invalid DNS/common-name SANs and a root role passed to intermediate issuance.
+- [x] **C17** Reject overflowing relative durations with checked multiplication and parse units at UTF-8 boundaries, including fault minute/hour values and nanosecond delays.
+- [x] **C18** Scan allocator candidates once from a random starting point, preserving concurrency and out-of-range adoption semantics.
+- [x] **C19** Count only successful metric/rollup deletions, expose removal and directory-enumeration errors with paths, and ignore concurrent NotFound without counting it.
+- [x] **C20** Retain worker/minute/series identity through an owned-rollup endpoint and deduplicate before summing; conflicting copies and malformed peers stay explicit unknown evidence. Oversized queries refuse rather than silently truncate.
+- [x] **C21** Choose explicit admission refusal: preflight the 1 MiB/100-event limits, bound the receiver to 16 connections and 16 queued reports, and acknowledge queue admission. Normal rollup failures request five-minute backfill; chunking and event production remain F06.
+- [x] **C22** Compact export receipts to current source generations only after a successful scan, in the existing locked durable transaction.
+- [x] **C23** Treat encoded expiry as critical regardless of stale rotation labels; require positive healthy rotation evidence to suppress near-expiry warnings.
+- [x] **C24** Require observed configured voters for quorum arithmetic; unavailable or degraded council responses stay unknown instead of using stale gossip flags.
+- [x] **C25** Report node-local Unix device identity without paths and coalesce only matching identities.
+- [x] **C26** Track exact CPU sample identities and compare parsed DNS answer IPs, excluding resolver/name/target text.
+- [x] **C27** Render collection failures as unknown and keep polling; handle interruption during collection and retain the last meaningful exit outcome.
+- [x] **C28** (P2) Make TUI status reflect the cluster.
+- [x] **C29** Include missing baseline metrics in the shared benchmark comparison verdict and name missing/new observations in human output.
+- [x] **C30** (P1) Replace unconditional unknown catalogue cases with real evidence: secret/config decryption inside the owning container, workload SPIFFE bundle validation against configured CA anchors, and a runnable leased registry fixture checked through an actual HTTP response.
+- [x] **C31** Generate 128-bit random run IDs instead of second-resolution timestamps.
+- [x] **C32** Replace magic-string verdicts with `CaseError::{Failed, Unknown}` and reject invalid runner timeouts, parallelism and namespace inputs before side effects.
+- [x] **C33** Publish actual bound service origins and use explicit managed host forwards, including an authenticated registry forward configurable with `--registry-port`. Workload clients keep Host/SNI through forwards with normal certificate hostname verification. Exact-candidate VM qualification belongs to V03/V04.
+- [x] **C34** Finish durable ownership and confirmed cleanup for every supported test resource. The [completion plan's C34 record](2026-09-17-codebase-completion-plan.md#c34--define-lease-ownership-for-the-remaining-test-resources) and the [closure matrix](2026-09-22-c34-closure.md) map each change to its regressions and platform qualification.
+  - [x] Bind test tokens to their exact authenticated lease owner and fingerprint; reclaim them through Raft after client or leader failure.
+  - [x] Persist node-local job leases and reserved namespaces; reclaim cron registrations and observed runtime retirement after Bun/client death. Catalogue completion requires an observed zero exit and bounded log publication.
+  - [x] Persist cron registration, explicit retirement and pre-launch minute claims. Recovery skips missed/uncertain occurrences without catch-up, as agreed.
+  - [x] Fence in-flight deploy/cron workers against stop, retirement and overlapping replacement; stop cancels Pending retries.
+  - [x] Require observed cleanup before retrying failed create/start/restart. Preserve ownership on failure and enforce in-memory backoff and retry budgets.
+  - [x] Refuse uncertain startup adoption and invalid process selectors. Preserve inspection failures in ProcessGrill, runc and Apple; retain runc ownership through OCI, rootfs and network cleanup failures.
+  - [x] Persist Pending placement ownership before queueing Deploy; retain it through uncertain convergence and retirement. Resolve peers through advertised per-node API endpoints.
+  - [x] Keep failed/expired uploads fenced until deletion and directory sync succeed. Claim exclusive upload-directory ownership on startup, reclaim recognised abandoned files and refuse uncertain inventory.
+  - [x] Wait for durable lease absence after HTTP 202; an empty runtime inventory can't override pending ownership.
+  - [x] Keep normal Stop/Retire ownership when identity or adoption-record removal fails; sync both parent directories and retry.
+  - [x] Require observed runtime exit on rolling/blue-green retirement. Failed or stalled kills and inspection errors preserve both generations; a later Retire cleans up.
+  - [x] Propagate artifact-cleanup errors on rolling/blue-green finalisation, retaining the whole retired fleet as stopped if one artifact fails.
+  - [x] Propagate runtime/artifact cleanup failures on halt and rollback. Reserve replacement ownership and ports before preparation, and observe kills and exits off the agent loop with bounded waits.
+  - [x] Fence the periodic restart driver before off-loop rollout retirement starts.
+  - [x] Prevent rollout generation reuse after adoption and preserve stopped/failed cleanup owners when applying replacements.
+  - [x] Reject invalid app/job names and namespace labels before runtime mutation.
+  - [x] Validate the full recorded identity inventory before recovery mutations; refuse aliases, unsafe labels and inconsistent app/namespace/replica/spec fields without runtime calls or record deletion.
+  - [x] Reject cross-app instance-ID collisions (e.g. a new `worker-g1` app against generation one of `worker`) before replacing an owner, checking the whole replica fleet before port allocation.
+  - [x] Record every former cluster placement owner and wait for exact retirement acknowledgements after runtime/artifact cleanup and checkpoint persistence.
+  - [x] Start and own the production lease reaper in the placement acceptance harness.
+  - [x] Add operator-attested decommissioning with permanent identity retirement and fresh enrolment under a new identity on return. One Raft decision clears the node's lease placements and node-chaos obligation, with a durable operator audit. See the [operator plan](2026-09-19-lease-retirement.md).
+  - [x] Persist ordinary-job launch intent, observed outcomes, stop intent and the finite retry budget across Bun replacement. Unknown outcomes survive further restarts and require `relish apply jobs.toml --rerun-jobs`. See the [job recovery record](2026-09-19-job-recovery.md).
+  - [x] Keep repository metadata independent when identical manifests share a digest: tag deletion affects only its own repository, and signatures survive copies and reload.
+  - [x] Persist registry catalogue mutations before acknowledging pushes; serialise publication and GC deletion under an owned guard and recheck required blobs after waiting. See the [registry retirement plan](2026-09-19-registry-retirement.md).
+  - [x] Retry approved registry blob deletion after failure or restart, preserving the last other holder.
+  - [x] Refuse unconfirmed clustered manifest pushes with 503 instead of success-class 202.
+  - [x] Forward worker/follower registry proposals to the advertised leader with live node TLS and service authority, restricting each writer to its own holdings.
+  - [x] Bind upload sessions to the exact authenticated credential, alongside repository and lifecycle checks.
+  - [x] Persist bounded repository writer receipts and a workload-retirement barrier in cluster and standalone leases; conditional manifest commits and write fences protect reserved repository namespaces.
+  - [x] Preserve complete repository paths in peer upload, HEAD and download requests.
+  - [x] Provide authenticated, quorum-backed ownership queries for registry workers.
+  - [x] Persist the exact repository lease generation in each catalogue, refusing conflicting claims, stale cleanup and unowned existing metadata.
+  - [x] Bind HTTP registry writers to their exact authenticated lease, persist receipts and generations before files, fence final publication and supervise node-local repository retirement.
+  - [x] Track runtime P2P and healer writes through repository ownership and owned upload tasks.
+  - [x] Refuse ordinary or differently leased app/job dependencies on a leased repository, including init-container images, both in HTTP preflight and when Raft applies app specs.
+  - [x] Resolve manifest digest reads through repository metadata before reading shared bytes, so retired disposable repositories return 404.
+  - [x] Resolve OCI metadata, peer image lookup and quotas through current authenticated catalogue authority on workers and followers; missing authority refuses instead of returning empty metadata.
+  - [x] Make the public image list use current catalogue authority on workers and followers; missing authority returns 503.
+  - [x] Fence manifest publication with a durable per-node GC generation, retaining transaction ownership from before arbitration through physical collection or publication.
+  - [x] Replace stale healer holder sets with storage-node copy confirmation under the committed GC generation fence.
+  - [x] Keep cluster lease cleanup Pending until every registry writer confirms retirement.
+  - [x] Qualify Bun death with an abandoned registry client and natural lease expiry: the replacement retires leased metadata and partial bytes and preserves identical ordinary content.
+  - [x] Qualify registry lease cleanup through a real three-node TLS leader change, including the dead leader's return.
+  - [x] Journal managed test volumes and generated configuration before provisioning; retire them only after confirmed runtime cleanup and keep ordinary Stop/rebalance data. Test snapshots are unsupported. See the [storage record](2026-09-19-managed-test-storage.md).
+  - [x] Persist an observed short process-job exit together with positive runtime absence, even when the job exited before a PID record existed. The separate window where a launch was never observed at all is closed by the durable process owner below, which records launch intent before starting.
+  - [x] Define the 0.1.0 process-mode scope: foreground workloads whose children stay in the supervised process group. Daemonising or detached workloads must use Linux containers.
+  - [x] Establish atomic process identity and complete retirement for the supported foreground process group. See the [foreground ownership plan](2026-09-20-foreground-process-ownership.md).
+    - [x] Add the single-threaded owner and durable execution gate as an internal Bun helper.
+    - [x] Add a persistent ProcessGrill adapter using durable generation records and bounded owner control.
+    - [x] Publish first process intent atomically from a private staging directory, holding the launch lock through rename and directory sync.
+    - [x] Preserve durable helper reaping across Bun self-upgrade.
+    - [x] Keep process diagnostic logs readable after owner loss without weakening signal/absence checks.
+    - [x] Discover every published process generation independently of agent adoption records.
+    - [x] Separate durable job preparation from permission to execute, including retries.
+    - [x] Select durable owners in production Bun and reconcile launch intent before agent adoption.
+    - [x] Require durable application adoption metadata before acknowledging deployment or publishing a restarted instance.
+    - [x] Fence queued start, stop, kill and create requests against successor generations.
+    - [x] Supervise process exec commands through child owners retained by the workload owner.
+    - [x] Make recovery fixtures wait for positive owner state across transient socket failures.
+    - [x] Require the first-run fixture's own Bun API announcement before accepting listener readiness.
+  - [x] Recover runtime/discovery resources created before their first adoption record. See the [OCI ownership plan](2026-09-20-oci-launch-ownership.md).
+    - [x] Persist and supervise external runtime commands before activation, retaining their complete inventory and uncertain cleanup obligations.
+      - [x] Add the owned-command adapter with durable input, complete inventory, actual output/exit evidence and bounded waits that retain ownership.
+      - [x] Retry transient owner-control failures within an external command's wait deadline, requiring positive retirement before returning output.
+      - [x] Retry transient cancellation-request failures within the original retirement deadline, then require positive exit evidence.
+    - [x] Scope Runc bundles and state to the node data directory and use its selected image cache.
+    - [x] Refuse duplicate Runc preparation while an entry still owns the instance, and refuse existing OCI state before any bundle mutation.
+    - [x] Journal original Runc specifications and generations before preparation; retain lifecycle guards through cancelled callers and blocking workers.
+      - [x] Add the original-intent journal with cross-adapter filesystem claims, stale-generation refusal and private atomic publication.
+      - [x] Connect generation claims to short runtime commands, persist admission sealing and require positive draining before cleanup.
+    - [x] Recover owned runc launchers and rootless slirp helpers without signalling recovered PIDs.
+      - [x] Bind launcher/helper command identities durably before activation, and validate and drain their complete inventories before confirming cleanup.
+      - [x] Route auxiliary runtime commands through the bound role owner without holding the adapter mutex during execution.
+      - [x] Replace positively retired rootless helper roles without rerunning the launcher.
+      - [x] Integrate owned rootless Runc and slirp with pinned namespace descriptors and a network-readiness gate.
+    - [x] Retire namespace/link/forwarding mutators before inspecting kernel-resource absence and releasing address reservations.
+      - [x] Run namespace and nftables commands under generation ownership, with shared-handle cancellation and caller-SIGKILL recovery.
+      - [x] Prune positively retired short-command records under exclusive generation ownership; retain every uncertain attempt.
+    - [x] Build the durable rootful Runc adapter: original launch inventory, complete create/start/cleanup workers, owned launcher/exec/network paths and recovered short exits.
+    - [x] Retire predecessor adoption and policy records before automatic application restart creates a successor.
+    - [x] Reconcile discovery/egress state before adoption. Direct Apple Container recovery is deferred under F10.
+      - [x] Disable direct Apple Container for 0.1.0 and exclude it from automatic detection; explicit selection points to the managed Linux VM.
+      - [x] Require positive kernel egress retirement: cleanup propagates enumeration/deletion errors and keeps bindings and adoption records until it succeeds.
+      - [x] Complete production kernel/discovery recovery across supported modes (enrolled rootful clusters, standalone rootful and standalone rootless).
+        - [x] Add a persistent kernel loader with private original ownership, exclusive claims, complete map/link checks and gap-free program replacement.
+        - [x] Persist original per-workload egress ownership before map writes and restore it before adoption.
+        - [x] Recover correctly from Bun death after an application crash but before its replacement record is published.
+        - [x] Correct generated OCI cgroup paths so the container joins the directory where Bun installs pre-start policy.
+        - [x] Resolve namespace rules, `relish path`, source-specific faults and recovered egress through verified container identity.
+        - [x] Isolate rolling and blue-green generations in their own cgroups.
+        - [x] Propagate refused firewall/namespace deletion from the map helpers.
+        - [x] Keep failed namespace/firewall reconciliation keys until confirmed removal.
+        - [x] Include outbound-only sources in namespace identity and explicit allow rules.
+        - [x] Require positive backend withdrawal before Stop/Retire discards workload records.
+        - [x] Persist source ownership and install namespace/allow rules before app/job execution; restore original source inventory across recovery.
+        - [x] Route each rootful container through its own veth using `/32` endpoints and explicit host/gateway routes.
+        - [x] Withdraw explicit Stop/Retire backends before runtime retirement releases an address.
+        - [x] Confirm per-instance kernel backend withdrawal before rollout drain/stop.
+        - [x] Refuse deployment completion when final kernel backend publication fails.
+        - [x] Exclude local stale catalogue endpoints independently of council membership.
+        - [x] Confirm live service destination-grant removal before freeing its allocated VIP.
+        - [x] Retain a durable generation-bound network reference across natural runtime exit until discovery confirms release.
+        - [x] Fence unsafe execution independently of refused discovery cleanup in the owned runtime.
+        - [x] Finish durable service/backend ownership: recover original destination grants across crashes and confirm backend withdrawal before network-address reuse on natural exits, rollouts and recovery.
+          - [x] Restore exact saved service allocations, including collision-resolved VIPs.
+          - [x] Persist complete discovery ownership under an exclusive private checkpoint, with withdrawal/release transitions and fenced uncertain writes.
+          - [x] Move discovery journal opening and writes onto blocking workers with owned filesystem claims.
+          - [x] Confirm replacement kernel publication before DNS/Wrapper cutover and predecessor retirement.
+          - [x] Propagate initial service registration/publication failures before runtime create/start.
+          - [x] Confirm health publication before restart, retry refused updates and publish confirmed userspace health.
+          - [x] Permit same-instance backend replacement at capacity without consuming a new slot.
+          - [x] Propagate rollout and restart backend insertion errors before reporting completion.
+          - [x] Preserve the latest service-map watch snapshot when no reader is attached (`send_replace`).
+          - [x] Publish confirmed restart addresses to DNS/Wrapper and keep health-checked replacements unhealthy until a successful probe.
+          - [x] Avoid blocking the shared drain tracker on a full completion channel.
+          - [x] Track ingress requests, including captured failover candidates, before deployment drain starts.
+          - [x] Require captured ingress release before ordinary Stop and automatic restart retire the runtime.
+          - [x] Require captured-request release at the shared stopped-runtime artifact cleanup boundary.
+          - [x] Persist conservative publication ownership before kernel updates and fence uncertain writes.
+          - [x] Persist exact original runtime address references before Start; refuse physical release without durable permission.
+          - [x] Persist standalone address-release permission before runtime release.
+          - [x] Persist confirmed standalone service withdrawal and owner removal before freeing its VIP.
+          - [x] Release the predecessor address through durable permission before automatic restart creates a successor.
+          - [x] Expose held/released references in the runtime inventory and correlate them against the discovery journal.
+          - [x] Preserve kernel backend lookup failures as errors; only KeyNotFound proves absence.
+          - [x] Recover standalone discovery before adoption: reserve original VIPs, refuse unknown kernel owners, confirm withdrawal and replay exact release permissions.
+          - [x] Preserve active catalogue VIPs across colliding arrivals/departures and temporary report loss; refuse conflicts and exhaustion instead of sharing an address.
+          - [x] Reconcile catalogue publication against committed state instead of a last-attempt cache.
+          - [x] Register catalogue consumers in Raft before serving placements; keep offline identities through snapshots and discharge them only on permanent decommission.
+          - [x] Derive execution-generation fingerprints from original Process/Runc intent records and reject discovery references that don't match.
+          - [x] Carry canonical execution identity through snapshots, reports, catalogue entries and remote routing keys.
+          - [x] Bound periodic runtime inventory reads across cancelled or timed-out callers.
+          - [x] Retry transient leader-unavailable responses during lease cleanup within its existing 30-second deadline.
+          - [x] Commit publication generations and bounded withdrawal obligations in Raft. See the [remote withdrawal plan](2026-09-22-remote-withdrawal-ledger.md).
+          - [x] Reserve withdrawn VIPs in the allocator and enforce valid, non-conflicting allocations atomically in Raft.
+          - [x] Reject stale catalogue writers with a required generation precondition in Raft.
+          - [x] Expose generation-bound withdrawal instructions to registered consumers from the same committed snapshot as their catalogue.
+          - [x] Accept authenticated consumer receipts for exact generations, deriving the consumer from its TLS identity.
+          - [x] Confirm cluster catalogue/DNS/ingress publication before placement work; keep previous views on refusal and retry lost replies.
+          - [x] Retain durable, identity-bound consumer publication attempts in the discovery journal.
+          - [x] Carry the committed catalogue generation into Bun and refuse stale or rewritten catalogues before changing any view.
+          - [x] Commit permanent producer execution fences atomically with catalogue withdrawal, and confirm release only after every consumer obligation finishes.
+          - [x] Add authenticated producer retirement and the durable agent release gate.
+          - [x] Add durable consumer publication/withdrawal phases, original ingress, pending/ready receipts and permission-checked compaction.
+          - [x] Implement the durable consumer agent boundary: journal before publication, withdraw original views, wait for captured request release, and keep receipt retry and generation fences through recovery.
+          - [x] Deliver consumer receipts through the placement reconciler with bounded rotating retries against the current leader.
+          - [x] Return proven ready receipts even when a publication is refused or stale.
+          - [x] Replay an exact durable cluster release permission without contacting the leader again.
+          - [x] Register clustered local services at the exact council VIP and retire the local reservation only after runtime holds and consumer guards drain.
+          - [x] Persist execution-generation witnesses for local backends without rootful address holds.
+          - [x] Activate durable clustered discovery on normal Bun startup using enrolled identity.
+          - [x] Report cancelled streamed HTTP responses as body errors rather than successful EOF.
+        - [x] Refresh source/egress policy after each successful init exit before the next init or main start.
+        - [x] Retain initialiser ownership through deployment failure and refused cleanup; retire children before parent policy and records.
+        - [x] Add the OCI interruption driver to privileged CI.
+        - [x] Recover from Bun death and caller cancellation during owned rootful OCI init creation, start and retirement, including admission before a runtime intent exists.
+          - [x] Cover Bun SIGKILL during init preparation, launcher admission, a running init, namespace retirement and after main adoption.
+          - [x] Cover Bun SIGKILL during a foreground process initialiser.
+        - [x] Bind firewall destination identity to the allocated service VIP instead of a bare-name hash.
+        - [x] Bind Linux command owners to the kernel boot UUID; prior-boot executions retire with unknown outcome without signalling saved PIDs.
+        - [x] Bind OCI intent to its original Linux boot, fence old-boot starts and refuse conflicting live cgroups, namespaces and veths.
+        - [x] Recover OCI executions and held addresses across a real VM power cycle.
+        - [x] Bind persistent kernel manifests to Linux boot identity, rebuilding only empty prior-boot pin inventories.
+        - [x] Select owned Runc, persistent kernel policy and durable discovery on normal rootful Runc startup with eBPF enabled; recovery completes before adoption and readiness.
+        - [x] Recover a real Bun with rootful Runc, persistent kernel pins and a published discovery reference across a host power cycle.
+        - [x] Refuse to recreate missing kernel lock/manifest authority.
+        - [x] Defer clustered startup retirement until API-driven confirmation can progress, retaining original runtime and port ownership.
+        - [x] Keep discovery polling and withdrawal receipts progressing while a deployment awaits completion.
+        - [x] Activate durable rootful Runc/eBPF cluster startup and standalone rootless Runc startup.
+        - [x] Preserve live owned Runc workloads through signed Bun upgrade and explicit rollback.
+        - [x] Make clustered backend withdrawal retryable after local removal.
+        - [x] Preserve the original execution through automatic revert from a failed upgrade candidate.
+        - [x] Carry three enrolled Runc/eBPF nodes through controlled leader-last upgrades and rollbacks without restarting their workloads. The rolling orchestrator and full catalogue belong to V01/V02.
+        - [x] Mount bpffs before managed Bun startup, preserving existing mounts.
+        - [x] Scope rootless Runc to standalone for 0.1.0: Bun refuses rootless Runc with `--cluster` before ownership recovery, adoption or networking. Rootless clustering needs durable host-port release permission first (F02).
+        - [x] Reconcile the C34 checkboxes against committed code and a full hosted CI and Build & Release run.
+  Node effects use C06/C10. Image-distribution benchmarks report uncontrolled cache state rather than evicting arbitrary images.
+- [x] **C35** Select exact chaos scenario names and require only their capability/operation union.
+- [x] **C36** Retire legacy partition/isolation and blanket-heal mutations in favour of the guarded catalogue; every old mutation returns an explicit migration error before contacting a node.
+- [x] **C37** Require a fresh direct gossip acknowledgement before committing the local upgrade marker, with an enforced rejoin deadline.
+- [x] **C38** Retain target ownership through worker completion and rollback, and add scoped, idempotent `relish cancel-deploy`. Only observed cancellation followed by worker completion becomes Cancelled.
+- [x] **C39** Validate development cluster names, ownership, resources, runtimes and saved addresses before Lima operations; quote checkout paths and test filters.
+- [x] **C40** Serialise rootless helper replacement and adoption, stop and reap displaced owners, and reject conflicting repeat-adoption records.
+- [x] **C41** Collect structured observations for every owned VM and exit 1 for missing/stopped VMs, unhealthy APIs or unknown evidence.
+- [x] **C42** Preserve labelled metric identities through queries, alert timers, API/dashboard/diagnostic output and webhook incident keys.
+- [x] **C43** Resolve short DNS names from runtime-owned source namespaces; unknown or ambiguous sources get REFUSED on UDP and TCP.
+- [x] **C44** Remove unused reporting worker listeners, preserve TLS/framing and bound upgrade-harness HTTP requests. An intermittent upgrade stall stays under V02.
+- [x] **C45** Poll readiness publication alongside its subsystem owner, avoiding a fair-lock deadlock in both supervision loops.
+- [x] **C46** Preserve authorised namespace/service identities through DNS fault publication and lookup; clearing one owner preserves the others.
+- [x] **C47** Persist exclusive ownership of the 509-address rootful pool before network mutation; refuse exhaustion and keep reservations on uncertain cleanup. Physical crash qualification belongs to V02.
+- [x] **C48** Confine upload Location responses to the declared registry origin before PATCH or PUT.
+- [x] **C49** Reject zero and overflowing token lifetimes before hashing or committing credentials.
+- [x] **C50** Enforce scope and Deploy/HostExec permission checks for every app/job target before any part of a manifest applies.
+- [x] **C51** Require an unscoped user administrator for permission/quota declarations before any mixed-manifest mutation; followers preserve caller credentials.
+- [x] **C52** Require unscoped user administrators for token create/list/revoke, join-token creation, secret rotation and image signing.
+- [x] **C53** Require an unscoped administrator to inspect or release another credential's lease.
+- [x] **C54** Bound transient direct upstream registry reads to four attempts and one deadline (30 seconds for manifest/config, 120 seconds per layer), keeping permanent failures terminal.
+- [x] **C55** Bound cross-node log response bodies and own their cancellation.
+- [x] **C56** Verify upstream raw manifests, index digests, platform descriptors and configuration bytes before cache publication.
+- [x] **C57** Validate upstream layer sizes before cache accounting or allocation, and require downloaded bytes to match their descriptor length.
+- [x] **C58** Give Pickle's upstream reads the direct puller's bounded retry policy.
+- [x] **C59** Resolve OCI indexes for the Linux container target, independently of the client's operating system.
+- [x] **C60** Hold Pickle registry requests to the caller's token scope (found while landing PR #194). A namespace-scoped Deployer could push to any repository over Bearer and Basic alike. Every write (upload start, chunk, completion, manifest `PUT`, copy confirmation) and every routable read now requires a repository named `<namespace>/<app>` inside the scope; bare names, `cache/…` and malformed names are refused to scoped tokens, except blob-only uploads to `_buildcontext` and `reliaburger-bun`. A scoped reader's blob `GET` must be for a blob the named repository references. `/v1/build` destinations use the same rule (a bare destination no longer counts as `default`), and `/v1/images` lists only readable repositories. Unscoped tokens, the service token and the bootstrap window are unchanged.
+- [x] **Snapshot confinement** (static review [PR #258](https://github.com/reliaburger/reliaburger/pull/258), findings B01, B02 and B06's zero retention). A Deployer scoped to one app could snapshot, and later restore over, another app's Btrfs volume with a traversal `volume`, and an absolute or `..` snapshot `name` placed a root-owned subvolume anywhere. The snapshot manager now resolves `volume` against the app's provisioned inventory (never joining request text), accepts only `[A-Za-z0-9._-]{1,128}` names not starting with `.`, requires namespace and app to be DNS labels, and answers `InvalidInput` (400) before any I/O. The inventory walk no longer follows symlinks or enters volumes, and `list` trusts metadata only where it is filed. A name shared by several volumes is `Ambiguous` (409) unless `--volume` picks one, and the retention sweep deletes by volume and name. `retain = 0` with a schedule is refused at startup. Remaining snapshot findings (B03–B05, B07) are not addressed here.
+
+Fixes from the [static review in PR #258](https://github.com/reliaburger/reliaburger/pull/258) (its IDs):
+
+- [x] **B14** Match GitOps trusted signing keys exactly against the `VALIDSIG` signing or primary fingerprint (GPG) or the `SHA256:` fingerprint (SSH), not as a substring of all verifier output. Follow-up: verify against a private `GNUPGHOME` holding only the trusted keys.
+- [x] **B15** Treat a committed but refused GitOps write (`CouncilResponse::Refused`) as unapplied, so the sync doesn't advance `last_applied_commit` past it.
+- [x] **B17** List GitOps files with `ls-tree -z` so tab and non-ASCII paths aren't dropped, and fail the sync when a listed file can't be read, instead of deleting what it declared.
+
+Fixes for the 0.1.1 milestone:
 
 - [x] **Known members forget departed nodes.** `KnownMembers` (#244) kept every member's last address until Bun restarted. Gossip now also publishes a roster with Dead and Left members (`set_roster_watch`, the live-only watch is unchanged); the known table forgets a member gossip reports as Left or the CRL lists as retired, and any down member not heard from for `KNOWN_MEMBER_RETENTION` (24 h, Smoker's hard fault ceiling), while still keeping a reaped dead member's address for fault clears.
 - [x] **`relish nodes` shows dead nodes as dead.** `/v1/cluster/nodes` was built from gossip's live-only watch, so a dead node vanished. The handler now hands the agent the members `KnownMembers` remembers as down, and the agent lists them after the live ones with state `dead` and their Raft council flags. The watch the scheduler, council and Pickle read is unchanged; `relish upgrade`, the test context's node inventory and route detection skip down members (`NodeStatus::is_down`).
@@ -45,14 +331,21 @@ is the live list). Done so far:
 - [x] **Cluster-wide `relish inspect`** (#283). It asked only the local agent, so with three replicas it showed two while `wtf` saw three. It now asks every node's `/v1/status` through the entry node's relay and the leader's `/v1/diagnostics/apps`, prints `N desired, M running` and the placements per namespace, gives every instance its node, and names each node that didn't answer or that gossip reports dead instead of omitting its instances (`relish::inspect`, `every_replica_is_listed_with_its_node_not_just_the_local_ones`).
 - [x] **Version skew in `relish wtf`** (#284). `wtf` reads each node's `/v1/version` through the relay (now on its allow list) and reports the version, commit and binary SHA-256. One build is an OK row; more is a `version-skew` warning naming the odd node(s). Builds are the same when version and commit match; the SHA-256 decides only without a commit, so one commit on two architectures isn't skew.
 
-The IDs below come from the [codebase completion plan](plans/archive/2026-09-17-codebase-completion-plan.md),
-which records the evidence, priority and completion test for each one.
-
 ### Engineering follow-ups
 
-H01–H04 and H06–H13 shipped in 0.1.0 (see [Released in 0.1.0](#released-in-010)).
-
+- [x] **H01** Reconcile scheduler/quota/scrape wiring, roadmap test locations, cleanup evidence and disabled-auth chaos policy with their callers; all-feature Rustdoc builds with warnings denied.
+- [x] **H02** Remove the obsolete proxy/autoscaler wrappers and unused memory-pressure allocation calculator, and record callers and contracts for the retained library-only helpers. CA recovery remains F04.
+- [x] **H03** Remove inert fields: the node `release_url` (use the CLI's `--url`), Wrapper thread-count/strategy fields and the local gossip timestamp counter. Remote resource/image propagation is F01.
+- [x] **H04** Use typed alert and scheduler error contracts through Bun, Relish, the TUI and diagnostics; capacity queries go to the live leader scheduler and return a typed refusal.
 - [ ] **H05** (P3) Split modules along existing ownership boundaries.
+- [x] **H06** Decode DNS with Hickory while Onion keeps operation, source and namespace admission; keep the distinct duration grammars (C17 fixes numeric overflow separately).
+- [x] **H07** Execute the public configuration and endpoint-validation examples as doctests.
+- [x] **H08** Require nextest 0.9.145 and pin it in CI, so test process leaks fail the gate.
+- [x] **H09** Complete node-pressure diagnostic hygiene: continuous bounded stderr draining and creator-thread checks before pressure starts.
+- [x] **H10** Reuse the enforcement check's capability for readiness within one health tick.
+- [x] **H11** Declare Rust 1.97 as the minimum, pin release/CI builds to 1.98.0 and add a locked minimum-compiler CI job for both feature configurations.
+- [x] **H12** Remove the Thrift advisory path (GHSA-2f9f-gq7v-9h6m) by upgrading DataFusion 45 → 55, which brings Parquet 59 without the Thrift crate. Until DataFusion moves to Parquet ≥ 60, `[patch.crates-io]` pins arrow-rs to a fork of 59.3.0 plus upstream fix apache/arrow-rs#10979, because 59 still aborts on impossible list counts on Linux. `tests/suite/parquet_safety.rs` checks the shipped reader through the public API.
+- [x] **H13** Make the autoscaler read the metrics the collector really records. It queried a rollup series literally named `cpu`/`memory`, which nothing produces, so it never scaled a real cluster; its only end-to-end test injected that fake series. `metric` now parses to `AutoscaleMetric::{Cpu, Memory}` (anything else fails validation), reads `process_cpu_percent` (percent of one core) or `process_memory_bytes`, and divides by the per-replica request (HPA convention). CPU with no request is measured against one core (ProcessGrill and rootless nodes refuse `cpu` declarations); memory without a request fails validation, and `relish import` warns about such HPAs. `placement::autoscaler_scales_up_from_real_collector_cpu` scales a busy-looping ProcessGrill app through the real collector → rollup worker → leader path. Limits: main process only (no children); runtimes without a host PID produce no per-app metrics.
 
 ### Missing capabilities and longer-term scope
 
@@ -71,28 +364,39 @@ H01–H04 and H06–H13 shipped in 0.1.0 (see [Released in 0.1.0](#released-in-0
 
 ### Acceptance and release gates
 
-These were the acceptance gates for 0.1.0; their records are in
-[qualification/](qualification/). V03 and V05 passed, and so did V02's soak.
-0.1.0 shipped with V01, most of V04 and two V02 items still open; they stay
-here, with their issues, until they're done.
+A 0.1.0 release signing identity is committed and its private key is configured
+in repository Actions. These are the acceptance gates for 0.1.0; their records
+are in [qualification/](../../qualification/).
 
-- [ ] **V01** (gate) Qualify the complete live three-node catalogue on independent Runc nodes ([#286](https://github.com/reliaburger/reliaburger/issues/286)).
-- [ ] **V02** (gate) Qualify sustained TLS, storage and upgrade recovery on the release candidate. The soak passed: the final candidate 7d7dfc0 passed the fast tier and the 8-hour final tier ([fast](qualification/2026-09-29-v02-fast-tier-7d7dfc0.md), [final](qualification/2026-09-29-sustained-v02.md), [candidates 1–13](qualification/2026-09-27-v0.1.0-release-closure.md)), with the power-cut fixtures for exports, leases and council backups ([record](qualification/2026-09-25-v02-power-cut.md)). Two leftovers ([#287](https://github.com/reliaburger/reliaburger/issues/287)):
+- [ ] **V01** (gate) Qualify the complete live three-node catalogue on independent Runc nodes.
+- [ ] **V02** (gate) Qualify sustained TLS, storage and upgrade recovery on the release candidate.
+  - [x] Wait for the retry workload's own counter write before injecting Bun death in the job crash fixture.
+  - [x] Keep the ordinary application running in the initialiser-identity regression.
+  - [x] Isolate the physical peer-route fixture from host forwarding policy.
+  - [x] Add power-cut fixtures for the exporter checkpoint/lock (C03) and `LocalLeaseStore` (C11), driven by `scripts/release/qualify-storage-power-cut.sh` on a disposable VM, and the `v02-loops` Actions lane ([record](../../qualification/2026-09-25-v02-power-cut.md)).
+  - [x] Sync local-destination exports before the checkpoint acknowledges them; the C03 power-cut fixture found every recent export empty after a cut, with most sources already pruned.
+  - [x] Open every object store (exports, metrics, snapshot upload, council backups) through one helper that syncs `file://` writes, and add a council-backup power-cut fixture (every retained backup was empty after a cut before the fix).
+  - [x] Write the snapshot uploader's `uploaded` metadata atomically and durably (it used a plain `std::fs::write`).
+  - [x] Stop a deploy that arrives before its committed allocation from wedging every retry on a runtime address hold nothing tracks.
+  - [x] Soak the final candidate: the fast tier and the 8-hour final tier were both clean on 7d7dfc0, the build `v0.1.0` was promoted from ([fast](../../qualification/2026-09-29-v02-fast-tier-7d7dfc0.md), [final](../../qualification/2026-09-29-sustained-v02.md), [candidates 1–13](../../qualification/2026-09-27-v0.1.0-release-closure.md)).
   - [ ] Qualify the snapshot uploader under power cuts (needs Btrfs volumes).
   - [ ] Run the `v02-loops` Actions lane and record its bounds.
-- [x] **V03** (gate) Publish and install the exact signed candidate. 7d7dfc0 (candidate run 36508614419, attempt 1) was staged, passed two staged cold installs on 29 September and was promoted unchanged as `v0.1.0` by promote run 36624159253 ([record](qualification/2026-09-27-v0.1.0-release-closure.md#how-it-ended), [staging runbook](releasing.md#staging-a-candidate)).
+- [x] **V03** (gate) Publish and install the exact signed candidate.
+  - [x] Preserve a complete signed candidate with source/run identity and per-file hashes; promote only the qualified bytes without rebuilding.
+  - [x] Add explicit HTTPS candidate mirrors to both installers and managed setup without bypassing checksums or signatures.
+  - [x] Stage a verified candidate as a pre-release that promotion refuses, and script the real `curl | sh` qualification against it ([runbook](../../releasing.md#staging-a-candidate)).
+  - [x] Qualify hosted candidate creation, staged HTTPS delivery and actual signed installation before promotion ([Apple silicon, 25 Sep](../../qualification/2026-09-25-staged-install-apple-silicon.md): candidate run 36078958881, two cold installs passed).
+  - [x] Publish the qualified candidate: 7d7dfc0 (candidate run 36508614419, attempt 1) was staged, passed two staged cold installs on 29 September (282 s, 178 s) and was promoted unchanged as `v0.1.0` by promote run 36624159253 ([record](../../qualification/2026-09-27-v0.1.0-release-closure.md#how-it-ended)).
 - [ ] **V04** (gate) Measure repeated cold installs on the advertised host matrix.
-  - [x] Apple silicon: two cold installs, 125–126 s from the first `curl` to a ready three-node cluster ([record](qualification/2026-09-25-staged-install-apple-silicon.md)).
-  - [ ] Intel macOS, Linux x86_64 and Linux arm64 ([#288](https://github.com/reliaburger/reliaburger/issues/288)).
-- [x] **V05** Review all dependency exceptions against the current RustSec database and [record their reachability and migration dispositions](qualification/2026-09-18-dependency-exceptions.md). `make audit` also refuses an active rkyv graph.
+  - [x] Apple silicon: two cold installs, 125–126 s from the first `curl` to a ready three-node cluster ([record](../../qualification/2026-09-25-staged-install-apple-silicon.md)).
+  - [ ] Intel macOS, Linux x86_64 and Linux arm64.
+- [x] **V05** Review all dependency exceptions against the current RustSec database and [record their reachability and migration dispositions](../../qualification/2026-09-18-dependency-exceptions.md). `make audit` also refuses an active rkyv graph.
 
 ### Known flakes
 
 CI runs with `retries = 0`. A failure that passes on one re-run is a flake, and it goes
 here the same day with its cause. Remove a row only when the fix has landed and a loop
 that used to fail passes.
-
-Two flakes seen on #277's CI still need rows and fixes ([#285](https://github.com/reliaburger/reliaburger/issues/285)).
 
 | Test | First seen | Cause | Status |
 |---|---|---|---|
@@ -155,7 +459,7 @@ Two flakes seen on #277's CI still need rows and fixes ([#285](https://github.co
 | V02 soak: `relish logs APP --tail N` out of order (`ACK 968, 974, 969, 975`), hour-old lines shown as newest after a Bun SIGKILL or VM power-off, Redis client "stepping by 2" | 25 Sep (V02 soak, 22 of ~1,400 writer tails) | Product, three causes: `LogStore` stamped lines with one-second timestamps and sorted on them alone, so rows sharing a second came back in DataFusion's partition order; a single-node tail was `ORDER BY timestamp LIMIT n`, the *oldest* n; and every Bun restart re-followed adopted containers' capture files from byte 0, storing their whole history again as new lines (the "stepping by 2" tail was an old rolling-deploy instance's re-ingested output) | Fixed: a strictly rising nanosecond `sequence` column orders rows and tails (`ORDER BY sequence DESC LIMIT n`, then ascending); the merge keys on `(node, sequence)`; runtimes report each line's capture-file offset and the store skips offsets it already flushed, checkpointed in `ingest-checkpoint.json` after each Parquet file; tails spanning several instances are labelled `[instance]`. Formats bumped to protocol 25 / state 41 (required `sequence` column, new `/v1/logs/entries` rows). `tail_returns_the_newest_lines_in_emission_order` and `lines_within_one_second_keep_emission_order_across_flushes` reproduced the soak's interleaving before the fix; `restart_does_not_reingest_lines_already_flushed` and `lines_lost_with_the_buffer_are_ingested_again_after_a_crash` cover restarts |
 | V02 fast-tier soak on eced11c: right after a graceful whole-cluster stop and start, `relish logs soak-redis-client --tail 20` showed `INCR 749 … 782` stepping by 2 while the counter was past 2,504; correct again 40 s later | 26 Sep (V02 soak, failures/4) | Product: the cluster-wide log query asked only the nodes where the app was placed *now*. The client had moved node 1 → 3 → 2 and spent half an hour on node 2; after the restart it was placed on node 1 again, whose newest stored lines were from when it left (a rolling overlap, hence the twos). No re-ingestion: `graceful_restart_does_not_reingest_a_retired_instances_capture_file` and `graceful_stop_keeps_lines_that_were_only_buffered` pass before and after | Fixed: the query fans out to every live member (`ketchup::query::query_targets`); a placed node missing from membership is still a warning. `tail_after_an_app_moves_back_includes_the_nodes_it_ran_on_meanwhile` and three `query_targets` unit tests fail before, pass after |
 | `relish_test_catalogue::secure_catalogue_node_jobs_have_durable_ownership_and_confirmed_cleanup` ("workload …/cron is still owned by deploy …", macOS) | 24 Sep (candidate run 36060321071) | Product: a cron firing started a deploy of the leased job just before lease cleanup, and node-local cleanup treated the agent's "still owned by deploy" refusal as final | Fixed: cleanup retries while a deploy owns the job, within its 10 s step budget (`node_job_cleanup_waits_for_a_deploy_that_still_owns_the_job`) |
-| `power_cut::actual_power_cut_preserves_acknowledged_log_exports` and `…_council_backups` (V02 power-cut fixtures, not a flaky test: failed every run) | 25 Sep (V02 C03 fixture) | Product: `object_store::parse_url` opens `file://` destinations with fsync off, so an acknowledged export or backup could be empty after a power cut. Exporters then pruned the only good source (up to 162 of 171 files lost); backup retention deleted every older backup, leaving 3 empty ones | Fixed: every object store opens through `object_storage::open`, which syncs local writes (exporter 25/25 and backups 25/25 power cuts after; [record](qualification/2026-09-25-v02-power-cut.md)) |
+| `power_cut::actual_power_cut_preserves_acknowledged_log_exports` and `…_council_backups` (V02 power-cut fixtures, not a flaky test: failed every run) | 25 Sep (V02 C03 fixture) | Product: `object_store::parse_url` opens `file://` destinations with fsync off, so an acknowledged export or backup could be empty after a power cut. Exporters then pruned the only good source (up to 162 of 171 files lost); backup retention deleted every older backup, leaving 3 empty ones | Fixed: every object store opens through `object_storage::open`, which syncs local writes (exporter 25/25 and backups 25/25 power cuts after; [record](../../qualification/2026-09-25-v02-power-cut.md)) |
 | `node_pressure::node_pressure_consumes_capacity_outside_bun_and_cleans_up` ("node uses 1743523840 bytes, below the 1844305633-byte target", Linux) | 26 Sep (run 36185229625 on #216) | Harness: asserted node-wide `MemTotal - MemAvailable` after apply, but the helper sizes its ballast once and other processes on the runner (the previous suite's teardown) freed ~100 MB afterwards. Holding the node-wide figure isn't the product contract: a topping-up ballast would give memory back to a growing workload | Fixed: assert the helper cgroup's `memory.current` holds the delta measured just before apply (and stays under `memory.max`); design doc and book state the one-shot sizing. Lima VM with a 400 MB allocate/free loop running: old test 8 of 15 failed with the CI message, new test 15/15 (and 6/6 without the loop) |
 | `relish_test_catalogue::runc_catalogue_deploys_the_exact_image_pushed_to_pickle` (and every other public-image pull in `make test-linux`) | 24 Sep | Product: one stalled registry read spent the whole 30 s budget with no retry. Harness: timed tests pulled from public registries | Fixed: per-attempt deadline inside a larger total; pinned images served from a local digest-verified mirror |
 | V02 soak: heavy check "registry: soak/pulse:baseline manifest returned 503 or changed" (twice in 12 h, at ~5.4 h and ~10.8 h) | 26 Sep (V02 soak) | Harness: both fired inside the 300 s quorum-loss window (nodes 2 and 3 powered off). Every pushed tag returned 503 from node 1 and every blob verified, because Pickle resolves tags only through the committed council catalogue and fails closed without a leader; the check counted that as data loss | Fixed: 503 is retried three times 5 s apart, a lasting 503 is recorded as unavailable (info inside a fault window, fail outside one); a changed digest or any other status still fails at once (`test_sustained_check.Registry`, 3 fail before) |
@@ -173,48 +477,35 @@ Two flakes seen on #277's CI still need rows and fixes ([#285](https://github.co
 | V02 final-tier soak (candidate 3fcb1fd): after the harness SIGKILLed the leader's Bun (20:49:06 BST), the new Bun printed nothing for 11 min, then exited with `cannot restore workload ownership: runtime adoption timed out for default__hello-0` (21:00:25); node missing, ingress 000, upgrade walk failed. systemd: `Consumed 11min 24s CPU` in 11 min 17 s | 28 Sep (V02 soak, failures/1-7) | Product, old and newly exposed (from #224, 26 Sep): startup adoption spawns a log forwarder per adopted instance that re-reads its capture file from byte 0. The runc forwarder read the whole file into memory and `CaptureReader::push` drained each line from the front of the buffer, O(bytes x lines); the soak spammer's ~56 MB, ~1 M-line capture kept a runtime worker in one synchronous call for minutes. On the two-vCPU soak VMs adoption's own work and its 10 s timer could not run until it finished, so the deadline fired late and Bun exited. The next start (same files) adopted all nine in 2 s: scheduling luck. The process runtime also `std::fs::read` the whole file every 200 ms | Fixed: `push` is linear (one scan, one drain); both runtimes follow captures in `read_capture_chunk` steps of at most 64 KiB, each an `.await`, and skip the poll sleep while chunks come back full. `replaying_a_large_capture_backlog_does_not_hold_the_runtime` (process) and `following_a_large_capture_after_a_restart_does_not_hold_the_runtime` (runc, Lima `reliaburger-test`) held the runtime for 5.5 s and 20.9 s before; `a_backlog_of_short_lines_splits_in_linear_time` took 21.6 s before. Lima `owned_runc` 18/18 and `owned_network` 5/5 after. Still open (design, post-0.1.0): adoption is fail-closed, so one instance that can't be adopted stops the node; bounding and quarantining it needs its name, port, lease and address fenced and a report state that is neither running nor gone |
 | V02 final-tier soak (candidate 3fcb1fd): every `relish test` pulse after the leader-kill hang (20:29, 21:33, 22:42 UTC) timed out 8 of 15 cases "still waiting for identity-app to reach 1 running replica(s) cluster-wide; last saw 0 instance(s)"; applies committed, cleanup confirmed. Passed at 19:29 and again at 23:46 after a graceful whole-cluster restart | 29 Sep (V02 soak, failures/8, 10, 11) | Product (since #260, 27 Sep): the agent loop's `biased;` `select!` polled commands before deploy steps, stop completions and the health tick. After node 1's hang the soak apps sat on one node (10 instances, node 3; node 2 in the 21:33 pulse) and the bin-packer put every test workload there too. Four cases polling status without pause kept that node's command channel non-empty, so a deploy task's first `DeployOp` never ran: `orchestrator: deploy of ing-web/rbtest-… failed … did not reach a terminal event within 300s` (node 3, 20:34:26 UTC; node 2 21:38:22; node 3 22:47:10), and the next deploy ran all its steps within 2 s of the first case wave ending. `registry-web` sat in `health-wait` for 300 s (probes run from the starved tick). Not a lease, quota, capacity or leader-state fault: the leader changed three times across the failing pulses. #275 and #278 don't touch the loop, so candidate 12 hits it whenever the soak's apps pile onto the node the test workloads land on | Fixed: stop completions and deploy ops (bounded: one outstanding per stop or deploy task) sit above commands; the tick runs unconditionally once `HEALTH_TICK_STARVATION_BOUND` (5 s) passes without one (`deploy_steps_progress_while_status_queries_keep_the_queue_busy`, `health_tick_runs_while_status_queries_keep_the_queue_busy`, both failed before; #260's `queued_commands_are_answered_before_the_next_slow_health_tick` still passes). Still open: the retried "local service requires its committed cluster allocation" on the first deploy after a starved one; not yet re-run in a soak |
 
-## Released in 0.1.0
+## 0.1.0 release checklist
 
-The release work from 16 to 29 September is done, and the
-[release closure record](qualification/2026-09-27-v0.1.0-release-closure.md)
-tells the story. In short:
+- [x] Commit the release scope and acceptance plan.
+- [x] Validate setup liveness and bounded subsystem readiness.
+- [x] Stream registry uploads and bound writers.
+- [x] Measure registry memory under concurrent pushes.
+- [x] Package self-contained Linux agents and native laptop CLIs.
+- [x] Publish verifiable release metadata and signed artefacts ([v0.1.0](https://github.com/reliaburger/reliaburger/releases/tag/v0.1.0), promote run 36624159253).
+- [x] Implement secure, resumable managed laptop clusters and installer.
+- [x] Fix registry/runtime cache compatibility, restart checkpoints and responsive health probing.
+- [x] Route ingress across nodes and report cluster-wide CLI status.
+- [x] Propagate storage/bootstrap errors, honour experimental Apple runtime settings, and audit HTTP methods.
+- [x] Report unavailable GitOps queues/export failures and show real dashboard replica counts.
+- [x] Connect the host browser through pinned TLS and show remote app instances.
+- [x] Fix promoted first-run defects and record residual dispositions in the release plan.
+- [x] Record an empty-cache development-binary laptop run.
+- [ ] Qualify the downloaded candidate on clean hosts and record three-node timing.
+- [ ] Pass the real-cluster and final release acceptance gates.
 
-- **Correctness and behavioural contracts, C01–C60.** Every item in the
-  [codebase completion plan](plans/archive/2026-09-17-codebase-completion-plan.md)
-  plus the ones found while landing it: durable log export and checkpoints,
-  bounded upstream registry reads with verified manifests, token-scoped
-  registry and administrator operations, lease ownership for test resources
-  (the [C34 closure](plans/archive/2026-09-22-c34-closure.md)), and the rest.
-  The [code audit](qualification/2026-09-17-code-audit.md) separates what was
-  reproduced from what was inspected.
-- **Static review fixes** from [PR #258](https://github.com/reliaburger/reliaburger/pull/258):
-  snapshot confinement (B01, B02, B06), exact GitOps signing-key matching
-  (B14), refused GitOps writes left unapplied (B15) and `ls-tree -z` file
-  listing (B17). Its should-fix findings are in 0.1.1 in the roadmap.
-- **Engineering follow-ups H01–H04 and H06–H13**, among them typed alert and
-  scheduler errors, Hickory DNS decoding, doctested configuration examples,
-  the pinned nextest and compiler baseline, the DataFusion upgrade that
-  removed the Thrift advisory, and an autoscaler that reads the metrics the
-  collector really records.
-- **The release checklist:** a self-contained Linux agent and native laptop
-  CLIs, signed release metadata, a secure and resumable managed laptop cluster
-  with its installer, cross-node ingress and status, and the first-run
-  fixes, ending with the signed [v0.1.0](https://github.com/reliaburger/reliaburger/releases/tag/v0.1.0)
-  release. Its two gate items became V01 and V04 above.
-
-The full item-by-item list, with the smaller CI fixes found along the way, is
-in [progress.md as tagged at v0.1.0](https://github.com/reliaburger/reliaburger/blob/v0.1.0/docs/progress.md#current-completion-backlog-17-september-2026).
-
-> **Historical reviews:** the [July wiring review](plans/archive/2026-07-02-review-codebase.md)
+> **Historical reviews:** the [July wiring review](2026-07-02-review-codebase.md)
 > found components that existed only as libraries. Later hardening wired many of
 > them into the binaries. The dated findings remain useful history; superseded
 > inline warnings are not current blockers. Current residuals are tracked separately.
 
 > **Three reviews, three ID spaces.** Finding IDs are scoped to the review that raised them, and
 > all three reviews reuse `C1`/`M1`/`O1`. When you see a bare ID, check which section you're in:
-> Phases 1–12 use the [2026-07-02 wiring review](plans/archive/2026-07-02-review-codebase.md);
-> Phase 15a uses the [2026-07-17 posture review](plans/archive/2026-07-17-review-codebase-current-state.md);
-> Phase 15b uses the [2026-07-19 code-logic review](plans/archive/2026-07-19-codebase-review-fable.md).
+> Phases 1–12 use the [2026-07-02 wiring review](2026-07-02-review-codebase.md);
+> Phase 15a uses the [2026-07-17 posture review](2026-07-17-review-codebase-current-state.md);
+> Phase 15b uses the [2026-07-19 code-logic review](2026-07-19-codebase-review-fable.md).
 > Where a later review contradicts an older caveat below, the later one wins — the Phase 15b
 > section records which earlier caveats it supersedes.
 
@@ -445,7 +736,7 @@ Phases 2–11 built the cluster subsystems but the `bun` binary always ran singl
 
 ## Phase 11b: Review & Tying the Loose Ends
 
-The July 2026 verification pass ([2026-07-02-review-codebase.md](plans/archive/2026-07-02-review-codebase.md)) found that the build
+The July 2026 verification pass ([2026-07-02-review-codebase.md](2026-07-02-review-codebase.md)) found that the build
 is clean, clippy is silent, and 1590 tests pass — but a large share of the "done" items above
 are **library-only** (unit-tested, never wired into the `bun`/`relish` binaries), plus five
 critical bugs and a long tail of correctness issues in the wired paths. This phase closes them.
@@ -516,7 +807,7 @@ Brioche", "Node PKI, join and mTLS", "Pickle storage and replication durability"
 
 ### Stage 4 — Wire the remaining library-only subsystems (one at a time, binary-driven test each)
 
-Implementation plan: [docs/plans/archive/2026-07-07-plan-wiring.md](plans/archive/2026-07-07-plan-wiring.md)
+Implementation plan: [docs/plans/2026-07-07-plan-wiring.md](2026-07-07-plan-wiring.md)
 
 - [x] `L1` Scheduler → placement → remote dispatch: `relish apply` under `--cluster` commits `AppSpec`s to Raft (followers forward to the leader); a leader-only scheduler places replicas and commits `SchedulingDecision`s; every node polls `/v1/placements/{node}` and reconciles its instances (idempotent). `H8` fixed (spread weight 60 > bin-pack 50; test now asserts distinct nodes). Flushed out a latent bug: durable Raft log + council TCP RPC used bincode, which can't drive the config types' `deserialize_any` — both switched to self-describing JSON (matching the snapshot). Binary-driven test in `tests/placement.rs`
 - [x] `L2` / `M16` / `X3` — `M16`: orchestrator no longer leaks a failed step's own half-started instance (regression test asserts it's stopped). `X3`: `relish rollback` actually rolls back — deploy history now carries the full `AppSpec` (every path records it, including the first deploy), `POST /v1/rollback/{app}/{ns}` redeploys the previous successful spec via the apply path (Raft in cluster mode). Note: cluster-wide *staged* rollout (max_unavailable gating across nodes) rides on the W6 desired-state reconciler and the per-node rolling redeploy; the imperative `DeployOrchestrator` stays library-side (correct + unit-tested) rather than duplicated as a parallel cluster driver
@@ -532,7 +823,7 @@ Implementation plan: [docs/plans/archive/2026-07-07-plan-wiring.md](plans/archiv
 - [x] `L16` Initial IPv4 egress allowlist programming and DNS refresh wired and Lima-tested. Phase 12b (NET6) made it fail closed, extended it to rolling deploy and crash-restart, and deletes per-cgroup entries on stop; IPv6/CIDR enforcement remains under the 12b network-policy theme.
 - [x] `M17` K8s import fidelity (`command`/`args` concatenated, `env.valueFrom` warned not dropped, namespace preserved, same-name-two-namespaces no longer overwrites)
 - [x] `H11` Fix `relish fmt` for nested-table configs — recursive section emission + a round-trip guard that refuses to write output that re-parses differently
-- [x] `X1`/`X3`/`X4`/`X5`/`X6` CLI mismatches: `X1` (build → registry port + real buildah execution), `X4` (logs `--grep`/`--since`/`--json-field` wired, server + client side) and `X5` (unreachable agent exits non-zero; explicit `--dry-run` flag added) done; `X3` rollback done (W7); `X6` no-args TUI is out of Stage 4 scope by design → [2026-07-06-plan-tui.md](plans/archive/2026-07-06-plan-tui.md)
+- [x] `X1`/`X3`/`X4`/`X5`/`X6` CLI mismatches: `X1` (build → registry port + real buildah execution), `X4` (logs `--grep`/`--since`/`--json-field` wired, server + client side) and `X5` (unreachable agent exits non-zero; explicit `--dry-run` flag added) done; `X3` rollback done (W7); `X6` no-args TUI is out of Stage 4 scope by design → [2026-07-06-plan-tui.md](2026-07-06-plan-tui.md)
 
 ### Throughout
 
@@ -563,7 +854,7 @@ original review. All fixed on this branch, tests-first (each drives the binary/a
 
 ## Phase 12: Optimisations
 
-> Detailed implementation plan: [2026-07-06-plan-optimisations.md](plans/archive/2026-07-06-plan-optimisations.md)
+> Detailed implementation plan: [2026-07-06-plan-optimisations.md](2026-07-06-plan-optimisations.md)
 > (revised 2026-07-09 after the Stage 4 wiring merge: slice B — Pickle catalog via Raft,
 > replication and two-phase GC — landed as-built in #71; 14 remaining implementation steps,
 > refreshed ground truth, config/endpoint/test inventories, Lima acceptance runbook).
@@ -580,13 +871,13 @@ original review. All fixed on this branch, tests-first (each drives the binary/a
 - [x] Parquet bloom filters for archive equality pruning — on `app`/`namespace` (1% FPP), not `line` (bloom filters answer equality, not substring LIKE; `bloom_filter_on_read` enabled in remote_query)
 - [x] Zstd compression for archived logs — via Parquet's native per-row-group ZSTD codec (random access preserved; >5x vs flat text), not a separate seekable-frame container
 - [x] Book chapter 12: "Squeezing Every Drop" — complete: logs (zstd + bloom), nftables maps + the wiring discovery, the as-shipped Raft catalog/GC/heal design (M2 TOCTOU), P2P planner + executor, pull-through cache, volumes/quotas/snapshots/scheduled backups, batch + build, and phase-wide lessons
-- [x] All Phase 12 tests green — the portable suite (`make ci`) plus the full Lima gated run (`relish dev test`: netns map DNAT + 1000-port stress, btrfs quota ENOSPC, snapshot create/corrupt/restore, real buildah build into the catalog, plus the existing runc/eBPF suites). Remaining acceptance: the live 3-node runbook in [the plan §10](plans/archive/2026-07-06-plan-optimisations.md)
+- [x] All Phase 12 tests green — the portable suite (`make ci`) plus the full Lima gated run (`relish dev test`: netns map DNAT + 1000-port stress, btrfs quota ENOSPC, snapshot create/corrupt/restore, real buildah build into the catalog, plus the existing runc/eBPF suites). Remaining acceptance: the live 3-node runbook in [the plan §10](2026-07-06-plan-optimisations.md)
 
 ## Phase 12b: Correctness, Security & Convergence
 
-> Consolidated review: [2026-07-10-review-past-phase-12.md](plans/archive/2026-07-10-review-past-phase-12.md).
-> It reconciles the renamed [code walkthrough](plans/archive/2026-07-09-review-codex.md),
-> [design discrepancy register](plans/archive/2026-07-09-review-design-discrepancies.md),
+> Consolidated review: [2026-07-10-review-past-phase-12.md](2026-07-10-review-past-phase-12.md).
+> It reconciles the renamed [code walkthrough](2026-07-09-review-codex.md),
+> [design discrepancy register](2026-07-09-review-design-discrepancies.md),
 > the former "Beyond Phase 11b" backlog and the 24 Low findings. M7 and M21/codex-M2
 > are fixed. M20 is still open: object-store features are compiled, but Ketchup export
 > still uses PathBuf plus std::fs::copy. X6 remains only in Phase 13.
@@ -1474,7 +1765,7 @@ whole theme lands.
 
 ## Phase 13: Relish TUI
 
-Implementation plan: [docs/plans/archive/2026-07-06-plan-tui.md](plans/archive/2026-07-06-plan-tui.md)
+Implementation plan: [docs/plans/2026-07-06-plan-tui.md](2026-07-06-plan-tui.md)
 
 - [x] Full interactive terminal UI (ratatui + crossterm) — `src/relish/tui/`
   (app loop, input/keys, navigation, live event/log streams, terminal, theme/palette)
@@ -1485,7 +1776,7 @@ Implementation plan: [docs/plans/archive/2026-07-06-plan-tui.md](plans/archive/2
 
 ## Phase 14: Self-Upgrade
 
-> Detailed implementation plan: [2026-07-06-plan-self-upgrade.md](plans/archive/2026-07-06-plan-self-upgrade.md)
+> Detailed implementation plan: [2026-07-06-plan-self-upgrade.md](2026-07-06-plan-self-upgrade.md)
 > (12 commit-sized steps, decision log, type definitions, test inventory, gotchas checklist).
 
 - [x] Rolling binary replacement (exec-in-place; workers → council → leader-last; state in Raft; `relish upgrade` command set). There is no leadership transfer: the leader upgrades itself last, in place (openraft 0.9 can't gracefully hand off against a live leader), and the returning process finishes the run via poll-first idempotency. Cordon, live-voter quorum headroom, server-derived identity and gossip-rejoin verification landed in 12b.6 (see above).
@@ -1506,7 +1797,7 @@ verification alone; its separate gossip-rejoin deadline remains unfinished.
 
 ## Phase 15: Testing, Benchmarking & Diagnostics
 
-> Detailed implementation plan: [2026-07-06-plan-chaos.md](plans/archive/2026-07-06-plan-chaos.md)
+> Detailed implementation plan: [2026-07-06-plan-chaos.md](2026-07-06-plan-chaos.md)
 > (20 numbered steps plus prerequisite tranches, test catalogue, data structures,
 > acceptance runbook).
 >
@@ -1587,11 +1878,11 @@ verification alone; its separate gossip-rejoin deadline remains unfinished.
 ## Phase 15a: Current-State Hardening
 
 > Prioritised follow-up plan:
-> [2026-07-18-plan-codebase-review-follow-up.md](plans/archive/2026-07-18-plan-codebase-review-follow-up.md)
+> [2026-07-18-plan-codebase-review-follow-up.md](2026-07-18-plan-codebase-review-follow-up.md)
 >
 > This is a hardening gate before the unfinished Phase 15 diagnostic commands,
 > not a declaration that Phase 15 is complete. The source review is
-> [2026-07-17-review-codebase-current-state.md](plans/archive/2026-07-17-review-codebase-current-state.md).
+> [2026-07-17-review-codebase-current-state.md](2026-07-17-review-codebase-current-state.md).
 >
 > **`M`/`O` IDs in this section belong to the 2026-07-17 review, not the 2026-07-19 one in
 > Phase 15b.** The 15b review re-verified this review's four security P1s as fixed by H1–H7
@@ -1730,7 +2021,7 @@ verification alone; its separate gossip-rejoin deadline remains unfinished.
 
 ## Phase 15b: Code-Logic Review Hardening
 
-> Source review: [2026-07-19-codebase-review-fable.md](plans/archive/2026-07-19-codebase-review-fable.md)
+> Source review: [2026-07-19-codebase-review-fable.md](2026-07-19-codebase-review-fable.md)
 > (16 Critical, 29 Medium, 20 Optional). Written independently of the 2026-07-17 posture
 > review and against `main` *after* the Phase 15a H1–H7 PRs landed, so the two barely
 > overlap: 15a is a **posture** review (fail-open defaults, docs drift, dependency shape),
@@ -2036,7 +2327,7 @@ The review flagged `O6`/`O7`/`O9` as the security-adjacent ones to prioritise wi
 ## UX Track: Learning Curve & Demonstrability
 
 Post-12b user-experience work (not a roadmap phase). Plan:
-`docs/plans/archive/2026-07-17-plan-ux-improvements.md`.
+`docs/plans/2026-07-17-plan-ux-improvements.md`.
 
 - [x] `relish setup` — guided install and first configuration: detects bun on
   PATH / in `~/.reliaburger/bin` / running, installs or upgrades through the
@@ -2062,11 +2353,11 @@ Post-12b user-experience work (not a roadmap phase). Plan:
 
 ## Phase 16: Post-Phase-15 Audit — Truthfulness & Hardening
 
-> Source audit: [2026-08-08-audit-post-phase15.md](plans/archive/2026-08-08-audit-post-phase15.md)
+> Source audit: [2026-08-08-audit-post-phase15.md](2026-08-08-audit-post-phase15.md)
 > (five parallel doc-vs-code sweeps run against `main` at the PR #151 merge:
 > whitepaper, the seven+eight component design docs, and the manual/READMEs).
 > The Phase-15 code-review bugs it references are staged separately in
-> [2026-08-06-plan-phase15-followup.md](plans/archive/2026-08-06-plan-phase15-followup.md);
+> [2026-08-06-plan-phase15-followup.md](2026-08-06-plan-phase15-followup.md);
 > Phase A of that plan (green CI) is done — its Phases B–H feed Section C below.
 >
 > The audit's one finding that shapes everything: **the code is more honest than

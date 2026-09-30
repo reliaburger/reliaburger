@@ -17,7 +17,7 @@ is configured, eBPF and DNS opt-ins, registry catalog persistence/GC, log
 forwarding, cluster placement, GitOps, metrics rollups, and self-upgrade all
 have real runtime paths. This document does not repeat items that have been
 explicitly deferred to a later phase and accurately labelled as such in
-[progress.md](../../progress.md).
+[progress.md](progress-to-0.1.0.md).
 
 It does record where the whitepaper/design contract remains ahead of the
 running system, where an existing implementation violates a stated invariant,

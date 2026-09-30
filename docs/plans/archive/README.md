@@ -11,8 +11,11 @@ relative links when files move.
 For what actually happened, start with the
 [0.1.0 release closure record](../../qualification/2026-09-27-v0.1.0-release-closure.md):
 it lists every candidate, soak run and fix from #196 to the tag, and what was
-carried past 0.1.0. What's still open lives in [progress.md](../../progress.md)
-and in the GitHub milestones 0.1.1 to 0.4.0, not in these files.
+carried past 0.1.0. What's still open lives in the [roadmap](../../roadmap.md) and the GitHub
+milestones and issues, not in these files. The checklist and roadmap as they
+stood at release are frozen here too:
+[progress-to-0.1.0.md](progress-to-0.1.0.md) and
+[roadmap-to-0.1.0.md](roadmap-to-0.1.0.md).
 
 Roughly, in order:
 

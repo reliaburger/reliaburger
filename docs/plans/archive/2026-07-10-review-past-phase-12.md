@@ -17,7 +17,7 @@ This review consolidates three earlier sources:
 - the [9 July design discrepancy register](2026-07-09-review-design-discrepancies.md),
   with D1-D22; and
 - the old "Beyond Phase 11b" section from
-  [progress.md](../../progress.md), including C5(b), L17, M3-M24, X8 and the
+  [progress.md](progress-to-0.1.0.md), including C5(b), L17, M3-M24, X8 and the
   24 Low findings from the [2 July review](2026-07-02-review-codebase.md).
 
 The filenames matter. The two 9 July reviews were renamed after their first
