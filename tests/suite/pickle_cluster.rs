@@ -875,9 +875,10 @@ async fn pull_through_caches_once_then_serves_peers() {
     assert!(first_pull_hits > 0, "first pull must reach upstream");
     {
         let catalog = node_a.state.catalog.read().await;
+        let cached = catalog.get_manifest_by_tag(&cached_repo, "v1");
         assert!(
-            catalog.get_manifest_by_tag(&cached_repo, "v1").is_some(),
-            "cache fill must commit under {cached_repo}"
+            cached.is_some_and(|manifest| !manifest.is_index()),
+            "a single-platform image is cached as itself under {cached_repo}"
         );
     }
 
@@ -1165,5 +1166,103 @@ async fn a_multi_platform_image_without_the_nodes_platform_is_refused() {
             reliaburger::pickle::types::PickleError::NoPlatformManifest { .. }
         ),
         "{err}"
+    );
+}
+
+/// A multi-platform upstream image goes through the pull-through cache whole:
+/// the cached tag names the upstream index, and a node of each architecture
+/// gets its own platform's manifest and layers, whichever node pulls first.
+/// The cache used to store only the first puller's platform, so a node of the
+/// other architecture got the wrong image (#353).
+#[tokio::test]
+async fn pull_through_caches_every_platform_of_a_multi_platform_image() {
+    use reliaburger::grill::image::ImageReference;
+    use std::sync::atomic::Ordering;
+
+    let (upstream, upstream_hits) = Registry::start_counted(9).await;
+    let configs = push_multi_platform_image(&upstream, "burger", "v1").await;
+    let upstream_index = upstream
+        .state
+        .catalog
+        .read()
+        .await
+        .get_manifest_by_tag("burger", "v1")
+        .unwrap()
+        .digest
+        .clone();
+
+    let image = ImageReference::parse(&format!("{}/burger:v1", upstream.addr)).unwrap();
+    let cached_repo = format!("cache/{}/burger", upstream.addr);
+
+    // An amd64 node fills the cache first.
+    let node_a = Registry::start(1, false).await;
+    let blobs = cluster_source_with_upstream(&node_a)
+        .ensure_external_image_for_architecture(&image, &[], "amd64")
+        .await
+        .unwrap()
+        .expect("pull-through should serve the image");
+    assert_eq!(
+        blobs.config_digest,
+        configs[0].as_str(),
+        "amd64 must get the amd64 image"
+    );
+    {
+        let catalog = node_a.state.catalog.read().await;
+        let cached = catalog.get_manifest_by_tag(&cached_repo, "v1").unwrap();
+        assert!(cached.is_index(), "the cached tag must name the index");
+        assert_eq!(cached.digest, upstream_index);
+    }
+
+    // An arm64 node sharing the catalogue asks for the same tag: it gets the
+    // arm64 image, filled from upstream on demand.
+    let node_b = Registry::start(2, false).await;
+    *node_b.state.catalog.write().await = node_a.state.catalog.read().await.clone();
+    let peers_b = vec![Peer {
+        node_id: 1,
+        base_url: node_a.base_url(),
+    }];
+    let blobs = cluster_source_with_upstream(&node_b)
+        .ensure_external_image_for_architecture(&image, &peers_b, "arm64")
+        .await
+        .unwrap()
+        .expect("pull-through should serve the image");
+    assert_eq!(
+        blobs.config_digest,
+        configs[1].as_str(),
+        "arm64 must get the arm64 image, not the first puller's"
+    );
+    assert_eq!(blobs.layers.len(), 1);
+    for path in blobs.layers.iter().chain([&blobs.config]) {
+        assert!(path.exists(), "{} was not stored", path.display());
+    }
+
+    // Both platforms are cached now: a third node pulls either one from its
+    // peers without another upstream request.
+    let hits = upstream_hits.load(Ordering::SeqCst);
+    let node_c = Registry::start(3, false).await;
+    *node_c.state.catalog.write().await = node_b.state.catalog.read().await.clone();
+    let peers_c = vec![
+        Peer {
+            node_id: 1,
+            base_url: node_a.base_url(),
+        },
+        Peer {
+            node_id: 2,
+            base_url: node_b.base_url(),
+        },
+    ];
+    let source_c = cluster_source_with_upstream(&node_c);
+    for (architecture, config) in [("amd64", &configs[0]), ("arm64", &configs[1])] {
+        let blobs = source_c
+            .ensure_external_image_for_architecture(&image, &peers_c, architecture)
+            .await
+            .unwrap()
+            .expect("cached image should be served");
+        assert_eq!(blobs.config_digest, config.as_str(), "{architecture}");
+    }
+    assert_eq!(
+        upstream_hits.load(Ordering::SeqCst),
+        hits,
+        "cached platforms must not touch upstream"
     );
 }
