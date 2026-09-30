@@ -86,7 +86,7 @@ the review findings.
    replication/GC, GitOps, API and OCI registry tasks.
 
 Most of the live wiring can be read top-to-bottom in
-[`src/bin/bun.rs`](../src/bin/bun.rs). The long file is informative but it is
+[`src/bin/bun.rs`](../../../src/bin/bun.rs). The long file is informative but it is
 also doing too many jobs: construction, policy, storage fallbacks, task
 supervision, API composition and signal handling. Splitting this into a
 `NodeRuntime::start(config)` builder and one task per subsystem would make
@@ -357,8 +357,8 @@ the code explicitly `continue`s in that case. The council is capped at seven
 voters. A scheduler can therefore assign a workload to node 8 and that node
 will never fetch or run it.
 
-Evidence: [`src/cluster/orchestrate.rs`](../src/cluster/orchestrate.rs)
-lines 397-416 and [`src/cluster/runtime.rs`](../src/cluster/runtime.rs) lines
+Evidence: [`src/cluster/orchestrate.rs`](../../../src/cluster/orchestrate.rs)
+lines 397-416 and [`src/cluster/runtime.rs`](../../../src/cluster/runtime.rs) lines
 427-570. The same leader-discovery limitation feeds the flat reporting tree.
 
 Fix this by publishing a signed, watchable leader endpoint through gossip or
@@ -375,7 +375,7 @@ reconcile, but it also preserves permanently dead voters forever. A council
 that has grown to seven members can lose quorum despite many healthy gossip
 members, and it cannot replace failed voters.
 
-Evidence: [`src/cluster/runtime.rs`](../src/cluster/runtime.rs) lines
+Evidence: [`src/cluster/runtime.rs`](../../../src/cluster/runtime.rs) lines
 431-481 and 484-570.
 
 Separate the invariant “never remove the current leader in this membership
@@ -393,9 +393,9 @@ resolve a remote service; a node receiving ingress without a local backend
 has no usable route. The eBPF map merely mirrors this local map, so it cannot
 correct the model.
 
-Evidence: [`src/onion/service_map.rs`](../src/onion/service_map.rs) lines
-20-64, [`src/bun/agent.rs`](../src/bun/agent.rs) lines 2776-2793, and
-[`src/bun/agent.rs`](../src/bun/agent.rs) lines 3407-3417.
+Evidence: [`src/onion/service_map.rs`](../../../src/onion/service_map.rs) lines
+20-64, [`src/bun/agent.rs`](../../../src/bun/agent.rs) lines 2776-2793, and
+[`src/bun/agent.rs`](../../../src/bun/agent.rs) lines 3407-3417.
 
 Make service endpoints a cluster-replicated projection of assignments plus
 health, keyed by `namespace + service name`; publish a local read cache to
@@ -409,7 +409,7 @@ code reads either field. Every protected handler checks only role. A token
 issued as restricted to one namespace can use any endpoint permitted by its
 role against every namespace.
 
-Evidence: [`src/sesame/auth.rs`](../src/sesame/auth.rs) lines 53-106 and the
+Evidence: [`src/sesame/auth.rs`](../../../src/sesame/auth.rs) lines 53-106 and the
 absence of scope checks outside that module; API handlers use `authorize()`
 only.
 
@@ -428,9 +428,9 @@ defaults to loopback, but cross-node replication requires an externally
 reachable bind and its router has no auth middleware; the default image policy
 also permits unsigned images.
 
-Evidence: [`src/sesame/auth.rs`](../src/sesame/auth.rs) lines 145-207,
-[`src/bin/bun.rs`](../src/bin/bun.rs) lines 812-907 and 967-1005, and
-[`src/cluster/runtime.rs`](../src/cluster/runtime.rs) lines 221-226.
+Evidence: [`src/sesame/auth.rs`](../../../src/sesame/auth.rs) lines 145-207,
+[`src/bin/bun.rs`](../../../src/bin/bun.rs) lines 812-907 and 967-1005, and
+[`src/cluster/runtime.rs`](../../../src/cluster/runtime.rs) lines 221-226.
 
 Require an explicit one-time bootstrap credential or local Unix-socket setup;
 refuse non-loopback API binding until it is complete. Put TLS/mTLS underneath
@@ -445,9 +445,9 @@ often put in plain `DATABASE_URL`, API-key or password variables. Meanwhile,
 the page fetches protected logs and metrics routes without a bearer-token
 mechanism, so those panels turn into 401s after auth becomes active.
 
-Evidence: [`src/bun/api.rs`](../src/bun/api.rs) lines 169-260 and 2083-2121;
-[`src/brioche/types.rs`](../src/brioche/types.rs) lines 31-40; and
-[`src/brioche/app_detail.rs`](../src/brioche/app_detail.rs) lines 86-117.
+Evidence: [`src/bun/api.rs`](../../../src/bun/api.rs) lines 169-260 and 2083-2121;
+[`src/brioche/types.rs`](../../../src/brioche/types.rs) lines 31-40; and
+[`src/brioche/app_detail.rs`](../../../src/brioche/app_detail.rs) lines 86-117.
 
 Make the UI authenticated or make it explicitly a redacted public status
 surface. Do not display env values by default. A secure browser session or a
@@ -462,7 +462,7 @@ ignores the deployment event stream. Image pull, port allocation, init or
 runtime failure means the node never starts the app, but the reconciler will
 not retry until the assignment fingerprint changes.
 
-Evidence: [`src/cluster/orchestrate.rs`](../src/cluster/orchestrate.rs) lines
+Evidence: [`src/cluster/orchestrate.rs`](../../../src/cluster/orchestrate.rs) lines
 431-460.
 
 Give internal deployment a result channel with an explicit terminal outcome,
@@ -478,9 +478,9 @@ applied in Bun's deployment path. In a development setup this is useful; on a
 node where Bun has elevated privileges it is arbitrary host command execution
 for any deploy-capable principal.
 
-Evidence: [`src/config/process_workloads.rs`](../src/config/process_workloads.rs),
-[`src/grill/process_workload.rs`](../src/grill/process_workload.rs), and OCI
-argument construction in [`src/grill/oci.rs`](../src/grill/oci.rs) lines
+Evidence: [`src/config/process_workloads.rs`](../../../src/config/process_workloads.rs),
+[`src/grill/process_workload.rs`](../../../src/grill/process_workload.rs), and OCI
+argument construction in [`src/grill/oci.rs`](../../../src/grill/oci.rs) lines
 247-265.
 
 Keep ProcessGrill a deliberately named development runtime, disable
@@ -497,8 +497,8 @@ callers often discard, or maps both conceptual services to the same VIP.
 Even unique names can collide in a 65,534-address hash space; no collision
 check exists.
 
-Evidence: [`src/onion/service_map.rs`](../src/onion/service_map.rs) lines
-20-64 and [`src/onion/vip.rs`](../src/onion/vip.rs) lines 25-40.
+Evidence: [`src/onion/service_map.rs`](../../../src/onion/service_map.rs) lines
+20-64 and [`src/onion/vip.rs`](../../../src/onion/vip.rs) lines 25-40.
 
 Use a `ServiceId { namespace, name }` newtype throughout Onion. Allocate VIPs
 from a replicated collision-aware allocator, or detect and reject conflicts
@@ -511,8 +511,8 @@ it. `VolumeManager::create_managed_volume()` has the creation and limit logic,
 yet no Bun path calls it. On runc, a missing bind source can fail deployment;
 where it exists, the requested size limit is not applied.
 
-Evidence: [`src/grill/oci.rs`](../src/grill/oci.rs) lines 312-333 and
-[`src/grill/volume.rs`](../src/grill/volume.rs) lines 22-78.
+Evidence: [`src/grill/oci.rs`](../../../src/grill/oci.rs) lines 312-333 and
+[`src/grill/volume.rs`](../../../src/grill/volume.rs) lines 22-78.
 
 Create/mount volumes in a single preparation stage before OCI spec creation,
 record their lifecycle in the instance record, and make unsupported size
@@ -528,7 +528,7 @@ the rolling path explicitly documents that it blocks the event loop. A slow
 or hung runtime operation delays every command, health transition, restart
 and firewall reconciliation.
 
-Evidence: [`src/bun/agent.rs`](../src/bun/agent.rs) lines 2709-2735 and
+Evidence: [`src/bun/agent.rs`](../../../src/bun/agent.rs) lines 2709-2735 and
 2156-2169.
 
 Keep `BunAgent` as the state owner, but move each deployment to a supervised
@@ -543,7 +543,7 @@ the caller holds the store's async write lock. This will grow memory, latency
 and lock contention with retention, and a query can interfere with all
 collection on the node.
 
-Evidence: [`src/mayo/store.rs`](../src/mayo/store.rs) lines 159-219 and
+Evidence: [`src/mayo/store.rs`](../../../src/mayo/store.rs) lines 159-219 and
 222-251; the Ketchup store mirrors the same architecture.
 
 Use DataFusion's Parquet table directly with predicate pushdown, retain a

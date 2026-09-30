@@ -990,6 +990,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn validate_autoscale_min_zero_rejected() {
+        let app: AppSpec = toml::from_str(
+            r#"
+            image = "web:v1"
+            cpu = "100m-500m"
+            [autoscale]
+            metric = "cpu"
+            target = "70%"
+            min = 0
+            max = 3
+        "#,
+        )
+        .unwrap();
+        let err = config_with_app("web", app).validate().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Validation { ref field, ref reason, .. }
+                if field == "autoscale" && reason.contains("min must be at least 1")),
+            "min = 0 must be rejected at validation: {err:?}"
+        );
+    }
+
     fn autoscaled_app(resources: &str, metric: &str) -> AppSpec {
         toml::from_str(&format!(
             r#"

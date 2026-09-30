@@ -1,0 +1,78 @@
+{
+  "_comment": "Every lane .github/workflows/v02-loops.yml runs, with the tests a lane's filter names exactly. loop_summary.py --combine fails the record when one is missing; test_loop_summary.py checks this list against the workflow matrix.",
+  "lanes": [
+    {"lane": "test-upgrade-cluster (ubuntu-latest)"},
+    {"lane": "test-upgrade-cluster (ubuntu-24.04-arm)"},
+    {"lane": "test-upgrade-cluster (macos-15)"},
+    {"lane": "test-upgrade-node (ubuntu-latest)"},
+    {"lane": "test-upgrade-node (ubuntu-24.04-arm)"},
+    {"lane": "test-upgrade-node (macos-15)"},
+    {"lane": "council_disaster_recovery (ubuntu-latest)"},
+    {"lane": "cluster_failover (ubuntu-latest)"},
+    {
+      "lane": "job-lease (ubuntu-latest)",
+      "tests": ["reliaburger::job_recovery::node_job_lease_reaps_a_surviving_process_after_bun_is_killed"]
+    },
+    {
+      "lane": "job-lease (ubuntu-24.04-arm)",
+      "tests": ["reliaburger::job_recovery::node_job_lease_reaps_a_surviving_process_after_bun_is_killed"]
+    },
+    {
+      "lane": "job-lease (macos-15)",
+      "tests": ["reliaburger::job_recovery::node_job_lease_reaps_a_surviving_process_after_bun_is_killed"]
+    },
+    {
+      "lane": "registry-lease-expiry (ubuntu-latest)",
+      "tests": ["reliaburger::registry_recovery::expired_registry_lease_recovers_after_bun_sigkill_and_preserves_shared_content"]
+    },
+    {
+      "lane": "registry-lease-expiry (ubuntu-24.04-arm)",
+      "tests": ["reliaburger::registry_recovery::expired_registry_lease_recovers_after_bun_sigkill_and_preserves_shared_content"]
+    },
+    {
+      "lane": "registry-lease-expiry (macos-15)",
+      "tests": ["reliaburger::registry_recovery::expired_registry_lease_recovers_after_bun_sigkill_and_preserves_shared_content"]
+    },
+    {
+      "lane": "registry-new-leader (ubuntu-latest)",
+      "tests": ["reliaburger::registry_recovery::new_leader_retains_registry_cleanup_until_the_killed_writer_returns"]
+    },
+    {
+      "lane": "registry-new-leader (ubuntu-24.04-arm)",
+      "tests": ["reliaburger::registry_recovery::new_leader_retains_registry_cleanup_until_the_killed_writer_returns"]
+    },
+    {
+      "lane": "registry-new-leader (macos-15)",
+      "tests": ["reliaburger::registry_recovery::new_leader_retains_registry_cleanup_until_the_killed_writer_returns"]
+    },
+    {
+      "lane": "export-lock-checkpoint (ubuntu-latest)",
+      "tests": [
+        "reliaburger::suite::log_export::active_export_lock_refuses_another_writer_without_uploading",
+        "reliaburger::suite::log_export::export_persists_and_reloads_the_authoritative_checkpoint"
+      ]
+    },
+    {
+      "lane": "export-lock-checkpoint (ubuntu-24.04-arm)",
+      "tests": [
+        "reliaburger::suite::log_export::active_export_lock_refuses_another_writer_without_uploading",
+        "reliaburger::suite::log_export::export_persists_and_reloads_the_authoritative_checkpoint"
+      ]
+    },
+    {
+      "lane": "export-lock-checkpoint (macos-15)",
+      "tests": [
+        "reliaburger::suite::log_export::active_export_lock_refuses_another_writer_without_uploading",
+        "reliaburger::suite::log_export::export_persists_and_reloads_the_authoritative_checkpoint"
+      ]
+    },
+    {
+      "lane": "test-storage-owner-death (ubuntu-latest)",
+      "tests": ["reliaburger::test_storage::lease_loop_storage_survives_owner_process_death"]
+    },
+    {
+      "lane": "test-storage-owner-death (ubuntu-24.04-arm)",
+      "tests": ["reliaburger::test_storage::lease_loop_storage_survives_owner_process_death"]
+    }
+  ]
+}

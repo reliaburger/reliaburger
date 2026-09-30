@@ -52,9 +52,10 @@ relish build app.toml
 relish apply app.toml
 ```
 
-Relish uploads the context to the registry at `localhost:5050`
-(`--registry-port` changes the port), so run it on a node or through a forward
-to one. A node then builds it with Buildah, which must be installed there, for
+Relish uploads the context to the registry: through the quickstart's registry
+forward (`127.0.0.1:15050`) on a laptop cluster, otherwise at `localhost:5050`,
+so run it on a node or through a forward to one (`--registry-port` names the
+port on this host). A node then builds it with Buildah, which must be installed there, for
 `linux/amd64` and `linux/arm64` by default. A build has
 15 minutes (`[images] build_timeout_secs`) and a 256 MiB context. Refer to the
 result by its bare name, as `api:v1.2.3`, and nodes find it in Pickle. Built

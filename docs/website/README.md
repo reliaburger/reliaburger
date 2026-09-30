@@ -15,7 +15,7 @@ needs https or localhost; opened from disk the script falls back to selecting
 the text and `document.execCommand("copy")`.
 
 `assets/tour-player.js` (decision D2 in
-`docs/plans/2026-09-23-zero-to-cluster.md`) plays the
+`docs/plans/archive/2026-09-23-zero-to-cluster.md`) plays the
 tour's recording, `assets/tour.cast`, with a vendored copy of the asciinema
 player in `assets/asciinema/`. It loads the player and the recording from this
 site, and only when someone opens the tour; nothing is fetched from anywhere
