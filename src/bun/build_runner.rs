@@ -989,12 +989,16 @@ async fn run_build_inner(
 
     // A multi-platform build must have exported every platform it asked for:
     // `buildah push` of a manifest list once exported only the builder's own.
+    // Buildah can stamp the builder stage's variant on every platform
+    // (`linux/amd64/v8`); drop it before anything reads the index.
     let layout_dir = oci_dir.clone();
-    let layout =
-        tokio::task::spawn_blocking(move || crate::pickle::build::read_oci_layout(&layout_dir))
-            .await
-            .map_err(|e| format!("reading the exported image failed: {e}"))?
-            .map_err(|e| e.to_string())?;
+    let layout = tokio::task::spawn_blocking(move || {
+        crate::pickle::build::drop_foreign_platform_variants(&layout_dir)?;
+        crate::pickle::build::read_oci_layout(&layout_dir)
+    })
+    .await
+    .map_err(|e| format!("reading the exported image failed: {e}"))?
+    .map_err(|e| e.to_string())?;
     crate::pickle::build::check_exported_platforms(&job.platforms, &layout)
         .map_err(|e| e.to_string())?;
 

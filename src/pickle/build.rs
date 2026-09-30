@@ -711,6 +711,100 @@ pub fn read_oci_layout(oci_dir: &Path) -> Result<OciLayoutImage, BuildError> {
     })
 }
 
+/// Whether `variant` is one that `architecture` has.
+///
+/// Only the architectures whose variants we know are checked (`amd64`
+/// levels, 32-bit `arm` versions, `arm64` versions); any other architecture
+/// keeps whatever variant it names.
+fn variant_fits_architecture(architecture: &str, variant: &str) -> bool {
+    match architecture {
+        "amd64" => matches!(variant, "v1" | "v2" | "v3" | "v4"),
+        "arm" => matches!(variant, "v5" | "v6" | "v7" | "v8"),
+        "arm64" => variant.starts_with("v8") || variant.starts_with("v9"),
+        _ => true,
+    }
+}
+
+/// Drop from an exported image index any platform variant its architecture
+/// doesn't have, rewriting the index in the layout.
+///
+/// Buildah 1.33 (Ubuntu 24.04's), building a Dockerfile whose first stage
+/// runs `FROM --platform=$BUILDPLATFORM` on arm64, copies that stage's `v8`
+/// into every platform it builds, so the index says `linux/amd64/v8`. Pickle
+/// ignores variants when a node pulls, but `relish images` would show the
+/// wrong platform and a Docker or containerd client on amd64 finds no
+/// manifest for `linux/amd64`. The platform manifests themselves are left
+/// alone: their digests are what the index names and what gets signed.
+///
+/// A layout whose top manifest isn't an index, or whose variants all fit,
+/// is left byte for byte. Otherwise the new index is written as a blob,
+/// `index.json` points at it, and the old index blob is removed so the
+/// upload doesn't carry it.
+pub fn drop_foreign_platform_variants(oci_dir: &Path) -> Result<(), BuildError> {
+    let layout_index_path = oci_dir.join("index.json");
+    let layout_index_bytes = std::fs::read(&layout_index_path)
+        .map_err(|e| layout_error(format!("reading oci layout index.json: {e}")))?;
+    let mut layout_index: serde_json::Value = serde_json::from_slice(&layout_index_bytes)
+        .map_err(|e| layout_error(format!("oci layout index.json is not valid json: {e}")))?;
+    let top = parse_oci_index(&layout_index_bytes)?;
+    let old_path = layout_blob_path(oci_dir, &top.digest)?;
+    let old_bytes = std::fs::read(&old_path).map_err(|e| {
+        layout_error(format!(
+            "oci layout is missing manifest {}: {e}",
+            top.digest
+        ))
+    })?;
+    let mut image_index: serde_json::Value = serde_json::from_slice(&old_bytes)
+        .map_err(|e| layout_error(format!("manifest {} is not valid json: {e}", top.digest)))?;
+    let Some(entries) = image_index
+        .get_mut("manifests")
+        .and_then(|m| m.as_array_mut())
+    else {
+        return Ok(());
+    };
+
+    let mut changed = false;
+    for platform in entries
+        .iter_mut()
+        .filter_map(|entry| entry.get_mut("platform"))
+        .filter_map(|platform| platform.as_object_mut())
+    {
+        let architecture = platform
+            .get("architecture")
+            .and_then(|a| a.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let foreign = platform
+            .get("variant")
+            .and_then(|v| v.as_str())
+            .is_some_and(|variant| !variant_fits_architecture(&architecture, variant));
+        if foreign {
+            platform.remove("variant");
+            changed = true;
+        }
+    }
+    if !changed {
+        return Ok(());
+    }
+
+    let new_bytes = serde_json::to_vec(&image_index)
+        .map_err(|e| layout_error(format!("encoding the image index failed: {e}")))?;
+    let new_digest = digest_of(&new_bytes);
+    std::fs::write(layout_blob_path(oci_dir, &new_digest)?, &new_bytes)
+        .map_err(|e| layout_error(format!("writing the image index failed: {e}")))?;
+    if let Some(descriptor) = layout_index.get_mut("manifests").and_then(|m| m.get_mut(0)) {
+        descriptor["digest"] = serde_json::json!(new_digest);
+        descriptor["size"] = serde_json::json!(new_bytes.len());
+    }
+    let layout_index_bytes = serde_json::to_vec(&layout_index)
+        .map_err(|e| layout_error(format!("encoding index.json failed: {e}")))?;
+    std::fs::write(&layout_index_path, layout_index_bytes)
+        .map_err(|e| layout_error(format!("writing index.json failed: {e}")))?;
+    std::fs::remove_file(&old_path)
+        .map_err(|e| layout_error(format!("removing the old image index failed: {e}")))?;
+    Ok(())
+}
+
 /// `os/architecture` of a platform string, dropping any variant, so
 /// `linux/arm64` matches an export that says `linux/arm64/v8`.
 fn os_and_architecture(platform: &str) -> String {
@@ -1548,6 +1642,71 @@ mod tests {
         );
         let err = read_oci_layout(dir.path()).unwrap_err();
         assert!(err.to_string().contains("names no platform"), "{err}");
+    }
+
+    /// The platforms `read_oci_layout` reports for a layout.
+    fn layout_platforms(dir: &Path) -> Vec<String> {
+        read_oci_layout(dir)
+            .unwrap()
+            .platform_manifests
+            .into_iter()
+            .map(|m| m.platform)
+            .collect()
+    }
+
+    #[test]
+    fn a_builder_stage_variant_is_dropped_from_the_foreign_architecture() {
+        // Buildah 1.33 on arm64, building `FROM --platform=$BUILDPLATFORM`
+        // for amd64, copies the builder's `v8` into the amd64 entry.
+        let dir = tempfile::tempdir().unwrap();
+        let before = write_multi_platform_layout(
+            dir.path(),
+            &[("linux/amd64", Some("v8")), ("linux/arm64", Some("v8"))],
+        );
+        drop_foreign_platform_variants(dir.path()).unwrap();
+
+        assert_eq!(
+            layout_platforms(dir.path()),
+            vec!["linux/amd64", "linux/arm64/v8"]
+        );
+        let image = read_oci_layout(dir.path()).unwrap();
+        assert_ne!(image.top.digest, before, "new bytes, new digest");
+        let hex = image.top.digest.trim_start_matches("sha256:");
+        let bytes = std::fs::read(dir.path().join("blobs/sha256").join(hex)).unwrap();
+        assert_eq!(digest_of(&bytes), image.top.digest);
+        let old = dir
+            .path()
+            .join("blobs/sha256")
+            .join(before.trim_start_matches("sha256:"));
+        assert!(!old.exists(), "the stale index isn't uploaded");
+        let index: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("index.json")).unwrap()).unwrap();
+        assert_eq!(index["manifests"][0]["size"], bytes.len());
+    }
+
+    #[test]
+    fn variants_that_belong_to_their_architecture_are_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let before = write_multi_platform_layout(
+            dir.path(),
+            &[
+                ("linux/amd64", None),
+                ("linux/arm64", Some("v8")),
+                ("linux/arm", Some("v7")),
+                ("linux/amd64", Some("v3")),
+            ],
+        );
+        drop_foreign_platform_variants(dir.path()).unwrap();
+        assert_eq!(read_oci_layout(dir.path()).unwrap().top.digest, before);
+    }
+
+    #[test]
+    fn a_single_image_layout_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let digest = write_layout_blob(dir.path(), &image_manifest("amd64"));
+        write_layout_index(dir.path(), &digest, OCI_IMAGE_MANIFEST_MEDIA_TYPE);
+        drop_foreign_platform_variants(dir.path()).unwrap();
+        assert_eq!(read_oci_layout(dir.path()).unwrap().top.digest, digest);
     }
 
     #[test]
