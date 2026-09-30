@@ -1013,6 +1013,33 @@ but only the durable record or an empty process group ever says "stopped". And
 `relish exec` commands get their own child owner under the workload's owner, so
 killing Bun can't orphan one and retiring the app waits for it.
 
+That waiting turned up one of our more obscure flakes. Once in a few hundred
+loaded runs on a Mac, retiring an app with an exec in flight never finished, and
+the exec owner's log said only `Operation not permitted`. A cancelled owner
+re-sends SIGKILL to its group on every 10 ms tick until `waitid` reports the
+exit, and it treated a failed signal as fatal. On macOS a group signal fails
+with `EPERM` when no member will take it, and the kernel skips processes that
+are already exiting. There's a window between SIGKILL and the moment `waitid`
+can see the exit where the group still exists but refuses everything. A small C
+loop hit it in 1,997 of 2,000 tries; the owner, sleeping 10 ms between signals,
+only landed in it when the machine was busy. The owner died with the exec still
+`Running` on disk, and the parent, which rightly won't retire without proof,
+waited forever. Now a refused group signal on macOS falls back to the root
+alone:
+
+```rust
+#[cfg(target_os = "macos")]
+Err(nix::errno::Errno::EPERM) => self.signal_refused_group(signal),
+```
+
+`#[cfg(...)]` compiles the arm only on macOS; Linux never refuses a group like
+this. `signal_refused_group` returns `Ok` if `waitid` already shows the exit,
+and otherwise signals the root's PID directly. The root is the owner's own
+unreaped child, so that PID can't belong to anyone else yet, and a direct
+signal succeeds while the process runs or exits and fails only on a real
+permission refusal. Retirement still lists every group member before it writes
+`Retiring`, so accepting the refusal can't publish a false absence.
+
 ### A signal is not proof of exit
 
 The same idea runs through the agent's stop path. A runtime can accept a kill
