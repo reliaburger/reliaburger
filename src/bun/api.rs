@@ -649,6 +649,10 @@ pub fn router_with_upgrade(
             post(super::build_runner::build_track_handler),
         )
         .route(
+            "/v1/build/sign",
+            post(super::build_runner::build_sign_handler),
+        )
+        .route(
             "/v1/build/{id}",
             get(super::build_runner::build_status_handler),
         )
@@ -4486,7 +4490,7 @@ async fn local_top_rows(state: &ApiState) -> Result<Vec<crate::bun::top::TopRow>
             );
             // Missing samples leave the columns empty; they don't hide the
             // workloads themselves.
-            match mayo.read().await.query_sql(&sql).await {
+            match mayo.read().await.query_sql_since(&sql, since).await {
                 Ok(samples) => crate::bun::top::latest_usage(&samples),
                 Err(_) => std::collections::HashMap::new(),
             }
@@ -7950,7 +7954,7 @@ async fn metrics_query_handler(
              WHERE timestamp >= {start} AND timestamp <= {end} \
              ORDER BY timestamp LIMIT 10000"
         );
-        match store.query_sql(&sql).await {
+        match store.query_sql_since(&sql, start).await {
             Ok(results) => {
                 let data: Vec<serde_json::Value> = results
                     .iter()

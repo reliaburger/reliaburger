@@ -989,3 +989,325 @@ async fn buildah_build_signs_and_the_signature_verifies_on_deploy() {
 
     registry_shutdown.cancel();
 }
+
+// --- Signing what a build pushed (#331) ---
+//
+// Only the leader can sign: the build signer's CSR reads the CA through a
+// linearised read, and `AttachSignature` is a Raft write. A build that runs
+// on a follower asks the leader through `/v1/build/sign`.
+
+/// The CA hierarchy and OIDC config a council needs to sign a build-signer
+/// CSR, written through `leader`.
+async fn bootstrap_security(leader: &CouncilNode) {
+    let wrapping_ikm = b"test-wrapping-material-32bytes!!";
+    let hierarchy =
+        reliaburger::sesame::ca::generate_ca_hierarchy("test-cluster", wrapping_ikm).unwrap();
+    let oidc_config = reliaburger::sesame::oidc::generate_oidc_keypair(
+        "https://test.reliaburger.dev",
+        wrapping_ikm,
+    )
+    .unwrap();
+    let security_state = reliaburger::sesame::types::SecurityState {
+        certificate_authorities: vec![
+            reliaburger::sesame::types::CertificateAuthority {
+                private_key_wrapped: None,
+                ..hierarchy.root.ca
+            },
+            hierarchy.node.ca,
+            hierarchy.workload.ca,
+            hierarchy.ingress.ca,
+        ],
+        age_keypairs: vec![],
+        api_tokens: vec![],
+        join_tokens: vec![],
+        next_serial: 10,
+        oidc_signing_config: Some(oidc_config),
+        crl: reliaburger::sesame::types::Crl::default(),
+        secret_seals: std::collections::BTreeMap::new(),
+    };
+    leader
+        .write(reliaburger::council::types::RaftRequest::SecurityStateInit(
+            Box::new(security_state),
+        ))
+        .await
+        .unwrap();
+}
+
+/// A two-member council with security bootstrapped: `(leader, follower)`.
+async fn two_node_council_with_security() -> (Arc<CouncilNode>, Arc<CouncilNode>) {
+    let wrapping_ikm = *b"test-wrapping-material-32bytes!!";
+    let router = InMemoryRaftRouter::new();
+    let mut nodes = Vec::new();
+    for id in [1u64, 2] {
+        let node = CouncilNode::new(
+            id,
+            fast_config(),
+            InMemoryRaftNetworkFactory::new(id, router.clone()),
+            MemLogStore::new(),
+            CouncilStateMachine::new(),
+            Some(wrapping_ikm),
+        )
+        .await
+        .unwrap();
+        router.register(id, node.raft().clone()).await;
+        nodes.push(Arc::new(node));
+    }
+    let members = BTreeMap::from([
+        (
+            1u64,
+            CouncilNodeInfo::new("127.0.0.1:9001".parse().unwrap(), "node-1".to_string()),
+        ),
+        (
+            2u64,
+            CouncilNodeInfo::new("127.0.0.1:9002".parse().unwrap(), "node-2".to_string()),
+        ),
+    ]);
+    nodes[0].initialize(members).await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let leader_index = loop {
+        if nodes[0].is_leader().await {
+            break 0;
+        }
+        if nodes[1].is_leader().await {
+            break 1;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "no leader elected");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let leader = Arc::clone(&nodes[leader_index]);
+    let follower = Arc::clone(&nodes[1 - leader_index]);
+    bootstrap_security(&leader).await;
+    // The follower must know who leads before it can forward.
+    while follower.current_leader().await.is_none() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the follower never learned the leader"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    (leader, follower)
+}
+
+/// Record a build through the leader, returning its id.
+async fn register_build(
+    leader: &CouncilNode,
+    state: reliaburger::bun::build_runner::BuildState,
+) -> u64 {
+    let response = leader
+        .write(reliaburger::council::types::RaftRequest::BuildRegister {
+            build: reliaburger::bun::build_runner::BuildRecord {
+                name: "app".to_string(),
+                runner_node: Some("node-2".to_string()),
+                state,
+                created_at_epoch_secs: reliaburger::meat::batch_tracker::epoch_now_secs(),
+            },
+        })
+        .await
+        .unwrap();
+    match response {
+        reliaburger::council::types::CouncilResponse::BuildRegistered { build_id } => build_id,
+        other => panic!("unexpected response: {other:?}"),
+    }
+}
+
+/// Commit an unsigned manifest to the catalogue, as a push would.
+async fn commit_pushed_manifest(leader: &CouncilNode) -> reliaburger::pickle::types::Digest {
+    use reliaburger::pickle::types::{Digest, ImageManifest, LayerDescriptor, ManifestCommit};
+    let digest = Digest::from_sha256_hex(&"ab".repeat(32));
+    let commit = ManifestCommit {
+        observed_gc_generation: 0,
+        manifest: ImageManifest {
+            digest: digest.clone(),
+            config: LayerDescriptor {
+                digest: Digest::from_sha256_hex(&"cd".repeat(32)),
+                size: 512,
+                media_type: String::new(),
+            },
+            layers: vec![],
+            repository: "app".to_string(),
+            tags: std::collections::BTreeSet::new(),
+            total_size: 512,
+            pushed_at: std::time::SystemTime::UNIX_EPOCH,
+            pushed_by: 1,
+            signature: None,
+        },
+        tag: "v1".to_string(),
+        holder_nodes: std::collections::BTreeSet::from([1]),
+    };
+    leader
+        .write(reliaburger::council::types::RaftRequest::ManifestCommit(
+            commit,
+        ))
+        .await
+        .unwrap();
+    digest
+}
+
+async fn post_build_sign(
+    base_url: &str,
+    token: Option<&str>,
+    body: serde_json::Value,
+) -> reqwest::Response {
+    let mut request = reqwest::Client::new()
+        .post(format!("{base_url}/v1/build/sign"))
+        .json(&body);
+    if let Some(token) = token {
+        request = request.bearer_auth(token);
+    }
+    request.send().await.unwrap()
+}
+
+/// Whether `digest` carries a signature that verifies against the cluster
+/// root CA, the way a deploy checks it.
+async fn carries_a_verified_signature(
+    council: &CouncilNode,
+    digest: &reliaburger::pickle::types::Digest,
+) -> bool {
+    let catalog = council.manifest_catalog().await;
+    let Some(signature) = catalog
+        .get_manifest_by_tag("app", "v1")
+        .filter(|manifest| &manifest.digest == digest)
+        .and_then(|manifest| manifest.signature.clone())
+    else {
+        return false;
+    };
+    let security = council.security_state().await;
+    let root = security
+        .get_ca(reliaburger::sesame::types::CaRole::Root)
+        .map(|ca| ca.certificate_der.clone());
+    reliaburger::pickle::signing::verify_signature(
+        &signature,
+        digest,
+        &reliaburger::config::node::TrustPolicySection {
+            require_signatures: true,
+            keys: vec![],
+        },
+        root.as_deref(),
+        None,
+    )
+    .is_ok()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn build_sign_requires_the_system_principal() {
+    let harness = Harness::start(HarnessOptions::default()).await;
+    let response = post_build_sign(
+        &harness.base_url,
+        None,
+        serde_json::json!({ "build_id": 1, "namespace": "default", "digests": [] }),
+    )
+    .await;
+    assert_eq!(response.status().as_u16(), 403);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_leader_signs_what_a_running_build_pushed() {
+    let council = single_node_leader_with_security().await;
+    let build_id = register_build(
+        &council,
+        reliaburger::bun::build_runner::BuildState::Running,
+    )
+    .await;
+    let digest = commit_pushed_manifest(&council).await;
+    let harness = Harness::start(HarnessOptions {
+        council: Some(Arc::clone(&council)),
+        node_name: Some("node-1".to_string()),
+        ..Default::default()
+    })
+    .await;
+
+    let response = post_build_sign(
+        &harness.base_url,
+        Some(TEST_SERVICE_TOKEN),
+        serde_json::json!({
+            "build_id": build_id,
+            "namespace": "default",
+            "digests": [digest.as_str()],
+        }),
+    )
+    .await;
+    let status = response.status().as_u16();
+    assert_eq!(status, 204, "{:?}", response.text().await);
+    assert!(carries_a_verified_signature(&council, &digest).await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_leader_refuses_to_sign_for_a_build_that_is_not_running() {
+    let council = single_node_leader_with_security().await;
+    let finished = register_build(
+        &council,
+        reliaburger::bun::build_runner::BuildState::Completed {
+            image: "app:v1".to_string(),
+        },
+    )
+    .await;
+    let digest = commit_pushed_manifest(&council).await;
+    let harness = Harness::start(HarnessOptions {
+        council: Some(Arc::clone(&council)),
+        node_name: Some("node-1".to_string()),
+        ..Default::default()
+    })
+    .await;
+
+    for build_id in [finished, finished + 100] {
+        let response = post_build_sign(
+            &harness.base_url,
+            Some(TEST_SERVICE_TOKEN),
+            serde_json::json!({
+                "build_id": build_id,
+                "namespace": "default",
+                "digests": [digest.as_str()],
+            }),
+        )
+        .await;
+        assert_eq!(response.status().as_u16(), 409, "build {build_id}");
+    }
+    assert!(!carries_a_verified_signature(&council, &digest).await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_build_on_a_follower_is_signed_by_the_leader() {
+    let (leader, follower) = two_node_council_with_security().await;
+    let leader_id = leader.current_leader().await.unwrap();
+    let leader_name = format!("node-{leader_id}");
+    let build_id =
+        register_build(&leader, reliaburger::bun::build_runner::BuildState::Running).await;
+    let digest = commit_pushed_manifest(&leader).await;
+    let leader_harness = Harness::start(HarnessOptions {
+        council: Some(Arc::clone(&leader)),
+        node_name: Some(leader_name.clone()),
+        ..Default::default()
+    })
+    .await;
+    let leader_address: std::net::SocketAddr = leader_harness
+        .base_url
+        .trim_start_matches("http://")
+        .parse()
+        .unwrap();
+    let follower_harness = Harness::start(HarnessOptions {
+        council: Some(Arc::clone(&follower)),
+        node_name: Some(format!("node-{}", 3 - leader_id)),
+        membership: Some(vec![NodeMembershipInfo {
+            node_id: reliaburger::meat::NodeId::new(&leader_name),
+            address: leader_address,
+            api_advertised: true,
+        }]),
+        ..Default::default()
+    })
+    .await;
+
+    // What the follower's build runner asks for after its push.
+    let response = post_build_sign(
+        &follower_harness.base_url,
+        Some(TEST_SERVICE_TOKEN),
+        serde_json::json!({
+            "build_id": build_id,
+            "namespace": "default",
+            "digests": [digest.as_str()],
+        }),
+    )
+    .await;
+    let status = response.status().as_u16();
+    assert_eq!(status, 204, "{:?}", response.text().await);
+    assert!(carries_a_verified_signature(&leader, &digest).await);
+}

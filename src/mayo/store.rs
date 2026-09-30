@@ -443,6 +443,16 @@ impl MayoStore {
     /// Build a DataFusion session exposing a `metrics` table over all data:
     /// the on-disk Parquet directory unioned with the unflushed buffer.
     async fn session(&self) -> Result<SessionContext, MayoError> {
+        self.session_since(None).await
+    }
+
+    /// [`session`](Self::session) for a query that only reads samples at or
+    /// after `since`. A local Parquet file whose newest sample is older is
+    /// left out, judged from its footer statistics without reading the data.
+    /// The periodic reads (alerts, rollups, the autoscaler) look back a few
+    /// minutes, and without this each one loaded the whole retention window
+    /// into memory, so their working set grew with a node's uptime (#310).
+    async fn session_since(&self, since: Option<u64>) -> Result<SessionContext, MayoError> {
         // Read Parquet string columns as `Utf8`, not `Utf8View`, so on-disk
         // batches share the canonical `metrics_schema` with the in-memory
         // buffer (DataFusion 45 forces view types by default).
@@ -455,7 +465,7 @@ impl MayoStore {
 
         // On-disk Parquet (durable, survives restarts). Read into memory only
         // transiently for this query — nothing is retained on the struct.
-        let disk_batches = self.read_disk_batches(&ctx).await?;
+        let disk_batches = self.read_disk_batches(&ctx, since).await?;
 
         // Unflushed buffer.
         let mut all_batches = disk_batches;
@@ -482,7 +492,11 @@ impl MayoStore {
     /// Each file is read on its own. A corrupt or truncated file is skipped
     /// with a log instead of failing the whole query (OBS5): a single bad flush
     /// must not make every unrelated read error out.
-    async fn read_disk_batches(&self, ctx: &SessionContext) -> Result<Vec<RecordBatch>, MayoError> {
+    async fn read_disk_batches(
+        &self,
+        ctx: &SessionContext,
+        since: Option<u64>,
+    ) -> Result<Vec<RecordBatch>, MayoError> {
         if let Backend::Remote { .. } = &self.backend {
             return self.read_remote_batches(ctx).await;
         }
@@ -496,6 +510,10 @@ impl MayoStore {
         for entry in entries.flatten() {
             let path = entry.path();
             if !path.extension().is_some_and(|x| x == "parquet") {
+                continue;
+            }
+            // A file without usable statistics is read, never guessed away.
+            if since.is_some_and(|since| file_max_timestamp(&path).is_some_and(|max| max < since)) {
                 continue;
             }
             let table_name = "metrics_one";
@@ -601,7 +619,26 @@ impl MayoStore {
 
     /// Query metrics using SQL. Returns (timestamp, name, labels, value) tuples.
     pub async fn query_sql(&self, sql: &str) -> Result<Vec<(u64, String, String, f64)>, MayoError> {
-        let ctx = self.session().await?;
+        self.query_rows(sql, None).await
+    }
+
+    /// [`query_sql`](Self::query_sql) for SQL that only selects samples with
+    /// `timestamp >= since`. Files entirely older than `since` aren't read,
+    /// so the SQL must filter on that bound itself or it would see a subset.
+    pub async fn query_sql_since(
+        &self,
+        sql: &str,
+        since: u64,
+    ) -> Result<Vec<(u64, String, String, f64)>, MayoError> {
+        self.query_rows(sql, Some(since)).await
+    }
+
+    async fn query_rows(
+        &self,
+        sql: &str,
+        since: Option<u64>,
+    ) -> Result<Vec<(u64, String, String, f64)>, MayoError> {
+        let ctx = self.session_since(since).await?;
         let df = ctx
             .sql(sql)
             .await
@@ -692,7 +729,7 @@ impl MayoStore {
                  ORDER BY timestamp DESC LIMIT {APP_QUERY_ROW_LIMIT}"
             ),
         };
-        let mut rows = self.query_sql(&sql).await?;
+        let mut rows = self.query_sql_since(&sql, start).await?;
         rows.reverse();
         Ok(rows)
     }
@@ -711,7 +748,7 @@ impl MayoStore {
              AND timestamp >= {start} AND timestamp <= {end} \
              ORDER BY timestamp"
         );
-        self.query_sql(&sql).await
+        self.query_sql_since(&sql, start).await
     }
 
     /// Query the average value of a metric over a time window.
@@ -740,7 +777,7 @@ impl MayoStore {
              AND timestamp >= {start} AND timestamp <= {now}"
         );
 
-        let ctx = self.session().await?;
+        let ctx = self.session_since(Some(start)).await?;
         let df = ctx
             .sql(&sql)
             .await
@@ -813,7 +850,7 @@ impl MayoStore {
              ORDER BY metric_name, labels"
         );
 
-        let ctx = self.session().await?;
+        let ctx = self.session_since(Some(start)).await?;
         let df = ctx
             .sql(&sql)
             .await
@@ -1190,6 +1227,36 @@ mod tests {
         let results = store.query("mem", 150, 250).await.unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].3, 2.0);
+    }
+
+    /// #310: a windowed read skips files wholly before its window, but a file
+    /// whose newest sample sits exactly on the window's start still counts,
+    /// and so does one that only straddles it.
+    #[tokio::test]
+    async fn windowed_reads_keep_every_file_that_reaches_the_window() {
+        let (mut store, _dir) = test_store();
+        let key = MetricKey::simple("mem");
+        for file in [[100, 150], [180, 200], [190, 260]] {
+            for timestamp in file {
+                store.insert(&key, Sample::at(timestamp, timestamp as f64));
+            }
+            store.flush().await.unwrap();
+        }
+        store.insert(&key, Sample::at(300, 300.0));
+
+        let rows = store.query("mem", 200, 400).await.unwrap();
+        let seen: Vec<u64> = rows.iter().map(|row| row.0).collect();
+        assert_eq!(seen, vec![200, 260, 300]);
+        let since = store
+            .query_sql_since(
+                "SELECT timestamp, metric_name, labels, value FROM metrics \
+                 WHERE timestamp >= 150 ORDER BY timestamp",
+                150,
+            )
+            .await
+            .unwrap();
+        let seen: Vec<u64> = since.iter().map(|row| row.0).collect();
+        assert_eq!(seen, vec![150, 180, 190, 200, 260, 300]);
     }
 
     #[tokio::test]

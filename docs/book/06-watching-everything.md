@@ -375,7 +375,7 @@ The cost: for a 100MB log file, the sparse index has about 25,000 entries (one p
 
 ## Hardening the metrics path
 
-The first cut of Mayo worked in the demo and passed its tests. A later review found five sharp edges that only bite in production, not in a thirty-second demo. They're worth walking through, because each one is a small change that fixes a whole class of failure.
+The first cut of Mayo worked in the demo and passed its tests. A later review found five sharp edges that only bite in production, not in a thirty-second demo, and a long soak found a sixth. They're worth walking through, because each one is a small change that fixes a whole class of failure.
 
 **SQL injection through a metric name.** The per-app query endpoint built its SQL by pasting the caller's `?name=` and the app's `namespace/app` straight into the string. Send `?name=x' OR '1'='1` and the injected quote closes the literal early, drops the tenant and time predicates, and hands back every app's metrics. The fix is the same one every database driver ships: escape the value. DataFusion follows standard SQL, so a `'` inside a literal is doubled:
 
@@ -413,7 +413,17 @@ if let Some(p) = pending {
 
 While the write is in flight, queries hold a read lock and proceed. And a corrupt or truncated Parquet file (a flush killed mid-write) no longer poisons the directory: we read each file on its own and skip the bad one with a log, so one botched flush doesn't fail every unrelated read.
 
-The theme across all five: the happy path was fine, and the failure paths — an attacker, a reassignment, a restart, a dead app, a crash mid-flush — were where the bugs lived. That's usually where they live.
+**Reads that grew with uptime.** After 0.1.0 a long soak showed Bun's memory climbing for hours without ever tripping the leak check. Nothing leaked. A test binary with its own counting allocator (a `#[global_allocator]` that forwards to `System` and adds up the bytes, so it counts the heap we ask for rather than what the allocator keeps mapped) showed each alert evaluation and rollup giving back every byte it took. What grew was the *peak*: about 1.5 MiB more per hour of history, because a query for the last two minutes still loaded every Parquet file in the directory before filtering. With seven days of retention that's a week of growth. A read with a lower bound now skips any file whose newest sample, read from the footer statistics, is older than the bound:
+
+```rust
+if since.is_some_and(|since| file_max_timestamp(&path).is_some_and(|max| max < since)) {
+    continue;
+}
+```
+
+A file with no usable statistics is still read: skipping it would silently drop data. Streaming the queries that have no lower bound is later work, but the reads that run on a timer are flat now.
+
+The theme across all of these: the happy path was fine, and the failure paths — an attacker, a reassignment, a restart, a dead app, a crash mid-flush — were where the bugs lived. That's usually where they live.
 
 ## Hardening the log path
 

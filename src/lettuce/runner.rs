@@ -18,6 +18,7 @@ use crate::council::types::{CouncilResponse, DesiredState, RaftRequest};
 
 use super::diff::{ChangePayload, ResourceChange};
 use super::git::GitRepo;
+use super::subprocess::CommandBudget;
 use super::sync::{SyncOutcome, execute_sync};
 use super::types::{
     CommitInfo, CoordinatorElection, CoordinatorElectionReason, GitOpsConfig, SyncHistoryEntry,
@@ -32,13 +33,18 @@ const MAX_SYNC_HISTORY: usize = 100;
 /// Syncs when the poll timer fires or a webhook arrives (whichever
 /// comes first). Non-leaders idle; the git clone and sync run in
 /// `spawn_blocking` because `GitRepo` shells out to `git`.
+///
+/// Every sync reconciles Git against desired state, even when Git hasn't
+/// moved, so a manual change is repaired on the next tick (B16). The
+/// returned handle finishes once `shutdown` is cancelled; a `git` child
+/// running at that moment is killed rather than waited for (B19).
 pub fn spawn_gitops_sync(
     council: Arc<CouncilNode>,
     config: GitOpsConfig,
     mut webhook_rx: mpsc::Receiver<()>,
     data_dir: PathBuf,
     shutdown: CancellationToken,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let repo_dir = data_dir.join("gitops-repo");
         let poll = Duration::from_secs(config.poll_interval_secs.max(1));
@@ -81,14 +87,25 @@ pub fn spawn_gitops_sync(
             // Git operations shell out — keep them off the runtime. Time the
             // whole cycle so each history entry and `last_sync_duration_ms`
             // reflect how long the sync actually took.
+            //
+            // Awaiting the blocking task is safe during shutdown: every `git`
+            // child runs under the shutdown token (B19), so cancellation
+            // kills the child and the task returns at once. Dropping the
+            // task instead would only stop us waiting; git would carry on.
             let config_clone = config.clone();
             let repo_dir_clone = repo_dir.clone();
+            let budget = CommandBudget {
+                cancel: shutdown.clone(),
+                ..CommandBudget::default()
+            };
+            let last_sha_clone = last_sha.clone();
             let started = std::time::Instant::now();
             let outcome = tokio::task::spawn_blocking(move || {
-                let repo = GitRepo::clone_or_open(
+                let repo = GitRepo::clone_or_open_with_budget(
                     &config_clone.repo,
                     &repo_dir_clone,
                     &config_clone.branch,
+                    budget,
                 )?;
                 Ok::<_, super::types::LettuceError>(execute_sync(
                     &repo,
@@ -97,11 +114,14 @@ pub fn spawn_gitops_sync(
                     &current_namespaces,
                     &current_permissions,
                     &overrides,
-                    last_sha.as_deref(),
+                    last_sha_clone.as_deref(),
                 ))
             })
             .await;
             let duration_ms = started.elapsed().as_millis() as u64;
+            if shutdown.is_cancelled() {
+                break;
+            }
 
             let outcome = match outcome {
                 Ok(Ok(outcome)) => outcome,
@@ -133,7 +153,7 @@ pub fn spawn_gitops_sync(
                 }
             };
 
-            // Skipped (HEAD unchanged) and hard failures: nothing to apply.
+            // Hard failures: nothing to apply.
             match &outcome.result {
                 SyncResult::Skipped { .. } => continue,
                 SyncResult::Failure { error } => {
@@ -194,22 +214,39 @@ pub fn spawn_gitops_sync(
 
             // A clean cycle: reset the failure run and record the applied
             // commit (D12) plus the elected coordinator, then clear the
-            // durable error.
+            // durable error. A tick that found Git and the cluster already
+            // in agreement, with nothing to clear, writes nothing: every
+            // poll reconciles now (B16), and recording each one would grow
+            // the Raft log every `poll_interval_secs` for no reason.
             consecutive_failures = 0;
+            let sha = outcome.commit.as_ref().map(|c| c.sha.as_str());
+            let same_commit = sha.is_some() && sha == last_sha.as_deref();
+            if same_commit && applied == 0 && sync_state_is_clean(&desired) {
+                continue;
+            }
             record_success(&council, &desired, &outcome, duration_ms).await;
 
             if applied > 0 {
+                let what = if same_commit {
+                    "repaired drift with"
+                } else {
+                    "applied"
+                };
                 println!(
-                    "gitops: applied {applied} change(s) from {}",
-                    outcome
-                        .commit
-                        .as_ref()
-                        .map(|c| c.sha.as_str())
-                        .unwrap_or("?")
+                    "gitops: {what} {applied} change(s) from {}",
+                    sha.unwrap_or("?")
                 );
             }
         }
-    });
+    })
+}
+
+/// Whether the recorded sync state has no error left to clear.
+fn sync_state_is_clean(desired: &DesiredState) -> bool {
+    desired
+        .gitops_sync_state
+        .as_ref()
+        .is_some_and(|state| state.last_error.is_none() && state.consecutive_failures == 0)
 }
 
 /// Sleep for the back-off delay, waking early on shutdown.
