@@ -22,7 +22,7 @@
 
 use std::collections::HashSet;
 
-use super::types::{KetchupError, LogEntry, LogQuery};
+use super::types::{KetchupError, LogEntry, LogQuery, LogQueryWarning, NodeFailureReason};
 
 /// One node's contribution to a fan-out: its id and the entries it returned.
 pub struct NodeLogs {
@@ -33,12 +33,40 @@ pub struct NodeLogs {
 }
 
 /// A node that failed to answer a fan-out query, and why.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeFailure {
     /// Which node failed.
     pub node_id: String,
-    /// A short reason (unreachable, non-2xx status, bad JSON, task error).
-    pub reason: String,
+    /// What went wrong, kept all the way to the caller's warning.
+    pub reason: NodeFailureReason,
+}
+
+impl From<NodeFailure> for LogQueryWarning {
+    fn from(failure: NodeFailure) -> Self {
+        LogQueryWarning::NodeFailed {
+            node_id: failure.node_id,
+            reason: failure.reason,
+        }
+    }
+}
+
+/// Most of an error body a warning repeats. A node's error bodies are short
+/// messages; anything longer is noise on a terminal.
+const MAX_ERROR_BODY_CHARS: usize = 200;
+
+/// An error and every `source()` beneath it, joined with `": "`.
+///
+/// reqwest's own message is "error sending request for url (...)"; the part
+/// that says *why* (refused, reset, unknown issuer) is further down the chain.
+fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    message
 }
 
 /// The outcome of a fan-out: merged entries plus any per-node failures.
@@ -59,7 +87,7 @@ pub struct QueryTargets {
     /// `(node id, API address)` for every node to ask.
     pub reachable: Vec<(String, String)>,
     /// Nodes the query should ask but that have no live membership entry.
-    pub unreachable: Vec<String>,
+    pub unreachable: Vec<NodeFailure>,
 }
 
 /// Pick the nodes a log query fans out to: every live member.
@@ -79,7 +107,10 @@ pub fn query_targets(placed: &[String], members: &[(String, String)]) -> QueryTa
         unreachable: placed
             .iter()
             .filter(|node| !members.iter().any(|(id, _)| id == *node))
-            .cloned()
+            .map(|node| NodeFailure {
+                node_id: node.clone(),
+                reason: NodeFailureReason::NotInMembership,
+            })
             .collect(),
     }
 }
@@ -149,6 +180,8 @@ pub async fn fan_out_query(
     service_token: Option<&str>,
 ) -> Result<FanOutResult, KetchupError> {
     let mut handles = tokio::task::JoinSet::new();
+    // A task that panics returns no node id, so remember whose task it was.
+    let mut owners = std::collections::HashMap::new();
 
     for (node_id, url) in nodes {
         let node_id = node_id.clone();
@@ -162,15 +195,19 @@ pub async fn fan_out_query(
         let end = query.end;
         let client = client.clone();
 
-        handles.spawn(async move {
+        let owner = node_id.clone();
+        let handle = handles.spawn(async move {
             // Build the target URL through `url::Url` so `app`/`namespace`
             // path segments are percent-encoded, and hand the query pairs to
             // reqwest's `.query()`, which encodes each value. A `grep` value
             // with `&` or `?` therefore travels as one parameter's data, not
             // as extra query syntax.
-            let outcome: Result<Vec<LogEntry>, String> = tokio::time::timeout(timeout, async {
-                let req_url = build_entries_url(&base, &app, &namespace)
-                    .map_err(|e| format!("bad url: {e}"))?;
+            let outcome = tokio::time::timeout(timeout, async {
+                let req_url = build_entries_url(&base, &app, &namespace).map_err(|e| {
+                    NodeFailureReason::Internal {
+                        detail: format!("bad node url {base:?}: {e}"),
+                    }
+                })?;
 
                 let mut params: Vec<(&str, String)> = Vec::new();
                 if let Some(t) = tail {
@@ -190,22 +227,46 @@ pub async fn fan_out_query(
                     crate::sesame::auth::bearer_get(&client, req_url.as_str(), token.as_deref())
                         .query(&params);
 
-                let response = request
-                    .send()
-                    .await
-                    .map_err(|error| format!("request failed: {error}"))?;
-                if !response.status().is_success() {
-                    return Err(format!("status {}", response.status().as_u16()));
+                let response =
+                    request
+                        .send()
+                        .await
+                        .map_err(|error| NodeFailureReason::Transport {
+                            detail: error_chain(&error),
+                        })?;
+                let status = response.status();
+                if !status.is_success() {
+                    // The body usually says why (a scope refusal, a store
+                    // error); a body that won't arrive leaves just the status.
+                    let body = response.text().await.unwrap_or_default();
+                    return Err(NodeFailureReason::HttpStatus {
+                        status: status.as_u16(),
+                        body: body.trim().chars().take(MAX_ERROR_BODY_CHARS).collect(),
+                    });
                 }
-                response
-                    .json::<Vec<LogEntry>>()
-                    .await
-                    .map_err(|error| format!("invalid json: {error}"))
+                response.json::<Vec<LogEntry>>().await.map_err(|error| {
+                    // A body that parses badly is the node's fault; one that
+                    // stops arriving is the connection's.
+                    if error.is_decode() {
+                        NodeFailureReason::BadBody {
+                            detail: error_chain(&error),
+                        }
+                    } else {
+                        NodeFailureReason::Transport {
+                            detail: error_chain(&error),
+                        }
+                    }
+                })
             })
             .await
-            .unwrap_or_else(|_| Err("timed out".to_string()));
+            .unwrap_or_else(|_| {
+                Err(NodeFailureReason::TimedOut {
+                    after_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+                })
+            });
             (node_id, outcome)
         });
+        owners.insert(handle.id(), owner);
     }
 
     let mut sources = Vec::new();
@@ -215,8 +276,12 @@ pub async fn fan_out_query(
             Ok((node_id, Ok(entries))) => sources.push(NodeLogs { node_id, entries }),
             Ok((node_id, Err(reason))) => failures.push(NodeFailure { node_id, reason }),
             Err(e) => failures.push(NodeFailure {
-                node_id: "unknown".to_string(),
-                reason: format!("task error: {e}"),
+                node_id: owners
+                    .remove(&e.id())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                reason: NodeFailureReason::Internal {
+                    detail: e.to_string(),
+                },
             }),
         }
     }
@@ -302,7 +367,10 @@ mod tests {
         assert!(result.entries.is_empty());
         assert_eq!(result.failures.len(), 1);
         assert_eq!(result.failures[0].node_id, "stalled");
-        assert!(result.failures[0].reason.contains("timed out"));
+        assert_eq!(
+            result.failures[0].reason,
+            NodeFailureReason::TimedOut { after_ms: 100 }
+        );
     }
 
     #[tokio::test]
@@ -371,7 +439,13 @@ mod tests {
     fn a_placed_node_missing_from_membership_is_reported_unreachable() {
         let targets = query_targets(&["n4".to_string()], &members(&["n1"]));
         assert_eq!(reachable_ids(&targets), vec!["n1"]);
-        assert_eq!(targets.unreachable, vec!["n4".to_string()]);
+        assert_eq!(
+            targets.unreachable,
+            vec![NodeFailure {
+                node_id: "n4".to_string(),
+                reason: NodeFailureReason::NotInMembership,
+            }]
+        );
     }
 
     #[test]
@@ -618,6 +692,16 @@ mod tests {
             "failure was swallowed as empty success"
         );
         assert_eq!(result.failures[0].node_id, "dead-node");
+        // The cause from deep in reqwest's error chain survives, not just
+        // "error sending request".
+        match &result.failures[0].reason {
+            NodeFailureReason::Transport { detail } => assert!(
+                detail.to_lowercase().contains("refused")
+                    || detail.to_lowercase().contains("connect"),
+                "{detail}"
+            ),
+            other => panic!("expected a transport failure, got {other:?}"),
+        }
     }
 
     /// A node returning a non-2xx status is a failure, not empty success.
@@ -629,7 +713,7 @@ mod tests {
 
         let app = Router::new().route(
             "/v1/logs/entries/{app}/{namespace}",
-            get(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
+            get(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "log store unavailable") }),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -653,6 +737,46 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(result.failures.len(), 1);
-        assert!(result.failures[0].reason.contains("status 500"));
+        assert_eq!(
+            result.failures[0].reason,
+            NodeFailureReason::HttpStatus {
+                status: 500,
+                body: "log store unavailable".to_string(),
+            }
+        );
+    }
+
+    /// A 2xx answer that isn't a list of entries is the node's fault, and
+    /// says so, rather than passing for a network problem.
+    #[tokio::test]
+    async fn unparseable_body_is_a_bad_body_failure() {
+        use axum::Router;
+        use axum::routing::get;
+
+        let app = Router::new().route(
+            "/v1/logs/entries/{app}/{namespace}",
+            get(|| async { "not json" }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+
+        let result = fan_out_query(
+            &log_query(None),
+            &[("n1".to_string(), format!("http://{addr}"))],
+            &reqwest::Client::new(),
+            Duration::from_secs(5),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.failures.len(), 1);
+        assert!(
+            matches!(result.failures[0].reason, NodeFailureReason::BadBody { .. }),
+            "{:?}",
+            result.failures[0].reason
+        );
     }
 }

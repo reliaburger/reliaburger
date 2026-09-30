@@ -35,6 +35,14 @@ filter = 'binary(kubernetes_demo)'
 test-group = "host-network"
 slow-timeout = { period = "120s", terminate-after = 5 }
 
+# Memory autoscaling waits for a complete one-minute rollup to reach the
+# leader on top of a runc pull and start. The first matching override wins,
+# so this precedes the host-network timeout its `runc_` name also matches.
+[[profile.default.overrides]]
+filter = 'binary(autoscale_memory)'
+test-group = "host-network"
+slow-timeout = { period = "120s", terminate-after = 4 }
+
 [[profile.default.overrides]]
 filter = 'binary(ebpf) | binary(owned_network) | binary(owned_runc) | binary(owned_rootless) | test(/(runc_|_runc|runc::|netns|btrfs|buildah|image_pull)/)'
 test-group = "host-network"
@@ -75,6 +83,14 @@ threads-required = "num-test-threads"
 filter = 'binary(kubernetes_demo)'
 test-group = "host-network"
 slow-timeout = { period = "120s", terminate-after = 5 }
+
+# Memory autoscaling waits for a complete one-minute rollup to reach the
+# leader on top of a runc pull and start. The first matching override wins,
+# so this precedes the host-network timeout its `runc_` name also matches.
+[[profile.ci.overrides]]
+filter = 'binary(autoscale_memory)'
+test-group = "host-network"
+slow-timeout = { period = "120s", terminate-after = 4 }
 
 [[profile.ci.overrides]]
 filter = 'binary(ebpf) | binary(owned_network) | binary(owned_runc) | binary(owned_rootless) | test(/(runc_|_runc|runc::|netns|btrfs|buildah|image_pull)/)'

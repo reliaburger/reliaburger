@@ -12,7 +12,7 @@ Meat is the single decision-maker for "what runs where." Every App placement, Jo
 
 - **Single-leader scheduling.** All scheduling decisions are made on one node. This eliminates coordination overhead between multiple schedulers and makes the Raft log the single source of truth for placement decisions. The tradeoff -- a single point of decision-making -- is mitigated by fast leader failover (< 5 seconds) and the delegated batch model.
 
-- **Delegated batch execution.** Meat does not schedule individual Jobs from high-throughput batch workloads. Instead, it allocates capacity budgets to nodes ("Node 7, here are your next 200 jobs"), and nodes execute and report completions asynchronously. This is the mechanism that enables 100M+ jobs/day without the leader becoming a bottleneck.
+- **Delegated batch execution.** Meat does not schedule individual Jobs from high-throughput batch workloads. Instead, it allocates capacity budgets to nodes ("Node 7, here are your next 200 jobs"), and nodes execute and report completions asynchronously. This is the mechanism meant to reach 100M+ jobs/day without the leader becoming a bottleneck. It's a target: the allocator ships, the delegated pipeline isn't wired end to end, and the throughput is unmeasured (see the status note in the batch section).
 
 - **Bin-packing first.** Meat uses a bin-packing algorithm as its primary placement strategy, maximising node utilisation before spreading to new nodes. This reduces the number of active nodes under low load and improves cache locality for images already present on a node.
 
@@ -305,7 +305,8 @@ pub struct AutoscaleConfig {
     pub request: f64,
     /// Target utilisation of the request as a fraction (0.70 for "70%").
     pub target: f64,
-    /// Minimum replica count. Autoscaler will never scale below this.
+    /// Minimum replica count, at least 1 (no scale-to-zero). Autoscaler
+    /// will never scale below this.
     pub min: u32,
     /// Maximum replica count. Autoscaler will never scale above this.
     pub max: u32,
@@ -607,7 +608,7 @@ pub struct MetricSample {
 
 When an App spec with `replicas = 3` is submitted:
 
-1. Meat validates the spec (schema, permissions, namespace quota).
+1. The API validates the spec (schema, permissions) before committing it; Meat checks the namespace quota in its scheduling pass (§5.6).
 2. For each replica (0..3), Meat runs the four-phase placement pipeline:
    - **Filter:** Eliminate nodes that lack resources, do not match `required` labels, or are not ready.
    - **Score:** Rank candidates using the weighted scoring model (bin-packing 50, preferred labels 20, image locality 15, spread 60, stability 5).
@@ -808,6 +809,7 @@ Utilisation follows the Kubernetes HPA convention: the average per-replica use d
 - **CPU with no CPU request** is measured against one whole core. ProcessGrill and rootless nodes refuse apps that declare `cpu` (they can't enforce the limit), so refusing here would make CPU autoscaling impossible on them.
 - **Memory with no memory request** fails config validation: there's no natural unit to fall back on.
 - **Any other `metric`** fails config validation. Custom (scraped) metrics are not supported.
+- **`min = 0`** fails config validation. Scale-to-zero needs a wake-up signal that exists while no replica runs (requests queued at the ingress, say), and both metrics are sampled from running instances: an app at zero replicas reports nothing to scale back up on. `min` must be at least 1; `relish stop` parks an app at zero by hand.
 - **Limits.** The collector samples each instance's main process (children aren't counted), and only runtimes that report a host PID produce per-app metrics: ProcessGrill and runc do; direct Apple Container (VM-isolated, disabled in 0.1.0) doesn't, so its apps can't autoscale. Rollups cover the previous complete minute, so the first signal reaches the leader 60–120 s after load changes.
 
 #### Algorithm
@@ -925,7 +927,7 @@ fn reconcile_daemon_apps(&self, membership_event: MembershipEvent) {
 
 ### 5.6 Namespace Quota Enforcement
 
-Quotas are enforced at scheduling time (admission check), not retroactively. Before running the placement pipeline, Meat checks:
+Quotas are enforced at scheduling time, not at apply time and not retroactively. `relish apply` commits an over-quota app to desired state like any other; the leader's scheduling pass (`plan_scheduling_pass` in `src/cluster/orchestrate.rs`) seeds a `QuotaLedger` with every converged app's footprint, then runs this check before placing each unconverged app. An app that fails it gets no placement that pass and the leader logs `scheduler: quota rejects <app>: <reason>`; the check runs again every pass, so the app places once the namespace has room. `over_quota_apply_is_accepted_but_never_placed` pins this contract. The check, in outline:
 
 ```rust
 fn check_namespace_quota(
@@ -1091,14 +1093,12 @@ All scheduler-related configuration is set in the cluster-level configuration (a
 
 **Response:**
 
-- **New deploys:** Rejected with a clear error:
+- **New deploys (0.1.0):** `relish apply` succeeds and the app is committed, but Meat leaves it unplaced, so it shows zero instances. The only record of why is a line in the leader's log, repeated each scheduling pass:
   ```
-  Error: namespace "team-backend" CPU quota exhausted
-    allocated: 7800m / limit: 8000m
-    requested: 500m (app.new-service, 2 replicas)
-    would exceed quota by 300m
+  scheduler: quota rejects prod/new-service: <QuotaError>
   ```
-- **Autoscale events:** The autoscaler's scale-up is blocked. The scale action is logged as `QuotaBlocked`, an alert fires, and the autoscaler retries at the next evaluation interval. The existing replicas continue running -- quota exhaustion does not cause running workloads to be terminated.
+- **Autoscale and replica changes:** a scale-up that would bust the budget is skipped the same way, and the app keeps the placements it already has. Running workloads are never terminated to satisfy a quota.
+- **Planned, not yet scheduled on the roadmap:** a durable "blocked by quota" reason on the app that `relish status` and Brioche can show, and an apply-time error for an app that can't fit its namespace's budget. There's no `QuotaBlocked` event or quota alert today.
 
 ### 7.4 Leader Failure Mid-Deploy
 

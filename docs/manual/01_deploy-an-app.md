@@ -59,6 +59,23 @@ Names (apps, jobs, namespaces) are lowercase DNS labels. Secrets go in `env`
 encrypted; see `security`. Ingress, firewall and egress rules are in
 `networking`, metrics scraping in `observability`.
 
+## Autoscaling
+
+An `autoscale` block lets the leader move `replicas` between `min` and `max`:
+
+```toml
+[app.api.autoscale]
+metric = "cpu"            # or "memory" (needs a memory request)
+target = "70%"            # of each replica's request
+min = 2
+max = 10
+```
+
+`min` must be at least 1. There's no scale-to-zero: CPU and memory come from
+running replicas, so an app at zero would have nothing to scale back up on, and
+`relish apply` refuses `min = 0`. To park an app at zero by hand, use
+`relish stop`.
+
 ## The everyday loop
 
 ```sh
@@ -68,7 +85,7 @@ relish lint app.toml             # validate only
 relish logs web -f               # stream logs from every node (--tail 20 for the last 20)
 relish exec web env              # run a command inside an instance, on whichever node runs it
 relish top                       # every workload on every node, with CPU and memory
-relish inspect web               # full detail
+relish inspect web               # every instance on every node, desired vs running
 relish stop web                  # scale to zero; `relish apply` starts it again
 relish delete web                # remove the app from the cluster
 ```

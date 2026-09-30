@@ -1943,6 +1943,9 @@ pub struct BunAgent<G: Grill> {
     /// Sink for container log lines. When set, each started instance spawns a
     /// forwarder that streams its output here (drained into the LogStore).
     log_tx: Option<mpsc::Sender<crate::ketchup::types::LogRecord>>,
+    /// Where the log store's checkpoint says each capture file was read up
+    /// to when Bun started. Forwarders resume there instead of byte 0 (#308).
+    capture_offsets: Arc<crate::ketchup::types::CaptureOffsets>,
     /// Bounded lifecycle event history shared with the API.
     events: Option<Arc<tokio::sync::RwLock<crate::bun::events::EventStore>>>,
     /// Schedulable CPU capacity (system total minus `[resources]`
@@ -2150,6 +2153,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             scheduled_jobs: std::collections::HashMap::new(),
             scheduled_jobs_store_uncertain: false,
             log_tx: None,
+            capture_offsets: Arc::default(),
             events: None,
             capacity_cpu_millicores: 0,
             capacity_memory_mb: 0,
@@ -2279,6 +2283,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             scheduled_jobs: std::collections::HashMap::new(),
             scheduled_jobs_store_uncertain: false,
             log_tx: None,
+            capture_offsets: Arc::default(),
             events: None,
             capacity_cpu_millicores: 0,
             capacity_memory_mb: 0,
@@ -2329,8 +2334,17 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// The binary drains this into the LogStore so container output is
     /// queryable. Without it, container output is only reachable live via
     /// `relish logs` (which asks the runtime directly).
-    pub fn set_log_sink(&mut self, log_tx: mpsc::Sender<crate::ketchup::types::LogRecord>) {
+    ///
+    /// `resume` is the store's checkpoint as it opened: each forwarder
+    /// starts its capture files there, so a restarted agent reads only the
+    /// output the store doesn't hold yet.
+    pub fn set_log_sink(
+        &mut self,
+        log_tx: mpsc::Sender<crate::ketchup::types::LogRecord>,
+        resume: crate::ketchup::types::CaptureOffsets,
+    ) {
         self.log_tx = Some(log_tx);
+        self.capture_offsets = Arc::new(resume);
     }
 
     /// Attach process-wide readiness and capability evidence.
@@ -3674,13 +3688,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let namespace = namespace.to_string();
 
         let (line_tx, mut line_rx) = mpsc::channel::<crate::ketchup::types::CapturedLine>(256);
-        // Producer: the runtime streams complete lines, from the start of the
-        // instance's output, into line_tx. The log store drops the ones it
-        // already holds, so an adopted instance isn't ingested twice.
+        // Producer: the runtime streams complete lines into line_tx, starting
+        // each capture file where the store's checkpoint stopped (#308). An
+        // adopted instance's earlier output is neither re-read nor, should a
+        // line come round again, ingested twice: the store drops it.
         let follow_grill = grill;
         let follow_id = id.clone();
+        let resume = Arc::clone(&self.capture_offsets);
         tokio::spawn(async move {
-            follow_grill.follow_logs(&follow_id, line_tx).await;
+            follow_grill.follow_logs(&follow_id, line_tx, &resume).await;
         });
         // Consumer: tag each line and forward it to the log sink.
         tokio::spawn(async move {
@@ -6953,12 +6969,20 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
 
         self.finish_instance_networking(app_name, namespace).await?;
-        if let Some(ref ingress) = spec.ingress {
-            self.ingress_configs.insert(
-                (namespace.to_string(), app_name.to_string()),
-                ingress.clone(),
-            );
+        // The rolled-out spec owns the route now (#307): a changed host
+        // replaces the old one, and a spec without ingress drops it. The
+        // stopped-app restore before the rollout only inserts when nothing
+        // is stored, so this is where a running app's route changes.
+        let key = (namespace.to_string(), app_name.to_string());
+        match &spec.ingress {
+            Some(ingress) => {
+                self.ingress_configs.insert(key, ingress.clone());
+            }
+            None => {
+                self.ingress_configs.remove(&key);
+            }
         }
+        self.rebuild_routing_table().await;
 
         let entry = crate::meat::deploy_types::DeployHistoryEntry {
             id: crate::meat::deploy_types::DeployId(
@@ -9888,7 +9912,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             let (instance_tx, mut instance_rx) =
                 mpsc::channel::<crate::ketchup::types::CapturedLine>(64);
             tokio::spawn(async move {
-                grill.follow_logs(&id, instance_tx).await;
+                // A live follow shows the instance's whole capture.
+                grill
+                    .follow_logs(&id, instance_tx, &Default::default())
+                    .await;
             });
             let tx = lines.clone();
             tokio::spawn(async move {
@@ -15936,6 +15963,128 @@ mod tests {
         assert!(routed, "the reapplied app has no ingress route");
     }
 
+    /// #307: redeploying a running app with a different ingress host moves
+    /// the route, under either deploy strategy. The new host reaches the
+    /// replacement instances and the old host stops routing. Dropping the
+    /// ingress section removes the route.
+    #[tokio::test]
+    async fn redeploy_with_a_changed_ingress_host_moves_the_route() {
+        for strategy in ["rolling", "blue-green"] {
+            redeploy_moves_the_ingress_route(strategy).await;
+        }
+    }
+
+    /// #307 in cluster mode: the council's route catalogue carries the new
+    /// host, and a replica node's own stored route must not keep the old
+    /// one alive underneath it. Dropping the ingress from the spec and from
+    /// the catalogue leaves no route on the node.
+    #[tokio::test]
+    async fn cluster_redeploy_with_a_changed_ingress_host_moves_the_route() {
+        let (mut agent, tx, shutdown) = test_agent();
+        let routes = agent.routing_table_handle();
+        let task = tokio::spawn(async move { agent.run().await });
+        let config = |ingress: &str| {
+            Config::parse(&format!(
+                "[app.web]\nimage = 'myapp:v1'\nport = 8080\n{ingress}"
+            ))
+            .unwrap()
+        };
+        let catalogue = |generation: u64, host: Option<&str>| {
+            let tx = tx.clone();
+            let ingress = host
+                .map(|host| crate::cluster::orchestrate::IngressAssignment {
+                    name: "web".into(),
+                    namespace: "default".into(),
+                    config: toml::from_str(&format!("host = '{host}'")).unwrap(),
+                })
+                .into_iter()
+                .collect();
+            async move {
+                let (response, reply) = oneshot::channel();
+                tx.send(AgentCommand::SyncClusterCatalog {
+                    generation,
+                    response,
+                    catalog: Box::default(),
+                    ingress,
+                })
+                .await
+                .unwrap();
+                reply.await.unwrap().unwrap();
+            }
+        };
+
+        expect_complete(&send_deploy(&tx, config("[app.web.ingress]\nhost = 'a.test'\n")).await);
+        catalogue(1, Some("a.test")).await;
+        let first = routes.read().await.contains_host("a.test");
+
+        expect_complete(&send_deploy(&tx, config("[app.web.ingress]\nhost = 'b.test'\n")).await);
+        catalogue(2, Some("b.test")).await;
+        let moved = routes.read().await.contains_host("b.test");
+        let old_host_routes = routes.read().await.contains_host("a.test");
+
+        expect_complete(&send_deploy(&tx, config("")).await);
+        catalogue(3, None).await;
+        let after_drop = routes.read().await.contains_host("b.test");
+        shutdown.cancel();
+        task.await.unwrap();
+
+        assert!(first, "a.test never routed");
+        assert!(moved, "the changed host b.test has no route");
+        assert!(!old_host_routes, "the old host a.test still routes");
+        assert!(!after_drop, "dropping the ingress left b.test routing");
+    }
+
+    async fn redeploy_moves_the_ingress_route(strategy: &str) {
+        let (mut agent, tx, shutdown) = test_agent();
+        let routes = agent.routing_table_handle();
+        let task = tokio::spawn(async move { agent.run().await });
+        let config = |ingress: &str| {
+            Config::parse(&format!(
+                "[app.web]\nimage = 'myapp:v1'\nport = 8080\n\
+                 [app.web.deploy]\nstrategy = '{strategy}'\n{ingress}"
+            ))
+            .unwrap()
+        };
+        let backends = |table: &crate::wrapper::routing::RoutingTable, host: &str| {
+            table.lookup(host, "/").map(|route| {
+                route
+                    .backends
+                    .iter()
+                    .map(|backend| backend.instance_id.clone())
+                    .collect::<Vec<_>>()
+            })
+        };
+
+        expect_complete(&send_deploy(&tx, config("[app.web.ingress]\nhost = 'a.test'\n")).await);
+        let first = backends(&*routes.read().await, "a.test").expect("a.test has no route");
+
+        let events = send_deploy(&tx, config("[app.web.ingress]\nhost = 'b.test'\n")).await;
+        let moved_to = backends(&*routes.read().await, "b.test");
+        let old_host_routes = routes.read().await.contains_host("a.test");
+
+        let dropped = send_deploy(&tx, config("")).await;
+        let after_drop = routes.read().await.contains_host("b.test");
+        shutdown.cancel();
+        task.await.unwrap();
+
+        expect_complete(&events);
+        expect_complete(&dropped);
+        let moved_to = moved_to.unwrap_or_else(|| panic!("{strategy}: b.test has no route"));
+        assert_eq!(moved_to.len(), 1, "{strategy}: {moved_to:?}");
+        assert_ne!(
+            moved_to, first,
+            "{strategy}: b.test routes to the old instances"
+        );
+        assert!(
+            !old_host_routes,
+            "{strategy}: the old host a.test still routes"
+        );
+        assert!(
+            !after_drop,
+            "{strategy}: dropping the ingress left b.test routing"
+        );
+    }
+
     /// Send a Deploy command and collect all events. Returns the list
     /// of events (the last one should be Complete or Error).
     async fn send_deploy(tx: &mpsc::Sender<AgentCommand>, config: Config) -> Vec<ApplyEvent> {
@@ -17430,7 +17579,7 @@ interval = 1
         let mut agent = BunAgent::new(grill, port_allocator, rx, shutdown.clone());
 
         let (log_tx, mut log_rx) = mpsc::channel(64);
-        agent.set_log_sink(log_tx);
+        agent.set_log_sink(log_tx, Default::default());
         let handle = tokio::spawn(async move { agent.run().await });
 
         let config = Config::parse(

@@ -18,30 +18,88 @@ pub struct Compatibility {
 /// Supported formats, including the per-node `directive_retry` record in a
 /// cluster upgrade, the 503 a node answers a directive with when the
 /// binary's registry is unavailable (the orchestrator retries it), and the
-/// nodes each app last ran on (`DesiredState::last_placed_nodes`).
+/// nodes each app last ran on (`DesiredState::last_placed_nodes`), and the
+/// log store's ingest checkpoint, which records each capture file's device
+/// and inode beside its offset.
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 27,
-    state: 44,
+    state: 45,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.
 pub const STATE_STAMP: &str = "state-format.json";
 
+/// Where the compatibility policy every refusal points to lives.
+pub const POLICY_URL: &str = "https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#compatibility-before-100";
+
+/// This binary as a refusal names it: `reliaburger v0.1.1 (3fcb1fd)`, or
+/// just the version when the build didn't know its commit.
+fn this_binary() -> String {
+    use crate::upgrade::version::{build_commit, compiled_version, describe};
+    format!(
+        "reliaburger {}",
+        describe(&compiled_version(), build_commit())
+    )
+}
+
 /// A format cannot be safely admitted or opened.
+///
+/// Every message leads with what was found and what this binary needs,
+/// because `journalctl` cuts a long line at the terminal's width. The
+/// remedy and the policy link follow.
 #[derive(Debug, thiserror::Error)]
 pub enum CompatibilityError {
-    /// The binary advertises a different protocol or storage generation.
-    #[error("incompatible cluster formats: received {received:?}, required {required:?}")]
-    Mismatch {
-        received: Compatibility,
-        required: Compatibility,
-    },
-    /// Existing development state has no supported format stamp.
-    #[error("unversioned development state at {0}; create a fresh cluster for 0.1.0")]
-    DevelopmentState(std::path::PathBuf),
-    /// The stamp cannot establish a supported storage format.
+    /// The other side (a peer, a joining node, a candidate binary) speaks a
+    /// different protocol or storage generation.
     #[error(
-        "invalid or incompatible state format at {0}; preserve the data and use a compatible binary"
+        "incompatible cluster formats: found protocol {}, state {}; this binary ({}) needs protocol {}, state {}. \
+         Pre-1.0 builds don't migrate or mix formats: run the same reliaburger release on every node, \
+         or recreate the cluster. See {POLICY_URL}",
+        .found.protocol,
+        .found.state,
+        this_binary(),
+        .expected.protocol,
+        .expected.state
+    )]
+    Mismatch {
+        /// The pair the other side advertised.
+        found: Compatibility,
+        /// The pair this binary requires.
+        expected: Compatibility,
+    },
+    /// Existing state has no format stamp, so no binary vouches for it.
+    #[error(
+        "unversioned state at {}; this binary ({}) needs state format {} and won't adopt unstamped data. \
+         Pre-1.0 builds don't migrate state: move the directory aside and recreate the cluster. See {POLICY_URL}",
+        .0.display(),
+        this_binary(),
+        CURRENT.state
+    )]
+    DevelopmentState(std::path::PathBuf),
+    /// The stamp was written by a binary with a different state format.
+    #[error(
+        "incompatible state format: found {found}; this binary ({}) needs {expected}. \
+         Pre-1.0 builds don't migrate state: run the reliaburger release that wrote {}, \
+         or move the data aside and recreate the cluster. See {POLICY_URL}",
+        this_binary(),
+        .stamp.display()
+    )]
+    StateMismatch {
+        /// The stamp file that was read.
+        stamp: std::path::PathBuf,
+        /// The state format the stamp records.
+        found: u32,
+        /// The state format this binary writes.
+        expected: u32,
+    },
+    /// The stamp exists but can't be read as a format number.
+    #[error(
+        "unreadable state format stamp at {}; this binary ({}) needs state format {}. \
+         Pre-1.0 builds don't migrate state, and a hand-written stamp won't make the data compatible: \
+         run the reliaburger release that wrote it, or move it aside and recreate the cluster. See {POLICY_URL}",
+        .0.display(),
+        this_binary(),
+        CURRENT.state
     )]
     InvalidState(std::path::PathBuf),
     /// A filesystem operation failed without permission to reinterpret the data.
@@ -56,8 +114,8 @@ impl Compatibility {
             Ok(())
         } else {
             Err(CompatibilityError::Mismatch {
-                received: self,
-                required: CURRENT,
+                found: self,
+                expected: CURRENT,
             })
         }
     }
@@ -88,7 +146,11 @@ pub fn ensure_state_compatible(directory: &Path) -> Result<(), CompatibilityErro
             let decoded = serde_json::from_slice::<StateStamp>(&bytes)
                 .map_err(|_| CompatibilityError::InvalidState(stamp.clone()))?;
             if decoded.format != CURRENT.state {
-                return Err(CompatibilityError::InvalidState(stamp));
+                return Err(CompatibilityError::StateMismatch {
+                    stamp,
+                    found: decoded.format,
+                    expected: CURRENT.state,
+                });
             }
             return Ok(());
         }
@@ -196,5 +258,116 @@ mod tests {
             .require_current()
             .is_err()
         );
+    }
+
+    /// The first sentence, which has to survive a journal line cut at
+    /// terminal width.
+    fn lead(message: &str) -> &str {
+        message.split(". ").next().unwrap()
+    }
+
+    #[test]
+    fn protocol_refusal_leads_with_both_pairs_and_names_the_way_out() {
+        let message = CompatibilityError::Mismatch {
+            found: Compatibility {
+                protocol: 26,
+                state: 43,
+            },
+            expected: Compatibility {
+                protocol: 27,
+                state: 44,
+            },
+        }
+        .to_string();
+        assert!(
+            lead(&message).starts_with(
+                "incompatible cluster formats: found protocol 26, state 43; this binary (reliaburger "
+            ),
+            "{message}"
+        );
+        assert!(
+            lead(&message).ends_with("needs protocol 27, state 44"),
+            "{message}"
+        );
+        assert!(message.contains(env!("CARGO_PKG_VERSION")), "{message}");
+        assert!(
+            message.contains("Pre-1.0 builds don't migrate"),
+            "{message}"
+        );
+        assert!(message.contains("recreate the cluster"), "{message}");
+        assert!(message.ends_with(POLICY_URL), "{message}");
+    }
+
+    #[test]
+    fn state_format_refusal_leads_with_found_and_expected() {
+        let stamp = std::path::PathBuf::from("/var/lib/reliaburger/data/state-format.json");
+        let message = CompatibilityError::StateMismatch {
+            stamp: stamp.clone(),
+            found: 43,
+            expected: 44,
+        }
+        .to_string();
+        assert!(
+            lead(&message)
+                .starts_with("incompatible state format: found 43; this binary (reliaburger "),
+            "{message}"
+        );
+        assert!(lead(&message).ends_with("needs 44"), "{message}");
+        assert!(
+            message.contains("Pre-1.0 builds don't migrate state"),
+            "{message}"
+        );
+        assert!(message.contains(&stamp.display().to_string()), "{message}");
+        assert!(message.contains("recreate the cluster"), "{message}");
+        assert!(message.ends_with(POLICY_URL), "{message}");
+    }
+
+    #[test]
+    fn unreadable_and_unversioned_state_refusals_name_the_expected_format() {
+        let expected = format!("needs state format {}", CURRENT.state);
+        for message in [
+            CompatibilityError::InvalidState("/data/state-format.json".into()).to_string(),
+            CompatibilityError::DevelopmentState("/data".into()).to_string(),
+        ] {
+            assert!(lead(&message).contains(&expected), "{message}");
+            assert!(
+                message.contains("Pre-1.0 builds don't migrate state"),
+                "{message}"
+            );
+            assert!(message.ends_with(POLICY_URL), "{message}");
+        }
+    }
+
+    #[test]
+    fn a_stamp_from_another_generation_reports_what_it_found() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join(STATE_STAMP), br#"{"format":1}"#).unwrap();
+        match ensure_state_compatible(directory.path()) {
+            Err(CompatibilityError::StateMismatch {
+                found, expected, ..
+            }) => {
+                assert_eq!(found, 1);
+                assert_eq!(expected, CURRENT.state);
+            }
+            other => panic!("expected a state mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn require_current_reports_the_pair_it_was_given() {
+        let found = Compatibility {
+            protocol: CURRENT.protocol + 1,
+            ..CURRENT
+        };
+        match found.require_current() {
+            Err(CompatibilityError::Mismatch {
+                found: reported,
+                expected,
+            }) => {
+                assert_eq!(reported, found);
+                assert_eq!(expected, CURRENT);
+            }
+            other => panic!("expected a mismatch, got {other:?}"),
+        }
     }
 }

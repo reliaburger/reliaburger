@@ -95,6 +95,20 @@ roll or roll back only when both generations match exactly. The agent verifies
 the signed executable and checks this contract before staging it. Joins and
 cluster transports also enforce compatibility; absent evidence is a refusal.
 
+Every refusal leads with the formats it found and the ones this binary needs,
+names the binary's version (and commit, when the build recorded one), and
+links back here, because `journalctl` cuts long lines at the terminal's width:
+
+```text
+incompatible state format: found 43; this binary (reliaburger v0.1.1 (3fcb1fd)) needs 44. Pre-1.0 builds don't migrate state: …
+incompatible cluster formats: found protocol 26, state 43; this binary (reliaburger v0.1.1 (3fcb1fd)) needs protocol 27, state 44. …
+```
+
+Before 1.0 nothing migrates between generations, so there are two ways
+forward: run the release that wrote the data (or that the rest of the cluster
+runs), or move the data directory aside and recreate the cluster. Both leave
+the refused data untouched.
+
 ### Compatibility before 1.0.0
 
 Until 1.0.0 every release is a development release, and we don't keep

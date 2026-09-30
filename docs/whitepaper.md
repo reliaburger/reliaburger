@@ -120,9 +120,9 @@ Reliaburger is designed to meet the following quantitative targets. These engine
 
 **100 million jobs per day** demands a scheduler (Meat) that can make placement decisions at high throughput without becoming a bottleneck. At a sustained rate, this is over a thousand jobs dispatched per second. The design implications (batch scheduling, delegated execution, and asynchronous reporting) are detailed in [design/scheduler-meat.md](design/scheduler-meat.md).
 
-**GPU as a first-class schedulable resource** means that AI/ML workloads aren't a day-two feature. The Bun agent detects NVIDIA GPUs at startup (it probes `/dev/nvidia0` and parses `nvidia-smi`, so no vendor library is linked into the binary) and reports them as schedulable resources alongside CPU and memory. Placement is honest today: a workload that asks for a GPU is refused on a node where GPU support is off or where fewer cards exist than requested. Passing the `/dev/nvidia*` devices into the container's OCI spec is a follow-up (see [design/agent-bun.md](design/agent-bun.md) §5.4), so treat whole-device passthrough as scheduled but not yet plumbed end to end.
+**GPU as a first-class schedulable resource** means that AI/ML workloads aren't a day-two feature. This is a target, not 0.1.0 behaviour. Today the Bun agent detects NVIDIA GPUs at startup (it probes `/dev/nvidia0` and parses `nvidia-smi`, so no vendor library is linked into the binary) and refuses a workload that asks for more cards than the node has, or any card when GPU support is off. The count doesn't reach the cluster scheduler yet, so Meat sees zero GPUs on every node and a clustered app with `gpu = 1` is never placed. Propagating GPU capacity (backlog item F01) and passing the `/dev/nvidia*` devices into the container's OCI spec (see [design/agent-bun.md](design/agent-bun.md) §5.4) are both planned; the [roadmap](roadmap.md#releases-after-010) lists GPU scheduling under "Later", after 0.4.0.
 
-**Automatic recovery from the loss of any single node, the leader, or the entire council** means that none of these failures interrupts the data plane. Applications continue running when the control plane is unavailable. Surviving nodes can reconstruct the full state. The cluster self-heals without operator intervention.
+**Recovery from the loss of any single node, the leader, or the entire council** means that none of these failures interrupts the data plane. Applications continue running when the control plane is unavailable. Losing a node, the leader or a minority of council voters heals without an operator. Losing the whole council is the exception: an operator restores the desired state from a sealed backup (§8.3), because that recovery throws away Raft history and a human should choose which backup wins.
 
 ---
 
@@ -218,7 +218,7 @@ metric = "cpu"
 target = "70%"
 ```
 
-`metric` is `"cpu"` or `"memory"`, and `target` is utilisation of each replica's request, the Kubernetes HPA convention (an app with no CPU request is measured against one core; memory scaling requires a memory request). The leader makes scaling decisions locally based on the per-instance CPU and memory Mayo records. The Lettuce GitOps engine treats autoscaler adjustments as runtime overrides (see Section 14).
+`metric` is `"cpu"` or `"memory"`, and `target` is utilisation of each replica's request, the Kubernetes HPA convention (an app with no CPU request is measured against one core; memory scaling requires a memory request). `min` must be at least 1: there's no scale-to-zero, because an app with no replicas reports no CPU or memory to scale back up on. The leader makes scaling decisions locally based on the per-instance CPU and memory Mayo records. The Lettuce GitOps engine treats autoscaler adjustments as runtime overrides (see Section 14).
 
 **Init containers:** Apps support init containers via an `[[app.web.init]]` block that runs before the main container starts, used for database migrations, config generation, or dependency checks.
 
@@ -493,7 +493,13 @@ When a new leader is elected, it enters a learning period, during which it colle
 
 ### 8.3 Catastrophic Recovery
 
-Losing a *majority* of the council is survivable automatically: the reconciler regrows the council from healthy members while a quorum still stands. Losing *every* voter at once is the case there's nothing left to elect from, and that recovery is deliberately operator-triggered rather than automatic, because it discards the dead cluster's Raft history. A surviving node restores the desired state from the last sealed backup (or from its own durable snapshot if it was a voter), re-bootstraps a fresh single-voter Raft with a bumped recovery epoch, and the reconciler regrows the council. The cost is honest: anything written after the last backup is lost. Network partitions can't cause split-brain: Raft requires a majority quorum to elect a leader, so a minority side simply has no quorum. Nodes on the minority side operate in data-plane-only mode (apps continue running, no new deploys) until the partition heals.
+There are three cases, and they behave differently.
+
+- **A minority of voters fails** (one of three, two of five). The survivors still form a quorum, so they elect a leader if they need one, and the council reconciler promotes healthy nodes to replace the dead voters before removing them. No operator is involved.
+- **A majority of voters fails, but some survive.** There's no quorum, so nothing can be elected, scheduled or written; apps keep running. If the lost voters come back, quorum returns and the cluster carries on where it left off. If they're gone for good, the survivors can't regrow the council on their own (changing Raft membership needs a quorum too), so this becomes the operator-triggered recovery below. `relish council recover` refuses while it can still see a live voter, so here you pass `--force` on one stopped survivor after making sure the dead voters won't return. The recovered node carries a new recovery epoch, which fences it off from the old council's other voters until you re-enrol them.
+- **Every voter fails at once.** There's nothing left to elect from.
+
+Recovery from the last two cases is deliberately operator-triggered rather than automatic, because it discards the dead cluster's Raft history. A surviving node restores the desired state from the last sealed backup (or from its own durable snapshot if it was a voter), re-bootstraps a fresh single-voter Raft with a bumped recovery epoch, and the reconciler regrows the council. The cost is honest: anything written after the last backup is lost. Network partitions can't cause split-brain: Raft requires a majority quorum to elect a leader, so a minority side simply has no quorum. Nodes on the minority side operate in data-plane-only mode (apps continue running, no new deploys) until the partition heals.
 
 > **Design note (fully-automatic recovery).** The original design called for *pre-seeded* recovery candidates chosen for zone diversity, gossiped as an encrypted list, so the highest-priority survivor could assume leadership with no operator in the loop. That remains an architecture proposal, not shipped behaviour: the operator-triggered restore above is what the binary does today (`relish council recover`, [design/gossip-mustard.md](design/gossip-mustard.md)). We chose to ship the operator-in-the-loop path first because full-council loss is the one failure where discarding history is unavoidable, and a human confirming *which* backup to restore is cheaper than getting an automated tie-break wrong.
 
@@ -694,7 +700,7 @@ When `require_signed_commits` is enabled, Lettuce only applies commits that are 
 
 Reliaburger includes a complete observability stack with zero configuration:
 
-**Metrics (Mayo):** Per-node TSDB that automatically collects CPU, memory, network, and GPU metrics per app and node. Auto-detects Prometheus `/metrics` endpoints on your apps. 3-tier retention (10s resolution for 24h, 1min for 7d, 1h for 90d, configurable). Hierarchical aggregation via council members enables cluster-wide dashboards at 10,000 nodes. Custom alerts use a PromQL-compatible subset. Five default alerts ship active out of the box (CPU throttle, OOM, memory pressure, disk filling, CPU idle).
+**Metrics (Mayo):** Per-node store (Parquet, queried with SQL) that collects node CPU, memory, disk and network, plus per-app CPU and memory. Apps that declare `metrics = {}` have their Prometheus `/metrics` endpoint scraped by the node running each instance. Data is kept at one resolution for `retention_days` (7 by default) and then pruned; tiered downsampling is planned. Council members aggregate one-minute rollups for cluster-wide dashboards. Alerts are fixed threshold rules; PromQL-style custom alerts are planned (see [design/metrics-mayo.md](design/metrics-mayo.md)). Five default alerts ship active out of the box (CPU throttle, OOM, memory pressure, disk filling, CPU idle).
 
 **Logs (Ketchup):** Captures stdout/stderr from every container. Structured storage with timestamp-based indexing, JSON auto-detection for field queries, and zstd compression. Export to S3 or external destinations on a schedule.
 
@@ -826,7 +832,7 @@ reverses them after failure, timeout or panic; unconfirmed reversal is
 
 ## 20. Self-Upgrades
 
-Since Reliaburger is a single binary, upgrading means replacing the binary and restarting the Bun process. The system automates this in a rolling fashion: workers upgrade first (with configurable parallelism), then council members one at a time to maintain quorum, then the leader upgrades last (in place — a council of three or more keeps quorum through the sub-second exec bounce; openraft 0.9 has no graceful leadership transfer). Application workloads are never interrupted, because the container runtime manages containers independently of Bun. During the rolling upgrade window, old and new binaries coexist; wire formats stay backward compatible within one major version (self-describing JSON for the Raft log, RPC and snapshots so variants can be added without renaming, plus versioned gossip datagrams — see the Phase 14 notes in [design/agent-bun.md](design/agent-bun.md)).
+Since Reliaburger is a single binary, upgrading means replacing the binary and restarting the Bun process. The system automates this in a rolling fashion: workers upgrade first (with configurable parallelism), then council members one at a time to maintain quorum, then the leader upgrades last (in place — a council of three or more keeps quorum through the sub-second exec bounce; openraft 0.9 has no graceful leadership transfer). Application workloads are never interrupted, because the container runtime manages containers independently of Bun. During the rolling upgrade window, old and new binaries coexist, but only when both speak the same formats. Every binary carries a cluster protocol generation and a durable state generation (`src/compatibility.rs`), and nodes refuse peers, snapshots, backups and data directories stamped with a different pair. Before 1.0.0 we don't keep backwards compatibility at all: a release that changes a wire or storage format bumps a generation, and upgrading across that bump means starting a fresh cluster, with no migration (see [compatibility before 1.0.0](releasing.md#compatibility-before-100)). Releases that don't bump roll in place. A compatibility promise across versions is a post-1.0 goal.
 
 Reliaburger verifies binary integrity via dual signatures: an embedded signing key set compiled into the binary AND an external signing key configured in `node.toml`. Network upgrades require both signatures. Automatic rollback triggers if a node fails to start on the new version.
 
@@ -929,6 +935,8 @@ This is an explicit design goal: Reliaburger should never be a dead end, regardl
 
 ## 23. Comparison Matrix
 
+The Reliaburger column describes 0.1.0. Rows marked *Target* are design goals from §2 that no release has measured yet, and *Planned* rows aren't in the binary; the [0.1.0 scope and limits](README.md#010-scope-and-limits) and the [release order](roadmap.md#releases-after-010) say what ships and when the rest is due.
+
 | | Kubernetes | k3s / k0s | Nomad | Docker Compose | **Reliaburger** |
 |---|---|---|---|---|---|
 | **Conceptual complexity** | Very high (50+ resource types) | Very high (same API) | Medium (~5 job types) | Low | **Low (7 types)** |
@@ -953,22 +961,22 @@ This is an explicit design goal: Reliaburger should never be a dead end, regardl
 | **Fault injection** | Separate (Chaos Mesh / Litmus) | Same | Separate (Gremlin) | N/A | **Built-in (Smoker, eBPF-native)** |
 | **Built-in test suite** | None | None | None | None | **Built-in (relish test, relish bench)** |
 | **Config format** | YAML (verbose) | YAML (same) | HCL | YAML | **TOML (concise)** |
-| **Max cluster size** | ~5,000 nodes | ~5,000 nodes | ~10,000 nodes | 1 host | **10,000 nodes** |
+| **Max cluster size** | ~5,000 nodes | ~5,000 nodes | ~10,000 nodes | 1 host | **Target: 10,000 nodes (unmeasured)** |
 | **Volume model** | Local + CSI (network) | Same as K8s | Local + CSI | Docker volumes | **Local only (by design)** |
 | **Multi-node** | Yes | Yes | Yes | No | **Yes** |
 | **Rolling deploys** | Yes | Yes | Yes | No | **Yes (auto-rollback)** |
 | **Autoscaling** | HPA (separate config) | Same as K8s | External | No | **Built-in** |
-| **Time to first deploy** | Hours to days | Minutes to 30 min | 30 min to hours | Minutes | **< 5 min** |
+| **Time to first deploy** | Hours to days | Minutes to 30 min | 30 min to hours | Minutes | **Target: < 5 min (unmeasured)** |
 | **Written in** | Go | Go | Go | Go | **Rust** |
-| **GPU scheduling** | Via device plugin (separate install) | Via device plugin | Yes (device plugins) | No | **Built-in (NVIDIA auto-detect via `nvidia-smi`)** |
+| **GPU scheduling** | Via device plugin (separate install) | Via device plugin | Yes (device plugins) | No | **Planned (node detects NVIDIA cards; cluster placement is F01, §2)** |
 | **Secret management** | Built-in (basic) or External (Vault, Sealed Secrets) | Same as K8s | Vault integration | Docker secrets | **Encrypted-in-git (built-in)** |
 | **Workload identity** | Separate (SPIRE, cert-manager) | Same | Consul Connect | None | **Built-in (SPIFFE-compatible, auto-rotated)** |
 | **Non-container jobs** | No | No | Yes (exec driver) | No | **Yes (allowlisted host exec; sandboxing planned)** |
 | **Non-container apps** | No | No | Yes (exec/raw_exec drivers) | No | **Yes (allowlisted host exec; sandboxing planned)** |
 | **Scheduling constraints** | nodeSelector, affinity/anti-affinity, taints/tolerations | Same | constraints, affinities | N/A | **Node labels with required/preferred (AND logic)** |
 | **Daemon mode** | DaemonSet (separate resource type) | Same | system scheduler | N/A | **replicas = "*" (same App resource)** |
-| **Job throughput** | Low (per-job API calls) | Low (same) | Medium | N/A | **100M+ per day** |
-| **Leader recovery** | Automatic within quorum; backup for quorum loss | Same | Automatic within quorum; backup for quorum loss | N/A | **Auto-reconstructs from nodes (survives total council loss)** |
+| **Job throughput** | Low (per-job API calls) | Low (same) | Medium | N/A | **Target: 100M+ per day (unmeasured; task arrays planned for 0.2.0)** |
+| **Leader recovery** | Automatic within quorum; backup for quorum loss | Same | Automatic within quorum; backup for quorum loss | N/A | **Automatic within quorum; operator restore from a sealed backup for quorum loss (§8.3)** |
 | **Multi-cluster** | Separate (Karmada / Cilium ClusterMesh / many CRDs) | Same | WAN gossip + API forwarding (Consul for service discovery) | N/A | **Planned (Franchise — WAN gossip + Wrapper ingress; not yet implemented, see §21)** |
 | **K8s migration** | N/A | N/A | N/A | N/A | **Built-in (relish import/export with migration reports)** |
 | **License** | Apache 2.0 | Apache 2.0 | MPL 2.0 (reverted from BSL 1.1) | Apache 2.0 | **Apache 2.0** |
@@ -1029,6 +1037,8 @@ Durability is eventual, not guaranteed at push time. A push commits the image lo
 
 ### Q8: Can a single leader actually schedule 100M+ jobs per day while doing everything else?
 
+Not yet, and nobody has measured it. 100M jobs a day is a design target (§2). In 0.1.0 the batch allocator exists, but the delegated pipeline below isn't wired end to end, so on-demand and cron jobs go through the ordinary per-job path. Task arrays, which keep a large batch as compact state in Raft and expand it on each node, are the headline of 0.2.0 ([roadmap](roadmap.md#releases-after-010)). Here's the design they build on.
+
 The leader doesn't schedule individual jobs. For batch workloads, Meat allocates job batches to nodes: "Node 7, here are your next 200 jobs." Nodes execute their assigned jobs and report completions asynchronously via the hierarchical reporting tree. The Raft log records only batch-level decisions, not individual job lifecycle events. The leader's hot path focuses on Apps (which change infrequently) and batch-level allocation decisions. The Meat scheduler runs on a dedicated async task with its own CPU budget, isolated from API serving, Brioche UI, and metrics queries.
 
 ### Q9: Local-only volumes with no distributed storage. How do teams not lose data?
@@ -1049,7 +1059,7 @@ Not in v1. Reliaburger v1 supports whole-device GPU allocation only (`gpu = 1`, 
 
 ### Q13: How does multi-tenancy work? Can one team starve the cluster?
 
-Namespaces provide resource quotas (CPU, memory, GPU, app count, and replica count budgets) that the Meat scheduler enforces at deploy time. When a deploy would exceed a namespace's quota, Meat rejects it with a clear error. The default namespace has no quotas unless you configure them, which is appropriate for single-team clusters. Multi-team clusters should configure per-team namespaces with quotas from day one.
+Namespaces provide resource quotas (CPU, memory, GPU, app count, and replica count budgets) that the Meat scheduler enforces when it places workloads. In 0.1.0 the check happens in the leader's scheduling pass, not at apply time: `relish apply` accepts an over-quota app and commits it to the desired state, and Meat then leaves it unplaced, logging `scheduler: quota rejects <app>` on the leader each pass. Running apps are never evicted to make room. So an app that sits at zero instances in a namespace with a budget is the sign to check the leader's log; a durable "blocked by quota" status that `relish status` can show isn't on the roadmap yet. The default namespace has no quotas unless you configure them, which is appropriate for single-team clusters. Multi-team clusters should configure per-team namespaces with quotas from day one.
 
 ### Q14: What's the minimum cluster size?
 

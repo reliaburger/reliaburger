@@ -400,7 +400,7 @@ if !self.seen_windows.insert(key) {
 
 **Rollups that vanished on restart.** The rollup store kept its flushed data in an in-memory `Vec<RecordBatch>` and named every Parquet file with a counter that reset to zero on start. So a restart both lost all history *and* overwrote `rollup_000000.parquet` with new data. We fixed both by making the rollup store read its history back from the Parquet directory (like the metrics store already did) and by seeding the flush counter one past the highest file on disk. Restart now recovers everything and appends rather than clobbering.
 
-**Per-app metrics that were never collected.** Production only collected node-level metrics (CPU, memory for the whole box). The autoscaler and the per-app dashboards had nothing to read. The collector already knew how to scrape a single process; it just wasn't being called. The collection loop now asks the agent for its running instances and collects per-process CPU and memory for each one, labelled `namespace/app`. (Even then the autoscaler kept asking for a series called `cpu` that nobody records. Chapter 9 tells that story.)
+**Per-app metrics that were never collected.** Production only collected node-level metrics (CPU, memory for the whole box). The autoscaler and the per-app dashboards had nothing to read. The collector already knew how to scrape a single process; it just wasn't being called. The collection loop now asks the agent for its running instances and collects per-process CPU and memory for each one, labelled `namespace/app`. (Even then the autoscaler kept asking for a series called `cpu` that nobody records. Chapter 9 tells that story. The per-process memory series is what memory autoscaling reads; Chapter 9 also shows it driving a real scale-up on runc.)
 
 **A flush that froze every query.** The flush wrote Parquet while holding the store's write lock, and Arrow's writer is synchronous. So for the duration of the write, every query waited. Worse, blocking I/O on an async task stalls the whole tokio runtime. We split the flush in two: drain the buffer under a brief lock, then write outside it, on the blocking pool:
 
@@ -580,22 +580,23 @@ positions after it. `follow_logs` now sends a `CapturedLine` carrying the
 stream and that position, which also means stderr is finally labelled as
 stderr instead of everything being called stdout.
 
-The runc runtime reads stdout and stderr through one reader each:
+The runc runtime reads stdout and stderr through one reader each, and opens
+each where the store's checkpoint left off (more on that below):
 
 ```rust
 let mut readers = [
-    (LogStream::Stdout, "stdout"),
-    (LogStream::Stderr, "stderr"),
-]
-.map(|(stream, extension)| {
-    CaptureReader::new(stream, Some(stem.with_extension(extension)))
-});
+    CaptureReader::resume(LogStream::Stdout, stem.with_extension("stdout"), resume).await,
+    CaptureReader::resume(LogStream::Stderr, stem.with_extension("stderr"), resume).await,
+];
 ```
 
-That's `map` on a fixed-size array, `[T; N]`, not on an iterator. It returns
-another array of the same length, `[CaptureReader; 2]`, with no `Vec` and no
-heap allocation. Go has fixed arrays too but no way to map over one; in
-Python you'd get a list back.
+That's a fixed-size array, `[CaptureReader; 2]`, built in place with no
+`Vec` and no heap allocation. Our first version built it with `.map` over
+an array of `(stream, extension)` pairs, which read nicely. Then opening a
+reader had to ask the filesystem how long the file is, and a closure passed
+to `map` can't `.await`. Rust has no async `map` on arrays (the closure
+would return a future, and you'd get an array of unstarted futures back), so
+we wrote the two elements out.
 
 The store then does the bookkeeping. It keeps the highest offset it has
 ingested per capture file and refuses anything at or below it:
@@ -623,8 +624,8 @@ and skips everything older.
 
 Keying on the file path works because each runc generation writes its own
 capture files, and the process runtime only ever appends. A restarted
-instance is a new file and starts from its first line; an adopted one resumes
-where the store left off. The Apple runtime is the exception: `container
+instance is a new file and starts from its first line; an adopted one picks
+up where the store left off. The Apple runtime is the exception: `container
 logs --follow` hands us lines with no offsets, so an adopted Apple container
 is still ingested again after a restart. It's a laptop runtime and the
 comment in `apple.rs` says so.
@@ -651,6 +652,52 @@ identity code uses: a uniquely named temp file, `fsync`, rename over the old
 checkpoint, `fsync` the directory. `flush_replaces_the_checkpoint_atomically`
 checks that two flushes leave exactly one complete checkpoint and no temp
 files behind.
+
+### Resume, don't replay
+
+The checkpoint stopped duplicates. It didn't stop the work. After every Bun
+restart each forwarder still opened its capture files at byte 0 and read
+the lot, and the store threw away every line at or below its offset. On
+the soak's log spammer that was a million lines read, split and discarded,
+per restart, per instance. Issue #308 wanted the obvious thing: start at
+the offset.
+
+So the offsets travel the other way now. The binary opens the log store
+before the agent adopts anything, takes a copy of its offsets, and hands
+it to the agent next to the log channel:
+
+```rust
+let capture_offsets = log_store.read().await.capture_offsets();
+agent.set_log_sink(log_tx, capture_offsets);
+```
+
+`follow_logs` gained a `resume: &CaptureOffsets` argument, and
+`CaptureReader::resume` starts the reader's byte count at the file's
+offset instead of zero. The agent keeps the copy in an `Arc` (a
+reference-counted pointer: cloning it bumps a counter rather than copying
+the map), so a hundred adopted instances share one map.
+
+An offset is only a promise about one particular file, though. Two things
+break it. Truncate the file and the offset points past the end, or into the
+middle of a line that isn't the one we counted. Rotate it (rename the old
+one away and start a new one under the same name) and the new file may well
+grow past the offset before Bun comes back, so length alone can't tell.
+The checkpoint now records each capture file's device and inode when it's
+saved, and `IngestCheckpoint::load` keeps an offset only while the path is
+still the same file and at least that long. Anything else is read from
+byte 0, and because the store dropped its offset too, every line in it is
+stored. The reader checks the length once more when it opens, which
+catches a truncation between the store loading and the forwarder
+starting. Recording the inode changed the checkpoint's format, so the
+durable state generation moved from 44 to 45.
+
+Two tests pin it. `a_restarted_forwarder_reads_only_the_lines_past_the_checkpoint`
+in `grill/process.rs` ingests three lines, flushes, appends two more and
+opens a fresh store and forwarder: the forwarder must *read* exactly the two
+new lines, not merely store two, and after truncating the file it must read
+the one line that's left. `a_rotated_capture_file_is_read_again_from_the_start`
+renames the capture file away and writes a longer one in its place, which is
+the case a length check alone gets wrong.
 
 ### Ask everyone, not just the current home
 
@@ -831,7 +878,9 @@ given offset, and both the runc and process runtimes loop on it, skipping
 their 200 ms poll interval while chunks come back full. Every chunk is a
 `tokio::fs` read, which is an `.await`, so between chunks the worker is free
 for everyone else. A hundred-megabyte backlog still takes a while to
-replay; it just can't take the node with it. The process runtime had a
+replay; it just can't take the node with it. (Since "Resume, don't
+replay" above, a restart only replays a capture the store has no usable
+offset for, so the backlog is usually the few seconds Bun was down.) The process runtime had a
 quieter version of the same problem: it called `std::fs::read` on the whole
 file every 200 ms, blocking I/O on a runtime thread, for as long as the
 workload lived.

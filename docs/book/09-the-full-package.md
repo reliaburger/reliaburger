@@ -209,6 +209,22 @@ Third, the tests. The integration test now feeds `process_cpu_percent` with coll
 
 Two limits remain, and we'd rather state them than bury them. The collector samples an instance's main process, not its children, so a shell that forks workers under-reports. And direct Apple Container instances (disabled in 0.1.0 anyway) run inside a VM with no host PID, so they produce no per-app metrics and can't autoscale.
 
+Memory got its own real-path test later, and writing it taught us something the CPU one couldn't. Memory scaling needs a memory request, and ProcessGrill refuses any app that declares one (it can't enforce the limit). So the portable cluster harness can't run a memory-autoscaled app at all. The memory acceptance test (`tests/autoscale_memory.rs`) runs instead on one real Bun with runc, in the privileged Linux suite: a busybox shell holds 48 MiB in a variable against a 16 MiB request, Bun's own collection loop samples it, the rollup reaches the node's own leader, and the app goes from one replica to two. Nothing writes a metric row by hand.
+
+### What about zero?
+
+`min = 0` used to pass validation. Then `compute_desired` returned early whenever the current count was zero, so an app that scaled down to nothing could never come back. Even without that early return, what would bring it back? Both metrics come from running replicas. At zero there's no process to sample, so there's no signal to scale up on.
+
+Scale-to-zero is a real feature elsewhere (Knative does it), but it needs a wake-up signal that exists without a replica: requests queuing at the ingress, say, with the proxy holding the first one while a replica starts. We don't have that, so `min = 0` is now a validation error that says why and points at `relish stop` for parking an app by hand:
+
+```rust
+if spec.min == 0 {
+    return Err(AutoscaleConfigError::ZeroMin);
+}
+```
+
+A feature that accepts a setting it can't honour is worse than one that refuses it. The refusal costs the operator one edit. The silent version costs them an app that never comes back.
+
 ### Getting the lifecycle right
 
 The first wired autoscaler had four subtle bugs the review caught, and each one is a small lesson in ordering.
@@ -217,7 +233,7 @@ The first wired autoscaler had four subtle bugs the review caught, and each one 
 
 **Clear an override the moment its baseline moves.** An override is a runtime adjustment *relative to a baseline*. Redeploy the app with a different replica count, or delete it entirely, and the old override is meaningless — worse than meaningless, because a stale "scale to 7" left sitting in Raft would quietly resize a freshly redeployed app. So the state machine clears the override in the same apply that changes the baseline: on `AppDelete`, and on an `AppSpec` whose replica count differs from the stored one. An image-only redeploy (same replica baseline) leaves the override alone — you don't want a routine version bump throwing away a legitimate scale-up.
 
-**`min > max` is an error, not a clamp.** The old code fed `min` and `max` straight into `.clamp()`, which silently swaps them if they're out of order — so `min = 10, max = 3` quietly became "always 3", hiding an obvious operator typo. Now the `[autoscale]` block is validated at config time: `min > max`, a zero `max`, an unparseable or zero window, an out-of-range threshold — every one fails the deploy loudly with a message naming the field. A validation error the operator reads beats a clamp the operator never sees.
+**`min > max` is an error, not a clamp.** The old code fed `min` and `max` straight into `.clamp()`, which silently swaps them if they're out of order — so `min = 10, max = 3` quietly became "always 3", hiding an obvious operator typo. Now the `[autoscale]` block is validated at config time: `min > max`, a zero `max` or `min`, an unparseable or zero window, an out-of-range threshold — every one fails the deploy loudly with a message naming the field. A validation error the operator reads beats a clamp the operator never sees.
 
 **Use the window the operator configured.** The rollup query was hardcoded to average the last five minutes regardless of what `evaluation_window` said. Now the configured window drives the query, as it always should have. And while we were in the numeric code, we made the resource parsers use checked arithmetic: a memory string like `99999999999999999999Gi` now returns a validation error instead of silently overflowing 64 bits into some small wrong number (a whole class of bug the review labelled DEP9).
 
@@ -896,6 +912,39 @@ writes to Tokio's blocking pool. An `Arc<File>` keeps the operation lock alive
 until a write finishes, even if its awaiting task is cancelled. The tests cover
 exclusive writers, stable identity and names, changed parameters, invalid
 ownership, private bootstrap files and damaged bundles.
+
+Dropping an operation releases its lock, and that turned out to need one more
+line than we thought. `File::try_lock` is `flock` underneath, and an `flock`
+belongs to the open file *description*, the kernel object that every duplicate
+of a descriptor shares. When any thread spawns a child process, the child starts
+with a copy of every descriptor and only closes the close-on-exec ones when it
+calls `exec`. For that brief moment the child holds our lock too, so
+closing our own descriptor doesn't release it. Under plain `cargo test`, where
+hundreds of tests share one process and some of them spawn helpers, the test
+that drops an operation and reopens it straight away was refused every so
+often with "another operation is using cluster". A loop of 100 reopens with two
+threads spawning `true` in the background was refused 69 times.
+
+So the lock is now a small type of its own whose `Drop` (the destructor we met
+in Chapter 1) unlocks before the file closes:
+
+```rust
+struct OperationLock(std::fs::File);
+
+impl Drop for OperationLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+```
+
+`self.0` is the tuple struct's only field, the file. `let _ =` throws the
+`Result` away on purpose: there's nothing useful to do with a failed unlock
+inside a destructor, and closing the descriptor a moment later releases the
+lock anyway. `flock(LOCK_UN)` acts on the description, so it frees the lock
+for every copy at once, including the one in a half-spawned child. The
+relish CLI never reopens an operation in the same process, so users never saw
+this, but the fix makes "dropping releases the lock" true without a caveat.
 
 ### Download before you trust, verify before you replace
 

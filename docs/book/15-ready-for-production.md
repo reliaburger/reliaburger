@@ -3262,6 +3262,109 @@ status comes back well inside two seconds, with that instance marked, still
 locks cost one deadline, not six. And the field round-trips, and stays out of
 the JSON when it's `false`.
 
+### Two commands, two answers
+
+Issue #241 had one more complaint in it. With three replicas of `hello`
+running, `relish inspect hello` listed two, while `relish wtf` said all three
+were fine. Both were telling the truth. `inspect` asked only the agent it was
+connected to, and that node ran two of the three. The third lived on node 2,
+and nothing in the output hinted that anyone else had been asked, because
+nobody had.
+
+`inspect` now asks the cluster the same way `wtf` does: every node's
+`/v1/status` through the entry node's relay, and the desired replica count
+from the leader's `/v1/diagnostics/apps`. What each node said is a small enum:
+
+```rust
+pub enum NodeAnswer {
+    Answered(Vec<InstanceStatus>),
+    Silent { reason: String },
+    Down { state: String },
+}
+```
+
+The three variants are the three things that can be true about a node, and
+`match` makes the renderer handle each one. A `Silent` node gets a warning
+line, and so does a `Down` one (gossip has already declared it dead, so we
+don't spend a timeout asking). Either way, the output says which instances it
+can't show instead of quietly showing fewer:
+
+```text
+App: hello (namespace default)
+  Replicas:  3 desired, 2 running
+  Placed:    node-1 2, node-3 1
+warning: node node-3 did not answer (timed out after 10s); its instances are not listed
+
+Instance: default__hello-0
+  Node:      node-1
+  ...
+```
+
+Why not call the cluster-wide `/v1/status?cluster=true` that the TUI uses?
+It fans out server-side and fails the whole answer when any peer is silent,
+which is the right contract for a dashboard that refreshes every second and
+the wrong one for the command you run when something is already broken. The
+per-node relay keeps each node's failure separate.
+
+The collection and the rendering are separate functions, which is what makes
+the tests cheap. `every_replica_is_listed_with_its_node_not_just_the_local_ones`
+serves a fake entry node whose own `/v1/status` holds two of three replicas
+(exactly what the old command saw) and whose relay answers for node 2 and
+refuses node 3. The output has to list all three instances with their nodes
+and the `3 desired, 3 running` line. Its siblings check the warning for the
+silent node, the dead node that isn't asked at all, and a standalone agent,
+which answers for itself as `local`.
+
+### Is everyone running the same build?
+
+The same issue started with a harder question: were the three nodes even
+running the same `bun`? Chapter 14 ("Which build is this?") taught every
+binary to name its commit. `wtf` now asks each
+node's `/v1/version` through the relay (the one new path on its allow list)
+and compares the answers.
+
+The interesting part is deciding what "the same build" means. The version
+string alone isn't enough; that was the whole problem in #241. The binary's
+SHA-256 is too much: one commit built for arm64 and for x86_64 produces two
+different hashes, and a mixed-architecture cluster isn't skewed. So the
+identity is the version plus the commit, falling back to the hash only when
+a build doesn't know its commit:
+
+```rust
+fn build_identity(build: &BuildObservation) -> (&str, Option<&str>) {
+    (
+        build.version.as_str(),
+        build.commit.as_deref().or(build.binary_sha256.as_deref()),
+    )
+}
+```
+
+`as_deref` turns an `&Option<String>` into an `Option<&str>`, borrowing the
+string inside rather than copying it, and `or` picks the first of the two
+that's `Some`. The tuple borrows from `build`; Rust's lifetime elision rules
+tie the returned references to the one reference argument, so we didn't have
+to write a lifetime by hand.
+
+`wtf` groups the nodes by that identity in a `BTreeMap`. One group is an OK
+row that names the build. More than one is a warning, and when one build
+clearly has the most nodes, the warning names the odd ones out:
+
+```text
+WARNING (1)
+  [version-skew] node-3 runs a different bun build from the other 2 nodes (cluster)
+    node-1: bun v0.1.1 (3fcb1fd), sha256 aaaa1111bbbb
+    node-2: bun v0.1.1 (3fcb1fd), sha256 aaaa1111bbbb
+    node-3: bun v0.1.1 (9e1d2c3), sha256 5c0ffee12345
+    next: bring every node to one build with `relish upgrade`, then re-run `relish wtf`
+```
+
+On a tie there's no majority to be wrong against, so the title just says how
+many builds there are and the details list every node. A node whose version
+can't be read makes the `builds` source UNKNOWN, as every other source does.
+The tests pin each of those cases: a uniform cluster, one odd node, a
+different version with no commits at all, one commit on two architectures,
+two commit-less builds told apart by their hashes, and an unreadable node.
+
 ## Walk the path you actually care about
 
 Say `web` can't reach `redis`. Checking Bun's own DNS and TCP access might tell
@@ -3795,3 +3898,13 @@ The audit's findings kept rhyming, so here they are in one place. Each is a case
 Several failures were in the harness rather than the product, and they're worth a sentence each. A fixture that released a port and then started Bun on it lost the port to another test, and its readiness probe cheerfully connected to *that* listener; fixtures now wait for Bun's own announcement of the address it bound. The cluster-upgrade job failed because the debug `bun` binary outgrew Pickle's 512 MiB upload limit; the harness now strips debug symbols from its copy. A nextest "leaked handle" warning turned out to be a runner bug on macOS, fixed upstream, so we pinned the fixed release and made leaks fail the gate instead of raising the timeout. And a few async tasks were doing blocking filesystem work, sweeping directories and hashing a stored Bun binary on a Tokio worker thread; that work now runs through `spawn_blocking`, and the one inventory read with no deadline got the same five-second bound as the others.
 
 One gap we closed by adding a test rather than fixing code. An app exits, Bun starts its replacement, then dies before saving the replacement's adoption record. Our physical interruption tests covered first deployments and explicit retries, but not this automatic restart. A test-only Linux interposer now pauses the adoption record's `fsync` at exactly that point and kills the real Bun process. Recovery must retire the unrecorded process before reporting ready. The existing code passed. Now it's a claim someone can check.
+
+### A test has to be able to fail
+
+The testing assessment after 0.1.0 found three pieces of evidence that couldn't say no.
+
+The cgroup v2 detector's test called the detector on Linux and threw the answer away (`let _ = result;`). It proved the function didn't panic. It would have passed if the detector said "v1" on a v2 host, or "v2" on a host with no cgroups at all. The fix is a small filesystem boundary: `check_cgroup_v2` now just passes `/sys/fs/cgroup` to `check_cgroup_v2_at(root: &Path)`, and three tests hand it fake mount trees in a temporary directory, one with `cgroup.controllers` (v2), one with a per-controller directory and no controllers file (v1), and one that doesn't exist. The host test still runs, and now it asserts: every Linux host that runs the suite is provisioned with v2, so a failure there is a real finding. How do we know the new tests can fail? We broke the detector on purpose, dropping the controllers check, and watched the v1 test go red.
+
+The node-pressure acceptance test was `#[ignore]`d (good) but, when selected without `RELIABURGER_NODE_PRESSURE_TESTS=1`, printed "skipped" and returned. Nextest has no idea what "skipped" means in a test's stderr. It saw a function return and reported a pass. Selecting an ignored test is a request to run it, so a missing prerequisite is now an `assert_eq!` failure with a message saying which variable to set. The one pattern we left alone is the subprocess fixture: a test that exists only to be re-executed by its parent (its `#[ignore]` reason says so) still returns when the parent didn't start it, because `make test-linux` selects whole binaries and would otherwise fail on every fixture.
+
+The third was the V02 loop summary, the script that turns hours of stress loops into a verdict. It wrote `Verdict: **FAIL**` and exited 0. It counted a JUnit `<skipped/>` as a run. And its combined mode summarised whichever lanes happened to upload a file, so a lane that never ran simply left the table, and the denominator shrank to fit. Now every row carries a status (pass, fail, skip or incomplete) and the commit it belongs to. A test with fewer runs than its loop's iterations is incomplete. The combined record is checked against `scripts/release/v02-loop-lanes.json`, the list of lanes the workflow runs, and a unit test keeps that list in step with the workflow matrix. A missing lane, a missing test, a stray lane or a record from another commit fails the summary, and the exit status finally says the same thing as the text.

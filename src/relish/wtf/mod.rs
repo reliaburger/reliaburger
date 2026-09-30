@@ -12,11 +12,11 @@ pub use collect::collect;
 pub(crate) use collect::node_client;
 pub use diagnose::diagnose;
 pub use model::{
-    AlertObservation, ApplicationEvidence, CertificateObservation, ClusterEvidence,
-    CorrelatedEvent, CouncilObservation, CpuThrottleObservation, DeployObservation,
-    DiskObservation, Evidence, FaultObservation, LogObservation, NodeObservation,
-    RegistryObservation, ReplicaObservation, RestartObservation, ServiceObservation, WtfFinding,
-    WtfInputs, WtfOk, WtfReport, WtfSummary, WtfUnknown,
+    AlertObservation, ApplicationEvidence, BuildObservation, CertificateObservation,
+    ClusterEvidence, CorrelatedEvent, CouncilObservation, CpuThrottleObservation,
+    DeployObservation, DiskObservation, Evidence, FaultObservation, LogObservation,
+    NodeObservation, RegistryObservation, ReplicaObservation, RestartObservation,
+    ServiceObservation, WtfFinding, WtfInputs, WtfOk, WtfReport, WtfSummary, WtfUnknown,
 };
 
 /// Current serialised `wtf` report contract.

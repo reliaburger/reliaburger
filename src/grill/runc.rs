@@ -630,8 +630,9 @@ impl super::Grill for RuncGrill {
         &self,
         instance: &InstanceId,
         lines_tx: tokio::sync::mpsc::Sender<crate::ketchup::types::CapturedLine>,
+        resume: &crate::ketchup::types::CaptureOffsets,
     ) {
-        self.owned_follow_logs(instance, lines_tx).await;
+        self.owned_follow_logs(instance, lines_tx, resume).await;
     }
 }
 

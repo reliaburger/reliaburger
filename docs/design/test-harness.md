@@ -95,9 +95,18 @@ are `#[ignore]`d with the reason, and each has a named way to run it:
 someone pushes the `v02-loops` branch or dispatches it by hand, and loops the upgrade,
 council, lease-recovery and exporter-lock suites for hours on Linux x86-64, Linux
 arm64 and macOS, then reports each lane's runs, failures and rule-of-three bound.
+`scripts/release/loop_summary.py` gives every test a status (pass, fail, skip or
+incomplete) and checks the combined record against
+`scripts/release/v02-loop-lanes.json`: a lane or named test with no results, a
+test with fewer runs than its loop's iterations, a skipped-only result or a record
+from another commit fails the summary, and its exit status matches its verdict.
 
-A gated test must be `#[ignore]`d. One that returns early when its variable is unset
-reports a pass without testing anything.
+A gated test must be `#[ignore]`d, and once selected it must fail when its
+prerequisite is missing: assert on the variable, don't return early. An early
+return reports a pass without testing anything, and `--run-ignored=only` on the
+wrong host would count it. The exceptions are subprocess fixtures (their
+`#[ignore]` reason says so), which return when their parent test didn't start
+them, because a gated binary selected whole also selects its fixtures.
 
 The dependency audit refreshes its database on every run. It denies new
 vulnerabilities, unsoundness, yanked packages and unmaintained-package notices.
