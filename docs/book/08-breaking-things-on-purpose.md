@@ -1266,6 +1266,8 @@ Pickle's OCI Distribution API lives on the same port as the Bun agent (9117). Bu
 
 `--tls-verify=false` because Pickle runs on localhost. No point doing TLS to yourself.
 
+(That's how the first version worked. Once Pickle required a bearer token for writes, which `buildah push` can't send, the runner switched to exporting an OCI layout and uploading it itself; chapter 5 tells that story, and `relish build` stopped printing a push line nobody ran.)
+
 **6. The image is ready.** `relish images` shows it. Other nodes pull it via Pickle's replication protocol. When you deploy with `image = "my-api:v1.2.3"`, the scheduler sees which nodes already have the layers cached (image locality scoring from Phase 2) and prefers them.
 
 The entire flow uses two existing pieces of infrastructure: Pickle for blob storage and transfer, buildah for Dockerfile execution. No new daemons, no shared filesystems, no scp.

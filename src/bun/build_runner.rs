@@ -1085,7 +1085,6 @@ async fn run_build_inner(
         &request.spec,
         &request.context_digest,
         Some(state.registry_port),
-        state.registry_scheme == "https",
     )
     .map_err(|e| format!("invalid build spec: {e}"))?;
 

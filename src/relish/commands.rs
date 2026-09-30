@@ -1746,6 +1746,18 @@ pub async fn wait_for_batch(
     }
 }
 
+/// What `relish build` prints about a job before submitting it: where the
+/// image goes and the Buildah command the node runs.
+fn build_plan_lines(job: &crate::pickle::build::BuildahJob) -> Vec<String> {
+    vec![
+        format!(
+            "  destination: pickle://{}:{}",
+            job.destination.name, job.destination.tag
+        ),
+        format!("  build:  {}", job.build_cmd.join(" ")),
+    ]
+}
+
 /// Build OCI images and push to Pickle.
 ///
 /// Reads `[build.*]` sections from the config, tars each context,
@@ -1823,19 +1835,14 @@ pub async fn build(
 
         // Prepare the build job (for display; the agent re-derives it with
         // its own registry port, which a host forward doesn't change).
-        let job = execute_build(spec, &digest, None, client.scheme() == "https").map_err(|e| {
-            RelishError::ApiError {
-                status: 0,
-                body: format!("build preparation failed: {e}"),
-            }
+        let job = execute_build(spec, &digest, None).map_err(|e| RelishError::ApiError {
+            status: 0,
+            body: format!("build preparation failed: {e}"),
         })?;
 
-        println!(
-            "  destination: pickle://{}:{}",
-            job.destination.name, job.destination.tag
-        );
-        println!("  build:  {}", job.build_cmd.join(" "));
-        println!("  push:   {}", job.push_cmd.join(" "));
+        for line in build_plan_lines(&job) {
+            println!("{line}");
+        }
 
         // Submit and poll: builds run async on the builder node —
         // minutes-long buildah runs must not hold an HTTP request open.
@@ -2257,6 +2264,26 @@ pub async fn snapshot_delete(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn build_plan_shows_the_destination_and_build_but_no_push() {
+        let spec = crate::config::build::BuildSpec {
+            context: ".".into(),
+            dockerfile: "Dockerfile".into(),
+            destination: "pickle://burger:v1".into(),
+            args: Default::default(),
+            namespace: None,
+            platform: vec!["linux/amd64".into(), "linux/arm64".into()],
+        };
+        let job = crate::pickle::build::execute_build(&spec, "sha256:abc", None).unwrap();
+        let lines = build_plan_lines(&job);
+        assert_eq!(lines[0], "  destination: pickle://burger:v1");
+        assert!(lines[1].starts_with("  build:  buildah bud"), "{lines:?}");
+        // The node exports an OCI layout and uploads it; it never runs a
+        // `buildah push` to `docker://`, so the plan doesn't claim one.
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines.iter().all(|line| !line.contains("push")), "{lines:?}");
+    }
+
     use super::*;
     use std::io::Write as _;
 

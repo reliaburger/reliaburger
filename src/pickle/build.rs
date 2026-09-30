@@ -33,20 +33,12 @@ const DEFAULT_PICKLE_PORT: u16 = 5050;
 
 /// A prepared buildah build, ready for execution as a process job.
 ///
-/// Contains the CLI commands and arguments for both the build and
-/// push steps. The caller runs these as subprocesses.
+/// Contains the `buildah bud` command the build node runs as a subprocess,
+/// and what it needs to export and upload the result afterwards.
 #[derive(Debug, Clone)]
 pub struct BuildahJob {
     /// The buildah bud command and arguments.
     pub build_cmd: Vec<String>,
-    /// The buildah push command and arguments.
-    ///
-    /// Kept for display and for the delegated single-node path. The clustered
-    /// runner does NOT run this: a `docker://` push cannot authenticate against
-    /// Pickle (see [`buildah_push_to_oci_args`] and B1). It exports an OCI
-    /// layout and uploads it through the bearer-carrying registry client
-    /// instead.
-    pub push_cmd: Vec<String>,
     /// Destination image reference.
     pub destination: PickleDestination,
     /// Local image tag (used between build and push).
@@ -227,30 +219,23 @@ pub fn digest_of(data: &[u8]) -> String {
 /// The `context_digest` is the Pickle blob digest of the tarred build
 /// context (uploaded by the CLI before scheduling the job). The build
 /// node downloads this blob, extracts it, and runs buildah.
-/// `registry_over_tls` decides whether the push verifies the registry's
-/// certificate (O2).
 ///
-/// The `push_cmd` here targets `docker://`, which the clustered runner no
-/// longer uses (it cannot authenticate — B1); the runner exports an OCI layout
-/// via [`buildah_push_to_oci_args`] and uploads it with the service-token
-/// bearer instead. This command is retained for `relish`'s display and the
-/// standalone/loopback case.
+/// There is no push command: a `docker://` push can't present the service
+/// token Pickle requires (B1), so the runner exports an OCI layout with
+/// [`buildah_export_to_oci_args`] and uploads it itself.
 pub fn execute_build(
     spec: &BuildSpec,
     context_digest: &str,
     pickle_port: Option<u16>,
-    registry_over_tls: bool,
 ) -> Result<BuildahJob, BuildError> {
     let dest = validate_build(spec)?;
     let port = pickle_port.unwrap_or(DEFAULT_PICKLE_PORT);
 
     let local_tag = format!("localhost:{port}/{}:{}", dest.name, dest.tag);
     let build_cmd = buildah_build_args(spec, &local_tag);
-    let push_cmd = buildah_push_args(&local_tag, registry_over_tls);
 
     Ok(BuildahJob {
         build_cmd,
-        push_cmd,
         destination: dest,
         local_tag,
         context_blob_digest: context_digest.to_string(),
@@ -296,24 +281,6 @@ fn buildah_build_args(spec: &BuildSpec, local_tag: &str) -> Vec<String> {
     args.push(".".to_string());
 
     args
-}
-
-/// Generate the `buildah push` command arguments.
-///
-/// `tls_verify` mirrors how the destination registry actually serves
-/// (O2). It was hardcoded off, which is right for the plaintext loopback
-/// default and wrong the moment the registry runs over TLS: a build would
-/// push its image without checking the certificate it was pushing to.
-fn buildah_push_args(local_tag: &str, tls_verify: bool) -> Vec<String> {
-    vec![
-        "buildah".to_string(),
-        "push".to_string(),
-        "--storage-driver".to_string(),
-        "vfs".to_string(),
-        format!("--tls-verify={tls_verify}"),
-        local_tag.to_string(),
-        format!("docker://{local_tag}"),
-    ]
 }
 
 /// Generate a `buildah push` that exports the built image to a *local* OCI
@@ -1253,7 +1220,7 @@ mod tests {
     #[test]
     fn execute_build_produces_valid_job() {
         let spec = spec_with_destination("pickle://myapp:v2");
-        let job = execute_build(&spec, "sha256:abc123", Some(9117), false).unwrap();
+        let job = execute_build(&spec, "sha256:abc123", Some(9117)).unwrap();
         assert_eq!(job.destination.name, "myapp");
         assert_eq!(job.destination.tag, "v2");
         assert_eq!(job.local_tag, "localhost:9117/myapp:v2");
@@ -1263,7 +1230,7 @@ mod tests {
     #[test]
     fn execute_build_uses_default_port() {
         let spec = spec_with_destination("pickle://app:latest");
-        let job = execute_build(&spec, "sha256:abc", None, false).unwrap();
+        let job = execute_build(&spec, "sha256:abc", None).unwrap();
         // Defaults to the Pickle registry port (5050), not the Bun API
         // port — see the X1 regression note on DEFAULT_PICKLE_PORT.
         assert!(job.local_tag.contains("5050"));
@@ -1279,7 +1246,7 @@ mod tests {
             namespace: None,
             platform: vec!["linux/amd64".into()],
         };
-        let err = execute_build(&spec, "sha256:abc", None, false).unwrap_err();
+        let err = execute_build(&spec, "sha256:abc", None).unwrap_err();
         assert!(matches!(err, BuildError::ContextNotFound { .. }));
     }
 
@@ -1288,7 +1255,7 @@ mod tests {
     #[test]
     fn buildah_build_cmd_uses_vfs_storage() {
         let spec = spec_with_destination("pickle://app:v1");
-        let job = execute_build(&spec, "sha256:abc", None, false).unwrap();
+        let job = execute_build(&spec, "sha256:abc", None).unwrap();
         assert!(job.build_cmd.contains(&"--storage-driver".to_string()));
         assert!(job.build_cmd.contains(&"vfs".to_string()));
     }
@@ -1303,7 +1270,7 @@ mod tests {
             namespace: None,
             platform: vec!["linux/amd64".into()],
         };
-        let job = execute_build(&spec, "sha256:abc", None, false).unwrap();
+        let job = execute_build(&spec, "sha256:abc", None).unwrap();
         let f_idx = job.build_cmd.iter().position(|a| a == "-f").unwrap();
         assert_eq!(job.build_cmd[f_idx + 1], "Dockerfile.prod");
     }
@@ -1314,7 +1281,7 @@ mod tests {
         args.insert("VERSION".to_string(), "1.78".to_string());
         args.insert("FEATURES".to_string(), "ebpf".to_string());
         let spec = spec_with_args(args);
-        let job = execute_build(&spec, "sha256:abc", None, false).unwrap();
+        let job = execute_build(&spec, "sha256:abc", None).unwrap();
 
         let build_arg_count = job
             .build_cmd
@@ -1329,55 +1296,14 @@ mod tests {
     #[test]
     fn buildah_build_cmd_ends_with_context_dot() {
         let spec = spec_with_destination("pickle://app:v1");
-        let job = execute_build(&spec, "sha256:abc", None, false).unwrap();
+        let job = execute_build(&spec, "sha256:abc", None).unwrap();
         assert_eq!(job.build_cmd.last().unwrap(), ".");
-    }
-
-    // --- buildah_push_args ---
-
-    #[test]
-    fn buildah_push_cmd_targets_pickle() {
-        let spec = spec_with_destination("pickle://myapp:v3");
-        let job = execute_build(&spec, "sha256:abc", Some(5000), false).unwrap();
-        assert!(
-            job.push_cmd
-                .contains(&"localhost:5000/myapp:v3".to_string())
-        );
-        assert!(
-            job.push_cmd
-                .contains(&"docker://localhost:5000/myapp:v3".to_string())
-        );
-    }
-
-    #[test]
-    fn buildah_push_cmd_uses_vfs_storage() {
-        let spec = spec_with_destination("pickle://app:v1");
-        let job = execute_build(&spec, "sha256:abc", None, false).unwrap();
-        assert!(job.push_cmd.contains(&"--storage-driver".to_string()));
-        assert!(job.push_cmd.contains(&"vfs".to_string()));
-    }
-
-    #[test]
-    fn buildah_push_skips_tls_verification_against_a_plaintext_registry() {
-        let spec = spec_with_destination("pickle://app:v1");
-        let job = execute_build(&spec, "sha256:abc", None, false).unwrap();
-        assert!(job.push_cmd.contains(&"--tls-verify=false".to_string()));
-    }
-
-    /// O2: `--tls-verify=false` was hardcoded, so a build pushed to a TLS
-    /// registry without ever checking the certificate it was pushing to.
-    #[test]
-    fn buildah_push_verifies_tls_against_a_secured_registry() {
-        let spec = spec_with_destination("pickle://app:v1");
-        let job = execute_build(&spec, "sha256:abc", None, true).unwrap();
-        assert!(job.push_cmd.contains(&"--tls-verify=true".to_string()));
-        assert!(!job.push_cmd.contains(&"--tls-verify=false".to_string()));
     }
 
     fn job_for_platforms(platforms: &[&str]) -> BuildahJob {
         let mut spec = spec_with_destination("pickle://myapp:v3");
         spec.platform = platforms.iter().map(|p| p.to_string()).collect();
-        execute_build(&spec, "sha256:abc", Some(5000), false).unwrap()
+        execute_build(&spec, "sha256:abc", Some(5000)).unwrap()
     }
 
     /// B1: the clustered runner exports the image to a local OCI layout dir
@@ -1996,7 +1922,7 @@ mod tests {
     #[test]
     fn buildah_multi_platform_uses_manifest_flag() {
         let spec = spec_with_destination("pickle://app:v1");
-        let job = execute_build(&spec, "sha256:abc", None, false).unwrap();
+        let job = execute_build(&spec, "sha256:abc", None).unwrap();
         assert!(job.build_cmd.contains(&"--manifest".to_string()));
         assert!(job.build_cmd.contains(&"--platform".to_string()));
         assert!(job.build_cmd.iter().any(|a| a == "linux/amd64,linux/arm64"));
@@ -2013,7 +1939,7 @@ mod tests {
             namespace: None,
             platform: vec!["linux/amd64".into()],
         };
-        let job = execute_build(&spec, "sha256:abc", None, false).unwrap();
+        let job = execute_build(&spec, "sha256:abc", None).unwrap();
         assert!(job.build_cmd.contains(&"-t".to_string()));
         assert!(job.build_cmd.contains(&"--platform".to_string()));
         assert!(job.build_cmd.iter().any(|a| a == "linux/amd64"));
