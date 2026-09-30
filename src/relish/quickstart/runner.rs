@@ -693,8 +693,7 @@ async fn start_vm(
         Some("Running") if !lima.console_started(name).await => {
             // A previous run left a VM that never booted; see BOOT_SILENCE.
             step.note("restarted a VM that never booted");
-            lima.command(&["stop", "--force", name]).await?;
-            lima.command(&["start", "--tty=false", name]).await?;
+            lima.restart(name).await?;
         }
         Some("Running") => step.note("already running"),
         Some("Stopped") => {
@@ -739,9 +738,7 @@ async fn start_watched(
     // Dropping the start command above killed limactl; the VM itself is
     // still registered with Lima, so stop it by name and start it again.
     step.note("restarted a VM that never booted");
-    lima.command(&["stop", "--force", name]).await?;
-    lima.command(&["start", "--tty=false", name]).await?;
-    Ok(())
+    lima.restart(name).await
 }
 
 /// Wait until Lima's shared network runs, or the first boot finishes.
@@ -962,14 +959,83 @@ mod tests {
             .await
             .unwrap();
         let calls = std::fs::read_to_string(home.path().join("calls")).unwrap();
+        // The restart polls `list` while it starts; only the VM commands matter.
         assert_eq!(
-            calls.lines().collect::<Vec<_>>(),
+            calls
+                .lines()
+                .filter(|call| !call.starts_with("list"))
+                .collect::<Vec<_>>(),
             [
                 "start --tty=false --name=vm vm.yaml",
                 "stop --force vm",
                 "start --tty=false vm"
             ]
         );
+    }
+
+    /// A stand-in `limactl` that models Lima's shared `user-v2` daemon: a
+    /// create starts it and never boots, `stop` tears it down once no VM is
+    /// `Running`, and a `start` fails if the daemon it found (or launched) is
+    /// torn down while the VM is still coming up. Stops finish 0, 0.3 and 0.6 seconds after they
+    /// begin, so three concurrent restarts reliably take the daemon away
+    /// from the first VM's start, as in issue #333.
+    fn fake_lima_with_shared_network(home: &Path) -> Lima {
+        let script = home.join("limactl");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+echo "$*" >> "$LIMA_HOME/calls"
+net="$LIMA_HOME/user-v2_fd.sock"
+case "$1" in
+start)
+  case "$3" in --name=*)
+    [ -e "$net" ] || echo $$ > "$net"
+    echo Running > "$LIMA_HOME/${3#--name=}.status"; exec sleep 30;;
+  esac
+  [ -e "$net" ] || echo $$ > "$net"
+  daemon=$(cat "$net")
+  sleep 1
+  if [ "$(cat "$net" 2>/dev/null)" != "$daemon" ]; then
+    echo "dial unix $net: connect: no such file or directory" >&2; exit 1
+  fi
+  echo Running > "$LIMA_HOME/$3.status";;
+stop)
+  case "$3" in vm1) sleep 0;; vm2) sleep 0.3;; *) sleep 0.6;; esac
+  echo Stopped > "$LIMA_HOME/$3.status"
+  grep -q Running "$LIMA_HOME"/*.status || rm -f "$net";;
+list)
+  for file in "$LIMA_HOME"/*.status; do
+    printf '{"name":"%s","status":"%s"}\n' "$(basename "$file" .status)" "$(cat "$file")"
+  done;;
+esac
+"#,
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        Lima::new(script, Duration::from_secs(10)).with_home(home.to_owned())
+    }
+
+    #[tokio::test]
+    async fn silent_vms_restart_one_at_a_time_so_the_shared_network_survives() {
+        let home = tempfile::tempdir().unwrap();
+        let lima = fake_lima_with_shared_network(home.path());
+        let boot = |name: &'static str| {
+            let lima = lima.clone();
+            async move {
+                let step = super::super::progress::tests_support::detached_step();
+                let name_flag = format!("--name={name}");
+                let create = ["start", "--tty=false", &name_flag, "vm.yaml"];
+                start_watched(&lima, name, &create, Duration::from_millis(200), &step).await
+            }
+        };
+        let (one, two, three) = tokio::join!(boot("vm1"), boot("vm2"), boot("vm3"));
+        for result in [one, two, three] {
+            result.unwrap();
+        }
+        for name in ["vm1", "vm2", "vm3"] {
+            assert_eq!(lima.status(name).await.unwrap().as_deref(), Some("Running"));
+        }
     }
 
     #[tokio::test]
