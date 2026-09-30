@@ -126,6 +126,25 @@ Leader-last upgrade ordering does not make an unknown Raft request safe during
 elections. Qualify the actual old/new binary pair before advertising it as
 supported.
 
+### Upgrading from 0.1.0
+
+0.1.1 can't roll onto a 0.1.0 cluster. The protocol is still 27, but the
+state format moved from 44 to 46 (the snapshot layout and the log store's
+ingest checkpoint changed), so 0.1.0 → 0.1.1 needs a fresh cluster. Move the
+data directories aside (or `relish local destroy --yes` a laptop cluster),
+install 0.1.1 and recreate the cluster, then re-apply your apps.
+
+If you try anyway, nothing moves. A 0.1.0 node asks every candidate for
+`bun --compatibility` after checking its signatures and before staging it, and
+refuses 0.1.1's `{"protocol":27,"state":46}` with a 409. A single node's
+`relish upgrade start v0.1.1` fails with that message. In a cluster, `start`
+records the run, the first node it directs refuses, and the run pauses with
+`directive to NODE refused: incompatible binary: incompatible cluster formats`
+while every node keeps running 0.1.0. `relish upgrade abort` ends the paused
+run, because no node moved. A laptop cluster refuses the other way: rerunning
+setup with the 0.1.1 installer says the existing cluster's parameters differ,
+because the saved record names 0.1.0.
+
 ## Signing identity
 
 Configure the Actions secret `RELIABURGER_RELEASE_KEY` with the base64 encoding
@@ -225,7 +244,7 @@ and the [release asset digest fields](https://docs.github.com/en/rest/releases/r
 The website and installer are separate static assets under `docs/website`,
 published by `static.yml`. GitHub Pages cannot select a different response for
 curl and a browser at `/`; the shell endpoint is `/install.sh`. The bootstrap
-installs the version in its `RELIABURGER_VERSION` default (`v0.1.0` today), so
+installs the version in its `RELIABURGER_VERSION` default (`v0.1.1` today), so
 bump that default in the same change that announces a newer release.
 
 Before tagging a release, complete the managed-cluster and clean-install
@@ -384,8 +403,17 @@ the real `curl … | sh` install against it on every host we advertise.
 8. **Update the docs** once the release is public: the release date in the
    [roadmap](roadmap.md) (tick the release) and the homepage
    (`docs/website/index.html`), and the bootstrap's default version if it
-   changed. The website deploys from `main`, so merge that change after
-   promotion, not before.
+   changed. Grep for the previous version to find the other "current
+   release" lines (the READMEs, the quickstart, the tour chapter, the
+   `VERSION=` lines in [linux-servers.md](linux-servers.md)), and leave
+   history alone. Update the five-minute tour to show off the release's new
+   features (the homepage's `data-tour` commands, the manual's
+   `08_five-minute-tour.md` and `scripts/demo/tour.sh` together), then
+   re-record `docs/website/assets/tour.cast` against the published install
+   with `scripts/demo/tour.sh --record … --install vX.Y.Z`
+   ([how](website/README.md#re-recording-the-tour)), and move the poster time
+   in `index.html` if its moment moved. The website deploys from `main`, so
+   merge that change after promotion, not before.
 
 ## Soaking a candidate in CI
 

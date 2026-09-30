@@ -350,6 +350,180 @@ async fn forward_track_to_leader(
     Ok(value["build_id"].as_u64())
 }
 
+// ---------------------------------------------------------------------------
+// Signing on the leader
+// ---------------------------------------------------------------------------
+
+/// Ask the leader to sign the manifests a build pushed, POSTed to
+/// `/v1/build/sign` (#331).
+///
+/// Only the leader can sign: provisioning the build signer reads the CA
+/// through a linearised read, and the signature lands through a Raft write.
+/// A build runs on whichever node has Buildah, so a follower's runner sends
+/// this to the leader.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuildSignRequest {
+    /// The tracked build that pushed the manifests. It must still be
+    /// running: a signature is only ever minted for a build in flight.
+    pub build_id: u64,
+    /// The build's namespace, which names its signing identity.
+    pub namespace: String,
+    /// Manifest digests to sign, as the registry catalogued them.
+    pub digests: Vec<String>,
+}
+
+/// Why the leader didn't sign a build's manifests.
+#[derive(Debug, thiserror::Error)]
+enum BuildSignError {
+    #[error("this node is not the council leader")]
+    NotLeader,
+    #[error("build {build_id} is not a running build")]
+    NotRunning { build_id: u64 },
+    #[error("{0}")]
+    Refused(String),
+    #[error("{0}")]
+    Failed(String),
+}
+
+impl BuildSignError {
+    fn status(&self) -> StatusCode {
+        match self {
+            BuildSignError::NotLeader | BuildSignError::Failed(_) => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+            BuildSignError::NotRunning { .. } | BuildSignError::Refused(_) => StatusCode::CONFLICT,
+        }
+    }
+}
+
+/// Marks a sign request a follower already forwarded, so a node that
+/// isn't the leader either refuses it instead of forwarding it again.
+const FORWARDED_SIGN_HEADER: &str = "x-reliaburger-forwarded-sign";
+
+/// Sign every digest in `request` on this node, which must lead.
+async fn sign_on_leader(
+    state: &ApiState,
+    request: &BuildSignRequest,
+) -> Result<(), BuildSignError> {
+    let Some(council) = &state.council else {
+        return Err(BuildSignError::Failed("no council available".to_string()));
+    };
+    if !council.is_leader().await {
+        return Err(BuildSignError::NotLeader);
+    }
+    let running = council
+        .desired_state()
+        .await
+        .build_state
+        .get(request.build_id)
+        .is_some_and(|record| matches!(record.state, BuildState::Running));
+    if !running {
+        return Err(BuildSignError::NotRunning {
+            build_id: request.build_id,
+        });
+    }
+    let digests = request
+        .digests
+        .iter()
+        .map(|digest| {
+            crate::pickle::types::Digest::new(digest).map_err(|e| {
+                BuildSignError::Refused(format!("manifest digest {digest:?} is invalid: {e}"))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let node_name = state.node_name.as_deref().unwrap_or("local");
+    let signer = get_or_provision_build_signer(
+        state.build_signers.as_ref(),
+        council,
+        &state.trust_domain,
+        &request.namespace,
+        node_name,
+    )
+    .await
+    .map_err(BuildSignError::Failed)?;
+    for digest in &digests {
+        sign_pushed_image(council, &signer, digest)
+            .await
+            .map_err(BuildSignError::Refused)?;
+    }
+    Ok(())
+}
+
+/// POST `request` to the leader's `/v1/build/sign`.
+async fn forward_sign_to_leader(
+    state: &ApiState,
+    request: &BuildSignRequest,
+) -> Result<(), String> {
+    let Some(council) = &state.council else {
+        return Err("no council available for signing".to_string());
+    };
+    let Some(leader_url) = super::api::leader_api_url(state, council).await else {
+        return Err("no cluster leader known yet".to_string());
+    };
+    let mut forwarded = state
+        .cluster_http
+        .client()
+        .post(format!("{leader_url}/v1/build/sign"))
+        .header(FORWARDED_SIGN_HEADER, "1")
+        .json(request);
+    if let Some(token) = &state.service_token {
+        forwarded = forwarded.bearer_auth(token);
+    }
+    let response = tokio::time::timeout(std::time::Duration::from_secs(30), forwarded.send())
+        .await
+        .map_err(|_| "the leader didn't answer the sign request in 30s".to_string())?
+        .map_err(|e| format!("leader forward failed: {e}"))?;
+    if response.status().is_success() {
+        return Ok(());
+    }
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    Err(format!("the leader refused to sign ({status}): {body}"))
+}
+
+/// Have the manifests a build pushed signed: here when this node leads,
+/// by the leader otherwise.
+async fn request_build_signatures(
+    state: &ApiState,
+    request: &BuildSignRequest,
+) -> Result<(), String> {
+    match sign_on_leader(state, request).await {
+        Err(BuildSignError::NotLeader) => forward_sign_to_leader(state, request).await,
+        other => other.map_err(|e| e.to_string()),
+    }
+}
+
+/// `POST /v1/build/sign` — sign what a running build pushed (#331).
+///
+/// Node-to-node only (the system principal). The leader signs; a follower
+/// forwards once to the leader, and a request that was already forwarded
+/// is refused rather than passed on again.
+pub async fn build_sign_handler(
+    State(state): State<ApiState>,
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    headers: axum::http::HeaderMap,
+    Json(request): Json<BuildSignRequest>,
+) -> Response {
+    if let Err(resp) = crate::sesame::auth::require_system(auth.as_deref()) {
+        return resp;
+    }
+    let outcome = match sign_on_leader(&state, &request).await {
+        Err(BuildSignError::NotLeader) if !headers.contains_key(FORWARDED_SIGN_HEADER) => {
+            forward_sign_to_leader(&state, &request)
+                .await
+                .map_err(|reason| (StatusCode::BAD_GATEWAY, reason))
+        }
+        other => other.map_err(|e| (e.status(), e.to_string())),
+    };
+    match outcome {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err((status, reason)) => {
+            (status, Json(serde_json::json!({ "error": reason }))).into_response()
+        }
+    }
+}
+
 /// Register a build record durably (Raft when a council exists, the
 /// local registry standalone), mirroring it locally either way.
 pub(crate) async fn register_build_record(
@@ -1020,7 +1194,7 @@ async fn run_build_inner(
     // Sign what was pushed so it deploys under require_signatures. With the
     // policy set, signing is part of success (JOB7); without it, a failure is
     // a warning and the unsigned image stays useful.
-    match sign_published_image(state, request, &job, &published).await {
+    match sign_published_image(state, build_id, request, &job, &published).await {
         Ok(()) => {}
         Err(reason) if state.require_signatures => {
             return Err(format!(
@@ -1170,13 +1344,14 @@ async fn run_cleanup_command(cmd: &[String], dir: &std::path::Path, timeout: std
 /// to one platform's digest verifies as well.
 async fn sign_published_image(
     state: &ApiState,
+    build_id: u64,
     request: &BuildSubmitRequest,
     job: &crate::pickle::build::BuildahJob,
     published: &crate::pickle::build::OciLayoutImage,
 ) -> Result<(), String> {
-    let Some(council) = &state.council else {
+    if state.council.is_none() {
         return Err("no council available for signing".to_string());
-    };
+    }
     let tagged = pushed_manifest_digest(state, &job.destination.name, &job.destination.tag)
         .await
         .ok_or_else(|| "pushed image not found in the catalogue".to_string())?;
@@ -1188,24 +1363,21 @@ async fn sign_published_image(
             published.top.digest
         ));
     }
-    let namespace = request.spec.namespace.as_deref().unwrap_or("default");
-    let node_name = state.node_name.as_deref().unwrap_or("local");
-    // Reuse a persistent code-signing identity across builds instead of
-    // minting a fresh ephemeral CSR each time.
-    let signer = get_or_provision_build_signer(
-        state.build_signers.as_ref(),
-        council,
-        &state.trust_domain,
-        namespace,
-        node_name,
-    )
-    .await?;
-    for digest in published.manifest_digests() {
-        let digest = crate::pickle::types::Digest::new(digest)
-            .map_err(|e| format!("pushed manifest digest {digest:?} is invalid: {e}"))?;
-        sign_pushed_image(council, &signer, &digest).await?;
-    }
-    Ok(())
+    // Only the leader can sign, so a build on a follower asks it (#331).
+    let sign = BuildSignRequest {
+        build_id,
+        namespace: request
+            .spec
+            .namespace
+            .clone()
+            .unwrap_or_else(|| "default".to_string()),
+        digests: published
+            .manifest_digests()
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+    };
+    request_build_signatures(state, &sign).await
 }
 
 /// The manifest digest the push landed under, from the local catalog

@@ -1082,15 +1082,28 @@ async fn lost_exec_owner_keeps_application_retirement_unconfirmed() {
     tokio::time::sleep(Duration::from_millis(250)).await;
     let state = grill.state(&id).await;
     let parent_dir = directory.path().join("process-owners").join(&id.0);
-    let record: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(parent_dir.join("owner.json")).unwrap()).unwrap();
     // Fault-injection cleanup: this fixture's retained helper deliberately
-    // cannot certify absence after its auxiliary owner was killed.
-    nix::sys::signal::kill(
+    // cannot certify absence after its auxiliary owner was killed. The
+    // contract is the durable record, not the helper's lifetime: an owner
+    // that has already exited (#335) must still have left it unconfirmed,
+    // which the record read after its death shows.
+    match nix::sys::signal::kill(
         nix::unistd::Pid::from_raw(parent_owner as i32),
         nix::sys::signal::Signal::SIGKILL,
-    )
-    .unwrap();
+    ) {
+        Ok(()) => {}
+        Err(nix::errno::Errno::ESRCH) => eprintln!(
+            "parent owner had already exited; its log: {:?}",
+            std::fs::read_to_string(parent_dir.join("owner.log"))
+        ),
+        Err(error) => panic!("cannot kill the parent owner: {error}"),
+    }
+    assert!(
+        exec_process_is_gone(parent_owner).await,
+        "parent owner survived SIGKILL"
+    );
+    let record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(parent_dir.join("owner.json")).unwrap()).unwrap();
     for path in std::iter::once(parent_dir.clone()).chain(
         std::fs::read_dir(&parent_dir)
             .unwrap()

@@ -4,36 +4,38 @@
 //! the pragmatic approach — avoids pulling in full PGP/SSH stacks
 //! while still providing real verification.
 
-use std::path::Path;
-use std::process::Command;
+use std::collections::{BTreeMap, HashMap};
 
+use super::git::GitRepo;
 use super::types::{CommitInfo, LettuceError, SignatureStatus};
 
 /// Verify the signature on a commit.
 ///
 /// Shells out to `git verify-commit` which handles both GPG and SSH
-/// signatures. Returns the updated `SignatureStatus`.
+/// signatures. Returns `NotChecked` when no keys are trusted, and an error
+/// when the verifier couldn't run to completion (it failed to start, hung
+/// past its deadline, or shutdown cancelled it).
 pub fn verify_commit(
-    repo_path: &Path,
+    repo: &GitRepo,
     commit: &CommitInfo,
     trusted_keys: &[String],
-) -> SignatureStatus {
+) -> Result<SignatureStatus, LettuceError> {
     if trusted_keys.is_empty() {
-        return SignatureStatus::NotChecked;
+        return Ok(SignatureStatus::NotChecked);
     }
 
-    let output = Command::new("git")
-        .args(["verify-commit", "--raw", &commit.sha])
-        .current_dir(repo_path)
-        .output();
-
-    let output = match output {
-        Ok(o) => o,
-        Err(_) => return SignatureStatus::NotChecked,
-    };
+    let mut command = std::process::Command::new("git");
+    command
+        .args(["verify-commit", "--raw", "--end-of-options", &commit.sha])
+        .current_dir(repo.path());
+    let output = repo.run(command, "git verify-commit")?;
 
     let stderr = String::from_utf8_lossy(&output.stderr);
-    classify_verification(output.status.success(), &stderr, trusted_keys)
+    Ok(classify_verification(
+        output.status.success(),
+        &stderr,
+        trusted_keys,
+    ))
 }
 
 /// Turn `git verify-commit --raw`'s exit status and stderr into a status.
@@ -58,30 +60,61 @@ fn classify_verification(
     }
 }
 
-/// Check whether a commit modifies any `script` field.
+/// Every `script` value declared in a set of TOML files.
 ///
-/// Parses the diff and looks for lines adding or changing a `script`
-/// field in a TOML file.
-pub fn commit_modifies_script(
-    repo_path: &Path,
-    sha: &str,
-    parent_sha: Option<&str>,
+/// Keys are `<file>:<dotted key path>` (`apps.toml:app.web.script`), values
+/// the parsed value in TOML form. Parsing first is the point (B13): a
+/// multiline `"""` or `'''` body, a literal or a basic string all reduce to
+/// the same value, so an edit to the body of a script is a changed value
+/// even though no line of the diff mentions `script`. A file that doesn't
+/// parse is an error, because its scripts can't be known.
+pub fn script_values(
+    files: &HashMap<String, String>,
+) -> Result<BTreeMap<String, String>, LettuceError> {
+    let mut scripts = BTreeMap::new();
+    for (file, content) in files {
+        let table: toml::Table =
+            content
+                .parse()
+                .map_err(|e: toml::de::Error| LettuceError::ParseError {
+                    file: file.clone(),
+                    error: e.to_string(),
+                })?;
+        collect_scripts(&format!("{file}:"), &table, &mut scripts);
+    }
+    Ok(scripts)
+}
+
+/// Walk `table`, recording every value whose key is `script`, at any depth.
+fn collect_scripts(prefix: &str, table: &toml::Table, scripts: &mut BTreeMap<String, String>) {
+    for (key, value) in table {
+        let path = format!("{prefix}{key}");
+        if key == "script" {
+            scripts.insert(path.clone(), value.to_string());
+        }
+        collect_value(&path, value, scripts);
+    }
+}
+
+fn collect_value(path: &str, value: &toml::Value, scripts: &mut BTreeMap<String, String>) {
+    match value {
+        toml::Value::Table(table) => collect_scripts(&format!("{path}."), table, scripts),
+        toml::Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                collect_value(&format!("{path}[{index}]"), item, scripts);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Whether `candidate` adds, changes or removes any script relative to
+/// `previous`. Both are the TOML files of a whole tree.
+pub fn scripts_changed(
+    previous: &HashMap<String, String>,
+    candidate: &HashMap<String, String>,
 ) -> Result<bool, LettuceError> {
-    let diff_args = match parent_sha {
-        Some(parent) => vec!["diff", parent, sha, "--", "*.toml"],
-        None => vec!["diff", "--root", sha, "--", "*.toml"],
-    };
-
-    let output = Command::new("git")
-        .args(&diff_args)
-        .current_dir(repo_path)
-        .output()
-        .map_err(|e| LettuceError::GitFailed(e.to_string()))?;
-
-    let diff_text = String::from_utf8_lossy(&output.stdout);
-    Ok(diff_text
-        .lines()
-        .any(|line| line.starts_with('+') && !line.starts_with("+++") && line.contains("script")))
+    Ok(script_values(previous)? != script_values(candidate)?)
 }
 
 /// Check whether the key that made a *valid* signature is in the trusted set.
@@ -167,19 +200,6 @@ fn normalise_gpg(fingerprint: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn no_trusted_keys_returns_not_checked() {
-        let commit = CommitInfo {
-            sha: "abc".to_string(),
-            message: "test".to_string(),
-            author: "dev".to_string(),
-            timestamp: 0,
-            signature: SignatureStatus::NotChecked,
-        };
-        let result = verify_commit(Path::new("/nonexistent"), &commit, &[]);
-        assert_eq!(result, SignatureStatus::NotChecked);
-    }
 
     const TRUSTED_FPR: &str = "0123456789ABCDEF0123456789ABCDEF01234567";
     const TRUSTED_SUBKEY_FPR: &str = "89ABCDEF0123456789ABCDEF0123456789ABCDEF";

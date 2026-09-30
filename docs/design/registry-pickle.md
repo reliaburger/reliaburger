@@ -841,6 +841,8 @@ When a build job with `build = true` pushes an image, the signing flow is:
     CRL, so a revoked signer fails closed).
 ```
 
+Only the council leader can do steps 3 to 5: minting the signer's certificate reads the CA through a linearised read, and `AttachSignature` is a Raft write. A build runs on whichever node has Buildah, so a runner that isn't the leader sends `POST /v1/build/sign` (`{build_id, namespace, digests}`, system principal) to the leader, which checks that the build is tracked and still running, provisions its own cached signer for the namespace and attaches the signatures. A request a follower already forwarded carries `x-reliaburger-forwarded-sign` and is refused rather than forwarded again (#331).
+
 There is no Fulcio-style ephemeral-key/OIDC exchange and no external signing key to manage: the build-signer is tied to the cluster's own Workload CA, so the trust policy accepts it by construction. Because the identity is persistent, `issuer` and `identity` on the signature are descriptive labels, not a live OIDC issuance path.
 
 **External key signing:**

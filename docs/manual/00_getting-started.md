@@ -42,7 +42,7 @@ It verifies `bun` against the release signatures, asks a few questions and
 writes a starter `reliaburger.toml`. Pass `--yes` to accept every default.
 Real containers need runc on Linux, and a cluster needs rootful runc with eBPF
 (see `cluster-basics`). On macOS, use the quickstart above: it runs the same
-runc path inside Linux VMs. Apple Container isn't supported in 0.1.0.
+runc path inside Linux VMs. Apple Container isn't supported in 0.1.1.
 
 ## From source, without containers
 

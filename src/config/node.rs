@@ -524,6 +524,10 @@ pub struct SnapshotsSection {
     /// (`file://`, `s3://`, `gs://`). Credentials come from the
     /// standard environment variables of each backend.
     pub upload_url: Option<String>,
+    /// Deadline, in seconds, for each stage of one snapshot's export:
+    /// writing its archive to the local spool, then uploading it. A stage
+    /// that overruns is abandoned and retried on the next sweep.
+    pub upload_timeout_secs: u64,
 }
 
 impl Default for SnapshotsSection {
@@ -532,6 +536,7 @@ impl Default for SnapshotsSection {
             interval_secs: 0,
             retain: 7,
             upload_url: None,
+            upload_timeout_secs: 3600,
         }
     }
 }

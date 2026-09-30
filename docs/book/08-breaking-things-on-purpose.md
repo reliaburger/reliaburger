@@ -837,6 +837,20 @@ any refusal. They'd have passed with the rail deleted. Now they insist on the
 rail's own `quorum risk` message. A test that accepts any "no" only proves that
 *something* said no.
 
+The reservation carries the membership the leader read when it proposed, and
+the state machine refuses it, before touching the ledger, if that membership is
+joint or has moved on by the time the entry applies. Counting the quorum budget
+against a configuration that's half-way between two voter sets would be
+guesswork. That refusal bit our own node-kill acceptance test on the 0.1.1
+release build. The test waited for "three voters" in openraft's metrics, which
+is the same trap Chapter 2 describes: the metrics show a membership as soon as
+it's appended, and a joint config mid-promotion already lists all three. It sent
+the kill a moment too early and the leader said no, exactly as designed. The
+fixture now waits until every node has applied the same uniform three-voter
+config, and retries that one refusal (and only that one, word for word) for a
+bounded 30 seconds in case the self-healing loop moves membership again in
+between. Anything else still fails the test.
+
 ## Process workloads
 
 Not everything runs in a container. Monitoring agents, log shippers, custom exporters — these are host binaries that need to run alongside your containerised apps. Until now, you'd manage them separately with systemd or supervisord. Process workloads make them first-class citizens.
@@ -1012,6 +1026,33 @@ few times (a busy machine can stall it past the owner's 100 ms request window),
 but only the durable record or an empty process group ever says "stopped". And
 `relish exec` commands get their own child owner under the workload's owner, so
 killing Bun can't orphan one and retiring the app waits for it.
+
+That waiting turned up one of our more obscure flakes. Once in a few hundred
+loaded runs on a Mac, retiring an app with an exec in flight never finished, and
+the exec owner's log said only `Operation not permitted`. A cancelled owner
+re-sends SIGKILL to its group on every 10 ms tick until `waitid` reports the
+exit, and it treated a failed signal as fatal. On macOS a group signal fails
+with `EPERM` when no member will take it, and the kernel skips processes that
+are already exiting. There's a window between SIGKILL and the moment `waitid`
+can see the exit where the group still exists but refuses everything. A small C
+loop hit it in 1,997 of 2,000 tries; the owner, sleeping 10 ms between signals,
+only landed in it when the machine was busy. The owner died with the exec still
+`Running` on disk, and the parent, which rightly won't retire without proof,
+waited forever. Now a refused group signal on macOS falls back to the root
+alone:
+
+```rust
+#[cfg(target_os = "macos")]
+Err(nix::errno::Errno::EPERM) => self.signal_refused_group(signal),
+```
+
+`#[cfg(...)]` compiles the arm only on macOS; Linux never refuses a group like
+this. `signal_refused_group` returns `Ok` if `waitid` already shows the exit,
+and otherwise signals the root's PID directly. The root is the owner's own
+unreaped child, so that PID can't belong to anyone else yet, and a direct
+signal succeeds while the process runs or exits and fails only on a real
+permission refusal. Retirement still lists every group member before it writes
+`Retiring`, so accepting the refusal can't publish a false absence.
 
 ### A signal is not proof of exit
 

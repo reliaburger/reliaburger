@@ -29,10 +29,11 @@ migration and no feature gate
   [release closure record](qualification/2026-09-27-v0.1.0-release-closure.md)
   lists every candidate, soak run and fix from #196 to the tag, and what was
   carried past it. The limits it ships with are in the
-  [documentation](README.md#010-scope-and-limits).
-- [ ] **0.1.1: every known bug fix**
-  ([milestone](https://github.com/reliaburger/reliaburger/milestone/1)). A full
-  release is expensive, so 0.1.1 takes every bug we know about:
+  [documentation](README.md#scope-and-limits).
+- [x] **0.1.1: bug fixes.** [Released](https://github.com/reliaburger/reliaburger/releases/tag/v0.1.1)
+  on 30 September 2026
+  ([milestone](https://github.com/reliaburger/reliaburger/milestone/1)). A
+  full release is expensive, so 0.1.1 took every bug we knew about:
   - [x] the soak follow-ups in [#276](https://github.com/reliaburger/reliaburger/pull/276)
     (departed nodes forgotten, dead nodes listed as dead, the commit in
     versions, the candidate digest in the build log);
@@ -45,20 +46,25 @@ migration and no feature gate
     0.1.0 ([#300](https://github.com/reliaburger/reliaburger/issues/300));
   - [x] a changed ingress host ignored on redeploy ([#307](https://github.com/reliaburger/reliaburger/issues/307)) and log
     forwarders not resuming from the checkpoint ([#308](https://github.com/reliaburger/reliaburger/issues/308));
-  - [ ] the rest of the static review's defects: snapshots
+  - [x] the rest of the static review's defects: snapshots
     ([#291](https://github.com/reliaburger/reliaburger/issues/291)–[#294](https://github.com/reliaburger/reliaburger/issues/294)), GitOps ([#295](https://github.com/reliaburger/reliaburger/issues/295)–[#297](https://github.com/reliaburger/reliaburger/issues/297), [#305](https://github.com/reliaburger/reliaburger/issues/305)) and
     autoscaler `min = 0` ([#299](https://github.com/reliaburger/reliaburger/issues/299));
-  - [ ] tests that can't fail ([#301](https://github.com/reliaburger/reliaburger/issues/301), [#302](https://github.com/reliaburger/reliaburger/issues/302)) and the open flake
+  - [x] tests that can't fail ([#301](https://github.com/reliaburger/reliaburger/issues/301), [#302](https://github.com/reliaburger/reliaburger/issues/302)) and the open flake
     ([#318](https://github.com/reliaburger/reliaburger/issues/318));
-  - [ ] further known bugs: the allocation error after a starved deploy
+  - [x] further known bugs: the allocation error after a starved deploy
     ([#309](https://github.com/reliaburger/reliaburger/issues/309)), Mayo memory growth over a long soak ([#310](https://github.com/reliaburger/reliaburger/issues/310)), and the rest
-    of the milestone;
-  - [ ] housekeeping: the plans that led to 0.1.0 archived, and this page
+    of the milestone ([#314](https://github.com/reliaburger/reliaburger/issues/314), [#322](https://github.com/reliaburger/reliaburger/issues/322), [#331](https://github.com/reliaburger/reliaburger/issues/331), [#333](https://github.com/reliaburger/reliaburger/issues/333), [#335](https://github.com/reliaburger/reliaburger/issues/335));
+  - [x] housekeeping: the plans that led to 0.1.0 archived, and this page
     replacing the old implementation checklist.
-- [ ] **0.1.2: images**
+
+  The homepage tour was re-recorded against the published install
+  ([#317](https://github.com/reliaburger/reliaburger/issues/317)). 0.1.1 changes the state format
+  (44 in 0.1.0), so a 0.1.0 cluster can't roll to it: recreate the cluster
+  ([upgrading from 0.1.0](releasing.md#upgrading-from-010)).
+- [ ] **0.1.2: images, the next release**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/2),
   [#248](https://github.com/reliaburger/reliaburger/pull/248)). The Go demo
-  build in the tour, multi-arch builds and pulls (which removes 0.1.0's
+  build in the tour, multi-arch builds and pulls (which removes the
   multi-platform limitation), platforms in `relish images`, a build cache cap,
   Buildah storage pruning and Buildah in the guest image.
 - [ ] **0.1.3: observability and test quality**

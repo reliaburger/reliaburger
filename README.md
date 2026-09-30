@@ -18,7 +18,7 @@ it heal. Five minutes is the target.
 
 ## Five minutes, zero to cluster
 
-0.1.0 was released on 29 September 2026, and the one-line installer fetches
+0.1.1 was released on 30 September 2026, and the one-line installer fetches
 its signed binaries. You'll need macOS, or Linux with QEMU and KVM, plus about
 8 GiB of free memory and 15 GiB of disk.
 
@@ -52,7 +52,7 @@ relish dashboard                     # live charts in the browser
 # Break things and watch the cluster recover
 relish fault kill frontend --count 1 --acknowledge
 relish local stop node-3             # lose a whole machine
-relish status                        # three frontends again, on two nodes
+relish inspect frontend              # three frontends again, each with its node
 relish wtf                           # what's wrong and what to do about it
 
 # Clean up
@@ -304,7 +304,7 @@ binary was built from. Neither needs a network.
 Config is TOML. The [whitepaper](docs/whitepaper.md) explains the architecture
 and its trade-offs; the [design docs](docs/design/) cover each subsystem.
 
-## Limits in 0.1.0
+## Limits in 0.1.1
 
 - **Clusters need rootful runc on Linux with eBPF.** macOS runs containers in
   managed Linux VMs; native macOS `bun` runs plain processes only.
@@ -329,7 +329,7 @@ and its trade-offs; the [design docs](docs/design/) cover each subsystem.
 - **Cron doesn't catch up.** It skips firings missed during a crash, and a job
   whose outcome is unknown waits for `relish apply <file> --rerun-jobs`.
 
-The [documentation](docs/README.md#010-scope-and-limits) has the full list.
+The [documentation](docs/README.md#scope-and-limits) has the full list.
 The [roadmap](docs/roadmap.md) has what's next and the known gaps, with the
 detail in GitHub milestones and issues.
 

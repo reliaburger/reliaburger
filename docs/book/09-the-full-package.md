@@ -429,8 +429,8 @@ Lettuce runs on a single council member elected as the **GitOps coordinator**. N
 The sync loop:
 
 1. **Trigger.** Poll timer (default 30s) or webhook
-2. **Git fetch.** If HEAD hasn't changed since last sync, short-circuit
-3. **Signature verification.** If required (global or auto-enforced for script changes)
+2. **Git fetch.** A new commit if there is one, otherwise the current HEAD. Every tick reconciles, so manual drift is repaired even when Git hasn't moved (Chapter 7 tells that story)
+3. **Signature verification.** If required (global, or auto-enforced when the parsed `script` values differ from the last applied tree)
 4. **TOML parse.** All `.toml` files under the configured path. Parse errors are per-file, not global
 5. **Diff.** Field-by-field comparison against current Raft state. Autoscaler-aware
 6. **Selective apply.** Only changed resources written to Raft
@@ -1229,6 +1229,34 @@ the `select!` drops the start future, which kills `limactl` (we built its
 once more. Dropping a future is how you cancel it in Rust; there's no
 `cancel()` method, and no context object to thread through as in Go. A resumed
 setup applies the same test to a VM left "running" by an earlier attempt.
+
+The restart had a race of its own. On a Mac with a load average of 29, all
+three VMs stayed silent for the full minute, so all three watchdogs fired
+together, and one restart died with `dial unix .../user-v2_fd.sock: connect:
+no such file or directory`. Rerunning setup fixed it, and we never saw it
+again. Our best reading of Lima (not proven) goes like this: `limactl stop`
+shuts the shared `user-v2` daemon down when no VM is `Running`, and a VM that
+is still starting doesn't count. VM 1 stops and starts; VM 2 and VM 3 then
+stop, the daemon goes, and VM 1's host agent finds no socket to dial.
+
+So `Lima::restart` takes its turn. Every clone of `Lima` shares one
+`Arc<tokio::sync::Mutex<()>>`, a lock guarding no data at all; the `()` is
+Rust's empty type, so the lock is only a turnstile. A restart holds it from
+`stop --force` until `limactl list` reports its VM `Running`, which is when
+the next restart's `stop` sees the daemon in use. Then it drops the guard and
+lets the boot finish alongside the others. `std::pin::pin!` pins the start
+future on the stack so that `select!` can poll it through `&mut` and we can
+still await it afterwards. Rust moves values freely, and a future that
+might hold references into itself has to be promised a fixed address before
+anyone polls it.
+
+We couldn't reproduce the real race on demand, so the test reproduces its
+shape instead. `silent_vms_restart_one_at_a_time_so_the_shared_network_survives`
+runs three watchdogged boots against a fake `limactl` whose `stop` removes a
+pretend daemon when nothing is `Running`, and whose `start` fails if the
+daemon it came up with has gone. The stops take 0, 0.3 and 0.6 seconds, so
+without the gate VM 1's start fails every time with the error from the Mac.
+With the gate, all three end up `Running`.
 
 ### Bake the image, don't install at boot
 

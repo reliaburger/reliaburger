@@ -5,11 +5,18 @@
 //! with replay detection.
 
 use std::collections::VecDeque;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ring::hmac;
 
 use super::types::{LettuceError, WebhookEvent};
+
+/// A source of the current time, injectable so tests can move the
+/// rate-limit window without sleeping.
+pub type Clock = Box<dyn Fn() -> Instant + Send>;
+
+/// How long a delivery counts against the rate budget.
+const RATE_WINDOW: Duration = Duration::from_secs(60);
 
 /// Validates and rate-limits incoming webhooks.
 pub struct WebhookValidator {
@@ -23,17 +30,25 @@ pub struct WebhookValidator {
     max_replay_entries: usize,
     /// Timestamps of recent triggers for rate limiting.
     recent_triggers: VecDeque<Instant>,
+    /// Where "now" comes from for the rate window.
+    clock: Clock,
 }
 
 impl WebhookValidator {
     /// Create a new validator with the given HMAC secret and rate limit.
     pub fn new(secret: &str, rate_limit: u32) -> Self {
+        Self::with_clock(secret, rate_limit, Box::new(Instant::now))
+    }
+
+    /// Create a validator that reads the time from `clock`.
+    pub fn with_clock(secret: &str, rate_limit: u32, clock: Clock) -> Self {
         Self {
             secret: secret.as_bytes().to_vec(),
             rate_limit,
             recent_ids: VecDeque::with_capacity(1000),
             max_replay_entries: 1000,
             recent_triggers: VecDeque::with_capacity(rate_limit as usize),
+            clock,
         }
     }
 
@@ -106,17 +121,12 @@ impl WebhookValidator {
                 "duplicate delivery ID (replay)".to_string(),
             ));
         }
-        self.recent_ids.push_back(id.to_string());
-        if self.recent_ids.len() > self.max_replay_entries {
-            self.recent_ids.pop_front();
-        }
 
-        let now = Instant::now();
-        let one_minute_ago = now - std::time::Duration::from_secs(60);
+        let now = (self.clock)();
         while self
             .recent_triggers
             .front()
-            .is_some_and(|t| *t < one_minute_ago)
+            .is_some_and(|t| now.duration_since(*t) > RATE_WINDOW)
         {
             self.recent_triggers.pop_front();
         }
@@ -125,6 +135,16 @@ impl WebhookValidator {
                 "rate limit exceeded ({}/min)",
                 self.rate_limit
             )));
+        }
+
+        // Admission is all or nothing (B10). The delivery ID used to be
+        // recorded before the rate check, so a delivery refused for being
+        // over budget was already "seen", and the provider's retry after
+        // the window was refused as a replay. Only an admitted delivery
+        // consumes its ID and a slot in the window.
+        self.recent_ids.push_back(id.to_string());
+        if self.recent_ids.len() > self.max_replay_entries {
+            self.recent_ids.pop_front();
         }
         self.recent_triggers.push_back(now);
         Ok(())
@@ -267,6 +287,47 @@ mod tests {
         let result = validator.validate(body, Some(&sig), Some("id-3"), "main");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("rate limit"));
+    }
+
+    /// B10: a delivery refused for being over the rate budget was already
+    /// recorded as seen, so the provider's retry after the window was
+    /// refused as a replay. Only an admitted delivery may consume its ID.
+    #[test]
+    fn rate_limited_delivery_is_accepted_when_retried_after_the_window() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let base = Instant::now();
+        let elapsed_secs = Arc::new(AtomicU64::new(0));
+        let clock_secs = Arc::clone(&elapsed_secs);
+        let mut validator = WebhookValidator::with_clock(
+            "mysecret",
+            1,
+            Box::new(move || base + Duration::from_secs(clock_secs.load(Ordering::SeqCst))),
+        );
+        let body = br#"{"after": "abc"}"#;
+        let sig = sign_payload("mysecret", body);
+
+        // Exhaust the budget, then get a fresh delivery refused.
+        validator
+            .validate(body, Some(&sig), Some("id-1"), "main")
+            .unwrap();
+        let limited = validator.validate(body, Some(&sig), Some("id-2"), "main");
+        assert!(
+            limited.unwrap_err().to_string().contains("rate limit"),
+            "the second delivery must be rate limited"
+        );
+
+        // The provider retries id-2 once the window has passed.
+        elapsed_secs.store(61, Ordering::SeqCst);
+        validator
+            .validate(body, Some(&sig), Some("id-2"), "main")
+            .expect("a retried rate-limited delivery must be admitted");
+
+        // A true replay of the admitted delivery is still refused.
+        elapsed_secs.store(200, Ordering::SeqCst);
+        let replay = validator.validate(body, Some(&sig), Some("id-2"), "main");
+        assert!(replay.unwrap_err().to_string().contains("duplicate"));
     }
 
     #[test]

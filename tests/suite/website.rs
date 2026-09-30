@@ -395,7 +395,7 @@ fn every_section_can_be_linked_to() {
     );
 }
 
-/// 0.1.0 is published, so the page leads with the one-line install and keeps
+/// A release is published, so the page leads with the one-line install and keeps
 /// building from source as the second path (#280).
 #[test]
 fn the_page_leads_with_the_one_line_install() {
@@ -413,6 +413,49 @@ fn the_page_leads_with_the_one_line_install() {
         "release-not-published",
     ] {
         assert!(!page.contains(stale), "the page still says {stale:?}");
+    }
+}
+
+/// The version the bootstrap installs by default is the one the site, the
+/// READMEs and the tour chapter announce, so promoting a release can't flip
+/// one of them and forget the rest (#317).
+#[test]
+fn the_site_and_docs_announce_the_version_the_installer_installs() {
+    let installer = read("docs/website/install.sh");
+    let default = installer
+        .split("${RELIABURGER_VERSION:-")
+        .nth(1)
+        .and_then(|rest| rest.split('}').next())
+        .expect("install.sh has no RELIABURGER_VERSION default");
+    let version = default.trim_start_matches('v');
+    let notes = format!("https://github.com/reliaburger/reliaburger/releases/tag/{default}");
+
+    let page = read("docs/website/index.html");
+    for expected in [
+        format!("{version} PROTOTYPE"),
+        format!("Install {version} "),
+        format!("<strong>{version} (Prototype)</strong>"),
+        format!("href=\"{notes}\""),
+    ] {
+        assert!(page.contains(&expected), "index.html lacks {expected:?}");
+    }
+    assert_eq!(
+        page.matches("/releases/tag/").count(),
+        page.matches(&notes).count(),
+        "index.html links release notes other than {notes}"
+    );
+    for (path, expected) in [
+        ("README.md", format!("{version} was released on")),
+        ("docs/README.md", notes.clone()),
+        ("docs/quickstart.md", format!("signed {version} release")),
+        (
+            "docs/manual/08_five-minute-tour.md",
+            format!("signed {version} release"),
+        ),
+        ("docs/linux-servers.md", format!("VERSION=\"{default}\"")),
+        ("docs/releasing.md", format!("(`{default}` today)")),
+    ] {
+        assert!(read(path).contains(&expected), "{path} lacks {expected:?}");
     }
 }
 

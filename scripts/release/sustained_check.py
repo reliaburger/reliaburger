@@ -345,9 +345,26 @@ def snapshot_archive_findings(state, node, text):
     return findings
 
 
-# How long a harness kill can wait for the systemd restart it explains; an
-# older expectation never excuses a later restart.
-EXPECT_WINDOW = 600
+# systemd restarts a killed bun within seconds, so a check this long after a
+# harness kill has seen the restart the kill caused, if it caused one. An
+# expectation that a check this late didn't use never excuses a later restart.
+RESTART_GRACE = 120
+
+
+def release_version(versions, soak_bun):
+    """The version every node reports, without the `v`: the candidate's own
+    release, which each upgrade walk rolls back to.
+
+    Nodes that disagree, don't answer ("?") or already run the soak build
+    mean the cluster isn't on the candidate, and a walk from it would prove
+    nothing."""
+    found = {version.removeprefix("v") for version in versions}
+    if len(found) != 1 or "?" in found or "" in found:
+        raise ValueError(f"nodes don't agree on a release version: {' '.join(versions) or 'none'}")
+    version = found.pop()
+    if version == Path(soak_bun).name.removeprefix("bun-v"):
+        raise ValueError(f"the cluster already runs the soak build {version}")
+    return version
 
 
 def restart_expectations(evidence, node):
@@ -374,8 +391,11 @@ def restart_findings(state, node, inventory, expectations, now):
     """systemd restarts of bun that no harness kill explains.
 
     Each expectation explains at most one restart, and stays available until
-    a restart uses it or it is EXPECT_WINDOW old, so a check that runs between
-    the kill being recorded and systemd restarting bun doesn't use it up."""
+    a restart uses it or an earlier check ran RESTART_GRACE after it without
+    using it. Expiry follows the checks, not the clock. A check that runs
+    between the kill being recorded and systemd restarting bun doesn't use it
+    up, and a slot that blocks for many minutes after a kill (an upgrade walk)
+    can't expire it before any check has looked."""
     boot = (inventory.get("boot") or [None])[0]
     count = inventory_number(inventory, "nrestarts")
     if count is None:
@@ -385,7 +405,8 @@ def restart_findings(state, node, inventory, expectations, now):
     restarts.setdefault("used", 0)
     findings = []
     pending = expectations[restarts["used"]:]
-    fresh = [ts for ts in pending if now - ts <= EXPECT_WINDOW]
+    checked = restarts.get("checked")
+    fresh = [ts for ts in pending if checked is None or checked < ts + RESTART_GRACE]
     restarts["used"] += len(pending) - len(fresh)
     if restarts["boot"] == boot:
         observed = max(count - restarts["n"], 0)
@@ -396,7 +417,7 @@ def restart_findings(state, node, inventory, expectations, now):
     else:
         # A new boot starts systemd's counter again; nothing carries over.
         restarts["used"] = len(expectations)
-    restarts.update(boot=boot, n=count)
+    restarts.update(boot=boot, n=count, checked=max(now, checked or now))
     panics = inventory_number(inventory, "panics") or 0
     if panics:
         findings.append(finding("bun-panic", "fail", f"{panics} panic line(s) in the journal", node))
@@ -972,7 +993,8 @@ def render(evidence, record):
     lines += [acceptance_line(metadata, result, elapsed), ""]
     lines += ["## Candidate and host", "", "| | |", "|---|---|"]
     for key, label in (("base_url", "Staged base URL"), ("candidate_digest", "`candidate.json` SHA-256"),
-                       ("versions", "Running versions"), ("soak_bun", "Soak build"), ("host", "Host"),
+                       ("versions", "Running versions"), ("soak_bun", "Soak build"),
+                       ("release_version", "Walks roll back to"), ("host", "Host"),
                        ("lima", "Lima"), ("guest", "Guest"), ("home", "RELIABURGER_HOME"), ("evidence", "Evidence")):
         if metadata.get(key):
             lines.append(f"| {label} | {metadata[key]} |")
@@ -1110,6 +1132,9 @@ def main(argv=None):
     nodes = commands.add_parser("nodes-json")
     nodes.add_argument("file")
     nodes.add_argument("what", choices=["leader", "followers", "alive", "council"])
+    release = commands.add_parser("release-version", help="the version every node reports, which upgrade walks roll back to")
+    release.add_argument("--soak-bun", required=True, help="the soak build's file name (bun-vVERSION)")
+    release.add_argument("versions", nargs="*")
     stamp = commands.add_parser("utc-stamp")
     stamp.add_argument("epoch", type=int)
     registry = commands.add_parser("registry")
@@ -1184,6 +1209,13 @@ def main(argv=None):
         return 0
     if args.command == "nodes-json":
         return nodes_query(args.file, args.what)
+    if args.command == "release-version":
+        try:
+            print(release_version(args.versions, args.soak_bun))
+        except ValueError as e:
+            print(f"sustained_check: {e}", file=sys.stderr)
+            return 1
+        return 0
     if args.command == "utc-stamp":
         print(time.strftime("%y%m%d%H%M%SZ", time.gmtime(args.epoch)))
         return 0

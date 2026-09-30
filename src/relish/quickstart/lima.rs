@@ -1,7 +1,7 @@
 //! Deadline-bound Lima commands and private guest file transfer.
 
 use anyhow::{Context, Result, bail};
-use std::{net::Ipv4Addr, path::PathBuf, time::Duration};
+use std::{net::Ipv4Addr, path::PathBuf, sync::Arc, time::Duration};
 
 /// Runs a selected Lima binary; command errors never include its argument list.
 #[derive(Clone)]
@@ -9,6 +9,8 @@ pub struct Lima {
     executable: PathBuf,
     timeout: Duration,
     home: Option<PathBuf>,
+    /// Shared by every clone, so only one VM restarts at a time; see `restart`.
+    restarts: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Lima {
@@ -18,6 +20,7 @@ impl Lima {
             executable,
             timeout,
             home: None,
+            restarts: Arc::default(),
         }
     }
 
@@ -157,6 +160,32 @@ impl Lima {
             && tokio::fs::try_exists(network.join("user-v2_fd.sock"))
                 .await
                 .unwrap_or(false)
+    }
+
+    /// Force a VM off and start it again, one VM at a time.
+    ///
+    /// `limactl stop` stops the shared `user-v2` daemon when no instance is
+    /// `Running`, and a VM that is still starting doesn't count. Two restarts
+    /// at once can therefore take the daemon away from the first VM's start,
+    /// whose host agent then fails to dial its socket (issue #333). Each
+    /// restart holds the gate until its VM reports `Running`, so the next
+    /// restart's `stop` sees the daemon in use; the rest of the boot overlaps.
+    pub async fn restart(&self, name: &str) -> Result<()> {
+        let turn = self.restarts.lock().await;
+        self.command(&["stop", "--force", name]).await?;
+        let args = ["start", "--tty=false", name];
+        let mut start = std::pin::pin!(self.command(&args));
+        let running = async {
+            while !matches!(self.status(name).await, Ok(Some(status)) if status == "Running") {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        };
+        tokio::select! {
+            result = &mut start => return result.map(drop),
+            () = running => {}
+        }
+        drop(turn);
+        start.await.map(drop)
     }
 
     /// Read the status of exactly one owned VM; absence is not a command failure.
