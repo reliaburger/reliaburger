@@ -80,6 +80,6 @@ Queries without a lower bound (`metric_names`, arbitrary `query_sql`, the
 object-store backend, and the council's rollup store) still load every file.
 They run on demand, not on a timer, so they don't grow a node's steady-state
 memory, but a wide query over a week of history is still expensive. Streaming
-those queries is the 0.1.4 observability work in the
+those queries is the 0.1.3 observability work in the
 [roadmap](../roadmap.md#releases-after-010). A soak on a 0.1.1 candidate will
 confirm the effect on resident memory.
