@@ -211,3 +211,115 @@ fn the_demo_manifest_is_published_from_the_tested_example() {
         assert!(exists, "{DEMO_SOURCE} is missing");
     }
 }
+
+/// The `id` of every `<section>` on the homepage, in page order.
+fn section_ids(page: &str) -> Vec<Option<String>> {
+    page.match_indices("<section")
+        .map(|(start, _)| {
+            let tag = &page[start..start + page[start..].find('>').unwrap()];
+            tag.split(" id=\"")
+                .nth(1)
+                .map(|rest| rest[..rest.find('"').unwrap()].to_string())
+        })
+        .collect()
+}
+
+/// Every section has a stable `id` and its heading a `#` link to it, so a
+/// section can be shared as `reliaburger.com/#install` (#280).
+#[test]
+fn every_section_can_be_linked_to() {
+    let page = read("docs/website/index.html");
+    let ids = section_ids(&page);
+    assert!(
+        ids.iter().all(Option::is_some),
+        "a <section> has no id: {ids:?}"
+    );
+    let ids: Vec<String> = ids.into_iter().flatten().collect();
+    let mut unique = ids.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), ids.len(), "duplicate section ids: {ids:?}");
+    for id in [
+        "install",
+        "tour",
+        "start",
+        "docs",
+        "internals",
+        "contributing",
+    ] {
+        assert!(ids.iter().any(|i| i == id), "no section with id {id:?}");
+    }
+    // The intro's heading is the page title; every other section's heading
+    // carries a permalink.
+    for id in ids.iter().filter(|id| *id != "intro") {
+        assert!(
+            page.contains(&format!("<a class=\"permalink\" href=\"#{id}\"")),
+            "section {id:?} has no heading permalink"
+        );
+    }
+    let css = read("docs/website/style.css");
+    assert!(
+        css.contains("scroll-margin-top"),
+        "linked headings need scroll-margin-top"
+    );
+}
+
+/// 0.1.0 is published, so the page leads with the one-line install and keeps
+/// building from source as the second path (#280).
+#[test]
+fn the_page_leads_with_the_one_line_install() {
+    let page = read("docs/website/index.html");
+    let first_snippet = &page[page.find("<pre").unwrap()..];
+    let first_snippet = &first_snippet[..first_snippet.find("</pre>").unwrap()];
+    assert_eq!(decode(&strip_tags(first_snippet)), INSTALL_LINE);
+    let ids: Vec<String> = section_ids(&page).into_iter().flatten().collect();
+    let position = |id: &str| ids.iter().position(|i| i == id).unwrap();
+    assert!(position("install") < position("tour"));
+    assert!(position("install") < position("start"));
+    for stale in [
+        "Arrives with 0.1.0",
+        "Working towards 0.1.0",
+        "release-not-published",
+    ] {
+        assert!(!page.contains(stale), "the page still says {stale:?}");
+    }
+}
+
+/// Every command snippet gets a copy button from the page's script, so
+/// without JavaScript there's no dead button, just selectable text (#280).
+#[test]
+fn command_snippets_are_copyable_and_still_selectable_without_script() {
+    let page = read("docs/website/index.html");
+    assert!(page.contains("<script src=\"./assets/copy.js\" defer></script>"));
+    assert!(
+        !page.contains("class=\"copy\""),
+        "copy buttons come from the script, not the markup"
+    );
+    let script = read("docs/website/assets/copy.js");
+    assert!(script.contains("querySelectorAll(\"pre\")"));
+    assert!(script.contains("aria-live"));
+    assert!(script.contains("\"Copied\""));
+    let css = read("docs/website/style.css");
+    assert!(!css.contains("user-select: none"));
+}
+
+/// Every release carries the PDFs, so the page links the stable "latest"
+/// release assets rather than sending people to CI artefacts (#280).
+#[test]
+fn the_pdfs_come_from_the_latest_release() {
+    let page = read("docs/website/index.html");
+    for pdf in [
+        "reliaburger-whitepaper.pdf",
+        "building-reliaburger.pdf",
+        "reliaburger-design-docs.pdf",
+        "reliaburger-roadmap.pdf",
+    ] {
+        let url =
+            format!("https://github.com/reliaburger/reliaburger/releases/latest/download/{pdf}");
+        assert!(page.contains(&url), "no link to {url}");
+    }
+    assert!(
+        !page.contains("<strong>Artifacts</strong>"),
+        "the page still sends people to CI artefacts for the PDFs"
+    );
+}

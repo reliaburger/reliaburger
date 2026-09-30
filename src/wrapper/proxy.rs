@@ -928,14 +928,28 @@ mod tests {
         use crate::onion::types::BackendInstance;
         use std::net::Ipv4Addr;
 
+        // Each backend answers one request per connection and says so. It
+        // reads the request head before answering, so closing never resets a
+        // request still in flight, and `Connection: close` stops the proxy
+        // pooling a socket the backend is about to drop. Without it the proxy
+        // could reuse that socket for the next request before it noticed the
+        // close, and the request came back as a 502 (#285).
         async fn answering(body: &'static str) -> u16 {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let port = listener.local_addr().unwrap().port();
             tokio::spawn(async move {
-                use tokio::io::AsyncWriteExt;
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 while let Ok((mut sock, _)) = listener.accept().await {
+                    let mut head = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => head.extend_from_slice(&buf[..n]),
+                        }
+                    }
                     let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
                         body.len()
                     );
                     let _ = sock.write_all(response.as_bytes()).await;

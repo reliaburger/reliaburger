@@ -2351,6 +2351,48 @@ mod tests {
         assert_eq!(state.apps.get(&app_id).unwrap().image, spec.image);
     }
 
+    /// #307: redeploying an app with a changed ingress host replaces the
+    /// route in the council's catalogue, and dropping the ingress removes it.
+    #[tokio::test]
+    async fn redeploying_with_a_changed_ingress_host_replaces_the_cluster_route() {
+        let mut sm = CouncilStateMachine::new();
+        let app_id = AppId::new("web", "prod");
+        let mut hosts = Vec::new();
+        for (index, host) in [Some("a.test"), Some("b.test"), None]
+            .into_iter()
+            .enumerate()
+        {
+            let spec = AppSpec {
+                ingress: host.map(|host| toml::from_str(&format!("host = '{host}'")).unwrap()),
+                ..default_spec()
+            };
+            let entry = normal_entry(
+                1,
+                index as u64 + 1,
+                RaftRequest::AppSpec {
+                    app_id: app_id.clone(),
+                    spec: Box::new(spec),
+                },
+            );
+            sm.apply(vec![entry]).await.unwrap();
+            let routes = crate::cluster::orchestrate::cluster_ingress(&sm.desired_state().await);
+            hosts.push(
+                routes
+                    .into_iter()
+                    .map(|route| route.config.host)
+                    .collect::<Vec<_>>(),
+            );
+        }
+        assert_eq!(
+            hosts,
+            vec![
+                vec!["a.test".to_string()],
+                vec!["b.test".to_string()],
+                vec![]
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn stop_keeps_the_spec_until_the_next_apply_and_delete_forgets_both() {
         let mut sm = CouncilStateMachine::new();

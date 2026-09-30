@@ -93,6 +93,25 @@ Rolling upgrades need matching protocol and state formats; `bun --compatibility`
 prints what a binary supports. Nothing is migrated before 1.0.0: a release
 that changes either format needs a fresh cluster.
 
+### When bun refuses its data directory
+
+Swap in a binary with a different state format and bun won't start. The first
+line says what it found and what it needs, so even a truncated journal line
+carries it:
+
+```text
+incompatible state format: found 43; this binary (reliaburger v0.1.1 (3fcb1fd)) needs 44. Pre-1.0 builds don't migrate state: …
+```
+
+A join between mismatched binaries fails the same way, starting
+`cannot join: incompatible cluster formats: found protocol 26, state 43; …`.
+The refusal is deliberate and leaves the data untouched. You have two ways on:
+run the release that wrote the data (`bun --compatibility` on a candidate
+tells you its pair), or move the data directory aside and recreate the
+cluster. Don't write a new `state-format.json` by hand; the stamp is the only
+thing standing between the new binary and data it can't read. The policy is
+in [docs/releasing.md](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#compatibility-before-100).
+
 ## GitOps
 
 Point the config at a repository and the council leader keeps the cluster in
