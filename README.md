@@ -330,8 +330,8 @@ and its trade-offs; the [design docs](docs/design/) cover each subsystem.
   whose outcome is unknown waits for `relish apply <file> --rerun-jobs`.
 
 The [documentation](docs/README.md#010-scope-and-limits) has the full list.
-[progress.md](docs/progress.md) tracks what's done and the backlog after
-0.1.0.
+The [roadmap](docs/roadmap.md) has what's next and the known gaps, with the
+detail in GitHub milestones and issues.
 
 ## Run it from source
 

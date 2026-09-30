@@ -5,7 +5,7 @@ docs/design/*.md, docs/manual/*.md, docs/README.md, top-level README.md, each
 verified claim-by-claim against src/. Classification: **(a)** doc stale — code
 is right or deliberately different; **(b)** code gap/bug — doc describes
 intended behaviour the code doesn't deliver; **(c)** ambiguous — needs a
-decision. Companion: docs/plans/2026-08-06-plan-phase15-followup.md (bugs and
+decision. Companion: docs/plans/archive/2026-08-06-plan-phase15-followup.md (bugs and
 missing work from the pre-merge review; still current except Phase A, which is
 done).
 

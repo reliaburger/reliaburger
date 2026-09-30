@@ -1,7 +1,7 @@
 # Quickstart timings, 23 September 2026
 
 Before-and-after measurements for plan items Z3.2–Z3.5
-([zero to cluster](../plans/2026-09-23-zero-to-cluster.md)).
+([zero to cluster](../plans/archive/2026-09-23-zero-to-cluster.md)).
 
 Host: Apple M2 Max, 32 GiB RAM, macOS 26.3.1. Three Lima 2.1.0 VZ VMs,
 2 vCPUs and 2 GiB each, Ubuntu 24.04 image dated 20260911. Ordinary home

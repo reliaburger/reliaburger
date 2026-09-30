@@ -6,7 +6,7 @@
 
 **Reviewed `main` SHA:** `8ba727f9332c35a1f6603a0f78f76a424513485c`
 
-**Scope:** code, tests, examples, the whitepaper, `docs/design/`, and the historical Phase 15 proposal in `docs/plans/2026-07-06-plan-chaos.md`
+**Scope:** code, tests, examples, the whitepaper, `docs/design/`, and the historical Phase 15 proposal in `docs/plans/archive/2026-07-06-plan-chaos.md`
 
 **Change policy:** review only. The tracked changes are this document and the isolated TC DNS proof under `poc/dns-tc/`; production code and the historical Phase 15 plan remain untouched.
 
@@ -510,7 +510,7 @@ Also remove or quarantine the dead `onion_dns.bpf.c` build product. Preserving h
 
 ### 8.1 Status and framing
 
-`docs/plans/2026-07-06-plan-chaos.md` is a useful historical proposal, not an executable plan for the reviewed SHA. Its opening baseline says the catalogue, command wiring and Chapter 15 foundations are absent (`:41-84`). Since then the repository has completed the suite taxonomy, truthful gating, deterministic async cleanup, required CI, Criterion/scale foundations, combined coverage and the first 303 lines of Chapter 15 (`docs/progress.md:1291-1314`). Keep that work. Do not re-embed testapp in Bun merely because the old plan says to; a standalone, deterministic OCI workload is needed for real runtimes, and `src/bun/testapp.rs` plus `src/bin/testapp.rs` already provide a reusable core/binary.
+`docs/plans/archive/2026-07-06-plan-chaos.md` is a useful historical proposal, not an executable plan for the reviewed SHA. Its opening baseline says the catalogue, command wiring and Chapter 15 foundations are absent (`:41-84`). Since then the repository has completed the suite taxonomy, truthful gating, deterministic async cleanup, required CI, Criterion/scale foundations, combined coverage and the first 303 lines of Chapter 15 (`docs/progress.md:1291-1314`). Keep that work. Do not re-embed testapp in Bun merely because the old plan says to; a standalone, deterministic OCI workload is needed for real runtimes, and `src/bun/testapp.rs` plus `src/bin/testapp.rs` already provide a reusable core/binary.
 
 Phase 15 omissions are planned work. Bugs above that prevent trustworthy implementation are labelled prerequisites rather than Phase 15 regressions.
 
@@ -525,7 +525,7 @@ Every observation must end in exactly one of:
 - `Skipped`: the selected profile declares the case optional and a known capability says it cannot run;
 - `Unknown`: evidence was missing, stale, timed out, ambiguous, or a collector failed.
 
-`Skipped` and `Unknown` aren't synonyms. The full acceptance profile requires a declared capability set and treats a missing required capability, timeout, `Unknown`, unsupported mandatory scenario and cleanup uncertainty as failure. A portable/development profile may allow named skips, but the report and exit policy must list them. The July plan's proposal to turn unavailable trace/firewall evidence into `Pass` (`docs/plans/2026-07-06-plan-chaos.md:53-62`) must be deleted.
+`Skipped` and `Unknown` aren't synonyms. The full acceptance profile requires a declared capability set and treats a missing required capability, timeout, `Unknown`, unsupported mandatory scenario and cleanup uncertainty as failure. A portable/development profile may allow named skips, but the report and exit policy must list them. The July plan's proposal to turn unavailable trace/firewall evidence into `Pass` (`docs/plans/archive/2026-07-06-plan-chaos.md:53-62`) must be deleted.
 
 Use a versioned JSON schema and snapshot it. Include profile, run ID, cluster identity, binary/build SHA, topology, runtime, kernel, capability evidence, start/end/deadline, outcome, observations and cleanup status. Human output is a rendering of the same report.
 
@@ -606,7 +606,7 @@ Statuses mean **delivered foundation** (equivalent lower-level/real-cluster cove
 
 ### 8.4 Chaos catalogue and prerequisites
 
-The five proposed scenarios (`docs/plans/2026-07-06-plan-chaos.md:499-517`) should not be implemented as written:
+The five proposed scenarios (`docs/plans/archive/2026-07-06-plan-chaos.md:499-517`) should not be implemented as written:
 
 - C1 leader failure, C2 worker death and C5 death during deploy require a real node-failure primitive. `NodeKill` currently rejects (`src/bun/agent.rs:3000-3012`). A process-local fault record is not node failure.
 - C4 asks for pressure on one worker, but current CPU/memory faults target workload cgroups. Implement node-scoped, bounded, automatically expiring pressure with reserved headroom for Bun/SSH/recovery.
@@ -619,7 +619,7 @@ Every scenario must state the steady-state hypothesis, exact blast radius, abort
 
 The existing developer benchmarks are good deterministic gossip foundations. They measure transport, setup and simulated convergence from 5 to 1,000 nodes, with a separate deterministic 10,000-member scale acceptance. Keep them.
 
-The proposed in-cluster suites use the wrong paths in two places (`docs/plans/2026-07-06-plan-chaos.md:521-535`):
+The proposed in-cluster suites use the wrong paths in two places (`docs/plans/archive/2026-07-06-plan-chaos.md:521-535`):
 
 - 200 `GET /v1/resolve/{name}` calls measure the control-plane HTTP handler and serialisation, not service discovery as experienced by a workload. Measure an actual DNS query plus connect from a workload namespace, and report DNS and connect separately.
 - Fetching a backend's host port directly bypasses Onion and Wrapper. Define direct-backend, Onion service and ingress throughput as distinct metrics.
@@ -630,7 +630,7 @@ Every report must include binary SHA/version/profile, Rust build mode, target ar
 
 ### 8.6 `wtf` data audit
 
-The pure `diagnose(WtfInputs) -> WtfReport` idea is worth keeping. It makes correlation deterministic and testable. The proposed patterns cannot all be honest with current data (`docs/plans/2026-07-06-plan-chaos.md:539-565`):
+The pure `diagnose(WtfInputs) -> WtfReport` idea is worth keeping. It makes correlation deterministic and testable. The proposed patterns cannot all be honest with current data (`docs/plans/archive/2026-07-06-plan-chaos.md:539-565`):
 
 | Pattern | Data available now | Required addition |
 |---|---|---|
@@ -651,7 +651,7 @@ Never emit an OK row when the source is absent. Emit `Unknown` with source/error
 
 ### 8.7 Trace redesign
 
-The old trace proposal admits that its firewall verdict is inferred from desired config and its TCP probe originates from Bun (`docs/plans/2026-07-06-plan-chaos.md:569-598`). Labelling those caveats doesn't make the overall trace an end-to-end observation.
+The old trace proposal admits that its firewall verdict is inferred from desired config and its TCP probe originates from Bun (`docs/plans/archive/2026-07-06-plan-chaos.md:569-598`). Labelling those caveats doesn't make the overall trace an end-to-end observation.
 
 The redesigned trace should be a protected `POST` operation (it has side effects on the network and may carry probe parameters), authorised for the source workload and destination. For an internal destination:
 

@@ -139,7 +139,7 @@ tutorial, because a tutorial over a broken path is a lie.
   1.9 MB layer. CI builds both architectures natively; the release signs each
   image's digest (`guest-image-metadata.json`), which the CLI verifies. A
   bare VM boots in 14–18 s instead of 31–53 s
-  ([measurements](../qualification/2026-09-24-guest-image.md)); a timed
+  ([measurements](../../qualification/2026-09-24-guest-image.md)); a timed
   quickstart awaits a signed candidate.
 - [x] **Z3.2 Boot every VM at once.** Generate Lima's SSH key in our `LIMA_HOME`
   before the first boot, then start all VMs in parallel. Done: peers start as
@@ -157,7 +157,7 @@ tutorial, because a tutorial over a broken path is a lie.
   on Apple silicon (and Intel and Linux when available), feeding release gate
   V04. Target: under three minutes cold on 100 Mbit/s, leaving two for the
   tutorial. Apple silicon done; Intel and Linux still to run. Measured on an M2 Max with development binaries
-  ([results](../qualification/2026-09-23-quickstart-timings.md)): cold
+  ([results](../../qualification/2026-09-23-quickstart-timings.md)): cold
   263 s → 194 s (147 s → 102 s excluding downloads), warm 160–177 s → about
   105 s. The runs also found and fixed a memory preflight that refused busy
   Macs, a 90 s logind stall in provisioning, and VMs that never boot. Z3.1
@@ -179,7 +179,7 @@ tutorial, because a tutorial over a broken path is a lie.
   promotion refuses and GitHub never marks latest;
   `scripts/release/qualify-staged-install.sh` runs the real `curl | sh`
   against it in an isolated home, with a short tour and teardown, and writes a
-  record. The runbook is in [releasing.md](../releasing.md#staging-a-candidate).
+  record. The runbook is in [releasing.md](../../releasing.md#staging-a-candidate).
   The first real staging run happens after this lands on `main`; its records
   feed V03 and V04.
 - [ ] **Z4.4 Uninstall.** `relish local destroy` exists; add
