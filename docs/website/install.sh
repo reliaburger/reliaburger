@@ -33,7 +33,7 @@ download() {
 main() {
   umask 077
   command -v curl >/dev/null 2>&1 || fail 'curl is required'
-  version=${RELIABURGER_VERSION:-v0.1.0}
+  version=${RELIABURGER_VERSION:-v0.1.1}
   # The character gate rejects newlines, so the grep below sees exactly one line.
   case $version in
     ''|*[!A-Za-z0-9.-]*) fail 'invalid RELIABURGER_VERSION' ;;

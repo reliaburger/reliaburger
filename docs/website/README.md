@@ -45,24 +45,36 @@ recording still plays.
 page's `data-tour` elements, types each one, runs it and waits on the
 cluster's real state where the tour says to wait. `tests/suite/website.rs`
 runs `tour.sh --check`, which fails if the page gains a command the script
-doesn't know how to run. To record, with `bun` and `relish` for Linux in
-`target/tour-bins` (built `--release --features ebpf`), the host `relish` on
-`PATH` or in `RELISH`, and no other quickstart cluster on the default ports:
+doesn't know how to run.
+
+Every promoted release re-records the tour against its published install
+([releasing step 8](../releasing.md#staging-a-candidate)). With no other
+quickstart cluster on the default ports, and a throwaway `RELIABURGER_HOME`
+so it can't touch yours:
 
 ```sh
 RELIABURGER_HOME=~/.rbtour scripts/demo/tour.sh \
-  --record docs/website/assets/tour.cast --setup target/tour-bins
-RELIABURGER_HOME=~/.rbtour relish local destroy --yes
+  --record docs/website/assets/tour.cast --install v0.1.1
+RELIABURGER_HOME=~/.rbtour ~/.rbtour/bin/relish local destroy --yes
+RELIABURGER_HOME=~/.rbtour ~/.rbtour/bin/relish uninstall --yes
+rm -rf ~/.rbtour
 ```
+
+`--install` runs the install line for real, with `RELIABURGER_VERSION` set so
+it fetches that release even before this page's default points at it. To
+record a build that isn't published yet, pass `--setup target/tour-bins`
+instead, with `bun` and `relish` for Linux in `target/tour-bins` (built
+`--release --features ebpf`) and the host `relish` on `PATH` or in `RELISH`;
+the recording then shows `relish setup --quickstart --development-binaries`
+where the tour says `curl … | sh`, and says so on screen.
 
 `--record` runs the tour inside `asciinema rec` (110x32, idle time cut to two
 seconds) and then plays the setup step four times faster, because setup redraws
 its timers several times a second and idle trimming can't shorten it. The
-narration says both, and every wait prints how long it really took. With
-`--setup`, the recording shows `relish setup --quickstart
---development-binaries` where the tour says `curl … | sh`; the script says so on
-screen. The published recording was made that way, before 0.1.0 was released. It applies the demo URL when it answers, and
-`examples/kubernetes/podinfo.yaml` (with a note) when it doesn't.
+narration says both, and every wait prints how long it really took. The
+published recording was made with `--install v0.1.1`. It applies the demo URL
+when it answers, and `examples/kubernetes/podinfo.yaml` (with a note) when it
+doesn't.
 `asciinema play docs/website/assets/tour.cast` plays the result in a terminal.
 
 The "Try it in five minutes" tour is a `<details>` element, so it opens and
@@ -92,7 +104,7 @@ every promoted release carries the four PDFs, and promotion marks it latest.
 The Build & Release workflow's `reliaburger-pdfs` artefact has newer copies
 from `main`; artefacts require GitHub sign-in and have limited retention.
 
-The page leads with the one-line install now that 0.1.0 is published;
+The page leads with the one-line install now that releases are published;
 building from source is the second path. Update the release-status paragraph
 (version, date and release-notes link) and the install section's release-notes
 link when you promote a release. The source quickstart intentionally matches
@@ -102,7 +114,7 @@ link when you promote a release. The source quickstart intentionally matches
 Both it and the generated installer are POSIX sh, so `curl … | sh` works where
 `sh` is dash or busybox, not only bash. `scripts/release/test_package.py` runs
 them under every POSIX shell it finds and under `shellcheck -s sh` when present.
-It installs `v0.1.0` unless `RELIABURGER_VERSION` names another release; bump
+It installs `v0.1.1` unless `RELIABURGER_VERSION` names another release; bump
 that default when you promote a newer one. If the requested release isn't
 published, it fails with a message saying so. The generated installer itself
 lives in the GitHub release, with native CLI checksums supplied by release

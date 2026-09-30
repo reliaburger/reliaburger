@@ -107,12 +107,12 @@ deleting images through the registry API.
 
 ## Multi-platform images
 
-0.1.0 can't run a multi-platform image (an OCI image index or Docker manifest
+0.1.1 can't run a multi-platform image (an OCI image index or Docker manifest
 list) stored in Pickle. A node pulling one treats the index as a single image
 and the workload fails to start. This hits `docker buildx build --platform
 linux/amd64,linux/arm64 --push` and multi-platform `relish build`, which is the
 default; a multi-platform `relish build` also stores only the builder's own
-platform. A release after 0.1.0 fixes both.
+platform. 0.1.2 is planned to fix both.
 
 Until then, push and build one platform that matches your nodes:
 
