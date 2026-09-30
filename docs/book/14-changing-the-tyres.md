@@ -1359,3 +1359,120 @@ deployed the instances rather than adopting them, always says no.
 starts from a checkpoint with the writer `Pending`, answers the question
 with yes, and checks that no deploy was sent and the checkpoint says
 `Applied`. Before the change it deployed.
+
+## Refused before it's recorded
+
+"A pause with no way out" moved one refusal from the first node to the leader. The 0.1.1 release found two more that still arrived late.
+
+The first was the format boundary. 0.1.1 moved the state format from 44 to 46, so a 0.1.0 cluster can't run it, and every node knows that: it asks each candidate for `bun --compatibility` before staging it. But in a cluster that question came *after* the leader had recorded the run. `relish upgrade start v0.1.1` answered "started", the first node refused, and the run paused until someone typed `relish upgrade abort`. Safe, but it's a strange way to say no.
+
+The second showed up in the 0.1.1 soak on 30 September. On a cluster running a release candidate, `relish upgrade rollback v0.1.0` answered "cluster rollback to v0.1.0 started". Then node 2 came back with `409 Conflict: version v0.1.0 is not installed in the binary store`, and that run paused too. The nodes had never run 0.1.0, so they had nothing to go back to.
+
+Can you see the pattern? Both refusals are facts the leader could have found out before writing anything to Raft.
+
+### Asking the candidate on the leader
+
+The leader already has everything a node uses to check a candidate: its own upgrade manager, the release keys, the operator's external key and the registry the binary was pushed to. So the start handler builds the exact directive the orchestrator will send (`orchestrator::build_directive`, now public) and hands it to the leader's manager. `UpgradeManager::prepare` used to fetch, verify and query inline; that sequence is now a method of its own:
+
+```rust
+async fn fetch_verified(
+    &self,
+    directive: &UpgradeDirective,
+) -> Result<(Vec<u8>, SignatureEnvelope), UpgradeError> {
+    let bytes = self.fetch_binary(directive).await?;
+    // ... build the envelope, verify both signatures ...
+    super::compatibility::check_binary(bytes.clone(), /* binary dir */).await?;
+    Ok((bytes, envelope))
+}
+```
+
+`prepare` keeps both halves of the tuple and stages them. The new `check_candidate` throws them away:
+
+```rust
+pub async fn check_candidate(&self, directive: &UpgradeDirective) -> Result<(), UpgradeError> {
+    self.fetch_verified(directive).await.map(|_| ())
+}
+```
+
+`Result::map` changes the success value and leaves an error alone, so `.map(|_| ())` means "I only care whether this worked". Sharing the function keeps the order that matters: signatures first, and only then execute the bytes. The leader never runs a binary a node wouldn't run.
+
+The refusal itself got a proper variant. `check_binary` used to flatten a format mismatch into `IncompatibleBinary(String)`. Now it returns the two pairs:
+
+```rust
+IncompatibleFormats {
+    found: crate::compatibility::Compatibility,
+    expected: crate::compatibility::Compatibility,
+},
+```
+
+and its message leads with them, like every other compatibility refusal in §14.8: `incompatible binary: found protocol 28, state 47; this cluster (reliaburger v0.1.2 (…)) needs protocol 27, state 46`, followed by the remedy and the policy link. Keeping the pairs typed rather than baked into a string lets a test match on `found` and `expected` directly instead of grepping prose.
+
+The check runs last among the start gates, after the cheap probes, because it's the expensive one: a fetch, a hash and a process spawn. It sits under a twenty-second `tokio::time::timeout`, since a follower that forwarded the call gives up after thirty.
+
+Only a definite answer refuses: other formats, a bad signature, a blob the registry doesn't have. Those are 409s and nothing reaches Raft. Our first draft also refused when the registry was unavailable, and the cluster suite caught it straight away: `a_registry_outage_at_directive_time_does_not_pause_the_upgrade` points the nodes at a registry that drops every connection for 25 seconds, and the start itself now waited out the node-side retry budget and timed out. An outage says nothing about the candidate, and "One blip is not a refusal" already taught the nodes to ride one out. So the leader asks once (a small `Fetch::Retrying` / `Fetch::Once` enum threaded through `fetch_binary`, rather than a bare `bool` nobody can read at the call site), logs that it couldn't check, and records the run. The nodes still check every candidate themselves.
+
+### Asking the nodes what they hold
+
+A rollback never downloads anything. Each node execs a binary already sitting in its binary directory, so the question is simply "which versions do you have?" `/v1/version` now answers it with `installed_versions`, read off the async runtime:
+
+```rust
+pub async fn installed_versions(&self) -> Option<Vec<BinaryVersion>> {
+    let store = self.store.clone();
+    tokio::task::spawn_blocking(move || store.installed_versions().ok())
+        .await
+        .ok()
+        .flatten()
+}
+```
+
+`spawn_blocking` runs the closure on a thread that's allowed to block, but that thread may outlive the call, so the closure has to own everything it touches (the `'static` bound). A reference to `self.store` would be a borrow of `self`, and the compiler won't let a borrow escape to another thread. Cloning the store (a directory path and a file stem) and `move`-ing the clone in is the usual answer. The two `Option`s at the end, one for "the task panicked" and one for "the directory couldn't be read", collapse into one with `flatten`.
+
+The rollback handler probes every planned node with the same concurrent, time-boxed probe the start handler uses, and a pure gate decides:
+
+```rust
+let missing: Vec<&str> = nodes
+    .iter()
+    .filter(|node| node.running != *target)
+    .filter(|node| {
+        node.installed
+            .as_ref()
+            .is_some_and(|installed| !installed.contains(target))
+    })
+    .map(|node| node.node.as_str())
+    .collect();
+```
+
+A node already on the target has nothing to exec, so it can't be missing it. A node that doesn't report its store (`None`) isn't blamed: the node-side check still stands behind the gate. `as_ref` turns an `&Option<Vec<_>>` into an `Option<&Vec<_>>` so `is_some_and` can look inside without taking the vector away from `node`. Everything else is named, all at once: `cannot roll back to v0.1.0: it is not installed in the binary store on node n2, node n3`. That's better than the old path even when it did pause, which only ever told you about the first node it tried.
+
+The probe reads the field leniently, the way it reads `failed_upgrade_ids`:
+
+```rust
+let installed_versions = value["installed_versions"].as_array().map(|versions| {
+    versions
+        .iter()
+        .filter_map(|version| version.as_str()?.parse().ok())
+        .collect()
+});
+```
+
+The `?` inside the closure is worth a second look. In a function returning `Option`, `?` on a `None` returns `None` from that function, and here the function is the closure. So an entry that isn't a string is skipped by `filter_map` rather than failing the whole probe.
+
+### The laptop cluster says which versions
+
+The third late refusal was the quickstart's. Rerun a newer installer over a laptop cluster from an older release and it refused with "existing cluster parameters differ; resume with the original parameters". True, but which parameter? The saved record names the release that set the cluster up, and the installer can only install its own, so there are no "original parameters" to resume with. `spec_mismatch` now treats a version change separately:
+
+```text
+cluster "laptop" was set up with v0.1.0, and this installer is v0.1.1. Before 1.0, a release that changes the cluster's protocol or state format can't take over an older cluster: run `relish local destroy --yes` and set it up again, then re-apply your apps. …
+```
+
+It adds `--name` when the cluster isn't the default `laptop`, so the command can be pasted as is. Any other change lists each field with its saved and requested value (`nodes: saved 3, requested 1`).
+
+### What we decided not to do
+
+We didn't read the candidate's formats on the client. relish has the bytes, but it may be a Mac talking to Linux nodes, and it can't execute their binary. The leader shares the nodes' platform and already runs the same check for its own upgrade.
+
+We didn't treat an unreachable node as missing the rollback target either. The start gates leave unreachable nodes to the orchestrator, which re-probes each one as the walk reaches it, and the rollback gate does the same. A rollback is often what you reach for when something's already broken, and a gate that refused because one node was down would get in the way exactly then.
+
+### Tests
+
+`plan::tests` covers the rollback gate: a version missing from two of three stores names both nodes, and a node already on the target or not reporting its store passes. `manager::tests` covers the candidate check through the leader's manager: a signed script that prints `{"protocol":1,"state":1}` is refused as `IncompatibleFormats` with both pairs in the message and nothing staged; a candidate with a bad external signature is refused before it runs (the script would `touch` a file, and the file must not exist); a compatible one passes and still stages nothing. `installed_versions_lists_the_binary_store` and `a_probe_reads_the_binary_store_a_node_reports` cover the new field from both ends. The quickstart tests check the version message, the `--name` form and the per-field list. The cluster suite gets two real-binary tests: `start_refuses_a_candidate_with_other_formats_before_recording_a_run` pushes a signed incompatible candidate through `relish upgrade start` and checks for the refusal with nothing recorded and no node moved, and `rollback_to_a_version_the_nodes_lack_is_refused_before_recording_a_run` asks for a rollback to a version no node holds and checks for a 409 naming every node.

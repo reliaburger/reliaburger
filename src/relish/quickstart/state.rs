@@ -149,9 +149,7 @@ impl Operation {
         let state = if path.exists() {
             let state = read_state(&path)?;
             if state.spec != *spec {
-                return Err(failed(
-                    "existing cluster parameters differ; resume with the original parameters",
-                ));
+                return Err(failed(&spec_mismatch(&state.spec, spec)));
             }
             state
         } else {
@@ -220,6 +218,61 @@ fn save_state(directory: &Path, state: &ClusterState) -> Result<(), RelishError>
     let bytes = serde_json::to_vec_pretty(state).map_err(RelishError::SerialiseJson)?;
     crate::sesame::identity::atomic_write_mode(&directory.join("state.json"), &bytes, Some(0o600))?;
     Ok(())
+}
+
+/// Why a saved cluster can't be resumed with the requested parameters.
+///
+/// A newer installer over an older laptop cluster is the common case, and
+/// before 1.0 the answer is usually a fresh cluster, so a version change
+/// gets its own message naming both versions and the command.
+fn spec_mismatch(saved: &ClusterSpec, requested: &ClusterSpec) -> String {
+    if saved.version != requested.version {
+        let name = if saved.name == "laptop" {
+            String::new()
+        } else {
+            format!(" --name {}", saved.name)
+        };
+        return format!(
+            "cluster {:?} was set up with {}, and this installer is {}. Before 1.0, a release that \
+             changes the cluster's protocol or state format can't take over an older cluster: run \
+             `relish local destroy{name} --yes` and set it up again, then re-apply your apps. \
+             See {}",
+            saved.name,
+            saved.version,
+            requested.version,
+            crate::compatibility::POLICY_URL
+        );
+    }
+    let mut changes = Vec::new();
+    let mut compare = |label: &str, saved: String, requested: String| {
+        if saved != requested {
+            changes.push(format!("{label}: saved {saved}, requested {requested}"));
+        }
+    };
+    compare(
+        "nodes",
+        saved.nodes.to_string(),
+        requested.nodes.to_string(),
+    );
+    compare(
+        "API port",
+        saved.api_port.to_string(),
+        requested.api_port.to_string(),
+    );
+    compare(
+        "ingress port",
+        saved.ingress_port.to_string(),
+        requested.ingress_port.to_string(),
+    );
+    compare(
+        "registry port",
+        saved.registry_port.to_string(),
+        requested.registry_port.to_string(),
+    );
+    format!(
+        "existing cluster parameters differ ({}); resume with the original parameters",
+        changes.join("; ")
+    )
 }
 
 fn vm_name(id: &str, index: usize) -> String {
@@ -372,6 +425,61 @@ mod tests {
         changed = spec();
         changed.version = "v0.2.0".parse().unwrap();
         assert!(Operation::open(root.path(), &changed).is_err());
+    }
+
+    #[test]
+    fn a_newer_installer_names_both_versions_and_the_fresh_cluster_remedy() {
+        let root = tempfile::tempdir().unwrap();
+        let mut saved = spec();
+        saved.name = "laptop".to_string();
+        drop(Operation::open(root.path(), &saved).unwrap());
+        let mut requested = saved.clone();
+        requested.version = "v0.1.1".parse().unwrap();
+        let message = Operation::open(root.path(), &requested)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            message.contains("set up with v0.1.0") && message.contains("this installer is v0.1.1"),
+            "{message}"
+        );
+        assert!(message.contains("relish local destroy --yes"), "{message}");
+        assert!(message.contains("Before 1.0"), "{message}");
+    }
+
+    #[test]
+    fn a_named_cluster_is_destroyed_by_name() {
+        let root = tempfile::tempdir().unwrap();
+        drop(Operation::open(root.path(), &spec()).unwrap());
+        let mut requested = spec();
+        requested.version = "v0.1.1".parse().unwrap();
+        let message = Operation::open(root.path(), &requested)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            message.contains("relish local destroy --name local --yes"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn other_changed_parameters_are_named_with_their_saved_values() {
+        let root = tempfile::tempdir().unwrap();
+        drop(Operation::open(root.path(), &spec()).unwrap());
+        let mut requested = spec();
+        requested.nodes = 1;
+        requested.api_port = 29117;
+        let message = Operation::open(root.path(), &requested)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            message.contains("nodes: saved 3, requested 1")
+                && message.contains("API port: saved 19117, requested 29117"),
+            "{message}"
+        );
+        assert!(message.contains("original parameters"), "{message}");
     }
 
     #[tokio::test]

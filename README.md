@@ -263,7 +263,8 @@ signatures if you ask it to.
 workers first, then council members one at a time, leader last. The new binary
 adopts running workloads without restarting them, and a crash-looping upgrade
 reverts itself. Network upgrades need two Ed25519 signatures: the release's
-and your own.
+and your own. A release with other cluster formats, or a rollback to a version
+some node doesn't hold, is refused before anything is recorded.
 
 **Diagnostics built for incidents.** `relish wtf` correlates cluster health into
 one screen of problems and next steps. `relish path` walks the network path

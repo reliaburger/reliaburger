@@ -81,6 +81,28 @@ needs `--allow-downgrade` (note that `v0.2.0-rc.1` is older than `v0.2.0`);
 without `[upgrades] external_signing_key` would refuse the binary, so `start`
 fails there and names the node, and nothing is recorded.
 
+Then the leader does what every node will do with the candidate: it fetches
+the binary from the registry, checks both signatures and runs
+`bun --compatibility` on it. A release with a different protocol or state
+format can't join the cluster, so `start` fails with both pairs and nothing is
+recorded:
+
+```text
+refusing to upgrade to v0.2.0: incompatible binary: found protocol 28, state 47; this cluster (reliaburger v0.1.2 (…)) needs protocol 27, state 46. …
+```
+
+A cluster `rollback` never downloads anything: each node goes back to a binary
+already in its binary directory. So the leader first asks every node which
+versions it holds (`installed_versions` in `GET /v1/version`) and refuses a
+version any of them lacks, naming those nodes:
+
+```text
+cannot roll back to v0.1.0: it is not installed in the binary store on node node-2, node node-3. …
+```
+
+A node that ran or was upgraded from a version keeps it, up to
+`[upgrades] retain_versions`.
+
 A node that refuses or reverts pauses the upgrade, and a paused upgrade blocks
 every new `start`. There are three ways on: fix the cause and
 `relish upgrade resume`; `relish upgrade abort`, which ends the upgrade when no
@@ -94,6 +116,14 @@ prints what a binary supports. Nothing is migrated before 1.0.0: a release
 that changes either format needs a fresh cluster. 0.1.1 is one: it moved the
 state format from 44 to 46, so a 0.1.0 cluster refuses it and stays on 0.1.0
 ([upgrading from 0.1.0](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#upgrading-from-010)).
+
+A laptop cluster says the same thing when you rerun the quickstart installer
+from a newer release over it. Its saved record names the release that set it
+up, so setup refuses and names both versions:
+
+```text
+cluster "laptop" was set up with v0.1.0, and this installer is v0.1.1. Before 1.0, a release that changes the cluster's protocol or state format can't take over an older cluster: run `relish local destroy --yes` and set it up again, then re-apply your apps. …
+```
 
 ### When bun refuses its data directory
 
