@@ -16432,6 +16432,77 @@ mod tests {
         let _ = handle.await;
     }
 
+    /// B03: a stopped instance waiting for its automatic restart will start
+    /// again on its own, so a restore must treat it as running. The old
+    /// check looked only at the state and accepted the restore.
+    #[tokio::test]
+    async fn a_restore_is_refused_while_an_instance_awaits_its_restart() {
+        let volumes_dir = tempfile::tempdir().unwrap();
+        let (mut agent, tx, shutdown) = test_agent();
+        agent.set_volumes_dir(volumes_dir.path().to_path_buf());
+        let id = InstanceId("default__web-0".to_string());
+        agent.supervisor.instances.insert(
+            id.clone(),
+            super::super::supervisor::WorkloadInstance {
+                id: id.clone(),
+                app_name: "web".into(),
+                namespace: "default".into(),
+                state: ContainerState::Stopped,
+                health_counters: Default::default(),
+                restart_count: 1,
+                last_restart: Some(Instant::now()),
+                host_port: None,
+                container_ip: None,
+                created_at: Instant::now(),
+                // Keep the restart pending for the whole test.
+                restart_policy: crate::bun::restart::RestartPolicy {
+                    initial_backoff: std::time::Duration::from_secs(3600),
+                    ..Default::default()
+                },
+                health_config: None,
+                is_job: false,
+                retry_pending: true,
+                image: "myapp:v1".into(),
+                oci_spec: None,
+                identity: None,
+                identity_mount: None,
+            },
+        );
+        agent
+            .supervisor
+            .app_instances
+            .entry(("web".into(), "default".into()))
+            .or_default()
+            .push(id);
+        let handle = tokio::spawn(async move {
+            agent.run().await;
+        });
+
+        let (resp_tx, resp_rx) = oneshot::channel();
+        tx.send(AgentCommand::SnapshotRestore {
+            namespace: "default".to_string(),
+            app_name: "web".to_string(),
+            name: "before-upgrade".to_string(),
+            volume: None,
+            response: resp_tx,
+        })
+        .await
+        .unwrap();
+        let result = resp_rx.await.unwrap();
+        assert!(
+            matches!(
+                result,
+                Err(BunError::Snapshot(
+                    crate::grill::snapshot::SnapshotError::AppRunning { .. }
+                ))
+            ),
+            "expected AppRunning, got {result:?}"
+        );
+
+        shutdown.cancel();
+        let _ = handle.await;
+    }
+
     /// B03: a caller that gives up on an accepted restore doesn't end its
     /// ownership; the restore still holds the volumes until it resolves.
     #[tokio::test]
