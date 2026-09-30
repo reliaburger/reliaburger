@@ -686,6 +686,10 @@ Requirements:
 - **A versioned binary directory** (default: the directory of the running
   executable): `bun` is a symlink to `bun-vX.Y.Z`; previous versions are
   retained for rollback (`upgrades.retain_versions`, default 3).
+- **Matching formats.** The leader runs `bun --compatibility` on a verified
+  candidate before recording a cluster upgrade and refuses one with a different
+  protocol or state format; a cluster rollback is refused when a node's binary
+  directory lacks the target (`installed_versions` in `GET /v1/version`).
 
 The release private key must live outside any repository. The project key's
 public half is compiled into `src/upgrade/keys.rs`; rotating it means shipping

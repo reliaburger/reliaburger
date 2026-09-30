@@ -65,6 +65,16 @@ const DEFAULT_FETCH_RETRY: FetchRetry = FetchRetry {
     ceiling: std::time::Duration::from_secs(75),
 };
 
+/// How hard to try for a Pickle binary.
+#[derive(Debug, Clone, Copy)]
+enum Fetch {
+    /// Ride out a brief outage ([`FetchRetry`]): a node preparing a directive.
+    Retrying,
+    /// One attempt: the leader's start-time check, which leaves an outage
+    /// to the nodes rather than hold up the caller.
+    Once,
+}
+
 /// A prepared upgrade: verified, staged, marked. Ready for [`execute`].
 ///
 /// [`execute`]: UpgradeManager::execute
@@ -245,6 +255,65 @@ impl UpgradeManager {
         self.external_key.is_some()
     }
 
+    /// Versions in this node's binary store, or `None` if the store can't
+    /// be read. The leader reads these before recording a cluster rollback,
+    /// which can only return a node to a binary it already holds.
+    pub async fn installed_versions(&self) -> Option<Vec<BinaryVersion>> {
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || store.installed_versions().ok())
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// Ask a cluster upgrade's candidate for its formats before the run is
+    /// recorded, exactly as each node will when it prepares the directive:
+    /// fetch it, verify its signatures, then run `--compatibility`.
+    /// Nothing is staged and no marker is written. The fetch is tried
+    /// once, so a registry outage comes back as a transient error at once.
+    pub async fn check_candidate(&self, directive: &UpgradeDirective) -> Result<(), UpgradeError> {
+        self.fetch_verified(directive, Fetch::Once)
+            .await
+            .map(|_| ())
+    }
+
+    /// Fetch a directive's binary, verify its signatures, and only then
+    /// run it once to check its formats. Returns the bytes and the
+    /// envelope they were verified against.
+    async fn fetch_verified(
+        &self,
+        directive: &UpgradeDirective,
+        fetch: Fetch,
+    ) -> Result<(Vec<u8>, SignatureEnvelope), UpgradeError> {
+        let bytes = self.fetch_binary(directive, fetch).await?;
+        let envelope = SignatureEnvelope {
+            schema: 1,
+            sha256: directive.binary_sha256.clone(),
+            embedded: directive.embedded_signature.clone(),
+            external: directive.external_signature.clone(),
+        };
+        // Treat the upgrade as network — and so demand the external signature —
+        // when the bytes came from the network by either route (M5): a Pickle
+        // fetch, or a single-node download staged as a local file.
+        let is_network = directive.source.is_network() || directive.network_provenance;
+        signing::verify_binary(
+            &bytes,
+            &envelope,
+            &self.release_keys,
+            self.external_key.as_ref(),
+            is_network,
+        )?;
+
+        super::compatibility::check_binary(
+            bytes.clone(),
+            self.store.symlink_path().parent().ok_or_else(|| {
+                UpgradeError::IncompatibleBinary("binary directory is missing".into())
+            })?,
+        )
+        .await?;
+        Ok((bytes, envelope))
+    }
+
     /// Is an upgrade currently in flight on this node? (Cheap: one stat.)
     pub fn upgrade_in_flight(&self) -> bool {
         self.marker_path.exists()
@@ -311,32 +380,7 @@ impl UpgradeManager {
 
         self.check_directive_target(directive).await?;
 
-        let bytes = self.fetch_binary(directive).await?;
-        let envelope = SignatureEnvelope {
-            schema: 1,
-            sha256: directive.binary_sha256.clone(),
-            embedded: directive.embedded_signature.clone(),
-            external: directive.external_signature.clone(),
-        };
-        // Treat the upgrade as network — and so demand the external signature —
-        // when the bytes came from the network by either route (M5): a Pickle
-        // fetch, or a single-node download staged as a local file.
-        let is_network = directive.source.is_network() || directive.network_provenance;
-        signing::verify_binary(
-            &bytes,
-            &envelope,
-            &self.release_keys,
-            self.external_key.as_ref(),
-            is_network,
-        )?;
-
-        super::compatibility::check_binary(
-            bytes.clone(),
-            self.store.symlink_path().parent().ok_or_else(|| {
-                UpgradeError::IncompatibleBinary("binary directory is missing".into())
-            })?,
-        )
-        .await?;
+        let (bytes, envelope) = self.fetch_verified(directive, Fetch::Retrying).await?;
 
         // First upgrade from an un-versioned install: adopt the running
         // binary into the store so rollback has something to return to.
@@ -708,7 +752,11 @@ impl UpgradeManager {
         }
     }
 
-    async fn fetch_binary(&self, directive: &UpgradeDirective) -> Result<Vec<u8>, UpgradeError> {
+    async fn fetch_binary(
+        &self,
+        directive: &UpgradeDirective,
+        fetch: Fetch,
+    ) -> Result<Vec<u8>, UpgradeError> {
         match &directive.source {
             BinarySource::LocalFile { path } => Ok(tokio::fs::read(path).await?),
             BinarySource::Pickle { registry_address } => {
@@ -722,7 +770,10 @@ impl UpgradeManager {
                         directive.binary_sha256
                     ),
                 );
-                self.fetch_with_retry(&url).await
+                match fetch {
+                    Fetch::Retrying => self.fetch_with_retry(&url).await,
+                    Fetch::Once => self.fetch_once(&url).await,
+                }
             }
         }
     }
@@ -1006,6 +1057,84 @@ mod tests {
         assert_eq!(
             fixture.manager.store().current_target().unwrap(),
             v("0.1.0")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_candidate_with_other_formats_is_refused_naming_found_and_expected() {
+        use crate::compatibility::{CURRENT, Compatibility};
+        let fixture = fixture();
+        let directive = directive_for(
+            &fixture,
+            b"#!/bin/sh\nprintf '%s' '{\"protocol\":1,\"state\":1}'\n",
+            "incompatible",
+        );
+        let err = fixture
+            .manager
+            .check_candidate(&directive)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                UpgradeError::IncompatibleFormats { found, expected }
+                    if found == Compatibility { protocol: 1, state: 1 } && expected == CURRENT
+            ),
+            "{err}"
+        );
+        let message = err.to_string();
+        assert!(message.contains("found protocol 1, state 1"), "{message}");
+        assert!(
+            message.contains(&format!(
+                "needs protocol {}, state {}",
+                CURRENT.protocol, CURRENT.state
+            )),
+            "{message}"
+        );
+        assert!(!fixture.manager.upgrade_in_flight());
+        assert!(!fixture.manager.store().binary_path(&v("0.2.0")).exists());
+    }
+
+    #[tokio::test]
+    async fn a_candidate_is_verified_before_it_is_asked_for_its_formats() {
+        let fixture = fixture();
+        // A script that would leave a trace if it ever ran.
+        let trace = fixture.binary_dir.join("ran");
+        let script = format!("#!/bin/sh\ntouch '{}'\n", trace.display());
+        let mut directive = directive_for(&fixture, script.as_bytes(), "unsigned");
+        directive.external_signature =
+            Some(sign(&fixture.release_pkcs8, b"different bytes").unwrap());
+        let err = fixture
+            .manager
+            .check_candidate(&directive)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, UpgradeError::ExternalSignatureInvalid),
+            "{err}"
+        );
+        assert!(!trace.exists(), "an unverified candidate must never run");
+    }
+
+    #[tokio::test]
+    async fn a_compatible_candidate_passes_without_being_staged() {
+        let fixture = fixture();
+        let directive = directive_for(&fixture, b"new binary", "compatible");
+        fixture.manager.check_candidate(&directive).await.unwrap();
+        assert!(!fixture.manager.upgrade_in_flight());
+        assert!(!fixture.manager.store().binary_path(&v("0.2.0")).exists());
+        assert_eq!(
+            fixture.manager.store().current_target().unwrap(),
+            v("0.1.0")
+        );
+    }
+
+    #[tokio::test]
+    async fn installed_versions_lists_the_binary_store() {
+        let fixture = fixture();
+        assert_eq!(
+            fixture.manager.installed_versions().await,
+            Some(vec![v("0.1.0")])
         );
     }
 
@@ -1347,7 +1476,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             fixture.manager.prepare_rollback(None, vec![]).await,
-            Err(UpgradeError::IncompatibleBinary(_))
+            Err(UpgradeError::IncompatibleFormats { .. })
         ));
         assert!(!fixture.manager.upgrade_in_flight());
         assert_eq!(
@@ -1591,7 +1720,10 @@ mod tests {
             allow_downgrade: false,
         };
 
-        let plaintext = fixture.manager.fetch_binary(&directive).await;
+        let plaintext = fixture
+            .manager
+            .fetch_binary(&directive, Fetch::Retrying)
+            .await;
         match plaintext {
             Err(UpgradeError::FetchUnavailable { url, .. }) => {
                 assert!(url.starts_with("http://127.0.0.1:1/v2/"), "got {url}");
@@ -1602,7 +1734,7 @@ mod tests {
         let secure = fixture
             .manager
             .with_cluster_http(crate::cluster::ClusterHttp::secure(reqwest::Client::new()))
-            .fetch_binary(&directive)
+            .fetch_binary(&directive, Fetch::Retrying)
             .await;
         match secure {
             Err(UpgradeError::FetchUnavailable { url, .. }) => {
@@ -1651,7 +1783,7 @@ mod tests {
         };
 
         // The 404 makes the fetch fail, but the request has already been sent.
-        let _ = manager.fetch_binary(&directive).await;
+        let _ = manager.fetch_binary(&directive, Fetch::Retrying).await;
 
         let request = capture.await.unwrap().to_lowercase();
         assert!(
@@ -1746,6 +1878,31 @@ mod tests {
             network_provenance: true,
             ..directive_for(fixture, bytes, "pickle-1")
         }
+    }
+
+    /// The leader's start-time check asks once: a registry that is down
+    /// says so straight away, and the nodes ride the outage out later.
+    #[tokio::test]
+    async fn a_candidate_check_does_not_wait_out_a_registry_outage() {
+        let fixture = fixture();
+        let binary = compatible_binary(b"from a registry that is down");
+        let (registry, requests) = flaky_registry(
+            vec![RegistryAnswer::Hangup, RegistryAnswer::Hangup],
+            binary.clone(),
+        )
+        .await;
+        let directive = pickle_directive(&fixture, &binary, &registry);
+        let err = fixture
+            .manager
+            .check_candidate(&directive)
+            .await
+            .unwrap_err();
+        assert!(err.is_transient(), "{err}");
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the check must not retry"
+        );
     }
 
     /// The V02 soak failure, node side: the leader restarted, and a worker

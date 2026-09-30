@@ -288,6 +288,50 @@ pub fn check_network_prerequisites(
     }
 }
 
+/// What one node holds in its binary store, as input to
+/// [`check_rollback_target`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredBinaries {
+    /// How to name the node in an error: `node n1`.
+    pub node: String,
+    /// The version the node runs now.
+    pub running: BinaryVersion,
+    /// Versions in the node's binary store. `None` when the node doesn't
+    /// report them; the node-side check still stands behind it.
+    pub installed: Option<Vec<BinaryVersion>>,
+}
+
+/// Refuse a cluster rollback to a version some node doesn't hold.
+///
+/// A rollback never fetches a binary: each node execs the one already in
+/// its store. A node without the target refuses the directive, and the run
+/// pauses on the first such node. Checking every node up front turns that
+/// into one 409 naming all of them. A node already running the target has
+/// nothing to do, so it can't be missing it.
+pub fn check_rollback_target(
+    target: &BinaryVersion,
+    nodes: &[StoredBinaries],
+) -> Result<(), UpgradeError> {
+    let missing: Vec<&str> = nodes
+        .iter()
+        .filter(|node| node.running != *target)
+        .filter(|node| {
+            node.installed
+                .as_ref()
+                .is_some_and(|installed| !installed.contains(target))
+        })
+        .map(|node| node.node.as_str())
+        .collect();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(UpgradeError::RollbackTargetMissing {
+            version: target.clone(),
+            nodes: missing.join(", "),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -592,5 +636,49 @@ mod tests {
         let nodes = [readiness("a", true), readiness("b", true)];
         check_network_prerequisites(Some("sig"), &nodes).unwrap();
         check_network_prerequisites(Some("sig"), &[]).unwrap();
+    }
+
+    fn stored(node: &str, running: &str, installed: Option<&[&str]>) -> StoredBinaries {
+        StoredBinaries {
+            node: format!("node {node}"),
+            running: running.parse().unwrap(),
+            installed: installed
+                .map(|versions| versions.iter().map(|v| v.parse().unwrap()).collect()),
+        }
+    }
+
+    #[test]
+    fn rollback_to_a_version_missing_from_some_stores_names_every_such_node() {
+        let target: BinaryVersion = "v0.1.0".parse().unwrap();
+        let nodes = [
+            stored("n1", "v0.1.1", Some(&["v0.1.0", "v0.1.1"])),
+            stored("n2", "v0.1.1", Some(&["v0.1.1"])),
+            stored("n3", "v0.1.1", Some(&[])),
+        ];
+        let err = check_rollback_target(&target, &nodes).unwrap_err();
+        assert!(
+            matches!(&err, UpgradeError::RollbackTargetMissing { nodes, .. } if nodes == "node n2, node n3"),
+            "{err}"
+        );
+        let message = err.to_string();
+        assert!(message.contains("v0.1.0"), "{message}");
+        assert!(
+            message.contains("not installed in the binary store"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn rollback_proceeds_when_every_reporting_node_holds_or_runs_the_version() {
+        let target: BinaryVersion = "v0.1.0".parse().unwrap();
+        let nodes = [
+            stored("n1", "v0.1.1", Some(&["v0.1.0", "v0.1.1"])),
+            // Already there: nothing to exec.
+            stored("n2", "v0.1.0", Some(&[])),
+            // Doesn't say: the node-side check still refuses if it must.
+            stored("n3", "v0.1.1", None),
+        ];
+        check_rollback_target(&target, &nodes).unwrap();
+        check_rollback_target(&target, &[]).unwrap();
     }
 }
