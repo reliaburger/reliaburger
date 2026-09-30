@@ -19,6 +19,7 @@ pub mod events;
 pub mod gpu;
 pub mod health;
 pub(crate) mod jobs;
+pub mod loop_meter;
 pub mod probe;
 pub mod readiness;
 pub mod restart;

@@ -74,6 +74,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             self.retire_instance_artifacts(&original.instance_id)
                 .await?;
             if let Some(port) = original.spec.port_mapping {
+                // LOOP-INLINE: in-memory lock, no I/O
                 self.supervisor
                     .port_allocator
                     .release(port.host_port)
@@ -92,6 +93,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     self.startup_retirements.push_back(pending);
                 }
                 if let Some(readiness) = &self.readiness {
+                    // LOOP-INLINE: in-memory lock, no I/O
                     readiness
                         .degraded("discovery:startup-cleanup", error.to_string())
                         .await;
@@ -109,9 +111,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 self.startup_cleanup_pending = false;
             }
             if let Some(readiness) = &self.readiness {
+                // LOOP-INLINE: in-memory lock, no I/O
                 match result {
                     Ok(()) => readiness.ready("discovery:startup-cleanup").await,
                     Err(error) => {
+                        // LOOP-INLINE: in-memory lock, no I/O
                         readiness
                             .degraded("discovery:startup-cleanup", error.to_string())
                             .await

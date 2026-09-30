@@ -549,6 +549,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 },
             )
             .collect();
+        // LOOP-INLINE: in-memory lock, no I/O
         if !self.drains.drain_all(&retiring).await {
             return Ok(());
         }
@@ -681,6 +682,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         for entry in &entries {
             self.withdraw_discovery_entry(entry).await?;
             for backend in &entry.backends {
+                // LOOP-INLINE: in-memory lock, no I/O
                 self.drains
                     .start_drain(&crate::wrapper::draining::DrainCommand {
                         app_name: entry.app_name.clone(),
@@ -690,9 +692,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     .await;
             }
         }
+        // LOOP-INLINE: in-memory lock, no I/O
         self.drains.check_completions().await;
         for entry in &entries {
             for backend in &entry.backends {
+                // LOOP-INLINE: in-memory lock, no I/O
                 if self.drains.is_draining(&backend.instance_id).await {
                     return Ok(false);
                 }

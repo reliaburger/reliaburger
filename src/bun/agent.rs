@@ -1,9 +1,37 @@
-/// Bun agent event loop.
-///
-/// Ties the supervisor, health checker, and container runtime together
-/// into a single async event loop. Commands arrive over an `mpsc` channel;
-/// health checks fire on a timer; shutdown is coordinated via a
-/// `CancellationToken`.
+//! Bun agent event loop.
+//!
+//! Ties the supervisor, health checker, and container runtime together
+//! into a single async event loop. Commands arrive over an `mpsc` channel;
+//! health checks fire on a timer; shutdown is coordinated via a
+//! `CancellationToken`.
+//!
+//! # The loop rule
+//!
+//! `run_loop` is the only owner of a node's state, so it runs one turn at a
+//! time, and every caller waits for the turn in progress. A turn must be
+//! short: the turn budget is 1 s ([`super::loop_meter::TURN_BUDGET`]). Once
+//! stage 3 of #351 lands, the V02 soak fails a tier whose worst turn exceeds
+//! it. So:
+//!
+//! 1. An `await` that a turn reaches must not wait on anything slow: a
+//!    runtime call, a council write, a subprocess, the network, a peer, or a
+//!    client draining a channel. Spawn that work and let it report back (as
+//!    stops, identity signings, deploys and probes do), or wrap it in
+//!    `tokio::time::timeout` with a deadline well under the budget.
+//! 2. An await that stays inline without a deadline carries a
+//!    `// LOOP-INLINE: <why>` comment on its statement: an in-memory lock,
+//!    an fsync'd persist (allowed, and bounded by the harness's slow-disk
+//!    scenario), or known debt naming its stage of #351.
+//! 3. `loop_rule::every_inline_await_on_the_agent_loop_has_a_deadline_or_a_reason`
+//!    walks every method a turn can reach and fails on an await with
+//!    neither. Reviewers read the tags, not the whole call graph.
+//! 4. The starvation harness (`tests::loop_harness`) proves it: each
+//!    scenario makes one inline await slow and checks that a queued status
+//!    is answered, and the worst turn ends, within the budget.
+//!
+//! Every turn is timed by branch ([`super::loop_meter`]) and exported as
+//! `bun_agent_loop_turn_seconds`; any turn over 250 ms is logged with the
+//! command or deploy op it ran.
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime};
@@ -27,6 +55,7 @@ use crate::mustard::membership::MembershipSnapshot;
 use crate::reporting::worker::CollectSnapshotRequest;
 
 use super::BunError;
+use super::loop_meter::LoopBranch;
 use super::probe::probe_health;
 use super::supervisor::{WorkloadInstance, WorkloadSupervisor};
 
@@ -643,6 +672,58 @@ pub enum AgentCommand {
     },
 }
 
+impl AgentCommand {
+    /// The variant's name, for the loop meter's slow-turn log.
+    fn name(&self) -> &'static str {
+        match self {
+            AgentCommand::Deploy { .. } => "deploy",
+            AgentCommand::RerunJobs { .. } => "rerun_jobs",
+            AgentCommand::Stop { .. } => "stop",
+            AgentCommand::Retire { .. } => "retire",
+            AgentCommand::RetireTestResources { .. } => "retire_test_resources",
+            AgentCommand::Status { .. } => "status",
+            AgentCommand::AdoptedPlacementMatches { .. } => "adopted_placement_matches",
+            AgentCommand::DesiredApps { .. } => "desired_apps",
+            AgentCommand::ScrapeTargets { .. } => "scrape_targets",
+            AgentCommand::CurrentResources { .. } => "current_resources",
+            AgentCommand::JobStatus { .. } => "job_status",
+            AgentCommand::ActiveImages { .. } => "active_images",
+            AgentCommand::DeployOperations { .. } => "deploy_operations",
+            AgentCommand::CancelDeploy { .. } => "cancel_deploy",
+            AgentCommand::Logs { .. } => "logs",
+            AgentCommand::FollowLogs { .. } => "follow_logs",
+            AgentCommand::Exec { .. } => "exec",
+            AgentCommand::Trace { .. } => "trace",
+            AgentCommand::Nodes { .. } => "nodes",
+            AgentCommand::Council { .. } => "council",
+            AgentCommand::JoinIssue { .. } => "join_issue",
+            AgentCommand::SnapshotCreate { .. } => "snapshot_create",
+            AgentCommand::SnapshotList { .. } => "snapshot_list",
+            AgentCommand::SnapshotRestore { .. } => "snapshot_restore",
+            AgentCommand::SnapshotDelete { .. } => "snapshot_delete",
+            AgentCommand::Resolve { .. } => "resolve",
+            AgentCommand::ResolveAll { .. } => "resolve_all",
+            AgentCommand::SyncClusterCatalog { .. } => "sync_cluster_catalog",
+            AgentCommand::SyncClusterConsumer { .. } => "sync_cluster_consumer",
+            AgentCommand::ConfirmConsumerReceipt { .. } => "confirm_consumer_receipt",
+            AgentCommand::Routes { .. } => "routes",
+            AgentCommand::PrepareNodeFault { .. } => "prepare_node_fault",
+            AgentCommand::FenceNodeFault { .. } => "fence_node_fault",
+            AgentCommand::InjectFault { .. } => "inject_fault",
+            AgentCommand::ClearFault { .. } => "clear_fault",
+            AgentCommand::ClearAllFaults { .. } => "clear_all_faults",
+            AgentCommand::ClearFaultsByService { .. } => "clear_faults_by_service",
+            AgentCommand::ListFaults { .. } => "list_faults",
+            AgentCommand::SignImage { .. } => "sign_image",
+            AgentCommand::AppConfig { .. } => "app_config",
+            AgentCommand::UpgradeApply { .. } => "upgrade_apply",
+            AgentCommand::UpgradeStatus { .. } => "upgrade_status",
+            AgentCommand::UpgradeRollback { .. } => "upgrade_rollback",
+            AgentCommand::UpgradeVerify { .. } => "upgrade_verify",
+        }
+    }
+}
+
 /// The fast, `&mut self` steps a deploy needs the command loop to perform on
 /// its behalf.
 ///
@@ -911,6 +992,49 @@ enum DeployOp {
         namespace: String,
         reply: oneshot::Sender<()>,
     },
+}
+
+impl DeployOp {
+    /// The variant's name, for the loop meter's slow-turn log.
+    fn name(&self) -> &'static str {
+        match self {
+            DeployOp::ConfirmJobSuccess { .. } => "confirm_job_success",
+            DeployOp::HealthProbeResult { .. } => "health_probe_result",
+            DeployOp::EnforceImageSignature { .. } => "enforce_image_signature",
+            DeployOp::StoreDeployedSpec { .. } => "store_deployed_spec",
+            DeployOp::ListExistingOwned { .. } => "list_existing_owned",
+            DeployOp::ReplicasToAddInPlace { .. } => "replicas_to_add_in_place",
+            DeployOp::AddAppReplicas { .. } => "add_app_replicas",
+            DeployOp::NextDeployGen { .. } => "next_deploy_gen",
+            DeployOp::SupervisorDeployApp { .. } => "supervisor_deploy_app",
+            DeployOp::SupervisorDeployJob { .. } => "supervisor_deploy_job",
+            DeployOp::RegisterServiceApp { .. } => "register_service_app",
+            DeployOp::RestoreStoppedRouting { .. } => "restore_stopped_routing",
+            DeployOp::AbandonUnstartedInstances { .. } => "abandon_unstarted_instances",
+            DeployOp::StoreIngress { .. } => "store_ingress",
+            DeployOp::PrepareFreshInstance { .. } => "prepare_fresh_instance",
+            DeployOp::StoreOciSpec { .. } => "store_oci_spec",
+            DeployOp::RegisterInitialiser { .. } => "register_initialiser",
+            DeployOp::ForgetInitialiser { .. } => "forget_initialiser",
+            DeployOp::ApplyNetworkPreStart { .. } => "apply_network_pre_start",
+            DeployOp::TransitionState { .. } => "transition_state",
+            DeployOp::FinishFreshInstance { .. } => "finish_fresh_instance",
+            DeployOp::ProvisionIdentity { .. } => "provision_identity",
+            DeployOp::ReserveRollingInstance { .. } => "reserve_rolling_instance",
+            DeployOp::PrepareRollingInstance { .. } => "prepare_rolling_instance",
+            DeployOp::RegisterRollingInstance { .. } => "register_rolling_instance",
+            DeployOp::RetainRollingInstance { .. } => "retain_rolling_instance",
+            DeployOp::FinaliseRollingDeploy { .. } => "finalise_rolling_deploy",
+            DeployOp::PublishNewBackend { .. } => "publish_new_backend",
+            DeployOp::FinishRetire { .. } => "finish_retire",
+            DeployOp::BeginRetire { .. } => "begin_retire",
+            DeployOp::DeferRetire { .. } => "defer_retire",
+            DeployOp::PushDeployHistory { .. } => "push_deploy_history",
+            DeployOp::FinishJobInstance { .. } => "finish_job_instance",
+            DeployOp::RebuildRoutingTable { .. } => "rebuild_routing_table",
+            DeployOp::RecordDeployedEvent { .. } => "record_deployed_event",
+        }
+    }
 }
 
 /// Launch data owned by the deploy worker before supervisor registration.
@@ -1839,6 +1963,47 @@ struct InstalledNetworkFaults {
     delays_swept: bool,
 }
 
+/// Test hook: an await on the loop that no mock stands behind (a
+/// subprocess, the disk), which the starvation harness can slow down.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum LoopStall {
+    /// Every fsync'd state persist: job ledger, instance record, schedules.
+    Persist,
+    /// Removing a retired instance's identity directory and record.
+    ArtifactCleanup,
+    /// The `nft -f -` subprocess that applies the perimeter ruleset.
+    Firewall,
+}
+
+/// How long each [`LoopStall`] takes. Shared with the test through an `Arc`
+/// because the agent moves into its task.
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct LoopStalls(std::sync::Mutex<std::collections::HashMap<LoopStall, std::time::Duration>>);
+
+#[cfg(test)]
+impl LoopStalls {
+    fn set(&self, stall: LoopStall, delay: std::time::Duration) {
+        if let Ok(mut stalls) = self.0.lock() {
+            stalls.insert(stall, delay);
+        }
+    }
+
+    /// Wait out `stall`'s delay, if the test set one; `true` when it did.
+    async fn hold(&self, stall: LoopStall) -> bool {
+        let delay = self
+            .0
+            .lock()
+            .ok()
+            .and_then(|stalls| stalls.get(&stall).copied());
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+        delay.is_some()
+    }
+}
+
 /// The Bun agent. Generic over `G: Grill` so tests can inject mocks.
 pub struct BunAgent<G: Grill> {
     supervisor: WorkloadSupervisor<G>,
@@ -1848,6 +2013,11 @@ pub struct BunAgent<G: Grill> {
     readiness: Option<crate::bun::readiness::ReadinessTracker>,
     #[cfg(test)]
     egress_observation_count: std::sync::atomic::AtomicUsize,
+    /// Times every turn of `run_loop` by branch; the metrics collector
+    /// exports it as `bun_agent_loop_turn_seconds`.
+    loop_meter: Arc<super::loop_meter::LoopTurnMeter>,
+    #[cfg(test)]
+    loop_stalls: Arc<LoopStalls>,
     /// Hard per-node concurrency bound for workload connectivity traces.
     trace_slots: std::sync::Arc<tokio::sync::Semaphore>,
     volumes_dir: PathBuf,
@@ -2148,6 +2318,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             readiness: None,
             #[cfg(test)]
             egress_observation_count: std::sync::atomic::AtomicUsize::new(0),
+            loop_meter: Arc::default(),
+            #[cfg(test)]
+            loop_stalls: Arc::default(),
             trace_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TRACES)),
             volumes_dir: crate::config::node::StorageSection::default().volumes,
             volume_maintenance: Default::default(),
@@ -2272,6 +2445,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             readiness: None,
             #[cfg(test)]
             egress_observation_count: std::sync::atomic::AtomicUsize::new(0),
+            loop_meter: Arc::default(),
+            #[cfg(test)]
+            loop_stalls: Arc::default(),
             trace_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TRACES)),
             volumes_dir: crate::config::node::StorageSection::default().volumes,
             volume_maintenance: Default::default(),
@@ -2780,6 +2956,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             if being_created {
                 continue;
             }
+            // LOOP-INLINE: stage 3 of #351: an unbounded runtime call
             match self.supervisor.grill().workload_cgroup(&id).await {
                 Ok(Some(cgroup)) => cgroup_ids.entry(key).or_default().push(cgroup),
                 Ok(None) => {}
@@ -2838,6 +3015,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.shutdown_grace = grace;
     }
 
+    /// The loop's turn meter, for the metrics collector to export.
+    pub fn loop_meter(&self) -> Arc<super::loop_meter::LoopTurnMeter> {
+        Arc::clone(&self.loop_meter)
+    }
+
     /// Attach the self-upgrade manager (enables the upgrade commands).
     pub fn set_upgrade_manager(&mut self, manager: crate::upgrade::manager::UpgradeManager) {
         self.upgrade = Some(manager);
@@ -2851,6 +3033,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             if instance.is_job || instance.state != ContainerState::Running {
                 continue;
             }
+            // LOOP-INLINE: stage 3 of #351: the upgrade path reads pids off the loop
             let Some(pid) = self.supervisor.grill().pid(&instance.id).await else {
                 continue;
             };
@@ -2912,6 +3095,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     .or_insert_with(|| job.clone());
             }
             let records = next.clone();
+            #[cfg(test)]
+            self.loop_stalls.hold(LoopStall::Persist).await;
+            // LOOP-INLINE: fsync'd persist (#351 decision 2); the slow-disk scenario bounds it
             tokio::task::spawn_blocking(move || super::jobs::persist(&directory, records))
                 .await
                 .map_err(|error| BunError::JobState(error.to_string()))?
@@ -3009,8 +3195,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
             self.record_job_runtime_absent(&id).await?;
             self.retire_instance_artifacts(&id).await?;
+            // LOOP-INLINE: in-memory lock, no I/O
             self.supervisor.retire_instance(&id).await;
         }
+        // LOOP-INLINE: in-memory lock, no I/O
         let ids = self
             .supervisor
             .deploy_job(name, namespace, spec, Instant::now())
@@ -3141,6 +3329,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let pid = if runtime == crate::grill::records::RuntimeKind::Apple {
             Some(std::process::id())
         } else {
+            // LOOP-INLINE: stage 3 of #351: an unbounded runtime call
             self.supervisor.grill().pid(instance_id).await
         };
         let Some(pid) = pid else {
@@ -3165,11 +3354,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let replica_index = crate::grill::InstanceIdentity::parse(&instance_id.0)
             .map(|ident| ident.ordinal)
             .unwrap_or(0);
+        // LOOP-INLINE: stage 3 of #351: an unbounded runtime call
         let rootless_network = self
             .supervisor
             .grill()
             .rootless_network_record(instance_id)
             .await;
+        // LOOP-INLINE: stage 3 of #351: an unbounded runtime call
         let record = crate::grill::records::InstanceRecord {
             schema: 2,
             instance_id: instance_id.0.clone(),
@@ -3193,6 +3384,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             oci_spec,
             rootless_network,
         };
+        #[cfg(test)]
+        self.loop_stalls.hold(LoopStall::Persist).await;
+        // LOOP-INLINE: fsync'd persist (#351 decision 2); the slow-disk scenario bounds it
         tokio::task::spawn_blocking(move || crate::grill::records::write_record(&dir, &record))
             .await
             .map_err(|error| fail(&error.to_string()))?
@@ -3214,6 +3408,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let pid = if runtime == crate::grill::records::RuntimeKind::Apple {
             Some(std::process::id())
         } else {
+            // LOOP-INLINE: stage 3 of #351: an unbounded runtime call
             grill.pid(&instance.instance_id).await
         }
         .ok_or_else(|| {
@@ -3226,6 +3421,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         })?;
         let identity = crate::grill::InstanceIdentity::parse(&instance.instance_id.0)
             .ok_or_else(|| fail("replacement has an invalid instance identity".into()))?;
+        // LOOP-INLINE: stage 3 of #351: an unbounded runtime call
         let record = crate::grill::records::InstanceRecord {
             schema: 2,
             instance_id: instance.instance_id.0.clone(),
@@ -3245,6 +3441,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             oci_spec: instance.oci_spec.clone(),
             rootless_network: grill.rootless_network_record(&instance.instance_id).await,
         };
+        // LOOP-INLINE: fsync'd persist (#351 decision 2); the slow-disk scenario bounds it
         tokio::task::spawn_blocking(move || {
             crate::grill::records::write_record(&directory, &record)
         })
@@ -3809,6 +4006,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
         if let Some(readiness) = self.readiness.clone() {
             let (capabilities, _) = self.live_egress_report_state().await;
+            // LOOP-INLINE: in-memory lock, no I/O
             readiness.set_capabilities(capabilities).await;
         }
 
@@ -3820,10 +4018,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             // Commands come before a tick that is merely due (#260), but a
             // steady stream of them must not hold the tick off for good:
             // health probes, restarts and retirements all run from it.
-            if last_health_tick.elapsed() >= HEALTH_TICK_STARVATION_BOUND {
+            let turn = if last_health_tick.elapsed() >= HEALTH_TICK_STARVATION_BOUND {
+                let turn = self.loop_meter.begin(LoopBranch::HealthTick, None);
                 self.run_health_tick().await;
                 last_health_tick = tokio::time::Instant::now();
                 health_interval.reset();
+                turn
             } else {
                 // Branches are polled in order, so the periodic tick runs only
                 // when nothing else is waiting. A tick can take seconds (every
@@ -3854,33 +4054,47 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         break;
                     }
                     Some(req) = Self::recv_snapshot(&mut self.cluster) => {
+                        let turn = self.loop_meter.begin(LoopBranch::Snapshot, None);
                         self.handle_snapshot_request(req).await;
+                        turn
                     }
                     Some(outcome) = self.stop_waits.join_next_with_id(),
                         if !self.stop_waits.is_empty() => {
+                        let turn = self.loop_meter.begin(LoopBranch::StopWait, None);
                         self.complete_app_stop(outcome).await;
+                        turn
                     }
                     Some(outcome) = self.identity_signing_tasks.join_next_with_id(),
                         if !self.identity_signing_tasks.is_empty() => {
+                        let turn = self.loop_meter.begin(LoopBranch::IdentitySigning, None);
                         self.finish_identity_provision(outcome);
+                        turn
                     }
                     Some(op) = self.deploy_ops_rx.recv() => {
+                        let turn = self.loop_meter.begin(LoopBranch::DeployOp, Some(op.name()));
                         self.handle_deploy_op(op).await;
+                        turn
                     }
                     Some(cmd) = self.command_rx.recv() => {
+                        let turn = self.loop_meter.begin(LoopBranch::Command, Some(cmd.name()));
                         self.handle_command(cmd).await;
+                        turn
                     }
                     _ = health_interval.tick() => {
+                        let turn = self.loop_meter.begin(LoopBranch::HealthTick, None);
                         self.run_health_tick().await;
                         last_health_tick = tokio::time::Instant::now();
+                        turn
                     }
                 }
-            }
+            };
             // Local changes only mark the consumer view stale, so a burst of
             // them costs one republication, and the old view serves meanwhile.
+            // The republication is part of the turn: a caller waits for it too.
             if let Err(error) = self.refresh_consumer_view().await {
                 eprintln!("bun: consumer view refresh awaits retry: {error}");
             }
+            self.loop_meter.finish(turn);
         }
     }
 
@@ -3910,6 +4124,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     async fn refresh_egress_readiness(&mut self) {
         let egress = self.enforce_live_egress_or_stop().await;
         if let Some(readiness) = self.readiness.clone() {
+            // LOOP-INLINE: in-memory lock, no I/O
             readiness
                 .set_capabilities(crate::meat::cluster_state::NodeCapabilities {
                     egress,
@@ -3970,6 +4185,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             _ => None,
         };
         let instances = self.supervisor.list_instances();
+        // LOOP-INLINE: in-memory lock, no I/O
         let snapshot = AgentSnapshot {
             instances: instances
                 .iter()
@@ -4204,6 +4420,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         };
 
         let metrics = metrics_rx.borrow().clone();
+        // LOOP-INLINE: reads the local council state machine; no quorum round trip
         let desired = council.desired_state().await;
 
         let leader_name = metrics.current_leader.and_then(|leader_id| {
@@ -4339,6 +4556,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         rerun_unknown_jobs: bool,
     ) {
         if self.startup_cleanup_pending {
+            // LOOP-INLINE: one of the first events on the caller's fresh channel; never waits
             let _ = events
                 .send(ApplyEvent::Error {
                     message: "startup cleanup still owns runtime allocations; retry after recovery"
@@ -4348,6 +4566,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             return;
         }
         if rerun_unknown_jobs && let Err(message) = super::jobs::validate_rerun(&config) {
+            // LOOP-INLINE: one of the first events on the caller's fresh channel; never waits
             let _ = events
                 .send(ApplyEvent::Error {
                     message: message.into(),
@@ -4356,6 +4575,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             return;
         }
         if let Err(message) = self.validate_deploy_names(&config) {
+            // LOOP-INLINE: one of the first events on the caller's fresh channel; never waits
             let _ = events.send(ApplyEvent::Error { message }).await;
             return;
         }
@@ -4366,6 +4586,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 "workload {}/{} is still stopping; retry once its exit is confirmed",
                 target.namespace, target.name
             );
+            // LOOP-INLINE: one of the first events on the caller's fresh channel; never waits
             let _ = events.send(ApplyEvent::Error { message }).await;
             return;
         }
@@ -4373,9 +4594,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             let message = format!(
                 "volumes of {namespace}/{app} are being restored from a snapshot; retry once the restore finishes"
             );
+            // LOOP-INLINE: one of the first events on the caller's fresh channel; never waits
             let _ = events.send(ApplyEvent::Error { message }).await;
             return;
         }
+        // LOOP-INLINE: in-memory lock, no I/O
         let operation = match self.deploy_operations.start(&config).await {
             Ok(operation) => operation,
             Err(error) => {
@@ -4388,10 +4611,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     message.clone(),
                 )
                 .await;
+                // LOOP-INLINE: one of the first events on the caller's fresh channel; never waits
                 let _ = events.send(ApplyEvent::Error { message }).await;
                 return;
             }
         };
+        // LOOP-INLINE: one of the first events on the caller's fresh channel; never waits
         let _ = events
             .send(ApplyEvent::Accepted {
                 operation_id: operation.id().to_string(),
@@ -4407,12 +4632,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 "deploy refused while node is draining".to_string(),
             )
             .await;
+            // LOOP-INLINE: in-memory lock, no I/O
             operation
                 .finish(
                     crate::bun::deploy_operations::DeployOperationOutcome::Failed,
                     message.clone(),
                 )
                 .await;
+            // LOOP-INLINE: one of the first events on the caller's fresh channel; never waits
             let _ = events.send(ApplyEvent::Error { message }).await;
             return;
         }
@@ -4420,12 +4647,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         // on their schedule rather than at deploy time (E).
         if register_schedule && let Err(error) = self.register_scheduled_jobs(&config).await {
             let message = error.to_string();
+            // LOOP-INLINE: in-memory lock, no I/O
             operation
                 .finish(
                     crate::bun::deploy_operations::DeployOperationOutcome::Failed,
                     message.clone(),
                 )
                 .await;
+            // LOOP-INLINE: one of the first events on the caller's fresh channel; never waits
             let _ = events.send(ApplyEvent::Error { message }).await;
             return;
         }
@@ -4674,6 +4903,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 operation_id,
                 response,
             } => {
+                // LOOP-INLINE: in-memory lock, no I/O
                 let operation = self
                     .deploy_operations
                     .request_cancellation(&operation_id)
@@ -4681,6 +4911,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 let _ = response.send(operation);
             }
             AgentCommand::DeployOperations { response } => {
+                // LOOP-INLINE: in-memory lock, no I/O
                 let _ = response.send(self.deploy_operations.snapshot().await);
             }
             AgentCommand::Logs {
@@ -5048,6 +5279,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                             crate::smoker::types::FaultType::NodePressure { .. }
                         );
                         if node_pressure {
+                            // LOOP-INLINE: stage 3 of #351: fault apply and reversal leave the loop
                             if let Err(reason) = self.node_pressure.clear(rule.id).await {
                                 let _ = response.send(Err(BunError::FaultRejected { reason }));
                                 return;
@@ -5237,6 +5469,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .store(true, std::sync::atomic::Ordering::Relaxed);
 
         let inventory = self.upgrade_inventory().await;
+        // LOOP-INLINE: stage 3 of #351: the upgrade fetch leaves the loop (decision 4)
         let prepared = match manager.prepare(&directive, inventory).await {
             Ok(Some(prepared)) => prepared,
             Ok(None) => {
@@ -5260,6 +5493,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         // Respond before the point of no return, and give the HTTP layer a
         // moment to flush the response — exec closes every socket.
         let _ = response.send(Ok(()));
+        // LOOP-INLINE: 200 ms on purpose, so the answer flushes before exec replaces the process
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
         // Only returns on failure (the symlink is already reverted then).
@@ -5286,6 +5520,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.draining
             .store(true, std::sync::atomic::Ordering::Relaxed);
         let inventory = self.upgrade_inventory().await;
+        // LOOP-INLINE: stages a binary already on disk and persists the marker, like a persist
         let prepared = match manager.prepare_rollback(version, inventory).await {
             Ok(prepared) => prepared,
             Err(e) => {
@@ -5298,6 +5533,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
         println!("bun: rolling back to {}", prepared.target_version());
         let _ = response.send(Ok(()));
+        // LOOP-INLINE: 200 ms on purpose, so the answer flushes before exec replaces the process
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
         let error = manager.execute(prepared);
@@ -5823,8 +6059,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 };
 
                 if self.node_drain_gate.begin() {
+                    // LOOP-INLINE: in-memory lock, no I/O
                     readiness.register("node:chaos-drain", true).await;
                 }
+                // LOOP-INLINE: in-memory lock, no I/O
                 readiness
                     .degraded("node:chaos-drain", "node drain fault is active")
                     .await;
@@ -5848,6 +6086,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         .map(|instance| instance.id.clone())
                         .collect();
                     for id in ids {
+                        // LOOP-INLINE: stage 3 of #351: fault apply and reversal leave the loop
                         if let Err(error) = self.supervisor.grill().kill(&id).await {
                             eprintln!("smoker: node-kill container {} failed: {error}", id.0);
                         }
@@ -5863,6 +6102,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 if rule.duration_ns == 0 {
                     return Err("node pressure requires a non-zero duration".to_string());
                 }
+                // LOOP-INLINE: stage 3 of #351: fault apply and reversal leave the loop
                 self.node_pressure
                     .apply(rule.id, *cpu_percentage, *memory_percentage)
                     .await?;
@@ -5903,6 +6143,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
         let mut pids = Vec::new();
         for id in ids {
+            // LOOP-INLINE: stage 3 of #351: fault apply and reversal leave the loop
             if let Some(pid) = self.supervisor.grill().pid(&id).await {
                 pids.push(pid);
                 if count > 0 && pids.len() as u32 >= count {
@@ -6060,6 +6301,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 grant.request.fault_type,
                 crate::smoker::types::FaultType::NodePressure { .. }
             ) {
+                // LOOP-INLINE: stage 3 of #351: fault apply and reversal leave the loop
                 self.node_pressure.clear(id).await?;
             }
             if let Some(rule) = self.fault_registry.get(id).cloned() {
@@ -6078,6 +6320,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             grant.request.fault_type,
             crate::smoker::types::FaultType::NodePressure { .. }
         ) {
+            // LOOP-INLINE: stage 3 of #351: fault apply and reversal leave the loop
             self.node_pressure.confirm_no_helpers().await?;
         }
         if self
@@ -6148,6 +6391,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 if self.node_drain_gate.finish()
                     && let Some(readiness) = self.readiness.clone()
                 {
+                    // LOOP-INLINE: in-memory lock, no I/O
                     readiness.ready("node:chaos-drain").await;
                 }
             }
@@ -6163,6 +6407,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 }
             }
             FaultReversal::NodePressure => {
+                // LOOP-INLINE: stage 3 of #351: fault apply and reversal leave the loop
                 if let Err(error) = self.node_pressure.clear(rule.id).await {
                     eprintln!(
                         "smoker: clear node pressure for {} failed: {error}",
@@ -6242,6 +6487,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         // Retry any node-pressure cgroup whose directory lingered after its
         // helper was killed, so a transient removal failure doesn't leave the
         // controller permanently refusing new pressure faults.
+        // LOOP-INLINE: stage 3 of #351: fault apply and reversal leave the loop
         self.node_pressure.retry_pending_cleanup().await;
     }
 
@@ -6286,6 +6532,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             let named_as_source = self.fault_registry.iter().any(|rule| {
                 rule.fault_type.source_app().is_some() && applies_to_caller(rule, &app, &namespace)
             });
+            // LOOP-INLINE: stage 3 of #351: fault apply and reversal leave the loop
             let cgroup_id = match self.network_faults.caller_cgroups.get(&id) {
                 _ if !named_as_source => None,
                 Some((seen_at, cgroup)) if *seen_at == restarts => Some(*cgroup),
@@ -6416,6 +6663,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .map(|instance| instance.id.0.clone())
             .collect();
         for instance in instances {
+            // LOOP-INLINE: stage 3 of #351: fault apply and reversal leave the loop
             match remove_delay_tree(&instance).await {
                 Ok(true) => eprintln!("smoker: removed a stale delay from {instance}"),
                 Ok(false) | Err(crate::smoker::network::NetnsCommandError::NoNamespace { .. }) => {}
@@ -6476,6 +6724,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 continue;
             }
             let bands = wanted.map(Vec::as_slice).unwrap_or_default();
+            // LOOP-INLINE: stage 3 of #351: fault apply and reversal leave the loop
             match program_delay_tree(&instance, bands).await {
                 Ok(()) => match wanted {
                     Some(wanted) => {
@@ -6615,6 +6864,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         });
         for cut in cuts {
             let args = crate::smoker::network::socket_destroy_args(&cut.backends);
+            // LOOP-INLINE: stage 3 of #351: fault apply and reversal leave the loop
             match crate::smoker::network::run_in_instance_netns(&cut.instance_id, "ss", &args).await
             {
                 // Process and host-network workloads have no namespace of
@@ -6673,7 +6923,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 spec.image.as_deref().unwrap_or("<none>")
             ));
         };
+        // LOOP-INLINE: reads the local council state machine; no quorum round trip
         let catalog = council.manifest_catalog().await;
+        // LOOP-INLINE: reads the local council state machine; no quorum round trip
         let security_state = council.security_state().await;
         let root_ca = security_state
             .get_ca(crate::sesame::types::CaRole::Root)
@@ -6711,6 +6963,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let Some(council) = cluster.council.as_ref() else {
             return Vec::new();
         };
+        // LOOP-INLINE: reads the local council state machine; no quorum round trip
         let security_state = council.security_state().await;
 
         let ns_scope = crate::sesame::types::AgeKeyScope::Namespace(namespace.to_string());
@@ -6938,6 +7191,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             });
         }
         let host_port = if spec.port.is_some() {
+            // LOOP-INLINE: in-memory lock, no I/O
             Some(self.supervisor.port_allocator.allocate().await?)
         } else {
             None
@@ -7294,6 +7548,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         // known before the process exists. runc joins an existing
         // `cgroupsPath` directory untouched, keeping the inode stable.
         let cgroup_id = if capability.can_enforce_allowlist() {
+            // LOOP-INLINE: one cgroupfs mkdir, microseconds
             let _ = tokio::fs::create_dir_all(cgroup_path).await;
             egress::cgroup_id_of_path(cgroup_path)
         } else {
@@ -7331,6 +7586,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         if spec.is_none_or(|spec| spec.port.is_none()) {
             return Ok(());
         }
+        // LOOP-INLINE: stage 3 of #351: an unbounded runtime call
         if let Some(reference) = self.supervisor.grill().retain_network_reference(id).await? {
             if reference.instance_id != *id {
                 return Err(BunError::RetirementState {
@@ -7354,6 +7610,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 // than leave a hold nothing tracks. After an uncertain write the
                 // journal may record it, so only retirement may release it.
                 if !matches!(self.discovery_ownership, DiscoveryOwnership::Uncertain) {
+                    // LOOP-INLINE: stage 3 of #351: an unbounded runtime call
                     let _ = self
                         .supervisor
                         .grill()
@@ -7375,6 +7632,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let reference = match self.network_references.get(id).cloned() {
             Some(reference) => reference,
             None => {
+                // LOOP-INLINE: stage 3 of #351: an unbounded runtime call
                 let Some(held) = self.supervisor.grill().network_reference(id).await? else {
                     return Ok(());
                 };
@@ -7382,6 +7640,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     // The hold was retained but its launch never recorded it, so
                     // no publication ever named the address: nothing to withdraw.
                     JournalReference::Unrecorded => {
+                        // LOOP-INLINE: stage 3 of #351: an unbounded runtime call
                         self.supervisor
                             .grill()
                             .release_network_reference(&held)
@@ -7406,6 +7665,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.authorise_local_discovery_release(&reference, remote)
             .await?;
         self.require_discovery_release_permission(&reference)?;
+        // LOOP-INLINE: stage 3 of #351: an unbounded runtime call
         self.supervisor
             .grill()
             .release_network_reference(&reference)
@@ -7486,6 +7746,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 instance_id: instance_id.clone(),
             })?;
         let source_namespace = crate::onion::vip::name_to_id(&source_identity.0);
+        // LOOP-INLINE: reads /proc boot_id, microseconds
         let boot_id = tokio::task::spawn_blocking(super::egress_owners::boot_id)
             .await
             .map_err(|error| BunError::AdoptionState(error.to_string()))?
@@ -7577,6 +7838,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         if binding.phase == PolicyPhase::Retired {
             return Ok(());
         }
+        // LOOP-INLINE: reads /proc boot_id, microseconds
         let boot_id = tokio::task::spawn_blocking(super::egress_owners::boot_id)
             .await
             .map_err(|error| BunError::AdoptionState(error.to_string()))?
@@ -7937,11 +8199,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 )
             })
             .collect();
+        // LOOP-INLINE: in-memory lock, no I/O
         self.supervisor.stop_app(app_name, namespace).await?;
         let mut first_error = None;
         for (id, publishes_address) in instances {
             let result = async {
                 if publishes_address {
+                    // LOOP-INLINE: stage 3 of #351: an unbounded runtime call
                     let reference = self.supervisor.grill().network_reference(&id).await?;
                     if reference.is_none()
                         || self
@@ -8015,6 +8279,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .collect();
 
         for (instance_id, binding) in bindings {
+            // LOOP-INLINE: stage 3 of #351: DNS lookups leave the loop
             let new_resolved =
                 match crate::sesame::egress::re_resolve_egress_async(&binding.allow).await {
                     Ok(r) => r,
@@ -8277,6 +8542,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
 
         // A later probe can complete publication that the transition probe failed.
+        // LOOP-INLINE: in-memory lock, no I/O
         if self
             .supervisor
             .get_instance(&instance_id)
@@ -8381,6 +8647,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     .entry(key.clone())
                     .or_insert_with(|| job.clone());
             }
+            #[cfg(test)]
+            self.loop_stalls.hold(LoopStall::Persist).await;
+            // LOOP-INLINE: fsync'd persist (#351 decision 2); the slow-disk scenario bounds it
             tokio::task::spawn_blocking(move || super::schedules::persist(&directory, records))
                 .await
                 .map_err(|error| BunError::ScheduleState(error.to_string()))?
@@ -8441,6 +8710,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
         let mut due: Vec<(String, String, JobSpec)> = Vec::new();
         let mut next = self.scheduled_jobs.clone();
+        // LOOP-INLINE: in-memory lock, no I/O
         let active = self.deploy_operations.snapshot().await.active_deploys;
         for job in next.values_mut() {
             if active.iter().any(|operation| {
@@ -8521,12 +8791,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .collect();
 
         for id in running_jobs {
+            // LOOP-INLINE: stage 2 of #351: check_jobs reads bounded and in parallel
             let grill_state = match self.supervisor.grill().state(&id).await {
                 Ok(s) => s,
                 Err(_) => continue,
             };
 
             if grill_state == ContainerState::Stopped {
+                // LOOP-INLINE: stage 2 of #351: check_jobs reads bounded and in parallel
                 let exit_code = self.supervisor.grill().exit_code(&id).await;
                 let phase = match exit_code {
                     Some(code) => super::jobs::JobPhase::Exited { code },
@@ -8575,6 +8847,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 }
 
                 // Job failed — attempt restart
+                // LOOP-INLINE: in-memory lock, no I/O
                 match self.supervisor.maybe_restart(&id, now).await {
                     Ok(true) => {
                         // Now in Pending — drive_pending_restarts will handle it
@@ -8636,6 +8909,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .collect();
 
         for id in running_apps {
+            // LOOP-INLINE: stage 2 of #351: check_apps reads bounded and in parallel
             let grill_state = match self.supervisor.grill().state(&id).await {
                 Ok(s) => s,
                 Err(_) => continue,
@@ -8654,6 +8928,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     instance.state = s;
                 }
             }
+            // LOOP-INLINE: in-memory lock, no I/O
             if let Err(BunError::RestartLimitExceeded { .. }) =
                 self.supervisor.maybe_restart(&id, now).await
                 && let Some(instance) = self.supervisor.get_instance_mut(&id)
@@ -8726,6 +9001,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     instance.state = stopped;
                 }
             }
+            // LOOP-INLINE: in-memory lock, no I/O
             match self.supervisor.maybe_restart(&id, Instant::now()).await {
                 Ok(true) => {
                     if let Some(instance) = self.supervisor.get_instance(&id) {
@@ -8857,6 +9133,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 }
             }
 
+            // LOOP-INLINE: stage 2 of #351: restarts move into per-restart tasks
             if let Err(error) = self.supervisor.grill().create(&id, &oci_spec).await {
                 self.record_failed_restart(&id, &error.to_string()).await;
                 continue;
@@ -8898,6 +9175,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             };
             if let Err(e) = restart_egress {
                 eprintln!("bun: restart of {} refused: {e}", id.0);
+                // LOOP-INLINE: stage 2 of #351: restarts move into per-restart tasks
                 if let Err(error) = self.supervisor.grill().stop(&id).await {
                     // The replacement is created but not stopped. Keep the
                     // cleanup owed instead of abandoning it as Failed.
@@ -8925,6 +9203,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 continue;
             }
 
+            // LOOP-INLINE: stage 2 of #351: restarts move into per-restart tasks
             if let Err(error) = self.supervisor.grill().start(&id).await {
                 self.record_failed_restart(&id, &error.to_string()).await;
                 continue;
@@ -8937,6 +9216,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
             // A re-created container may get a fresh IP; refresh it before
             // registering the backend so routing points at the live address.
+            // LOOP-INLINE: stage 2 of #351: restarts move into per-restart tasks
             let container_ip = self.supervisor.grill().container_ip(&id).await;
             if let Some(instance) = self.supervisor.get_instance_mut(&id) {
                 instance.container_ip = container_ip;
@@ -9007,6 +9287,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         // Worker completion releases ownership only after its last runtime
         // mutation. Refuse before retiring a schedule or claiming a stop.
         // Both command admission and cron firing run on this same event loop.
+        // LOOP-INLINE: in-memory lock, no I/O
         if let Some(operation) = self
             .deploy_operations
             .snapshot()
@@ -9055,6 +9336,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .map(|instance| instance.id.clone())
             .collect();
         for id in instances {
+            // LOOP-INLINE: in-memory lock, no I/O
             self.supervisor.retire_instance(&id).await;
         }
         self.deployed_specs
@@ -9083,6 +9365,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let manager = crate::grill::volume::VolumeManager::new(self.volumes_dir.clone());
         let namespace = namespace.to_string();
         let app = app_name.to_string();
+        // LOOP-INLINE: stage 3 of #351: disk cleanup leaves the loop
         tokio::task::spawn_blocking(move || manager.retire_test_storage(&namespace, &app))
             .await
             .map_err(|error| BunError::DeployFailed {
@@ -9115,6 +9398,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let namespace = namespace.to_string();
         let app = app_name.to_string();
         let spec = spec.clone();
+        // LOOP-INLINE: stage 3 of #351: volume provisioning leaves the loop
         tokio::task::spawn_blocking(move || {
             if crate::testkit::lease::valid_test_namespace(&namespace) {
                 manager.prepare_test_storage(&namespace, &app, &spec)?;
@@ -9215,6 +9499,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
         // Stop via supervisor (moves the tracked state to Stopping).
         if !instances.is_empty() {
+            // LOOP-INLINE: in-memory lock, no I/O
             self.supervisor.stop_app(app_name, namespace).await?;
         }
 
@@ -9499,6 +9784,20 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.service_map_tx.send_replace(merged);
     }
 
+    /// Apply `ruleset` with `nft`. A test that stalls the firewall stands in
+    /// for `nft` entirely, so the harness never rewrites the host's firewall.
+    async fn apply_perimeter_ruleset(
+        &self,
+        ruleset: &str,
+    ) -> Result<(), crate::firewall::rules::FirewallError> {
+        #[cfg(test)]
+        if self.loop_stalls.hold(LoopStall::Firewall).await {
+            return Ok(());
+        }
+        // LOOP-INLINE: stage 3 of #351: the nft subprocess leaves the loop
+        crate::firewall::rules::apply_ruleset(ruleset).await
+    }
+
     /// Reconcile the perimeter firewall if cluster membership changed.
     async fn reconcile_firewall(&mut self) {
         if !self.perimeter_config.enabled {
@@ -9527,7 +9826,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
         };
 
-        if let Err(e) = crate::firewall::rules::apply_ruleset(&ruleset).await {
+        if let Err(e) = self.apply_perimeter_ruleset(&ruleset).await {
             eprintln!("warning: firewall reconciliation failed: {e}");
         } else {
             self.last_firewall_nodes = Some(cluster_nodes);
@@ -9580,6 +9879,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .await?;
         if let Some(directory) = self.records_dir.clone() {
             let id = instance_id.0.clone();
+            // LOOP-INLINE: fsync'd persist (#351 decision 2); the slow-disk scenario bounds it
             tokio::task::spawn_blocking(move || {
                 crate::grill::records::remove_record(&directory, &id)
             })
@@ -9602,6 +9902,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     async fn retire_initialisers(&mut self, parent: &InstanceId) -> Result<(), BunError> {
         let children = self.initialisers.get(parent).cloned().unwrap_or_default();
         for child in children {
+            // LOOP-INLINE: stage 3 of #351: an unbounded runtime call
             kill_runtime_instance(
                 self.supervisor.grill(),
                 &child,
@@ -9638,6 +9939,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let identity_dir = self.instance_identity_dir(instance_id);
         let records_dir = self.records_dir.clone();
         let id = instance_id.0.clone();
+        #[cfg(test)]
+        self.loop_stalls.hold(LoopStall::ArtifactCleanup).await;
+        // LOOP-INLINE: stage 3 of #351: disk cleanup leaves the loop
         let cleanup = tokio::task::spawn_blocking(move || {
             crate::sesame::identity::cleanup_identity_dir(&identity_dir)?;
             if let Some(directory) = records_dir {
@@ -9733,6 +10037,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
         // Fast-fail check against the replicated state (unknown/expired/already
         // consumed token). The authoritative consume happens atomically below.
+        // LOOP-INLINE: reads the local council state machine; no quorum round trip
         let security_state = council.security_state().await;
         let token_hash = crate::sesame::join::check_join_token(token, node_id, &security_state)
             .map_err(|e| BunError::SecurityError {
@@ -9742,6 +10047,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         // Atomically consume the token and allocate a serial in one committed
         // Raft entry (PKI5). Two racing joiners with the same token: exactly one
         // gets a serial here; the loser is refused, so a token issues one cert.
+        // LOOP-INLINE: stage 3 of #351: an unbounded council write
         let serial = match council
             .write(crate::council::RaftRequest::ConsumeJoinTokenForIssue { token_hash })
             .await
@@ -9764,6 +10070,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         };
 
         // Confirm the identity still has authority after consuming the token.
+        // LOOP-INLINE: stage 3 of #351: an unbounded council write
         let security_state = council
             .security_state_linearizable()
             .await
@@ -9822,6 +10129,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             manifest_digest: digest.clone(),
             signature,
         };
+        // LOOP-INLINE: stage 3 of #351: an unbounded council write
         let response = council
             .write(crate::council::RaftRequest::AttachSignature(attach))
             .await
@@ -9937,6 +10245,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             for instance in batch {
                 reads.push(self.runtime_evidence(instance, deadline));
             }
+            // LOOP-INLINE: every read shares the 500 ms status deadline
             evidence.extend(futures_util::future::join_all(reads).await);
         }
         instances
@@ -10040,6 +10349,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
         let mut all_logs = String::new();
         for id in &instance_ids {
+            // LOOP-INLINE: stage 3 of #351: reading whole captures leaves the loop
             let logs = self.supervisor.grill().logs(id).await.unwrap_or_default();
             if !logs.is_empty() {
                 if instance_ids.len() > 1 {
@@ -10084,10 +10394,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         // Send initial tail lines if requested
         if let Some(n) = tail {
             for id in &instance_ids {
+                // LOOP-INLINE: stage 3 of #351: the follow tail leaves the loop
                 let logs = self.supervisor.grill().logs(id).await.unwrap_or_default();
                 let tailed = tail_lines(&logs, n);
                 let prefix = prefix(id).unwrap_or_default();
                 for line in tailed.lines() {
+                    // LOOP-INLINE: stage 3 of #351: the follow tail leaves the loop
                     if lines.send(format!("{prefix}{line}")).await.is_err() {
                         return;
                     }
@@ -10673,6 +10985,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         timeout: std::time::Duration,
     ) -> Result<bool, BunError> {
         self.withdraw_instance_backend(id).await?;
+        // LOOP-INLINE: in-memory lock, no I/O
         Ok(self
             .drains
             .drain_all(&[crate::wrapper::draining::DrainCommand {
@@ -10692,6 +11005,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         {
             return Ok(());
         }
+        // LOOP-INLINE: stage 2 of #351: restarts move into per-restart tasks
         kill_runtime_instance(self.supervisor.grill(), id, self.stop_confirmation_timeout).await
     }
 
@@ -10824,6 +11138,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.retain_stopped_instance(old_id);
         self.withdraw_instance_backend(old_id).await?;
         self.retire_instance_artifacts(old_id).await?;
+        // LOOP-INLINE: in-memory lock, no I/O
         self.supervisor.retire_instance(old_id).await;
         self.sync_firewall_ebpf().await;
         self.rebuild_routing_table().await;
@@ -10869,6 +11184,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         // longer than needed) for it to exit, then force-kill (SIGKILL) whatever
         // is still running so nothing is orphaned.
         for id in &ids {
+            // LOOP-INLINE: shutdown's last turn; nothing is queued behind it
             let _ = self.supervisor.grill().stop(id).await;
         }
         let deadline = Instant::now() + self.shutdown_grace;
@@ -10886,6 +11202,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             if all_stopped || Instant::now() >= deadline {
                 break;
             }
+            // LOOP-INLINE: shutdown's last turn; nothing is queued behind it
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         for id in &ids {
@@ -10893,6 +11210,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 self.supervisor.grill().state(id).await,
                 Ok(ContainerState::Stopped)
             ) {
+                // LOOP-INLINE: shutdown's last turn; nothing is queued behind it
                 let _ = self.supervisor.grill().kill(id).await;
             }
         }
@@ -10964,6 +11282,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 count,
                 reply,
             } => {
+                // LOOP-INLINE: in-memory lock, no I/O
                 let result = self
                     .supervisor
                     .add_app_replicas(&app_name, &namespace, &spec, count, Instant::now())
@@ -11008,6 +11327,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 reply,
             } => {
                 let now = Instant::now();
+                // LOOP-INLINE: in-memory lock, no I/O
                 let result = self
                     .supervisor
                     .deploy_app(&app_name, &namespace, &spec, now)
@@ -11090,6 +11410,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                             .get_instance(id)
                             .is_some_and(|instance| instance.state == ContainerState::Pending)
                         {
+                            // LOOP-INLINE: in-memory lock, no I/O
                             self.supervisor.retire_instance(id).await;
                         }
                     }
@@ -11198,6 +11519,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     {
                         instance.state = state;
                     }
+                    // LOOP-INLINE: stage 3 of #351: an unbounded runtime call
                     let _ = self.supervisor.grill().stop(&instance_id).await;
                 }
                 let _ = reply.send(result);
@@ -11278,6 +11600,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
             DeployOp::RetainRollingInstance { instance, reply } => {
                 let id = instance.instance_id.clone();
+                // LOOP-INLINE: stage 3 of #351: an unbounded runtime call
                 let container_ip = self.supervisor.grill().container_ip(&id).await;
                 let result = match self.supervisor.get_instance_mut(&id) {
                     Some(owner)
@@ -13452,6 +13775,9 @@ pub fn workload_spiffe_uri(
 mod tests {
     use super::*;
     use crate::grill::mock::MockGrill;
+
+    mod loop_harness;
+    mod loop_rule;
 
     #[test]
     fn trace_targets_are_positional_arguments_not_shell_source() {
