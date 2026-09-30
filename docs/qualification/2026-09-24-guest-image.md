@@ -1,7 +1,7 @@
 # Baked guest image, 24 September 2026
 
 Measurements for plan item Z3.1
-([zero to cluster](../plans/2026-09-23-zero-to-cluster.md)): the quickstart
+([zero to cluster](../plans/archive/2026-09-23-zero-to-cluster.md)): the quickstart
 guest image built by `scripts/release/build_guest_image.sh`, compared with the
 stock Ubuntu image it's built from.
 

@@ -52,7 +52,7 @@ src/
 docs/
   README.md            # User documentation
   whitepaper.md        # Architectural vision
-  progress.md          # What's done, what's next
+  roadmap.md           # Releases, status and known gaps
   design/              # Per-component design docs
   book/                # "Building Reliaburger" chapters
   manual/              # These chapters

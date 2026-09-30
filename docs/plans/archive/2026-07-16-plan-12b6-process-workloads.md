@@ -1,7 +1,7 @@
 # Phase 12b.6 — Process workloads and platform capabilities (Theme PW)
 
 Theme: `docs/progress.md` §12b.6. Findings: H8, D17, D15, old M22/M23.
-Source: `docs/plans/2026-07-10-review-past-phase-12.md`,
+Source: `docs/plans/archive/2026-07-10-review-past-phase-12.md`,
 `...2026-07-09-review-design-discrepancies.md`.
 
 Harness contract (#106): green = `make ci` (nextest portable + doctest +

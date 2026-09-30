@@ -597,7 +597,7 @@ since nothing gates on their numbers yet.
 
 Speed is only half of it. A flaky suite teaches everyone to press "re-run" without reading,
 and then a real race looks exactly like noise. Our retries stay at zero, so a failure that
-passes on a re-run goes into a register in `docs/progress.md` with its cause the same day. Of
+passes on a re-run goes into a register (now `docs/flakes.md`) with its cause the same day. Of
 the seven we chased down, three were product races, not test problems: a node back from a
 fault spread stale suspicions about healthy peers, a rollout interrupted by a crash dropped the
 reservation its own retirement needed, and a two-second kill deadline was too short for a busy
@@ -3876,7 +3876,7 @@ Finally, a milestone checkbox needs a scope. The cluster upgrade coordinator
 already checks gossip rejoin; the replacement process's local boot-marker check
 still has a separate gap. Calling all upgrade verification either finished or
 missing hides useful information. We now keep completed milestones and explicit
-residual tasks side by side in [progress](../progress.md).
+residual tasks side by side in the [roadmap](../roadmap.md).
 
 Portable tests and controlled servers let us force awkward orderings quickly.
 They don't establish that three independent Linux nodes survive the complete
@@ -3898,3 +3898,13 @@ The audit's findings kept rhyming, so here they are in one place. Each is a case
 Several failures were in the harness rather than the product, and they're worth a sentence each. A fixture that released a port and then started Bun on it lost the port to another test, and its readiness probe cheerfully connected to *that* listener; fixtures now wait for Bun's own announcement of the address it bound. The cluster-upgrade job failed because the debug `bun` binary outgrew Pickle's 512 MiB upload limit; the harness now strips debug symbols from its copy. A nextest "leaked handle" warning turned out to be a runner bug on macOS, fixed upstream, so we pinned the fixed release and made leaks fail the gate instead of raising the timeout. And a few async tasks were doing blocking filesystem work, sweeping directories and hashing a stored Bun binary on a Tokio worker thread; that work now runs through `spawn_blocking`, and the one inventory read with no deadline got the same five-second bound as the others.
 
 One gap we closed by adding a test rather than fixing code. An app exits, Bun starts its replacement, then dies before saving the replacement's adoption record. Our physical interruption tests covered first deployments and explicit retries, but not this automatic restart. A test-only Linux interposer now pauses the adoption record's `fsync` at exactly that point and kills the real Bun process. Recovery must retire the unrecorded process before reporting ready. The existing code passed. Now it's a claim someone can check.
+
+### A test has to be able to fail
+
+The testing assessment after 0.1.0 found three pieces of evidence that couldn't say no.
+
+The cgroup v2 detector's test called the detector on Linux and threw the answer away (`let _ = result;`). It proved the function didn't panic. It would have passed if the detector said "v1" on a v2 host, or "v2" on a host with no cgroups at all. The fix is a small filesystem boundary: `check_cgroup_v2` now just passes `/sys/fs/cgroup` to `check_cgroup_v2_at(root: &Path)`, and three tests hand it fake mount trees in a temporary directory, one with `cgroup.controllers` (v2), one with a per-controller directory and no controllers file (v1), and one that doesn't exist. The host test still runs, and now it asserts: every Linux host that runs the suite is provisioned with v2, so a failure there is a real finding. How do we know the new tests can fail? We broke the detector on purpose, dropping the controllers check, and watched the v1 test go red.
+
+The node-pressure acceptance test was `#[ignore]`d (good) but, when selected without `RELIABURGER_NODE_PRESSURE_TESTS=1`, printed "skipped" and returned. Nextest has no idea what "skipped" means in a test's stderr. It saw a function return and reported a pass. Selecting an ignored test is a request to run it, so a missing prerequisite is now an `assert_eq!` failure with a message saying which variable to set. The one pattern we left alone is the subprocess fixture: a test that exists only to be re-executed by its parent (its `#[ignore]` reason says so) still returns when the parent didn't start it, because `make test-linux` selects whole binaries and would otherwise fail on every fixture.
+
+The third was the V02 loop summary, the script that turns hours of stress loops into a verdict. It wrote `Verdict: **FAIL**` and exited 0. It counted a JUnit `<skipped/>` as a run. And its combined mode summarised whichever lanes happened to upload a file, so a lane that never ran simply left the table, and the denominator shrank to fit. Now every row carries a status (pass, fail, skip or incomplete) and the commit it belongs to. A test with fewer runs than its loop's iterations is incomplete. The combined record is checked against `scripts/release/v02-loop-lanes.json`, the list of lanes the workflow runs, and a unit test keeps that list in step with the workflow matrix. A missing lane, a missing test, a stray lane or a record from another commit fails the summary, and the exit status finally says the same thing as the text.

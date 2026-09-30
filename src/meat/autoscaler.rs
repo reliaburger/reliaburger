@@ -105,6 +105,12 @@ pub enum AutoscaleConfigError {
     MinExceedsMax { min: u32, max: u32 },
     #[error("autoscale max must be at least 1")]
     ZeroMax,
+    #[error(
+        "autoscale min must be at least 1: scale-to-zero isn't supported, because an app \
+         with no replicas reports no cpu or memory to scale back up on \
+         (use `relish stop` to park an app at zero)"
+    )]
+    ZeroMin,
     #[error("autoscale {field} {value:?} is not a valid duration")]
     InvalidDuration { field: &'static str, value: String },
     #[error("autoscale {field} must be positive")]
@@ -124,8 +130,9 @@ impl AutoscaleConfig {
     /// Parse and validate from an `AutoscaleSpec` plus the app's `cpu` and
     /// `memory` ranges, applying defaults for optional fields. Rejects an
     /// unsupported metric, a missing or zero request for the chosen
-    /// metric, `min > max`, a zero max, unparseable or zero
-    /// windows/cooldowns, and an out-of-range hysteresis threshold. An
+    /// metric, `min > max`, a zero max, a zero min (no scale-to-zero),
+    /// unparseable or zero windows/cooldowns, and an out-of-range
+    /// hysteresis threshold. An
     /// invalid block is an error, never a silent clamp or a silent no-op.
     pub fn from_spec(
         spec: &AutoscaleSpec,
@@ -155,6 +162,13 @@ impl AutoscaleConfig {
             })?;
         if spec.max == 0 {
             return Err(AutoscaleConfigError::ZeroMax);
+        }
+        // Scale-to-zero would need a wake-up signal that exists without a
+        // running replica (queued requests at the ingress, say). CPU and
+        // memory are sampled from running instances, so at zero there is
+        // nothing to scale back up on.
+        if spec.min == 0 {
+            return Err(AutoscaleConfigError::ZeroMin);
         }
         if spec.min > spec.max {
             return Err(AutoscaleConfigError::MinExceedsMax {
@@ -699,6 +713,7 @@ mod tests {
             AutoscaleConfigError::ZeroMax
         );
         let bad_threshold = AutoscaleSpec {
+            min: 1,
             max: 5,
             scale_down_threshold: Some(1.5),
             ..base
@@ -707,6 +722,22 @@ mod tests {
             AutoscaleConfig::from_spec(&bad_threshold, CPU_REQUEST, None),
             Err(AutoscaleConfigError::InvalidThreshold { .. })
         ));
+    }
+
+    #[test]
+    fn from_spec_rejects_zero_min() {
+        let spec = AutoscaleSpec {
+            metric: "cpu".to_string(),
+            target: "70%".to_string(),
+            min: 0,
+            max: 5,
+            evaluation_window: None,
+            cooldown: None,
+            scale_down_threshold: None,
+        };
+        let err = AutoscaleConfig::from_spec(&spec, CPU_REQUEST, None).unwrap_err();
+        assert_eq!(err, AutoscaleConfigError::ZeroMin);
+        assert!(err.to_string().contains("scale-to-zero"), "{err}");
     }
 
     #[test]
