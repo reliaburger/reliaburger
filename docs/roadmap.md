@@ -40,24 +40,19 @@ migration and no feature gate
     [#281](https://github.com/reliaburger/reliaburger/issues/281)–[#284](https://github.com/reliaburger/reliaburger/issues/284);
   - [x] UI polish ([#280](https://github.com/reliaburger/reliaburger/issues/280))
     and the two flakes from #277's CI ([#285](https://github.com/reliaburger/reliaburger/issues/285));
-  - [ ] the static review's defects ([#258](https://github.com/reliaburger/reliaburger/pull/258)):
-    snapshots ([#291](https://github.com/reliaburger/reliaburger/issues/291)–[#294](https://github.com/reliaburger/reliaburger/issues/294)),
-    GitOps ([#295](https://github.com/reliaburger/reliaburger/issues/295)–[#297](https://github.com/reliaburger/reliaburger/issues/297),
-    [#305](https://github.com/reliaburger/reliaburger/issues/305)), the
-    permission matrix for read routes ([#298](https://github.com/reliaburger/reliaburger/issues/298)),
-    autoscaler `min = 0` ([#299](https://github.com/reliaburger/reliaburger/issues/299))
-    and docs that contradict 0.1.0 ([#300](https://github.com/reliaburger/reliaburger/issues/300));
-  - [ ] tests that can't fail ([#301](https://github.com/reliaburger/reliaburger/issues/301),
-    [#302](https://github.com/reliaburger/reliaburger/issues/302)) and the
-    open flake ([#318](https://github.com/reliaburger/reliaburger/issues/318));
-  - [ ] further known bugs: a changed ingress host ignored on redeploy
-    ([#307](https://github.com/reliaburger/reliaburger/issues/307)), log
-    forwarders not resuming from the checkpoint
-    ([#308](https://github.com/reliaburger/reliaburger/issues/308)), the
-    allocation error after a starved deploy
-    ([#309](https://github.com/reliaburger/reliaburger/issues/309)), Mayo
-    memory growth over a long soak ([#310](https://github.com/reliaburger/reliaburger/issues/310)),
-    and the rest of the milestone;
+  - [x] from the static review ([#258](https://github.com/reliaburger/reliaburger/pull/258)): the
+    permission matrix for read routes ([#298](https://github.com/reliaburger/reliaburger/issues/298)) and docs that contradicted
+    0.1.0 ([#300](https://github.com/reliaburger/reliaburger/issues/300));
+  - [x] a changed ingress host ignored on redeploy ([#307](https://github.com/reliaburger/reliaburger/issues/307)) and log
+    forwarders not resuming from the checkpoint ([#308](https://github.com/reliaburger/reliaburger/issues/308));
+  - [ ] the rest of the static review's defects: snapshots
+    ([#291](https://github.com/reliaburger/reliaburger/issues/291)–[#294](https://github.com/reliaburger/reliaburger/issues/294)), GitOps ([#295](https://github.com/reliaburger/reliaburger/issues/295)–[#297](https://github.com/reliaburger/reliaburger/issues/297), [#305](https://github.com/reliaburger/reliaburger/issues/305)) and
+    autoscaler `min = 0` ([#299](https://github.com/reliaburger/reliaburger/issues/299));
+  - [ ] tests that can't fail ([#301](https://github.com/reliaburger/reliaburger/issues/301), [#302](https://github.com/reliaburger/reliaburger/issues/302)) and the open flake
+    ([#318](https://github.com/reliaburger/reliaburger/issues/318));
+  - [ ] further known bugs: the allocation error after a starved deploy
+    ([#309](https://github.com/reliaburger/reliaburger/issues/309)), Mayo memory growth over a long soak ([#310](https://github.com/reliaburger/reliaburger/issues/310)), and the rest
+    of the milestone;
   - [ ] housekeeping: the plans that led to 0.1.0 archived, and this page
     replacing the old implementation checklist.
 - [ ] **0.1.2: images**
