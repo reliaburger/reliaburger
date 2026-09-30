@@ -360,9 +360,25 @@ class Leaks(Evidence):
     def test_an_old_expectation_does_not_excuse_a_later_restart(self):
         status = [{"node": "rb-a-1", "id": "default__web-0"}]
         self.evaluate(self.snapshot(**{"status_json": status, "inventory__rb-a-1_txt": INVENTORY}))
-        checker.main(["expect", str(self.evidence), "restart", "rb-a-1", "--at", str(NOW - checker.EXPECT_WINDOW - 1)])
-        _, verdict = self.evaluate(self.snapshot(**{"status_json": status, "inventory__rb-a-1_txt": INVENTORY.replace("nrestarts 0", "nrestarts 1")}))
+        checker.main(["expect", str(self.evidence), "restart", "rb-a-1", "--at", str(NOW)])
+        # A check well after the kill saw no restart: the kill didn't cause one.
+        later = NOW + checker.RESTART_GRACE
+        _, quiet = self.evaluate(self.snapshot(ts=later, **{"status_json": status, "inventory__rb-a-1_txt": INVENTORY}))
+        _, verdict = self.evaluate(self.snapshot(ts=later + 300, **{"status_json": status, "inventory__rb-a-1_txt": INVENTORY.replace("nrestarts 0", "nrestarts 1")}))
+        self.assertEqual(self.failures(quiet), [])
         self.assertIn("bun-restart", self.failures(verdict))
+
+    def test_a_kill_first_checked_long_after_still_explains_its_restart(self):
+        # 0.1.1 candidate 2's fast tier: the upgrade slot killed the leader
+        # mid-walk, then blocked for 718 s (a walk and a 600 s rollback
+        # wait) without a check. The restart was the harness's own, however
+        # long it took for a check to look.
+        status = [{"node": "rb-a-1", "id": "default__web-0"}]
+        self.evaluate(self.snapshot(**{"status_json": status, "inventory__rb-a-1_txt": INVENTORY}))
+        killed = NOW + 100
+        checker.main(["expect", str(self.evidence), "restart", "rb-a-1", "--at", str(killed)])
+        _, verdict = self.evaluate(self.snapshot(ts=killed + 718, **{"status_json": status, "inventory__rb-a-1_txt": INVENTORY.replace("nrestarts 0", "nrestarts 1")}))
+        self.assertEqual(self.failures(verdict), [])
 
     def test_file_descriptors_rising_every_ten_minutes_for_half_an_hour_fail(self):
         # e8c9653's leader: the floor went 206 -> 254 -> 399 -> 531 while
@@ -590,6 +606,31 @@ class Recovery(Evidence):
     def test_ingress_errors_outside_a_fault_window_fail(self):
         _, verdict = self.evaluate(self.snapshot(kind="light", **{"http_txt": "502 0.10\n"}))
         self.assertEqual(self.failures(verdict), ["ingress-http"])
+
+
+class ReleaseVersion(unittest.TestCase):
+    """The upgrade walk rolls back to the candidate's own version, which the
+    cluster reports before the first walk. 0.1.1 candidate 2's fast tier
+    rolled back to a hardcoded v0.1.0 and waited 600 s for it."""
+
+    def release_version(self, *versions, soak="bun-v0.1.1-soak.2"):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            code = checker.main(["release-version", "--soak-bun", soak, *versions])
+        return code, out.getvalue().strip()
+
+    def test_every_node_agreeing_names_the_release(self):
+        self.assertEqual(self.release_version("v0.1.1", "v0.1.1", "v0.1.1"), (0, "0.1.1"))
+        self.assertEqual(self.release_version("0.2.0", "v0.2.0", "0.2.0", soak="bun-v0.2.0-soak.1"), (0, "0.2.0"))
+
+    def test_nodes_disagreeing_or_unreachable_name_nothing(self):
+        self.assertEqual(self.release_version("v0.1.1", "v0.1.1", "v0.1.0")[0], 1)
+        self.assertEqual(self.release_version("v0.1.1", "?", "v0.1.1")[0], 1)
+        self.assertEqual(self.release_version()[0], 1)
+
+    def test_a_cluster_already_on_the_soak_build_is_refused(self):
+        # Rolling "back" to the soak build itself would prove nothing.
+        self.assertEqual(self.release_version("v0.1.1-soak.2", "v0.1.1-soak.2", "v0.1.1-soak.2")[0], 1)
 
 
 class TomlEditing(unittest.TestCase):
