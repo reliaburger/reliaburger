@@ -244,7 +244,7 @@ and the [release asset digest fields](https://docs.github.com/en/rest/releases/r
 The website and installer are separate static assets under `docs/website`,
 published by `static.yml`. GitHub Pages cannot select a different response for
 curl and a browser at `/`; the shell endpoint is `/install.sh`. The bootstrap
-installs the version in its `RELIABURGER_VERSION` default (`v0.1.0` today), so
+installs the version in its `RELIABURGER_VERSION` default (`v0.1.1` today), so
 bump that default in the same change that announces a newer release.
 
 Before tagging a release, complete the managed-cluster and clean-install
@@ -403,8 +403,17 @@ the real `curl … | sh` install against it on every host we advertise.
 8. **Update the docs** once the release is public: the release date in the
    [roadmap](roadmap.md) (tick the release) and the homepage
    (`docs/website/index.html`), and the bootstrap's default version if it
-   changed. The website deploys from `main`, so merge that change after
-   promotion, not before.
+   changed. Grep for the previous version to find the other "current
+   release" lines (the READMEs, the quickstart, the tour chapter, the
+   `VERSION=` lines in [linux-servers.md](linux-servers.md)), and leave
+   history alone. Update the five-minute tour to show off the release's new
+   features (the homepage's `data-tour` commands, the manual's
+   `08_five-minute-tour.md` and `scripts/demo/tour.sh` together), then
+   re-record `docs/website/assets/tour.cast` against the published install
+   with `scripts/demo/tour.sh --record … --install vX.Y.Z`
+   ([how](website/README.md#re-recording-the-tour)), and move the poster time
+   in `index.html` if its moment moved. The website deploys from `main`, so
+   merge that change after promotion, not before.
 
 ## Soaking a candidate in CI
 
