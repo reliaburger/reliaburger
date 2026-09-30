@@ -14,7 +14,7 @@ on:
   workflow_dispatch:
     inputs:
       staging_tag:
-        description: Staging pre-release tag (staging-v0.1.0-RUN-ATTEMPT) or its https base URL
+        description: Staging pre-release tag (staging-vX.Y.Z-RUN-ATTEMPT) or its https base URL
         required: true
         type: string
       qualified_digest:
