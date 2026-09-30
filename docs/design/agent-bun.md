@@ -1201,7 +1201,7 @@ Bun uses cgroup v2 exclusively. The cgroup hierarchy is:
 
 ### 5.5 Self-Upgrade Sequence
 
-The self-upgrade mechanism replaces the Bun binary on every node in a rolling fashion. Bun is the orchestrator for its own upgrade. This section describes the shipped implementation (Phase 14, `src/upgrade/`); the design rationale for the choices below lives in `docs/plans/2026-07-06-plan-self-upgrade.md`.
+The self-upgrade mechanism replaces the Bun binary on every node in a rolling fashion. Bun is the orchestrator for its own upgrade. This section describes the shipped implementation (Phase 14, `src/upgrade/`); the design rationale for the choices below lives in `docs/plans/archive/2026-07-06-plan-self-upgrade.md`.
 
 Three decisions shape everything that follows, and each earns its keep against the alternatives an earlier draft assumed:
 

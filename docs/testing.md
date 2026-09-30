@@ -79,7 +79,7 @@ a user would install it. The runbook is [`releasing.md`](releasing.md).
 ## When a test flakes
 
 CI runs with `retries = 0`. A test that passes on a re-run still failed once,
-so it goes in the [known flakes register](progress.md#known-flakes) the same
+so it goes in the [known flakes register](flakes.md) the same
 day, with its cause, and stays there until a fix has landed and a loop that used
 to fail passes. Most rows turned out to be product bugs, not test bugs.
 
