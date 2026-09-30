@@ -1,6 +1,7 @@
 # Review: the node agent's loop
 
-**Status:** for discussion. Nothing here is decided and no code has changed.
+**Status:** decided, 30 September 2026. The maintainer approved option (c)
+with the answers in [Decision](#decision). Work is tracked in #351.
 Code references are against `9ba64f6c` (main, 30 September 2026).
 
 Bun's agent loop (`run_loop`, `src/bun/agent.rs:3748`) caused most of the soak
@@ -350,3 +351,40 @@ the least.
    the loop entirely and is small on its own.
 6. **#346.** The scheduler pile-up amplified #279. Fix it before the harness
    work, or in parallel?
+
+## Decision
+
+The maintainer approved recommendation 1: **option (c)**. We keep the
+single-owner loop and add a meter, a starvation harness and a rule, then fix
+what the harness finds. (b) stays on the table for 0.4.0's design; (a) is off
+it. The open questions are answered as follows.
+
+1. **Turn threshold: 1 s.** A soak tier whose worst turn exceeds 1 s fails.
+   It sits well under the report deadline (2 s), so a node fails the checker
+   before it goes stale, not after.
+2. **fsync'd persists may stay inline.** Each one carries a `// LOOP-INLINE:`
+   comment saying why, and the harness bounds it under slow-disk conditions.
+   Answering before state is durable would undo what the job ledger and
+   discovery owners were written for.
+3. **Restarts move into per-restart tasks now**, in (c). The task takes the
+   kill, create and start and reports back to the loop, shaped so that (b)'s
+   per-instance supervisor can absorb it later instead of replacing it.
+4. **The upgrade fetch leaves the loop.** Only the final commit and exec stay
+   on it, so status and reports keep flowing while a node downloads its next
+   binary.
+5. **Status reads a published snapshot.** The loop publishes a status snapshot
+   on a `tokio::sync::watch` channel and `/v1/status` reads it without asking
+   the loop. That takes the largest command class off the loop entirely.
+6. **#346 is fixed** (#349 merged), so it no longer amplifies the harness
+   work.
+
+### Stages
+
+The work is three stages, each its own PR under #351.
+
+| Stage | What it does | Done when |
+|---|---|---|
+| 1 | The meter (`bun_agent_loop_turn_seconds{branch}` through Mayo, the worst turn recorded under `cfg(test)`), the starvation harness (slowable `MockGrill`, a council write that hangs, a log client that never reads, one scenario per stall in section 3) and the rule (`// LOOP-INLINE:` on every allowlisted await, plus a mechanical check). Scenarios that fail are `#[ignore = "stage N of #351"]` | The meter exports, the check runs in `make ci`, every section 3 stall has a scenario |
+| 2 | Status via `watch`; bounded, parallel `check_apps` and `check_jobs`; restarts in per-restart tasks | The stage-2 scenarios run un-ignored and pass |
+| 3 | The remaining inline awaits leave the loop (`Logs`, the `FollowLogs` tail, `JoinIssue`, `SignImage`, the upgrade fetch, DNS re-resolution, `nft`, and whatever else the harness flags); the V02 soak checker fails a tier on the meter's worst turn | No ignored harness scenario is left, and the checker gates on the meter |
+
