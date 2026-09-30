@@ -319,6 +319,10 @@ Fixes from the [static review in PR #258](https://github.com/reliaburger/reliabu
 - [x] **B14** Match GitOps trusted signing keys exactly against the `VALIDSIG` signing or primary fingerprint (GPG) or the `SHA256:` fingerprint (SSH), not as a substring of all verifier output. Follow-up: verify against a private `GNUPGHOME` holding only the trusted keys.
 - [x] **B15** Treat a committed but refused GitOps write (`CouncilResponse::Refused`) as unapplied, so the sync doesn't advance `last_applied_commit` past it.
 - [x] **B17** List GitOps files with `ls-tree -z` so tab and non-ASCII paths aren't dropped, and fail the sync when a listed file can't be read, instead of deleting what it declared.
+- [x] **B10** Admit a GitOps webhook delivery all or nothing: the rate check runs before the delivery ID is recorded, so a delivery refused as rate-limited is accepted when the provider retries it after the window. The validator takes an injected clock.
+- [x] **B13** Decide whether a GitOps commit changes a script by comparing the parsed `script` values of the last applied tree and the candidate tree, not by searching the diff for an added line containing `script`. A multiline body edit, a deletion, and a comparison that can't complete (an unreadable previous tree) all need a trusted signature, and so does any script on the first sync.
+- [x] **B16** Reconcile on every GitOps tick, not only when Git moves: an unchanged commit is still diffed against desired state, so manual drift is repaired on the next poll. Autoscale overrides and `relish stop` live outside the app spec and survive it. A tick with nothing to change writes nothing to Raft.
+- [x] **B19** Bound every GitOps `git` subprocess: a new session with no terminal, prompts off, a 120 s deadline, an output cap, cancellation on shutdown, and a process-group kill and reap however it ends. The sync loop finishes promptly on shutdown.
 
 Fixes for the 0.1.1 milestone:
 

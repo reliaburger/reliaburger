@@ -122,14 +122,24 @@ everything. List full fingerprints: the 40-hex-digit GPG fingerprint of the
 signing key or its primary key (case and spaces don't matter), or an SSH
 key's `SHA256:…` fingerprint exactly as `ssh-keygen -lf` prints it. Git checks
 the signature against the node's own GnuPG keyring or
-`gpg.ssh.allowedSignersFile`, so install the public keys there. There's no `relish gitops` command: the web dashboard's GitOps
-page shows the last sync.
+`gpg.ssh.allowedSignersFile`, so install the public keys there. Even without
+`require_signed_commits`, a commit that adds, edits or removes an app's or
+job's `script` needs a signature from one of `trusted_signing_keys`, and so
+does any script on the first sync.
+
+Every poll reconciles, not just polls that find a new commit: change or delete
+a GitOps-managed app by hand and the next poll puts it back. Autoscaler
+replica overrides and `relish stop` are left alone. A `git` command that runs
+longer than two minutes is killed and the sync retried later, so a stalled
+remote can't wedge GitOps. There's no `relish gitops` command: the web
+dashboard's GitOps page shows the last sync.
 
 To sync on push rather than on the next poll, point a GitHub, Gitea or GitLab
 webhook at `https://NODE:9117/v1/gitops/webhook` with the same secret. The
 endpoint needs no token, only the HMAC signature (`X-Hub-Signature-256`) or
 GitLab's `X-Gitlab-Token`. It refuses replays and is rate-limited
-(`webhook_rate_limit`, 10 a minute by default).
+(`webhook_rate_limit`, 10 a minute by default). A delivery refused for the
+rate limit isn't counted as seen, so the provider's retry gets through.
 
 ## Backing up the council
 

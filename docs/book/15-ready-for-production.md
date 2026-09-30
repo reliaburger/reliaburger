@@ -241,6 +241,16 @@ shutdown did not complete. Reporting tests join listeners, aggregators and worke
 success and failure paths. Ports come from binding `127.0.0.1:0`, which asks the operating
 system for an unused port, and every filesystem fixture lives in a temporary directory.
 
+Production code had the same blind spot, one level down. GitOps ran `git` with
+`Command::output()` inside `spawn_blocking`, so a stuck remote held the only sync loop, and
+shutdown waited with it (B19, Chapter 7). A timeout around the task would have freed the loop
+and left `git` running. The fix gives each child an owner that can end it: its own session and
+process group, a deadline, the shutdown token, and a group kill and reap however it finishes.
+The tests prove the ending, not the waiting. A fetch pointed at an upload-pack that never
+answers must fail inside its budget, the sleeping descendant it left must be gone, and the
+next fetch must work. Cancelling shutdown during that fetch must finish the loop's
+`JoinHandle` within five seconds.
+
 This matters more with nextest. Cargo's built-in runner executes the tests in one test binary
 in a process. Nextest runs each test in its own process and schedules tests from different
 binaries concurrently. Isolation exposes assumptions about global ports, shared paths and
