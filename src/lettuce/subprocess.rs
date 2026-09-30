@@ -398,7 +398,12 @@ mod tests {
     #[test]
     fn the_child_has_no_controlling_terminal() {
         let mut command = Command::new("sh");
-        command.args(["-c", "exec 3</dev/tty && echo has-tty || echo no-tty"]);
+        // The probe runs in a subshell: a failed redirection on a special
+        // builtin ends a POSIX shell (dash does), so only the subshell dies.
+        command.args([
+            "-c",
+            "if (: </dev/tty) 2>/dev/null; then echo has-tty; else echo no-tty; fi",
+        ]);
         let output = run_bounded(command, &short_budget(Duration::from_secs(10)), "tty").unwrap();
         assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "no-tty");
     }
