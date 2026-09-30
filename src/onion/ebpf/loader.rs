@@ -417,19 +417,27 @@ fn check_kernel_version() -> Result<(), OnionError> {
     }
 }
 
-/// Verify cgroup v2 is mounted.
+/// Verify cgroup v2 is mounted at `/sys/fs/cgroup`.
 fn check_cgroup_v2() -> Result<(), OnionError> {
-    let cgroup_path = Path::new("/sys/fs/cgroup");
-    if !cgroup_path.exists() {
+    check_cgroup_v2_at(Path::new("/sys/fs/cgroup"))
+}
+
+/// Verify the unified (v2) hierarchy is mounted at `cgroup_root`. Only v2
+/// exposes `cgroup.controllers` at the root; a v1 mount has one directory
+/// per controller instead.
+fn check_cgroup_v2_at(cgroup_root: &Path) -> Result<(), OnionError> {
+    if !cgroup_root.exists() {
         return Err(OnionError::EbpfLoadFailed {
-            reason: "/sys/fs/cgroup does not exist".to_string(),
+            reason: format!("{} does not exist", cgroup_root.display()),
         });
     }
 
-    let controllers = cgroup_path.join("cgroup.controllers");
-    if !controllers.exists() {
+    if !cgroup_root.join("cgroup.controllers").is_file() {
         return Err(OnionError::EbpfLoadFailed {
-            reason: "cgroup v2 not mounted (no cgroup.controllers at /sys/fs/cgroup)".to_string(),
+            reason: format!(
+                "cgroup v2 not mounted (no cgroup.controllers at {})",
+                cgroup_root.display()
+            ),
         });
     }
 
@@ -475,12 +483,34 @@ mod tests {
     }
 
     #[test]
+    fn cgroup_v2_detected_when_controllers_file_present() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("cgroup.controllers"), "cpu memory pids\n").unwrap();
+        assert!(check_cgroup_v2_at(root.path()).is_ok());
+    }
+
+    #[test]
+    fn cgroup_v1_tree_without_controllers_file_is_refused() {
+        // A v1 host mounts a tmpfs at the root with one directory per
+        // controller and no unified cgroup.controllers file.
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("memory")).unwrap();
+        let err = check_cgroup_v2_at(root.path()).unwrap_err();
+        assert!(err.to_string().contains("cgroup v2 not mounted"), "{err}");
+    }
+
+    #[test]
+    fn missing_cgroup_mount_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let err = check_cgroup_v2_at(&root.path().join("absent")).unwrap_err();
+        assert!(err.to_string().contains("does not exist"), "{err}");
+    }
+
+    #[test]
     fn check_cgroup_v2_on_test_host() {
+        // The module is Linux-only, and every Linux host that runs this
+        // suite (CI runners, the Lima guest) has the unified hierarchy.
         let result = check_cgroup_v2();
-        if cfg!(target_os = "linux") {
-            let _ = result;
-        } else {
-            assert!(result.is_err());
-        }
+        assert!(result.is_ok(), "cgroup v2 check failed: {result:?}");
     }
 }

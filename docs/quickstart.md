@@ -1,8 +1,11 @@
 # A laptop cluster
 
-The managed quickstart installs the signed 0.1.0 release (29 September 2026)
-and builds a laptop cluster from it. Five minutes is the target; how long it
-takes depends on your connection and on what's already cached.
+The command below installs the published, signed 0.1.0 release (29 September
+2026) and builds a laptop cluster from it. The two cold installs of the
+release candidate on Apple silicon took 178 s and 282 s from the first `curl`
+to a ready three-node cluster ([record](qualification/2026-09-27-v0.1.0-release-closure.md#how-it-ended)).
+Intel Macs and Linux hosts haven't been measured yet, and your connection and
+what's already cached decide most of the time.
 
 ## Install and boot
 

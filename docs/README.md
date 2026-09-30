@@ -2,15 +2,15 @@
 
 User guide for building and running Reliaburger. For managed Linux VMs on a
 laptop, see the [quickstart guide](quickstart.md). For the architectural vision,
-see the [whitepaper](whitepaper.md); for implementation status, see
-[progress.md](progress.md).
+see the [whitepaper](whitepaper.md); for status and what's next, see the
+[roadmap](roadmap.md).
 
 0.1.0 was released on 29 September 2026. Its signed binaries, guest images and
 installer are on the [GitHub release](https://github.com/reliaburger/reliaburger/releases/tag/v0.1.0),
 and `curl -fsSL https://reliaburger.com/install.sh | sh` installs it. Every
 release follows the same [build, staging and promotion procedure](releasing.md#metadata-and-publication).
-The limits below are the ones 0.1.0 ships with; [progress.md](progress.md) tracks
-the backlog after it.
+The limits below are the ones 0.1.0 ships with; the [roadmap](roadmap.md) tracks
+what comes after it.
 
 ## 0.1.0 scope and limits
 
