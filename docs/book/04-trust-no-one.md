@@ -465,6 +465,43 @@ The apply handler checked a manifest's apps against the caller's scope and then 
 
 Finally, the check has to survive a network hop. A follower that forwards an apply to the leader passes along the *user's* token or session cookie. Swapping in the node's own service token would erase the identity whose permissions the leader needs to check. Each fix got a test that looks at Raft state and the agent's command queue, not just the HTTP status, and a positive test next to it. A permission system that refuses everything is secure and useless.
 
+### Evaluating a policy isn't enforcing it
+
+Roles and scopes are blunt. A `[permission]` block sharpens them: it names a token and lists what that token may do, and to which apps.
+
+```toml
+[permission.ci]
+actions = ["deploy"]
+apps = ["web"]
+```
+
+`PermissionSpec::allows(action, app, namespace)` answers the question correctly, and its unit tests prove it. The trouble was who asked. Only the deploy, scale, exec and host-exec handlers called it. The log, metric and admin handlers checked role and scope and stopped there, so `ci` above could deploy nothing but `web`, yet it could still read every app's logs and metrics. Even `actions = []` didn't take those reads away. A release review caught it (B18), and the lesson is worth more than the fix: a test that says `allows` returns `false` proves nothing about a handler that never calls it.
+
+So the route matrix in `src/bun/authz.rs`, which already recorded the role every route needs, grew a third column: the action a spec must grant.
+
+```rust
+pub enum PermissionGate {
+    App(PermissionAction),      // on the {app} the path names
+    Body(PermissionAction),     // on each app the request body names
+    Cluster(PermissionAction),  // on every app, in every namespace
+    Filtered(PermissionAction), // answer, minus what isn't granted
+}
+
+gated(Get, "/v1/logs/{app}/{namespace}", AnyToken, App(LOGS)),
+gated(Get, "/v1/logs/sql", AnyToken, Cluster(LOGS)),
+gated(Get, "/v1/top", AnyToken, Filtered(METRICS)),
+```
+
+Each variant of a Rust `enum` can carry data, here the action. `gated` is a `const fn`: a function the compiler can run at compile time, which is what lets the matrix stay a plain `const` array rather than something built at startup.
+
+`Cluster` is the interesting one. Raw log SQL, the metric store and token management name no app, so there's nothing to check a per-app grant against. The only grant that covers them is one for every app in every namespace, and `allows_cluster_wide` says exactly that. Admin routes are `Cluster(ADMIN)`, so a spec on an Admin token that leaves out `admin` quietly takes away token management and upgrades. That's a sharp edge, and the manual says so.
+
+`Filtered` covers routes that shouldn't fail outright. `relish top` with a grant for `api` shows `api`'s rows. The dashboard renders without its alert panel, and an app page renders without charts that would only have drawn 403s.
+
+Two tests keep it honest. The cheap one reads the source: for every gated row, the handler's body must mention `PermissionAction::Logs` (or whichever action). The expensive one sends real requests. It walks every refusing row in the matrix and plays each caller against it: every role with no spec, a grant for the action, for `admin`, for another app, for another namespace, a spec with `deploy` only, an empty one, a browser session, a scoped token, the system principal and the bootstrap window. A refusal must be a 403, and an allowed caller must never get one. A router layer injects each caller's identity, so hundreds of requests don't each pay for an Argon2 hash. One more test drives the review's first failing rows through the real middleware, with a real bearer token and a real session cookie.
+
+Two things stay deliberately ungated. Nodes fan out log and metric reads to each other as the system principal, and no spec can name it, so `relish logs` still hears from every node; the node you asked filters the merged answer for you. And `secret-read` gates nothing, because no API route returns a decrypted secret: the agent decrypts `ENC[...]` straight into the instance's environment. We documented that rather than invent a route for it to guard.
+
 ## Secret encryption
 
 Application secrets shouldn't live in plaintext in your git repository. Reliaburger uses `age` for asymmetric encryption. You encrypt secrets with the cluster's public key, and only the cluster can decrypt them.
