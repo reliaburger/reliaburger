@@ -1541,7 +1541,40 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             .await?;
         }
     }
-    agent.set_log_sink(log_tx);
+    // Create the log store before the agent adopts anything: its checkpoint
+    // tells each adopted instance's forwarder where to resume (#308). (The
+    // Mayo store was created above, before the cluster runtime that its
+    // rollup worker feeds from.)
+    let logs_dir = storage_directory(&config.storage.logs, "logs").await?;
+
+    // Create Arrow/DataFusion log store (SQL queries over logs)
+    let log_store_dir = logs_dir.join("parquet");
+    tokio::fs::create_dir_all(&log_store_dir)
+        .await
+        .with_context(|| format!("failed to create log store at {}", log_store_dir.display()))?;
+    // Seed the log store with startup events so it's never empty
+    let mut log_store_inner = LogStore::new(log_store_dir);
+    log_store_inner.append(
+        "bun",
+        "system",
+        reliaburger::ketchup::types::LogStream::Stdout,
+        &format!(
+            "reliaburger node agent {} started",
+            reliaburger::upgrade::version::describe(
+                &reliaburger::upgrade::version::compiled_version(),
+                reliaburger::upgrade::version::build_commit()
+            )
+        ),
+    );
+    log_store_inner.append(
+        "bun",
+        "system",
+        reliaburger::ketchup::types::LogStream::Stdout,
+        &format!("runtime: {}", cli.runtime),
+    );
+    let log_store = Arc::new(RwLock::new(log_store_inner));
+    let capture_offsets = log_store.read().await.capture_offsets();
+    agent.set_log_sink(log_tx, capture_offsets);
     agent.set_readiness_tracker(readiness.clone());
     agent.set_trust_policy(config.images.trust_policy.clone());
     agent.set_records_dir(instances_dir.clone());
@@ -1692,37 +1725,6 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             agent.run_with_readiness(ready).await;
         },
     );
-
-    // Create observability stores (the Mayo store was created above,
-    // before the cluster runtime that its rollup worker feeds from)
-    let logs_dir = storage_directory(&config.storage.logs, "logs").await?;
-
-    // Create Arrow/DataFusion log store (SQL queries over logs)
-    let log_store_dir = logs_dir.join("parquet");
-    tokio::fs::create_dir_all(&log_store_dir)
-        .await
-        .with_context(|| format!("failed to create log store at {}", log_store_dir.display()))?;
-    // Seed the log store with startup events so it's never empty
-    let mut log_store_inner = LogStore::new(log_store_dir);
-    log_store_inner.append(
-        "bun",
-        "system",
-        reliaburger::ketchup::types::LogStream::Stdout,
-        &format!(
-            "reliaburger node agent {} started",
-            reliaburger::upgrade::version::describe(
-                &reliaburger::upgrade::version::compiled_version(),
-                reliaburger::upgrade::version::build_commit()
-            )
-        ),
-    );
-    log_store_inner.append(
-        "bun",
-        "system",
-        reliaburger::ketchup::types::LogStream::Stdout,
-        &format!("runtime: {}", cli.runtime),
-    );
-    let log_store = Arc::new(RwLock::new(log_store_inner));
 
     // Tasks that feed the metric/log buffers. They must stop before the final
     // shutdown flush, or a last record can be appended *after* the flush and

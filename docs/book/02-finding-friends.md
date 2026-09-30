@@ -1862,11 +1862,13 @@ Some workloads need to run everywhere: log collectors, monitoring agents, securi
 
 ### Namespace quotas
 
-Namespaces provide resource isolation. Each namespace can have limits on CPU, memory, GPUs, number of apps, and total replica count. The scheduler checks quotas before the filter phase. If a deployment would push a namespace over its budget, the scheduler rejects it with a clear error message:
+Namespaces provide resource isolation. Each namespace can have limits on CPU, memory, GPUs, number of apps, and total replica count. The scheduler checks quotas before the filter phase. If a deployment would push a namespace over its budget, the scheduler refuses to place it, with a message like this:
 
 ```
 namespace "staging" would exceed CPU quota: 1800+500 > 2000m
 ```
+
+Notice *where* that message ends up. The quota check runs in the leader's scheduling pass, long after `relish apply` has committed the app to desired state and returned success. So in 0.1.0 the operator sees an app stuck at zero instances, and the reason is a `scheduler: quota rejects …` line in the leader's log, repeated every pass until the namespace has room. We'll meet the consequences of that in Chapter 15, where a test expected `apply` itself to fail. A durable "blocked by quota" status is still on the to-do list.
 
 The leader tallies each namespace's usage once per scheduling pass and adds every app it admits as it goes, so two apps admitted in the same pass can't each squeeze under a limit they exceed together. It also skips nodes cordoned by an in-progress upgrade before selecting.
 

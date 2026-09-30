@@ -12,6 +12,8 @@ use crate::bun::agent::InstanceStatus;
 use crate::config::EnvValue;
 use crate::meat::deploy_types::DeployHistoryEntry;
 
+use super::units::ChartUnit;
+
 // ---------------------------------------------------------------------------
 // SafeEnvValue
 // ---------------------------------------------------------------------------
@@ -54,7 +56,8 @@ pub fn safe_env(env: &BTreeMap<String, EnvValue>) -> Vec<SafeEnvValue> {
 pub struct ChartConfig {
     pub endpoint: String,
     pub title: String,
-    pub y_label: String,
+    /// How the axis and legend scale and label the values.
+    pub unit: ChartUnit,
     pub refresh_secs: u32,
     pub range_secs: u64,
 }
@@ -132,12 +135,13 @@ mod tests {
         let cfg = ChartConfig {
             endpoint: "/v1/metrics?name=cpu".to_string(),
             title: "CPU Usage".to_string(),
-            y_label: "%".to_string(),
+            unit: ChartUnit::Percent,
             refresh_secs: 10,
             range_secs: 3600,
         };
         let json = serde_json::to_string(&cfg).unwrap();
         assert!(json.contains("\"endpoint\":\"/v1/metrics?name=cpu\""));
         assert!(json.contains("\"refresh_secs\":10"));
+        assert!(json.contains(r#""unit":[{"factor":1.0,"suffix":"%"}]"#));
     }
 }

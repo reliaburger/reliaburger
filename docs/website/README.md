@@ -5,14 +5,30 @@ fonts, analytics or third-party requests. Publish the contents of this directory
 with the GitHub Pages workflow (`.github/workflows/static.yml`); workflow and
 custom-domain configuration are managed separately.
 
-JavaScript: one script, for one thing (decision D2 in
-`docs/plans/2026-09-23-zero-to-cluster.md`). `assets/tour-player.js` plays the
+JavaScript: two small scripts, each for one thing. `assets/copy.js` adds a
+copy button beside every command snippet (`<pre>`) with a short "Copied"
+confirmation announced through a live region, and makes each heading's `#`
+permalink copy the section's address as well as navigate to it. It adds the
+buttons itself, so without JavaScript there's no dead button: the snippets are
+plain, selectable text and the permalinks are ordinary links. The Clipboard API
+needs https or localhost; opened from disk the script falls back to selecting
+the text and `document.execCommand("copy")`.
+
+`assets/tour-player.js` (decision D2 in
+`docs/plans/2026-09-23-zero-to-cluster.md`) plays the
 tour's recording, `assets/tour.cast`, with a vendored copy of the asciinema
 player in `assets/asciinema/`. It loads the player and the recording from this
 site, and only when someone opens the tour; nothing is fetched from anywhere
 else. With scripts disabled a `<noscript>` note links the `.cast` file, and the
-written tour works as before. Don't add other scripts. The footer says the same,
-so change both together.
+written tour works as before. Don't add other scripts. The footer names both,
+so change the two together.
+
+Every `<section>` has a stable `id` (`install`, `tour`, `start`, `docs`,
+`internals`, `contributing`) and every section heading a `#` permalink, shown on
+hover or focus, so a section can be shared as `reliaburger.com/#install`.
+Renaming an `id` breaks links people have already shared; add a new section
+instead. `tests/suite/website.rs` checks the ids, the permalinks and that the
+page leads with the one-line install.
 
 The player is asciinema-player 3.17.0 (Apache 2.0, `assets/asciinema/LICENSE`),
 the `dist/bundle/asciinema-player.min.js` and `asciinema-player.css` files from
@@ -76,9 +92,11 @@ every promoted release carries the four PDFs, and promotion marks it latest.
 The Build & Release workflow's `reliaburger-pdfs` artefact has newer copies
 from `main`; artefacts require GitHub sign-in and have limited retention.
 
-Update the release-status paragraph (version, date and release-notes link) when
-you promote a release. The
-source quickstart intentionally matches `examples/phase-1/proc-first-run.toml`.
+The page leads with the one-line install now that 0.1.0 is published;
+building from source is the second path. Update the release-status paragraph
+(version, date and release-notes link) and the install section's release-notes
+link when you promote a release. The source quickstart intentionally matches
+`examples/phase-1/proc-first-run.toml`.
 
 `install.sh` is a small HTTPS bootstrap for the versioned release installer.
 Both it and the generated installer are POSIX sh, so `curl … | sh` works where

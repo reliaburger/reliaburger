@@ -11,11 +11,11 @@ evidence, and prints a categorised report: CRITICAL, WARNING, UNKNOWN and OK.
 It doesn't just list problems. It links a crashloop to the recent deploy and
 the error log line behind it.
 
-You only need to reach one node. `wtf` and `path` send every per-node request
-through the node you're connected to (`/v1/nodes/<node>/relay/...`), carrying
+You only need to reach one node. `wtf`, `inspect` and `path` send every
+per-node request through the node you're connected to (`/v1/nodes/<node>/relay/...`), carrying
 your own credential, so they work from a laptop whose VMs sit behind Lima's
 private network. The relay forwards only the handful of read-only diagnostic
-calls these two commands make, plus the path probe itself, and each target
+calls these commands make, plus the path probe itself, and each target
 repeats every authentication and authorisation check.
 
 ```sh
@@ -33,6 +33,18 @@ is the contract:
 - `0`: every selected check was observed and healthy.
 - `1`: at least one CRITICAL finding.
 - `2`: warnings or unknown evidence only, nothing critical.
+
+`wtf` also asks every node which `bun` it runs: the version, the commit it was
+built from and the binary's SHA-256. When they all match, the OK row names the
+build. When they don't, a `version-skew` warning names the odd node(s) and
+lists every node's build. Nodes count as the same build when their version and
+commit match, so one commit built for arm64 and x86_64 isn't skew; the SHA-256
+decides only for a build that doesn't know its commit.
+
+`relish inspect <app>` uses the same relay to list every instance of an app on
+every node, with the node it runs on, under a `desired` vs `running` replica
+count. A node that doesn't answer, or that gossip already considers dead, gets
+a warning line naming it instead of silently shrinking the list.
 
 ## `relish path`: can A reach B?
 
