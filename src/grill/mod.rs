@@ -504,17 +504,20 @@ pub trait Grill: Send + Sync {
 
     /// Stream logs for an instance.
     ///
-    /// Sends every captured line over the channel, from the start of the
-    /// instance's output, then new lines as they are produced. File-backed
-    /// runtimes tag each line with its capture position so the log store can
-    /// skip lines it already ingested. The default does nothing (stream
-    /// closes immediately). Runtimes that support streaming override this.
+    /// Sends every captured line over the channel, then new lines as they
+    /// are produced. File-backed runtimes start each capture file at its
+    /// offset in `resume` (byte 0 when it has none, or when the file is now
+    /// shorter than the offset) and tag each line with its capture position,
+    /// so a restarted agent neither re-reads nor re-ingests what the log
+    /// store already holds. The default does nothing (stream closes
+    /// immediately). Runtimes that support streaming override this.
     fn follow_logs(
         &self,
         instance: &InstanceId,
         lines_tx: mpsc::Sender<crate::ketchup::types::CapturedLine>,
+        resume: &crate::ketchup::types::CaptureOffsets,
     ) -> impl std::future::Future<Output = ()> + Send {
-        let _ = (instance, lines_tx);
+        let _ = (instance, lines_tx, resume);
         std::future::ready(())
     }
 
@@ -777,13 +780,14 @@ impl Grill for AnyGrill {
         &self,
         instance: &InstanceId,
         lines_tx: mpsc::Sender<crate::ketchup::types::CapturedLine>,
+        resume: &crate::ketchup::types::CaptureOffsets,
     ) {
         match self {
-            AnyGrill::Process(g) => g.follow_logs(instance, lines_tx).await,
+            AnyGrill::Process(g) => g.follow_logs(instance, lines_tx, resume).await,
             #[cfg(target_os = "linux")]
-            AnyGrill::Runc(g) => g.follow_logs(instance, lines_tx).await,
+            AnyGrill::Runc(g) => g.follow_logs(instance, lines_tx, resume).await,
             #[cfg(target_os = "macos")]
-            AnyGrill::Apple(g) => g.follow_logs(instance, lines_tx).await,
+            AnyGrill::Apple(g) => g.follow_logs(instance, lines_tx, resume).await,
         }
     }
 

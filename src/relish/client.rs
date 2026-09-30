@@ -28,6 +28,20 @@ pub struct TokenSummary {
     pub expires_at: Option<u64>,
 }
 
+/// The build a Bun agent reports on `/v1/version`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct AgentVersion {
+    /// Cargo version, as `BinaryVersion` displays it (`v0.1.1`).
+    pub version: String,
+    /// Commit the binary was built from, when the build knew it.
+    #[serde(default)]
+    pub commit: Option<String>,
+    /// SHA-256 of the running binary. Absent when the agent runs without
+    /// its self-upgrade manager, which is what hashes it.
+    #[serde(default)]
+    pub binary_sha256: Option<String>,
+}
+
 /// Client for the Bun agent HTTP API.
 #[derive(Clone)]
 pub struct BunClient {
@@ -1007,6 +1021,11 @@ impl BunClient {
         parse_typed_response(response).await
     }
 
+    /// Fetch the build this agent runs (`GET /v1/version`).
+    pub async fn version(&self) -> Result<AgentVersion, RelishError> {
+        self.get_typed_json("/v1/version").await
+    }
+
     /// Fetch desired application replicas and current scheduler coverage.
     pub async fn desired_apps(
         &self,
@@ -1530,13 +1549,9 @@ impl BunClient {
             // already filtered.
             let output = render_log_entries(&result.entries, options);
 
-            // Show warnings if any nodes were unreachable
+            // Name every node that contributed nothing, and why.
             for warning in &result.warnings {
-                match warning {
-                    crate::ketchup::types::LogQueryWarning::NodeUnresponsive { node_id } => {
-                        eprintln!("warning: node {node_id} did not respond");
-                    }
-                }
+                eprintln!("warning: {warning}");
             }
 
             // If we got entries, return them

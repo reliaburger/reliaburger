@@ -1191,6 +1191,23 @@ desired
 
 A single Bun without a cluster got that last part wrong. There's no council there, so `relish stop` stops the replicas itself and keeps them owned, `Stopped`, for the next apply to replace. Once every exit is confirmed, the stop releases the app's service entry and ingress route, which is right for a stopped app: nothing should resolve to it. But the apply that follows sees owned replicas and takes the redeploy path, and a redeploy assumes the service it publishes backends into is already there. It wasn't, so the first replacement failed with "cannot publish backend for default/web: service not found" and the rollout rolled back to replicas that were already stopped. The fresh-deploy path registers the service; the redeploy path never had to, until stop started keeping replicas around. Now, before it rolls anything, the redeploy puts back whatever a stop released: the service, if the app has a port and the map doesn't have it, and the ingress route, if none is stored. The VIP is a hash of the app's name, so the service comes back at the address it had before, just as the cluster catalogue keeps it. Cluster mode never hit this, because there the reconciler retires the replicas outright and the next apply is a fresh deploy.
 
+"If none is stored" was the right rule for a stopped app and a trap for a running one. While fixing the stop, we noticed that a redeploy of a running app never touched its stored route at all, beyond an insert at the very end of the rollout. Change the host and it happened to work, because that insert overwrote the entry and a final rebuild picked it up. Delete the `[app.web.ingress]` section and nothing removed anything: the old host kept routing to the new instances. The same stale entry leaked into cluster mode, where a replica node merges its own stored routes under the council's catalogue. The council dropped the route, the node's copy kept it alive. The end of the rollout (`finalise_rolling_deploy`, which blue-green shares) now makes the rolled-out spec the owner of the route, whichever way it changed:
+
+```rust
+let key = (namespace.to_string(), app_name.to_string());
+match &spec.ingress {
+    Some(ingress) => {
+        self.ingress_configs.insert(key, ingress.clone());
+    }
+    None => {
+        self.ingress_configs.remove(&key);
+    }
+}
+self.rebuild_routing_table().await;
+```
+
+The pre-rollout restore still only inserts. Until the new instances are serving, the old host is the one that should answer. `redeploy_with_a_changed_ingress_host_moves_the_route` runs `a.test`, then `b.test`, then no ingress, under both rolling and blue-green, and checks that `b.test` reaches the new instances, `a.test` stops, and nothing is left at the end. Its cluster twin feeds the same three specs through a replica node alongside matching council catalogues, and a state-machine test checks the catalogue itself.
+
 ### A stopped app forgets where its data is
 
 Keeping the specification wasn't enough, either. The V02 soak's `volume_data_survives_instance_restart` case writes a marker into a managed volume, stops the app, applies it again and reads the marker back. On one fast-tier run it got this:

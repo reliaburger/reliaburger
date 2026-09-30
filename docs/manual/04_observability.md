@@ -27,6 +27,19 @@ that moved nodes keeps its name, so its two runs show as
 wrote them. Lines from different runs are interleaved by their nodes' clocks,
 so near-simultaneous lines from two runs can appear in either order.
 
+A node that contributes nothing gets a `warning:` line on stderr naming it and
+the reason, and you still get every other node's lines:
+
+| Warning ends with | What to look at |
+|---|---|
+| `not in the membership table` | the app is placed there but gossip doesn't see the node; `relish nodes` |
+| `timed out after 10s` | the node is up but slow or stuck; its journal, `relish wtf` |
+| `request failed (connect or TLS): …` | network, firewall or certificates between the nodes |
+| `answered HTTP 403: …` (or another status) | the node refused or failed; the body says why |
+| `answered with an unreadable body: …` | the node answered with something other than log entries |
+
+`relish wtf` reports the same reasons in its log evidence.
+
 Retention and export are node config:
 
 ```toml
@@ -99,6 +112,8 @@ With `--name` you get one line per instance, a rate for counters and a
 sparkline; a histogram named by its base shows mean latency per instance.
 `up` is 1 while an instance's last scrape worked and 0 when it failed. The
 app's page in the web dashboard charts the same data, one line per instance.
+Axes and legends pick a readable unit (`12 MiB`, `300 µs`, `1.5k req/s`),
+and the legend shows each line's newest value until you hover over a point.
 
 There's no PromQL. You read metrics through `relish metrics`, the dashboards
 and the API. For something that isn't an app on the cluster, such as a node
