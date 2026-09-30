@@ -49,7 +49,7 @@ h1 { font-size: clamp(2.4rem, 5.1vw, 3.7rem); line-height: 1.12; letter-spacing:
 .section-number { color: var(--accent); }
 h2 { margin: 0; font-size: 1.5rem; line-height: 1.3; font-weight: 650; letter-spacing: -.03em; }
 .section-note { color: var(--muted); margin-left: auto; font-size: .875rem; }
-/* The tour reuses the release-status aside's accent rule: both describe what isn't published yet. */
+/* The tour reuses the release-status aside's accent rule. */
 .tour { border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); border-left: 3px solid var(--accent); }
 .tour summary { display: flex; align-items: baseline; flex-wrap: wrap; gap: 12px; padding: 20px; cursor: pointer; list-style: none; }
 .tour summary::-webkit-details-marker { display: none; }
@@ -57,7 +57,6 @@ h2 { margin: 0; font-size: 1.5rem; line-height: 1.3; font-weight: 650; letter-sp
 .tour[open] summary::after { content: "−"; }
 .tour summary:hover h2 { color: var(--accent); }
 .tour summary:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
-.pending { font: 500 .75rem var(--mono); letter-spacing: .07em; text-transform: uppercase; color: var(--accent); border: 1px solid var(--accent); border-radius: 2px; padding: 1px 8px; }
 .tour-body { padding: 0 20px 24px; }
 .tour-note { max-width: 760px; color: var(--muted); }
 .tour-steps { list-style: none; counter-reset: step; margin: 22px 0; padding: 0; }

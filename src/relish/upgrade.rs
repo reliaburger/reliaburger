@@ -242,7 +242,8 @@ pub async fn plan(
     let (workers, council, leader) = match cluster_size {
         Some(size) => hypothetical_roles(size),
         None => match client.nodes().await {
-            Ok(nodes) => {
+            Ok(mut nodes) => {
+                nodes.retain(|node| !node.is_down());
                 let leader = nodes.iter().filter(|n| n.is_leader).count();
                 let council = nodes
                     .iter()
@@ -654,6 +655,8 @@ fn build_node_list(
 ) -> Result<Vec<serde_json::Value>, RelishError> {
     nodes
         .iter()
+        // The listing shows dead members too; only live ones take a binary.
+        .filter(|node| !node.is_down())
         .map(|node| {
             let address = overrides
                 .iter()
@@ -801,6 +804,19 @@ mod tests {
         assert_eq!(list[0]["role"], "Worker");
         assert_eq!(list[1]["address"], "[2001:db8::2]:19443"); // advertised
         assert_eq!(list[1]["role"], "Leader");
+    }
+
+    #[test]
+    fn build_node_list_leaves_out_dead_members() {
+        let mut dead = member("n2", "10.0.0.2:9443");
+        dead.state = "dead".to_string();
+        let mut live = member("n1", "10.0.0.1:9443");
+        live.api_address = Some("10.0.0.1:9117".parse().unwrap());
+        // The dead member has no address either; listing it would refuse
+        // the whole plan.
+        let list = build_node_list(&[live, dead], &[]).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0]["node_id"], "n1");
     }
 
     fn member(node_id: &str, gossip: &str) -> crate::bun::agent::NodeStatus {

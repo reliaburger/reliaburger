@@ -69,6 +69,10 @@ pub struct ClusterRuntime {
     /// endpoints and the best leader hint. This is what lets non-voters
     /// find the leader (Phase 12b.2, H1).
     pub directory_rx: watch::Receiver<NodeDirectory>,
+    /// Every gossip member, Dead and Left ones included until they are
+    /// reaped. For reporting on the cluster only: placement, the council and
+    /// the registry read the live-only `ClusterHandle::membership_rx`.
+    pub roster_rx: watch::Receiver<Vec<MembershipSnapshot>>,
 }
 
 /// Configuration for starting the cluster runtime, derived from node config.
@@ -238,6 +242,8 @@ pub async fn start(
 
     let (membership_tx, membership_rx) = watch::channel::<Vec<MembershipSnapshot>>(Vec::new());
     node.set_membership_watch(membership_tx);
+    let (roster_tx, roster_rx) = watch::channel::<Vec<MembershipSnapshot>>(Vec::new());
+    node.set_roster_watch(roster_tx);
     let (rejoin_tx, gossip_rejoined_rx) = watch::channel(false);
     node.set_rejoin_watch(rejoin_tx);
 
@@ -581,6 +587,9 @@ pub async fn start(
         council_rx,
         shutdown.clone(),
     );
+    if let Some(tracker) = readiness.clone() {
+        worker = worker.with_readiness(tracker);
+    }
     spawn_supervised("cluster:report-worker", supervision.clone(), async move {
         worker.run().await
     });
@@ -626,6 +635,7 @@ pub async fn start(
             aggregated_rx,
             rollup_store,
             directory_rx,
+            roster_rx,
         },
     ))
 }

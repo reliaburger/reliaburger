@@ -534,6 +534,17 @@ impl NodeConfig {
             });
         }
 
+        // Each sweep prunes before it uploads, so retaining zero would delete
+        // every snapshot the moment it was taken, before it ever left the node.
+        let snapshots = &self.storage.snapshots;
+        if snapshots.interval_secs > 0 && snapshots.retain == 0 {
+            return Err(ConfigError::Validation {
+                field: "storage.snapshots.retain".into(),
+                context: "node config".into(),
+                reason: "must retain at least one snapshot when interval_secs is set".into(),
+            });
+        }
+
         // A zero deadline would fail every stop before the runtime answered,
         // leaving every workload owned and unstoppable.
         if self.runtime.stop_confirmation_timeout_secs == 0 {
@@ -1032,6 +1043,22 @@ mod tests {
             nc.validate(),
             Err(ConfigError::NonAbsolutePath { .. })
         ));
+    }
+
+    #[test]
+    fn scheduled_snapshots_must_retain_at_least_one() {
+        let mut nc = NodeConfig::default();
+        nc.storage.snapshots.interval_secs = 3600;
+        nc.storage.snapshots.retain = 0;
+        let error = nc.validate().unwrap_err().to_string();
+        assert!(error.contains("storage.snapshots.retain"), "{error}");
+
+        // Disabled schedules don't prune, so zero is harmless there.
+        nc.storage.snapshots.interval_secs = 0;
+        assert!(nc.validate().is_ok());
+        nc.storage.snapshots.interval_secs = 3600;
+        nc.storage.snapshots.retain = 1;
+        assert!(nc.validate().is_ok());
     }
 
     #[test]

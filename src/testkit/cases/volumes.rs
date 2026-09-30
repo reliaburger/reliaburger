@@ -247,6 +247,7 @@ mod tests {
             host_port: None,
             exit_code: None,
             pid: None,
+            runtime_unknown: false,
         }
     }
 

@@ -20,6 +20,12 @@ relish upgrade abort                  # end a paused upgrade that moved no node
 relish upgrade rollback v0.1.0        # also replaces a paused upgrade
 ```
 
+To see what a node runs, ask it. `bun --version` and `relish --version` print
+the version and the commit it was built from, such as `bun 0.1.0 (3fcb1fd)`,
+and so does bun's first log line. Two builds of the same version can hold
+different code; the commit tells them apart. `GET /v1/version` has the full
+commit in `commit`, next to `version` and `binary_sha256`.
+
 It needs three things on every node:
 
 - **A supervisor that restarts bun whenever it exits**, such as systemd with
@@ -84,7 +90,8 @@ that version. `abort` refuses once a node has moved, and says which, because
 ending the upgrade then would leave the cluster on two versions.
 
 Rolling upgrades need matching protocol and state formats; `bun --compatibility`
-prints what a binary supports. Development builds' state isn't migrated.
+prints what a binary supports. Nothing is migrated before 1.0.0: a release
+that changes either format needs a fresh cluster.
 
 ## GitOps
 
@@ -111,7 +118,11 @@ The sync always reads every `.toml` file under `path`, subdirectories
 included. Credentials go in the URL; Bun strips them out of the process arguments and
 Git's config. With `require_signed_commits`, a commit that doesn't verify
 against `trusted_signing_keys` isn't applied, and an empty key list refuses
-everything. There's no `relish gitops` command: the web dashboard's GitOps
+everything. List full fingerprints: the 40-hex-digit GPG fingerprint of the
+signing key or its primary key (case and spaces don't matter), or an SSH
+key's `SHA256:…` fingerprint exactly as `ssh-keygen -lf` prints it. Git checks
+the signature against the node's own GnuPG keyring or
+`gpg.ssh.allowedSignersFile`, so install the public keys there. There's no `relish gitops` command: the web dashboard's GitOps
 page shows the last sync.
 
 To sync on push rather than on the next poll, point a GitHub, Gitea or GitLab

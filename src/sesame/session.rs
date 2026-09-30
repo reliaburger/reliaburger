@@ -9,6 +9,11 @@
 //! The dashboard only reads, and a read-only cookie contains the blast radius
 //! of any cross-site request forgery: a forged request riding the cookie can
 //! look but never mutate.
+//!
+//! A session is also never worth more than the token it came from. It records
+//! which exact credential created it (the token's principal id) and cannot
+//! outlive that token's expiry; the auth middleware refuses a session whose
+//! token has since been revoked or has expired.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -22,17 +27,22 @@ use super::types::TokenScope;
 /// The cookie name carrying the session id.
 pub const SESSION_COOKIE: &str = "rb_session";
 
-/// How long a session stays valid after creation.
-const SESSION_TTL: Duration = Duration::from_secs(12 * 3600);
+/// The longest a session stays valid after creation. A token that expires
+/// sooner shortens it (see [`SessionStore::create`]).
+pub const SESSION_TTL: Duration = Duration::from_secs(12 * 3600);
 
-/// The identity a live session resolves to: the originating token's name plus
-/// the app/namespace scope it was confined to. The scope travels with the
-/// session so a tenant-scoped token cannot widen to cluster-wide reads by
-/// exchanging itself for a cookie (the C3 gap).
+/// The identity a live session resolves to: the originating token's name and
+/// principal id, plus the app/namespace scope it was confined to. The scope
+/// travels with the session so a tenant-scoped token cannot widen to
+/// cluster-wide reads by exchanging itself for a cookie (the C3 gap).
 #[derive(Debug, Clone)]
 pub struct SessionIdentity {
     /// The token name the session was created from.
     pub token_name: String,
+    /// The exact credential the session was created from (the token's
+    /// principal id, or the system principal). A reissued token with the same
+    /// name has a different principal id, so it never revives this session.
+    pub principal_id: String,
     /// The originating token's scope, carried onto the session context.
     pub scope: TokenScope,
 }
@@ -40,12 +50,21 @@ pub struct SessionIdentity {
 /// One active browser session.
 #[derive(Debug, Clone)]
 struct Session {
-    /// The token name the session was created from (for audit only).
-    token_name: String,
-    /// The scope the originating token was confined to.
-    scope: TokenScope,
-    /// When the session expires.
+    /// Who the session speaks for.
+    identity: SessionIdentity,
+    /// When the session expires: at most [`SESSION_TTL`] after creation, and
+    /// never after the originating token expires.
     expires_at: SystemTime,
+}
+
+/// A freshly created session: its opaque id and how long it lives, so the
+/// caller can give the cookie a matching `Max-Age`.
+#[derive(Debug, Clone)]
+pub struct NewSession {
+    /// The opaque session id to put in the cookie.
+    pub id: String,
+    /// How long the session stays valid from now.
+    pub lifetime: Duration,
 }
 
 /// A store of active browser sessions, keyed by opaque session id.
@@ -60,12 +79,17 @@ impl SessionStore {
         Self::default()
     }
 
-    /// Create a new session for `token_name` with the originating token's
-    /// `scope`, and return its opaque id.
+    /// Create a new session for `identity` and return its opaque id and
+    /// lifetime.
     ///
-    /// The id is 256 bits of randomness, hex-encoded. Creating a session
-    /// opportunistically sweeps expired ones.
-    pub async fn create(&self, token_name: &str, scope: TokenScope) -> String {
+    /// The session lasts [`SESSION_TTL`], or until `credential_expires_at` if
+    /// the originating token expires sooner. The id is 256 bits of randomness,
+    /// hex-encoded. Creating a session opportunistically sweeps expired ones.
+    pub async fn create(
+        &self,
+        identity: SessionIdentity,
+        credential_expires_at: Option<SystemTime>,
+    ) -> NewSession {
         let mut bytes = [0u8; 32];
         // The system RNG only fails if the OS entropy source is unavailable,
         // which on a running node it is not.
@@ -74,18 +98,21 @@ impl SessionStore {
             .expect("system RNG unavailable");
         let id = hex::encode(bytes);
 
-        let mut guard = self.inner.write().await;
         let now = SystemTime::now();
+        let lifetime = credential_expires_at
+            .map(|at| at.duration_since(now).unwrap_or(Duration::ZERO))
+            .map_or(SESSION_TTL, |left| left.min(SESSION_TTL));
+
+        let mut guard = self.inner.write().await;
         guard.retain(|_, s| s.expires_at > now);
         guard.insert(
             id.clone(),
             Session {
-                token_name: token_name.to_string(),
-                scope,
-                expires_at: now + SESSION_TTL,
+                identity,
+                expires_at: now + lifetime,
             },
         );
-        id
+        NewSession { id, lifetime }
     }
 
     /// Return the session identity if `id` names a live session, else `None`.
@@ -96,10 +123,7 @@ impl SessionStore {
             let guard = self.inner.read().await;
             match guard.get(id) {
                 Some(s) if s.expires_at > SystemTime::now() => {
-                    return Some(SessionIdentity {
-                        token_name: s.token_name.clone(),
-                        scope: s.scope.clone(),
-                    });
+                    return Some(s.identity.clone());
                 }
                 Some(_) => {} // expired — fall through to remove it
                 None => return None,
@@ -130,12 +154,24 @@ pub fn session_id_from_cookie_header(header: &str) -> Option<&str> {
 mod tests {
     use super::*;
 
+    fn identity(name: &str, scope: TokenScope) -> SessionIdentity {
+        SessionIdentity {
+            token_name: name.to_string(),
+            principal_id: format!("token:{name}"),
+            scope,
+        }
+    }
+
     #[tokio::test]
-    async fn create_then_validate_returns_the_token_name() {
+    async fn create_then_validate_returns_the_token_name_and_principal() {
         let store = SessionStore::new();
-        let id = store.create("ci", TokenScope::default()).await;
+        let id = store
+            .create(identity("ci", TokenScope::default()), None)
+            .await
+            .id;
         let identity = store.validate(&id).await.expect("session should be live");
         assert_eq!(identity.token_name, "ci");
+        assert_eq!(identity.principal_id, "token:ci");
     }
 
     #[tokio::test]
@@ -145,7 +181,10 @@ mod tests {
             apps: Some(vec!["web".to_string()]),
             namespaces: Some(vec!["team-a".to_string()]),
         };
-        let id = store.create("scoped", scope.clone()).await;
+        let id = store
+            .create(identity("scoped", scope.clone()), None)
+            .await
+            .id;
         let identity = store.validate(&id).await.expect("session should be live");
         assert_eq!(identity.scope.apps, scope.apps);
         assert_eq!(identity.scope.namespaces, scope.namespaces);
@@ -160,9 +199,45 @@ mod tests {
     #[tokio::test]
     async fn a_removed_session_no_longer_validates() {
         let store = SessionStore::new();
-        let id = store.create("ci", TokenScope::default()).await;
+        let id = store
+            .create(identity("ci", TokenScope::default()), None)
+            .await
+            .id;
         store.remove(&id).await;
         assert!(store.validate(&id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_session_without_a_token_expiry_lasts_the_full_ttl() {
+        let store = SessionStore::new();
+        let session = store
+            .create(identity("ci", TokenScope::default()), None)
+            .await;
+        assert_eq!(session.lifetime, SESSION_TTL);
+    }
+
+    #[tokio::test]
+    async fn a_session_never_outlives_its_token() {
+        // A token expiring in an hour caps the session at (about) an hour,
+        // not the full twelve (B11).
+        let store = SessionStore::new();
+        let expiry = SystemTime::now() + Duration::from_secs(3600);
+        let session = store
+            .create(identity("ci", TokenScope::default()), Some(expiry))
+            .await;
+        assert!(session.lifetime <= Duration::from_secs(3600));
+        assert!(session.lifetime > Duration::from_secs(3500));
+    }
+
+    #[tokio::test]
+    async fn a_session_from_an_already_expired_token_is_dead_on_arrival() {
+        let store = SessionStore::new();
+        let expiry = SystemTime::now() - Duration::from_secs(1);
+        let session = store
+            .create(identity("ci", TokenScope::default()), Some(expiry))
+            .await;
+        assert_eq!(session.lifetime, Duration::ZERO);
+        assert!(store.validate(&session.id).await.is_none());
     }
 
     #[test]

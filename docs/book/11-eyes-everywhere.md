@@ -605,11 +605,73 @@ The flow is a single exchange. The operator visits the dashboard, gets redirecte
 Set-Cookie: rb_session=<256-bit hex>; HttpOnly; SameSite=Strict; Path=/
 ```
 
-The session id is opaque — it is not the token, just a random handle into an in-memory `SessionStore` with a 12-hour TTL. `HttpOnly` keeps page JavaScript from reading it; `SameSite=Strict` keeps it off cross-site requests. From then on the `hx-get` fragments, the metrics fetches and the `EventSource` all carry the cookie without a line of JavaScript changing, because the browser sends it for us.
+The session id is opaque — it is not the token, just a random handle into an in-memory `SessionStore` that lives for 12 hours at most. `HttpOnly` keeps page JavaScript from reading it; `SameSite=Strict` keeps it off cross-site requests. From then on the `hx-get` fragments, the metrics fetches and the `EventSource` all carry the cookie without a line of JavaScript changing, because the browser sends it for us.
 
 There is one deliberate asymmetry worth calling out. A session is **always read-only**, even if the token you logged in with is an Admin token. The dashboard only ever reads, so a session never needs write permission — and withholding it contains the blast radius of a forged request. If someone tricks your browser into POSTing to `/v1/apply` while your cookie rides along, the worst they achieve is a `403`. The test that pins this logs in with an Admin token and asserts that an apply through the cookie is still forbidden. Authentication and authorisation are different questions; a cookie answers the first, not the second.
 
 The middleware change is small: after the bearer check, if there's no token, look for the session cookie and, if it names a live session, attach a read-only context. If neither is present, a browser navigation (one that says `Accept: text/html`) gets a `303` to the login page instead of a bare `401` — because a human staring at a JSON error is a worse experience than a form. Public routes stay public: health, version, JWKS, the static assets, and the login page itself.
+
+#### A session is only as good as its token
+
+The first version of the session store had a fixed 12-hour TTL and no memory of which token created it, beyond a name kept for display. So revoking a token did nothing to the browser sessions it had already bought. Neither did the token expiring: log in five minutes before your token lapses and you kept reading for another twelve hours. Same PR #258 review, finding B11. The middleware even loaded the token store a few lines above the session check; it just never looked.
+
+A token's name isn't good enough to link them, because names get reused. Revoke `ci`, mint a new `ci`, and a name check would happily revive every session the old one created. We already had a better handle. `AuthContext::principal_id` for a stored token is `token:` plus the SHA-256 of its Argon2 hash, which names that exact credential. A reissue under the same name has a new hash and so a new principal id. The session records it:
+
+```rust
+pub struct SessionIdentity {
+    pub token_name: String,
+    pub principal_id: String,
+    pub scope: TokenScope,
+}
+```
+
+`SessionStore::create` now takes the identity plus the token's `expires_at`, an `Option<SystemTime>`, and caps the lifetime at whichever comes first:
+
+```rust
+let lifetime = credential_expires_at
+    .map(|at| at.duration_since(now).unwrap_or(Duration::ZERO))
+    .map_or(SESSION_TTL, |left| left.min(SESSION_TTL));
+```
+
+`Option::map` transforms the value inside a `Some` and leaves `None` alone, and `map_or` then supplies a default for `None`. `duration_since` returns a `Result` because the other instant might be later (the clock isn't monotonic), and `unwrap_or(Duration::ZERO)` turns "already expired" into a zero lifetime rather than a panic. The login handler hands the lifetime back to the browser as the cookie's `Max-Age`, so the cookie and the session die together.
+
+Capping the TTL covers expiry, not revocation, so the middleware checks every session request against the token store it has already snapshotted:
+
+```rust
+fn session_credential_is_live(
+    identity: &SessionIdentity,
+    tokens: &[ApiToken],
+    service_token_configured: bool,
+) -> bool {
+    if identity.principal_id == SYSTEM_PRINCIPAL {
+        return service_token_configured;
+    }
+    let now = std::time::SystemTime::now();
+    find_token_by_principal(&identity.principal_id, tokens)
+        .is_some_and(|token| token.expires_at.is_none_or(|at| now < at))
+}
+```
+
+`is_some_and` and `is_none_or` are the `Option` versions of "exists and satisfies" and "absent or satisfies"; a token with no expiry passes. A session that fails the check is removed from the store and the request carries on as unauthenticated, which means a browser gets redirected to the login page. The internal service token isn't in the store at all (it's derived from the master key), so a session made from it holds for as long as the node has a service token.
+
+Hashing every stored token's hash on every cookie request sounds wasteful, but SHA-256 over a few dozen bytes takes microseconds, and the store holds tens of tokens, not millions. If that ever changes, a map from principal id to token is a small refactor. The tests log in, then revoke the token, expire it in place, or replace it with a same-name reissue, and each time the cookie that worked a moment earlier gets a `401`.
+
+#### The login form is a public Argon2 endpoint
+
+Public routes stay public, and one of them does something expensive. `POST /ui/session` has to check the pasted token against the store, which means Argon2. In Chapter 10 we bounded that work for bearers: a string check turns away anything that isn't `rbrg_` plus 64 hex characters, and a process-wide semaphore (`VERIFY_PERMITS`) admits at most four hashes at a time. The login handler didn't use any of it. It had its own copy of the verification, a `spawn_blocking` straight into `authenticate`, with no shape check and no permit.
+
+You can't demand a credential from someone who's trying to log in, so anyone who could reach a node could post junk tokens as fast as they liked. Each one ran Argon2 against every stored token, about 19 MiB apiece, on a blocking pool that grows to 512 threads. That's roughly 10 GB and every core pinned, from an unauthenticated form. A static review of the release (PR #258) caught it.
+
+The fix is one call. `authenticate_off_lock` became `pub(crate)` (visible anywhere in our crate, invisible outside it) and the login handler uses it instead of rolling its own:
+
+```rust
+let tokens = auth.tokens.read().await.clone();
+crate::sesame::auth::authenticate_off_lock(&form.token, tokens)
+    .await
+    .ok()
+```
+
+Two tests pin both halves. With every permit held (a test-only `hold_all_verify_permits` calls `acquire_many` on the semaphore), a login of `nope` still comes back `401` inside the timeout, so it never went near Argon2. A well-shaped login under the same conditions is still pending after 200 ms, and finishes with a redirect once we drop the permits. A bound only works if every path to the expensive thing goes through it. Two copies of the same check is one too many.
 
 ### Node detail page
 

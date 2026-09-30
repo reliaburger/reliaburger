@@ -95,6 +95,7 @@ mod tests {
                     restart_count: 0,
                     host_port: Some(8080),
                     pid: Some(1234),
+                    runtime_unknown: false,
                 },
                 InstanceStatus {
                     exit_code: None,
@@ -105,6 +106,7 @@ mod tests {
                     restart_count: 1,
                     host_port: Some(9090),
                     pid: Some(5678),
+                    runtime_unknown: false,
                 },
             ],
             charts: vec![ChartConfig {

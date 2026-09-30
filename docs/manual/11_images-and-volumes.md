@@ -141,6 +141,32 @@ anonymously to a standalone node's loopback registry before its first API
 token exists. Pickle has no Docker token service, and it doesn't support
 deleting images through the registry API.
 
+## Multi-platform images
+
+0.1.0 can't run a multi-platform image (an OCI image index or Docker manifest
+list) stored in Pickle. A node pulling one treats the index as a single image
+and the workload fails to start. This hits `docker buildx build --platform
+linux/amd64,linux/arm64 --push` and multi-platform `relish build`, which is the
+default; a multi-platform `relish build` also stores only the builder's own
+platform. A release after 0.1.0 fixes both.
+
+Until then, push and build one platform that matches your nodes:
+
+```sh
+docker buildx build --platform linux/arm64 -t NODE:5050/api:v1 --push .
+```
+
+```toml
+[build.api]
+context = "./api"
+destination = "pickle://api:v1.2.3"
+platform = ["linux/arm64"]      # or ["linux/amd64"], whatever your nodes run
+```
+
+On a cluster whose nodes share one architecture, multi-platform images from
+an upstream registry work: the pull-through cache picks the node's platform
+from the index and stores that single image.
+
 ## Volumes
 
 ```toml
@@ -159,9 +185,10 @@ survives restarts and redeploys. Bun hands it to the container's user the first
 time it's mounted. It stays on its node, so it's local storage, not a
 network volume. An app with a managed volume stays with it too: after
 `relish stop`, the next `relish apply` starts it again on the node that holds
-its volume, and waits there if that node is short of room. Only when that node
-is gone (or no longer matches the app's `placement.required` labels) does it
-start elsewhere, on a new, empty volume. A host-path volume is never chowned: make it readable (or
+its volume, and waits there if that node is short of room, not ready, or in the
+middle of an upgrade. A running app stays put for the same reasons. Only when
+that node is gone (or no longer matches the app's `placement.required` labels)
+does it start elsewhere, on a new, empty volume. A host-path volume is never chowned: make it readable (or
 writable) by the container's mapped user yourself.
 
 ## Snapshots
@@ -179,13 +206,25 @@ relish apply db.toml     # start it again
 ```
 
 Restore overwrites the live volume, so stop the app first. On other
-filesystems, snapshot commands fail with an error saying so. For scheduled
-snapshots, optionally uploaded as archives to object storage:
+filesystems, snapshot commands fail with an error saying so.
+
+`--volume` must be one of the app's own managed volumes, named by its
+container mount path. A custom `--name` is 1 to 128 characters from
+`A-Z a-z 0-9 . _ -` and can't start with a dot. Anything else is refused with
+a 400. Without `--volume`, `create` snapshots every managed volume of the app
+under one shared name. Restoring or deleting that name then needs `--volume`
+to say which copy you mean:
+
+```sh
+relish snapshot restore db 1752000000 --volume /var/lib/postgresql/data
+```
+
+For scheduled snapshots, optionally uploaded as archives to object storage:
 
 ```toml
 [storage.snapshots]
 interval_secs = 86400                 # 0 (the default) disables it
-retain = 7                            # newest N per volume
+retain = 7                            # newest N per volume; at least 1 when scheduled
 upload_url = "s3://backups/volumes"   # optional; file:// and gs:// too
 ```
 

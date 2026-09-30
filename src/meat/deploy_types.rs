@@ -91,6 +91,32 @@ impl DeployConfig {
         cfg
     }
 
+    /// The config a node actually rolls an app out with: its own `[deploy]`
+    /// table, except that an app with a managed volume always rolls
+    /// stop-first.
+    ///
+    /// A managed volume is one directory per app on the node, shared by
+    /// every instance there. A surge-first rollout (or blue-green, which is
+    /// one big surge) starts the replacement while the old instance is
+    /// still writing, so for a few seconds two processes write the same
+    /// files. That's how the V02 soak's writer got a line twice. Retiring
+    /// first costs a moment of unavailability; a database that two
+    /// processes append to at once costs rather more. Host-path volumes
+    /// are left alone: sharing one is the operator's call.
+    pub fn for_app(spec: &crate::config::app::AppSpec) -> Self {
+        let mut cfg = spec
+            .deploy
+            .as_ref()
+            .map(Self::from_spec)
+            .unwrap_or_default();
+        if spec.volumes.iter().any(|volume| volume.source.is_none()) {
+            cfg.strategy = DeployStrategy::Rolling;
+            cfg.max_surge = 0;
+            cfg.max_unavailable = cfg.max_unavailable.max(1);
+        }
+        cfg
+    }
+
     /// Reject a surge/unavailable pair that can't make progress (M7).
     ///
     /// With `max_surge = 0` a rollout may not exceed the replica target, and

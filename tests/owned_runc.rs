@@ -367,6 +367,76 @@ async fn runc_owned_completed_log_reader_cannot_block_a_replacement_generation()
     stream.await.unwrap();
 }
 
+/// V02 soak blocker (candidate 3fcb1fd): a restarted Bun follows every
+/// adopted container's capture from byte 0. The soak's log spammer had
+/// written about a million lines, and splitting them in one synchronous step
+/// held a runtime worker for minutes, which starved startup adoption until
+/// its 10 s deadline expired. The replay must hand the runtime back between
+/// bounded chunks. `#[tokio::test]` is single-threaded, so a stalled 1 ms
+/// timer is the runtime being held.
+#[tokio::test]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft"]
+async fn following_a_large_capture_after_a_restart_does_not_hold_the_runtime() {
+    const LINES: u64 = 200_000;
+    const LINE: &str = "spam the quick brown fox jumps over";
+    let root = tempfile::tempdir().unwrap();
+    let id = instance(root.path());
+    let first = runtime(root.path());
+    first
+        .create(
+            &id,
+            &spec(
+                root.path(),
+                &format!(
+                    "/bin/busybox yes '{LINE}' | /bin/busybox head -n {LINES}; \
+                     /bin/busybox touch /work/written; exec /bin/busybox sleep 60"
+                ),
+            ),
+        )
+        .await
+        .unwrap();
+    install_fixture(root.path(), &id);
+    first.start(&id).await.unwrap();
+    wait_file(&root.path().join("shared/written")).await;
+    drop(first);
+
+    // A fresh runtime handle, as after a Bun restart, re-follows from byte 0.
+    let restarted = runtime(root.path());
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(256);
+    let reader = restarted.clone();
+    let log_id = id.clone();
+    let stream = tokio::spawn(async move { reader.follow_logs(&log_id, sender).await });
+    let consumer = tokio::spawn(async move {
+        let mut last = None;
+        for _ in 0..LINES {
+            last = receiver.recv().await;
+        }
+        last
+    });
+    let mut longest_stall = Duration::ZERO;
+    let started = std::time::Instant::now();
+    while !consumer.is_finished() && started.elapsed() < Duration::from_secs(120) {
+        let tick = std::time::Instant::now();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        longest_stall = longest_stall.max(tick.elapsed());
+    }
+    let last = consumer.await.unwrap();
+    stream.abort();
+    restarted.kill(&id).await.unwrap();
+    assert_absent(root.path(), &id);
+
+    let last = last.expect("the replay ended before the whole capture arrived");
+    assert_eq!(last.line, LINE);
+    assert_eq!(
+        last.position.unwrap().end_offset,
+        LINES * (LINE.len() as u64 + 1)
+    );
+    assert!(
+        longest_stall < Duration::from_secs(1),
+        "replaying the capture held the runtime for {longest_stall:?}"
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft"]
 async fn generated_cgroup_path_matches_the_actual_container_before_its_first_instruction() {

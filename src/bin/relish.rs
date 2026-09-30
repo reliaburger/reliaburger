@@ -11,7 +11,11 @@ use reliaburger::relish::OutputFormat;
 use reliaburger::relish::commands;
 
 #[derive(Parser)]
-#[command(name = "relish", version, about = "Reliaburger CLI")]
+#[command(
+    name = "relish",
+    version = reliaburger::upgrade::version::VERSION_LINE.as_str(),
+    about = "Reliaburger CLI"
+)]
 struct Cli {
     /// Output format: human, json, or yaml.
     #[arg(long, default_value = "human", global = true)]
@@ -931,6 +935,10 @@ enum SnapshotAction {
         /// Namespace (default: "default").
         #[arg(short = 'n', long, default_value = "default")]
         namespace: String,
+        /// Volume to restore (container mount path, e.g. /data);
+        /// required when several volumes share the snapshot name.
+        #[arg(long)]
+        volume: Option<String>,
     },
     /// Delete a snapshot.
     Delete {
@@ -941,6 +949,10 @@ enum SnapshotAction {
         /// Namespace (default: "default").
         #[arg(short = 'n', long, default_value = "default")]
         namespace: String,
+        /// Volume whose snapshot to delete (container mount path);
+        /// required when several volumes share the snapshot name.
+        #[arg(long)]
+        volume: Option<String>,
     },
 }
 
@@ -1366,12 +1378,14 @@ async fn main() -> ExitCode {
                 app,
                 name,
                 namespace,
-            } => commands::snapshot_restore(app, namespace, name).await,
+                volume,
+            } => commands::snapshot_restore(app, namespace, name, volume.as_deref()).await,
             SnapshotAction::Delete {
                 app,
                 name,
                 namespace,
-            } => commands::snapshot_delete(app, namespace, name).await,
+                volume,
+            } => commands::snapshot_delete(app, namespace, name, volume.as_deref()).await,
         },
         Command::Fault { ref action } => match action {
             FaultAction::Delay {
@@ -3305,13 +3319,32 @@ mod tests {
                         app,
                         name,
                         namespace,
+                        volume,
                     },
             } => {
                 assert_eq!(app, "db");
                 assert_eq!(name, "1752000000");
                 assert_eq!(namespace, "default");
+                assert_eq!(volume, None);
             }
             _ => panic!("expected a snapshot restore command"),
+        }
+
+        let cli = parse(&[
+            "relish",
+            "snapshot",
+            "delete",
+            "db",
+            "1752000000",
+            "--volume",
+            "/wal",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Snapshot {
+                action: SnapshotAction::Delete { volume, .. },
+            } => assert_eq!(volume.as_deref(), Some("/wal")),
+            _ => panic!("expected a snapshot delete command"),
         }
     }
 

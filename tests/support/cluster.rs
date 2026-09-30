@@ -32,7 +32,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use reliaburger::bun::agent::{AgentCommand, BunAgent, PartitionBlocklists};
-use reliaburger::bun::api::{self, KnownMembers, NodeMembershipInfo};
+use reliaburger::bun::api::{self, KnownMembers, NodeMembershipInfo, RosterMember};
 use reliaburger::cluster::identity::raft_id_from_name;
 use reliaburger::cluster::orchestrate::{spawn_leader_scheduler, spawn_placement_reconciler};
 use reliaburger::cluster::runtime::{self, ClusterParams, CouncilReconcilerConfig};
@@ -414,10 +414,10 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
     let membership_table: Arc<RwLock<Vec<NodeMembershipInfo>>> = Arc::new(RwLock::new(Vec::new()));
     // Every member gossip has shown, so the relay and node-fault reversal
     // reach a node-killed peer as `bun` wires them.
-    let known_members = KnownMembers(Arc::new(RwLock::new(Vec::new())));
+    let known_members = KnownMembers::default();
     tasks.push(match membership {
         MembershipSource::Gossip => spawn_gossip_membership_table(
-            membership_rx.clone(),
+            cluster_runtime.roster_rx.clone(),
             Arc::clone(&membership_table),
             known_members.clone(),
             shutdown.clone(),
@@ -588,7 +588,8 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
     }
 }
 
-/// Keep `table` in step with the alive gossip members (API = gossip + 3).
+/// Keep `table` in step with the alive gossip members (API = gossip + 3),
+/// and `known` with gossip's whole roster.
 fn spawn_gossip_membership_table(
     mut rx: watch::Receiver<Vec<MembershipSnapshot>>,
     table: Arc<RwLock<Vec<NodeMembershipInfo>>>,
@@ -597,28 +598,29 @@ fn spawn_gossip_membership_table(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            let (snapshot, published): (Vec<NodeMembershipInfo>, Vec<NodeMembershipInfo>) = {
-                let members = rx.borrow();
-                let info = |m: &MembershipSnapshot| NodeMembershipInfo {
-                    node_id: m.node_id.clone(),
-                    address: SocketAddr::new(m.address.ip(), m.address.port() + 3),
-                    api_advertised: true,
-                };
-                (
-                    members
-                        .iter()
-                        .filter(|m| m.state == NodeState::Alive)
-                        .map(info)
-                        .collect(),
-                    members
-                        .iter()
-                        .filter(|m| m.state != NodeState::Left)
-                        .map(info)
-                        .collect(),
-                )
-            };
-            *table.write().await = snapshot;
-            known.refresh(published).await;
+            let roster: Vec<RosterMember> = rx
+                .borrow()
+                .iter()
+                .map(|m| RosterMember {
+                    info: NodeMembershipInfo {
+                        node_id: m.node_id.clone(),
+                        address: SocketAddr::new(m.address.ip(), m.address.port() + 3),
+                        api_advertised: true,
+                    },
+                    gossip_address: m.address,
+                    state: m.state,
+                    incarnation: m.incarnation,
+                    labels: m.labels.clone(),
+                })
+                .collect();
+            *table.write().await = roster
+                .iter()
+                .filter(|m| m.state == NodeState::Alive)
+                .map(|m| m.info.clone())
+                .collect();
+            known
+                .refresh(roster, &Default::default(), std::time::Instant::now())
+                .await;
             tokio::select! {
                 _ = shutdown.cancelled() => break,
                 changed = rx.changed() => if changed.is_err() { break },

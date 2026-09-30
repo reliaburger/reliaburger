@@ -447,6 +447,40 @@ The second is a hazard the interleaving created. Retiring old instances *during*
 
 Testing this is where the pure planner pays off. The unit tests don't assert step sequences — that would pin the implementation — they replay a whole rollout and assert the *envelope*: peak total and minimum serving. A proptest then does the same for every combination of target, existing count and bounds that validation permits. And because a planner nothing calls is worse than no planner (this codebase has a long history of exactly that), there are agent-level tests that replay the grill's call log to count live containers: three replicas with `max_surge = 1` peak at four, and they peak at six against the old code.
 
+### One volume, one writer
+
+Surge-first is the right default for a web server. For an app with a managed volume it's quietly wrong, and the V02 soak found out how.
+
+The soak's writer is a shell loop on a managed volume: append the next number to `/data/seq`, `sync`, log `ACK n`. It started on node 2, and then the harness cut node 2's power in the middle of an upgrade walk. The node came back, the old binary started the writer again, and four seconds later the upgrade replaced the binary before its placement reconciler could record that deploy as applied. The new binary adopted the running writer, found the placement still pending and deployed it again. The app already had an instance, so that deploy was a rolling redeploy with the default `max_surge = 1`: start `soak-writer-g1-0`, wait for it, then retire `soak-writer-0`.
+
+Two instances of one app on one node share one managed volume. That's the design (`volumes/<namespace>/<app>/<path>`, one directory per app), and it's why a restart finds its data. So for a few seconds two shells appended to the same file. The new one read `21925` as the last line, the old one appended `21926`, and then the new one appended its own `21926`. Every acknowledged number was still in the file. It just had one of them twice, and a database with two processes appending to its write-ahead log wouldn't get off so lightly.
+
+The fix is a rule, not a knob. `DeployConfig::for_app` is what a node rolls an app out with: the app's own `[deploy]` table, except that an app with a managed volume always rolls stop-first (`max_surge = 0`, `max_unavailable` at least 1), and blue-green (which is one big surge) falls back to that too:
+
+```rust
+pub fn for_app(spec: &crate::config::app::AppSpec) -> Self {
+    let mut cfg = spec
+        .deploy
+        .as_ref()
+        .map(Self::from_spec)
+        .unwrap_or_default();
+    if spec.volumes.iter().any(|volume| volume.source.is_none()) {
+        cfg.strategy = DeployStrategy::Rolling;
+        cfg.max_surge = 0;
+        cfg.max_unavailable = cfg.max_unavailable.max(1);
+    }
+    cfg
+}
+```
+
+`spec.deploy.as_ref().map(Self::from_spec)` reads as: if there's a `[deploy]` table, parse it; `as_ref` borrows the `Option`'s contents rather than moving them out of `spec`, and `unwrap_or_default` supplies `DeployConfig::default()` when there's none. Host-path volumes (`source = "/srv/..."`) are left alone: the operator chose to share that directory and knows whether its users can.
+
+Stop-first costs a moment of unavailability on every redeploy of a volume app. We could have kept surge-first and fenced the volume instead (a lock file, or a lease the new instance waits on), but that asks every workload to cooperate, and the busybox loop that caught this never would. Kubernetes has the same trap: a `Deployment` with a `ReadWriteOnce` claim will happily run old and new pods on one node, which is why databases go in a `StatefulSet`. We'd rather not make you know that.
+
+The regression tests replay the grill's call log like the `max_surge` tests above: a volume app's redeploy must never have two instances live at once, a blue-green volume app must roll stop-first, and a host-path-only app keeps its surge. The soak's own check got fixed in the same change. Its `awk` stopped at the first line out of place and printed `LAST` from its `END` block, and `END` runs even after `exit`, so a file with one repeated line read as a file cut off at that line, below thousands of later ACKs. That looked like lost data for an hour. The check now reads the whole file and says which values are missing (lost data), which appear twice (two writers) and what the highest one is.
+
+Stop-first makes that redeploy safe. It was also unnecessary: the adopted writer already ran exactly what the placement asked for. Chapter 14 ("Adopted, and already done") shows how the reconciler now asks the agent about its adopted instances and records such a placement as applied without deploying it at all.
+
 ### "Healthy" has to mean the app answered
 
 One more audit finding, and it's the one that would have hurt most in production. The opening of this chapter promised "health-check each new instance before moving on". The live path's version of that promise was a poll on `grill.state == Running` — the *runtime's* view. The process came up, the container didn't crash, so: healthy, publish the backend, retire an old instance. At no point did anyone ask the app the question the operator configured: does `GET /healthz` return 200?
@@ -617,6 +651,8 @@ pub enum AssignmentState {
 
 Rust enum variants can carry data: `Pending` carries nothing, `Applied { fingerprint }` carries a string, a bit like a tagged union in C where the compiler checks the tag for you. The reconciler writes `Pending` *before* it queues the `Deploy` command and upgrades it to `Applied` only on `Complete`. Both states mean "this node owns resources for the app", so a withdrawn assignment in either state needs a confirmed retirement before its entry disappears. A restarted bun now neither double-deploys converged work nor forgets an interrupted deploy.
 
+The release soak found one more way to fall between the two records, and it needed nobody to crash mid-deploy. The harness restarts bun on all three nodes, one after another. While that happens the leader briefly gives up on node 2 and takes its `frontend` replica away, then hands the very same assignment back a few seconds later. In between, node 2 starts retiring the replica. The stop succeeds. Freeing its address doesn't, not yet: that waits until every other node confirms it has stopped routing there, and the other nodes are busy restarting. So the retirement fails with "will retry", the entry stays `Applied`, and on the next tick the assignment is back with an identical fingerprint. Same fingerprint? Skip it. The replica stayed stopped for good, and `frontend` ran two of its three replicas until the harness gave up ten minutes later. The leader wasn't wrong, either: it had placed the replica on a live node, so it had no reason to place it anywhere else. The fix is one rule: a retirement that doesn't finish drops the entry back to `Pending`. That keeps ownership, so the retirement is retried if the assignment stays gone, and it stops claiming convergence, so a returning assignment gets deployed. The agent's rolling path already turns a stopped replica into a fresh running one. `a_placement_returning_after_a_failed_retirement_is_deployed_again` plays the leader's withdraw-and-return against a stand-in agent whose retirement answers "other nodes have not yet confirmed". Before the fix, it saw the same single "will retry" line the soak journal shows, followed by silence.
+
 ## Stopping an app is a decision, not a signal
 
 Stopping an app in a cluster used to be a local affair. `POST /v1/stop/{app}/{namespace}` sent the receiving node's agent a `Stop` command, that node killed its local replicas, and the handler returned. Done — except it wasn't.
@@ -771,8 +807,11 @@ async fn apply_changes(council: &CouncilNode, changes: &[ResourceChange]) -> Res
     let mut applied = 0;
     for change in changes {
         let Some(request) = change_to_request(change) else { continue };
-        if let Err(e) = council.write(request).await {
-            return Err(change_id(change).to_string());   // stop; don't advance
+        match council.write(request).await {
+            Ok(CouncilResponse::Refused { .. }) | Err(_) => {
+                return Err(change_id(change).to_string());   // stop; don't advance
+            }
+            Ok(_) => {}
         }
         applied += 1;
     }
@@ -785,6 +824,8 @@ async fn apply_changes(council: &CouncilNode, changes: &[ResourceChange]) -> Res
 The caller advances `last_applied_commit` only on `Ok`. On `Err`, it leaves the commit untouched and moves on; the next tick sees an unapplied commit and re-runs the whole set. That only works because the writes are idempotent — applying a `NamespaceSpec` that's already there is an upsert, a harmless no-op — so re-running a partially-applied sync converges instead of double-counting. Idempotence is what buys you "just retry the whole thing," which is the simplest correct recovery there is.
 
 The test for this drives `apply_changes` against a council that was never made leader, so every write is refused. The function must stop at the first failure and report *which* change failed, and the app must never reach desired state. Run it against the old code and the commit advances over a wholesale failure; run it against the new code and the failure surfaces, the commit holds, and the next tick gets another go.
+
+The first version of this fix only checked the outer `Err`, and a static review (B15) caught what that misses. `council.write` returns `Result<CouncilResponse, CouncilError>`, and `Err` only means Raft didn't commit the entry. An entry can commit and still be *refused*: the state machine applies it in log order, decides it isn't allowed, and answers `Ok(CouncilResponse::Refused { reason })` with desired state untouched. An app in an `rbtest-*` namespace is one, since only a leased test write may create those. That `Ok` counted as applied, and the commit advanced past a change that never happened. The `match` above names the refusal next to the transport error, so both stop the sync. The pattern `A | B` in one arm matches either shape, and `Ok(_)` after it catches every other response. The test drives `apply_changes` on a real leader with an `rbtest-lease/web` app and expects the refusal to come back as that resource's id.
 
 ## The namespace bug that got away
 
@@ -892,6 +933,18 @@ One subtlety cost us a test. `git rev-parse --end-of-options HEAD` *echoes the s
 The same wrapper learned two more manners. A clone left over at the data path is now *checked* before it's reused — its `remote.origin.url` and tracked branch must still match the config — because a stale clone from a repointed `[gitops] repo`, or one left behind by a failover, would otherwise sync the wrong repository entirely. On a mismatch, Lettuce discards it and clones fresh. And the file merge, which used to `HashMap::extend` files in whatever order the hash felt like, now sorts by path first: two nodes handed the identical repo must converge on the identical config, and "last writer wins by hash order" is not a property you can reason about. A resource declared twice across files is reported as a duplicate against the later file rather than silently overwritten.
 
 The listing itself uses `git ls-tree -r`, which always descends into subdirectories. For a while `[gitops]` still accepted a `recursive` flag that did nothing, and `recursive = false` earned a startup warning because it promised a shallow sync it never delivered. We kept it "so existing configs still parse". Before 0.1.0 there are no existing configs worth a shim, so the field is gone. `GitOpsConfig` has `#[serde(deny_unknown_fields)]`, so a leftover `recursive = ...` is now a parse error that names the key, which is louder and more honest than a warning scrolling past in the Bun log.
+
+The static review in PR #258 (B17) found two ways that listing could shrink without anyone noticing, and in a reconciler a missing file is a deletion. First, plain `ls-tree` output is for humans: a path with a tab or a non-ASCII byte comes out C-quoted, so `café.toml` prints as `"caf\303\251.toml"`. That string doesn't end in `.toml`, so the loop skipped it, and every app it declared was removed on the next sync. Now the listing runs with `-z`, which prints raw paths terminated by NUL bytes, and the loop splits the bytes on zero rather than splitting a string into lines:
+
+```rust
+for entry in output.stdout.split(|byte| *byte == 0) {
+    if !entry.ends_with(b".toml") {
+        continue;
+    }
+    let name = std::str::from_utf8(entry).map_err(|_| /* … */)?;
+```
+
+`output.stdout` is a `Vec<u8>`, and `split` takes a closure (`|byte| *byte == 0`, Rust's lambda syntax) that marks the separators. `b".toml"` is a byte-string literal, a `&[u8; 5]` rather than a `&str`, so the suffix test works on raw bytes before we've decided they're text. Rust's `str` is always valid UTF-8, so turning bytes into one is a fallible `from_utf8`; a name that isn't valid UTF-8 fails the sync rather than being skipped. Second, a `.toml` whose `git show` failed was dropped from the result. It now fails the whole listing, because a partial desired state is exactly the thing that deletes apps. The tests build a real repository with `café.toml`, `tab\tname.toml` and a non-ASCII subdirectory and expect all of them back; another unpacks the clone's objects, deletes one blob and expects an error that names the file.
 
 ## A broken sync you can actually see
 
@@ -1023,6 +1076,8 @@ desired
 
 `filter` hands the closure a reference to each `(key, value)` pair, so `id` is a `&&AppId` there; `*id` strips one layer to get the `&AppId` that `contains` wants. A stopped app keeps its service and VIP, though, with zero backends, so the same name and address come back when you apply it again.
 
+A single Bun without a cluster got that last part wrong. There's no council there, so `relish stop` stops the replicas itself and keeps them owned, `Stopped`, for the next apply to replace. Once every exit is confirmed, the stop releases the app's service entry and ingress route, which is right for a stopped app: nothing should resolve to it. But the apply that follows sees owned replicas and takes the redeploy path, and a redeploy assumes the service it publishes backends into is already there. It wasn't, so the first replacement failed with "cannot publish backend for default/web: service not found" and the rollout rolled back to replicas that were already stopped. The fresh-deploy path registers the service; the redeploy path never had to, until stop started keeping replicas around. Now, before it rolls anything, the redeploy puts back whatever a stop released: the service, if the app has a port and the map doesn't have it, and the ingress route, if none is stored. The VIP is a hash of the app's name, so the service comes back at the address it had before, just as the cluster catalogue keeps it. Cluster mode never hit this, because there the reconciler retires the replicas outright and the next apply is a fresh deploy.
+
 ### A stopped app forgets where its data is
 
 Keeping the specification wasn't enough, either. The V02 soak's `volume_data_survives_instance_restart` case writes a marker into a managed volume, stops the app, applies it again and reads the marker back. On one fast-tier run it got this:
@@ -1051,6 +1106,50 @@ A struct that holds references needs a lifetime parameter, `'a`, which tells the
 `reserve` sorts each home node into one of three outcomes. A home that's alive, ready and still matches the app's required labels gets the replica. A home that could run it but has no room makes the app wait, because starting it elsewhere is exactly the bug. A home that's gone, or that the operator has excluded with new labels, is dropped, and that replica goes through the normal scheduler: losing a local volume with its node is the documented trade-off of local storage. It checks every home before reserving any of them, so an app that ends up waiting doesn't leave phantom reservations behind for the apps after it in the same pass.
 
 The gated cluster test `a_stopped_volume_app_starts_again_on_the_node_that_holds_its_volume` reproduces the soak deterministically. Three nodes carry zone labels; the app is pinned to zone `b` and lands on `v2`. Then it's stopped and applied again without the pin, so every node is empty and the scheduler, left to itself, picks `v1`, the lowest node id. Before the fix, it came back on `v1`. The new field changes the durable state format, so `compatibility::CURRENT` moved to state 44.
+
+### "Not ready" isn't "gone"
+
+The final-tier soak on the fixed candidate failed the same case, with the same message. This time the record of where the app ran was intact. What let us down was the line that dropped a home node that was "gone, not ready, or no longer matching the labels".
+
+Look at how the leader decides a node isn't ready. Each node's report worker sends a state report, a capability report and a readiness report every five seconds. If the leader hasn't received anything from a node for 30 seconds, it keeps the last state report, lists the node as stale and throws away its readiness and capability evidence, so the cache it schedules against says `ready: false`. During that pulse, the report workers on nodes 2 and 3 logged `snapshot collection failed or timed out` every five seconds, for more than a minute each. The soak's own volume apps, pinned to those nodes by label, tell us exactly when: the leader logged `cannot place default/soak-redis: no eligible nodes` while node 3 was stale and `cannot place default/soak-writer` while node 2 was. The test app's re-apply landed inside node 2's window. Its home looked not ready, so it was dropped like a dead node, and the scheduler started the app on another node with a fresh, empty volume. The node had been alive the whole time, with the marker on its disk.
+
+The pinned apps were only lucky: a label pin leaves the scheduler nowhere else to go. An unpinned app with a volume was worse off than the test. `placement_holds` decides whether a *running* placement can stay, and it said no for a stale or not-ready node, so a running database would have been restarted elsewhere on an empty volume. The upgrade cordon sets `ready: false` on the node being upgraded, so every `relish upgrade` walk would have done it on purpose.
+
+So the rule is now stricter, and it matches what the manual already promised. Only two things release a volume's node: gossip no longer having it alive, and the operator's `placement.required` labels excluding it. Everything else is a reason to wait, and the waits say why:
+
+```rust
+enum HomeOutcome {
+    Placed(Vec<crate::meat::types::Placement>),
+    Wait { node: NodeId, reason: HomeWait },
+}
+
+enum HomeWait {
+    Unreported,
+    NotReady,
+    NoRoom,
+}
+```
+
+`Wait` is a struct-like variant: its fields have names, like a C struct inside a tagged union, and a `match` binds them by name (`HomeOutcome::Wait { node, reason } => ...`). `HomeWait` implements `std::fmt::Display`, the trait `{}` formatting calls, which is Rust's equivalent of Go's `String()` method, so the log line reads `waits for rb-2, which holds its volumes: it isn't ready` instead of printing a debug dump.
+
+`placement_holds` gets the same rule for running apps. A fixed-replica app with a managed volume keeps its placement for as long as its node is alive:
+
+```rust
+if unheard.contains(&placement.node_id) || has_managed_volume(spec) {
+    return true;
+}
+cache
+    .get_node(&placement.node_id)
+    .is_none_or(|node| node_can_run(node, spec, dns_required))
+```
+
+`Option::is_none_or` is true for `None`, and otherwise calls the closure on the value inside. It replaces a `let ... else` with an early return: a node the leader has no report for keeps its placements, and a reported one keeps them only if it can run the app.
+
+We did think about keeping the old behaviour for "reported, fresh and not ready", which is real evidence of trouble, and moving only on silence. It doesn't help. A node that reports not ready still has the data, and a stateful app that's down until its node recovers is a better outcome than one that's up with nothing in it. Kubernetes makes the same call for local persistent volumes: the pod stays pending, bound to its node. An operator who really wants the app elsewhere changes its labels, or retires the node.
+
+The first test builds the scheduler's view the way the leader does, from an `AggregatedState` with node `home` listed stale, through `build_cluster_cache` and `unheard_nodes`. Before the fix, it placed the app on `busy`. A second test does the same for a running app, and checks that a node gossip has declared dead still releases it.
+
+The report worker's stalls are their own problem, and they're still open. Even with this fix, they make the leader move apps *without* volumes off a node that is running them fine.
 
 ## Two seconds is too eager
 
@@ -1115,6 +1214,41 @@ Moving the wait off the loop opened gaps that the old serial code closed by acci
 The agent was only half the stall. On each cycle the node's placement reconciler sent `Retire` for every app it no longer owned, one at a time, and gave each ten seconds for queueing and reply. That's the same ten seconds as the stop grace, so a stubborn app's retirement *always* timed out on the first try, and five of them held up the reconciler (and every deploy queued behind it) for fifty seconds. The deadline now comes from the stop itself: `stop_completion_bound` adds up the worst case (a drain of up to one grace, the grace, and three runtime confirmation timeouts), and the reconciler adds its queueing allowance on top. A cycle's retirements go through `buffer_unordered(4)`, a stream adaptor that keeps up to four futures in flight and yields each result as it lands, so five stubborn retirements cost about one grace, not five. A test with a stand-in agent whose every stop takes a grace checks that three retirements finish inside two graces, each on its first attempt; one at a time they took 4.5 s for three 1.5 s stops.
 
 What didn't change is the guarantee that matters: a port, an address or a volume is released only after the runtime has confirmed the old process is gone. `Retire` still answers only after the exit, and the tests hold both ends of that. With a process-runtime workload running `sh -c "trap '' TERM; sleep 60"`, `Status` must answer in under a second while the stop waits, the stop must take at least the grace and end with the process gone, a retirement must keep its instance listed until the exit, and two stubborn stops must finish in under 1.8 graces (one after the other they can't take less than two). Each of those fails against the old loop. The overlap test, for example, reported `4.03s for two 2s graces`.
+
+### Retire first, deploy second
+
+Side-by-side retirements fixed the stops. They didn't fix the order. A reconcile cycle deployed first, one app at a time, and each deploy may wait up to five minutes for its terminal event. Only then did it retire the placements that had left the node. After a node went stale, or when a cluster powered back on, the surviving nodes had a wave of rescheduled replicas to start, and every retirement on those nodes queued behind the wave. The V02 soak saw it as test-lease cleanup: the owner was the leader, busy rolling out frontend replicas it had inherited from a killed worker, and the release outlived `lease_retirement_bound`, whose doc comment had to admit the gap ("a deploy it's still finishing runs first").
+
+Two changes close it. The cycle now retires before it deploys. A retirement only covers placements that are already gone from this node, so running it first costs no availability, and it frees ports, addresses and volumes for the deploys that follow. That handles what was due when the cycle started. For what becomes due *during* a long deploy, the reconciler already polled the leader on every tick while it waited (the producer can need this node's withdrawal receipt before it can finish). It used to throw that answer away. Now it retires whatever the fresh answer says has left.
+
+Retiring in the middle of a deploy raises the one-writer question from #267. What if the app that's deploying is the one the fresh answer withdraws? The retirement skips it: `retire_departed` takes the in-flight placement as `busy`, and it waits for the next cycle, after its deploy has finished. The agent would refuse the overlap anyway (a stop of an app that's deploying gets `WorkloadBusy`, a deploy of an app that's stopping gets "still stopping"), but the reconciler shouldn't lean on refusals it then has to retry. The other direction matters too. If a fresh answer withdraws an app the cycle hasn't reached yet, the cycle skips it rather than deploying it from the older answer. For a volume app that the leader has just moved elsewhere (#269), that stale deploy would have been a second writer on another node.
+
+The retirement code moved into a small struct that borrows what it needs from the reconciler:
+
+```rust
+struct Retirer<'a> {
+    node_name: &'a str,
+    cmd_tx: &'a mpsc::Sender<AgentCommand>,
+    client: &'a reqwest::Client,
+    // ...
+}
+
+impl Retirer<'_> {
+    async fn retire_departed(
+        &self,
+        applied: &mut AppliedMap,
+        leader_url: &str,
+        assignments: &NodeAssignments,
+        busy: Option<&(String, String)>,
+    ) -> Option<()> { /* ... */ }
+}
+```
+
+`<'a>` is a lifetime parameter. A struct that holds references has to say how long they're valid, and `'a` names "as long as the reconciler's own values", so the compiler rejects any `Retirer` that could outlive them. In C you'd just store the pointers and hope. In the `impl` we don't care which lifetime it is, so `'_` asks the compiler to fill it in. The map of owned placements is *not* in the struct. It's passed as `&mut AppliedMap` on each call, because the deploy loop changes it between calls, and Rust won't let one value hold a long-lived mutable borrow while another piece of code writes to the same map.
+
+There was one trap. While the reconciler retires, it isn't reading the deploy's event stream. The agent never lets a slow reader hold a deploy hostage: when the stream's buffer is full, it closes the stream, and the reconciler would then see a perfectly healthy deploy as "closed without an outcome". So the stream now drains on its own task. `tokio::spawn` returns a `JoinHandle`, which is itself a future that resolves to the task's result, so `select!` can wait on it exactly as it waited on the inline future before. On shutdown the reconciler calls `abort()` on it instead of leaving it to run out its five minutes.
+
+Four tests pin this down, each with a stand-in leader whose answer the test rewrites mid-flight. A retirement due at the start of a cycle must reach the agent before the cycle's deploy, which never finishes. A lease released while a deploy hangs must be retired and acknowledged well inside `lease_retirement_bound`. A volume app that leaves the node during its own deploy must be retired only after that deploy completes, and redeployed only after the retirement answers. A placement withdrawn during another app's deploy must never be deployed. Three of them failed against the old order; the fourth passes either way and fails as soon as the `busy` exclusion is removed.
 
 ## What we deferred
 

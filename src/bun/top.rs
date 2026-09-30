@@ -131,6 +131,7 @@ mod tests {
             host_port: None,
             exit_code: None,
             pid,
+            runtime_unknown: false,
         }
     }
 

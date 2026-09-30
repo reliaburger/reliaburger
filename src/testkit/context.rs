@@ -81,7 +81,12 @@ impl PeerRoute {
         let Ok(nodes) = client.nodes().await else {
             return Self::Direct;
         };
-        for node in nodes.iter().filter(|node| node.node_id != entry_node) {
+        // The listing also shows members gossip has declared dead. Probing
+        // one usually costs both timeouts and decides nothing.
+        let peers = nodes
+            .iter()
+            .filter(|node| node.node_id != entry_node && !node.is_down());
+        for node in peers {
             if answers_health(client.for_node(node)).await {
                 continue;
             }
@@ -442,8 +447,11 @@ impl TestContext {
         if nodes.is_empty() {
             return Ok(vec![("local".to_string(), self.client.clone())]);
         }
+        // The listing shows members gossip has declared dead, which run
+        // nothing the cluster counts and may not answer at all.
         nodes
             .into_iter()
+            .filter(|node| !node.is_down())
             .map(|node| {
                 let client = if node.node_id == self.capabilities.node_id {
                     Ok(self.client.clone())
@@ -723,10 +731,10 @@ impl TestContext {
                     };
                 }
                 // Reached it, but the lease was still held when the release's
-                // own 30 s budget ran out: not the same as unreachable.
+                // own budget ran out: not the same as unreachable.
                 Ok(Err(crate::relish::RelishError::RequestTimeout)) => {
                     return CleanupOutcome::Unknown {
-                        reason: "the lease owner did not confirm cleanup within 30 s".to_string(),
+                        reason: unconfirmed_release_reason(),
                     };
                 }
                 Ok(Err(error)) => {
@@ -839,6 +847,15 @@ impl TestContext {
     }
 }
 
+/// Why cleanup is unknown when the lease owner was reached but the release
+/// ran out of its budget, naming the budget it actually had.
+fn unconfirmed_release_reason() -> String {
+    format!(
+        "the lease owner did not confirm cleanup within {} s",
+        crate::relish::client::lease_release_budget().as_secs()
+    )
+}
+
 fn merge_cleanup(left: CleanupOutcome, right: CleanupOutcome) -> CleanupOutcome {
     use CleanupOutcome::{Confirmed, Failed, NotRequired, Unknown};
 
@@ -900,6 +917,18 @@ mod tests {
     use super::*;
     use crate::config::Config;
 
+    /// V02: the report said "within 30 s" long after the release budget
+    /// became the product's retirement bound (72 s by default).
+    #[test]
+    fn an_unconfirmed_release_reports_the_budget_it_actually_had() {
+        let budget = crate::relish::client::lease_release_budget().as_secs();
+        assert_ne!(budget, 30);
+        assert_eq!(
+            unconfirmed_release_reason(),
+            format!("the lease owner did not confirm cleanup within {budget} s")
+        );
+    }
+
     fn context(namespace: &str) -> TestContext {
         TestContext {
             client: BunClient::new_with_token("http://127.0.0.1:9117", None),
@@ -933,6 +962,28 @@ mod tests {
         assert_eq!(clients.len(), 2);
         assert_eq!(clients[0].1.base_url(), "http://127.0.0.1:19117");
         assert_eq!(clients[1].1.base_url(), "http://[::1]:29117");
+    }
+
+    #[tokio::test]
+    async fn node_clients_leave_out_members_gossip_declared_dead() {
+        let router = axum::Router::new().route("/v1/cluster/nodes", axum::routing::get(|| async {
+            axum::Json(serde_json::json!([
+                {"node_id":"one", "address":"127.0.0.1:7946", "api_address":"127.0.0.1:19117",
+                 "state":"alive", "incarnation":1, "is_council":true, "is_leader":true, "labels":{}},
+                {"node_id":"two", "address":"127.0.0.1:7947",
+                 "state":"dead", "incarnation":1, "is_council":true, "is_leader":false, "labels":{}}
+            ]))
+        }));
+        let (base, server) = serve(router).await;
+        let mut context = context("rbtest-dead-peer");
+        context.client = BunClient::new(&base);
+        // A dead peer with no endpoint would refuse the whole inventory.
+        let clients = context.node_clients().await.unwrap();
+        let route = PeerRoute::detect(&BunClient::new(&base), "one").await;
+        server.abort();
+        assert_eq!(clients.len(), 1);
+        assert_eq!(clients[0].0, "one");
+        assert_eq!(route, PeerRoute::Direct);
     }
 
     /// Two nodes as the entry node lists them. `one` is the entry node; both

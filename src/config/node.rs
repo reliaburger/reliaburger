@@ -517,7 +517,8 @@ impl Default for StorageSection {
 pub struct SnapshotsSection {
     /// Seconds between snapshot sweeps. `0` disables the loop.
     pub interval_secs: u64,
-    /// Snapshots retained per volume; older ones are pruned.
+    /// Snapshots retained per volume; older ones are pruned. Must be at
+    /// least 1 when `interval_secs` is set.
     pub retain: usize,
     /// Optional object-store destination for snapshot archives
     /// (`file://`, `s3://`, `gs://`). Credentials come from the
