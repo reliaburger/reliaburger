@@ -126,6 +126,25 @@ Leader-last upgrade ordering does not make an unknown Raft request safe during
 elections. Qualify the actual old/new binary pair before advertising it as
 supported.
 
+### Upgrading from 0.1.0
+
+0.1.1 can't roll onto a 0.1.0 cluster. The protocol is still 27, but the
+state format moved from 44 to 46 (the snapshot layout and the log store's
+ingest checkpoint changed), so 0.1.0 → 0.1.1 needs a fresh cluster. Move the
+data directories aside (or `relish local destroy --yes` a laptop cluster),
+install 0.1.1 and recreate the cluster, then re-apply your apps.
+
+If you try anyway, nothing moves. A 0.1.0 node asks every candidate for
+`bun --compatibility` after checking its signatures and before staging it, and
+refuses 0.1.1's `{"protocol":27,"state":46}` with a 409. A single node's
+`relish upgrade start v0.1.1` fails with that message. In a cluster, `start`
+records the run, the first node it directs refuses, and the run pauses with
+`directive to NODE refused: incompatible binary: incompatible cluster formats`
+while every node keeps running 0.1.0. `relish upgrade abort` ends the paused
+run, because no node moved. A laptop cluster refuses the other way: rerunning
+setup with the 0.1.1 installer says the existing cluster's parameters differ,
+because the saved record names 0.1.0.
+
 ## Signing identity
 
 Configure the Actions secret `RELIABURGER_RELEASE_KEY` with the base64 encoding

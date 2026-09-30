@@ -91,7 +91,9 @@ ending the upgrade then would leave the cluster on two versions.
 
 Rolling upgrades need matching protocol and state formats; `bun --compatibility`
 prints what a binary supports. Nothing is migrated before 1.0.0: a release
-that changes either format needs a fresh cluster.
+that changes either format needs a fresh cluster. 0.1.1 is one: it moved the
+state format from 44 to 46, so a 0.1.0 cluster refuses it and stays on 0.1.0
+([upgrading from 0.1.0](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#upgrading-from-010)).
 
 ### When bun refuses its data directory
 
