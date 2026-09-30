@@ -1191,14 +1191,17 @@ async fn a_two_platform_build_runs_the_nodes_own_platform_under_runc() {
         index.is_index(),
         "a two-platform build must land as an index"
     );
+    // Buildah may add an arm64 variant (`linux/arm64/v8`); the node matches
+    // on `os/architecture`, so that's what the test compares.
     let mut platforms: Vec<String> = index
         .layers
         .iter()
         .map(|entry| {
-            entry
+            let platform = entry
                 .platform
-                .clone()
-                .expect("an index entry records its platform")
+                .as_deref()
+                .expect("an index entry records its platform");
+            platform.split('/').take(2).collect::<Vec<_>>().join("/")
         })
         .collect();
     platforms.sort();
