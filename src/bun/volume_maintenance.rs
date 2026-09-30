@@ -8,7 +8,10 @@
 //! the task carries a [`VolumeLease`], and the reservation lasts exactly as
 //! long as the lease does. Dropping the lease, whether the task finished,
 //! failed or panicked, releases it. The caller that asked for the restore
-//! giving up doesn't: the blocking task still owns the lease.
+//! giving up doesn't: the blocking task still owns the lease. A task drops
+//! its lease before it answers, not after, so a caller that fires its next
+//! snapshot request the moment it has the answer never finds the volumes
+//! still held by the operation it just watched finish.
 //!
 //! The map belongs to the agent loop alone, so it needs no lock. A lease
 //! is an `Arc<()>` and the map keeps a `Weak` to it: the reservation is
