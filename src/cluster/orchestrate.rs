@@ -1380,6 +1380,16 @@ async fn persist_placements(
 
 // Discovery must keep progressing while a rollout waits for its terminal event.
 #[allow(clippy::too_many_arguments)]
+/// One confirmed placement poll: the leader's answer, once its catalogue is
+/// published locally.
+struct ConsumerPoll {
+    leader_url: String,
+    assignments: NodeAssignments,
+    /// The agent registers services only at committed allocations, so a
+    /// placement must wait for its allocation to reach the catalogue.
+    requires_allocations: bool,
+}
+
 async fn poll_consumer(
     node_name: &str,
     metrics_rx: &watch::Receiver<openraft::RaftMetrics<u64, CouncilNodeInfo>>,
@@ -1391,7 +1401,7 @@ async fn poll_consumer(
     cluster_http: &crate::cluster::ClusterHttp,
     receipt_cursor: &mut usize,
     io_timeout: Duration,
-) -> Option<(String, NodeAssignments)> {
+) -> Option<ConsumerPoll> {
     let client = cluster_http.client();
     let leader_url = {
         let metrics = metrics_rx.borrow();
@@ -1494,7 +1504,11 @@ async fn poll_consumer(
     if !update.published {
         return None;
     }
-    Some((leader_url, assignments))
+    Some(ConsumerPoll {
+        leader_url,
+        assignments,
+        requires_allocations: update.requires_allocations,
+    })
 }
 
 /// Spawn the per-node placement reconciler.
@@ -1630,7 +1644,11 @@ fn spawn_placement_reconciler_with_io_timeout(
                 checkpoint_verified = true;
             }
 
-            let Some((leader_url, assignments)) = poll_consumer(
+            let Some(ConsumerPoll {
+                leader_url,
+                assignments,
+                requires_allocations,
+            }) = poll_consumer(
                 &node_name,
                 &metrics_rx,
                 &directory_rx,
@@ -1681,7 +1699,9 @@ fn spawn_placement_reconciler_with_io_timeout(
                 // separate writes, so an answer can place an app whose
                 // allocation hasn't committed yet (#309). The agent would refuse
                 // to register the service; a later poll carries it.
-                if awaits_allocation(&assignments.endpoint_catalog, assignment) {
+                if requires_allocations
+                    && awaits_allocation(&assignments.endpoint_catalog, assignment)
+                {
                     if awaiting.insert(key.clone()) {
                         eprintln!(
                             "orchestrator: {}/{} is placed here but its service allocation \
@@ -1760,7 +1780,7 @@ fn spawn_placement_reconciler_with_io_timeout(
                         _ = tick.tick() => {
                             // The producer can need our own withdrawal receipt before
                             // it can emit the terminal deployment event.
-                            let Some((fresh_url, fresh)) = poll_consumer(
+                            let Some(ConsumerPoll { leader_url: fresh_url, assignments: fresh, .. }) = poll_consumer(
                                 &node_name, &metrics_rx, &directory_rx, raft_to_api_offset,
                                 &service_token, &cmd_tx, &shutdown, &cluster_http,
                                 &mut receipt_cursor, io_timeout,
@@ -2240,6 +2260,7 @@ mod tests {
                         let _ = response.send(Ok(crate::bun::agent::ConsumerUpdate {
                             published: true,
                             receipts: vec![],
+                            requires_allocations: false,
                         }));
                     }
                     AgentCommand::Retire {
@@ -2355,6 +2376,7 @@ mod tests {
                 let _ = response.send(Ok(crate::bun::agent::ConsumerUpdate {
                     published: true,
                     receipts: vec![],
+                    requires_allocations: false,
                 }));
                 None
             }
@@ -2474,6 +2496,16 @@ mod tests {
         let counted = deploys.clone();
         let agent = tokio::spawn(async move {
             while let Some(command) = received.recv().await {
+                // An enrolled consumer, which registers services only at
+                // their committed allocation.
+                if let AgentCommand::SyncClusterConsumer { response, .. } = command {
+                    let _ = response.send(Ok(crate::bun::agent::ConsumerUpdate {
+                        published: true,
+                        receipts: vec![],
+                        requires_allocations: true,
+                    }));
+                    continue;
+                }
                 let Some(command) = answer_housekeeping(command) else {
                     continue;
                 };
@@ -2523,6 +2555,38 @@ mod tests {
             deployed.is_ok(),
             "never deployed once the allocation arrived"
         );
+    }
+
+    /// An agent without discovery ownership allocates services locally, so
+    /// its placements never wait for a catalogue that may not come (the
+    /// cluster tests run workers like this, with no scheduler on the leader).
+    #[tokio::test]
+    async fn a_placement_deploys_at_once_when_the_agent_allocates_locally() {
+        const WEB: &str = "[app.web]\nimage = \"proc-grill:image-ignored\"\n\
+                           command = [\"sleep\", \"60\"]\nport = 8080";
+        let leader = ScriptedLeader::serve(NodeAssignments {
+            apps: vec![assigned("web", "default", WEB)],
+            ..Default::default()
+        })
+        .await;
+        let root = tempfile::tempdir().unwrap();
+        let (commands, mut received) = mpsc::channel(8);
+        let reconciler = reconciler_for_deadline_test(leader.address, root.path(), commands);
+        let deployed = tokio::time::timeout(RECONCILE_INTERVAL * 3, async {
+            loop {
+                let Some(command) = answer_housekeeping(received.recv().await.unwrap()) else {
+                    continue;
+                };
+                if matches!(command, AgentCommand::Deploy { .. }) {
+                    break;
+                }
+            }
+        })
+        .await;
+        reconciler.abort();
+        let _ = reconciler.await;
+        leader.server.abort();
+        assert!(deployed.is_ok(), "waited for an allocation it doesn't need");
     }
 
     /// A lease released while this node is still waiting on a deploy retires
@@ -2858,6 +2922,7 @@ mod tests {
                         let _ = response.send(Ok(crate::bun::agent::ConsumerUpdate {
                             published: true,
                             receipts: vec![],
+                            requires_allocations: false,
                         }));
                     }
                     AgentCommand::Retire { response, .. } => {
@@ -2969,6 +3034,7 @@ mod tests {
                     .send(Ok(crate::bun::agent::ConsumerUpdate {
                         published: true,
                         receipts: vec![],
+                        requires_allocations: false,
                     }))
                     .unwrap();
             } else {
@@ -3033,6 +3099,7 @@ mod tests {
                             .send(Ok(crate::bun::agent::ConsumerUpdate {
                                 published: deployment.is_none(),
                                 receipts: vec![],
+                                requires_allocations: false,
                             }))
                             .unwrap();
                         if deployment.is_some() {
@@ -3142,7 +3209,7 @@ mod tests {
                     _ = ack_rx.recv() => break,
                     command = received.recv() => match command.unwrap() {
                         AgentCommand::Status { response } => { response.send(vec![]).unwrap(); }
-                        AgentCommand::SyncClusterConsumer { response, .. } => { let _ = response.send(Ok(crate::bun::agent::ConsumerUpdate { published: true, receipts: vec![] })); }
+                        AgentCommand::SyncClusterConsumer { response, .. } => { let _ = response.send(Ok(crate::bun::agent::ConsumerUpdate { published: true, receipts: vec![], requires_allocations: false })); }
                         AgentCommand::RetireTestResources { app_name, namespace, response } => {
                             assert_eq!((app_name.as_str(), namespace.as_str()), ("web", "rbtest-run1"));
                             assert_eq!(acknowledgements.load(Ordering::SeqCst), 0);
@@ -3258,6 +3325,7 @@ mod tests {
                         let _ = response.send(Ok(crate::bun::agent::ConsumerUpdate {
                             published: true,
                             receipts: vec![],
+                            requires_allocations: false,
                         }));
                     }
                     AgentCommand::Retire {
@@ -3359,6 +3427,7 @@ command = ["false"]
                         let _ = response.send(Ok(crate::bun::agent::ConsumerUpdate {
                             published: true,
                             receipts: vec![],
+                            requires_allocations: false,
                         }));
                     }
                     AgentCommand::Deploy { events, .. } => {
@@ -3470,6 +3539,7 @@ image = "busybox:latest"
                         let _ = response.send(Ok(crate::bun::agent::ConsumerUpdate {
                             published: true,
                             receipts: vec![],
+                            requires_allocations: false,
                         }));
                     }
                     AgentCommand::AdoptedPlacementMatches {
@@ -3583,6 +3653,7 @@ namespace = "rbtest-interrupted"
                         let _ = response.send(Ok(crate::bun::agent::ConsumerUpdate {
                             published: true,
                             receipts: vec![],
+                            requires_allocations: false,
                         }));
                     }
                     AgentCommand::Deploy { events, .. } => {
@@ -3629,6 +3700,7 @@ namespace = "rbtest-interrupted"
                             let _ = response.send(Ok(crate::bun::agent::ConsumerUpdate {
                                 published: true,
                                 receipts: vec![],
+                                requires_allocations: false,
                             }));
                         }
                         AgentCommand::Retire {
@@ -3698,6 +3770,7 @@ namespace = "rbtest-interrupted"
                         let _ = response.send(Ok(crate::bun::agent::ConsumerUpdate {
                             published: true,
                             receipts: vec![],
+                            requires_allocations: false,
                         }));
                     }
                     AgentCommand::Deploy { .. } => {
