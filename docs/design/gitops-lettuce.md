@@ -76,12 +76,12 @@ The core of Lettuce is a continuous sync loop running on the coordinator:
 **Step-by-step flow:**
 
 1. **Trigger.** Either the poll timer fires (every `poll_interval`, default 30s) or a validated webhook arrives.
-2. **Git fetch.** Lettuce performs `git fetch origin <branch>` on the local bare clone. If the remote HEAD hasn't changed since the last sync, the loop short-circuits.
-3. **Commit signature verification.** If `require_signed_commits` is enabled globally, or if the incoming commit modifies any `script` field (auto-enforcement per Section 17), the commit signature is verified against `trusted_signing_keys`. Unsigned or untrusted commits are rejected and the reason is recorded in `SyncState.last_error`. (A dedicated alert on rejection is **planned — not yet implemented**; today the rejection surfaces through sync state, not the alerting subsystem.)
+2. **Git fetch.** Lettuce performs `git fetch origin <branch>` on the local bare clone. If the remote HEAD hasn't moved, the loop carries on with the current HEAD rather than stopping: every tick reconciles (B16), so a manual change to desired state is repaired without waiting for a commit. Each `git` call runs under a deadline and the shutdown token (see Section 5.3).
+3. **Commit signature verification.** If `require_signed_commits` is enabled globally, or if the commit adds, changes or removes any `script` value (auto-enforcement per Section 17, Section 5.8), the commit signature is verified against `trusted_signing_keys`. Unsigned or untrusted commits are rejected and the reason is recorded in `SyncState.last_error`. (A dedicated alert on rejection is **planned — not yet implemented**; today the rejection surfaces through sync state, not the alerting subsystem.)
 4. **TOML parse.** All `.toml` files under the configured `path` are parsed into the internal `DesiredState` representation. Parse errors are non-fatal per file -- a single malformed file doesn't block sync of other files, but the malformed file is flagged as an error in sync status.
 5. **Diff computation.** The parsed desired state is compared field-by-field against the current desired state stored in Raft. The `replicas` field is compared independently (see Section 5.6).
 6. **Selective apply.** Only changed resources are written to Raft via the leader. Unchanged resources are skipped entirely.
-7. **State update.** The `SyncState` struct in Raft is updated with the new commit hash, sync timestamp, applied changes, and any errors.
+7. **State update.** The `SyncState` struct in Raft is updated with the new commit hash, sync timestamp, applied changes, and any errors. A tick on an unchanged commit that found nothing to change and no error to clear writes nothing, so polling doesn't grow the Raft log.
 
 ### 3.2 Coordinator Election
 
@@ -121,7 +121,7 @@ Lettuce parses TOML files in a defined order to handle cross-references:
    - Port numbers in valid range
    - Label keys and values conform to naming rules
    - No duplicate app/job names within a namespace
-4. **Script field detection.** If any `script` field is present in the parsed output, the file is flagged for mandatory signed-commit verification, regardless of the global setting.
+4. **Script field detection.** Every `script` value in the tree is collected from the parsed TOML and compared with the values in the last applied tree. Any difference means the commit needs a trusted signature, regardless of the global setting (Section 5.8).
 5. **Assembly.** All parsed files are assembled into a single `DesiredState` struct representing the full desired state of the cluster as declared in git.
 
 ### 3.4 Autoscaler Interaction
@@ -563,14 +563,19 @@ A replay and any bad/missing signature currently return **401** (not 409), and r
 excess returns **429**; the `Retry-After` header and the wrong-branch 200 short-circuit are
 not yet implemented (the sync loop tracks the configured branch regardless). The validator
 holds a bounded replay set and per-minute trigger window in an `Arc<Mutex<WebhookValidator>>`
-shared with the handler.
+shared with the handler. Admission is all or nothing (B10): the replay check and the rate
+check both run before either is recorded, so a delivery refused as rate-limited doesn't use
+up its delivery ID and is accepted when the provider retries it after the window. The window
+reads an injected clock, which is how the tests move it.
 
 ### 5.3 Commit Signature Verification
 
 Two modes of enforcement:
 
 1. **Global enforcement.** When `require_signed_commits = true`, every commit that Lettuce attempts to apply must be signed by a key in `trusted_signing_keys`. Unsigned commits or commits signed by unknown keys are rejected.
-2. **Auto-enforcement for scripts.** Regardless of the global setting, any commit that adds or modifies a `script` field in any TOML file is subject to mandatory signed-commit verification. This is determined by diffing the incoming commit against the previous applied commit and checking whether any `script` fields changed. This closes the RCE-via-git-push attack vector.
+2. **Auto-enforcement for scripts.** Regardless of the global setting, any commit that adds, modifies or removes a `script` value in any TOML file is subject to mandatory signed-commit verification. This is determined by parsing both the last applied tree and the incoming tree and comparing their `script` values (Section 5.8). This closes the RCE-via-git-push attack vector.
+
+**Bounded `git` calls (B19).** Clone, fetch, file reads and `git verify-commit` all run through one helper, `lettuce::subprocess::run_bounded`. The child starts in a new session, so it has no controlling terminal to prompt on and everything it spawns shares its process group; `GIT_TERMINAL_PROMPT=0`, `GCM_INTERACTIVE=never` and `SSH_ASKPASS_REQUIRE=never` switch off the prompts git, Git Credential Manager and OpenSSH would otherwise try. A deadline (120 s by default), a 32 MiB output cap and the node's shutdown token each stop the child. However it ends, the helper kills the whole process group and then reaps the child, so a helper or daemon it left behind can't hold the pipes open or outlive the sync. A verifier that can't finish is a sync failure with that diagnostic, never a `NotChecked` status.
 
 **Verification procedure:**
 
@@ -674,11 +679,13 @@ Per Section 17 of the whitepaper, Lettuce automatically enforces `require_signed
 
 **Detection logic:**
 
-1. When computing the diff, Lettuce checks every `added` and `modified` resource for the presence of a `script` field.
-2. If any `script` field is found (whether newly added or modified from a previous value), the commit must be signed.
-3. This check applies even if `require_signed_commits = false` globally.
-4. If the commit is unsigned and contains script changes, Lettuce rejects it with an error message: `"Commit <sha> modifies script fields but is not signed. Script changes always require signed commits (Section 17)."`
-5. If `trusted_signing_keys` is empty but a script change is detected, the sync fails with: `"Cannot apply script changes: no trusted signing keys configured. Add keys to [gitops] trusted_signing_keys."`
+1. Lettuce parses every `.toml` file of the last applied tree and of the incoming tree as plain TOML and collects each value whose key is `script`, at any depth, keyed by file and key path.
+2. If the two collections differ (a script added, removed, or with a different value), the commit must carry a signature from a trusted key. Because the values are parsed, an edit inside a multiline `"""` or `'''` body counts, and the choice of string syntax doesn't.
+3. If the comparison can't be completed (the previous tree can't be listed, read or parsed), the commit is treated as changing scripts. On the first sync there is no previous tree, so any script at all needs a signature.
+4. This check applies even if `require_signed_commits = false` globally. When a commit is the one already applied (a reconciliation tick with an unchanged HEAD), there is nothing to compare.
+5. Only `SignatureStatus::Verified` admits the commit. With no `trusted_signing_keys` the verifier doesn't run and the status is `NotChecked`, which is refused. The error names the commit, the reason (`modifies a script field`, or `can't be shown to leave scripts unchanged`) and the status.
+
+**Implementation status (B13).** The first implementation grepped `git diff` for an added line containing `script`. That missed an edit to the body of a multiline script (the key sits in unchanged context), a deletion (no added line), and a failed `git diff` whose empty output read as "no change". The parsed comparison above replaced it.
 
 ---
 
@@ -1079,6 +1086,8 @@ Git operations (clone, fetch, log, `verify-commit`) are shelled out to the syste
 **Question:** When Lettuce detects drift (actual state differs from desired state in git), should it auto-fix or alert only?
 
 **Current design:** Auto-fix. Lettuce applies the git state on every sync, which overwrites any manual changes. This is the standard GitOps behaviour (Flux and ArgoCD both do this by default).
+
+**Implementation status (B16).** Until 0.1.1 the loop skipped any tick whose HEAD equalled the last applied commit, so drift stood until the next commit. Every tick now diffs the current commit against desired state. Two manual operations are not drift, because they live outside the app spec that GitOps writes: an autoscale override (`autoscale_overrides`) and `relish stop` (`stopped_apps`). An unchanged spec produces no write, so neither is touched; a spec GitOps does rewrite with a new `replicas` value clears the override, as a manual apply would.
 
 **Alternative:** An `alert-only` mode where Lettuce detects drift and fires an alert but doesn't apply changes. The operator must manually approve the sync (via `relish gitops sync --approve` or the Brioche UI).
 

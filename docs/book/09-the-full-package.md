@@ -429,8 +429,8 @@ Lettuce runs on a single council member elected as the **GitOps coordinator**. N
 The sync loop:
 
 1. **Trigger.** Poll timer (default 30s) or webhook
-2. **Git fetch.** If HEAD hasn't changed since last sync, short-circuit
-3. **Signature verification.** If required (global or auto-enforced for script changes)
+2. **Git fetch.** A new commit if there is one, otherwise the current HEAD. Every tick reconciles, so manual drift is repaired even when Git hasn't moved (Chapter 7 tells that story)
+3. **Signature verification.** If required (global, or auto-enforced when the parsed `script` values differ from the last applied tree)
 4. **TOML parse.** All `.toml` files under the configured path. Parse errors are per-file, not global
 5. **Diff.** Field-by-field comparison against current Raft state. Autoscaler-aware
 6. **Selective apply.** Only changed resources written to Raft
