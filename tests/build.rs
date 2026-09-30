@@ -292,15 +292,39 @@ async fn start_registry_with_council(
     CancellationToken,
     tempfile::TempDir,
 ) {
-    use reliaburger::pickle::api::{PickleState, router as pickle_router};
-    use reliaburger::pickle::store::BlobStore;
+    use reliaburger::pickle::api::router as pickle_router;
     use reliaburger::pickle::types::ManifestCatalog;
 
     let dir = tempfile::tempdir().unwrap();
     let catalog = Arc::new(RwLock::new(ManifestCatalog::default()));
-    let state = PickleState {
-        store: Arc::new(BlobStore::new(dir.path().join("blobs"))),
-        catalog: Arc::clone(&catalog),
+    let state = registry_state(dir.path(), Arc::clone(&catalog), council);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let app = pickle_router(state);
+    let shutdown = CancellationToken::new();
+    let serve_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move { serve_shutdown.cancelled().await })
+            .await
+            .ok();
+    });
+    (port, catalog, shutdown, dir)
+}
+
+/// Pickle state over the blobs under `dir` and `catalog`. The test registry
+/// serves one; a test that pulls as a node builds a second over the same
+/// directory, the way a node's runtime shares its registry's blob store.
+fn registry_state(
+    dir: &std::path::Path,
+    catalog: Arc<RwLock<reliaburger::pickle::types::ManifestCatalog>>,
+    council: Option<Arc<CouncilNode>>,
+) -> reliaburger::pickle::api::PickleState {
+    reliaburger::pickle::api::PickleState {
+        store: Arc::new(reliaburger::pickle::store::BlobStore::new(
+            dir.join("blobs"),
+        )),
+        catalog,
         node_raft_id: 1,
         council,
         forwarder: None,
@@ -314,19 +338,7 @@ async fn start_registry_with_council(
         sessions: reliaburger::pickle::registry_auth::UploadSessions::new(
             reliaburger::pickle::registry_auth::DEFAULT_UPLOAD_TTL,
         ),
-    };
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let app = pickle_router(state);
-    let shutdown = CancellationToken::new();
-    let serve_shutdown = shutdown.clone();
-    tokio::spawn(async move {
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async move { serve_shutdown.cancelled().await })
-            .await
-            .ok();
-    });
-    (port, catalog, shutdown, dir)
+    }
 }
 
 /// Tar a trivial context and upload it to the given registry port;
@@ -1054,6 +1066,198 @@ async fn buildah_build_signs_and_the_signature_verifies_on_deploy() {
         )
         .expect("the build signature must verify on deploy");
     }
+
+    registry_shutdown.cancel();
+}
+
+/// The OCI name of this host's architecture, as a platform in an index names it.
+#[cfg(target_os = "linux")]
+fn host_oci_architecture() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        other => panic!("no OCI platform for host architecture {other}"),
+    }
+}
+
+/// Mixed architectures (#248): a real two-platform build lands in Pickle as an
+/// index over `linux/amd64` and `linux/arm64`, and a node pulls and runs its
+/// own platform's image under runc. Only the host's platform carries a
+/// runnable binary, and each platform carries a marker naming itself, so the
+/// container answering at all, and answering with the host's architecture,
+/// shows the node picked the right entry. CI's privileged Linux job runs this
+/// on x86_64, which makes it the amd64 half of a mixed cluster; an arm64 host
+/// (the Lima VM) checks the other half.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires root, runc, Buildah, static /usr/bin/busybox, RELIABURGER_BUILDAH_TESTS=1 and RELIABURGER_RUNC_TESTS=1"]
+async fn a_two_platform_build_runs_the_nodes_own_platform_under_runc() {
+    use reliaburger::grill::runc::RuncGrill;
+    use reliaburger::grill::{Grill, ImageStore, InstanceId, OciSpec};
+
+    assert!(
+        std::env::var("RELIABURGER_BUILDAH_TESTS").is_ok()
+            && std::env::var("RELIABURGER_RUNC_TESTS").is_ok(),
+        "set RELIABURGER_BUILDAH_TESTS=1 and RELIABURGER_RUNC_TESTS=1 on a host with Buildah and runc"
+    );
+    assert!(nix::unistd::geteuid().is_root(), "runc needs root");
+    let host = host_oci_architecture();
+
+    // `COPY $TARGETARCH/ /` gives each platform its own directory. The host's
+    // holds busybox; the other holds only its marker, so running it fails.
+    let (registry_port, catalog, registry_shutdown, registry_dir) = start_registry().await;
+    let context = tempfile::tempdir().unwrap();
+    for architecture in ["amd64", "arm64"] {
+        let dir = context.path().join(architecture);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("platform"), architecture).unwrap();
+    }
+    std::fs::copy(
+        "/usr/bin/busybox",
+        context.path().join(host).join("busybox"),
+    )
+    .unwrap();
+    std::fs::write(
+        context.path().join("Dockerfile"),
+        "FROM scratch\nARG TARGETARCH\nCOPY $TARGETARCH/ /\n",
+    )
+    .unwrap();
+    let tar_bytes = reliaburger::pickle::build::tar_context(context.path()).unwrap();
+    let context_digest = reliaburger::pickle::build::digest_of(&tar_bytes);
+    let response = reqwest::Client::new()
+        .post(reliaburger::pickle::build::context_upload_url(
+            "http",
+            registry_port,
+            &context_digest,
+        ))
+        .body(tar_bytes)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 201, "context upload failed");
+
+    let storage = tempfile::tempdir().unwrap();
+    let harness = Harness::start(HarnessOptions {
+        node_name: Some("builder".to_string()),
+        registry_port,
+        pickle_catalog: Some(Arc::clone(&catalog)),
+        build_settings: Some(isolated_build_settings(storage.path())),
+        ..Default::default()
+    })
+    .await;
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/build", harness.base_url))
+        .json(&serde_json::json!({
+            "name": "mixed",
+            "context_digest": context_digest,
+            "spec": { "context": ".", "destination": "pickle://mixed:v1" },
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 202, "submit should accept");
+    let build_id = response.json::<serde_json::Value>().await.unwrap()["build_id"]
+        .as_u64()
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
+    loop {
+        let status: serde_json::Value =
+            reqwest::get(format!("{}/v1/build/{build_id}", harness.base_url))
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        match status["status"].as_str() {
+            Some("completed") => break,
+            Some("failed") => panic!("build failed: {status}"),
+            _ => {}
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "build did not finish: {status}"
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+
+    // Both platforms are in Pickle, under one index.
+    let index = catalog
+        .read()
+        .await
+        .get_manifest_by_tag("mixed", "v1")
+        .cloned()
+        .expect("built image missing from the catalog");
+    assert!(
+        index.is_index(),
+        "a two-platform build must land as an index"
+    );
+    let mut platforms: Vec<String> = index
+        .layers
+        .iter()
+        .map(|entry| {
+            entry
+                .platform
+                .clone()
+                .expect("an index entry records its platform")
+        })
+        .collect();
+    platforms.sort();
+    assert_eq!(platforms, ["linux/amd64", "linux/arm64"]);
+
+    // The node's runtime shares the registry's blob store and catalogue, as
+    // Bun wires it, and resolves `mixed:v1` through Pickle.
+    let runtime_root = tempfile::tempdir().unwrap();
+    let images = ImageStore::new(runtime_root.path().join("images"));
+    images.set_cluster_source(Arc::new(reliaburger::pickle::p2p::ClusterSource {
+        state: registry_state(registry_dir.path(), Arc::clone(&catalog), None),
+        members: None,
+        registry_port,
+        peer_scheme: "http".to_string(),
+        concurrency: 4,
+        client: reqwest::Client::new(),
+        upstream: None,
+        pull_through: false,
+        cache_recheck_secs: 0,
+        fill_lock: tokio::sync::Mutex::new(()),
+    }));
+    let runtime = RuncGrill::new(
+        runtime_root.path().join("bundles"),
+        images,
+        false,
+        runtime_root.path().join("state"),
+        env!("CARGO_BIN_EXE_bun").into(),
+    )
+    .unwrap();
+    let id = InstanceId(format!(
+        "rbtest-mixed-arch-{}",
+        runtime_root
+            .path()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .trim_start_matches('.')
+    ));
+    let mut spec: OciSpec = serde_json::from_value(serde_json::json!({
+        "root": {"path": "mixed:v1", "readonly": true},
+        "process": {"args": ["/busybox", "sleep", "60"], "env": ["PATH=/"], "cwd": "/", "user": {"uid": 0, "gid": 0}},
+        "mounts": [], "linux": {"namespaces": []}
+    }))
+    .unwrap();
+    spec.mounts = reliaburger::grill::oci::standard_mounts();
+    spec.linux.namespaces = reliaburger::grill::oci::standard_namespaces(None);
+
+    runtime.create(&id, &spec).await.unwrap();
+    runtime.start(&id).await.unwrap();
+    let answer = runtime
+        .exec(&id, &["/busybox".into(), "cat".into(), "/platform".into()])
+        .await;
+    runtime.kill(&id).await.unwrap();
+    assert_eq!(
+        answer.expect("the node's own platform must run").trim(),
+        host,
+        "the node must run linux/{host} from the index"
+    );
 
     registry_shutdown.cancel();
 }
