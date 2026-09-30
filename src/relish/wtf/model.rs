@@ -113,6 +113,19 @@ pub struct NodeObservation {
     pub agent_reachable: bool,
 }
 
+/// The Bun build one node runs, as its `/v1/version` reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuildObservation {
+    /// Stable cluster node identifier.
+    pub node_id: String,
+    /// Cargo version, for example `v0.1.1`.
+    pub version: String,
+    /// Commit the binary was built from, when the build knew it.
+    pub commit: Option<String>,
+    /// SHA-256 of the running binary, when the node hashes it.
+    pub binary_sha256: Option<String>,
+}
+
 /// Current council composition and liveness.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CouncilObservation {
@@ -305,6 +318,8 @@ pub struct LogObservation {
 pub struct ClusterEvidence {
     /// Membership plus authenticated per-node reachability.
     pub nodes: Evidence<Vec<NodeObservation>>,
+    /// The Bun build each node runs.
+    pub builds: Evidence<Vec<BuildObservation>>,
     /// Council composition and leader state.
     pub council: Evidence<CouncilObservation>,
     /// Active Smoker faults.

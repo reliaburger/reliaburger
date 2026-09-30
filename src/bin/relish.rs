@@ -160,7 +160,7 @@ enum Command {
         #[arg(trailing_var_arg = true)]
         command: Vec<String>,
     },
-    /// Show detailed info about an app, node, or job.
+    /// Show every instance of an app across the cluster, with its node.
     Inspect {
         /// Resource name.
         name: String,

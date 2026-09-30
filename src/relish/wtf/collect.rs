@@ -15,10 +15,10 @@ use crate::relish::RelishError;
 use crate::relish::client::BunClient;
 
 use super::{
-    AlertObservation, ApplicationEvidence, CertificateObservation, ClusterEvidence,
-    CouncilObservation, CpuThrottleObservation, DeployObservation, DiskObservation, Evidence,
-    FaultObservation, LogObservation, NodeObservation, RegistryObservation, ReplicaObservation,
-    RestartObservation, ServiceObservation, WtfInputs,
+    AlertObservation, ApplicationEvidence, BuildObservation, CertificateObservation,
+    ClusterEvidence, CouncilObservation, CpuThrottleObservation, DeployObservation,
+    DiskObservation, Evidence, FaultObservation, LogObservation, NodeObservation,
+    RegistryObservation, ReplicaObservation, RestartObservation, ServiceObservation, WtfInputs,
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -39,6 +39,7 @@ struct NodeCollection {
     alerts: Result<Vec<crate::mayo::alert::AlertStatus>, String>,
     faults: Result<Vec<crate::smoker::types::FaultSummary>, String>,
     instances: Result<Vec<InstanceStatus>, String>,
+    version: Result<crate::relish::client::AgentVersion, String>,
 }
 
 struct LocalEvidenceSet {
@@ -184,6 +185,7 @@ pub async fn collect(client: &BunClient, app: Option<&str>) -> Result<WtfInputs,
     let collected = futures_util::future::join_all(endpoints.iter().map(collect_node)).await;
     let collected_at = unix_seconds();
     let nodes = collect_node_evidence(membership.as_deref(), &endpoints, &collected, collected_at);
+    let builds = collect_builds(&collected, collected_at);
 
     let leader_client = leader_client(client, &endpoints, cluster_enabled);
     let control_client = leader_client.as_ref().unwrap_or(client);
@@ -217,6 +219,7 @@ pub async fn collect(client: &BunClient, app: Option<&str>) -> Result<WtfInputs,
         app: app.map(str::to_string),
         cluster: ClusterEvidence {
             nodes,
+            builds,
             council,
             faults,
             disks: local.disks,
@@ -249,10 +252,11 @@ async fn collect_node(endpoint: &NodeEndpoint) -> NodeCollection {
                 alerts: Err(reason.clone()),
                 faults: Err(reason.clone()),
                 instances: Err(reason.clone()),
+                version: Err(reason.clone()),
             };
         }
     };
-    let (health, diagnostics, events, deploys, alerts, faults, instances) = tokio::join!(
+    let (health, diagnostics, events, deploys, alerts, faults, instances, version) = tokio::join!(
         bounded("health", client.health()),
         bounded("diagnostics", client.diagnostics(1)),
         bounded("events", client.events(EVENT_LIMIT)),
@@ -260,6 +264,7 @@ async fn collect_node(endpoint: &NodeEndpoint) -> NodeCollection {
         bounded("alerts", client.alerts()),
         bounded("faults", client.list_faults()),
         bounded("instances", client.status()),
+        bounded("version", client.version()),
     );
     NodeCollection {
         node_id,
@@ -270,6 +275,7 @@ async fn collect_node(endpoint: &NodeEndpoint) -> NodeCollection {
         alerts,
         faults,
         instances,
+        version,
     }
 }
 
@@ -370,6 +376,25 @@ fn collect_node_evidence(
             })
             .collect(),
     )
+}
+
+fn collect_builds(
+    collected: &[NodeCollection],
+    observed_at: u64,
+) -> Evidence<Vec<BuildObservation>> {
+    let mut builder = EvidenceBuilder::default();
+    for node in collected {
+        match &node.version {
+            Ok(version) => builder.values.push(BuildObservation {
+                node_id: node.node_id.clone(),
+                version: version.version.clone(),
+                commit: version.commit.clone(),
+                binary_sha256: version.binary_sha256.clone(),
+            }),
+            Err(error) => builder.unavailable(format!("node {}: {error}", node.node_id)),
+        }
+    }
+    builder.finish(observed_at)
 }
 
 fn collect_council_evidence(
@@ -919,12 +944,7 @@ fn append_logs(
     builder: &mut EvidenceBuilder<LogObservation>,
 ) {
     for warning in result.warnings {
-        match warning {
-            crate::ketchup::types::LogQueryWarning::NodeUnresponsive { node_id } => builder
-                .unavailable(format!(
-                    "{app}/{namespace}: log source node {node_id} did not answer"
-                )),
-        }
+        builder.unavailable(format!("{app}/{namespace}: {warning}"));
     }
     builder
         .values
@@ -978,6 +998,30 @@ mod tests {
             is_leader: true,
             labels: BTreeMap::new(),
         }
+    }
+
+    /// #282: wtf's log evidence names why a node's lines are missing.
+    #[test]
+    fn log_evidence_keeps_the_reason_a_node_sent_no_logs() {
+        use crate::ketchup::types::{LogQueryWarning, NodeFailureReason};
+        let mut builder = EvidenceBuilder::default();
+        append_logs(
+            "web",
+            "default",
+            LogQueryResult {
+                entries: vec![],
+                node_count: 2,
+                warnings: vec![LogQueryWarning::NodeFailed {
+                    node_id: "wolf4".to_string(),
+                    reason: NodeFailureReason::TimedOut { after_ms: 10_000 },
+                }],
+            },
+            &mut builder,
+        );
+        assert_eq!(
+            builder.errors,
+            ["web/default: no logs from node wolf4: timed out after 10s"]
+        );
     }
 
     #[test]
@@ -1081,6 +1125,7 @@ mod tests {
             alerts: Err("unused".to_string()),
             faults: Err("unused".to_string()),
             instances: Err("unused".to_string()),
+            version: Err("unused".into()),
         }];
 
         let evidence = collect_local_diagnostics(&collected, 10);
@@ -1118,6 +1163,7 @@ mod tests {
             alerts: Ok(alerts.to_vec()),
             faults: Err("unused".into()),
             instances: Err("unused".into()),
+            version: Err("unused".into()),
         });
         let evidence = collect_alerts(&collected, None, 10);
         let observed = evidence.value().unwrap();
@@ -1137,6 +1183,7 @@ mod tests {
             alerts: Err("unused".to_string()),
             faults: Err("unused".to_string()),
             instances: Err("unused".to_string()),
+            version: Err("unused".into()),
         }];
 
         let evidence = collect_restarts(&collected, 10);
@@ -1157,6 +1204,7 @@ mod tests {
             alerts: Err("unused".to_string()),
             faults: Err("unused".to_string()),
             instances: Err("unused".to_string()),
+            version: Err("unused".into()),
         }];
 
         let evidence = collect_restarts(&collected, 10);
@@ -1294,6 +1342,40 @@ mod tests {
                     .any(|finding| ["quorum-loss", "no-leader"].contains(&finding.id.as_str()))
             );
         }
+    }
+
+    #[test]
+    fn builds_come_from_every_node_that_answered_and_name_the_rest() {
+        let answered = crate::relish::client::AgentVersion {
+            version: "v0.1.1".into(),
+            commit: Some("3fcb1fd".into()),
+            binary_sha256: Some("aaaa".into()),
+        };
+        let collected = [
+            ("node-1", Ok(answered)),
+            ("node-2", Err("version: timed out after 10s".to_string())),
+        ]
+        .map(|(node, version)| NodeCollection {
+            node_id: node.into(),
+            reachable: true,
+            diagnostics: Err("unused".into()),
+            events: Err("unused".into()),
+            deploys: Err("unused".into()),
+            alerts: Err("unused".into()),
+            faults: Err("unused".into()),
+            instances: Err("unused".into()),
+            version,
+        });
+
+        let evidence = collect_builds(&collected, 10);
+
+        let Evidence::Degraded { value, reason, .. } = evidence else {
+            panic!("one silent node degrades the evidence: {evidence:?}");
+        };
+        assert_eq!(value.len(), 1);
+        assert_eq!(value[0].node_id, "node-1");
+        assert_eq!(value[0].commit.as_deref(), Some("3fcb1fd"));
+        assert!(reason.contains("node node-2"), "{reason}");
     }
 
     #[test]

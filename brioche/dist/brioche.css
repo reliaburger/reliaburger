@@ -1,9 +1,20 @@
 /* Brioche dashboard styles — dark theme. */
 
+/* Theme tokens. brioche.js reads --fg-muted and --chart-grid for the chart
+   canvases, and src/brioche/assets.rs checks every text token against the
+   backgrounds for WCAG AA contrast (4.5:1). */
+:root {
+    --bg: #1a1a2e;
+    --panel: #16213e;
+    --fg: #e0e0e0;
+    --fg-muted: #b4bccb;
+    --chart-grid: #34416a;
+}
+
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body {
-    background: #1a1a2e;
-    color: #e0e0e0;
+    background: var(--bg);
+    color: var(--fg);
     font-family: -apple-system, 'Segoe UI', Roboto, monospace;
     padding: 1rem;
 }
@@ -105,14 +116,14 @@ a.row-link:hover { text-decoration: underline; }
 
 /* Charts */
 .chart-container {
-    background: #16213e;
+    background: var(--panel);
     border-radius: 6px;
     padding: 1rem;
     margin-bottom: 1rem;
 }
 .chart-container h3 {
     font-size: 0.9rem;
-    color: #aaa;
+    color: var(--fg-muted);
     margin-bottom: 0.5rem;
 }
 .chart-placeholder {
@@ -123,6 +134,24 @@ a.row-link:hover { text-decoration: underline; }
     color: #555;
     font-style: italic;
 }
+/* uPlot's legend is a table, so undo the dashboard's table styles. */
+.chart-container .u-legend {
+    color: var(--fg);
+    font-size: 0.8rem;
+    text-align: left;
+}
+.chart-container .u-legend th {
+    color: var(--fg-muted);
+    font-weight: normal;
+    text-transform: none;
+    font-size: 0.8rem;
+    padding: 0.1rem 0.3rem;
+}
+.chart-container .u-legend td {
+    border-top: none;
+    padding: 0.1rem 0.3rem;
+}
+.chart-container .u-legend tr:hover td { background: none; }
 .charts-row {
     display: grid;
     grid-template-columns: 1fr 1fr;
@@ -165,6 +194,24 @@ a.row-link:hover { text-decoration: underline; }
 
 /* Responsive: horizontal scroll for tables on narrow viewports */
 @media (max-width: 768px) {
-    .charts-row { grid-template-columns: 1fr; }
+    /* uPlot's legend is a table, so undo the dashboard's table styles. */
+.chart-container .u-legend {
+    color: var(--fg);
+    font-size: 0.8rem;
+    text-align: left;
+}
+.chart-container .u-legend th {
+    color: var(--fg-muted);
+    font-weight: normal;
+    text-transform: none;
+    font-size: 0.8rem;
+    padding: 0.1rem 0.3rem;
+}
+.chart-container .u-legend td {
+    border-top: none;
+    padding: 0.1rem 0.3rem;
+}
+.chart-container .u-legend tr:hover td { background: none; }
+.charts-row { grid-template-columns: 1fr; }
     table { display: block; overflow-x: auto; }
 }

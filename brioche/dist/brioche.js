@@ -81,14 +81,90 @@
         return null;
     }
 
-    // Axis ticks short enough not to run into the axis label: 8M, not
-    // 8,000,000.
-    function compact(value) {
-        var magnitude = Math.abs(value);
-        if (magnitude >= 1e9) return (value / 1e9).toFixed(1).replace(/\.0$/, "") + "G";
-        if (magnitude >= 1e6) return (value / 1e6).toFixed(1).replace(/\.0$/, "") + "M";
-        if (magnitude >= 1e4) return (value / 1e3).toFixed(1).replace(/\.0$/, "") + "k";
-        return String(Number(value.toPrecision(3)));
+    // -- Units ----------------------------------------------------------
+    //
+    // Each chart config carries its unit as a ladder of steps, smallest
+    // first: `[{factor: 1, suffix: " B"}, {factor: 1024, suffix: " KiB"}, …]`.
+    // The ladders and the rules below are mirrored by src/brioche/units.rs,
+    // whose unit tests pin the boundaries (1023 B / 1 KiB, 999 µs / 1 ms).
+
+    var PLAIN = [{ factor: 1, suffix: "" }];
+
+    // The largest step whose factor doesn't exceed `magnitude`; zero uses
+    // the base (factor 1) step. Rust: `pick_step`.
+    function pickStep(steps, magnitude) {
+        var chosen = steps[0];
+        for (var i = 0; i < steps.length; i++) {
+            var fits = magnitude === 0 ? steps[i].factor === 1 : steps[i].factor <= magnitude;
+            if (fits) chosen = steps[i];
+        }
+        return chosen;
+    }
+
+    // Three significant figures at most, trailing zeros dropped. Rust:
+    // `format_in`.
+    function formatIn(step, value) {
+        var scaled = value / step.factor;
+        var magnitude = Math.abs(scaled);
+        var decimals = magnitude >= 100 ? 0 : magnitude >= 10 ? 1 : 2;
+        return String(Number(scaled.toFixed(decimals))) + step.suffix;
+    }
+
+    // One value in its own best step, for the legend. Rust:
+    // `ChartUnit::format`.
+    function formatValue(steps, value) {
+        return formatIn(pickStep(steps, Math.abs(value)), value);
+    }
+
+    // Tick spacings of 1, 2 and 5 times each step, so a byte axis ticks
+    // every 2 MiB rather than every 2,000,000 bytes. The smallest step also
+    // gets fractions and the largest big multiples, for values outside the
+    // ladder.
+    function increments(steps) {
+        var multiples = [1, 2, 5, 10, 20, 50, 100, 200, 500];
+        var out = [];
+        steps.forEach(function (step, i) {
+            var extra = [];
+            if (i === 0) extra = [0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5];
+            if (i === steps.length - 1) extra = extra.concat([1e3, 2e3, 5e3, 1e4, 2e4, 5e4, 1e5, 2e5, 5e5, 1e6]);
+            multiples.concat(extra).forEach(function (m) { out.push(m * step.factor); });
+        });
+        return out.sort(function (a, b) { return a - b; });
+    }
+
+    // Tick labels sharing the step chosen by the largest tick. Rust:
+    // `ChartUnit::format_axis`.
+    function formatAxis(steps, splits) {
+        var largest = 0;
+        for (var i = 0; i < splits.length; i++) {
+            largest = Math.max(largest, Math.abs(splits[i]));
+        }
+        var step = pickStep(steps, largest);
+        return splits.map(function (v) { return formatIn(step, v); });
+    }
+
+    // The newest non-empty value of a series, for the legend when nobody is
+    // hovering over the chart.
+    function latest(values) {
+        for (var i = values.length - 1; i >= 0; i--) {
+            if (values[i] != null) return values[i];
+        }
+        return null;
+    }
+
+    // -- Theme ----------------------------------------------------------
+
+    // Canvas text can't use CSS variables, so read the tokens brioche.css
+    // defines once and hand uPlot plain colours.
+    function theme() {
+        var style = getComputedStyle(document.documentElement);
+        function token(name, fallback) {
+            return style.getPropertyValue(name).trim() || fallback;
+        }
+        return {
+            text: token("--fg-muted", "#b4bccb"),
+            grid: token("--chart-grid", "#2f3b5c")
+        };
     }
 
     function draw(el, cfg, chart) {
@@ -103,23 +179,43 @@
         if (el._uplot) {
             el._uplot.destroy();
         }
-        var series = [{}];
+        var steps = cfg.unit && cfg.unit.length ? cfg.unit : PLAIN;
+        var colours = theme();
+        // Without a cursor on the chart uPlot asks for the value at a null
+        // index; show the newest value (and "latest" for the time) instead
+        // of its "--" placeholder.
+        var series = [{
+            label: "Time",
+            value: function (u, v, sidx, idx) {
+                return idx == null ? "latest" : new Date(v * 1000).toLocaleTimeString();
+            }
+        }];
         for (var i = 0; i < chart.series.length; i++) {
             series.push({
                 label: chart.series[i].label,
                 stroke: COLOURS[i % COLOURS.length],
                 width: 2,
-                spanGaps: true
+                spanGaps: true,
+                value: function (u, v, sidx, idx) {
+                    var shown = idx == null ? latest(u.data[sidx]) : v;
+                    return shown == null ? "no data" : formatValue(steps, shown);
+                }
             });
         }
+        var axis = {
+            stroke: colours.text,
+            grid: { stroke: colours.grid, width: 1 },
+            ticks: { stroke: colours.grid, width: 1 }
+        };
         var opts = {
             width: el.clientWidth || 400,
             height: 200,
             series: series,
-            axes: [{}, {
-                label: cfg.y_label || "",
-                values: function (u, splits) { return splits.map(compact); }
-            }],
+            axes: [axis, Object.assign({}, axis, {
+                size: 64,
+                incrs: increments(steps),
+                values: function (u, splits) { return formatAxis(steps, splits); }
+            })],
             scales: { x: { time: true } }
         };
         el._uplot = new uPlot(opts, data, el);

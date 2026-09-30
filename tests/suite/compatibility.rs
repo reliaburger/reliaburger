@@ -87,7 +87,8 @@ registry_port = {registry_port}
         matches!(status, Ok(Ok(status)) if !status.success()),
         "legacy startup was not refused: {error}"
     );
-    assert!(error.contains("fresh cluster"), "{error}");
+    assert!(error.contains("unversioned state at"), "{error}");
+    assert!(error.contains("recreate the cluster"), "{error}");
     assert_eq!(std::fs::read(&legacy).unwrap(), b"preserve this state");
     assert_eq!(std::fs::read_dir(&data).unwrap().count(), 1);
 }

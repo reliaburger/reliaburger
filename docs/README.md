@@ -1188,8 +1188,9 @@ failures and the hard safety limit fail the suite.
 `relish wtf` collects bounded evidence from every expected node using the same
 authenticated client identity. It diagnoses node and council health,
 crashloops, stalled deploys, missing service backends, active faults and alerts,
-disk pressure, actual cgroup throttling, certificate lifecycle and Pickle
-redundancy. Use `--app <name>` for application scope or `--watch` for a
+disk pressure, actual cgroup throttling, certificate lifecycle, Pickle
+redundancy and version skew (each node's bun version, commit and binary
+SHA-256; a warning names nodes on a different build). Use `--app <name>` for application scope or `--watch` for a
 human refresh every 30 seconds (`--interval <secs>` changes the period). JSON and YAML use schema version 1. Exit status 0 means
 all selected evidence was observed and healthy, 1 means a critical finding,
 and 2 means warnings or unknown evidence. Bounded in-memory restart and deploy
@@ -1206,6 +1207,10 @@ state, live attached firewall state, the faults active on the path, and the TCP
 result. Each step is labelled `observed`, `inferred` or `unavailable`. A
 failure exits 1; missing evidence or missing probe tools exits 2 rather than
 pretending the path is healthy.
+
+`relish inspect <app>` lists every instance of the app on every node, with its
+node, under a desired vs running replica count; a node that did not answer or
+that gossip reports dead is named rather than silently left out.
 
 External probes are denied by default. They require an Admin credential,
 `probe_external_destination` in `[testing].allowed_operations`, the protected
