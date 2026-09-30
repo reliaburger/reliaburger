@@ -229,9 +229,11 @@ systemctl reboot
 
 `os-stage` checks the new version's signature and hashes, and writes it into
 the spare slot. Each CI run signs with its own key, so name the new run's key
-explicitly, as above. Serve it from its artefact directory (for example
-`python3 -m http.server 8080`): `netboot-server.sh` serves only what a fresh
-install needs. `bootctl list` on the node shows both versions afterwards.
+explicitly, as above. Serve the new run's artefacts yourself:
+`netboot-server.sh` serves only what a fresh install needs. Download them the
+same way as before, into `new/x86_64`, and run `python3 -m http.server 8080`
+in `new/`, so the URLs above find them. Stop `netboot-server.sh` first, since
+it also uses port 8080. `bootctl list` on the node shows both versions afterwards.
 
 ## What's missing
 
