@@ -89,6 +89,21 @@
   - **the launcher's first run moved bun to `/var/lib/reliaburger/bin/bun-v0.1.0`** (it logged "bun 0.1.0 from the image is now active");
   - the cluster ended at term 18, log 2007, 5/5, and `wtf` showed 12 OK, 0 warnings.
 
+**The bare-metal preview (29–30 Sep).** It covers the manual chapter `docs/manual/14_appliance.md`, the book chapter `docs/book/15a-becoming-the-os.md`, and the tools in `image/tools/`.
+- **Seeds for real machines:** real hardware has no SMBIOS channel for the lab's seed credential. So `reliaburger-seed` now also reads a USB stick labelled `RBSEED`, with `seeds/<mac>.seed` for one of the machine's NICs, so one stick serves a whole fleet. Without it, a physical node could install but never join a cluster, and S5 would have been blocked.
+- **The guide, followed end to end in the lab:**
+  1. `image/tools/netboot-server.sh` ran in the netboot namespace in place of the lab's own services, and served two netboot installs (16 s each). The installer prints each NIC's MAC and address.
+  2. `seed-fleet.sh init` ran on the Mac. The first run compiles the seed-admin helper, which took 8 min in release, so the helper now builds in debug.
+  3. The stick seeded node 1.
+  4. `seed-fleet.sh join` ran on the lab server.
+  5. The same stick, now holding both seeds, seeded node 2. The `home` cluster came up 2/2, and `wtf` showed 12 OK.
+- **SSH from a seed** (`seed-fleet.sh init --ssh-key`, spike only, so OS updates can be staged on real machines):
+  - Node 8 booted with no SSH credential. The seed installed root's key, `ssh.socket` started, and root SSH worked on 2026.40.33.
+  - CI's six boots, with no key and no seed, started sshd zero times.
+- **Bugs found and fixed:**
+  - dnsmasq serves TFTP as an unprivileged user, and couldn't read `netboot-server.sh`'s 0700 temp directory.
+  - The lab server VM has no NTP, and its clock fell behind whenever the Mac slept. The nodes use timesyncd and stayed right.
+
 ## Findings
 
 - **Stubble**: see S1's log. The unwrap has to be a *postinst* script, because for `Format=uki` mkosi saves the kernel aside before finalize scripts run. Without it, the aarch64 installer couldn't start (`Error 0x7f048281`).
