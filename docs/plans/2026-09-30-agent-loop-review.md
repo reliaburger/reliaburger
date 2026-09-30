@@ -1,7 +1,8 @@
 # Review: the node agent's loop
 
 **Status:** decided, 30 September 2026. The maintainer approved option (c)
-with the answers in [Decision](#decision). Work is tracked in #351.
+with the answers in [Decision](#decision). The work ships in 0.1.3 and is
+tracked in #351.
 Code references are against `9ba64f6c` (main, 30 September 2026).
 
 Bun's agent loop (`run_loop`, `src/bun/agent.rs:3748`) caused most of the soak
@@ -357,7 +358,8 @@ the least.
 The maintainer approved recommendation 1: **option (c)**. We keep the
 single-owner loop and add a meter, a starvation harness and a rule, then fix
 what the harness finds. (b) stays on the table for 0.4.0's design; (a) is off
-it. The open questions are answered as follows.
+it. The work is a 0.1.3 item, not 0.1.2 as section 5 proposed: 0.1.2 ships
+images first. The open questions are answered as follows.
 
 1. **Turn threshold: 1 s.** A soak tier whose worst turn exceeds 1 s fails.
    It sits well under the report deadline (2 s), so a node fails the checker
