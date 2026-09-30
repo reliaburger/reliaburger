@@ -21,12 +21,16 @@ seed="$WORK/cluster/seeds/wyse-$(printf %02d "$n").tgz"
 [ -f "$seed" ] && creds+=(-smbios "type=11,value=io.systemd.credential.binary:reliaburger.seed=$(base64 < "$seed" | tr -d '\n')")
 : > "wyse$n.serial.log"
 # STICK=<image> plugs in a seed stick (make-seed-stick.sh) as USB storage.
+# NOSSH=1: no SSH credential, so only a seed's key can grant SSH.
+[ -n "${NOSSH:-}" ] && creds=("${creds[@]:2}")
+# NETFIRST=1: network boot before the disk, as an operator might leave it.
+[ -n "${NETFIRST:-}" ] && { DISKIDX=2; NETIDX=1; }
 [ -n "${STICK:-}" ] && creds+=(-device qemu-xhci -device usb-storage,drive=stick,removable=on -drive "if=none,id=stick,format=raw,file=$STICK")
 qemu-system-x86_64 -name "wyse$n" -machine q35 -accel tcg,thread=multi -cpu Westmere -smp 4 -m 2048 \
     -drive if=pflash,format=raw,readonly=on,file=OVMF_CODE_4M.fd \
     -drive if=pflash,format=raw,file="wyse$n-vars.fd" \
-    -drive if=none,id=d0,format=qcow2,file="wyse$n.qcow2" -device virtio-blk-pci,drive=d0,bootindex=1 \
-    -device virtio-net-pci,netdev=n0,mac=52:54:00:00:02:$hex,bootindex=2 \
+    -drive if=none,id=d0,format=qcow2,file="wyse$n.qcow2" -device virtio-blk-pci,drive=d0,bootindex=${DISKIDX:-1} \
+    -device virtio-net-pci,netdev=n0,mac=52:54:00:00:02:$hex,bootindex=${NETIDX:-2} \
     -netdev "stream,id=n0,server=off,addr.type=unix,addr.path=sock/l2-$slot.sock,reconnect-ms=1000" \
     -device virtio-rng-pci "${creds[@]}" \
     -display none -monitor none -serial file:"wyse$n.serial.log" -pidfile "wyse$n.pid" </dev/null >>qemu-stderr.log 2>&1 &

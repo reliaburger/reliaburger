@@ -104,6 +104,19 @@
   - dnsmasq serves TFTP as an unprivileged user, and couldn't read `netboot-server.sh`'s 0700 temp directory.
   - The lab server VM has no NTP, and its clock fell behind whenever the Mac slept. The nodes use timesyncd and stayed right.
 
+**The guide on two virtual Wyses (30 Sep).** Both are x86_64 under TCG, `-cpu Westmere`, with 2 GiB and an 8 GB disk. Everything came from `netboot-server.sh` and `seed-fleet.sh --ssh-key`, with no SMBIOS credentials at all.
+- **Wyse 1, disk first.**
+  - Real OVMF PXE → ProxyDHCP → **iPXE `snp.efi`** (its first real-firmware run) → installer, which took 25 s.
+  - The installer's `efibootmgr` entry (Boot0008, "Reliaburger OS") came first, and the firmware booted it.
+  - The stick seeded node-01 with root's SSH key. bun was healthy at 67 s.
+- **Wyse 2, network first.**
+  - It installed (30 s), but OVMF still put the network first, because QEMU's boot order overrides the one the OS writes.
+  - So it netbooted again. The installer found the existing install and logged `/dev/vda already holds Reliaburger OS; booting it (boot entry 0008, now first)`. It then set `BootNext` to the disk and rebooted.
+  - The stick seeded node-02. bun was healthy at 82 s.
+  - The `wyse` cluster came up 2/2, and `wtf` showed 12 OK.
+- **Wyse 2, network first, with the netboot server off.** The firmware tried PXE over IPv4 and IPv6, then HTTP Boot over IPv4 and IPv6, and each failed. It then booted Boot0008, and bun was healthy. Under TCG this took about 5 minutes, mostly firmware timeouts.
+- **What this means for S5:** if a Wyse keeps network first, every boot either goes through the installer (about 30 s, then back to the disk) or waits for the firmware's network timeouts. So put the disk first in the BIOS.
+
 ## Findings
 
 - **Stubble**: see S1's log. The unwrap has to be a *postinst* script, because for `Format=uki` mkosi saves the kernel aside before finalize scripts run. Without it, the aarch64 installer couldn't start (`Error 0x7f048281`).

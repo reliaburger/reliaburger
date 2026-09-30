@@ -85,6 +85,12 @@ In each machine's firmware setup:
 A blank disk isn't bootable, so the first boot falls through to the network.
 After that, the disk boots.
 
+If you leave the network first, it still works, only slower. With the netboot
+server running, each boot starts the installer. The installer sees the
+installed disk and sends the machine straight back to it, which costs about
+half a minute. With the server off, the firmware tries every kind of network
+boot it has before it gives up and boots the disk, which can take minutes.
+
 ## Install
 
 Power the machines on, all at once if you like. Each one takes its address
