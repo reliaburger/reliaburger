@@ -3,18 +3,19 @@
 //! A runtime that captures a stream to an append-only file reads it in
 //! chunks and feeds them to a [`CaptureReader`], which hands back whole
 //! lines. Each line carries the byte offset just past its newline, so the log
-//! store can tell a line it already ingested from a new one after the agent
-//! restarts and reads the file again from the start.
+//! store can tell a line it already ingested from a new one. After an agent
+//! restart a reader resumes at the offset the store checkpointed, rather
+//! than reading the whole file again.
 
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::ketchup::types::{CapturePosition, CapturedLine, LogStream};
+use crate::ketchup::types::{CaptureOffsets, CapturePosition, CapturedLine, LogStream};
 
 /// The most a follower reads from a capture file in one step.
 ///
-/// A follower that starts from byte 0 (every adopted instance, after each
-/// Bun restart) may face hours of output. Reading and splitting it in
+/// A follower that starts from byte 0 (a capture file the log store has no
+/// checkpoint for, or one that was truncated) may face hours of output. Reading and splitting it in
 /// bounded chunks, with an await between them, keeps that replay from
 /// holding a runtime worker: on a two-vCPU node one long synchronous split
 /// starved startup adoption for eleven minutes.
@@ -59,6 +60,30 @@ impl CaptureReader {
             stream,
             file,
             consumed: 0,
+            partial: Vec::new(),
+        }
+    }
+
+    /// A reader for the capture `file` of `stream`, positioned where the log
+    /// store's checkpoint says it stopped.
+    ///
+    /// Falls back to byte 0 when the store holds nothing from `file`, or when
+    /// the file is now shorter than the checkpointed offset: it was truncated
+    /// (or replaced), so the offset no longer names a line in it. The store
+    /// forgets offsets of replaced files when it loads its checkpoint.
+    pub async fn resume(stream: LogStream, file: PathBuf, offsets: &CaptureOffsets) -> Self {
+        let length = tokio::fs::metadata(&file)
+            .await
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        let consumed = offsets
+            .get(&file)
+            .filter(|offset| *offset <= length)
+            .unwrap_or(0);
+        Self {
+            stream,
+            file: Some(file),
+            consumed,
             partial: Vec::new(),
         }
     }
@@ -240,6 +265,52 @@ mod tests {
         }
         assert_eq!(sizes, vec![CAPTURE_CHUNK_BYTES, CAPTURE_CHUNK_BYTES, 10]);
         assert_eq!(read, contents);
+    }
+
+    /// #308: a restarted forwarder starts where the store's checkpoint
+    /// stopped, so the lines before it are never read again.
+    #[tokio::test]
+    async fn resume_starts_at_the_checkpointed_offset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("web.stdout");
+        std::fs::write(&path, b"one\ntwo\nthree\n").unwrap();
+        let offsets = CaptureOffsets([(path.clone(), 8)].into_iter().collect());
+
+        let mut reader = CaptureReader::resume(LogStream::Stdout, path.clone(), &offsets).await;
+        assert_eq!(reader.read_offset(), 8);
+        let chunk = read_capture_chunk(&path, reader.read_offset())
+            .await
+            .unwrap();
+        let lines = reader.push(&chunk);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].line, "three");
+        assert_eq!(ends(&lines), vec![14]);
+    }
+
+    #[tokio::test]
+    async fn resume_without_a_checkpoint_starts_at_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("web.stdout");
+        std::fs::write(&path, b"one\n").unwrap();
+        let reader =
+            CaptureReader::resume(LogStream::Stdout, path, &CaptureOffsets::default()).await;
+        assert_eq!(reader.read_offset(), 0);
+    }
+
+    /// A capture file shorter than its checkpoint was truncated: the offset
+    /// no longer names a line in it, so everything in it is new.
+    #[tokio::test]
+    async fn resume_falls_back_to_zero_when_the_file_was_truncated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("web.stdout");
+        std::fs::write(&path, b"new\n").unwrap();
+        let offsets = CaptureOffsets([(path.clone(), 14)].into_iter().collect());
+        let reader = CaptureReader::resume(LogStream::Stdout, path.clone(), &offsets).await;
+        assert_eq!(reader.read_offset(), 0);
+
+        std::fs::remove_file(&path).unwrap();
+        let reader = CaptureReader::resume(LogStream::Stdout, path, &offsets).await;
+        assert_eq!(reader.read_offset(), 0);
     }
 
     #[test]
