@@ -143,29 +143,28 @@ deleting images through the registry API.
 
 ## Multi-platform images
 
-0.1.1 can't run a multi-platform image (an OCI image index or Docker manifest
-list) stored in Pickle. A node pulling one treats the index as a single image
-and the workload fails to start. This hits `docker buildx build --platform
-linux/amd64,linux/arm64 --push` and multi-platform `relish build`, which is the
-default; a multi-platform `relish build` also stores only the builder's own
-platform. 0.1.2 is planned to fix both.
+A multi-platform image (an OCI image index or Docker manifest list) in Pickle
+runs on every node whose platform it offers. The node reads the index, picks
+`linux/amd64` or `linux/arm64` to match its own architecture, and pulls only
+that platform's layers. A node whose platform the index doesn't list refuses
+the image and names the architecture it looked for, rather than running the
+wrong one.
 
-Until then, push and build one platform that matches your nodes:
-
-```sh
-docker buildx build --platform linux/arm64 -t NODE:5050/api:v1 --push .
-```
+That covers `docker buildx build --platform linux/amd64,linux/arm64 --push`
+and `relish build`, which builds both platforms by default and stores all of
+them under one tag. To build just one, name it:
 
 ```toml
 [build.api]
 context = "./api"
 destination = "pickle://api:v1.2.3"
-platform = ["linux/arm64"]      # or ["linux/amd64"], whatever your nodes run
+platform = ["linux/arm64"]
 ```
 
-On a cluster whose nodes share one architecture, multi-platform images from
-an upstream registry work: the pull-through cache picks the node's platform
-from the index and stores that single image.
+Multi-platform images from an upstream registry go through the pull-through
+cache, which picks the platform of the node that fills it and stores that
+single image under the tag. On a cluster that mixes architectures, push such
+an image to Pickle instead, so every node finds its own platform.
 
 ## Volumes
 

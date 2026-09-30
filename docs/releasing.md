@@ -146,7 +146,7 @@ paused run, because no node moved.
 From 0.1.2 the leader refuses before it records anything. It fetches the
 candidate, checks its signatures and runs `bun --compatibility` on it, and
 `start` fails with both format pairs:
-`refusing to upgrade to vX: incompatible binary: found protocol P, state S; this cluster (reliaburger v0.1.2 (…)) needs protocol 27, state 46`.
+`refusing to upgrade to vX: incompatible binary: found protocol P, state S; this cluster (reliaburger v0.1.2 (…)) needs protocol 28, state 47`.
 A cluster `relish upgrade rollback vX` is checked the same way: the leader
 asks every node which versions its binary store holds (`installed_versions`
 in `GET /v1/version`) and refuses a version any node lacks, naming those
@@ -158,6 +158,15 @@ installer finds a saved record that names the older release, so it names
 both versions and tells you to run `relish local destroy --yes` (with
 `--name` for a cluster not called `laptop`) and set it up again. Before 0.1.2
 the message only said the existing cluster's parameters differ.
+
+### Upgrading from 0.1.1
+
+0.1.2 can't roll onto a 0.1.1 cluster either. Pickle's catalogue now records
+each image index entry's platform, and image listings carry it, so the
+protocol moved from 27 to 28 and the state format from 46 to 47. Recreate the
+cluster the same way as above. A 0.1.1 cluster behaves as a 0.1.0 one does
+when you try: the first node refuses 0.1.2's `{"protocol":28,"state":47}` and
+the run pauses until `relish upgrade abort`.
 
 ## Signing identity
 

@@ -305,7 +305,7 @@ binary was built from. Neither needs a network.
 Config is TOML. The [whitepaper](docs/whitepaper.md) explains the architecture
 and its trade-offs; the [design docs](docs/design/) cover each subsystem.
 
-## Limits in 0.1.1
+## Limits in 0.1.2
 
 - **Clusters need rootful runc on Linux with eBPF.** macOS runs containers in
   managed Linux VMs; native macOS `bun` runs plain processes only.
@@ -321,12 +321,6 @@ and its trade-offs; the [design docs](docs/design/) cover each subsystem.
 - **Clusters start fresh.** Development-build state isn't migrated, and rolling
   upgrades need matching protocol and state formats (see the
   [compatibility policy](docs/releasing.md#cluster-compatibility)).
-- **Multi-platform images don't run from Pickle.** Nodes treat an image index
-  (a multi-platform `docker buildx` push, or `relish build`'s default of two
-  platforms) as a single image and fail to run it, and a multi-platform
-  `relish build` stores only the builder's platform. Push or build one platform
-  that matches your nodes; see
-  [Images and volumes](docs/manual/11_images-and-volumes.md#multi-platform-images).
 - **Cron doesn't catch up.** It skips firings missed during a crash, and a job
   whose outcome is unknown waits for `relish apply <file> --rerun-jobs`.
 

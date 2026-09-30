@@ -62,15 +62,24 @@ migration and no feature gate
   (44 in 0.1.0), so a 0.1.0 cluster can't roll to it: recreate the cluster
   ([upgrading from 0.1.0](releasing.md#upgrading-from-010)).
 - [ ] **0.1.2: images, the next release**
-  ([milestone](https://github.com/reliaburger/reliaburger/milestone/2),
-  [#248](https://github.com/reliaburger/reliaburger/pull/248)). The Go demo
-  build in the tour, multi-arch builds and pulls (which removes the
+  ([milestone](https://github.com/reliaburger/reliaburger/milestone/2)).
+  Images ([#248](https://github.com/reliaburger/reliaburger/pull/248)): the Go
+  demo build in the tour, multi-arch builds and pulls (which removes the
   multi-platform limitation), platforms in `relish images`, a build cache cap,
-  Buildah storage pruning and Buildah in the guest image.
+  Buildah storage pruning and Buildah in the guest image. Upgrades and
+  rollbacks that can't succeed are refused before a run starts
+  ([#339](https://github.com/reliaburger/reliaburger/issues/339)), and replicas
+  spread over the survivors when a node dies, with healthy ones left in place
+  ([#346](https://github.com/reliaburger/reliaburger/issues/346)). 0.1.2 changes
+  the protocol and state formats (27 and 46 in 0.1.1), so a 0.1.1 cluster
+  can't roll to it: recreate the cluster
+  ([upgrading from 0.1.1](releasing.md#upgrading-from-011)).
 - [ ] **0.1.3: observability and test quality**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/4)).
   Streamed metrics queries, so Mayo and rollup sessions no longer load every
-  Parquet file; an owner for every ignored test and tested CI job selection
+  Parquet file; an agent loop that's metered and never waits inline on slow
+  work ([#351](https://github.com/reliaburger/reliaburger/issues/351)); an
+  owner for every ignored test and tested CI job selection
   ([#303](https://github.com/reliaburger/reliaburger/issues/303)); JUnit
   evidence for every suite ([#304](https://github.com/reliaburger/reliaburger/issues/304)).
 - [ ] **0.2.0: "A million jobs"**

@@ -238,6 +238,23 @@ CI for steps 9–11 is green with `full-ci` on 54bba46e.
       `sign_published_image` sends every published manifest digest (the
       index and each platform manifest) through `request_build_signatures`.
 
+### Round 4: shipping in 0.1.2 (30 September)
+
+- [x] 17. `origin/main` merged with #349 (spread on node loss) and #350
+      (refusing impossible upgrades). Main stayed at protocol 27 / state 46,
+      so this branch keeps 28 / 47; the upgrade-refusal examples and
+      `docs/releasing.md` now say 0.1.2 needs 28 / 47 and a 0.1.1 cluster
+      must be recreated.
+- [x] 18. The amd64 half of a mixed cluster runs in CI:
+      `tests/build.rs::a_two_platform_build_runs_the_nodes_own_platform_under_runc`
+      (privileged Linux job, x86_64) builds two platforms with Buildah, checks
+      the index, and runs the host's platform from Pickle under runc; only the
+      host's platform has a runnable binary. The arm64 half ran in the laptop
+      tour. Both in one cluster is still unrun.
+- [x] 19. The multi-platform limitation is gone from the README,
+      `docs/README.md` and manual chapter 11. The pull-through cache's
+      one-platform-per-tag behaviour is listed as a limit instead.
+
 Note: 0.1.0 lists "multi-platform images in the built-in registry aren't
 supported yet" as a known limitation (release-docs PR, not this one). The
 multi-arch pull fix here ships after 0.1.0.
@@ -247,8 +264,8 @@ multi-arch pull fix here ships after 0.1.0.
 - Run the tour end to end on a quickstart (`relish build burger/burger.toml`,
   apply, `curl …/order`) and check `buildah --root /var/lib/reliaburger/data/buildah/root images`
   after the build: only the Go base image should remain.
-- On a two-architecture cluster (or with `platform` forced to the foreign
-  architecture), check that each node pulls its own platform.
+- On a two-architecture cluster, check that each node pulls its own platform
+  (each half is covered on its own: step 18 and the tour).
 - A build with a networked `RUN` step on a node with the perimeter firewall
   on: confirm the step reaches the internet and `nft list ruleset` still shows
   both Reliaburger's and netavark's tables afterwards.

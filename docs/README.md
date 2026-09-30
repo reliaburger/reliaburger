@@ -9,7 +9,7 @@ see the [whitepaper](whitepaper.md); for status and what's next, see the
 installer are on the [GitHub release](https://github.com/reliaburger/reliaburger/releases/tag/v0.1.1),
 and `curl -fsSL https://reliaburger.com/install.sh | sh` installs it. Every
 release follows the same [build, staging and promotion procedure](releasing.md#metadata-and-publication).
-The limits below are the ones 0.1.1 ships with; the [roadmap](roadmap.md) tracks
+The limits below are the ones 0.1.2 ships with; the [roadmap](roadmap.md) tracks
 what comes after it.
 
 ## Scope and limits
@@ -40,12 +40,9 @@ what comes after it.
   [compatibility policy](releasing.md#cluster-compatibility).
 - **One Bun per writable image store.** Registry startup claims exclusive
   ownership of the image store's upload directory.
-- **Multi-platform images don't run from Pickle.** A node pulling an OCI
-  image index or Docker manifest list from the built-in registry treats it as
-  a single image and fails to run it. That covers `docker buildx build
-  --platform linux/amd64,linux/arm64 --push` and `relish build` with more than
-  one platform (the default), which also stores only the builder's platform.
-  Push or build a single platform matching your nodes; see
+- **The pull-through cache holds one platform per tag.** It stores the
+  platform of the node that first pulls an upstream multi-platform image, so on
+  a cluster that mixes architectures, push such images to Pickle instead; see
   [Images and volumes](manual/11_images-and-volumes.md#multi-platform-images).
 - **Test volumes have no snapshots.** Disposable test-volume snapshots aren't
   supported.
