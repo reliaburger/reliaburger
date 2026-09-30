@@ -309,6 +309,33 @@ pub fn context_upload_url(scheme: &str, pickle_port: u16, digest: &str) -> Strin
     )
 }
 
+/// The URL `relish build` uploads its context to.
+///
+/// An explicit `--registry-port` means a registry on this host at that port.
+/// Without one, a managed connection's declared registry forward wins (a
+/// quickstart's `https://127.0.0.1:15050`, which leads to the node the CLI's
+/// API forward reaches, so the build finds its context there). Otherwise it's
+/// the default port on this host, which is right when relish runs on a node.
+/// Before the forward was honoured, `relish build` on a quickstart host
+/// uploaded to `localhost:5050`, where nothing listens.
+pub fn cli_context_upload_url(
+    scheme: &str,
+    registry_port: Option<u16>,
+    declared_registry: Option<&str>,
+    digest: &str,
+) -> String {
+    match (registry_port, declared_registry) {
+        (Some(port), _) => context_upload_url(scheme, port, digest),
+        (None, Some(origin)) => match origin.trim_end_matches('/').split_once("://") {
+            Some((declared_scheme, address)) => {
+                context_upload_url_at(declared_scheme, address, digest)
+            }
+            None => context_upload_url_at(scheme, origin.trim_end_matches('/'), digest),
+        },
+        (None, None) => context_upload_url(scheme, DEFAULT_PICKLE_PORT, digest),
+    }
+}
+
 /// Build the URL to upload a context blob to a specific node's Pickle
 /// registry (`address` is `host:port`). Used by a delegating node to
 /// transfer the context to the chosen builder (12b.2, JOB5): bare
@@ -865,6 +892,30 @@ mod tests {
         assert!(
             context_upload_url_at("https", "10.0.1.5:5050", "sha256:abc")
                 .starts_with("https://10.0.1.5:5050/")
+        );
+    }
+
+    #[test]
+    fn cli_upload_uses_the_declared_registry_forward_without_an_explicit_port() {
+        assert_eq!(
+            cli_context_upload_url("https", None, Some("https://127.0.0.1:15050/"), "sha256:ab"),
+            "https://127.0.0.1:15050/v2/_buildcontext/blobs/uploads/?digest=sha256:ab"
+        );
+    }
+
+    #[test]
+    fn cli_upload_prefers_an_explicit_registry_port_over_the_forward() {
+        assert_eq!(
+            cli_context_upload_url("https", Some(5051), Some("https://127.0.0.1:15050"), "d"),
+            "https://localhost:5051/v2/_buildcontext/blobs/uploads/?digest=d"
+        );
+    }
+
+    #[test]
+    fn cli_upload_defaults_to_the_local_registry_port() {
+        assert_eq!(
+            cli_context_upload_url("http", None, None, "d"),
+            "http://localhost:5050/v2/_buildcontext/blobs/uploads/?digest=d"
         );
     }
 
