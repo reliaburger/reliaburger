@@ -77,6 +77,51 @@ expire unless you give `--ttl-days`. `revoke` refuses to remove the last admin
 token; create its replacement first. Revoking a token, or letting it expire,
 also ends every dashboard session that was logged in with it.
 
+### Permissions
+
+Roles and scopes are coarse. A `[permission.<token-name>]` block narrows one
+token further, to named actions on named apps:
+
+```toml
+[permission.ci-deploy]
+actions = ["deploy", "logs"]
+apps = ["web"]
+namespaces = ["shop"]   # omit for every namespace
+```
+
+A permission can only take away: the token still needs the role and scope for
+anything it does. A token with no block is governed by its role and scope
+alone, so permissions are opt-in per token. Once a token has a block, it may
+do only what the block lists:
+
+| Action | What it covers |
+|--------|----------------|
+| `deploy` | apply, delete and roll back the listed apps, cancel their deploys |
+| `scale` | stop the listed apps |
+| `exec` | `relish exec` into the listed apps |
+| `host-exec` | jobs and process workloads that run host commands |
+| `logs` | the listed apps' logs: `relish logs`, follow, WebSocket stream, entries |
+| `metrics` | the listed apps' metrics and charts, and their rows in `relish top` |
+| `secret-write` | `relish secret rotate` (needs `apps = ["*"]` and no `namespaces`) |
+| `admin` | every action above, plus tokens, join tokens, upgrades, elections, node decommissioning, image signing, log export and `[permission]`/`[namespace]` declarations |
+| `secret-read` | nothing yet: no API route returns a decrypted secret |
+
+Some reads span every app: `/v1/logs/sql`, the raw metric store, the cluster
+metric rollups and alerts. They need the action granted with `apps = ["*"]` and
+no `namespaces` list. So do the admin routes. A block that grants `metrics` on
+one app still shows that app's charts on its dashboard page, but the dashboard
+leaves out the alert panel, and `relish top` shows only that app's rows.
+
+A browser session keeps its token's permissions. Nodes talking to each other
+use the cluster's internal identity, which no block can restrict, so
+`relish logs` and `relish top` still gather every node's answer; the
+node you asked filters it. `relish wtf` reads health, membership and
+diagnostics, none of which a permission block gates.
+
+Take care putting a block on an admin token. Leave out `admin` and that token
+loses token management and upgrades. Keep at least one admin token with no
+block.
+
 A new cluster starts with no tokens, and until the first one exists the API is
 open. Bun only allows that on a loopback listener, so mint the first admin
 token on the node itself before exposing the API (see `cluster-basics`).

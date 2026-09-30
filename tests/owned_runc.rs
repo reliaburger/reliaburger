@@ -354,7 +354,11 @@ async fn runc_owned_completed_log_reader_cannot_block_a_replacement_generation()
     let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
     let reader = runtime.clone();
     let log_id = id.clone();
-    let stream = tokio::spawn(async move { reader.follow_logs(&log_id, sender).await });
+    let stream = tokio::spawn(async move {
+        reader
+            .follow_logs(&log_id, sender, &Default::default())
+            .await
+    });
     assert_eq!(receiver.recv().await.unwrap().line, "first");
     // The reader is now stalled on its tiny output channel, after retirement.
     runtime
@@ -405,7 +409,11 @@ async fn following_a_large_capture_after_a_restart_does_not_hold_the_runtime() {
     let (sender, mut receiver) = tokio::sync::mpsc::channel(256);
     let reader = restarted.clone();
     let log_id = id.clone();
-    let stream = tokio::spawn(async move { reader.follow_logs(&log_id, sender).await });
+    let stream = tokio::spawn(async move {
+        reader
+            .follow_logs(&log_id, sender, &Default::default())
+            .await
+    });
     let consumer = tokio::spawn(async move {
         let mut last = None;
         for _ in 0..LINES {

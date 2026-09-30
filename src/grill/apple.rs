@@ -486,6 +486,7 @@ impl super::Grill for AppleContainerGrill {
         &self,
         instance: &InstanceId,
         lines_tx: tokio::sync::mpsc::Sender<crate::ketchup::types::CapturedLine>,
+        _resume: &crate::ketchup::types::CaptureOffsets,
     ) {
         let mut child = match tokio::process::Command::new(&self.container_program)
             .args(["logs", "--follow", &instance.0])
