@@ -19,7 +19,7 @@ burger                         v1              linux/amd64, linux/arm64         
 podinfo                        6.5.4           -                                   4      32.1 MB
 ```
 
-LAYERS is `-` because each platform has its own. `relish images -o json`
+LAYERS is `-` because each platform has its own. `relish images --output json`
 lists them under `platforms`, each with its own manifest `digest`, `layers`
 and `total_size`; a single-platform image has no `platforms` field. The
 image's `digest` is the index's, which is what a deploy of `burger:v1`

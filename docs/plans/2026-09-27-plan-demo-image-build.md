@@ -171,7 +171,14 @@ this).
 - [x] 7. PR body updated (still a draft); CI green with `full-ci` on 44486883
       (portable Linux/macOS, privileged Linux with the gated Buildah tests,
       multi-node cluster, acceptance, demo app, build/guest-image jobs).
-- [ ] 8. The VM checks below, once no soak is running.
+- [x] 8. The VM checks below, on 30 September: the tour end to end, signing,
+      bare-name pulls, the ingress route, `backend` from the container, a
+      networked `RUN` beside the perimeter firewall and the cache under the
+      1 GiB cap all passed ([record](../qualification/2026-09-30-demo-image-build-tour.md)).
+      It found #331 (a follower's build can't be signed; fixed in #332) and a
+      Buildah 1.33 variant leak (`linux/amd64/v8`, fixed here). A
+      mixed-architecture pull couldn't be arranged on Apple silicon, and
+      `tour.cast` is re-recorded separately (#280).
 
 ### Round 2: maintainer answers (27 September)
 
