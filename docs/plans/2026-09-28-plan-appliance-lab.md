@@ -115,6 +115,7 @@
   - The stick seeded node-02. bun was healthy at 82 s.
   - The `wyse` cluster came up 2/2, and `wtf` showed 12 OK.
 - **Wyse 2, network first, with the netboot server off.** The firmware tried PXE over IPv4 and IPv6, then HTTP Boot over IPv4 and IPv6, and each failed. It then booted Boot0008, and bun was healthy. Under TCG this took about 5 minutes, mostly firmware timeouts.
+- **The manual's "Updating the OS" section, run word for word on both Wyses.** It moved them from 2026.40.33 to 2026.40.34 (run 36664269208), node-02 first, with `os-stage` over the seed's SSH key and the new run's spike key. Both booted `+3-0`, both were blessed, and the cluster stayed 2/2 with 12 OK. Following it caught one error in the manual, now fixed: its URLs include `/x86_64/`, but it said to serve the artefact directory itself.
 - **What this means for S5:** if a Wyse keeps network first, every boot either goes through the installer (about 30 s, then back to the disk) or waits for the firmware's network timeouts. So put the disk first in the BIOS.
 
 ## Findings
