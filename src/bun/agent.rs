@@ -1798,6 +1798,10 @@ pub struct BunAgent<G: Grill> {
     /// Test hook: an accepted restore waits here before touching the disk.
     #[cfg(test)]
     restore_pause: Option<std::sync::Arc<std::sync::Barrier>>,
+    /// Test hook: a snapshot task waits here after it has answered, for
+    /// as long as the test holds the write lock.
+    #[cfg(test)]
+    snapshot_answered_hold: Option<std::sync::Arc<tokio::sync::RwLock<()>>>,
     cluster: Option<ClusterHandle>,
     /// Immutable cluster identity used as every workload SPIFFE trust domain.
     trust_domain: String,
@@ -2091,6 +2095,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             volume_maintenance: Default::default(),
             #[cfg(test)]
             restore_pause: None,
+            #[cfg(test)]
+            snapshot_answered_hold: None,
             cluster: None,
             trust_domain: "default".to_string(),
             fault_registry: crate::smoker::registry::FaultRegistry::new(),
@@ -2213,6 +2219,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             volume_maintenance: Default::default(),
             #[cfg(test)]
             restore_pause: None,
+            #[cfg(test)]
+            snapshot_answered_hold: None,
             cluster: Some(cluster),
             trust_domain,
             fault_registry: crate::smoker::registry::FaultRegistry::new(),
@@ -4187,6 +4195,29 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.volume_maintenance.reserve(namespace, app, operation)
     }
 
+    /// Hand a snapshot operation's volumes back, then answer it. The order
+    /// matters: once the caller has the answer it may send its next
+    /// snapshot request straight away, and that request must not find this
+    /// finished operation still holding the volumes (#340). The work is done
+    /// by now, so releasing first can't let anything overlap it.
+    fn release_then_answer<T>(
+        lease: crate::bun::volume_maintenance::VolumeLease,
+        response: oneshot::Sender<Result<T, BunError>>,
+        result: Result<T, BunError>,
+    ) {
+        drop(lease);
+        let _ = response.send(result);
+    }
+
+    /// Test hook: park a snapshot task that has already answered until
+    /// the test releases its write lock on `hold`.
+    #[cfg(test)]
+    fn hold_after_answer(hold: Option<&tokio::sync::RwLock<()>>) {
+        if let Some(hold) = hold {
+            let _parked = hold.blocking_read();
+        }
+    }
+
     fn volumes_busy(namespace: &str, app: &str) -> BunError {
         crate::grill::snapshot::SnapshotError::Busy {
             namespace: namespace.to_string(),
@@ -4700,8 +4731,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 };
                 // btrfs subprocess + fs walks off the command loop (M7).
                 let volumes_dir = self.volumes_dir.clone();
+                #[cfg(test)]
+                let hold = self.snapshot_answered_hold.clone();
                 tokio::task::spawn_blocking(move || {
-                    let _lease = lease;
                     let result = crate::grill::snapshot::SnapshotManager::new(&volumes_dir)
                         .create_for_app(
                             &namespace,
@@ -4711,7 +4743,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                             std::time::SystemTime::now(),
                         )
                         .map_err(BunError::from);
-                    let _ = response.send(result);
+                    Self::release_then_answer(lease, response, result);
+                    #[cfg(test)]
+                    Self::hold_after_answer(hold.as_deref());
                 });
             }
             AgentCommand::SnapshotList {
@@ -4764,8 +4798,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 let volumes_dir = self.volumes_dir.clone();
                 #[cfg(test)]
                 let pause = self.restore_pause.clone();
+                #[cfg(test)]
+                let hold = self.snapshot_answered_hold.clone();
                 tokio::task::spawn_blocking(move || {
-                    let _lease = lease;
                     #[cfg(test)]
                     if let Some(pause) = pause {
                         pause.wait();
@@ -4773,7 +4808,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     let result = crate::grill::snapshot::SnapshotManager::new(&volumes_dir)
                         .restore(&namespace, &app_name, &name, volume.as_deref())
                         .map_err(BunError::from);
-                    let _ = response.send(result);
+                    Self::release_then_answer(lease, response, result);
+                    #[cfg(test)]
+                    Self::hold_after_answer(hold.as_deref());
                 });
             }
             AgentCommand::SnapshotDelete {
@@ -4792,14 +4829,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     return;
                 };
                 let volumes_dir = self.volumes_dir.clone();
+                #[cfg(test)]
+                let hold = self.snapshot_answered_hold.clone();
                 tokio::task::spawn_blocking(move || {
-                    let _lease = lease;
-                    let manager = crate::grill::snapshot::SnapshotManager::new(&volumes_dir);
-                    let _ = response.send(
-                        manager
-                            .delete(&namespace, &app_name, &name, volume.as_deref())
-                            .map_err(BunError::from),
-                    );
+                    let result = crate::grill::snapshot::SnapshotManager::new(&volumes_dir)
+                        .delete(&namespace, &app_name, &name, volume.as_deref())
+                        .map_err(BunError::from);
+                    Self::release_then_answer(lease, response, result);
+                    #[cfg(test)]
+                    Self::hold_after_answer(hold.as_deref());
                 });
             }
             AgentCommand::PrepareNodeFault {
@@ -16350,6 +16388,87 @@ mod tests {
             "expected AppRunning, got {result:?}"
         );
 
+        shutdown.cancel();
+        let _ = handle.await;
+    }
+
+    /// #340: an operation hands its volumes back before it answers. A client
+    /// that sends its next snapshot request the moment it has the answer
+    /// must never be refused as "busy" by the operation it just finished.
+    /// The hook parks every task after its answer, so a lease still held at
+    /// that point is guaranteed to be seen.
+    #[tokio::test]
+    async fn a_snapshot_operation_releases_its_volumes_before_answering() {
+        let volumes_dir = tempfile::tempdir().unwrap();
+        let (mut agent, tx, shutdown) = test_agent();
+        agent.set_volumes_dir(volumes_dir.path().to_path_buf());
+        let hold = std::sync::Arc::new(tokio::sync::RwLock::new(()));
+        agent.snapshot_answered_hold = Some(hold.clone());
+        let handle = tokio::spawn(async move {
+            agent.run().await;
+        });
+        let parked = hold.write().await;
+
+        let create = || {
+            let (response, rx) = oneshot::channel();
+            let command = AgentCommand::SnapshotCreate {
+                namespace: "default".to_string(),
+                app_name: "web".to_string(),
+                volume: None,
+                name: Some("first".to_string()),
+                response,
+            };
+            (command, async move { rx.await.unwrap().map(|_| ()) })
+        };
+        let restore = || {
+            let (response, rx) = oneshot::channel();
+            let command = AgentCommand::SnapshotRestore {
+                namespace: "default".to_string(),
+                app_name: "web".to_string(),
+                name: "first".to_string(),
+                volume: None,
+                response,
+            };
+            (command, async move { rx.await.unwrap() })
+        };
+        let delete = || {
+            let (response, rx) = oneshot::channel();
+            let command = AgentCommand::SnapshotDelete {
+                namespace: "default".to_string(),
+                app_name: "web".to_string(),
+                name: "first".to_string(),
+                volume: None,
+                response,
+            };
+            (command, async move { rx.await.unwrap() })
+        };
+        let busy = |result: &Result<(), BunError>| {
+            matches!(
+                result,
+                Err(BunError::Snapshot(
+                    crate::grill::snapshot::SnapshotError::Busy { .. }
+                ))
+            )
+        };
+
+        let (command, answer) = create();
+        tx.send(command).await.unwrap();
+        let first = answer.await;
+        assert!(!busy(&first), "create: {first:?}");
+        let (command, answer) = restore();
+        tx.send(command).await.unwrap();
+        let second = answer.await;
+        assert!(!busy(&second), "restore right after create: {second:?}");
+        let (command, answer) = delete();
+        tx.send(command).await.unwrap();
+        let third = answer.await;
+        assert!(!busy(&third), "delete right after restore: {third:?}");
+        let (command, answer) = create();
+        tx.send(command).await.unwrap();
+        let fourth = answer.await;
+        assert!(!busy(&fourth), "create right after delete: {fourth:?}");
+
+        drop(parked);
         shutdown.cancel();
         let _ = handle.await;
     }
