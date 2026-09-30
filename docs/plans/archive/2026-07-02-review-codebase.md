@@ -1,6 +1,6 @@
 # Codebase Review — July 2026
 
-A full verification pass against the claims in [progress.md](progress.md), run across
+A full verification pass against the claims in [progress.md](progress-to-0.1.0.md), run across
 six parallel subsystem reviews. Every finding below was checked against the source and
 cited as `file:line`. This document is the backlog: work items reference these IDs.
 

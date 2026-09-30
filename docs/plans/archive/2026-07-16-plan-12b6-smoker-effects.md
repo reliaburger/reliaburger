@@ -1,7 +1,7 @@
 # Phase 12b.6 — Smoker effects and cleanup (Theme SM)
 
 Theme: `docs/progress.md` §12b.6. Finding: CHAOS1.
-Source: `docs/plans/2026-07-10-review-past-phase-12.md`.
+Source: `docs/plans/archive/2026-07-10-review-past-phase-12.md`.
 
 Harness contract (#106): green = `make ci`; deterministic, observable sync,
 no sleeps; env tests `#[ignore]` + named; coverage floor 78.65 — cover new

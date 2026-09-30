@@ -597,7 +597,7 @@ since nothing gates on their numbers yet.
 
 Speed is only half of it. A flaky suite teaches everyone to press "re-run" without reading,
 and then a real race looks exactly like noise. Our retries stay at zero, so a failure that
-passes on a re-run goes into a register in `docs/progress.md` with its cause the same day. Of
+passes on a re-run goes into a register (now `docs/flakes.md`) with its cause the same day. Of
 the seven we chased down, three were product races, not test problems: a node back from a
 fault spread stale suspicions about healthy peers, a rollout interrupted by a crash dropped the
 reservation its own retirement needed, and a two-second kill deadline was too short for a busy
@@ -3876,7 +3876,7 @@ Finally, a milestone checkbox needs a scope. The cluster upgrade coordinator
 already checks gossip rejoin; the replacement process's local boot-marker check
 still has a separate gap. Calling all upgrade verification either finished or
 missing hides useful information. We now keep completed milestones and explicit
-residual tasks side by side in [progress](../progress.md).
+residual tasks side by side in the [roadmap](../roadmap.md).
 
 Portable tests and controlled servers let us force awkward orderings quickly.
 They don't establish that three independent Linux nodes survive the complete

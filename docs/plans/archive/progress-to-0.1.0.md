@@ -1,41 +1,43 @@
 # Implementation Progress
 
-Single source of truth for what's done and what's next. Check off an item only when it compiles, passes tests, and is committed. See [roadmap.md](roadmap.md) for full details on each phase.
+> **Frozen.** This is the pre-0.1.0 implementation checklist, as it stood when 0.1.0 was released (with the first 0.1.1 fixes), and it isn't updated any more. Status now lives in the [roadmap](../../roadmap.md) and in GitHub milestones and issues.
+
+Single source of truth for what's done and what's next. Check off an item only when it compiles, passes tests, and is committed. See [roadmap.md](roadmap-to-0.1.0.md) for full details on each phase.
 
 Done means implemented, tested and committed. An implemented subsystem can still
 have tracked defects or acceptance gates; those stay unchecked. Git history and the
-[archived plans](plans/archive/) hold the per-change evidence (regressions, test
+[archived plans](./) hold the per-change evidence (regressions, test
 runs, CI results) that used to live here.
 
 > **0.1.0 released on 29 September 2026.** The tag `v0.1.0` points at
 > candidate commit 7d7dfc0, promoted unchanged from the build it was qualified
-> on ([runbook](releasing.md)). The [0.1.0 release closure
-> record](qualification/2026-09-27-v0.1.0-release-closure.md) (25–29 September)
+> on ([runbook](../../releasing.md)). The [0.1.0 release closure
+> record](../../qualification/2026-09-27-v0.1.0-release-closure.md) (25–29 September)
 > lists every V02 soak run and candidate, the PRs from #196 to the tag with each
 > bug's cause and fix, and what's carried past 0.1.0. The [release-readiness
-> review](plans/2026-09-16-v0.1.0-release-plan.md) and the [remaining
-> work](plans/2026-09-22-v0.1.0-remaining-work.md) plan are now history: they
+> review](2026-09-16-v0.1.0-release-plan.md) and the [remaining
+> work](2026-09-22-v0.1.0-remaining-work.md) plan are now history: they
 > record the supported scope and the [acceptance gates](#acceptance-and-release-gates),
-> with their evidence in [qualification/](qualification/). V01, the Intel macOS
+> with their evidence in [qualification/](../../qualification/). V01, the Intel macOS
 > and Linux rows of V04 and two V02 items were still open at release.
 >
 > **After 0.1.0:** the open items are the
 > [missing capabilities](#missing-capabilities-and-longer-term-scope) (F01–F12),
 > the one open [engineering follow-up](#engineering-follow-ups) (H05) and the
 > [known flakes](#known-flakes). The limits 0.1.0 ships with are in the
-> [documentation](README.md#010-scope-and-limits). The next releases follow
-> the [release order](roadmap.md#releases-after-010) in the roadmap: patch
+> [documentation](../../README.md#010-scope-and-limits). The next releases follow
+> the [release order](roadmap-to-0.1.0.md#releases-after-010) in the roadmap: patch
 > releases 0.1.1–0.1.4 (soak follow-ups, images, hardening, observability), then one
 > headline feature per minor release, up to 0.4.0's full container migration.
 > Nothing before 1.0.0 is backwards compatible; an incompatible format change
-> needs a fresh cluster. New work starts with a dated plan in [plans/](plans/).
+> needs a fresh cluster. New work starts with a dated plan in [plans/](../).
 
 ## Current completion backlog (17 September 2026)
 
-The [codebase completion plan](plans/archive/2026-09-17-codebase-completion-plan.md)
+The [codebase completion plan](2026-09-17-codebase-completion-plan.md)
 records the evidence, priority, dependency order, completion test and book chapter
 for every item below. IDs are scoped to that plan, not the older C1/M1 review IDs.
-The [audit record](qualification/2026-09-17-code-audit.md) separates local defect
+The [audit record](../../qualification/2026-09-17-code-audit.md) separates local defect
 reproductions from inspected source and previous acceptance evidence.
 
 The work packages distinguish release correctness, optional refactors and future
@@ -108,7 +110,7 @@ Smaller fixes that CI runs turned up along the way:
 - [x] **C31** Generate 128-bit random run IDs instead of second-resolution timestamps.
 - [x] **C32** Replace magic-string verdicts with `CaseError::{Failed, Unknown}` and reject invalid runner timeouts, parallelism and namespace inputs before side effects.
 - [x] **C33** Publish actual bound service origins and use explicit managed host forwards, including an authenticated registry forward configurable with `--registry-port`. Workload clients keep Host/SNI through forwards with normal certificate hostname verification. Exact-candidate VM qualification belongs to V03/V04.
-- [x] **C34** Finish durable ownership and confirmed cleanup for every supported test resource. The [completion plan's C34 record](plans/archive/2026-09-17-codebase-completion-plan.md#c34--define-lease-ownership-for-the-remaining-test-resources) and the [closure matrix](plans/archive/2026-09-22-c34-closure.md) map each change to its regressions and platform qualification.
+- [x] **C34** Finish durable ownership and confirmed cleanup for every supported test resource. The [completion plan's C34 record](2026-09-17-codebase-completion-plan.md#c34--define-lease-ownership-for-the-remaining-test-resources) and the [closure matrix](2026-09-22-c34-closure.md) map each change to its regressions and platform qualification.
   - [x] Bind test tokens to their exact authenticated lease owner and fingerprint; reclaim them through Raft after client or leader failure.
   - [x] Persist node-local job leases and reserved namespaces; reclaim cron registrations and observed runtime retirement after Bun/client death. Catalogue completion requires an observed zero exit and bounded log publication.
   - [x] Persist cron registration, explicit retirement and pre-launch minute claims. Recovery skips missed/uncertain occurrences without catch-up, as agreed.
@@ -129,10 +131,10 @@ Smaller fixes that CI runs turned up along the way:
   - [x] Reject cross-app instance-ID collisions (e.g. a new `worker-g1` app against generation one of `worker`) before replacing an owner, checking the whole replica fleet before port allocation.
   - [x] Record every former cluster placement owner and wait for exact retirement acknowledgements after runtime/artifact cleanup and checkpoint persistence.
   - [x] Start and own the production lease reaper in the placement acceptance harness.
-  - [x] Add operator-attested decommissioning with permanent identity retirement and fresh enrolment under a new identity on return. One Raft decision clears the node's lease placements and node-chaos obligation, with a durable operator audit. See the [operator plan](plans/archive/2026-09-19-lease-retirement.md).
-  - [x] Persist ordinary-job launch intent, observed outcomes, stop intent and the finite retry budget across Bun replacement. Unknown outcomes survive further restarts and require `relish apply jobs.toml --rerun-jobs`. See the [job recovery record](plans/archive/2026-09-19-job-recovery.md).
+  - [x] Add operator-attested decommissioning with permanent identity retirement and fresh enrolment under a new identity on return. One Raft decision clears the node's lease placements and node-chaos obligation, with a durable operator audit. See the [operator plan](2026-09-19-lease-retirement.md).
+  - [x] Persist ordinary-job launch intent, observed outcomes, stop intent and the finite retry budget across Bun replacement. Unknown outcomes survive further restarts and require `relish apply jobs.toml --rerun-jobs`. See the [job recovery record](2026-09-19-job-recovery.md).
   - [x] Keep repository metadata independent when identical manifests share a digest: tag deletion affects only its own repository, and signatures survive copies and reload.
-  - [x] Persist registry catalogue mutations before acknowledging pushes; serialise publication and GC deletion under an owned guard and recheck required blobs after waiting. See the [registry retirement plan](plans/archive/2026-09-19-registry-retirement.md).
+  - [x] Persist registry catalogue mutations before acknowledging pushes; serialise publication and GC deletion under an owned guard and recheck required blobs after waiting. See the [registry retirement plan](2026-09-19-registry-retirement.md).
   - [x] Retry approved registry blob deletion after failure or restart, preserving the last other holder.
   - [x] Refuse unconfirmed clustered manifest pushes with 503 instead of success-class 202.
   - [x] Forward worker/follower registry proposals to the advertised leader with live node TLS and service authority, restricting each writer to its own holdings.
@@ -152,10 +154,10 @@ Smaller fixes that CI runs turned up along the way:
   - [x] Keep cluster lease cleanup Pending until every registry writer confirms retirement.
   - [x] Qualify Bun death with an abandoned registry client and natural lease expiry: the replacement retires leased metadata and partial bytes and preserves identical ordinary content.
   - [x] Qualify registry lease cleanup through a real three-node TLS leader change, including the dead leader's return.
-  - [x] Journal managed test volumes and generated configuration before provisioning; retire them only after confirmed runtime cleanup and keep ordinary Stop/rebalance data. Test snapshots are unsupported. See the [storage record](plans/archive/2026-09-19-managed-test-storage.md).
+  - [x] Journal managed test volumes and generated configuration before provisioning; retire them only after confirmed runtime cleanup and keep ordinary Stop/rebalance data. Test snapshots are unsupported. See the [storage record](2026-09-19-managed-test-storage.md).
   - [x] Persist an observed short process-job exit together with positive runtime absence, even when the job exited before a PID record existed. The separate window where a launch was never observed at all is closed by the durable process owner below, which records launch intent before starting.
   - [x] Define the 0.1.0 process-mode scope: foreground workloads whose children stay in the supervised process group. Daemonising or detached workloads must use Linux containers.
-  - [x] Establish atomic process identity and complete retirement for the supported foreground process group. See the [foreground ownership plan](plans/archive/2026-09-20-foreground-process-ownership.md).
+  - [x] Establish atomic process identity and complete retirement for the supported foreground process group. See the [foreground ownership plan](2026-09-20-foreground-process-ownership.md).
     - [x] Add the single-threaded owner and durable execution gate as an internal Bun helper.
     - [x] Add a persistent ProcessGrill adapter using durable generation records and bounded owner control.
     - [x] Publish first process intent atomically from a private staging directory, holding the launch lock through rename and directory sync.
@@ -169,7 +171,7 @@ Smaller fixes that CI runs turned up along the way:
     - [x] Supervise process exec commands through child owners retained by the workload owner.
     - [x] Make recovery fixtures wait for positive owner state across transient socket failures.
     - [x] Require the first-run fixture's own Bun API announcement before accepting listener readiness.
-  - [x] Recover runtime/discovery resources created before their first adoption record. See the [OCI ownership plan](plans/archive/2026-09-20-oci-launch-ownership.md).
+  - [x] Recover runtime/discovery resources created before their first adoption record. See the [OCI ownership plan](2026-09-20-oci-launch-ownership.md).
     - [x] Persist and supervise external runtime commands before activation, retaining their complete inventory and uncertain cleanup obligations.
       - [x] Add the owned-command adapter with durable input, complete inventory, actual output/exit evidence and bounded waits that retain ownership.
       - [x] Retry transient owner-control failures within an external command's wait deadline, requiring positive retirement before returning output.
@@ -242,7 +244,7 @@ Smaller fixes that CI runs turned up along the way:
           - [x] Carry canonical execution identity through snapshots, reports, catalogue entries and remote routing keys.
           - [x] Bound periodic runtime inventory reads across cancelled or timed-out callers.
           - [x] Retry transient leader-unavailable responses during lease cleanup within its existing 30-second deadline.
-          - [x] Commit publication generations and bounded withdrawal obligations in Raft. See the [remote withdrawal plan](plans/archive/2026-09-22-remote-withdrawal-ledger.md).
+          - [x] Commit publication generations and bounded withdrawal obligations in Raft. See the [remote withdrawal plan](2026-09-22-remote-withdrawal-ledger.md).
           - [x] Reserve withdrawn VIPs in the allocator and enforce valid, non-conflicting allocations atomically in Raft.
           - [x] Reject stale catalogue writers with a required generation precondition in Raft.
           - [x] Expose generation-bound withdrawal instructions to registered consumers from the same committed snapshot as their catalogue.
@@ -325,7 +327,6 @@ Fixes for the 0.1.1 milestone:
 - [x] **Known members forget departed nodes.** `KnownMembers` (#244) kept every member's last address until Bun restarted. Gossip now also publishes a roster with Dead and Left members (`set_roster_watch`, the live-only watch is unchanged); the known table forgets a member gossip reports as Left or the CRL lists as retired, and any down member not heard from for `KNOWN_MEMBER_RETENTION` (24 h, Smoker's hard fault ceiling), while still keeping a reaped dead member's address for fault clears.
 - [x] **`relish nodes` shows dead nodes as dead.** `/v1/cluster/nodes` was built from gossip's live-only watch, so a dead node vanished. The handler now hands the agent the members `KnownMembers` remembers as down, and the agent lists them after the live ones with state `dead` and their Raft council flags. The watch the scheduler, council and Pickle read is unchanged; `relish upgrade`, the test context's node inventory and route detection skip down members (`NodeStatus::is_down`).
 - [x] **Commit hash in versions.** `bun --version`, `relish --version`, bun's startup line and its first log-store line printed only `0.1.0`, so different builds looked identical (issue #241). They now print `0.1.0 (3fcb1fd)` via `upgrade::version::describe`, and `/v1/version` has an additive `commit` field. Release builds take the commit from `RELIABURGER_GIT_SHA` as before; `build.rs` asks git for builds from a checkout and reruns when `HEAD` moves.
-- [x] **B18 Log, metric, secret and admin permissions are enforced (#298).** `[permission]` accepted `logs`, `metrics`, `admin`, `secret-read` and `secret-write`, but only deploy, scale, exec and host-exec reached a handler, so a `deploy`-only spec for `web` still read every app's logs and metrics. The route matrix (`src/bun/authz.rs`) now records each route's permission gate (`App`, `Body`, `Cluster`, `Filtered`) and every log, metric, alert, secret-rotation and admin handler enforces it; rollback needs `deploy`. `secret-read` gates nothing because no route returns a decrypted secret (documented). `every_gated_route_enforces_its_permission_for_every_principal` drives every gated route against every role, grant shape, session, scope, system and bootstrap caller, and `bearer_and_cookie_identities_hit_the_same_log_and_metric_gates` repeats the review's first rows through the real middleware; both failed before.
 - [x] **`build.yml` prints the candidate digest.** The qualified digest was only in the job summary, so reading it meant downloading the ~2 GB candidate artefact to hash `candidate.json`. The `candidate` job now echoes `Qualification manifest SHA-256: <digest>` in its log and uploads `candidate.json` alone as `candidate-manifest-<commit>-<attempt>` (1-day retention); `stage.yml` and promotion still verify every byte of the full candidate (`scripts/release/test_build_workflow.py`).
 - [x] **A placement waits for its allocation (#309).** The leader commits a placement and its service allocation in separate council writes, so a node could be told to deploy an app its catalogue didn't allocate yet; the agent refused with "local service requires its committed cluster allocation" and the app waited out a backoff. The reconciler now skips such a placement until a poll carries the allocation (`a_placement_waits_for_its_committed_allocation_before_deploying`).
 - [x] **Mayo's periodic reads stop growing with uptime (#310).** The alert, rollup, autoscaler and `relish top` reads look back minutes but loaded every Parquet file in the retention window, so their working set grew by about 1.5 MiB per hour of history per 40 series. Windowed reads now skip files whose newest sample (from the footer statistics) is older than the window; measured flat in `tests/mayo_memory.rs` ([record](qualification/2026-09-29-mayo-memory.md)). Wide and ad-hoc queries still load everything until the streamed queries of 0.1.4.
@@ -367,31 +368,31 @@ Fixes for the 0.1.1 milestone:
 
 A 0.1.0 release signing identity is committed and its private key is configured
 in repository Actions. These are the acceptance gates for 0.1.0; their records
-are in [qualification/](qualification/).
+are in [qualification/](../../qualification/).
 
 - [ ] **V01** (gate) Qualify the complete live three-node catalogue on independent Runc nodes.
 - [ ] **V02** (gate) Qualify sustained TLS, storage and upgrade recovery on the release candidate.
   - [x] Wait for the retry workload's own counter write before injecting Bun death in the job crash fixture.
   - [x] Keep the ordinary application running in the initialiser-identity regression.
   - [x] Isolate the physical peer-route fixture from host forwarding policy.
-  - [x] Add power-cut fixtures for the exporter checkpoint/lock (C03) and `LocalLeaseStore` (C11), driven by `scripts/release/qualify-storage-power-cut.sh` on a disposable VM, and the `v02-loops` Actions lane ([record](qualification/2026-09-25-v02-power-cut.md)).
+  - [x] Add power-cut fixtures for the exporter checkpoint/lock (C03) and `LocalLeaseStore` (C11), driven by `scripts/release/qualify-storage-power-cut.sh` on a disposable VM, and the `v02-loops` Actions lane ([record](../../qualification/2026-09-25-v02-power-cut.md)).
   - [x] Sync local-destination exports before the checkpoint acknowledges them; the C03 power-cut fixture found every recent export empty after a cut, with most sources already pruned.
   - [x] Open every object store (exports, metrics, snapshot upload, council backups) through one helper that syncs `file://` writes, and add a council-backup power-cut fixture (every retained backup was empty after a cut before the fix).
   - [x] Write the snapshot uploader's `uploaded` metadata atomically and durably (it used a plain `std::fs::write`).
   - [x] Stop a deploy that arrives before its committed allocation from wedging every retry on a runtime address hold nothing tracks.
-  - [x] Soak the final candidate: the fast tier and the 8-hour final tier were both clean on 7d7dfc0, the build `v0.1.0` was promoted from ([fast](qualification/2026-09-29-v02-fast-tier-7d7dfc0.md), [final](qualification/2026-09-29-sustained-v02.md), [candidates 1–13](qualification/2026-09-27-v0.1.0-release-closure.md)).
+  - [x] Soak the final candidate: the fast tier and the 8-hour final tier were both clean on 7d7dfc0, the build `v0.1.0` was promoted from ([fast](../../qualification/2026-09-29-v02-fast-tier-7d7dfc0.md), [final](../../qualification/2026-09-29-sustained-v02.md), [candidates 1–13](../../qualification/2026-09-27-v0.1.0-release-closure.md)).
   - [ ] Qualify the snapshot uploader under power cuts (needs Btrfs volumes).
   - [ ] Run the `v02-loops` Actions lane and record its bounds.
 - [x] **V03** (gate) Publish and install the exact signed candidate.
   - [x] Preserve a complete signed candidate with source/run identity and per-file hashes; promote only the qualified bytes without rebuilding.
   - [x] Add explicit HTTPS candidate mirrors to both installers and managed setup without bypassing checksums or signatures.
-  - [x] Stage a verified candidate as a pre-release that promotion refuses, and script the real `curl | sh` qualification against it ([runbook](releasing.md#staging-a-candidate)).
-  - [x] Qualify hosted candidate creation, staged HTTPS delivery and actual signed installation before promotion ([Apple silicon, 25 Sep](qualification/2026-09-25-staged-install-apple-silicon.md): candidate run 36078958881, two cold installs passed).
-  - [x] Publish the qualified candidate: 7d7dfc0 (candidate run 36508614419, attempt 1) was staged, passed two staged cold installs on 29 September (282 s, 178 s) and was promoted unchanged as `v0.1.0` by promote run 36624159253 ([record](qualification/2026-09-27-v0.1.0-release-closure.md#how-it-ended)).
+  - [x] Stage a verified candidate as a pre-release that promotion refuses, and script the real `curl | sh` qualification against it ([runbook](../../releasing.md#staging-a-candidate)).
+  - [x] Qualify hosted candidate creation, staged HTTPS delivery and actual signed installation before promotion ([Apple silicon, 25 Sep](../../qualification/2026-09-25-staged-install-apple-silicon.md): candidate run 36078958881, two cold installs passed).
+  - [x] Publish the qualified candidate: 7d7dfc0 (candidate run 36508614419, attempt 1) was staged, passed two staged cold installs on 29 September (282 s, 178 s) and was promoted unchanged as `v0.1.0` by promote run 36624159253 ([record](../../qualification/2026-09-27-v0.1.0-release-closure.md#how-it-ended)).
 - [ ] **V04** (gate) Measure repeated cold installs on the advertised host matrix.
-  - [x] Apple silicon: two cold installs, 125–126 s from the first `curl` to a ready three-node cluster ([record](qualification/2026-09-25-staged-install-apple-silicon.md)).
+  - [x] Apple silicon: two cold installs, 125–126 s from the first `curl` to a ready three-node cluster ([record](../../qualification/2026-09-25-staged-install-apple-silicon.md)).
   - [ ] Intel macOS, Linux x86_64 and Linux arm64.
-- [x] **V05** Review all dependency exceptions against the current RustSec database and [record their reachability and migration dispositions](qualification/2026-09-18-dependency-exceptions.md). `make audit` also refuses an active rkyv graph.
+- [x] **V05** Review all dependency exceptions against the current RustSec database and [record their reachability and migration dispositions](../../qualification/2026-09-18-dependency-exceptions.md). `make audit` also refuses an active rkyv graph.
 
 ### Known flakes
 
@@ -461,7 +462,7 @@ that used to fail passes.
 | V02 soak: `relish logs APP --tail N` out of order (`ACK 968, 974, 969, 975`), hour-old lines shown as newest after a Bun SIGKILL or VM power-off, Redis client "stepping by 2" | 25 Sep (V02 soak, 22 of ~1,400 writer tails) | Product, three causes: `LogStore` stamped lines with one-second timestamps and sorted on them alone, so rows sharing a second came back in DataFusion's partition order; a single-node tail was `ORDER BY timestamp LIMIT n`, the *oldest* n; and every Bun restart re-followed adopted containers' capture files from byte 0, storing their whole history again as new lines (the "stepping by 2" tail was an old rolling-deploy instance's re-ingested output) | Fixed: a strictly rising nanosecond `sequence` column orders rows and tails (`ORDER BY sequence DESC LIMIT n`, then ascending); the merge keys on `(node, sequence)`; runtimes report each line's capture-file offset and the store skips offsets it already flushed, checkpointed in `ingest-checkpoint.json` after each Parquet file; tails spanning several instances are labelled `[instance]`. Formats bumped to protocol 25 / state 41 (required `sequence` column, new `/v1/logs/entries` rows). `tail_returns_the_newest_lines_in_emission_order` and `lines_within_one_second_keep_emission_order_across_flushes` reproduced the soak's interleaving before the fix; `restart_does_not_reingest_lines_already_flushed` and `lines_lost_with_the_buffer_are_ingested_again_after_a_crash` cover restarts |
 | V02 fast-tier soak on eced11c: right after a graceful whole-cluster stop and start, `relish logs soak-redis-client --tail 20` showed `INCR 749 … 782` stepping by 2 while the counter was past 2,504; correct again 40 s later | 26 Sep (V02 soak, failures/4) | Product: the cluster-wide log query asked only the nodes where the app was placed *now*. The client had moved node 1 → 3 → 2 and spent half an hour on node 2; after the restart it was placed on node 1 again, whose newest stored lines were from when it left (a rolling overlap, hence the twos). No re-ingestion: `graceful_restart_does_not_reingest_a_retired_instances_capture_file` and `graceful_stop_keeps_lines_that_were_only_buffered` pass before and after | Fixed: the query fans out to every live member (`ketchup::query::query_targets`); a placed node missing from membership is still a warning. `tail_after_an_app_moves_back_includes_the_nodes_it_ran_on_meanwhile` and three `query_targets` unit tests fail before, pass after |
 | `relish_test_catalogue::secure_catalogue_node_jobs_have_durable_ownership_and_confirmed_cleanup` ("workload …/cron is still owned by deploy …", macOS) | 24 Sep (candidate run 36060321071) | Product: a cron firing started a deploy of the leased job just before lease cleanup, and node-local cleanup treated the agent's "still owned by deploy" refusal as final | Fixed: cleanup retries while a deploy owns the job, within its 10 s step budget (`node_job_cleanup_waits_for_a_deploy_that_still_owns_the_job`) |
-| `power_cut::actual_power_cut_preserves_acknowledged_log_exports` and `…_council_backups` (V02 power-cut fixtures, not a flaky test: failed every run) | 25 Sep (V02 C03 fixture) | Product: `object_store::parse_url` opens `file://` destinations with fsync off, so an acknowledged export or backup could be empty after a power cut. Exporters then pruned the only good source (up to 162 of 171 files lost); backup retention deleted every older backup, leaving 3 empty ones | Fixed: every object store opens through `object_storage::open`, which syncs local writes (exporter 25/25 and backups 25/25 power cuts after; [record](qualification/2026-09-25-v02-power-cut.md)) |
+| `power_cut::actual_power_cut_preserves_acknowledged_log_exports` and `…_council_backups` (V02 power-cut fixtures, not a flaky test: failed every run) | 25 Sep (V02 C03 fixture) | Product: `object_store::parse_url` opens `file://` destinations with fsync off, so an acknowledged export or backup could be empty after a power cut. Exporters then pruned the only good source (up to 162 of 171 files lost); backup retention deleted every older backup, leaving 3 empty ones | Fixed: every object store opens through `object_storage::open`, which syncs local writes (exporter 25/25 and backups 25/25 power cuts after; [record](../../qualification/2026-09-25-v02-power-cut.md)) |
 | `node_pressure::node_pressure_consumes_capacity_outside_bun_and_cleans_up` ("node uses 1743523840 bytes, below the 1844305633-byte target", Linux) | 26 Sep (run 36185229625 on #216) | Harness: asserted node-wide `MemTotal - MemAvailable` after apply, but the helper sizes its ballast once and other processes on the runner (the previous suite's teardown) freed ~100 MB afterwards. Holding the node-wide figure isn't the product contract: a topping-up ballast would give memory back to a growing workload | Fixed: assert the helper cgroup's `memory.current` holds the delta measured just before apply (and stays under `memory.max`); design doc and book state the one-shot sizing. Lima VM with a 400 MB allocate/free loop running: old test 8 of 15 failed with the CI message, new test 15/15 (and 6/6 without the loop) |
 | `relish_test_catalogue::runc_catalogue_deploys_the_exact_image_pushed_to_pickle` (and every other public-image pull in `make test-linux`) | 24 Sep | Product: one stalled registry read spent the whole 30 s budget with no retry. Harness: timed tests pulled from public registries | Fixed: per-attempt deadline inside a larger total; pinned images served from a local digest-verified mirror |
 | V02 soak: heavy check "registry: soak/pulse:baseline manifest returned 503 or changed" (twice in 12 h, at ~5.4 h and ~10.8 h) | 26 Sep (V02 soak) | Harness: both fired inside the 300 s quorum-loss window (nodes 2 and 3 powered off). Every pushed tag returned 503 from node 1 and every blob verified, because Pickle resolves tags only through the committed council catalogue and fails closed without a leader; the check counted that as data loss | Fixed: 503 is retried three times 5 s apart, a lasting 503 is recorded as unavailable (info inside a fault window, fail outside one); a changed digest or any other status still fails at once (`test_sustained_check.Registry`, 3 fail before) |
@@ -498,16 +499,16 @@ that used to fail passes.
 - [ ] Qualify the downloaded candidate on clean hosts and record three-node timing.
 - [ ] Pass the real-cluster and final release acceptance gates.
 
-> **Historical reviews:** the [July wiring review](plans/2026-07-02-review-codebase.md)
+> **Historical reviews:** the [July wiring review](2026-07-02-review-codebase.md)
 > found components that existed only as libraries. Later hardening wired many of
 > them into the binaries. The dated findings remain useful history; superseded
 > inline warnings are not current blockers. Current residuals are tracked separately.
 
 > **Three reviews, three ID spaces.** Finding IDs are scoped to the review that raised them, and
 > all three reviews reuse `C1`/`M1`/`O1`. When you see a bare ID, check which section you're in:
-> Phases 1–12 use the [2026-07-02 wiring review](plans/2026-07-02-review-codebase.md);
-> Phase 15a uses the [2026-07-17 posture review](plans/2026-07-17-review-codebase-current-state.md);
-> Phase 15b uses the [2026-07-19 code-logic review](plans/2026-07-19-codebase-review-fable.md).
+> Phases 1–12 use the [2026-07-02 wiring review](2026-07-02-review-codebase.md);
+> Phase 15a uses the [2026-07-17 posture review](2026-07-17-review-codebase-current-state.md);
+> Phase 15b uses the [2026-07-19 code-logic review](2026-07-19-codebase-review-fable.md).
 > Where a later review contradicts an older caveat below, the later one wins — the Phase 15b
 > section records which earlier caveats it supersedes.
 
@@ -738,7 +739,7 @@ Phases 2–11 built the cluster subsystems but the `bun` binary always ran singl
 
 ## Phase 11b: Review & Tying the Loose Ends
 
-The July 2026 verification pass ([2026-07-02-review-codebase.md](plans/2026-07-02-review-codebase.md)) found that the build
+The July 2026 verification pass ([2026-07-02-review-codebase.md](2026-07-02-review-codebase.md)) found that the build
 is clean, clippy is silent, and 1590 tests pass — but a large share of the "done" items above
 are **library-only** (unit-tested, never wired into the `bun`/`relish` binaries), plus five
 critical bugs and a long tail of correctness issues in the wired paths. This phase closes them.
@@ -809,7 +810,7 @@ Brioche", "Node PKI, join and mTLS", "Pickle storage and replication durability"
 
 ### Stage 4 — Wire the remaining library-only subsystems (one at a time, binary-driven test each)
 
-Implementation plan: [docs/plans/2026-07-07-plan-wiring.md](plans/2026-07-07-plan-wiring.md)
+Implementation plan: [docs/plans/2026-07-07-plan-wiring.md](2026-07-07-plan-wiring.md)
 
 - [x] `L1` Scheduler → placement → remote dispatch: `relish apply` under `--cluster` commits `AppSpec`s to Raft (followers forward to the leader); a leader-only scheduler places replicas and commits `SchedulingDecision`s; every node polls `/v1/placements/{node}` and reconciles its instances (idempotent). `H8` fixed (spread weight 60 > bin-pack 50; test now asserts distinct nodes). Flushed out a latent bug: durable Raft log + council TCP RPC used bincode, which can't drive the config types' `deserialize_any` — both switched to self-describing JSON (matching the snapshot). Binary-driven test in `tests/placement.rs`
 - [x] `L2` / `M16` / `X3` — `M16`: orchestrator no longer leaks a failed step's own half-started instance (regression test asserts it's stopped). `X3`: `relish rollback` actually rolls back — deploy history now carries the full `AppSpec` (every path records it, including the first deploy), `POST /v1/rollback/{app}/{ns}` redeploys the previous successful spec via the apply path (Raft in cluster mode). Note: cluster-wide *staged* rollout (max_unavailable gating across nodes) rides on the W6 desired-state reconciler and the per-node rolling redeploy; the imperative `DeployOrchestrator` stays library-side (correct + unit-tested) rather than duplicated as a parallel cluster driver
@@ -825,7 +826,7 @@ Implementation plan: [docs/plans/2026-07-07-plan-wiring.md](plans/2026-07-07-pla
 - [x] `L16` Initial IPv4 egress allowlist programming and DNS refresh wired and Lima-tested. Phase 12b (NET6) made it fail closed, extended it to rolling deploy and crash-restart, and deletes per-cgroup entries on stop; IPv6/CIDR enforcement remains under the 12b network-policy theme.
 - [x] `M17` K8s import fidelity (`command`/`args` concatenated, `env.valueFrom` warned not dropped, namespace preserved, same-name-two-namespaces no longer overwrites)
 - [x] `H11` Fix `relish fmt` for nested-table configs — recursive section emission + a round-trip guard that refuses to write output that re-parses differently
-- [x] `X1`/`X3`/`X4`/`X5`/`X6` CLI mismatches: `X1` (build → registry port + real buildah execution), `X4` (logs `--grep`/`--since`/`--json-field` wired, server + client side) and `X5` (unreachable agent exits non-zero; explicit `--dry-run` flag added) done; `X3` rollback done (W7); `X6` no-args TUI is out of Stage 4 scope by design → [2026-07-06-plan-tui.md](plans/2026-07-06-plan-tui.md)
+- [x] `X1`/`X3`/`X4`/`X5`/`X6` CLI mismatches: `X1` (build → registry port + real buildah execution), `X4` (logs `--grep`/`--since`/`--json-field` wired, server + client side) and `X5` (unreachable agent exits non-zero; explicit `--dry-run` flag added) done; `X3` rollback done (W7); `X6` no-args TUI is out of Stage 4 scope by design → [2026-07-06-plan-tui.md](2026-07-06-plan-tui.md)
 
 ### Throughout
 
@@ -856,7 +857,7 @@ original review. All fixed on this branch, tests-first (each drives the binary/a
 
 ## Phase 12: Optimisations
 
-> Detailed implementation plan: [2026-07-06-plan-optimisations.md](plans/2026-07-06-plan-optimisations.md)
+> Detailed implementation plan: [2026-07-06-plan-optimisations.md](2026-07-06-plan-optimisations.md)
 > (revised 2026-07-09 after the Stage 4 wiring merge: slice B — Pickle catalog via Raft,
 > replication and two-phase GC — landed as-built in #71; 14 remaining implementation steps,
 > refreshed ground truth, config/endpoint/test inventories, Lima acceptance runbook).
@@ -873,13 +874,13 @@ original review. All fixed on this branch, tests-first (each drives the binary/a
 - [x] Parquet bloom filters for archive equality pruning — on `app`/`namespace` (1% FPP), not `line` (bloom filters answer equality, not substring LIKE; `bloom_filter_on_read` enabled in remote_query)
 - [x] Zstd compression for archived logs — via Parquet's native per-row-group ZSTD codec (random access preserved; >5x vs flat text), not a separate seekable-frame container
 - [x] Book chapter 12: "Squeezing Every Drop" — complete: logs (zstd + bloom), nftables maps + the wiring discovery, the as-shipped Raft catalog/GC/heal design (M2 TOCTOU), P2P planner + executor, pull-through cache, volumes/quotas/snapshots/scheduled backups, batch + build, and phase-wide lessons
-- [x] All Phase 12 tests green — the portable suite (`make ci`) plus the full Lima gated run (`relish dev test`: netns map DNAT + 1000-port stress, btrfs quota ENOSPC, snapshot create/corrupt/restore, real buildah build into the catalog, plus the existing runc/eBPF suites). Remaining acceptance: the live 3-node runbook in [the plan §10](plans/2026-07-06-plan-optimisations.md)
+- [x] All Phase 12 tests green — the portable suite (`make ci`) plus the full Lima gated run (`relish dev test`: netns map DNAT + 1000-port stress, btrfs quota ENOSPC, snapshot create/corrupt/restore, real buildah build into the catalog, plus the existing runc/eBPF suites). Remaining acceptance: the live 3-node runbook in [the plan §10](2026-07-06-plan-optimisations.md)
 
 ## Phase 12b: Correctness, Security & Convergence
 
-> Consolidated review: [2026-07-10-review-past-phase-12.md](plans/2026-07-10-review-past-phase-12.md).
-> It reconciles the renamed [code walkthrough](plans/2026-07-09-review-codex.md),
-> [design discrepancy register](plans/2026-07-09-review-design-discrepancies.md),
+> Consolidated review: [2026-07-10-review-past-phase-12.md](2026-07-10-review-past-phase-12.md).
+> It reconciles the renamed [code walkthrough](2026-07-09-review-codex.md),
+> [design discrepancy register](2026-07-09-review-design-discrepancies.md),
 > the former "Beyond Phase 11b" backlog and the 24 Low findings. M7 and M21/codex-M2
 > are fixed. M20 is still open: object-store features are compiled, but Ketchup export
 > still uses PathBuf plus std::fs::copy. X6 remains only in Phase 13.
@@ -1767,7 +1768,7 @@ whole theme lands.
 
 ## Phase 13: Relish TUI
 
-Implementation plan: [docs/plans/2026-07-06-plan-tui.md](plans/2026-07-06-plan-tui.md)
+Implementation plan: [docs/plans/2026-07-06-plan-tui.md](2026-07-06-plan-tui.md)
 
 - [x] Full interactive terminal UI (ratatui + crossterm) — `src/relish/tui/`
   (app loop, input/keys, navigation, live event/log streams, terminal, theme/palette)
@@ -1778,7 +1779,7 @@ Implementation plan: [docs/plans/2026-07-06-plan-tui.md](plans/2026-07-06-plan-t
 
 ## Phase 14: Self-Upgrade
 
-> Detailed implementation plan: [2026-07-06-plan-self-upgrade.md](plans/2026-07-06-plan-self-upgrade.md)
+> Detailed implementation plan: [2026-07-06-plan-self-upgrade.md](2026-07-06-plan-self-upgrade.md)
 > (12 commit-sized steps, decision log, type definitions, test inventory, gotchas checklist).
 
 - [x] Rolling binary replacement (exec-in-place; workers → council → leader-last; state in Raft; `relish upgrade` command set). There is no leadership transfer: the leader upgrades itself last, in place (openraft 0.9 can't gracefully hand off against a live leader), and the returning process finishes the run via poll-first idempotency. Cordon, live-voter quorum headroom, server-derived identity and gossip-rejoin verification landed in 12b.6 (see above).
@@ -1799,7 +1800,7 @@ verification alone; its separate gossip-rejoin deadline remains unfinished.
 
 ## Phase 15: Testing, Benchmarking & Diagnostics
 
-> Detailed implementation plan: [2026-07-06-plan-chaos.md](plans/2026-07-06-plan-chaos.md)
+> Detailed implementation plan: [2026-07-06-plan-chaos.md](2026-07-06-plan-chaos.md)
 > (20 numbered steps plus prerequisite tranches, test catalogue, data structures,
 > acceptance runbook).
 >
@@ -1880,11 +1881,11 @@ verification alone; its separate gossip-rejoin deadline remains unfinished.
 ## Phase 15a: Current-State Hardening
 
 > Prioritised follow-up plan:
-> [2026-07-18-plan-codebase-review-follow-up.md](plans/2026-07-18-plan-codebase-review-follow-up.md)
+> [2026-07-18-plan-codebase-review-follow-up.md](2026-07-18-plan-codebase-review-follow-up.md)
 >
 > This is a hardening gate before the unfinished Phase 15 diagnostic commands,
 > not a declaration that Phase 15 is complete. The source review is
-> [2026-07-17-review-codebase-current-state.md](plans/2026-07-17-review-codebase-current-state.md).
+> [2026-07-17-review-codebase-current-state.md](2026-07-17-review-codebase-current-state.md).
 >
 > **`M`/`O` IDs in this section belong to the 2026-07-17 review, not the 2026-07-19 one in
 > Phase 15b.** The 15b review re-verified this review's four security P1s as fixed by H1–H7
@@ -2023,7 +2024,7 @@ verification alone; its separate gossip-rejoin deadline remains unfinished.
 
 ## Phase 15b: Code-Logic Review Hardening
 
-> Source review: [2026-07-19-codebase-review-fable.md](plans/2026-07-19-codebase-review-fable.md)
+> Source review: [2026-07-19-codebase-review-fable.md](2026-07-19-codebase-review-fable.md)
 > (16 Critical, 29 Medium, 20 Optional). Written independently of the 2026-07-17 posture
 > review and against `main` *after* the Phase 15a H1–H7 PRs landed, so the two barely
 > overlap: 15a is a **posture** review (fail-open defaults, docs drift, dependency shape),
@@ -2355,11 +2356,11 @@ Post-12b user-experience work (not a roadmap phase). Plan:
 
 ## Phase 16: Post-Phase-15 Audit — Truthfulness & Hardening
 
-> Source audit: [2026-08-08-audit-post-phase15.md](plans/2026-08-08-audit-post-phase15.md)
+> Source audit: [2026-08-08-audit-post-phase15.md](2026-08-08-audit-post-phase15.md)
 > (five parallel doc-vs-code sweeps run against `main` at the PR #151 merge:
 > whitepaper, the seven+eight component design docs, and the manual/READMEs).
 > The Phase-15 code-review bugs it references are staged separately in
-> [2026-08-06-plan-phase15-followup.md](plans/2026-08-06-plan-phase15-followup.md);
+> [2026-08-06-plan-phase15-followup.md](2026-08-06-plan-phase15-followup.md);
 > Phase A of that plan (green CI) is done — its Phases B–H feed Section C below.
 >
 > The audit's one finding that shapes everything: **the code is more honest than
