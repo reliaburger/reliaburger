@@ -1378,8 +1378,6 @@ async fn persist_placements(
         .map_err(std::io::Error::other)?
 }
 
-// Discovery must keep progressing while a rollout waits for its terminal event.
-#[allow(clippy::too_many_arguments)]
 /// One confirmed placement poll: the leader's answer, once its catalogue is
 /// published locally.
 struct ConsumerPoll {
@@ -1390,6 +1388,8 @@ struct ConsumerPoll {
     requires_allocations: bool,
 }
 
+// Discovery must keep progressing while a rollout waits for its terminal event.
+#[allow(clippy::too_many_arguments)]
 async fn poll_consumer(
     node_name: &str,
     metrics_rx: &watch::Receiver<openraft::RaftMetrics<u64, CouncilNodeInfo>>,
