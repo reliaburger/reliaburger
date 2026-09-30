@@ -137,13 +137,27 @@ install 0.1.1 and recreate the cluster, then re-apply your apps.
 If you try anyway, nothing moves. A 0.1.0 node asks every candidate for
 `bun --compatibility` after checking its signatures and before staging it, and
 refuses 0.1.1's `{"protocol":27,"state":46}` with a 409. A single node's
-`relish upgrade start v0.1.1` fails with that message. In a cluster, `start`
-records the run, the first node it directs refuses, and the run pauses with
-`directive to NODE refused: incompatible binary: incompatible cluster formats`
-while every node keeps running 0.1.0. `relish upgrade abort` ends the paused
-run, because no node moved. A laptop cluster refuses the other way: rerunning
-setup with the 0.1.1 installer says the existing cluster's parameters differ,
-because the saved record names 0.1.0.
+`relish upgrade start v0.1.1` fails with that message. In a 0.1.0 or 0.1.1
+cluster, `start` records the run, the first node it directs refuses, and the
+run pauses with `directive to NODE refused: incompatible binary: …` while
+every node keeps running the old release. `relish upgrade abort` ends the
+paused run, because no node moved.
+
+From 0.1.2 the leader refuses before it records anything. It fetches the
+candidate, checks its signatures and runs `bun --compatibility` on it, and
+`start` fails with both format pairs:
+`refusing to upgrade to vX: incompatible binary: found protocol P, state S; this cluster (reliaburger v0.1.2 (…)) needs protocol 27, state 46`.
+A cluster `relish upgrade rollback vX` is checked the same way: the leader
+asks every node which versions its binary store holds (`installed_versions`
+in `GET /v1/version`) and refuses a version any node lacks, naming those
+nodes, instead of pausing on the first node's
+`version vX is not installed in the binary store`.
+
+A laptop cluster refuses the other way. Rerunning setup with a newer
+installer finds a saved record that names the older release, so it names
+both versions and tells you to run `relish local destroy --yes` (with
+`--name` for a cluster not called `laptop`) and set it up again. Before 0.1.2
+the message only said the existing cluster's parameters differ.
 
 ## Signing identity
 

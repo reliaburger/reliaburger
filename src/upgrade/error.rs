@@ -9,6 +9,27 @@ pub enum UpgradeError {
     #[error("incompatible binary: {0}")]
     IncompatibleBinary(String),
 
+    /// A verified candidate answered `--compatibility` with formats other
+    /// than the ones this binary, and so this cluster, speaks.
+    #[error(
+        "incompatible binary: found protocol {}, state {}; this cluster ({}) needs protocol {}, state {}. \
+         Pre-1.0 releases don't migrate or mix formats, so no rolling upgrade or rollback crosses this change: \
+         recreate the cluster on the release you want (a laptop cluster: `relish local destroy --yes`, then set it up again). \
+         See {}",
+        .found.protocol,
+        .found.state,
+        crate::compatibility::this_binary(),
+        .expected.protocol,
+        .expected.state,
+        crate::compatibility::POLICY_URL
+    )]
+    IncompatibleFormats {
+        /// The pair the candidate reported.
+        found: crate::compatibility::Compatibility,
+        /// The pair this binary requires.
+        expected: crate::compatibility::Compatibility,
+    },
+
     /// The input could not be parsed as a semantic version.
     #[error("invalid version {input:?}: {reason}")]
     InvalidVersion { input: String, reason: String },
@@ -139,6 +160,18 @@ pub enum UpgradeError {
         version: crate::upgrade::version::BinaryVersion,
         stored: String,
         incoming: String,
+    },
+
+    /// A cluster rollback names a version some nodes don't hold. Rollbacks
+    /// never download anything, so those nodes would refuse the directive.
+    #[error(
+        "cannot roll back to {version}: it is not installed in the binary store on {nodes}. \
+         A rollback only returns to a binary a node already holds (one it ran before an upgrade)"
+    )]
+    RollbackTargetMissing {
+        version: crate::upgrade::version::BinaryVersion,
+        /// `node n1, node n2`.
+        nodes: String,
     },
 
     /// No older version is installed to roll back to.

@@ -36,7 +36,7 @@ pub const POLICY_URL: &str = "https://github.com/reliaburger/reliaburger/blob/ma
 
 /// This binary as a refusal names it: `reliaburger v0.1.1 (3fcb1fd)`, or
 /// just the version when the build didn't know its commit.
-fn this_binary() -> String {
+pub(crate) fn this_binary() -> String {
     use crate::upgrade::version::{build_commit, compiled_version, describe};
     format!(
         "reliaburger {}",

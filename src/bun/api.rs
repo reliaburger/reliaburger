@@ -1895,6 +1895,9 @@ async fn version_handler(State(state): State<ApiState>) -> impl IntoResponse {
             // reports false, rather than recording a run the node will
             // refuse and leaving it paused.
             "accepts_network_upgrades": manager.accepts_network_upgrades(),
+            // What a rollback could return to. The leader refuses a
+            // cluster rollback up front when a node lacks the target.
+            "installed_versions": manager.installed_versions().await,
         })),
         None => Json(serde_json::json!({
             "version": crate::upgrade::version::compiled_version().to_string(),
@@ -2385,6 +2388,13 @@ async fn upgrade_start_handler(
         allow_downgrade: request.allow_downgrade,
         nodes: derived_nodes,
     };
+    // Check the directive every node will get here, before anything is
+    // recorded: a candidate with other formats would otherwise pause the
+    // run on the first node it reached.
+    let directive = crate::upgrade::orchestrator::build_directive(&upgrade);
+    if let Err(resp) = check_candidate_on_leader(&state, &directive).await {
+        return resp;
+    }
 
     match council
         .write(crate::council::types::RaftRequest::UpgradeUpdate {
@@ -2409,9 +2419,6 @@ async fn upgrade_start_handler(
 
 /// Ask every planned node what it runs and whether it can verify a
 /// network upgrade, for the start-time gates.
-///
-/// Probes run concurrently, each bounded. An unreachable node is left out:
-/// the orchestrator re-checks every node as the walk reaches it.
 async fn probe_running_binaries(
     state: &ApiState,
     nodes: &[crate::upgrade::types::NodeUpgradeRecord],
@@ -2419,6 +2426,33 @@ async fn probe_running_binaries(
     Vec<crate::upgrade::plan::RunningBinary>,
     Vec<crate::upgrade::plan::NetworkReadiness>,
 ) {
+    probe_planned_nodes(state, nodes)
+        .await
+        .into_iter()
+        .map(|(node, probe)| {
+            (
+                crate::upgrade::plan::RunningBinary {
+                    node: node.clone(),
+                    version: probe.version,
+                    sha256: probe.binary_sha256,
+                },
+                crate::upgrade::plan::NetworkReadiness {
+                    node,
+                    accepts_network_upgrades: probe.accepts_network_upgrades,
+                },
+            )
+        })
+        .unzip()
+}
+
+/// Probe every planned node, named as an error names it (`node n1`).
+///
+/// Probes run concurrently, each bounded. An unreachable node is left out:
+/// the orchestrator re-checks every node as the walk reaches it.
+async fn probe_planned_nodes(
+    state: &ApiState,
+    nodes: &[crate::upgrade::types::NodeUpgradeRecord],
+) -> Vec<(String, crate::upgrade::orchestrator::NodeProbe)> {
     use crate::upgrade::orchestrator::NodeControl as _;
 
     let control = crate::upgrade::orchestrator::HttpNodeControl::with_http(
@@ -2435,25 +2469,63 @@ async fn probe_running_binaries(
             .await
             .ok()
             .flatten()?;
-            let node = format!("node {}", record.node_id);
-            Some((
-                crate::upgrade::plan::RunningBinary {
-                    node: node.clone(),
-                    version: probe.version,
-                    sha256: probe.binary_sha256,
-                },
-                crate::upgrade::plan::NetworkReadiness {
-                    node,
-                    accepts_network_upgrades: probe.accepts_network_upgrades,
-                },
-            ))
+            Some((format!("node {}", record.node_id), probe))
         }
     });
     futures_util::future::join_all(probes)
         .await
         .into_iter()
         .flatten()
-        .unzip()
+        .collect()
+}
+
+/// How long the leader spends fetching, verifying and querying a
+/// candidate before recording a run. It stays under the time a follower
+/// waits for a forwarded start.
+const CANDIDATE_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Ask the candidate for its formats on the leader, the way every node
+/// will, so a release the cluster can't run is refused before it's
+/// recorded rather than paused on the first node (#339).
+///
+/// Only a definite answer refuses: other formats, a bad signature, a blob
+/// the registry doesn't hold. A registry that's down right now, or a check
+/// that runs out of time, proves nothing about the candidate, so the run is
+/// recorded and the nodes check it themselves, riding out the outage as
+/// they always have. A leader without an upgrade manager can't check
+/// either; the nodes still do.
+// `Response` is large but it IS the HTTP reply to send on failure.
+#[allow(clippy::result_large_err)]
+async fn check_candidate_on_leader(
+    state: &ApiState,
+    directive: &crate::upgrade::types::UpgradeDirective,
+) -> Result<(), Response> {
+    let Some(manager) = &state.upgrade else {
+        return Ok(());
+    };
+    let unchecked = |reason: String| {
+        eprintln!(
+            "bun: could not check the candidate {} before recording the upgrade ({reason}); \
+             each node checks it when directed",
+            directive.target_version
+        );
+        Ok(())
+    };
+    match tokio::time::timeout(CANDIDATE_CHECK_TIMEOUT, manager.check_candidate(directive)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) if e.is_transient() => unchecked(e.to_string()),
+        Ok(Err(e)) => Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!("refusing to upgrade to {}: {e}", directive.target_version)
+            })),
+        )
+            .into_response()),
+        Err(_) => unchecked(format!(
+            "no answer within {}s",
+            CANDIDATE_CHECK_TIMEOUT.as_secs()
+        )),
+    }
 }
 
 /// The 409 for a start or rollback while another run is active. A paused
@@ -2803,6 +2875,28 @@ async fn upgrade_cluster_rollback_handler(
         Ok(nodes) => nodes,
         Err(e) => return plan_error_response(&e),
     };
+
+    // A rollback execs a binary each node already holds; nothing is
+    // downloaded. Ask every node what its store holds and refuse here,
+    // naming each node without the target, rather than record a run the
+    // first such node refuses (#339).
+    let stored: Vec<crate::upgrade::plan::StoredBinaries> =
+        probe_planned_nodes(&state, &derived_nodes)
+            .await
+            .into_iter()
+            .map(|(node, probe)| crate::upgrade::plan::StoredBinaries {
+                node,
+                running: probe.version,
+                installed: probe.installed_versions,
+            })
+            .collect();
+    if let Err(e) = crate::upgrade::plan::check_rollback_target(&request.target_version, &stored) {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response();
+    }
 
     let upgrade_id = format!(
         "rollback-{}-{}",
