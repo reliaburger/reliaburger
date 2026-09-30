@@ -2350,27 +2350,6 @@ Post-12b user-experience work (not a roadmap phase). Plan:
   book); the components table and repo layout moved into a new
   "Under the hood" manual chapter; the status wall replaced by a
   progress.md link.
-- [ ] Build an app in the five-minute tour (post-0.1.0, draft PR #248; plan
-  [2026-09-27-plan-demo-image-build.md](plans/2026-09-27-plan-demo-image-build.md)).
-  - [x] `examples/demo/burger` (Go, cross-compiling Dockerfile), the tarball
-    served from the website, `relish build` through the quickstart registry
-    forward, Buildah in the guest image, the build step in staged-install
-    qualification; `go vet`/`go test` in CI's `demo app` job.
-  - [x] Multi-arch builds store every platform: `buildah manifest push --all`,
-    platform manifests published by digest before the index, a build missing a
-    requested platform fails, the index and every platform manifest are signed,
-    and `ClusterSource` pulls the node's own platform from an index.
-  - [x] Buildah runs on its own storage under `<storage.data>/buildah` and is
-    pruned after every build; base images stay cached up to
-    `[images] build_cache_max_bytes` (100 GiB; quickstart nodes 1 GiB). Builds
-    on one node queue (maintainer: fine as is).
-  - [x] `relish images` shows a multi-platform image as one row with its
-    platforms (table and JSON); the catalogue records each index entry's
-    platform. The change is additive (an optional field, old data loads, old
-    readers ignore it), so there's no compatibility bump.
-  - [ ] VM checks (plan, "Needs a VM later"): the tour end to end on a
-    quickstart, a mixed-architecture pull, a networked `RUN` step next to the
-    perimeter firewall; re-record `assets/tour.cast`.
 
 ## Phase 16: Post-Phase-15 Audit — Truthfulness & Hardening
 
