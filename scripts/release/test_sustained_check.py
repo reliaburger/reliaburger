@@ -72,18 +72,39 @@ class Evidence(unittest.TestCase):
 class WriterAndRedis(Evidence):
     def test_writer_file_ending_below_an_acknowledged_write_is_a_regression(self):
         self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 10\nACK 11\nACK 12\n"}))
-        code, verdict = self.evaluate(self.snapshot(**{"writer__file_txt": "LAST 11\n"}))
+        code, verdict = self.evaluate(self.snapshot(**{"writer__file_txt": "MAX 11\nLAST 11\n"}))
         self.assertEqual(code, 1)
         self.assertIn("writer-regression", self.failures(verdict))
 
-    def test_writer_file_with_a_gap_fails(self):
-        code, verdict = self.evaluate(self.snapshot(**{"writer__file_txt": "BAD 7: 8\nLAST 7\n"}))
+    def test_writer_file_with_a_missing_value_is_lost_data(self):
+        code, verdict = self.evaluate(self.snapshot(**{"writer__file_txt": "BAD 7: 8\nMISSING 1 first 7\nMAX 9\nLAST 8\n"}))
         self.assertEqual(code, 1)
-        self.assertIn("writer-gap", self.failures(verdict))
+        self.assertEqual(self.failures(verdict), ["writer-lost"])
+
+    def test_writer_file_with_a_repeated_value_is_two_writers_not_lost_data(self):
+        # V02, 28 Sep 2026: line 21927 held 21926 again. The old check read
+        # that as a file ending at 21927 below ACK 23539; it held every value.
+        self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 23538\nACK 23539\n"}))
+        code, verdict = self.evaluate(self.snapshot(**{
+            "writer__file_txt": "BAD 21927: 21926\nDUP 1 first 21926\nMAX 23540\nLAST 23541\n"}))
+        self.assertEqual(code, 1)
+        self.assertEqual(self.failures(verdict), ["writer-duplicate"])
+        detail = next(item["detail"] for item in verdict["findings"] if item["check"] == "writer-duplicate")
+        self.assertIn("two writers", detail)
+
+    def test_writer_file_with_an_out_of_place_line_alone_is_a_gap(self):
+        code, verdict = self.evaluate(self.snapshot(**{"writer__file_txt": "BAD 3: x\nMAX 5\nLAST 5\n"}))
+        self.assertEqual(code, 1)
+        self.assertEqual(self.failures(verdict), ["writer-gap"])
+
+    def test_writer_file_without_a_summary_warns(self):
+        code, verdict = self.evaluate(self.snapshot(**{"writer__file_txt": "LAST 5\n"}))
+        self.assertEqual(self.failures(verdict), [])
+        self.assertIn("writer-file", [item["check"] for item in verdict["findings"]])
 
     def test_writer_file_at_or_beyond_the_highest_ack_passes(self):
         self.evaluate(self.snapshot(**{"writer__log_txt": "RESUME 0 after 0 lines\nACK 1\nACK 2\n"}))
-        code, verdict = self.evaluate(self.snapshot(**{"writer__file_txt": "LAST 5\n"}))
+        code, verdict = self.evaluate(self.snapshot(**{"writer__file_txt": "MAX 5\nLAST 5\n"}))
         self.assertEqual(self.failures(verdict), [])
 
     def test_redis_counter_going_backwards_within_one_tail_fails(self):
@@ -96,10 +117,40 @@ class WriterAndRedis(Evidence):
         code, verdict = self.evaluate(self.snapshot(**{"redis__log_txt": "ERR Could not connect\nINCR 3\nINCR 4\n"}))
         self.assertIn("redis-log-order", self.failures(verdict))
 
+    def test_one_instance_on_two_nodes_is_ordered_per_node(self):
+        # V02 final tier, 28 Sep 2026 (ff854cb): the rollback walk moved
+        # soak-redis-client-0 from rb-2 to rb-3 under the same name. The tail
+        # interleaves the two runs by two nodes' clocks, so 11632 came before
+        # 11631. Each run rose; the order across runs isn't the client's.
+        self.evaluate(self.snapshot(**{"redis__log_txt": "INCR 11629\n"}))
+        code, verdict = self.evaluate(self.snapshot(**{"redis__log_txt":
+            "[soak-redis-client-0@rb-a-2] INCR 11630\n"
+            "[soak-redis-client-0@rb-a-3] INCR 11632\n"
+            "[soak-redis-client-0@rb-a-2] INCR 11631\n"
+            "[soak-redis-client-0@rb-a-3] INCR 11633\n"}))
+        self.assertEqual(self.failures(verdict), [])
+        # The next tail is judged against the newest line of either run.
+        _, verdict = self.evaluate(self.snapshot(**{"redis__log_txt": "INCR 11632\n"}))
+        self.assertIn("redis-log-order", self.failures(verdict))
+
+    def test_lines_going_backwards_within_one_labelled_run_still_fail(self):
+        _, verdict = self.evaluate(self.snapshot(**{"redis__log_txt":
+            "[soak-redis-client-0@rb-a-2] INCR 11631\n"
+            "[soak-redis-client-0@rb-a-3] INCR 11633\n"
+            "[soak-redis-client-0@rb-a-3] INCR 11632\n"}))
+        self.assertIn("redis-log-order", self.failures(verdict))
+        detail = next(item["detail"] for item in verdict["findings"] if item["check"] == "redis-log-order")
+        self.assertIn("soak-redis-client-0@rb-a-3", detail)
+
+    def test_an_unlabelled_tail_is_still_one_run(self):
+        # Without labels the view shows one instance, so any step back fails.
+        _, verdict = self.evaluate(self.snapshot(**{"redis__log_txt": "INCR 11632\nINCR 11631\n"}))
+        self.assertIn("redis-log-order", self.failures(verdict))
+
     def test_writer_log_going_backwards_is_a_log_order_failure_not_data_loss(self):
         self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 10\nACK 11\n"}))
         code, verdict = self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 12\nACK 9\nACK 13\n",
-                                                        "writer__file_txt": "LAST 13\n"}))
+                                                        "writer__file_txt": "MAX 13\nLAST 13\n"}))
         self.assertEqual(code, 1)
         self.assertEqual(self.failures(verdict), ["writer-log-order"])
         detail = next(item["detail"] for item in verdict["findings"] if item["check"] == "writer-log-order")
@@ -140,7 +191,7 @@ class WriterAndRedis(Evidence):
         self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 40640\n"}))
         self.power_cut()
         self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 40314\n"}))
-        code, verdict = self.evaluate(self.snapshot(**{"writer__file_txt": "LAST 40314\n"}))
+        code, verdict = self.evaluate(self.snapshot(**{"writer__file_txt": "MAX 40314\nLAST 40314\n"}))
         self.assertEqual(code, 1)
         self.assertIn("writer-regression", self.failures(verdict))
 
@@ -309,15 +360,53 @@ class Leaks(Evidence):
     def test_an_old_expectation_does_not_excuse_a_later_restart(self):
         status = [{"node": "rb-a-1", "id": "default__web-0"}]
         self.evaluate(self.snapshot(**{"status_json": status, "inventory__rb-a-1_txt": INVENTORY}))
-        checker.main(["expect", str(self.evidence), "restart", "rb-a-1", "--at", str(NOW - checker.EXPECT_WINDOW - 1)])
-        _, verdict = self.evaluate(self.snapshot(**{"status_json": status, "inventory__rb-a-1_txt": INVENTORY.replace("nrestarts 0", "nrestarts 1")}))
+        checker.main(["expect", str(self.evidence), "restart", "rb-a-1", "--at", str(NOW)])
+        # A check well after the kill saw no restart: the kill didn't cause one.
+        later = NOW + checker.RESTART_GRACE
+        _, quiet = self.evaluate(self.snapshot(ts=later, **{"status_json": status, "inventory__rb-a-1_txt": INVENTORY}))
+        _, verdict = self.evaluate(self.snapshot(ts=later + 300, **{"status_json": status, "inventory__rb-a-1_txt": INVENTORY.replace("nrestarts 0", "nrestarts 1")}))
+        self.assertEqual(self.failures(quiet), [])
         self.assertIn("bun-restart", self.failures(verdict))
 
-    def test_file_descriptors_growing_every_hour_for_six_hours_fail(self):
-        samples = [[NOW - 6 * 3600 + hour * 3600 + minute * 300, 300 + hour * 10] for hour in range(6) for minute in range(12)]
-        self.assertEqual([item["check"] for item in checker.fd_findings(samples, NOW)], ["leak-fd"])
-        samples[-5][1] = 250
-        self.assertEqual(checker.fd_findings(samples, NOW), [])
+    def test_a_kill_first_checked_long_after_still_explains_its_restart(self):
+        # 0.1.1 candidate 2's fast tier: the upgrade slot killed the leader
+        # mid-walk, then blocked for 718 s (a walk and a 600 s rollback
+        # wait) without a check. The restart was the harness's own, however
+        # long it took for a check to look.
+        status = [{"node": "rb-a-1", "id": "default__web-0"}]
+        self.evaluate(self.snapshot(**{"status_json": status, "inventory__rb-a-1_txt": INVENTORY}))
+        killed = NOW + 100
+        checker.main(["expect", str(self.evidence), "restart", "rb-a-1", "--at", str(killed)])
+        _, verdict = self.evaluate(self.snapshot(ts=killed + 718, **{"status_json": status, "inventory__rb-a-1_txt": INVENTORY.replace("nrestarts 0", "nrestarts 1")}))
+        self.assertEqual(self.failures(verdict), [])
+
+    def test_file_descriptors_rising_every_ten_minutes_for_half_an_hour_fail(self):
+        # e8c9653's leader: the floor went 206 -> 254 -> 399 -> 531 while
+        # sockets piled up. Bun images live an hour or two between kills
+        # and upgrade walks, so a six-hour trend never got to run.
+        started = NOW - 3000
+        floors = [206, 254, 399, 531]
+        samples = [[started + 600 + bucket * 600 + minute * 60, floor + minute * 5]
+                   for bucket, floor in enumerate(floors) for minute in range(0, 10, 3)]
+        now = started + 3000
+        self.assertEqual([item["check"] for item in checker.fd_findings(samples, started, now)], ["leak-fd"])
+        # Not a complete window yet: the warm-up plus four buckets.
+        self.assertEqual(checker.fd_findings(samples, started, now - 60), [])
+
+    def test_bounded_file_descriptors_pass(self):
+        started = NOW - 3000
+        def samples(floors):
+            return [[started + 600 + bucket * 600 + minute * 60, floor + (100 if minute == 3 else 0)]
+                    for bucket, floor in enumerate(floors) for minute in range(0, 10, 3)]
+        now = started + 3000
+        # A settle burst doubles the count for a sample; the floor stays put.
+        self.assertEqual(checker.fd_findings(samples([55, 56, 55, 57]), started, now), [])
+        # Small steady rises (candidate e8c9653's node 3: 59 -> 72) are not a leak.
+        self.assertEqual(checker.fd_findings(samples([59, 63, 68, 72]), started, now), [])
+        # One step up (a peer's restart) and then flat is not a leak either.
+        self.assertEqual(checker.fd_findings(samples([60, 120, 121, 121]), started, now), [])
+        # A dip anywhere breaks the run.
+        self.assertEqual(checker.fd_findings(samples([200, 300, 290, 500]), started, now), [])
 
     def test_rss_over_a_quarter_above_the_warm_sample_fails(self):
         node = {}
@@ -325,6 +414,34 @@ class Leaks(Evidence):
         self.assertEqual(checker.rss_findings(node, 100, NOW, NOW - 3600), [])
         self.assertEqual(checker.rss_findings(node, 125, NOW, NOW - 7200), [])
         self.assertEqual([item["check"] for item in checker.rss_findings(node, 126, NOW, NOW - 7200)], ["leak-rss"])
+
+    def test_an_upgrade_exec_restarts_the_rss_warm_up(self):
+        # The candidate-9 soak: an upgrade walk exec'd bun in place (same pid,
+        # new image), RSS fell from 594 to 242 MB, and the warm sample was
+        # taken ten minutes later, before the new image had filled its
+        # working set. A fresh image gets a fresh hour.
+        state = {}
+        def sample(ts, image, rss_kb):
+            text = INVENTORY.replace("bun_rss_kb 300000", f"bun_rss_kb {rss_kb}") + f"bun_image {image}\n"
+            return checker.resource_trend_findings(state, "rb-a-2", checker.parse_inventory(text), ts)
+        start = NOW - 4 * 3600
+        self.assertEqual(sample(start, "a1", 217124), [])
+        self.assertEqual(sample(start + 3000, "b2", 242000), [])
+        self.assertEqual(sample(start + 3600 + 600, "b2", 479532), [])
+        self.assertEqual(sample(start + 5700, "b2", 625572), [])
+        self.assertEqual(sample(start + 3000 + 3600, "b2", 657000), [])
+        self.assertEqual([item["check"] for item in sample(start + 3000 + 7000, "b2", 830000)], ["leak-rss"])
+
+    def test_inventories_without_an_image_line_still_track_the_pid(self):
+        state = {}
+        def sample(ts, pid, rss_kb):
+            text = INVENTORY.replace("bun_pid 100", f"bun_pid {pid}").replace("bun_rss_kb 300000", f"bun_rss_kb {rss_kb}")
+            return checker.resource_trend_findings(state, "rb-a-1", checker.parse_inventory(text), ts)
+        self.assertEqual(sample(NOW, 100, 100000), [])
+        self.assertEqual(sample(NOW + 3600, 100, 100000), [])
+        self.assertEqual([item["check"] for item in sample(NOW + 3700, 100, 130000)], ["leak-rss"])
+        self.assertEqual(sample(NOW + 3800, 101, 50000), [])
+        self.assertEqual(sample(NOW + 3900, 101, 130000), [])
 
 
 class Exports(Evidence):
@@ -491,6 +608,31 @@ class Recovery(Evidence):
         self.assertEqual(self.failures(verdict), ["ingress-http"])
 
 
+class ReleaseVersion(unittest.TestCase):
+    """The upgrade walk rolls back to the candidate's own version, which the
+    cluster reports before the first walk. 0.1.1 candidate 2's fast tier
+    rolled back to a hardcoded v0.1.0 and waited 600 s for it."""
+
+    def release_version(self, *versions, soak="bun-v0.1.1-soak.2"):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            code = checker.main(["release-version", "--soak-bun", soak, *versions])
+        return code, out.getvalue().strip()
+
+    def test_every_node_agreeing_names_the_release(self):
+        self.assertEqual(self.release_version("v0.1.1", "v0.1.1", "v0.1.1"), (0, "0.1.1"))
+        self.assertEqual(self.release_version("0.2.0", "v0.2.0", "0.2.0", soak="bun-v0.2.0-soak.1"), (0, "0.2.0"))
+
+    def test_nodes_disagreeing_or_unreachable_name_nothing(self):
+        self.assertEqual(self.release_version("v0.1.1", "v0.1.1", "v0.1.0")[0], 1)
+        self.assertEqual(self.release_version("v0.1.1", "?", "v0.1.1")[0], 1)
+        self.assertEqual(self.release_version()[0], 1)
+
+    def test_a_cluster_already_on_the_soak_build_is_refused(self):
+        # Rolling "back" to the soak build itself would prove nothing.
+        self.assertEqual(self.release_version("v0.1.1-soak.2", "v0.1.1-soak.2", "v0.1.1-soak.2")[0], 1)
+
+
 class TomlEditing(unittest.TestCase):
     NODE = """[node]
 name = "rb-a-2"
@@ -560,7 +702,7 @@ class Record(Evidence):
         self.assertIn("| fault:bun-kill-follower | 2 | 2 | 0 | 0 | 60 s / 60 s |", text)
         self.assertIn("| upgrade | 1 | 0 | 0 | 1 | n/a |", text)
         self.assertIn("highest ACK 20000", text)
-        self.assertIn("the writer file checks (writer-gap, writer-regression) decide data loss", text)
+        self.assertIn("the writer file checks (writer-lost, writer-regression) decide data loss", text)
         self.assertIn("not supplied: upgrade slots skipped", text)
         self.assertIn("short leaf lifetimes unavailable", text)
         self.assertIn("- Teardown: `relish local destroy --yes` and `relish uninstall --yes` succeeded", text)

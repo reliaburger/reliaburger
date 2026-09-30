@@ -9,7 +9,7 @@
 //! leadership changes self-heal — there is no per-instance RPC whose
 //! failure needs bespoke bookkeeping.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -46,8 +46,10 @@ fn retire_timeout(io_timeout: Duration, stop_confirmation_timeout: Duration) -> 
 /// The longest one owner may take, once a test lease is released, to confirm
 /// its share of the cleanup: waiting for its next placement poll, one whole
 /// retirement, then its acknowledgement to the leader. Owners retire side by
-/// side, so this also bounds the whole release when nothing else holds the
-/// owner's reconcile tick (a deploy it's still finishing runs first).
+/// side, so this also bounds the whole release. A retirement never waits for
+/// a deploy: a reconcile cycle retires before it deploys, and keeps polling
+/// and retiring while it waits on a deploy. It can still queue behind the
+/// same owner's previous retirement batch, if that batch is still running.
 pub fn lease_retirement_bound(stop_confirmation_timeout: Duration) -> Duration {
     RECONCILE_INTERVAL
         + retire_timeout(RECONCILE_IO_TIMEOUT, stop_confirmation_timeout)
@@ -428,10 +430,12 @@ pub fn spawn_leader_scheduler(
             let mut quotas = crate::meat::quota::ledger_from_namespaces(&desired.namespaces);
 
             let unheard = unheard_nodes(&alive, &reports);
+            let suspect = nodes_in_state(&members, NodeState::Suspect);
             let decisions = plan_scheduling_pass_with_dns(
                 &mut cache,
                 &desired,
                 &alive,
+                &suspect,
                 &mut quotas,
                 dns_required,
                 &unheard,
@@ -488,11 +492,12 @@ pub fn spawn_leader_scheduler(
                 // Raft write: a node that died between planning and commit
                 // (or between two commits in this pass) must not receive the
                 // placement. `members`/`reports` were snapshotted at the top
-                // of the tick; membership can move under a slow write.
+                // of the tick; membership can move under a slow write. A
+                // suspect node still holds the placements it kept.
                 let live: HashSet<NodeId> = membership_rx
                     .borrow()
                     .iter()
-                    .filter(|m| m.state == NodeState::Alive)
+                    .filter(|m| matches!(m.state, NodeState::Alive | NodeState::Suspect))
                     .map(|m| m.node_id.clone())
                     .collect();
                 if !decision
@@ -543,7 +548,15 @@ fn plan_scheduling_pass(
     alive: &HashSet<NodeId>,
     quotas: &mut crate::meat::quota::QuotaLedger,
 ) -> Vec<crate::meat::types::SchedulingDecision> {
-    plan_scheduling_pass_with_dns(cache, desired, alive, quotas, false, &HashSet::new())
+    plan_scheduling_pass_with_dns(
+        cache,
+        desired,
+        alive,
+        &HashSet::new(),
+        quotas,
+        false,
+        &HashSet::new(),
+    )
 }
 
 /// Plan a pass with the cluster's configured DNS requirement.
@@ -555,6 +568,7 @@ fn plan_scheduling_pass_with_dns(
     cache: &mut ClusterStateCache,
     desired: &crate::council::types::DesiredState,
     alive: &HashSet<NodeId>,
+    suspect: &HashSet<NodeId>,
     quotas: &mut crate::meat::quota::QuotaLedger,
     dns_required: bool,
     unheard: &HashSet<NodeId>,
@@ -615,9 +629,9 @@ fn plan_scheduling_pass_with_dns(
             .get(app_id)
             .map(|placements| {
                 placements.len() == want
-                    && placements
-                        .iter()
-                        .all(|p| placement_holds(p, spec, cache, alive, unheard, dns_required))
+                    && placements.iter().all(|p| {
+                        placement_holds(p, spec, cache, alive, suspect, unheard, dns_required)
+                    })
             })
             .unwrap_or(false);
         planned.push((app_id, spec, override_replicas, want, converged));
@@ -677,7 +691,9 @@ fn plan_scheduling_pass_with_dns(
                 .map(|placements| {
                     placements
                         .iter()
-                        .filter(|p| placement_holds(p, spec, cache, alive, unheard, dns_required))
+                        .filter(|p| {
+                            placement_holds(p, spec, cache, alive, suspect, unheard, dns_required)
+                        })
                         .take(want)
                         .cloned()
                         .collect()
@@ -691,14 +707,15 @@ fn plan_scheduling_pass_with_dns(
             let home = VolumeHome {
                 cache,
                 alive,
+                suspect,
                 unheard,
                 dns_required,
             };
             match home.reserve(app_id, spec, desired.last_placed_nodes.get(app_id), want) {
                 HomeOutcome::Placed(placements) => kept = placements,
-                HomeOutcome::Busy(node) => {
+                HomeOutcome::Wait { node, reason } => {
                     eprintln!(
-                        "scheduler: {app_id} waits for room on {node}, which holds its volumes"
+                        "scheduler: {app_id} waits for {node}, which holds its volumes: {reason}"
                     );
                     continue;
                 }
@@ -714,6 +731,12 @@ fn plan_scheduling_pass_with_dns(
                 continue;
             }
             effective_spec.replicas = Replicas::Fixed(missing as u32);
+        }
+        // Spread the rest against what's kept, not against what the nodes
+        // last reported: a report can lag a new leader, or still list a
+        // replica on its way out.
+        if matches!(effective_spec.replicas, Replicas::Fixed(_)) {
+            count_kept_replicas(cache, app_id, &kept);
         }
         // The scheduler owns its cache, so hand it the shared one and take
         // it back afterwards (Rust move semantics — no shared &mut alias).
@@ -744,22 +767,59 @@ fn plan_scheduling_pass_with_dns(
     decisions
 }
 
+/// Record in `cache` exactly the replicas of `app_id` that `kept` places on
+/// each node, so the scheduler spreads what it adds around them.
+fn count_kept_replicas(
+    cache: &mut ClusterStateCache,
+    app_id: &crate::meat::types::AppId,
+    kept: &[crate::meat::types::Placement],
+) {
+    for node_id in cache.node_ids() {
+        let count = kept.iter().filter(|p| p.node_id == node_id).count();
+        cache.set_replicas(&node_id, app_id, u32::try_from(count).unwrap_or(u32::MAX));
+    }
+}
+
 /// What returning an app to the nodes that hold its volumes came to.
 enum HomeOutcome {
     /// Replicas reserved on their volumes' nodes; empty when the app has no
     /// managed volume or none of its nodes can run it any more, so the
     /// scheduler places it freely.
     Placed(Vec<crate::meat::types::Placement>),
-    /// A node holding the app's volumes could run it but has no room yet (or
-    /// hasn't reported). Placing it elsewhere would start it on an empty
+    /// A node holding the app's volumes is still in the cluster but can't
+    /// take it right now. Placing it elsewhere would start it on an empty
     /// volume, so it waits.
-    Busy(NodeId),
+    Wait { node: NodeId, reason: HomeWait },
+}
+
+/// Why an app waits for the node that holds its volumes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HomeWait {
+    /// The node is alive but this leader has no fresh report from it: a new
+    /// leader, or a report worker that stalled long enough to go stale.
+    Unreported,
+    /// The node reported it isn't ready, is cordoned for an upgrade, or
+    /// lacks a capability the app needs.
+    NotReady,
+    /// The node is ready but short of room.
+    NoRoom,
+}
+
+impl std::fmt::Display for HomeWait {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            HomeWait::Unreported => "it hasn't reported fresh state",
+            HomeWait::NotReady => "it isn't ready",
+            HomeWait::NoRoom => "it has no room yet",
+        })
+    }
 }
 
 /// The leader's view of the nodes a returning app's volumes live on.
 struct VolumeHome<'a> {
     cache: &'a mut ClusterStateCache,
     alive: &'a HashSet<NodeId>,
+    suspect: &'a HashSet<NodeId>,
     unheard: &'a HashSet<NodeId>,
     dns_required: bool,
 }
@@ -768,9 +828,12 @@ impl VolumeHome<'_> {
     /// Reserve up to `want` replicas of `app_id` on the nodes it last ran on,
     /// if it has a managed volume.
     ///
-    /// A node that is gone, not ready, or no longer matches the app's
-    /// required labels is dropped: that's the documented loss of a local
-    /// volume with its node, or the operator moving the app on purpose.
+    /// Only two things release a home: the node leaving the cluster (gossip
+    /// no longer has it alive or suspect), which is the documented loss of a local
+    /// volume with its node, and the node no longer matching the app's
+    /// required labels, which is the operator moving the app on purpose.
+    /// Anything else (a stale or missing report, not ready, cordoned for an
+    /// upgrade, full) makes the app wait, because its data is still there.
     fn reserve(
         self,
         app_id: &crate::meat::types::AppId,
@@ -778,8 +841,7 @@ impl VolumeHome<'_> {
         last_nodes: Option<&Vec<NodeId>>,
         want: usize,
     ) -> HomeOutcome {
-        let has_managed_volume = spec.volumes.iter().any(|volume| volume.source.is_none());
-        let Some(last_nodes) = last_nodes.filter(|_| has_managed_volume) else {
+        let Some(last_nodes) = last_nodes.filter(|_| has_managed_volume(spec)) else {
             return HomeOutcome::Placed(Vec::new());
         };
         let resources = scheduler_resources(spec);
@@ -790,35 +852,35 @@ impl VolumeHome<'_> {
             .unwrap_or_default();
         let mut homes = Vec::new();
         for node_id in last_nodes.iter().take(want) {
-            let placement = crate::meat::types::Placement {
-                node_id: node_id.clone(),
-                resources,
+            let wait = |reason| HomeOutcome::Wait {
+                node: node_id.clone(),
+                reason,
             };
-            let holds = placement_holds(
-                &placement,
-                spec,
-                self.cache,
-                self.alive,
-                self.unheard,
-                self.dns_required,
-            );
-            if !holds {
+            if self.suspect.contains(node_id) {
+                return wait(HomeWait::Unreported);
+            }
+            if !self.alive.contains(node_id) {
                 continue;
             }
-            let reported = self
-                .cache
-                .get_node(node_id)
-                .filter(|_| !self.unheard.contains(node_id));
-            let Some(node) = reported else {
-                return HomeOutcome::Busy(node_id.clone());
+            let Some(node) = self.cache.get_node(node_id) else {
+                return wait(HomeWait::Unreported);
             };
             if !node.matches_labels(&required) {
                 continue;
             }
-            if !node.can_fit(&resources) {
-                return HomeOutcome::Busy(node_id.clone());
+            if self.unheard.contains(node_id) {
+                return wait(HomeWait::Unreported);
             }
-            homes.push(placement);
+            if !node_can_run(node, spec, self.dns_required) {
+                return wait(HomeWait::NotReady);
+            }
+            if !node.can_fit(&resources) {
+                return wait(HomeWait::NoRoom);
+            }
+            homes.push(crate::meat::types::Placement {
+                node_id: node_id.clone(),
+                resources,
+            });
         }
         // Reserve only once every home is known to fit, so a wait leaves
         // no phantom reservation behind for the rest of the pass.
@@ -839,28 +901,62 @@ impl VolumeHome<'_> {
 /// to a council member that just died can take longer still; "not heard from
 /// yet" is not evidence of trouble, and moving its replicas would restart
 /// healthy workloads. A node that reported and went stale, or reported not
-/// ready or not capable, does lose them.
+/// ready or not capable, does lose them, unless the app keeps a managed
+/// volume there: its replacement would start on an empty volume, so it stays
+/// for as long as the node is alive.
 fn placement_holds(
     placement: &crate::meat::types::Placement,
     spec: &AppSpec,
     cache: &ClusterStateCache,
     alive: &HashSet<NodeId>,
+    suspect: &HashSet<NodeId>,
     unheard: &HashSet<NodeId>,
     dns_required: bool,
 ) -> bool {
+    // Suspicion is gossip's "missed a probe", not "gone": SWIM gives the
+    // node its suspicion timeout to refute it. Moving its replicas now would
+    // stop healthy ones for a late ack (#346).
+    if suspect.contains(&placement.node_id) {
+        return true;
+    }
     if !alive.contains(&placement.node_id) {
         return false;
     }
-    if unheard.contains(&placement.node_id) {
+    if unheard.contains(&placement.node_id) || has_managed_volume(spec) {
         return true;
     }
-    let Some(node) = cache.get_node(&placement.node_id) else {
-        return true;
-    };
+    cache
+        .get_node(&placement.node_id)
+        .is_none_or(|node| node_can_run(node, spec, dns_required))
+}
+
+/// Whether a fixed-size app keeps state in a managed volume, which lives on
+/// the node it runs on. A daemon set runs on every eligible node anyway, so
+/// there is nowhere else for its volume to be.
+fn has_managed_volume(spec: &AppSpec) -> bool {
+    matches!(spec.replicas, Replicas::Fixed(_))
+        && spec.volumes.iter().any(|volume| volume.source.is_none())
+}
+
+/// Whether a reported node is ready and can enforce what `spec` needs.
+fn node_can_run(
+    node: &crate::meat::cluster_state::SchedulerNodeState,
+    spec: &AppSpec,
+    dns_required: bool,
+) -> bool {
     let requires_egress = spec.egress.as_ref().is_some_and(|e| !e.allow.is_empty());
     node.ready
         && (!requires_egress || node.capabilities.egress.can_enforce_allowlist())
         && (!dns_required || node.capabilities.dns.can_resolve_internal())
+}
+
+/// The members gossip currently puts in `state`.
+fn nodes_in_state(members: &[MembershipSnapshot], state: NodeState) -> HashSet<NodeId> {
+    members
+        .iter()
+        .filter(|member| member.state == state)
+        .map(|member| member.node_id.clone())
+        .collect()
 }
 
 /// Live nodes whose state report is fresh but whose readiness or capability
@@ -1221,11 +1317,16 @@ fn build_cluster_cache(
             continue; // capacity unset
         }
 
-        let running_apps = report
-            .running_apps
-            .iter()
-            .map(|a| crate::meat::types::AppId::new(&a.app_name, &a.namespace))
-            .collect();
+        // One entry per running instance, so this counts replicas.
+        let mut app_replicas = HashMap::new();
+        for app in &report.running_apps {
+            *app_replicas
+                .entry(crate::meat::types::AppId::new(
+                    &app.app_name,
+                    &app.namespace,
+                ))
+                .or_default() += 1;
+        }
 
         cache.set_node(SchedulerNodeState {
             node_id: member.node_id.clone(),
@@ -1248,7 +1349,7 @@ fn build_cluster_cache(
             capabilities: capability_report
                 .map(|capability| capability.capabilities)
                 .unwrap_or_default(),
-            running_apps,
+            app_replicas,
             uptime_secs: member.first_seen.elapsed().as_secs(),
             // Nothing reports cached images yet; locality scoring is
             // inert rather than fed guesses.
@@ -1256,6 +1357,30 @@ fn build_cluster_cache(
         });
     }
     cache
+}
+
+/// Ask the agent whether instances it adopted at startup already run `spec`.
+/// No answer in time counts as "no", which deploys as before.
+async fn adopted_instances_match(
+    cmd_tx: &mpsc::Sender<AgentCommand>,
+    key: &(String, String),
+    spec: &crate::config::app::AppSpec,
+    io_timeout: Duration,
+) -> bool {
+    let ask = async {
+        let (response, answer) = tokio::sync::oneshot::channel();
+        cmd_tx
+            .send(AgentCommand::AdoptedPlacementMatches {
+                app_name: key.0.clone(),
+                namespace: key.1.clone(),
+                spec: Box::new(spec.clone()),
+                response,
+            })
+            .await
+            .ok()?;
+        answer.await.ok()
+    };
+    matches!(tokio::time::timeout(io_timeout, ask).await, Ok(Some(true)))
 }
 
 /// Recheck convergence after restart without forgetting owned resources.
@@ -1312,6 +1437,16 @@ async fn persist_placements(
         .map_err(std::io::Error::other)?
 }
 
+/// One confirmed placement poll: the leader's answer, once its catalogue is
+/// published locally.
+struct ConsumerPoll {
+    leader_url: String,
+    assignments: NodeAssignments,
+    /// The agent registers services only at committed allocations, so a
+    /// placement must wait for its allocation to reach the catalogue.
+    requires_allocations: bool,
+}
+
 // Discovery must keep progressing while a rollout waits for its terminal event.
 #[allow(clippy::too_many_arguments)]
 async fn poll_consumer(
@@ -1325,7 +1460,7 @@ async fn poll_consumer(
     cluster_http: &crate::cluster::ClusterHttp,
     receipt_cursor: &mut usize,
     io_timeout: Duration,
-) -> Option<(String, NodeAssignments)> {
+) -> Option<ConsumerPoll> {
     let client = cluster_http.client();
     let leader_url = {
         let metrics = metrics_rx.borrow();
@@ -1428,7 +1563,11 @@ async fn poll_consumer(
     if !update.published {
         return None;
     }
-    Some((leader_url, assignments))
+    Some(ConsumerPoll {
+        leader_url,
+        assignments,
+        requires_allocations: update.requires_allocations,
+    })
 }
 
 /// Spawn the per-node placement reconciler.
@@ -1520,6 +1659,19 @@ fn spawn_placement_reconciler_with_io_timeout(
         // waits before the same specification is tried again, instead of
         // being redeployed on every poll.
         let mut backoff = super::deploy_backoff::DeployBackoff::default();
+        // Placements already reported as waiting for their allocation, so
+        // the wait is logged once rather than every poll.
+        let mut awaiting: HashSet<(String, String)> = HashSet::new();
+        let retirer = Retirer {
+            node_name: &node_name,
+            cmd_tx: &cmd_tx,
+            client: &client,
+            service_token: &service_token,
+            checkpoint_path: checkpoint_path.as_deref(),
+            shutdown: &shutdown,
+            io_timeout,
+            retire_timeout,
+        };
 
         loop {
             tokio::select! {
@@ -1551,7 +1703,11 @@ fn spawn_placement_reconciler_with_io_timeout(
                 checkpoint_verified = true;
             }
 
-            let Some((leader_url, assignments)) = poll_consumer(
+            let Some(ConsumerPoll {
+                leader_url,
+                assignments,
+                requires_allocations,
+            }) = poll_consumer(
                 &node_name,
                 &metrics_rx,
                 &directory_rx,
@@ -1568,10 +1724,27 @@ fn spawn_placement_reconciler_with_io_timeout(
                 continue;
             };
 
-            let mut seen: HashSet<(String, String)> = HashSet::new();
+            // Placements already gone from this node retire before anything
+            // deploys: that costs no availability, and a deploy may take
+            // minutes (a lease's cleanup bound can't include them).
+            if retirer
+                .retire_departed(&mut applied, &leader_url, &assignments, None)
+                .await
+                .is_none()
+            {
+                return;
+            }
+
+            let seen = assigned_keys(&assignments);
+            // Placements a poll taken during this cycle no longer assigns
+            // here. Deploying them from this cycle's older answer could start
+            // a volume app on a node the leader has already moved it from.
+            let mut withdrawn: HashSet<(String, String)> = HashSet::new();
             for assignment in &assignments.apps {
                 let key = (assignment.name.clone(), assignment.namespace.clone());
-                seen.insert(key.clone());
+                if withdrawn.contains(&key) {
+                    continue;
+                }
 
                 let mut spec = assignment.spec.clone();
                 // The local agent runs exactly this node's share.
@@ -1581,7 +1754,46 @@ fn spawn_placement_reconciler_with_io_timeout(
                 {
                     continue; // already converged; don't redeploy
                 }
+                // The leader commits a placement and its service allocation in
+                // separate writes, so an answer can place an app whose
+                // allocation hasn't committed yet (#309). The agent would refuse
+                // to register the service; a later poll carries it.
+                if requires_allocations
+                    && awaits_allocation(&assignments.endpoint_catalog, assignment)
+                {
+                    if awaiting.insert(key.clone()) {
+                        eprintln!(
+                            "orchestrator: {}/{} is placed here but its service allocation \
+                             hasn't committed yet; deploying once it has",
+                            key.0, key.1
+                        );
+                    }
+                    continue;
+                }
+                awaiting.remove(&key);
+
                 if !backoff.may_attempt(&key, &fingerprint, std::time::Instant::now()) {
+                    continue;
+                }
+                // A restart or self-upgrade between queueing a deploy and
+                // recording it applied leaves the entry pending while the
+                // adopted instances already run it. Rolling them again would
+                // replace every replica for nothing (and surge a second writer
+                // onto a volume app's data before #267).
+                if adopted_instances_match(&cmd_tx, &key, &spec, io_timeout).await {
+                    let mut next = applied.clone();
+                    next.insert(key.clone(), AssignmentState::Applied { fingerprint });
+                    match persist_placements(checkpoint_path.as_deref(), &next).await {
+                        Ok(()) => {
+                            applied = next;
+                            backoff.clear(&key);
+                            eprintln!(
+                                "orchestrator: adopted instances of {}/{} already run their placement; not redeploying",
+                                key.0, key.1
+                            );
+                        }
+                        Err(error) => eprintln!("orchestrator: cannot record convergence: {error}"),
+                    }
                     continue;
                 }
 
@@ -1609,20 +1821,40 @@ fn spawn_placement_reconciler_with_io_timeout(
                 if !matches!(queued, Ok(Ok(()))) {
                     continue;
                 }
-                let terminal = deploy_outcome(event_rx, DEPLOY_TERMINAL_TIMEOUT);
-                tokio::pin!(terminal);
+                // The deploy's events drain on their own task, so retiring
+                // below can't stall the stream: the agent closes a stream its
+                // reader leaves full, and the deploy would then look failed.
+                let mut terminal = tokio::spawn(deploy_outcome(event_rx, DEPLOY_TERMINAL_TIMEOUT));
                 let outcome = loop {
                     tokio::select! {
-                        _ = shutdown.cancelled() => return,
-                        result = &mut terminal => break result,
+                        _ = shutdown.cancelled() => {
+                            terminal.abort();
+                            return;
+                        }
+                        result = &mut terminal => {
+                            break result.unwrap_or_else(|error| {
+                                Err(DeployWaitError::WatcherLost(error.to_string()))
+                            });
+                        }
                         _ = tick.tick() => {
                             // The producer can need our own withdrawal receipt before
                             // it can emit the terminal deployment event.
-                            let _ = poll_consumer(
+                            let Some(ConsumerPoll { leader_url: fresh_url, assignments: fresh, .. }) = poll_consumer(
                                 &node_name, &metrics_rx, &directory_rx, raft_to_api_offset,
                                 &service_token, &cmd_tx, &shutdown, &cluster_http,
                                 &mut receipt_cursor, io_timeout,
-                            ).await;
+                            ).await else {
+                                continue;
+                            };
+                            withdrawn.extend(seen.difference(&assigned_keys(&fresh)).cloned());
+                            // A retirement must not wait out a deploy of some other app.
+                            let retired = retirer
+                                .retire_departed(&mut applied, &fresh_url, &fresh, Some(&key))
+                                .await;
+                            if retired.is_none() {
+                                terminal.abort();
+                                return;
+                            }
                         }
                     }
                 };
@@ -1648,119 +1880,221 @@ fn spawn_placement_reconciler_with_io_timeout(
             }
 
             backoff.retain(|key| seen.contains(key));
+            awaiting.retain(|key| seen.contains(key));
+        }
+    })
+}
 
-            // The leader retains owners across rescheduling and local journal
-            // loss. Its instructions therefore supplement our local inventory.
-            let mut removed: std::collections::BTreeMap<_, Vec<LeaseRetirement>> = applied
-                .keys()
-                .filter(|key| !seen.contains(*key))
-                .map(|key| (key.clone(), Vec::new()))
-                .collect();
-            for retirement in &assignments.retirements {
-                let app = &retirement.placement.app_id;
-                let key = (app.name.clone(), app.namespace.clone());
-                if retirement.placement.node_id.0 != node_name || seen.contains(&key) {
-                    eprintln!("orchestrator: refusing conflicting retirement instruction");
-                    continue;
-                }
+/// Whether `assignment` declares a port that `catalog` doesn't allocate yet,
+/// at that port. The agent registers a clustered service only at its
+/// committed allocation, so deploying before it arrives can only fail.
+fn awaits_allocation(
+    catalog: &crate::onion::catalog::EndpointCatalog,
+    assignment: &NodeAssignment,
+) -> bool {
+    let Some(port) = assignment.spec.port else {
+        return false;
+    };
+    let service = crate::onion::service_id::ServiceId::new(&assignment.namespace, &assignment.name);
+    catalog
+        .resolve(&service)
+        .is_none_or(|allocation| allocation.port != port)
+}
+
+/// The (name, namespace) of every app `assignments` places on this node.
+fn assigned_keys(assignments: &NodeAssignments) -> HashSet<(String, String)> {
+    assignments
+        .apps
+        .iter()
+        .map(|assignment| (assignment.name.clone(), assignment.namespace.clone()))
+        .collect()
+}
+
+/// What one node's placement reconciler needs to retire the placements that
+/// have left the node. It only borrows the reconciler's own values.
+struct Retirer<'a> {
+    node_name: &'a str,
+    cmd_tx: &'a mpsc::Sender<AgentCommand>,
+    client: &'a reqwest::Client,
+    service_token: &'a Option<String>,
+    checkpoint_path: Option<&'a std::path::Path>,
+    shutdown: &'a CancellationToken,
+    io_timeout: Duration,
+    retire_timeout: Duration,
+}
+
+impl Retirer<'_> {
+    /// Retire every placement this node owns that `assignments` no longer
+    /// lists, and every lease retirement the leader asks of this node, then
+    /// acknowledge each confirmed lease retirement to the leader.
+    ///
+    /// `busy` names a placement whose deploy is still in flight. It waits
+    /// for a later cycle, so no app ever has a deploy and a retirement
+    /// outstanding at once. Returns `None` if shutdown interrupted it.
+    async fn retire_departed(
+        &self,
+        applied: &mut AppliedMap,
+        leader_url: &str,
+        assignments: &NodeAssignments,
+        busy: Option<&(String, String)>,
+    ) -> Option<()> {
+        let seen = assigned_keys(assignments);
+        // The leader retains owners across rescheduling and local journal
+        // loss. Its instructions therefore supplement our local inventory.
+        let mut removed: BTreeMap<_, Vec<LeaseRetirement>> = applied
+            .keys()
+            .filter(|key| !seen.contains(*key) && Some(*key) != busy)
+            .map(|key| (key.clone(), Vec::new()))
+            .collect();
+        for retirement in &assignments.retirements {
+            let app = &retirement.placement.app_id;
+            let key = (app.name.clone(), app.namespace.clone());
+            if retirement.placement.node_id.0 != self.node_name || seen.contains(&key) {
+                eprintln!("orchestrator: refusing conflicting retirement instruction");
+                continue;
+            }
+            if Some(&key) != busy {
                 removed.entry(key).or_default().push(retirement.clone());
             }
-            // Retirements run side by side: each may wait out a stubborn
-            // workload's stop grace, and one must not hold up the rest.
-            // Each future owns its inputs: a spawned task can't hold futures
-            // that borrow from a closure's arguments.
-            let mut retirements = futures_util::stream::iter(removed.into_iter().map(
-                |((name, namespace), confirmations)| {
-                    let cmd_tx = cmd_tx.clone();
-                    async move {
-                        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-                        // Queueing and acknowledgement share one deadline. An unknown
-                        // outcome keeps ownership and lets other owners progress.
-                        let retire = async {
-                            let command = if confirmations.is_empty() {
-                                AgentCommand::Retire {
-                                    app_name: name.clone(),
-                                    namespace: namespace.clone(),
-                                    response: response_tx,
-                                }
-                            } else {
-                                AgentCommand::RetireTestResources {
-                                    app_name: name.clone(),
-                                    namespace: namespace.clone(),
-                                    response: response_tx,
-                                }
-                            };
-                            cmd_tx
-                                .send(command)
-                                .await
-                                .map_err(|_| "agent command channel closed")?;
-                            response_rx
-                                .await
-                                .map_err(|_| "agent dropped retirement response")
+        }
+        let retire_timeout = self.retire_timeout;
+        // Retirements run side by side: each may wait out a stubborn
+        // workload's stop grace, and one must not hold up the rest.
+        // Each future owns its inputs: a spawned task can't hold futures
+        // that borrow from a closure's arguments.
+        let mut retirements = futures_util::stream::iter(removed.into_iter().map(
+            |((name, namespace), confirmations)| {
+                let cmd_tx = self.cmd_tx.clone();
+                async move {
+                    let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+                    // Queueing and acknowledgement share one deadline. An unknown
+                    // outcome keeps ownership and lets other owners progress.
+                    let retire = async {
+                        let command = if confirmations.is_empty() {
+                            AgentCommand::Retire {
+                                app_name: name.clone(),
+                                namespace: namespace.clone(),
+                                response: response_tx,
+                            }
+                        } else {
+                            AgentCommand::RetireTestResources {
+                                app_name: name.clone(),
+                                namespace: namespace.clone(),
+                                response: response_tx,
+                            }
                         };
-                        let retired = tokio::time::timeout(retire_timeout, retire).await;
-                        (name, namespace, confirmations, retired)
+                        cmd_tx
+                            .send(command)
+                            .await
+                            .map_err(|_| "agent command channel closed")?;
+                        response_rx
+                            .await
+                            .map_err(|_| "agent dropped retirement response")
+                    };
+                    let retired = tokio::time::timeout(retire_timeout, retire).await;
+                    (name, namespace, confirmations, retired)
+                }
+            },
+        ))
+        .buffer_unordered(MAX_CONCURRENT_RETIREMENTS);
+        loop {
+            let next = tokio::select! {
+                _ = self.shutdown.cancelled() => return None,
+                next = retirements.next() => next,
+            };
+            let Some((name, namespace, confirmations, retired)) = next else {
+                return Some(());
+            };
+            let key = (name, namespace);
+            match retired {
+                Ok(Ok(Ok(()))) => {
+                    let mut next = applied.clone();
+                    next.remove(&key);
+                    if let Err(error) = persist_placements(self.checkpoint_path, &next).await {
+                        eprintln!("orchestrator: cannot record retirement: {error}");
+                        continue;
                     }
-                },
-            ))
-            .buffer_unordered(MAX_CONCURRENT_RETIREMENTS);
-            loop {
-                let next = tokio::select! {
-                    _ = shutdown.cancelled() => return,
-                    next = retirements.next() => next,
-                };
-                let Some((name, namespace, confirmations, retired)) = next else {
-                    break;
-                };
-                match retired {
-                    Ok(Ok(Ok(()))) => {
-                        let mut next = applied.clone();
-                        next.remove(&(name, namespace));
-                        if let Err(error) =
-                            persist_placements(checkpoint_path.as_deref(), &next).await
-                        {
-                            eprintln!("orchestrator: cannot record retirement: {error}");
-                            continue;
-                        }
-                        applied = next;
-                        for confirmation in confirmations {
-                            let mut request = client
-                                .post(format!("{leader_url}/v1/test/leases/retired"))
-                                .json(&confirmation);
-                            if let Some(token) = &service_token {
-                                request = request.bearer_auth(token);
-                            }
-                            let acknowledged = tokio::select! {
-                                _ = shutdown.cancelled() => return,
-                                result = tokio::time::timeout(io_timeout, request.send()) => result,
-                            };
-                            if !matches!(acknowledged, Ok(Ok(ref response)) if response.status() == reqwest::StatusCode::NO_CONTENT)
-                            {
-                                eprintln!(
-                                    "orchestrator: lease retirement acknowledgement failed; leader retains ownership"
-                                );
-                            }
-                        }
+                    *applied = next;
+                    for confirmation in confirmations {
+                        self.acknowledge(leader_url, &confirmation).await?;
                     }
-                    Ok(Ok(Err(e))) => {
-                        eprintln!(
-                            "orchestrator: retirement of {name}/{namespace} failed, will retry: {e}"
-                        );
-                    }
-                    Ok(Err(error)) => {
-                        eprintln!(
-                            "orchestrator: retirement of {name}/{namespace}: {error}; will retry"
-                        );
-                    }
-                    Err(_) => {
-                        eprintln!(
-                            "orchestrator: retirement of {name}/{namespace} exceeded {retire_timeout:?}; ownership retained"
-                        );
-                    }
+                }
+                Ok(Ok(Err(e))) => {
+                    eprintln!(
+                        "orchestrator: retirement of {}/{} failed, will retry: {e}",
+                        key.0, key.1
+                    );
+                    forget_convergence(applied, key, self.checkpoint_path).await;
+                }
+                Ok(Err(error)) => {
+                    eprintln!(
+                        "orchestrator: retirement of {}/{}: {error}; will retry",
+                        key.0, key.1
+                    );
+                    forget_convergence(applied, key, self.checkpoint_path).await;
+                }
+                Err(_) => {
+                    eprintln!(
+                        "orchestrator: retirement of {}/{} exceeded {retire_timeout:?}; ownership retained",
+                        key.0, key.1
+                    );
+                    forget_convergence(applied, key, self.checkpoint_path).await;
                 }
             }
         }
-    })
+    }
+
+    /// Tell the leader this node has confirmed one lease retirement. A lost
+    /// acknowledgement only means the leader asks again. Returns `None` if
+    /// shutdown interrupted it.
+    async fn acknowledge(&self, leader_url: &str, confirmation: &LeaseRetirement) -> Option<()> {
+        let mut request = self
+            .client
+            .post(format!("{leader_url}/v1/test/leases/retired"))
+            .json(confirmation);
+        if let Some(token) = self.service_token {
+            request = request.bearer_auth(token);
+        }
+        let acknowledged = tokio::select! {
+            _ = self.shutdown.cancelled() => return None,
+            result = tokio::time::timeout(self.io_timeout, request.send()) => result,
+        };
+        if !matches!(acknowledged, Ok(Ok(ref response)) if response.status() == reqwest::StatusCode::NO_CONTENT)
+        {
+            eprintln!(
+                "orchestrator: lease retirement acknowledgement failed; leader retains ownership"
+            );
+        }
+        Some(())
+    }
+}
+
+/// Keep ownership of a workload whose retirement did not finish, but stop
+/// calling it converged.
+///
+/// A retirement that fails part-way has usually stopped the replicas already
+/// (the address release is what waits on other nodes). If the leader then
+/// hands the same assignment back, as it does when a node it briefly gave up
+/// on reports again, an `Applied` fingerprint would match and the stopped
+/// replicas would never be started. `Pending` still retires the workload if
+/// the assignment stays gone, and deploys it if the assignment returns.
+async fn forget_convergence(
+    applied: &mut AppliedMap,
+    key: (String, String),
+    checkpoint_path: Option<&std::path::Path>,
+) {
+    let Some(state) = applied.get_mut(&key) else {
+        return;
+    };
+    if matches!(state, AssignmentState::Pending) {
+        return;
+    }
+    *state = AssignmentState::Pending;
+    // The in-memory state already drives this process; a failed write only
+    // means a restart re-derives convergence from the runtime inventory.
+    if let Err(error) = persist_placements(checkpoint_path, applied).await {
+        eprintln!("orchestrator: cannot record unfinished retirement: {error}");
+    }
 }
 
 /// How long the reconciler waits for a deploy's terminal event before giving
@@ -1783,6 +2117,9 @@ enum DeployWaitError {
     /// No terminal event arrived in time.
     #[error("the deploy did not reach a terminal event within {}s", .0.as_secs())]
     TimedOut(Duration),
+    /// The task reading the event stream ended without an outcome.
+    #[error("the deploy's event reader ended without an outcome: {0}")]
+    WatcherLost(String),
 }
 
 /// Drain a deploy's event stream until it reaches `Complete` within `timeout`.
@@ -1982,6 +2319,7 @@ mod tests {
                         let _ = response.send(Ok(crate::bun::agent::ConsumerUpdate {
                             published: true,
                             receipts: vec![],
+                            requires_allocations: false,
                         }));
                     }
                     AgentCommand::Retire {
@@ -2031,6 +2369,642 @@ mod tests {
         assert!(
             elapsed < grace * 2,
             "retirements serialised: {elapsed:?} for three {grace:?} stops"
+        );
+    }
+
+    /// A stand-in leader whose placement answer a test rewrites as it goes,
+    /// counting every lease-retirement acknowledgement it receives.
+    struct ScriptedLeader {
+        assignments: Arc<std::sync::Mutex<NodeAssignments>>,
+        acknowledgements: Arc<std::sync::atomic::AtomicUsize>,
+        address: std::net::SocketAddr,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    impl ScriptedLeader {
+        async fn serve(initial: NodeAssignments) -> Self {
+            let assignments = Arc::new(std::sync::Mutex::new(initial));
+            let acknowledgements = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let served = assignments.clone();
+            let counted = acknowledgements.clone();
+            let router = axum::Router::new()
+                .route(
+                    "/v1/placements/worker",
+                    axum::routing::get(move || {
+                        let current = served.lock().unwrap().clone();
+                        async move { axum::Json(current) }
+                    }),
+                )
+                .route(
+                    "/v1/test/leases/retired",
+                    axum::routing::post(move || {
+                        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        async { axum::http::StatusCode::NO_CONTENT }
+                    }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+            Self {
+                assignments,
+                acknowledgements,
+                address,
+                server,
+            }
+        }
+
+        fn assign(&self, assignments: NodeAssignments) {
+            *self.assignments.lock().unwrap() = assignments;
+        }
+
+        fn acknowledged(&self) -> usize {
+            self.acknowledgements
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// Answer the reconciler's inventory and discovery requests as a healthy
+    /// agent does, and hand every other command back to the test.
+    fn answer_housekeeping(command: AgentCommand) -> Option<AgentCommand> {
+        match command {
+            AgentCommand::Status { response } => {
+                let _ = response.send(vec![]);
+                None
+            }
+            AgentCommand::SyncClusterConsumer { response, .. } => {
+                let _ = response.send(Ok(crate::bun::agent::ConsumerUpdate {
+                    published: true,
+                    receipts: vec![],
+                    requires_allocations: false,
+                }));
+                None
+            }
+            other => Some(other),
+        }
+    }
+
+    fn assigned(name: &str, namespace: &str, toml: &str) -> NodeAssignment {
+        NodeAssignment {
+            name: name.into(),
+            namespace: namespace.into(),
+            replicas: 1,
+            spec: spec_from_toml(toml),
+        }
+    }
+
+    fn deployed_app(config: &Config) -> String {
+        config.app.keys().next().cloned().unwrap_or_default()
+    }
+
+    const SLOW_APP: &str =
+        "[app.slow]\nimage = \"proc-grill:image-ignored\"\ncommand = [\"sleep\", \"60\"]";
+
+    /// V02 (#251 follow-up): a placement that had left this node waited for
+    /// every deploy of the same cycle, each allowed five minutes, before it
+    /// was retired. Retirements now run first: they only cover placements
+    /// already gone from this node, so nothing loses availability.
+    #[tokio::test]
+    async fn a_retirement_due_at_the_start_of_a_cycle_does_not_wait_for_its_deploys() {
+        let leader = ScriptedLeader::serve(NodeAssignments {
+            apps: vec![assigned("slow", "default", SLOW_APP)],
+            ..Default::default()
+        })
+        .await;
+        let root = tempfile::tempdir().unwrap();
+        let checkpoint = crate::cluster::applied::checkpoint_path(root.path());
+        crate::cluster::applied::save(
+            &checkpoint,
+            &[(
+                ("departed".to_string(), "default".to_string()),
+                AssignmentState::Pending,
+            )]
+            .into_iter()
+            .collect(),
+        )
+        .unwrap();
+        let (commands, mut received) = mpsc::channel(8);
+        let reconciler = reconciler_for_deadline_test(leader.address, root.path(), commands);
+
+        // The deploy never reaches a terminal event while the test runs.
+        let mut held_deploys = Vec::new();
+        let mut order = Vec::new();
+        let observed = tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                let Some(command) = answer_housekeeping(received.recv().await.unwrap()) else {
+                    continue;
+                };
+                match command {
+                    AgentCommand::Deploy { config, events } => {
+                        order.push(format!("deploy {}", deployed_app(&config)));
+                        held_deploys.push(events);
+                    }
+                    AgentCommand::Retire {
+                        app_name, response, ..
+                    } => {
+                        order.push(format!("retire {app_name}"));
+                        let _ = response.send(Ok(()));
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await;
+        let retired = tokio::time::timeout(Duration::from_secs(2), async {
+            while crate::cluster::applied::load(&checkpoint)
+                .unwrap()
+                .keys()
+                .any(|(name, _)| name == "departed")
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        reconciler.abort();
+        let _ = reconciler.await;
+        leader.server.abort();
+
+        assert!(
+            observed.is_ok(),
+            "the retirement waited behind a deploy: {order:?}"
+        );
+        assert_eq!(order.first().map(String::as_str), Some("retire departed"));
+        assert!(retired.is_ok(), "the retirement was never recorded");
+    }
+
+    /// #309: the leader commits an app's placement and its catalogue
+    /// allocation in separate council writes. When the catalogue write stalls
+    /// or is refused ("endpoint publication generation changed") the node's
+    /// answer places the app but its catalogue doesn't name the service yet.
+    /// The agent then refuses the deploy with "local service requires its
+    /// committed cluster allocation" and the app backs off. The reconciler
+    /// now waits for the allocation instead of spending a deploy on it.
+    #[tokio::test]
+    async fn a_placement_waits_for_its_committed_allocation_before_deploying() {
+        const WEB: &str = "[app.web]\nimage = \"proc-grill:image-ignored\"\n\
+                           command = [\"sleep\", \"60\"]\nport = 8080";
+        let leader = ScriptedLeader::serve(NodeAssignments {
+            apps: vec![assigned("web", "default", WEB)],
+            ..Default::default()
+        })
+        .await;
+        let root = tempfile::tempdir().unwrap();
+        let (commands, mut received) = mpsc::channel(8);
+        let reconciler = reconciler_for_deadline_test(leader.address, root.path(), commands);
+        let deploys = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = deploys.clone();
+        let agent = tokio::spawn(async move {
+            while let Some(command) = received.recv().await {
+                // An enrolled consumer, which registers services only at
+                // their committed allocation.
+                if let AgentCommand::SyncClusterConsumer { response, .. } = command {
+                    let _ = response.send(Ok(crate::bun::agent::ConsumerUpdate {
+                        published: true,
+                        receipts: vec![],
+                        requires_allocations: true,
+                    }));
+                    continue;
+                }
+                let Some(command) = answer_housekeeping(command) else {
+                    continue;
+                };
+                if let AgentCommand::Deploy { events, .. } = command {
+                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let _ = events
+                        .send(ApplyEvent::Error {
+                            message: "cluster discovery publication failed: local service \
+                                      requires its committed cluster allocation"
+                                .into(),
+                        })
+                        .await;
+                }
+            }
+        });
+
+        // Two full reconcile cycles with the allocation still missing.
+        tokio::time::sleep(RECONCILE_INTERVAL * 2 + Duration::from_millis(500)).await;
+        let early = deploys.load(std::sync::atomic::Ordering::SeqCst);
+
+        let service = crate::onion::service_id::ServiceId::new("default", "web");
+        let catalog = crate::onion::catalog::EndpointCatalog::new()
+            .reconcile(vec![(service, 8080, vec![])])
+            .unwrap();
+        leader.assign(NodeAssignments {
+            apps: vec![assigned("web", "default", WEB)],
+            endpoint_generation: 1,
+            endpoint_catalog: catalog,
+            ..Default::default()
+        });
+        let deployed = tokio::time::timeout(RECONCILE_INTERVAL * 3, async {
+            while deploys.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        reconciler.abort();
+        let _ = reconciler.await;
+        agent.abort();
+        leader.server.abort();
+
+        assert_eq!(
+            early, 0,
+            "deployed before the catalogue allocated the service"
+        );
+        assert!(
+            deployed.is_ok(),
+            "never deployed once the allocation arrived"
+        );
+    }
+
+    /// An agent without discovery ownership allocates services locally, so
+    /// its placements never wait for a catalogue that may not come (the
+    /// cluster tests run workers like this, with no scheduler on the leader).
+    #[tokio::test]
+    async fn a_placement_deploys_at_once_when_the_agent_allocates_locally() {
+        const WEB: &str = "[app.web]\nimage = \"proc-grill:image-ignored\"\n\
+                           command = [\"sleep\", \"60\"]\nport = 8080";
+        let leader = ScriptedLeader::serve(NodeAssignments {
+            apps: vec![assigned("web", "default", WEB)],
+            ..Default::default()
+        })
+        .await;
+        let root = tempfile::tempdir().unwrap();
+        let (commands, mut received) = mpsc::channel(8);
+        let reconciler = reconciler_for_deadline_test(leader.address, root.path(), commands);
+        let deployed = tokio::time::timeout(RECONCILE_INTERVAL * 3, async {
+            loop {
+                let Some(command) = answer_housekeeping(received.recv().await.unwrap()) else {
+                    continue;
+                };
+                if matches!(command, AgentCommand::Deploy { .. }) {
+                    break;
+                }
+            }
+        })
+        .await;
+        reconciler.abort();
+        let _ = reconciler.await;
+        leader.server.abort();
+        assert!(deployed.is_ok(), "waited for an allocation it doesn't need");
+    }
+
+    /// A lease released while this node is still waiting on a deploy retires
+    /// within its own bound, not after the deploy: the reconciler keeps
+    /// polling while it waits, and retires what those polls say has left.
+    #[tokio::test]
+    async fn a_released_lease_retires_while_a_deploy_is_still_in_flight() {
+        const LEASED_APP: &str =
+            "[app.web]\nimage = \"proc-grill:image-ignored\"\ncommand = [\"sleep\", \"60\"]";
+        let leader = ScriptedLeader::serve(NodeAssignments {
+            apps: vec![
+                assigned("slow", "default", SLOW_APP),
+                assigned("web", "rbtest-run1", LEASED_APP),
+            ],
+            ..Default::default()
+        })
+        .await;
+        let root = tempfile::tempdir().unwrap();
+        let checkpoint = crate::cluster::applied::checkpoint_path(root.path());
+        crate::cluster::applied::save(
+            &checkpoint,
+            &[(
+                ("web".to_string(), "rbtest-run1".to_string()),
+                AssignmentState::Pending,
+            )]
+            .into_iter()
+            .collect(),
+        )
+        .unwrap();
+        let (commands, mut received) = mpsc::channel(8);
+        let reconciler = reconciler_for_deadline_test(leader.address, root.path(), commands);
+
+        let mut held_deploys = Vec::new();
+        let mut released_at = None;
+        let retired = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let Some(command) = answer_housekeeping(received.recv().await.unwrap()) else {
+                    continue;
+                };
+                match command {
+                    AgentCommand::Deploy { config, events } => {
+                        assert_eq!(deployed_app(&config), "slow", "only slow may deploy");
+                        held_deploys.push(events);
+                        // The test run ends and releases its lease.
+                        leader.assign(NodeAssignments {
+                            apps: vec![assigned("slow", "default", SLOW_APP)],
+                            retirements: vec![
+                                serde_json::from_value(serde_json::json!({
+                                    "lease_id": "run1",
+                                    "placement": {
+                                        "app_id": {"name": "web", "namespace": "rbtest-run1"},
+                                        "node_id": "worker"
+                                    }
+                                }))
+                                .unwrap(),
+                            ],
+                            ..Default::default()
+                        });
+                        released_at = Some(std::time::Instant::now());
+                    }
+                    AgentCommand::RetireTestResources {
+                        app_name,
+                        namespace,
+                        response,
+                    } => {
+                        assert_eq!(
+                            (app_name.as_str(), namespace.as_str()),
+                            ("web", "rbtest-run1")
+                        );
+                        let _ = response.send(Ok(()));
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await;
+        let acknowledged = tokio::time::timeout(Duration::from_secs(4), async {
+            while leader.acknowledged() == 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        let elapsed = released_at.map(|at| at.elapsed());
+        reconciler.abort();
+        let _ = reconciler.await;
+        leader.server.abort();
+
+        assert!(
+            retired.is_ok(),
+            "the lease retirement waited behind the deploy"
+        );
+        assert!(
+            acknowledged.is_ok(),
+            "the lease retirement was never acknowledged"
+        );
+        assert!(
+            !held_deploys.is_empty() && held_deploys.iter().all(|events| !events.is_closed()),
+            "the deploy must still be in flight when the lease retires"
+        );
+        let elapsed = elapsed.unwrap();
+        assert!(
+            elapsed < lease_retirement_bound(Duration::from_secs(2)),
+            "lease cleanup took {elapsed:?}"
+        );
+    }
+
+    /// Retiring while a deploy is in flight must still leave one writer per
+    /// app. A volume app replaced on this node (stop-first, #267) that then
+    /// leaves the node is retired only once its own deploy has finished, and
+    /// its return is deployed only once that retirement has answered.
+    #[tokio::test]
+    async fn a_volume_app_never_has_a_deploy_and_a_retirement_outstanding_at_once() {
+        const VOLUME_APP: &str = "[app.db]\nimage = \"proc-grill:image-ignored\"\n\
+                                  command = [\"sleep\", \"60\"]\n\
+                                  [[app.db.volumes]]\npath = \"/data\"\nsize = \"1Gi\"";
+        const VOLUME_APP_V2: &str = "[app.db]\nimage = \"proc-grill:image-ignored\"\n\
+                                     command = [\"sleep\", \"61\"]\n\
+                                     [[app.db.volumes]]\npath = \"/data\"\nsize = \"1Gi\"";
+        let leader = ScriptedLeader::serve(NodeAssignments {
+            apps: vec![assigned("db", "default", VOLUME_APP)],
+            ..Default::default()
+        })
+        .await;
+        let root = tempfile::tempdir().unwrap();
+        let (commands, mut received) = mpsc::channel(8);
+        let reconciler = reconciler_for_deadline_test(leader.address, root.path(), commands);
+
+        // The one mutation of `db` the stand-in agent is carrying out.
+        let writer: Arc<std::sync::Mutex<Option<&'static str>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let mut history = Vec::new();
+        let finished = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let Some(command) = answer_housekeeping(received.recv().await.unwrap()) else {
+                    continue;
+                };
+                match command {
+                    AgentCommand::Deploy { config, events } => {
+                        assert_eq!(deployed_app(&config), "db");
+                        let outstanding = *writer.lock().unwrap();
+                        assert_eq!(outstanding, None, "a deploy overlapped a {outstanding:?}");
+                        history.push("deploy");
+                        if history.len() > 1 {
+                            break;
+                        }
+                        *writer.lock().unwrap() = Some("deploy");
+                        // The app leaves this node while its deploy runs,
+                        // for longer than one reconcile interval.
+                        leader.assign(NodeAssignments::default());
+                        let writer = writer.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(RECONCILE_INTERVAL + Duration::from_millis(500))
+                                .await;
+                            *writer.lock().unwrap() = None;
+                            let _ = events
+                                .send(ApplyEvent::Complete {
+                                    created: 1,
+                                    instances: vec!["default__db-0".into()],
+                                })
+                                .await;
+                        });
+                    }
+                    AgentCommand::Retire {
+                        app_name, response, ..
+                    } => {
+                        assert_eq!(app_name, "db");
+                        let outstanding = *writer.lock().unwrap();
+                        assert_eq!(
+                            outstanding, None,
+                            "a retirement overlapped a {outstanding:?}"
+                        );
+                        history.push("retire");
+                        *writer.lock().unwrap() = Some("retirement");
+                        // The app comes back, changed, while its stop runs.
+                        leader.assign(NodeAssignments {
+                            apps: vec![assigned("db", "default", VOLUME_APP_V2)],
+                            ..Default::default()
+                        });
+                        let writer = writer.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                            *writer.lock().unwrap() = None;
+                            let _ = response.send(Ok(()));
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await;
+        reconciler.abort();
+        let _ = reconciler.await;
+        leader.server.abort();
+
+        assert!(finished.is_ok(), "the app never came back: {history:?}");
+        assert_eq!(history, ["deploy", "retire", "deploy"]);
+    }
+
+    /// A poll taken while a deploy runs can withdraw a placement the cycle
+    /// was still going to deploy. Deploying it from the older answer would
+    /// start a volume app on a node the leader has already moved it from.
+    #[tokio::test]
+    async fn a_placement_withdrawn_while_a_deploy_runs_is_not_deployed_from_the_older_answer() {
+        const MOVED_APP: &str = "[app.db]\nimage = \"proc-grill:image-ignored\"\n\
+                                 command = [\"sleep\", \"60\"]\n\
+                                 [[app.db.volumes]]\npath = \"/data\"\nsize = \"1Gi\"";
+        let leader = ScriptedLeader::serve(NodeAssignments {
+            apps: vec![
+                assigned("slow", "default", SLOW_APP),
+                assigned("db", "default", MOVED_APP),
+            ],
+            ..Default::default()
+        })
+        .await;
+        let root = tempfile::tempdir().unwrap();
+        let (commands, mut received) = mpsc::channel(8);
+        let reconciler = reconciler_for_deadline_test(leader.address, root.path(), commands);
+
+        let mut deployed = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(3) + RECONCILE_INTERVAL * 2, async {
+            loop {
+                let Some(command) = answer_housekeeping(received.recv().await.unwrap()) else {
+                    continue;
+                };
+                let AgentCommand::Deploy { config, events } = command else {
+                    continue;
+                };
+                let app = deployed_app(&config);
+                deployed.push(app.clone());
+                if app != "slow" {
+                    continue;
+                }
+                leader.assign(NodeAssignments {
+                    apps: vec![assigned("slow", "default", SLOW_APP)],
+                    ..Default::default()
+                });
+                tokio::spawn(async move {
+                    tokio::time::sleep(RECONCILE_INTERVAL + Duration::from_millis(500)).await;
+                    let _ = events
+                        .send(ApplyEvent::Complete {
+                            created: 1,
+                            instances: vec!["default__slow-0".into()],
+                        })
+                        .await;
+                });
+            }
+        })
+        .await;
+        reconciler.abort();
+        let _ = reconciler.await;
+        leader.server.abort();
+
+        assert_eq!(deployed, ["slow"], "a withdrawn placement was deployed");
+    }
+
+    /// V02 soak (final tier, setup): after every node's agent restarted, the
+    /// leader briefly moved `frontend` off node 2 and then placed it back with
+    /// the same spec. The retirement in between stopped the replica but could
+    /// not release its address yet ("other nodes have not yet confirmed the
+    /// endpoint's withdrawal"), so the replica stayed stopped. The checkpoint
+    /// still said the assignment was applied, so the returning placement was
+    /// skipped as already converged, and the app ran 2 of 3 replicas for good.
+    #[tokio::test]
+    async fn a_placement_returning_after_a_failed_retirement_is_deployed_again() {
+        let spec = spec_from_toml(
+            "[app.web]\nimage = \"proc-grill:image-ignored\"\ncommand = [\"sleep\", \"60\"]",
+        );
+        let assignment = NodeAssignment {
+            name: "web".into(),
+            namespace: "default".into(),
+            replicas: 1,
+            spec: spec.clone(),
+        };
+        let mut applied_spec = spec;
+        applied_spec.replicas = Replicas::Fixed(1);
+        let root = tempfile::tempdir().unwrap();
+        let checkpoint = crate::cluster::applied::checkpoint_path(root.path());
+        crate::cluster::applied::save(
+            &checkpoint,
+            &[(
+                ("web".to_string(), "default".to_string()),
+                AssignmentState::Applied {
+                    fingerprint: serde_json::to_string(&applied_spec).unwrap(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        )
+        .unwrap();
+
+        // The leader withdraws the assignment until the node has tried to
+        // retire it, then hands the identical assignment back.
+        let returned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let serve_returned = returned.clone();
+        let router = axum::Router::new().route(
+            "/v1/placements/worker",
+            axum::routing::get(move || {
+                let returned = serve_returned.load(std::sync::atomic::Ordering::SeqCst);
+                let assignment = assignment.clone();
+                async move {
+                    axum::Json(NodeAssignments {
+                        apps: if returned { vec![assignment] } else { vec![] },
+                        ..Default::default()
+                    })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let (commands, mut received) = mpsc::channel(8);
+        let reconciler = reconciler_for_deadline_test(address, root.path(), commands);
+
+        let redeployed = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match received.recv().await.unwrap() {
+                    AgentCommand::Status { response } => {
+                        // The replica runs when the restarted reconciler checks.
+                        let _ = response.send(vec![crate::bun::agent::InstanceStatus {
+                            id: "default__web-0".into(),
+                            app_name: "web".into(),
+                            namespace: "default".into(),
+                            state: "running".into(),
+                            restart_count: 0,
+                            host_port: Some(30000),
+                            exit_code: None,
+                            pid: Some(1),
+                            runtime_unknown: false,
+                        }]);
+                    }
+                    AgentCommand::SyncClusterConsumer { response, .. } => {
+                        let _ = response.send(Ok(crate::bun::agent::ConsumerUpdate {
+                            published: true,
+                            receipts: vec![],
+                            requires_allocations: false,
+                        }));
+                    }
+                    AgentCommand::Retire { response, .. } => {
+                        // The stop went through; the address release did not.
+                        returned.store(true, std::sync::atomic::Ordering::SeqCst);
+                        let _ = response.send(Err(crate::bun::BunError::ProducerReleasePending {
+                            instance_id: crate::grill::InstanceId("default__web-0".into()),
+                            reason: "other nodes have not yet confirmed the endpoint's withdrawal",
+                        }));
+                    }
+                    AgentCommand::Deploy { .. } => break,
+                    _ => {}
+                }
+            }
+        })
+        .await;
+        reconciler.abort();
+        let _ = reconciler.await;
+        server.abort();
+        let _ = server.await;
+        assert!(
+            redeployed.is_ok(),
+            "the returning placement was skipped as already converged"
         );
     }
 
@@ -2119,6 +3093,7 @@ mod tests {
                     .send(Ok(crate::bun::agent::ConsumerUpdate {
                         published: true,
                         receipts: vec![],
+                        requires_allocations: false,
                     }))
                     .unwrap();
             } else {
@@ -2183,6 +3158,7 @@ mod tests {
                             .send(Ok(crate::bun::agent::ConsumerUpdate {
                                 published: deployment.is_none(),
                                 receipts: vec![],
+                                requires_allocations: false,
                             }))
                             .unwrap();
                         if deployment.is_some() {
@@ -2195,6 +3171,9 @@ mod tests {
                             "duplicate deployment while original is pending"
                         );
                         deployment = Some(events);
+                    }
+                    AgentCommand::AdoptedPlacementMatches { response, .. } => {
+                        let _ = response.send(false);
                     }
                     _ => panic!("unexpected command"),
                 }
@@ -2289,7 +3268,7 @@ mod tests {
                     _ = ack_rx.recv() => break,
                     command = received.recv() => match command.unwrap() {
                         AgentCommand::Status { response } => { response.send(vec![]).unwrap(); }
-                        AgentCommand::SyncClusterConsumer { response, .. } => { let _ = response.send(Ok(crate::bun::agent::ConsumerUpdate { published: true, receipts: vec![] })); }
+                        AgentCommand::SyncClusterConsumer { response, .. } => { let _ = response.send(Ok(crate::bun::agent::ConsumerUpdate { published: true, receipts: vec![], requires_allocations: false })); }
                         AgentCommand::RetireTestResources { app_name, namespace, response } => {
                             assert_eq!((app_name.as_str(), namespace.as_str()), ("web", "rbtest-run1"));
                             assert_eq!(acknowledgements.load(Ordering::SeqCst), 0);
@@ -2405,6 +3384,7 @@ mod tests {
                         let _ = response.send(Ok(crate::bun::agent::ConsumerUpdate {
                             published: true,
                             receipts: vec![],
+                            requires_allocations: false,
                         }));
                     }
                     AgentCommand::Retire {
@@ -2506,6 +3486,7 @@ command = ["false"]
                         let _ = response.send(Ok(crate::bun::agent::ConsumerUpdate {
                             published: true,
                             receipts: vec![],
+                            requires_allocations: false,
                         }));
                     }
                     AgentCommand::Deploy { events, .. } => {
@@ -2529,6 +3510,127 @@ command = ["false"]
             deploys.len(),
             1,
             "a failed deploy was retried before its backoff elapsed"
+        );
+    }
+
+    /// PR #267: a Bun upgraded between queueing the writer's deploy and
+    /// recording it applied came back to a pending placement whose instances
+    /// it had adopted, and rolled them anyway. When the agent says its adopted
+    /// instances already run the placement, the reconciler records it applied
+    /// and sends no deploy.
+    #[tokio::test]
+    async fn pending_placement_run_by_adopted_instances_is_recorded_without_a_redeploy() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let assignments = NodeAssignments {
+            apps: vec![NodeAssignment {
+                name: "writer".into(),
+                namespace: "default".into(),
+                replicas: 1,
+                spec: spec_from_toml(
+                    r#"[app.writer]
+image = "busybox:latest"
+"#,
+                ),
+            }],
+            ..NodeAssignments::default()
+        };
+        let router = axum::Router::new().route(
+            "/v1/placements/worker",
+            axum::routing::get(move || {
+                let assignments = assignments.clone();
+                async move { axum::Json(assignments) }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let (_metrics, metrics_rx) = watch::channel(openraft::RaftMetrics::new_initial(1));
+        let (_directory, directory_rx) = watch::channel(crate::mustard::directory::NodeDirectory {
+            leader: Some(crate::mustard::message::LeaderHint {
+                node_id: NodeId::new("leader"),
+                term: 1,
+                api_address: address,
+                reporting_address: address,
+            }),
+            ..Default::default()
+        });
+        let root = tempfile::tempdir().unwrap();
+        let checkpoint = crate::cluster::applied::checkpoint_path(root.path());
+        let key = ("writer".to_string(), "default".to_string());
+        crate::cluster::applied::save(
+            &checkpoint,
+            &AppliedMap::from([(key.clone(), AssignmentState::Pending)]),
+        )
+        .unwrap();
+        let (commands, mut received) = mpsc::channel(8);
+        let shutdown = CancellationToken::new();
+        let reconciler = spawn_placement_reconciler(
+            "worker".into(),
+            metrics_rx,
+            directory_rx,
+            0,
+            None,
+            commands,
+            shutdown.clone(),
+            crate::cluster::ClusterHttp::plaintext(),
+            Some(root.path().to_path_buf()),
+            crate::config::node::RuntimeSection::default().stop_confirmation_timeout(),
+        );
+        let running = crate::bun::agent::InstanceStatus {
+            id: "default__writer-0".into(),
+            app_name: "writer".into(),
+            namespace: "default".into(),
+            state: "running".into(),
+            restart_count: 0,
+            host_port: None,
+            exit_code: None,
+            pid: Some(42),
+            runtime_unknown: false,
+        };
+        let mut asked = Vec::new();
+        let mut deploys = 0;
+        let _ = tokio::time::timeout(Duration::from_millis(4500), async {
+            while let Some(command) = received.recv().await {
+                match command {
+                    AgentCommand::Status { response } => {
+                        let _ = response.send(vec![running.clone()]);
+                    }
+                    AgentCommand::SyncClusterConsumer { response, .. } => {
+                        let _ = response.send(Ok(crate::bun::agent::ConsumerUpdate {
+                            published: true,
+                            receipts: vec![],
+                            requires_allocations: false,
+                        }));
+                    }
+                    AgentCommand::AdoptedPlacementMatches {
+                        app_name,
+                        spec,
+                        response,
+                        ..
+                    } => {
+                        asked.push((app_name, spec.replicas));
+                        let _ = response.send(true);
+                    }
+                    AgentCommand::Deploy { .. } => deploys += 1,
+                    _ => {}
+                }
+            }
+        })
+        .await;
+        shutdown.cancel();
+        reconciler.await.unwrap();
+        server.abort();
+        assert_eq!(
+            deploys, 0,
+            "adopted instances that run the placement were redeployed"
+        );
+        assert_eq!(
+            asked.first(),
+            Some(&("writer".to_string(), Replicas::Fixed(1)))
+        );
+        let saved = crate::cluster::applied::load(&checkpoint).unwrap();
+        assert!(
+            matches!(saved.get(&key), Some(AssignmentState::Applied { .. })),
+            "{saved:?}"
         );
     }
 
@@ -2610,6 +3712,7 @@ namespace = "rbtest-interrupted"
                         let _ = response.send(Ok(crate::bun::agent::ConsumerUpdate {
                             published: true,
                             receipts: vec![],
+                            requires_allocations: false,
                         }));
                     }
                     AgentCommand::Deploy { events, .. } => {
@@ -2656,6 +3759,7 @@ namespace = "rbtest-interrupted"
                             let _ = response.send(Ok(crate::bun::agent::ConsumerUpdate {
                                 published: true,
                                 receipts: vec![],
+                                requires_allocations: false,
                             }));
                         }
                         AgentCommand::Retire {
@@ -2725,6 +3829,7 @@ namespace = "rbtest-interrupted"
                         let _ = response.send(Ok(crate::bun::agent::ConsumerUpdate {
                             published: true,
                             receipts: vec![],
+                            requires_allocations: false,
                         }));
                     }
                     AgentCommand::Deploy { .. } => {
@@ -2797,6 +3902,7 @@ image = "busybox:latest"
                 host_port: None,
                 exit_code: None,
                 pid: Some(42),
+                runtime_unknown: false,
             },
             crate::bun::agent::InstanceStatus {
                 id: "stopped-0".into(),
@@ -2807,6 +3913,7 @@ image = "busybox:latest"
                 host_port: None,
                 exit_code: Some(0),
                 pid: None,
+                runtime_unknown: false,
             },
         ];
         retain_live_assignments(&mut applied, &statuses);
@@ -3503,7 +4610,7 @@ image = "busybox:latest"
             labels,
             ready: true,
             capabilities: Default::default(),
-            running_apps: Default::default(),
+            app_replicas: Default::default(),
             uptime_secs: 86400,
             cached_images: Default::default(),
         }
@@ -3678,6 +4785,106 @@ image = "busybox:latest"
         assert_eq!(nodes_of(&decisions[0]), ["busy"]);
     }
 
+    /// V02 FINAL on ff854cb: `vol-persist` lost its marker again. Between
+    /// the stop and the apply, the home node's report worker timed out for
+    /// over 30 seconds. The leader kept the node's last state report but
+    /// marked it stale and dropped its readiness, so the home looked "not
+    /// ready" and was dropped as if it were gone. The node was alive the
+    /// whole time, with the data on it.
+    #[test]
+    fn a_volume_app_waits_while_the_node_that_holds_its_volume_reports_stale() {
+        let (desired, _) = stopped_and_applied_again(app_with_volume(100));
+        let members = vec![member("busy", 1), member("home", 2)];
+        let mut reports = AggregatedState::default();
+        reports
+            .reports
+            .insert(NodeId::new("busy"), report(4000, 3000));
+        reports.reports.insert(NodeId::new("home"), report(4000, 0));
+        reports
+            .readiness
+            .insert(NodeId::new("busy"), readiness("busy", true));
+        reports.stale_nodes.push(NodeId::new("home"));
+        let alive = HashSet::from([NodeId::new("busy"), NodeId::new("home")]);
+        let mut cache = build_cluster_cache(&members, &reports);
+        let unheard = unheard_nodes(&alive, &reports);
+
+        let decisions = plan_scheduling_pass_with_dns(
+            &mut cache,
+            &desired,
+            &alive,
+            &HashSet::new(),
+            &mut QuotaLedger::default(),
+            false,
+            &unheard,
+        );
+
+        assert!(decisions.is_empty(), "{decisions:?}");
+    }
+
+    /// A node mid-upgrade is cordoned, which the cache records as not
+    /// ready. That's a reason to put nothing new on it, not to start its
+    /// volume app somewhere else on an empty volume.
+    #[test]
+    fn a_volume_app_waits_while_the_node_that_holds_its_volume_is_not_ready() {
+        let (desired, mut cache) = stopped_and_applied_again(app_with_volume(100));
+        let mut unready = sched_node("home", 4000, BTreeMap::new());
+        unready.ready = false;
+        cache.set_node(unready);
+        let alive = HashSet::from([NodeId::new("busy"), NodeId::new("home")]);
+
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+
+        assert!(decisions.is_empty(), "{decisions:?}");
+    }
+
+    /// The same stall must not move a running volume app either: its
+    /// replacement would start on an empty volume while the data sits on
+    /// the node it left.
+    #[test]
+    fn a_running_volume_app_stays_on_its_node_while_that_node_is_not_ready() {
+        let (mut desired, mut cache) = stopped_and_applied_again(app_with_volume(100));
+        let app = AppId::new("db", "default");
+        desired.scheduling.insert(app, placed_on(&["home"]));
+        let mut unready = sched_node("home", 4000, BTreeMap::new());
+        unready.ready = false;
+        cache.set_node(unready);
+        let alive = HashSet::from([NodeId::new("busy"), NodeId::new("home")]);
+
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+
+        assert!(decisions.is_empty(), "{decisions:?}");
+
+        // Gone from gossip is the documented loss: it moves.
+        let alive = HashSet::from([NodeId::new("busy")]);
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+        assert_eq!(nodes_of(&decisions[0]), ["busy"]);
+    }
+
+    /// The operator moving an app with `placement.required` is on purpose.
+    #[test]
+    fn a_volume_app_whose_node_no_longer_matches_its_labels_is_placed_elsewhere() {
+        let mut spec = app_with_volume(100);
+        spec.placement = Some(toml::from_str(r#"required = ["disk=ssd"]"#).unwrap());
+        let (desired, mut cache) = stopped_and_applied_again(spec);
+        let mut busy = sched_node(
+            "busy",
+            4000,
+            BTreeMap::from([("disk".to_string(), "ssd".to_string())]),
+        );
+        busy.allocated = Resources::new(3000, 0, 0);
+        cache.set_node(busy);
+        let alive = HashSet::from([NodeId::new("busy"), NodeId::new("home")]);
+
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+
+        assert_eq!(decisions.len(), 1, "{decisions:?}");
+        assert_eq!(nodes_of(&decisions[0]), ["busy"]);
+    }
+
     /// #211 made `relish stop` keep the spec; the app's ingress route must
     /// still go, or its host answers 503 instead of 404.
     #[test]
@@ -3723,6 +4930,147 @@ image = "busybox:latest"
         assert_eq!(nodes.len(), 3);
         assert_eq!(nodes[..2], ["n1", "n2"], "survivors keep their replicas");
         assert!(["n1", "n2"].contains(&nodes[2]), "{nodes:?}");
+    }
+
+    /// A survivor's load outside this app, so the bin-packer prefers it.
+    fn busier_node(name: &str, used_cpu: u64) -> SchedulerNodeState {
+        let mut node = sched_node(name, 4000, BTreeMap::new());
+        node.allocated = Resources::new(used_cpu, 0, 0);
+        node
+    }
+
+    /// How many of a decision's placements land on each node.
+    fn per_node(decision: &crate::meat::types::SchedulingDecision) -> BTreeMap<&str, usize> {
+        let mut counts = BTreeMap::new();
+        for node in nodes_of(decision) {
+            *counts.entry(node).or_default() += 1;
+        }
+        counts
+    }
+
+    /// #346: a node running two of four replicas dies. Both survivors run
+    /// the app and one is busier, so the bin-packer used to put both
+    /// replacements there: three on one node, one on the other.
+    #[test]
+    fn replacements_spread_over_the_survivors_with_fewest_replicas() {
+        let app = AppId::new("frontend", "default");
+        let mut desired = DesiredState::default();
+        desired.apps.insert(app.clone(), app_spec(100, 4));
+        desired
+            .scheduling
+            .insert(app.clone(), placed_on(&["n1", "n1", "n2", "n3"]));
+        let mut cache = ClusterStateCache::new();
+        cache.set_node(busier_node("n2", 2000));
+        cache.set_node(sched_node("n3", 4000, BTreeMap::new()));
+        // Both survivors report their replica.
+        for name in ["n2", "n3"] {
+            cache.reserve(&NodeId::new(name), &app, &Resources::new(100, 0, 0));
+        }
+        let alive = HashSet::from([NodeId::new("n2"), NodeId::new("n3")]);
+
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+
+        let nodes = nodes_of(&decisions[0]);
+        assert_eq!(nodes[..2], ["n2", "n3"], "survivors keep their replicas");
+        assert_eq!(
+            per_node(&decisions[0]),
+            BTreeMap::from([("n2", 2), ("n3", 2)]),
+            "{nodes:?}"
+        );
+    }
+
+    /// #346: the survivors' kept placements count towards spread even before
+    /// their reports list the app (a new leader, or a report in transit).
+    #[test]
+    fn kept_placements_count_towards_spread_before_reports_list_them() {
+        let app = AppId::new("frontend", "default");
+        let mut desired = DesiredState::default();
+        desired.apps.insert(app.clone(), app_spec(100, 4));
+        desired
+            .scheduling
+            .insert(app.clone(), placed_on(&["n1", "n2", "n2", "n3"]));
+        let mut cache = ClusterStateCache::new();
+        cache.set_node(busier_node("n2", 2000));
+        cache.set_node(sched_node("n3", 4000, BTreeMap::new()));
+        let alive = HashSet::from([NodeId::new("n2"), NodeId::new("n3")]);
+
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+
+        assert_eq!(
+            per_node(&decisions[0]),
+            BTreeMap::from([("n2", 2), ("n3", 2)]),
+            "{:?}",
+            nodes_of(&decisions[0])
+        );
+    }
+
+    /// Spread gives way to resources: a survivor with no room left doesn't
+    /// take a replacement, so the other one takes both.
+    #[test]
+    fn replacements_stack_only_when_the_other_survivor_is_full() {
+        let app = AppId::new("frontend", "default");
+        let mut desired = DesiredState::default();
+        desired.apps.insert(app.clone(), app_spec(100, 4));
+        desired
+            .scheduling
+            .insert(app.clone(), placed_on(&["n1", "n1", "n2", "n3"]));
+        let mut cache = ClusterStateCache::new();
+        cache.set_node(sched_node("n2", 4000, BTreeMap::new()));
+        cache.set_node(busier_node("n3", 3950));
+        let alive = HashSet::from([NodeId::new("n2"), NodeId::new("n3")]);
+
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+
+        assert_eq!(nodes_of(&decisions[0]), ["n2", "n3", "n2", "n2"]);
+    }
+
+    /// #346: one of three nodes dies while gossip only suspects another
+    /// survivor (a probe answered late on a loaded laptop). Suspicion isn't
+    /// death: the suspect keeps its replica, the dead node's replica moves to
+    /// a live survivor, and nothing else changes.
+    #[test]
+    fn a_suspect_node_keeps_its_replicas() {
+        let app = AppId::new("frontend", "default");
+        let mut desired = DesiredState::default();
+        desired.apps.insert(app.clone(), app_spec(100, 3));
+        desired
+            .scheduling
+            .insert(app.clone(), placed_on(&["n1", "n2", "n3"]));
+        // A suspect node isn't in the scheduler's cache: only live nodes are.
+        let mut cache = ClusterStateCache::new();
+        cache.set_node(sched_node("n1", 4000, BTreeMap::new()));
+        let alive = HashSet::from([NodeId::new("n1")]);
+        let suspect = HashSet::from([NodeId::new("n2")]);
+
+        let decisions = plan_scheduling_pass_with_dns(
+            &mut cache,
+            &desired,
+            &alive,
+            &suspect,
+            &mut QuotaLedger::default(),
+            false,
+            &HashSet::new(),
+        );
+
+        assert_eq!(nodes_of(&decisions[0]), ["n1", "n2", "n1"]);
+
+        // With every placement on a live or suspect node, nothing moves.
+        desired
+            .scheduling
+            .insert(app.clone(), placed_on(&["n1", "n2", "n1"]));
+        let decisions = plan_scheduling_pass_with_dns(
+            &mut cache,
+            &desired,
+            &alive,
+            &suspect,
+            &mut QuotaLedger::default(),
+            false,
+            &HashSet::new(),
+        );
+        assert!(decisions.is_empty(), "{decisions:?}");
     }
 
     /// A new leader that hasn't heard from a live node yet leaves that
@@ -3781,6 +5129,7 @@ image = "busybox:latest"
             &mut cache_with_n2_unready(),
             &desired,
             &alive,
+            &HashSet::new(),
             &mut QuotaLedger::default(),
             false,
             &unheard,
@@ -3793,6 +5142,7 @@ image = "busybox:latest"
             &mut cache_with_n2_unready(),
             &desired,
             &alive,
+            &HashSet::new(),
             &mut QuotaLedger::default(),
             false,
             &HashSet::new(),
@@ -4195,6 +5545,7 @@ image = "busybox:latest"
             &mut cache,
             &desired,
             &alive,
+            &HashSet::new(),
             &mut QuotaLedger::default(),
             true,
             &HashSet::new(),
@@ -4223,6 +5574,7 @@ image = "busybox:latest"
             &mut cache,
             &desired,
             &alive,
+            &HashSet::new(),
             &mut QuotaLedger::default(),
             true,
             &HashSet::new(),
@@ -4293,6 +5645,57 @@ image = "busybox:latest"
         assert!(
             decisions.is_empty(),
             "namespace budget from desired state must reject the app: {decisions:?}"
+        );
+    }
+
+    /// Pins the 0.1.0 quota contract the whitepaper (Q13) and the Meat design
+    /// doc describe: an over-quota app passes validation and `relish apply`
+    /// writes it to desired state, but the leader's scheduling pass never
+    /// places it. The rejection is only a line in the leader's log.
+    #[test]
+    fn over_quota_apply_is_accepted_but_never_placed() {
+        let config = crate::config::Config::parse(
+            r#"
+            [namespace.prod]
+            cpu = "1000m"
+
+            [app.greedy]
+            image = "x:1"
+            namespace = "prod"
+            replicas = 2
+            cpu = "800m"
+        "#,
+        )
+        .unwrap();
+        config
+            .validate_against(&[])
+            .expect("apply-time validation doesn't check the budget");
+
+        let mut desired = DesiredState::default();
+        for write in crate::council::apply::config_to_desired_writes(&config) {
+            match write {
+                crate::council::types::RaftRequest::NamespaceSpec { name, spec } => {
+                    desired.namespaces.insert(name, *spec);
+                }
+                crate::council::types::RaftRequest::AppSpec { app_id, spec } => {
+                    desired.apps.insert(app_id, *spec);
+                }
+                other => panic!("unexpected write for this config: {other:?}"),
+            }
+        }
+        assert!(
+            desired.apps.contains_key(&AppId::new("greedy", "prod")),
+            "apply writes the over-quota app to desired state"
+        );
+
+        let mut cache = ClusterStateCache::new();
+        cache.set_node(sched_node("big", 10000, BTreeMap::new()));
+        let mut quotas = crate::meat::quota::ledger_from_namespaces(&desired.namespaces);
+        let alive = HashSet::from([NodeId::new("big")]);
+        let decisions = plan_scheduling_pass(&mut cache, &desired, &alive, &mut quotas);
+        assert!(
+            decisions.is_empty(),
+            "the scheduling pass leaves the over-quota app unplaced: {decisions:?}"
         );
     }
 

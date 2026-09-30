@@ -11,6 +11,7 @@ run it.
 |---|---|---|---|
 | Unit tests | Pure logic, state machines, parsers, every failure branch | `#[cfg(test)]` modules across [`src/`](../src) | `make test` |
 | 10,000-member gossip | One node's membership table and dissemination at 10,000 members, in about a second | [`tests/gossip_10k.rs`](../tests/gossip_10k.rs) | `make test` |
+| Mayo memory | Periodic metrics reads need the same heap whether a node holds one hour of history or four, and leave nothing behind (a counting allocator in its own binary) | [`tests/mayo_memory.rs`](../tests/mayo_memory.rs), [record](qualification/2026-09-29-mayo-memory.md) | `make test` |
 | Property tests | Invariants over generated inputs: scheduling, allocation, parsing | [`proptest`](https://docs.rs/proptest) blocks in `src/` | `make test` |
 | Snapshot tests | CLI output, rendered config and TUI frames stay exactly as reviewed | [`insta`](https://insta.rs) snapshots, e.g. [`src/relish/snapshots/`](../src/relish/snapshots) | `make test` |
 | Integration suite | Real Bun and Relish processes over HTTP, TLS and the registry | [`tests/suite/`](../tests/suite) | `make test` |
@@ -79,7 +80,7 @@ a user would install it. The runbook is [`releasing.md`](releasing.md).
 ## When a test flakes
 
 CI runs with `retries = 0`. A test that passes on a re-run still failed once,
-so it goes in the [known flakes register](progress.md#known-flakes) the same
+so it goes in the [known flakes register](flakes.md) the same
 day, with its cause, and stays there until a fix has landed and a loop that used
 to fail passes. Most rows turned out to be product bugs, not test bugs.
 

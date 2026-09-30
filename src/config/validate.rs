@@ -534,6 +534,25 @@ impl NodeConfig {
             });
         }
 
+        // Retaining zero would delete every snapshot the moment it was
+        // taken (or, with an upload destination, the moment it shipped).
+        let snapshots = &self.storage.snapshots;
+        if snapshots.interval_secs > 0 && snapshots.retain == 0 {
+            return Err(ConfigError::Validation {
+                field: "storage.snapshots.retain".into(),
+                context: "node config".into(),
+                reason: "must retain at least one snapshot when interval_secs is set".into(),
+            });
+        }
+        // A zero deadline would abandon every export before it started.
+        if snapshots.upload_url.is_some() && snapshots.upload_timeout_secs == 0 {
+            return Err(ConfigError::Validation {
+                field: "storage.snapshots.upload_timeout_secs".into(),
+                context: "node config".into(),
+                reason: "must be greater than zero when upload_url is set".into(),
+            });
+        }
+
         // A zero deadline would fail every stop before the runtime answered,
         // leaving every workload owned and unstoppable.
         if self.runtime.stop_confirmation_timeout_secs == 0 {
@@ -971,6 +990,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn validate_autoscale_min_zero_rejected() {
+        let app: AppSpec = toml::from_str(
+            r#"
+            image = "web:v1"
+            cpu = "100m-500m"
+            [autoscale]
+            metric = "cpu"
+            target = "70%"
+            min = 0
+            max = 3
+        "#,
+        )
+        .unwrap();
+        let err = config_with_app("web", app).validate().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Validation { ref field, ref reason, .. }
+                if field == "autoscale" && reason.contains("min must be at least 1")),
+            "min = 0 must be rejected at validation: {err:?}"
+        );
+    }
+
     fn autoscaled_app(resources: &str, metric: &str) -> AppSpec {
         toml::from_str(&format!(
             r#"
@@ -1032,6 +1073,33 @@ mod tests {
             nc.validate(),
             Err(ConfigError::NonAbsolutePath { .. })
         ));
+    }
+
+    #[test]
+    fn scheduled_snapshots_must_retain_at_least_one() {
+        let mut nc = NodeConfig::default();
+        nc.storage.snapshots.interval_secs = 3600;
+        nc.storage.snapshots.retain = 0;
+        let error = nc.validate().unwrap_err().to_string();
+        assert!(error.contains("storage.snapshots.retain"), "{error}");
+
+        // Disabled schedules don't prune, so zero is harmless there.
+        nc.storage.snapshots.interval_secs = 0;
+        assert!(nc.validate().is_ok());
+        nc.storage.snapshots.interval_secs = 3600;
+        nc.storage.snapshots.retain = 1;
+        assert!(nc.validate().is_ok());
+    }
+
+    #[test]
+    fn snapshot_uploads_need_a_nonzero_deadline() {
+        let mut nc = NodeConfig::default();
+        nc.storage.snapshots.upload_url = Some("file:///backups".into());
+        nc.storage.snapshots.upload_timeout_secs = 0;
+        let error = nc.validate().unwrap_err().to_string();
+        assert!(error.contains("upload_timeout_secs"), "{error}");
+        nc.storage.snapshots.upload_timeout_secs = 60;
+        assert!(nc.validate().is_ok());
     }
 
     #[test]

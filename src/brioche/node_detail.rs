@@ -95,6 +95,7 @@ mod tests {
                     restart_count: 0,
                     host_port: Some(8080),
                     pid: Some(1234),
+                    runtime_unknown: false,
                 },
                 InstanceStatus {
                     exit_code: None,
@@ -105,12 +106,13 @@ mod tests {
                     restart_count: 1,
                     host_port: Some(9090),
                     pid: Some(5678),
+                    runtime_unknown: false,
                 },
             ],
             charts: vec![ChartConfig {
                 endpoint: "/v1/metrics?name=node_cpu_usage_percent".to_string(),
                 title: "CPU Usage".to_string(),
-                y_label: "%".to_string(),
+                unit: crate::brioche::units::ChartUnit::Percent,
                 refresh_secs: 10,
                 range_secs: 3600,
             }],

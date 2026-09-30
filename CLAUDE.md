@@ -15,11 +15,11 @@ For book, manual or website prose, follow [docs/book/STYLE.md](docs/book/STYLE.m
 
 ## Project Structure
 
-- `docs/` — [roadmap.md](docs/roadmap.md), [progress.md](docs/progress.md), [testing.md](docs/testing.md), [releasing.md](docs/releasing.md), [quickstart.md](docs/quickstart.md), [whitepaper.md](docs/whitepaper.md)
+- `docs/` — [roadmap.md](docs/roadmap.md) (releases, status, known gaps), [flakes.md](docs/flakes.md), [testing.md](docs/testing.md), [releasing.md](docs/releasing.md), [quickstart.md](docs/quickstart.md), [whitepaper.md](docs/whitepaper.md), [linux-servers.md](docs/linux-servers.md)
 - `docs/design/` — one design doc per subsystem, plus [test-harness.md](docs/design/test-harness.md)
 - `docs/book/` — the "Building Reliaburger" chapters
 - `docs/manual/` — the user manual (compiled into `relish`)
-- `docs/plans/` — dated plans and reviews; finished ones move to `docs/plans/archive/`
+- `docs/plans/` — dated plans for current work, indexed in [docs/plans/README.md](docs/plans/README.md); finished ones move to `docs/plans/archive/`, which holds the plans that led to 0.1.0 and the frozen pre-0.1.0 roadmap and checklist
 - `docs/qualification/` — dated release-gate and audit records
 - `docs/website/` — the project homepage and `install.sh`
 - `docs/talks/` — conference talk material
@@ -38,7 +38,7 @@ For book, manual or website prose, follow [docs/book/STYLE.md](docs/book/STYLE.m
 
 ### 1. Follow the Plan
 
-Every roadmap phase is done. Current work is closing out the 0.1.0 release: read the status box at the top of [docs/progress.md](docs/progress.md) and the plan it links before starting. New work goes through a dated plan in `docs/plans/`.
+Every roadmap phase is done; 0.1.0 was released on 29 September 2026 and 0.1.1 on 30 September 2026. Status lives in [docs/roadmap.md](docs/roadmap.md) plus the GitHub milestones and issues it links: read its release list and "Known gaps" before starting. Releases after 0.1.0 follow its [release order](docs/roadmap.md#releases-after-010): patch releases 0.1.2 and 0.1.3 next, then one headline feature per minor release. New work goes through a dated plan in `docs/plans/`; the plans that led to 0.1.0 are history in `docs/plans/archive/`. Releases follow [docs/releasing.md](docs/releasing.md).
 
 ### 2. Tests First
 
@@ -118,7 +118,7 @@ See [docs/testing.md](docs/testing.md) and [docs/design/test-harness.md](docs/de
 
 - Tests run under nextest. The portable suite is the unit tests plus the single `tests/suite/` binary: add a portable integration test there as a module. A new `tests/*.rs` binary is only for gated, heavy or process-isolated tests.
 - `make ci` runs `fmt-check`, `lint`, `test` and `test-doc`, portable only. Also run the gated target matching what you touched: `make test-cluster`, `test-linux`, `test-rootless-runc`, `test-upgrade` (or `test-upgrade-node` / `test-upgrade-cluster`), `test-slow`, `test-apple`, `bench` / `bench-large`.
-- Retries are 0 (`.config/nextest.toml`). A failure that passes on re-run goes in the "Known flakes" register in [docs/progress.md](docs/progress.md) the same day.
+- Retries are 0 (`.config/nextest.toml`). A failure that passes on re-run goes in the [known flakes register](docs/flakes.md) the same day, with an issue if it isn't fixed that day.
 - The `full-ci` PR label runs the heavy suites on a stacked PR.
 - The coverage floor `COVERAGE_MIN_LINES` in the `Makefile` is never lowered.
 
@@ -126,8 +126,8 @@ See [docs/testing.md](docs/testing.md) and [docs/design/test-harness.md](docs/de
 
 - Releases follow [docs/releasing.md](docs/releasing.md): `build.yml` → `stage.yml` → qualification with `scripts/release/qualify-*.sh` (including the V02 soak, `qualify-sustained.sh --tier fast|final`), recorded in `docs/qualification/` → `promote.yml`.
 - Only the maintainer tags and promotes. Agents never do.
-- Any change to a wire or durable-state format bumps `protocol` or `state` in `CURRENT` in `src/compatibility.rs`.
-- No legacy code, shims or migrations before 0.1.0. Old state is refused; start a fresh cluster.
+- No backwards compatibility before 1.0.0 (maintainer decision, 28 September 2026). Every release below 1.0.0 is a development release: no migrations, no mixed-version or rolling compatibility across a format change, no feature gates, no additive-field rules.
+- Any incompatible wire or durable-state change bumps `protocol` or `state` in `CURRENT` in `src/compatibility.rs`. Nodes then refuse old peers and old state; start a fresh cluster ([cluster compatibility](docs/releasing.md#compatibility-before-100)).
 
 ## Commit Hygiene
 
@@ -307,7 +307,7 @@ let vip = (hash % 254) + 1;
 
 **`// SAFETY:`** on every `unsafe` block, explaining why the invariants hold.
 
-**`// TODO(<progress.md item or plan>):`** for deferred work, naming the `docs/progress.md` item or plan that will address it.
+**`// TODO(#<issue>):`** for deferred work, naming the GitHub issue that will address it.
 
 ### What NOT to Do
 
@@ -321,5 +321,6 @@ let vip = (hash % 254) + 1;
 
 ### Tracking Progress
 
-- [docs/progress.md](docs/progress.md) is the checklist. Check an item off only when it compiles, passes tests and is committed.
-- Use `// TODO(<progress.md item or plan>):` for deferred work.
+- Status lives in [docs/roadmap.md](docs/roadmap.md) and in GitHub milestones and issues. Work items are issues; close one only when its fix compiles, passes tests and is merged.
+- The roadmap stays high-level: a line or two per release with its milestone and key issues, never item-by-item detail. Don't grow a new checklist file.
+- Use `// TODO(#<issue>):` for deferred work.

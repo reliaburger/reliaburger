@@ -48,7 +48,14 @@ WTF_WARNING_LIMIT = 600
 NO_LEADER_LIMIT = 30
 RSS_WARMUP = 3600
 RSS_GROWTH = 1.25
-FD_WINDOW = 6 * 3600
+# A leak-fd window: floors over 10-minute buckets after a 10-minute warm-up,
+# each at least FD_STEP above the last, 25% up overall. Bun images rarely
+# live more than two hours in the soak, so the window has to be short.
+FD_WARMUP = 600
+FD_BUCKET = 600
+FD_RISES = 3
+FD_STEP = 10
+FD_GROWTH = 1.25
 REPEAT_WINDOW = 1800
 LEAK_KINDS = ("runc", "netns", "lease", "veth", "cgroup", "bpf", "listen")
 # Pickle resolves every tag through the council's committed catalogue and
@@ -94,10 +101,21 @@ def finding(check, severity, detail, target=None):
 
 # --- parsers -----------------------------------------------------------------
 
-def parse_sequence(text, prefix):
-    """Numbers from lines like `ACK 12`, in log order."""
-    pattern = re.compile(r"\b" + re.escape(prefix) + r" (\d+)\b")
-    return [int(match.group(1)) for match in pattern.finditer(text)]
+def parse_runs(text, prefix):
+    """Numbers from lines like `ACK 12`, in log order, per run.
+
+    `relish logs` labels each line `[instance]`, or `[instance@node]` when one
+    instance name ran on two nodes, once the view holds more than one run. A
+    run is one process writing in order; the view interleaves runs by their
+    nodes' clocks, which isn't an order any of them wrote. Unlabelled lines
+    are one run."""
+    pattern = re.compile(r"^(?:\[([^\]]+)\] )?.*?\b" + re.escape(prefix) + r" (\d+)\b")
+    runs = {}
+    for line in text.splitlines():
+        match = pattern.match(line)
+        if match:
+            runs.setdefault(match.group(1), []).append(int(match.group(2)))
+    return runs
 
 
 def parse_inventory(text):
@@ -145,32 +163,59 @@ def instances_by_node(status):
 
 # --- invariants (pure) -------------------------------------------------------
 
-def sequence_findings(check, values, highest, source, target=None):
+def view_end(runs):
+    """The newest value in the view: the highest any run ended on."""
+    return max((values[-1] for values in runs.values() if values), default=None)
+
+
+def sequence_findings(check, runs, highest, source, target=None):
     """Log-view ordering: the writer's ACKs and redis INCRs, as `relish logs`
-    returns them, must keep rising. Still failures, but about the order the
-    log view shows, not what was stored; `source` says what decides that."""
+    returns them, must keep rising within each run (see `parse_runs`). Still
+    failures, but about the order the log view shows, not what was stored;
+    `source` says what decides that."""
     findings = []
-    for before, after in zip(values, values[1:]):
-        if after <= before:
-            findings.append(finding(check, "fail", f"log view went backwards from {before} to {after} ({source})", target))
-    if values and highest is not None and values[-1] < highest:
-        findings.append(finding(check, "fail", f"log view ends at {values[-1]}, below the {highest} an earlier check saw ({source})", target))
+    for label, values in runs.items():
+        run = f" in run {label}" if label else ""
+        for before, after in zip(values, values[1:]):
+            if after <= before:
+                findings.append(finding(check, "fail", f"log view went backwards from {before} to {after}{run} ({source})", target))
+    end = view_end(runs)
+    if end is not None and highest is not None and end < highest:
+        findings.append(finding(check, "fail", f"log view ends at {end}, below the {highest} an earlier check saw ({source})", target))
     return findings
 
 
 def writer_file_findings(text, highest_ack):
-    """The writer's file must hold 1..N with N at least the highest ACK seen."""
-    last = None
-    findings = []
+    """What the writer's file holds, from the harness's one-pass summary.
+
+    `MAX` is the highest value in the file and `LAST` its line count.
+    `MISSING` counts values in 1..MAX that aren't there, `DUP` values that
+    are there more than once, and `BAD` names the first line that isn't
+    its own line number. Only a missing value or a MAX below an ACK is
+    lost data. A duplicate means two writers appended at once, which the
+    product must never allow on one volume, so it fails too, but it is
+    reported as what it is.
+    """
+    fields = {}
     for line in text.splitlines():
-        if line.startswith("LAST "):
-            last = int(line.split()[1])
-        elif line.startswith("BAD "):
-            findings.append(finding("writer-gap", "fail", "sequence file line " + line[4:]))
-    if last is None:
-        return findings + [finding("writer-file", "warn", "no LAST line from the writer check")]
-    if highest_ack is not None and last < highest_ack:
-        findings.append(finding("writer-regression", "fail", f"file ends at {last} but ACK {highest_ack} was logged"))
+        key, _, rest = line.partition(" ")
+        if key in ("BAD", "DUP", "MISSING", "MAX", "LAST"):
+            fields.setdefault(key, rest)
+    if "MAX" not in fields or "LAST" not in fields:
+        return [finding("writer-file", "warn", "no MAX/LAST summary from the writer check")]
+    findings = []
+    maximum = int(fields["MAX"])
+    lines = int(fields["LAST"])
+    if "MISSING" in fields:
+        findings.append(finding("writer-lost", "fail", f"values absent from 1..{maximum}: {fields['MISSING']}"))
+    if highest_ack is not None and maximum < highest_ack:
+        findings.append(finding("writer-regression", "fail", f"file holds values up to {maximum} but ACK {highest_ack} was logged"))
+    if "DUP" in fields:
+        findings.append(finding("writer-duplicate", "fail",
+                                f"values written more than once: {fields['DUP']} ({lines} lines, max {maximum}); "
+                                "two writers appended to one volume"))
+    if "BAD" in fields and "MISSING" not in fields and "DUP" not in fields:
+        findings.append(finding("writer-gap", "fail", "sequence file line " + fields["BAD"]))
     return findings
 
 
@@ -217,20 +262,27 @@ def leak_findings(baseline, current, baseline_instances, current_instances, node
     return findings
 
 
-def fd_findings(samples, now):
-    """Fail when every hourly minimum over the last six hours is higher than the one before."""
-    window = [(ts, fd) for ts, fd in samples if ts >= now - FD_WINDOW]
-    if not window or window[0][0] > now - FD_WINDOW + 600:
+def fd_findings(samples, started, now):
+    """Fail when bun's fd floor rose sharply across each of the last four 10-minute windows.
+
+    Samples belong to one bun image (a new pid or exec starts over). The floor
+    (each window's minimum) ignores the bursts every settle causes; a leak
+    lifts it every time, a peer's restart once.
+    """
+    floors = {}
+    for ts, fd in samples:
+        if ts - started >= FD_WARMUP:
+            window = (ts - started - FD_WARMUP) // FD_BUCKET
+            floors[window] = min(floors.get(window, fd), fd)
+    last = (now - started - FD_WARMUP) // FD_BUCKET - 1
+    windows = range(last - FD_RISES, last + 1)
+    if any(window < 0 or window not in floors for window in windows):
         return []
-    minima = {}
-    for ts, fd in window:
-        bucket = min(5, int((ts - (now - FD_WINDOW)) // 3600))
-        minima[bucket] = min(minima.get(bucket, fd), fd)
-    if len(minima) < 6:
-        return []
-    values = [minima[bucket] for bucket in range(6)]
-    if all(after > before for before, after in zip(values, values[1:])):
-        return [finding("leak-fd", "fail", "bun file descriptors grew for six hours: " + " ".join(map(str, values)))]
+    values = [floors[window] for window in windows]
+    rising = all(after >= before + FD_STEP for before, after in zip(values, values[1:]))
+    if rising and values[-1] >= values[0] * FD_GROWTH:
+        return [finding("leak-fd", "fail", "bun's lowest fd count rose every 10 minutes for half an hour: "
+                        + " ".join(map(str, values)))]
     return []
 
 
@@ -293,9 +345,26 @@ def snapshot_archive_findings(state, node, text):
     return findings
 
 
-# How long a harness kill can wait for the systemd restart it explains; an
-# older expectation never excuses a later restart.
-EXPECT_WINDOW = 600
+# systemd restarts a killed bun within seconds, so a check this long after a
+# harness kill has seen the restart the kill caused, if it caused one. An
+# expectation that a check this late didn't use never excuses a later restart.
+RESTART_GRACE = 120
+
+
+def release_version(versions, soak_bun):
+    """The version every node reports, without the `v`: the candidate's own
+    release, which each upgrade walk rolls back to.
+
+    Nodes that disagree, don't answer ("?") or already run the soak build
+    mean the cluster isn't on the candidate, and a walk from it would prove
+    nothing."""
+    found = {version.removeprefix("v") for version in versions}
+    if len(found) != 1 or "?" in found or "" in found:
+        raise ValueError(f"nodes don't agree on a release version: {' '.join(versions) or 'none'}")
+    version = found.pop()
+    if version == Path(soak_bun).name.removeprefix("bun-v"):
+        raise ValueError(f"the cluster already runs the soak build {version}")
+    return version
 
 
 def restart_expectations(evidence, node):
@@ -322,8 +391,11 @@ def restart_findings(state, node, inventory, expectations, now):
     """systemd restarts of bun that no harness kill explains.
 
     Each expectation explains at most one restart, and stays available until
-    a restart uses it or it is EXPECT_WINDOW old, so a check that runs between
-    the kill being recorded and systemd restarting bun doesn't use it up."""
+    a restart uses it or an earlier check ran RESTART_GRACE after it without
+    using it. Expiry follows the checks, not the clock. A check that runs
+    between the kill being recorded and systemd restarting bun doesn't use it
+    up, and a slot that blocks for many minutes after a kill (an upgrade walk)
+    can't expire it before any check has looked."""
     boot = (inventory.get("boot") or [None])[0]
     count = inventory_number(inventory, "nrestarts")
     if count is None:
@@ -333,7 +405,8 @@ def restart_findings(state, node, inventory, expectations, now):
     restarts.setdefault("used", 0)
     findings = []
     pending = expectations[restarts["used"]:]
-    fresh = [ts for ts in pending if now - ts <= EXPECT_WINDOW]
+    checked = restarts.get("checked")
+    fresh = [ts for ts in pending if checked is None or checked < ts + RESTART_GRACE]
     restarts["used"] += len(pending) - len(fresh)
     if restarts["boot"] == boot:
         observed = max(count - restarts["n"], 0)
@@ -344,7 +417,7 @@ def restart_findings(state, node, inventory, expectations, now):
     else:
         # A new boot starts systemd's counter again; nothing carries over.
         restarts["used"] = len(expectations)
-    restarts.update(boot=boot, n=count)
+    restarts.update(boot=boot, n=count, checked=max(now, checked or now))
     panics = inventory_number(inventory, "panics") or 0
     if panics:
         findings.append(finding("bun-panic", "fail", f"{panics} panic line(s) in the journal", node))
@@ -437,7 +510,7 @@ def evaluate(evidence, snapshot):
             findings.append(finding("ingress-http", "info" if fault_window else "fail",
                                     "podinfo answered " + (http.strip() or "nothing")))
 
-    # The writer file (writer-gap, writer-regression) is the data-loss check;
+    # The writer file (writer-lost, writer-regression) is the data-loss check;
     # these only see lines through the log view. State keeps the old keys:
     # state[check] is the highest value ever seen and never goes down (the
     # writer-regression check compares the file against it), while
@@ -453,34 +526,35 @@ def evaluate(evidence, snapshot):
         text = read(snapshot, name)
         if text is None:
             continue
-        values = parse_sequence(text, prefix)
+        runs = parse_runs(text, prefix)
+        end = view_end(runs)
         baseline = baselines.get(check, state.get(check))
-        order = sequence_findings(order_check, values, baseline, source)
-        if state.get("power_cut") and values and baseline is not None and values[-1] < baseline:
+        order = sequence_findings(order_check, runs, baseline, source)
+        if state.get("power_cut") and end is not None and baseline is not None and end < baseline:
             # A powered-off node loses the stdout it hadn't synced yet, as any
             # log does; the tail may end below what an earlier check saw. Only
             # the "ends below" finding is excused, and the baseline restarts
             # from here; lines going backwards within one tail still fail.
             order = [dict(item, severity="info", detail=item["detail"] + "; after a power cut, lines not yet synced are lost from the log view")
                      if "below the" in item["detail"] else item for item in order]
-            baselines[check] = values[-1]
+            baselines[check] = end
             power_cut_excused = True
-        elif fault_window and values and baseline is not None and values[-1] < baseline:
+        elif fault_window and end is not None and baseline is not None and end < baseline:
             # A bun that just restarted (killed, upgraded) re-reads its
             # capture files; until it has, the newest lines are missing from
             # the view. That's judged once the window closes, against the
             # unchanged baseline, so a dip that never recovers still fails.
             order = [dict(item, severity="info", detail=item["detail"] + "; inside a fault window, judged again once it settles")
                      if "below the" in item["detail"] else item for item in order]
-        elif values:
-            advanced = advanced or baseline is None or values[-1] > baseline
-            baselines[check] = max(values[-1], baseline or 0)
+        elif end is not None:
+            advanced = advanced or baseline is None or end > baseline
+            baselines[check] = max(end, baseline or 0)
         findings += order
-        if values:
-            if values[-1] == state.get(check) and not fault_window:
-                findings.append(finding(check, "warn", f"not advancing at {values[-1]}"))
-            state[check] = max(values[-1], state.get(check, 0))
-            state.setdefault("progress", {})[check] = values[-1]
+        if end is not None:
+            if end == state.get(check) and not fault_window:
+                findings.append(finding(check, "warn", f"not advancing at {end}"))
+            state[check] = max(end, state.get(check, 0))
+            state.setdefault("progress", {})[check] = end
     if state.get("power_cut") and not fault_window and advanced and not power_cut_excused:
         state.pop("power_cut")
 
@@ -629,13 +703,16 @@ def served_serial_findings(state, kind, node, serial, now):
 def resource_trend_findings(state, node, inventory, now):
     node_state = state.setdefault("resources", {}).setdefault(node, {})
     pid = inventory_number(inventory, "bun_pid")
+    image = (inventory.get("bun_image") or [None])[0]
     fd = inventory_number(inventory, "bun_fd")
     rss = inventory_number(inventory, "bun_rss_kb")
-    if pid != node_state.get("pid"):
-        node_state.update(pid=pid, fd_samples=[], started=now)
+    # An upgrade walk execs bun in place: same pid, a new image whose RSS
+    # starts from nothing. Either change is a new process to warm up.
+    if pid != node_state.get("pid") or image != node_state.get("image"):
+        node_state.update(pid=pid, image=image, fd_samples=[], started=now)
         node_state.pop("rss_warm_kb", None)
     if fd is not None:
-        node_state["fd_samples"] = [sample for sample in node_state["fd_samples"] if sample[0] >= now - FD_WINDOW] + [[now, fd]]
+        node_state["fd_samples"] = [sample for sample in node_state["fd_samples"] if sample[0] >= now - (FD_RISES + 3) * FD_BUCKET] + [[now, fd]]
     trend = state.setdefault("trends", {}).setdefault(node, {})
     for key, value in (("fd", fd), ("rss_kb", rss)):
         if value is None:
@@ -649,7 +726,7 @@ def resource_trend_findings(state, node, inventory, now):
             entry = trend.setdefault("disk_kb " + name, {"first": int(size), "max": int(size)})
             entry["last"] = int(size)
             entry["max"] = max(entry["max"], int(size))
-    findings = [dict(item, target=node) for item in fd_findings(node_state["fd_samples"], now)]
+    findings = [dict(item, target=node) for item in fd_findings(node_state["fd_samples"], node_state["started"], now)]
     findings += [dict(item, target=node) for item in rss_findings(node_state, rss, now, node_state["started"])]
     return findings
 
@@ -916,7 +993,8 @@ def render(evidence, record):
     lines += [acceptance_line(metadata, result, elapsed), ""]
     lines += ["## Candidate and host", "", "| | |", "|---|---|"]
     for key, label in (("base_url", "Staged base URL"), ("candidate_digest", "`candidate.json` SHA-256"),
-                       ("versions", "Running versions"), ("soak_bun", "Soak build"), ("host", "Host"),
+                       ("versions", "Running versions"), ("soak_bun", "Soak build"),
+                       ("release_version", "Walks roll back to"), ("host", "Host"),
                        ("lima", "Lima"), ("guest", "Guest"), ("home", "RELIABURGER_HOME"), ("evidence", "Evidence")):
         if metadata.get(key):
             lines.append(f"| {label} | {metadata[key]} |")
@@ -960,7 +1038,7 @@ def render(evidence, record):
     progress = state.get("progress", {})
     lines += ["## Data", "",
               f"- Volume writer: highest ACK {state.get('writer-ack', 'none')} in the log view; "
-              "the writer file checks (writer-gap, writer-regression) decide data loss, "
+              "the writer file checks (writer-lost, writer-regression) decide data loss, "
               "and `*-log-order` failures are about the order the log view returned lines in",
               f"- Redis counter: highest INCR {state.get('redis-counter', 'none')} in the log view"]
     for node, count in sorted(state.get("export_counts", {}).items()):
@@ -1054,6 +1132,9 @@ def main(argv=None):
     nodes = commands.add_parser("nodes-json")
     nodes.add_argument("file")
     nodes.add_argument("what", choices=["leader", "followers", "alive", "council"])
+    release = commands.add_parser("release-version", help="the version every node reports, which upgrade walks roll back to")
+    release.add_argument("--soak-bun", required=True, help="the soak build's file name (bun-vVERSION)")
+    release.add_argument("versions", nargs="*")
     stamp = commands.add_parser("utc-stamp")
     stamp.add_argument("epoch", type=int)
     registry = commands.add_parser("registry")
@@ -1128,6 +1209,13 @@ def main(argv=None):
         return 0
     if args.command == "nodes-json":
         return nodes_query(args.file, args.what)
+    if args.command == "release-version":
+        try:
+            print(release_version(args.versions, args.soak_bun))
+        except ValueError as e:
+            print(f"sustained_check: {e}", file=sys.stderr)
+            return 1
+        return 0
     if args.command == "utc-stamp":
         print(time.strftime("%y%m%d%H%M%SZ", time.gmtime(args.epoch)))
         return 0

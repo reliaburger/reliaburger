@@ -6,8 +6,9 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 
+use super::subprocess::{CommandBudget, run_bounded};
 use super::types::{CommitInfo, LettuceError, SignatureStatus};
 
 /// A local bare git clone managed by Lettuce.
@@ -20,6 +21,8 @@ pub struct GitRepo {
     url: String,
     /// Branch to track.
     branch: String,
+    /// Deadline and cancellation every `git` call runs under (B19).
+    budget: CommandBudget,
 }
 
 impl GitRepo {
@@ -33,13 +36,25 @@ impl GitRepo {
     /// temporary sibling directory and swapped in, so a mid-clone crash
     /// never leaves a half-populated repo in place.
     pub fn clone_or_open(url: &str, path: &Path, branch: &str) -> Result<Self, LettuceError> {
+        Self::clone_or_open_with_budget(url, path, branch, CommandBudget::default())
+    }
+
+    /// [`GitRepo::clone_or_open`], with every `git` call (the clone
+    /// included) bounded by `budget`.
+    pub fn clone_or_open_with_budget(
+        url: &str,
+        path: &Path,
+        branch: &str,
+        budget: CommandBudget,
+    ) -> Result<Self, LettuceError> {
         if path.join("HEAD").exists() {
-            match reused_clone_matches(path, url, branch) {
+            match reused_clone_matches(path, url, branch, &budget) {
                 Ok(true) => {
                     return Ok(Self {
                         path: path.to_path_buf(),
                         url: url.to_string(),
                         branch: branch.to_string(),
+                        budget,
                     });
                 }
                 // Drift or an unreadable clone: discard and re-clone.
@@ -54,11 +69,16 @@ impl GitRepo {
             }
         }
 
-        Self::fresh_clone(url, path, branch)
+        Self::fresh_clone(url, path, branch, budget)
     }
 
     /// Perform a fresh bare clone at `path`.
-    fn fresh_clone(url: &str, path: &Path, branch: &str) -> Result<Self, LettuceError> {
+    fn fresh_clone(
+        url: &str,
+        path: &Path,
+        branch: &str,
+        budget: CommandBudget,
+    ) -> Result<Self, LettuceError> {
         // M27: keep the secret out of argv (world-readable via /proc) and out
         // of the clone's `.git/config` (where it would outlive the process).
         // The sanitised URL is what git stores as the remote; `fetch` supplies
@@ -68,14 +88,13 @@ impl GitRepo {
         // branch beginning with `-` can't be read as a git flag (GIT4).
         let mut command = Command::new("git");
         with_credentials(&mut command, password.as_deref());
-        let output = command
+        command
             .args(["clone", "--bare", "--single-branch", "--branch"])
             .arg(branch)
             .arg("--")
             .arg(&safe_url)
-            .arg(path)
-            .output()
-            .map_err(|e| LettuceError::GitFailed(format!("failed to run git clone: {e}")))?;
+            .arg(path);
+        let output = run_bounded(command, &budget, "git clone")?;
 
         if !output.status.success() {
             return Err(LettuceError::GitFailed(format!(
@@ -88,7 +107,20 @@ impl GitRepo {
             path: path.to_path_buf(),
             url: url.to_string(),
             branch: branch.to_string(),
+            budget,
         })
+    }
+
+    /// A `git` command that runs in the clone.
+    fn git(&self) -> Command {
+        let mut command = Command::new("git");
+        command.current_dir(&self.path);
+        command
+    }
+
+    /// Run a `git` command within this repository's budget.
+    pub(crate) fn run(&self, command: Command, what: &str) -> Result<Output, LettuceError> {
+        run_bounded(command, &self.budget, what)
     }
 
     /// Fetch the latest from the remote.
@@ -100,14 +132,10 @@ impl GitRepo {
         // The stored remote is credential-free (M27), so the secret has to be
         // supplied on every fetch too.
         let (_, password) = split_credentials(&self.url);
-        let mut command = Command::new("git");
+        let mut command = self.git();
         with_credentials(&mut command, password.as_deref());
-        let output = command
-            .args(["fetch", "origin", "--"])
-            .arg(&self.branch)
-            .current_dir(&self.path)
-            .output()
-            .map_err(|e| LettuceError::GitFailed(format!("failed to run git fetch: {e}")))?;
+        command.args(["fetch", "origin", "--"]).arg(&self.branch);
+        let output = self.run(command, "git fetch")?;
 
         if !output.status.success() {
             return Err(LettuceError::GitFailed(format!(
@@ -126,18 +154,15 @@ impl GitRepo {
         // a `GitOpsSyncUpdate` to Raft every 30s — unbounded log churn. Move the
         // local ref forward so a genuinely unchanged remote reports `None`.
         if old_head.as_deref() != Some(&new_head) {
-            let update = Command::new("git")
+            let mut command = self.git();
+            command
                 .args([
                     "update-ref",
                     &format!("refs/heads/{}", self.branch),
                     "--end-of-options",
                 ])
-                .arg(&new_head)
-                .current_dir(&self.path)
-                .output()
-                .map_err(|e| {
-                    LettuceError::GitFailed(format!("failed to run git update-ref: {e}"))
-                })?;
+                .arg(&new_head);
+            let update = self.run(command, "git update-ref")?;
             if !update.status.success() {
                 return Err(LettuceError::GitFailed(format!(
                     "git update-ref failed: {}",
@@ -156,13 +181,16 @@ impl GitRepo {
 
     /// Get the SHA of the local HEAD.
     pub fn head_sha(&self) -> Result<String, LettuceError> {
-        let output = Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .current_dir(&self.path)
-            .output()
-            .map_err(|e| LettuceError::GitFailed(e.to_string()))?;
-
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        let mut command = self.git();
+        command.args(["rev-parse", "--verify", "--quiet", "HEAD"]);
+        let output = self.run(command, "git rev-parse")?;
+        let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !output.status.success() || sha.is_empty() {
+            return Err(LettuceError::GitFailed(
+                "failed to resolve local HEAD".to_string(),
+            ));
+        }
+        Ok(sha)
     }
 
     /// Get the SHA of the remote branch HEAD.
@@ -178,12 +206,11 @@ impl GitRepo {
             // fail), so `--end-of-options` isn't echoed back into stdout the
             // way plain rev-parse would. It also fails cleanly on a ref that
             // doesn't resolve, which the fallback loop relies on.
-            let output = Command::new("git")
+            let mut command = self.git();
+            command
                 .args(["rev-parse", "--verify", "--quiet", "--end-of-options"])
-                .arg(&refname)
-                .current_dir(&self.path)
-                .output()
-                .map_err(|e| LettuceError::GitFailed(e.to_string()))?;
+                .arg(&refname);
+            let output = self.run(command, "git rev-parse")?;
 
             if output.status.success() {
                 let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -203,12 +230,11 @@ impl GitRepo {
         // `--end-of-options` stops a SHA beginning with `-` from being
         // parsed as an option, while still treating it as a revision (a
         // plain `--` would make git read it as a pathspec instead). GIT4.
-        let output = Command::new("git")
+        let mut command = self.git();
+        command
             .args(["log", "-1", "--format=%H%n%s%n%an%n%ct", "--end-of-options"])
-            .arg(sha)
-            .current_dir(&self.path)
-            .output()
-            .map_err(|e| LettuceError::GitFailed(e.to_string()))?;
+            .arg(sha);
+        let output = self.run(command, "git log")?;
 
         let text = String::from_utf8_lossy(&output.stdout);
         let lines: Vec<&str> = text.lines().collect();
@@ -245,12 +271,15 @@ impl GitRepo {
             format!("{sha}:{prefix}")
         };
 
-        let output = Command::new("git")
-            .args(["ls-tree", "-r", "--name-only", "--end-of-options"])
-            .arg(&tree_arg)
-            .current_dir(&self.path)
-            .output()
-            .map_err(|e| LettuceError::GitFailed(e.to_string()))?;
+        // `-z` prints each path raw and NUL-terminated. Without it git
+        // C-quotes any path holding a tab or a non-ASCII byte, and the quoted
+        // name neither ends in `.toml` nor names a blob, so the file silently
+        // dropped out of desired state and its apps were deleted (B17).
+        let mut command = self.git();
+        command
+            .args(["ls-tree", "-r", "-z", "--name-only", "--end-of-options"])
+            .arg(&tree_arg);
+        let output = self.run(command, "git ls-tree")?;
 
         // A failed ls-tree (a renamed watched directory, a typo in
         // `[gitops] path`, a bad object) exits non-zero with empty stdout.
@@ -264,33 +293,46 @@ impl GitRepo {
             )));
         }
 
-        let listing = String::from_utf8_lossy(&output.stdout);
         let mut files = HashMap::new();
 
-        for line in listing.lines() {
-            if !line.ends_with(".toml") {
+        for entry in output.stdout.split(|byte| *byte == 0) {
+            if !entry.ends_with(b".toml") {
                 continue;
             }
+            // A config path must be text to be a map key; refuse rather
+            // than skip, since skipping would delete what it declares.
+            let name = std::str::from_utf8(entry).map_err(|_| {
+                LettuceError::GitFailed(format!(
+                    "{sha}: path {:?} is not valid UTF-8",
+                    String::from_utf8_lossy(entry)
+                ))
+            })?;
 
             let blob_path = if prefix.is_empty() {
-                line.to_string()
+                name.to_string()
             } else {
-                format!("{prefix}/{line}")
+                format!("{prefix}/{name}")
             };
 
             // Read file content. `--end-of-options` guards the object spec
             // in case the commit SHA begins with `-` (GIT4).
-            let content_output = Command::new("git")
+            let mut command = self.git();
+            command
                 .args(["show", "--end-of-options"])
-                .arg(format!("{sha}:{blob_path}"))
-                .current_dir(&self.path)
-                .output()
-                .map_err(|e| LettuceError::GitFailed(e.to_string()))?;
+                .arg(format!("{sha}:{blob_path}"));
+            let content_output = self.run(command, "git show")?;
 
-            if content_output.status.success() {
-                let content = String::from_utf8_lossy(&content_output.stdout).to_string();
-                files.insert(line.to_string(), content);
+            // A file that's listed but unreadable fails the whole sync (B17).
+            // Dropping it would leave a partial desired state, and the diff
+            // would delete everything that file declares.
+            if !content_output.status.success() {
+                return Err(LettuceError::GitFailed(format!(
+                    "git show {sha}:{blob_path:?} failed: {}",
+                    String::from_utf8_lossy(&content_output.stderr).trim()
+                )));
             }
+            let content = String::from_utf8_lossy(&content_output.stdout).to_string();
+            files.insert(name.to_string(), content);
         }
 
         Ok(files)
@@ -415,12 +457,17 @@ pub(crate) fn redact_url_credentials(text: &str) -> String {
 /// Reads the clone's `remote.origin.url` and confirms the branch ref
 /// exists. A mismatch (config repointed, stale failover clone) means the
 /// clone is the wrong repo and must be discarded rather than synced.
-fn reused_clone_matches(path: &Path, url: &str, branch: &str) -> Result<bool, LettuceError> {
-    let origin = Command::new("git")
+fn reused_clone_matches(
+    path: &Path,
+    url: &str,
+    branch: &str,
+    budget: &CommandBudget,
+) -> Result<bool, LettuceError> {
+    let mut command = Command::new("git");
+    command
         .args(["config", "--", "remote.origin.url"])
-        .current_dir(path)
-        .output()
-        .map_err(|e| LettuceError::GitFailed(format!("failed to read clone remote: {e}")))?;
+        .current_dir(path);
+    let origin = run_bounded(command, budget, "git config")?;
 
     if !origin.status.success() {
         return Ok(false);
@@ -440,12 +487,12 @@ fn reused_clone_matches(path: &Path, url: &str, branch: &str) -> Result<bool, Le
     }
 
     // Confirm the tracked branch is present in the clone.
-    let branch_ref = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .args(["rev-parse", "--verify", "--quiet", "--end-of-options"])
         .arg(format!("refs/heads/{branch}"))
-        .current_dir(path)
-        .output()
-        .map_err(|e| LettuceError::GitFailed(format!("failed to verify clone branch: {e}")))?;
+        .current_dir(path);
+    let branch_ref = run_bounded(command, budget, "git rev-parse")?;
 
     Ok(branch_ref.status.success())
 }
@@ -561,6 +608,11 @@ mod tests {
 
     /// Create a test git repo with a TOML file.
     fn create_test_repo() -> (TempDir, PathBuf) {
+        create_test_repo_with_files(&[("app.toml", "[app.web]\nimage = \"myapp:v1\"\n")])
+    }
+
+    /// Create a test git repo whose one commit holds `files` (path, content).
+    fn create_test_repo_with_files(files: &[(&str, &str)]) -> (TempDir, PathBuf) {
         let dir = TempDir::new().unwrap();
         let repo_path = dir.path().join("test-repo");
 
@@ -596,15 +648,14 @@ mod tests {
             .output()
             .unwrap();
 
-        // Add a TOML file
-        fs::write(
-            working.join("app.toml"),
-            "[app.web]\nimage = \"myapp:v1\"\n",
-        )
-        .unwrap();
+        for (path, content) in files {
+            let file = working.join(path);
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(file, content).unwrap();
+        }
 
         Command::new("git")
-            .args(["add", "app.toml"])
+            .args(["add", "--all"])
             .current_dir(&working)
             .output()
             .unwrap();
@@ -676,6 +727,225 @@ mod tests {
 
         assert!(files.contains_key("app.toml"), "keys: {:?}", files.keys());
         assert!(files["app.toml"].contains("[app.web]"));
+    }
+
+    /// B17: git quotes a path with non-ASCII bytes or a tab in plain
+    /// `ls-tree` output (`"caf\303\251.toml"`), and the quoted name neither
+    /// ends in `.toml` nor names a blob. Those files were silently left
+    /// out of desired state, so the sync deleted whatever they declared.
+    #[test]
+    fn list_toml_files_reads_non_ascii_and_tab_filenames() {
+        let (dir, repo_path) = create_test_repo_with_files(&[
+            ("café.toml", "[app.cafe]\nimage = \"cafe:v1\"\n"),
+            ("tab\tname.toml", "[app.tab]\nimage = \"tab:v1\"\n"),
+            (
+                "über dir/zürich.toml",
+                "[app.zurich]\nimage = \"zurich:v1\"\n",
+            ),
+            ("plain.toml", "[app.plain]\nimage = \"plain:v1\"\n"),
+        ]);
+        let clone_path = dir.path().join("clone");
+        let url = format!("file://{}", repo_path.display());
+        let repo = GitRepo::clone_or_open(&url, &clone_path, "main").unwrap();
+        let sha = repo.head_sha().unwrap();
+
+        let files = repo.list_toml_files(&sha, "/").unwrap();
+
+        let mut names: Vec<&str> = files.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            [
+                "café.toml",
+                "plain.toml",
+                "tab\tname.toml",
+                "über dir/zürich.toml"
+            ]
+        );
+        assert!(files["café.toml"].contains("[app.cafe]"));
+        assert!(files["tab\tname.toml"].contains("[app.tab]"));
+        assert!(files["über dir/zürich.toml"].contains("[app.zurich]"));
+
+        // Under a path prefix the listing is relative to it.
+        let files = repo.list_toml_files(&sha, "über dir").unwrap();
+        assert_eq!(files.keys().collect::<Vec<_>>(), ["zürich.toml"]);
+        assert!(files["zürich.toml"].contains("[app.zurich]"));
+    }
+
+    /// B17: a listed `.toml` whose blob can't be read used to be dropped,
+    /// leaving a partial desired state that deletes what the file
+    /// declared. The whole listing must fail instead.
+    #[test]
+    fn list_toml_files_fails_when_a_blob_cannot_be_read() {
+        let (dir, repo_path) = create_test_repo_with_files(&[
+            ("app.toml", "[app.web]\nimage = \"myapp:v1\"\n"),
+            ("other.toml", "[app.other]\nimage = \"other:v1\"\n"),
+        ]);
+        let clone_path = dir.path().join("clone");
+        let url = format!("file://{}", repo_path.display());
+        let repo = GitRepo::clone_or_open(&url, &clone_path, "main").unwrap();
+        let sha = repo.head_sha().unwrap();
+
+        let blob = git_stdout(&clone_path, &["rev-parse", &format!("{sha}:other.toml")]);
+        remove_object(&clone_path, &blob);
+
+        let result = repo.list_toml_files(&sha, "/");
+        assert!(
+            matches!(result, Err(LettuceError::GitFailed(ref message)) if message.contains("other.toml")),
+            "an unreadable blob must fail the listing, not vanish from it: {result:?}"
+        );
+    }
+
+    /// Make every fetch from `clone` hang: the upload-pack it runs records
+    /// a descendant's pid in `pid_file`, leaves that descendant sleeping,
+    /// and never exits itself. The trailing `#` comments out the repository
+    /// path git appends.
+    fn make_fetch_hang(clone: &Path, pid_file: &Path) {
+        let hang = format!(
+            "sh -c 'echo $$ > {}; exec sleep 300' & exec sleep 300 #",
+            pid_file.display()
+        );
+        git_stdout(clone, &["config", "remote.origin.uploadpack", &hang]);
+    }
+
+    fn is_running(pid: i32) -> bool {
+        let output = Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        let stat = String::from_utf8_lossy(&output.stdout);
+        !stat.trim().is_empty() && !stat.trim().starts_with('Z')
+    }
+
+    fn descendant_pid(pid_file: &Path) -> i32 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Ok(text) = fs::read_to_string(pid_file)
+                && let Ok(pid) = text.trim().parse()
+            {
+                return pid;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the hanging upload-pack never started"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    fn wait_until_gone(pid: i32) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if !is_running(pid) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        false
+    }
+
+    /// B19: a fetch against a remote that never answers used to block the
+    /// only sync loop forever. It must fail within its deadline, leave no
+    /// process behind, and the next fetch must work.
+    #[test]
+    fn a_hung_fetch_fails_within_its_deadline_and_leaves_nothing_running() {
+        let (dir, repo_path) = create_test_repo();
+        let clone_path = dir.path().join("clone");
+        let url = format!("file://{}", repo_path.display());
+        GitRepo::clone_or_open(&url, &clone_path, "main").unwrap();
+        let pid_file = dir.path().join("upload-pack.pid");
+        make_fetch_hang(&clone_path, &pid_file);
+
+        let budget = CommandBudget {
+            timeout: std::time::Duration::from_millis(1500),
+            cancel: tokio_util::sync::CancellationToken::new(),
+        };
+        let repo = GitRepo::clone_or_open_with_budget(&url, &clone_path, "main", budget).unwrap();
+
+        let started = std::time::Instant::now();
+        let result = repo.fetch();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the fetch outlived its deadline: {:?}",
+            started.elapsed()
+        );
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("git fetch timed out"), "got: {error}");
+        let pid = descendant_pid(&pid_file);
+        assert!(wait_until_gone(pid), "upload-pack's descendant survived");
+
+        git_stdout(
+            &clone_path,
+            &["config", "--unset", "remote.origin.uploadpack"],
+        );
+        assert!(repo.fetch().is_ok(), "the next fetch must succeed");
+    }
+
+    /// B19: shutdown during a stuck fetch stops it at once rather than
+    /// waiting for the deadline.
+    #[test]
+    fn cancelling_a_hung_fetch_returns_promptly() {
+        let (dir, repo_path) = create_test_repo();
+        let clone_path = dir.path().join("clone");
+        let url = format!("file://{}", repo_path.display());
+        GitRepo::clone_or_open(&url, &clone_path, "main").unwrap();
+        let pid_file = dir.path().join("upload-pack.pid");
+        make_fetch_hang(&clone_path, &pid_file);
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let budget = CommandBudget {
+            timeout: std::time::Duration::from_secs(300),
+            cancel: cancel.clone(),
+        };
+        let repo = GitRepo::clone_or_open_with_budget(&url, &clone_path, "main", budget).unwrap();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            cancel.cancel();
+        });
+
+        let started = std::time::Instant::now();
+        let error = repo.fetch().unwrap_err().to_string();
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert!(error.contains("cancelled"), "got: {error}");
+        assert!(wait_until_gone(descendant_pid(&pid_file)));
+    }
+
+    fn git_stdout(repo: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?} failed");
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    /// Delete one object from a bare repo: unpack every pack into loose
+    /// objects, then remove that object's file.
+    fn remove_object(repo: &Path, object: &str) {
+        let pack_dir = repo.join("objects/pack");
+        for entry in fs::read_dir(&pack_dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "pack")
+            {
+                let pack = fs::read(&path).unwrap();
+                for extension in ["pack", "idx", "rev"] {
+                    let _ = fs::remove_file(path.with_extension(extension));
+                }
+                let mut child = Command::new("git")
+                    .arg("unpack-objects")
+                    .current_dir(repo)
+                    .stdin(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                std::io::Write::write_all(child.stdin.as_mut().unwrap(), &pack).unwrap();
+                assert!(child.wait().unwrap().success());
+            }
+        }
+        let loose = repo.join("objects").join(&object[..2]).join(&object[2..]);
+        fs::remove_file(&loose).unwrap();
     }
 
     /// GIT4: a commit SHA or path beginning with `-` must not be able to

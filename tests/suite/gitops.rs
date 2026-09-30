@@ -368,6 +368,39 @@ async fn apply_changes_stops_and_reports_on_write_failure() {
     node.shutdown().await.ok();
 }
 
+/// B15: a write the state machine commits but *refuses* (here an app in an
+/// `rbtest-*` test-lease namespace, which only a leased write may create)
+/// is a failure, not an applied change. Before the fix `apply_changes`
+/// checked only the outer `Err`, so the refused write counted as applied
+/// and the runner advanced `last_applied_commit` past a commit that never
+/// reached desired state.
+#[tokio::test]
+async fn apply_changes_reports_a_refused_write_as_a_failure() {
+    use reliaburger::lettuce::diff::{ChangePayload, ResourceChange};
+    use reliaburger::lettuce::runner::apply_changes;
+
+    let council = single_node_leader().await;
+    assert!(council.is_leader().await, "node must be leader");
+
+    let spec = reliaburger::config::Config::parse("[app.web]\nimage = \"x:1\"\n")
+        .unwrap()
+        .app
+        .remove("web")
+        .unwrap();
+    let changes = vec![ResourceChange::Add {
+        resource_id: "app.rbtest-lease/web".to_string(),
+        spec: ChangePayload::App(Box::new(spec)),
+    }];
+
+    let result = apply_changes(&council, &changes).await;
+    assert!(
+        matches!(result, Err(ref id) if id == "app.rbtest-lease/web"),
+        "a refused write must be reported as unapplied: {result:?}"
+    );
+    assert!(council.desired_state().await.apps.is_empty());
+    council.shutdown().await.ok();
+}
+
 /// GIT2: a `prod/web` removed from git deletes `prod/web`, and a
 /// same-named `default/web` that git never mentioned is untouched. Before
 /// the fix the diff keyed on the bare name, so a `prod` deletion could
@@ -485,6 +518,207 @@ async fn a_failed_sync_is_recorded_in_sync_state() {
     );
 
     shutdown.cancel();
+    council.shutdown().await.ok();
+}
+
+/// B16: after a sync, manual changes (a different image, a deleted app)
+/// are repaired by the next poll even though Git hasn't moved. The old
+/// loop skipped every poll whose HEAD equalled the last applied commit,
+/// so drift stood until the next commit. An autoscale override is not
+/// drift and survives the same polls.
+#[tokio::test]
+async fn an_unchanged_commit_still_repairs_manual_drift() {
+    use reliaburger::config::Config;
+    use reliaburger::council::types::RaftRequest;
+
+    assert!(
+        which_git().is_some(),
+        "git is required for the GitOps suite"
+    );
+
+    let repo_dir = tempfile::tempdir().unwrap();
+    make_repo(
+        repo_dir.path(),
+        r#"
+        [app.web]
+        image = "web:v1"
+
+        [app.api]
+        image = "api:v1"
+
+        [app.worker]
+        image = "worker:v1"
+        replicas = 2
+    "#,
+    );
+
+    let council = single_node_leader().await;
+    let shutdown = CancellationToken::new();
+    let (_webhook_tx, webhook_rx) = mpsc::channel::<()>(4);
+    let data_dir = tempfile::tempdir().unwrap();
+    let config = repo_config(&repo_dir.path().to_string_lossy(), 1);
+    spawn_gitops_sync(
+        Arc::clone(&council),
+        config,
+        webhook_rx,
+        data_dir.path().to_path_buf(),
+        shutdown.clone(),
+    );
+
+    let web = AppId::new("web", "default");
+    let api = AppId::new("api", "default");
+    let worker = AppId::new("worker", "default");
+    let council_check = Arc::clone(&council);
+    let synced = wait_for(Duration::from_secs(15), || {
+        let c = Arc::clone(&council_check);
+        Box::pin(async move {
+            c.desired_state()
+                .await
+                .gitops_sync_state
+                .is_some_and(|s| s.last_applied_commit.is_some())
+        })
+    })
+    .await;
+    assert!(synced, "the initial sync never completed");
+    let applied_sha = council
+        .desired_state()
+        .await
+        .gitops_sync_state
+        .and_then(|s| s.last_applied_commit)
+        .map(|c| c.sha);
+
+    // Manual changes through the same Raft writes `relish apply`,
+    // `relish delete` and the autoscaler make.
+    let rogue = Config::parse("[app.web]\nimage = \"web:rogue\"\n")
+        .unwrap()
+        .app
+        .remove("web")
+        .unwrap();
+    council
+        .write(RaftRequest::AppSpec {
+            app_id: web.clone(),
+            spec: Box::new(rogue),
+        })
+        .await
+        .unwrap();
+    council
+        .write(RaftRequest::AppDelete {
+            app_id: api.clone(),
+        })
+        .await
+        .unwrap();
+    council
+        .write(RaftRequest::AutoscaleOverride {
+            app_id: worker.clone(),
+            replicas: 5,
+            reason: "load".to_string(),
+        })
+        .await
+        .unwrap();
+
+    let repaired = wait_for(Duration::from_secs(15), || {
+        let c = Arc::clone(&council_check);
+        let web = web.clone();
+        let api = api.clone();
+        Box::pin(async move {
+            let state = c.desired_state().await;
+            state
+                .apps
+                .get(&web)
+                .is_some_and(|spec| spec.image.as_deref() == Some("web:v1"))
+                && state.apps.contains_key(&api)
+        })
+    })
+    .await;
+    assert!(
+        repaired,
+        "polls with an unchanged commit must converge the cluster back to Git"
+    );
+
+    let state = council.desired_state().await;
+    assert_eq!(
+        state
+            .gitops_sync_state
+            .and_then(|s| s.last_applied_commit)
+            .map(|c| c.sha),
+        applied_sha,
+        "Git never moved, so the applied commit must not either"
+    );
+    assert!(
+        state
+            .autoscale_overrides
+            .iter()
+            .any(|(key, replicas)| key == &worker.to_string() && *replicas == 5),
+        "an autoscale override is not drift and must survive: {:?}",
+        state.autoscale_overrides
+    );
+
+    shutdown.cancel();
+    council.shutdown().await.ok();
+}
+
+/// B19: shutdown during a stuck `git fetch` ends the sync loop promptly
+/// and kills the fetch, rather than waiting for the remote.
+#[tokio::test]
+async fn shutdown_during_a_stuck_fetch_stops_the_loop_promptly() {
+    assert!(
+        which_git().is_some(),
+        "git is required for the GitOps suite"
+    );
+
+    let repo_dir = tempfile::tempdir().unwrap();
+    make_repo(repo_dir.path(), "[app.web]\nimage = \"web:v1\"\n");
+    let url = repo_dir.path().to_string_lossy().to_string();
+
+    // Pre-seed the loop's clone and make every fetch from it hang: the
+    // upload-pack records its pid and then sleeps. The trailing `#`
+    // comments out the repository path git appends.
+    let data_dir = tempfile::tempdir().unwrap();
+    let clone = data_dir.path().join("gitops-repo");
+    reliaburger::lettuce::git::GitRepo::clone_or_open(&url, &clone, "main").unwrap();
+    let pid_file = data_dir.path().join("upload-pack.pid");
+    let hang = format!("echo $$ > {}; exec sleep 300 #", pid_file.display());
+    git(&clone, &["config", "remote.origin.uploadpack", &hang]);
+
+    let council = single_node_leader().await;
+    let shutdown = CancellationToken::new();
+    let (_webhook_tx, webhook_rx) = mpsc::channel::<()>(4);
+    let handle = spawn_gitops_sync(
+        Arc::clone(&council),
+        repo_config(&url, 1),
+        webhook_rx,
+        data_dir.path().to_path_buf(),
+        shutdown.clone(),
+    );
+
+    let stuck = wait_for(Duration::from_secs(15), || {
+        let pid_file = pid_file.clone();
+        Box::pin(async move { pid_file.exists() })
+    })
+    .await;
+    assert!(stuck, "the sync never reached the hanging fetch");
+    let pid: i32 = std::fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+
+    shutdown.cancel();
+    let stopped = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    assert!(
+        stopped.is_ok(),
+        "the sync loop kept waiting on a stuck fetch after shutdown"
+    );
+    let ps = Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    let stat = String::from_utf8_lossy(&ps.stdout).trim().to_string();
+    assert!(
+        stat.is_empty() || stat.starts_with('Z'),
+        "the stuck upload-pack is still running ({stat})"
+    );
+
     council.shutdown().await.ok();
 }
 

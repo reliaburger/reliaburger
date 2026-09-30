@@ -388,17 +388,51 @@ There's a subtle detail with `tail`. If you ask for `?tail=10` and the app runs 
 
 ### Graceful degradation
 
-If a node is unreachable, the fan-out returns empty for that node. The response includes a `warnings` array listing which nodes didn't respond:
+If a node is unreachable, the fan-out returns empty for that node. The response includes a `warnings` array listing which nodes didn't answer, and why:
 
 ```json
 {
   "entries": [...],
   "node_count": 3,
-  "warnings": [{"NodeUnresponsive": {"node_id": "node-7"}}]
+  "warnings": [{"NodeFailed": {
+    "node_id": "node-7",
+    "reason": {"kind": "timed_out", "after_ms": 10000}
+  }}]
 }
 ```
 
 You get partial results rather than a hard failure. The caller decides whether that's acceptable.
+
+The first version of this warning was `NodeUnresponsive { node_id }`, and it taught us something. A user reported `warning: node wolf4 did not respond` and nothing else (issue #241). Did wolf4 time out? Refuse the TLS handshake? Answer 403? The fan-out knew. Each per-node task already produced an error string, and the handler threw it away when it built the warning. "Did not respond" was also wrong half the time: a node that answers HTTP 500 responded just fine.
+
+So the reason is now a type, not a string:
+
+```rust
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum NodeFailureReason {
+    NotInMembership,
+    TimedOut { after_ms: u64 },
+    Transport { detail: String },
+    HttpStatus { status: u16, body: String },
+    BadBody { detail: String },
+    Internal { detail: String },
+}
+```
+
+Each kind points somewhere different. `NotInMembership` is a gossip question: the app is placed there, but there's no live address to ask. `TimedOut` is a slow or stuck node. `Transport` is the network or the certificates. `HttpStatus` and `BadBody` are the node's own API. `#[serde(tag = "kind")]` makes serde write the variant name *inside* the object (`{"kind": "timed_out", ...}`) rather than wrapping it (`{"TimedOut": {...}}`), which reads better in JSON and is what most non-Rust clients expect. `rename_all = "snake_case"` turns `TimedOut` into `timed_out`.
+
+Two details make the reasons worth reading. First, reqwest's top-level error says "error sending request for url (...)"; the useful part ("connection refused", "invalid peer certificate: UnknownIssuer") sits further down the `source()` chain, so `error_chain` walks it and joins every level. Second, a non-2xx answer keeps the first 200 characters of its body, because the body is usually where the node says *why* it refused.
+
+`LogQueryWarning` implements `Display`, the trait behind `{}` in format strings (Go's `String()` method, Python's `__str__`). Both consumers use it, so `relish logs` and `relish wtf` can't drift apart:
+
+```text
+warning: no logs from node wolf4: timed out after 10s
+warning: no logs from node wolf4: request failed (connect or TLS): ...: invalid peer certificate: UnknownIssuer
+warning: no logs from node wolf4: answered HTTP 500: {"error":"..."}
+```
+
+The warning is part of the API response between `relish` and bun, not something nodes exchange with each other (they swap plain `Vec<LogEntry>`), so the protocol generation didn't need a bump. The tests give each kind its own expected sentence, and the fan-out tests check that a refused connection, a 500, a bad body and a stalled body each land in the right variant.
 
 ### Testing cross-node queries
 
@@ -538,16 +572,82 @@ We split rendering into two layers:
 
 uPlot is a 10KB JavaScript library that renders time-series charts on a canvas element. It handles millions of data points at 60fps — massively overkill for our use case, but that means it'll never be the bottleneck.
 
-The server doesn't know about uPlot. It renders a `<div>` with a JSON `data-chart-config` attribute:
+The server doesn't know about uPlot. It renders a `<div>` with a JSON `data-chart-config` attribute: the endpoint to poll, a title, a unit, and how often and how far back to fetch.
+
+A small custom script (`brioche.js`) finds these elements on page load, creates uPlot instances, and periodically fetches data from the existing metrics API. The metrics endpoints already return JSON arrays of `{timestamp, value}` objects — no new backend work needed.
+
+### Units a human can read
+
+The first version put the raw numbers on the axis: `0.0003` next to the word "seconds", `10M` next to "bytes". On the dark panels the tick labels and legend were dark grey on navy, and the legend read `TIME: --` until you hovered over a point. You could read the charts. You just had to squint and do arithmetic.
+
+So each chart now carries a unit instead of an axis title. In Rust that's an enum, not a string:
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChartUnit {
+    Percent,
+    Bytes,
+    Seconds,
+    RequestsPerSecond,
+    Number,
+}
+```
+
+Every unit owns a *ladder*: bytes go B → KiB → MiB → GiB, seconds go ns → µs → ms → s. A value is shown in the largest step that doesn't exceed it, with three significant figures at most. So 1023 bytes is `1023 B` and 1024 is `1 KiB`; 999 µs stays `999 µs` and 0.001 s becomes `1 ms`. An axis picks one step for all its ticks, from the largest, so it reads `0.5 MiB, 1 MiB, 1.5 MiB` rather than mixing units.
+
+The ladders are constant arrays built with a `const fn`, a function the compiler can run at compile time (think of a C macro that type-checks):
+
+```rust
+const fn step(factor: f64, suffix: &'static str) -> UnitStep {
+    UnitStep { factor, suffix }
+}
+
+const SECONDS: [UnitStep; 4] = [
+    step(1e-9, " ns"),
+    step(1e-6, " µs"),
+    step(1e-3, " ms"),
+    step(1.0, " s"),
+];
+```
+
+`&'static str` is a string slice that lives for the whole program: string literals are baked into the binary, so the borrow checker knows they never go away. That's what lets `ChartUnit::steps()` hand out `&'static [UnitStep]` without anybody owning a copy.
+
+Now, the formatting has to happen in the browser, because uPlot picks tick positions as you resize. Brioche has no JavaScript test harness, and we didn't want Node in the portable test suite just for eight lines of arithmetic. So Rust owns the part that's easy to get wrong, the boundaries, and ships it to the browser. Instead of `#[derive(Serialize)]`, `ChartUnit` implements the trait by hand and serialises as its ladder:
+
+```rust
+impl Serialize for ChartUnit {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.steps().serialize(serializer)
+    }
+}
+```
+
+A derive would have written `"Seconds"`, and then `brioche.js` would need its own copy of every ladder. Writing the impl ourselves is the Rust way of saying "this type goes over the wire as something else". The config now looks like this:
 
 ```html
-<div data-chart-config='{"endpoint":"/v1/metrics/app/web/default?name=process_cpu_percent",
-                          "title":"CPU Usage","y_label":"%",
-                          "refresh_secs":10,"range_secs":3600}'>
+<div data-chart-config='{"endpoint":"/v1/metrics/app/web/default/chart?name=process_cpu_percent&kind=gauge",
+                          "title":"CPU Usage","unit":[{"factor":1.0,"suffix":"%"}],
+                          "refresh_secs":10,"range_secs":900}'>
 </div>
 ```
 
-A small custom script (`brioche.js`, about 100 lines) finds these elements on page load, creates uPlot instances, and periodically fetches data from the existing metrics API. The metrics endpoints already return JSON arrays of `{timestamp, value}` objects — no new backend work needed.
+`brioche.js` runs the same two rules as `ChartUnit::format` and `ChartUnit::format_axis` over whatever ladder it receives, and the unit tests in `src/brioche/units.rs` pin the boundaries: 1023/1024 B, 999 µs/1 ms, zero, and values far past the top step. The JavaScript mirror is the one piece the tests don't execute, which is why it stays small enough to read side by side with the Rust. For byte axes it also asks uPlot for tick spacings of 1, 2 and 5 times each step, so ticks land on whole mebibytes instead of every 2,000,000 bytes.
+
+The legend got two fixes. uPlot calls a series' `value` function with a null index when nobody is hovering; ours answers with the newest value (and `latest` for the time column) instead of `--`. And the dashboard's table styles were leaking into uPlot's legend, which is a table: uppercase, grey `th` cells. The legend now uses the theme's tokens.
+
+Those tokens live in `brioche.css`:
+
+```css
+:root {
+    --bg: #1a1a2e;
+    --panel: #16213e;
+    --fg: #e0e0e0;
+    --fg-muted: #b4bccb;
+    --chart-grid: #34416a;
+}
+```
+
+A canvas can't read CSS variables, so `brioche.js` reads them once with `getComputedStyle` and hands uPlot plain colours for the tick labels and gridlines. A test in `src/brioche/assets.rs` parses the embedded stylesheet, computes the WCAG contrast ratio of each text token against each background, and fails below 4.5:1 (AA for normal text). The muted grey now sits at about 8.3:1 on the chart panel (the old `#888` managed 4.5:1 by a whisker, and the legend was darker still). Gridlines aren't text, so they only have to show and stay fainter than the labels; the same test checks that too. Change a colour and the build tells you whether people can still read it.
 
 ### Vendored assets, no build pipeline
 
@@ -559,7 +659,7 @@ HTMX and uPlot ship as single minified JS files. We vendor them into `brioche/di
 struct BriocheAssets;
 ```
 
-At runtime, `GET /ui/static/htmx.min.js` serves the file from the binary's memory. No filesystem reads, no CDN dependency, no separate install step. Total JS payload: ~50KB (HTMX) + ~50KB (uPlot) + ~3KB (custom) — about 103KB uncompressed. For comparison, Grafana loads 2-5MB of JavaScript.
+At runtime, `GET /ui/static/htmx.min.js` serves the file from the binary's memory. No filesystem reads, no CDN dependency, no separate install step. Total JS payload: ~50KB (HTMX) + ~50KB (uPlot) + ~10KB (custom) — about 110KB uncompressed. For comparison, Grafana loads 2-5MB of JavaScript.
 
 ### App detail page
 
@@ -605,11 +705,73 @@ The flow is a single exchange. The operator visits the dashboard, gets redirecte
 Set-Cookie: rb_session=<256-bit hex>; HttpOnly; SameSite=Strict; Path=/
 ```
 
-The session id is opaque — it is not the token, just a random handle into an in-memory `SessionStore` with a 12-hour TTL. `HttpOnly` keeps page JavaScript from reading it; `SameSite=Strict` keeps it off cross-site requests. From then on the `hx-get` fragments, the metrics fetches and the `EventSource` all carry the cookie without a line of JavaScript changing, because the browser sends it for us.
+The session id is opaque — it is not the token, just a random handle into an in-memory `SessionStore` that lives for 12 hours at most. `HttpOnly` keeps page JavaScript from reading it; `SameSite=Strict` keeps it off cross-site requests. From then on the `hx-get` fragments, the metrics fetches and the `EventSource` all carry the cookie without a line of JavaScript changing, because the browser sends it for us.
 
 There is one deliberate asymmetry worth calling out. A session is **always read-only**, even if the token you logged in with is an Admin token. The dashboard only ever reads, so a session never needs write permission — and withholding it contains the blast radius of a forged request. If someone tricks your browser into POSTing to `/v1/apply` while your cookie rides along, the worst they achieve is a `403`. The test that pins this logs in with an Admin token and asserts that an apply through the cookie is still forbidden. Authentication and authorisation are different questions; a cookie answers the first, not the second.
 
 The middleware change is small: after the bearer check, if there's no token, look for the session cookie and, if it names a live session, attach a read-only context. If neither is present, a browser navigation (one that says `Accept: text/html`) gets a `303` to the login page instead of a bare `401` — because a human staring at a JSON error is a worse experience than a form. Public routes stay public: health, version, JWKS, the static assets, and the login page itself.
+
+#### A session is only as good as its token
+
+The first version of the session store had a fixed 12-hour TTL and no memory of which token created it, beyond a name kept for display. So revoking a token did nothing to the browser sessions it had already bought. Neither did the token expiring: log in five minutes before your token lapses and you kept reading for another twelve hours. Same PR #258 review, finding B11. The middleware even loaded the token store a few lines above the session check; it just never looked.
+
+A token's name isn't good enough to link them, because names get reused. Revoke `ci`, mint a new `ci`, and a name check would happily revive every session the old one created. We already had a better handle. `AuthContext::principal_id` for a stored token is `token:` plus the SHA-256 of its Argon2 hash, which names that exact credential. A reissue under the same name has a new hash and so a new principal id. The session records it:
+
+```rust
+pub struct SessionIdentity {
+    pub token_name: String,
+    pub principal_id: String,
+    pub scope: TokenScope,
+}
+```
+
+`SessionStore::create` now takes the identity plus the token's `expires_at`, an `Option<SystemTime>`, and caps the lifetime at whichever comes first:
+
+```rust
+let lifetime = credential_expires_at
+    .map(|at| at.duration_since(now).unwrap_or(Duration::ZERO))
+    .map_or(SESSION_TTL, |left| left.min(SESSION_TTL));
+```
+
+`Option::map` transforms the value inside a `Some` and leaves `None` alone, and `map_or` then supplies a default for `None`. `duration_since` returns a `Result` because the other instant might be later (the clock isn't monotonic), and `unwrap_or(Duration::ZERO)` turns "already expired" into a zero lifetime rather than a panic. The login handler hands the lifetime back to the browser as the cookie's `Max-Age`, so the cookie and the session die together.
+
+Capping the TTL covers expiry, not revocation, so the middleware checks every session request against the token store it has already snapshotted:
+
+```rust
+fn session_credential_is_live(
+    identity: &SessionIdentity,
+    tokens: &[ApiToken],
+    service_token_configured: bool,
+) -> bool {
+    if identity.principal_id == SYSTEM_PRINCIPAL {
+        return service_token_configured;
+    }
+    let now = std::time::SystemTime::now();
+    find_token_by_principal(&identity.principal_id, tokens)
+        .is_some_and(|token| token.expires_at.is_none_or(|at| now < at))
+}
+```
+
+`is_some_and` and `is_none_or` are the `Option` versions of "exists and satisfies" and "absent or satisfies"; a token with no expiry passes. A session that fails the check is removed from the store and the request carries on as unauthenticated, which means a browser gets redirected to the login page. The internal service token isn't in the store at all (it's derived from the master key), so a session made from it holds for as long as the node has a service token.
+
+Hashing every stored token's hash on every cookie request sounds wasteful, but SHA-256 over a few dozen bytes takes microseconds, and the store holds tens of tokens, not millions. If that ever changes, a map from principal id to token is a small refactor. The tests log in, then revoke the token, expire it in place, or replace it with a same-name reissue, and each time the cookie that worked a moment earlier gets a `401`.
+
+#### The login form is a public Argon2 endpoint
+
+Public routes stay public, and one of them does something expensive. `POST /ui/session` has to check the pasted token against the store, which means Argon2. In Chapter 10 we bounded that work for bearers: a string check turns away anything that isn't `rbrg_` plus 64 hex characters, and a process-wide semaphore (`VERIFY_PERMITS`) admits at most four hashes at a time. The login handler didn't use any of it. It had its own copy of the verification, a `spawn_blocking` straight into `authenticate`, with no shape check and no permit.
+
+You can't demand a credential from someone who's trying to log in, so anyone who could reach a node could post junk tokens as fast as they liked. Each one ran Argon2 against every stored token, about 19 MiB apiece, on a blocking pool that grows to 512 threads. That's roughly 10 GB and every core pinned, from an unauthenticated form. A static review of the release (PR #258) caught it.
+
+The fix is one call. `authenticate_off_lock` became `pub(crate)` (visible anywhere in our crate, invisible outside it) and the login handler uses it instead of rolling its own:
+
+```rust
+let tokens = auth.tokens.read().await.clone();
+crate::sesame::auth::authenticate_off_lock(&form.token, tokens)
+    .await
+    .ok()
+```
+
+Two tests pin both halves. With every permit held (a test-only `hold_all_verify_permits` calls `acquire_many` on the semaphore), a login of `nope` still comes back `401` inside the timeout, so it never went near Argon2. A well-shaped login under the same conditions is still pending after 200 ms, and finishes with a redirect once we drop the permits. A bound only works if every path to the expensive thing goes through it. Two copies of the same check is one too many.
 
 ### Node detail page
 

@@ -11,7 +11,11 @@ use reliaburger::relish::OutputFormat;
 use reliaburger::relish::commands;
 
 #[derive(Parser)]
-#[command(name = "relish", version, about = "Reliaburger CLI")]
+#[command(
+    name = "relish",
+    version = reliaburger::upgrade::version::VERSION_LINE.as_str(),
+    about = "Reliaburger CLI"
+)]
 struct Cli {
     /// Output format: human, json, or yaml.
     #[arg(long, default_value = "human", global = true)]
@@ -156,7 +160,7 @@ enum Command {
         #[arg(trailing_var_arg = true)]
         command: Vec<String>,
     },
-    /// Show detailed info about an app, node, or job.
+    /// Show every instance of an app across the cluster, with its node.
     Inspect {
         /// Resource name.
         name: String,
@@ -338,9 +342,11 @@ enum Command {
     Build {
         /// Path to a TOML config file with [build.*] sections.
         path: PathBuf,
-        /// Pickle registry port for context upload and image push.
-        #[arg(long, default_value_t = 5050)]
-        registry_port: u16,
+        /// Upload the context to the Pickle registry on this port of this
+        /// host. Default: the managed context's registry forward (15050 on
+        /// a quickstart), else 5050.
+        #[arg(long)]
+        registry_port: Option<u16>,
         /// Give up waiting after this many seconds (the server-side
         /// build timeout is 900s; the margin covers queueing).
         #[arg(long, default_value_t = 960)]
@@ -929,6 +935,10 @@ enum SnapshotAction {
         /// Namespace (default: "default").
         #[arg(short = 'n', long, default_value = "default")]
         namespace: String,
+        /// Volume to restore (container mount path, e.g. /data);
+        /// required when several volumes share the snapshot name.
+        #[arg(long)]
+        volume: Option<String>,
     },
     /// Delete a snapshot.
     Delete {
@@ -939,6 +949,10 @@ enum SnapshotAction {
         /// Namespace (default: "default").
         #[arg(short = 'n', long, default_value = "default")]
         namespace: String,
+        /// Volume whose snapshot to delete (container mount path);
+        /// required when several volumes share the snapshot name.
+        #[arg(long)]
+        volume: Option<String>,
     },
 }
 
@@ -1364,12 +1378,14 @@ async fn main() -> ExitCode {
                 app,
                 name,
                 namespace,
-            } => commands::snapshot_restore(app, namespace, name).await,
+                volume,
+            } => commands::snapshot_restore(app, namespace, name, volume.as_deref()).await,
             SnapshotAction::Delete {
                 app,
                 name,
                 namespace,
-            } => commands::snapshot_delete(app, namespace, name).await,
+                volume,
+            } => commands::snapshot_delete(app, namespace, name, volume.as_deref()).await,
         },
         Command::Fault { ref action } => match action {
             FaultAction::Delay {
@@ -3251,7 +3267,14 @@ mod tests {
     fn parse_build_command() {
         let cli = parse(&["relish", "build", "build.toml"]).unwrap();
         match cli.command {
-            Command::Build { timeout, .. } => assert_eq!(timeout, 960),
+            Command::Build {
+                timeout,
+                registry_port,
+                ..
+            } => {
+                assert_eq!(timeout, 960);
+                assert_eq!(registry_port, None);
+            }
             _ => panic!("expected Build"),
         }
     }
@@ -3296,13 +3319,32 @@ mod tests {
                         app,
                         name,
                         namespace,
+                        volume,
                     },
             } => {
                 assert_eq!(app, "db");
                 assert_eq!(name, "1752000000");
                 assert_eq!(namespace, "default");
+                assert_eq!(volume, None);
             }
             _ => panic!("expected a snapshot restore command"),
+        }
+
+        let cli = parse(&[
+            "relish",
+            "snapshot",
+            "delete",
+            "db",
+            "1752000000",
+            "--volume",
+            "/wal",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Snapshot {
+                action: SnapshotAction::Delete { volume, .. },
+            } => assert_eq!(volume.as_deref(), Some("/wal")),
+            _ => panic!("expected a snapshot delete command"),
         }
     }
 

@@ -10,7 +10,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use super::*;
-use crate::grill::capture::CaptureReader;
+use crate::grill::capture::{CAPTURE_CHUNK_BYTES, CaptureReader, read_capture_chunk};
 use crate::grill::command::{
     ClaimedCommandExecutor, CommandOutput, CommandState, RuntimeCommandExecutor,
 };
@@ -878,6 +878,7 @@ impl RuncGrill {
         &self,
         instance: &InstanceId,
         sender: tokio::sync::mpsc::Sender<CapturedLine>,
+        resume: &crate::ketchup::types::CaptureOffsets,
     ) {
         let source = self
             .owned_operation(instance, |_runtime, _id, context| async move {
@@ -892,22 +893,31 @@ impl RuncGrill {
             return;
         };
         let mut terminal = context.is_none();
-        let mut readers = [(LogStream::Stdout, "stdout"), (LogStream::Stderr, "stderr")].map(
-            |(stream, extension)| CaptureReader::new(stream, Some(stem.with_extension(extension))),
-        );
+        let mut readers = [
+            CaptureReader::resume(LogStream::Stdout, stem.with_extension("stdout"), resume).await,
+            CaptureReader::resume(LogStream::Stderr, stem.with_extension("stderr"), resume).await,
+        ];
         loop {
+            // A capture with no checkpoint replays from byte 0. Bounded
+            // chunks, each read behind an `.await`, keep that replay from
+            // holding a runtime worker (it once starved startup adoption).
+            let mut backlog = false;
             for reader in &mut readers {
                 let Some(file) = reader.file().map(std::path::Path::to_path_buf) else {
                     continue;
                 };
-                let Ok(bytes) = read_from_offset(&file, reader.read_offset()).await else {
+                let Ok(bytes) = read_capture_chunk(&file, reader.read_offset()).await else {
                     continue;
                 };
+                backlog |= bytes.len() == CAPTURE_CHUNK_BYTES;
                 for line in reader.push(&bytes) {
                     if sender.send(line).await.is_err() {
                         return;
                     }
                 }
+            }
+            if backlog {
+                continue;
             }
             if terminal || sender.is_closed() {
                 for reader in &mut readers {

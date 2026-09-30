@@ -67,6 +67,9 @@ pub struct NodeProbe {
     /// Whether the node has an external key to verify network upgrades
     /// with. A node that doesn't say can't: every 0.1.0 node reports it.
     pub accepts_network_upgrades: bool,
+    /// Versions in the node's binary store, when it reports them. A
+    /// cluster rollback is refused up front if a node lacks the target.
+    pub installed_versions: Option<Vec<BinaryVersion>>,
 }
 
 /// Effects the orchestrator performs on nodes. Mocked in unit tests; the
@@ -470,7 +473,8 @@ async fn poll_and_drive_group<C: NodeControl>(
     }
 }
 
-fn build_directive(state: &ClusterUpgradeState) -> UpgradeDirective {
+/// The directive every node gets for a cluster upgrade run.
+pub fn build_directive(state: &ClusterUpgradeState) -> UpgradeDirective {
     UpgradeDirective {
         upgrade_id: state.upgrade_id.clone(),
         target_version: state.target_version.clone(),
@@ -759,6 +763,12 @@ impl NodeControl for HttpNodeControl {
 
         let binary_sha256 = value["binary_sha256"].as_str().map(String::from);
         let accepts_network_upgrades = value["accepts_network_upgrades"].as_bool().unwrap_or(false);
+        let installed_versions = value["installed_versions"].as_array().map(|versions| {
+            versions
+                .iter()
+                .filter_map(|version| version.as_str()?.parse().ok())
+                .collect()
+        });
 
         Some(NodeProbe {
             version,
@@ -767,6 +777,7 @@ impl NodeControl for HttpNodeControl {
             failed_upgrade_ids,
             binary_sha256,
             accepts_network_upgrades,
+            installed_versions,
         })
     }
 
@@ -1033,6 +1044,7 @@ mod tests {
                     failed_upgrade_ids: Vec::new(),
                     binary_sha256: Some(fixture_sha256(version).to_string()),
                     accepts_network_upgrades: true,
+                    installed_versions: None,
                 },
             );
         }
@@ -1047,6 +1059,7 @@ mod tests {
                     failed_upgrade_ids: vec![failed_id.to_string()],
                     binary_sha256: Some(fixture_sha256(version).to_string()),
                     accepts_network_upgrades: true,
+                    installed_versions: None,
                 },
             );
         }
@@ -1776,6 +1789,21 @@ mod tests {
         }))
         .await;
         assert!(ready.accepts_network_upgrades);
+    }
+
+    #[tokio::test]
+    async fn a_probe_reads_the_binary_store_a_node_reports() {
+        let silent = probe_version_body(serde_json::json!({"version": "v0.1.1"})).await;
+        assert_eq!(silent.installed_versions, None);
+        let reporting = probe_version_body(serde_json::json!({
+            "version": "v0.1.1",
+            "installed_versions": ["v0.1.0", "v0.1.1"],
+        }))
+        .await;
+        assert_eq!(
+            reporting.installed_versions,
+            Some(vec![v("0.1.0"), v("0.1.1")])
+        );
     }
 
     fn paused(nodes: Vec<NodeUpgradeRecord>) -> ClusterUpgradeState {

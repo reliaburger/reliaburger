@@ -375,7 +375,7 @@ The cost: for a 100MB log file, the sparse index has about 25,000 entries (one p
 
 ## Hardening the metrics path
 
-The first cut of Mayo worked in the demo and passed its tests. A later review found five sharp edges that only bite in production, not in a thirty-second demo. They're worth walking through, because each one is a small change that fixes a whole class of failure.
+The first cut of Mayo worked in the demo and passed its tests. A later review found five sharp edges that only bite in production, not in a thirty-second demo, and a long soak found a sixth. They're worth walking through, because each one is a small change that fixes a whole class of failure.
 
 **SQL injection through a metric name.** The per-app query endpoint built its SQL by pasting the caller's `?name=` and the app's `namespace/app` straight into the string. Send `?name=x' OR '1'='1` and the injected quote closes the literal early, drops the tenant and time predicates, and hands back every app's metrics. The fix is the same one every database driver ships: escape the value. DataFusion follows standard SQL, so a `'` inside a literal is doubled:
 
@@ -400,7 +400,7 @@ if !self.seen_windows.insert(key) {
 
 **Rollups that vanished on restart.** The rollup store kept its flushed data in an in-memory `Vec<RecordBatch>` and named every Parquet file with a counter that reset to zero on start. So a restart both lost all history *and* overwrote `rollup_000000.parquet` with new data. We fixed both by making the rollup store read its history back from the Parquet directory (like the metrics store already did) and by seeding the flush counter one past the highest file on disk. Restart now recovers everything and appends rather than clobbering.
 
-**Per-app metrics that were never collected.** Production only collected node-level metrics (CPU, memory for the whole box). The autoscaler and the per-app dashboards had nothing to read. The collector already knew how to scrape a single process; it just wasn't being called. The collection loop now asks the agent for its running instances and collects per-process CPU and memory for each one, labelled `namespace/app`. (Even then the autoscaler kept asking for a series called `cpu` that nobody records. Chapter 9 tells that story.)
+**Per-app metrics that were never collected.** Production only collected node-level metrics (CPU, memory for the whole box). The autoscaler and the per-app dashboards had nothing to read. The collector already knew how to scrape a single process; it just wasn't being called. The collection loop now asks the agent for its running instances and collects per-process CPU and memory for each one, labelled `namespace/app`. (Even then the autoscaler kept asking for a series called `cpu` that nobody records. Chapter 9 tells that story. The per-process memory series is what memory autoscaling reads; Chapter 9 also shows it driving a real scale-up on runc.)
 
 **A flush that froze every query.** The flush wrote Parquet while holding the store's write lock, and Arrow's writer is synchronous. So for the duration of the write, every query waited. Worse, blocking I/O on an async task stalls the whole tokio runtime. We split the flush in two: drain the buffer under a brief lock, then write outside it, on the blocking pool:
 
@@ -413,7 +413,17 @@ if let Some(p) = pending {
 
 While the write is in flight, queries hold a read lock and proceed. And a corrupt or truncated Parquet file (a flush killed mid-write) no longer poisons the directory: we read each file on its own and skip the bad one with a log, so one botched flush doesn't fail every unrelated read.
 
-The theme across all five: the happy path was fine, and the failure paths — an attacker, a reassignment, a restart, a dead app, a crash mid-flush — were where the bugs lived. That's usually where they live.
+**Reads that grew with uptime.** After 0.1.0 a long soak showed Bun's memory climbing for hours without ever tripping the leak check. Nothing leaked. A test binary with its own counting allocator (a `#[global_allocator]` that forwards to `System` and adds up the bytes, so it counts the heap we ask for rather than what the allocator keeps mapped) showed each alert evaluation and rollup giving back every byte it took. What grew was the *peak*: about 1.5 MiB more per hour of history, because a query for the last two minutes still loaded every Parquet file in the directory before filtering. With seven days of retention that's a week of growth. A read with a lower bound now skips any file whose newest sample, read from the footer statistics, is older than the bound:
+
+```rust
+if since.is_some_and(|since| file_max_timestamp(&path).is_some_and(|max| max < since)) {
+    continue;
+}
+```
+
+A file with no usable statistics is still read: skipping it would silently drop data. Streaming the queries that have no lower bound is later work, but the reads that run on a timer are flat now.
+
+The theme across all of these: the happy path was fine, and the failure paths — an attacker, a reassignment, a restart, a dead app, a crash mid-flush — were where the bugs lived. That's usually where they live.
 
 ## Hardening the log path
 
@@ -580,22 +590,23 @@ positions after it. `follow_logs` now sends a `CapturedLine` carrying the
 stream and that position, which also means stderr is finally labelled as
 stderr instead of everything being called stdout.
 
-The runc runtime reads stdout and stderr through one reader each:
+The runc runtime reads stdout and stderr through one reader each, and opens
+each where the store's checkpoint left off (more on that below):
 
 ```rust
 let mut readers = [
-    (LogStream::Stdout, "stdout"),
-    (LogStream::Stderr, "stderr"),
-]
-.map(|(stream, extension)| {
-    CaptureReader::new(stream, Some(stem.with_extension(extension)))
-});
+    CaptureReader::resume(LogStream::Stdout, stem.with_extension("stdout"), resume).await,
+    CaptureReader::resume(LogStream::Stderr, stem.with_extension("stderr"), resume).await,
+];
 ```
 
-That's `map` on a fixed-size array, `[T; N]`, not on an iterator. It returns
-another array of the same length, `[CaptureReader; 2]`, with no `Vec` and no
-heap allocation. Go has fixed arrays too but no way to map over one; in
-Python you'd get a list back.
+That's a fixed-size array, `[CaptureReader; 2]`, built in place with no
+`Vec` and no heap allocation. Our first version built it with `.map` over
+an array of `(stream, extension)` pairs, which read nicely. Then opening a
+reader had to ask the filesystem how long the file is, and a closure passed
+to `map` can't `.await`. Rust has no async `map` on arrays (the closure
+would return a future, and you'd get an array of unstarted futures back), so
+we wrote the two elements out.
 
 The store then does the bookkeeping. It keeps the highest offset it has
 ingested per capture file and refuses anything at or below it:
@@ -623,8 +634,8 @@ and skips everything older.
 
 Keying on the file path works because each runc generation writes its own
 capture files, and the process runtime only ever appends. A restarted
-instance is a new file and starts from its first line; an adopted one resumes
-where the store left off. The Apple runtime is the exception: `container
+instance is a new file and starts from its first line; an adopted one picks
+up where the store left off. The Apple runtime is the exception: `container
 logs --follow` hands us lines with no offsets, so an adopted Apple container
 is still ingested again after a restart. It's a laptop runtime and the
 comment in `apple.rs` says so.
@@ -651,6 +662,52 @@ identity code uses: a uniquely named temp file, `fsync`, rename over the old
 checkpoint, `fsync` the directory. `flush_replaces_the_checkpoint_atomically`
 checks that two flushes leave exactly one complete checkpoint and no temp
 files behind.
+
+### Resume, don't replay
+
+The checkpoint stopped duplicates. It didn't stop the work. After every Bun
+restart each forwarder still opened its capture files at byte 0 and read
+the lot, and the store threw away every line at or below its offset. On
+the soak's log spammer that was a million lines read, split and discarded,
+per restart, per instance. Issue #308 wanted the obvious thing: start at
+the offset.
+
+So the offsets travel the other way now. The binary opens the log store
+before the agent adopts anything, takes a copy of its offsets, and hands
+it to the agent next to the log channel:
+
+```rust
+let capture_offsets = log_store.read().await.capture_offsets();
+agent.set_log_sink(log_tx, capture_offsets);
+```
+
+`follow_logs` gained a `resume: &CaptureOffsets` argument, and
+`CaptureReader::resume` starts the reader's byte count at the file's
+offset instead of zero. The agent keeps the copy in an `Arc` (a
+reference-counted pointer: cloning it bumps a counter rather than copying
+the map), so a hundred adopted instances share one map.
+
+An offset is only a promise about one particular file, though. Two things
+break it. Truncate the file and the offset points past the end, or into the
+middle of a line that isn't the one we counted. Rotate it (rename the old
+one away and start a new one under the same name) and the new file may well
+grow past the offset before Bun comes back, so length alone can't tell.
+The checkpoint now records each capture file's device and inode when it's
+saved, and `IngestCheckpoint::load` keeps an offset only while the path is
+still the same file and at least that long. Anything else is read from
+byte 0, and because the store dropped its offset too, every line in it is
+stored. The reader checks the length once more when it opens, which
+catches a truncation between the store loading and the forwarder
+starting. Recording the inode changed the checkpoint's format, so the
+durable state generation moved from 44 to 45.
+
+Two tests pin it. `a_restarted_forwarder_reads_only_the_lines_past_the_checkpoint`
+in `grill/process.rs` ingests three lines, flushes, appends two more and
+opens a fresh store and forwarder: the forwarder must *read* exactly the two
+new lines, not merely store two, and after truncating the file it must read
+the one line that's left. `a_rotated_capture_file_is_read_again_from_the_start`
+renames the capture file away and writes a longer one in its place, which is
+the case a length check alone gets wrong.
 
 ### Ask everyone, not just the current home
 
@@ -703,6 +760,159 @@ The alternative, recording
 every node an app ever ran on, is state the cluster would have to keep
 forever for the sake of a log query. `tail_after_an_app_moves_back_includes_the_nodes_it_ran_on_meanwhile`
 reproduces the soak with two stores and fails against the old node choice.
+
+### Two runs, one name
+
+The final soak tier found the next one, and it was the same shape again. The
+tail read `INCR 11630`, `INCR 11632`, `INCR 11631`, `INCR 11633`: one swap,
+no label, so it looked like a single client counting backwards. The status
+snapshots either side of it had the client on node 2 and then on node 3. A
+rollback walk had just restarted every node's Bun, and the scheduler moved
+the client in the middle of it. Same instance name, `default__soak-redis-client-0`,
+on both nodes.
+
+The labelling we added for rolling deploys keys on the instance name, so two
+runs of one name printed bare. And the merge put them in order by `sequence`,
+which is ingest time in nanoseconds *on the node that stored the line*. Each
+node's sequence rises strictly, so node 2's lines are in order and so are
+node 3's. Between the two, the order is only as good as two VMs' clocks plus
+up to 200 ms of capture polling each. The old run's last `INCR` and the new
+run's first one were well inside that. Nothing went backwards. Two processes
+wrote, and we sorted them by two clocks.
+
+Could we sort them properly? Not with timestamps. The capture file holds raw
+bytes with no emission time, and even an emission time would come from two
+different clocks. There is no single order between two processes on two
+machines to recover, only the counter itself. So the fix is to stop hiding
+that there were two. The cross-node merge now names the node on every entry:
+
+```rust
+let entry = LogEntry {
+    node: Some(source.node_id.clone()),
+    ..entry
+};
+```
+
+`..entry` is the struct update syntax from Chapter 1. Here it *moves* the
+other fields out of `entry`, strings and all, with no copying; that's fine
+because the loop owns `entry` and never touches it again. The field itself is `#[serde(default,
+skip_serializing_if = "Option::is_none")]`, so a node answering for itself
+sends exactly what it sent before, and the node-to-node format doesn't move.
+
+`relish logs` then labels by *run*, an `(instance, node)` pair, and adds the
+node only where the name alone is ambiguous: `[default__soak-redis-client-0@rb-2]`.
+Two replicas on two nodes keep their short `[instance]` labels. The soak
+checker now judges order within each labelled run, and "the view ends below
+what we saw before" against the newest line of any run.
+`one_instance_on_two_nodes_names_each_line_s_node` and
+`merged_entries_name_the_node_that_stored_them` fail without the change.
+
+### Eleven minutes of splitting lines
+
+Re-reading every capture file from byte 0 after a restart looked free: the
+store skips what it already holds. Then a release candidate's soak SIGKILLed
+the leader's Bun, systemd started a new one two seconds later, and it
+printed nothing for eleven minutes. At 21:00:25 it gave up with `cannot
+restore workload ownership: runtime adoption timed out for
+default__hello-0` and exited. systemd's summary line had the real clue:
+`Consumed 11min 24.238s CPU time` in 11 minutes 17 seconds of wall time.
+Something had kept a CPU busy the whole time while adoption waited.
+
+Adoption itself was innocent. As it adopts each instance, Bun spawns the
+log forwarder that follows its capture file from the start. One of the
+soak's workloads is a log spammer, 200 lines a second, and after 80 minutes
+its capture held about a million lines. The forwarder read the whole file
+into one buffer and handed it to `CaptureReader::push`, which did this:
+
+```rust
+while let Some(newline) = self.partial.iter().position(|byte| *byte == b'\n') {
+    let raw: Vec<u8> = self.partial.drain(..=newline).collect();
+    // ...
+}
+```
+
+`Vec::drain(..=newline)` removes the front of the vector, and a `Vec` keeps
+its elements contiguous, so every call shifts all the bytes behind it
+forward. One line costs the size of the rest of the buffer; a million lines
+cost a million times half of 56 MB. It's the same trap as `list.pop(0)` in
+a Python loop, and like the Python version it's invisible on the small
+inputs every unit test uses.
+
+That's the slow part. What made it fatal is where it ran. Tokio runs tasks
+on a small pool of worker threads, one per CPU by default, and a task only
+gives its thread back at an `.await`. `push` is an ordinary synchronous
+function, so for as long as it ran, its worker ran nothing else. The soak
+VMs have two vCPUs, so two workers. Tokio can steal queued work from a busy
+worker, but not all of it: the task a worker has just woken waits in a slot
+only that worker polls. The journals can't tell us exactly which task was
+stuck where, only that adoption's work and its 10 s deadline (a timer needs
+a free worker to notice it) got nowhere until the splitting was done. By
+then the deadline was eleven minutes old. The numbers fit: the unit test
+below, a 4 MiB backlog, stalls for 5.5 s with the old code, and the cost
+grows with bytes times lines, which puts the spammer's capture at around
+ten minutes.
+
+Why did earlier candidates survive the same fault? Scheduling and log
+volume. Two seconds after this failure, systemd's next Bun adopted all nine
+instances with the same files on disk, because this time the scheduling fell
+the other way. The bug arrived with the offsets change a few days earlier,
+and it needs a capture this big on the node being killed.
+
+The fix has two halves. `push` now walks the buffer once, remembering where
+the current line starts, and drains the finished lines in one go at the end:
+
+```rust
+let mut search_from = self.partial.len();
+self.partial.extend_from_slice(bytes);
+let mut line_start = 0;
+while let Some(found) = self.partial[search_from..]
+    .iter()
+    .position(|byte| *byte == b'\n')
+{
+    let newline = search_from + found;
+    // ... hand back `self.partial[line_start..newline]` ...
+    line_start = newline + 1;
+    search_from = line_start;
+}
+self.partial.drain(..line_start);
+```
+
+`self.partial[search_from..]` is a slice, a borrowed view into the vector
+with no copy, like a Go slice expression. Starting the search at the old
+length is safe because bytes already waiting are, by definition, the part
+of a line with no newline yet.
+
+The second half matters more: no forwarder reads a whole file any more.
+`read_capture_chunk` returns at most `CAPTURE_CHUNK_BYTES` (64 KiB) from a
+given offset, and both the runc and process runtimes loop on it, skipping
+their 200 ms poll interval while chunks come back full. Every chunk is a
+`tokio::fs` read, which is an `.await`, so between chunks the worker is free
+for everyone else. A hundred-megabyte backlog still takes a while to
+replay; it just can't take the node with it. (Since "Resume, don't
+replay" above, a restart only replays a capture the store has no usable
+offset for, so the backlog is usually the few seconds Bun was down.) The process runtime had a
+quieter version of the same problem: it called `std::fs::read` on the whole
+file every 200 ms, blocking I/O on a runtime thread, for as long as the
+workload lived.
+
+The tests measure the thing the soak felt. `replaying_a_large_capture_backlog_does_not_hold_the_runtime`
+writes a 4 MiB backlog, follows it on a single-threaded runtime, and times a
+1 ms sleep in a loop while the lines arrive; the old code held the runtime
+for 5.5 s in one go, the new one for a few milliseconds at most. The runc version,
+`following_a_large_capture_after_a_restart_does_not_hold_the_runtime`, has a
+real container print 200,000 lines and follows it from a fresh runtime
+handle, as a restarted Bun would. `a_backlog_of_short_lines_splits_in_linear_time`
+pins `push` itself.
+
+Should one stuck instance be able to stop a node at all? Adoption is
+fail-closed by design: an instance Bun can't prove it owns stops startup,
+because the alternative is a reconciler that doesn't see it and starts a
+second copy under the same name, port and address. Bounding each adoption
+and quarantining the stuck one is possible, but the quarantined instance
+would have to keep its name, port, lease and discovery address fenced, stay
+out of both "running" and "gone" in reports, and be retried. That's a
+design change with its own tests, and we've written it down for after
+0.1.0 rather than slip it in behind this fix.
 
 ## When nothing looks like success
 

@@ -7,6 +7,7 @@ use std::net::SocketAddr;
 /// 429 when rate-limited, 502 for no healthy backends, 503 if the
 /// connection limit is reached.
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::body::Body;
 use axum::extract::{ConnectInfo, State};
@@ -29,6 +30,10 @@ pub struct ProxyState {
     /// released only when the splice ends, not at the 101 (ING2).
     pub connection_limit: Arc<Semaphore>,
     pub client: reqwest::Client,
+    /// A client that never pools, for the one retry after a pooled
+    /// connection turned out to be closed. It always dials a fresh socket, so
+    /// the retry can't land on another stale connection from the same pool.
+    pub fresh_client: reqwest::Client,
     /// Per-route, per-client-IP token buckets, sharded to avoid a single
     /// global lock (ING5: keyed on the route, not the IP alone).
     pub rate_limiter: ShardedRateLimiter,
@@ -50,6 +55,12 @@ pub struct ProxyState {
 /// out across an entire unhealthy pool, and only ever advances on a pure
 /// connection failure (never on a 5xx, which may have had side effects).
 const MAX_UPSTREAM_ATTEMPTS: usize = 3;
+
+/// How long an idle upstream connection may sit in the pool before Wrapper
+/// closes it. Kept under the keep-alive timeouts backends commonly use
+/// (nginx 60 s, Go's `net/http` 90 s, and reqwest's own 90 s default), so
+/// Wrapper usually retires an idle connection before the backend does.
+const UPSTREAM_POOL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(50);
 
 /// Marks that the current request arrived over the HTTPS listener.
 ///
@@ -179,6 +190,12 @@ pub async fn bind_proxy_with_tls(
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .pool_max_idle_per_host(32)
+        .pool_idle_timeout(UPSTREAM_POOL_IDLE_TIMEOUT)
+        .build()
+        .map_err(|e| WrapperError::ProxyFailed(format!("failed to build http client: {e}")))?;
+    let fresh_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .pool_max_idle_per_host(0)
         .build()
         .map_err(|e| WrapperError::ProxyFailed(format!("failed to build http client: {e}")))?;
 
@@ -186,6 +203,7 @@ pub async fn bind_proxy_with_tls(
         routing_table,
         connection_limit: Arc::new(Semaphore::new(config.max_connections)),
         client,
+        fresh_client,
         rate_limiter: ShardedRateLimiter::new(),
         max_request_body_bytes: config.max_request_body_bytes,
         drains,
@@ -605,11 +623,27 @@ async fn do_proxy(
             || is_forwarded_header(n)
             || n.eq_ignore_ascii_case("x-real-ip")
             || n.eq_ignore_ascii_case("x-request-id")
+            || name == axum::http::header::CONTENT_LENGTH
         {
             continue;
         }
         forward_headers.push((name.clone(), value.clone()));
     }
+    let upstream = UpstreamRequest {
+        method: &parts.method,
+        forward_headers: &forward_headers,
+        remote,
+        over_tls,
+        request_id: &request_id,
+        body: &body_bytes,
+        // The buffered body is the truth about its length, whatever framing
+        // the client used.
+        content_length: (!body_bytes.is_empty()
+            || parts
+                .headers
+                .contains_key(axum::http::header::CONTENT_LENGTH))
+        .then_some(body_bytes.len()),
+    };
 
     // Try the primary, then failover candidates — but only re-send on a *pure
     // connection failure*. A backend that answered (even with a 5xx) may have
@@ -621,28 +655,28 @@ async fn do_proxy(
             None => continue,
         };
 
-        let mut upstream_req = state
-            .client
-            .request(parts.method.clone(), upstream_uri.to_string());
-        for (name, value) in &forward_headers {
-            upstream_req = upstream_req.header(name, value);
-        }
-        // The proxy's own view of the connection (ING5), plus X-Real-IP and the
-        // request id. A client cannot influence these — we stripped any it sent.
-        for (name, value) in forwarded_headers(remote, over_tls) {
-            upstream_req = upstream_req.header(name, value);
-        }
-        upstream_req = upstream_req.header("x-real-ip", remote.ip().to_string());
-        upstream_req = upstream_req.header("x-request-id", request_id.as_str());
-        if !body_bytes.is_empty() {
-            upstream_req = upstream_req.body(body_bytes.clone());
-        }
-
-        let sent = tokio::select! {
+        let (upstream_req, body_sent) = upstream.build(&state.client, &upstream_uri);
+        let mut sent = tokio::select! {
             biased;
             _ = super::draining::wait_for_termination(&terminate) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
             result = upstream_req.send() => result,
         };
+        // A pooled keep-alive connection the backend had already closed fails
+        // before any response arrives. Send it once more on a fresh
+        // connection, but only when the backend can't have acted on it: the
+        // method is idempotent, or the body never left the proxy (#322).
+        if let Err(e) = &sent
+            && is_closed_connection(e)
+            && (parts.method.is_idempotent()
+                || (!body_bytes.is_empty() && !body_sent.load(Ordering::SeqCst)))
+        {
+            let (retry_req, _) = upstream.build(&state.fresh_client, &upstream_uri);
+            sent = tokio::select! {
+                biased;
+                _ = super::draining::wait_for_termination(&terminate) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                result = retry_req.send() => result,
+            };
+        }
         match sent {
             Ok(resp) => {
                 let status =
@@ -700,6 +734,89 @@ async fn do_proxy(
     drop(drain_guard);
     drop(permit);
     StatusCode::BAD_GATEWAY.into_response()
+}
+
+/// Everything needed to send one client request upstream, so each attempt
+/// (failover or retry) builds an identical copy.
+struct UpstreamRequest<'a> {
+    method: &'a axum::http::Method,
+    forward_headers: &'a [(axum::http::HeaderName, axum::http::HeaderValue)],
+    remote: SocketAddr,
+    over_tls: bool,
+    request_id: &'a str,
+    body: &'a axum::body::Bytes,
+    /// `Content-Length` to send, if any. Set from the buffered body.
+    content_length: Option<usize>,
+}
+
+impl UpstreamRequest<'_> {
+    /// Build one attempt against `uri`. The returned flag turns true once
+    /// the HTTP client starts reading the body, which is the proxy's only
+    /// evidence of whether the body may have reached the backend.
+    fn build(
+        &self,
+        client: &reqwest::Client,
+        uri: &Uri,
+    ) -> (reqwest::RequestBuilder, Arc<AtomicBool>) {
+        let mut request = client.request(self.method.clone(), uri.to_string());
+        for (name, value) in self.forward_headers {
+            request = request.header(name, value);
+        }
+        // The proxy's own view of the connection (ING5), plus X-Real-IP and
+        // the request id. A client cannot influence these: we stripped any
+        // it sent.
+        for (name, value) in forwarded_headers(self.remote, self.over_tls) {
+            request = request.header(name, value);
+        }
+        request = request.header("x-real-ip", self.remote.ip().to_string());
+        request = request.header("x-request-id", self.request_id);
+        if let Some(length) = self.content_length {
+            request = request.header(axum::http::header::CONTENT_LENGTH, length);
+        }
+        let body_sent = Arc::new(AtomicBool::new(false));
+        if !self.body.is_empty() {
+            let body = self.body.clone();
+            let flag = Arc::clone(&body_sent);
+            // `stream::once` runs the async block on the first poll, so the
+            // flag records the moment the client begins writing the body.
+            let stream = futures_util::stream::once(async move {
+                flag.store(true, Ordering::SeqCst);
+                Ok::<_, std::io::Error>(body)
+            });
+            request = request.body(reqwest::Body::wrap_stream(stream));
+        }
+        (request, body_sent)
+    }
+}
+
+/// Whether an upstream error means the connection closed before the backend
+/// sent a response head: EOF or a reset on a socket the pool handed out.
+/// Connect failures and timeouts are handled elsewhere and don't count.
+fn is_closed_connection(error: &reqwest::Error) -> bool {
+    if error.is_connect() || error.is_timeout() {
+        return false;
+    }
+    let mut source = std::error::Error::source(error);
+    while let Some(cause) = source {
+        if let Some(hyper_error) = cause.downcast_ref::<hyper::Error>()
+            && hyper_error.is_incomplete_message()
+        {
+            return true;
+        }
+        if let Some(io_error) = cause.downcast_ref::<std::io::Error>()
+            && matches!(
+                io_error.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::UnexpectedEof
+            )
+        {
+            return true;
+        }
+        source = cause.source();
+    }
+    false
 }
 
 /// Wrap a byte stream so it owns the connection permit and drain guard.
@@ -928,14 +1045,28 @@ mod tests {
         use crate::onion::types::BackendInstance;
         use std::net::Ipv4Addr;
 
+        // Each backend answers one request per connection and says so. It
+        // reads the request head before answering, so closing never resets a
+        // request still in flight, and `Connection: close` stops the proxy
+        // pooling a socket the backend is about to drop. Without it the proxy
+        // could reuse that socket for the next request before it noticed the
+        // close, and the request came back as a 502 (#285).
         async fn answering(body: &'static str) -> u16 {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let port = listener.local_addr().unwrap().port();
             tokio::spawn(async move {
-                use tokio::io::AsyncWriteExt;
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 while let Ok((mut sock, _)) = listener.accept().await {
+                    let mut head = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => head.extend_from_slice(&buf[..n]),
+                        }
+                    }
                     let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
                         body.len()
                     );
                     let _ = sock.write_all(response.as_bytes()).await;
@@ -2426,6 +2557,177 @@ mod tests {
             "drain never completed after the request finished"
         );
 
+        shutdown.cancel();
+    }
+
+    /// A backend that answers the first request on each connection with
+    /// keep-alive, then drops the connection as soon as the next request
+    /// arrives on it. That's the race a real backend with a shorter idle
+    /// timeout than ours loses: it gives up on the socket just as the proxy
+    /// reuses it. Returns the port and a log of the request lines it read.
+    async fn backend_that_drops_reused_connections() -> (u16, Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn read_head(sock: &mut tokio::net::TcpStream) -> Option<String> {
+            let mut head = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => return None,
+                    Ok(n) => head.extend_from_slice(&buf[..n]),
+                }
+            }
+            let head = String::from_utf8_lossy(&head).to_string();
+            head.lines().next().map(str::to_string)
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let log = Arc::clone(&log);
+                tokio::spawn(async move {
+                    let Some(line) = read_head(&mut sock).await else {
+                        return;
+                    };
+                    log.lock().unwrap().push(line);
+                    let _ = sock
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                        .await;
+                    // The connection is now idle in the proxy's pool. The
+                    // next request on it is read and then dropped unanswered.
+                    if let Some(line) = read_head(&mut sock).await {
+                        log.lock().unwrap().push(line);
+                    }
+                });
+            }
+        });
+        (port, seen)
+    }
+
+    /// Serve one route, `web.test`, backed by a single backend on `port`.
+    async fn proxy_for_one_backend(port: u16) -> (String, CancellationToken) {
+        use crate::onion::types::BackendInstance;
+
+        let mut service_map = crate::onion::service_map::ServiceMap::new();
+        service_map
+            .register_app("web", "default", 80, None)
+            .unwrap();
+        service_map
+            .add_backend(
+                &crate::onion::service_id::ServiceId::new("default", "web"),
+                BackendInstance {
+                    instance_id: "default__web-0".to_string(),
+                    node_ip: std::net::Ipv4Addr::LOCALHOST,
+                    host_port: port,
+                    healthy: true,
+                    local: false,
+                },
+            )
+            .unwrap();
+        let mut ingress = std::collections::HashMap::new();
+        ingress.insert(
+            ("default".to_string(), "web".to_string()),
+            crate::config::app::IngressSpec {
+                host: "web.test".to_string(),
+                path: None,
+                tls: None,
+                websocket: None,
+                rate_limit_rps: None,
+                rate_limit_burst: None,
+            },
+        );
+        let mut table = RoutingTable::new();
+        table.rebuild(&service_map, &ingress).unwrap();
+        let shutdown = CancellationToken::new();
+        let bound = bind_proxy(
+            WrapperConfig {
+                http_port: 0,
+                https_port: 0,
+                ..WrapperConfig::default()
+            },
+            Arc::new(RwLock::new(table)),
+            shutdown.clone(),
+        )
+        .await
+        .unwrap();
+        let url = format!("http://127.0.0.1:{}/", bound.http_addr.port());
+        tokio::spawn(async move {
+            bound.serve().await.ok();
+        });
+        (url, shutdown)
+    }
+
+    /// #322: a backend that closes a pooled keep-alive connection just as the
+    /// proxy reuses it has not answered, and a GET is safe to send again. The
+    /// proxy retries once on a fresh connection instead of answering 502.
+    #[tokio::test]
+    async fn idempotent_request_on_a_closed_pooled_connection_is_retried() {
+        let (port, seen) = backend_that_drops_reused_connections().await;
+        let (url, shutdown) = proxy_for_one_backend(port).await;
+        let client = reqwest::Client::new();
+
+        for attempt in 0..3 {
+            let response = client
+                .get(format!("{url}item/{attempt}"))
+                .header("host", "web.test")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "request {attempt} on a closed pooled connection was not retried"
+            );
+            assert_eq!(response.text().await.unwrap(), "ok");
+        }
+        // A later request reached the backend twice: once on the dropped
+        // pooled connection, once on the fresh one.
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(
+            seen.iter().filter(|l| l.contains("/item/1 ")).count(),
+            2,
+            "{seen:?}"
+        );
+        shutdown.cancel();
+    }
+
+    /// #322: a POST whose body the proxy already sent may have been acted on,
+    /// so a closed pooled connection is not a licence to send it again. The
+    /// client gets 502 and the backend saw the POST exactly once.
+    #[tokio::test]
+    async fn streamed_post_on_a_closed_pooled_connection_is_not_replayed() {
+        let (port, seen) = backend_that_drops_reused_connections().await;
+        let (url, shutdown) = proxy_for_one_backend(port).await;
+        let client = reqwest::Client::new();
+
+        let warm = client
+            .get(format!("{url}warm"))
+            .header("host", "web.test")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(warm.status(), StatusCode::OK);
+        assert_eq!(warm.text().await.unwrap(), "ok");
+
+        let response = client
+            .post(format!("{url}orders"))
+            .header("host", "web.test")
+            .body("charge the card")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(
+            seen.iter()
+                .filter(|l| l.starts_with("POST /orders"))
+                .count(),
+            1,
+            "the POST was replayed: {seen:?}"
+        );
         shutdown.cancel();
     }
 }

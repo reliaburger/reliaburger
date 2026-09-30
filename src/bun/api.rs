@@ -66,10 +66,135 @@ pub struct NodeMembershipInfo {
 /// node's cluster transports and leaves its management API open: gossip calls
 /// it dead while it can still answer. The node relay and node-fault reversal
 /// reach it through this table, so a caller outside the cluster network can
-/// still inspect it and heal it. `bun` attaches it as a layer; without it the
-/// relay reaches live members only.
-#[derive(Clone)]
-pub struct KnownMembers(pub Arc<RwLock<Vec<NodeMembershipInfo>>>);
+/// still inspect it and heal it, and the nodes listing reports it as dead
+/// rather than dropping it. `bun` attaches it as a layer; without it the relay
+/// reaches live members only.
+///
+/// Remembering is bounded. A member that left on purpose, or whose identity
+/// the operator retired, is forgotten at once: nothing on it needs healing.
+/// A member unheard of for [`KNOWN_MEMBER_RETENTION`] is forgotten too.
+#[derive(Clone, Default)]
+pub struct KnownMembers(Arc<RwLock<Vec<KnownMember>>>);
+
+/// How long a down member's last address outlives the last time gossip heard
+/// from it.
+///
+/// A dead node's address is kept so a fault injected into it can be cleared.
+/// Injection needs a live target, and every fault expires within
+/// [`crate::smoker::types::MAX_FAULT_DURATION_NS`] (24 hours) of injection. So
+/// a node silent for longer holds no fault anyone could still clear, and its
+/// entry only feeds a stale row to `relish nodes`. A day also spans an
+/// overnight outage, so a node that died at 18:00 is still listed as dead the
+/// next morning.
+pub const KNOWN_MEMBER_RETENTION: std::time::Duration =
+    std::time::Duration::from_nanos(crate::smoker::types::MAX_FAULT_DURATION_NS);
+
+/// One member as gossip's roster reports it, with its API address resolved.
+#[derive(Debug, Clone)]
+pub struct RosterMember {
+    /// The member's identity and API endpoint.
+    pub info: NodeMembershipInfo,
+    /// The member's gossip endpoint.
+    pub gossip_address: std::net::SocketAddr,
+    /// The member's SWIM state as this node last saw it.
+    pub state: crate::mustard::state::NodeState,
+    /// The member's SWIM incarnation.
+    pub incarnation: u64,
+    /// The member's placement labels.
+    pub labels: std::collections::BTreeMap<String, String>,
+}
+
+/// A remembered member and when gossip last called it alive or suspect.
+#[derive(Debug, Clone)]
+struct KnownMember {
+    member: RosterMember,
+    last_heard: std::time::Instant,
+}
+
+impl KnownMembers {
+    /// Take gossip's latest roster, remembering members it has reaped.
+    ///
+    /// Gossip reaps a dead member a minute after declaring it dead, while a
+    /// node-kill fault on it may still need clearing. So a member missing from
+    /// `roster` keeps its last address, as dead, rather than vanishing; a
+    /// fresh entry for the same node replaces it. A remembered node that
+    /// really has gone just fails to connect, which is the honest answer for
+    /// a reversal aimed at it.
+    ///
+    /// Members gossip reports as Left, and those named in `retired`, are
+    /// dropped, as is any down member not heard from since
+    /// [`KNOWN_MEMBER_RETENTION`] before `now`.
+    pub async fn refresh(
+        &self,
+        roster: Vec<RosterMember>,
+        retired: &std::collections::BTreeSet<String>,
+        now: std::time::Instant,
+    ) {
+        use crate::mustard::state::NodeState;
+        let mut table = self.0.write().await;
+        let previous: Vec<KnownMember> = table.drain(..).collect();
+        let heard_before = |node_id: &crate::meat::NodeId| {
+            previous
+                .iter()
+                .find(|known| &known.member.info.node_id == node_id)
+                .map(|known| known.last_heard)
+        };
+        let mut next = Vec::new();
+        for member in &roster {
+            if member.state == NodeState::Left || retired.contains(&member.info.node_id.0) {
+                continue;
+            }
+            let last_heard = if member.state.is_down() {
+                heard_before(&member.info.node_id).unwrap_or(now)
+            } else {
+                now
+            };
+            next.push(KnownMember {
+                member: member.clone(),
+                last_heard,
+            });
+        }
+        for known in &previous {
+            let node_id = &known.member.info.node_id;
+            if roster.iter().any(|member| &member.info.node_id == node_id)
+                || retired.contains(&node_id.0)
+            {
+                continue;
+            }
+            // Gossip reaps only down members, and a Left one was forgotten
+            // the moment the roster showed it, so a reaped member was dead.
+            let mut known = known.clone();
+            known.member.state = NodeState::Dead;
+            next.push(known);
+        }
+        next.retain(|known| {
+            !known.member.state.is_down()
+                || now.saturating_duration_since(known.last_heard) <= KNOWN_MEMBER_RETENTION
+        });
+        *table = next;
+    }
+
+    /// The last API address of a member, live or down.
+    pub async fn api_address(&self, node_id: &crate::meat::NodeId) -> Option<std::net::SocketAddr> {
+        self.0
+            .read()
+            .await
+            .iter()
+            .find(|known| &known.member.info.node_id == node_id)
+            .map(|known| known.member.info.address)
+    }
+
+    /// Remembered members that are down: dead to gossip, or reaped by it.
+    pub async fn down(&self) -> Vec<RosterMember> {
+        self.0
+            .read()
+            .await
+            .iter()
+            .filter(|known| known.member.state.is_down())
+            .map(|known| known.member.clone())
+            .collect()
+    }
+}
 
 /// The gossip control-plane directory, which names the leader and its API
 /// endpoint to every node, including workers outside Raft that have no
@@ -79,26 +204,6 @@ pub struct KnownMembers(pub Arc<RwLock<Vec<NodeMembershipInfo>>>);
 pub struct LeaderDirectory(
     pub tokio::sync::watch::Receiver<crate::mustard::directory::NodeDirectory>,
 );
-
-impl KnownMembers {
-    /// Take gossip's latest published members, remembering the rest.
-    ///
-    /// Gossip's published view drops a member the moment it is declared dead,
-    /// which is exactly when a node-kill fault on it needs clearing. So a
-    /// member missing from `current` keeps its last address rather than
-    /// vanishing; a fresh entry for the same node replaces it. A remembered
-    /// node that really has gone just fails to connect, which is the honest
-    /// answer for a reversal aimed at it.
-    pub async fn refresh(&self, current: Vec<NodeMembershipInfo>) {
-        let mut table = self.0.write().await;
-        let remembered: Vec<_> = table
-            .drain(..)
-            .filter(|old| !current.iter().any(|member| member.node_id == old.node_id))
-            .collect();
-        *table = current;
-        table.extend(remembered);
-    }
-}
 
 /// Shared state for API handlers.
 #[derive(Clone)]
@@ -542,6 +647,10 @@ pub fn router_with_upgrade(
         .route(
             "/v1/build/track",
             post(super::build_runner::build_track_handler),
+        )
+        .route(
+            "/v1/build/sign",
+            post(super::build_runner::build_sign_handler),
         )
         .route(
             "/v1/build/{id}",
@@ -1395,6 +1504,12 @@ async fn test_lease_get_handler(
         if let Err(response) = crate::sesame::auth::require_unscoped(Some(auth)) {
             return response;
         }
+        if let Err(response) =
+            enforce_cluster_permission(&state, Some(auth), crate::config::PermissionAction::Admin)
+                .await
+        {
+            return response;
+        }
     }
     Json(lease).into_response()
 }
@@ -1505,6 +1620,12 @@ async fn test_lease_release_handler(
         Some(auth.principal_id.as_str())
     } else if auth.role == crate::sesame::types::ApiRole::Admin {
         if let Err(response) = crate::sesame::auth::require_unscoped(Some(auth)) {
+            return response;
+        }
+        if let Err(response) =
+            enforce_cluster_permission(&state, Some(auth), crate::config::PermissionAction::Admin)
+                .await
+        {
             return response;
         }
         None
@@ -1762,6 +1883,9 @@ async fn version_handler(State(state): State<ApiState>) -> impl IntoResponse {
             // start gate and the orchestrator compare this digest with the
             // candidate's so a same-version build can't pass as a swap.
             "binary_sha256": manager.running_binary_sha256().await,
+            // The commit the running bytes were built from, so two builds
+            // with the same version are told apart at a glance.
+            "commit": crate::upgrade::version::build_commit(),
             "compatibility": crate::compatibility::CURRENT,
             "upgrade_in_flight": manager.upgrade_in_flight(),
             // Ids this node attempted and reverted — the orchestrator
@@ -1771,9 +1895,13 @@ async fn version_handler(State(state): State<ApiState>) -> impl IntoResponse {
             // reports false, rather than recording a run the node will
             // refuse and leaving it paused.
             "accepts_network_upgrades": manager.accepts_network_upgrades(),
+            // What a rollback could return to. The leader refuses a
+            // cluster rollback up front when a node lacks the target.
+            "installed_versions": manager.installed_versions().await,
         })),
         None => Json(serde_json::json!({
             "version": crate::upgrade::version::compiled_version().to_string(),
+            "commit": crate::upgrade::version::build_commit(),
             "compatibility": crate::compatibility::CURRENT,
             "upgrade_in_flight": false,
             "failed_upgrade_ids": [],
@@ -1787,13 +1915,19 @@ async fn version_handler(State(state): State<ApiState>) -> impl IntoResponse {
 /// on every node and every tenant, so an Admin token scoped to some apps or
 /// namespaces is refused (403) like on the other cluster-wide routes. The
 /// service token (the orchestrator directing nodes) passes.
+///
+/// A principal with a `[permission]` spec also needs `admin` granted across
+/// the whole cluster (B18), so a spec can take cluster administration away
+/// from an Admin token without revoking it.
 // `Response` is large but it IS the HTTP reply to send on failure.
 #[allow(clippy::result_large_err)]
-fn authorize_cluster_admin(
+async fn authorize_cluster_admin(
+    state: &ApiState,
     auth: Option<&crate::sesame::auth::AuthContext>,
 ) -> Result<(), Response> {
     crate::sesame::auth::authorize(auth, crate::sesame::types::ApiRole::Admin)?;
-    crate::sesame::auth::require_unscoped(auth)
+    crate::sesame::auth::require_unscoped(auth)?;
+    enforce_cluster_permission(state, auth, crate::config::PermissionAction::Admin).await
 }
 
 /// Apply a node-level upgrade directive (admin). Responds 202 once the
@@ -1803,7 +1937,7 @@ async fn upgrade_apply_handler(
     State(state): State<ApiState>,
     body: String,
 ) -> Response {
-    if let Err(resp) = authorize_cluster_admin(auth.as_deref()) {
+    if let Err(resp) = authorize_cluster_admin(&state, auth.as_deref()).await {
         return resp;
     }
     let directive: crate::upgrade::types::UpgradeDirective = match serde_json::from_str(&body) {
@@ -1886,7 +2020,7 @@ async fn upgrade_rollback_handler(
     State(state): State<ApiState>,
     body: String,
 ) -> Response {
-    if let Err(resp) = authorize_cluster_admin(auth.as_deref()) {
+    if let Err(resp) = authorize_cluster_admin(&state, auth.as_deref()).await {
         return resp;
     }
     #[derive(serde::Deserialize, Default)]
@@ -2091,7 +2225,7 @@ async fn upgrade_start_handler(
     headers: HeaderMap,
     body: String,
 ) -> Response {
-    if let Err(resp) = authorize_cluster_admin(auth.as_deref()) {
+    if let Err(resp) = authorize_cluster_admin(&state, auth.as_deref()).await {
         return resp;
     }
     #[derive(serde::Deserialize)]
@@ -2254,6 +2388,13 @@ async fn upgrade_start_handler(
         allow_downgrade: request.allow_downgrade,
         nodes: derived_nodes,
     };
+    // Check the directive every node will get here, before anything is
+    // recorded: a candidate with other formats would otherwise pause the
+    // run on the first node it reached.
+    let directive = crate::upgrade::orchestrator::build_directive(&upgrade);
+    if let Err(resp) = check_candidate_on_leader(&state, &directive).await {
+        return resp;
+    }
 
     match council
         .write(crate::council::types::RaftRequest::UpgradeUpdate {
@@ -2278,9 +2419,6 @@ async fn upgrade_start_handler(
 
 /// Ask every planned node what it runs and whether it can verify a
 /// network upgrade, for the start-time gates.
-///
-/// Probes run concurrently, each bounded. An unreachable node is left out:
-/// the orchestrator re-checks every node as the walk reaches it.
 async fn probe_running_binaries(
     state: &ApiState,
     nodes: &[crate::upgrade::types::NodeUpgradeRecord],
@@ -2288,6 +2426,33 @@ async fn probe_running_binaries(
     Vec<crate::upgrade::plan::RunningBinary>,
     Vec<crate::upgrade::plan::NetworkReadiness>,
 ) {
+    probe_planned_nodes(state, nodes)
+        .await
+        .into_iter()
+        .map(|(node, probe)| {
+            (
+                crate::upgrade::plan::RunningBinary {
+                    node: node.clone(),
+                    version: probe.version,
+                    sha256: probe.binary_sha256,
+                },
+                crate::upgrade::plan::NetworkReadiness {
+                    node,
+                    accepts_network_upgrades: probe.accepts_network_upgrades,
+                },
+            )
+        })
+        .unzip()
+}
+
+/// Probe every planned node, named as an error names it (`node n1`).
+///
+/// Probes run concurrently, each bounded. An unreachable node is left out:
+/// the orchestrator re-checks every node as the walk reaches it.
+async fn probe_planned_nodes(
+    state: &ApiState,
+    nodes: &[crate::upgrade::types::NodeUpgradeRecord],
+) -> Vec<(String, crate::upgrade::orchestrator::NodeProbe)> {
     use crate::upgrade::orchestrator::NodeControl as _;
 
     let control = crate::upgrade::orchestrator::HttpNodeControl::with_http(
@@ -2304,25 +2469,63 @@ async fn probe_running_binaries(
             .await
             .ok()
             .flatten()?;
-            let node = format!("node {}", record.node_id);
-            Some((
-                crate::upgrade::plan::RunningBinary {
-                    node: node.clone(),
-                    version: probe.version,
-                    sha256: probe.binary_sha256,
-                },
-                crate::upgrade::plan::NetworkReadiness {
-                    node,
-                    accepts_network_upgrades: probe.accepts_network_upgrades,
-                },
-            ))
+            Some((format!("node {}", record.node_id), probe))
         }
     });
     futures_util::future::join_all(probes)
         .await
         .into_iter()
         .flatten()
-        .unzip()
+        .collect()
+}
+
+/// How long the leader spends fetching, verifying and querying a
+/// candidate before recording a run. It stays under the time a follower
+/// waits for a forwarded start.
+const CANDIDATE_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Ask the candidate for its formats on the leader, the way every node
+/// will, so a release the cluster can't run is refused before it's
+/// recorded rather than paused on the first node (#339).
+///
+/// Only a definite answer refuses: other formats, a bad signature, a blob
+/// the registry doesn't hold. A registry that's down right now, or a check
+/// that runs out of time, proves nothing about the candidate, so the run is
+/// recorded and the nodes check it themselves, riding out the outage as
+/// they always have. A leader without an upgrade manager can't check
+/// either; the nodes still do.
+// `Response` is large but it IS the HTTP reply to send on failure.
+#[allow(clippy::result_large_err)]
+async fn check_candidate_on_leader(
+    state: &ApiState,
+    directive: &crate::upgrade::types::UpgradeDirective,
+) -> Result<(), Response> {
+    let Some(manager) = &state.upgrade else {
+        return Ok(());
+    };
+    let unchecked = |reason: String| {
+        eprintln!(
+            "bun: could not check the candidate {} before recording the upgrade ({reason}); \
+             each node checks it when directed",
+            directive.target_version
+        );
+        Ok(())
+    };
+    match tokio::time::timeout(CANDIDATE_CHECK_TIMEOUT, manager.check_candidate(directive)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) if e.is_transient() => unchecked(e.to_string()),
+        Ok(Err(e)) => Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!("refusing to upgrade to {}: {e}", directive.target_version)
+            })),
+        )
+            .into_response()),
+        Err(_) => unchecked(format!(
+            "no answer within {}s",
+            CANDIDATE_CHECK_TIMEOUT.as_secs()
+        )),
+    }
 }
 
 /// The 409 for a start or rollback while another run is active. A paused
@@ -2472,7 +2675,7 @@ async fn upgrade_resume_handler(
     directory: Option<axum::Extension<LeaderDirectory>>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(resp) = authorize_cluster_admin(auth.as_deref()) {
+    if let Err(resp) = authorize_cluster_admin(&state, auth.as_deref()).await {
         return resp;
     }
     let Some(council) = &state.council else {
@@ -2541,7 +2744,7 @@ async fn upgrade_abort_handler(
     directory: Option<axum::Extension<LeaderDirectory>>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(resp) = authorize_cluster_admin(auth.as_deref()) {
+    if let Err(resp) = authorize_cluster_admin(&state, auth.as_deref()).await {
         return resp;
     }
     let Some(council) = &state.council else {
@@ -2600,7 +2803,7 @@ async fn upgrade_cluster_rollback_handler(
     headers: HeaderMap,
     body: String,
 ) -> Response {
-    if let Err(resp) = authorize_cluster_admin(auth.as_deref()) {
+    if let Err(resp) = authorize_cluster_admin(&state, auth.as_deref()).await {
         return resp;
     }
     #[derive(serde::Deserialize)]
@@ -2673,6 +2876,28 @@ async fn upgrade_cluster_rollback_handler(
         Err(e) => return plan_error_response(&e),
     };
 
+    // A rollback execs a binary each node already holds; nothing is
+    // downloaded. Ask every node what its store holds and refuse here,
+    // naming each node without the target, rather than record a run the
+    // first such node refuses (#339).
+    let stored: Vec<crate::upgrade::plan::StoredBinaries> =
+        probe_planned_nodes(&state, &derived_nodes)
+            .await
+            .into_iter()
+            .map(|(node, probe)| crate::upgrade::plan::StoredBinaries {
+                node,
+                running: probe.version,
+                installed: probe.installed_versions,
+            })
+            .collect();
+    if let Err(e) = crate::upgrade::plan::check_rollback_target(&request.target_version, &stored) {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response();
+    }
+
     let upgrade_id = format!(
         "rollback-{}-{}",
         request.target_version,
@@ -2728,7 +2953,7 @@ async fn cluster_elect_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
 ) -> Response {
-    if let Err(resp) = authorize_cluster_admin(auth.as_deref()) {
+    if let Err(resp) = authorize_cluster_admin(&state, auth.as_deref()).await {
         return resp;
     }
     let Some(council) = &state.council else {
@@ -2764,11 +2989,32 @@ async fn enforce_permission(
     app: &str,
     namespace: &str,
 ) -> Result<(), Response> {
-    let permissions = match &state.council {
+    let permissions = permission_map(state).await;
+    crate::sesame::auth::authorize_permission(auth, action, app, namespace, &permissions)
+}
+
+/// Enforce a principal's `[permission]` spec for a cluster-wide action: one
+/// that names no single app, so only a grant for every app in every
+/// namespace covers it. See [`crate::sesame::auth::authorize_cluster_permission`].
+#[allow(clippy::result_large_err)]
+async fn enforce_cluster_permission(
+    state: &ApiState,
+    auth: Option<&crate::sesame::auth::AuthContext>,
+    action: crate::config::PermissionAction,
+) -> Result<(), Response> {
+    let permissions = permission_map(state).await;
+    crate::sesame::auth::authorize_cluster_permission(auth, action, &permissions)
+}
+
+/// The replicated `[permission]` map, keyed by token name. Empty without a
+/// council (single-node mode, where permissions can't be configured).
+async fn permission_map(
+    state: &ApiState,
+) -> std::collections::BTreeMap<String, crate::config::PermissionSpec> {
+    match &state.council {
         Some(council) => council.desired_state().await.permissions,
         None => std::collections::BTreeMap::new(),
-    };
-    crate::sesame::auth::authorize_permission(auth, action, app, namespace, &permissions)
+    }
 }
 
 /// Deploy workloads, streaming progress via SSE.
@@ -2993,6 +3239,15 @@ async fn apply_handler(
         if let Err(response) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
             return response;
         }
+        if let Err(response) = enforce_cluster_permission(
+            &state,
+            auth.as_deref(),
+            crate::config::PermissionAction::Admin,
+        )
+        .await
+        {
+            return response;
+        }
     }
 
     let images = config
@@ -3012,10 +3267,7 @@ async fn apply_handler(
     // Check every workload before any Raft write or agent command. A job in
     // a mixed manifest must not bypass admission after its apps have committed.
     // Host execution includes both explicit binaries and inline scripts.
-    let permissions = match &state.council {
-        Some(council) => council.desired_state().await.permissions,
-        None => std::collections::BTreeMap::new(),
-    };
+    let permissions = permission_map(&state).await;
     let targets = config
         .app
         .iter()
@@ -3494,6 +3746,11 @@ async fn node_decommission_handler(
         return response;
     }
     if let Err(response) = crate::sesame::auth::require_unscoped(Some(auth)) {
+        return response;
+    }
+    if let Err(response) =
+        enforce_cluster_permission(&state, Some(auth), crate::config::PermissionAction::Admin).await
+    {
         return response;
     }
     if let Err(error) = request.validate() {
@@ -4225,8 +4482,19 @@ async fn top_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
 ) -> Response {
     let auth = auth.as_deref();
+    // CPU and memory are metrics, so a `[permission]` spec must grant
+    // `metrics` on a row's app for the caller to see it (B18).
+    let permissions = permission_map(&state).await;
     let visible = |row: &crate::bun::top::TopRow| {
-        crate::sesame::auth::authorize_scoped(auth, &row.instance.app_name, &row.instance.namespace)
+        let (app, namespace) = (&row.instance.app_name, &row.instance.namespace);
+        crate::sesame::auth::authorize_scoped(auth, app, namespace).is_ok()
+            && crate::sesame::auth::authorize_permission(
+                auth,
+                crate::config::PermissionAction::Metrics,
+                app,
+                namespace,
+                &permissions,
+            )
             .is_ok()
     };
     let mut rows = match local_top_rows(&state).await {
@@ -4316,7 +4584,7 @@ async fn local_top_rows(state: &ApiState) -> Result<Vec<crate::bun::top::TopRow>
             );
             // Missing samples leave the columns empty; they don't hide the
             // workloads themselves.
-            match mayo.read().await.query_sql(&sql).await {
+            match mayo.read().await.query_sql_since(&sql, since).await {
                 Ok(samples) => crate::bun::top::latest_usage(&samples),
                 Err(_) => std::collections::HashMap::new(),
             }
@@ -4665,6 +4933,17 @@ async fn logs_handler(
     if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
         return resp;
     }
+    if let Err(resp) = enforce_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Logs,
+        &app,
+        &namespace,
+    )
+    .await
+    {
+        return resp;
+    }
     let follow = query.follow.unwrap_or(false);
 
     if follow {
@@ -5004,6 +5283,17 @@ async fn ws_logs_handler(
     if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
         return resp;
     }
+    if let Err(resp) = enforce_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Logs,
+        &app,
+        &namespace,
+    )
+    .await
+    {
+        return resp;
+    }
     upgrade
         .on_upgrade(move |socket| ws_logs_session(socket, state.cmd_tx, app, namespace, query.tail))
         .into_response()
@@ -5054,6 +5344,17 @@ async fn logs_entries_handler(
     if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
         return resp;
     }
+    if let Err(resp) = enforce_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Logs,
+        &app,
+        &namespace,
+    )
+    .await
+    {
+        return resp;
+    }
     let Some(log_store) = &state.log_store else {
         return Json(Vec::<LogEntry>::new()).into_response();
     };
@@ -5093,6 +5394,17 @@ async fn logs_cross_node_handler(
     use crate::meat::types::AppId;
 
     if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
+        return resp;
+    }
+    if let Err(resp) = enforce_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Logs,
+        &app,
+        &namespace,
+    )
+    .await
+    {
         return resp;
     }
 
@@ -5137,7 +5449,7 @@ async fn logs_cross_node_handler(
         let mut warnings: Vec<LogQueryWarning> = targets
             .unreachable
             .into_iter()
-            .map(|node_id| LogQueryWarning::NodeUnresponsive { node_id })
+            .map(LogQueryWarning::from)
             .collect();
 
         let node_count = nodes.len() + warnings.len();
@@ -5155,13 +5467,10 @@ async fn logs_cross_node_handler(
         {
             Ok(result) => {
                 let mut entries = result.entries;
-                // Each node that failed the fan-out becomes a warning, so the
-                // caller sees "some replicas were down", not a silent empty.
-                for failure in result.failures {
-                    warnings.push(LogQueryWarning::NodeUnresponsive {
-                        node_id: failure.node_id,
-                    });
-                }
+                // Each node that failed the fan-out becomes a warning that
+                // keeps its cause, so the caller sees "wolf4 timed out after
+                // 10s", not a silent empty or a bare "did not respond" (#282).
+                warnings.extend(result.failures.into_iter().map(LogQueryWarning::from));
                 // Apply tail after merge (fan_out already merge-sorted)
                 if let Some(tail) = query.tail
                     && entries.len() > tail
@@ -5269,13 +5578,47 @@ async fn exec_handler(
     }
 }
 
-/// List cluster nodes.
-async fn nodes_handler(State(state): State<ApiState>) -> Response {
-    match ask_agent(&state.cmd_tx, |response| AgentCommand::Nodes { response }).await {
+/// List cluster nodes: gossip's live members, then the ones this node
+/// remembers as dead.
+///
+/// Gossip's live view drops a member the moment it is declared dead, and the
+/// scheduler, council and Pickle rely on that. A listing is for people,
+/// though, and a node that vanished is harder to act on than one marked
+/// dead, so down members come from [`KnownMembers`] instead.
+async fn nodes_handler(
+    State(state): State<ApiState>,
+    known: Option<axum::Extension<KnownMembers>>,
+) -> Response {
+    let down = match known {
+        Some(known) => known
+            .down()
+            .await
+            .into_iter()
+            .map(|member| crate::bun::agent::NodeStatus {
+                node_id: member.info.node_id.0.clone(),
+                address: member.gossip_address.to_string(),
+                api_address: member.info.api_advertised.then_some(member.info.address),
+                state: member.state.to_string(),
+                incarnation: member.incarnation,
+                is_council: false,
+                is_leader: false,
+                labels: member.labels,
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    match ask_agent(&state.cmd_tx, |response| AgentCommand::Nodes {
+        down,
+        response,
+    })
+    .await
+    {
         Ok(mut nodes) => {
             if let Some(membership) = &state.membership {
                 let members = membership.read().await;
-                for node in &mut nodes {
+                // A down row already carries its last advertised address,
+                // and the live table has none for it.
+                for node in nodes.iter_mut().filter(|n| n.api_address.is_none()) {
                     node.api_address = members
                         .iter()
                         .find(|member| member.node_id.0 == node.node_id && member.api_advertised)
@@ -5295,8 +5638,8 @@ const MAX_RELAY_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 /// A path probe runs for up to 25 seconds on the target; allow for the hop.
 const RELAY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// The per-node reads `relish wtf`, `relish path` and `relish test` make, and
-/// nothing else. The relay is a reachability aid, not a general proxy.
+/// The per-node reads `relish wtf`, `relish inspect`, `relish path` and
+/// `relish test` make, and nothing else. The relay is a reachability aid, not a general proxy.
 fn relay_allows(method: &axum::http::Method, path: &str) -> bool {
     const READS: &[&str] = &[
         "v1/health",
@@ -5310,6 +5653,7 @@ fn relay_allows(method: &axum::http::Method, path: &str) -> bool {
         "v1/cluster/council",
         "v1/cluster/nodes",
         "v1/capabilities",
+        "v1/version",
     ];
     match *method {
         // `relish test` compares each node's own deploy history.
@@ -5469,7 +5813,10 @@ async fn ui_session_handler(
 ) -> Response {
     // Accept the internal service token or any valid user token. The session
     // inherits the presented token's scope (C3), so a tenant-scoped token
-    // cannot widen to cluster-wide reads by exchanging itself for a cookie.
+    // cannot widen to cluster-wide reads by exchanging itself for a cookie. It
+    // also records which exact token it came from and that token's expiry
+    // (B11), so the auth middleware can end it when the token is revoked or
+    // lapses.
     let identity = if auth
         .service_token
         .as_deref()
@@ -5478,33 +5825,43 @@ async fn ui_session_handler(
         // The operator presented the real service token; the session is
         // unconfined (but still read-only), matching the service principal.
         Some((
-            crate::sesame::auth::SYSTEM_PRINCIPAL.to_string(),
-            crate::sesame::types::TokenScope::default(),
+            crate::sesame::session::SessionIdentity {
+                token_name: crate::sesame::auth::SYSTEM_PRINCIPAL.to_string(),
+                principal_id: crate::sesame::auth::SYSTEM_PRINCIPAL.to_string(),
+                scope: crate::sesame::types::TokenScope::default(),
+            },
+            None,
         ))
     } else {
-        // Snapshot the tokens under the lock, then run the Argon2id verify on
-        // the blocking pool (M7) so the deliberately-slow hashing doesn't stall
-        // the async runtime worker.
+        // Snapshot the tokens under the lock, then verify through the same
+        // bounded path as a bearer (B12): a malformed token is refused by a
+        // string check before any hashing, and a well-shaped one waits for a
+        // permit from the process-wide Argon2 semaphore. This route is
+        // unauthenticated, so calling Argon2 directly here would let anyone on
+        // the network pin every core and exhaust memory with junk logins.
         let tokens = auth.tokens.read().await.clone();
-        let candidate = form.token.clone();
-        tokio::task::spawn_blocking(move || {
-            crate::sesame::auth::authenticate(&candidate, &tokens)
-                .ok()
-                .map(|ctx| {
-                    (
-                        ctx.token_name,
-                        crate::sesame::types::TokenScope {
+        crate::sesame::auth::authenticate_off_lock(&form.token, tokens.clone())
+            .await
+            .ok()
+            .map(|ctx| {
+                let expires_at =
+                    crate::sesame::auth::find_token_by_principal(&ctx.principal_id, &tokens)
+                        .and_then(|token| token.expires_at);
+                (
+                    crate::sesame::session::SessionIdentity {
+                        token_name: ctx.token_name,
+                        principal_id: ctx.principal_id,
+                        scope: crate::sesame::types::TokenScope {
                             apps: ctx.scoped_apps,
                             namespaces: ctx.scoped_namespaces,
                         },
-                    )
-                })
-        })
-        .await
-        .unwrap_or(None)
+                    },
+                    expires_at,
+                )
+            })
     };
 
-    let Some((name, scope)) = identity else {
+    let Some((identity, expires_at)) = identity else {
         return (
             StatusCode::UNAUTHORIZED,
             axum::response::Html(crate::brioche::login::render_login(Some(
@@ -5514,10 +5871,14 @@ async fn ui_session_handler(
             .into_response();
     };
 
-    let id = auth.sessions.create(&name, scope).await;
+    let session = auth.sessions.create(identity, expires_at).await;
+    // The cookie lives no longer than the session, which lives no longer
+    // than the token.
     let cookie = format!(
-        "{}={id}; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200",
-        crate::sesame::session::SESSION_COOKIE
+        "{}={}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}",
+        crate::sesame::session::SESSION_COOKIE,
+        session.id,
+        session.lifetime.as_secs()
     );
     (
         [(axum::http::header::SET_COOKIE, cookie)],
@@ -5845,20 +6206,36 @@ struct SnapshotCreateBody {
 #[derive(serde::Deserialize)]
 struct SnapshotRestoreBody {
     name: String,
+    /// Container mount path; required when several volumes share the name.
+    volume: Option<String>,
 }
 
-/// Map snapshot failures to honest status codes: a running app is a
-/// conflict, missing things are 404, a non-btrfs volume is the
-/// client's setup problem, anything else is ours.
+#[derive(serde::Deserialize)]
+struct SnapshotDeleteQuery {
+    /// Container mount path; required when several volumes share the name.
+    volume: Option<String>,
+}
+
+/// Map snapshot failures to honest status codes: a running app, an
+/// ambiguous name or volumes another operation owns is a conflict, missing
+/// things are 404, a non-btrfs volume or an out-of-scope input is the
+/// client's problem, anything else is ours.
 fn snapshot_error_response(error: &crate::bun::BunError) -> Response {
     use crate::grill::snapshot::SnapshotError;
     let status = match error {
-        crate::bun::BunError::Snapshot(SnapshotError::AppRunning { .. }) => StatusCode::CONFLICT,
+        crate::bun::BunError::Snapshot(
+            SnapshotError::AppRunning { .. }
+            | SnapshotError::Ambiguous { .. }
+            | SnapshotError::Busy { .. }
+            | SnapshotError::RestoreInProgress { .. },
+        ) => StatusCode::CONFLICT,
         crate::bun::BunError::Snapshot(
             SnapshotError::NotFound { .. } | SnapshotError::NoVolumes { .. },
         ) => StatusCode::NOT_FOUND,
         crate::bun::BunError::Snapshot(
-            SnapshotError::UnsupportedFilesystem { .. } | SnapshotError::TestStorage,
+            SnapshotError::UnsupportedFilesystem { .. }
+            | SnapshotError::TestStorage
+            | SnapshotError::InvalidInput(_),
         ) => StatusCode::BAD_REQUEST,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
@@ -5938,6 +6315,7 @@ async fn snapshot_restore_handler(
         namespace,
         app_name: app,
         name: body.name,
+        volume: body.volume,
         response,
     })
     .await
@@ -5952,6 +6330,7 @@ async fn snapshot_delete_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
     Path((namespace, app, name)): Path<(String, String, String)>,
+    Query(query): Query<SnapshotDeleteQuery>,
 ) -> Response {
     if let Err(resp) =
         crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::Deployer)
@@ -5965,6 +6344,7 @@ async fn snapshot_delete_handler(
         namespace,
         app_name: app,
         name,
+        volume: query.volume,
         response,
     })
     .await
@@ -7014,12 +7394,8 @@ async fn known_node_api_url(
         return live;
     };
     let address = known
-        .0
-        .read()
-        .await
-        .iter()
-        .find(|member| member.node_id == crate::meat::NodeId::new(target_node))
-        .map(|member| member.address);
+        .api_address(&crate::meat::NodeId::new(target_node))
+        .await;
     match address {
         Some(address) => Ok(state.cluster_http.url(&address.to_string(), path)),
         None => live,
@@ -7049,7 +7425,7 @@ async fn send_node_request(
     request: reqwest::RequestBuilder,
     operation: &str,
 ) -> Response {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + NODE_REQUEST_TIMEOUT;
     let response = match tokio::time::timeout_at(deadline, request.send()).await {
         Ok(Ok(response)) => response,
         Ok(Err(error)) => {
@@ -7207,18 +7583,33 @@ async fn fault_clear_handler(
         )
             .into_response();
     }
-    match ask_agent(&state.cmd_tx, |response| AgentCommand::ClearFault {
+    // One budget covers the agent's answer and the release wait, so a node
+    // that forwarded this clear hears this node's own verdict, not its own
+    // deadline passing.
+    let deadline = tokio::time::Instant::now() + NODE_FAULT_CLEAR_BUDGET;
+    let cleared = ask_agent(&state.cmd_tx, |response| AgentCommand::ClearFault {
         fault_id: id,
         allow_workload_fault,
         allow_node_fault,
         allow_node_pressure,
         response,
-    })
-    .await
-    {
+    });
+    let Ok(cleared) = tokio::time::timeout_at(deadline, cleared).await else {
+        // A clear already queued still runs; asking again is idempotent.
+        return (
+            StatusCode::GATEWAY_TIMEOUT,
+            Json(serde_json::json!({
+                "error": format!(
+                    "the agent has not answered the clear of fault {id} yet; retry the clear"
+                )
+            })),
+        )
+            .into_response();
+    };
+    match cleared {
         Ok(Ok(clearance)) => {
             if let Some(sequence) = clearance.reservation
-                && !wait_for_node_fault_release(&state, sequence).await
+                && !wait_for_node_fault_release(&state, sequence, deadline).await
             {
                 return (
                     StatusCode::GATEWAY_TIMEOUT,
@@ -7258,23 +7649,32 @@ async fn fault_clear_handler(
     }
 }
 
-/// How long a clear waits for the council to release a node fault's
-/// reservation. It stays under the 5-second deadline a forwarding node gives
-/// the owning node, so a forwarded clear reports this node's own verdict.
-const NODE_FAULT_RELEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
+/// How long a node that forwards a node-level request waits for the owning
+/// node's answer.
+const NODE_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long a clear may spend on the owning node: the agent's answer plus the
+/// wait for the council to release a node fault's reservation. It stays a
+/// second under [`NODE_REQUEST_TIMEOUT`], so a forwarded clear reports this
+/// node's own verdict rather than the forwarder's timeout.
+const NODE_FAULT_CLEAR_BUDGET: std::time::Duration =
+    NODE_REQUEST_TIMEOUT.saturating_sub(std::time::Duration::from_secs(1));
 
 /// Wait until the council no longer holds the reservation a cleared node fault
-/// owned, or the deadline passes. Returns whether it was released.
+/// owned, or `deadline` passes. Returns whether it was released.
 ///
 /// The leader's reaper releases a reservation only after it has fenced the
 /// target node through its own live membership view. So once this returns
 /// `true`, the leader that will judge the next node fault has already seen
 /// this node back, and the single experiment slot is free again.
-async fn wait_for_node_fault_release(state: &ApiState, sequence: u64) -> bool {
+async fn wait_for_node_fault_release(
+    state: &ApiState,
+    sequence: u64,
+    deadline: tokio::time::Instant,
+) -> bool {
     let Some(council) = &state.council else {
         return true;
     };
-    let deadline = tokio::time::Instant::now() + NODE_FAULT_RELEASE_TIMEOUT;
     loop {
         let released = council
             .desired_state()
@@ -7595,6 +7995,15 @@ async fn metrics_query_handler(
     if let Err(resp) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
         return resp;
     }
+    if let Err(resp) = enforce_cluster_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Metrics,
+    )
+    .await
+    {
+        return resp;
+    }
     let Some(mayo) = &state.mayo else {
         return Json(serde_json::json!({"error": "metrics not enabled"})).into_response();
     };
@@ -7639,7 +8048,7 @@ async fn metrics_query_handler(
              WHERE timestamp >= {start} AND timestamp <= {end} \
              ORDER BY timestamp LIMIT 10000"
         );
-        match store.query_sql(&sql).await {
+        match store.query_sql_since(&sql, start).await {
             Ok(results) => {
                 let data: Vec<serde_json::Value> = results
                     .iter()
@@ -7681,6 +8090,15 @@ async fn metrics_summary_handler(
     State(state): State<ApiState>,
 ) -> Response {
     if let Err(resp) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
+        return resp;
+    }
+    if let Err(resp) = enforce_cluster_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Metrics,
+    )
+    .await
+    {
         return resp;
     }
     let Some(mayo) = &state.mayo else {
@@ -7762,23 +8180,8 @@ async fn gather_dashboard_apps(state: &ApiState) -> Result<Vec<DashboardApp>, St
 async fn gather_dashboard_data(state: &ApiState) -> Result<DashboardData, String> {
     let apps = gather_dashboard_apps(state).await?;
 
-    let (alert_count, alerts) = if let Some(ref evaluator) = state.alerts {
-        let eval = evaluator.read().await;
-        let firing = eval.firing_alerts();
-        let count = firing.len();
-        let alert_rows = firing
-            .iter()
-            .map(|a| crate::brioche::dashboard::DashboardAlert {
-                labels: a.labels.clone(),
-                name: a.rule_name.clone(),
-                severity: format!("{:?}", a.severity),
-                description: a.description.clone(),
-            })
-            .collect();
-        (count, alert_rows)
-    } else {
-        (0, vec![])
-    };
+    let alerts = firing_dashboard_alerts(state).await;
+    let alert_count = alerts.len();
 
     let nodes = gather_dashboard_nodes(state).await;
     // The node count follows the real membership when we have it. A
@@ -7839,11 +8242,29 @@ fn html_response(html: String) -> Response {
 }
 
 /// `GET /` — serve the Brioche cluster overview dashboard.
-async fn dashboard_handler(State(state): State<ApiState>) -> Response {
-    match gather_dashboard_data(&state).await {
-        Ok(data) => html_response(render_dashboard(&data)),
-        Err(error) => unavailable_response(error),
+///
+/// The alert panel follows `/v1/alerts`: a principal whose `[permission]`
+/// spec doesn't grant `metrics` across the cluster sees the page without it.
+async fn dashboard_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+) -> Response {
+    let mut data = match gather_dashboard_data(&state).await {
+        Ok(data) => data,
+        Err(error) => return unavailable_response(error),
+    };
+    if enforce_cluster_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Metrics,
+    )
+    .await
+    .is_err()
+    {
+        data.alerts.clear();
+        data.alert_count = 0;
     }
+    html_response(render_dashboard(&data))
 }
 
 /// Names of the metrics an app's instances reported in the last five
@@ -7934,11 +8355,24 @@ async fn app_detail_handler(
         vec![]
     };
 
-    let charts = crate::brioche::app_detail::app_charts(
+    // Each chart polls the app's metric endpoint, which refuses a principal
+    // without `metrics` on this app; leave them out rather than draw errors.
+    let charts = match enforce_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Metrics,
         &app,
         &namespace,
-        &scraped_metric_names(&state, &app, &namespace).await,
-    );
+    )
+    .await
+    {
+        Ok(()) => crate::brioche::app_detail::app_charts(
+            &app,
+            &namespace,
+            &scraped_metric_names(&state, &app, &namespace).await,
+        ),
+        Err(_) => Vec::new(),
+    };
 
     let data = AppDetailData {
         app_name: app,
@@ -7989,14 +8423,14 @@ async fn node_detail_handler(State(state): State<ApiState>, Path(name): Path<Str
             ChartConfig {
                 endpoint: "/v1/metrics?name=node_cpu_usage_percent".to_string(),
                 title: "CPU Usage".to_string(),
-                y_label: "%".to_string(),
+                unit: crate::brioche::units::ChartUnit::Percent,
                 refresh_secs: 10,
                 range_secs: 3600,
             },
             ChartConfig {
                 endpoint: "/v1/metrics?name=node_memory_used_bytes".to_string(),
                 title: "Memory Usage".to_string(),
-                y_label: "bytes".to_string(),
+                unit: crate::brioche::units::ChartUnit::Bytes,
                 refresh_secs: 10,
                 range_secs: 3600,
             },
@@ -8036,22 +8470,42 @@ async fn fragment_nodes_handler(State(state): State<ApiState>) -> Response {
 }
 
 /// `GET /ui/fragment/alerts` — alerts table HTML fragment for HTMX swap.
-async fn fragment_alerts_handler(State(state): State<ApiState>) -> Response {
-    let alerts = if let Some(ref evaluator) = state.alerts {
-        let eval = evaluator.read().await;
-        eval.firing_alerts()
-            .iter()
-            .map(|a| crate::brioche::dashboard::DashboardAlert {
-                labels: a.labels.clone(),
-                name: a.rule_name.clone(),
-                severity: format!("{:?}", a.severity),
-                description: a.description.clone(),
-            })
-            .collect()
-    } else {
-        vec![]
-    };
+async fn fragment_alerts_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+) -> Response {
+    if let Err(resp) = enforce_cluster_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Metrics,
+    )
+    .await
+    {
+        return resp;
+    }
+    let alerts = firing_dashboard_alerts(&state).await;
     html_response(fragments::render_alerts_table_fragment(&alerts))
+}
+
+/// The firing alerts, shaped for the dashboard's alert table.
+async fn firing_dashboard_alerts(
+    state: &ApiState,
+) -> Vec<crate::brioche::dashboard::DashboardAlert> {
+    let Some(evaluator) = &state.alerts else {
+        return Vec::new();
+    };
+    evaluator
+        .read()
+        .await
+        .firing_alerts()
+        .iter()
+        .map(|a| crate::brioche::dashboard::DashboardAlert {
+            labels: a.labels.clone(),
+            name: a.rule_name.clone(),
+            severity: format!("{:?}", a.severity),
+            description: a.description.clone(),
+        })
+        .collect()
 }
 
 /// `GET /ui/fragment/app/{app}/{namespace}/instances` — instance table fragment.
@@ -8119,6 +8573,15 @@ async fn logs_sql_handler(
     if let Err(resp) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
         return resp;
     }
+    if let Err(resp) = enforce_cluster_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Logs,
+    )
+    .await
+    {
+        return resp;
+    }
     let Some(log_store) = &state.log_store else {
         return Json(serde_json::json!({"error": "log store not enabled"})).into_response();
     };
@@ -8173,6 +8636,15 @@ async fn logs_export_handler(
     {
         return resp;
     }
+    if let Err(resp) = enforce_cluster_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Admin,
+    )
+    .await
+    {
+        return resp;
+    }
     let Some(log_store) = &state.log_store else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -8211,14 +8683,30 @@ async fn logs_export_handler(
 }
 
 /// `GET /v1/alerts` — list all alert statuses.
-async fn alerts_handler(State(state): State<ApiState>) -> impl IntoResponse {
+///
+/// Alerts are rules evaluated over the whole metric store, so a principal
+/// with a `[permission]` spec needs `metrics` across the cluster (B18).
+async fn alerts_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+) -> Response {
+    if let Err(resp) = enforce_cluster_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Metrics,
+    )
+    .await
+    {
+        return resp;
+    }
     let Some(alerts) = &state.alerts else {
-        return Json(crate::mayo::alert::AlertsResponse { alerts: Vec::new() });
+        return Json(crate::mayo::alert::AlertsResponse { alerts: Vec::new() }).into_response();
     };
     let evaluator = alerts.read().await;
     Json(crate::mayo::alert::AlertsResponse {
         alerts: evaluator.all_statuses(),
     })
+    .into_response()
 }
 
 /// `GET /v1/metrics/keys` — list all distinct metric names.
@@ -8227,6 +8715,15 @@ async fn metrics_keys_handler(
     State(state): State<ApiState>,
 ) -> Response {
     if let Err(resp) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
+        return resp;
+    }
+    if let Err(resp) = enforce_cluster_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Metrics,
+    )
+    .await
+    {
         return resp;
     }
     let Some(mayo) = &state.mayo else {
@@ -8254,6 +8751,15 @@ async fn metrics_rollup_handler(
     Query(params): Query<MetricsQueryParams>,
 ) -> Response {
     if let Err(resp) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
+        return resp;
+    }
+    if let Err(resp) = enforce_cluster_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Metrics,
+    )
+    .await
+    {
         return resp;
     }
     let Some(rollup_store) = &state.rollup_store else {
@@ -8309,6 +8815,15 @@ async fn metrics_owned_rollup_handler(
     Query(params): Query<MetricsQueryParams>,
 ) -> Response {
     if let Err(response) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
+        return response;
+    }
+    if let Err(response) = enforce_cluster_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Metrics,
+    )
+    .await
+    {
         return response;
     }
     let Some(store) = &state.rollup_store else {
@@ -8380,6 +8895,15 @@ async fn metrics_cluster_handler(
     Query(params): Query<MetricsQueryParams>,
 ) -> Response {
     if let Err(resp) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
+        return resp;
+    }
+    if let Err(resp) = enforce_cluster_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Metrics,
+    )
+    .await
+    {
         return resp;
     }
     let start = params.start.unwrap_or(0);
@@ -8563,6 +9087,17 @@ async fn metrics_app_handler(
     if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
         return resp;
     }
+    if let Err(resp) = enforce_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Metrics,
+        &app,
+        &namespace,
+    )
+    .await
+    {
+        return resp;
+    }
     let (start, end) = app_query_window(params.start, params.end);
     match app_metric_rows(
         &state,
@@ -8613,6 +9148,17 @@ async fn metrics_app_chart_handler(
     use crate::mayo::series::{self, ChartKind};
 
     if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
+        return resp;
+    }
+    if let Err(resp) = enforce_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Metrics,
+        &app,
+        &namespace,
+    )
+    .await
+    {
         return resp;
     }
     let (start, end) = app_query_window(params.start, params.end);
@@ -8685,10 +9231,7 @@ async fn deploy_cancel_handler(
         )
             .into_response();
     };
-    let permissions = match &state.council {
-        Some(council) => council.desired_state().await.permissions,
-        None => std::collections::BTreeMap::new(),
-    };
+    let permissions = permission_map(&state).await;
     for target in &operation.targets {
         if let Err(response) =
             crate::sesame::auth::authorize_scoped(auth.as_deref(), &target.name, &target.namespace)
@@ -8847,6 +9390,17 @@ async fn rollback_handler(
         return resp;
     }
     if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
+        return resp;
+    }
+    if let Err(resp) = enforce_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Deploy,
+        &app,
+        &namespace,
+    )
+    .await
+    {
         return resp;
     }
     let Some(history) = &state.deploy_history else {
@@ -9138,6 +9692,15 @@ async fn identity_sign_handler(
     if let Err(response) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
         return response;
     }
+    if let Err(response) = enforce_cluster_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Admin,
+    )
+    .await
+    {
+        return response;
+    }
     let submission: crate::pickle::signing::SignatureSubmission = match serde_json::from_str(&body)
     {
         Ok(r) => r,
@@ -9187,6 +9750,15 @@ async fn token_list_handler(
     if let Err(response) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
         return response;
     }
+    if let Err(response) = enforce_cluster_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Admin,
+    )
+    .await
+    {
+        return response;
+    }
     let Some(ref council) = state.council else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -9224,6 +9796,15 @@ async fn token_revoke_handler(
         return resp;
     }
     if let Err(response) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
+        return response;
+    }
+    if let Err(response) = enforce_cluster_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Admin,
+    )
+    .await
+    {
         return response;
     }
     #[derive(serde::Deserialize)]
@@ -9290,6 +9871,15 @@ async fn token_create_handler(
         return resp;
     }
     if let Err(response) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
+        return response;
+    }
+    if let Err(response) = enforce_cluster_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Admin,
+    )
+    .await
+    {
         return response;
     }
     #[derive(serde::Deserialize, serde::Serialize)]
@@ -9493,6 +10083,15 @@ async fn join_token_create_handler(
     if let Err(response) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
         return response;
     }
+    if let Err(response) = enforce_cluster_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Admin,
+    )
+    .await
+    {
+        return response;
+    }
 
     fn default_ttl_seconds() -> u64 {
         crate::sesame::join::DEFAULT_JOIN_TOKEN_TTL.as_secs()
@@ -9640,6 +10239,15 @@ async fn secret_rotate_handler(
     if let Err(response) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
         return response;
     }
+    if let Err(response) = enforce_cluster_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::SecretWrite,
+    )
+    .await
+    {
+        return response;
+    }
     #[derive(serde::Deserialize)]
     struct RotateRequest {
         #[serde(default)]
@@ -9758,6 +10366,10 @@ async fn secret_rotate_handler(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "api_permission_tests.rs"]
+mod permission_tests;
 
 #[cfg(test)]
 mod tests {
@@ -9987,7 +10599,7 @@ mod tests {
     /// Build a single-node council, initialised as leader and seeded with a
     /// real `SecurityState` (four CAs, an age keypair, an OIDC config). `tag`
     /// disambiguates the temp dir so concurrent tests don't collide.
-    async fn seeded_council(tag: &str) -> Arc<crate::council::CouncilNode> {
+    pub(super) async fn seeded_council(tag: &str) -> Arc<crate::council::CouncilNode> {
         use std::collections::BTreeMap;
 
         use crate::council::log_store::MemLogStore;
@@ -10787,6 +11399,71 @@ mod tests {
             StatusCode::OK
         );
         shutdown.cancel();
+    }
+
+    /// A node forwarding a clear gives the owning node [`NODE_REQUEST_TIMEOUT`].
+    /// When the owning agent is busy, the owning node must still answer inside
+    /// that, with its own retryable 504, instead of letting the forwarder's
+    /// deadline pass first.
+    #[tokio::test(start_paused = true)]
+    async fn a_clear_answers_within_its_budget_when_the_agent_is_busy() {
+        // An agent that never gets round to the command.
+        let (cmd_tx, _cmd_rx) = mpsc::channel(4);
+        let app = router_with_upgrade(
+            cmd_tx,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            9117,
+            None,
+            None,
+            None,
+            "default".to_string(),
+            Some("node-2".to_string()),
+            900,
+            crate::cluster::ClusterHttp::plaintext(),
+            5050,
+            "http",
+            256 * 1024 * 1024,
+            false,
+            workload_fault_static_capabilities(),
+            crate::bun::readiness::ReadinessTracker::new(),
+            None,
+            None,
+        );
+        let started = tokio::time::Instant::now();
+        let response = tokio::time::timeout(
+            NODE_REQUEST_TIMEOUT * 2,
+            app.oneshot(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri("/v1/fault/7")
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        )
+        .await
+        .expect("the clear never answered")
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert!(started.elapsed() < NODE_REQUEST_TIMEOUT);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&body).contains("retry the clear"),
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
     }
 
     #[tokio::test]
@@ -14226,6 +14903,146 @@ schedule = "* * * * *"
         shutdown.cancel();
     }
 
+    /// B01: a Deployer scoped to `a/web` passes the route's scope check,
+    /// so the snapshot inputs themselves must not reach outside `a/web`.
+    /// A traversal volume used to snapshot `b/db`'s volume, and an
+    /// absolute or `..` name placed a root-owned subvolume anywhere.
+    #[tokio::test]
+    async fn scoped_deployer_cannot_escape_its_app_through_snapshot_inputs() {
+        let volumes_dir = tempfile::tempdir().unwrap();
+        let volumes = crate::grill::volume::VolumeManager::new(volumes_dir.path());
+        for (namespace, app) in [("a", "web"), ("b", "db")] {
+            volumes
+                .create_managed_volume(namespace, app, std::path::Path::new("/data"), None)
+                .unwrap();
+        }
+        let tree = |root: &std::path::Path| {
+            let mut out = Vec::new();
+            let mut stack = vec![root.to_path_buf()];
+            while let Some(dir) = stack.pop() {
+                for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                    if entry.file_type().unwrap().is_dir() {
+                        stack.push(entry.path());
+                    }
+                    out.push(entry.path());
+                }
+            }
+            out.sort();
+            out
+        };
+        let before = tree(volumes_dir.path());
+
+        let (cmd_tx, cmd_rx) = mpsc::channel(32);
+        let shutdown = CancellationToken::new();
+        let mut agent = BunAgent::new(
+            MockGrill::new(),
+            PortAllocator::new(30000, 31000),
+            cmd_rx,
+            shutdown.clone(),
+        );
+        agent.set_volumes_dir(volumes_dir.path().to_path_buf());
+        tokio::spawn(async move {
+            agent.run().await;
+        });
+        let scope = crate::sesame::types::TokenScope {
+            apps: Some(vec!["web".to_string()]),
+            namespaces: Some(vec!["a".to_string()]),
+        };
+        let created = crate::sesame::token::create_token(
+            "a-web",
+            crate::sesame::types::ApiRole::Deployer,
+            scope,
+            None,
+        )
+        .unwrap();
+        let store = crate::sesame::auth::new_token_store();
+        store.write().await.push(created.token);
+        let app = router(
+            cmd_tx,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(store),
+            None,
+            None,
+            None,
+            None,
+            9117,
+            None,
+        );
+        let tok = created.plaintext;
+
+        // Refused as invalid input: on a non-btrfs tempdir a merely
+        // "unsupported filesystem" 400 would hide that validation never ran.
+        let send = |method: &'static str, uri: &'static str, body: String| {
+            let request = axum::http::Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("authorization", format!("Bearer {tok}"))
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap();
+            let app = app.clone();
+            async move {
+                let response = app.oneshot(request).await.unwrap();
+                let status = response.status();
+                let bytes = response.into_body().collect().await.unwrap().to_bytes();
+                (status, String::from_utf8_lossy(&bytes).into_owned())
+            }
+        };
+        let refused = |(status, body): (StatusCode, String), what: &str| {
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{what}: {body}");
+            assert!(
+                body.contains("invalid snapshot request"),
+                "{what} was not refused as invalid input: {body}"
+            );
+        };
+
+        for body in [
+            serde_json::json!({ "volume": "/../../b/db/data" }),
+            serde_json::json!({ "volume": "../../b/db/data" }),
+            serde_json::json!({ "name": "/abs/path" }),
+            serde_json::json!({ "name": "../../../../tmp/owned" }),
+            serde_json::json!({ "name": "a/b" }),
+            serde_json::json!({ "volume": "/data", "name": ".." }),
+        ] {
+            let what = format!("create {body}");
+            refused(
+                send("POST", "/v1/snapshots/a/web", body.to_string()).await,
+                &what,
+            );
+        }
+        for body in [
+            serde_json::json!({ "name": "../../../b/db/data/x" }),
+            serde_json::json!({ "name": "1", "volume": "/../../b/db/data" }),
+        ] {
+            let what = format!("restore {body}");
+            refused(
+                send("POST", "/v1/snapshots/a/web/restore", body.to_string()).await,
+                &what,
+            );
+        }
+        refused(
+            send(
+                "DELETE",
+                "/v1/snapshots/a/web/1?volume=/../../b/db/data",
+                String::new(),
+            )
+            .await,
+            "delete",
+        );
+
+        assert_eq!(
+            tree(volumes_dir.path()),
+            before,
+            "a refused request touched the volumes directory"
+        );
+        shutdown.cancel();
+    }
+
     #[tokio::test]
     async fn readonly_token_is_refused_rolling_back() {
         // AUTH2: app rollback now requires a Deployer.
@@ -15068,7 +15885,7 @@ schedule = "* * * * *"
     async fn nodes_endpoint_advertises_only_resolved_peer_api_addresses() {
         let (tx, mut rx) = mpsc::channel(1);
         let worker = tokio::spawn(async move {
-            let Some(AgentCommand::Nodes { response }) = rx.recv().await else {
+            let Some(AgentCommand::Nodes { response, .. }) = rx.recv().await else {
                 panic!("expected membership request");
             };
             response
@@ -15137,6 +15954,98 @@ schedule = "* * * * *"
         assert_eq!(nodes[1].api_address, None);
         assert_eq!(nodes[2].api_address, None);
         worker.await.unwrap();
+    }
+
+    /// Gossip's live view drops a dead member; the listing hands the agent
+    /// the ones this node remembers, so `relish nodes` shows them as dead.
+    #[tokio::test]
+    async fn nodes_endpoint_lists_remembered_dead_members_as_dead() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let worker = tokio::spawn(async move {
+            let Some(AgentCommand::Nodes { down, response }) = rx.recv().await else {
+                panic!("expected membership request");
+            };
+            // The agent lists them after its live members; echo them back.
+            response.send(down).unwrap();
+        });
+        let known = KnownMembers::default();
+        let member = |name: &str, port: u16, state| RosterMember {
+            info: NodeMembershipInfo {
+                node_id: crate::meat::NodeId::new(name),
+                address: std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+                api_advertised: true,
+            },
+            gossip_address: std::net::SocketAddr::from(([127, 0, 0, 1], port - 3)),
+            state,
+            incarnation: 4,
+            labels: std::collections::BTreeMap::from([("zone".to_string(), "a".to_string())]),
+        };
+        use crate::mustard::state::NodeState::{Alive, Dead, Suspect};
+        known
+            .refresh(
+                vec![
+                    member("one", 19117, Alive),
+                    member("doubtful", 19217, Suspect),
+                    member("dead", 19317, Dead),
+                ],
+                &Default::default(),
+                std::time::Instant::now(),
+            )
+            .await;
+        let app = router(
+            tx, None, None, None, None, None, None, None, None, None, None, None, 9117, None,
+        )
+        .layer(axum::Extension(known));
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/cluster/nodes")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let nodes: Vec<crate::bun::agent::NodeStatus> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(nodes.len(), 1, "{nodes:?}");
+        assert_eq!(nodes[0].node_id, "dead");
+        assert_eq!(nodes[0].state, "dead");
+        assert_eq!(nodes[0].address, "127.0.0.1:19314");
+        assert_eq!(
+            nodes[0].api_address,
+            Some("127.0.0.1:19317".parse().unwrap())
+        );
+        assert_eq!(nodes[0].incarnation, 4);
+        assert_eq!(nodes[0].labels["zone"], "a");
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn version_endpoint_reports_the_build_commit() {
+        let (app, shutdown) = test_setup();
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/version")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["commit"].as_str(),
+            crate::upgrade::version::build_commit()
+        );
+        assert!(json.get("commit").is_some(), "the field is always present");
+        assert_eq!(
+            json["version"],
+            crate::upgrade::version::compiled_version().to_string()
+        );
+        shutdown.cancel();
     }
 
     #[tokio::test]
@@ -15250,6 +16159,21 @@ schedule = "* * * * *"
     /// A router whose token store holds one user token of the given role.
     /// Returns the router, its shutdown handle, and the plaintext token.
     fn ui_setup(role: crate::sesame::types::ApiRole) -> (Router, CancellationToken, String) {
+        let (app, shutdown, plaintext, _store) = ui_setup_with_store(role, None);
+        (app, shutdown, plaintext)
+    }
+
+    /// Like `ui_setup`, but the token can expire and the caller keeps the
+    /// token store, so a test can revoke or reissue tokens after logging in.
+    fn ui_setup_with_store(
+        role: crate::sesame::types::ApiRole,
+        expires_at: Option<std::time::SystemTime>,
+    ) -> (
+        Router,
+        CancellationToken,
+        String,
+        crate::sesame::auth::TokenStore,
+    ) {
         let (cmd_tx, cmd_rx) = mpsc::channel(32);
         let shutdown = CancellationToken::new();
         let grill = MockGrill::new();
@@ -15263,7 +16187,7 @@ schedule = "* * * * *"
             "dash",
             role,
             crate::sesame::types::TokenScope::default(),
-            None,
+            expires_at,
         )
         .unwrap();
         let plaintext = created.plaintext.clone();
@@ -15279,7 +16203,7 @@ schedule = "* * * * *"
             None,
             None,
             None,
-            Some(store),
+            Some(store.clone()),
             None,
             None,
             None,
@@ -15287,7 +16211,7 @@ schedule = "* * * * *"
             9117,
             None,
         );
-        (app, shutdown, plaintext)
+        (app, shutdown, plaintext, store)
     }
 
     async fn ui_get(app: &Router, uri: &str, headers: &[(&str, &str)]) -> Response {
@@ -15409,6 +16333,103 @@ schedule = "* * * * *"
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        shutdown.cancel();
+    }
+
+    /// Build a POST /ui/session request carrying `token`.
+    fn login_request(token: &str) -> axum::http::Request<Body> {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/ui/session")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from(format!("token={token}")))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_malformed_login_is_refused_without_touching_argon2() {
+        // Every verification permit is held, so any login that reached the
+        // Argon2 path would block. A junk token must be refused by the shape
+        // check alone, promptly (B12).
+        let (app, shutdown, _t) = ui_setup(crate::sesame::types::ApiRole::ReadOnly);
+        let _permits = crate::sesame::auth::hold_all_verify_permits().await;
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            app.clone().oneshot(login_request("nope")),
+        )
+        .await
+        .expect("a malformed login must not wait for an Argon2 permit")
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn a_well_shaped_login_shares_the_argon2_concurrency_bound() {
+        // With every permit held, a login that looks like a real token has to
+        // queue for the same semaphore the bearer path uses (B12) rather than
+        // hashing on the blocking pool unbounded.
+        let (app, shutdown, token) = ui_setup(crate::sesame::types::ApiRole::ReadOnly);
+        let permits = crate::sesame::auth::hold_all_verify_permits().await;
+        let pending = tokio::spawn(app.clone().oneshot(login_request(&token)));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !pending.is_finished(),
+            "login verified without waiting for a permit"
+        );
+
+        // Releasing the permits lets the queued login finish normally.
+        drop(permits);
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(10), pending)
+            .await
+            .expect("login should proceed once a permit frees up")
+            .unwrap()
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn a_dashboard_session_ends_when_its_token_is_revoked() {
+        // B11: the cookie is only as good as the token it was exchanged for.
+        // A second token keeps the store non-empty, so auth stays enforced.
+        let (app, shutdown, token, store) =
+            ui_setup_with_store(crate::sesame::types::ApiRole::ReadOnly, None);
+        let spare = crate::sesame::token::create_token(
+            "spare",
+            crate::sesame::types::ApiRole::Admin,
+            crate::sesame::types::TokenScope::default(),
+            None,
+        )
+        .unwrap();
+        store.write().await.push(spare.token);
+        let id = login(&app, &token).await;
+        let cookie = format!("rb_session={id}");
+        let before = ui_get(&app, "/ui/fragment/apps", &[("cookie", &cookie)]).await;
+        assert_eq!(before.status(), StatusCode::OK);
+
+        store.write().await.retain(|t| t.name != "dash");
+        let after = ui_get(&app, "/ui/fragment/apps", &[("cookie", &cookie)]).await;
+        assert_eq!(after.status(), StatusCode::UNAUTHORIZED);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn the_session_cookie_expires_no_later_than_its_token() {
+        let expiry = std::time::SystemTime::now() + std::time::Duration::from_secs(600);
+        let (app, shutdown, token, _store) =
+            ui_setup_with_store(crate::sesame::types::ApiRole::ReadOnly, Some(expiry));
+        let resp = app.clone().oneshot(login_request(&token)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let cookie = resp.headers().get("set-cookie").unwrap().to_str().unwrap();
+        let max_age: u64 = cookie
+            .split("; ")
+            .find_map(|part| part.strip_prefix("Max-Age="))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(max_age <= 600, "cookie outlives its token: {cookie}");
+        assert!(max_age > 500, "cookie cut unexpectedly short: {cookie}");
         shutdown.cancel();
     }
 
@@ -16102,6 +17123,7 @@ mod cluster_routing_tests {
             host_port: None,
             exit_code: None,
             pid: Some(4242),
+            runtime_unknown: false,
         }
     }
 
@@ -16221,7 +17243,14 @@ mod cluster_routing_tests {
             });
             listeners.push(listener);
         }
-        let known = KnownMembers(Arc::new(RwLock::new(membership.clone())));
+        let known = KnownMembers::default();
+        known
+            .refresh(
+                roster_of(&membership, crate::mustard::state::NodeState::Alive),
+                &Default::default(),
+                std::time::Instant::now(),
+            )
+            .await;
         let membership = Arc::new(RwLock::new(membership));
         let mut nodes = Vec::new();
         for ((name, instances), listener) in layout.into_iter().zip(listeners) {
@@ -16717,7 +17746,14 @@ mod cluster_routing_tests {
             .cloned()
             .collect();
         *cluster.membership.write().await = live.clone();
-        cluster.known.refresh(live).await;
+        cluster
+            .known
+            .refresh(
+                roster_of(&live, crate::mustard::state::NodeState::Alive),
+                &Default::default(),
+                std::time::Instant::now(),
+            )
+            .await;
 
         let (status, body) = relay(
             &cluster,
@@ -16732,28 +17768,173 @@ mod cluster_routing_tests {
         cluster.stop.cancel();
     }
 
-    #[tokio::test]
-    async fn known_members_take_a_returning_members_new_address_once() {
-        let member = |name: &str, port: u16| NodeMembershipInfo {
+    /// Gossip's roster for `members`, every one in `state`.
+    fn roster_of(
+        members: &[NodeMembershipInfo],
+        state: crate::mustard::state::NodeState,
+    ) -> Vec<RosterMember> {
+        members
+            .iter()
+            .map(|info| RosterMember {
+                info: info.clone(),
+                gossip_address: info.address,
+                state,
+                incarnation: 1,
+                labels: Default::default(),
+            })
+            .collect()
+    }
+
+    fn known_member(name: &str, port: u16) -> NodeMembershipInfo {
+        NodeMembershipInfo {
             node_id: crate::meat::NodeId::new(name),
             address: std::net::SocketAddr::from(([127, 0, 0, 1], port)),
             api_advertised: true,
-        };
-        let known = KnownMembers(Arc::default());
+        }
+    }
+
+    async fn known_ports(known: &KnownMembers) -> Vec<(String, u16)> {
+        let mut ports = Vec::new();
+        for name in ["node-1", "node-2", "node-3"] {
+            if let Some(address) = known.api_address(&crate::meat::NodeId::new(name)).await {
+                ports.push((name.to_string(), address.port()));
+            }
+        }
+        ports
+    }
+
+    #[tokio::test]
+    async fn known_members_take_a_returning_members_new_address_once() {
+        use crate::mustard::state::NodeState::Alive;
+        let known = KnownMembers::default();
+        let none = Default::default();
+        let now = std::time::Instant::now();
+        let both = [known_member("node-1", 1001), known_member("node-2", 1002)];
+        known.refresh(roster_of(&both, Alive), &none, now).await;
+        let one = [known_member("node-1", 1001)];
+        known.refresh(roster_of(&one, Alive), &none, now).await;
+        let returned = [known_member("node-1", 1001), known_member("node-2", 2002)];
+        known.refresh(roster_of(&returned, Alive), &none, now).await;
+
+        assert_eq!(
+            known_ports(&known).await,
+            vec![("node-1".to_string(), 1001), ("node-2".to_string(), 2002)]
+        );
+    }
+
+    /// The #244 behaviour: a node gossip declared dead, then reaped, keeps
+    /// its last address so a node-kill fault on it can still be cleared.
+    #[tokio::test]
+    async fn known_members_keep_a_dead_member_after_gossip_reaps_it() {
+        use crate::mustard::state::NodeState::{Alive, Dead};
+        let known = KnownMembers::default();
+        let none = Default::default();
+        let now = std::time::Instant::now();
+        let alive = [known_member("node-1", 1001), known_member("node-2", 1002)];
+        known.refresh(roster_of(&alive, Alive), &none, now).await;
+        let mut roster = roster_of(&alive[..1], Alive);
+        roster.extend(roster_of(&alive[1..], Dead));
+        known.refresh(roster, &none, now).await;
         known
-            .refresh(vec![member("node-1", 1001), member("node-2", 1002)])
-            .await;
-        known.refresh(vec![member("node-1", 1001)]).await;
-        known
-            .refresh(vec![member("node-1", 1001), member("node-2", 2002)])
+            .refresh(roster_of(&alive[..1], Alive), &none, now)
             .await;
 
-        let table = known.0.read().await;
-        let ports: Vec<_> = table
-            .iter()
-            .map(|member| (member.node_id.0.as_str(), member.address.port()))
-            .collect();
-        assert_eq!(ports, vec![("node-1", 1001), ("node-2", 2002)]);
+        assert_eq!(
+            known_ports(&known).await,
+            vec![("node-1".to_string(), 1001), ("node-2".to_string(), 1002)]
+        );
+        let down = known.down().await;
+        assert_eq!(down.len(), 1);
+        assert_eq!(down[0].info.node_id.0, "node-2");
+        assert_eq!(down[0].state, Dead);
+    }
+
+    #[tokio::test]
+    async fn known_members_forget_a_member_that_left() {
+        use crate::mustard::state::NodeState::{Alive, Left};
+        let known = KnownMembers::default();
+        let none = Default::default();
+        let now = std::time::Instant::now();
+        let alive = [known_member("node-1", 1001), known_member("node-2", 1002)];
+        known.refresh(roster_of(&alive, Alive), &none, now).await;
+        let mut roster = roster_of(&alive[..1], Alive);
+        roster.extend(roster_of(&alive[1..], Left));
+        known.refresh(roster, &none, now).await;
+        // Gossip reaps the Left entry; it must not come back as dead.
+        known
+            .refresh(roster_of(&alive[..1], Alive), &none, now)
+            .await;
+
+        assert_eq!(
+            known_ports(&known).await,
+            vec![("node-1".to_string(), 1001)]
+        );
+        assert!(known.down().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn known_members_forget_a_retired_member_live_or_remembered() {
+        use crate::mustard::state::NodeState::{Alive, Dead};
+        let known = KnownMembers::default();
+        let none = std::collections::BTreeSet::new();
+        let now = std::time::Instant::now();
+        let all = [
+            known_member("node-1", 1001),
+            known_member("node-2", 1002),
+            known_member("node-3", 1003),
+        ];
+        known.refresh(roster_of(&all, Alive), &none, now).await;
+        // node-2 dies and is reaped; node-3 is still dead in gossip's table.
+        let mut roster = roster_of(&all[..1], Alive);
+        roster.extend(roster_of(&all[2..], Dead));
+        known.refresh(roster.clone(), &none, now).await;
+
+        let retired =
+            std::collections::BTreeSet::from(["node-2".to_string(), "node-3".to_string()]);
+        known.refresh(roster, &retired, now).await;
+
+        assert_eq!(
+            known_ports(&known).await,
+            vec![("node-1".to_string(), 1001)]
+        );
+    }
+
+    #[tokio::test]
+    async fn known_members_forget_a_dead_member_unheard_of_for_the_retention() {
+        use crate::mustard::state::NodeState::Alive;
+        let known = KnownMembers::default();
+        let none = Default::default();
+        let start = std::time::Instant::now();
+        let alive = [known_member("node-1", 1001), known_member("node-2", 1002)];
+        known.refresh(roster_of(&alive, Alive), &none, start).await;
+        // node-2 dies and is reaped at once.
+        let later = start + std::time::Duration::from_secs(60);
+        known
+            .refresh(roster_of(&alive[..1], Alive), &none, later)
+            .await;
+
+        let just_inside = start + KNOWN_MEMBER_RETENTION;
+        known
+            .refresh(roster_of(&alive[..1], Alive), &none, just_inside)
+            .await;
+        assert_eq!(known_ports(&known).await.len(), 2);
+
+        let past = just_inside + std::time::Duration::from_secs(1);
+        known
+            .refresh(roster_of(&alive[..1], Alive), &none, past)
+            .await;
+        assert_eq!(
+            known_ports(&known).await,
+            vec![("node-1".to_string(), 1001)]
+        );
+    }
+
+    #[test]
+    fn known_member_retention_covers_the_longest_fault() {
+        assert_eq!(
+            KNOWN_MEMBER_RETENTION,
+            std::time::Duration::from_secs(24 * 3600)
+        );
     }
 
     #[test]
@@ -16767,6 +17948,13 @@ mod cluster_routing_tests {
             &axum::http::Method::POST,
             "v1/deploys/history/web"
         ));
+    }
+
+    #[test]
+    fn the_relay_forwards_each_nodes_version_for_wtf() {
+        let get = axum::http::Method::GET;
+        assert!(relay_allows(&get, "v1/version"));
+        assert!(!relay_allows(&axum::http::Method::POST, "v1/version"));
     }
 
     #[test]

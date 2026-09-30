@@ -7,7 +7,7 @@
 //! machine with automatic rollback, and the leader-side rolling
 //! orchestration across the cluster.
 //!
-//! Detailed design: `docs/plans/2026-07-06-plan-self-upgrade.md` and
+//! Detailed design: `docs/plans/archive/2026-07-06-plan-self-upgrade.md` and
 //! `docs/design/agent-bun.md` §5.5.
 
 mod compatibility;

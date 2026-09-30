@@ -456,7 +456,7 @@ pub async fn gather_latest_values(
          WHERE timestamp >= {window_start} \
          ORDER BY timestamp DESC"
     );
-    if let Ok(rows) = store.query_sql(&sql).await {
+    if let Ok(rows) = store.query_sql_since(&sql, window_start).await {
         for (timestamp, name, labels, value) in rows {
             // DESC order means the first row per series is its newest.
             series.entry((name, labels)).or_insert((timestamp, value));

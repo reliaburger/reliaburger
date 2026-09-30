@@ -28,10 +28,15 @@ fn pressure_target() -> u8 {
 #[tokio::test]
 #[ignore = "requires rootful Linux cgroup v2 (RELIABURGER_NODE_PRESSURE_TESTS=1)"]
 async fn node_pressure_consumes_capacity_outside_bun_and_cleans_up() {
-    if std::env::var("RELIABURGER_NODE_PRESSURE_TESTS").as_deref() != Ok("1") {
-        eprintln!("skipped: set RELIABURGER_NODE_PRESSURE_TESTS=1");
-        return;
-    }
+    // Selecting this ignored test is a request to run it. A host without the
+    // opt-in fails loudly instead of printing "skipped" and passing, which
+    // nextest would report as success without the behaviour ever running.
+    assert_eq!(
+        std::env::var("RELIABURGER_NODE_PRESSURE_TESTS").as_deref(),
+        Ok("1"),
+        "set RELIABURGER_NODE_PRESSURE_TESTS=1 on a rootful cgroup-v2 Linux host \
+         (make test-linux does); refusing to pass without running"
+    );
 
     // This binary runs with every nextest thread reserved, but the suite
     // that just finished is still being torn down: the kernel reclaims the

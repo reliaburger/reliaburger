@@ -224,8 +224,21 @@ jobs:
             --version "$RELEASE_TAG" --repository "$RELEASE_REPOSITORY" \
             --commit "$CANDIDATE_COMMIT" --run-id "$CANDIDATE_RUN" \
             --run-attempt "$CANDIDATE_ATTEMPT")
+          # The log line is what `gh run view --log` finds; the summary is
+          # for people reading the run page.
+          echo "Qualification manifest SHA-256: $digest"
           printf 'Candidate commit: `%s`\n\nRun: `%s`, attempt: `%s`\n\nQualification manifest SHA-256: `%s`\n' \
             "$CANDIDATE_COMMIT" "$CANDIDATE_RUN" "$CANDIDATE_ATTEMPT" "$digest" >> "$GITHUB_STEP_SUMMARY"
+      - name: Preserve the qualification manifest on its own
+        # A few kilobytes that hash to the digest above, so qualification
+        # can read it without the whole candidate. Staging and promotion
+        # still download the full artefact and verify every byte.
+        uses: actions/upload-artifact@v4
+        with:
+          name: candidate-manifest-${{ github.sha }}-${{ github.run_attempt }}
+          path: dist/candidate.json
+          if-no-files-found: error
+          retention-days: 1
       - name: Preserve signed candidate without publishing a release
         uses: actions/upload-artifact@v4
         with:

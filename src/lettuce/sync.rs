@@ -32,13 +32,11 @@ pub struct SyncOutcome {
     pub file_errors: HashMap<String, String>,
 }
 
-/// A "nothing to do" outcome with the given reason.
-fn skipped(reason: &str) -> SyncOutcome {
+/// A failed outcome for `commit` with the given error.
+fn failed(commit: Option<CommitInfo>, error: String) -> SyncOutcome {
     SyncOutcome {
-        commit: None,
-        result: SyncResult::Skipped {
-            reason: reason.to_string(),
-        },
+        commit,
+        result: SyncResult::Failure { error },
         diff_summary: None,
         changes: Vec::new(),
         file_errors: HashMap::new(),
@@ -63,6 +61,13 @@ fn signature_admitted(status: &SignatureStatus, require_signed: bool) -> bool {
 ///
 /// This is the pure logic of the sync loop, separated from the
 /// async runtime and Raft interaction so it can be tested in isolation.
+///
+/// Every cycle reconciles, whether or not Git moved (B16). The old loop
+/// returned "HEAD unchanged" as soon as the fetch found nothing new, so a
+/// manual change to an app (a different image, a deleted app) stood until
+/// the next commit. Now the cycle always diffs the current commit's config
+/// against the cluster's desired state; when the two already agree the
+/// diff is empty and the runner writes nothing.
 pub fn execute_sync(
     repo: &GitRepo,
     config: &GitOpsConfig,
@@ -72,123 +77,41 @@ pub fn execute_sync(
     autoscale_overrides: &[(String, u32)],
     last_applied_sha: Option<&str>,
 ) -> SyncOutcome {
-    // Step 1: Fetch
-    let new_commit = match repo.fetch() {
-        Ok(Some(commit)) => commit,
-        Ok(None) => {
-            // No *new* commit since the last fetch — but the current
-            // HEAD may still be unapplied (e.g. the very first sync
-            // after cloning, where the clone already contains the
-            // commit so there's nothing to "fetch"). Apply when HEAD
-            // differs from what we last applied; otherwise skip.
-            let head = repo.head_sha().ok();
-            let up_to_date =
-                matches!((head.as_deref(), last_applied_sha), (Some(h), Some(a)) if h == a);
-            match (head, up_to_date) {
-                (Some(head_sha), false) => match repo.commit_info(&head_sha) {
-                    Ok(commit) => commit,
-                    Err(_) => {
-                        return skipped("HEAD unchanged");
-                    }
-                },
-                _ => return skipped("HEAD unchanged"),
-            }
-        }
-        Err(e) => {
-            return SyncOutcome {
-                commit: None,
-                result: SyncResult::Failure {
-                    error: e.to_string(),
-                },
-                diff_summary: None,
-                changes: Vec::new(),
-                file_errors: HashMap::new(),
-            };
-        }
+    // Step 1: Fetch, then settle on the commit to reconcile: the new one,
+    // or the current HEAD when nothing new arrived.
+    let fetched = repo.fetch().and_then(|new_commit| match new_commit {
+        Some(commit) => Ok(commit),
+        None => repo.head_sha().and_then(|head| repo.commit_info(&head)),
+    });
+    let mut commit = match fetched {
+        Ok(commit) => commit,
+        Err(e) => return failed(None, e.to_string()),
     };
 
     // Step 2: Verify commit signature
-    let mut commit = new_commit;
     if config.require_signed_commits {
-        let status = verify::verify_commit(repo.path(), &commit, &config.trusted_signing_keys);
+        let status = match verify::verify_commit(repo, &commit, &config.trusted_signing_keys) {
+            Ok(status) => status,
+            Err(e) => {
+                let error = format!("commit {} signature check failed: {e}", commit.sha);
+                return failed(Some(commit), error);
+            }
+        };
         commit.signature = status.clone();
         if !signature_admitted(&status, true) {
-            return SyncOutcome {
-                commit: Some(commit.clone()),
-                result: SyncResult::Failure {
-                    error: format!(
-                        "commit {} rejected: require_signed_commits is set but the \
-                         signature is {:?} (configure trusted_signing_keys and sign commits)",
-                        commit.sha, commit.signature
-                    ),
-                },
-                diff_summary: None,
-                changes: Vec::new(),
-                file_errors: HashMap::new(),
-            };
-        }
-    }
-
-    // Step 2b: Check for script field changes (auto-enforce signing)
-    if !config.require_signed_commits {
-        match verify::commit_modifies_script(repo.path(), &commit.sha, last_applied_sha) {
-            Ok(true) => {
-                let status =
-                    verify::verify_commit(repo.path(), &commit, &config.trusted_signing_keys);
-                commit.signature = status.clone();
-                // Only a *verified* signature admits a script-modifying commit
-                // (M20). Admitting `NotChecked` — which means verification never
-                // ran because no trusted keys are configured — made this gate a
-                // no-op on the common default, exactly the "verification never
-                // ran" case the fail-closed rationale above calls unsafe. So a
-                // script change through GitOps now requires configured trusted
-                // keys and a valid signature.
-                if !matches!(status, SignatureStatus::Verified) {
-                    return SyncOutcome {
-                        commit: Some(commit.clone()),
-                        result: SyncResult::Failure {
-                            error: format!(
-                                "commit {} modifies a script field but has no verified \
-                                 signature (status: {status:?}); configure \
-                                 [gitops] trusted_signing_keys and sign the commit",
-                                commit.sha
-                            ),
-                        },
-                        diff_summary: None,
-                        changes: Vec::new(),
-                        file_errors: HashMap::new(),
-                    };
-                }
-            }
-            Ok(false) => {}
-            Err(e) => {
-                return SyncOutcome {
-                    commit: Some(commit.clone()),
-                    result: SyncResult::Failure {
-                        error: format!("failed to check script changes: {e}"),
-                    },
-                    diff_summary: None,
-                    changes: Vec::new(),
-                    file_errors: HashMap::new(),
-                };
-            }
+            let error = format!(
+                "commit {} rejected: require_signed_commits is set but the \
+                 signature is {:?} (configure trusted_signing_keys and sign commits)",
+                commit.sha, commit.signature
+            );
+            return failed(Some(commit), error);
         }
     }
 
     // Step 3: Parse TOML files
     let toml_files = match repo.list_toml_files(&commit.sha, &config.path) {
         Ok(files) => files,
-        Err(e) => {
-            return SyncOutcome {
-                commit: Some(commit),
-                result: SyncResult::Failure {
-                    error: e.to_string(),
-                },
-                diff_summary: None,
-                changes: Vec::new(),
-                file_errors: HashMap::new(),
-            };
-        }
+        Err(e) => return failed(Some(commit), e.to_string()),
     };
 
     let (git_config, file_errors) = parse_toml_files(&toml_files);
@@ -228,15 +151,16 @@ pub fn execute_sync(
     // straight to desired state via git and then silently ignored downstream.
     let known_namespaces: Vec<String> = current_namespaces.keys().cloned().collect();
     if let Err(e) = git_config.validate_against(&known_namespaces) {
-        return SyncOutcome {
-            commit: Some(commit),
-            result: SyncResult::Failure {
-                error: format!("config validation failed: {e}"),
-            },
-            diff_summary: None,
-            changes: Vec::new(),
-            file_errors,
-        };
+        return failed(Some(commit), format!("config validation failed: {e}"));
+    }
+
+    // Step 3c: A script change needs a trusted signature even when
+    // signing isn't required globally.
+    if !config.require_signed_commits
+        && let Err(error) =
+            admit_script_changes(repo, config, &mut commit, &toml_files, last_applied_sha)
+    {
+        return failed(Some(commit), error);
     }
 
     // Step 4: Compute diff (only on a fully-parsed, valid config).
@@ -254,6 +178,61 @@ pub fn execute_sync(
         changes,
         file_errors,
     }
+}
+
+/// Admit `commit` under the script-signing rule, or say why not.
+///
+/// A commit that adds, edits or removes any `script` value must carry a
+/// signature from a trusted key, whatever `require_signed_commits` says
+/// (M20). The comparison is semantic (B13): the scripts parsed out of the
+/// last applied tree against the scripts parsed out of this one. The old
+/// check searched the diff text for an added line containing `script`,
+/// which missed an edit inside a multiline body, a deletion, and a `git
+/// diff` that failed with empty output.
+///
+/// When the comparison can't be completed (the previous tree can't be
+/// read or parsed) the commit is treated as changing scripts: only a
+/// verified signature admits it. On the first sync there is no previous
+/// tree, so any script at all needs a signature.
+fn admit_script_changes(
+    repo: &GitRepo,
+    config: &GitOpsConfig,
+    commit: &mut CommitInfo,
+    candidate: &HashMap<String, String>,
+    last_applied_sha: Option<&str>,
+) -> Result<(), String> {
+    let comparison = match last_applied_sha {
+        Some(previous) if previous == commit.sha => Ok(false),
+        Some(previous) => repo
+            .list_toml_files(previous, &config.path)
+            .and_then(|previous| verify::scripts_changed(&previous, candidate)),
+        None => verify::scripts_changed(&HashMap::new(), candidate),
+    };
+    let reason = match comparison {
+        Ok(false) => return Ok(()),
+        Ok(true) => "modifies a script field".to_string(),
+        Err(e) => format!("can't be shown to leave scripts unchanged ({e})"),
+    };
+
+    let status =
+        verify::verify_commit(repo, commit, &config.trusted_signing_keys).map_err(|e| {
+            format!(
+                "commit {} {reason}; signature check failed: {e}",
+                commit.sha
+            )
+        })?;
+    commit.signature = status.clone();
+    // Only a *verified* signature admits it (M20). `NotChecked` means
+    // verification never ran because no trusted keys are configured, the
+    // common default, and admitting it would make this gate a no-op.
+    if status == SignatureStatus::Verified {
+        return Ok(());
+    }
+    Err(format!(
+        "commit {} {reason} but has no verified signature (status: {status:?}); \
+         configure [gitops] trusted_signing_keys and sign the commit",
+        commit.sha
+    ))
 }
 
 /// Parse a set of TOML files into a merged Config.
@@ -619,6 +598,270 @@ mod tests {
             outcome.changes.is_empty(),
             "a validation failure must emit no changes"
         );
+    }
+
+    /// A real repository for the script-signing tests: a working clone that
+    /// commits (signed with an SSH key, or not) and pushes to a bare
+    /// remote, and a Lettuce clone that trusts that key.
+    struct SigningRepo {
+        _dir: tempfile::TempDir,
+        work: std::path::PathBuf,
+        repo: GitRepo,
+        fingerprint: String,
+    }
+
+    impl SigningRepo {
+        fn new() -> Self {
+            use std::process::Command;
+
+            let dir = tempfile::TempDir::new().unwrap();
+            let bare = dir.path().join("repo.git");
+            let work = dir.path().join("work");
+            let key = dir.path().join("signing-key");
+            let status = Command::new("ssh-keygen")
+                .args([
+                    "-q",
+                    "-t",
+                    "ed25519",
+                    "-N",
+                    "",
+                    "-C",
+                    "dev@example.com",
+                    "-f",
+                ])
+                .arg(&key)
+                .status()
+                .unwrap();
+            assert!(status.success(), "ssh-keygen failed");
+            let public = std::fs::read_to_string(key.with_extension("pub")).unwrap();
+            let listing = Command::new("ssh-keygen")
+                .arg("-lf")
+                .arg(key.with_extension("pub"))
+                .output()
+                .unwrap();
+            let fingerprint = String::from_utf8_lossy(&listing.stdout)
+                .split_whitespace()
+                .nth(1)
+                .unwrap()
+                .to_string();
+            let allowed = dir.path().join("allowed_signers");
+            std::fs::write(&allowed, format!("dev@example.com {public}")).unwrap();
+
+            git_ok(
+                dir.path(),
+                &["init", "-q", "--bare", "--initial-branch=main"],
+                &bare,
+            );
+            git_ok(dir.path(), &["clone", "-q"], &bare);
+            std::fs::rename(dir.path().join("repo"), &work).unwrap();
+            for (key_name, value) in [
+                ("user.email", "dev@example.com".to_string()),
+                ("user.name", "Dev".to_string()),
+                ("gpg.format", "ssh".to_string()),
+                ("user.signingkey", key.display().to_string()),
+                ("commit.gpgsign", "false".to_string()),
+            ] {
+                git_ok(
+                    &work,
+                    &["config", key_name, &value],
+                    std::path::Path::new(""),
+                );
+            }
+            git_ok(
+                &work,
+                &["checkout", "-q", "-B", "main"],
+                std::path::Path::new(""),
+            );
+            std::fs::write(work.join("base.toml"), "[app.base]\nimage = \"base:v1\"\n").unwrap();
+            commit_in(&work, "base", false);
+            let url = format!("file://{}", bare.display());
+            let clone = dir.path().join("clone");
+            let repo = GitRepo::clone_or_open(&url, &clone, "main").unwrap();
+            git_ok(
+                &clone,
+                &[
+                    "config",
+                    "gpg.ssh.allowedSignersFile",
+                    &allowed.display().to_string(),
+                ],
+                std::path::Path::new(""),
+            );
+            Self {
+                _dir: dir,
+                work,
+                repo,
+                fingerprint,
+            }
+        }
+
+        /// Write `apps.toml`, commit it (signed or not) and push. Returns
+        /// the new commit's SHA.
+        fn commit_apps(&mut self, content: &str, signed: bool) -> String {
+            std::fs::write(self.work.join("apps.toml"), content).unwrap();
+            commit_in(&self.work, "change apps", signed)
+        }
+
+        fn config(&self) -> GitOpsConfig {
+            GitOpsConfig {
+                repo: self.repo.url().to_string(),
+                branch: "main".to_string(),
+                path: "/".to_string(),
+                poll_interval_secs: 30,
+                require_signed_commits: false,
+                trusted_signing_keys: vec![self.fingerprint.clone()],
+                webhook_secret: None,
+                webhook_rate_limit: 10,
+            }
+        }
+
+        fn sync(&self, last_applied: Option<&str>) -> SyncOutcome {
+            execute_sync(
+                &self.repo,
+                &self.config(),
+                &HashMap::new(),
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &[],
+                last_applied,
+            )
+        }
+    }
+
+    /// Commit everything in `work` (signed or not), push it, and return
+    /// the new SHA.
+    fn commit_in(work: &std::path::Path, message: &str, signed: bool) -> String {
+        let empty = std::path::Path::new("");
+        git_ok(work, &["add", "-A"], empty);
+        let sign = if signed { "-S" } else { "--no-gpg-sign" };
+        git_ok(
+            work,
+            &["commit", "-q", "--allow-empty", sign, "-m", message],
+            empty,
+        );
+        git_ok(work, &["push", "-q", "origin", "main"], empty);
+        let output = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(work)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// Run `git args [extra]` in `cwd`, asserting success. An empty
+    /// `extra` path is left off.
+    fn git_ok(cwd: &std::path::Path, args: &[&str], extra: &std::path::Path) {
+        let mut command = std::process::Command::new("git");
+        command.args(args).current_dir(cwd);
+        if !extra.as_os_str().is_empty() {
+            command.arg(extra);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn assert_refused(outcome: &SyncOutcome, case: &str) {
+        match &outcome.result {
+            SyncResult::Failure { error } => assert!(
+                error.contains("no verified signature"),
+                "{case}: refused for the wrong reason: {error}"
+            ),
+            other => panic!("{case}: an unsigned script change was admitted: {other:?}"),
+        }
+        assert!(
+            outcome.changes.is_empty(),
+            "{case}: a refusal emits no changes"
+        );
+    }
+
+    fn assert_admitted(outcome: &SyncOutcome, case: &str) {
+        assert!(
+            matches!(outcome.result, SyncResult::Success),
+            "{case}: a signed script change was refused: {:?}",
+            outcome.result
+        );
+    }
+
+    const MULTILINE_OLD: &str =
+        "[app.web]\nreplicas = 1\nscript = \"\"\"\nset -e\necho old\n\"\"\"\n";
+    const MULTILINE_NEW: &str =
+        "[app.web]\nreplicas = 1\nscript = \"\"\"\nset -e\necho new\n\"\"\"\n";
+    const LITERAL_OLD: &str = "[app.web]\nreplicas = 1\nscript = '''\nset -e\necho old\n'''\n";
+    const LITERAL_NEW: &str = "[app.web]\nreplicas = 1\nscript = '''\nset -e\necho new\n'''\n";
+    const BASIC_OLD: &str = "[app.web]\nreplicas = 1\nscript = \"echo old\"\n";
+    const BASIC_NEW: &str = "[app.web]\nreplicas = 1\nscript = \"echo new\"\n";
+    const NO_SCRIPT: &str = "[app.web]\nimage = \"web:v1\"\n";
+
+    /// B13: every way of changing a script, relative to an applied commit,
+    /// is refused unsigned and admitted with a trusted signature. The old
+    /// check only saw an added diff line containing `script`, so editing a
+    /// multiline body or deleting the script slipped through unsigned.
+    #[test]
+    fn every_script_change_needs_a_trusted_signature() {
+        let cases = [
+            ("multiline body edit", MULTILINE_OLD, MULTILINE_NEW),
+            ("literal string body edit", LITERAL_OLD, LITERAL_NEW),
+            ("basic string edit", BASIC_OLD, BASIC_NEW),
+            ("script deleted", MULTILINE_OLD, NO_SCRIPT),
+            ("script added", NO_SCRIPT, BASIC_NEW),
+        ];
+        for (case, before, after) in cases {
+            let mut repo = SigningRepo::new();
+            let applied = repo.commit_apps(before, true);
+
+            repo.commit_apps(after, false);
+            assert_refused(&repo.sync(Some(&applied)), case);
+
+            repo.commit_apps(after, true);
+            assert_admitted(&repo.sync(Some(&applied)), case);
+        }
+    }
+
+    /// B13 negative control: an unsigned commit that leaves every script
+    /// alone is admitted, even when the file holds scripts.
+    #[test]
+    fn an_unsigned_change_that_leaves_scripts_alone_is_admitted() {
+        let mut repo = SigningRepo::new();
+        let applied = repo.commit_apps(MULTILINE_OLD, true);
+        let reformatted = MULTILINE_OLD.replace("replicas = 1", "replicas = 2");
+        repo.commit_apps(&reformatted, false);
+        assert_admitted(&repo.sync(Some(&applied)), "replicas-only change");
+    }
+
+    /// B13: on the first sync there is nothing to compare against, so a
+    /// script present at all needs a signature.
+    #[test]
+    fn a_script_on_the_initial_sync_needs_a_trusted_signature() {
+        let mut repo = SigningRepo::new();
+        repo.commit_apps(MULTILINE_OLD, false);
+        assert_refused(&repo.sync(None), "initial sync, unsigned");
+
+        repo.commit_apps(MULTILINE_OLD, true);
+        assert_admitted(&repo.sync(None), "initial sync, signed");
+    }
+
+    /// B13: when the previous tree can't be read, the comparison is
+    /// incomplete, and an incomplete comparison is never read as "no
+    /// script change".
+    #[test]
+    fn an_unreadable_previous_tree_needs_a_trusted_signature() {
+        let mut repo = SigningRepo::new();
+        let missing = "0123456789abcdef0123456789abcdef01234567";
+
+        repo.commit_apps(NO_SCRIPT, false);
+        let outcome = repo.sync(Some(missing));
+        match &outcome.result {
+            SyncResult::Failure { error } => {
+                assert!(error.contains("can't be shown"), "got: {error}")
+            }
+            other => panic!("an incomplete comparison was admitted: {other:?}"),
+        }
+
+        repo.commit_apps(NO_SCRIPT, true);
+        assert_admitted(&repo.sync(Some(missing)), "unreadable previous, signed");
     }
 
     #[test]

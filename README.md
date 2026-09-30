@@ -18,9 +18,9 @@ it heal. Five minutes is the target.
 
 ## Five minutes, zero to cluster
 
-The one-line installer arrives with 0.1.0. Until the signed release is
-published, it stops with a release-not-published message. You'll need macOS, or
-Linux with QEMU and KVM, plus about 8 GiB of free memory and 15 GiB of disk.
+0.1.1 was released on 30 September 2026, and the one-line installer fetches
+its signed binaries. You'll need macOS, or Linux with QEMU and KVM, plus about
+8 GiB of free memory and 15 GiB of disk.
 
 ```sh
 # Install relish and build a three-node cluster in Linux VMs
@@ -45,7 +45,7 @@ relish dashboard                     # live charts in the browser
 # Break things and watch the cluster recover
 relish fault kill frontend --count 1 --acknowledge
 relish local stop node-3             # lose a whole machine
-relish status                        # three frontends again, on two nodes
+relish inspect frontend              # three frontends again, each with its node
 relish wtf                           # what's wrong and what to do about it
 
 # Clean up
@@ -81,7 +81,7 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 
 - `relish apply [PATH_OR_URL]`: Apply a Reliaburger TOML or Kubernetes YAML manifest
 - `relish status`: Show cluster and app status
-- `relish inspect <NAME>`: Show detailed info about an app, node, or job
+- `relish inspect <NAME>`: Show every instance of an app across the cluster, with its node
 - `relish exec <APP> [COMMAND]...`: Execute a command inside a running container
 - `relish deploy <PATH>`: Trigger a rolling deploy for an app
 - `relish cancel-deploy <OPERATION_ID>`: Cancel a node-local deploy and wait for its current work to finish
@@ -256,7 +256,8 @@ signatures if you ask it to.
 workers first, then council members one at a time, leader last. The new binary
 adopts running workloads without restarting them, and a crash-looping upgrade
 reverts itself. Network upgrades need two Ed25519 signatures: the release's
-and your own.
+and your own. A release with other cluster formats, or a rollback to a version
+some node doesn't hold, is refused before anything is recorded.
 
 **Diagnostics built for incidents.** `relish wtf` correlates cluster health into
 one screen of problems and next steps. `relish path` walks the network path
@@ -297,7 +298,7 @@ binary was built from. Neither needs a network.
 Config is TOML. The [whitepaper](docs/whitepaper.md) explains the architecture
 and its trade-offs; the [design docs](docs/design/) cover each subsystem.
 
-## Limits in 0.1.0
+## Limits in 0.1.1
 
 - **Clusters need rootful runc on Linux with eBPF.** macOS runs containers in
   managed Linux VMs; native macOS `bun` runs plain processes only.
@@ -313,12 +314,18 @@ and its trade-offs; the [design docs](docs/design/) cover each subsystem.
 - **Clusters start fresh.** Development-build state isn't migrated, and rolling
   upgrades need matching protocol and state formats (see the
   [compatibility policy](docs/releasing.md#cluster-compatibility)).
+- **Multi-platform images don't run from Pickle.** Nodes treat an image index
+  (a multi-platform `docker buildx` push, or `relish build`'s default of two
+  platforms) as a single image and fail to run it, and a multi-platform
+  `relish build` stores only the builder's platform. Push or build one platform
+  that matches your nodes; see
+  [Images and volumes](docs/manual/11_images-and-volumes.md#multi-platform-images).
 - **Cron doesn't catch up.** It skips firings missed during a crash, and a job
   whose outcome is unknown waits for `relish apply <file> --rerun-jobs`.
 
-The [documentation](docs/README.md#010-scope-and-limits) has the full list.
-[progress.md](docs/progress.md) tracks what's done and what's left before the
-release.
+The [documentation](docs/README.md#scope-and-limits) has the full list.
+The [roadmap](docs/roadmap.md) has what's next and the known gaps, with the
+detail in GitHub milestones and issues.
 
 ## Run it from source
 

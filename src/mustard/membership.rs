@@ -350,18 +350,37 @@ impl MembershipTable {
     pub fn snapshot(&self) -> Vec<MembershipSnapshot> {
         self.active_members()
             .into_iter()
-            .map(|m| MembershipSnapshot {
-                node_id: m.node_id.clone(),
-                address: m.address,
-                state: m.state,
-                incarnation: m.incarnation,
-                is_council: m.is_council,
-                is_leader: m.is_leader,
-                labels: m.labels.clone(),
-                first_seen: m.first_seen,
-                resources: m.resources.clone(),
-            })
+            .map(MembershipSnapshot::from)
             .collect()
+    }
+
+    /// Produce a snapshot of every member in the table, including Dead and
+    /// Left ones gossip has not reaped yet.
+    ///
+    /// The scheduler, council and registry must only ever see [`Self::snapshot`]:
+    /// a down member is no place to put work. This fuller view is for callers
+    /// that report on the cluster, and need to say *how* a member went away.
+    pub fn roster(&self) -> Vec<MembershipSnapshot> {
+        self.members
+            .values()
+            .map(MembershipSnapshot::from)
+            .collect()
+    }
+}
+
+impl From<&NodeMembership> for MembershipSnapshot {
+    fn from(m: &NodeMembership) -> Self {
+        MembershipSnapshot {
+            node_id: m.node_id.clone(),
+            address: m.address,
+            state: m.state,
+            incarnation: m.incarnation,
+            is_council: m.is_council,
+            is_leader: m.is_leader,
+            labels: m.labels.clone(),
+            first_seen: m.first_seen,
+            resources: m.resources.clone(),
+        }
     }
 }
 

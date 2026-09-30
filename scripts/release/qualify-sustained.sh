@@ -15,10 +15,12 @@
 #
 #   --base-url URL          staged candidate directory (the staging pre-release)
 #   --qualified-digest SHA  require candidate.json to have this SHA-256
-#   --soak-bun PATH         signed soak build named bun-v0.1.0-soak.1 with PATH.sig
-#                           (release signature) beside it; the harness adds the
-#                           operator signature to a copy (OpenSSL 3 needed);
-#                           without it the upgrade slots are skipped
+#   --soak-bun PATH         signed soak build named bun-vVERSION (for example
+#                           bun-v0.1.1-soak.1) with PATH.sig (release signature)
+#                           beside it; the harness adds the operator signature
+#                           to a copy (OpenSSL 3 needed); each walk upgrades to
+#                           it and rolls back to the version the candidate's
+#                           nodes report; without it the upgrade slots are skipped
 #   --tier T                fast (compressed schedule, 90m: the iteration loop
 #                           after each round of fixes) or final (full schedule,
 #                           8h: the acceptance run on the final candidate)
@@ -655,6 +657,10 @@ echo "bun_pid $pid"
 if [ "${pid:-0}" -gt 0 ]; then
     echo "bun_fd $(ls /proc/"$pid"/fd | wc -l)"
     echo "bun_rss_kb $(awk '/^VmRSS/ {print $2}' /proc/"$pid"/status)"
+    # exec keeps the pid, but the kernel hands the new image a fresh
+    # auxiliary vector whose addresses ASLR randomises: its checksum tells a
+    # self-upgrade's exec apart from the process it replaced.
+    echo "bun_image $(cksum < /proc/"$pid"/auxv | cut -d' ' -f1)"
 fi
 runc --root /var/lib/reliaburger/data/instances/runc/state list -q 2>/dev/null | sed 's/^/runc /'
 ls /run/netns 2>/dev/null | sed 's/^/netns /'
@@ -744,7 +750,11 @@ collect() {
     done
     if [ "$kind" = heavy ]; then
         # The writer's volume lives on node 2; exec reaches the local instance.
-        [ "${down[2]}" = 1 ] || rel_on 2 exec soak-writer awk '$0 != NR { print "BAD " NR ": " $0; exit } END { print "LAST " NR }' /data/seq \
+        # One pass over the whole file: the first line out of place, then
+        # which values are missing or repeated. The old check's `exit` ran
+        # END with NR at the bad line, so one repeated line read as a file
+        # truncated there (V02, 28 Sep 2026).
+        [ "${down[2]}" = 1 ] || rel_on 2 exec soak-writer awk '$0 != NR && bad == "" { bad = NR ": " $0 } { if (count[$0]++ == 1) { dups++; if (first_dup == "") first_dup = $0 } if ($0 + 0 > max) max = $0 + 0 } END { if (bad != "") print "BAD " bad; missing = 0; for (i = 1; i <= max; i++) if (!(i in count)) { if (!missing) first_missing = i; missing++ } if (dups) print "DUP " dups " first " first_dup; if (missing) print "MISSING " missing " first " first_missing; print "MAX " max + 0; print "LAST " NR }' /data/seq \
             > "$directory/writer-file.txt" 2>/dev/null || rm -f "$directory/writer-file.txt"
         [ "${down[1]}" = 1 ] || registry verify > "$directory/registry.json" 2>/dev/null || true
     fi
@@ -1062,9 +1072,12 @@ special_all_off() {
     settle special:all-off 600 || true
 }
 
-# v0.1.0 -> soak build -> v0.1.0, from node 1 against its own registry (the
-# host forward can't reach the registry address nodes are told to use).
+# The candidate's version -> soak build -> back, from node 1 against its own
+# registry (the host forward can't reach the registry address nodes are told
+# to use). The version to return to is what the nodes reported at bootstrap
+# (release_version), never a pinned release.
 upgrade_walks=0
+release_version=
 slot_upgrade() {
     upgrade_walks=$(( upgrade_walks + 1 ))
     local target name inject started
@@ -1094,9 +1107,9 @@ slot_upgrade() {
     # rollback replaces it.
     if wait_versions "$target" 600 "$started" upgrade; then wait_upgrade_idle 120 || true; fi
     started=$(date +%s)
-    gsh 1 "RELIABURGER_TOKEN=\$(cat /root/.soak-token) relish --endpoint https://127.0.0.1:9117 --ca-cert /etc/reliaburger/identity/root-ca.crt upgrade rollback v0.1.0" \
+    gsh 1 "RELIABURGER_TOKEN=\$(cat /root/.soak-token) relish --endpoint https://127.0.0.1:9117 --ca-cert /etc/reliaburger/identity/root-ca.crt upgrade rollback v$release_version" \
         > "$evidence/snapshots/upgrade-$upgrade_walks-rollback.log" 2>&1 || record_failure upgrade "upgrade rollback failed"
-    wait_versions 0.1.0 600 "$started" rollback || true
+    wait_versions "$release_version" 600 "$started" rollback || true
     settle upgrade:settle 600 || true
     return 0
 }
@@ -1115,14 +1128,21 @@ wait_upgrade_idle() {
     done
 }
 
+# The version each node's API reports, one line per node, "?" for a node
+# that doesn't answer.
+node_versions() {
+    local node
+    for node in 1 2 3; do
+        curl -fsS --max-time 5 --cacert "$ca" --connect-to "${vm[node]}:9117:127.0.0.1:$(( api_port + node - 1 ))" \
+            "https://${vm[node]}:9117/v1/version" 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])' 2>/dev/null || echo '?'
+    done
+}
+
 wait_versions() {
-    local want=$1 budget=$2 started=$3 label=$4 node versions
+    local want=$1 budget=$2 started=$3 label=$4 version versions
     while :; do
         versions=
-        for node in 1 2 3; do
-            versions+="$(curl -fsS --max-time 5 --cacert "$ca" --connect-to "${vm[node]}:9117:127.0.0.1:$(( api_port + node - 1 ))" \
-                "https://${vm[node]}:9117/v1/version" 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"].lstrip("v"))' 2>/dev/null || echo '?') "
-        done
+        while read -r version; do versions+="${version#v} "; done < <(node_versions)
         if [ "$versions" = "$want $want $want " ]; then
             event --phase "upgrade:$label" --verdict ok --duration $(( $(date +%s) - started )) --detail "$versions"
             return 0
@@ -1307,6 +1327,8 @@ if [ "$resume" = true ]; then
     generation=$(meta_get generation); generation=${generation:-0}
     first_cycle=$(meta_get cycles); first_cycle=${first_cycle:-0}
     started_at=$(meta_get started_at)
+    release_version=$(meta_get release_version)
+    [ -z "$soak_bun" ] || [ -n "$release_version" ] || fail "--resume with --soak-bun needs a run that recorded release_version"
     last_event=$(tail -n 1 "$evidence/events.jsonl" | python3 -c 'import json,sys; print(json.load(sys.stdin)["ts"])')
     gap=$(( $(date +%s) - last_event ))
     event --phase pause --duration "$gap" --detail 'resumed after an interruption'
@@ -1339,7 +1361,14 @@ json.dump({"nodes": sys.argv[2:]}, open(sys.argv[1], "w"))
 PY
     configure_nodes
     apply_workloads
-    meta versions "$(for node in 1 2 3; do curl -fsS --max-time 5 --cacert "$ca" --connect-to "${vm[node]}:9117:127.0.0.1:$(( api_port + node - 1 ))" "https://${vm[node]}:9117/v1/version" 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])' || echo '?'; done | sort | uniq -c | awk '{printf "%s%s x%s", sep, $2, $1; sep=", "}')"
+    versions=$(node_versions)
+    meta versions "$(printf '%s\n' "$versions" | sort | uniq -c | awk '{printf "%s%s x%s", sep, $2, $1; sep=", "}')"
+    if [ -n "$soak_bun" ]; then
+        # shellcheck disable=SC2086  # one argument per node
+        release_version=$(check release-version --soak-bun "$soak_bun" $versions) \
+            || setup_fail "no release version to roll back to: the nodes report $(printf '%s' "$versions" | tr '\n' ' ')"
+        meta release_version "$release_version"
+    fi
     say 'waiting for the baseline to settle'
     open_window baseline
     settle baseline 600 || setup_fail 'the cluster did not settle for the baseline'

@@ -2,16 +2,17 @@
 
 User guide for building and running Reliaburger. For managed Linux VMs on a
 laptop, see the [quickstart guide](quickstart.md). For the architectural vision,
-see the [whitepaper](whitepaper.md); for implementation status, see
-[progress.md](progress.md).
+see the [whitepaper](whitepaper.md); for status and what's next, see the
+[roadmap](roadmap.md).
 
-0.1.0 hasn't shipped yet. The source builds and runs today; the signed public
-installer arrives with the release. Release candidates follow a separate
-[build and promotion procedure](releasing.md#metadata-and-publication), and the
-[remaining work](plans/2026-09-22-v0.1.0-remaining-work.md) lists the acceptance
-gates still open.
+0.1.1 was released on 30 September 2026. Its signed binaries, guest images and
+installer are on the [GitHub release](https://github.com/reliaburger/reliaburger/releases/tag/v0.1.1),
+and `curl -fsSL https://reliaburger.com/install.sh | sh` installs it. Every
+release follows the same [build, staging and promotion procedure](releasing.md#metadata-and-publication).
+The limits below are the ones 0.1.1 ships with; the [roadmap](roadmap.md) tracks
+what comes after it.
 
-## 0.1.0 scope and limits
+## Scope and limits
 
 - **Container clusters run on rootful Linux Runc with eBPF.** Set
   `[ebpf] enabled = true`; policy recovery also needs bpffs at `/sys/fs/bpf`.
@@ -39,6 +40,13 @@ gates still open.
   [compatibility policy](releasing.md#cluster-compatibility).
 - **One Bun per writable image store.** Registry startup claims exclusive
   ownership of the image store's upload directory.
+- **Multi-platform images don't run from Pickle.** A node pulling an OCI
+  image index or Docker manifest list from the built-in registry treats it as
+  a single image and fails to run it. That covers `docker buildx build
+  --platform linux/amd64,linux/arm64 --push` and `relish build` with more than
+  one platform (the default), which also stores only the builder's platform.
+  Push or build a single platform matching your nodes; see
+  [Images and volumes](manual/11_images-and-volumes.md#multi-platform-images).
 - **Test volumes have no snapshots.** Disposable test-volume snapshots aren't
   supported.
 
@@ -223,7 +231,7 @@ xcode-select --install
 
 ## Container runtimes (optional)
 
-For 0.1.0, Bun selects Linux runc or the built-in process runtime. macOS containers run through managed Linux VMs. **ProcessGrill** (plain OS processes) is the built-in fallback that works everywhere without extra software — you don't need to install anything else to get started.
+For 0.1.1, Bun selects Linux runc or the built-in process runtime. macOS containers run through managed Linux VMs. **ProcessGrill** (plain OS processes) is the built-in fallback that works everywhere without extra software — you don't need to install anything else to get started.
 
 ### runc (Linux)
 
@@ -262,7 +270,7 @@ or operator firewall rules when diagnosing direct-host connectivity.
 
 ### macOS containers: managed Linux VMs
 
-For 0.1.0, run containers through the [managed laptop quickstart](quickstart.md):
+For 0.1.1, run containers through the [managed laptop quickstart](quickstart.md):
 
 ```sh
 relish setup --quickstart --nodes 3
@@ -273,7 +281,7 @@ foreground process workloads. Direct Apple Container selection is disabled,
 even when its CLI is installed: interrupted CLI requests can outlive Bun and
 mutate the Apple daemon, and their recovery guarantees are not yet complete.
 The adapter and its manual development tests remain in the repository for future
-work; they are outside the 0.1.0 runtime profile.
+work; they are outside the 0.1.1 runtime profile.
 
 ### ProcessGrill (built-in fallback)
 
@@ -293,7 +301,7 @@ sixteen concurrent exec requests, with a five-minute deadline, 64 KiB request
 limit and 1 MiB combined stdout/stderr response limit. Commands inherit the host
 environment and run without container isolation.
 
-**0.1.0 contract: foreground workloads only.** The main process stays under Bun's
+**0.1.1 contract: foreground workloads only.** The main process stays under Bun's
 supervision and children must remain in its supervised process group. A service
 can run unattended and spawn workers; foreground does not mean an open terminal.
 Use the application's foreground/no-daemon option. A shell wrapper should `exec`
@@ -459,10 +467,11 @@ cargo run --bin bun -- --listen 127.0.0.1:9217
 cargo run --bin bun -- --config node.toml
 ```
 
-The agent prints which runtime it selected on startup:
+The agent prints its version, the commit it was built from, and the runtime
+it selected on startup:
 
 ```
-bun: reliaburger node agent v0.1.0
+bun: reliaburger node agent v0.1.0 (3fcb1fd)
 bun: auto-detected runtime: process
 bun: API server listening on 127.0.0.1:9117
 ```
@@ -680,6 +689,10 @@ Requirements:
 - **A versioned binary directory** (default: the directory of the running
   executable): `bun` is a symlink to `bun-vX.Y.Z`; previous versions are
   retained for rollback (`upgrades.retain_versions`, default 3).
+- **Matching formats.** The leader runs `bun --compatibility` on a verified
+  candidate before recording a cluster upgrade and refuses one with a different
+  protocol or state format; a cluster rollback is refused when a node's binary
+  directory lacks the target (`installed_versions` in `GET /v1/version`).
 
 The release private key must live outside any repository. The project key's
 public half is compiled into `src/upgrade/keys.rs`; rotating it means shipping
@@ -950,6 +963,10 @@ upload_url = "s3://backups/burger"    # optional; file:// and gs:// work too
 Snapshot archives upload as `.tar.gz` through `object_store`; credentials come
 from each backend's standard environment variables. On non-Btrfs filesystems
 snapshots return a clear error (sized volumes fall back to loop-mounted ext4).
+A snapshot request may only name the app's own managed volumes and a custom
+name of 1–128 characters from `[A-Za-z0-9._-]` (no leading dot); anything else
+is a 400. A multi-volume snapshot shares one name, so `restore` and `delete` of
+that name take `--volume`. `retain` must be at least 1 when `interval_secs` is set.
 
 ### Apps
 
@@ -1071,7 +1088,7 @@ The bun agent exposes a local HTTP API on port 9117:
 | `POST` | `/v1/stop/{app}/{namespace}` | Stop an app |
 | `GET` | `/v1/logs/{app}/{namespace}` | Captured stdout/stderr (`?tail=N&follow=true`) |
 | `POST` | `/v1/exec/{app}/{namespace}` | Execute a command (JSON body: `{"command":["..."]}`) |
-| `GET` | `/v1/cluster/nodes` | List cluster nodes (gossip membership) |
+| `GET` | `/v1/cluster/nodes` | List cluster nodes (gossip membership, dead members included with state `dead`) |
 | `GET` | `/v1/cluster/council` | Council (Raft) status |
 | `POST` | `/v1/cluster/join` | Join with a single-use token, node ID, CSR and format compatibility |
 | `POST` | `/v1/cluster/renew` | Renew the authenticated TLS node’s CSR on the leader; requires the service token, current peer certificate and format compatibility |
@@ -1178,8 +1195,9 @@ failures and the hard safety limit fail the suite.
 `relish wtf` collects bounded evidence from every expected node using the same
 authenticated client identity. It diagnoses node and council health,
 crashloops, stalled deploys, missing service backends, active faults and alerts,
-disk pressure, actual cgroup throttling, certificate lifecycle and Pickle
-redundancy. Use `--app <name>` for application scope or `--watch` for a
+disk pressure, actual cgroup throttling, certificate lifecycle, Pickle
+redundancy and version skew (each node's bun version, commit and binary
+SHA-256; a warning names nodes on a different build). Use `--app <name>` for application scope or `--watch` for a
 human refresh every 30 seconds (`--interval <secs>` changes the period). JSON and YAML use schema version 1. Exit status 0 means
 all selected evidence was observed and healthy, 1 means a critical finding,
 and 2 means warnings or unknown evidence. Bounded in-memory restart and deploy
@@ -1196,6 +1214,10 @@ state, live attached firewall state, the faults active on the path, and the TCP
 result. Each step is labelled `observed`, `inferred` or `unavailable`. A
 failure exits 1; missing evidence or missing probe tools exits 2 rather than
 pretending the path is healthy.
+
+`relish inspect <app>` lists every instance of the app on every node, with its
+node, under a desired vs running replica count; a node that did not answer or
+that gossip reports dead is named rather than silently left out.
 
 External probes are denied by default. They require an Admin credential,
 `probe_external_destination` in `[testing].allowed_operations`, the protected
@@ -1286,7 +1308,7 @@ different name or namespace for the other kind.
 
 Release maintainers: see [the build, signing and publication procedure](releasing.md).
 
-Direct Apple Container is disabled for 0.1.0 while interrupted daemon-command
+Direct Apple Container is disabled for 0.1.1 while interrupted daemon-command
 recovery remains unfinished. Use the managed Linux/runc quickstart on macOS.
 
 Node chaos (kill, drain, pressure and council partitions) reserves one cluster-wide
@@ -1345,5 +1367,5 @@ machines.
   record with a rule-of-three bound. It refuses the shared `reliaburger-test`
   VM.
 
-Passing them doesn't close the release gates in the
-[remaining-work table](plans/2026-09-22-v0.1.0-remaining-work.md).
+They're one part of a release's acceptance, not all of it; the
+[release runbook](releasing.md) lists the gates a candidate has to pass.

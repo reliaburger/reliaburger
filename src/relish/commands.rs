@@ -139,10 +139,7 @@ async fn status_with_client(output: OutputFormat, client: &BunClient) -> Result<
                 );
                 for row in &statuses {
                     let s = &row.instance;
-                    let pid = s
-                        .pid
-                        .map(|p| p.to_string())
-                        .unwrap_or_else(|| "-".to_string());
+                    let pid = pid_cell(s);
                     println!(
                         "{:<24} {:<20} {:<15} {:<12} {:<10} {:<10} {:<6}",
                         row.node, s.id, s.app_name, s.namespace, s.state, pid, s.restart_count
@@ -459,34 +456,14 @@ async fn delete_with_client(
     Ok(())
 }
 
-/// Show detailed info about an app, node, or job.
+/// Show every instance of an app across the cluster, with its node.
 pub async fn inspect(name: &str) -> Result<(), RelishError> {
     inspect_with_client(name, &BunClient::default_local()).await
 }
 
 async fn inspect_with_client(name: &str, client: &BunClient) -> Result<(), RelishError> {
-    let statuses = client.status().await?;
-    let matching: Vec<_> = statuses.iter().filter(|s| s.app_name == name).collect();
-
-    if matching.is_empty() {
-        println!("no instances found for {name}");
-    } else {
-        for s in &matching {
-            println!("Instance: {}", s.id);
-            println!("  App:       {}", s.app_name);
-            println!("  Namespace: {}", s.namespace);
-            println!("  State:     {}", s.state);
-            println!("  Restarts:  {}", s.restart_count);
-            if let Some(pid) = s.pid {
-                println!("  PID:       {pid}");
-            }
-            if let Some(port) = s.host_port {
-                println!("  Port:      {port}");
-            }
-            println!();
-        }
-    }
-
+    let inspection = super::inspect::collect(client, name).await?;
+    print!("{}", super::inspect::render(&inspection));
     Ok(())
 }
 
@@ -918,9 +895,7 @@ pub async fn council_recover(
     // cluster by mistake.
     if !force {
         if let Ok(nodes) = BunClient::default_local().nodes().await {
-            let live_voter = nodes
-                .iter()
-                .find(|n| n.is_council && !matches!(n.state.as_str(), "dead" | "left"));
+            let live_voter = nodes.iter().find(|n| n.is_council && !n.is_down());
             if let Some(voter) = live_voter {
                 return Err(RelishError::Recovery(format!(
                     "a live council voter ({}) is still reachable; stop the cluster or pass --force",
@@ -1429,6 +1404,16 @@ pub async fn top(output: OutputFormat) -> Result<(), RelishError> {
     Ok(())
 }
 
+/// An instance's PID for a table: `-` when it has none, `?` when the node's
+/// runtime didn't answer in time.
+fn pid_cell(status: &crate::bun::agent::InstanceStatus) -> String {
+    match status.pid {
+        Some(pid) => pid.to_string(),
+        None if status.runtime_unknown => "?".to_string(),
+        None => "-".to_string(),
+    }
+}
+
 /// The `relish top` table.
 fn render_top(rows: &[crate::bun::top::TopRow]) -> String {
     use std::fmt::Write as _;
@@ -1441,11 +1426,7 @@ fn render_top(rows: &[crate::bun::top::TopRow]) -> String {
         "NODE", "APP", "NAMESPACE", "STATE", "PID", "RESTARTS", "CPU", "MEMORY"
     );
     for row in rows {
-        let pid = row
-            .instance
-            .pid
-            .map(|pid| pid.to_string())
-            .unwrap_or_else(|| "-".to_string());
+        let pid = pid_cell(&row.instance);
         let cpu = row
             .cpu_percent
             .map(|cpu| format!("{cpu:.1}%"))
@@ -1746,11 +1727,11 @@ pub async fn wait_for_batch(
 /// uploads it to Pickle, and submits a build job.
 pub async fn build(
     path: &std::path::Path,
-    registry_port: u16,
+    registry_port: Option<u16>,
     timeout_secs: u64,
 ) -> Result<(), RelishError> {
     use crate::config::Config;
-    use crate::pickle::build::{digest_of, execute_build, tar_context};
+    use crate::pickle::build::{cli_context_upload_url, digest_of, execute_build, tar_context};
 
     let config = Config::from_file(path)?;
     if config.build.is_empty() {
@@ -1789,8 +1770,12 @@ pub async fn build(
         // O2: address the registry the way it actually serves. Hardcoding
         // `http://` failed outright against a TLS registry, and where it
         // worked it pushed the context — the caller's source tree — in clear.
-        let upload_url =
-            crate::pickle::build::context_upload_url(client.scheme(), registry_port, &digest);
+        let upload_url = cli_context_upload_url(
+            client.scheme(),
+            registry_port,
+            client.declared_registry(),
+            &digest,
+        );
         let resp = client
             .http()?
             .post(&upload_url)
@@ -1811,16 +1796,13 @@ pub async fn build(
         }
         println!("  context uploaded to Pickle");
 
-        // Prepare the build job (for display; the agent re-derives it)
-        let job = execute_build(
-            spec,
-            &digest,
-            Some(registry_port),
-            client.scheme() == "https",
-        )
-        .map_err(|e| RelishError::ApiError {
-            status: 0,
-            body: format!("build preparation failed: {e}"),
+        // Prepare the build job (for display; the agent re-derives it with
+        // its own registry port, which a host forward doesn't change).
+        let job = execute_build(spec, &digest, None, client.scheme() == "https").map_err(|e| {
+            RelishError::ApiError {
+                status: 0,
+                body: format!("build preparation failed: {e}"),
+            }
         })?;
 
         println!(
@@ -2189,17 +2171,29 @@ pub async fn snapshot_list(app: &str, namespace: &str) -> Result<(), RelishError
         println!("no snapshots for {namespace}/{app}");
         return Ok(());
     }
-    println!("{:<24} {:<12} {:>12}  UPLOADED", "NAME", "VOLUME", "SIZE");
+    println!(
+        "{:<24} {:<12} {:>12}  EXPORTED TO",
+        "NAME", "VOLUME", "SIZE"
+    );
     for meta in list {
+        let destinations: Vec<&str> = meta["exports"]
+            .as_array()
+            .map(|exports| {
+                exports
+                    .iter()
+                    .filter_map(|receipt| receipt["destination"].as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
         println!(
             "{:<24} {:<12} {:>12}  {}",
             meta["name"].as_str().unwrap_or("?"),
             meta["volume_path"].as_str().unwrap_or("?"),
             meta["size_bytes"].as_u64().unwrap_or(0),
-            if meta["uploaded"].as_bool().unwrap_or(false) {
-                "yes"
+            if destinations.is_empty() {
+                "-".to_string()
             } else {
-                "no"
+                destinations.join(", ")
             },
         );
     }
@@ -2207,17 +2201,31 @@ pub async fn snapshot_list(app: &str, namespace: &str) -> Result<(), RelishError
 }
 
 /// Restore a snapshot over its live volume (stop the app first).
-pub async fn snapshot_restore(app: &str, namespace: &str, name: &str) -> Result<(), RelishError> {
+/// `volume` picks between volumes that share the snapshot name.
+pub async fn snapshot_restore(
+    app: &str,
+    namespace: &str,
+    name: &str,
+    volume: Option<&str>,
+) -> Result<(), RelishError> {
     let client = BunClient::default_local();
-    client.snapshot_restore(app, namespace, name).await?;
+    client
+        .snapshot_restore(app, namespace, name, volume)
+        .await?;
     println!("restored {namespace}/{app} from snapshot {name}");
     Ok(())
 }
 
-/// Delete a snapshot.
-pub async fn snapshot_delete(app: &str, namespace: &str, name: &str) -> Result<(), RelishError> {
+/// Delete a snapshot. `volume` picks between volumes that share the
+/// snapshot name.
+pub async fn snapshot_delete(
+    app: &str,
+    namespace: &str,
+    name: &str,
+    volume: Option<&str>,
+) -> Result<(), RelishError> {
     let client = BunClient::default_local();
-    client.snapshot_delete(app, namespace, name).await?;
+    client.snapshot_delete(app, namespace, name, volume).await?;
     println!("deleted snapshot {name} of {namespace}/{app}");
     Ok(())
 }
@@ -2259,6 +2267,7 @@ mod tests {
                 host_port: None,
                 exit_code: None,
                 pid,
+                runtime_unknown: false,
             },
             cpu_percent: cpu,
             memory_bytes: memory,
@@ -2284,6 +2293,20 @@ mod tests {
             ),
             top_row("rb-3", "default__podinfo-0", None, None, None),
         ]));
+    }
+
+    #[test]
+    fn top_marks_a_pid_the_runtime_did_not_report_in_time() {
+        let mut busy = top_row("rb-2", "default__podinfo-1", None, None, None);
+        busy.instance.runtime_unknown = true;
+        let table = render_top(&[
+            top_row("rb-1", "default__podinfo-0", None, None, None),
+            busy,
+        ]);
+        let pid_column = |line: &str| line.split_whitespace().nth(4).map(str::to_string);
+        let lines: Vec<&str> = table.lines().collect();
+        assert_eq!(pid_column(lines[1]).as_deref(), Some("-"), "{table}");
+        assert_eq!(pid_column(lines[2]).as_deref(), Some("?"), "{table}");
     }
 
     #[test]

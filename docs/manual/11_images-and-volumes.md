@@ -52,9 +52,10 @@ relish build app.toml
 relish apply app.toml
 ```
 
-Relish uploads the context to the registry at `localhost:5050`
-(`--registry-port` changes the port), so run it on a node or through a forward
-to one. A node then builds it with Buildah, which must be installed there, for
+Relish uploads the context to the registry: through the quickstart's registry
+forward (`127.0.0.1:15050`) on a laptop cluster, otherwise at `localhost:5050`,
+so run it on a node or through a forward to one (`--registry-port` names the
+port on this host). A node then builds it with Buildah, which must be installed there, for
 `linux/amd64` and `linux/arm64` by default. A build has
 15 minutes (`[images] build_timeout_secs`) and a 256 MiB context. Refer to the
 result by its bare name, as `api:v1.2.3`, and nodes find it in Pickle. Built
@@ -104,6 +105,32 @@ anonymously to a standalone node's loopback registry before its first API
 token exists. Pickle has no Docker token service, and it doesn't support
 deleting images through the registry API.
 
+## Multi-platform images
+
+0.1.1 can't run a multi-platform image (an OCI image index or Docker manifest
+list) stored in Pickle. A node pulling one treats the index as a single image
+and the workload fails to start. This hits `docker buildx build --platform
+linux/amd64,linux/arm64 --push` and multi-platform `relish build`, which is the
+default; a multi-platform `relish build` also stores only the builder's own
+platform. 0.1.2 is planned to fix both.
+
+Until then, push and build one platform that matches your nodes:
+
+```sh
+docker buildx build --platform linux/arm64 -t NODE:5050/api:v1 --push .
+```
+
+```toml
+[build.api]
+context = "./api"
+destination = "pickle://api:v1.2.3"
+platform = ["linux/arm64"]      # or ["linux/amd64"], whatever your nodes run
+```
+
+On a cluster whose nodes share one architecture, multi-platform images from
+an upstream registry work: the pull-through cache picks the node's platform
+from the index and stores that single image.
+
 ## Volumes
 
 ```toml
@@ -122,9 +149,10 @@ survives restarts and redeploys. Bun hands it to the container's user the first
 time it's mounted. It stays on its node, so it's local storage, not a
 network volume. An app with a managed volume stays with it too: after
 `relish stop`, the next `relish apply` starts it again on the node that holds
-its volume, and waits there if that node is short of room. Only when that node
-is gone (or no longer matches the app's `placement.required` labels) does it
-start elsewhere, on a new, empty volume. A host-path volume is never chowned: make it readable (or
+its volume, and waits there if that node is short of room, not ready, or in the
+middle of an upgrade. A running app stays put for the same reasons. Only when
+that node is gone (or no longer matches the app's `placement.required` labels)
+does it start elsewhere, on a new, empty volume. A host-path volume is never chowned: make it readable (or
 writable) by the container's mapped user yourself.
 
 ## Snapshots
@@ -142,15 +170,58 @@ relish apply db.toml     # start it again
 ```
 
 Restore overwrites the live volume, so stop the app first. On other
-filesystems, snapshot commands fail with an error saying so. For scheduled
-snapshots, optionally uploaded as archives to object storage:
+filesystems, snapshot commands fail with an error saying so.
+
+While a restore runs it owns the app's volumes: `relish apply` for that app,
+automatic restarts, and any other snapshot command for it get a "retry
+shortly" refusal (a 409) until the restore finishes. The restored volume keeps
+the original's `size` quota. If Bun dies mid-restore, it finishes or rolls back
+the swap when it starts again, so the app sees either its old data or the
+restored data, never a missing volume. When it can't tell which copy is right,
+it keeps every copy (`<volume>.restore-staged`, `<volume>.restore-old`), logs
+`needs manual recovery`, and refuses to mount that volume until you move the
+right copy into place and delete the `<volume>.restore.json` journal.
+
+`relish snapshot list` reports an error, rather than a shorter list, when
+snapshot metadata can't be read.
+
+`--volume` must be one of the app's own managed volumes, named by its
+container mount path. A custom `--name` is 1 to 128 characters from
+`A-Z a-z 0-9 . _ -` and can't start with a dot. Anything else is refused with
+a 400. Without `--volume`, `create` snapshots every managed volume of the app
+under one shared name. Restoring or deleting that name then needs `--volume`
+to say which copy you mean:
+
+```sh
+relish snapshot restore db 1752000000 --volume /var/lib/postgresql/data
+```
+
+For scheduled snapshots, optionally uploaded as archives to object storage:
 
 ```toml
 [storage.snapshots]
 interval_secs = 86400                 # 0 (the default) disables it
-retain = 7                            # newest N per volume
+retain = 7                            # newest N per volume; at least 1 when scheduled
 upload_url = "s3://backups/volumes"   # optional; file:// and gs:// too
+upload_timeout_secs = 3600            # deadline for archiving, then for uploading, each snapshot
 ```
 
 Object-storage credentials come from each backend's standard environment
 variables.
+
+Each sweep takes new snapshots, uploads every snapshot the destination hasn't
+confirmed, then prunes past `retain`. A snapshot that hasn't reached the
+destination is never pruned: if the store is down for longer than the
+retention window, snapshots pile up on the node (Bun logs how many it's
+keeping) and ship once the store is back. Change `upload_url` and the new
+destination receives every retained snapshot. `relish snapshot list` shows
+which destinations hold each one.
+
+Archives are streamed to a spool file in `<volumes>/.snapshot-spool` and
+uploaded in 8 MiB parts, so a large volume doesn't need its size in memory.
+The spool never takes the volumes filesystem below 5% free. Objects land under
+`<prefix>/<namespace>/<app>/<node>/<volume>/`: the archive is
+`archives/sha256-<digest>.tar.gz`, and a JSON manifest in `manifests/` names
+the snapshot, its volume, node and creation time. Two nodes running the same
+app never overwrite each other's archives, and neither does reusing a
+snapshot name.

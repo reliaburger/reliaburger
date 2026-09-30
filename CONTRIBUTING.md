@@ -4,7 +4,7 @@ Thanks for helping build Reliaburger. This repository is both a working `Rust` p
 
 ## Before You Start
 
-Read the project [documentation](docs/README.md), [roadmap](docs/roadmap.md), and [implementation progress](docs/progress.md) before starting substantial work. The roadmap is organised into phases, and we generally work through those phases in order.
+Read the project [documentation](docs/README.md) and [roadmap](docs/roadmap.md) before starting substantial work. 0.1.1 is released; the open work is in the roadmap's release list and known gaps, and in the GitHub milestones and issues they link.
 
 For a new feature or a change to public behaviour:
 
@@ -59,7 +59,7 @@ Run `make fmt` locally after editing Rust. Do not introduce unrelated formatting
 
 ## Documentation And The Book
 
-Documentation is part of the feature. Update the relevant design document, `docs/progress.md`, user documentation, or book chapter when a change affectsarchitecture, behaviour, configuration, commands, or the current roadmap.
+Documentation is part of the feature. Update the relevant design document, user documentation, or book chapter (and the roadmap, if the plan changes) when a change affects architecture, behaviour, configuration, commands, or the current roadmap.
 
 Book chapters are written for programmers who may know C, Python, or Go but not Rust. When adding `Rust` syntax to a chapter for the first time explain it in plain language. Include the design reasoning, tests, trade-offs, and lessons learned rather than documenting only the finished code.
 

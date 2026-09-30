@@ -578,9 +578,42 @@ pub struct Compatibility {
 
 Every boundary checks the pair. Raft requests carry both generations, gossip rejects a mismatch before touching membership, reporting frames carry a fixed header, and a joining node has to match before it reveals its one-time token. Absent evidence is a refusal.
 
+#### A refusal you can act on
+
+A refusal is only as good as its first line. The 0.1.0 version said `invalid or incompatible state format at /var/lib/reliaburger/data/state-format.json; preserve the data and use a compatible binary`. Correct, and nearly useless. It didn't say which format it found, which one it wanted, or what "a compatible binary" might be. And `journalctl` cuts long lines at the terminal's width, so the part a user saw was mostly a path. A user who'd swapped in a newer dev build (issue #241) had no way to tell what went wrong or what to do about it.
+
+So every refusal now leads with the pair, then the remedy, then a link to the policy:
+
+```text
+incompatible state format: found 43; this binary (reliaburger v0.1.1 (3fcb1fd)) needs 44. Pre-1.0 builds don't migrate state: run the reliaburger release that wrote /var/lib/reliaburger/data/state-format.json, or move the data aside and recreate the cluster. See https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#compatibility-before-100
+```
+
+A stamp from another generation used to share a variant with a corrupt one. They're different problems (one has an answer, the other doesn't), so the number now travels in its own variant:
+
+```rust
+#[error(
+    "incompatible state format: found {found}; this binary ({}) needs {expected}. \
+     Pre-1.0 builds don't migrate state: run the reliaburger release that wrote {}, \
+     or move the data aside and recreate the cluster. See {POLICY_URL}",
+    this_binary(),
+    .stamp.display()
+)]
+StateMismatch { stamp: PathBuf, found: u32, expected: u32 },
+```
+
+Two bits of `thiserror` syntax are new here. `{found}` names a field of the variant, as before. The arguments after the string are extra format arguments, like trailing arguments to C's `printf`. They can be any expression, and a leading dot (`.stamp`) means "this variant's field", so `.stamp.display()` calls a method on it. `{POLICY_URL}` isn't a field at all: Rust's format strings capture a name from the surrounding scope, and a module-level `const` counts. The backslash at the end of a line continues the string literal and swallows the next line's leading whitespace, so the message stays one line on screen and readable in the source.
+
+`this_binary()` names the release and, when the build knew it, the commit, reusing the same `describe` that `relish version` prints (`v0.1.1 (3fcb1fd)`). Two dev builds can share a version number and still hold different code, so the commit is what tells a user which one refused.
+
+The join refusal gets the same treatment. It used to wrap the mismatch as `cluster member rejected the join: ...`, which blamed a member that never rejected anything: the joiner itself refused the member's formats after asking `/v1/version`. `JoinClientError::Incompatible` now carries the `CompatibilityError` through `#[from]`, so `?` converts it and the message starts `cannot join: incompatible cluster formats: found protocol 26, state 43; this binary (...) needs protocol 27, state 44`.
+
+The tests pin the order, not just the content. A helper takes everything before the first `". "` and checks that it holds both numbers and the version, so a future edit can't push the key facts past the point where the journal cuts the line.
+
 A candidate binary gets checked too, before it's staged. Run `bun --compatibility` and it prints the pair as JSON without loading config or starting a runtime. The upgrade manager verifies the release signature first, writes those verified bytes to a private temporary file, runs *that* copy with `--compatibility`, and caps the output at 4 KiB with a ten-second deadline. Why a copy? Checking the download path and executing it later would let the file change in between. `NamedTempFile::into_temp_path` hands us a path that deletes the file when dropped, and closes our writable descriptor first, because Linux refuses to execute a file that's open for writing (`ETXTBSY`, "text file busy"). Even then, the full test suite caught the occasional `ETXTBSY`: another thread forking at the wrong moment briefly inherits the descriptor. That's a [known race in process launching](https://github.com/rust-lang/rust/issues/114554), so the probe retries that one error within the same deadline. Retrying can't turn an incompatible binary into an accepted one.
 
 Tests cover mismatched gossip and Raft messages, refused development state, rejected joins, signed-but-incompatible executables and rollback refusal. Test fixtures that model a *compatible* peer take their pair from `compatibility::CURRENT` rather than hard-coding numbers. We learnt that one when a state bump turned ten unrelated tests red at the compatibility check instead of at the behaviour they were meant to test.
+
+That fresh-cluster promise outlived 0.1.0. We sketched a stricter rule for after the release: bump a generation only for a change old nodes can't read, ship a migration with every bump, and let additive JSON fields through without one. Then we asked who it would serve. Before 1.0.0 every release is a development release, and every migration is code we'd have to test and then carry for a cluster you could simply rebuild. So the rule waits for 1.0.0. Until then, any incompatible change bumps its generation, nodes refuse old peers and old state, and you start a fresh cluster.
 
 ### Cordoning
 
@@ -1078,3 +1111,368 @@ One gap is left, and the manual says so. relish builds the `start` and
 outside Raft doesn't know which node leads, so its plan names none and the
 leader refuses it. Forwarding gets the call to the right place; it can't fix
 a plan built from a node that doesn't know the answer.
+
+## Same pid, new process
+
+Self-upgrade ends in `execv`, and `exec` keeps the pid. That's the point:
+systemd never sees Bun exit, so it doesn't restart it or count a restart. It
+also fooled our own soak harness, which is how we found out how much the
+harness leaned on the pid.
+
+The soak's leak check samples Bun's resident memory (RSS) every few minutes.
+When the pid changes it starts a one-hour warm-up, takes the first sample
+after that as the process's "warm" size, and fails if RSS ever goes more than
+25% above it. On the candidate-9 run, node 2's Bun kept pid 670 for almost two
+hours. Halfway through, an upgrade walk exec'd it into the soak build and
+straight back, and RSS fell from 594 MB to 242 MB: a brand-new image with an
+empty heap, under the old pid. The pid was already more than an hour old, so
+the checker took its warm sample ten minutes after the exec, at 480 MB, while
+the new image was still filling its working set. Forty minutes later the
+leader was killed, node 2 absorbed the burst of reconnections and catch-up,
+and it settled at 657 MB. That's 31% over "warm", so the check failed.
+
+It wasn't a leak. Line the samples up per image and they all look alike: a
+climb to 450-550 MB (750-870 MB on the leader) in the first five to fifteen
+minutes, then a step up after a peer's restart that doesn't come back down,
+because glibc keeps freed memory in its arenas for the next burst. File
+descriptors rose in every burst and fell straight back to about 55.
+
+So the harness needs to know when the image changes, not just the pid. How
+do you tell from outside? The start time in `/proc/<pid>/stat` doesn't move
+on `exec`, and after a rollback the binary is the same file as before, so
+neither its path nor its inode helps. What does change is the auxiliary
+vector. At every `exec` the kernel writes a fresh one for the new image
+(entry point, program headers, the address of 16 random bytes for the stack
+protector), and with ASLR those addresses differ each time. The guest report
+now prints a checksum of it:
+
+```sh
+echo "bun_image $(cksum < /proc/"$pid"/auxv | cut -d' ' -f1)"
+```
+
+and the checker treats a new pid *or* a new image as a new process, with its
+own warm-up. We checked on a Linux container that a shell which `exec`s
+itself keeps its pid and start time and gets a different checksum.
+
+### Replaying old soaks
+
+Fixing one false alarm is easy. Did we also blind the check to real leaks?
+We still had the evidence of seventeen soak runs on disk, three of them with
+a leak we'd since fixed: the Mayo collector keeping `/proc` stat files open
+(#220), an earlier candidate that climbed the same way, and a guest agent that never
+closed forwarded sockets (#257). Replaying the checker over them, with image
+boundaries taken from each run's upgrade events, answered it, and not in the
+way we hoped. With the pid-only key the RSS check reproduced every recorded
+finding. With the image key it kept one of them, on #220's node 3. The #257
+leader finding went too: it had compared a post-exec image against a warm
+sample from before the exec, so it caught a real leak by accident.
+
+The runs said what did work. In every leaking run the file descriptors gave
+it away within the hour: 206, 254, 399, 531 on e8c9653's leader, 770 to 1,902
+on #220's. The fd check should have fired, but it wanted the hourly minimum
+to rise six hours in a row, and with a Bun kill or an upgrade walk every hour
+or two, no image in any run lived six hours. It never ran.
+
+`fd_findings` now works per image, like the RSS check. After a ten-minute
+warm-up it takes each ten-minute window's floor, its lowest sample, which
+ignores the bursts every settle causes. It fails when the last four floors
+each rise by at least ten descriptors and end at least 25% above where they
+started. A peer's restart lifts the floor once; a leak lifts it every time.
+Replayed, it flags all three leaking runs, on seven images between them, and
+nothing on the fourteen clean ones, including candidate 9.
+
+### Tests
+
+`an_upgrade_exec_restarts_the_rss_warm_up` replays node 2's numbers: same
+pid, a new `bun_image`, the sample that became the old warm one, and the
+626 MB that failed. Without the image in the key it fails exactly as the soak
+did. `inventories_without_an_image_line_still_track_the_pid` keeps evidence
+from older harnesses working. `file_descriptors_rising_every_ten_minutes_for_half_an_hour_fail`
+uses e8c9653's floors, and `bounded_file_descriptors_pass` covers the settle
+spikes, a slow creep (59 to 72, which the replay would otherwise have
+flagged), a single step and a dip.
+
+What didn't we do? We tried trend rules for RSS too. Ten-minute windows
+flagged healthy post-restart climbs in the candidate-9 run, and fifteen-minute
+ones missed #220. RSS in this soak mixes three things (a working set that
+grows with history, allocator high-water marks, leaks) and a two-hour image
+can't tell them apart. Descriptors don't have the first two problems, so
+they carry the leak signal and RSS keeps its coarse 25% ceiling.
+
+
+## Which build is this?
+
+Issue #241 was a three-node Ubuntu cluster whose Bun crash-looped after a
+restart, with an error a fix from the week before had removed. The likely
+answer was that two nodes still ran an older build. Proving it was harder
+than it should have been, because every build said the same thing:
+
+```text
+$ bun --version
+bun 0.1.0
+```
+
+That was true and useless. Every release candidate, and every local build,
+was 0.1.0, and nothing on the node said which one it had. The way to check
+was to hash the binary and compare it with each candidate's published
+checksums. `/v1/version` reports that same `binary_sha256`, which identifies
+the bytes exactly, but a SHA-256 doesn't tell a human which code it holds. A
+commit does.
+
+The release workflow already knew it. `build.yml` sets
+`RELIABURGER_GIT_SHA` to the commit it builds, and the capabilities report
+(the build fingerprint in `/v1/capabilities`) already read it with `option_env!`.
+That macro is `env!`'s forgiving sibling: it reads an environment variable
+*at compile time* and gives you `Option<&'static str>`, `None` if it wasn't
+set, instead of failing the build. Nothing printed it, though, and a build
+from a checkout didn't have it at all.
+
+So there are two changes. `build.rs` fills the gap for local builds: when the
+variable isn't set, it runs `git rev-parse HEAD` and hands the result to
+rustc with `cargo:rustc-env=RELIABURGER_GIT_SHA=...`, which makes it visible
+to `option_env!` exactly as if the workflow had set it. A tree with no git, or
+one git refuses to read, just goes without; that's `None`, not an error. The
+script also has to tell Cargo when to run again, or the first commit it saw
+would be baked in forever. It watches `HEAD`, the branch file `HEAD` points
+to and `packed-refs`, each through `git rev-parse --git-path` so a worktree
+(which keeps its own `HEAD` but shares refs with the main checkout) gets the
+right files. A path that doesn't exist isn't watched, because Cargo treats a
+missing watched path as changed and would rerun the script on every build.
+
+The other change is one place that formats a version for people:
+
+```rust
+pub fn describe(version: &dyn fmt::Display, commit: Option<&str>) -> String {
+    match commit {
+        Some(commit) => {
+            let short = commit.get(..SHORT_COMMIT_LEN).unwrap_or(commit);
+            format!("{version} ({short})")
+        }
+        None => version.to_string(),
+    }
+}
+```
+
+`&dyn fmt::Display` is a *trait object*: a reference to any value that
+implements `Display`, with the method looked up at run time through a small
+table (like an interface value in Go). It lets the same function take the
+Cargo version string and a `BinaryVersion`, which displays with a leading
+`v`. `commit.get(..7)` is the non-panicking way to slice a string: indexing
+with `&commit[..7]` panics if the string is shorter, while `get` returns an
+`Option`.
+
+clap's `--version` wants a `&'static str`, a string that lives for the whole
+program. A `format!` result doesn't, so the version line lives in a
+`LazyLock`:
+
+```rust
+pub static VERSION_LINE: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| describe(&env!("CARGO_PKG_VERSION"), build_commit()));
+```
+
+`LazyLock` runs its closure the first time anyone reads it and keeps the
+answer. Because the lock itself is a `static`, borrowing the `String` inside
+it borrows for `'static`, so `VERSION_LINE.as_str()` is exactly what
+`#[command(version = ...)]` needs. Now both binaries say:
+
+```text
+$ bun --version
+bun 0.1.0 (3fcb1fd)
+```
+
+Bun's startup line goes through `describe` too, as does the line it writes
+into its own log store, and `/v1/version` gains a `commit` field with the
+full SHA (or `null`). The field is additive: the orchestrator and the soak
+harness read `version` and `binary_sha256` as before and ignore it.
+
+The tests don't insist that a commit exists, because a CI container that
+mounts the tree as another user can make git refuse it, and that build must
+still pass. `describe_adds_the_short_commit_when_known` pins the formatting,
+`version_line_carries_the_build_commit` checks the line and, when there is a
+commit, that it looks like one. `relish_cli`'s `--version` test runs the real
+binary and expects `relish 0.1.0 (<commit>)` whenever the build knew the
+commit, and `version_endpoint_reports_the_build_commit` does the same for
+the API.
+
+## Adopted, and already done
+
+A self-upgrade is supposed to be invisible to workloads: the new binary
+adopts every running instance and carries on. The V02 soak found a gap
+between "adopted" and "done". Its timeline is in chapter 7 ("One volume, one
+writer"): node 2 lost power mid-walk, the old binary came back and started
+the writer, and four seconds later the upgrade exec'd the new one. The
+placement reconciler records an assignment `Pending` before it deploys and
+`Applied` only once the deploy has finished, so the exec landed between the
+two. The new binary adopted the running writer, found its placement still
+pending, and deployed it again. The app already had an instance, so that was
+a rolling redeploy of a workload that was running exactly as placed.
+
+Chapter 7's fix stops that redeploy from overlapping two writers. This one
+stops it happening. Adoption reads each instance's record, and the record
+carries the spec the instance was launched from, so the new agent remembers,
+per app, which instances it adopted and from what:
+
+```rust
+pub(super) struct AdoptedApp {
+    /// The spec every adopted instance was launched from, or `None` when
+    /// their records disagree or don't say.
+    spec: Option<AppSpec>,
+    instances: HashSet<InstanceId>,
+}
+```
+
+Before the reconciler deploys anything, it asks the agent a yes-or-no
+question over the command channel: do your adopted instances already run
+this? The agent says yes only when the app's live instances are exactly the
+adopted ones, all `Running`, as many as the placement asks for, and launched
+from the placement's spec. Two small wrinkles. A signature check pins
+`web:v1` to `web@sha256:...` before launch, so a pinned launch matches its
+tag. And an instance's record can be rewritten later (a restart persists it
+again with whatever spec the agent holds by then), so the record's image has
+to agree with the instance's own recorded image before the spec counts as
+evidence. If the answer is yes, the reconciler writes `Applied` with the
+placement's fingerprint and moves on. If the agent doesn't answer in time,
+it deploys as before; a spurious redeploy is the old behaviour, not a new
+failure.
+
+The evidence is forgotten the moment this agent deploys the app itself.
+From then on the reconciler's own bookkeeping is the truth again, and
+adoption is ancient history.
+
+`AdoptedApp::spec` is an `Option` for a reason worth spelling out. When two
+adopted replicas' records disagree (one says port 8080, one says 9999),
+there's no single spec to compare against, so the field becomes `None` and
+the answer is always no. The type makes "we don't know" a distinct value
+instead of letting the first record win.
+
+### Tests
+
+`adopted_instances_that_run_their_placement_are_recognised` deploys two
+replicas with records on, starts a second agent over the same records, and
+checks the answer: yes for the same spec; no for a new image, a third
+replica, an unknown app or an instance that has turned unhealthy; and no
+again once the new agent has deployed the app itself. The first agent, which
+deployed the instances rather than adopting them, always says no.
+`adopted_instances_with_disagreeing_records_are_not_converged` covers the
+`None` case. On the reconciler's side,
+`pending_placement_run_by_adopted_instances_is_recorded_without_a_redeploy`
+starts from a checkpoint with the writer `Pending`, answers the question
+with yes, and checks that no deploy was sent and the checkpoint says
+`Applied`. Before the change it deployed.
+
+## Refused before it's recorded
+
+"A pause with no way out" moved one refusal from the first node to the leader. The 0.1.1 release found two more that still arrived late.
+
+The first was the format boundary. 0.1.1 moved the state format from 44 to 46, so a 0.1.0 cluster can't run it, and every node knows that: it asks each candidate for `bun --compatibility` before staging it. But in a cluster that question came *after* the leader had recorded the run. `relish upgrade start v0.1.1` answered "started", the first node refused, and the run paused until someone typed `relish upgrade abort`. Safe, but it's a strange way to say no.
+
+The second showed up in the 0.1.1 soak on 30 September. On a cluster running a release candidate, `relish upgrade rollback v0.1.0` answered "cluster rollback to v0.1.0 started". Then node 2 came back with `409 Conflict: version v0.1.0 is not installed in the binary store`, and that run paused too. The nodes had never run 0.1.0, so they had nothing to go back to.
+
+Can you see the pattern? Both refusals are facts the leader could have found out before writing anything to Raft.
+
+### Asking the candidate on the leader
+
+The leader already has everything a node uses to check a candidate: its own upgrade manager, the release keys, the operator's external key and the registry the binary was pushed to. So the start handler builds the exact directive the orchestrator will send (`orchestrator::build_directive`, now public) and hands it to the leader's manager. `UpgradeManager::prepare` used to fetch, verify and query inline; that sequence is now a method of its own:
+
+```rust
+async fn fetch_verified(
+    &self,
+    directive: &UpgradeDirective,
+) -> Result<(Vec<u8>, SignatureEnvelope), UpgradeError> {
+    let bytes = self.fetch_binary(directive).await?;
+    // ... build the envelope, verify both signatures ...
+    super::compatibility::check_binary(bytes.clone(), /* binary dir */).await?;
+    Ok((bytes, envelope))
+}
+```
+
+`prepare` keeps both halves of the tuple and stages them. The new `check_candidate` throws them away:
+
+```rust
+pub async fn check_candidate(&self, directive: &UpgradeDirective) -> Result<(), UpgradeError> {
+    self.fetch_verified(directive).await.map(|_| ())
+}
+```
+
+`Result::map` changes the success value and leaves an error alone, so `.map(|_| ())` means "I only care whether this worked". Sharing the function keeps the order that matters: signatures first, and only then execute the bytes. The leader never runs a binary a node wouldn't run.
+
+The refusal itself got a proper variant. `check_binary` used to flatten a format mismatch into `IncompatibleBinary(String)`. Now it returns the two pairs:
+
+```rust
+IncompatibleFormats {
+    found: crate::compatibility::Compatibility,
+    expected: crate::compatibility::Compatibility,
+},
+```
+
+and its message leads with them, like every other compatibility refusal in §14.8: `incompatible binary: found protocol 28, state 47; this cluster (reliaburger v0.1.2 (…)) needs protocol 27, state 46`, followed by the remedy and the policy link. Keeping the pairs typed rather than baked into a string lets a test match on `found` and `expected` directly instead of grepping prose.
+
+The check runs last among the start gates, after the cheap probes, because it's the expensive one: a fetch, a hash and a process spawn. It sits under a twenty-second `tokio::time::timeout`, since a follower that forwarded the call gives up after thirty.
+
+Only a definite answer refuses: other formats, a bad signature, a blob the registry doesn't have. Those are 409s and nothing reaches Raft. Our first draft also refused when the registry was unavailable, and the cluster suite caught it straight away: `a_registry_outage_at_directive_time_does_not_pause_the_upgrade` points the nodes at a registry that drops every connection for 25 seconds, and the start itself now waited out the node-side retry budget and timed out. An outage says nothing about the candidate, and "One blip is not a refusal" already taught the nodes to ride one out. So the leader asks once (a small `Fetch::Retrying` / `Fetch::Once` enum threaded through `fetch_binary`, rather than a bare `bool` nobody can read at the call site), logs that it couldn't check, and records the run. The nodes still check every candidate themselves.
+
+### Asking the nodes what they hold
+
+A rollback never downloads anything. Each node execs a binary already sitting in its binary directory, so the question is simply "which versions do you have?" `/v1/version` now answers it with `installed_versions`, read off the async runtime:
+
+```rust
+pub async fn installed_versions(&self) -> Option<Vec<BinaryVersion>> {
+    let store = self.store.clone();
+    tokio::task::spawn_blocking(move || store.installed_versions().ok())
+        .await
+        .ok()
+        .flatten()
+}
+```
+
+`spawn_blocking` runs the closure on a thread that's allowed to block, but that thread may outlive the call, so the closure has to own everything it touches (the `'static` bound). A reference to `self.store` would be a borrow of `self`, and the compiler won't let a borrow escape to another thread. Cloning the store (a directory path and a file stem) and `move`-ing the clone in is the usual answer. The two `Option`s at the end, one for "the task panicked" and one for "the directory couldn't be read", collapse into one with `flatten`.
+
+The rollback handler probes every planned node with the same concurrent, time-boxed probe the start handler uses, and a pure gate decides:
+
+```rust
+let missing: Vec<&str> = nodes
+    .iter()
+    .filter(|node| node.running != *target)
+    .filter(|node| {
+        node.installed
+            .as_ref()
+            .is_some_and(|installed| !installed.contains(target))
+    })
+    .map(|node| node.node.as_str())
+    .collect();
+```
+
+A node already on the target has nothing to exec, so it can't be missing it. A node that doesn't report its store (`None`) isn't blamed: the node-side check still stands behind the gate. `as_ref` turns an `&Option<Vec<_>>` into an `Option<&Vec<_>>` so `is_some_and` can look inside without taking the vector away from `node`. Everything else is named, all at once: `cannot roll back to v0.1.0: it is not installed in the binary store on node n2, node n3`. That's better than the old path even when it did pause, which only ever told you about the first node it tried.
+
+The probe reads the field leniently, the way it reads `failed_upgrade_ids`:
+
+```rust
+let installed_versions = value["installed_versions"].as_array().map(|versions| {
+    versions
+        .iter()
+        .filter_map(|version| version.as_str()?.parse().ok())
+        .collect()
+});
+```
+
+The `?` inside the closure is worth a second look. In a function returning `Option`, `?` on a `None` returns `None` from that function, and here the function is the closure. So an entry that isn't a string is skipped by `filter_map` rather than failing the whole probe.
+
+### The laptop cluster says which versions
+
+The third late refusal was the quickstart's. Rerun a newer installer over a laptop cluster from an older release and it refused with "existing cluster parameters differ; resume with the original parameters". True, but which parameter? The saved record names the release that set the cluster up, and the installer can only install its own, so there are no "original parameters" to resume with. `spec_mismatch` now treats a version change separately:
+
+```text
+cluster "laptop" was set up with v0.1.0, and this installer is v0.1.1. Before 1.0, a release that changes the cluster's protocol or state format can't take over an older cluster: run `relish local destroy --yes` and set it up again, then re-apply your apps. …
+```
+
+It adds `--name` when the cluster isn't the default `laptop`, so the command can be pasted as is. Any other change lists each field with its saved and requested value (`nodes: saved 3, requested 1`).
+
+### What we decided not to do
+
+We didn't read the candidate's formats on the client. relish has the bytes, but it may be a Mac talking to Linux nodes, and it can't execute their binary. The leader shares the nodes' platform and already runs the same check for its own upgrade.
+
+We didn't treat an unreachable node as missing the rollback target either. The start gates leave unreachable nodes to the orchestrator, which re-probes each one as the walk reaches it, and the rollback gate does the same. A rollback is often what you reach for when something's already broken, and a gate that refused because one node was down would get in the way exactly then.
+
+### Tests
+
+`plan::tests` covers the rollback gate: a version missing from two of three stores names both nodes, and a node already on the target or not reporting its store passes. `manager::tests` covers the candidate check through the leader's manager: a signed script that prints `{"protocol":1,"state":1}` is refused as `IncompatibleFormats` with both pairs in the message and nothing staged; a candidate with a bad external signature is refused before it runs (the script would `touch` a file, and the file must not exist); a compatible one passes and still stages nothing. `installed_versions_lists_the_binary_store` and `a_probe_reads_the_binary_store_a_node_reports` cover the new field from both ends. The quickstart tests check the version message, the `--name` form and the per-field list. The cluster suite gets two real-binary tests: `start_refuses_a_candidate_with_other_formats_before_recording_a_run` pushes a signed incompatible candidate through `relish upgrade start` and checks for the refusal with nothing recorded and no node moved, and `rollback_to_a_version_the_nodes_lack_is_refused_before_recording_a_run` asks for a rollback to a version no node holds and checks for a 409 naming every node.

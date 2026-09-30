@@ -20,6 +20,12 @@ relish upgrade abort                  # end a paused upgrade that moved no node
 relish upgrade rollback v0.1.0        # also replaces a paused upgrade
 ```
 
+To see what a node runs, ask it. `bun --version` and `relish --version` print
+the version and the commit it was built from, such as `bun 0.1.0 (3fcb1fd)`,
+and so does bun's first log line. Two builds of the same version can hold
+different code; the commit tells them apart. `GET /v1/version` has the full
+commit in `commit`, next to `version` and `binary_sha256`.
+
 It needs three things on every node:
 
 - **A supervisor that restarts bun whenever it exits**, such as systemd with
@@ -75,6 +81,28 @@ needs `--allow-downgrade` (note that `v0.2.0-rc.1` is older than `v0.2.0`);
 without `[upgrades] external_signing_key` would refuse the binary, so `start`
 fails there and names the node, and nothing is recorded.
 
+Then the leader does what every node will do with the candidate: it fetches
+the binary from the registry, checks both signatures and runs
+`bun --compatibility` on it. A release with a different protocol or state
+format can't join the cluster, so `start` fails with both pairs and nothing is
+recorded:
+
+```text
+refusing to upgrade to v0.2.0: incompatible binary: found protocol 28, state 47; this cluster (reliaburger v0.1.2 (…)) needs protocol 27, state 46. …
+```
+
+A cluster `rollback` never downloads anything: each node goes back to a binary
+already in its binary directory. So the leader first asks every node which
+versions it holds (`installed_versions` in `GET /v1/version`) and refuses a
+version any of them lacks, naming those nodes:
+
+```text
+cannot roll back to v0.1.0: it is not installed in the binary store on node node-2, node node-3. …
+```
+
+A node that ran or was upgraded from a version keeps it, up to
+`[upgrades] retain_versions`.
+
 A node that refuses or reverts pauses the upgrade, and a paused upgrade blocks
 every new `start`. There are three ways on: fix the cause and
 `relish upgrade resume`; `relish upgrade abort`, which ends the upgrade when no
@@ -84,7 +112,37 @@ that version. `abort` refuses once a node has moved, and says which, because
 ending the upgrade then would leave the cluster on two versions.
 
 Rolling upgrades need matching protocol and state formats; `bun --compatibility`
-prints what a binary supports. Development builds' state isn't migrated.
+prints what a binary supports. Nothing is migrated before 1.0.0: a release
+that changes either format needs a fresh cluster. 0.1.1 is one: it moved the
+state format from 44 to 46, so a 0.1.0 cluster refuses it and stays on 0.1.0
+([upgrading from 0.1.0](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#upgrading-from-010)).
+
+A laptop cluster says the same thing when you rerun the quickstart installer
+from a newer release over it. Its saved record names the release that set it
+up, so setup refuses and names both versions:
+
+```text
+cluster "laptop" was set up with v0.1.0, and this installer is v0.1.1. Before 1.0, a release that changes the cluster's protocol or state format can't take over an older cluster: run `relish local destroy --yes` and set it up again, then re-apply your apps. …
+```
+
+### When bun refuses its data directory
+
+Swap in a binary with a different state format and bun won't start. The first
+line says what it found and what it needs, so even a truncated journal line
+carries it:
+
+```text
+incompatible state format: found 43; this binary (reliaburger v0.1.1 (3fcb1fd)) needs 44. Pre-1.0 builds don't migrate state: …
+```
+
+A join between mismatched binaries fails the same way, starting
+`cannot join: incompatible cluster formats: found protocol 26, state 43; …`.
+The refusal is deliberate and leaves the data untouched. You have two ways on:
+run the release that wrote the data (`bun --compatibility` on a candidate
+tells you its pair), or move the data directory aside and recreate the
+cluster. Don't write a new `state-format.json` by hand; the stamp is the only
+thing standing between the new binary and data it can't read. The policy is
+in [docs/releasing.md](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#compatibility-before-100).
 
 ## GitOps
 
@@ -111,14 +169,28 @@ The sync always reads every `.toml` file under `path`, subdirectories
 included. Credentials go in the URL; Bun strips them out of the process arguments and
 Git's config. With `require_signed_commits`, a commit that doesn't verify
 against `trusted_signing_keys` isn't applied, and an empty key list refuses
-everything. There's no `relish gitops` command: the web dashboard's GitOps
-page shows the last sync.
+everything. List full fingerprints: the 40-hex-digit GPG fingerprint of the
+signing key or its primary key (case and spaces don't matter), or an SSH
+key's `SHA256:…` fingerprint exactly as `ssh-keygen -lf` prints it. Git checks
+the signature against the node's own GnuPG keyring or
+`gpg.ssh.allowedSignersFile`, so install the public keys there. Even without
+`require_signed_commits`, a commit that adds, edits or removes an app's or
+job's `script` needs a signature from one of `trusted_signing_keys`, and so
+does any script on the first sync.
+
+Every poll reconciles, not just polls that find a new commit: change or delete
+a GitOps-managed app by hand and the next poll puts it back. Autoscaler
+replica overrides and `relish stop` are left alone. A `git` command that runs
+longer than two minutes is killed and the sync retried later, so a stalled
+remote can't wedge GitOps. There's no `relish gitops` command: the web
+dashboard's GitOps page shows the last sync.
 
 To sync on push rather than on the next poll, point a GitHub, Gitea or GitLab
 webhook at `https://NODE:9117/v1/gitops/webhook` with the same secret. The
 endpoint needs no token, only the HMAC signature (`X-Hub-Signature-256`) or
 GitLab's `X-Gitlab-Token`. It refuses replays and is rate-limited
-(`webhook_rate_limit`, 10 a minute by default).
+(`webhook_rate_limit`, 10 a minute by default). A delivery refused for the
+rate limit isn't counted as seen, so the provider's retry gets through.
 
 ## Backing up the council
 

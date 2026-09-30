@@ -12,19 +12,23 @@
 #   scripts/demo/tour.sh --check
 #       Check that the script knows how to run every command on the homepage,
 #       then exit. tests/suite/website.rs runs this.
-#   scripts/demo/tour.sh [--setup DEV_BINARIES_DIR]
-#       Run the tour. Without --setup it needs a running quickstart cluster
-#       and starts at `relish apply`. With --setup it first builds one with
+#   scripts/demo/tour.sh [--install VERSION | --setup DEV_BINARIES_DIR]
+#       Run the tour. With neither option it needs a running quickstart
+#       cluster and starts at `relish apply`. With --install it runs the
+#       install line for real, with RELIABURGER_VERSION=VERSION so it fetches
+#       that published release whatever the live site's default is, then puts
+#       the installed relish on PATH. With --setup it builds the cluster with
 #       `relish setup --quickstart --development-binaries DEV_BINARIES_DIR`,
-#       which is what the install line runs once the release is published.
-#   scripts/demo/tour.sh --record CAST [--setup DEV_BINARIES_DIR]
+#       the same setup the install line runs, with binaries from this checkout.
+#   scripts/demo/tour.sh --record CAST [--install VERSION | --setup DEV_BINARIES_DIR]
 #       Record the run with asciinema into CAST (110x32, idle time cut to
 #       2 s), then play the setup step SETUP_SPEEDUP (4) times faster. Setup
 #       redraws its timers several times a second, so idle trimming alone
 #       would leave a minute and a half of VM boots. Both are said on screen.
 #
 # Environment:
-#   RELISH   the relish binary to run (default: the one on PATH)
+#   RELISH             the relish binary to run (default: the one on PATH)
+#   RELIABURGER_HOME   where --install puts relish (default: ~/.reliaburger)
 #
 # The script needs bash 3.2 (macOS's /bin/bash), so no associative arrays.
 
@@ -41,15 +45,21 @@ SETUP_SPEEDUP=4
 
 MODE="run"
 SETUP_BINARIES=""
+INSTALL_VERSION=""
 CAST=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --check) MODE="check"; shift ;;
         --setup) SETUP_BINARIES="${2:?--setup needs a directory}"; shift 2 ;;
+        --install) INSTALL_VERSION="${2:?--install needs a version, such as v0.1.1}"; shift 2 ;;
         --record) MODE="record"; CAST="${2:?--record needs a file}"; shift 2 ;;
         *) echo "unknown argument: $1" >&2; exit 64 ;;
     esac
 done
+if [[ -n "${SETUP_BINARIES}" && -n "${INSTALL_VERSION}" ]]; then
+    echo "--install and --setup are alternatives; pass one" >&2
+    exit 64
+fi
 # Set when this script runs inside its own recording, so the narration only
 # mentions trimming and speed-ups that really happen.
 RECORDING="${TOUR_RECORDING:-}"
@@ -77,6 +87,7 @@ known_command() {
         | "relish dashboard" \
         | "relish fault kill frontend --count 1 --acknowledge" \
         | "relish local stop node-3" \
+        | "relish inspect frontend" \
         | "relish wtf" \
         | "relish local destroy --yes" \
         | "relish uninstall" \
@@ -107,6 +118,8 @@ if [[ "${MODE}" == "record" ]]; then
     inner="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
     if [[ -n "${SETUP_BINARIES}" ]]; then
         inner="${inner} --setup ${SETUP_BINARIES}"
+    elif [[ -n "${INSTALL_VERSION}" ]]; then
+        inner="${inner} --install ${INSTALL_VERSION}"
     fi
     TOUR_RECORDING=1 asciinema rec --headless --overwrite --return \
         --window-size 110x32 --idle-time-limit "${IDLE_LIMIT}" \
@@ -135,10 +148,17 @@ PYTHON
 fi
 
 cd "${REPO_DIR}"
-if [[ -n "${RELISH:-}" ]]; then
+if [[ -n "${INSTALL_VERSION}" ]]; then
+    # Where the installer puts relish; the installed one must win over any
+    # other relish on PATH.
+    PATH="${RELIABURGER_HOME:-${HOME}/.reliaburger}/bin:${PATH}"
+    export RELIABURGER_VERSION="${INSTALL_VERSION}"
+elif [[ -n "${RELISH:-}" ]]; then
     PATH="$(cd "$(dirname "${RELISH}")" && pwd):${PATH}"
 fi
-command -v relish >/dev/null || { echo "relish isn't on PATH; set RELISH" >&2; exit 1; }
+if [[ -z "${INSTALL_VERSION}" ]]; then
+    command -v relish >/dev/null || { echo "relish isn't on PATH; set RELISH" >&2; exit 1; }
+fi
 
 BOLD=$'\033[1m'
 DIM=$'\033[2m'
@@ -257,14 +277,21 @@ previous=""
 while IFS= read -r command <&3; do
     case "${command}" in
         "curl -fsSL https://reliaburger.com/install.sh | sh")
-            if [[ -z "${SETUP_BINARIES}" ]]; then
+            if [[ -n "${INSTALL_VERSION}" ]]; then
+                say "Step 1 installs the published ${INSTALL_VERSION} release, then runs"
+                say "\`relish setup --quickstart\`. The times on the right are real."
+                if [[ -n "${RECORDING}" ]]; then
+                    say "This step plays ${SETUP_SPEEDUP}× faster than it ran."
+                fi
+                show "${command}"
+            elif [[ -z "${SETUP_BINARIES}" ]]; then
                 say "Step 1 ran before this recording: it installs relish and runs"
                 say "\`relish setup --quickstart\`. The cluster is up."
                 printf '\n'
             else
                 say "Step 1, the install line, installs relish and runs \`relish setup --quickstart\`."
-                say "The signed release isn't published yet, so this runs the same setup with"
-                say "binaries built from this checkout. The times on the right are real."
+                say "This recording runs the same setup with binaries built from this checkout."
+                say "The times on the right are real."
                 if [[ -n "${RECORDING}" ]]; then
                     say "This step plays ${SETUP_SPEEDUP}× faster than it ran."
                 fi
@@ -294,14 +321,14 @@ while IFS= read -r command <&3; do
                     wait_for "the killed replica to come back" 120 frontend_restarted
                     show "${command}"
                     ;;
-                "relish local stop node-3")
-                    wait_for "three frontends on the two surviving nodes" 240 three_frontends_without_node_3
-                    show "${command}"
-                    ;;
                 *)
                     show "${command}"
                     ;;
             esac
+            ;;
+        "relish inspect frontend")
+            wait_for "three frontends on the two surviving nodes" 240 three_frontends_without_node_3
+            show "${command}"
             ;;
         "relish path frontend --to redis")
             wait_for "redis to reach the service map" 120 path_passes

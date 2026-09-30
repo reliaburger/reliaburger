@@ -18,6 +18,10 @@ pub struct ConsumerUpdate {
     pub published: bool,
     /// Original generations with durable local withdrawal proof.
     pub receipts: Vec<u64>,
+    /// Whether a local service registers only at its committed catalogue
+    /// allocation. False when discovery ownership is disabled, where the
+    /// agent allocates locally instead.
+    pub requires_allocations: bool,
 }
 
 impl<G: Grill + Clone + 'static> BunAgent<G> {
@@ -347,6 +351,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             return Ok(ConsumerUpdate {
                 published: true,
                 receipts: vec![],
+                requires_allocations: false,
             });
         }
         let publication = self
@@ -604,6 +609,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         .collect()
                 })
                 .unwrap_or_default(),
+            requires_allocations: self.consumer_controls_views(),
         }
     }
 

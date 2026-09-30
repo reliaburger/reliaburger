@@ -93,7 +93,12 @@ pub(super) async fn check_binary(bytes: Vec<u8>, directory: &Path) -> Result<(),
         serde_json::from_slice(&output).map_err(|e| {
             UpgradeError::IncompatibleBinary(format!("invalid compatibility response: {e}"))
         })?;
-    formats
-        .require_current()
-        .map_err(|e| UpgradeError::IncompatibleBinary(e.to_string()))
+    if formats == crate::compatibility::CURRENT {
+        Ok(())
+    } else {
+        Err(UpgradeError::IncompatibleFormats {
+            found: formats,
+            expected: crate::compatibility::CURRENT,
+        })
+    }
 }

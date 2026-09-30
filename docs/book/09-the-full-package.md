@@ -209,6 +209,22 @@ Third, the tests. The integration test now feeds `process_cpu_percent` with coll
 
 Two limits remain, and we'd rather state them than bury them. The collector samples an instance's main process, not its children, so a shell that forks workers under-reports. And direct Apple Container instances (disabled in 0.1.0 anyway) run inside a VM with no host PID, so they produce no per-app metrics and can't autoscale.
 
+Memory got its own real-path test later, and writing it taught us something the CPU one couldn't. Memory scaling needs a memory request, and ProcessGrill refuses any app that declares one (it can't enforce the limit). So the portable cluster harness can't run a memory-autoscaled app at all. The memory acceptance test (`tests/autoscale_memory.rs`) runs instead on one real Bun with runc, in the privileged Linux suite: a busybox shell holds 48 MiB in a variable against a 16 MiB request, Bun's own collection loop samples it, the rollup reaches the node's own leader, and the app goes from one replica to two. Nothing writes a metric row by hand.
+
+### What about zero?
+
+`min = 0` used to pass validation. Then `compute_desired` returned early whenever the current count was zero, so an app that scaled down to nothing could never come back. Even without that early return, what would bring it back? Both metrics come from running replicas. At zero there's no process to sample, so there's no signal to scale up on.
+
+Scale-to-zero is a real feature elsewhere (Knative does it), but it needs a wake-up signal that exists without a replica: requests queuing at the ingress, say, with the proxy holding the first one while a replica starts. We don't have that, so `min = 0` is now a validation error that says why and points at `relish stop` for parking an app by hand:
+
+```rust
+if spec.min == 0 {
+    return Err(AutoscaleConfigError::ZeroMin);
+}
+```
+
+A feature that accepts a setting it can't honour is worse than one that refuses it. The refusal costs the operator one edit. The silent version costs them an app that never comes back.
+
 ### Getting the lifecycle right
 
 The first wired autoscaler had four subtle bugs the review caught, and each one is a small lesson in ordering.
@@ -217,7 +233,7 @@ The first wired autoscaler had four subtle bugs the review caught, and each one 
 
 **Clear an override the moment its baseline moves.** An override is a runtime adjustment *relative to a baseline*. Redeploy the app with a different replica count, or delete it entirely, and the old override is meaningless — worse than meaningless, because a stale "scale to 7" left sitting in Raft would quietly resize a freshly redeployed app. So the state machine clears the override in the same apply that changes the baseline: on `AppDelete`, and on an `AppSpec` whose replica count differs from the stored one. An image-only redeploy (same replica baseline) leaves the override alone — you don't want a routine version bump throwing away a legitimate scale-up.
 
-**`min > max` is an error, not a clamp.** The old code fed `min` and `max` straight into `.clamp()`, which silently swaps them if they're out of order — so `min = 10, max = 3` quietly became "always 3", hiding an obvious operator typo. Now the `[autoscale]` block is validated at config time: `min > max`, a zero `max`, an unparseable or zero window, an out-of-range threshold — every one fails the deploy loudly with a message naming the field. A validation error the operator reads beats a clamp the operator never sees.
+**`min > max` is an error, not a clamp.** The old code fed `min` and `max` straight into `.clamp()`, which silently swaps them if they're out of order — so `min = 10, max = 3` quietly became "always 3", hiding an obvious operator typo. Now the `[autoscale]` block is validated at config time: `min > max`, a zero `max` or `min`, an unparseable or zero window, an out-of-range threshold — every one fails the deploy loudly with a message naming the field. A validation error the operator reads beats a clamp the operator never sees.
 
 **Use the window the operator configured.** The rollup query was hardcoded to average the last five minutes regardless of what `evaluation_window` said. Now the configured window drives the query, as it always should have. And while we were in the numeric code, we made the resource parsers use checked arithmetic: a memory string like `99999999999999999999Gi` now returns a validation error instead of silently overflowing 64 bits into some small wrong number (a whole class of bug the review labelled DEP9).
 
@@ -413,8 +429,8 @@ Lettuce runs on a single council member elected as the **GitOps coordinator**. N
 The sync loop:
 
 1. **Trigger.** Poll timer (default 30s) or webhook
-2. **Git fetch.** If HEAD hasn't changed since last sync, short-circuit
-3. **Signature verification.** If required (global or auto-enforced for script changes)
+2. **Git fetch.** A new commit if there is one, otherwise the current HEAD. Every tick reconciles, so manual drift is repaired even when Git hasn't moved (Chapter 7 tells that story)
+3. **Signature verification.** If required (global, or auto-enforced when the parsed `script` values differ from the last applied tree)
 4. **TOML parse.** All `.toml` files under the configured path. Parse errors are per-file, not global
 5. **Diff.** Field-by-field comparison against current Raft state. Autoscaler-aware
 6. **Selective apply.** Only changed resources written to Raft
@@ -538,6 +554,21 @@ Wiring it flushed out a bug that only a real repo could surface. `execute_sync` 
 One security fix rides along. Lettuce can require commits to be GPG-signed by a trusted key, and `is_key_trusted` checked the signing fingerprint against the configured allowlist. Or it looked like it did. After the loop that searched for a matching key, the function ended with `return true` — a comment explained it as "trust any valid signature when trusted_keys is provided." So a validly-signed commit from *any* key sailed through: a departed employee's key, a compromised laptop, an attacker who forked your repo and signed with their own key. The allowlist was decoration; the only check that ran was "is the signature cryptographically valid," which proves the committer holds *some* private key, not *your* private key.
 
 The fix is one line — return whether any trusted fingerprint appears in the verify output, with no fall-through. A valid signature from an unlisted key is now `UntrustedKey`, and the commit is rejected. The two regression tests are the ones that should have existed from the start: a matching fingerprint is trusted, an unlisted one is not. It's a reminder that a security check which always returns "yes" is worse than no check, because it shows up green in the audit.
+
+The one-line fix had a second hole, which a later static review (B14) found. "Any trusted fingerprint appears in the output" is a substring search over everything `git verify-commit --raw` prints: the user id, the key ids, the dates. Git checks the signature against whatever keys the node's GnuPG keyring happens to hold, so an attacker whose key is in there only needs a user id like `Mallory (0123…4567)`, or a fingerprint that contains the configured one, and the check says yes. Now `is_key_trusted` reads structure instead of text. GnuPG's status protocol reports a good signature as one line, `[GNUPG:] VALIDSIG <signing-fpr> … <primary-fpr>`, and only those two fields are compared, for equality, ignoring case and spaces. SSH signatures get the same treatment with the `SHA256:` fingerprint at the end of `ssh-keygen`'s "Good signature" line, compared exactly because base64 is case-sensitive.
+
+The parser returns borrowed slices of the output, not copies:
+
+```rust
+enum Signer<'a> {
+    Gpg(&'a str),
+    Ssh(&'a str),
+}
+
+fn valid_signer_fingerprints(verify_output: &str) -> Vec<Signer<'_>> { … }
+```
+
+`'a` is a lifetime parameter: it says each `&str` inside a `Signer` points into some string that must outlive it. In the function signature `'_` asks the compiler to fill in the obvious lifetime, the one of `verify_output`. In C you'd be trusting yourself not to free the buffer while the pointers are live; in Go the garbage collector would keep it alive for you. Rust checks it at compile time, so a caller that drops the output while still holding the fingerprints doesn't build. The tests feed it fixture status output: a valid trusted signature, a trusted primary key signing with its subkey, an attacker whose fingerprint and user id both contain the trusted one, a `BADSIG`, and output with no `VALIDSIG` at all.
 
 ## Kubernetes migration
 
@@ -882,6 +913,39 @@ until a write finishes, even if its awaiting task is cancelled. The tests cover
 exclusive writers, stable identity and names, changed parameters, invalid
 ownership, private bootstrap files and damaged bundles.
 
+Dropping an operation releases its lock, and that turned out to need one more
+line than we thought. `File::try_lock` is `flock` underneath, and an `flock`
+belongs to the open file *description*, the kernel object that every duplicate
+of a descriptor shares. When any thread spawns a child process, the child starts
+with a copy of every descriptor and only closes the close-on-exec ones when it
+calls `exec`. For that brief moment the child holds our lock too, so
+closing our own descriptor doesn't release it. Under plain `cargo test`, where
+hundreds of tests share one process and some of them spawn helpers, the test
+that drops an operation and reopens it straight away was refused every so
+often with "another operation is using cluster". A loop of 100 reopens with two
+threads spawning `true` in the background was refused 69 times.
+
+So the lock is now a small type of its own whose `Drop` (the destructor we met
+in Chapter 1) unlocks before the file closes:
+
+```rust
+struct OperationLock(std::fs::File);
+
+impl Drop for OperationLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+```
+
+`self.0` is the tuple struct's only field, the file. `let _ =` throws the
+`Result` away on purpose: there's nothing useful to do with a failed unlock
+inside a destructor, and closing the descriptor a moment later releases the
+lock anyway. `flock(LOCK_UN)` acts on the description, so it frees the lock
+for every copy at once, including the one in a half-spawned child. The
+relish CLI never reopens an operation in the same process, so users never saw
+this, but the fix makes "dropping releases the lock" true without a caveat.
+
 ### Download before you trust, verify before you replace
 
 The installer needs a guest image and prebuilt binaries. A partial download
@@ -1166,6 +1230,34 @@ once more. Dropping a future is how you cancel it in Rust; there's no
 `cancel()` method, and no context object to thread through as in Go. A resumed
 setup applies the same test to a VM left "running" by an earlier attempt.
 
+The restart had a race of its own. On a Mac with a load average of 29, all
+three VMs stayed silent for the full minute, so all three watchdogs fired
+together, and one restart died with `dial unix .../user-v2_fd.sock: connect:
+no such file or directory`. Rerunning setup fixed it, and we never saw it
+again. Our best reading of Lima (not proven) goes like this: `limactl stop`
+shuts the shared `user-v2` daemon down when no VM is `Running`, and a VM that
+is still starting doesn't count. VM 1 stops and starts; VM 2 and VM 3 then
+stop, the daemon goes, and VM 1's host agent finds no socket to dial.
+
+So `Lima::restart` takes its turn. Every clone of `Lima` shares one
+`Arc<tokio::sync::Mutex<()>>`, a lock guarding no data at all; the `()` is
+Rust's empty type, so the lock is only a turnstile. A restart holds it from
+`stop --force` until `limactl list` reports its VM `Running`, which is when
+the next restart's `stop` sees the daemon in use. Then it drops the guard and
+lets the boot finish alongside the others. `std::pin::pin!` pins the start
+future on the stack so that `select!` can poll it through `&mut` and we can
+still await it afterwards. Rust moves values freely, and a future that
+might hold references into itself has to be promised a fixed address before
+anyone polls it.
+
+We couldn't reproduce the real race on demand, so the test reproduces its
+shape instead. `silent_vms_restart_one_at_a_time_so_the_shared_network_survives`
+runs three watchdogged boots against a fake `limactl` whose `stop` removes a
+pretend daemon when nothing is `Running`, and whose `start` fails if the
+daemon it came up with has gone. The stops take 0, 0.3 and 0.6 seconds, so
+without the gate VM 1's start fails every time with the error from the Mac.
+With the gate, all three end up `Running`.
+
 ### Bake the image, don't install at boot
 
 The measurements had one more thing to say. The kernel reached a login prompt
@@ -1432,6 +1524,22 @@ The tag was the interesting decision. `v0.1.0-staging.123` reads nicely and is v
 
 Re-running the workflow is safe. If the pre-release is published, it only re-checks GitHub's stored digests against the record. If an earlier run died with an unpublished draft (nobody can have installed from that), it deletes the draft and starts again. If the published bytes differ, it stops and touches nothing, because somebody might be halfway through qualifying them. Then `scripts/release/qualify-staged-install.sh` runs the real pipeline on each laptop in the matrix, in a throwaway `RELIABURGER_HOME`, and writes down the timings and every downloaded digest.
 
+One small friction took a while to notice. The digest qualification keeps is
+the SHA-256 of `candidate.json`, and the build put it in exactly one place:
+the job summary, which is a page for a browser, not something `gh` prints.
+So whoever ran the qualification from a terminal (usually an agent) did the
+obvious thing and downloaded the whole candidate, about 2 GB of binaries and
+guest images, to hash one small JSON file. Now the `candidate` job also
+`echo`es `Qualification manifest SHA-256: <digest>` into its log, where
+`gh run view --log | grep` finds it, and uploads `candidate.json` alone as a
+second artefact, `candidate-manifest-<commit>-<attempt>`, kept for a day.
+Neither is trusted more than the summary was. They come from the same run,
+and `stage.yml` and promotion still download the full candidate and check
+every byte against the digest the operator hands them.
+`scripts/release/test_build_workflow.py` reads `build.yml` and checks all
+three: the log line, the one-day manifest artefact, and the 90-day full
+candidate that still carries the real weight.
+
 ### `| sh`, not `| bash`
 
 The homepage tells you to pipe the installer to `sh`. Our first installer said `bash` on its first line and used `[[ … =~ … ]]` to validate the version and the mirror URL, so `curl … | sh` failed on Ubuntu and Debian, where `sh` is dash, and in any container image with busybox. Bash's features were convenient. They weren't necessary.
@@ -1507,4 +1615,4 @@ Here's what a real run found that thousands of unit and integration tests hadn't
 
 Every one of those has its own test now. The deeper lesson is about where the bugs were: not in any one component, but between them. The lock was correct, and so was the agent loop. So were the ledger and the catalogue, each on its own terms. Only a whole cluster, with real images, real timings and a leader that dies, puts them in the same room.
 
-Two things still aren't pretty. While a node is down, nothing can release an address it might still route to, so a survivor that gains a replica keeps retrying its rolling replacement until the node returns (traffic is fine; the survivor already runs the new replicas). And a replica-count change is still a rolling redeploy on that node rather than "start one more". Both are honest behaviour, not wrong answers, and both are on the list.
+Two things still weren't pretty. While a node is down, nothing can release an address it might still route to, so a survivor that gains a replica keeps retrying its rolling replacement until the node returns (traffic is fine; the survivor already runs the new replicas). And a replica-count change was still a rolling redeploy on that node rather than "start one more". The 0.1.1 recording showed where that leads: node-1 rolled twice, node-2's healthy frontend was moved as well, and `relish inspect` listed five stopped leftovers. In 0.1.2 the agent starts only the added replicas, a suspect node keeps its placements, and the replacement goes to the survivor with the fewest replicas (Chapter 2, "Losing a node shouldn't move the survivors").

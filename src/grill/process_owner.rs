@@ -445,11 +445,30 @@ impl OwnedChild {
         // be recycled between observing exit and sending the signal.
         match kill(Pid::from_raw(-(self.child.id() as i32)), signal) {
             Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
-            // macOS can refuse signals to a zombie-only group. The retained
-            // root proves its exit, but complete retirement still checks every
-            // group member before the owner publishes absence.
             #[cfg(target_os = "macos")]
-            Err(nix::errno::Errno::EPERM) if observe_exit(self.child.id())?.is_some() => Ok(()),
+            Err(nix::errno::Errno::EPERM) => self.signal_refused_group(signal),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Decide whether a group signal macOS refused with EPERM still reached
+    /// every member that needs it.
+    ///
+    /// XNU answers EPERM when no member of the group accepts the signal, and
+    /// it skips zombies and processes already exiting. A root that has been
+    /// sent SIGKILL stays in that exit window until `waitid` can report it,
+    /// so the owner's next tick lands there under load (#318). The root is
+    /// this owner's unreaped child, so its PID can't be recycled: signalling
+    /// it directly succeeds while it runs or exits, and fails only on a real
+    /// permission refusal. Complete retirement still checks every group
+    /// member before the owner publishes absence.
+    #[cfg(target_os = "macos")]
+    fn signal_refused_group(&self, signal: Signal) -> io::Result<()> {
+        if observe_exit(self.child.id())?.is_some() {
+            return Ok(());
+        }
+        match kill(Pid::from_raw(self.child.id() as i32), signal) {
+            Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
             Err(error) => Err(error.into()),
         }
     }
@@ -769,6 +788,31 @@ mod tests {
         assert!(valid_boot_id(&first), "{first}");
         assert_eq!(first, first.to_ascii_lowercase());
         assert_eq!(current_boot_id().unwrap(), Some(first));
+    }
+
+    /// A cancelled owner re-sends SIGKILL every tick until it sees the exit.
+    /// On macOS the group refuses signals with EPERM while its only member
+    /// is exiting but `waitid` can't report it yet; that must not end the
+    /// owner, which would abandon the group without retirement proof (#318).
+    #[test]
+    fn killing_a_group_again_while_it_exits_is_not_an_error() {
+        for _ in 0..20 {
+            let child = Command::new("/bin/sleep")
+                .arg("60")
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let mut owned = OwnedChild {
+                child,
+                reaped: false,
+            };
+            owned.signal(Signal::SIGKILL).unwrap();
+            while observe_exit(owned.child.id()).unwrap().is_none() {
+                owned.signal(Signal::SIGKILL).unwrap();
+            }
+            owned.child.wait().unwrap();
+            owned.reaped = true;
+        }
     }
 
     #[test]

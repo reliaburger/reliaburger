@@ -22,6 +22,10 @@ pub enum VolumeError {
     InvalidSize(String),
     #[error("mount path {0:?} escapes the volumes directory")]
     PathTraversal(String),
+    /// A snapshot restore of this volume was interrupted and hasn't been
+    /// recovered yet, so the live name may not hold a complete volume.
+    #[error("volume {0} has an interrupted snapshot restore awaiting recovery")]
+    RestorePending(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -100,6 +104,12 @@ impl VolumeManager {
             .join(app_name)
             .join(relative_path);
 
+        // Until recovery settles which copy owns the live name, handing the
+        // path to a container could mount nothing, or the wrong data.
+        if super::snapshot::restore_journal_path(&host_path).exists() {
+            return Err(VolumeError::RestorePending(host_path.display().to_string()));
+        }
+
         if let Some(backend) = self.backend_of(&host_path) {
             // A loop mount doesn't survive a reboot. Without this the app
             // would write into the bare mountpoint on the root filesystem,
@@ -158,7 +168,10 @@ impl VolumeManager {
             }
         }
 
-        self.write_backend(&host_path, backend)?;
+        // Only a Btrfs qgroup lives on the subvolume itself; a restore swaps
+        // in a new subvolume and must set the same limit again.
+        let quota = size_bytes.filter(|_| backend == super::btrfs::VolumeBackend::BtrfsSubvolume);
+        self.write_backend(&host_path, backend, quota)?;
         Ok(host_path)
     }
 
@@ -174,21 +187,44 @@ impl VolumeManager {
         volumes
     }
 
+    /// Collect sidecars under `dir`. Volume contents belong to the
+    /// container, so the walk never descends into a provisioned volume
+    /// (a planted `x.volume.json` there must not become a "volume") and
+    /// never follows a symlink (one pointing at `/` would otherwise surface
+    /// every other app's volumes as this app's).
     fn walk_sidecars(root: &Path, dir: &Path, out: &mut Vec<String>) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
         };
+        let mut subdirs = Vec::new();
+        let mut volumes = std::collections::HashSet::new();
         for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
             let path = entry.path();
-            if path.is_dir() {
-                Self::walk_sidecars(root, &path, out);
-            } else if let Some(name) = path.file_name().and_then(|n| n.to_str())
+            if file_type.is_dir() {
+                subdirs.push(path);
+            } else if file_type.is_file()
+                && let Some(name) = path.file_name().and_then(|n| n.to_str())
                 && let Some(volume_name) = name.strip_suffix(".volume.json")
             {
                 let volume_dir = path.with_file_name(volume_name);
                 if let Ok(relative) = volume_dir.strip_prefix(root) {
                     out.push(format!("/{}", relative.to_string_lossy()));
                 }
+                volumes.insert(volume_dir);
+            }
+        }
+        for subdir in subdirs {
+            // A snapshot restore's staged or displaced copy is volume
+            // content too.
+            let restore_copy = subdir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(".restore-staged") || n.ends_with(".restore-old"));
+            if !volumes.contains(&subdir) && !restore_copy {
+                Self::walk_sidecars(root, &subdir, out);
             }
         }
     }
@@ -231,10 +267,16 @@ impl VolumeManager {
         read_sidecar(host_path).map(|sidecar| sidecar.backend)
     }
 
+    /// The Btrfs qgroup limit a provisioned volume was created with, if any.
+    pub fn quota_of(&self, host_path: &Path) -> Option<u64> {
+        read_sidecar(host_path).and_then(|sidecar| sidecar.quota_bytes)
+    }
+
     fn write_backend(
         &self,
         host_path: &Path,
         backend: super::btrfs::VolumeBackend,
+        quota_bytes: Option<u64>,
     ) -> Result<(), VolumeError> {
         write_sidecar(
             host_path,
@@ -242,6 +284,7 @@ impl VolumeManager {
                 schema: 1,
                 backend,
                 owner: None,
+                quota_bytes,
             },
         )
     }
@@ -406,6 +449,10 @@ struct VolumeSidecar {
     /// Who the volume was last handed to; `None` until its first mount.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     owner: Option<VolumeOwner>,
+    /// Btrfs qgroup limit set on the subvolume; `None` when unlimited or
+    /// when the backend enforces size some other way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    quota_bytes: Option<u64>,
 }
 
 fn read_sidecar(host_path: &Path) -> Option<VolumeSidecar> {
@@ -759,6 +806,36 @@ mod tests {
         assert_eq!(std::fs::read(path.join("keep-me")).unwrap(), b"data");
     }
 
+    /// Volume contents are the container's to write. Neither a sidecar
+    /// planted inside a volume nor a symlink to another app's directory
+    /// may add entries to this app's volume inventory, which snapshots
+    /// trust to decide what a request may touch.
+    #[cfg(unix)]
+    #[test]
+    fn provisioned_volumes_ignore_what_the_container_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let vm = VolumeManager::new(dir.path());
+        let mine = vm
+            .create_managed_volume("a", "web", Path::new("/data"), None)
+            .unwrap();
+        vm.create_managed_volume("b", "db", Path::new("/data"), None)
+            .unwrap();
+
+        std::fs::create_dir(mine.join("fake")).unwrap();
+        std::fs::write(mine.join("fake.volume.json"), br#"{"schema":1}"#).unwrap();
+        std::os::unix::fs::symlink(dir.path(), mine.join("escape")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("b"), dir.path().join("a/web/link")).unwrap();
+        // A leftover copy from an interrupted restore holds container data.
+        let leftover = dir.path().join("a/web/data.restore-old");
+        std::fs::create_dir_all(leftover.join("x")).unwrap();
+        std::fs::write(leftover.join("x.volume.json"), br#"{"schema":1}"#).unwrap();
+
+        assert_eq!(
+            vm.provisioned_volumes("a", "web"),
+            vec!["/data".to_string()]
+        );
+    }
+
     #[test]
     fn create_managed_volume_with_size_without_root() {
         assert!(
@@ -1070,7 +1147,7 @@ mod tests {
                 .map_err(|e| format!("snapshot: {e}"))?;
             std::fs::write(live.join("state"), b"garbage").map_err(|e| e.to_string())?;
             snapshots
-                .restore("default", "db", &meta.name)
+                .restore("default", "db", &meta.name, None)
                 .map_err(|e| format!("restore: {e}"))?;
 
             let plan = hand_to_container_user(&live, mapped(0)).map_err(|e| e.to_string())?;

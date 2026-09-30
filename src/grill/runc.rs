@@ -175,25 +175,6 @@ impl RuncGrill {
     }
 }
 
-/// Read the bytes of `path` from `offset` to end. Returns an empty vec if the
-/// file is shorter than `offset` or doesn't exist yet.
-async fn read_from_offset(path: &std::path::Path, offset: u64) -> std::io::Result<Vec<u8>> {
-    use tokio::io::{AsyncReadExt, AsyncSeekExt};
-    let mut file = match tokio::fs::File::open(path).await {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e),
-    };
-    let len = file.metadata().await?.len();
-    if offset >= len {
-        return Ok(Vec::new());
-    }
-    file.seek(std::io::SeekFrom::Start(offset)).await?;
-    let mut buf = Vec::with_capacity((len - offset) as usize);
-    file.read_to_end(&mut buf).await?;
-    Ok(buf)
-}
-
 impl RuncGrill {
     async fn prepare_with_commands(
         &self,
@@ -649,8 +630,9 @@ impl super::Grill for RuncGrill {
         &self,
         instance: &InstanceId,
         lines_tx: tokio::sync::mpsc::Sender<crate::ketchup::types::CapturedLine>,
+        resume: &crate::ketchup::types::CaptureOffsets,
     ) {
-        self.owned_follow_logs(instance, lines_tx).await;
+        self.owned_follow_logs(instance, lines_tx, resume).await;
     }
 }
 
@@ -782,29 +764,6 @@ mod tests {
                 remove_test_network(instance);
             }
         }
-    }
-
-    // Runtime-agnostic: exercises the log-tailing primitive used by
-    // `logs`/`follow_logs` without needing runc.
-    #[tokio::test]
-    async fn read_from_offset_tails_appends() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("output.log");
-
-        // Missing file reads as empty, not an error.
-        assert!(read_from_offset(&path, 0).await.unwrap().is_empty());
-
-        std::fs::write(&path, b"line one\n").unwrap();
-        let first = read_from_offset(&path, 0).await.unwrap();
-        assert_eq!(first, b"line one\n");
-
-        // Reading from the end yields nothing until more is appended.
-        let offset = first.len() as u64;
-        assert!(read_from_offset(&path, offset).await.unwrap().is_empty());
-
-        std::fs::write(&path, b"line one\nline two\n").unwrap();
-        let second = read_from_offset(&path, offset).await.unwrap();
-        assert_eq!(second, b"line two\n");
     }
 
     #[tokio::test]

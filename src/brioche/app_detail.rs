@@ -7,6 +7,7 @@
 use super::dashboard::escape_html;
 use super::fragments::render_instance_table_fragment;
 use super::types::{AppDetailData, ChartConfig, SafeEnvValue};
+use super::units::ChartUnit;
 
 /// Shared HTML head included by all Brioche pages.
 pub(crate) fn render_head(title: &str) -> String {
@@ -135,22 +136,45 @@ const RUNTIME_METRIC_PREFIXES: [&str; 3] = ["go_", "process_", "promhttp_"];
 /// from its request counter and a latency chart from its duration
 /// histogram, when it has them.
 pub fn app_charts(app: &str, namespace: &str, scraped_names: &[String]) -> Vec<ChartConfig> {
-    let chart = |name: &str, kind: &str, title: &str, y_label: &str| ChartConfig {
+    let chart = |name: &str, kind: &str, title: &str, unit: ChartUnit| ChartConfig {
         endpoint: format!("/v1/metrics/app/{app}/{namespace}/chart?name={name}&kind={kind}"),
         title: title.to_string(),
-        y_label: y_label.to_string(),
+        unit,
         refresh_secs: 10,
         range_secs: APP_CHART_RANGE_SECS,
     };
     let mut charts = vec![
-        chart("process_cpu_percent", "gauge", "CPU Usage", "%"),
-        chart("process_memory_bytes", "gauge", "Memory Usage", "bytes"),
+        chart(
+            "process_cpu_percent",
+            "gauge",
+            "CPU Usage",
+            ChartUnit::Percent,
+        ),
+        chart(
+            "process_memory_bytes",
+            "gauge",
+            "Memory Usage",
+            ChartUnit::Bytes,
+        ),
     ];
     if let Some(counter) = request_counter(scraped_names) {
-        charts.push(chart(counter, "rate", "Requests/s", "req/s"));
+        charts.push(chart(
+            counter,
+            "rate",
+            "Requests/s",
+            ChartUnit::RequestsPerSecond,
+        ));
     }
     if let Some(histogram) = latency_histogram(scraped_names) {
-        charts.push(chart(histogram, "mean", "Mean Latency", "seconds"));
+        // Prometheus convention puts the base unit last in the name. A
+        // histogram in anything but seconds reads as a plain number rather
+        // than a duration off by a factor of a thousand.
+        let unit = if histogram.ends_with("_seconds") {
+            ChartUnit::Seconds
+        } else {
+            ChartUnit::Number
+        };
+        charts.push(chart(histogram, "mean", "Mean Latency", unit));
     }
     charts
 }
@@ -251,6 +275,7 @@ mod tests {
                     restart_count: 0,
                     host_port: Some(8080),
                     pid: Some(1234),
+                    runtime_unknown: false,
                 },
                 InstanceStatus {
                     exit_code: None,
@@ -261,6 +286,7 @@ mod tests {
                     restart_count: 0,
                     host_port: Some(8081),
                     pid: Some(1235),
+                    runtime_unknown: false,
                 },
             ],
             env: vec![
@@ -279,7 +305,7 @@ mod tests {
             charts: vec![ChartConfig {
                 endpoint: "/v1/metrics/app/web/default?name=process_cpu_percent".to_string(),
                 title: "CPU Usage".to_string(),
-                y_label: "%".to_string(),
+                unit: ChartUnit::Percent,
                 refresh_secs: 10,
                 range_secs: 3600,
             }],
@@ -393,6 +419,31 @@ mod tests {
                 .endpoint
                 .ends_with("name=http_request_duration_seconds&kind=mean")
         );
+        let units: Vec<ChartUnit> = charts.iter().map(|c| c.unit).collect();
+        assert_eq!(
+            units,
+            vec![
+                ChartUnit::Percent,
+                ChartUnit::Bytes,
+                ChartUnit::RequestsPerSecond,
+                ChartUnit::Seconds
+            ]
+        );
+    }
+
+    #[test]
+    fn a_latency_histogram_not_in_seconds_reads_as_a_plain_number() {
+        let charts = app_charts(
+            "web",
+            "default",
+            &names(&[
+                "request_latency_milliseconds_bucket",
+                "request_latency_milliseconds_count",
+                "request_latency_milliseconds_sum",
+            ]),
+        );
+        let latency = charts.iter().find(|c| c.title == "Mean Latency").unwrap();
+        assert_eq!(latency.unit, ChartUnit::Number);
     }
 
     #[test]

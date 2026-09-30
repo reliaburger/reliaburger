@@ -269,7 +269,7 @@ The scheduler turns "I want 3 replicas of web app" into "put them on nodes 2, 5,
 
 #### `cluster_state.rs` — The cache
 
-`ClusterStateCache` holds per-node `SchedulerNodeState`: allocatable resources, currently allocated resources, labels, readiness flag, and the set of running apps. The `reserve()` and `release()` methods update the allocated resources when placements are made or removed.
+`ClusterStateCache` holds per-node `SchedulerNodeState`: allocatable resources, currently allocated resources, labels, readiness flag, and how many replicas of each app the node runs. The `reserve()` and `release()` methods update the allocated resources and those counts when placements are made or removed.
 
 #### `filter.rs` — Phase 1: Filter
 
@@ -277,17 +277,16 @@ The scheduler turns "I want 3 replicas of web app" into "put them on nodes 2, 5,
 
 #### `score.rs` (220 lines) — Phase 2: Score
 
-`score_nodes()` ranks candidates on a 0-100 weighted scale:
+`score_nodes()` ranks candidates by spread first (fewest replicas of the app), then by a 0-90 weighted score:
 
 | Dimension | Weight | What it measures |
 |-----------|--------|-----------------|
-| Bin-packing | 50% | Prefer fuller nodes (maximise density, leave empty nodes for big workloads) |
-| Preferred labels | 20% | Soft constraints (zone preference, SSD preference) |
-| Image locality | 15% | Prefer nodes with cached images (placeholder, returns 0 until Phase 5) |
-| Spread | 10% | Penalise nodes already running the same app |
-| Stability | 5% | Prefer longer-running nodes (placeholder, returns 50) |
+| Bin-packing | 50 | Prefer fuller nodes (maximise density, leave empty nodes for big workloads) |
+| Preferred labels | 20 | Soft constraints (zone preference, SSD preference) |
+| Image locality | 15 | Prefer nodes with cached images (nodes don't report them yet, so 0) |
+| Stability | 5 | Prefer longer-running nodes (full marks at 24 hours) |
 
-The bin-packing dimension is the dominant factor. If two nodes have the same labels and neither is running the app, the fuller one wins. This might seem counterintuitive, but it's deliberate. By packing workloads onto fewer nodes, you leave other nodes empty and available for large workloads that need a lot of resources. Kubernetes does the opposite by default (LeastRequested), which fragments your cluster and leaves no node with enough free capacity for big jobs.
+Among nodes running the same number of the app's replicas, bin-packing is the dominant factor. If two nodes have the same labels and the same replica count, the fuller one wins. This might seem counterintuitive, but it's deliberate. By packing workloads onto fewer nodes, you leave other nodes empty and available for large workloads that need a lot of resources. Kubernetes does the opposite by default (LeastRequested), which fragments your cluster and leaves no node with enough free capacity for big jobs.
 
 Ties are broken by NodeId, ascending. Fully deterministic. Same inputs, same output, every time.
 

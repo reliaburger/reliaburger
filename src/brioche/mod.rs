@@ -13,3 +13,4 @@ pub mod gitops;
 pub mod login;
 pub mod node_detail;
 pub mod types;
+pub mod units;

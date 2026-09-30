@@ -5,8 +5,7 @@ Kubernetes app on a three-node laptop cluster, walk its network path, measure
 it, break it and watch it heal. Open it any time with `relish manual tour`.
 
 It needs macOS, or Linux with QEMU and KVM, plus about 8 GiB of free memory and
-15 GiB of disk. The one-line install arrives with 0.1.0; until the signed
-release is published, it stops with a release-not-published message.
+15 GiB of disk. The one-line install fetches the signed 0.1.1 release.
 
 ## Install and build the cluster
 
@@ -93,9 +92,10 @@ ingress takes almost a second.
 relish dashboard
 ```
 
-The same numbers as live charts in your browser: CPU, memory, requests per
-second and mean latency, one line per replica. It runs over the CLI's own
-authenticated connection. Ctrl-C closes it; the cluster keeps running.
+The same numbers as live charts in your browser: CPU, memory in MiB, requests
+per second and mean latency in milliseconds, one line per replica. It runs over
+the CLI's own authenticated connection. Ctrl-C closes it; the cluster keeps
+running.
 
 ## Break it
 
@@ -109,19 +109,24 @@ restart counted: the node agent restarts what should be running.
 
 ```sh
 relish local stop node-3
-relish status
+relish inspect frontend
 ```
 
-Now lose a whole machine. Within a minute there are three frontends again, all
-on the two survivors. Nobody had to notice first.
+Now lose a whole machine. About a minute later there are three running
+frontends again, spread over the two nodes that are left: each keeps the one it
+had, and one of them starts a replacement for node-3's. Nobody had to notice
+first.
+`relish inspect` asks every node for its instances, lists each one, running or
+stopped, with the node it's on, and names the node that didn't answer.
 
 ```sh
 relish wtf
 ```
 
 One screen on what's wrong and what to do about it. Here it warns that a
-council member is missing and one more failure would lose quorum. It's what
-you'd run first in a real incident.
+council member is missing and one more failure would lose quorum. Its `builds`
+row checks that every node runs the same build, and warns when one doesn't.
+It's what you'd run first in a real incident.
 
 ## Clean up
 

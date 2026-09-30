@@ -1092,6 +1092,90 @@ async fn start_refuses_when_a_node_cannot_verify_network_upgrades() {
     harness.shutdown().await;
 }
 
+/// The 0.1.0 → 0.1.1 dead end (#339): a candidate with other formats was
+/// recorded, the first node refused it, and the run paused. The leader now
+/// asks the candidate for its formats before recording anything.
+#[tokio::test]
+#[ignore = "requires RELIABURGER_UPGRADE_TESTS=1 and a multi-core host"]
+async fn start_refuses_a_candidate_with_other_formats_before_recording_a_run() {
+    assert!(
+        upgrade_tests_enabled(),
+        "set RELIABURGER_UPGRADE_TESTS=1 on a provisioned multi-core host"
+    );
+    let _serial = SERIAL.lock().await;
+    let harness = ClusterHarness::start(2).await;
+    let leader = harness.wait_for_idle_leader().await;
+    let client = harness.relish_client(harness.node(&leader));
+    let staging = tempfile::tempdir().unwrap();
+    let candidate = harness.signed_candidate(
+        staging.path(),
+        "v0.2.0",
+        b"#!/bin/sh\nprintf '%s' '{\"protocol\":1,\"state\":1}'\n",
+    );
+
+    let err =
+        reliaburger::relish::upgrade::start(&client, ClusterHarness::start_args(candidate, false))
+            .await
+            .expect_err("a candidate with other formats must stop the start");
+    let message = err.to_string();
+    assert!(
+        message.contains("found protocol 1, state 1") && message.contains("needs protocol"),
+        "unexpected refusal: {message}"
+    );
+    assert!(
+        harness.cluster_state().await.unwrap()["active"].is_null(),
+        "nothing may be recorded for a refused start"
+    );
+    assert!(
+        harness.versions().await.values().all(|v| v == "v0.1.0"),
+        "no node may have moved"
+    );
+
+    harness.shutdown().await;
+}
+
+/// The 0.1.1 soak's late refusal (#339): a rollback to a version no node
+/// held was accepted, and the run paused on the first node's 409.
+#[tokio::test]
+#[ignore = "requires RELIABURGER_UPGRADE_TESTS=1 and a multi-core host"]
+async fn rollback_to_a_version_the_nodes_lack_is_refused_before_recording_a_run() {
+    assert!(
+        upgrade_tests_enabled(),
+        "set RELIABURGER_UPGRADE_TESTS=1 on a provisioned multi-core host"
+    );
+    let _serial = SERIAL.lock().await;
+    let harness = ClusterHarness::start(2).await;
+    let leader = harness.wait_for_idle_leader().await;
+    let (nodes, _) = harness.plan_nodes_for(&leader);
+    let request = serde_json::json!({ "target_version": "v0.0.5", "nodes": nodes });
+    let response = harness
+        .client
+        .post(format!(
+            "http://{}/v1/upgrade/cluster-rollback",
+            harness.node(&leader).api
+        ))
+        .json(&request)
+        .send()
+        .await
+        .expect("cluster rollback");
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    assert_eq!(status.as_u16(), 409, "rollback not refused: {body}");
+    assert!(
+        body.contains("not installed in the binary store on node"),
+        "unexpected refusal: {body}"
+    );
+    for node in &harness.nodes {
+        assert!(body.contains(&node.name), "{} not named: {body}", node.name);
+    }
+    assert!(
+        harness.cluster_state().await.unwrap()["active"].is_null(),
+        "nothing may be recorded for a refused rollback"
+    );
+
+    harness.shutdown().await;
+}
+
 /// A paused run is no longer a dead end: `relish upgrade abort` ends one
 /// that moved no node, and `relish upgrade rollback` replaces one outright.
 #[tokio::test]

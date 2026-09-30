@@ -119,7 +119,25 @@ pub struct Operation {
     pub directory: PathBuf,
     /// Current checkpoints; call `save` after a completed external step.
     pub state: ClusterState,
-    _lock: std::sync::Arc<std::fs::File>,
+    _lock: std::sync::Arc<OperationLock>,
+}
+
+/// The `flock` on an operation's `operation.lock`, released when dropped.
+///
+/// A `flock` belongs to the open file description, not to the descriptor, and
+/// a child process that another thread is spawning holds a copy of every
+/// descriptor until its `exec` closes it. Closing our descriptor alone would
+/// leave the lock held by that copy for a moment, so a reopen straight after a
+/// drop could be refused (#285). Unlocking explicitly releases it for every
+/// copy at once.
+struct OperationLock(std::fs::File);
+
+impl Drop for OperationLock {
+    fn drop(&mut self) {
+        // Nothing useful can be done with a failed unlock: closing the
+        // descriptor straight after still releases the lock eventually.
+        let _ = self.0.unlock();
+    }
 }
 
 impl Operation {
@@ -131,9 +149,7 @@ impl Operation {
         let state = if path.exists() {
             let state = read_state(&path)?;
             if state.spec != *spec {
-                return Err(failed(
-                    "existing cluster parameters differ; resume with the original parameters",
-                ));
+                return Err(failed(&spec_mismatch(&state.spec, spec)));
             }
             state
         } else {
@@ -155,7 +171,7 @@ impl Operation {
         let operation = Self {
             directory,
             state,
-            _lock: std::sync::Arc::new(lock),
+            _lock: std::sync::Arc::new(OperationLock(lock)),
         };
         operation.save()?;
         Ok(operation)
@@ -173,7 +189,7 @@ impl Operation {
         Ok(Self {
             directory,
             state,
-            _lock: std::sync::Arc::new(lock),
+            _lock: std::sync::Arc::new(OperationLock(lock)),
         })
     }
 
@@ -202,6 +218,61 @@ fn save_state(directory: &Path, state: &ClusterState) -> Result<(), RelishError>
     let bytes = serde_json::to_vec_pretty(state).map_err(RelishError::SerialiseJson)?;
     crate::sesame::identity::atomic_write_mode(&directory.join("state.json"), &bytes, Some(0o600))?;
     Ok(())
+}
+
+/// Why a saved cluster can't be resumed with the requested parameters.
+///
+/// A newer installer over an older laptop cluster is the common case, and
+/// before 1.0 the answer is usually a fresh cluster, so a version change
+/// gets its own message naming both versions and the command.
+fn spec_mismatch(saved: &ClusterSpec, requested: &ClusterSpec) -> String {
+    if saved.version != requested.version {
+        let name = if saved.name == "laptop" {
+            String::new()
+        } else {
+            format!(" --name {}", saved.name)
+        };
+        return format!(
+            "cluster {:?} was set up with {}, and this installer is {}. Before 1.0, a release that \
+             changes the cluster's protocol or state format can't take over an older cluster: run \
+             `relish local destroy{name} --yes` and set it up again, then re-apply your apps. \
+             See {}",
+            saved.name,
+            saved.version,
+            requested.version,
+            crate::compatibility::POLICY_URL
+        );
+    }
+    let mut changes = Vec::new();
+    let mut compare = |label: &str, saved: String, requested: String| {
+        if saved != requested {
+            changes.push(format!("{label}: saved {saved}, requested {requested}"));
+        }
+    };
+    compare(
+        "nodes",
+        saved.nodes.to_string(),
+        requested.nodes.to_string(),
+    );
+    compare(
+        "API port",
+        saved.api_port.to_string(),
+        requested.api_port.to_string(),
+    );
+    compare(
+        "ingress port",
+        saved.ingress_port.to_string(),
+        requested.ingress_port.to_string(),
+    );
+    compare(
+        "registry port",
+        saved.registry_port.to_string(),
+        requested.registry_port.to_string(),
+    );
+    format!(
+        "existing cluster parameters differ ({}); resume with the original parameters",
+        changes.join("; ")
+    )
 }
 
 fn vm_name(id: &str, index: usize) -> String {
@@ -356,6 +427,61 @@ mod tests {
         assert!(Operation::open(root.path(), &changed).is_err());
     }
 
+    #[test]
+    fn a_newer_installer_names_both_versions_and_the_fresh_cluster_remedy() {
+        let root = tempfile::tempdir().unwrap();
+        let mut saved = spec();
+        saved.name = "laptop".to_string();
+        drop(Operation::open(root.path(), &saved).unwrap());
+        let mut requested = saved.clone();
+        requested.version = "v0.1.1".parse().unwrap();
+        let message = Operation::open(root.path(), &requested)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            message.contains("set up with v0.1.0") && message.contains("this installer is v0.1.1"),
+            "{message}"
+        );
+        assert!(message.contains("relish local destroy --yes"), "{message}");
+        assert!(message.contains("Before 1.0"), "{message}");
+    }
+
+    #[test]
+    fn a_named_cluster_is_destroyed_by_name() {
+        let root = tempfile::tempdir().unwrap();
+        drop(Operation::open(root.path(), &spec()).unwrap());
+        let mut requested = spec();
+        requested.version = "v0.1.1".parse().unwrap();
+        let message = Operation::open(root.path(), &requested)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            message.contains("relish local destroy --name local --yes"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn other_changed_parameters_are_named_with_their_saved_values() {
+        let root = tempfile::tempdir().unwrap();
+        drop(Operation::open(root.path(), &spec()).unwrap());
+        let mut requested = spec();
+        requested.nodes = 1;
+        requested.api_port = 29117;
+        let message = Operation::open(root.path(), &requested)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            message.contains("nodes: saved 3, requested 1")
+                && message.contains("API port: saved 19117, requested 29117"),
+            "{message}"
+        );
+        assert!(message.contains("original parameters"), "{message}");
+    }
+
     #[tokio::test]
     async fn progress_is_persisted_before_the_next_step() {
         let root = tempfile::tempdir().unwrap();
@@ -404,5 +530,39 @@ mod tests {
         ] {
             assert!(Operation::open(root.path(), &invalid).is_err());
         }
+    }
+
+    /// #285: while another thread spawns a child, the child briefly shares
+    /// every open descriptor, including the lock. Dropping an operation must
+    /// still release its lock at once, or the reopen right after is refused.
+    #[test]
+    fn a_dropped_operation_reopens_while_other_threads_spawn_processes() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let root = tempfile::tempdir().unwrap();
+        let spawning = Arc::new(AtomicBool::new(true));
+        let spawners: Vec<_> = (0..2)
+            .map(|_| {
+                let spawning = Arc::clone(&spawning);
+                std::thread::spawn(move || {
+                    while spawning.load(Ordering::Relaxed) {
+                        let _ = std::process::Command::new("true")
+                            .stdin(std::process::Stdio::null())
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .status();
+                    }
+                })
+            })
+            .collect();
+        let refused = (0..100)
+            .filter(|_| Operation::open(root.path(), &spec()).is_err())
+            .count();
+        spawning.store(false, Ordering::Relaxed);
+        for spawner in spawners {
+            spawner.join().unwrap();
+        }
+        assert_eq!(refused, 0, "reopens refused by a lock nobody holds");
     }
 }

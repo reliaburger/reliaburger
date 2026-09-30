@@ -1840,21 +1840,28 @@ pub fn filter_nodes(
 
 Required labels are hard constraints. If an app says `required = ["gpu=a100"]`, only nodes with that label are eligible. If no nodes match, the app stays unscheduled. Preferred labels are soft constraints handled in scoring.
 
-**Phase 2: Score.** Rank the surviving candidates on a 0–150 scale. The score is a weighted sum of several dimensions:
+**Phase 2: Score.** Rank the surviving candidates. Spread goes first: a node running fewer replicas of this app always beats one running more. Between nodes running the same number, a weighted sum on a 0–90 scale decides:
 
 | Dimension | Weight | Logic |
 |-----------|--------|-------|
 | Bin-packing | 50 | Prefer fuller nodes (maximise density) |
 | Preferred labels | 20 | Prefer nodes matching soft constraints |
 | Image locality | 15 | Prefer nodes with cached images (Phase 5) |
-| Spread | 60 | Penalise nodes already running this app |
 | Stability | 5 | Prefer longer-running nodes |
 
-These are points, not percentages. Spread contributes either zero or 60 points, so it outweighs bin-packing when the other dimensions are equal. Once candidates are equal on spread, bin-packing favours density. Image locality is wired into scoring, but nodes don't report their cached images to the leader yet, so in a live cluster it currently scores zero everywhere.
+These are points, not percentages. Image locality is wired into scoring, but nodes don't report their cached images to the leader yet, so in a live cluster it currently scores zero everywhere.
 
-**Phase 3: Select.** Pick the highest-scoring node. Ties are broken by `NodeId` (alphabetical), which gives us deterministic results. The same inputs always produce the same placement. This matters for debugging and for the property-based tests.
+Spread used to be a weight too, and it took two bugs to get it out of the table. At 10 points against bin-packing's 50, the bin-packer put every replica of an app on one node, which defeats the point of having replicas. At 60 points, scored as "runs this app or doesn't", it beat bin-packing for a node with no replica at all, but once every candidate ran one, bin-packing chose again. Lose one node of three running four replicas and both survivors run the app, so the busier one took both replacements: three replicas on one node, one on the other. No weight fixes that for good, because the next dimension someone adds can outvote it. So the replica count is the first sort key and the weighted score only breaks ties:
 
-**Phase 4: Commit.** Reserve the resources in the cluster state cache and record the placement. The `Scheduler.reserve()` method updates the node's allocated resources and marks the app as running there, which affects the next replica's scoring (spread penalty kicks in).
+```rust
+scored.sort_by(|a, b| a.1.cmp(&b.1).then(b.2.cmp(&a.2)).then(a.0.cmp(&b.0)));
+```
+
+Each tuple is `(node, replicas, score)`. `cmp` returns an `Ordering` (less, equal or greater), and `then` only looks at the next key when the first says equal. Fewest replicas ascending, then score descending (note the swapped `b` and `a`), then node id ascending. It's the same idea as a SQL `ORDER BY replicas, score DESC, node_id`, and it keeps working however many weights we add later.
+
+**Phase 3: Select.** Pick the first node in that order. Ties end at `NodeId` (alphabetical), which gives us deterministic results. The same inputs always produce the same placement. This matters for debugging and for the property-based tests.
+
+**Phase 4: Commit.** Reserve the resources in the cluster state cache and record the placement. `ClusterStateCache::reserve()` adds to the node's allocated resources and counts one more replica of the app there, so the next replica sees it.
 
 ### Daemon mode
 
@@ -1862,11 +1869,13 @@ Some workloads need to run everywhere: log collectors, monitoring agents, securi
 
 ### Namespace quotas
 
-Namespaces provide resource isolation. Each namespace can have limits on CPU, memory, GPUs, number of apps, and total replica count. The scheduler checks quotas before the filter phase. If a deployment would push a namespace over its budget, the scheduler rejects it with a clear error message:
+Namespaces provide resource isolation. Each namespace can have limits on CPU, memory, GPUs, number of apps, and total replica count. The scheduler checks quotas before the filter phase. If a deployment would push a namespace over its budget, the scheduler refuses to place it, with a message like this:
 
 ```
 namespace "staging" would exceed CPU quota: 1800+500 > 2000m
 ```
+
+Notice *where* that message ends up. The quota check runs in the leader's scheduling pass, long after `relish apply` has committed the app to desired state and returned success. So in 0.1.0 the operator sees an app stuck at zero instances, and the reason is a `scheduler: quota rejects …` line in the leader's log, repeated every pass until the namespace has room. We'll meet the consequences of that in Chapter 15, where a test expected `apply` itself to fail. A durable "blocked by quota" status is still on the to-do list.
 
 The leader tallies each namespace's usage once per scheduling pass and adds every app it admits as it goes, so two apps admitted in the same pass can't each squeeze under a limit they exceed together. It also skips nodes cordoned by an in-progress upgrade before selecting.
 
@@ -2429,6 +2438,12 @@ fn unheard_nodes(alive: &HashSet<NodeId>, reports: &AggregatedState) -> HashSet<
 The `*node` is worth a second look. `alive.iter()` yields `&NodeId`, borrowed references into the set, and `filter` hands its closure a reference to each item, so inside the closure `node` is a `&&NodeId`. `contains_key` wants a `&NodeId`, and one `*` peels off the outer layer. At the end, `.cloned()` turns the surviving `&NodeId`s into owned `NodeId`s so they can live in a new set. In Go you'd write the loop and never think about it; in Rust the layers of borrowing are spelled out, which is noisier but means you can't accidentally keep a pointer into a set someone else is about to change.
 
 What still moves a replica is evidence: a node that's dead in gossip, one whose reports went stale, or one that reported itself not ready or unable to enforce what the app needs. Silence while the post is still arriving isn't evidence.
+
+Neither is suspicion. The 0.1.1 tour recording showed node-2's frontend stopped and all three frontends on node-1 after node-3 went away, and the scheduler moved a replica for the same kind of reason in one more place: it only kept placements on nodes gossip called `Alive`. A `Suspect` node is one that missed a probe. SWIM gives it the suspicion timeout (five seconds) to refute that, and a three-node cluster that just lost a member has no third node left to relay an indirect probe, so one slow ack on a loaded laptop is enough to be suspected. The pass now takes the suspect set as well, and a placement on a suspect node holds until gossip declares it dead. Rescheduling a dead node's replicas waits those five seconds longer. That's the price, and we'd rather pay it than stop a healthy replica over a late packet.
+
+Keeping placements put was half the job. The other half is where the missing replica goes. The pass tells the cache how many replicas of the app each node keeps, from the placements themselves rather than from the last reports (which can lag a new leader), and spread picks the survivor with the fewest. `replacements_spread_over_the_survivors_with_fewest_replicas` loses the node holding two of four replicas and checks the two replacements land one on each survivor, even though the busier survivor wins on bin-packing. `replacements_stack_only_when_the_other_survivor_is_full` checks the other side: spread gives way when a node simply has no room.
+
+The node agent had its own version of the problem. A node's share of an app arrives as the app's spec with `replicas` set to that share, so when node-1's share went from one to two, it saw a changed spec and rolled every replica: the healthy frontend stopped, two new ones started. While a node is down, the old replica's address can't be released (the dead node never confirms the withdrawal), so the stopped instance lingered in `relish inspect` for a minute. Now, if the new spec is the old one with a higher count and every replica is running, the agent starts only the extra replicas beside the old ones, through the same path a fresh deploy uses. Anything else, a new image, a crash-looping replica, a stopped app, still rolls.
 
 ### An instance id that forgot which namespace it lived in
 

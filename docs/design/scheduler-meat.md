@@ -12,7 +12,7 @@ Meat is the single decision-maker for "what runs where." Every App placement, Jo
 
 - **Single-leader scheduling.** All scheduling decisions are made on one node. This eliminates coordination overhead between multiple schedulers and makes the Raft log the single source of truth for placement decisions. The tradeoff -- a single point of decision-making -- is mitigated by fast leader failover (< 5 seconds) and the delegated batch model.
 
-- **Delegated batch execution.** Meat does not schedule individual Jobs from high-throughput batch workloads. Instead, it allocates capacity budgets to nodes ("Node 7, here are your next 200 jobs"), and nodes execute and report completions asynchronously. This is the mechanism that enables 100M+ jobs/day without the leader becoming a bottleneck.
+- **Delegated batch execution.** Meat does not schedule individual Jobs from high-throughput batch workloads. Instead, it allocates capacity budgets to nodes ("Node 7, here are your next 200 jobs"), and nodes execute and report completions asynchronously. This is the mechanism meant to reach 100M+ jobs/day without the leader becoming a bottleneck. It's a target: the allocator ships, the delegated pipeline isn't wired end to end, and the throughput is unmeasured (see the status note in the batch section).
 
 - **Bin-packing first.** Meat uses a bin-packing algorithm as its primary placement strategy, maximising node utilisation before spreading to new nodes. This reduces the number of active nodes under low load and improves cache locality for images already present on a node.
 
@@ -103,15 +103,16 @@ Meat uses a four-phase placement pipeline for App scheduling:
 - Namespace quota would not be exceeded by this placement.
 - For process workloads: node has the required binary in its allowlist.
 
-**Phase 2: Score.** Rank remaining candidate nodes (0-100 scale, higher is better).
+**Phase 2: Score.** Rank remaining candidate nodes. Spread comes first: a node running fewer replicas of the App always ranks above one running more, which provides failure-domain diversity. Among nodes running the same number, a weighted score (0-90, higher is better) decides:
 
 - **Bin-packing score (weight 50):** Prefer nodes with the least remaining allocatable resources after placing this workload. This maximizes density.
 - **Preferred label score (weight 20):** Nodes matching `preferred` labels receive a bonus.
 - **Image locality score (weight 15):** Nodes that already have the required image cached score higher (full marks if the image is present, zero otherwise).
-- **Spread score (weight 60):** Penalize nodes that already run other replicas of the same App. This provides failure-domain diversity. The weight deliberately exceeds bin-packing's 50, so a spread-clean node always outscores a fuller node running the same app.
 - **Node stability score (weight 5):** Prefer nodes with longer uptime, scaled from the node's reported uptime (full marks at 24h).
 
-**Phase 3: Select.** Pick the highest-scoring node. Ties are broken by node ID (deterministic). For multi-replica placements, Meat runs the pipeline iteratively, updating the cluster state cache after each placement to reflect the newly committed resources.
+Spread was once a weight (60, scored on whether a node ran the App at all). That beat bin-packing only against a node with no replica: once every candidate ran one, the busier node took every replacement (#346). The replica count is now the first sort key, so no weight can outvote it.
+
+**Phase 3: Select.** Pick the first node: fewest replicas, then highest score. Remaining ties are broken by node ID (deterministic). For multi-replica placements, Meat runs the pipeline iteratively, updating the cluster state cache after each placement to reflect the newly committed resources.
 
 **Phase 4: Commit.** Write the scheduling decision to the Raft log. Once committed, the decision is replicated to council members and the assignment is sent to the target Bun agent via the reporting tree.
 
@@ -305,7 +306,8 @@ pub struct AutoscaleConfig {
     pub request: f64,
     /// Target utilisation of the request as a fraction (0.70 for "70%").
     pub target: f64,
-    /// Minimum replica count. Autoscaler will never scale below this.
+    /// Minimum replica count, at least 1 (no scale-to-zero). Autoscaler
+    /// will never scale below this.
     pub min: u32,
     /// Maximum replica count. Autoscaler will never scale above this.
     pub max: u32,
@@ -607,15 +609,15 @@ pub struct MetricSample {
 
 When an App spec with `replicas = 3` is submitted:
 
-1. Meat validates the spec (schema, permissions, namespace quota).
+1. The API validates the spec (schema, permissions) before committing it; Meat checks the namespace quota in its scheduling pass (§5.6).
 2. For each replica (0..3), Meat runs the four-phase placement pipeline:
    - **Filter:** Eliminate nodes that lack resources, do not match `required` labels, or are not ready.
-   - **Score:** Rank candidates using the weighted scoring model (bin-packing 50, preferred labels 20, image locality 15, spread 60, stability 5).
+   - **Score:** Rank candidates by fewest replicas of the App, then by the weighted score (bin-packing 50, preferred labels 20, image locality 15, stability 5).
    - **Select:** Pick the highest-scoring node.
    - **Commit:** Reserve resources on the selected node in the cluster state cache, then commit the `SchedulingDecision` to the Raft log.
 3. After all replicas are committed, the decisions are disseminated to target Bun agents.
 
-The iterative per-replica approach (rather than computing all placements at once) ensures that the spread penalty accumulates correctly -- the second replica of an App scores a given node lower if the first replica was already placed there.
+The iterative per-replica approach (rather than computing all placements at once) ensures that spread accumulates correctly: the second replica of an App ranks a given node lower if the first replica was already placed there.
 
 #### Required Labels (Hard Constraints)
 
@@ -664,8 +666,10 @@ Higher utilisation after placement is better (the node is more "full"). An imbal
 A managed volume lives on one node, so placement follows the data. Desired state keeps `last_placed_nodes`: the nodes of the app's last non-empty scheduling decision. `relish stop` commits an empty decision, which leaves that record alone. When a fixed-replica app with a managed volume has no placement left to keep (it was stopped and is applied again), the leader puts its replicas back on those nodes before scoring anything:
 
 - A home node that is alive, ready and still matches the app's required labels gets the replica, reserved in the pass's cache.
-- A home node that could run it but hasn't room (or hasn't reported to this leader yet) makes the app wait: placing it elsewhere would start it on an empty volume.
-- A home node that is gone, not ready, or no longer matches the labels is dropped, and that replica goes through the normal pipeline. That's the documented loss of a local volume with its node, or the operator moving the app on purpose.
+- A home node that is alive but can't take it right now makes the app wait: placing it elsewhere would start it on an empty volume. That covers no room, no fresh report (a new leader, or a report worker that stalled for longer than `stale_report_timeout_secs`), not ready, cordoned for an upgrade, and missing a capability the app needs.
+- A home node that gossip no longer has alive (or that was retired), or that no longer matches the labels, is dropped, and that replica goes through the normal pipeline. That's the documented loss of a local volume with its node, or the operator moving the app on purpose.
+
+The same rule keeps a *running* volume app where it is. For an app without a volume, a placement on a node that went stale, reported not ready or was cordoned is replaced elsewhere; for a fixed-replica app with a managed volume, the placement holds for as long as the node is alive. Moving it would restart it on an empty volume while its data sits on the node it left.
 
 `relish delete` forgets the record. Apps without a managed volume are placed by score as usual.
 
@@ -806,6 +810,7 @@ Utilisation follows the Kubernetes HPA convention: the average per-replica use d
 - **CPU with no CPU request** is measured against one whole core. ProcessGrill and rootless nodes refuse apps that declare `cpu` (they can't enforce the limit), so refusing here would make CPU autoscaling impossible on them.
 - **Memory with no memory request** fails config validation: there's no natural unit to fall back on.
 - **Any other `metric`** fails config validation. Custom (scraped) metrics are not supported.
+- **`min = 0`** fails config validation. Scale-to-zero needs a wake-up signal that exists while no replica runs (requests queued at the ingress, say), and both metrics are sampled from running instances: an app at zero replicas reports nothing to scale back up on. `min` must be at least 1; `relish stop` parks an app at zero by hand.
 - **Limits.** The collector samples each instance's main process (children aren't counted), and only runtimes that report a host PID produce per-app metrics: ProcessGrill and runc do; direct Apple Container (VM-isolated, disabled in 0.1.0) doesn't, so its apps can't autoscale. Rollups cover the previous complete minute, so the first signal reaches the leader 60–120 s after load changes.
 
 #### Algorithm
@@ -923,7 +928,7 @@ fn reconcile_daemon_apps(&self, membership_event: MembershipEvent) {
 
 ### 5.6 Namespace Quota Enforcement
 
-Quotas are enforced at scheduling time (admission check), not retroactively. Before running the placement pipeline, Meat checks:
+Quotas are enforced at scheduling time, not at apply time and not retroactively. `relish apply` commits an over-quota app to desired state like any other; the leader's scheduling pass (`plan_scheduling_pass` in `src/cluster/orchestrate.rs`) seeds a `QuotaLedger` with every converged app's footprint, then runs this check before placing each unconverged app. An app that fails it gets no placement that pass and the leader logs `scheduler: quota rejects <app>: <reason>`; the check runs again every pass, so the app places once the namespace has room. `over_quota_apply_is_accepted_but_never_placed` pins this contract. The check, in outline:
 
 ```rust
 fn check_namespace_quota(
@@ -985,7 +990,8 @@ The `default` namespace has no quotas unless explicitly configured, which is app
 > `[defaults.app.deploy]`) configuration namespace described in this section does
 > not exist yet. The scheduler's behaviour is currently baked into constants:
 > the reconcile tick is a hardcoded 2 seconds, the scoring weights are `const`s
-> in `meat::score` (bin-pack 50, preferred 20, image 15, spread 60, stability 5),
+> in `meat::score` (bin-pack 50, preferred 20, image 15, stability 5; spread is
+> the first sort key, not a weight),
 > and there is no runtime knob to change any of them. Treat the tables below as
 > the intended configuration surface, not as keys you can set today. (The
 > per-node reconstruction knobs under `[reconstruction]` — e.g.
@@ -1010,7 +1016,6 @@ All scheduler-related configuration is set in the cluster-level configuration (a
 | `scheduler.scoring.bin_packing_weight` | `50` | Weight for the bin-packing score (0-100). |
 | `scheduler.scoring.preferred_label_weight` | `20` | Weight for preferred label matching (0-100). |
 | `scheduler.scoring.image_locality_weight` | `15` | Weight for image cache locality (0-100). |
-| `scheduler.scoring.spread_weight` | `10` | Weight for anti-affinity spread (0-100). |
 | `scheduler.scoring.stability_weight` | `5` | Weight for node uptime/stability (0-100). |
 
 ### Batch Jobs
@@ -1089,14 +1094,12 @@ All scheduler-related configuration is set in the cluster-level configuration (a
 
 **Response:**
 
-- **New deploys:** Rejected with a clear error:
+- **New deploys (0.1.0):** `relish apply` succeeds and the app is committed, but Meat leaves it unplaced, so it shows zero instances. The only record of why is a line in the leader's log, repeated each scheduling pass:
   ```
-  Error: namespace "team-backend" CPU quota exhausted
-    allocated: 7800m / limit: 8000m
-    requested: 500m (app.new-service, 2 replicas)
-    would exceed quota by 300m
+  scheduler: quota rejects prod/new-service: <QuotaError>
   ```
-- **Autoscale events:** The autoscaler's scale-up is blocked. The scale action is logged as `QuotaBlocked`, an alert fires, and the autoscaler retries at the next evaluation interval. The existing replicas continue running -- quota exhaustion does not cause running workloads to be terminated.
+- **Autoscale and replica changes:** a scale-up that would bust the budget is skipped the same way, and the app keeps the placements it already has. Running workloads are never terminated to satisfy a quota.
+- **Planned, not yet scheduled on the roadmap:** a durable "blocked by quota" reason on the app that `relish status` and Brioche can show, and an apply-time error for an app that can't fit its namespace's budget. There's no `QuotaBlocked` event or quota alert today.
 
 ### 7.4 Leader Failure Mid-Deploy
 
@@ -1112,7 +1115,19 @@ All scheduler-related configuration is set in the cluster-level configuration (a
 
 If `auto_rollback = true` and the health check of the in-progress step was pending when the leader failed, the new leader restarts the health check timer from zero (conservative approach -- it does not assume the previous leader's timer was accurate).
 
-### 7.5 Cascading Node Failures
+### 7.5 Losing One Node
+
+**Scenario:** One node of three dies while an App runs one replica on each.
+
+**Response:** Meat moves as little as it can.
+
+1. Only a placement on a node gossip no longer lists as `Alive` or `Suspect` is lost, or one on a node that reported itself not ready, not capable, or went stale. A `Suspect` node missed a probe and has the suspicion timeout to refute it; in a three-node cluster that just lost a member there is no third node to relay an indirect probe, so a loaded survivor can be suspected for a late ack. Its placements hold until gossip declares it dead (#346). A live node whose readiness report hasn't reached a new leader yet keeps its placements too (§7.2).
+2. Every placement that holds stays where it is. Meat places only the missing replicas.
+3. Before placing them, the pass sets each node's replica count for the App from the kept placements (reports can lag a new leader), so spread sends each replacement to the eligible survivor running the fewest replicas. No node ends up with more than `ceil(replicas / eligible nodes)` unless the others lack room.
+4. The survivor that gains a replica receives the same spec with a higher count. Its agent starts only the added replica beside the running ones; it rolls its replicas only when the spec changed in any other way, or when not every replica is running.
+5. When the lost node returns, nothing moves back: the App is converged, and rebalancing would restart healthy replicas.
+
+### 7.6 Cascading Node Failures
 
 **Scenario:** Multiple nodes fail simultaneously (rack failure, network partition).
 
@@ -1419,7 +1434,7 @@ V1 supports whole-device GPU allocation only (`gpu = 1`, `gpu = 2`). Fractional 
 
 ### 13.4 Spread Strategy as First-Class Alternative
 
-Currently, bin-packing is the primary strategy and spread is a scoring component. Some workloads (latency-sensitive services) benefit from a spread-first strategy that distributes replicas across as many nodes as possible, even if this reduces density. Should Meat support a per-App `strategy = "spread"` that inverts the scoring weights? **Current decision: under consideration. The current spread weight (60) already exceeds bin-packing's 50, so a spread-clean node wins by default; a dedicated spread mode would go further and also reduce bin-packing weight.**
+Currently, bin-packing is the primary strategy and spread is a scoring component. Some workloads (latency-sensitive services) benefit from a spread-first strategy that distributes replicas across as many nodes as possible, even if this reduces density. Should Meat support a per-App `strategy = "spread"` that inverts the scoring weights? **Current decision: under consideration. Spread is already the first sort key, so replicas land on the nodes running fewest of them; a dedicated spread mode would go further and prefer emptier nodes over fuller ones as well.**
 
 ### 13.5 Topology-Aware Scheduling
 

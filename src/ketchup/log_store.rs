@@ -172,6 +172,7 @@ pub(crate) fn batches_to_entries(batches: &[RecordBatch]) -> Result<Vec<LogEntry
                 timestamp: timestamps.value(row),
                 sequence,
                 instance,
+                node: None,
                 stream,
                 line: lines.value(row).to_string(),
             });
@@ -206,21 +207,48 @@ const CHECKPOINT_FILE: &str = "ingest-checkpoint.json";
 /// What the store has durably ingested, saved after every successful flush.
 ///
 /// `offsets` is the highest capture-file offset whose line reached Parquet,
-/// per capture file. A restarted agent re-reads capture files from the start;
-/// the store skips every line at or below these offsets instead of storing it
-/// a second time under a new timestamp. `last_sequence` keeps
-/// [`LogEntry::sequence`] rising across a restart even if the clock stepped
-/// back while the node was down.
+/// per capture file. A restarted agent's forwarders resume each capture file
+/// at its offset (see [`LogStore::capture_offsets`]), and the store still
+/// skips every line at or below it, so a line is never stored a second time
+/// under a new timestamp. `files` records which file each offset belongs to
+/// (device and inode, taken when the checkpoint is saved), so a capture file
+/// replaced under the same path isn't mistaken for the one the offset
+/// counted. `last_sequence` keeps [`LogEntry::sequence`] rising across a
+/// restart even if the clock stepped back while the node was down.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct IngestCheckpoint {
     last_sequence: u64,
     offsets: std::collections::BTreeMap<PathBuf, u64>,
+    files: std::collections::BTreeMap<PathBuf, FileIdentity>,
+}
+
+/// Which file a path named when the checkpoint was saved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl FileIdentity {
+    fn of(metadata: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
 }
 
 impl IngestCheckpoint {
-    /// Load the checkpoint from `data_dir`, forgetting capture files that no
-    /// longer exist. A missing or unreadable checkpoint starts empty: at worst
-    /// the store ingests a line twice, never loses one.
+    /// Load the checkpoint from `data_dir`. A missing or unreadable
+    /// checkpoint starts empty: at worst the store ingests a line twice,
+    /// never loses one.
+    ///
+    /// An offset survives only while it still describes its capture file:
+    /// the file exists, is the same file (device and inode) the checkpoint
+    /// counted, and is at least as long as the offset. A deleted, replaced
+    /// (rotated) or truncated file is read again from byte 0, and every line
+    /// in it is new.
     fn load(data_dir: &std::path::Path) -> Self {
         let path = data_dir.join(CHECKPOINT_FILE);
         let mut checkpoint = match std::fs::read(&path) {
@@ -233,15 +261,36 @@ impl IngestCheckpoint {
             }),
             Err(_) => Self::default(),
         };
-        checkpoint.offsets.retain(|file, _| file.exists());
+        let files = std::mem::take(&mut checkpoint.files);
+        checkpoint.offsets.retain(|file, offset| {
+            let Ok(metadata) = std::fs::metadata(file) else {
+                return false;
+            };
+            files.get(file) == Some(&FileIdentity::of(&metadata)) && metadata.len() >= *offset
+        });
+        checkpoint.files = files
+            .into_iter()
+            .filter(|(file, _)| checkpoint.offsets.contains_key(file))
+            .collect();
         checkpoint
     }
 
     /// Durably replace the checkpoint: a unique temp file, fsync, rename over
     /// the old one, then fsync the directory. A reader sees the old
     /// checkpoint or the new one, never half of either.
-    fn save(&self, data_dir: &std::path::Path) -> Result<(), KetchupError> {
-        let bytes = serde_json::to_vec(self)
+    ///
+    /// Records the identity of every capture file it has an offset for first.
+    /// This runs on the blocking pool, off the ingest path.
+    fn save(mut self, data_dir: &std::path::Path) -> Result<(), KetchupError> {
+        self.files = self
+            .offsets
+            .keys()
+            .filter_map(|file| {
+                let metadata = std::fs::metadata(file).ok()?;
+                Some((file.clone(), FileIdentity::of(&metadata)))
+            })
+            .collect();
+        let bytes = serde_json::to_vec(&self)
             .map_err(|error| KetchupError::Io(std::io::Error::other(error.to_string())))?;
         crate::sesame::identity::atomic_write(&data_dir.join(CHECKPOINT_FILE), &bytes)?;
         Ok(())
@@ -392,6 +441,15 @@ impl LogStore {
         }
     }
 
+    /// Where the store has read each capture file up to, for forwarders to
+    /// resume from (#308).
+    ///
+    /// Right after [`new`](Self::new) this is the loaded checkpoint, already
+    /// cleared of files that were deleted, replaced or truncated.
+    pub fn capture_offsets(&self) -> super::types::CaptureOffsets {
+        super::types::CaptureOffsets(self.ingested.offsets.clone())
+    }
+
     /// The directory where Parquet files are stored.
     pub fn data_dir(&self) -> &std::path::Path {
         &self.data_dir
@@ -428,9 +486,10 @@ impl LogStore {
     /// time.
     ///
     /// Returns `false`, storing nothing, when the line's capture position is
-    /// at or below what this store already holds from that file: a restarted
-    /// agent re-reads capture files from the start, and those lines are
-    /// already here under their original timestamps.
+    /// at or below what this store already holds from that file: those lines
+    /// are already here under their original timestamps. Forwarders resume
+    /// past them after a restart, but a line re-read for any other reason
+    /// still lands only once.
     pub fn ingest(&mut self, record: &super::types::LogRecord) -> bool {
         self.ingest_at_nanos(now_nanos(), record)
     }
@@ -1056,10 +1115,17 @@ mod tests {
 
     const LINE_BYTES: u64 = "ACK 0000\n".len() as u64;
 
-    /// A capture file that exists, so the checkpoint doesn't forget it.
+    /// Lines a test capture file holds: more than any test ingests.
+    const CAPTURE_LINES: u64 = 16;
+
+    /// A capture file holding `CAPTURE_LINES` writer lines, so the
+    /// checkpoint doesn't forget it as deleted or truncated.
     fn capture_file(dir: &tempfile::TempDir, name: &str) -> PathBuf {
         let path = dir.path().join(name);
-        std::fs::write(&path, b"").unwrap();
+        let lines: String = (1..=CAPTURE_LINES)
+            .map(|n| format!("ACK {n:04}\n"))
+            .collect();
+        std::fs::write(&path, lines).unwrap();
         path
     }
 
@@ -1216,7 +1282,70 @@ mod tests {
             serde_json::from_slice(&std::fs::read(dir.path().join(CHECKPOINT_FILE)).unwrap())
                 .unwrap();
         assert_eq!(saved.offsets.get(&file), Some(&(2 * LINE_BYTES)));
-        assert_eq!(saved, store.ingested);
+        assert_eq!(saved.offsets, store.ingested.offsets);
+        assert_eq!(saved.last_sequence, store.ingested.last_sequence);
+        assert!(saved.files.contains_key(&file), "{saved:?}");
+    }
+
+    /// #308: a restarted store hands its forwarders the offsets it
+    /// checkpointed, so they resume there instead of at byte 0.
+    #[tokio::test]
+    async fn a_reopened_store_offers_its_checkpointed_capture_offsets() {
+        let dir = tempfile::tempdir().unwrap();
+        let captures = tempfile::tempdir().unwrap();
+        let file = capture_file(&captures, "writer.stdout");
+        let mut store = LogStore::new(dir.path().to_path_buf());
+        for n in 1..=3 {
+            store.ingest_at(100, &writer_line(&file, n));
+        }
+        store.flush().await.unwrap();
+
+        let store = LogStore::new(dir.path().to_path_buf());
+        assert_eq!(store.capture_offsets().get(&file), Some(3 * LINE_BYTES));
+    }
+
+    /// A capture file cut shorter than its checkpoint (truncated, or
+    /// rewritten in place) holds only new lines. The store forgets its
+    /// offset, so the forwarder reads it from byte 0 and the store keeps
+    /// every line it finds.
+    #[tokio::test]
+    async fn a_truncated_capture_file_is_read_again_from_the_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let captures = tempfile::tempdir().unwrap();
+        let file = capture_file(&captures, "writer.stdout");
+        let mut store = LogStore::new(dir.path().to_path_buf());
+        for n in 1..=3 {
+            store.ingest_at(100, &writer_line(&file, n));
+        }
+        store.flush().await.unwrap();
+        std::fs::write(&file, "ACK 0001\n").unwrap();
+
+        let mut store = LogStore::new(dir.path().to_path_buf());
+        assert_eq!(store.capture_offsets().get(&file), None);
+        assert!(store.ingest_at(200, &writer_line(&file, 1)));
+    }
+
+    /// A capture file replaced under the same path (rotated) is a different
+    /// file, even when it has grown past the old offset. The checkpoint's
+    /// offset counted the old one, so the new one starts at byte 0.
+    #[tokio::test]
+    async fn a_rotated_capture_file_is_read_again_from_the_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let captures = tempfile::tempdir().unwrap();
+        let file = capture_file(&captures, "writer.stdout");
+        let mut store = LogStore::new(dir.path().to_path_buf());
+        for n in 1..=3 {
+            store.ingest_at(100, &writer_line(&file, n));
+        }
+        store.flush().await.unwrap();
+        // Keep the old inode alive so the new file can't reuse its number.
+        let rotated = captures.path().join("writer.stdout.1");
+        std::fs::rename(&file, &rotated).unwrap();
+        capture_file(&captures, "writer.stdout");
+
+        let mut store = LogStore::new(dir.path().to_path_buf());
+        assert_eq!(store.capture_offsets().get(&file), None);
+        assert!(store.ingest_at(200, &writer_line(&file, 1)));
     }
 
     #[tokio::test]

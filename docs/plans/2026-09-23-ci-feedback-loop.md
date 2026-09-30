@@ -244,7 +244,7 @@ VM). A fix counts only when the loop that used to fail passes.
 - [x] **C3.7 (F7)** Seed the gossip RNG in the five-node convergence test, or
   loop until convergence with a round cap.
 - [x] **C3.8 Flake register.** Add a short "Known flakes" table to
-  `docs/progress.md` (test, first seen, cause, owner item), maintained by the
+  `docs/progress.md`, now `docs/flakes.md` (test, first seen, cause, owner item), maintained by the
   rerun-once rule above.
 
 ### Phase 4: tidy the layout (smaller builds, less duplication)

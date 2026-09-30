@@ -241,6 +241,16 @@ shutdown did not complete. Reporting tests join listeners, aggregators and worke
 success and failure paths. Ports come from binding `127.0.0.1:0`, which asks the operating
 system for an unused port, and every filesystem fixture lives in a temporary directory.
 
+Production code had the same blind spot, one level down. GitOps ran `git` with
+`Command::output()` inside `spawn_blocking`, so a stuck remote held the only sync loop, and
+shutdown waited with it (B19, Chapter 7). A timeout around the task would have freed the loop
+and left `git` running. The fix gives each child an owner that can end it: its own session and
+process group, a deadline, the shutdown token, and a group kill and reap however it finishes.
+The tests prove the ending, not the waiting. A fetch pointed at an upload-pack that never
+answers must fail inside its budget, the sleeping descendant it left must be gone, and the
+next fetch must work. Cancelling shutdown during that fetch must finish the loop's
+`JoinHandle` within five seconds.
+
 This matters more with nextest. Cargo's built-in runner executes the tests in one test binary
 in a process. Nextest runs each test in its own process and schedules tests from different
 binaries concurrently. Isolation exposes assumptions about global ports, shared paths and
@@ -597,7 +607,7 @@ since nothing gates on their numbers yet.
 
 Speed is only half of it. A flaky suite teaches everyone to press "re-run" without reading,
 and then a real race looks exactly like noise. Our retries stay at zero, so a failure that
-passes on a re-run goes into a register in `docs/progress.md` with its cause the same day. Of
+passes on a re-run goes into a register (now `docs/flakes.md`) with its cause the same day. Of
 the seven we chased down, three were product races, not test problems: a node back from a
 fault spread stale suspicions about healthy peers, a rollout interrupted by a crash dropped the
 reservation its own retirement needed, and a two-second kill deadline was too short for a busy
@@ -1780,6 +1790,8 @@ How long should that deadline be? We first picked 30 seconds, and the V02 soak s
 
 So the number is no longer ours to pick. `lease_retirement_bound` in `src/cluster/orchestrate.rs` adds up what an owner does after a release (wait for its next placement poll, retire, acknowledge to the leader) from the same constants the reconciler uses. Relish's `lease_release_budget` is that bound with the default runtime configuration, and the case runner's teardown is that budget plus 30 seconds for reversing faults and checking the runtime independently. `pub fn` rather than `const` here isn't a style choice: `RuntimeSection::default()` builds a struct at run time, and Rust only lets a `const` call functions marked `const fn`, which `Default::default` isn't. If someone later lengthens the stop grace, the runner's patience grows with it instead of silently turning green runs into `unknown` ones.
 
+That bound still had a hole: it assumed nothing else held the owner's reconcile cycle, and a deploy did. So the reconciler now retires before it deploys, and keeps retiring while it waits on one (Chapter 7, "Retire first, deploy second"). The report changed too. It used to say "within 30 s" whatever the budget was; it now prints the budget it actually had.
+
 What if a worker will never come back? Waiting forever keeps the record honest but leaves the operator stuck. `relish decommission-node worker-a --workloads-stopped --reason "powered off"` is the escape hatch, and it's deliberately a *different* kind of evidence. Only an unscoped Admin can submit it. Raft records who said it, why and when, releases that node's outstanding placements, and permanently retires the node identity, so an old disk can't come back with an old certificate and resume work the cluster has already forgotten. Bun observing a process exit and an operator promising they've pulled the plug are both valid reasons to finish cleanup. They're not the same reason, and the audit record says which one it was.
 
 Tokens, jobs and faults needed their own owners too. A test token is minted inside the lease, scoped to its namespace, never Admin, and it expires no later than the lease does. Jobs in 0.1 run on the node that received them, so their leases live on that node (`scope = "node_jobs"`) and a local reaper retires both running jobs and cron registrations that haven't fired yet. Chaos faults get a receipt *before* the request goes out, because the server may accept a fault whose response never reaches us; an unresolved receipt makes cleanup `Unknown` rather than `NotRequired`.
@@ -2716,6 +2728,653 @@ product was wrong. A stopped app forgot which node held its volume, so the
 redeploy could start it on another node with an empty one. Chapter 7 has the
 fix.
 
+The candidate after that, 0eb6071, failed the dead-worker case again, and the
+504 was back with different words:
+
+```text
+owned fault cleanup failed: 2: API error (status 504):
+node fault reversal request to rb-…-2 timed out
+```
+
+This time it wasn't the reservation. That message comes from the entry node,
+which gives the owning node five seconds to answer a forwarded clear. Node 2
+did reverse the fault (its journal says so at 21:15:12 BST), but it never
+answered anyone in time again: seven minutes later `relish wtf` still reported
+"rb-…-2 did not answer", and every agent query to it timed out. Its journal
+showed why. The fault had killed all six of its containers, so every replica
+was a pending restart, and every restart was stuck waiting for the cluster to
+confirm its old endpoint was withdrawn. Each health tick walked all six, and
+each one spent about 400 ms on runtime cleanup it couldn't finish yet. A tick
+took two and a half seconds, and the tick interval is one.
+
+The agent loop is one `tokio::select!` over the command channel, a few other
+queues and that one-second tick. By default `select!` polls its branches in a
+random order, which is fair when every branch is cheap. Here the tick was
+always due, because ticks that fall behind fire at once, so every queued
+command had to win a coin toss against a two-and-a-half-second tick, and lost
+about half the time. The fault clear, the leader's fence and, worst of all,
+the consumer-view update that would have let the restarts finish all queued
+behind ticks and timed out. The node had talked itself into a corner: the
+restarts kept the loop busy, and the busy loop kept the restarts from ever
+finishing.
+
+The fix is one word:
+
+```rust
+tokio::select! {
+    biased;
+    _ = self.shutdown.cancelled() => { /* ... */ }
+    Some(req) = Self::recv_snapshot(&mut self.cluster) => { /* ... */ }
+    Some(cmd) = self.command_rx.recv() => { /* ... */ }
+    // stop completions, deploy operations ...
+    _ = health_interval.tick() => { /* the periodic work */ }
+}
+```
+
+`biased;` is a directive to the macro, not a branch: it tells `select!` to
+poll the branches top to bottom every time. Shutdown wins over everything, a
+waiting command over any background work, and the tick runs only when nothing
+else is waiting. A command now waits for at most the tick already running.
+The obvious risk is starvation, a branch near the top that's always ready and
+never lets the tick run. Commands are requests with replies, so each caller
+waits for its answer before sending the next; nothing floods the channel.
+
+The test builds exactly that node: three replicas in pending restart, a mock
+runtime that takes 400 ms to fail each cleanup, so every tick lasts 1.2 s. It
+waits for a tick to start, queues eight status commands, and counts the
+cleanups that run before all eight are answered. At most the rest of the
+running tick is allowed. Before `biased;` it counted 57, nineteen whole ticks
+for eight commands, and took 23 s; now it takes about three.
+
+The same failure also showed a budget that didn't add up. The owning node's
+clear handler waited for its agent without any deadline, then waited up to
+4 s for the reservation release, while the forwarder gave it 5 s in total.
+Any agent delay over a second meant the forwarder's timeout, not the owning
+node's own answer. Both numbers now come from one constant:
+
+```rust
+const NODE_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const NODE_FAULT_CLEAR_BUDGET: Duration =
+    NODE_REQUEST_TIMEOUT.saturating_sub(Duration::from_secs(1));
+```
+
+`saturating_sub` is a `const fn`, so the compiler works out the budget and a
+change to the forwarding timeout carries the clear's budget with it. The
+handler sets one deadline on arrival, and both waits share it:
+
+```rust
+let deadline = tokio::time::Instant::now() + NODE_FAULT_CLEAR_BUDGET;
+let Ok(cleared) = tokio::time::timeout_at(deadline, cleared).await else {
+    return (StatusCode::GATEWAY_TIMEOUT, /* "...; retry the clear" */)
+        .into_response();
+};
+```
+
+`let ... else` is a refutable `let`: if the pattern (`Ok(cleared)`) matches,
+the binding lives on in the rest of the function; if it doesn't, the `else`
+block runs, and it must leave the function (`return`, `break` or a panic).
+It's the early-return guard from Go, minus the separate `if err != nil`. A
+busy agent now gets the client a 504 that says "retry", which `clear_fault`
+already retries, and the clear that was queued still runs. The API test
+stalls the agent completely and checks that the clear answers inside
+`NODE_REQUEST_TIMEOUT`. Before, it never answered at all.
+
+Was it the new connection timeouts in 0eb6071? No. The forwarded clear
+reached node 2 and ran there; the request was slow on the far side, not lost
+on a dead pooled connection. The earlier candidates were lucky: the loop was
+as unfair then, and the case passes whenever the coin tosses go its way.
+
+### Busy isn't dead
+
+`biased;` bought fairness for commands, and the final tier of the soak on
+ff854cb found who paid for it. During the `relish test` pulse, node 3 logged
+`report worker: snapshot collection failed or timed out` every five seconds
+from 09:12:08 to 09:13:48 BST, and node 2 did the same in bursts until
+09:15:46. After 30 s without a report the leader marked each node stale, the
+scheduler called it not ready, and it moved apps off perfectly healthy nodes.
+Apps pinned by label had nowhere to go: node 1 logged `cannot place
+default/soak-redis: no eligible nodes` every two seconds for 46 s.
+
+The report worker doesn't read agent state itself. Once per interval it sends
+the agent loop a snapshot request and gives it two seconds to answer. In the
+biased order that request sat *below* the command channel, and the pulse keeps
+that channel busy: four test cases polling instance status, the placement
+reconciler, deploys and retirements, and every status request asks the runtime
+for each instance's pid and exit code. The earlier argument that "each caller
+waits for its reply, so nothing floods the channel" holds for one caller. It
+doesn't hold for a dozen of them taking turns. The channel was rarely empty,
+so the one request that decides whether the node is alive waited behind all
+of it, missed its deadline, and was answered later into a closed channel,
+which cost another inventory read.
+
+There were two fixes, one at each end of the channel. In the loop, the snapshot
+branch moved up to sit straight under shutdown, and a request the worker has
+already given up on is dropped unbuilt (`req.response.is_closed()`). A report
+arrives once every five seconds and costs a bounded amount of work, so it
+can't starve commands. It now waits for at most the one operation already
+running.
+
+That operation can still be long. Some of the loop's work awaits other
+machines: signing a follower's workload certificate goes to the leader with a
+ten-second limit. So the worker no longer treats a slow loop as a dead node. A
+report says two things: "I'm alive" and "here's what I run". Only the second
+needs the loop. When the loop misses the deadline, the worker re-sends the
+last snapshot it *did* answer, stamped with the time it was taken, and reads
+readiness straight from the node's `ReadinessTracker`, which never needed the
+loop in the first place:
+
+```rust
+let (snapshot, observed_wall) = match self.collect_snapshot().await {
+    Some(snapshot) => { /* remember it, with both clocks */ }
+    None => match self.recent_observation() {
+        Some(observed) => (observed.snapshot.clone(), observed.observed_wall),
+        None => return, // nothing honest to send
+    },
+};
+```
+
+Is re-sending old state a lie? It tells the leader nothing it didn't already
+hold: the aggregator keeps a stale node's last report either way. The only
+thing that changes is the verdict. The loop is the only writer of the agent's
+state, so while it's stuck nothing it knows has changed either. A loop that
+*never* answers again is wedged rather than busy, and a wedged node should
+still be fenced. So `recent_observation` only offers a snapshot younger than
+four stale windows (two minutes by default). After that the worker goes
+quiet and the leader does what it did before.
+
+`recent_observation` returns `Option<&ObservedSnapshot>`, a reference into the
+worker's own field. The `&` means the caller borrows the snapshot rather than
+taking it. The report builder consumes its snapshot by value, so the call
+site clones it and the cached copy stays put for the next busy interval.
+
+The tests come in two halves. In the agent, twenty `Status` commands queue up
+against a mock runtime that takes 100 ms per pid read, about six seconds of
+loop work, and a snapshot request must still come back inside the worker's
+two seconds. It didn't before. A second test queues three abandoned requests
+ahead of a live one with a runtime inventory that always hits its one-second
+limit. Before, the live one waited four seconds. In the worker, a test
+answers one snapshot and then goes silent: eight intervals later the leader
+is still getting the same `web` instance and readiness from the tracker. The
+guard rails get tests too. After the two-minute grace the worker sends
+nothing, a worker that has never had an answer sends nothing at all, and
+neither does one whose agent loop has exited (its end of the channel is
+closed, so it's gone, not busy).
+
+### Remembering, with a limit
+
+The `KnownMembers` fix earlier in this chapter had a quiet flaw: it never
+forgot anything. Every node that ever joined kept its last address in the
+table until Bun restarted. That's fine for a node-killed peer, which is the
+whole point. It's less fine for a node that left on purpose, or one the
+operator decommissioned last week. Neither holds a fault anyone could clear,
+and a relay aimed at them just waits for a connection timeout.
+
+So when should a remembered member go? There are three answers, and the
+table needs all of them.
+
+A node that *left* announced it. Gossip marks it `Left`, holds that entry for
+a minute so everyone hears, then reaps it. But the refresher couldn't see any
+of that. It read the same watch the scheduler reads, and that watch publishes
+only members that aren't down. A member that left and a member that died
+vanished from it in exactly the same way. Rather than change what that watch
+means (the scheduler, the council and Pickle all treat "published" as "worth
+talking to"), gossip got a second one. `MembershipTable::roster()` returns
+every member, down ones included, until they're reaped, and
+`MustardNode::set_roster_watch` publishes it next to the old view. The
+refresher reads the roster. A `Left` entry is forgotten on sight.
+
+A node the operator *retired* is gone for good: its identity is on the CRL,
+and Chapter 4's mTLS verifiers already refuse it. Every node keeps a
+`CrlHandle` fresh from Raft, so the refresher asks it for
+`retired_node_ids()` and drops those too.
+
+Everything else gets a time limit, and the question is how long. The only
+reason to keep a dead node's address is to clear a fault on it. A fault can
+only be injected into a live node, and Smoker clamps every fault to 24 hours
+(`MAX_FAULT_DURATION_NS`). So a node that nobody has heard from in 24 hours
+can't be holding a fault anyone could still clear. That's the bound:
+
+```rust
+pub const KNOWN_MEMBER_RETENTION: std::time::Duration =
+    std::time::Duration::from_nanos(crate::smoker::types::MAX_FAULT_DURATION_NS);
+```
+
+We could have typed `from_secs(24 * 3600)` and been right today. Deriving it
+from Smoker's ceiling says *why* it's 24 hours, and if someone ever raises
+that ceiling, the table follows. `from_nanos` is a `const fn`, which is what
+lets it appear in a `const` at all: Rust evaluates constants at compile time,
+so only functions marked `const fn` can be called there.
+
+The clock the table measures from is "last heard alive or suspect", not "last
+seen in the roster". A dead member sits in the roster for another minute
+before gossip reaps it, and restarting the clock on every one of those
+refreshes would quietly stretch the limit. Each entry carries a `last_heard:
+Instant`, and `refresh` takes `now` as a parameter instead of calling
+`Instant::now()` itself. That makes the 24-hour tests instant: they pass
+`start + KNOWN_MEMBER_RETENTION` and one second past it, and check that the
+entry survives the first and not the second. The comparison uses
+`now.saturating_duration_since(last_heard)`, which returns zero rather than
+panicking if the two instants arrive out of order.
+
+One catch: a reaped member has already left the roster, so nothing gossip
+publishes will ever change when its 24 hours run out, or when it's retired.
+The refresher used to wake only on a new roster or directory. It now also
+ticks once a minute, which is plenty for a one-day limit.
+
+Five tests cover it: a dead member survives being reaped (the #244
+behaviour), a returning member's new address replaces the old one, a `Left`
+member is forgotten and doesn't come back as dead once gossip reaps it, a
+retired one is forgotten whether gossip still lists it or not, and the
+retention boundary itself. In gossip,
+`roster_watch_reports_down_members_the_active_watch_drops` checks that the
+old watch still hides Dead and Left members while the roster shows them, and
+that both views lose them once they're reaped.
+
+The same table fixed a smaller annoyance. `relish nodes` listed gossip's live
+view, so a node that died didn't show up as `dead`. It just wasn't there, and
+you had to notice the gap. The watch that hid it can't change, for the same
+reason as before, but the known table already holds exactly the rows we
+wanted. So `nodes_handler` asks it for its `down()` members and passes them
+to the agent inside the `Nodes` command. The agent lists its live members
+first, then any down member gossip doesn't list any more. It gives both the
+same council and leader check against Raft, because a dead voter is still a
+voter, and an operator staring at a dead node wants to know that first.
+
+Handing the rows to the agent instead of appending them in the handler is
+deliberate: the agent is where the Raft metrics live, so that's where the
+council flags get decided, once, for every row. The destructuring in its
+loop is worth a second look:
+
+```rust
+(node.is_council, node.is_leader) = roles(&node.node_id, false, false);
+```
+
+That's a *destructuring assignment*: a tuple pattern on the left of a plain
+`=`, assigning both fields at once. Rust has had it since 1.59; before that
+you needed a `let` and two more lines.
+
+Showing dead nodes also meant finding who relied on them being hidden. Three
+callers did. `relish upgrade` builds its rollout from the listing and would
+have tried to upgrade a dead node (and refused the whole plan if it had no
+address). The test harness's node inventory would have tried to inspect one.
+Its route detection would have spent two timeouts probing one. Each now
+skips members for which `NodeStatus::is_down()` is true, which keeps their
+old behaviour exactly, and each has a test with a dead member in the listing.
+
+### Everyone below the line
+
+Moving the snapshot request up fixed the one branch we'd caught starving. It
+didn't fix the order. Candidate 11's final tier showed what else lived under
+the command channel.
+
+At 19:49 UTC the harness SIGKILLed the leader's Bun on node 1. That restart
+hung for eleven minutes (the capture-file replay from Chapter 6), and while
+node 1 was gone the leader moved its soak apps elsewhere. Node 3 ended up
+running ten of the fourteen. Nothing moved them back; nothing had to. Then
+every `relish test` pulse for the next two hours failed the same way: eight of
+fifteen cases timed out "still waiting for identity-app to reach 1 running
+replica(s) cluster-wide; last saw 0 instance(s)". The apply had committed. The
+leader had placed the apps. No instance ever appeared.
+
+The placement part is ordinary. Our scheduler bin-packs, so every test workload
+went to the fullest node, which was now node 3 (node 2 during one pulse, after
+a power-off shuffled things around). Node 3's journal (BST, an hour ahead of
+the UTC above) had the rest:
+
+```text
+21:34:26 orchestrator: deploy of ing-web/rbtest-…-06 failed (attempt 1),
+         retrying in 5s: the deploy did not reach a terminal event within 300s
+21:34:28 orchestrator: deploy of ing-listed/rbtest-…-08 failed (attempt 1), …
+21:39:40 orchestrator: deploy of vol-b/rbtest-…-10 failed (attempt 1),
+         retrying in 5s: the deploy did not reach a terminal event within 300s
+```
+
+A deploy runs on its own task, and every step that touches the agent's state
+(check the image signature, record the spec, create the instances) goes back to
+the loop as a `DeployOp` and waits for the reply. Those ops sat below the
+command channel in the `biased;` order. Four cases polled every node's status
+without a pause, node 3 read the runtime of ten instances for each answer, and
+the channel was never empty. Status kept answering, so the cases saw "0
+instances" rather than an error, while the deploy's first step waited all 300 s
+for a turn that never came. The tell is in the timestamps: the first wave of
+cases hit its deadline and stopped polling at 21:34:22, and two seconds later
+the next deploy on the same node had run every step up to publishing its
+service. (It then failed for want of the service's cluster address, and the
+reconciler retried it; that part is ordinary.) The health tick, at the very
+bottom, starved too: during one
+pulse `registry-web` did get an instance, and it sat in `health-wait` for the
+whole five minutes, because health probes run from the tick.
+
+Why did the pulses before 19:49 pass, and the one after 22:55 (a graceful
+restart of the whole cluster put node 1's apps back)? Load. The
+earlier pulses took 40 to 110 s per case, which already says the deploy steps
+were fighting for turns; they just won often enough. Ten instances on the node
+under test tipped them into never winning.
+
+The fix changes the order, not the budget:
+
+```rust
+tokio::select! {
+    biased;
+    _ = self.shutdown.cancelled() => { /* ... */ }
+    Some(req) = Self::recv_snapshot(&mut self.cluster) => { /* ... */ }
+    Some(outcome) = self.stop_waits.join_next_with_id(),
+        if !self.stop_waits.is_empty() => { /* ... */ }
+    Some(op) = self.deploy_ops_rx.recv() => { /* ... */ }
+    Some(cmd) = self.command_rx.recv() => { /* ... */ }
+    _ = health_interval.tick() => { self.run_health_tick().await; }
+}
+```
+
+The argument for putting a branch above commands is the one we got wrong the
+first time, so it's worth spelling out. A branch may sit above another only if
+it can't flood. Stop completions come from a `JoinSet` of stops already
+started, one each. Every deploy op comes from a deploy task that sends one and
+waits for its reply before sending the next, so there are never more of them
+waiting than deploys (plus health probes) in flight, and a command waits for at
+most that many short steps. Commands are the opposite: any number of API
+callers, the reconciler and the reporting paths all send them, and a dozen
+polite callers taking turns are a flood.
+
+The tick can't move up like that. It's always due again after a slow round, and
+that's exactly what #260 was about. So it gets a floor instead: if no tick has
+run for `HEALTH_TICK_STARVATION_BOUND` (five seconds), the loop runs one before
+it looks at the queues at all:
+
+```rust
+let starved = last_health_tick.elapsed() >= HEALTH_TICK_STARVATION_BOUND;
+if starved {
+    self.run_health_tick().await;
+    last_health_tick = tokio::time::Instant::now();
+    health_interval.reset();
+} else {
+    tokio::select! { /* as above */ }
+}
+```
+
+`tokio::time::Instant` rather than `std::time::Instant`: the tokio one follows
+tokio's clock, so a test that pauses time controls it too. `reset()` pushes the
+interval's next tick a full period away, so the forced tick doesn't get a
+second, back-to-back run from the interval. Commands still come before a tick
+that is merely due; they just can't hold it off for more than five seconds.
+
+Both tests start four callers that ask for status again the moment they get an
+answer, against a mock runtime that takes 20 ms per pid read. That's the pulse
+in miniature. In the first, a fresh deploy must complete within ten seconds; it
+never did before. In the second, a replica dies and must be restarted, which
+only the tick does; before, nothing happened for fifteen seconds. The #260 test
+still passes: eight queued commands are answered with at most the running
+tick's cleanups in between.
+
+### Shorter turns
+
+`biased;`, the re-sent snapshot and the tick's floor make a long turn of the
+loop survivable. They don't make it short. Both investigations left a list of turns that could
+still run for seconds, and the next release took them one at a time.
+
+The first was the tick from #260 itself. `drive_pending_restarts` walked
+*every* pending restart on every tick, and each one that couldn't clean up yet
+cost about 400 ms. Three of them made a 1.2 s tick. Thirty would make a
+twelve-second one, and a command queued behind it waits all twelve. So the
+tick now has a budget:
+
+```rust
+const PENDING_RESTART_TICK_BUDGET: Duration = Duration::from_millis(500);
+
+let deadline = tokio::time::Instant::now() + PENDING_RESTART_TICK_BUDGET;
+for (index, (id, state)) in retrying.into_iter().enumerate() {
+    if index > 0 && tokio::time::Instant::now() >= deadline {
+        break;
+    }
+    self.restart_rotation.cleanup = Some(id.clone());
+    // ...
+}
+```
+
+`enumerate()` pairs each item with its position, like Python's `enumerate`.
+The `index > 0` guard means a tick always makes progress on at least one
+restart, however slow. A budget on its own would starve somebody, though.
+Collect the pending restarts in the same order every tick, stop after two,
+and the same two get retried forever while the rest wait. So the agent
+remembers the last instance each phase touched, and the next tick starts just
+after it:
+
+```rust
+fn rotate_after<T>(
+    mut items: Vec<T>,
+    last: Option<&InstanceId>,
+    id: impl Fn(&T) -> &InstanceId,
+) -> Vec<T> {
+    items.sort_by(|a, b| id(a).0.cmp(&id(b).0));
+    if let Some(last) = last {
+        let start = items.partition_point(|item| id(item).0 <= last.0);
+        items.rotate_left(start);
+    }
+    items
+}
+```
+
+`id: impl Fn(&T) -> &InstanceId` takes any closure that can pull an instance
+id out of an item, so both phases (which carry different tuples) share one
+helper. It's still a generic function, compiled once per closure type, with
+no function pointer or boxing involved. `partition_point` is a binary search
+on a sorted slice: it returns the index of the first item for which the
+predicate is false, here the first id after the one we stopped at.
+`rotate_left` then moves everything before that index to the back, in place.
+An instance that disappeared since the last tick doesn't matter: the search
+finds where it *would* be, and the walk carries on from there.
+
+Two tests pin it down. One puts eight replicas into pending restart, each
+spending 400 ms and failing, and checks that a single tick finishes well short
+of the 3.2 s the old walk took, without trying all eight. The other runs six
+ticks over six slow restarts and checks that each got its turn and that no
+instance got more than one attempt more than any other.
+
+The second long turn was the one #270 named: signing a follower's workload
+certificate. Only the leader holds the Workload CA, so a follower sends its
+CSR over mTLS and waits up to ten seconds for the answer. That wait ran inline
+twice over, from the deploy worker's `ProvisionIdentity` request and from the
+rotation tick. A slow leader meant ten seconds of nobody else getting an
+answer from the node.
+
+We already had the shape of the fix. #237 moved stop waits off the loop by
+splitting a stop into the part that must happen on the loop, the part that
+only waits, and the part that records the result back on the loop. Signing
+splits the same way. The loop generates the CSR (the private key never leaves
+the node), then spawns the signing into a `JoinSet`:
+
+```rust
+let task = self
+    .identity_signing_tasks
+    .spawn(async move {
+        let result = tokio::time::timeout(WORKLOAD_SIGNING_TIMEOUT, request.sign())
+            .await
+            .unwrap_or_else(|_| Err("workload signing timed out".to_string()));
+        SignedIdentity { spiffe_uri, private_key_der, result }
+    })
+    .id();
+```
+
+`async move` makes the future take ownership of everything it uses: the
+`Arc` to the council, a clone of the leader transport, the CSR bytes. That's
+what lets it outlive the function that spawned it, and the compiler insists
+on it, because `spawn` requires a `'static` future: one that borrows nothing
+from the caller's stack. In Go you'd capture the variables and hope nobody
+changes them underneath the goroutine. Here the borrow checker won't compile a
+future that could see them change.
+
+A new `select!` branch collects finished signings with `join_next_with_id`,
+writes the certificate files and records the identity, all on the loop, as
+before. It sits next to the stop completions, above commands, and passes the
+same test: a signing is only in flight for a provision the loop already
+started, at most one per instance, so finished ones can't flood the loop. The deploy worker's reply travels with the signing and is answered
+only when it's done, so the worker still waits, just not *on* the loop. Two
+details came out of the split. The rotation tick runs every second and a
+signing can take ten, so a request for an instance that already has a signing
+in flight joins it rather than sending a second CSR. And a signature can now
+arrive after its instance has been retired; retirement deleted the identity
+directory, so writing the files would recreate it with nobody left to delete
+it. The loop checks the instance still exists before it writes anything.
+
+The tests stand up a follower with a "leader" that accepts the TCP connection
+and then says nothing. The deploy worker's identity request must return in
+under a second, with its reply still pending (it took the full ten before);
+the rotation tick likewise. A leader that hangs up at once checks the other
+end: two requests for one instance share one signing, and both get answered
+when it fails. The last test hands the loop two finished signatures, one for
+a live instance and one for a retired one, and checks that only the live one
+gets files.
+
+The third was status itself. Every `Status` command asks the runtime for each
+instance's pid and exit code, and runc answers both under the instance's
+lifecycle lock. A create that's pulling a slow image, or a stop waiting out
+its grace, holds that lock for seconds, and `get_status` waited on it with no
+deadline, one instance after another. One slow instance stalled the answer
+for all of them, and the loop with it.
+
+What should status say about an instance the runtime won't talk about yet?
+Not nothing: the agent still knows its app, state, port and restart count.
+Not "no pid" either, because that means something (the process has gone).
+So the answer carries what's known and says which part isn't:
+
+```rust
+/// The runtime didn't answer for this instance before the status
+/// deadline, so `pid` and `exit_code` are unknown rather than absent.
+#[serde(default, skip_serializing_if = "std::ops::Not::not")]
+pub runtime_unknown: bool,
+```
+
+The serde attributes keep the wire form backward compatible in both
+directions: an older peer's JSON without the field reads as `false`
+(`default`), and an unmarked status serialises exactly as before
+(`skip_serializing_if` takes a function path, and `std::ops::Not::not` is the
+`!` operator as a function). The CLI prints `?` in the PID column for a marked
+instance, next to the `-` that means "no process".
+
+The reads now share one deadline for the whole answer. They run eight at a
+time with `join_all`, which polls a batch of futures together and returns
+their results in order, each under `tokio::time::timeout_at(deadline, ...)`.
+`timeout_at` polls the inner future once before it checks the clock, so an
+instance that answers at once is never marked unknown just because an earlier
+batch used up the time.
+
+We first wrote this as a stream, `stream::iter(&instances).map(...).buffered(8)`,
+and got 380 errors saying ``implementation of `Send` is not general enough``.
+The closure passed to `map` takes a reference, which makes it generic over
+that reference's lifetime, and the compiler can't yet prove a future built
+from such a closure is `Send` for *every* lifetime, which `tokio::spawn`
+needs. Plain `for` loops that push futures into a `Vec` sidestep the question,
+and read just as well.
+
+Three tests cover it. One instance of three holds its lock for thirty seconds:
+status comes back well inside two seconds, with that instance marked, still
+`running`, and the other two with their pids. Six instances all holding their
+locks cost one deadline, not six. And the field round-trips, and stays out of
+the JSON when it's `false`.
+
+### Two commands, two answers
+
+Issue #241 had one more complaint in it. With three replicas of `hello`
+running, `relish inspect hello` listed two, while `relish wtf` said all three
+were fine. Both were telling the truth. `inspect` asked only the agent it was
+connected to, and that node ran two of the three. The third lived on node 2,
+and nothing in the output hinted that anyone else had been asked, because
+nobody had.
+
+`inspect` now asks the cluster the same way `wtf` does: every node's
+`/v1/status` through the entry node's relay, and the desired replica count
+from the leader's `/v1/diagnostics/apps`. What each node said is a small enum:
+
+```rust
+pub enum NodeAnswer {
+    Answered(Vec<InstanceStatus>),
+    Silent { reason: String },
+    Down { state: String },
+}
+```
+
+The three variants are the three things that can be true about a node, and
+`match` makes the renderer handle each one. A `Silent` node gets a warning
+line, and so does a `Down` one (gossip has already declared it dead, so we
+don't spend a timeout asking). Either way, the output says which instances it
+can't show instead of quietly showing fewer:
+
+```text
+App: hello (namespace default)
+  Replicas:  3 desired, 2 running
+  Placed:    node-1 2, node-3 1
+warning: node node-3 did not answer (timed out after 10s); its instances are not listed
+
+Instance: default__hello-0
+  Node:      node-1
+  ...
+```
+
+Why not call the cluster-wide `/v1/status?cluster=true` that the TUI uses?
+It fans out server-side and fails the whole answer when any peer is silent,
+which is the right contract for a dashboard that refreshes every second and
+the wrong one for the command you run when something is already broken. The
+per-node relay keeps each node's failure separate.
+
+The collection and the rendering are separate functions, which is what makes
+the tests cheap. `every_replica_is_listed_with_its_node_not_just_the_local_ones`
+serves a fake entry node whose own `/v1/status` holds two of three replicas
+(exactly what the old command saw) and whose relay answers for node 2 and
+refuses node 3. The output has to list all three instances with their nodes
+and the `3 desired, 3 running` line. Its siblings check the warning for the
+silent node, the dead node that isn't asked at all, and a standalone agent,
+which answers for itself as `local`.
+
+### Is everyone running the same build?
+
+The same issue started with a harder question: were the three nodes even
+running the same `bun`? Chapter 14 ("Which build is this?") taught every
+binary to name its commit. `wtf` now asks each
+node's `/v1/version` through the relay (the one new path on its allow list)
+and compares the answers.
+
+The interesting part is deciding what "the same build" means. The version
+string alone isn't enough; that was the whole problem in #241. The binary's
+SHA-256 is too much: one commit built for arm64 and for x86_64 produces two
+different hashes, and a mixed-architecture cluster isn't skewed. So the
+identity is the version plus the commit, falling back to the hash only when
+a build doesn't know its commit:
+
+```rust
+fn build_identity(build: &BuildObservation) -> (&str, Option<&str>) {
+    (
+        build.version.as_str(),
+        build.commit.as_deref().or(build.binary_sha256.as_deref()),
+    )
+}
+```
+
+`as_deref` turns an `&Option<String>` into an `Option<&str>`, borrowing the
+string inside rather than copying it, and `or` picks the first of the two
+that's `Some`. The tuple borrows from `build`; Rust's lifetime elision rules
+tie the returned references to the one reference argument, so we didn't have
+to write a lifetime by hand.
+
+`wtf` groups the nodes by that identity in a `BTreeMap`. One group is an OK
+row that names the build. More than one is a warning, and when one build
+clearly has the most nodes, the warning names the odd ones out:
+
+```text
+WARNING (1)
+  [version-skew] node-3 runs a different bun build from the other 2 nodes (cluster)
+    node-1: bun v0.1.1 (3fcb1fd), sha256 aaaa1111bbbb
+    node-2: bun v0.1.1 (3fcb1fd), sha256 aaaa1111bbbb
+    node-3: bun v0.1.1 (9e1d2c3), sha256 5c0ffee12345
+    next: bring every node to one build with `relish upgrade`, then re-run `relish wtf`
+```
+
+On a tie there's no majority to be wrong against, so the title just says how
+many builds there are and the details list every node. A node whose version
+can't be read makes the `builds` source UNKNOWN, as every other source does.
+The tests pin each of those cases: a uniform cluster, one odd node, a
+different version with no commits at all, one commit on two architectures,
+two commit-less builds told apart by their hashes, and an unreadable node.
+
 ## Walk the path you actually care about
 
 Say `web` can't reach `redis`. Checking Bun's own DNS and TCP access might tell
@@ -3186,8 +3845,8 @@ sets of runs.
 Could an ordinary test have caught this? Not honestly. Every file was fine
 until the kernel went away, and no amount of killing processes reproduces
 that. The snapshot uploader still needs its own fixture: it needs Btrfs
-volumes, and the metadata that marks a snapshot as uploaded is itself written
-without a sync.
+volumes. Its export receipts are written atomically and durably now, and an
+upload is only receipted once the destination has confirmed the archive.
 
 ## Lessons learned: audit the evidence too
 
@@ -3227,7 +3886,7 @@ Finally, a milestone checkbox needs a scope. The cluster upgrade coordinator
 already checks gossip rejoin; the replacement process's local boot-marker check
 still has a separate gap. Calling all upgrade verification either finished or
 missing hides useful information. We now keep completed milestones and explicit
-residual tasks side by side in [progress](../progress.md).
+residual tasks side by side in the [roadmap](../roadmap.md).
 
 Portable tests and controlled servers let us force awkward orderings quickly.
 They don't establish that three independent Linux nodes survive the complete
@@ -3249,3 +3908,13 @@ The audit's findings kept rhyming, so here they are in one place. Each is a case
 Several failures were in the harness rather than the product, and they're worth a sentence each. A fixture that released a port and then started Bun on it lost the port to another test, and its readiness probe cheerfully connected to *that* listener; fixtures now wait for Bun's own announcement of the address it bound. The cluster-upgrade job failed because the debug `bun` binary outgrew Pickle's 512 MiB upload limit; the harness now strips debug symbols from its copy. A nextest "leaked handle" warning turned out to be a runner bug on macOS, fixed upstream, so we pinned the fixed release and made leaks fail the gate instead of raising the timeout. And a few async tasks were doing blocking filesystem work, sweeping directories and hashing a stored Bun binary on a Tokio worker thread; that work now runs through `spawn_blocking`, and the one inventory read with no deadline got the same five-second bound as the others.
 
 One gap we closed by adding a test rather than fixing code. An app exits, Bun starts its replacement, then dies before saving the replacement's adoption record. Our physical interruption tests covered first deployments and explicit retries, but not this automatic restart. A test-only Linux interposer now pauses the adoption record's `fsync` at exactly that point and kills the real Bun process. Recovery must retire the unrecorded process before reporting ready. The existing code passed. Now it's a claim someone can check.
+
+### A test has to be able to fail
+
+The testing assessment after 0.1.0 found three pieces of evidence that couldn't say no.
+
+The cgroup v2 detector's test called the detector on Linux and threw the answer away (`let _ = result;`). It proved the function didn't panic. It would have passed if the detector said "v1" on a v2 host, or "v2" on a host with no cgroups at all. The fix is a small filesystem boundary: `check_cgroup_v2` now just passes `/sys/fs/cgroup` to `check_cgroup_v2_at(root: &Path)`, and three tests hand it fake mount trees in a temporary directory, one with `cgroup.controllers` (v2), one with a per-controller directory and no controllers file (v1), and one that doesn't exist. The host test still runs, and now it asserts: every Linux host that runs the suite is provisioned with v2, so a failure there is a real finding. How do we know the new tests can fail? We broke the detector on purpose, dropping the controllers check, and watched the v1 test go red.
+
+The node-pressure acceptance test was `#[ignore]`d (good) but, when selected without `RELIABURGER_NODE_PRESSURE_TESTS=1`, printed "skipped" and returned. Nextest has no idea what "skipped" means in a test's stderr. It saw a function return and reported a pass. Selecting an ignored test is a request to run it, so a missing prerequisite is now an `assert_eq!` failure with a message saying which variable to set. The one pattern we left alone is the subprocess fixture: a test that exists only to be re-executed by its parent (its `#[ignore]` reason says so) still returns when the parent didn't start it, because `make test-linux` selects whole binaries and would otherwise fail on every fixture.
+
+The third was the V02 loop summary, the script that turns hours of stress loops into a verdict. It wrote `Verdict: **FAIL**` and exited 0. It counted a JUnit `<skipped/>` as a run. And its combined mode summarised whichever lanes happened to upload a file, so a lane that never ran simply left the table, and the denominator shrank to fit. Now every row carries a status (pass, fail, skip or incomplete) and the commit it belongs to. A test with fewer runs than its loop's iterations is incomplete. The combined record is checked against `scripts/release/v02-loop-lanes.json`, the list of lanes the workflow runs, and a unit test keeps that list in step with the workflow matrix. A missing lane, a missing test, a stray lane or a record from another commit fails the summary, and the exit status finally says the same thing as the text.

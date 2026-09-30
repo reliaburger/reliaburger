@@ -364,7 +364,7 @@ pub(super) fn prepare(
                 ensure_loop_mount(&path)?;
             }
         }
-        manager.write_backend(&path, backend)?;
+        manager.write_backend(&path, backend, None)?;
         let mut directory = Some(path.as_path());
         while let Some(current) = directory {
             std::fs::File::open(current)?.sync_all()?;

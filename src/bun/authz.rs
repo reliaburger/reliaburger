@@ -18,6 +18,13 @@
 //! handlers by convention until C3 found every per-app read ignoring it,
 //! so it is now a test too: see `every_per_app_route_checks_the_callers_scope`
 //! below. A route pattern naming `{app}` must call `authorize_scoped`.
+//!
+//! There is a third question, too: what must the caller's `[permission]`
+//! spec grant? Role and scope say who may read logs at all; a spec can narrow
+//! a principal further, to named actions on named apps (B18). Every route that
+//! reads logs or metrics, changes secrets, or performs administration records
+//! the action it needs in [`Route::permission`], and the tests below prove
+//! each such handler checks it.
 
 /// The principal class a route requires.
 ///
@@ -50,6 +57,27 @@ pub enum Method {
     Delete,
 }
 
+/// What a principal's `[permission]` spec must grant for a route, on top of
+/// its role and token scope.
+///
+/// A principal with no spec is governed by role and scope alone, so these
+/// gates only bite once an operator writes a `[permission.<token-name>]`
+/// block. The internal system principal (node-to-node fan-out) always passes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionGate {
+    /// The action on the `{app}` in `{namespace}` the path names.
+    App(PermissionAction),
+    /// The action on every app the request body names (a manifest, or the
+    /// deploy an operation id refers to).
+    Body(PermissionAction),
+    /// The action across the whole cluster: `apps = ["*"]` and no
+    /// `namespaces` restriction. For routes that name no single app.
+    Cluster(PermissionAction),
+    /// The route still answers, but leaves out the rows or page sections
+    /// whose app the spec doesn't grant the action for.
+    Filtered(PermissionAction),
+}
+
 /// One row of the matrix: which principal a `(method, path)` needs.
 #[derive(Debug, Clone, Copy)]
 pub struct Route {
@@ -57,6 +85,8 @@ pub struct Route {
     /// The axum path pattern exactly as mounted (e.g. `/v1/stop/{app}/{namespace}`).
     pub path: &'static str,
     pub principal: RoutePrincipal,
+    /// The `[permission]` action the handler enforces, if any.
+    pub permission: Option<PermissionGate>,
 }
 
 const fn route(method: Method, path: &'static str, principal: RoutePrincipal) -> Route {
@@ -64,11 +94,37 @@ const fn route(method: Method, path: &'static str, principal: RoutePrincipal) ->
         method,
         path,
         principal,
+        permission: None,
     }
 }
 
+/// A row whose handler also enforces a `[permission]` action.
+const fn gated(
+    method: Method,
+    path: &'static str,
+    principal: RoutePrincipal,
+    gate: PermissionGate,
+) -> Route {
+    Route {
+        method,
+        path,
+        principal,
+        permission: Some(gate),
+    }
+}
+
+use crate::config::PermissionAction;
 use Method::{Delete, Get, Post};
+use PermissionGate::{App, Body, Cluster, Filtered};
 use RoutePrincipal::{Admin, AnyToken, Deployer, Public, System};
+
+const ADMIN: PermissionAction = PermissionAction::Admin;
+const DEPLOY: PermissionAction = PermissionAction::Deploy;
+const EXEC: PermissionAction = PermissionAction::Exec;
+const LOGS: PermissionAction = PermissionAction::Logs;
+const METRICS: PermissionAction = PermissionAction::Metrics;
+const SCALE: PermissionAction = PermissionAction::Scale;
+const SECRET_WRITE: PermissionAction = PermissionAction::SecretWrite;
 
 /// Every route the Bun API mounts, with the principal it requires.
 ///
@@ -87,13 +143,18 @@ pub const ROUTE_MATRIX: &[Route] = &[
     route(Post, "/ui/session", Public),
     route(Post, "/ui/logout", Public),
     // Dashboard + fragments — any authenticated caller (session cookie).
-    route(Get, "/", AnyToken),
-    route(Get, "/ui/app/{app}/{namespace}", AnyToken),
+    gated(Get, "/", AnyToken, Filtered(METRICS)),
+    gated(
+        Get,
+        "/ui/app/{app}/{namespace}",
+        AnyToken,
+        Filtered(METRICS),
+    ),
     route(Get, "/ui/node/{name}", AnyToken),
     route(Get, "/ui/gitops", AnyToken),
     route(Get, "/ui/fragment/apps", AnyToken),
     route(Get, "/ui/fragment/nodes", AnyToken),
-    route(Get, "/ui/fragment/alerts", AnyToken),
+    gated(Get, "/ui/fragment/alerts", AnyToken, Cluster(METRICS)),
     route(
         Get,
         "/ui/fragment/app/{app}/{namespace}/instances",
@@ -101,22 +162,27 @@ pub const ROUTE_MATRIX: &[Route] = &[
     ),
     route(Get, "/ui/app/{app}/{namespace}/env", AnyToken),
     // Workload lifecycle.
-    route(Post, "/v1/apply", Deployer),
+    gated(Post, "/v1/apply", Deployer, Body(DEPLOY)),
     route(Get, "/v1/status", AnyToken),
     route(Get, "/v1/apps", AnyToken),
     route(Get, "/v1/readiness", AnyToken),
     route(Get, "/v1/jobs", AnyToken),
     route(Get, "/v1/events", AnyToken),
     route(Get, "/v1/ws/events", AnyToken),
-    route(Get, "/v1/ws/logs/{app}/{namespace}", AnyToken),
+    gated(Get, "/v1/ws/logs/{app}/{namespace}", AnyToken, App(LOGS)),
     route(Get, "/v1/status/{app}/{namespace}", AnyToken),
-    route(Get, "/v1/top", AnyToken),
-    route(Post, "/v1/stop/{app}/{namespace}", Deployer),
-    route(Post, "/v1/delete/{app}/{namespace}", Deployer),
-    route(Get, "/v1/logs/{app}/{namespace}", AnyToken),
-    route(Get, "/v1/logs/entries/{app}/{namespace}", AnyToken),
-    route(Get, "/v1/logs/query/{app}/{namespace}", AnyToken),
-    route(Post, "/v1/exec/{app}/{namespace}", Deployer),
+    gated(Get, "/v1/top", AnyToken, Filtered(METRICS)),
+    gated(Post, "/v1/stop/{app}/{namespace}", Deployer, App(SCALE)),
+    gated(Post, "/v1/delete/{app}/{namespace}", Deployer, App(DEPLOY)),
+    gated(Get, "/v1/logs/{app}/{namespace}", AnyToken, App(LOGS)),
+    gated(
+        Get,
+        "/v1/logs/entries/{app}/{namespace}",
+        AnyToken,
+        App(LOGS),
+    ),
+    gated(Get, "/v1/logs/query/{app}/{namespace}", AnyToken, App(LOGS)),
+    gated(Post, "/v1/exec/{app}/{namespace}", Deployer, App(EXEC)),
     // Cluster + upgrade.
     // Renewal additionally requires the existing node TLS peer certificate.
     route(Post, "/v1/cluster/renew", System),
@@ -140,15 +206,15 @@ pub const ROUTE_MATRIX: &[Route] = &[
     route(Get, "/v1/cluster/council", AnyToken),
     // Upgrades and elections act on the whole cluster: the handlers also
     // refuse a scoped Admin (`authorize_cluster_admin`).
-    route(Post, "/v1/upgrade/apply", Admin),
+    gated(Post, "/v1/upgrade/apply", Admin, Cluster(ADMIN)),
     route(Get, "/v1/upgrade/status", AnyToken),
-    route(Post, "/v1/upgrade/rollback", Admin),
-    route(Post, "/v1/upgrade/start", Admin),
+    gated(Post, "/v1/upgrade/rollback", Admin, Cluster(ADMIN)),
+    gated(Post, "/v1/upgrade/start", Admin, Cluster(ADMIN)),
     route(Get, "/v1/upgrade/cluster", AnyToken),
-    route(Post, "/v1/upgrade/resume", Admin),
-    route(Post, "/v1/upgrade/abort", Admin),
-    route(Post, "/v1/upgrade/cluster-rollback", Admin),
-    route(Post, "/v1/cluster/elect", Admin),
+    gated(Post, "/v1/upgrade/resume", Admin, Cluster(ADMIN)),
+    gated(Post, "/v1/upgrade/abort", Admin, Cluster(ADMIN)),
+    gated(Post, "/v1/upgrade/cluster-rollback", Admin, Cluster(ADMIN)),
+    gated(Post, "/v1/cluster/elect", Admin, Cluster(ADMIN)),
     // Chaos.
     route(Post, "/v1/chaos/reserve", System),
     route(Post, "/v1/chaos/fence", System),
@@ -171,27 +237,47 @@ pub const ROUTE_MATRIX: &[Route] = &[
     route(Get, "/v1/resolve/{name}", AnyToken),
     route(Get, "/v1/routes", AnyToken),
     // Metrics + logs + deploys.
-    route(Get, "/v1/metrics", AnyToken),
-    route(Get, "/v1/metrics/summary", AnyToken),
-    route(Get, "/v1/metrics/keys", AnyToken),
-    route(Get, "/v1/metrics/rollup", AnyToken),
-    route(Get, "/v1/metrics/rollup/owned", AnyToken),
-    route(Get, "/v1/metrics/cluster", AnyToken),
-    route(Get, "/v1/metrics/app/{app}/{namespace}", AnyToken),
-    route(Get, "/v1/metrics/app/{app}/{namespace}/chart", AnyToken),
-    route(Get, "/v1/alerts", AnyToken),
-    route(Get, "/v1/logs/sql", AnyToken),
-    route(Post, "/v1/logs/export", Admin),
+    gated(Get, "/v1/metrics", AnyToken, Cluster(METRICS)),
+    gated(Get, "/v1/metrics/summary", AnyToken, Cluster(METRICS)),
+    gated(Get, "/v1/metrics/keys", AnyToken, Cluster(METRICS)),
+    gated(Get, "/v1/metrics/rollup", AnyToken, Cluster(METRICS)),
+    gated(Get, "/v1/metrics/rollup/owned", AnyToken, Cluster(METRICS)),
+    gated(Get, "/v1/metrics/cluster", AnyToken, Cluster(METRICS)),
+    gated(
+        Get,
+        "/v1/metrics/app/{app}/{namespace}",
+        AnyToken,
+        App(METRICS),
+    ),
+    gated(
+        Get,
+        "/v1/metrics/app/{app}/{namespace}/chart",
+        AnyToken,
+        App(METRICS),
+    ),
+    gated(Get, "/v1/alerts", AnyToken, Cluster(METRICS)),
+    gated(Get, "/v1/logs/sql", AnyToken, Cluster(LOGS)),
+    gated(Post, "/v1/logs/export", Admin, Cluster(ADMIN)),
     route(Get, "/v1/deploys/active", AnyToken),
     route(Get, "/v1/deploys/operations", AnyToken),
-    route(Post, "/v1/deploys/operations/{id}/cancel", Deployer),
+    gated(
+        Post,
+        "/v1/deploys/operations/{id}/cancel",
+        Deployer,
+        Body(DEPLOY),
+    ),
     route(Get, "/v1/deploys/history/{app}", AnyToken),
-    route(Post, "/v1/rollback/{app}/{namespace}", Deployer),
+    gated(
+        Post,
+        "/v1/rollback/{app}/{namespace}",
+        Deployer,
+        App(DEPLOY),
+    ),
     route(Get, "/v1/placements/{node_id}", AnyToken),
     route(Post, "/v1/test/leases/retired", System),
-    route(Post, "/v1/nodes/decommission", Admin),
+    gated(Post, "/v1/nodes/decommission", Admin, Cluster(ADMIN)),
     route(Get, "/v1/images", AnyToken),
-    // Batch + build. `run`/`report`/`track` are node-to-node (System).
+    // Batch + build. `run`/`report`/`track`/`sign` are node-to-node (System).
     route(Post, "/v1/batch", Deployer),
     route(Post, "/v1/batch/run", System),
     route(Post, "/v1/batch/{id}/report", System),
@@ -199,19 +285,20 @@ pub const ROUTE_MATRIX: &[Route] = &[
     route(Post, "/v1/build", Deployer),
     route(Post, "/v1/build/run", System),
     route(Post, "/v1/build/track", System),
+    route(Post, "/v1/build/sign", System),
     route(Get, "/v1/build/{id}", AnyToken),
     // GitOps + identity + tokens + secrets.
     route(Post, "/v1/gitops/webhook", AnyToken),
     // Operator-only (Admin). The service principal is refused here (AUTH4),
     // so despite being a signing route it isn't a node-to-node one.
-    route(Post, "/v1/identity/sign", Admin),
+    gated(Post, "/v1/identity/sign", Admin, Cluster(ADMIN)),
     // Credential and trust management additionally requires an unscoped user.
-    route(Post, "/v1/token/create", Admin),
-    route(Get, "/v1/token/list", Admin),
-    route(Post, "/v1/token/revoke", Admin),
-    route(Post, "/v1/join-token/create", Admin),
+    gated(Post, "/v1/token/create", Admin, Cluster(ADMIN)),
+    gated(Get, "/v1/token/list", Admin, Cluster(ADMIN)),
+    gated(Post, "/v1/token/revoke", Admin, Cluster(ADMIN)),
+    gated(Post, "/v1/join-token/create", Admin, Cluster(ADMIN)),
     route(Get, "/v1/secret/public-key", AnyToken),
-    route(Post, "/v1/secret/rotate", Admin),
+    gated(Post, "/v1/secret/rotate", Admin, Cluster(SECRET_WRITE)),
 ];
 
 /// Look up the principal a `(method, path)` requires, if the matrix
@@ -267,6 +354,7 @@ mod tests {
             "/v1/batch/{id}/report",
             "/v1/build/run",
             "/v1/build/track",
+            "/v1/build/sign",
         ] {
             assert_eq!(
                 required_principal(Method::Post, path),
@@ -450,6 +538,61 @@ mod tests {
         assert!(
             unscoped.is_empty(),
             "per-app routes that never check the token's scope (C3): {unscoped:?}"
+        );
+    }
+
+    /// Every route the matrix gates on a `[permission]` action must name that
+    /// action in its handler (B18).
+    ///
+    /// This is the cheap static half of the guard: it catches a new gated row
+    /// whose handler forgot the check. The behavioural half, a request per
+    /// route × principal, lives in `api_permission_tests`.
+    #[test]
+    fn every_gated_route_checks_its_permission_action() {
+        let sources = [
+            include_str!("api.rs"),
+            include_str!("batch.rs"),
+            include_str!("build_runner.rs"),
+        ];
+        let mut unchecked = Vec::new();
+        let mut checked = 0;
+        for row in ROUTE_MATRIX {
+            let Some(gate) = row.permission else {
+                continue;
+            };
+            let action = match gate {
+                PermissionGate::App(action)
+                | PermissionGate::Body(action)
+                | PermissionGate::Cluster(action)
+                | PermissionGate::Filtered(action) => action,
+            };
+            let marker = format!("PermissionAction::{action:?}");
+            let handlers: Vec<(&str, String)> = sources
+                .iter()
+                .flat_map(|source| {
+                    mounted_route_handlers(source)
+                        .into_iter()
+                        .filter(|(path, _)| path == row.path)
+                        .flat_map(|(_, handlers)| handlers)
+                        .map(move |handler| (*source, handler))
+                })
+                .collect();
+            assert!(!handlers.is_empty(), "no handler found for {}", row.path);
+            for (source, handler) in handlers {
+                let body = handler_body(source, &handler)
+                    .unwrap_or_else(|| panic!("{} dispatches to missing {handler}", row.path));
+                checked += 1;
+                let cluster_admin =
+                    action == PermissionAction::Admin && body.contains("authorize_cluster_admin");
+                if !body.contains(&marker) && !cluster_admin {
+                    unchecked.push(format!("{} → {handler} ({marker})", row.path));
+                }
+            }
+        }
+        assert!(checked >= 30, "only found {checked} gated handlers");
+        assert!(
+            unchecked.is_empty(),
+            "gated routes whose handler never checks the permission action: {unchecked:?}"
         );
     }
 

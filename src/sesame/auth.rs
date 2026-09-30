@@ -182,9 +182,40 @@ pub fn authenticate(
     })
 }
 
+/// The stable principal id for a stored token: a digest of its hash, so it
+/// names this exact credential rather than its (reusable) name.
 fn token_principal_id(token: &ApiToken) -> String {
     let digest = ring::digest::digest(&ring::digest::SHA256, &token.token_hash);
     format!("token:{}", hex::encode(digest.as_ref()))
+}
+
+/// The stored token that `principal_id` names, if it is still in the store.
+///
+/// The lifetime `'a` says the returned reference borrows from `tokens`, so it
+/// can't outlive the snapshot it was found in.
+pub(crate) fn find_token_by_principal<'a>(
+    principal_id: &str,
+    tokens: &'a [ApiToken],
+) -> Option<&'a ApiToken> {
+    tokens
+        .iter()
+        .find(|token| token_principal_id(token) == principal_id)
+}
+
+/// Whether the credential a browser session was created from still stands
+/// (B11): the exact token must still be in the store and unexpired. A session
+/// from the internal service token holds while that token is configured.
+fn session_credential_is_live(
+    identity: &super::session::SessionIdentity,
+    tokens: &[ApiToken],
+    service_token_configured: bool,
+) -> bool {
+    if identity.principal_id == SYSTEM_PRINCIPAL {
+        return service_token_configured;
+    }
+    let now = std::time::SystemTime::now();
+    find_token_by_principal(&identity.principal_id, tokens)
+        .is_some_and(|token| token.expires_at.is_none_or(|at| now < at))
 }
 
 /// Authenticate a bearer without holding the token-store lock (AUTH5).
@@ -198,7 +229,11 @@ fn token_principal_id(token: &ApiToken) -> String {
 /// `async fn` returning `Result` is Rust's way of saying "this may await and
 /// may fail"; `.await` on the `spawn_blocking` handle yields until the
 /// blocking thread finishes without parking the async worker.
-async fn authenticate_off_lock(
+///
+/// Every path that verifies a presented token against the store goes through
+/// here: the bearer middleware and the unauthenticated `POST /ui/session`
+/// login alike, so neither can run unbounded Argon2 on a stranger's behalf.
+pub(crate) async fn authenticate_off_lock(
     plaintext: &str,
     tokens: Vec<ApiToken>,
 ) -> Result<AuthContext, (StatusCode, String)> {
@@ -237,6 +272,16 @@ async fn authenticate_off_lock(
             "authentication failed".to_string(),
         )),
     }
+}
+
+/// Hold every verification permit, so a test can prove a caller waits on the
+/// shared Argon2 bound instead of hashing on its own.
+#[cfg(test)]
+pub(crate) async fn hold_all_verify_permits() -> tokio::sync::SemaphorePermit<'static> {
+    VERIFY_PERMITS
+        .acquire_many(MAX_CONCURRENT_VERIFICATIONS as u32)
+        .await
+        .unwrap()
 }
 
 /// Check that the authenticated context has sufficient role.
@@ -345,7 +390,10 @@ pub async fn auth_middleware(
     }
 
     // No bearer: fall back to a browser session cookie. A valid session
-    // authenticates as a read-only principal (see `session` module).
+    // authenticates as a read-only principal (see `session` module), but only
+    // while the token it came from is still in the store and unexpired (B11):
+    // revoking a token must end its browser sessions too, and a same-name
+    // reissue is a different credential that never revives them.
     let session_id = request
         .headers()
         .get("cookie")
@@ -355,10 +403,13 @@ pub async fn auth_middleware(
     if let Some(id) = session_id
         && let Some(identity) = state.sessions.validate(&id).await
     {
-        request
-            .extensions_mut()
-            .insert(readonly_session_context(&identity));
-        return next.run(request).await;
+        if session_credential_is_live(&identity, &tokens, state.service_token.is_some()) {
+            request
+                .extensions_mut()
+                .insert(readonly_session_context(&identity));
+            return next.run(request).await;
+        }
+        state.sessions.remove(&id).await;
     }
 
     // Unauthenticated. A browser navigating to a page gets redirected to the
@@ -532,6 +583,44 @@ pub fn authorize_permission(
             StatusCode::FORBIDDEN,
             format!(
                 "permission for {:?} does not grant {} on {app} in namespace {namespace}",
+                ctx.token_name,
+                action.as_str()
+            ),
+        )
+            .into_response())
+    }
+}
+
+/// Enforce a principal's `[permission]` spec on a **cluster-wide** action.
+///
+/// The per-app twin of this is [`authorize_permission`]. Some routes name no
+/// app (raw log SQL, the metric store, token management, upgrades), so the
+/// only grant that can cover them is one for every app in every namespace
+/// (see [`crate::config::PermissionSpec::allows_cluster_wide`]). The bypasses
+/// match [`authorize_permission`]: pre-init, the system principal, and a
+/// principal with no spec all pass, so permissions stay opt-in.
+#[allow(clippy::result_large_err)]
+pub fn authorize_cluster_permission(
+    ctx: Option<&AuthContext>,
+    action: crate::config::PermissionAction,
+    permissions: &std::collections::BTreeMap<String, crate::config::PermissionSpec>,
+) -> Result<(), Response> {
+    let Some(ctx) = ctx else {
+        return Ok(());
+    };
+    if ctx.token_name == SYSTEM_PRINCIPAL {
+        return Ok(());
+    }
+    let Some(spec) = permissions.get(&ctx.token_name) else {
+        return Ok(());
+    };
+    if spec.allows_cluster_wide(action) {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::FORBIDDEN,
+            format!(
+                "permission for {:?} does not grant {} across the cluster",
                 ctx.token_name,
                 action.as_str()
             ),
@@ -905,14 +994,112 @@ mod tests {
         let user = create_token("u", ApiRole::ReadOnly, TokenScope::default(), None).unwrap();
         let store = new_token_store();
         store.write().await.push(user.token);
-        let state = AuthState::new(store, Some("rbrg_service".to_string()));
-        let id = state.sessions.create("u", TokenScope::default()).await;
+        let state = AuthState::new(store.clone(), Some("rbrg_service".to_string()));
+        let id = session_for(&state, &store, "u").await;
 
         let cookie = format!("rb_session={id}");
         let status = respond(guarded_router(state), &[("cookie", &cookie)])
             .await
             .status();
         assert_eq!(status, StatusCode::OK);
+    }
+
+    /// Create a session for the stored token named `name`, the way the login
+    /// handler does: keyed by the token's principal id, capped at its expiry.
+    async fn session_for(state: &AuthState, store: &TokenStore, name: &str) -> String {
+        let token = store
+            .read()
+            .await
+            .iter()
+            .find(|t| t.name == name)
+            .cloned()
+            .unwrap();
+        let identity = super::super::session::SessionIdentity {
+            token_name: token.name.clone(),
+            principal_id: token_principal_id(&token),
+            scope: token.scope.clone(),
+        };
+        state.sessions.create(identity, token.expires_at).await.id
+    }
+
+    async fn cookie_status(state: &AuthState, id: &str) -> StatusCode {
+        let cookie = format!("rb_session={id}");
+        respond(guarded_router(state.clone()), &[("cookie", &cookie)])
+            .await
+            .status()
+    }
+
+    #[tokio::test]
+    async fn a_session_is_refused_once_its_token_is_revoked() {
+        // Two tokens, so removing one doesn't reopen the bootstrap window.
+        let user = create_token("u", ApiRole::ReadOnly, TokenScope::default(), None).unwrap();
+        let other = create_token("other", ApiRole::Admin, TokenScope::default(), None).unwrap();
+        let store = new_token_store();
+        store.write().await.extend([user.token, other.token]);
+        let state = AuthState::new(store.clone(), None);
+        let id = session_for(&state, &store, "u").await;
+        assert_eq!(cookie_status(&state, &id).await, StatusCode::OK);
+
+        store.write().await.retain(|t| t.name != "u");
+        assert_eq!(cookie_status(&state, &id).await, StatusCode::UNAUTHORIZED);
+        // The dead session is dropped, not just skipped.
+        assert!(state.sessions.validate(&id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_session_is_refused_once_its_token_expires() {
+        let user = create_token("u", ApiRole::ReadOnly, TokenScope::default(), None).unwrap();
+        let store = new_token_store();
+        store.write().await.push(user.token);
+        let state = AuthState::new(store.clone(), None);
+        let id = session_for(&state, &store, "u").await;
+        assert_eq!(cookie_status(&state, &id).await, StatusCode::OK);
+
+        // The token lapses after login; the session must not carry on.
+        store.write().await[0].expires_at =
+            Some(std::time::SystemTime::now() - std::time::Duration::from_secs(1));
+        assert_eq!(cookie_status(&state, &id).await, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_same_name_reissue_does_not_revive_an_old_session() {
+        let old = create_token("u", ApiRole::ReadOnly, TokenScope::default(), None).unwrap();
+        let store = new_token_store();
+        store.write().await.push(old.token);
+        let state = AuthState::new(store.clone(), None);
+        let id = session_for(&state, &store, "u").await;
+
+        // Revoke `u` and issue a new token under the same name.
+        let reissued = create_token("u", ApiRole::ReadOnly, TokenScope::default(), None).unwrap();
+        *store.write().await = vec![reissued.token];
+        assert_eq!(cookie_status(&state, &id).await, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_service_token_session_holds_while_the_service_token_is_configured() {
+        let user = create_token("u", ApiRole::ReadOnly, TokenScope::default(), None).unwrap();
+        let store = new_token_store();
+        store.write().await.push(user.token);
+        let identity = super::super::session::SessionIdentity {
+            token_name: SYSTEM_PRINCIPAL.to_string(),
+            principal_id: SYSTEM_PRINCIPAL.to_string(),
+            scope: TokenScope::default(),
+        };
+
+        let with_service = AuthState::new(store.clone(), Some("rbrg_service".to_string()));
+        let id = with_service
+            .sessions
+            .create(identity.clone(), None)
+            .await
+            .id;
+        assert_eq!(cookie_status(&with_service, &id).await, StatusCode::OK);
+
+        let without_service = AuthState::new(store, None);
+        let id = without_service.sessions.create(identity, None).await.id;
+        assert_eq!(
+            cookie_status(&without_service, &id).await,
+            StatusCode::UNAUTHORIZED
+        );
     }
 
     #[test]
@@ -1076,11 +1263,62 @@ mod tests {
     }
 
     #[test]
+    fn authorize_cluster_permission_needs_a_grant_for_every_app() {
+        use crate::config::{PermissionAction, PermissionSpec};
+        let ctx = AuthContext {
+            token_name: "ops".to_string(),
+            principal_id: "token:ops".to_string(),
+            role: ApiRole::Admin,
+            scoped_apps: None,
+            scoped_namespaces: None,
+        };
+        let mut permissions = std::collections::BTreeMap::new();
+        // No spec: role and scope alone decide.
+        assert!(
+            authorize_cluster_permission(Some(&ctx), PermissionAction::Admin, &permissions).is_ok()
+        );
+
+        permissions.insert(
+            "ops".to_string(),
+            PermissionSpec {
+                actions: vec!["logs".to_string()],
+                apps: vec!["web".to_string()],
+                namespaces: None,
+            },
+        );
+        // Logs on one app doesn't cover the whole cluster, and never admin.
+        assert!(
+            authorize_cluster_permission(Some(&ctx), PermissionAction::Logs, &permissions).is_err()
+        );
+        assert!(
+            authorize_cluster_permission(Some(&ctx), PermissionAction::Admin, &permissions)
+                .is_err()
+        );
+
+        permissions.get_mut("ops").unwrap().apps = vec!["*".to_string()];
+        assert!(
+            authorize_cluster_permission(Some(&ctx), PermissionAction::Logs, &permissions).is_ok()
+        );
+
+        // Pre-init and the system principal are never gated.
+        assert!(authorize_cluster_permission(None, PermissionAction::Admin, &permissions).is_ok());
+        assert!(
+            authorize_cluster_permission(
+                Some(&system_context()),
+                PermissionAction::Admin,
+                &permissions
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn a_session_context_inherits_the_token_scope() {
         // A tenant-scoped token that exchanges itself for a session cookie must
         // stay confined — its session context carries the same scope (C3).
         let identity = super::super::session::SessionIdentity {
             token_name: "scoped".to_string(),
+            principal_id: "token:scoped".to_string(),
             scope: TokenScope {
                 apps: Some(vec!["web".to_string()]),
                 namespaces: Some(vec!["team-a".to_string()]),

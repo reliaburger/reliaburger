@@ -304,7 +304,7 @@ pub(crate) fn canonical_repository(name: &str) -> &str {
 /// <repo>` and are exempt by construction: unsigned upstream content
 /// stays deployable under `require_signatures` (it was never signable
 /// by us). Pinned by `check_image_schedulable_exempts_pull_through_cache`.
-/// TODO(F03 in docs/progress.md): upstream trust policy (digest pinning, cosign).
+/// TODO(F03, #320): upstream trust policy (digest pinning, cosign).
 fn lookup_pickle_manifest<'a>(
     image_ref: &str,
     catalog: &'a crate::pickle::types::ManifestCatalog,
@@ -421,7 +421,7 @@ mod tests {
             labels,
             ready: true,
             capabilities: Default::default(),
-            running_apps: HashSet::new(),
+            app_replicas: Default::default(),
             uptime_secs: 86400,
             cached_images: HashSet::new(),
         }
