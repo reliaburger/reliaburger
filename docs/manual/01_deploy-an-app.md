@@ -132,10 +132,14 @@ of unavailability on every redeploy of such an app. Host-path volumes don't
 change the rollout.
 
 ```sh
-relish history web               # what shipped when
+relish history web               # what shipped when, on every node
 relish rollback web              # back to the previous version
 relish cancel-deploy <OPERATION_ID>
 ```
+
+`relish history` asks every node, because each records its own rollout: you
+get one row per node per deploy, with a NODE column. A node that doesn't answer
+prints `warning: history incomplete: …` on stderr.
 
 A new instance that doesn't turn healthy within `health_timeout` fails the
 deploy, and with `auto_rollback` (the default) Bun restores the previous

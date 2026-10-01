@@ -6,7 +6,7 @@ expression: "render_to_string(&app, 120, 40)"
                                                                                                                         
 ┌logs──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │web · default · follow on                                                                                             │
-│live logs from the connected node                                                                                     │
+│live logs from every node running the app                                                                             │
 │web-0 │ request completed                                                                                             │
 │                                                                                                                      │
 │                                                                                                                      │

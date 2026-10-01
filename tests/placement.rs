@@ -1928,6 +1928,135 @@ async fn follow_and_top_cover_every_node_and_survive_one_leaving() {
     }
 }
 
+/// The node from a `[node instance]` log line prefix.
+fn line_node(line: &str) -> Option<String> {
+    Some(line.strip_prefix('[')?.split_once(' ')?.0.to_string())
+}
+
+/// F07 (#365): the TUI's views read through one node and still cover the
+/// cluster. The WebSocket log stream merges every node's lines and warns
+/// when a node leaves; deploy history and recent events carry every node's
+/// records, each tagged with its node, and name a member that stops
+/// answering instead of quietly shrinking.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
+async fn tui_logs_history_and_events_cover_every_node_and_name_a_missing_one() {
+    use futures_util::StreamExt;
+    use reliaburger::ketchup::follow::LogFrame;
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+    let shutdown = CancellationToken::new();
+    let nodes = start_spread_web_cluster("cv", 20541, &shutdown).await;
+    let entry = &nodes[0];
+    let doomed = nodes[1..]
+        .iter()
+        .find(|node| !*node.thinks_leader.borrow())
+        .expect("a follower other than the entry node");
+    let mut names: Vec<String> = nodes.iter().map(|node| node.name.clone()).collect();
+    names.sort();
+
+    // Deploy history: every node recorded its own rollout of `web`.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let history_nodes = loop {
+        let view = entry.client.deploy_history("web", "default").await.unwrap();
+        let mut seen: Vec<String> = view.history.iter().map(|row| row.node.clone()).collect();
+        seen.sort();
+        seen.dedup();
+        if (view.warnings.is_empty() && seen == names) || tokio::time::Instant::now() >= deadline {
+            break seen;
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    };
+    assert_eq!(history_nodes, names, "deploy history from every node");
+
+    // Events: each node's deploy event, named by its node.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let event_nodes = loop {
+        let view = entry.client.events(500).await.unwrap();
+        let mut seen: Vec<String> = view
+            .events
+            .iter()
+            .filter(|event| event.app.as_deref() == Some("web"))
+            .filter_map(|event| event.node.clone())
+            .collect();
+        seen.sort();
+        seen.dedup();
+        if (view.warnings.is_empty() && seen == names) || tokio::time::Instant::now() >= deadline {
+            break seen;
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    };
+    assert_eq!(event_nodes, names, "events from every node");
+
+    // The WebSocket stream the TUI reads follows every node.
+    let mut socket = entry.client.ws_logs("web", "default", 5).await.unwrap();
+    let mut frames: Vec<LogFrame> = Vec::new();
+    let followed = |frames: &[LogFrame]| {
+        let mut nodes: Vec<String> = frames
+            .iter()
+            .filter_map(|frame| match frame {
+                LogFrame::Line(line) => line_node(line),
+                LogFrame::Warning(_) => None,
+            })
+            .collect();
+        nodes.sort();
+        nodes.dedup();
+        nodes
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while followed(&frames) != names {
+        match tokio::time::timeout_at(deadline, socket.next()).await {
+            Ok(Some(Ok(WsMessage::Text(text)))) => {
+                frames.push(serde_json::from_str(&text).expect("a LogFrame"))
+            }
+            Ok(Some(Ok(_))) => {}
+            _ => break,
+        }
+    }
+    assert_eq!(followed(&frames), names, "WebSocket lines from every node");
+
+    // Take a node away: the stream warns about it, history and events name it.
+    doomed._wired.shutdown.cancel();
+    let warned_at = tokio::time::Instant::now() + Duration::from_secs(45);
+    let mut warned = false;
+    while !warned {
+        match tokio::time::timeout_at(warned_at, socket.next()).await {
+            Ok(Some(Ok(WsMessage::Text(text)))) => {
+                if let Ok(LogFrame::Warning(warning)) = serde_json::from_str(&text) {
+                    warned = warning.contains(&doomed.name);
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+            _ => break,
+        }
+    }
+    assert!(warned, "no WebSocket warning about {}", doomed.name);
+
+    // Until gossip drops the dead node from membership, the fan-out still
+    // asks it and must say it didn't answer; afterwards it simply isn't a
+    // member. Either way no view may fail whole.
+    let history = entry.client.deploy_history("web", "default").await.unwrap();
+    assert!(
+        history.history.iter().any(|row| row.node == entry.name),
+        "the entry node's own history must survive a peer's loss"
+    );
+    let events = entry.client.events(500).await.unwrap();
+    assert!(
+        events
+            .events
+            .iter()
+            .any(|event| event.node.as_deref() == Some(entry.name.as_str())),
+        "the entry node's own events must survive a peer's loss"
+    );
+
+    shutdown.cancel();
+    for node in &nodes {
+        if let Some(council) = &node.handle.council {
+            council.shutdown().await.ok();
+        }
+    }
+}
+
 /// Z2.3: `relish wtf` and `relish path` reach every node through the node
 /// the CLI talks to. A laptop host can only reach node 1's forwarded port, so
 /// neither may dial a node's own advertised address.

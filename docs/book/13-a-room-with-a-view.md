@@ -267,5 +267,82 @@ pub struct ClusterInstanceStatus {
 `node`) while the Rust type stays nested, so renderers can borrow
 `&status.instance` and reuse their existing code. If the cluster answer is
 incomplete, the UI keeps its last good data and shows the error rather than a
-shorter list. Logs and deployment history still say plainly that they cover the
-connected node only; one cluster-wide view doesn't make the others cluster-wide.
+shorter list. Logs and deployment history still said plainly that they covered
+the connected node only; one cluster-wide view doesn't make the others
+cluster-wide.
+
+### Every view, not just one
+
+Saying so plainly was better than lying, but it was still a gap. Deploy
+history, recent events and the jobs list all lived in per-node memory: each
+agent records its own rollout of the replicas placed on it, its own events and
+its own jobs. Ask node 1 about an app whose replicas ran on nodes 2 and 3 and
+the Deploys tab said "no deploy history". The dashboard's node page was worse.
+Click node 2 and you got node 2's name above node 1's CPU chart, because the
+chart read the metrics store of whichever node served the page.
+
+Live logs got their fix in Chapter 6. The other three views all needed the
+same shape of answer, so they share one function:
+
+```rust
+async fn fan_out_to_peers<T: serde::de::DeserializeOwned>(
+    state: &ApiState,
+    path: &str,
+    timeout: std::time::Duration,
+) -> (Vec<(String, T)>, Vec<String>)
+```
+
+`T` is a type parameter, the same idea as a Go generic. The part after the
+colon is a *bound*: `T` can be any type serde knows how to build from bytes it
+doesn't own (`DeserializeOwned`). That's all the function needs to know, so
+history entries, events, jobs, instance statuses and `relish top` rows all go
+through it. It returns two things: each member's answer beside its name, and
+one sorted line per member that failed or timed out. The caller decides what a
+partial answer means. For cluster status a missing node is an error, because a
+shorter list of replicas looks like a scheduling bug. For history, events and
+jobs it's a warning beside the rows we did get.
+
+Each peer is asked with `local=true`. Without it a peer would helpfully fan
+out again and every row would come back three times. Peers answer with the
+node's service token, which sees every namespace, so the node that merged the
+rows trims them to the caller's token scope afterwards. A tenant scoped to
+`team-a` sees `team-a`'s jobs from every node, and nothing else.
+
+Every merged row needs its node, so we generalised the wrapper from earlier:
+
+```rust
+pub struct NodeTagged<T> {
+    pub node: String,
+    #[serde(flatten)]
+    pub row: T,
+}
+```
+
+`NodeTagged<DeployHistoryEntry>` and `NodeTagged<JobStatus>` are two
+different concrete types the compiler stamps out from one definition. There's
+no boxing and no runtime type check, unlike an `interface{}` field in Go. With
+`flatten` the JSON stays flat, so a script that read `image` or `state` before
+still finds it there, now next to `node`. Events already had a `node` field;
+the merge fills it in where the recording node left it empty.
+
+One compile error from this work is worth showing. The events handler built
+the peer's query string with `url::form_urlencoded::Serializer`, right there
+in the `async fn`, and axum refused the handler with a wall of trait errors.
+The serializer holds a reference to an encoding callback that isn't `Send`, so
+it can't move between threads. A value that lives across an `.await` becomes
+part of the future, and axum needs futures it can hand to any worker thread.
+Moving the query-string building into a plain `fn` fixed it: the serializer
+now lives and dies before the first `.await`. In Go you'd find that kind of
+problem with the race detector, if you were lucky. Here the compiler found it
+before the code ran once.
+
+The views changed in small ways. The Jobs and Events tables grew a NODE
+column, the Deploys tab lists one row per node that rolled each deploy out,
+and any missing member shows as a yellow `incomplete: node node-3 timed out`
+line above the rows. The dashboard's node page asks that node for its status
+directly, says "node-3 did not answer" when it can't, and only draws CPU and
+memory charts on a node's own page. The tests live in
+`src/bun/api_cluster_view_tests.rs`: each view gets a fake peer on an
+ephemeral port, and the tests check the merge, the warning for a member that
+doesn't answer, that a `local=true` request never fans out, and that a scoped
+token's rows stay inside its namespace.

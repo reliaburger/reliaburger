@@ -2,7 +2,8 @@
 
 use crossterm::event::KeyEvent;
 
-use crate::bun::agent::{ClusterInstanceStatus, CouncilStatus, JobStatus, NodeStatus};
+use crate::bun::agent::{ClusterInstanceStatus, CouncilStatus, NodeStatus};
+use crate::bun::cluster_view::{ClusterDeployHistory, ClusterEvents, ClusterJobs};
 use crate::bun::events::ClusterEvent;
 use crate::mayo::rollup::MetricsQueryResult;
 use crate::wrapper::types::RouteInfo;
@@ -35,12 +36,12 @@ pub enum DataUpdate {
     Council(Result<CouncilStatus, ProviderError>),
     Alerts(Result<Vec<crate::mayo::alert::AlertStatus>, ProviderError>),
     Routes(Result<Vec<RouteInfo>, ProviderError>),
-    Jobs(Result<Vec<JobStatus>, ProviderError>),
-    EventsSeed(Result<Vec<ClusterEvent>, ProviderError>),
+    Jobs(Result<ClusterJobs, ProviderError>),
+    EventsSeed(Result<ClusterEvents, ProviderError>),
     DeployHistory {
         app: String,
         namespace: String,
-        result: Result<Vec<serde_json::Value>, ProviderError>,
+        result: Result<ClusterDeployHistory, ProviderError>,
     },
     AppMetrics(Result<MetricsQueryResult, ProviderError>),
 }
@@ -56,7 +57,14 @@ pub enum StreamKind {
 #[derive(Debug)]
 pub enum StreamItem {
     LogLine(LogLine),
+    /// A node's part of a cluster-wide log follow stopped.
+    LogWarning(String),
     Event(ClusterEvent),
-    StreamDown { what: StreamKind, error: String },
-    StreamUp { what: StreamKind },
+    StreamDown {
+        what: StreamKind,
+        error: String,
+    },
+    StreamUp {
+        what: StreamKind,
+    },
 }

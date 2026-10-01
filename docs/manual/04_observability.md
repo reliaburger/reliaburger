@@ -149,6 +149,16 @@ relish dashboard                 # authenticated, read-only browser session
 The TUI shows apps, nodes, jobs, routes, live logs and events; press `?`
 inside for keys. It needs a terminal of at least 80×24.
 
+Every view covers the whole cluster, whichever node the TUI talks to. Live
+logs follow every node that runs the app, like `relish logs -f`, and a node
+that leaves shows as a `warning │` line where it happened. The jobs and events
+tables have a NODE column, and an app's Deploys tab lists one row per node
+that rolled each deploy out. When a node doesn't answer, the view keeps what
+the others sent and adds a yellow `incomplete: node … timed out` line, so a
+short list never passes for a complete one. On the web dashboard, a node's
+page lists that node's apps (or says it didn't answer) and charts CPU and
+memory only on the node's own dashboard.
+
 `relish dashboard` serves the web dashboard (Brioche) on a loopback port and
 opens a one-time link to it. It forwards read-only requests using the CLI's own
 token and CA, so you don't install a certificate in your browser or paste a

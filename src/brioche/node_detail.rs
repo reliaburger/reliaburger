@@ -47,7 +47,13 @@ pub fn render_node_detail(data: &NodeDetailData) -> String {
 
     // Running apps table
     html.push_str("<section>\n<h2>Running Apps</h2>\n");
-    if data.apps.is_empty() {
+    if let Some(warning) = &data.warning {
+        html.push_str(&format!(
+            "<p class=\"warning\">{} {}</p>\n",
+            escape_html(&data.name),
+            escape_html(warning)
+        ));
+    } else if data.apps.is_empty() {
         html.push_str("<p class=\"empty\">no apps on this node</p>\n");
     } else {
         html.push_str(
@@ -111,6 +117,7 @@ mod tests {
                     status_age_ms: None,
                 },
             ],
+            warning: None,
             charts: vec![ChartConfig {
                 endpoint: "/v1/metrics?name=node_cpu_usage_percent".to_string(),
                 title: "CPU Usage".to_string(),
@@ -163,10 +170,26 @@ mod tests {
             state: "alive".to_string(),
             app_count: 0,
             apps: vec![],
+            warning: None,
             charts: vec![],
         };
         let html = render_node_detail(&data);
         assert!(html.contains("no apps on this node"));
+    }
+
+    #[test]
+    fn a_node_that_did_not_answer_is_named_instead_of_listed_empty() {
+        let data = NodeDetailData {
+            name: "node-03".to_string(),
+            state: "alive".to_string(),
+            app_count: 0,
+            apps: vec![],
+            warning: Some("did not answer: node node-03 timed out".to_string()),
+            charts: vec![],
+        };
+        let html = render_node_detail(&data);
+        assert!(html.contains("node-03 did not answer"));
+        assert!(!html.contains("no apps on this node"));
     }
 
     #[test]

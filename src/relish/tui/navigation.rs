@@ -123,7 +123,7 @@ impl TuiApp {
                 }
             }
             View::Jobs => {
-                if let Some(job) = self.data.jobs.get(self.jobs_cursor) {
+                if let Some(job) = self.data.jobs.get(self.jobs_cursor).map(|job| &job.row) {
                     self.push(View::JobDetail {
                         name: job.name.clone(),
                         namespace: job.namespace.clone(),

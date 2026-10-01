@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use crate::bun::agent::{
     ClusterInstanceStatus, CouncilStatus, InstanceStatus, JobStatus, NodeStatus,
 };
+use crate::bun::cluster_view::NodeTagged;
 use crate::bun::events::{ClusterEvent, EventKind, EventSeverity};
 use crate::mayo::rollup::{MetricsQueryResult, MetricsQueryRow};
 use crate::wrapper::types::RouteInfo;
@@ -89,14 +90,17 @@ impl TestScenario {
                 total_backends: 2,
                 websocket: true,
             });
-            data.jobs.push(JobStatus {
-                name: "migrate".into(),
-                namespace: "default".into(),
-                instance_id: "migrate-0".into(),
-                image: "proc-grill:image-ignored".into(),
-                state: "stopped".into(),
-                restart_count: 0,
-                age_seconds: 60,
+            data.jobs.push(NodeTagged {
+                node: "node-1".into(),
+                row: JobStatus {
+                    name: "migrate".into(),
+                    namespace: "default".into(),
+                    instance_id: "migrate-0".into(),
+                    image: "proc-grill:image-ignored".into(),
+                    state: "stopped".into(),
+                    restart_count: 0,
+                    age_seconds: 60,
+                },
             });
             data.app_metrics = Some(MetricsQueryResult {
                 data: vec![

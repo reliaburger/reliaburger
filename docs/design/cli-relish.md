@@ -1119,6 +1119,14 @@ payment-service history (last 24h):
   Feb 11 09:15  deploy          v2.0.9 → v2.1.0 by alice@myorg (relish deploy)
 ```
 
+**What ships:** deploy records only, from every node. Each agent records its
+own rollout of the replicas placed on it, so the node the CLI talks to asks
+every live member (`GET /v1/deploys/history/{app}?namespace=…`, peers get
+`local=true`) and prints one row per node per deploy: `ID NODE IMAGE RESULT
+DONE TOTAL`. A member that didn't answer is a `warning: history incomplete: …`
+line on stderr, so `-o json` stays parseable. Scale events, restarts, alerts
+and actors, and `--since`, are **planned — not yet implemented**.
+
 #### Interactive Commands
 
 **`relish exec <app> <cmd...>`**
@@ -1156,9 +1164,9 @@ Detailed view for a single app. Tabbed sections:
 
 - **Overview:** image, replicas, placement, ports, health check config.
 - **Instances:** table of all instances with node, port, health, CPU, memory.
-- **Logs:** streaming log tail for this app (multiplexed across instances).
+- **Logs:** streaming log tail for this app, from every node that runs it (the WebSocket follow merges every placed node, lines prefixed `[node instance]`, and a node that leaves shows as an in-line warning).
 - **Metrics:** terminal sparkline charts for CPU, memory, request rate.
-- **Deploys:** recent deploy history with version, actor, duration, status.
+- **Deploys:** deploy history from every node, one row per node per deploy (id, node, image, result, steps), with an `incomplete:` line for each member that didn't answer. Actor and duration are planned.
 - **Config:** resolved environment variables, resource limits.
 
 **Nodes view (`n`)**
@@ -1169,9 +1177,13 @@ List of all nodes with columns: name, role (Council/Worker, leader star), apps c
 
 Running and recent jobs with columns: name, status (running/succeeded/failed), duration, schedule, success rate, queue depth. Enter to see job execution history.
 
+**What ships:** every node's jobs (`GET /v1/jobs?cluster=true`) with name, node, namespace, state, restarts, age and image, trimmed to the token's scope, and an `incomplete:` line per member that didn't answer. Duration, schedule, success rate and queue depth are planned.
+
 **Events view (`e`)**
 
 Scrollable, filterable event stream. Filter bar at top for app, node, type, severity. Events persist for the full Ketchup retention period. New events appear at the top (or bottom in chronological mode). Press `/` to search within events.
+
+**What ships:** each node keeps a bounded in-memory event ring (1,024 events). Every refresh reads `GET /v1/events`, which merges the newest events from every live member, names each event's node, and lists members that didn't answer as `incomplete:` lines; the WebSocket adds the connected node's new events between refreshes. A merged live event stream, filters and retention beyond the ring are planned (#365).
 
 **Logs view (`l`)**
 

@@ -97,7 +97,12 @@ async fn wait_job(client: &BunClient, expected_state: &str, restarts: u32) {
     loop {
         let last_observed = match client.jobs().await {
             Ok(jobs) => {
-                let work: Vec<_> = jobs.iter().filter(|job| job.name == "work").collect();
+                let work: Vec<_> = jobs
+                    .jobs
+                    .iter()
+                    .map(|job| &job.row)
+                    .filter(|job| job.name == "work")
+                    .collect();
                 if work
                     .iter()
                     .any(|job| job.state == expected_state && job.restart_count == restarts)

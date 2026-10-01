@@ -937,23 +937,32 @@ impl BunClient {
         Ok(response.alerts)
     }
 
-    /// List run-to-completion workload instances.
-    pub async fn jobs(&self) -> Result<Vec<crate::bun::agent::JobStatus>, RelishError> {
-        self.get_typed_json("/v1/jobs").await
+    /// List every node's run-to-completion workload instances, each with
+    /// its node, plus a warning per node that didn't answer.
+    pub async fn jobs(&self) -> Result<crate::bun::cluster_view::ClusterJobs, RelishError> {
+        self.get_typed_json("/v1/jobs?cluster=true").await
     }
 
-    /// Fetch recent cluster events.
+    /// Fetch the newest `limit` events across the cluster, oldest first,
+    /// plus a warning per node that didn't answer.
     pub async fn events(
         &self,
         limit: usize,
+    ) -> Result<crate::bun::cluster_view::ClusterEvents, RelishError> {
+        self.get_typed_json(&format!("/v1/events?limit={limit}"))
+            .await
+    }
+
+    /// Fetch the newest `limit` events recorded by the node this client
+    /// talks to, and no other.
+    pub async fn node_events(
+        &self,
+        limit: usize,
     ) -> Result<Vec<crate::bun::events::ClusterEvent>, RelishError> {
-        let value: serde_json::Value = self
-            .get_typed_json(&format!("/v1/events?limit={limit}"))
+        let view: crate::bun::cluster_view::ClusterEvents = self
+            .get_typed_json(&format!("/v1/events?limit={limit}&local=true"))
             .await?;
-        serde_json::from_value(value["events"].clone()).map_err(|error| RelishError::ApiError {
-            status: 0,
-            body: format!("failed to parse events response: {error}"),
-        })
+        Ok(view.events)
     }
 
     /// Ask a node what it has wired up (Phase 15).
@@ -1079,23 +1088,22 @@ impl BunClient {
         .await
     }
 
-    /// Fetch deploy history for an app in a namespace.
+    /// Fetch an app's deploy history from every node, each entry tagged
+    /// with its node, plus a warning per node that didn't answer.
     pub async fn deploy_history(
         &self,
         app: &str,
         namespace: &str,
-    ) -> Result<Vec<serde_json::Value>, RelishError> {
+    ) -> Result<crate::bun::cluster_view::ClusterDeployHistory, RelishError> {
         // Encode both: an app or namespace carrying `/`, `&` or a space would
         // otherwise split into extra path segments or query parameters.
         let app_segment: String = url::form_urlencoded::byte_serialize(app.as_bytes()).collect();
         let namespace_value: String =
             url::form_urlencoded::byte_serialize(namespace.as_bytes()).collect();
-        let value: serde_json::Value = self
-            .get_typed_json(&format!(
-                "/v1/deploys/history/{app_segment}?namespace={namespace_value}"
-            ))
-            .await?;
-        Ok(value["history"].as_array().cloned().unwrap_or_default())
+        self.get_typed_json(&format!(
+            "/v1/deploys/history/{app_segment}?namespace={namespace_value}"
+        ))
+        .await
     }
 
     /// Fetch live deploy operations and bounded terminal history.

@@ -24,9 +24,11 @@ pub struct Compatibility {
 /// volume slugs, per-destination export receipts, restore journals and
 /// volume quotas in the sidecar), and each image index entry's platform in
 /// Pickle's catalogue (`LayerDescriptor::platform`) and image listings
-/// (`ImageSummary::platforms`).
+/// (`ImageSummary::platforms`), and the cluster-wide views: peers answer
+/// deploy history, events and jobs for themselves on `local=true`, and the
+/// WebSocket log stream sends `LogFrame` JSON (F07).
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 28,
+    protocol: 29,
     state: 47,
 };
 
