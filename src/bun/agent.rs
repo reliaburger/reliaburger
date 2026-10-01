@@ -71,36 +71,67 @@ use super::BunError;
 use super::loop_meter::LoopBranch;
 use super::probe::probe_health;
 use super::supervisor::{WorkloadInstance, WorkloadSupervisor};
-mod trace;
-use trace::MAX_CONCURRENT_TRACES;
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
-use trace::backend_addresses;
-mod faults;
-use faults::{InstalledNetworkFaults, NodeFaultFence};
-mod deploy_worker;
-use deploy_worker::DeployWorker;
-mod deploy_ops;
-use deploy_ops::{DeployOp, DeployOps, PreparedInstance, RollingInstance};
+
+// The loop's work, one concern per file. Each child module adds methods
+// to `BunAgent` (or owns a type the loop drives); `run_loop` stays here.
+mod adopted_placements;
+mod app_stop;
 mod commands;
-pub use commands::{AgentCommand, ApplyEvent, FaultClearance};
-mod job_runs;
-mod networking;
-mod routing;
-use job_runs::ScheduledJob;
+mod consumer;
+mod council_requests;
+mod deploy_ops;
+mod deploy_worker;
+mod discovery_ownership;
+mod discovery_recovery;
+mod egress_ownership;
+mod egress_resolution;
+mod faults;
+mod follow_ups;
 mod health_checks;
-mod launch;
-mod records;
-use health_checks::wait_instance_healthy;
-use restarts::RestartRotation;
 mod identity;
+mod identity_signing;
+mod job_runs;
+mod launch;
+mod launch_evidence;
+mod logs;
+mod networking;
+mod node_pressure_work;
+mod off_loop_work;
+mod producer_release;
+mod records;
+mod restarts;
 mod retirement;
-pub use identity::workload_spiffe_uri;
+mod routing;
+mod runtime_inventory;
+mod scale_in_place;
+mod signal_faults;
+mod startup_recovery;
+mod state_sweep;
 mod status;
+mod status_snapshot;
+mod trace;
 mod volumes;
+
+use app_stop::{PendingStops, StopPurpose};
+pub use commands::{AgentCommand, ApplyEvent, FaultClearance};
+pub use consumer::ConsumerUpdate;
+use deploy_ops::{DeployOp, DeployOps, PreparedInstance, RollingInstance};
+use deploy_worker::DeployWorker;
+use discovery_ownership::{DiscoveryOwnership, JournalReference};
+use faults::{InstalledNetworkFaults, NodeFaultFence};
+use health_checks::wait_instance_healthy;
+pub use identity::workload_spiffe_uri;
+use job_runs::ScheduledJob;
+use restarts::RestartRotation;
+use runtime_inventory::{LOOP_RUNTIME_INVENTORY_TIMEOUT, RUNTIME_INVENTORY_TIMEOUT};
 pub use status::{
     ApplyResult, ClusterInstanceStatus, CouncilMemberInfo, CouncilStatus, CurrentResourceStatus,
     InstanceStatus, JobStatus, NodeStatus,
 };
+pub use status_snapshot::{StatusReader, StatusUnavailable};
+use trace::MAX_CONCURRENT_TRACES;
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+use trace::backend_addresses;
 
 /// Deadline for an `exec` run off the command loop (H3). Bounds an orphaned
 /// task if the caller disconnects; the exec no longer blocks the loop, so this
@@ -324,33 +355,6 @@ pub struct PartitionBlocklists {
 
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 use super::egress_owners::{EgressBinding, PolicyPhase};
-mod app_stop;
-mod consumer;
-mod council_requests;
-mod startup_recovery;
-pub use consumer::ConsumerUpdate;
-mod adopted_placements;
-mod discovery_ownership;
-mod discovery_recovery;
-mod egress_ownership;
-mod egress_resolution;
-mod follow_ups;
-mod identity_signing;
-mod launch_evidence;
-mod logs;
-mod node_pressure_work;
-mod off_loop_work;
-mod producer_release;
-mod restarts;
-mod runtime_inventory;
-mod scale_in_place;
-mod signal_faults;
-mod state_sweep;
-mod status_snapshot;
-use app_stop::{PendingStops, StopPurpose};
-use discovery_ownership::{DiscoveryOwnership, JournalReference};
-use runtime_inventory::{LOOP_RUNTIME_INVENTORY_TIMEOUT, RUNTIME_INVENTORY_TIMEOUT};
-pub use status_snapshot::{StatusReader, StatusUnavailable};
 
 /// Test hook: an await on the loop that no mock stands behind (a
 /// subprocess, the disk), which the starvation harness can slow down.
@@ -1444,8 +1448,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
     }
 }
-
-impl<G: Grill + Clone + 'static> BunAgent<G> {}
 
 /// Return the last `n` lines of a string.
 ///
