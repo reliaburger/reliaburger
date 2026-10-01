@@ -139,6 +139,8 @@ pub const ROUTE_MATRIX: &[Route] = &[
     route(Get, "/ui/static/{*path}", Public),
     route(Post, "/v1/cluster/join", Public),
     route(Get, "/v1/cluster/ca", Public),
+    // No bearer token: the handler requires a member's TLS client certificate.
+    route(Get, "/v1/cluster/master-key", Public),
     route(Get, "/ui/login", Public),
     route(Post, "/ui/session", Public),
     route(Post, "/ui/logout", Public),

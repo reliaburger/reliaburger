@@ -489,6 +489,43 @@ fn mint_join_token(
     Ok((plaintext, join_token))
 }
 
+/// Fetch the cluster's master key from a member, as the node that just
+/// joined (G1): the request presents the node's new certificate, and the
+/// member's certificate must chain to the cluster CA in that identity.
+pub async fn fetch_master_key(
+    member_url: &str,
+    identity: &NodeIdentity,
+) -> Result<[u8; 32], JoinClientError> {
+    let client =
+        super::mtls::build_cluster_http_client(identity, super::mtls::CrlHandle::default())
+            .map_err(|e| JoinClientError::Transport(e.to_string()))?;
+    let url = format!("{}/v1/cluster/master-key", member_url.trim_end_matches('/'));
+    let response = client
+        .get(&url)
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|e| JoinClientError::Transport(e.to_string()))?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(JoinClientError::Rejected(format!("{status}: {body}")));
+    }
+    #[derive(Deserialize)]
+    struct MasterKey {
+        master_key: String,
+    }
+    let body: MasterKey = response
+        .json()
+        .await
+        .map_err(|e| JoinClientError::Malformed(e.to_string()))?;
+    let bytes = hex::decode(body.master_key.trim())
+        .map_err(|e| JoinClientError::Malformed(format!("master key: {e}")))?;
+    bytes
+        .try_into()
+        .map_err(|_| JoinClientError::Malformed("master key isn't 32 bytes".into()))
+}
+
 /// What `relish join-token list` shows for one token: never the token
 /// itself, nor enough of its hash to matter.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -88,7 +88,7 @@ use internal::{
     endpoint_withdrawal_receipt_handler, node_decommission_handler, placements_handler,
     producer_retirement_handler, refuse_retired_tls_peer, workload_csr_handler,
 };
-use join::{cluster_ca_handler, join_handler, node_renewal_handler};
+use join::{cluster_ca_handler, join_handler, master_key_handler, node_renewal_handler};
 use logs::{
     logs_cross_node_handler, logs_entries_handler, logs_export_handler, logs_handler,
     logs_sql_handler, ws_logs_handler,
@@ -569,6 +569,9 @@ pub fn router_with_upgrade(
         .route("/ui/static/{*path}", get(static_asset_handler))
         .route("/v1/cluster/join", post(join_handler))
         .route("/v1/cluster/ca", get(cluster_ca_handler))
+        // Authenticated by the node's TLS client certificate inside the
+        // handler: a joiner has no bearer token until it has the master key.
+        .route("/v1/cluster/master-key", get(master_key_handler))
         // The GitOps webhook is public: real providers (GitHub, GitLab)
         // send `X-Hub-Signature-256`/`X-Gitlab-Token`, never a Reliaburger
         // bearer token, so it can't sit behind the bearer-auth middleware.
