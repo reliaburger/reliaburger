@@ -30,6 +30,15 @@ permissions:
   contents: read
 
 jobs:
+  # The image's shell scripts that have unit tests (image/tests): quick, and
+  # Linux-only, since the scripts use GNU coreutils as the appliance does.
+  scripts:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Script tests
+        run: python3 -m unittest discover -s image/tests -v
+
   image:
     name: image (${{ matrix.arch }})
     strategy:

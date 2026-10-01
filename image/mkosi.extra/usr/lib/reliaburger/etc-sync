@@ -1,0 +1,112 @@
+#!/bin/bash
+# Bring /etc up to the running image's /etc, keeping what the node changed.
+#
+# Each image ships its /etc in /usr/share/factory/etc (mkosi.finalize). The
+# node keeps, in $state, what the last sync installed for every path (a hash,
+# or a symlink's target). On the first boot of a new /usr, per path:
+#   - the same as the new image's: nothing to do;
+#   - missing, and never installed: added;
+#   - unchanged since we installed it: replaced with the new image's;
+#   - changed (or deleted) on the node: kept as it is, and logged;
+#   - gone from the new image, unchanged here: removed.
+# That is dpkg's rule for conffiles. Paths the node owns (its identity, users,
+# the seed) are never touched. Without a record yet (the first sync on this
+# node), anything that differs counts as changed and is kept.
+#
+# It runs once per image version: $state.version holds the IMAGE_VERSION it
+# last ran for. FACTORY, ETC, STATE and VERSION override the inputs, for
+# testing.
+set -euo pipefail
+
+factory=${FACTORY:-/usr/share/factory/etc}
+etc=${ETC:-/etc}
+state=${STATE:-/var/lib/reliaburger/etc-factory}
+
+[ -d "$factory" ] || { echo "reliaburger: etc-sync: no $factory, nothing to do"; exit 0; }
+version=${VERSION:-$(. /usr/lib/os-release && echo "${IMAGE_VERSION:-}")}
+if [ -n "$version" ] && [ "$(cat "$state.version" 2>/dev/null)" = "$version" ]; then
+    exit 0
+fi
+
+# The node's own: identity, users and passwords, host keys, the seed, and
+# files systemd writes at runtime.
+owned() {
+    case $1 in
+        machine-id | hostname | adjtime | mtab | resolv.conf | .updated | .pwd.lock) return 0 ;;
+        passwd | passwd- | group | group- | shadow | shadow- | gshadow | gshadow-) return 0 ;;
+        subuid | subuid- | subgid | subgid-) return 0 ;;
+        ssh/ssh_host_* | reliaburger | reliaburger/*) return 0 ;;
+    esac
+    return 1
+}
+
+# What a path is: "l <target>" for a symlink, "f <sha256> <mode>" for a file,
+# "-" when it doesn't exist.
+ident() {
+    if [ -L "$1" ]; then
+        echo "l $(readlink "$1")"
+    elif [ -f "$1" ]; then
+        echo "f $(sha256sum < "$1" | cut -d' ' -f1) $(stat -c %a "$1")"
+    else
+        echo "-"
+    fi
+}
+
+declare -A last=()
+if [ -f "$state" ]; then
+    while IFS=$'\t' read -r path id; do
+        last[$path]=$id
+    done < "$state"
+fi
+
+added=0 updated=0 removed=0 kept=()
+mkdir -p "$(dirname "$state")"
+next=$(mktemp "$state.XXXXXX")
+trap 'rm -f "$next"' EXIT
+
+install_path() {
+    local rel=$1 tmp
+    mkdir -p "$etc/$(dirname "$rel")"
+    tmp="$etc/$(dirname "$rel")/.etc-sync.$$"
+    cp -a "$factory/$rel" "$tmp"
+    mv -Tf "$tmp" "$etc/$rel"
+}
+
+declare -A seen=()
+while IFS= read -r -d '' rel; do
+    rel=${rel#./}
+    owned "$rel" && continue
+    seen[$rel]=1
+    new=$(ident "$factory/$rel")
+    cur=$(ident "$etc/$rel")
+    printf '%s\t%s\n' "$rel" "$new" >> "$next"
+    [ "$cur" = "$new" ] && continue
+    if [ -z "${last[$rel]+x}" ]; then
+        if [ "$cur" = "-" ]; then
+            install_path "$rel"; added=$((added + 1))
+        else
+            kept+=("$rel")
+        fi
+    elif [ "$cur" = "${last[$rel]}" ] && [ "$cur" != "-" ]; then
+        install_path "$rel"; updated=$((updated + 1))
+    else
+        kept+=("$rel")
+    fi
+done < <(cd "$factory" && find . ! -type d -print0 | sort -z)
+
+# Paths the previous image shipped and this one doesn't.
+for rel in "${!last[@]}"; do
+    [ -n "${seen[$rel]+x}" ] && continue
+    owned "$rel" && continue
+    if [ "$(ident "$etc/$rel")" = "${last[$rel]}" ] && [ "${last[$rel]}" != "-" ]; then
+        rm -f "$etc/$rel"; removed=$((removed + 1))
+    fi
+done
+
+mv -f "$next" "$state"
+trap - EXIT
+[ -n "$version" ] && echo "$version" > "$state.version"
+echo "reliaburger: etc-sync: $updated updated, $added added, $removed removed, ${#kept[@]} changed on this node and kept"
+for rel in "${kept[@]}"; do
+    echo "reliaburger: etc-sync: kept /etc/$rel (changed on this node, or not from an image)"
+done

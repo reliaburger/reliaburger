@@ -1,0 +1,24 @@
+# Bring /etc up to a new image's /etc on the first boot of each new /usr,
+# keeping what the node changed (/usr/lib/reliaburger/etc-sync). It runs
+# early on every boot and returns at once unless the image version changed
+# since its last run (the script checks; /usr's mtime is no use as a trigger,
+# a reproducible build may pin it).
+#
+# Enabled from /usr (sysinit.target.wants/ next to this file), not through a
+# preset: preset symlinks live in /etc, which is exactly what an OS update
+# doesn't change, so a node installed from an older image would never enable
+# it.
+[Unit]
+Description=Reliaburger /etc update
+DefaultDependencies=no
+RequiresMountsFor=/var/lib/reliaburger
+After=local-fs.target
+Before=sysinit.target systemd-update-done.service ldconfig.service systemd-sysusers.service systemd-tmpfiles-setup.service
+Conflicts=shutdown.target
+Before=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+StandardOutput=journal+console
+ExecStart=/usr/lib/reliaburger/etc-sync
