@@ -1199,7 +1199,9 @@ async fn start_refuses_a_candidate_with_other_formats_before_recording_a_run() {
         "set RELIABURGER_UPGRADE_TESTS=1 on a provisioned multi-core host"
     );
     let _serial = SERIAL.lock().await;
-    let harness = ClusterHarness::start(2).await;
+    // Three nodes, not two: two would be a two-voter council, which the
+    // leader refuses to roll (#372) before this test's own refusal.
+    let harness = ClusterHarness::start(3).await;
     let leader = harness.wait_for_idle_leader().await;
     let client = harness.relish_client(harness.node(&leader));
     let staging = tempfile::tempdir().unwrap();
@@ -1240,7 +1242,9 @@ async fn rollback_to_a_version_the_nodes_lack_is_refused_before_recording_a_run(
         "set RELIABURGER_UPGRADE_TESTS=1 on a provisioned multi-core host"
     );
     let _serial = SERIAL.lock().await;
-    let harness = ClusterHarness::start(2).await;
+    // Three nodes, not two: two would be a two-voter council, which the
+    // leader refuses to roll (#372) before this test's own refusal.
+    let harness = ClusterHarness::start(3).await;
     let leader = harness.wait_for_idle_leader().await;
     let (nodes, _) = harness.plan_nodes_for(&leader);
     let request = serde_json::json!({ "target_version": "v0.0.5", "nodes": nodes });
