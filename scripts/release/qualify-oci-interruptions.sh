@@ -15,8 +15,12 @@ for line in open(sys.argv[1]):
     if row.get('reason') == 'compiler-artifact' and row.get('target', {}).get('name') in {'owned_runc', 'owned_network', 'oci_crash'} and row.get('executable'):
         print(row['executable'])
 PY
+grep '/oci_crash-' "$evidence/binaries" > "$evidence/only" && mv "$evidence/only" "$evidence/binaries"
+for round in $(seq 1 20); do
 while IFS= read -r binary; do
-    name=$(basename "$binary")
+    name=$(basename "$binary")-$round
+    printf '=== round %s ===\n' "$round"
+
     sha256sum "$binary" >> "$evidence/binaries.sha256"
     # Scope links, routing/firewall changes and namespace mount points to the
     # fixture. A failed test must not pollute the host's /run/netns directory.
@@ -28,7 +32,10 @@ while IFS= read -r binary; do
         mount -t tmpfs tmpfs /run/netns
         ip link set lo up
         exec "$1" --ignored --nocapture --test-threads=1 --skip normal_rootless_bun \
-            --skip actual_host_reboot --skip actual_bun_kernel_discovery_host_reboot
+            --skip actual_host_reboot --skip actual_bun_kernel_discovery_host_reboot \
+            normal_standalone_bun_recovers_durable_kernel_and_discovery \
+            automatic_restart_bun_death_before_adoption_retires_the_unrecorded_successor
     ' qualification "$binary" 2>&1 | tee "$evidence/$name.log"
 done < "$evidence/binaries"
+done
 printf 'PASS: OCI interruptions; evidence retained at %s\n' "$evidence"
