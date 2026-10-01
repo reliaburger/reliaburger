@@ -5,7 +5,7 @@ on:
     branches: [main]
   workflow_dispatch:
   pull_request:
-    branches: [main, "codex/**"]
+    branches: [main, "codex/**", "feat/appliance-*"]
 
 # PR updates supersede earlier checks. Main/candidate runs retain their own group.
 # Fixed prefixes also keep reusable source CI separate from its release caller.

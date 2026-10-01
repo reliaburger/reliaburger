@@ -30,7 +30,7 @@ on:
     # Monday 04:00 UTC: Ubuntu's kernels and USNs of the previous week.
     - cron: "0 4 * * 1"
   pull_request:
-    branches: [main]
+    branches: [main, "feat/appliance-*"]
     paths:
       - "image/**"
       - ".github/workflows/appliance.yml"
