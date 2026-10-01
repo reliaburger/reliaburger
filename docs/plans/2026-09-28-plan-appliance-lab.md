@@ -100,6 +100,12 @@
   - the boot check passed: `bun healthy (bun 0.1.1 (77bace5)) on OS 2026.40.42`.
 - **Still open:** a rolling upgrade that actually swaps bun. It needs two consecutive release-signed versions with the same `protocol` and `state`. main is already at 28/47 against 0.1.1's 27/46, so 0.1.1 → 0.1.2 won't roll either.
 
+**`/etc` follows each image (1 Oct).** A node installed from 2026.40.22 (before `etc-sync`), with `/etc/systemd/timesyncd.conf` edited by hand, was updated with `os-stage` to 2026.40.53:
+- `reliaburger-etc-sync` ran on the first boot of .53: "0 updated, 0 added, 0 removed, 1 changed on this node and kept", naming `timesyncd.conf`, and the edit survived. As designed, a node's first sync has no record and keeps whatever differs.
+- It wrote its record (`/var/lib/reliaburger/etc-factory`, 39 KB) and the version it ran for. A reboot on the same version left it silent.
+- **It caught a bug the unit tests couldn't:** ordering the unit before `systemd-sysusers.service` (which runs before `local-fs-pre.target`) while also after `local-fs.target` made an ordering cycle. systemd broke it by deleting jobs, `boot.automount` and `var-lib-machines.mount` among them, so `/boot` would have stayed unmounted. Without that ordering the boot has no cycles and `boot.automount` is active. sysusers only writes `passwd` and `group`, which the sync never touches.
+- On the emulated aarch64 CI boot, the one-pass rewrite brought the sync from about 90 s to about 1 s.
+
 **The appliance profile, ahead of S5 (1 Oct).** Research §9.2–9.3 asks for it on a 2 GB, 8 GB eMMC machine. Build 2026.40.46 (run 36808394596) has it, checked on a lab VM:
 - **zram swap:** `systemd-zram-generator`, half of RAM with zstd (973 MB on a 2 GiB VM, priority 100).
 - **The data partition** mounts `noatime,compress=zstd:1` (`rootflags=` on the command line; Btrfs adds `discard=async` itself).
