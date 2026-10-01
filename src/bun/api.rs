@@ -1005,6 +1005,45 @@ fn unavailable_response(error: String) -> Response {
         .into_response()
 }
 
+/// Desired replicas, placements and any quota block for every app the
+/// council knows, sorted by namespace and name.
+fn council_app_evidence(
+    desired: &crate::council::types::DesiredState,
+    live_nodes: usize,
+) -> Vec<crate::bun::diagnostics::DesiredAppEvidence> {
+    let mut apps = desired
+        .apps
+        .iter()
+        .map(
+            |(app_id, spec)| crate::bun::diagnostics::DesiredAppEvidence {
+                app: app_id.name.clone(),
+                namespace: app_id.namespace.clone(),
+                desired_replicas: crate::bun::diagnostics::desired_replica_count(
+                    spec.replicas,
+                    live_nodes,
+                ),
+                scheduled_replicas: desired.scheduling.get(app_id).map_or(0, |placements| {
+                    placements.len().try_into().unwrap_or(u32::MAX)
+                }),
+                placements: desired.scheduling.get(app_id).map_or_else(
+                    Default::default,
+                    |placements| {
+                        let mut per_node = std::collections::BTreeMap::new();
+                        for placement in placements {
+                            *per_node.entry(placement.node_id.0.clone()).or_insert(0u32) += 1;
+                        }
+                        per_node
+                    },
+                ),
+                service_port: spec.port,
+                blocked: desired.quota_blocked.get(app_id).cloned(),
+            },
+        )
+        .collect::<Vec<_>>();
+    apps.sort_by(|left, right| (&left.namespace, &left.app).cmp(&(&right.namespace, &right.app)));
+    apps
+}
+
 async fn gather_desired_apps(
     state: &ApiState,
 ) -> Result<Vec<crate::bun::diagnostics::DesiredAppEvidence>, String> {
@@ -1014,38 +1053,7 @@ async fn gather_desired_apps(
             Some(membership) => membership.read().await.len().max(1),
             None => 1,
         };
-        let mut apps = desired
-            .apps
-            .iter()
-            .map(
-                |(app_id, spec)| crate::bun::diagnostics::DesiredAppEvidence {
-                    app: app_id.name.clone(),
-                    namespace: app_id.namespace.clone(),
-                    desired_replicas: crate::bun::diagnostics::desired_replica_count(
-                        spec.replicas,
-                        live_nodes,
-                    ),
-                    scheduled_replicas: desired.scheduling.get(app_id).map_or(0, |placements| {
-                        placements.len().try_into().unwrap_or(u32::MAX)
-                    }),
-                    placements: desired.scheduling.get(app_id).map_or_else(
-                        Default::default,
-                        |placements| {
-                            let mut per_node = std::collections::BTreeMap::new();
-                            for placement in placements {
-                                *per_node.entry(placement.node_id.0.clone()).or_insert(0u32) += 1;
-                            }
-                            per_node
-                        },
-                    ),
-                    service_port: spec.port,
-                },
-            )
-            .collect::<Vec<_>>();
-        apps.sort_by(|left, right| {
-            (&left.namespace, &left.app).cmp(&(&right.namespace, &right.app))
-        });
-        apps
+        council_app_evidence(&desired, live_nodes)
     } else {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let (response, receiver) = oneshot::channel();
@@ -4624,14 +4632,14 @@ async fn local_top_rows(state: &ApiState) -> Result<Vec<crate::bun::top::TopRow>
                 .unwrap_or_default()
                 .as_secs()
                 .saturating_sub(USAGE_WINDOW_SECS);
-            let sql = format!(
-                "SELECT timestamp, metric_name, labels, value FROM metrics \
-                 WHERE metric_name IN ('{CPU_METRIC}', '{MEMORY_METRIC}') \
-                 AND timestamp >= {since} ORDER BY timestamp"
-            );
             // Missing samples leave the columns empty; they don't hide the
             // workloads themselves.
-            match mayo.read().await.query_sql_since(&sql, since).await {
+            match mayo
+                .read()
+                .await
+                .query_names_since(&[CPU_METRIC, MEMORY_METRIC], since)
+                .await
+            {
                 Ok(samples) => crate::bun::top::latest_usage(&samples),
                 Err(_) => std::collections::HashMap::new(),
             }
@@ -8090,12 +8098,7 @@ async fn metrics_query_handler(
     }
 
     if name == "*" {
-        let sql = format!(
-            "SELECT timestamp, metric_name, labels, value FROM metrics \
-             WHERE timestamp >= {start} AND timestamp <= {end} \
-             ORDER BY timestamp LIMIT 10000"
-        );
-        match store.query_sql_since(&sql, start).await {
+        match store.query_all(start, end).await {
             Ok(results) => {
                 let data: Vec<serde_json::Value> = results
                     .iter()
@@ -8199,6 +8202,13 @@ fn statuses_to_dashboard_apps(
         }
         if matches!(instance.state.as_str(), "failed" | "unhealthy") {
             row.state = "unhealthy".into();
+        }
+    }
+    for app in desired.iter().filter(|app| app.blocked.is_some()) {
+        if let Some(row) = rows.get_mut(&(app.namespace.clone(), app.app.clone()))
+            && row.state == "pending"
+        {
+            row.state = "blocked".into();
         }
     }
     for row in rows.values_mut() {
@@ -8355,6 +8365,11 @@ async fn app_detail_handler(
     let (overall_state, desired_instances) = summary
         .map(|row| (row.state, row.instances_desired))
         .unwrap_or_else(|| ("unknown".to_string(), 0));
+    let blocked = desired
+        .iter()
+        .find(|evidence| evidence.app == app && evidence.namespace == namespace)
+        .and_then(|evidence| evidence.blocked.as_ref())
+        .map(ToString::to_string);
 
     let env = if let Some(council) = &state.council {
         let desired = council.desired_state().await;
@@ -8423,6 +8438,7 @@ async fn app_detail_handler(
         app_name: app,
         namespace,
         state: overall_state,
+        blocked,
         desired_instances,
         instances,
         env,
@@ -8820,16 +8836,7 @@ async fn metrics_rollup_handler(
 
     let result = match &params.name {
         Some(name) => store.query_cluster_metric(name, start, end).await,
-        None => {
-            let sql = format!(
-                "SELECT timestamp, metric_name, labels, SUM(sum_val) as total_sum \
-                 FROM rollups \
-                 WHERE timestamp >= {start} AND timestamp <= {end} \
-                 GROUP BY timestamp, metric_name, labels \
-                 ORDER BY timestamp LIMIT 10000"
-            );
-            store.query_sql(&sql).await
-        }
+        None => store.query_all(start, end).await,
     };
 
     match result {
@@ -10469,6 +10476,7 @@ mod tests {
             scheduled_replicas: 1,
             placements: Default::default(),
             service_port: Some(8080),
+            blocked: None,
         };
 
         let visible = filter_desired_apps_for_scope(
@@ -15833,6 +15841,31 @@ schedule = "* * * * *"
         assert_eq!(repositories(body), ["team-a/web", "team-b/web", "web"]);
     }
 
+    /// #326: the council's record of why an app isn't placed reaches every
+    /// reader of desired-app evidence (`relish status`, `inspect`, `wtf`
+    /// and the dashboard).
+    #[test]
+    fn council_app_evidence_carries_the_quota_block() {
+        let mut desired = crate::council::types::DesiredState::default();
+        let greedy = crate::meat::types::AppId::new("greedy", "prod");
+        let fine = crate::meat::types::AppId::new("fine", "prod");
+        let spec: crate::config::app::AppSpec = toml::from_str(r#"image = "x:1""#).unwrap();
+        desired.apps.insert(greedy.clone(), spec.clone());
+        desired.apps.insert(fine.clone(), spec);
+        let reason = crate::meat::quota::QuotaError::MaxAppsExceeded {
+            namespace: "prod".into(),
+            current: 1,
+            limit: 1,
+        };
+        desired.quota_blocked.insert(greedy, reason.clone());
+
+        let evidence = council_app_evidence(&desired, 1);
+        assert_eq!(evidence[0].app, "fine");
+        assert_eq!(evidence[0].blocked, None);
+        assert_eq!(evidence[1].app, "greedy");
+        assert_eq!(evidence[1].blocked, Some(reason));
+    }
+
     #[test]
     fn dashboard_shows_desired_replicas_and_counts_only_running_instances() {
         let mut running: InstanceStatus = serde_json::from_value(serde_json::json!({
@@ -15851,6 +15884,7 @@ schedule = "* * * * *"
                 scheduled_replicas: 2,
                 placements: Default::default(),
                 service_port: None,
+                blocked: None,
             },
             crate::bun::diagnostics::DesiredAppEvidence {
                 app: "pending".into(),
@@ -15859,6 +15893,7 @@ schedule = "* * * * *"
                 scheduled_replicas: 0,
                 placements: Default::default(),
                 service_port: None,
+                blocked: None,
             },
         ];
         let rows = statuses_to_dashboard_apps(&[running.clone(), failed], &desired);
@@ -15870,6 +15905,20 @@ schedule = "* * * * *"
             (pending.instances_running, pending.instances_desired),
             (0, 2)
         );
+        assert_eq!(pending.state, "pending");
+
+        // #326: an app the namespace quota keeps off every node reads as
+        // blocked, not as waiting for room.
+        let mut quota_blocked = desired.clone();
+        quota_blocked[1].blocked = Some(crate::meat::quota::QuotaError::MaxAppsExceeded {
+            namespace: "default".into(),
+            current: 1,
+            limit: 1,
+        });
+        let rows = statuses_to_dashboard_apps(&[running.clone()], &quota_blocked);
+        let pending = rows.iter().find(|row| row.name == "pending").unwrap();
+        assert_eq!(pending.state, "blocked");
+
         running.state = "stopped".into();
         let rows = statuses_to_dashboard_apps(&[running], &desired);
         assert_eq!(

@@ -34,7 +34,10 @@ pub struct NamespaceUsage {
 }
 
 /// Quota check error.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+///
+/// Also the durable reason an app isn't placed: the leader records it in
+/// the council's `DesiredState::quota_blocked`, so it is serialisable.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, thiserror::Error)]
 pub enum QuotaError {
     #[error("namespace {namespace:?} would exceed CPU quota: {current}+{requested} > {limit}m")]
     CpuExceeded {

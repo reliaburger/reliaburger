@@ -73,6 +73,9 @@ pub struct AppDetailData {
     pub app_name: String,
     pub namespace: String,
     pub state: String,
+    /// Why the scheduler won't place the app (its namespace quota has no
+    /// room), when it won't.
+    pub blocked: Option<String>,
     pub instances: Vec<InstanceStatus>,
     pub env: Vec<SafeEnvValue>,
     pub deploy_history: Vec<DeployHistoryEntry>,

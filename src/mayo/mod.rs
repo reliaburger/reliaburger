@@ -12,6 +12,7 @@ pub mod rollup;
 pub mod rollup_generator;
 pub mod rollup_store;
 pub mod rollup_worker;
+pub(crate) mod scan;
 pub mod scrape;
 pub mod series;
 pub mod store;

@@ -187,6 +187,10 @@ pub struct DesiredAppEvidence {
     pub placements: BTreeMap<String, u32>,
     /// Declared service port. `None` means this app is not a service.
     pub service_port: Option<u16>,
+    /// Why the scheduler won't place the app: its namespace quota has no
+    /// room. `None` when nothing blocks it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked: Option<crate::meat::quota::QuotaError>,
 }
 
 /// Current diagnostics wire schema.

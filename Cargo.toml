@@ -66,6 +66,9 @@ argon2 = "0.5"
 age = { version = "0.10", features = ["armor"] }
 base64 = "0.22"
 datafusion = "55"
+# DataFusion declares `TableProvider` with `#[async_trait]`; Mayo's streamed
+# Parquet table (#377) implements it, so it needs the same attribute.
+async-trait = "0.1"
 object_store = { version = "0.14", features = ["fs", "aws", "gcp"] }
 url = "2"
 sysinfo = "0.33"

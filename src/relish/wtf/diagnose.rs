@@ -544,6 +544,26 @@ fn check_replicas(inputs: &WtfInputs, report: &mut WtfReport) {
             continue;
         }
         found = true;
+        // The scheduler isn't failing to find room: the namespace quota
+        // forbids it, and only the operator can change that.
+        if let Some(reason) = &app.blocked {
+            report.warnings.push(WtfFinding {
+                id: "quota-blocked".to_string(),
+                title: format!(
+                    "app {}/{} is not placed: its namespace quota has no room",
+                    app.app, app.namespace
+                ),
+                details: vec![reason.clone()],
+                suggestion: format!(
+                    "raise the quota in the [namespace.{}] block and apply it, or shrink or \
+                     delete other apps in {}; the app is placed on the next scheduling pass",
+                    app.namespace, app.namespace
+                ),
+                correlated_events: Vec::new(),
+                affected_resource: app_resource(&app.app, &app.namespace),
+            });
+            continue;
+        }
         let replicas = |count: u32| {
             if count == 1 {
                 "1 replica".to_string()
@@ -1061,6 +1081,7 @@ mod tests {
                     placed: BTreeMap::from([("node-1".to_string(), 1)]),
                     running: BTreeMap::from([("node-1".to_string(), 1)]),
                     unanswered: Vec::new(),
+                    blocked: None,
                 }]),
                 alerts: available(Vec::new()),
                 cpu_throttling: available(Vec::new()),
@@ -1537,6 +1558,7 @@ mod tests {
             ]),
             running: BTreeMap::from([("node-1".to_string(), 1), ("node-2".to_string(), 1)]),
             unanswered: vec!["node-3".to_string()],
+            blocked: None,
         }]);
 
         let report = diagnose(&inputs);
@@ -1563,6 +1585,7 @@ mod tests {
             placed: BTreeMap::from([("node-1".to_string(), 2)]),
             running: BTreeMap::from([("node-1".to_string(), 1)]),
             unanswered: Vec::new(),
+            blocked: None,
         }]);
         let report = diagnose(&inputs);
         let finding = report
@@ -1587,6 +1610,7 @@ mod tests {
             placed: BTreeMap::from([("node-1".to_string(), 1), ("node-3".to_string(), 1)]),
             running: BTreeMap::from([("node-1".to_string(), 1)]),
             unanswered: Vec::new(),
+            blocked: None,
         }]);
         let report = diagnose(&inputs);
         let finding = report
@@ -1600,6 +1624,46 @@ mod tests {
         );
     }
 
+    /// #326: an app its namespace quota keeps unplaced is its own finding,
+    /// naming the quota, not a vague under-replication.
+    #[test]
+    fn an_over_quota_app_is_flagged_with_the_quota_that_blocks_it() {
+        let mut inputs = healthy_inputs();
+        let reason = "namespace \"prod\" would exceed CPU quota: 0+1600 > 1000m";
+        inputs.applications.replicas = available(vec![ReplicaObservation {
+            app: "greedy".to_string(),
+            namespace: "prod".to_string(),
+            desired_replicas: 2,
+            placed: BTreeMap::new(),
+            running: BTreeMap::new(),
+            unanswered: Vec::new(),
+            blocked: Some(reason.to_string()),
+        }]);
+
+        let report = diagnose(&inputs);
+
+        let finding = report
+            .warnings
+            .iter()
+            .find(|finding| finding.id == "quota-blocked")
+            .expect("a quota-blocked app is a warning");
+        assert_eq!(
+            finding.title,
+            "app greedy/prod is not placed: its namespace quota has no room"
+        );
+        assert_eq!(finding.details, [reason]);
+        assert_eq!(finding.affected_resource, "app.greedy/prod");
+        assert!(finding.suggestion.contains("[namespace.prod]"));
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|finding| finding.id == "under-replicated"),
+            "the quota finding replaces the generic one"
+        );
+        assert!(!report.ok.iter().any(|ok| ok.id == "replicas"));
+    }
+
     #[test]
     fn apps_at_or_above_their_desired_replicas_are_ok() {
         let mut inputs = healthy_inputs();
@@ -1611,6 +1675,7 @@ mod tests {
             placed: BTreeMap::from([("node-1".to_string(), 1)]),
             running: BTreeMap::from([("node-1".to_string(), 2)]),
             unanswered: Vec::new(),
+            blocked: None,
         }]);
         let report = diagnose(&inputs);
         assert!(report.warnings.is_empty());

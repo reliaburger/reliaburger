@@ -431,7 +431,10 @@ pub fn spawn_leader_scheduler(
 
             let unheard = unheard_nodes(&alive, &reports);
             let suspect = nodes_in_state(&members, NodeState::Suspect);
-            let decisions = plan_scheduling_pass_with_dns(
+            let PassPlan {
+                decisions,
+                quota_blocked,
+            } = plan_pass(
                 &mut cache,
                 &desired,
                 &alive,
@@ -521,6 +524,13 @@ pub fn spawn_leader_scheduler(
                     );
                 }
             }
+            // Why an app isn't placed is durable council state, so any node
+            // can answer `relish status`. Written only when it changes.
+            if let Some(update) = quota_blocked_update(&desired.quota_blocked, &quota_blocked)
+                && let Err(e) = council.write(update).await
+            {
+                eprintln!("scheduler: failed to record quota-blocked apps: {e}");
+            }
         }
     });
     admission
@@ -559,11 +569,8 @@ fn plan_scheduling_pass(
     )
 }
 
-/// Plan a pass with the cluster's configured DNS requirement.
-///
-/// The requirement is an explicit configuration input. Deriving it from live
-/// capability reports creates a fail-open edge: if every DNS lease expires,
-/// absence would look exactly like an intentionally disabled resolver.
+/// The placements a pass decided on, for tests that only look at those.
+#[cfg(test)]
 fn plan_scheduling_pass_with_dns(
     cache: &mut ClusterStateCache,
     desired: &crate::council::types::DesiredState,
@@ -573,6 +580,68 @@ fn plan_scheduling_pass_with_dns(
     dns_required: bool,
     unheard: &HashSet<NodeId>,
 ) -> Vec<crate::meat::types::SchedulingDecision> {
+    plan_pass(
+        cache,
+        desired,
+        alive,
+        suspect,
+        quotas,
+        dns_required,
+        unheard,
+    )
+    .decisions
+}
+
+/// What one scheduling pass decided.
+#[derive(Debug, Default)]
+struct PassPlan {
+    /// Placements to commit.
+    decisions: Vec<crate::meat::types::SchedulingDecision>,
+    /// Apps the pass refused to place because their namespace quota has no
+    /// room, with the reason. Ordered so the Raft write is deterministic.
+    quota_blocked: BTreeMap<crate::meat::types::AppId, crate::meat::quota::QuotaError>,
+}
+
+/// The `QuotaBlocked` write that brings the recorded reasons in line with
+/// what this pass found, or `None` when they already match.
+///
+/// The leader plans a pass every tick, and an over-quota app stays blocked
+/// for as long as nobody changes the quota or the app. Writing the same set
+/// every tick would grow the Raft log for nothing, so only a change is
+/// proposed.
+fn quota_blocked_update(
+    recorded: &HashMap<crate::meat::types::AppId, crate::meat::quota::QuotaError>,
+    planned: &BTreeMap<crate::meat::types::AppId, crate::meat::quota::QuotaError>,
+) -> Option<RaftRequest> {
+    let unchanged = recorded.len() == planned.len()
+        && planned
+            .iter()
+            .all(|(app_id, reason)| recorded.get(app_id) == Some(reason));
+    if unchanged {
+        return None;
+    }
+    Some(RaftRequest::QuotaBlocked {
+        blocked: planned
+            .iter()
+            .map(|(app_id, reason)| (app_id.clone(), reason.clone()))
+            .collect(),
+    })
+}
+
+/// Plan a pass with the cluster's configured DNS requirement.
+///
+/// The requirement is an explicit configuration input. Deriving it from live
+/// capability reports creates a fail-open edge: if every DNS lease expires,
+/// absence would look exactly like an intentionally disabled resolver.
+fn plan_pass(
+    cache: &mut ClusterStateCache,
+    desired: &crate::council::types::DesiredState,
+    alive: &HashSet<NodeId>,
+    suspect: &HashSet<NodeId>,
+    quotas: &mut crate::meat::quota::QuotaLedger,
+    dns_required: bool,
+    unheard: &HashSet<NodeId>,
+) -> PassPlan {
     use crate::meat::scheduler::Scheduler;
 
     for node_id in cache.node_ids() {
@@ -588,6 +657,7 @@ fn plan_scheduling_pass_with_dns(
         }
     }
     let mut decisions = Vec::new();
+    let mut quota_blocked = BTreeMap::new();
     // A stable order so a pass is deterministic (HashMap iteration isn't).
     let mut app_ids: Vec<_> = desired.apps.keys().cloned().collect();
     app_ids.sort_by_key(|a| a.to_string());
@@ -660,16 +730,20 @@ fn plan_scheduling_pass_with_dns(
         }
 
         // Quota admission (cumulative within the pass, on top of the seeded
-        // committed usage). A rejection is a deploy-time error surfaced
-        // through the log, not a silent skip that leaves the app forever
-        // pending without explanation.
+        // committed usage). A rejection is returned with the plan, and the
+        // leader records it in council state, so the app isn't left pending
+        // without an explanation anyone can read.
         let per_replica = scheduler_resources(spec);
         let is_new_app = !desired.scheduling.contains_key(app_id);
         if !quotas.is_empty()
             && let Err(e) =
                 quotas.try_admit(&app_id.namespace, &per_replica, want as u32, is_new_app)
         {
-            eprintln!("scheduler: quota rejects {app_id}: {e}");
+            // Log only news, not the same rejection every tick.
+            if desired.quota_blocked.get(app_id) != Some(&e) {
+                eprintln!("scheduler: quota rejects {app_id}: {e}");
+            }
+            quota_blocked.insert(app_id.clone(), e);
             continue;
         }
 
@@ -764,7 +838,10 @@ fn plan_scheduling_pass_with_dns(
             }
         }
     }
-    decisions
+    PassPlan {
+        decisions,
+        quota_blocked,
+    }
 }
 
 /// Record in `cache` exactly the replicas of `app_id` that `kept` places on
@@ -5652,12 +5729,12 @@ image = "busybox:latest"
         );
     }
 
-    /// Pins the 0.1.0 quota contract the whitepaper (Q13) and the Meat design
-    /// doc describe: an over-quota app passes validation and `relish apply`
-    /// writes it to desired state, but the leader's scheduling pass never
-    /// places it. The rejection is only a line in the leader's log.
+    /// An over-quota app passes validation and `relish apply` writes it to
+    /// desired state, but the leader's scheduling pass never places it. The
+    /// pass says why, so the leader can record the reason in council state
+    /// (#326) instead of leaving only a line in its log.
     #[test]
-    fn over_quota_apply_is_accepted_but_never_placed() {
+    fn over_quota_app_is_not_placed_and_the_pass_says_why() {
         let config = crate::config::Config::parse(
             r#"
             [namespace.prod]
@@ -5687,20 +5764,172 @@ image = "busybox:latest"
                 other => panic!("unexpected write for this config: {other:?}"),
             }
         }
+        let greedy = AppId::new("greedy", "prod");
         assert!(
-            desired.apps.contains_key(&AppId::new("greedy", "prod")),
+            desired.apps.contains_key(&greedy),
             "apply writes the over-quota app to desired state"
         );
 
+        let plan = quota_pass(&desired);
+        assert!(
+            plan.decisions.is_empty(),
+            "the scheduling pass leaves the over-quota app unplaced: {:?}",
+            plan.decisions
+        );
+        assert_eq!(
+            plan.quota_blocked.get(&greedy),
+            Some(&crate::meat::quota::QuotaError::CpuExceeded {
+                namespace: "prod".to_string(),
+                current: 0,
+                requested: 1600,
+                limit: 1000,
+            }),
+            "the pass records why the app isn't placed"
+        );
+    }
+
+    /// Plan one pass on a roomy node with the quotas `desired` declares.
+    fn quota_pass(desired: &DesiredState) -> PassPlan {
         let mut cache = ClusterStateCache::new();
         cache.set_node(sched_node("big", 10000, BTreeMap::new()));
         let mut quotas = crate::meat::quota::ledger_from_namespaces(&desired.namespaces);
         let alive = HashSet::from([NodeId::new("big")]);
-        let decisions = plan_scheduling_pass(&mut cache, &desired, &alive, &mut quotas);
+        plan_pass(
+            &mut cache,
+            desired,
+            &alive,
+            &HashSet::new(),
+            &mut quotas,
+            false,
+            &HashSet::new(),
+        )
+    }
+
+    fn cpu_namespace(cpu: &str) -> crate::config::NamespaceSpec {
+        crate::config::NamespaceSpec {
+            cpu: Some(cpu.to_string()),
+            memory: None,
+            gpu: None,
+            max_apps: None,
+            max_replicas: None,
+        }
+    }
+
+    /// Growing the namespace's budget clears the reason on the next pass,
+    /// and the app is placed.
+    #[test]
+    fn quota_block_clears_once_the_namespace_quota_grows() {
+        let mut desired = DesiredState::default();
+        desired
+            .namespaces
+            .insert("prod".to_string(), cpu_namespace("1000m"));
+        let greedy = AppId::new("greedy", "prod");
+        desired.apps.insert(greedy.clone(), app_spec(800, 2));
+        assert!(quota_pass(&desired).quota_blocked.contains_key(&greedy));
+
+        desired
+            .namespaces
+            .insert("prod".to_string(), cpu_namespace("2000m"));
+        let plan = quota_pass(&desired);
+        assert!(plan.quota_blocked.is_empty(), "{:?}", plan.quota_blocked);
+        assert_eq!(plan.decisions.len(), 1, "the app now fits and is placed");
+    }
+
+    /// Removing the apps that used the budget clears the reason too.
+    #[test]
+    fn quota_block_clears_once_other_apps_leave_the_namespace() {
+        let mut desired = DesiredState::default();
+        desired
+            .namespaces
+            .insert("prod".to_string(), cpu_namespace("1000m"));
+        let first = AppId::new("a-first", "prod");
+        let second = AppId::new("b-second", "prod");
+        desired.apps.insert(first.clone(), app_spec(600, 1));
+        desired.apps.insert(second.clone(), app_spec(600, 1));
+
+        let plan = quota_pass(&desired);
+        assert!(!plan.quota_blocked.contains_key(&first));
         assert!(
-            decisions.is_empty(),
-            "the scheduling pass leaves the over-quota app unplaced: {decisions:?}"
+            matches!(
+                plan.quota_blocked.get(&second),
+                Some(crate::meat::quota::QuotaError::CpuExceeded { current: 600, .. })
+            ),
+            "the second app is blocked by the first one's usage: {:?}",
+            plan.quota_blocked
         );
+
+        desired.apps.remove(&first);
+        let plan = quota_pass(&desired);
+        assert!(plan.quota_blocked.is_empty(), "{:?}", plan.quota_blocked);
+        assert_eq!(plan.decisions.len(), 1);
+    }
+
+    /// The leader proposes a `QuotaBlocked` write only when the set of
+    /// blocked apps or a reason changes. Every pass recomputes it, so an
+    /// unconditional write would churn the Raft log once a tick.
+    #[test]
+    fn an_unchanged_quota_block_writes_nothing() {
+        let greedy = AppId::new("greedy", "prod");
+        let reason = |current| crate::meat::quota::QuotaError::CpuExceeded {
+            namespace: "prod".to_string(),
+            current,
+            requested: 1600,
+            limit: 1000,
+        };
+        let recorded = HashMap::from([(greedy.clone(), reason(0))]);
+
+        let same = BTreeMap::from([(greedy.clone(), reason(0))]);
+        assert_eq!(quota_blocked_update(&recorded, &same), None);
+
+        let moved = BTreeMap::from([(greedy.clone(), reason(200))]);
+        assert_eq!(
+            quota_blocked_update(&recorded, &moved),
+            Some(RaftRequest::QuotaBlocked {
+                blocked: vec![(greedy.clone(), reason(200))],
+            }),
+            "a changed reason is written"
+        );
+
+        assert_eq!(
+            quota_blocked_update(&recorded, &BTreeMap::new()),
+            Some(RaftRequest::QuotaBlocked { blocked: vec![] }),
+            "an app that fits again is cleared"
+        );
+        assert_eq!(
+            quota_blocked_update(&HashMap::new(), &BTreeMap::new()),
+            None,
+            "nothing blocked and nothing recorded writes nothing"
+        );
+    }
+
+    /// Run several passes over the same over-quota state, applying what the
+    /// leader would write after each: the first records the block, and the
+    /// rest find nothing to write.
+    #[test]
+    fn a_steady_over_quota_cluster_stops_writing_after_the_first_pass() {
+        let mut desired = DesiredState::default();
+        desired
+            .namespaces
+            .insert("prod".to_string(), cpu_namespace("1000m"));
+        desired
+            .apps
+            .insert(AppId::new("greedy", "prod"), app_spec(800, 2));
+
+        let first = quota_pass(&desired);
+        let Some(RaftRequest::QuotaBlocked { blocked }) =
+            quota_blocked_update(&desired.quota_blocked, &first.quota_blocked)
+        else {
+            panic!("the first pass records the block");
+        };
+        desired.quota_blocked = blocked.into_iter().collect();
+
+        for _ in 0..3 {
+            let again = quota_pass(&desired);
+            assert_eq!(
+                quota_blocked_update(&desired.quota_blocked, &again.quota_blocked),
+                None
+            );
+        }
     }
 
     /// A namespace with headroom admits the app.
