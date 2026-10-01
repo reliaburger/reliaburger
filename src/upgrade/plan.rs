@@ -632,6 +632,30 @@ mod tests {
     }
 
     #[test]
+    fn a_two_voter_council_is_refused_before_the_run_is_recorded() {
+        let err = check_council_can_roll(2).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                UpgradeError::CouncilTooSmallToRoll {
+                    voters: 2,
+                    remaining: 1,
+                    quorum: 2
+                }
+            ),
+            "{err}"
+        );
+        assert!(err.to_string().contains("at least three voters"));
+    }
+
+    #[test]
+    fn one_voter_or_three_and_more_can_roll() {
+        for voters in [0, 1, 3, 4, 5, 7] {
+            check_council_can_roll(voters).unwrap();
+        }
+    }
+
+    #[test]
     fn cluster_upgrade_proceeds_when_every_node_can_verify() {
         let nodes = [readiness("a", true), readiness("b", true)];
         check_network_prerequisites(Some("sig"), &nodes).unwrap();
