@@ -1,3 +1,4 @@
+use super::deploy_worker::DeployWorker;
 use super::trace::{MAX_CONCURRENT_TRACES, trace_dns_command, trace_dns_step, trace_tcp_command};
 use super::*;
 use crate::grill::mock::MockGrill;
@@ -8444,7 +8445,7 @@ fn rolling_health_wait_honours_the_configured_timeout_not_a_5s_cap() {
         ..Default::default()
     };
     assert_eq!(
-        super::effective_health_wait(&config),
+        super::deploy_worker::effective_health_wait(&config),
         std::time::Duration::from_secs(60)
     );
 
@@ -8453,7 +8454,7 @@ fn rolling_health_wait_honours_the_configured_timeout_not_a_5s_cap() {
         ..Default::default()
     };
     assert_eq!(
-        super::effective_health_wait(&short),
+        super::deploy_worker::effective_health_wait(&short),
         std::time::Duration::from_secs(2),
         "a short timeout is still honoured exactly"
     );
