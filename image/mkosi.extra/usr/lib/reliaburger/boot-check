@@ -23,6 +23,10 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
         findmnt -n -o TARGET,SOURCE,FSTYPE,OPTIONS / /usr 2>/dev/null | sed 's/^/reliaburger: mount: /'
         journalctl -b -o cat --no-pager -u systemd-repart.service -u systemd-growfs-root.service 2>/dev/null \
             | tail -n 40 | sed 's/^/reliaburger: journal: /'
+        # systemd breaks an ordering cycle by dropping jobs (a mount, say),
+        # and says so only in the journal; the CI boot test fails on this line.
+        journalctl -b -o cat --no-pager 2>/dev/null | grep "Found ordering cycle" \
+            | sed 's/^/reliaburger: ordering cycle: /'
         exit 0
     fi
     sleep 2
