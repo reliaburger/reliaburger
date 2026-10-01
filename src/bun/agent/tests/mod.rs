@@ -1,4 +1,4 @@
-
+use super::trace::{MAX_CONCURRENT_TRACES, trace_dns_command, trace_dns_step, trace_tcp_command};
 use super::*;
 use crate::grill::mock::MockGrill;
 
