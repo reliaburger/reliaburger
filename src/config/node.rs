@@ -314,9 +314,12 @@ pub struct SecuritySection {
     /// identity on disk, and a joiner starts in enrollment mode until
     /// `relish join` installs one.
     pub require_mtls: bool,
-    /// Known joining peers allowed through the perimeter to management and cluster
-    /// ports before membership exists. Does not change protocol authentication.
-    pub bootstrap_peers: Vec<std::net::IpAddr>,
+    /// Joining peers allowed through the perimeter to management and cluster
+    /// ports before membership exists: bare addresses, or IPv4/IPv6 CIDRs for
+    /// a network new nodes may join from (a fleet that grows later). Container
+    /// host ports stay closed to them. `/0` and CIDRs with host bits set are
+    /// rejected at load. Does not change protocol authentication.
+    pub bootstrap_peers: Vec<String>,
     /// Operator networks allowed through the perimeter firewall to this node's
     /// API port (`--listen`, default 9117) and to no other port. IPv4 or IPv6
     /// CIDRs, or bare addresses for a single host. `/0` and CIDRs with host

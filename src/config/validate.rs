@@ -575,6 +575,13 @@ impl NodeConfig {
                 reason: error.to_string(),
             })?;
         }
+        for value in &self.security.bootstrap_peers {
+            crate::firewall::rules::parse_cidr(value).map_err(|error| ConfigError::Validation {
+                field: "security.bootstrap_peers".to_string(),
+                context: "node config".to_string(),
+                reason: error.to_string(),
+            })?;
+        }
 
         self.testing
             .validate()
@@ -1151,6 +1158,24 @@ mod tests {
                 .to_string()
                 .contains("security.leaf_lifetime_override_secs")
         );
+    }
+
+    #[test]
+    fn bootstrap_peers_accept_addresses_and_networks_and_refuse_the_rest() {
+        let config = NodeConfig::parse(
+            "[security]\nbootstrap_peers = [\"192.168.1.51\", \"192.168.1.0/24\", \"fd00::/64\"]\n",
+        )
+        .unwrap();
+        config.validate().unwrap();
+        for bad in ["0.0.0.0/0", "192.168.1.51/24", "not-an-address"] {
+            let mut config = NodeConfig::default();
+            config.security.bootstrap_peers = vec![bad.to_string()];
+            let err = config.validate().unwrap_err();
+            assert!(
+                err.to_string().contains("security.bootstrap_peers"),
+                "{bad}: {err}"
+            );
+        }
     }
 
     #[test]

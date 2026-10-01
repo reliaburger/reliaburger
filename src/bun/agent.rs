@@ -2570,7 +2570,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         &mut self,
         cluster_ports: Vec<u16>,
         management_port: u16,
-        bootstrap_peers: Vec<std::net::IpAddr>,
+        bootstrap_peers: Vec<String>,
         operator_cidrs: Vec<String>,
     ) {
         self.perimeter_config.cluster_ports = cluster_ports;

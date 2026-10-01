@@ -5,16 +5,21 @@
 # stick labelled RBSEED and each node picks its own seed on boot
 # (reliaburger-seed.service).
 #
-#   seed-fleet.sh init <dir> --cluster NAME --operator IP [--ssh-key FILE] MAC@IP...
+#   seed-fleet.sh init <dir> --cluster NAME --operator IP [--network CIDR]
+#                          [--ssh-key FILE] MAC@IP...
 #       Creates the cluster (relish init, keys and CA stay in <dir>) and node
-#       1's seed. List node 1 first, and every node the cluster will have:
-#       each seed lets only these addresses through the firewall. IP is each node's reserved address;
-#       --operator is this laptop's address, the one relish connects from.
+#       1's seed. List node 1 first. Each node's firewall lets only these
+#       addresses reach the cluster ports before they've joined, unless
+#       --network names the LAN that nodes added later will join from
+#       (192.168.1.0/24, say); it needs a bun newer than 0.1.1. IP is each
+#       node's reserved address; --operator is this laptop's address, the
+#       one relish connects from.
 #       --ssh-key puts a public key in every seed (spike only: root SSH, for
 #       staging OS updates by hand until bun does it).
 #   seed-fleet.sh join <dir>
 #       Once node 1 is up: enrols every other node (a join token each, then
-#       relish join) and writes their seeds.
+#       relish join) and writes their seeds. To add nodes later, append
+#       "N MAC IP" lines to <dir>/fleet and run join again.
 #   . <dir>/env.sh
 #       Points relish at the cluster (endpoint, CA, admin token).
 #
@@ -63,12 +68,13 @@ shift 2
 
 case $cmd in
 init)
-    cluster= operator= ssh_key=
+    cluster= operator= ssh_key= network=
     nodes=()
     while [ $# -gt 0 ]; do
         case $1 in
             --cluster) cluster=$2; shift 2 ;;
             --operator) operator=$2; shift 2 ;;
+            --network) network=$2; shift 2 ;;
             --ssh-key) ssh_key=$2; shift 2 ;;
             *@*) nodes+=("$1"); shift ;;
             *) usage ;;
@@ -85,7 +91,7 @@ init)
         i=$((i + 1))
         echo "$i ${node%@*} ${node#*@}"
     done > "$dir/fleet"
-    echo "$cluster $operator $addresses" > "$dir/cluster"
+    echo "$cluster $operator $addresses $network" > "$dir/cluster"
     if [ -n "$ssh_key" ]; then
         cp "$ssh_key" "$dir/authorized_keys"
     fi
@@ -98,7 +104,8 @@ init)
     cp "$dir/init/$cluster-security-bootstrap.json" "$node/security-bootstrap.json"
     (umask 077; "$h/seed-admin" "$node/security-bootstrap.json" > "$dir/admin.token")
     "$tools/node-toml.py" --cluster "$cluster" --addresses "$addresses" --index 1 \
-        --operator "$operator" ${OPERATOR_KEY:+--operator-key "$OPERATOR_KEY"} > "$node/node.toml"
+        --operator "$operator" ${network:+--network "$network"} \
+        ${OPERATOR_KEY:+--operator-key "$OPERATOR_KEY"} > "$node/node.toml"
     check "$node/node.toml"
     first=$(head -n 1 "$dir/fleet")
     echo "seed for node-01 ($(echo "$first" | cut -d' ' -f2)):"
@@ -115,7 +122,10 @@ ENV
 join)
     [ -f "$dir/fleet" ] || { echo "$dir holds no fleet; run init first" >&2; exit 1; }
     dir=$(cd "$dir" && pwd)
-    read -r cluster operator addresses < "$dir/cluster"
+    # Without --network (and in fleets made before it) nodes admit only the
+    # addresses listed at init.
+    read -r cluster operator addresses network < "$dir/cluster"
+    addresses=$(cut -d' ' -f3 "$dir/fleet" | paste -sd, -)
     # shellcheck disable=SC1091
     . "$dir/env.sh"
     first_ip=$(head -n 1 "$dir/fleet" | cut -d' ' -f3)
@@ -132,7 +142,8 @@ join)
         rm -f "$node/join-token"
         cp "$dir/init/$cluster-master.key" "$node/master.key"
         "$tools/node-toml.py" --cluster "$cluster" --addresses "$addresses" --index "$i" \
-            --operator "$operator" ${OPERATOR_KEY:+--operator-key "$OPERATOR_KEY"} > "$node/node.toml"
+            --operator "$operator" ${network:+--network "$network"} \
+            ${OPERATOR_KEY:+--operator-key "$OPERATOR_KEY"} > "$node/node.toml"
         check "$node/node.toml"
         echo "seed for $id ($mac):"
         pack "$node" "$mac"

@@ -94,7 +94,7 @@ pub fn node_config(
     config.cluster.join = seed.into_iter().map(|ip| format!("{ip}:9443")).collect();
     config.network.advertise_address = Some(address.to_string());
     config.security.require_mtls = true;
-    config.security.bootstrap_peers = peers.iter().copied().map(std::net::IpAddr::V4).collect();
+    config.security.bootstrap_peers = peers.iter().map(ToString::to_string).collect();
     config.security.allow_insecure_cluster = false;
     config.security.identity_dir = Some("/etc/reliaburger/identity".into());
     config.security.master_key_path = Some("/etc/reliaburger/master.key".into());
@@ -297,7 +297,7 @@ mod tests {
         assert!(node.security.require_mtls);
         assert_eq!(
             node.security.bootstrap_peers,
-            vec!["192.168.104.3".parse::<std::net::IpAddr>().unwrap()]
+            vec!["192.168.104.3".to_string()]
         );
         assert!(!node.security.allow_insecure_cluster);
         assert!(node.security.bootstrap_path.is_some());

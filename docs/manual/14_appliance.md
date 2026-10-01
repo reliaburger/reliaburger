@@ -131,10 +131,12 @@ image/tools/seed-fleet.sh init ~/home-cluster --cluster home --operator 192.168.
 `--operator` is your laptop's address, the one relish connects from. Only
 that address can reach the nodes' API.
 
-List every machine the cluster will ever have, now. Each seed carries the
-list, and a node's firewall only lets in the listed addresses until they've
-joined. So a machine added later can't reach the others (see
-[What's missing](#whats-missing)). The first run builds a small helper
+List every machine you have now. A node's firewall only lets in the listed
+addresses until they've joined, so a machine added later can't reach the
+others. With a bun newer than 0.1.1, `--network 192.168.1.0/24` lets in
+any machine on your LAN instead (only to the cluster ports, which all need
+the cluster's certificates). Then add a machine by appending `N MAC IP` to
+`~/home-cluster/fleet` and running `seed-fleet.sh join` again. The first run builds a small helper
 from the repository, which takes a few minutes.
 
 `~/home-cluster/init` now holds the cluster's master key and its sealed root
@@ -249,9 +251,9 @@ it also uses port 8080. `bootctl list` on the node shows both versions afterward
   enrols it.
 - **No OS updates run by bun.** Staging by hand over SSH stands in for them.
 - **Secure Boot** has to be off.
-- **No adding machines later.** Seeds carry the address list from
-  `seed-fleet.sh init`, and the other nodes' firewalls drop a machine that
-  isn't on it. Adding one means editing `bootstrap_peers` in
+- **Adding machines later needs `--network`**, and so a bun newer than
+  0.1.1. Without it, seeds carry only the addresses from `seed-fleet.sh
+  init`, and adding a machine means editing `bootstrap_peers` in
   `/etc/reliaburger/node.toml` on every node and restarting bun.
 - **Two machines can't roll a bun upgrade.** Both are in the council, and
   upgrading one would leave the other without a majority, so

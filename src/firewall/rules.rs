@@ -44,7 +44,7 @@ pub struct PerimeterConfig {
     /// Explicit peers permitted to reach authenticated enrolment and cluster ports
     /// before gossip discovers them. Does not open container host ports.
     #[serde(default)]
-    pub bootstrap_peers: Vec<IpAddr>,
+    pub bootstrap_peers: Vec<String>,
 }
 
 impl Default for PerimeterConfig {
@@ -173,6 +173,7 @@ fn render_family_table(
     config: &PerimeterConfig,
     node_ips: &[IpAddr],
     operator_cidrs: &[(IpAddr, u8)],
+    bootstrap_peers: &[(IpAddr, u8)],
 ) -> String {
     let mut rules = String::new();
 
@@ -234,10 +235,14 @@ fn render_family_table(
         .map(u16::to_string)
         .collect::<Vec<_>>()
         .join(", ");
-    for peer in &config.bootstrap_peers {
-        if peer.is_ipv4() != (family == "ip") {
-            continue;
-        }
+    for &(address, prefix_len) in bootstrap_peers {
+        // A single host renders bare, as it always has; a network as a CIDR.
+        let host_len = if address.is_ipv4() { 32 } else { 128 };
+        let peer = if prefix_len == host_len {
+            address.to_string()
+        } else {
+            render_cidr(address, prefix_len)
+        };
         rules.push_str(&format!(
             "    {saddr_keyword} saddr {peer} tcp dport {{ {tcp_ports} }} accept\n"
         ));
@@ -299,21 +304,14 @@ fn render_family_table(
 /// ports from non-authorised sources. SSH and everything else the
 /// operator runs is untouched.
 ///
-/// Errors when an operator CIDR does not parse; nothing unvalidated is
+/// Errors when an operator CIDR or bootstrap peer does not parse; nothing unvalidated is
 /// ever rendered.
 pub fn generate_ruleset(
     config: &PerimeterConfig,
     cluster_nodes: &ClusterNodes,
 ) -> Result<String, FirewallError> {
-    let mut operator_v4: Vec<(IpAddr, u8)> = Vec::new();
-    let mut operator_v6: Vec<(IpAddr, u8)> = Vec::new();
-    for value in &config.operator_cidrs {
-        let (address, prefix_len) = parse_cidr(value)?;
-        match address {
-            IpAddr::V4(_) => operator_v4.push((address, prefix_len)),
-            IpAddr::V6(_) => operator_v6.push((address, prefix_len)),
-        }
-    }
+    let (operator_v4, operator_v6) = parse_cidrs_by_family(&config.operator_cidrs)?;
+    let (bootstrap_v4, bootstrap_v6) = parse_cidrs_by_family(&config.bootstrap_peers)?;
 
     let nodes_v4: Vec<IpAddr> = cluster_nodes
         .iter()
@@ -326,15 +324,31 @@ pub fn generate_ruleset(
         .filter(IpAddr::is_ipv6)
         .collect();
 
-    let mut rules = render_family_table("ip", "ip", config, &nodes_v4, &operator_v4);
+    let mut rules = render_family_table("ip", "ip", config, &nodes_v4, &operator_v4, &bootstrap_v4);
     rules.push_str(&render_family_table(
         "ip6",
         "ip6",
         config,
         &nodes_v6,
         &operator_v6,
+        &bootstrap_v6,
     ));
     Ok(rules)
+}
+
+/// Parse CIDRs (or bare addresses), split into IPv4 and IPv6.
+type CidrsByFamily = (Vec<(IpAddr, u8)>, Vec<(IpAddr, u8)>);
+fn parse_cidrs_by_family(values: &[String]) -> Result<CidrsByFamily, FirewallError> {
+    let mut v4 = Vec::new();
+    let mut v6 = Vec::new();
+    for value in values {
+        let (address, prefix_len) = parse_cidr(value)?;
+        match address {
+            IpAddr::V4(_) => v4.push((address, prefix_len)),
+            IpAddr::V6(_) => v6.push((address, prefix_len)),
+        }
+    }
+    Ok((v4, v6))
 }
 
 /// Apply the firewall ruleset to the kernel via nftables. The `nft`
@@ -423,7 +437,7 @@ mod tests {
     #[test]
     fn bootstrap_peers_can_enrol_without_opening_container_ports_to_outsiders() {
         let config = PerimeterConfig {
-            bootstrap_peers: vec!["192.168.104.5".parse().unwrap(), "fd00::5".parse().unwrap()],
+            bootstrap_peers: vec!["192.168.104.5".to_string(), "fd00::5".to_string()],
             ..Default::default()
         };
         let rules = generate_ruleset(&config, &ClusterNodes::new()).unwrap();
@@ -438,6 +452,35 @@ mod tests {
             rules.find("ip saddr 192.168.104.5").unwrap()
                 < rules.find("tcp dport 9117 drop").unwrap()
         );
+    }
+
+    #[test]
+    fn a_bootstrap_network_admits_joiners_to_cluster_ports_only() {
+        let config = PerimeterConfig {
+            bootstrap_peers: vec!["192.168.104.0/24".to_string(), "fd00::/64".to_string()],
+            ..Default::default()
+        };
+        let rules = generate_ruleset(&config, &ClusterNodes::new()).unwrap();
+        assert!(
+            rules.contains("ip saddr 192.168.104.0/24 tcp dport { 9117, 9443, 9444, 9445 } accept")
+        );
+        assert!(rules.contains("ip6 saddr fd00::/64 tcp dport { 9117, 9443, 9444, 9445 } accept"));
+        assert!(!rules.contains("ip saddr 192.168.104.0/24 accept"));
+        assert!(rules.contains("tcp dport 10000-60000 drop"));
+    }
+
+    #[test]
+    fn a_bootstrap_peer_that_does_not_parse_renders_nothing() {
+        for bad in ["0.0.0.0/0", "192.168.104.1/24", "10.0.0.0/8; drop", "nope"] {
+            let config = PerimeterConfig {
+                bootstrap_peers: vec![bad.to_string()],
+                ..Default::default()
+            };
+            assert!(
+                generate_ruleset(&config, &ClusterNodes::new()).is_err(),
+                "{bad}"
+            );
+        }
     }
 
     use super::*;

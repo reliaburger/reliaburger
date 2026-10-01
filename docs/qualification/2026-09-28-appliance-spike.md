@@ -112,6 +112,6 @@ PASS for everything that can be proven without the hardware, apart from one item
   - one OS update across the fleet.
 - **A rolling `relish upgrade` that swaps bun** on the appliance, once two release-signed versions share `protocol` and `state`.
 - **Found on the way, to fix outside the spike:**
-  - a seeded fleet can't grow past the addresses given to `seed-fleet.sh init`, since each seed fixes `bootstrap_peers` and the firewall drops anyone else before they join;
+  - a seeded fleet couldn't grow past the addresses given to `seed-fleet.sh init`, since each seed fixes `bootstrap_peers` and the firewall drops anyone else before they join. Fixed on this branch: `bootstrap_peers` takes CIDRs and `seed-fleet.sh init --network` writes the LAN (needs a bun newer than 0.1.1);
   - a two-node cluster held `relish upgrade` in `UpgradingCouncil` with no reason shown, and `abort` refused it because it wasn't paused. Fixed on this branch: `start` and a cluster `rollback` refuse a two-voter council, and the leader logs a quorum hold.
 - **S6:** fold the numbers into the research note, write `<date>-wyse-3040.md`, and give the go/no-go.
