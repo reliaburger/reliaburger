@@ -60,7 +60,13 @@ be visible until we remove its race.
 | `make test-cluster` | Gossip, placement, failover, healing, recovery and chaos | Linux, serial resource group; PRs into `main`, `main` and nightly |
 | `make test-upgrade-node` | Real single-node binary replacement | Linux; PRs into `main`, `main` and nightly |
 | `make test-upgrade-cluster` | Real rolling cluster replacement | Linux; PRs into `main`, `main` and nightly |
+| `make test-rootless-runc` | Rootless runc networking and port adoption as a non-root user | Privileged Linux; PRs into `main`, `main` and nightly |
+| `make test-standard-clients` | `crane` against Pickle's TLS listener | Linux, with a pinned `crane`; PRs into `main`, `main` and nightly |
 | `make test-apple` | Deferred Apple adapter | Manual Apple-silicon development check, outside 0.1.0 |
+| `make test-gpu`, `make test-s3` | Real NVIDIA hardware; a real S3 bucket | Manual |
+| `make test-ci-scripts`, `make check-ignored` | The CI scripts' fixtures; every `#[ignore]` names its owner | Every pull request ("CI policy") and `make ci` |
+| `make ci` | `fmt-check`, `lint`, `test`, `test-doc`, `test-ci-scripts`, `check-ignored` | Local; CI runs the same pieces as separate jobs |
+| `make ci-bench` | `make ci`, then `make bench` | Local |
 | `make bench` | Criterion transport and 5–250-node measurements | `main`, nightly, and PRs touching gossip |
 | `make bench-large` | Criterion 500- and 1,000-node measurements | `main`, nightly, and PRs touching gossip |
 | `make coverage` | The portable suite, run once under line coverage; this is the Linux test gate too | Linux |
@@ -75,19 +81,28 @@ acceptance uses Linux VMs (V04 in the roadmap's [known gaps](../roadmap.md#known
 
 Pull requests stacked on another branch skip the acceptance suites (wall-clock,
 cluster, upgrade and privileged Linux) unless labelled `full-ci`; they run once the
-PR targets `main`. Documentation-only pull requests skip the Rust jobs entirely,
-except for the manual and the snippets `documentation_first_run` checks.
+PR targets `main`, and `ci-retarget.yml` reruns CI as soon as GitHub retargets one.
+Documentation-only pull requests skip the Rust jobs entirely, except for the manual
+and the snippets `documentation_first_run` checks. `scripts/ci/test_select_jobs.py`
+holds a fixture for each of these rules.
+
+Every nextest suite in CI keeps its own JUnit report (`scripts/ci/keep-junit.sh`
+moves `target/nextest/ci/junit.xml` to `target/junit/<suite>.xml`, with a
+`.meta.txt` naming the command, commit, run and host) and each job uploads them as
+`junit-<job>` for 14 days, even on failure. The `ignored-test evidence` job fails
+when an ignored test owned by a gate CI runs is missing from every report; see
+[who runs an ignored test](../testing.md#who-runs-an-ignored-test).
 
 ### Tests no CI job runs
 
 These need hardware, credentials or a reboot that hosted runners can't provide. They
-are `#[ignore]`d with the reason, and each has a named way to run it:
+are `#[ignore]`d with a reason naming the target or script that runs them:
 
 | Test | Needs | How to run |
 |---|---|---|
 | `grill::apple::tests::*` | Apple silicon with Apple Container | `make test-apple` |
-| `bun::gpu::tests::nvidia_detector_finds_hardware` | An NVIDIA GPU and `nvidia-smi` | `RELIABURGER_GPU_TESTS=1 cargo nextest run --run-ignored=only -E 'test(nvidia_detector_finds_hardware)'` |
-| `ketchup::export::tests::export_to_real_s3_manual` | AWS credentials and a bucket | `RELIABURGER_TEST_S3_URL=s3://bucket/prefix cargo nextest run --run-ignored=only -E 'test(export_to_real_s3_manual)'` |
+| `bun::gpu::tests::nvidia_detector_finds_hardware` | An NVIDIA GPU and `nvidia-smi` | `make test-gpu` |
+| `ketchup::export::tests::export_to_real_s3_manual` | AWS credentials and a bucket | `RELIABURGER_TEST_S3_URL=s3://bucket/prefix make test-s3` |
 | `owned_runc::actual_host_reboot_*`, `oci_crash::actual_bun_kernel_discovery_host_reboot` | A Linux VM that can be rebooted mid-test | `scripts/release/qualify-oci-reboot.sh`, `scripts/release/qualify-discovery-reboot.sh` |
 | `power_cut::actual_power_cut_*` | A disposable Linux VM whose power can be cut while workers write | `scripts/release/qualify-storage-power-cut.sh --vm VM --fixture exporter\|leases\|backups --iterations N` |
 
@@ -131,9 +146,10 @@ The `all` predicate means both conditions must hold. This matters when macOS run
 Aya available. The compiler omits the module, so it must be counted as platform-specific
 rather than ignored.
 
-Use `#[ignore = "requires …"]` for code that compiles but needs root, a provisioned runtime
-or deliberate wall-clock time. The matching Make target supplies the prerequisite and runs
-ignored tests only. The first assertion in an environment-gated test is a preflight: asking
+Use `#[ignore = "requires …; run with make <gate>"]` for code that compiles but needs root,
+a provisioned runtime or deliberate wall-clock time. The matching Make target supplies the
+prerequisite and runs ignored tests only, and the reason must name it: `make check-ignored`
+fails on a reason with no owner. The first assertion in an environment-gated test is a preflight: asking
 for the suite without its prerequisite fails instead of manufacturing a pass.
 
 Do not inspect the host inside a test and return successfully. If a portable prerequisite
@@ -206,7 +222,7 @@ capacity. Criterion data is uploaded from CI, but we will not set a regression t
 until runs are stable on consistent hardware.
 
 `cargo-llvm-cov` runs the portable suite once, instrumented, and writes LCOV and HTML
-artefacts. On Linux that run is also the test gate and the JUnit source, so the suite isn't
+artefacts. On Linux that run is also the test gate and the portable JUnit source, so the suite isn't
 compiled and run a second time uninstrumented. The measured Linux CI line baseline is 79.65%, so CI starts at 78.65%,
 one percentage point lower. Raise it when coverage improves; do not lower it to land
 unrelated work.

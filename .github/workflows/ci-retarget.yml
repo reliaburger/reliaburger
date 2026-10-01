@@ -1,0 +1,21 @@
+name: CI after retarget
+
+# A stacked pull request skips the heavy suites until it targets main. GitHub
+# retargets it when the branch under it merges, but that's an `edited` event,
+# which ci.yml doesn't listen to, so the heavy suites used to wait for the
+# next push. This reruns the whole of CI, selection included, on a base
+# change. ci.yml can't take `edited` itself: a title or body edit would start
+# a run whose skipped jobs could replace the real results on the same commit.
+on:
+  pull_request:
+    branches: [main, "codex/**", "fix/**"]
+    types: [edited]
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    # Title and body edits fire `edited` too; only a base change reruns CI.
+    if: github.event.changes.base
+    uses: ./.github/workflows/ci.yml

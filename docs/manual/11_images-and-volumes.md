@@ -11,12 +11,14 @@ pulls anywhere in the cluster come from peers.
 relish images             # what the cluster's registry holds
 ```
 
-A multi-platform image is one row, with the platforms it offers:
+A multi-platform image is one row, with the platforms it offers. Images
+pulled through the cache live under `cache/<registry>/<repository>`, and the
+columns widen to fit those long names:
 
 ```text
-REPOSITORY                     TAG             PLATFORMS                      LAYERS         SIZE
-burger                         v1              linux/amd64, linux/arm64            -       9.4 MB
-podinfo                        6.5.4           -                                   4      32.1 MB
+REPOSITORY                          TAG     PLATFORMS                 LAYERS     SIZE
+burger                              v1      linux/amd64, linux/arm64       -   9.4 MB
+cache/ghcr.io/stefanprodan/podinfo  <none>  linux/amd64, linux/arm64       -  33.0 MB
 ```
 
 LAYERS is `-` because each platform has its own. `relish images --output json`

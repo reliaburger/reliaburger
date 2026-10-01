@@ -875,7 +875,7 @@ fn buildah_output(
 /// buildah bud + push, manifest lands in the catalog — through the
 /// async submit/poll API. Lima only (`RELIABURGER_BUILDAH_TESTS=1`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires Buildah and RELIABURGER_BUILDAH_TESTS=1"]
+#[ignore = "requires Buildah and RELIABURGER_BUILDAH_TESTS=1; run with make test-linux"]
 async fn buildah_build_lands_in_the_catalog() {
     assert!(
         std::env::var("RELIABURGER_BUILDAH_TESTS").is_ok(),
@@ -964,7 +964,7 @@ async fn buildah_build_lands_in_the_catalog() {
 /// signature that passes the deploy-time check (build-sign → deploy-verify
 /// round-trip). Lima only (`RELIABURGER_BUILDAH_TESTS=1`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires Buildah and RELIABURGER_BUILDAH_TESTS=1"]
+#[ignore = "requires Buildah and RELIABURGER_BUILDAH_TESTS=1; run with make test-linux"]
 async fn buildah_build_signs_and_the_signature_verifies_on_deploy() {
     assert!(
         std::env::var("RELIABURGER_BUILDAH_TESTS").is_ok(),
@@ -1091,7 +1091,7 @@ fn host_oci_architecture() -> &'static str {
 /// (the Lima VM) checks the other half.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires root, runc, Buildah, static /usr/bin/busybox, RELIABURGER_BUILDAH_TESTS=1 and RELIABURGER_RUNC_TESTS=1"]
+#[ignore = "requires root, runc, Buildah, static /usr/bin/busybox, RELIABURGER_BUILDAH_TESTS=1 and RELIABURGER_RUNC_TESTS=1; run with make test-linux"]
 async fn a_two_platform_build_runs_the_nodes_own_platform_under_runc() {
     use reliaburger::grill::runc::RuncGrill;
     use reliaburger::grill::{Grill, ImageStore, InstanceId, OciSpec};

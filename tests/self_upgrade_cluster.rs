@@ -725,7 +725,7 @@ fn phase_label(value: &serde_json::Value) -> String {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore = "requires RELIABURGER_UPGRADE_TESTS=1 and a multi-core host"]
+#[ignore = "requires RELIABURGER_UPGRADE_TESTS=1 and a multi-core host; run with make test-upgrade-cluster"]
 async fn rolling_upgrade_walks_workers_council_then_leader() {
     assert!(
         upgrade_tests_enabled(),
@@ -794,7 +794,7 @@ async fn one_shot_forward(target: String) -> String {
 }
 
 #[tokio::test]
-#[ignore = "requires RELIABURGER_UPGRADE_TESTS=1 and a multi-core host"]
+#[ignore = "requires RELIABURGER_UPGRADE_TESTS=1 and a multi-core host; run with make test-upgrade-cluster"]
 async fn relish_pushes_through_a_forward_while_nodes_fetch_from_the_cluster_address() {
     assert!(
         upgrade_tests_enabled(),
@@ -850,7 +850,7 @@ async fn relish_pushes_through_a_forward_while_nodes_fetch_from_the_cluster_addr
 /// follower case is `bun::api`'s
 /// `a_follower_forwards_upgrade_control_calls_to_the_leader_with_the_callers_token`.
 #[tokio::test]
-#[ignore = "requires RELIABURGER_UPGRADE_TESTS=1 and a multi-core host"]
+#[ignore = "requires RELIABURGER_UPGRADE_TESTS=1 and a multi-core host; run with make test-upgrade-cluster"]
 async fn upgrade_start_sent_to_a_node_that_is_not_the_leader_reaches_the_leader() {
     assert!(
         upgrade_tests_enabled(),
@@ -880,7 +880,7 @@ async fn upgrade_start_sent_to_a_node_that_is_not_the_leader_reaches_the_leader(
 }
 
 #[tokio::test]
-#[ignore = "requires RELIABURGER_UPGRADE_TESTS=1 and a multi-core host"]
+#[ignore = "requires RELIABURGER_UPGRADE_TESTS=1 and a multi-core host; run with make test-upgrade-cluster"]
 async fn start_refuses_same_version_other_bytes_and_unrequested_downgrades() {
     assert!(
         upgrade_tests_enabled(),
@@ -936,7 +936,7 @@ async fn start_refuses_same_version_other_bytes_and_unrequested_downgrades() {
 }
 
 #[tokio::test]
-#[ignore = "requires RELIABURGER_UPGRADE_TESTS=1 and a multi-core host"]
+#[ignore = "requires RELIABURGER_UPGRADE_TESTS=1 and a multi-core host; run with make test-upgrade-cluster"]
 async fn upgrade_failure_pauses_cluster_and_reverts_node() {
     assert!(
         upgrade_tests_enabled(),
@@ -1004,7 +1004,7 @@ async fn upgrade_failure_pauses_cluster_and_reverts_node() {
 }
 
 #[tokio::test]
-#[ignore = "requires RELIABURGER_UPGRADE_TESTS=1 and a multi-core host"]
+#[ignore = "requires RELIABURGER_UPGRADE_TESTS=1 and a multi-core host; run with make test-upgrade-cluster"]
 async fn cluster_rollback_returns_every_node_to_previous_version() {
     assert!(
         upgrade_tests_enabled(),
@@ -1060,7 +1060,7 @@ async fn cluster_rollback_returns_every_node_to_previous_version() {
 /// directive, the run paused, and the paused run blocked every later start.
 /// The leader now asks each node first and refuses the start outright.
 #[tokio::test]
-#[ignore = "requires RELIABURGER_UPGRADE_TESTS=1 and a multi-core host"]
+#[ignore = "requires RELIABURGER_UPGRADE_TESTS=1 and a multi-core host; run with make test-upgrade-cluster"]
 async fn start_refuses_when_a_node_cannot_verify_network_upgrades() {
     assert!(
         upgrade_tests_enabled(),
@@ -1096,7 +1096,7 @@ async fn start_refuses_when_a_node_cannot_verify_network_upgrades() {
 /// recorded, the first node refused it, and the run paused. The leader now
 /// asks the candidate for its formats before recording anything.
 #[tokio::test]
-#[ignore = "requires RELIABURGER_UPGRADE_TESTS=1 and a multi-core host"]
+#[ignore = "requires RELIABURGER_UPGRADE_TESTS=1 and a multi-core host; run with make test-upgrade-cluster"]
 async fn start_refuses_a_candidate_with_other_formats_before_recording_a_run() {
     assert!(
         upgrade_tests_enabled(),
@@ -1137,7 +1137,7 @@ async fn start_refuses_a_candidate_with_other_formats_before_recording_a_run() {
 /// The 0.1.1 soak's late refusal (#339): a rollback to a version no node
 /// held was accepted, and the run paused on the first node's 409.
 #[tokio::test]
-#[ignore = "requires RELIABURGER_UPGRADE_TESTS=1 and a multi-core host"]
+#[ignore = "requires RELIABURGER_UPGRADE_TESTS=1 and a multi-core host; run with make test-upgrade-cluster"]
 async fn rollback_to_a_version_the_nodes_lack_is_refused_before_recording_a_run() {
     assert!(
         upgrade_tests_enabled(),
@@ -1179,7 +1179,7 @@ async fn rollback_to_a_version_the_nodes_lack_is_refused_before_recording_a_run(
 /// A paused run is no longer a dead end: `relish upgrade abort` ends one
 /// that moved no node, and `relish upgrade rollback` replaces one outright.
 #[tokio::test]
-#[ignore = "requires RELIABURGER_UPGRADE_TESTS=1 and a multi-core host"]
+#[ignore = "requires RELIABURGER_UPGRADE_TESTS=1 and a multi-core host; run with make test-upgrade-cluster"]
 async fn paused_upgrade_can_be_aborted_or_replaced_by_a_rollback() {
     assert!(
         upgrade_tests_enabled(),
@@ -1298,7 +1298,7 @@ async fn registry_with_outage(
 /// fetch failed and that single blip paused the run. A registry that is
 /// down when the directive lands must be ridden out, not paused on.
 #[tokio::test]
-#[ignore = "requires RELIABURGER_UPGRADE_TESTS=1 and a multi-core host"]
+#[ignore = "requires RELIABURGER_UPGRADE_TESTS=1 and a multi-core host; run with make test-upgrade-cluster"]
 async fn a_registry_outage_at_directive_time_does_not_pause_the_upgrade() {
     assert!(
         upgrade_tests_enabled(),
