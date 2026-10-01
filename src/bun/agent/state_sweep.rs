@@ -93,8 +93,11 @@ pub(super) async fn sweep_states<G: Grill>(grill: G, reads: Vec<StateRead>) -> S
 
 async fn observe<G: Grill>(grill: &G, read: &StateRead) -> Observed {
     match grill.state(&read.id).await {
-        Ok(ContainerState::Stopped) if read.is_job => Observed::Exited {
-            exit_code: grill.exit_code(&read.id).await,
+        // A job's exit code the runtime couldn't read is unknown, not "none":
+        // the next sweep asks again rather than settling the outcome (#389).
+        Ok(ContainerState::Stopped) if read.is_job => match grill.exit_code(&read.id).await {
+            Ok(exit_code) => Observed::Exited { exit_code },
+            Err(_) => Observed::Unknown,
         },
         Ok(ContainerState::Stopped) => Observed::Exited { exit_code: None },
         Ok(_) => Observed::Alive,

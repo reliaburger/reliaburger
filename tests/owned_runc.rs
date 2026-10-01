@@ -140,7 +140,7 @@ async fn runc_owned_short_job_keeps_its_actual_exit_and_logs_after_reconstructio
     })
     .await
     .unwrap();
-    assert_eq!(recovered.exit_code(&id).await, Some(7));
+    assert_eq!(recovered.exit_code(&id).await.unwrap(), Some(7));
     assert!(recovered.logs(&id).await.unwrap().contains("short-job"));
     assert_absent(root.path(), &id);
 }
@@ -915,7 +915,7 @@ async fn actual_host_reboot_preserves_holds_and_retires_original_execution() {
                 "fixture must retain stale OCI metadata across reboot"
             );
             assert_eq!(runtime.state(&id).await.unwrap(), ContainerState::Stopped);
-            assert_eq!(runtime.exit_code(&id).await, None);
+            assert_eq!(runtime.exit_code(&id).await.unwrap(), None);
             assert_eq!(
                 runtime.state(&prepared).await.unwrap(),
                 ContainerState::Stopped
@@ -948,7 +948,7 @@ async fn actual_host_reboot_preserves_holds_and_retires_original_execution() {
             })
             .await
             .unwrap();
-            assert_eq!(runtime.exit_code(&id).await, Some(7));
+            assert_eq!(runtime.exit_code(&id).await.unwrap(), Some(7));
             runtime.release_network_reference(&successor).await.unwrap();
             assert_absent(root, &id);
             assert_absent(root, &prepared);

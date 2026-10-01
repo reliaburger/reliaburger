@@ -2384,6 +2384,9 @@ pub struct BunAgent<G: Grill> {
     /// Disk cleanup and provisioning running in tasks, which a later turn
     /// collects.
     off_loop_work: off_loop_work::OffLoopWork,
+    /// Retirement's reads of a network reference, likewise (#387).
+    network_reference_reads:
+        off_loop_work::OffLoopWork<Option<crate::grill::runc_intent::NetworkReference>>,
 }
 
 /// The last instance each phase of `drive_pending_restarts` handled.
@@ -2559,6 +2562,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             turn_deadline: None,
             namespace_firewall_stale: false,
             off_loop_work: off_loop_work::OffLoopWork::default(),
+            network_reference_reads: off_loop_work::OffLoopWork::default(),
             egress_resolving: None,
             adopted_apps: adopted_placements::AdoptedApps::new(),
         }
@@ -2708,6 +2712,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             turn_deadline: None,
             namespace_firewall_stale: false,
             off_loop_work: off_loop_work::OffLoopWork::default(),
+            network_reference_reads: off_loop_work::OffLoopWork::default(),
             egress_resolving: None,
             adopted_apps: adopted_placements::AdoptedApps::new(),
         }
@@ -3673,7 +3678,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 job.runtime_absent = true;
                 job.phase = match job.phase {
                     JobPhase::Launching if state == ContainerState::Stopped => {
-                        match self.supervisor.grill().exit_code(id).await {
+                        match self.supervisor.grill().exit_code(id).await? {
                             Some(code) => JobPhase::Exited { code },
                             None => JobPhase::Unknown,
                         }
@@ -3892,7 +3897,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         job.phase = if launch_inventory.is_some()
                             && job.phase == super::jobs::JobPhase::Launching
                         {
-                            match self.supervisor.grill().exit_code(&runtime_id).await {
+                            match self.supervisor.grill().exit_code(&runtime_id).await? {
                                 Some(code) => super::jobs::JobPhase::Exited { code },
                                 None => super::jobs::JobPhase::Unknown,
                             }
@@ -4198,6 +4203,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         // closed channel, and the node on its current binary.
                         self.follow_ups.abort_all();
                         self.off_loop_work.abandon_all();
+                        self.network_reference_reads.abandon_all();
                         self.shutdown_all().await;
                         break;
                     }
@@ -7886,37 +7892,24 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         id: &InstanceId,
         remote: Option<&crate::onion::producer::ProducerReleaseConfirmation>,
     ) -> Result<(), BunError> {
-        // The runtime answers these under the instance's lifecycle lock. One
-        // that can't within the turn fails the retirement, which retries;
-        // a release is idempotent, so a late one that did land is harmless.
-        let deadline = self.turn_deadline();
-        let late = || BunError::RetirementState {
-            instance_id: id.clone(),
-            reason: "the runtime did not answer for the network reference within the turn".into(),
-        };
+        // The runtime answers these under the instance's lifecycle lock, and
+        // on runc the health sweep's and status reader's state reads queue
+        // for it too, so either call can take longer than a turn (#387). Each
+        // runs in a task: one that hasn't answered within the turn fails the
+        // retirement with `StillRunning`, and the retry collects the same
+        // task instead of asking again. A release is idempotent and names its
+        // generation, so one that lands late is harmless.
         let reference = match self.network_references.get(id).cloned() {
             Some(reference) => reference,
             None => {
-                let held = tokio::time::timeout_at(
-                    deadline,
-                    self.supervisor.grill().network_reference(id),
-                )
-                .await
-                .map_err(|_| late())??;
-                let Some(held) = held else {
+                let Some(held) = self.read_network_reference(id).await? else {
                     return Ok(());
                 };
                 match self.journal_reference(&held) {
                     // The hold was retained but its launch never recorded it, so
                     // no publication ever named the address: nothing to withdraw.
                     JournalReference::Unrecorded => {
-                        tokio::time::timeout_at(
-                            deadline,
-                            self.supervisor.grill().release_network_reference(&held),
-                        )
-                        .await
-                        .map_err(|_| late())??;
-                        return Ok(());
+                        return self.finish_network_release(id, held).await;
                     }
                     // Recorded by a write whose outcome was uncertain at the time.
                     JournalReference::Recorded => {
@@ -7936,17 +7929,61 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.authorise_local_discovery_release(&reference, remote)
             .await?;
         self.require_discovery_release_permission(&reference)?;
-        tokio::time::timeout_at(
-            deadline,
-            self.supervisor
-                .grill()
-                .release_network_reference(&reference),
-        )
-        .await
-        .map_err(|_| late())??;
+        self.finish_network_release(id, reference.clone()).await?;
         self.forget_released_discovery_reference(&reference).await?;
         self.network_references.remove(id);
         Ok(())
+    }
+
+    /// Which network reference the runtime holds for `id`, read in a task
+    /// ([`off_loop_work`]). `StillRunning` means ask again.
+    async fn read_network_reference(
+        &mut self,
+        id: &InstanceId,
+    ) -> Result<Option<crate::grill::runc_intent::NetworkReference>, BunError> {
+        let grill = self.supervisor.grill().clone();
+        let read_id = id.clone();
+        let read = async move {
+            grill
+                .network_reference(&read_id)
+                .await
+                .map_err(|error| error.to_string())
+        };
+        let key = off_loop_work::WorkKey::ReadNetworkReference(id.clone());
+        let incarnation = self.incarnation_of(id);
+        let turn_deadline = self.turn_deadline();
+        // LOOP-INLINE: `finish` waits with `timeout_at(turn_deadline)`
+        self.network_reference_reads
+            .finish(key, incarnation, read, turn_deadline)
+            .await?
+            .map_err(|reason| BunError::RetirementState {
+                instance_id: id.clone(),
+                reason,
+            })
+    }
+
+    /// Hand `reference` back to the runtime from a task ([`off_loop_work`]).
+    /// `StillRunning` means ask again.
+    async fn finish_network_release(
+        &mut self,
+        id: &InstanceId,
+        reference: crate::grill::runc_intent::NetworkReference,
+    ) -> Result<(), BunError> {
+        let grill = self.supervisor.grill().clone();
+        let release = async move {
+            grill
+                .release_network_reference(&reference)
+                .await
+                .map_err(|error| error.to_string())
+        };
+        let key = off_loop_work::WorkKey::ReleaseNetworkReference(id.clone());
+        let incarnation = self.incarnation_of(id);
+        self.finish_off_loop_work(key, incarnation, release)
+            .await?
+            .map_err(|reason| BunError::RetirementState {
+                instance_id: id.clone(),
+                reason,
+            })
     }
 
     /// A build without the eBPF data path cannot enforce an allowlist.
@@ -12380,7 +12417,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 let state = self.grill.state(&init_id).await?;
                 if state == ContainerState::Stopped {
-                    break match self.grill.exit_code(&init_id).await {
+                    break match self.grill.exit_code(&init_id).await? {
                         Some(0) => None,
                         Some(code) => Some(format!("exited with code {code}")),
                         None => Some("stopped without an exit code".to_string()),
@@ -12524,7 +12561,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 let state = self.grill.state(id).await?;
                 if state == ContainerState::Stopped {
-                    let exit_code = self.grill.exit_code(id).await;
+                    let exit_code = self.grill.exit_code(id).await?;
                     if exit_code == Some(0) {
                         self.ops.confirm_job_success(id).await?;
                         break;

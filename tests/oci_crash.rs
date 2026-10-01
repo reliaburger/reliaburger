@@ -1732,7 +1732,13 @@ async fn actual_bun_kernel_discovery_host_reboot() {
                 runtime(root).state(&reference.instance_id).await.unwrap(),
                 ContainerState::Stopped
             );
-            assert_eq!(runtime(root).exit_code(&reference.instance_id).await, None);
+            assert_eq!(
+                runtime(root)
+                    .exit_code(&reference.instance_id)
+                    .await
+                    .unwrap(),
+                None
+            );
             assert_eq!(
                 std::fs::read_to_string(root.join("shared/main")).unwrap(),
                 "main\n"
