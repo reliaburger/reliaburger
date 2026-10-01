@@ -13,6 +13,7 @@ use tokio::sync::oneshot;
 use super::{BunAgent, BunError, Grill, InstanceId};
 
 /// A stop that has withdrawn routing and marked its instances Stopping.
+#[derive(Clone)]
 pub(super) struct AppStop {
     pub(super) instances: Vec<InstanceId>,
     /// Whether any instance is a recorded job whose phase must be committed.
@@ -47,7 +48,14 @@ pub(super) struct PendingStop {
     /// Fence the app's execution at once if the stop fails: the egress
     /// fence relies on this stop and must not wait for its next tick.
     fence_on_failure: bool,
+    /// The stop itself has finished; only what its waiters asked for after
+    /// it (a retirement's disk cleanup) is still running off the loop.
+    stopped: bool,
 }
+
+/// How long a stop waits before it checks again on disk work still running
+/// off the loop (#351, stage 3). Each check is one short turn.
+const DISK_WORK_RECHECK: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Pending stops by (app, namespace).
 pub(super) type PendingStops = HashMap<(String, String), PendingStop>;
@@ -133,8 +141,23 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 task,
                 waiters,
                 fence_on_failure,
+                stopped: false,
             },
         );
+    }
+
+    /// Keep a stop pending while disk work it needs runs off the loop, and
+    /// look again shortly. The exits are confirmed, so the wait is a timer,
+    /// not another exit wait.
+    fn recheck_stop_later(&mut self, key: (String, String), mut pending: PendingStop) {
+        pending.task = self
+            .stop_waits
+            .spawn(async {
+                tokio::time::sleep(DISK_WORK_RECHECK).await;
+                Ok(())
+            })
+            .id();
+        self.pending_stops.insert(key, pending);
     }
 
     /// Record a finished exit wait and answer everyone waiting on it.
@@ -151,17 +174,26 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         else {
             return;
         };
-        let Some(pending) = self.pending_stops.remove(&key) else {
+        let Some(mut pending) = self.pending_stops.remove(&key) else {
             return;
         };
-        let (app_name, namespace) = (&key.0, &key.1);
+        let (app_name, namespace) = (key.0.clone(), key.1.clone());
+        let (app_name, namespace) = (app_name.as_str(), namespace.as_str());
         let finished = match waited {
+            Ok(()) if pending.stopped => Ok(()),
             Ok(()) => {
-                self.finish_app_stop(app_name, namespace, pending.stop)
+                self.finish_app_stop(app_name, namespace, pending.stop.clone())
                     .await
             }
             Err(error) => Err(error),
         };
+        // Retirement's disk cleanup runs off the loop; look again shortly,
+        // rather than answer anyone before it has finished.
+        if matches!(finished, Err(BunError::StillRunning { .. })) {
+            self.recheck_stop_later(key, pending);
+            return;
+        }
+        pending.stopped = true;
         if let Err(error) = &finished
             && pending.fence_on_failure
         {
@@ -171,7 +203,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         // The first waiter gets the error itself; later ones get its text.
         let reason = finished.as_ref().err().map(ToString::to_string);
         let mut error = finished.err();
-        for waiter in pending.waiters {
+        let mut still_waiting = Vec::new();
+        for waiter in std::mem::take(&mut pending.waiters) {
             let result = match &reason {
                 Some(reason) => Err(error
                     .take()
@@ -181,7 +214,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         .await
                 }
             };
+            if matches!(result, Err(BunError::StillRunning { .. })) {
+                still_waiting.push(waiter);
+                continue;
+            }
             let _ = waiter.response.send(result);
+        }
+        if !still_waiting.is_empty() {
+            pending.waiters = still_waiting;
+            self.recheck_stop_later(key, pending);
         }
     }
 
@@ -281,6 +322,7 @@ mod tests {
                 task,
                 waiters,
                 fence_on_failure: false,
+                stopped: false,
             },
         );
 

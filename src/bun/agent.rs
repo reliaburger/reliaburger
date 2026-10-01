@@ -1107,6 +1107,35 @@ where
     }
 }
 
+/// How often a deploy worker asks again for a step whose disk work is still
+/// running off the agent loop.
+const STILL_RUNNING_RECHECK: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// How long a deploy worker keeps asking before it reports the disk work as
+/// stuck. A provisioning or cleanup task that runs this long has hung.
+const STILL_RUNNING_PATIENCE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Ask the loop for a step until the disk work it waits on has finished
+/// (#351, stage 3). Each attempt is a short turn; the worker sleeps between
+/// them, off the loop.
+async fn retry_while_still_running<T, F, Fut>(mut attempt: F) -> Result<T, BunError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, BunError>>,
+{
+    let deadline = tokio::time::Instant::now() + STILL_RUNNING_PATIENCE;
+    loop {
+        match attempt().await {
+            Err(BunError::StillRunning { .. })
+                if tokio::time::Instant::now() + STILL_RUNNING_RECHECK < deadline =>
+            {
+                tokio::time::sleep(STILL_RUNNING_RECHECK).await;
+            }
+            outcome => return outcome,
+        }
+    }
+}
+
 /// A handle a deploy task uses to ask the command loop to perform its
 /// authoritative `&mut self` steps. Each method sends a `DeployOp` and awaits
 /// the reply, so the loop stays the single owner of supervisor state.
@@ -1267,16 +1296,18 @@ impl DeployOps {
         spec: &JobSpec,
         rerun_unknown: bool,
     ) -> Result<Vec<InstanceId>, BunError> {
-        self.call(
-            |reply| DeployOp::SupervisorDeployJob {
-                rerun_unknown,
-                job_name: job_name.to_string(),
-                namespace: namespace.to_string(),
-                spec: Box::new(spec.clone()),
-                reply,
-            },
-            Ok(Vec::new()),
-        )
+        retry_while_still_running(|| {
+            self.call(
+                |reply| DeployOp::SupervisorDeployJob {
+                    rerun_unknown,
+                    job_name: job_name.to_string(),
+                    namespace: namespace.to_string(),
+                    spec: Box::new(spec.clone()),
+                    reply,
+                },
+                Ok(Vec::new()),
+            )
+        })
         .await
     }
 
@@ -1366,18 +1397,20 @@ impl DeployOps {
         namespace: &str,
         spec: &AppSpec,
     ) -> Result<PreparedInstance, BunError> {
-        self.call(
-            |reply| DeployOp::PrepareFreshInstance {
-                instance_id: instance_id.clone(),
-                app_name: app_name.to_string(),
-                namespace: namespace.to_string(),
-                spec: Box::new(spec.clone()),
-                reply,
-            },
-            Err(BunError::InstanceNotFound {
-                instance_id: instance_id.clone(),
-            }),
-        )
+        retry_while_still_running(|| {
+            self.call(
+                |reply| DeployOp::PrepareFreshInstance {
+                    instance_id: instance_id.clone(),
+                    app_name: app_name.to_string(),
+                    namespace: namespace.to_string(),
+                    spec: Box::new(spec.clone()),
+                    reply,
+                },
+                Err(BunError::InstanceNotFound {
+                    instance_id: instance_id.clone(),
+                }),
+            )
+        })
         .await
     }
 
@@ -1540,19 +1573,21 @@ impl DeployOps {
         spec: &AppSpec,
         host_port: Option<u16>,
     ) -> Result<crate::grill::oci::OciSpec, BunError> {
-        self.call(
-            |reply| DeployOp::PrepareRollingInstance {
-                instance_id: instance_id.clone(),
-                app_name: app_name.to_string(),
-                namespace: namespace.to_string(),
-                spec: Box::new(spec.clone()),
-                host_port,
-                reply,
-            },
-            Err(BunError::InstanceNotFound {
-                instance_id: instance_id.clone(),
-            }),
-        )
+        retry_while_still_running(|| {
+            self.call(
+                |reply| DeployOp::PrepareRollingInstance {
+                    instance_id: instance_id.clone(),
+                    app_name: app_name.to_string(),
+                    namespace: namespace.to_string(),
+                    spec: Box::new(spec.clone()),
+                    host_port,
+                    reply,
+                },
+                Err(BunError::InstanceNotFound {
+                    instance_id: instance_id.clone(),
+                }),
+            )
+        })
         .await
     }
 
@@ -1674,17 +1709,19 @@ impl DeployOps {
     /// replacements). The loop stays free between attempts, so this node can
     /// deliver its own receipt meanwhile.
     async fn finish_retire(&self, old_id: &InstanceId) -> Result<(), BunError> {
-        retry_while_release_pending(PRODUCER_RELEASE_PATIENCE, PRODUCER_RELEASE_RETRY, || {
-            self.call(
-                |reply| DeployOp::FinishRetire {
-                    old_id: old_id.clone(),
-                    reply,
-                },
-                Err(BunError::RetirementState {
-                    instance_id: old_id.clone(),
-                    reason: "agent loop closed before retirement".into(),
-                }),
-            )
+        retry_while_still_running(|| {
+            retry_while_release_pending(PRODUCER_RELEASE_PATIENCE, PRODUCER_RELEASE_RETRY, || {
+                self.call(
+                    |reply| DeployOp::FinishRetire {
+                        old_id: old_id.clone(),
+                        reply,
+                    },
+                    Err(BunError::RetirementState {
+                        instance_id: old_id.clone(),
+                        reason: "agent loop closed before retirement".into(),
+                    }),
+                )
+            })
         })
         .await
     }
@@ -1940,6 +1977,7 @@ pub use consumer::ConsumerUpdate;
 mod adopted_placements;
 mod discovery_ownership;
 mod discovery_recovery;
+mod disk_work;
 mod egress_ownership;
 mod follow_ups;
 mod identity_signing;
@@ -2306,6 +2344,9 @@ pub struct BunAgent<G: Grill> {
     /// Whether the namespace-firewall maps missed a sync (a runtime that
     /// didn't name a workload's cgroup in time), so the tick retries it.
     namespace_firewall_stale: bool,
+    /// Disk cleanup and provisioning running in tasks, which a later turn
+    /// collects.
+    disk_work: disk_work::DiskWork,
 }
 
 /// The last instance each phase of `drive_pending_restarts` handled.
@@ -2480,6 +2521,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             firewall_applying: None,
             turn_deadline: None,
             namespace_firewall_stale: false,
+            disk_work: disk_work::DiskWork::default(),
             adopted_apps: adopted_placements::AdoptedApps::new(),
         }
     }
@@ -2627,6 +2669,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             firewall_applying: None,
             turn_deadline: None,
             namespace_firewall_stale: false,
+            disk_work: disk_work::DiskWork::default(),
             adopted_apps: adopted_placements::AdoptedApps::new(),
         }
     }
@@ -3598,7 +3641,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         // parent artifacts first would lift policy while that init still runs.
         for id in retired {
             if !self.defer_startup_retirement(&id).await? {
-                self.retire_instance_artifacts(&id).await?;
+                self.retire_instance_artifacts_fully(&id).await?;
             }
         }
         for (id, job) in jobs.iter_mut() {
@@ -3813,7 +3856,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     self.commit_jobs(recovered_jobs.clone()).await?;
                 }
                 if !self.defer_startup_retirement(&runtime_id).await? {
-                    self.retire_instance_artifacts(&runtime_id).await?;
+                    self.retire_instance_artifacts_fully(&runtime_id).await?;
                 }
                 continue;
             }
@@ -4105,6 +4148,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         // An upgrade still preparing leaves its caller a
                         // closed channel, and the node on its current binary.
                         self.follow_ups.abort_all();
+                        self.disk_work.abandon_all();
                         self.shutdown_all().await;
                         break;
                     }
@@ -5168,6 +5212,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         app: app_name.clone(),
                     }
                     .into()));
+                    return;
+                }
+                // A deploy still creating the volumes off the loop would
+                // race the restore's swap.
+                if self.disk_work.provisioning(&namespace, &app_name) {
+                    let _ = response.send(Err(Self::volumes_busy(&namespace, &app_name)));
                     return;
                 }
                 // Reserve before dispatching, with no await in between: from
@@ -7363,7 +7413,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
         for old_id in existing {
             match self.finish_retire_bookkeeping(old_id).await {
-                Err(BunError::ProducerReleasePending { .. }) => self.defer_retirement(old_id),
+                // The tick finishes either: one waits on the leader, the
+                // other on disk cleanup running off the loop.
+                Err(BunError::ProducerReleasePending { .. } | BunError::StillRunning { .. }) => {
+                    self.defer_retirement(old_id)
+                }
                 result => result?,
             }
         }
@@ -9340,25 +9394,38 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     /// Remove a retired lease's disposable managed storage.
-    async fn retire_test_storage(&self, app_name: &str, namespace: &str) -> Result<(), BunError> {
+    /// The removal runs in a task ([`disk_work`]); `StillRunning` means ask
+    /// again.
+    async fn retire_test_storage(
+        &mut self,
+        app_name: &str,
+        namespace: &str,
+    ) -> Result<(), BunError> {
         let manager = crate::grill::volume::VolumeManager::new(self.volumes_dir.clone());
-        let namespace = namespace.to_string();
-        let app = app_name.to_string();
-        // LOOP-INLINE: stage 3 of #351: disk cleanup leaves the loop
-        tokio::task::spawn_blocking(move || manager.retire_test_storage(&namespace, &app))
-            .await
-            .map_err(|error| BunError::DeployFailed {
+        let key = disk_work::DiskWorkKey::RetireTestStorage {
+            namespace: namespace.to_string(),
+            app: app_name.to_string(),
+        };
+        let (namespace, app) = (namespace.to_string(), app_name.to_string());
+        let removal = async move {
+            tokio::task::spawn_blocking(move || manager.retire_test_storage(&namespace, &app))
+                .await
+                .map_err(|error| error.to_string())?
+                .map_err(|error| error.to_string())
+        };
+        self.finish_disk_work(key, None, removal)
+            .await?
+            .map_err(|reason| BunError::DeployFailed {
                 app_name: app_name.into(),
-                reason: error.to_string(),
-            })?
-            .map_err(|error| BunError::DeployFailed {
-                app_name: app_name.into(),
-                reason: error.to_string(),
+                reason,
             })
     }
 
+    /// Claim test storage and create managed volumes before launch. The disk
+    /// work runs in a task ([`disk_work`]); `StillRunning` means ask again,
+    /// and a snapshot restore of the app waits until it has finished.
     async fn prepare_storage(
-        &self,
+        &mut self,
         app_name: &str,
         namespace: &str,
         spec: &AppSpec,
@@ -9374,34 +9441,39 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             });
         }
         let manager = crate::grill::volume::VolumeManager::new(self.volumes_dir.clone());
-        let namespace = namespace.to_string();
-        let app = app_name.to_string();
+        let key = disk_work::DiskWorkKey::ProvisionStorage {
+            namespace: namespace.to_string(),
+            app: app_name.to_string(),
+            volumes: format!("{:?}", spec.volumes),
+        };
+        let (namespace, app) = (namespace.to_string(), app_name.to_string());
         let spec = spec.clone();
-        // LOOP-INLINE: stage 3 of #351: volume provisioning leaves the loop
-        tokio::task::spawn_blocking(move || {
-            if crate::testkit::lease::valid_test_namespace(&namespace) {
-                manager.prepare_test_storage(&namespace, &app, &spec)?;
-            } else {
-                for volume in spec.volumes.iter().filter(|volume| volume.source.is_none()) {
-                    manager.create_managed_volume(
-                        &namespace,
-                        &app,
-                        &volume.path,
-                        volume.size.as_deref(),
-                    )?;
+        let provisioning = async move {
+            tokio::task::spawn_blocking(move || {
+                if crate::testkit::lease::valid_test_namespace(&namespace) {
+                    manager.prepare_test_storage(&namespace, &app, &spec)?;
+                } else {
+                    for volume in spec.volumes.iter().filter(|volume| volume.source.is_none()) {
+                        manager.create_managed_volume(
+                            &namespace,
+                            &app,
+                            &volume.path,
+                            volume.size.as_deref(),
+                        )?;
+                    }
                 }
-            }
-            Ok::<(), crate::grill::volume::VolumeError>(())
-        })
-        .await
-        .map_err(|error| BunError::DeployFailed {
-            app_name: app_name.into(),
-            reason: error.to_string(),
-        })?
-        .map_err(|error| BunError::DeployFailed {
-            app_name: app_name.into(),
-            reason: error.to_string(),
-        })
+                Ok::<(), crate::grill::volume::VolumeError>(())
+            })
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())
+        };
+        self.finish_disk_work(key, None, provisioning)
+            .await?
+            .map_err(|reason| BunError::DeployFailed {
+                app_name: app_name.into(),
+                reason,
+            })
     }
 
     /// Stop an app's instances, waiting for their exit inline.
@@ -9902,7 +9974,57 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     /// Retire durable artifacts before allowing the caller to forget an owner.
+    ///
+    /// The identity directory and adoption record go last, from a task
+    /// ([`disk_work`]): `Err(BunError::StillRunning)` means that removal
+    /// hasn't finished within the turn, and asking again picks it up where
+    /// it is without repeating the steps before it.
     async fn retire_instance_artifacts(
+        &mut self,
+        instance_id: &InstanceId,
+    ) -> Result<(), BunError> {
+        let key = disk_work::DiskWorkKey::RetireArtifacts(instance_id.clone());
+        let incarnation = self.incarnation_of(instance_id);
+        if !self.disk_work.started(&key, incarnation) {
+            self.retire_instance_artifacts_up_to_disk(instance_id)
+                .await?;
+        }
+        let identity_dir = self.instance_identity_dir(instance_id);
+        let records_dir = self.records_dir.clone();
+        let id = instance_id.0.clone();
+        #[cfg(test)]
+        let stalls = Arc::clone(&self.loop_stalls);
+        let cleanup = async move {
+            #[cfg(test)]
+            stalls.hold(LoopStall::ArtifactCleanup).await;
+            tokio::task::spawn_blocking(move || {
+                crate::sesame::identity::cleanup_identity_dir(&identity_dir)?;
+                if let Some(directory) = records_dir {
+                    crate::grill::records::remove_record(&directory, &id)?;
+                }
+                Ok::<(), std::io::Error>(())
+            })
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())
+        };
+        self.finish_disk_work(key, incarnation, cleanup)
+            .await?
+            .map_err(|reason| BunError::RetirementState {
+                instance_id: instance_id.clone(),
+                reason,
+            })?;
+        self.forget_retired_egress_owner(instance_id).await?;
+        if let Some(instance) = self.supervisor.get_instance_mut(instance_id) {
+            instance.identity = None;
+            instance.identity_mount = None;
+        }
+        Ok(())
+    }
+
+    /// Retirement up to the disk cleanup: initialisers, routing, producer
+    /// release, egress and the network reference.
+    async fn retire_instance_artifacts_up_to_disk(
         &mut self,
         instance_id: &InstanceId,
     ) -> Result<(), BunError> {
@@ -9919,35 +10041,21 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let remote = self.confirm_producer_release(instance_id).await?;
         self.clear_egress(instance_id).await?;
         self.release_network_reference(instance_id, remote.as_ref())
-            .await?;
-        let identity_dir = self.instance_identity_dir(instance_id);
-        let records_dir = self.records_dir.clone();
-        let id = instance_id.0.clone();
-        #[cfg(test)]
-        self.loop_stalls.hold(LoopStall::ArtifactCleanup).await;
-        // LOOP-INLINE: stage 3 of #351: disk cleanup leaves the loop
-        let cleanup = tokio::task::spawn_blocking(move || {
-            crate::sesame::identity::cleanup_identity_dir(&identity_dir)?;
-            if let Some(directory) = records_dir {
-                crate::grill::records::remove_record(&directory, &id)?;
+            .await
+    }
+
+    /// Retire an instance's artifacts outside the loop (startup adoption),
+    /// where nothing else is waiting, so a slow disk is simply waited out.
+    async fn retire_instance_artifacts_fully(
+        &mut self,
+        instance_id: &InstanceId,
+    ) -> Result<(), BunError> {
+        loop {
+            match self.retire_instance_artifacts(instance_id).await {
+                Err(BunError::StillRunning { .. }) => continue,
+                result => return result,
             }
-            Ok::<(), std::io::Error>(())
-        })
-        .await
-        .map_err(|error| BunError::RetirementState {
-            instance_id: instance_id.clone(),
-            reason: error.to_string(),
-        })?;
-        cleanup.map_err(|error| BunError::RetirementState {
-            instance_id: instance_id.clone(),
-            reason: error.to_string(),
-        })?;
-        self.forget_retired_egress_owner(instance_id).await?;
-        if let Some(instance) = self.supervisor.get_instance_mut(instance_id) {
-            instance.identity = None;
-            instance.identity_mount = None;
         }
-        Ok(())
     }
 
     /// Remove identity directories that don't belong to any tracked

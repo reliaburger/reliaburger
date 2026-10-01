@@ -36,7 +36,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     self.sync_firewall_ebpf().await;
                     self.rebuild_routing_table().await;
                 }
-                Err(BunError::ProducerReleasePending { .. }) => {}
+                Err(BunError::ProducerReleasePending { .. } | BunError::StillRunning { .. }) => {}
                 Err(error) => eprintln!("bun: releasing {} awaits retry: {error}", id.0),
             }
         }

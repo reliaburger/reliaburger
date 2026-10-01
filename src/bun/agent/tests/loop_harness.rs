@@ -591,7 +591,6 @@ async fn status_answers_while_every_persist_waits_on_a_slow_disk() {
 
 /// Retiring an instance removes its identity directory and record inline.
 #[tokio::test]
-#[ignore = "stage 3 of #351"]
 async fn status_answers_while_a_retirement_removes_artifacts() {
     let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
     expect_complete(&drain_deploy(&mut agent, replicated("web", 1)).await);
