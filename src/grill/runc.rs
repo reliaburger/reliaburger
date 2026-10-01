@@ -533,7 +533,7 @@ impl super::Grill for RuncGrill {
         self.owned_exit_code(instance).await
     }
 
-    async fn pid(&self, instance: &InstanceId) -> Option<u32> {
+    async fn pid(&self, instance: &InstanceId) -> Result<Option<u32>, GrillError> {
         self.owned_pid(instance).await
     }
 
@@ -1397,7 +1397,7 @@ mod tests {
             "duplicate create must refuse before cleanup"
         );
         assert_eq!(original.container_ip(&id).await, Some(container_ip));
-        let pid = original.pid(&id).await.unwrap();
+        let pid = original.pid(&id).await.unwrap().unwrap();
         let started_at = crate::grill::records::process_start_time(pid).unwrap();
         let rootfs = bundle_base.join(&id.0).join("rootfs");
 

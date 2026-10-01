@@ -182,3 +182,47 @@ async fn the_liveness_check_does_not_delay_the_pid_read() {
     assert!(!statuses[0].runtime_unknown, "{statuses:?}");
     assert_eq!(statuses[0].pid, Some(4242));
 }
+
+/// Runc serialises every runtime call for one instance, so a liveness check
+/// can queue behind the health sweep's own for longer than the status
+/// deadline (#358). The pid answered in time, so it is reported; only the
+/// liveness verdict is unknown, and the loop's view stands in for it.
+#[tokio::test]
+async fn a_slow_liveness_check_does_not_hide_a_pid_that_answered() {
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    expect_complete(&drain_deploy(&mut agent, replicated("web", 1)).await);
+    grill.set_pid(4242);
+    grill.set_call_delay(MockCall::State, Some(std::time::Duration::from_secs(2)));
+    let statuses = agent.get_status().await;
+    assert_eq!(statuses[0].pid, Some(4242), "{statuses:?}");
+    assert_eq!(statuses[0].state, "running");
+    assert!(statuses[0].runtime_unknown, "{statuses:?}");
+}
+
+/// The runtime failed to read the pid of a live instance (a process owner
+/// that didn't answer, #358). That is an unknown pid, not "no process".
+#[tokio::test]
+async fn a_pid_the_runtime_could_not_read_is_unknown_not_absent() {
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    expect_complete(&drain_deploy(&mut agent, replicated("web", 1)).await);
+    grill.set_pid(4242);
+    grill.set_fail_pid(true);
+    let statuses = agent.get_status().await;
+    assert_eq!(statuses[0].state, "running");
+    assert_eq!(statuses[0].pid, None);
+    assert!(statuses[0].runtime_unknown, "{statuses:?}");
+}
+
+/// The runtime says the instance has exited, so it has no process left,
+/// even if the pid read still named the one it had.
+#[tokio::test]
+async fn an_exited_instance_reports_no_pid() {
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    expect_complete(&drain_deploy(&mut agent, replicated("web", 1)).await);
+    grill.set_pid(4242);
+    crash(&grill);
+    let statuses = agent.get_status().await;
+    assert_eq!(statuses[0].state, "stopped");
+    assert_eq!(statuses[0].pid, None, "{statuses:?}");
+    assert!(!statuses[0].runtime_unknown, "{statuses:?}");
+}
