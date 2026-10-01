@@ -242,9 +242,9 @@ jobs:
           cat "$log" || true
           # systemd breaks an ordering cycle by dropping jobs (once, /boot's
           # automount), and the boot can still look healthy: refuse it.
-          if grep -q "Found ordering cycle" "$log"; then
+          # boot-check copies them from the journal onto the console.
+          if grep -q "reliaburger: ordering cycle:" "$log"; then
             result="$result, with ordering cycles"
-            grep "Found ordering cycle" "$log" >> "$GITHUB_STEP_SUMMARY"
           fi
           echo "### Boot test: $result after ${elapsed} s" >> "$GITHUB_STEP_SUMMARY"
           grep "reliaburger:" "$log" >> "$GITHUB_STEP_SUMMARY" || true
