@@ -11,11 +11,11 @@ use std::time::SystemTime;
 use datafusion::arrow::array::{Array, Float64Array, StringArray, UInt64Array};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::datasource::MemTable;
 use datafusion::parquet::arrow::ArrowWriter;
 use datafusion::prelude::*;
 use object_store::{ObjectStore, ObjectStoreExt};
 
+use super::scan::{ParquetTable, list_local, list_remote, streaming_session};
 use super::types::{MayoError, MetricKey, Sample};
 
 /// Where a [`MayoStore`] reads and writes Parquet.
@@ -271,10 +271,10 @@ struct BufferedSample {
 /// Arrow/DataFusion time-series store.
 ///
 /// Inserts go into an in-memory buffer. On flush, the buffer is written to a
-/// Parquet file and dropped from memory. Queries read the on-disk Parquet
-/// directory (durable across restarts) unioned with the unflushed buffer, so
-/// memory stays bounded to the buffer regardless of how much history is on
-/// disk.
+/// Parquet file and dropped from memory. Queries stream the Parquet files
+/// (durable across restarts) one at a time, unioned with the unflushed
+/// buffer, skipping whatever the files' statistics rule out, so a query's
+/// memory is its working set regardless of how much history is on disk.
 pub struct MayoStore {
     /// In-memory buffer of unflushed samples.
     buffer: Vec<BufferedSample>,
@@ -444,180 +444,36 @@ impl MayoStore {
     }
 
     /// Build a DataFusion session exposing a `metrics` table over all data:
-    /// the on-disk Parquet directory unioned with the unflushed buffer.
+    /// the Parquet files unioned with the unflushed buffer.
     async fn session(&self) -> Result<SessionContext, MayoError> {
         self.session_since(None).await
     }
 
-    /// [`session`](Self::session) for a query that only reads samples at or
-    /// after `since`. A local Parquet file whose newest sample is older is
-    /// left out, judged from its footer statistics without reading the data.
-    /// The periodic reads (alerts, rollups, the autoscaler) look back a few
-    /// minutes, and without this each one loaded the whole retention window
-    /// into memory, so their working set grew with a node's uptime (#310).
+    /// [`session`](Self::session) for a query whose SQL only wants samples at
+    /// or after `since`.
+    ///
+    /// The `metrics` table is streamed (#377): nothing is read here beyond a
+    /// listing of file names. Each query reads its files one at a time, skips
+    /// files and row groups whose footer statistics rule out its time range
+    /// or metric names, and decodes only the columns it uses. `since` is one
+    /// more lower bound for that pruning; the SQL's own `timestamp`
+    /// predicates already give the same, so it's a promise, not a filter.
     async fn session_since(&self, since: Option<u64>) -> Result<SessionContext, MayoError> {
-        // Read Parquet string columns as `Utf8`, not `Utf8View`, so on-disk
-        // batches share the canonical `metrics_schema` with the in-memory
-        // buffer (DataFusion 45 forces view types by default).
-        let config = SessionConfig::new().set_bool(
-            "datafusion.execution.parquet.schema_force_view_types",
-            false,
+        let ctx = streaming_session();
+        let sources = match &self.backend {
+            Backend::Local => list_local(&self.data_dir)?,
+            Backend::Remote { store, prefix } => list_remote(store, prefix, "metrics").await?,
+        };
+        let table = ParquetTable::new(
+            Arc::new(metrics_schema()),
+            sources,
+            self.buffer_to_batch()?,
+            since,
+            "metrics",
         );
-        let ctx = SessionContext::new_with_config(config);
-        let schema = Arc::new(metrics_schema());
-
-        // On-disk Parquet (durable, survives restarts). Read into memory only
-        // transiently for this query — nothing is retained on the struct.
-        let disk_batches = self.read_disk_batches(&ctx, since).await?;
-
-        // Unflushed buffer.
-        let mut all_batches = disk_batches;
-        if let Some(buffer_batch) = self.buffer_to_batch()? {
-            all_batches.push(buffer_batch);
-        }
-
-        if all_batches.is_empty() {
-            all_batches.push(RecordBatch::new_empty(schema.clone()));
-        }
-
-        let table = MemTable::try_new(schema, vec![all_batches])
-            .map_err(|e| MayoError::DataFusion(e.to_string()))?;
         ctx.register_table("metrics", Arc::new(table))
             .map_err(|e| MayoError::DataFusion(e.to_string()))?;
         Ok(ctx)
-    }
-
-    /// Read every intact `metrics_*.parquet` file in the data dir into
-    /// RecordBatches, normalised to the canonical `metrics_schema` (so the
-    /// Parquet-inferred nullability doesn't clash with the in-memory buffer's
-    /// schema).
-    ///
-    /// Each file is read on its own. A corrupt or truncated file is skipped
-    /// with a log instead of failing the whole query (OBS5): a single bad flush
-    /// must not make every unrelated read error out.
-    async fn read_disk_batches(
-        &self,
-        ctx: &SessionContext,
-        since: Option<u64>,
-    ) -> Result<Vec<RecordBatch>, MayoError> {
-        if let Backend::Remote { .. } = &self.backend {
-            return self.read_remote_batches(ctx).await;
-        }
-        if !dir_has_parquet(&self.data_dir) {
-            return Ok(Vec::new());
-        }
-        let schema = Arc::new(metrics_schema());
-        let mut normalised = Vec::new();
-
-        let entries = std::fs::read_dir(&self.data_dir).map_err(MayoError::Io)?;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.extension().is_some_and(|x| x == "parquet") {
-                continue;
-            }
-            // A file without usable statistics is read, never guessed away.
-            if since.is_some_and(|since| file_max_timestamp(&path).is_some_and(|max| max < since)) {
-                continue;
-            }
-            let table_name = "metrics_one";
-            let _ = ctx.deregister_table(table_name);
-            let file = path.to_string_lossy().to_string();
-            if ctx
-                .register_parquet(table_name, &file, ParquetReadOptions::default())
-                .await
-                .is_err()
-            {
-                eprintln!("mayo: skipping unreadable metrics file {file}");
-                continue;
-            }
-            let read = async {
-                let df = ctx
-                    .sql("SELECT timestamp, metric_name, labels, value FROM metrics_one")
-                    .await
-                    .map_err(|e| MayoError::QueryFailed(e.to_string()))?;
-                df.collect()
-                    .await
-                    .map_err(|e| MayoError::QueryFailed(e.to_string()))
-            }
-            .await;
-            let _ = ctx.deregister_table(table_name);
-            match read {
-                Ok(batches) => {
-                    for batch in batches {
-                        match RecordBatch::try_new(schema.clone(), batch.columns().to_vec()) {
-                            Ok(b) => normalised.push(b),
-                            Err(e) => {
-                                eprintln!("mayo: skipping malformed metrics batch in {file}: {e}")
-                            }
-                        }
-                    }
-                }
-                Err(_) => eprintln!("mayo: skipping corrupt metrics file {file}"),
-            }
-        }
-        Ok(normalised)
-    }
-
-    /// Read all `metrics_*.parquet` objects from the remote backend into
-    /// RecordBatches, normalised to the canonical schema (H8).
-    ///
-    /// Bytes are fetched with `object_store` and parsed with DataFusion's
-    /// in-memory Parquet reader, so we never register the object store on the
-    /// DataFusion runtime — that would clash with the different `object_store`
-    /// version DataFusion links. A corrupt object is skipped with a log, like
-    /// the local path, so one bad flush can't fail every query.
-    async fn read_remote_batches(
-        &self,
-        _ctx: &SessionContext,
-    ) -> Result<Vec<RecordBatch>, MayoError> {
-        use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-        use futures_util::StreamExt;
-
-        let Backend::Remote { store, prefix, .. } = &self.backend else {
-            return Ok(Vec::new());
-        };
-
-        let mut keys = Vec::new();
-        let mut listing = store.list(Some(prefix));
-        while let Some(item) = listing.next().await {
-            let meta = item.map_err(|e| MayoError::ObjectStore(e.to_string()))?;
-            let name = meta.location.filename().unwrap_or("");
-            if name.starts_with("metrics_") && name.ends_with(".parquet") {
-                keys.push(meta.location);
-            }
-        }
-
-        let schema = Arc::new(metrics_schema());
-        let mut normalised = Vec::new();
-        for key in keys {
-            let bytes = match store.get(&key).await {
-                Ok(result) => result
-                    .bytes()
-                    .await
-                    .map_err(|e| MayoError::ObjectStore(e.to_string()))?,
-                Err(_) => continue, // deleted between list and get; skip
-            };
-            let builder = match ParquetRecordBatchReaderBuilder::try_new(bytes) {
-                Ok(builder) => builder,
-                Err(e) => {
-                    eprintln!("mayo: skipping unreadable remote metrics object {key}: {e}");
-                    continue;
-                }
-            };
-            let reader = builder
-                .build()
-                .map_err(|e| MayoError::Arrow(e.to_string()))?;
-            for batch in reader {
-                match batch {
-                    Ok(b) => match RecordBatch::try_new(schema.clone(), b.columns().to_vec()) {
-                        Ok(nb) => normalised.push(nb),
-                        Err(e) => eprintln!("mayo: skipping malformed remote metrics batch: {e}"),
-                    },
-                    Err(e) => eprintln!("mayo: error reading remote metrics batch: {e}"),
-                }
-            }
-        }
-        Ok(normalised)
     }
 
     /// Query metrics using SQL. Returns (timestamp, name, labels, value) tuples.
@@ -1836,6 +1692,154 @@ mod tests {
             .unwrap();
         golden_store(&mut remote, Some(bucket.path())).await;
         assert_eq!(golden_report(&remote).await, local_report);
+    }
+
+    /// The eager reader this store used before #377: every file decoded in
+    /// full into one in-memory table with the buffer, then queried.
+    async fn eager_rows(store: &MayoStore, sql: &str) -> Vec<(u64, String, String, f64)> {
+        use datafusion::datasource::MemTable;
+        use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let schema = Arc::new(metrics_schema());
+        let mut batches = Vec::new();
+        for entry in std::fs::read_dir(&store.data_dir).unwrap().flatten() {
+            let path = entry.path();
+            if !path.extension().is_some_and(|x| x == "parquet") {
+                continue;
+            }
+            let Ok(builder) =
+                ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(&path).unwrap())
+            else {
+                continue;
+            };
+            for batch in builder.build().unwrap() {
+                let batch = batch.unwrap();
+                batches
+                    .push(RecordBatch::try_new(schema.clone(), batch.columns().to_vec()).unwrap());
+            }
+        }
+        batches.extend(store.buffer_to_batch().unwrap());
+        batches.push(RecordBatch::new_empty(schema.clone()));
+        let ctx = SessionContext::new();
+        ctx.register_table(
+            "metrics",
+            Arc::new(MemTable::try_new(schema, vec![batches]).unwrap()),
+        )
+        .unwrap();
+        let mut rows = Vec::new();
+        for batch in ctx.sql(sql).await.unwrap().collect().await.unwrap() {
+            let timestamps = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap();
+            let names = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let labels = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let values = batch
+                .column(3)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                rows.push((
+                    timestamps.value(i),
+                    names.value(i).to_string(),
+                    labels.value(i).to_string(),
+                    values.value(i),
+                ));
+            }
+        }
+        rows
+    }
+
+    /// The query shapes the pruning has to survive: ranges, strict bounds,
+    /// names, IN lists, disjunctions, negations and an aggregate.
+    fn property_sql(shape: usize, a: u64, b: u64, name: &str, other: &str) -> String {
+        let select = "SELECT timestamp, metric_name, labels, value FROM metrics";
+        match shape {
+            0 => format!("{select} WHERE timestamp >= {a} AND timestamp <= {b}"),
+            1 => format!(
+                "{select} WHERE metric_name = '{name}' AND timestamp > {a} AND timestamp < {b}"
+            ),
+            2 => format!(
+                "{select} WHERE metric_name IN ('{name}', '{other}') \
+                 AND timestamp BETWEEN {a} AND {b}"
+            ),
+            3 => format!("{select} WHERE timestamp < {a} OR metric_name = '{name}'"),
+            4 => format!(
+                "{select} WHERE (metric_name = '{name}' AND timestamp <= {a}) \
+                 OR timestamp >= {b}"
+            ),
+            5 => format!("{select} WHERE NOT (timestamp >= {a} AND timestamp <= {b})"),
+            6 => format!("{select} WHERE timestamp = {a} OR timestamp = {b}"),
+            7 => format!("{select} WHERE timestamp > {a}"),
+            8 => format!("{select} WHERE {b} > timestamp"),
+            _ => format!(
+                "SELECT MAX(timestamp) AS timestamp, metric_name, labels, \
+                 SUM(value) AS value FROM metrics WHERE timestamp >= {a} \
+                 GROUP BY metric_name, labels"
+            ),
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(256))]
+
+        /// #377: whatever the files hold and whatever the query asks, the
+        /// streamed, pruned scan returns exactly the rows the eager reader
+        /// did. Pruning may only skip data no answer could contain. Files are
+        /// small and timestamps dense, so bounds often land exactly on a
+        /// file's first or last sample, where an off-by-one would show.
+        #[test]
+        fn streamed_reads_match_the_eager_reader(
+            files in proptest::collection::vec(
+                proptest::collection::vec((0usize..4, 0u64..16, 0usize..2), 1..5),
+                0..8,
+            ),
+            buffer in proptest::collection::vec((0usize..4, 0u64..16, 0usize..2), 0..4),
+            shape in 0usize..10,
+            a in 0u64..18,
+            b in 0u64..18,
+            name in 0usize..4,
+            other in 0usize..4,
+        ) {
+            let names = ["alpha", "beta", "delta", "gamma"];
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let (mut store, _dir) = test_store();
+                let insert = |store: &mut MayoStore, rows: &[(usize, u64, usize)]| {
+                    for (index, (series, timestamp, app)) in rows.iter().enumerate() {
+                        let key = app_key(names[*series], &format!("default/app-{app}"), "i-0");
+                        store.insert(&key, Sample::at(*timestamp, index as f64));
+                    }
+                };
+                for file in &files {
+                    insert(&mut store, file);
+                    store.flush().await.unwrap();
+                }
+                insert(&mut store, &buffer);
+
+                let sql = property_sql(shape, a, b, names[name], names[other]);
+                let streamed = store.query_sql(&sql).await.unwrap();
+                let eager = eager_rows(&store, &sql).await;
+                assert_eq!(canonical(&streamed), canonical(&eager), "{sql}");
+                if shape == 0 {
+                    let floored = store.query_sql_since(&sql, a).await.unwrap();
+                    assert_eq!(canonical(&floored), canonical(&eager), "{sql} since {a}");
+                }
+            });
+        }
     }
 
     /// A flushed metrics file is the only copy once the buffer is cleared,

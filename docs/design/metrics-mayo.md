@@ -83,7 +83,20 @@ Each node stores its own metrics locally. There is no central metrics database. 
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-Inserts land in an in-memory buffer. On flush the buffer becomes an Arrow `RecordBatch`, is written to a new `metrics_NNNNNN.parquet` file, and dropped from memory. Queries register the on-disk Parquet directory plus the unflushed buffer as a DataFusion `metrics` table (columns `timestamp UInt64`, `metric_name Utf8`, `labels Utf8` (a JSON object), `value Float64`) and run SQL over the union. A corrupt or truncated Parquet file is skipped with a log rather than failing the whole query.
+Inserts land in an in-memory buffer. On flush the buffer becomes an Arrow `RecordBatch`, is written to a new `metrics_NNNNNN.parquet` file, and dropped from memory. Queries see the Parquet files plus the unflushed buffer as a DataFusion `metrics` table (columns `timestamp UInt64`, `metric_name Utf8`, `labels Utf8` (a JSON object), `value Float64`) and run SQL over the union, streamed as §3.1.1 describes. A corrupt or truncated Parquet file is skipped with a log rather than failing the whole query.
+
+#### 3.1.1 Streamed queries
+
+Every read path streams (#377): `/v1/metrics` by name or `*`, `/v1/metrics/app/…`, SQL over metrics (`query_sql`, `query_sql_since`), the alert evaluator (`gather_latest_values`), the rollup generator, the autoscaler's `query_avg`, `relish top`, the council's rollup store (every `/v1/metrics/rollup`, `/v1/metrics/cluster` and autoscaler query, plus `hydrate_seen_windows` at startup), on the local and the object-store backend alike. None of them loads files up front.
+
+- **The table.** `src/mayo/scan.rs` defines `ParquetTable`, a DataFusion `TableProvider` over a list of sources (local paths, or bucket keys with their sizes) and the buffer. Building a session only lists file names. When a query runs, its single partition reads one source at a time, in listing order, then the buffer, so at most one file's decoded batches are held by the scan at once.
+- **Pushdown.** The table accepts every filter as `Inexact`. From the filters DataFusion pushes, `ScanBounds` derives an inclusive `timestamp` range and a set of `metric_name`s: `=`, `<`, `<=`, `>`, `>=`, `BETWEEN`, `IN`, `AND`, and `OR` (as the hull of its sides). Anything else gives no bound. A row group whose footer statistics (min/max of `timestamp` and `metric_name`) can't overlap the bounds isn't decoded; a file with no admitted row group isn't read past its footer. DataFusion still applies the real filter on top, so pruning only has to be safe, never complete. `query_sql_since`'s `since` is one more lower bound.
+- **Projection.** Only the columns a query uses are decoded (`SELECT DISTINCT metric_name` reads one column).
+- **Object store.** A bucket object's footer is fetched with two range reads (the 8-byte tail, then the metadata), so an object the bounds rule out is never downloaded.
+- **Incremental aggregation.** DataFusion's filter, hash aggregate and top-k sort consume the stream as it arrives: an aggregate holds one accumulator per group, `ORDER BY … LIMIT n` holds `n` rows. Sessions use one target partition, because a repartition step after the scan reads ahead of its consumers and queued batches grew with the files read.
+- **What still scales with history.** The list of file names a query starts from (a couple of hundred bytes per file). A query whose *answer* scales with history (`/v1/metrics?name=X` with no start, which has no row cap, or `/v1/metrics/rollup` grouped by minute) still needs memory for that answer.
+
+`tests/mayo_memory.rs` measures each path's peak heap with a counting allocator as history grows from one to four hours and fails if any grows by half. Golden snapshots recorded from the eager implementation (`src/mayo/snapshots/`) and a property test against an eager reference (`streamed_reads_match_the_eager_reader`) hold the answers identical.
 
 ### 3.2 Retention
 

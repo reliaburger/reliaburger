@@ -181,11 +181,11 @@ fn assert_flat(reads: &[(&str, &[(u64, usize)])]) {
     for (label, peaks) in reads {
         let (first_hours, first) = peaks[0];
         let (last_hours, last) = peaks[peaks.len() - 1];
-        println!(
-            "{label}: {} KiB at {first_hours} h, {} KiB at {last_hours} h",
-            first / 1024,
-            last / 1024
-        );
+        let each: Vec<String> = peaks
+            .iter()
+            .map(|(hours, peak)| format!("{} KiB at {hours} h", peak / 1024))
+            .collect();
+        println!("{label}: {}", each.join(", "));
         if last * 2 >= first * 3 {
             grew.push(format!(
                 "{label} needed {} KiB at {first_hours} h of history and {} KiB at \

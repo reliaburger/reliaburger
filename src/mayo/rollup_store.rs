@@ -13,10 +13,10 @@ use std::time::{Duration, SystemTime};
 use datafusion::arrow::array::{Array, Float64Array, StringArray, UInt32Array, UInt64Array};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::datasource::MemTable;
 use datafusion::prelude::*;
 
 use super::rollup::{MetricsQueryRow, NodeRollup, OwnedRollupRow};
+use super::scan::{ParquetSource, ParquetTable, list_local, streaming_session};
 use super::store::{dir_has_parquet, next_flush_counter, write_batch_parquet};
 use super::types::MayoError;
 
@@ -52,6 +52,20 @@ pub fn rollup_schema() -> Schema {
         Field::new("sum_val", DataType::Float64, false),
         Field::new("count_val", DataType::UInt32, false),
     ])
+}
+
+/// The newest window any rollup file in `directory` holds, from footer
+/// statistics alone. A file whose footer can't be read is skipped, as every
+/// query skips it. Blocking: it opens every file.
+fn newest_flushed_window(directory: &std::path::Path) -> Option<u64> {
+    list_local(directory)
+        .ok()?
+        .iter()
+        .filter_map(|source| match source {
+            ParquetSource::Local(path) => super::store::file_max_timestamp(path),
+            ParquetSource::Remote { .. } => None,
+        })
+        .max()
 }
 
 /// A buffered rollup entry waiting to be flushed.
@@ -120,9 +134,19 @@ impl RollupStore {
         if !dir_has_parquet(&self.data_dir) {
             return Ok(());
         }
+        // Only windows within the horizon of the newest one are kept, so only
+        // they are read, with the newest taken from the files' footers.
+        let directory = self.data_dir.clone();
+        let cutoff = tokio::task::spawn_blocking(move || newest_flushed_window(&directory))
+            .await
+            .ok()
+            .flatten()
+            .map_or(0, |newest| newest.saturating_sub(IDEMPOTENCY_HORIZON_SECS));
         let ctx = self.session().await?;
         let df = ctx
-            .sql("SELECT DISTINCT node_id, timestamp FROM rollups")
+            .sql(&format!(
+                "SELECT DISTINCT node_id, timestamp FROM rollups WHERE timestamp >= {cutoff}"
+            ))
             .await
             .map_err(|e| MayoError::QueryFailed(e.to_string()))?;
         let batches = df
@@ -273,89 +297,21 @@ impl RollupStore {
     }
 
     /// Build a DataFusion session exposing a `rollups` table over all data: the
-    /// on-disk Parquet directory unioned with the unflushed buffer.
+    /// Parquet files unioned with the unflushed buffer, streamed per query and
+    /// pruned by each query's time and metric-name predicates (#377), so a
+    /// cluster query reads the files its window touches, not every one.
     async fn session(&self) -> Result<SessionContext, MayoError> {
-        // Read Parquet string columns as `Utf8`, not `Utf8View`, so on-disk
-        // batches share the canonical schema with the in-memory buffer.
-        let config = SessionConfig::new().set_bool(
-            "datafusion.execution.parquet.schema_force_view_types",
-            false,
+        let ctx = streaming_session();
+        let table = ParquetTable::new(
+            Arc::new(rollup_schema()),
+            list_local(&self.data_dir)?,
+            self.buffer_to_batch()?,
+            None,
+            "rollup",
         );
-        let ctx = SessionContext::new_with_config(config);
-        let schema = Arc::new(rollup_schema());
-
-        let mut all_batches = self.read_disk_batches(&ctx).await?;
-        if let Some(buffer_batch) = self.buffer_to_batch()? {
-            all_batches.push(buffer_batch);
-        }
-
-        if all_batches.is_empty() {
-            all_batches.push(RecordBatch::new_empty(schema.clone()));
-        }
-
-        let table = MemTable::try_new(schema, vec![all_batches])
-            .map_err(|e| MayoError::DataFusion(e.to_string()))?;
         ctx.register_table("rollups", Arc::new(table))
             .map_err(|e| MayoError::DataFusion(e.to_string()))?;
         Ok(ctx)
-    }
-
-    /// Read every intact `rollup_*.parquet` file into RecordBatches, normalised
-    /// to the canonical schema. A corrupt or truncated file is skipped with a
-    /// log rather than failing the whole query (OBS5): one bad flush must not
-    /// take down every unrelated read.
-    async fn read_disk_batches(&self, ctx: &SessionContext) -> Result<Vec<RecordBatch>, MayoError> {
-        if !dir_has_parquet(&self.data_dir) {
-            return Ok(Vec::new());
-        }
-        let schema = Arc::new(rollup_schema());
-        let mut normalised = Vec::new();
-
-        let entries = std::fs::read_dir(&self.data_dir).map_err(MayoError::Io)?;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.extension().is_some_and(|x| x == "parquet") {
-                continue;
-            }
-            // Register and read each file on its own so a single corrupt file
-            // can be skipped instead of poisoning a directory-wide scan.
-            let table_name = "rollup_one";
-            let _ = ctx.deregister_table(table_name);
-            let file = path.to_string_lossy().to_string();
-            if ctx
-                .register_parquet(table_name, &file, ParquetReadOptions::default())
-                .await
-                .is_err()
-            {
-                eprintln!("mayo: skipping unreadable rollup file {file}");
-                continue;
-            }
-            let read = async {
-                let df = ctx
-                    .sql("SELECT timestamp, node_id, metric_name, labels, min_val, max_val, sum_val, count_val FROM rollup_one")
-                    .await
-                    .map_err(|e| MayoError::QueryFailed(e.to_string()))?;
-                df.collect()
-                    .await
-                    .map_err(|e| MayoError::QueryFailed(e.to_string()))
-            }
-            .await;
-            let _ = ctx.deregister_table(table_name);
-            match read {
-                Ok(batches) => {
-                    for batch in batches {
-                        match RecordBatch::try_new(schema.clone(), batch.columns().to_vec()) {
-                            Ok(b) => normalised.push(b),
-                            Err(e) => {
-                                eprintln!("mayo: skipping malformed rollup batch in {file}: {e}")
-                            }
-                        }
-                    }
-                }
-                Err(_) => eprintln!("mayo: skipping corrupt rollup file {file}"),
-            }
-        }
-        Ok(normalised)
     }
 
     /// Query rollup data using SQL.
