@@ -121,6 +121,34 @@ async fn wait_job(client: &BunClient, expected_state: &str, restarts: u32) {
     }
 }
 
+/// The job's pid, once status reports one.
+///
+/// Status reads each pid from the process owner when it answers, and
+/// reports one it couldn't read in time as unknown rather than hold the
+/// answer; a busy runner right after a Bun starts or adopts can miss that
+/// (#358). Comparing pids across a crash has to compare known ones: a
+/// different pid still fails, only a missing one waits.
+async fn job_pid(client: &BunClient) -> u32 {
+    let deadline = tokio::time::Instant::now() + STATE_DEADLINE;
+    loop {
+        let last_observed = match client.status().await {
+            Ok(statuses) => match statuses.first() {
+                Some(status) => match status.pid {
+                    Some(pid) => return pid,
+                    None => format!("{status:?}"),
+                },
+                None => "no instances".to_string(),
+            },
+            Err(error) => format!("status request failed: {error}"),
+        };
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "job never reported a pid within {STATE_DEADLINE:?}; last observed {last_observed}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 #[tokio::test]
 async fn killed_bun_preserves_job_budget_and_requires_explicit_rerun() {
     let root = tempfile::tempdir().unwrap();
@@ -173,7 +201,7 @@ registry_port = 0
     let client = &node.client;
     client.apply(&config).await.unwrap();
     wait_job(client, "running", 1).await;
-    let pid = client.status().await.unwrap()[0].pid.unwrap();
+    let pid = job_pid(client).await;
     // Running proves spawn succeeded, not that the child has executed printf.
     // The gate deliberately exercises that scheduling gap before the crash.
     std::fs::write(&start_retry, "start").unwrap();
@@ -194,7 +222,7 @@ registry_port = 0
     let mut node = Node::start(&config_path, &log).await;
     let client = &node.client;
     wait_job(client, "running", 1).await;
-    assert_eq!(client.status().await.unwrap()[0].pid, Some(pid));
+    assert_eq!(job_pid(client).await, pid);
     std::fs::write(&release, "release").unwrap();
     wait_job(client, "unknown", 1).await;
     let error = client.apply(&config).await.unwrap_err();
@@ -335,7 +363,7 @@ registry_port = 0
     let mut node = Node::start(&config_path, &log).await;
     node.client.apply(&config).await.unwrap();
     wait_job(&node.client, "running", 0).await;
-    let main_pid = node.client.status().await.unwrap()[0].pid.unwrap();
+    let main_pid = job_pid(&node.client).await;
     let marker = root.path().join("exec-pid");
     let client = BunClient::new(&node.endpoint);
     let command = vec![
@@ -368,10 +396,7 @@ registry_port = 0
     let _ = request.await;
     let mut recovered = Node::start(&config_path, &log).await;
     wait_job(&recovered.client, "running", 0).await;
-    assert_eq!(
-        recovered.client.status().await.unwrap()[0].pid,
-        Some(main_pid)
-    );
+    assert_eq!(job_pid(&recovered.client).await, main_pid);
     std::fs::write(release, "release").unwrap();
     wait_job(&recovered.client, "stopped", 0).await;
     recovered.client.stop("work", "default").await.unwrap();
