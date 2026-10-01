@@ -995,6 +995,7 @@ fn owned_upgrade_directive(
 #[cfg(feature = "ebpf")]
 async fn failed_owned_upgrade_reverts(root: &Path, node: &mut Node, key: &[u8]) {
     let original = node.client.status().await.unwrap().remove(0);
+    assert!(original.pid.is_some(), "{original:?}");
     std::fs::write(
         root.join("upgrade-bin/bun-v0.2.0.fail-boot"),
         "broken candidate",
@@ -1020,7 +1021,7 @@ async fn failed_owned_upgrade_reverts(root: &Path, node: &mut Node, key: &[u8]) 
     );
     let adopted = node.client.status().await.unwrap().remove(0);
     assert_eq!(adopted.id, original.id);
-    assert_eq!(adopted.pid, original.pid);
+    assert_eq!(adopted.pid, original.pid, "{adopted:?}");
     assert_eq!(adopted.host_port, original.host_port);
     assert_eq!(
         std::fs::read_to_string(root.join("shared/main")).unwrap(),
@@ -1031,6 +1032,7 @@ async fn failed_owned_upgrade_reverts(root: &Path, node: &mut Node, key: &[u8]) 
 #[cfg(feature = "ebpf")]
 async fn upgrade_and_rollback(root: &Path, node: &Node, key: &[u8]) {
     let original = node.client.status().await.unwrap().remove(0);
+    assert!(original.pid.is_some(), "{original:?}");
     let directive = owned_upgrade_directive(root, key);
     for version in ["v0.2.0", "v0.1.0"] {
         if version == "v0.2.0" {
@@ -1053,7 +1055,7 @@ async fn upgrade_and_rollback(root: &Path, node: &Node, key: &[u8]) {
         .unwrap_or_else(|_| panic!("owned runtime never settled on {version}"));
         let adopted = node.client.status().await.unwrap().remove(0);
         assert_eq!(adopted.id, original.id);
-        assert_eq!(adopted.pid, original.pid);
+        assert_eq!(adopted.pid, original.pid, "{adopted:?}");
         assert_eq!(adopted.host_port, original.host_port);
         assert_eq!(
             std::fs::read_link(root.join("upgrade-bin/bun")).unwrap(),
@@ -1126,6 +1128,7 @@ async fn normal_rootless_bun_recovers_owned_forward_and_discovery() {
     node.client.apply(&app).await.unwrap();
     wait_file(&root.join("shared/main")).await;
     let original = node.client.status().await.unwrap().remove(0);
+    assert!(original.pid.is_some(), "{original:?}");
     let url = format!("http://127.0.0.1:{}/", original.host_port.unwrap());
     assert_eq!(
         reqwest::get(&url).await.unwrap().text().await.unwrap(),
@@ -1134,7 +1137,7 @@ async fn normal_rootless_bun_recovers_owned_forward_and_discovery() {
     node.crash().await;
     let mut recovered = Node::start(&root).await;
     let adopted = recovered.client.status().await.unwrap().remove(0);
-    assert_eq!(adopted.pid, original.pid);
+    assert_eq!(adopted.pid, original.pid, "{adopted:?}");
     assert_eq!(adopted.host_port, original.host_port);
     assert_eq!(
         reqwest::get(&url).await.unwrap().text().await.unwrap(),
@@ -1209,6 +1212,7 @@ async fn normal_clustered_bun_recovers_enrolled_consumer_before_adoption() {
     // recovery then rightly redeploys instead of adopting the original.
     wait_placement_applied(&root, &name).await;
     let original = node.client.status().await.unwrap().remove(0);
+    assert!(original.pid.is_some(), "{original:?}");
     node.crash().await;
     // A failed first launch rolls to a new generation and would still pass
     // the rest of this test, hiding whatever made the first one fail.
@@ -1228,7 +1232,7 @@ async fn normal_clustered_bun_recovers_enrolled_consumer_before_adoption() {
     let mut recovered = Node::start(&root).await;
     wait_cluster_publication(&recovered.client, &name).await;
     let adopted = recovered.client.status().await.unwrap().remove(0);
-    assert_eq!(adopted.pid, original.pid);
+    assert_eq!(adopted.pid, original.pid, "{adopted:?}");
     assert_eq!(adopted.host_port, original.host_port);
     assert_eq!(
         std::fs::read_to_string(root.join("shared/main")).unwrap(),

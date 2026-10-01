@@ -314,6 +314,55 @@ async fn rootless_helper_that_keeps_dying_is_reported_then_recovers() {
     runtime.kill(&id).await.unwrap();
 }
 
+/// A status read asks for the launcher's pid while state reads hold the
+/// instance: here, each one retrying a network helper that keeps dying,
+/// with backoff (#358). Nothing they do changes the launcher, so its pid
+/// answers at once instead of queueing behind them past the status
+/// deadline. A fresh runtime stands in for the Bun that just exec'd.
+#[tokio::test]
+#[ignore = "requires unprivileged Linux user, rootless runc, slirp4netns and static busybox"]
+async fn rootless_pid_answers_while_state_reads_hold_the_instance() {
+    let root = tempfile::tempdir().unwrap();
+    let id = InstanceId("rootless-busy".into());
+    let (first, network, url) = start_published_with_wrapper(root.path(), &id).await;
+    let launcher = first.pid(&id).await.unwrap();
+    drop(first);
+    let runtime = runtime(root.path());
+    assert_eq!(runtime.state(&id).await.unwrap(), ContainerState::Running);
+
+    std::fs::write(root.path().join("break-helper"), "").unwrap();
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(network.owner_pid as i32),
+        nix::sys::signal::Signal::SIGKILL,
+    )
+    .unwrap();
+    let busy: Vec<_> = (0..4)
+        .map(|_| {
+            let runtime = runtime.clone();
+            let id = id.clone();
+            tokio::spawn(async move { runtime.state(&id).await })
+        })
+        .collect();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let asked = std::time::Instant::now();
+    assert_eq!(runtime.pid(&id).await, Some(launcher));
+    assert!(
+        asked.elapsed() < Duration::from_millis(250),
+        "the pid waited {:?} behind state reads",
+        asked.elapsed()
+    );
+    for read in busy {
+        // Each fails or recovers; only the pid's latency is under test.
+        let _ = read.await.unwrap();
+    }
+
+    std::fs::remove_file(root.path().join("break-helper")).unwrap();
+    assert_eq!(runtime.state(&id).await.unwrap(), ContainerState::Running);
+    assert_eq!(read_page(&url).await, "owned-rootless");
+    runtime.kill(&id).await.unwrap();
+    assert_eq!(runtime.pid(&id).await, None);
+}
+
 #[tokio::test]
 #[ignore = "requires unprivileged Linux user, rootless runc, slirp4netns and static busybox"]
 async fn rootless_caller_death_recovers_without_an_adoption_record() {
