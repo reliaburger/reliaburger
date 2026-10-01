@@ -77,6 +77,50 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "### Appliance $version, publish: $publish" >> "$GITHUB_STEP_SUMMARY"
 
+  # Lab builds carry the bun and relish of the commit under test, so a PR's
+  # bun changes run in its own appliance image. Published builds and a
+  # dispatch naming bun_release take a release instead.
+  bun:
+    name: bun from source (${{ matrix.arch }})
+    needs: plan
+    if: needs.plan.outputs.publish != 'true' && inputs.bun_release == ''
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - arch: aarch64
+            target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    env:
+      RELIABURGER_GIT_SHA: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: appliance-${{ matrix.target }}
+      - name: Build bun and relish
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang llvm libbpf-dev
+          cargo build --locked --release --target ${{ matrix.target }} --features ebpf --bin bun --bin relish
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/bun dist/bun-linux-${{ matrix.arch }}
+          cp target/${{ matrix.target }}/release/relish dist/relish-linux-${{ matrix.arch }}
+          dist/bun-linux-${{ matrix.arch }} --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bun-source-${{ matrix.arch }}
+          path: dist/*
+          retention-days: 1
+
   # The image's shell scripts that have unit tests (image/tests): quick, and
   # Linux-only, since the scripts use GNU coreutils as the appliance does.
   scripts:
@@ -88,7 +132,9 @@ jobs:
 
   image:
     name: image (${{ matrix.arch }})
-    needs: plan
+    needs: [plan, bun]
+    # bun is skipped for published builds; the image still runs.
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.bun.result != 'failure' }}
     strategy:
       fail-fast: false
       matrix:
@@ -116,12 +162,25 @@ jobs:
       - name: Set up mkosi v27
         uses: systemd/mkosi@f2b04fcd671110e3a7372027162752f71de0c9b0 # v27
 
+      - uses: actions/download-artifact@v4
+        if: needs.bun.result == 'success'
+        with:
+          name: bun-source-${{ matrix.arch }}
+          path: source-bin
+
       - name: Fetch bun and relish
         env:
           GH_TOKEN: ${{ github.token }}
           REQUESTED: ${{ inputs.bun_release }}
         run: |
           set -euo pipefail
+          if [ -d source-bin ]; then
+            install -D -m 0755 "source-bin/bun-linux-$ARCH" image/bin-tree/usr/lib/reliaburger/bin/bun
+            install -D -m 0755 "source-bin/relish-linux-$ARCH" image/bin-tree/usr/lib/reliaburger/bin/relish
+            echo "BUN_RELEASE=source-$GITHUB_SHA" >> "$GITHUB_ENV"
+            echo "### bun and relish built from \`$GITHUB_SHA\`" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           tag="$REQUESTED"
           if [ -z "$tag" ]; then
             # Published releases only: old v0.0.x pre-releases lack SHA256SUMS.
