@@ -58,6 +58,12 @@ FD_STEP = 10
 FD_GROWTH = 1.25
 REPEAT_WINDOW = 1800
 LEAK_KINDS = ("runc", "netns", "lease", "veth", "cgroup", "bpf", "listen")
+# The agent loop's turn budget (docs/plans/2026-09-30-agent-loop-review.md,
+# decision 1): a tier fails if any node runs one turn longer than this. Bun
+# exports its turns as the histogram bun_agent_loop_turn_seconds, and 1 s is
+# one of its bucket bounds, so `+Inf` minus `le="1"` counts the turns over.
+TURN_BUDGET_LE = "1"
+TURN_BUCKET_BOUNDS = ("2.5", "5", "10", "+Inf")
 # Pickle resolves every tag through the council's committed catalogue and
 # answers 503 while there is no leader. A few tries ride out an election;
 # a quorum loss outlasts them and is judged against the fault window.
@@ -610,6 +616,11 @@ def evaluate(evidence, snapshot):
         if text is not None:
             findings += export_findings(state, node, text)
             findings += snapshot_archive_findings(state, node, text)
+        # After the inventory, so a new bun process is known before its
+        # turn counters are compared with the old one's.
+        turns = read_json(snapshot, f"turns-{node}.json")
+        if turns is not None:
+            findings += turn_findings(state, node, turns)
     # Leaks only count once the cluster has settled; before that they are progress.
     findings += [dict(leak, severity="info") if fault_window else leak for leak in leaks]
 
@@ -655,6 +666,62 @@ def suppress_repeats(state, findings, now):
                 reported[key] = now
         result.append(item)
     return result
+
+
+def turn_buckets(samples):
+    """The latest cumulative bucket count per (branch, le) of a node's
+    bun_agent_loop_turn_seconds_bucket samples, as /v1/metrics returns them."""
+    latest = {}
+    for sample in samples if isinstance(samples, list) else []:
+        labels = sample.get("labels") or {}
+        if isinstance(labels, str):
+            try:
+                labels = json.loads(labels)
+            except json.JSONDecodeError:
+                continue
+        key = (labels.get("branch"), labels.get("le"))
+        if None in key:
+            continue
+        stamp = sample.get("timestamp", 0)
+        if key not in latest or stamp >= latest[key][0]:
+            latest[key] = (stamp, sample.get("value", 0))
+    return {key: value for key, (_, value) in latest.items()}
+
+
+def turn_findings(state, node, samples):
+    """Fail on every agent-loop turn over the 1 s budget since the last check.
+
+    The buckets count from the bun process's start, so the check remembers
+    what it last saw per branch, and starts again from zero when the process
+    changes (a kill, an upgrade's exec), as the resource trends do."""
+    buckets = turn_buckets(samples)
+    resources = state.get("resources", {}).get(node, {})
+    process = [resources.get("pid"), resources.get("image")]
+    seen = state.setdefault("turns", {}).setdefault(node, {})
+    if seen.get("process") != process:
+        seen.update(process=process, over={})
+    findings = []
+    for branch in sorted({branch for branch, _ in buckets}):
+        total = buckets.get((branch, "+Inf"))
+        within = buckets.get((branch, TURN_BUDGET_LE))
+        if total is None or within is None:
+            continue
+        over = int(total - within)
+        previous = seen["over"].get(branch, 0)
+        # Counters only go down when bun restarted between two checks
+        # without its pid changing; count that process from zero.
+        new = over - previous if over >= previous else over
+        seen["over"][branch] = over
+        if new <= 0:
+            continue
+        worst = next((bound for bound in TURN_BUCKET_BOUNDS
+                      if buckets.get((branch, bound)) == total), "+Inf")
+        lower = {"2.5": "1", "5": "2.5", "10": "5", "+Inf": "10"}[worst]
+        span = f"over {lower} s" if worst == "+Inf" else f"between {lower} and {worst} s"
+        findings.append(finding("agent-loop-turn", "fail",
+                                f"{new} {branch} turn(s) over the 1 s budget, the worst {span}", node))
+        state.setdefault("turns_over_budget", {})[node] = state.get("turns_over_budget", {}).get(node, 0) + new
+    return findings
 
 
 def diagnostics_findings(state, node, diagnostics, now):
@@ -1044,6 +1111,13 @@ def render(evidence, record):
     for node, count in sorted(state.get("export_counts", {}).items()):
         lines.append(f"- Export {node}: {count['source']} source files, {count['destination']} at the destination")
     lines.append(f"- Registry images pushed and re-verified: {len(state.get('registry_pushed', []))}")
+    over_budget = state.get("turns_over_budget", {})
+    checked = sorted(state.get("turns", {}))
+    if checked:
+        lines.append("- Agent-loop turns over the 1 s budget: " + ", ".join(
+            f"{node} {over_budget.get(node, 0)}" for node in checked))
+    else:
+        lines.append("- Agent-loop turns over the 1 s budget: not measured")
     lines.append(f"- Checks evaluated: {state.get('checks', 0)} ({', '.join(f'{kind} {n}' for kind, n in sorted(state.get('check_counts', {}).items()))})")
     if progress:
         lines.append(f"- Last observed progress: {', '.join(f'{key} {value}' for key, value in sorted(progress.items()))}")

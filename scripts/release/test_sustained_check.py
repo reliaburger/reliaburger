@@ -671,6 +671,67 @@ max_lease_seconds = 3600
         self.assertEqual(checker.toml_set(once, [("logs.max_storage_mb", "8")]), once)
 
 
+def turns(branch="command", within=10, over=(), ts=NOW):
+    """bun_agent_loop_turn_seconds_bucket samples as /v1/metrics returns them:
+    `within` turns of at most 1 s, plus one for each bound in `over`."""
+    bounds = ["0.25", "0.5", "1", "2.5", "5", "10", "+Inf"]
+    bigger = {"2.5": 0, "5": 1, "10": 2, "+Inf": 3}
+    samples = []
+    for bound in bounds:
+        count = within
+        if bound in bigger:
+            count += sum(1 for slot in over if bigger[slot] <= bigger[bound])
+        labels = json.dumps({"branch": branch, "le": bound})
+        samples.append({"timestamp": ts, "metric_name": "bun_agent_loop_turn_seconds_bucket",
+                        "labels": labels, "value": float(count)})
+    return samples
+
+
+class AgentLoopTurns(Evidence):
+    """The soak fails a tier on any agent-loop turn over 1 s (#351)."""
+
+    def test_turns_within_the_budget_pass(self):
+        code, verdict = self.evaluate(self.snapshot(**{"turns__rb-a-1_json": turns(within=500)}))
+        self.assertNotEqual(code, 1)
+        self.assertEqual(self.failures(verdict), [])
+
+    def test_one_turn_over_a_second_fails_and_says_how_long(self):
+        code, verdict = self.evaluate(self.snapshot(**{
+            "inventory__rb-a-2_txt": INVENTORY,
+            "turns__rb-a-2_json": turns(branch="deploy_op", over=("5",))}))
+        self.assertEqual(code, 1)
+        failure = next(item for item in verdict["findings"] if item["check"] == "agent-loop-turn")
+        self.assertEqual(failure["target"], "rb-a-2")
+        self.assertIn("1 deploy_op turn(s) over the 1 s budget, the worst between 2.5 and 5 s", failure["detail"])
+
+    def test_only_turns_since_the_last_check_count(self):
+        evidence = {"inventory__rb-a-1_txt": INVENTORY, "turns__rb-a-1_json": turns(over=("2.5",))}
+        self.evaluate(self.snapshot(**evidence))
+        code, verdict = self.evaluate(self.snapshot(ts=NOW + 3600, **evidence))
+        self.assertNotIn("agent-loop-turn", self.failures(verdict))
+        code, verdict = self.evaluate(self.snapshot(ts=NOW + 7200, **{
+            "inventory__rb-a-1_txt": INVENTORY, "turns__rb-a-1_json": turns(over=("2.5", "+Inf"))}))
+        self.assertEqual(code, 1)
+        failure = next(item for item in verdict["findings"] if item["check"] == "agent-loop-turn")
+        self.assertIn("1 command turn(s) over the 1 s budget, the worst over 10 s", failure["detail"])
+
+    def test_a_restarted_bun_counts_its_turns_from_zero(self):
+        self.evaluate(self.snapshot(**{"inventory__rb-a-1_txt": INVENTORY,
+                                       "turns__rb-a-1_json": turns(over=("2.5",))}))
+        code, verdict = self.evaluate(self.snapshot(ts=NOW + 3600, **{
+            "inventory__rb-a-1_txt": INVENTORY.replace("bun_pid 100", "bun_pid 200"),
+            "turns__rb-a-1_json": turns(within=3, over=("2.5",))}))
+        self.assertEqual(code, 1)
+        self.assertIn("agent-loop-turn", self.failures(verdict))
+
+    def test_the_record_counts_turns_over_the_budget_per_node(self):
+        self.evaluate(self.snapshot(**{"turns__rb-a-1_json": turns(over=("2.5", "5")),
+                                       "turns__rb-a-2_json": turns()}))
+        state = checker.load_state(self.evidence)
+        self.assertEqual(state["turns_over_budget"], {"rb-a-1": 2})
+        self.assertEqual(sorted(state["turns"]), ["rb-a-1", "rb-a-2"])
+
+
 class Record(Evidence):
     def write_run(self, failures=()):
         (self.evidence / "metadata.json").write_text(json.dumps({
