@@ -1136,27 +1136,20 @@ pub async fn history(app: &str, namespace: &str, output: OutputFormat) -> Result
     // `reqwest::get` carried no bearer/CA, so it 401'd against a secured agent
     // and silently exited 0. `deploy_history` routes through the configured
     // client and propagates the failure.
-    let entries = client.deploy_history(app, namespace).await?;
+    let view = client.deploy_history(app, namespace).await?;
+    // Every node records its own rollout; a node that didn't answer leaves a
+    // gap the reader must know about, on stderr so `-o json` stays parseable.
+    for warning in &view.warnings {
+        eprintln!("warning: history incomplete: {warning}");
+    }
+    let entries = &view.history;
 
     match output {
         OutputFormat::Human => {
             if entries.is_empty() {
                 println!("no deploy history for {app} in namespace {namespace}");
             } else {
-                println!(
-                    "{:<8} {:<20} {:<12} {:<6} {:<6}",
-                    "ID", "IMAGE", "RESULT", "DONE", "TOTAL"
-                );
-                for e in &entries {
-                    println!(
-                        "{:<8} {:<20} {:<12} {:<6} {:<6}",
-                        e["id"].as_u64().unwrap_or(0),
-                        e["image"].as_str().unwrap_or("-"),
-                        e["result"].as_str().unwrap_or("-"),
-                        e["steps_completed"].as_u64().unwrap_or(0),
-                        e["steps_total"].as_u64().unwrap_or(0),
-                    );
-                }
+                print!("{}", render_history_table(entries));
             }
         }
         OutputFormat::Json => {
@@ -1171,6 +1164,35 @@ pub async fn history(app: &str, namespace: &str, output: OutputFormat) -> Result
     }
 
     Ok(())
+}
+
+/// `relish history` as a table: one row per node that rolled each deploy out.
+fn render_history_table(
+    entries: &[crate::bun::cluster_view::NodeTagged<
+        crate::meat::deploy_types::DeployHistoryEntry,
+    >],
+) -> String {
+    let mut table = format!(
+        "{:<8} {:<16} {:<20} {:<12} {:<6} {:<6}\n",
+        "ID", "NODE", "IMAGE", "RESULT", "DONE", "TOTAL"
+    );
+    for entry in entries {
+        let image = if entry.row.image.is_empty() {
+            "-"
+        } else {
+            entry.row.image.as_str()
+        };
+        table.push_str(&format!(
+            "{:<8} {:<16} {:<20} {:<12} {:<6} {:<6}\n",
+            entry.row.id.0,
+            entry.node,
+            image,
+            format!("{:?}", entry.row.result),
+            entry.row.steps_completed,
+            entry.row.steps_total,
+        ));
+    }
+    table
 }
 
 /// Rollback an app to the previous version.
@@ -2320,6 +2342,33 @@ pub async fn snapshot_delete(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn history_table_names_the_node_of_every_entry() {
+        let at = std::time::SystemTime::UNIX_EPOCH;
+        let entry = |node: &str, id: u64| crate::bun::cluster_view::NodeTagged {
+            node: node.to_string(),
+            row: crate::meat::deploy_types::DeployHistoryEntry {
+                id: crate::meat::deploy_types::DeployId(id),
+                app_id: crate::meat::types::AppId::new("web", "default"),
+                image: String::new(),
+                result: crate::meat::deploy_types::DeployResult::Completed,
+                created_at: at,
+                completed_at: at,
+                steps_completed: 1,
+                steps_total: 1,
+                spec: None,
+            },
+        };
+        let table = super::render_history_table(&[entry("node-1", 7), entry("node-2", 7)]);
+        let rows: Vec<Vec<&str>> = table
+            .lines()
+            .map(|line| line.split_whitespace().collect())
+            .collect();
+        assert_eq!(rows[0], ["ID", "NODE", "IMAGE", "RESULT", "DONE", "TOTAL"]);
+        assert_eq!(rows[1], ["7", "node-1", "-", "Completed", "1", "1"]);
+        assert_eq!(rows[2], ["7", "node-2", "-", "Completed", "1", "1"]);
+    }
+
     #[test]
     fn build_plan_shows_the_destination_and_build_but_no_push() {
         let spec = crate::config::build::BuildSpec {

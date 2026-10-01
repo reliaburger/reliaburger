@@ -567,6 +567,55 @@ its own statuses to its own samples (`bun::top::node_rows`), and the node you
 ask merges finished rows. A PID never crosses a machine boundary without the
 node it belongs to.
 
+### One stream, two transports
+
+The fix above reached `relish logs -f` and the dashboard, which both speak
+SSE. The terminal UI doesn't. It follows logs over a WebSocket, and that
+handler still asked the agent for this node's lines and nothing else. The TUI
+even said so, in a grey line above the logs: "live logs from the connected
+node". Honest, but not much use when the replica you care about is on node 3.
+
+The merge task already existed, so the WebSocket only needed to read from it.
+What stood in the way was the channel's item type. `follow_cluster_logs` pushed
+`axum::response::sse::Event`s, which is SSE's wire format, and you can't ask an
+`Event` afterwards whether it was a warning. The WebSocket has no `event:`
+field to carry that distinction anyway. So the task now speaks a type of our
+own, and each transport translates it at the edge:
+
+```rust
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogFrame {
+    Line(String),
+    Warning(String),
+}
+```
+
+This is a Rust enum whose variants carry data, the thing C needs a tagged
+union and a `switch` for and Go approximates with an interface and a type
+switch. A `LogFrame` is either a line *or* a warning, never both and never
+neither, and `match` won't compile until you've said what happens to each. By
+default serde writes an enum like this "externally tagged": the variant name
+becomes the JSON key, so a WebSocket frame reads
+`{"line":"[node-2 web-1] ready"}` or `{"warning":"node node-3 left the
+cluster; no longer following its logs"}`. The SSE side maps `Warning` to an
+`event: warning` block, exactly as before, so `relish logs -f` didn't change.
+
+The TUI decodes each frame and shows a warning in line, where it happened,
+instead of in a status bar that the next refresh would overwrite. A frame that
+doesn't parse is shown as a raw line rather than dropped. A log line shown
+oddly beats a log line lost.
+
+Peers relay through the same type. A peer's SSE stream comes back through
+`SseDecoder`; a block marked `event: warning` becomes `LogFrame::Warning`, and
+anything else becomes a `Line`. There's no third case to forget.
+
+The cluster test,
+`tui_logs_history_and_events_cover_every_node_and_name_a_missing_one` in
+`tests/placement.rs`, opens the WebSocket the TUI uses through one node of
+three, waits for lines stamped with every node's name, shuts a follower down
+and waits for the warning that names it.
+
 ## Tails that tell the truth
 
 The V02 soak runs a tiny app that appends 1, 2, 3, … to a file ten times a

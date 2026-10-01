@@ -82,7 +82,7 @@ pub fn lines(app: &TuiApp, height: usize) -> Vec<Line<'static>> {
             }
         }
         DetailTab::Logs => {
-            lines.push(Line::raw("live logs from the connected node"));
+            lines.push(Line::raw("live logs from every node running the app"));
             if let Some(error) = &app.log_stream_down {
                 lines.push(Line::raw(format!(
                     "stream disconnected — reconnecting: {error}"
@@ -147,19 +147,31 @@ pub fn lines(app: &TuiApp, height: usize) -> Vec<Line<'static>> {
             }
         }
         DetailTab::Deploys => {
-            lines.push(Line::raw("deployment history from the connected node"));
+            lines.push(Line::raw("deployment history from every node"));
             let history =
                 app.data
                     .deploy_history
                     .get(&crate::relish::tui::state::deploy_history_key(
                         name, namespace,
                     ));
-            if history.is_none_or(Vec::is_empty) {
+            let Some(history) = history else {
                 lines.push(Line::raw("no deploy history"));
-            } else if let Some(history) = history {
-                for entry in history {
-                    lines.push(Line::raw(entry.to_string()));
-                }
+                return lines;
+            };
+            lines.extend(widgets::partial_warnings(&history.warnings));
+            if history.history.is_empty() {
+                lines.push(Line::raw("no deploy history"));
+            }
+            for entry in &history.history {
+                lines.push(Line::raw(format!(
+                    "{:<8} {:<12} {:<24} {:<10?} {}/{}",
+                    entry.row.id.0,
+                    entry.node,
+                    entry.row.image,
+                    entry.row.result,
+                    entry.row.steps_completed,
+                    entry.row.steps_total,
+                )));
             }
         }
         DetailTab::Config => {

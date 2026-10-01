@@ -102,17 +102,26 @@ pub fn render_app_detail(data: &AppDetailData) -> String {
 
     // Deploy history
     html.push_str("<section>\n<h2>Deploy History</h2>\n");
+    for warning in &data.history_warnings {
+        html.push_str(&format!(
+            "<p class=\"warning\">history incomplete: {}</p>\n",
+            escape_html(warning)
+        ));
+    }
     if data.deploy_history.is_empty() {
         html.push_str("<p class=\"empty\">no deploys</p>\n");
     } else {
-        html.push_str("<table>\n<tr><th>Image</th><th>Result</th><th>Steps</th></tr>\n");
+        html.push_str(
+            "<table>\n<tr><th>Node</th><th>Image</th><th>Result</th><th>Steps</th></tr>\n",
+        );
         for entry in &data.deploy_history {
             html.push_str(&format!(
-                "<tr><td>{}</td><td>{:?}</td><td>{}/{}</td></tr>\n",
-                escape_html(&entry.image),
-                entry.result,
-                entry.steps_completed,
-                entry.steps_total,
+                "<tr><td>{}</td><td>{}</td><td>{:?}</td><td>{}/{}</td></tr>\n",
+                escape_html(&entry.node),
+                escape_html(&entry.row.image),
+                entry.row.result,
+                entry.row.steps_completed,
+                entry.row.steps_total,
             ));
         }
         html.push_str("</table>\n");
@@ -311,6 +320,7 @@ mod tests {
                 },
             ],
             deploy_history: vec![],
+            history_warnings: vec![],
             charts: vec![ChartConfig {
                 endpoint: "/v1/metrics/app/web/default?name=process_cpu_percent".to_string(),
                 title: "CPU Usage".to_string(),
@@ -319,6 +329,30 @@ mod tests {
                 range_secs: 3600,
             }],
         }
+    }
+
+    #[test]
+    fn deploy_history_names_each_entrys_node_and_any_missing_member() {
+        let mut data = sample_data();
+        let at = std::time::SystemTime::UNIX_EPOCH;
+        data.deploy_history = vec![crate::bun::cluster_view::NodeTagged {
+            node: "node-02".to_string(),
+            row: crate::meat::deploy_types::DeployHistoryEntry {
+                id: crate::meat::deploy_types::DeployId(1),
+                app_id: crate::meat::types::AppId::new("web", "default"),
+                image: "web:v2".to_string(),
+                result: crate::meat::deploy_types::DeployResult::Completed,
+                created_at: at,
+                completed_at: at,
+                steps_completed: 1,
+                steps_total: 1,
+                spec: None,
+            },
+        }];
+        data.history_warnings = vec!["node node-03 timed out".to_string()];
+        let html = render_app_detail(&data);
+        assert!(html.contains("<td>node-02</td><td>web:v2</td>"), "{html}");
+        assert!(html.contains("history incomplete: node node-03 timed out"));
     }
 
     #[test]

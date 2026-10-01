@@ -118,3 +118,17 @@ pub fn format_time(timestamp: u64) -> String {
         seconds % 60
     )
 }
+
+/// One line per node whose share of a cluster-wide view is missing, so a
+/// partial list never passes for a complete one.
+pub fn partial_warnings(warnings: &[String]) -> Vec<Line<'static>> {
+    warnings
+        .iter()
+        .map(|warning| {
+            Line::styled(
+                format!("incomplete: {warning}"),
+                Style::default().fg(theme::WARNING),
+            )
+        })
+        .collect()
+}

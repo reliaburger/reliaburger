@@ -228,7 +228,7 @@ async fn tui_events_endpoint_records_successful_deploy() {
         .unwrap();
 
     let events = harness.client.events(20).await.unwrap();
-    assert!(events.iter().any(|event| {
+    assert!(events.events.iter().any(|event| {
         event.kind == reliaburger::bun::events::EventKind::Deploy
             && event.app.as_deref() == Some("worker")
     }));
@@ -248,9 +248,10 @@ async fn tui_jobs_endpoint_lists_supervisor_job_state() {
     harness.client.apply(&config).await.unwrap();
 
     let jobs = harness.client.jobs().await.unwrap();
-    assert_eq!(jobs.len(), 1);
-    assert_eq!(jobs[0].name, "listed");
-    assert_eq!(jobs[0].namespace, "default");
+    assert!(jobs.warnings.is_empty(), "{:?}", jobs.warnings);
+    assert_eq!(jobs.jobs.len(), 1);
+    assert_eq!(jobs.jobs[0].row.name, "listed");
+    assert_eq!(jobs.jobs[0].row.namespace, "default");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -7,16 +7,18 @@ use super::widgets;
 pub fn lines(app: &TuiApp) -> Vec<Line<'static>> {
     match app.view() {
         View::JobDetail { name, namespace } => {
-            let Some(job) = app
+            let Some(tagged) = app
                 .data
                 .jobs
                 .iter()
-                .find(|job| &job.name == name && &job.namespace == namespace)
+                .find(|job| &job.row.name == name && &job.row.namespace == namespace)
             else {
                 return vec![Line::raw("job not found")];
             };
+            let job = &tagged.row;
             vec![
                 widgets::heading(&job.name),
+                Line::raw(format!("node            {}", tagged.node)),
                 Line::raw(format!("namespace       {}", job.namespace)),
                 Line::raw(format!("instance        {}", job.instance_id)),
                 Line::raw(format!("state           {}", job.state)),
@@ -27,16 +29,19 @@ pub fn lines(app: &TuiApp) -> Vec<Line<'static>> {
         }
         _ => {
             let mut lines = vec![widgets::heading(
-                "NAME                 NS           STATE        RESTARTS  AGE      IMAGE",
+                "NAME                 NODE         NS           STATE        RESTARTS  AGE      IMAGE",
             )];
+            lines.extend(widgets::partial_warnings(&app.data.job_warnings));
             if app.data.jobs.is_empty() {
                 lines.push(Line::raw("no jobs"));
             }
-            for (index, job) in app.data.jobs.iter().enumerate() {
+            for (index, tagged) in app.data.jobs.iter().enumerate() {
+                let job = &tagged.row;
                 lines.push(widgets::row(
                     format!(
-                        "{:<20} {:<12} {:<12} {:>8}  {:>6}s  {}",
+                        "{:<20} {:<12} {:<12} {:<12} {:>8}  {:>6}s  {}",
                         job.name,
+                        tagged.node,
                         job.namespace,
                         job.state,
                         job.restart_count,

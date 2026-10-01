@@ -27,6 +27,7 @@ use crate::brioche::fragments;
 use crate::brioche::node_detail::render_node_detail;
 use crate::brioche::types::{AppDetailData, ChartConfig, NodeDetailData, safe_env};
 use crate::config::Config;
+use crate::ketchup::follow::LogFrame;
 use crate::ketchup::log_store::LogStore;
 use crate::ketchup::query::fan_out_query;
 use crate::ketchup::types::{LogEntry, LogQuery, LogQueryResult, LogQueryWarning};
@@ -4450,22 +4451,45 @@ fn local_node_name(state: &ApiState) -> String {
         .unwrap_or_else(|| "local".to_string())
 }
 
-/// Every node's workload statuses, plus one message per peer that didn't
-/// answer. Only this node's own status failing is an error: callers decide
-/// whether a partial cluster view is good enough.
-async fn collect_cluster_statuses(
+/// Ask one member for `path` and decode its JSON answer, within `timeout`.
+///
+/// The request carries this node's service token, so the peer answers as it
+/// would to the system principal; the caller trims the result to its own
+/// caller's scope. The error names the member, ready to show as a warning.
+async fn fetch_from_peer<T: serde::de::DeserializeOwned>(
     state: &ApiState,
-    peer_timeout: std::time::Duration,
-) -> Result<(Vec<super::agent::ClusterInstanceStatus>, Vec<String>), String> {
+    member: &NodeMembershipInfo,
+    path: &str,
+    timeout: std::time::Duration,
+) -> Result<T, String> {
+    let name = &member.node_id.0;
+    let result = tokio::time::timeout(timeout, async {
+        let url = state.cluster_http.url(&member.address.to_string(), path);
+        let mut request = state.cluster_http.client().get(url);
+        if let Some(token) = &state.service_token {
+            request = request.bearer_auth(token);
+        }
+        request.send().await?.error_for_status()?.json::<T>().await
+    })
+    .await;
+    match result {
+        Ok(Ok(answer)) => Ok(answer),
+        Ok(Err(error)) => Err(format!("node {name}: {error}")),
+        Err(_) => Err(format!("node {name} timed out")),
+    }
+}
+
+/// Ask every live member except this node for `path`.
+///
+/// Returns each member's answer beside its name, and one sorted warning per
+/// member that failed or timed out. A cluster-wide view shows what it has
+/// and names what's missing, rather than failing whole or going quiet.
+async fn fan_out_to_peers<T: serde::de::DeserializeOwned>(
+    state: &ApiState,
+    path: &str,
+    timeout: std::time::Duration,
+) -> (Vec<(String, T)>, Vec<String>) {
     let local_name = local_node_name(state);
-    let mut statuses: Vec<_> = local_statuses(state)
-        .await?
-        .into_iter()
-        .map(|instance| super::agent::ClusterInstanceStatus {
-            node: local_name.to_string(),
-            instance,
-        })
-        .collect();
     let members = match &state.membership {
         Some(membership) => membership.read().await.clone(),
         None => Vec::new(),
@@ -4475,46 +4499,46 @@ async fn collect_cluster_statuses(
             .into_iter()
             .filter(|member| member.node_id.0 != local_name)
             .map(|member| async move {
-                let name = member.node_id.0;
-                let result = tokio::time::timeout(peer_timeout, async {
-                    let url = state
-                        .cluster_http
-                        .url(&member.address.to_string(), "/v1/status");
-                    let mut request = state.cluster_http.client().get(url);
-                    if let Some(token) = &state.service_token {
-                        request = request.bearer_auth(token);
-                    }
-                    request
-                        .send()
-                        .await?
-                        .error_for_status()?
-                        .json::<Vec<InstanceStatus>>()
-                        .await
-                })
-                .await;
-                match result {
-                    Ok(Ok(instances)) => Ok(instances
-                        .into_iter()
-                        .map(|instance| super::agent::ClusterInstanceStatus {
-                            node: name.clone(),
-                            instance,
-                        })
-                        .collect::<Vec<_>>()),
-                    Ok(Err(error)) => Err(format!("node {name}: {error}")),
-                    Err(_) => Err(format!("node {name} timed out")),
-                }
+                let answer = fetch_from_peer(state, &member, path, timeout).await;
+                (member.node_id.0, answer)
             }),
     )
     .buffer_unordered(8);
     tokio::pin!(requests);
+    let mut answers = Vec::new();
     let mut failures = Vec::new();
-    while let Some(result) = requests.next().await {
-        match result {
-            Ok(instances) => statuses.extend(instances),
+    while let Some((name, answer)) = requests.next().await {
+        match answer {
+            Ok(answer) => answers.push((name, answer)),
             Err(failure) => failures.push(failure),
         }
     }
     failures.sort();
+    (answers, failures)
+}
+
+/// Every node's workload statuses, plus one message per peer that didn't
+/// answer. Only this node's own status failing is an error: callers decide
+/// whether a partial cluster view is good enough.
+async fn collect_cluster_statuses(
+    state: &ApiState,
+    peer_timeout: std::time::Duration,
+) -> Result<(Vec<super::agent::ClusterInstanceStatus>, Vec<String>), String> {
+    let local_name = local_node_name(state);
+    let local = local_statuses(state).await?;
+    let (peers, failures) =
+        fan_out_to_peers::<Vec<InstanceStatus>>(state, "/v1/status", peer_timeout).await;
+    let mut statuses: Vec<_> = std::iter::once((local_name, local))
+        .chain(peers)
+        .flat_map(|(node, instances)| {
+            instances
+                .into_iter()
+                .map(move |instance| super::agent::ClusterInstanceStatus {
+                    node: node.clone(),
+                    instance,
+                })
+        })
+        .collect();
     statuses.sort_by(|left, right| {
         (&left.node, &left.instance.namespace, &left.instance.id).cmp(&(
             &right.node,
@@ -4560,52 +4584,10 @@ async fn top_handler(
         rows.retain(visible);
         return Json(rows).into_response();
     }
-    let mut warnings = Vec::new();
-    let local_name = local_node_name(&state);
-    let members = match &state.membership {
-        Some(membership) => membership.read().await.clone(),
-        None => Vec::new(),
-    };
-    let requests = futures_util::stream::iter(
-        members
-            .into_iter()
-            .filter(|member| member.node_id.0 != local_name)
-            .map(|member| {
-                let state = &state;
-                async move {
-                    let name = member.node_id.0;
-                    let result = tokio::time::timeout(CLUSTER_STATUS_TIMEOUT, async {
-                        let url = state
-                            .cluster_http
-                            .url(&member.address.to_string(), "/v1/top");
-                        let mut request = state.cluster_http.client().get(url);
-                        if let Some(token) = &state.service_token {
-                            request = request.bearer_auth(token);
-                        }
-                        request
-                            .send()
-                            .await?
-                            .error_for_status()?
-                            .json::<Vec<crate::bun::top::TopRow>>()
-                            .await
-                    })
-                    .await;
-                    match result {
-                        Ok(Ok(rows)) => Ok(rows),
-                        Ok(Err(error)) => Err(format!("node {name}: {error}")),
-                        Err(_) => Err(format!("node {name} timed out")),
-                    }
-                }
-            }),
-    )
-    .buffer_unordered(8);
-    tokio::pin!(requests);
-    while let Some(result) = requests.next().await {
-        match result {
-            Ok(peer_rows) => rows.extend(peer_rows),
-            Err(warning) => warnings.push(warning),
-        }
-    }
+    let (peers, warnings) =
+        fan_out_to_peers::<Vec<crate::bun::top::TopRow>>(&state, "/v1/top", CLUSTER_STATUS_TIMEOUT)
+            .await;
+    rows.extend(peers.into_iter().flat_map(|(_, peer_rows)| peer_rows));
     // Peers answered with the node's service token, which sees everything,
     // so the caller's scope applies here.
     rows.retain(visible);
@@ -4616,7 +4598,6 @@ async fn top_handler(
             &right.instance.id,
         ))
     });
-    warnings.sort();
     Json(crate::bun::top::ClusterTop { rows, warnings }).into_response()
 }
 
@@ -4654,15 +4635,44 @@ async fn local_top_rows(state: &ApiState) -> Result<Vec<crate::bun::top::TopRow>
 }
 
 /// List all run-to-completion workload instances.
-async fn jobs_handler(State(state): State<ApiState>) -> Response {
-    match ask_agent(&state.cmd_tx, |response| AgentCommand::JobStatus {
+///
+/// `?cluster=true` merges every live member's jobs, each tagged with its
+/// node, and names any member that didn't answer. Either way the rows are
+/// trimmed to the caller's token scope.
+async fn jobs_handler(
+    State(state): State<ApiState>,
+    Query(query): Query<StatusQuery>,
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+) -> Response {
+    let auth = auth.as_deref();
+    let visible = |job: &crate::bun::agent::JobStatus| {
+        crate::sesame::auth::authorize_scoped(auth, &job.name, &job.namespace).is_ok()
+    };
+    let Ok(mut local) = ask_agent(&state.cmd_tx, |response| AgentCommand::JobStatus {
         response,
     })
     .await
-    {
-        Ok(statuses) => Json(statuses).into_response(),
-        Err(_) => agent_unavailable(),
+    else {
+        return agent_unavailable();
+    };
+    if !query.cluster {
+        local.retain(visible);
+        return Json(local).into_response();
     }
+    let (peers, warnings) = fan_out_to_peers::<Vec<crate::bun::agent::JobStatus>>(
+        &state,
+        "/v1/jobs",
+        CLUSTER_STATUS_TIMEOUT,
+    )
+    .await;
+    let mut jobs = crate::bun::cluster_view::merge_jobs(
+        std::iter::once((local_node_name(&state), local))
+            .chain(peers)
+            .collect(),
+    );
+    // Peers answered with the service token, which sees every namespace.
+    jobs.retain(|job| visible(&job.row));
+    Json(crate::bun::cluster_view::ClusterJobs { jobs, warnings }).into_response()
 }
 
 #[derive(Deserialize)]
@@ -4670,9 +4680,37 @@ struct EventsQuery {
     limit: Option<usize>,
     app: Option<String>,
     severity: Option<crate::bun::events::EventSeverity>,
+    /// Answer from this node's store only. Set on the fan-out's own requests
+    /// so a peer never fans out again.
+    #[serde(default)]
+    local: bool,
 }
 
-/// Return recent events from the bounded in-memory store.
+/// The request a peer gets for its share of `/v1/events`: the same filters,
+/// answered from its own store.
+//
+// A plain function rather than inline in the handler because the URL
+// serializer holds a non-`Send` reference; kept out of the async body it
+// can't make the handler's future un-`Send`.
+fn peer_events_path(query: &EventsQuery, limit: usize) -> String {
+    let mut params = url::form_urlencoded::Serializer::new(String::new());
+    params.append_pair("limit", &limit.to_string());
+    params.append_pair("local", "true");
+    if let Some(app) = &query.app {
+        params.append_pair("app", app);
+    }
+    if let Some(severity) = query.severity
+        && let Ok(serde_json::Value::String(severity)) = serde_json::to_value(severity)
+    {
+        params.append_pair("severity", &severity);
+    }
+    format!("/v1/events?{}", params.finish())
+}
+
+/// Return the newest events across the cluster, oldest first.
+///
+/// Each node keeps its own bounded store, so the node asked merges its own
+/// with every live member's and names any member that didn't answer.
 async fn events_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
@@ -4683,17 +4721,31 @@ async fn events_handler(
     if let Err(resp) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
         return resp;
     }
-    let Some(events) = &state.events else {
-        return Json(serde_json::json!({"events": []})).into_response();
+    let limit = query.limit.unwrap_or(100);
+    let local = match &state.events {
+        Some(events) => events
+            .read()
+            .await
+            .recent(limit, query.app.as_deref(), query.severity),
+        None => Vec::new(),
     };
-    let store = events.read().await;
-    Json(serde_json::json!({
-        "events": store.recent(
-            query.limit.unwrap_or(100),
-            query.app.as_deref(),
-            query.severity,
+    let mut answers = vec![(local_node_name(&state), local)];
+    let mut warnings = Vec::new();
+    if !query.local {
+        let path = peer_events_path(&query, limit);
+        let (peers, failures) = fan_out_to_peers::<crate::bun::cluster_view::ClusterEvents>(
+            &state,
+            &path,
+            CLUSTER_STATUS_TIMEOUT,
         )
-    }))
+        .await;
+        answers.extend(peers.into_iter().map(|(node, view)| (node, view.events)));
+        warnings = failures;
+    }
+    Json(crate::bun::cluster_view::ClusterEvents {
+        events: crate::bun::cluster_view::merge_events(answers, limit),
+        warnings,
+    })
     .into_response()
 }
 
@@ -5005,21 +5057,10 @@ async fn logs_handler(
         // A cluster member follows every node that runs the app; the
         // per-node streams it opens come back here with `local=true`.
         if !query.local.unwrap_or(false)
-            && let (Some(council), Some(membership), Some(self_name)) =
-                (&state.council, &state.membership, &state.node_name)
+            && let Some(frames) = spawn_cluster_log_follow(&state, &app, &namespace, query.tail)
         {
-            let (events_tx, events_rx) = mpsc::channel::<Event>(256);
-            tokio::spawn(follow_cluster_logs(
-                state.clone(),
-                Arc::clone(council),
-                Arc::clone(membership),
-                self_name.clone(),
-                app,
-                namespace,
-                query.tail,
-                events_tx,
-            ));
-            let stream = ReceiverStream::new(events_rx).map(Ok::<_, std::convert::Infallible>);
+            let stream = ReceiverStream::new(frames)
+                .map(|frame| Ok::<_, std::convert::Infallible>(log_frame_event(frame)));
             return Sse::new(stream)
                 .keep_alive(axum::response::sse::KeepAlive::default())
                 .into_response();
@@ -5088,6 +5129,46 @@ async fn follow_local_logs(
     Ok(lines_rx)
 }
 
+/// Start following an app on every node that runs it, when this node is a
+/// cluster member; `None` on a standalone node, which follows itself.
+///
+/// The SSE and WebSocket endpoints both read the returned frames, so a
+/// browser, `relish logs -f` and the TUI see the same merged stream.
+fn spawn_cluster_log_follow(
+    state: &ApiState,
+    app: &str,
+    namespace: &str,
+    tail: Option<usize>,
+) -> Option<mpsc::Receiver<LogFrame>> {
+    let (Some(council), Some(membership), Some(self_name)) =
+        (&state.council, &state.membership, &state.node_name)
+    else {
+        return None;
+    };
+    let (frames_tx, frames_rx) = mpsc::channel::<LogFrame>(256);
+    tokio::spawn(follow_cluster_logs(
+        state.clone(),
+        Arc::clone(council),
+        Arc::clone(membership),
+        self_name.clone(),
+        app.to_string(),
+        namespace.to_string(),
+        tail,
+        frames_tx,
+    ));
+    Some(frames_rx)
+}
+
+/// One followed frame as an SSE event: a warning carries `event: warning`.
+fn log_frame_event(frame: LogFrame) -> Event {
+    match frame {
+        LogFrame::Line(line) => Event::default().data(line),
+        LogFrame::Warning(warning) => Event::default()
+            .event(crate::ketchup::sse::WARNING_EVENT)
+            .data(warning),
+    }
+}
+
 /// How often a cluster-wide follow re-reads placements, to pick up replicas
 /// scheduled onto new nodes and to notice nodes that left.
 const LOG_FOLLOW_REFRESH: std::time::Duration = std::time::Duration::from_secs(2);
@@ -5105,8 +5186,8 @@ struct LogSourceEnded {
 /// Every [`LOG_FOLLOW_REFRESH`] it re-reads the app's placements and the live
 /// membership: it opens a stream to each placed node it isn't following yet
 /// and drops the streams of nodes that left. A node that goes away produces a
-/// `warning` event and the follow carries on with the rest. It returns when
-/// the client disconnects.
+/// [`LogFrame::Warning`] and the follow carries on with the rest. It returns
+/// when the client disconnects.
 #[allow(clippy::too_many_arguments)]
 async fn follow_cluster_logs(
     state: ApiState,
@@ -5116,7 +5197,7 @@ async fn follow_cluster_logs(
     app: String,
     namespace: String,
     tail: Option<usize>,
-    events: mpsc::Sender<Event>,
+    events: mpsc::Sender<LogFrame>,
 ) {
     let app_id = crate::meat::types::AppId::new(&app, &namespace);
     let mut sources: std::collections::HashMap<String, tokio::task::AbortHandle> =
@@ -5225,15 +5306,8 @@ async fn follow_cluster_logs(
     }
 }
 
-async fn send_log_warning(events: &mpsc::Sender<Event>, warning: String) -> bool {
-    events
-        .send(
-            Event::default()
-                .event(crate::ketchup::sse::WARNING_EVENT)
-                .data(warning),
-        )
-        .await
-        .is_ok()
+async fn send_log_warning(events: &mpsc::Sender<LogFrame>, warning: String) -> bool {
+    events.send(LogFrame::Warning(warning)).await.is_ok()
 }
 
 /// Follow this node's own instances as one source of a cluster-wide follow.
@@ -5243,7 +5317,7 @@ async fn spawn_local_log_source(
     namespace: &str,
     tail: Option<usize>,
     self_name: &str,
-    events: mpsc::Sender<Event>,
+    events: mpsc::Sender<LogFrame>,
     ended: mpsc::Sender<LogSourceEnded>,
 ) -> Option<tokio::task::AbortHandle> {
     let mut lines = follow_local_logs(
@@ -5259,7 +5333,7 @@ async fn spawn_local_log_source(
     Some(
         tokio::spawn(async move {
             while let Some(line) = lines.recv().await {
-                if events.send(Event::default().data(line)).await.is_err() {
+                if events.send(LogFrame::Line(line)).await.is_err() {
                     return;
                 }
             }
@@ -5276,7 +5350,7 @@ fn spawn_peer_log_source(
     node: String,
     url: String,
     tail: Option<usize>,
-    events: mpsc::Sender<Event>,
+    events: mpsc::Sender<LogFrame>,
     ended: mpsc::Sender<LogSourceEnded>,
 ) -> tokio::task::AbortHandle {
     let mut request = state.cluster_http.client().get(url).query(&[
@@ -5299,7 +5373,7 @@ fn spawn_peer_log_source(
 
 async fn relay_peer_log_stream(
     request: reqwest::RequestBuilder,
-    events: &mpsc::Sender<Event>,
+    events: &mpsc::Sender<LogFrame>,
 ) -> Result<(), String> {
     let response = tokio::time::timeout(std::time::Duration::from_secs(5), request.send())
         .await
@@ -5313,10 +5387,10 @@ async fn relay_peer_log_stream(
     while let Some(chunk) = body.next().await {
         let chunk = chunk.map_err(|error| format!("log stream broke: {error}"))?;
         for event in decoder.push(&chunk) {
-            let mut forwarded = Event::default().data(event.data);
-            if let Some(kind) = event.event {
-                forwarded = forwarded.event(kind);
-            }
+            let forwarded = match event.event.as_deref() {
+                Some(crate::ketchup::sse::WARNING_EVENT) => LogFrame::Warning(event.data),
+                _ => LogFrame::Line(event.data),
+            };
             if events.send(forwarded).await.is_err() {
                 return Ok(());
             }
@@ -5326,6 +5400,9 @@ async fn relay_peer_log_stream(
 }
 
 /// Upgrade an authenticated request to a live log stream.
+///
+/// A cluster member follows every node that runs the app, exactly as the SSE
+/// follow does; each text frame is one [`LogFrame`] as JSON.
 async fn ws_logs_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
@@ -5349,38 +5426,41 @@ async fn ws_logs_handler(
     {
         return resp;
     }
+    let frames = match spawn_cluster_log_follow(&state, &app, &namespace, query.tail) {
+        Some(frames) => frames,
+        None => match follow_local_logs(&state, app, namespace, query.tail, None).await {
+            Ok(lines) => frame_local_lines(lines),
+            Err(response) => return response,
+        },
+    };
     upgrade
-        .on_upgrade(move |socket| ws_logs_session(socket, state.cmd_tx, app, namespace, query.tail))
+        .on_upgrade(move |socket| ws_logs_session(socket, frames))
         .into_response()
 }
 
-async fn ws_logs_session(
-    mut socket: WebSocket,
-    command_tx: mpsc::Sender<AgentCommand>,
-    app: String,
-    namespace: String,
-    tail: Option<usize>,
-) {
-    let (lines_tx, mut lines_rx) = mpsc::channel(64);
-    if command_tx
-        .send(AgentCommand::FollowLogs {
-            app_name: app,
-            namespace,
-            tail,
-            label: None,
-            lines: lines_tx,
-        })
-        .await
-        .is_err()
-    {
-        return;
-    }
+/// Wrap a standalone node's own followed lines as [`LogFrame::Line`]s.
+fn frame_local_lines(mut lines: mpsc::Receiver<String>) -> mpsc::Receiver<LogFrame> {
+    let (frames_tx, frames_rx) = mpsc::channel(64);
+    tokio::spawn(async move {
+        while let Some(line) = lines.recv().await {
+            if frames_tx.send(LogFrame::Line(line)).await.is_err() {
+                return;
+            }
+        }
+    });
+    frames_rx
+}
+
+async fn ws_logs_session(mut socket: WebSocket, mut frames: mpsc::Receiver<LogFrame>) {
     loop {
         tokio::select! {
-            line = lines_rx.recv() => match line {
-                Some(line) => if socket.send(Message::Text(line.into())).await.is_err() { return; },
-                None => return,
-            },
+            frame = frames.recv() => {
+                let Some(frame) = frame else { return };
+                let Ok(json) = serde_json::to_string(&frame) else { continue };
+                if socket.send(Message::Text(json.into())).await.is_err() {
+                    return;
+                }
+            }
             message = socket.recv() => if message.is_none() { return; },
         }
     }
@@ -8404,16 +8484,7 @@ async fn app_detail_handler(
         }
     };
 
-    // Get deploy history
-    let deploy_history = if let Some(ref history) = state.deploy_history {
-        let h = history.read().await;
-        h.iter()
-            .filter(|e| e.app_id.name == app && e.app_id.namespace == namespace)
-            .cloned()
-            .collect()
-    } else {
-        vec![]
-    };
+    let deploy_history = cluster_deploy_history(&state, &app, &namespace, false).await;
 
     // Each chart polls the app's metric endpoint, which refuses a principal
     // without `metrics` on this app; leave them out rather than draw errors.
@@ -8442,7 +8513,8 @@ async fn app_detail_handler(
         desired_instances,
         instances,
         env,
-        deploy_history,
+        deploy_history: deploy_history.history,
+        history_warnings: deploy_history.warnings,
         charts,
     };
 
@@ -8450,55 +8522,78 @@ async fn app_detail_handler(
 }
 
 /// `GET /ui/node/{name}` — node detail page.
+///
+/// Any node's page lists that node's workloads: this node answers from its
+/// own status, another member is asked for its status directly, and a
+/// member that doesn't answer is named on the page rather than shown empty.
 async fn node_detail_handler(State(state): State<ApiState>, Path(name): Path<String>) -> Response {
-    // M14: the old handler ignored `name` entirely — it rendered *this* node's
-    // instances with a hard-coded `state: "alive"`, so clicking node B showed
-    // node A's workloads labelled as B. Only this node knows its own running
-    // instances, so show the instance list only when the request is for this
-    // node; for any other node show its presence in gossip but no (misattributed)
-    // workloads. Cross-node instance detail would need a fan-out and is left as a
-    // follow-up.
-    let is_self = state.node_name.as_deref() == Some(name.as_str());
-    let in_membership = match &state.membership {
-        Some(m) => m.read().await.iter().any(|info| info.node_id.0 == name),
-        None => false,
+    let is_self = local_node_name(&state) == name;
+    let member = match &state.membership {
+        Some(m) => m
+            .read()
+            .await
+            .iter()
+            .find(|info| info.node_id.0 == name)
+            .cloned(),
+        None => None,
     };
-    let node_state = if is_self || in_membership {
+    let node_state = if is_self || member.is_some() {
         "alive"
     } else {
         "unknown"
     }
     .to_string();
-    let statuses = if is_self {
-        gather_statuses(&state).await
-    } else {
-        Vec::new()
+    let (statuses, warning) = match (is_self, &member) {
+        (true, _) => (gather_statuses(&state).await, None),
+        (false, Some(member)) => {
+            match fetch_from_peer::<Vec<InstanceStatus>>(
+                &state,
+                member,
+                "/v1/status",
+                CLUSTER_STATUS_TIMEOUT,
+            )
+            .await
+            {
+                Ok(statuses) => (statuses, None),
+                Err(error) => (Vec::new(), Some(format!("did not answer: {error}"))),
+            }
+        }
+        (false, None) => (Vec::new(), None),
     };
+    // The charts read this node's metrics store, so drawing them on another
+    // node's page would label this node's CPU and memory as that node's.
+    let charts = if is_self { node_charts() } else { Vec::new() };
 
     let data = NodeDetailData {
         name,
         state: node_state,
         app_count: statuses.len(),
         apps: statuses,
-        charts: vec![
-            ChartConfig {
-                endpoint: "/v1/metrics?name=node_cpu_usage_percent".to_string(),
-                title: "CPU Usage".to_string(),
-                unit: crate::brioche::units::ChartUnit::Percent,
-                refresh_secs: 10,
-                range_secs: 3600,
-            },
-            ChartConfig {
-                endpoint: "/v1/metrics?name=node_memory_used_bytes".to_string(),
-                title: "Memory Usage".to_string(),
-                unit: crate::brioche::units::ChartUnit::Bytes,
-                refresh_secs: 10,
-                range_secs: 3600,
-            },
-        ],
+        warning,
+        charts,
     };
 
     html_response(render_node_detail(&data))
+}
+
+/// CPU and memory charts for this node's own page.
+fn node_charts() -> Vec<ChartConfig> {
+    vec![
+        ChartConfig {
+            endpoint: "/v1/metrics?name=node_cpu_usage_percent".to_string(),
+            title: "CPU Usage".to_string(),
+            unit: crate::brioche::units::ChartUnit::Percent,
+            refresh_secs: 10,
+            range_secs: 3600,
+        },
+        ChartConfig {
+            endpoint: "/v1/metrics?name=node_memory_used_bytes".to_string(),
+            title: "Memory Usage".to_string(),
+            unit: crate::brioche::units::ChartUnit::Bytes,
+            refresh_secs: 10,
+            range_secs: 3600,
+        },
+    ]
 }
 
 /// `GET /ui/gitops` — Lettuce GitOps status page: current sync phase,
@@ -9392,9 +9487,62 @@ async fn deploy_operation_snapshot(
 #[derive(Deserialize)]
 struct NamespaceQuery {
     namespace: Option<String>,
+    /// Answer from this node's records only (set on fan-out requests).
+    #[serde(default)]
+    local: bool,
 }
 
-/// `GET /v1/deploys/history/{app}` — deploy history for an app.
+/// An app's deploy history across the cluster.
+///
+/// Every node records its own rollout of the replicas placed on it, so the
+/// full history is the merge of every live member's records. `local_only`
+/// answers with this node's records alone, as a peer does for a fan-out.
+async fn cluster_deploy_history(
+    state: &ApiState,
+    app: &str,
+    namespace: &str,
+    local_only: bool,
+) -> crate::bun::cluster_view::ClusterDeployHistory {
+    let local: Vec<DeployHistoryEntry> = match &state.deploy_history {
+        Some(history) => history
+            .read()
+            .await
+            .iter()
+            .filter(|entry| entry.app_id.name == app && entry.app_id.namespace == namespace)
+            .cloned()
+            .collect(),
+        None => Vec::new(),
+    };
+    let mut answers = vec![(local_node_name(state), local)];
+    let mut warnings = Vec::new();
+    if !local_only {
+        let app_segment: String = url::form_urlencoded::byte_serialize(app.as_bytes()).collect();
+        let namespace_value: String =
+            url::form_urlencoded::byte_serialize(namespace.as_bytes()).collect();
+        let path =
+            format!("/v1/deploys/history/{app_segment}?namespace={namespace_value}&local=true");
+        let (peers, failures) = fan_out_to_peers::<crate::bun::cluster_view::ClusterDeployHistory>(
+            state,
+            &path,
+            CLUSTER_STATUS_TIMEOUT,
+        )
+        .await;
+        answers.extend(peers.into_iter().map(|(node, view)| {
+            let entries = view.history.into_iter().map(|entry| entry.row).collect();
+            (node, entries)
+        }));
+        warnings = failures;
+    }
+    crate::bun::cluster_view::ClusterDeployHistory {
+        app: app.to_string(),
+        namespace: namespace.to_string(),
+        history: crate::bun::cluster_view::merge_deploy_history(answers),
+        warnings,
+    }
+}
+
+/// `GET /v1/deploys/history/{app}` — deploy history for an app, from every
+/// node, each entry tagged with the node that recorded it.
 ///
 /// The namespace rides in as a query parameter rather than a path segment
 /// so the route (and every client bookmarking it) keeps its shape. It
@@ -9411,17 +9559,7 @@ async fn deploys_history_handler(
     if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, namespace) {
         return resp;
     }
-    let Some(history) = &state.deploy_history else {
-        return Json(serde_json::json!({"app": app, "namespace": namespace, "history": []}))
-            .into_response();
-    };
-    let all = history.read().await;
-    let filtered: Vec<&DeployHistoryEntry> = all
-        .iter()
-        .filter(|e| e.app_id.name == app && e.app_id.namespace == namespace)
-        .collect();
-    Json(serde_json::json!({"app": app, "namespace": namespace, "history": filtered}))
-        .into_response()
+    Json(cluster_deploy_history(&state, &app, namespace, query.local).await).into_response()
 }
 
 /// `POST /v1/rollback/{app}/{namespace}` — redeploy the app's previous
@@ -10422,6 +10560,10 @@ async fn secret_rotate_handler(
 #[cfg(test)]
 #[path = "api_permission_tests.rs"]
 mod permission_tests;
+
+#[cfg(test)]
+#[path = "api_cluster_view_tests.rs"]
+mod cluster_view_tests;
 
 #[cfg(test)]
 mod tests {

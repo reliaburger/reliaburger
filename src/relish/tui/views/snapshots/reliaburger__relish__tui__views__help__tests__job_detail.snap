@@ -6,13 +6,13 @@ expression: "render_to_string(&app, 120, 40)"
                                                                                                                         
 ┌job detail────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │migrate                                                                                                               │
+│node            node-1                                                                                                │
 │namespace       default                                                                                               │
 │instance        migrate-0                                                                                             │
 │state           stopped                                                                                               │
 │restarts        0                                                                                                     │
 │age             60s                                                                                                   │
 │image           proc-grill:image-ignored                                                                              │
-│                                                                                                                      │
 │                                                                                                                      │
 │                                                                                                                      │
 │                                                                                                                      │
