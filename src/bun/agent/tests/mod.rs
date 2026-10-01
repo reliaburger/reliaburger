@@ -1,3 +1,4 @@
+use super::commands::{AgentCommand, ApplyEvent};
 use super::deploy_ops::{DeployOp, DeployOps, retry_while_release_pending};
 use super::deploy_worker::DeployWorker;
 use super::trace::{MAX_CONCURRENT_TRACES, trace_dns_command, trace_dns_step, trace_tcp_command};

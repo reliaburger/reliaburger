@@ -17,6 +17,7 @@
 //! ignored with the stage of #351 that will fix them; un-ignore one in the
 //! same change that makes it pass.
 
+use super::commands::AgentCommand;
 use super::*;
 use crate::bun::loop_meter::{LoopTurnMeter, TURN_BUDGET};
 use crate::grill::mock::MockCall;

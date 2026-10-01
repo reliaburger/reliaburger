@@ -7,6 +7,7 @@
 //! runtime), and a state read from before a restart never touches the
 //! replacement.
 
+use super::commands::AgentCommand;
 use super::loop_harness::{calls_of, crash, replicated};
 use super::*;
 use crate::grill::mock::MockCall;

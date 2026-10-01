@@ -4,6 +4,7 @@
 //! how old its answer is, refuse one that is too old, and never report an
 //! exited container as running just because the loop hasn't noticed yet.
 
+use super::commands::AgentCommand;
 use super::loop_harness::{crash, replicated};
 use super::*;
 use crate::grill::mock::MockCall;
