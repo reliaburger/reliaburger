@@ -19,7 +19,7 @@ It's a **preview**, and the rough edges are part of what it's for:
 
 ## What you need
 
-- **Two to seven machines**:
+- **Two to seven machines**, ideally three or more:
   - x86_64 or arm64, with UEFI and network boot (PXE);
   - at least 2 GiB of RAM and an 8 GB disk;
   - wired to the same network.
@@ -129,7 +129,12 @@ image/tools/seed-fleet.sh init ~/home-cluster --cluster home --operator 192.168.
 ```
 
 `--operator` is your laptop's address, the one relish connects from. Only
-that address can reach the nodes' API. The first run builds a small helper
+that address can reach the nodes' API.
+
+List every machine the cluster will ever have, now. Each seed carries the
+list, and a node's firewall only lets in the listed addresses until they've
+joined. So a machine added later can't reach the others (see
+[What's missing](#whats-missing)). The first run builds a small helper
 from the repository, which takes a few minutes.
 
 `~/home-cluster/init` now holds the cluster's master key and its sealed root
@@ -244,6 +249,14 @@ it also uses port 8080. `bootctl list` on the node shows both versions afterward
   enrols it.
 - **No OS updates run by bun.** Staging by hand over SSH stands in for them.
 - **Secure Boot** has to be off.
+- **No adding machines later.** Seeds carry the address list from
+  `seed-fleet.sh init`, and the other nodes' firewalls drop a machine that
+  isn't on it. Adding one means editing `bootstrap_peers` in
+  `/etc/reliaburger/node.toml` on every node and restarting bun.
+- **Two machines can't roll a bun upgrade.** Both are in the council, and
+  upgrading one would leave the other without a majority, so
+  `relish upgrade` waits, and `relish upgrade status` doesn't say why. Use
+  three or more.
 
 The design and the test results are in `docs/plans/2026-09-28-plan-appliance-lab.md`.
 The QEMU lab that exercises all of this without hardware is in `image/lab/`.

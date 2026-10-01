@@ -18,7 +18,7 @@
 - [x] **S3, the x86_64 smoke run**: the virtual Wyse installs through the same path with real firmware PXE, and starts bun.
 - [x] **S4, good update**: a second CI version is staged by hand the way bun would (`os-stage`: Ed25519, SHA-256, `systemd-sysupdate` from a local directory) and rolled across the cluster. Boot counting blesses each node, and Raft, images and volumes stay intact.
 - [x] **S4, bad update**: a deliberately broken version (bun won't start) falls back to the previous slot within three boots, with no hands.
-- [ ] **S4, bun upgrade on top**: `relish upgrade` still swaps bun's binary on the appliance. The launcher that makes it possible is in (see the log); the end-to-end run waits for a release-signed bun newer than v0.1.0.
+- [ ] **S4, bun upgrade on top**: an OS update never moves bun backwards (passed, 1 Oct), and `relish upgrade` refuses 0.1.0 → 0.1.1 on the appliance as `docs/releasing.md` says it must (passed). A rolling `relish upgrade` that actually swaps bun waits for two release-signed versions with the same formats. 0.1.0 and 0.1.1 differ, and main has bumped them again.
 - [ ] **S5, ten Dell Wyse 3040s**: the last step, on the hardware (spike plan, research §9.7).
 - [ ] **S6, write-up**: `docs/qualification/<date>-appliance-spike.md` and `<date>-wyse-3040.md`.
 
@@ -89,6 +89,17 @@
   - **the launcher's first run moved bun to `/var/lib/reliaburger/bin/bun-v0.1.0`** (it logged "bun 0.1.0 from the image is now active");
   - the cluster ended at term 18, log 2007, 5/5, and `wtf` showed 12 OK, 0 warnings.
 
+**bun upgrade on top, with real releases (30 Sep – 1 Oct).** Cluster `upg` on 2026.40.38 (bun 0.1.0), seeded from an RBSEED stick, with relish 0.1.0 on the lab server and the v0.1.1 release countersigned with the lab operator key.
+- **Two nodes held forever.** `relish upgrade start --binary bun-v0.1.1` recorded the run, and it stayed in `UpgradingCouncil` with both nodes `Pending`. `live_quorum_headroom_ok` won't take one of two voters down, which is right, but nothing told the operator so. `status` showed no reason, and `abort` refused because the run wasn't paused. Only adding a third node moved it.
+- **A third node couldn't join.** Its bun waited for replicated API credentials and timed out, again and again. The seeds from `seed-fleet.sh init` carry `bootstrap_peers` for the addresses listed then (.106 and .107), and node-01's perimeter firewall dropped .108 before it had joined. After adding .108 to `bootstrap_peers` on nodes 1 and 2 and restarting their buns, node-03 joined (3/3 in the council).
+- **Then 0.1.0 refused 0.1.1, as documented.** node-02 answered the directive with `409 incompatible cluster formats: received protocol 27, state 46, required protocol 27, state 44`. The run paused, `abort` ended it, and all three nodes stayed on `bun-v0.1.0`. `docs/releasing.md` ("Upgrading from 0.1.0") says exactly this.
+- **An OS update doesn't downgrade bun.** Runs 36795751727 (#41, bun 0.1.1) and 36795766209 (#42, bun 0.1.0) built a pair where the newer OS carries the older bun. Node 9:
+  - netboot-installed 2026.40.41, and the launcher logged `bun 0.1.1 from the image is now active (was none)`;
+  - `os-stage` put 2026.40.42 in the spare slot, and the node rebooted into it, blessed, 25 s later;
+  - `/usr/lib/reliaburger/bin/bun` was 0.1.0, but the launcher left `bun -> bun-v0.1.1` and logged nothing, and bun ran from `/var/lib/reliaburger/bin/bun-v0.1.1`;
+  - the boot check passed: `bun healthy (bun 0.1.1 (77bace5)) on OS 2026.40.42`.
+- **Still open:** a rolling upgrade that actually swaps bun. It needs two consecutive release-signed versions with the same `protocol` and `state`. main is already at 28/47 against 0.1.1's 27/46, so 0.1.1 → 0.1.2 won't roll either.
+
 **The bare-metal preview (29–30 Sep).** It covers the manual chapter `docs/manual/14_appliance.md`, the book chapter `docs/book/15a-becoming-the-os.md`, and the tools in `image/tools/`.
 - **Seeds for real machines:** real hardware has no SMBIOS channel for the lab's seed credential. So `reliaburger-seed` now also reads a USB stick labelled `RBSEED`, with `seeds/<mac>.seed` for one of the machine's NICs, so one stick serves a whole fleet. Without it, a physical node could install but never join a cluster, and S5 would have been blocked.
 - **The guide, followed end to end in the lab:**
@@ -153,7 +164,9 @@ For `relish netboot` (Phase 2b):
 ## Known gaps
 
 - `/etc` lives on the data partition, so a later image's `/etc` doesn't reach installed nodes (S1). The seed and SSH credentials land in `/etc` too.
-- bun's end-to-end upgrade on the appliance hasn't run yet (see S4).
+- A rolling bun upgrade on the appliance hasn't swapped a binary yet: no two release-signed versions share formats (see S4).
+- A seeded fleet can't grow past the addresses given to `seed-fleet.sh init`, because each seed fixes `bootstrap_peers`. The claim flow (Phase 2) has to update them, or the firewall has to admit anything the CA has enrolled.
+- A two-node cluster holds a bun upgrade in `UpgradingCouncil` indefinitely, and `relish upgrade status` gives no reason. bun should report the quorum hold, or `start` should refuse it.
 - The fallback takes about 16 minutes, because the boot check waits 300 s each try.
 - The lab's SSH (`openssh-server`, started only with an `ssh.authorized_keys.root` credential) exists so S4 can stage by hand. Phase 1 drops it, once bun stages OS updates itself.
 - Every spike build signs with its own throwaway key, so staging a later build needs that build's public key passed to `os-stage` explicitly.

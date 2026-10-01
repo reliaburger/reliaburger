@@ -6,7 +6,7 @@
 
 PASS for everything that can be proven without the hardware, apart from one item.
 
-- **The open item:** bun's own `relish upgrade` on top of the appliance. A launcher now makes it possible, but it hasn't run end to end, because no release-signed bun newer than v0.1.0 exists yet.
+- **The open item:** a rolling `relish upgrade` that swaps bun on the appliance. The appliance side is proven: an OS update carrying an older bun leaves the newer bun running (2026.40.41 → .42, bun 0.1.1 kept), and 0.1.0 refuses 0.1.1 the documented way. The swap itself waits for two release-signed versions with the same formats; 0.1.0 → 0.1.1 is a fresh-cluster upgrade by policy.
 - The plan and the full log are in [`2026-09-28-plan-appliance-lab.md`](../plans/2026-09-28-plan-appliance-lab.md) (S2–S4) and [`2026-09-28-plan-appliance-image.md`](../plans/2026-09-28-plan-appliance-image.md) (S1).
 - The lab is scripted in [`image/lab/`](../../image/lab/README.md).
 
@@ -75,6 +75,8 @@ PASS for everything that can be proven without the hardware, apart from one item
   - Raft continued (term 12, log 964 → 1008);
   - a volume's data survived on its node.
 - **A second rolling update, to the newest image (2026.40.30), also went cleanly.** The new launcher moved bun onto `/var` on every node, and the cluster ended at 5/5 with `wtf` showing 12 OK.
+- **An OS update never moves bun backwards.** 2026.40.41 shipped bun 0.1.1 and 2026.40.42 shipped 0.1.0. After the update to .42 the node still ran `bun-v0.1.1` from `/var/lib/reliaburger/bin`, and the boot check blessed it.
+- **0.1.0 → 0.1.1 through `relish upgrade`:** refused, as `docs/releasing.md` says. The run paused on `incompatible cluster formats (state 46, required 44)`, `abort` ended it, and no node moved.
 - **The broken version** (bun never starts):
   - three counted boots each failed the 300 s health gate;
   - systemd-boot then went back to the previous version on its own;
@@ -108,5 +110,8 @@ PASS for everything that can be proven without the hardware, apart from one item
   - eMMC writes per day;
   - the `dw_dmac` reboot hang;
   - one OS update across the fleet.
-- **bun's end-to-end `relish upgrade`** on the appliance, once a newer signed bun exists.
+- **A rolling `relish upgrade` that swaps bun** on the appliance, once two release-signed versions share `protocol` and `state`.
+- **Found on the way, to fix outside the spike:**
+  - a seeded fleet can't grow past the addresses given to `seed-fleet.sh init`, since each seed fixes `bootstrap_peers` and the firewall drops anyone else before they join;
+  - a two-node cluster holds `relish upgrade` in `UpgradingCouncil` with no reason shown, and `abort` refuses it because it isn't paused.
 - **S6:** fold the numbers into the research note, write `<date>-wyse-3040.md`, and give the go/no-go.

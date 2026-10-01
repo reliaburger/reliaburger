@@ -7,7 +7,8 @@
 #
 #   seed-fleet.sh init <dir> --cluster NAME --operator IP [--ssh-key FILE] MAC@IP...
 #       Creates the cluster (relish init, keys and CA stay in <dir>) and node
-#       1's seed. List node 1 first. IP is each node's reserved address;
+#       1's seed. List node 1 first, and every node the cluster will have:
+#       each seed lets only these addresses through the firewall. IP is each node's reserved address;
 #       --operator is this laptop's address, the one relish connects from.
 #       --ssh-key puts a public key in every seed (spike only: root SSH, for
 #       staging OS updates by hand until bun does it).
