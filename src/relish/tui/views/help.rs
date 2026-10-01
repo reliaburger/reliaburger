@@ -49,6 +49,68 @@ mod tests {
         }
     }
 
+    /// Every cluster-wide view names the node behind each row and says which
+    /// members are missing, so a partial list never passes for a whole one.
+    #[test]
+    fn cluster_views_show_each_rows_node_and_name_missing_members() {
+        use crate::bun::cluster_view::{ClusterDeployHistory, NodeTagged};
+        use crate::relish::tui::msg::StreamItem;
+
+        let mut app = TuiApp::with_test_data(TestScenario::HealthyCluster);
+        let at = std::time::SystemTime::UNIX_EPOCH;
+        let entry = |node: &str| NodeTagged {
+            node: node.to_string(),
+            row: crate::meat::deploy_types::DeployHistoryEntry {
+                id: crate::meat::deploy_types::DeployId(4),
+                app_id: crate::meat::types::AppId::new("web", "default"),
+                image: "web:v4".into(),
+                result: crate::meat::deploy_types::DeployResult::Completed,
+                created_at: at,
+                completed_at: at,
+                steps_completed: 1,
+                steps_total: 1,
+                spec: None,
+            },
+        };
+        app.data.deploy_history.insert(
+            crate::relish::tui::state::deploy_history_key("web", "default"),
+            ClusterDeployHistory {
+                app: "web".into(),
+                namespace: "default".into(),
+                history: vec![entry("node-1"), entry("node-2")],
+                warnings: vec!["node node-3 timed out".into()],
+            },
+        );
+        app.view_stack.push(View::AppDetail {
+            app: "web".into(),
+            namespace: "default".into(),
+            tab: DetailTab::Deploys,
+        });
+        let deploys = render_to_string(&app, 120, 40);
+        assert!(deploys.contains("node-1"), "{deploys}");
+        assert!(deploys.contains("node-2"), "{deploys}");
+        assert!(deploys.contains("incomplete: node node-3 timed out"));
+
+        app.data.job_warnings = vec!["node node-3 timed out".into()];
+        app.view_stack.push(View::Jobs);
+        assert!(render_to_string(&app, 120, 40).contains("incomplete: node node-3"));
+
+        app.data.event_warnings = vec!["node node-2: connection refused".into()];
+        app.view_stack.push(View::Events);
+        assert!(render_to_string(&app, 120, 40).contains("incomplete: node node-2"));
+
+        app.view_stack.push(View::Logs {
+            app: Some(("web".into(), "default".into())),
+        });
+        app.update(Msg::Stream(StreamItem::LogWarning(
+            "node node-3 left the cluster; no longer following its logs".into(),
+        )));
+        assert!(
+            render_to_string(&app, 120, 40)
+                .contains("warning │ node node-3 left the cluster; no longer following its logs")
+        );
+    }
+
     #[test]
     fn small_terminal_is_deterministic() {
         let app = TuiApp::with_test_data(TestScenario::Empty);

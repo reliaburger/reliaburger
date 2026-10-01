@@ -4006,6 +4006,21 @@ kill, up to twenty seconds, inside one turn. Both now kill through this path.
 A rerun also fences the old run first (Stopping, no retries, no probes), so
 nothing restarts it while the kill is in flight.
 
+"The steps before it aren't repeated" held for retirement, because its caller
+re-enters past the steps it already took. Provisioning broke that promise, and
+we found out from a flake. The loop's half of a fresh launch moved the
+instance from `Pending` to `Preparing` and *then* provisioned its volumes. On a
+loaded machine provisioning outlasted the turn, the deploy worker asked again,
+and the second ask tried to move a `Preparing` instance to `Preparing`. The
+state machine refused, as it should, and the deploy failed. Two lease tests
+caught it about one run in four under CPU load and never alone. The fix is one
+guard: a step that can answer `StillRunning` has to be safe to run again from
+the top, so the transition only happens when the instance isn't already
+`Preparing`. The test that pins it doesn't need any load at all. Under
+`#[tokio::test]` the runtime has one thread, so a task spawned during the call
+can't have run by the time a turn with no budget left polls it, and the first
+ask is `StillRunning` every time.
+
 A day later the budget's cost came due, in exactly the place we'd said it
 could (#387). The privileged CI run's OCI interruption qualification restarts
 Bun, recovers its containers and stops them, and twice the stop came back as a

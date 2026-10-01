@@ -4,6 +4,7 @@
 //! with sparse timestamp indexes for efficient time-range queries.
 
 pub mod export;
+pub mod follow;
 pub mod log_store;
 pub mod query;
 pub mod remote_query;

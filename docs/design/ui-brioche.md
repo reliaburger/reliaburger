@@ -17,8 +17,8 @@ Because Brioche is embedded in Bun via Rust's `include_bytes!` / `rust-embed` me
 Three pages ship today, plus a login page:
 
 - **Cluster overview** (route `/`) -- total resource usage, node health map, app list, active alerts (rendered as a dashboard fragment)
-- **App detail** (route `/ui/app/{app}/{namespace}`) -- CPU/memory charts with one line per instance, plus requests/s and mean-latency charts when the app's own metrics are scraped, instance status, deploy history, environment variables, current image
-- **Node detail** (route `/ui/node/{name}`) -- resource utilisation, running apps, disk usage, GPU status
+- **App detail** (route `/ui/app/{app}/{namespace}`) -- CPU/memory charts with one line per instance, plus requests/s and mean-latency charts when the app's own metrics are scraped, instance status, deploy history from every node (a Node column, and a "history incomplete" line per member that didn't answer), environment variables, current image
+- **Node detail** (route `/ui/node/{name}`) -- that node's running apps, asked of the node itself (a node that doesn't answer is named on the page, never shown empty), and CPU/memory charts on the node's own dashboard only: the charts read the serving node's metrics store, so drawing them on another node's page would mislabel them. Disk usage and GPU status are planned
 
 The **GitOps status** page (`/ui/gitops`) now ships (§5.5). The following pages remain **planned — not yet implemented** as standalone views:
 
@@ -38,7 +38,7 @@ Brioche depends on the following Reliaburger subsystems:
 |------------|------|-------------|
 | **Bun** | HTTP server; hosts Brioche's static assets and API endpoints | Brioche's compiled assets are served by Bun's built-in HTTP listener on the API port (default `9117`) |
 | **Mayo** | Metrics queries (CPU, memory, disk, GPU, request rate, error rate, custom metrics) | Brioche issues name-parameterised queries against `/v1/metrics` on the local Mayo store (DataFusion SQL under the hood, not PromQL); the cluster/app endpoints fan out across council members |
-| **Ketchup** | Log queries and streaming | Brioche opens a streaming connection (WebSocket or SSE) for live log tailing (local node only); historical queries run DataFusion SQL over Ketchup's Parquet log store (no separate index) |
+| **Ketchup** | Log queries and streaming | Brioche opens an SSE connection for live log tailing, merged from every node that runs the app; historical queries run DataFusion SQL over Ketchup's Parquet log store (no separate index) |
 | **Cluster API** | State queries (apps, nodes, jobs, deploy history, configuration, alert state) | Standard Bun API endpoints; reads are served by any council member from local Raft state |
 | **Wrapper** | Ingress routing info (route table, TLS cert status, per-route metrics) | Brioche queries Wrapper's routing table and certificate metadata via internal API |
 | **Lettuce** | GitOps sync status (sync state, last commit, diff preview, sync history) | Brioche queries Lettuce's sync state via the cluster API; the GitOps coordinator (a council member) serves this data |

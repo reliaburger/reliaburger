@@ -7293,7 +7293,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         namespace: &str,
         spec: &AppSpec,
     ) -> Result<PreparedInstance, BunError> {
-        // Pending → Preparing
+        // Pending → Preparing. Storage provisioning below can outlast the
+        // turn and answer `StillRunning`; the deploy worker then asks again
+        // for the same incarnation, which is already Preparing (#386).
         {
             let instance = self
                 .supervisor
@@ -7301,7 +7303,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 .ok_or_else(|| BunError::InstanceNotFound {
                     instance_id: instance_id.clone(),
                 })?;
-            instance.state = instance.state.transition_to(ContainerState::Preparing)?;
+            if instance.state != ContainerState::Preparing {
+                instance.state = instance.state.transition_to(ContainerState::Preparing)?;
+            }
         }
 
         let host_port = self
@@ -16284,6 +16288,60 @@ mod tests {
         assert!(store.get("cleanup").await.is_none());
         shutdown.cancel();
         task.await.unwrap();
+    }
+
+    /// #386: storage provisioning that outlasts the turn answers
+    /// `StillRunning`, and the deploy worker asks again. The second ask is
+    /// the same step of the same incarnation, so it must carry on rather
+    /// than try to move a `Preparing` instance to `Preparing` again.
+    #[tokio::test]
+    async fn a_fresh_instance_asked_again_after_slow_storage_still_prepares() {
+        let (mut agent, _tx, _shutdown) = test_agent();
+        let volumes = tempfile::tempdir().unwrap();
+        agent.set_volumes_dir(volumes.path().to_path_buf());
+        let config = Config::parse(
+            "[app.web]\nimage = 'test:v1'\nnamespace = 'rbtest-slow'\n[[app.web.volumes]]\npath = '/data'\n",
+        )
+        .unwrap();
+        let spec = config.app["web"].clone();
+        let ids = agent
+            .supervisor
+            .deploy_app("web", "rbtest-slow", &spec, Instant::now())
+            .await
+            .unwrap();
+        let id = ids[0].clone();
+        // A turn with no budget left: on this single-threaded runtime the
+        // provisioning task can't even have started, so the first ask is
+        // always `StillRunning`.
+        agent.turn_deadline = Some(tokio::time::Instant::now());
+        let first = agent
+            .prepare_fresh_instance(&id, "web", "rbtest-slow", &spec)
+            .await;
+        assert!(
+            matches!(first, Err(BunError::StillRunning { .. })),
+            "expected StillRunning, got {:?}",
+            first.err()
+        );
+        assert_eq!(
+            agent.supervisor.get_instance(&id).unwrap().state,
+            ContainerState::Preparing
+        );
+        let prepared = loop {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            match agent
+                .prepare_fresh_instance(&id, "web", "rbtest-slow", &spec)
+                .await
+            {
+                Err(BunError::StillRunning { .. }) => continue,
+                outcome => break outcome,
+            }
+        };
+        assert!(prepared.is_ok(), "retry failed: {:?}", prepared.err());
+        assert_eq!(
+            agent.supervisor.get_instance(&id).unwrap().state,
+            ContainerState::Preparing
+        );
+        assert!(volumes.path().join("rbtest-slow/web/data").is_dir());
     }
 
     #[tokio::test]

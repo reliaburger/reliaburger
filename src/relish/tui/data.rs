@@ -6,8 +6,8 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::bun::agent::{ClusterInstanceStatus, CouncilStatus, JobStatus, NodeStatus};
-use crate::bun::events::ClusterEvent;
+use crate::bun::agent::{ClusterInstanceStatus, CouncilStatus, NodeStatus};
+use crate::bun::cluster_view::{ClusterDeployHistory, ClusterEvents, ClusterJobs};
 use crate::mayo::rollup::MetricsQueryResult;
 use crate::relish::client::BunClient;
 use crate::wrapper::types::RouteInfo;
@@ -47,16 +47,16 @@ pub trait DataProvider: Send + Sync + 'static {
         &self,
     ) -> impl Future<Output = Result<Vec<crate::mayo::alert::AlertStatus>, ProviderError>> + Send;
     fn routes(&self) -> impl Future<Output = Result<Vec<RouteInfo>, ProviderError>> + Send;
-    fn jobs(&self) -> impl Future<Output = Result<Vec<JobStatus>, ProviderError>> + Send;
+    fn jobs(&self) -> impl Future<Output = Result<ClusterJobs, ProviderError>> + Send;
     fn recent_events(
         &self,
         limit: usize,
-    ) -> impl Future<Output = Result<Vec<ClusterEvent>, ProviderError>> + Send;
+    ) -> impl Future<Output = Result<ClusterEvents, ProviderError>> + Send;
     fn deploy_history(
         &self,
         app: &str,
         namespace: &str,
-    ) -> impl Future<Output = Result<Vec<serde_json::Value>, ProviderError>> + Send;
+    ) -> impl Future<Output = Result<ClusterDeployHistory, ProviderError>> + Send;
     fn app_metrics(
         &self,
         app: &str,
@@ -98,17 +98,17 @@ impl DataProvider for HttpDataProvider {
     async fn routes(&self) -> Result<Vec<RouteInfo>, ProviderError> {
         self.client.routes().await.map_err(Into::into)
     }
-    async fn jobs(&self) -> Result<Vec<JobStatus>, ProviderError> {
+    async fn jobs(&self) -> Result<ClusterJobs, ProviderError> {
         self.client.jobs().await.map_err(Into::into)
     }
-    async fn recent_events(&self, limit: usize) -> Result<Vec<ClusterEvent>, ProviderError> {
+    async fn recent_events(&self, limit: usize) -> Result<ClusterEvents, ProviderError> {
         self.client.events(limit).await.map_err(Into::into)
     }
     async fn deploy_history(
         &self,
         app: &str,
         namespace: &str,
-    ) -> Result<Vec<serde_json::Value>, ProviderError> {
+    ) -> Result<ClusterDeployHistory, ProviderError> {
         self.client
             .deploy_history(app, namespace)
             .await
@@ -162,34 +162,37 @@ impl DataProvider for MockDataProvider {
     async fn routes(&self) -> Result<Vec<RouteInfo>, ProviderError> {
         Ok(self.scenario.data().routes)
     }
-    async fn jobs(&self) -> Result<Vec<JobStatus>, ProviderError> {
-        Ok(self.scenario.data().jobs)
+    async fn jobs(&self) -> Result<ClusterJobs, ProviderError> {
+        let data = self.scenario.data();
+        Ok(ClusterJobs {
+            jobs: data.jobs,
+            warnings: data.job_warnings,
+        })
     }
-    async fn recent_events(&self, limit: usize) -> Result<Vec<ClusterEvent>, ProviderError> {
-        Ok(self
-            .scenario
-            .data()
-            .events
-            .into_iter()
-            .rev()
-            .take(limit)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect())
+    async fn recent_events(&self, limit: usize) -> Result<ClusterEvents, ProviderError> {
+        let data = self.scenario.data();
+        let skip = data.events.len().saturating_sub(limit);
+        Ok(ClusterEvents {
+            events: data.events.into_iter().skip(skip).collect(),
+            warnings: data.event_warnings,
+        })
     }
     async fn deploy_history(
         &self,
         app: &str,
-        _namespace: &str,
-    ) -> Result<Vec<serde_json::Value>, ProviderError> {
+        namespace: &str,
+    ) -> Result<ClusterDeployHistory, ProviderError> {
         Ok(self
             .scenario
             .data()
             .deploy_history
-            .get(app)
-            .cloned()
-            .unwrap_or_default())
+            .remove(&super::state::deploy_history_key(app, namespace))
+            .unwrap_or_else(|| ClusterDeployHistory {
+                app: app.to_string(),
+                namespace: namespace.to_string(),
+                history: Vec::new(),
+                warnings: Vec::new(),
+            }))
     }
     async fn app_metrics(
         &self,

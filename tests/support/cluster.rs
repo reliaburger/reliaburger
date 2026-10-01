@@ -392,8 +392,12 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
     // Several agents share this host; don't spawn nft against the real
     // host firewall (`with_cluster` enables it by default on Linux).
     agent.set_perimeter_enabled(false);
-    // The API answers status from the loop's published snapshot, as Bun does.
+    // The API answers status from the loop's published snapshot, and reads
+    // the agent's event ring and deploy history, as Bun does.
     let status_reader = agent.status_reader();
+    let event_store = Arc::new(RwLock::new(reliaburger::bun::events::EventStore::new()));
+    agent.set_event_store(Arc::clone(&event_store));
+    let deploy_history = agent.deploy_history_handle();
     let agent_task = reliaburger::bun::readiness::spawn_owned(
         "agent",
         true,
@@ -493,7 +497,7 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
             cmd_tx.clone(),
             None,
             None,
-            None,
+            Some(Arc::clone(&deploy_history)),
             None,
             None,
             Some(Arc::clone(&council)),
@@ -504,7 +508,7 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
             None,
             None,
             api_port,
-            None,
+            Some(Arc::clone(&event_store)),
             None,
             None,
             "default".to_string(),
@@ -526,7 +530,7 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
             cmd_tx.clone(),
             None,
             None,
-            None,
+            Some(deploy_history),
             None,
             None,
             Some(Arc::clone(&council)),
@@ -537,7 +541,7 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
             None,
             None,
             api_port,
-            None,
+            Some(event_store),
             None,
             None,
             "default".to_string(),

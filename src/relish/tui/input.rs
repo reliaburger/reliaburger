@@ -163,7 +163,7 @@ impl TuiApp {
                     });
                 }
             }
-            for job in &self.data.jobs {
+            for job in self.data.jobs.iter().map(|job| &job.row) {
                 if job.name.to_lowercase().contains(&query) {
                     hits.push(SearchHit {
                         kind: "job".into(),

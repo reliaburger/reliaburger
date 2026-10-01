@@ -259,7 +259,7 @@ async fn collect_node(endpoint: &NodeEndpoint) -> NodeCollection {
     let (health, diagnostics, events, deploys, alerts, faults, instances, version) = tokio::join!(
         bounded("health", client.health()),
         bounded("diagnostics", client.diagnostics(1)),
-        bounded("events", client.events(EVENT_LIMIT)),
+        bounded("events", client.node_events(EVENT_LIMIT)),
         bounded("deploy operations", client.deploy_operations()),
         bounded("alerts", client.alerts()),
         bounded("faults", client.list_faults()),
