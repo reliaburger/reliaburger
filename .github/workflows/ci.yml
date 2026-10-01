@@ -248,7 +248,7 @@ jobs:
         if: false
         run: make test-rootless-runc
       - name: Keep the rootless report
-        if: ${{ !cancelled() }}
+        if: false
         run: scripts/ci/keep-junit.sh test-rootless-runc make test-rootless-runc
       - name: Qualify actual Bun OCI interruptions
         run: scripts/release/qualify-oci-interruptions.sh
@@ -269,7 +269,7 @@ jobs:
           TEST_IMAGE_CACHE="$RUNNER_TEMP/test-images"
           LINUX_EXCLUDE='& not binary(owned_runc) & not binary(owned_network)'
       - name: Keep the provisioned Linux report
-        if: ${{ !cancelled() }}
+        if: false
         run: >-
           scripts/ci/keep-junit.sh test-linux make test-linux --features ebpf
           LINUX_EXCLUDE='& not binary(owned_runc) & not binary(owned_network)'
