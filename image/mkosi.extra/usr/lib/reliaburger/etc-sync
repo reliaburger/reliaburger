@@ -40,17 +40,28 @@ owned() {
     return 1
 }
 
-# What a path is: "l <target>" for a symlink, "f <sha256> <mode>" for a file,
-# "-" when it doesn't exist.
-ident() {
-    if [ -L "$1" ]; then
-        echo "l $(readlink "$1")"
-    elif [ -f "$1" ]; then
-        echo "f $(sha256sum < "$1" | cut -d' ' -f1) $(stat -c %a "$1")"
-    else
-        echo "-"
-    fi
+# scan <dir> <array>: what every path under <dir> is, as "l <target>" for a
+# symlink or "f <sha256> <mode>" for a file. One find and one sha256sum for
+# the whole tree: a process per file took 90 s on an emulated CI boot.
+scan() {
+    local -n into=$2
+    local -A hash=()
+    local line type mode target rel
+    while IFS= read -r -d '' line; do
+        hash[${line#*  }]=${line%% *}
+    done < <(cd "$1" && find . -type f -printf '%P\0' | xargs -0 -r sha256sum -z --)
+    # \037 (unit separator), not a tab: read collapses empty fields between
+    # whitespace separators, and a file's link target is empty.
+    while IFS=$'\037' read -r -d '' type mode rel target; do
+        case $type in
+            l) into[$rel]="l $target" ;;
+            f) into[$rel]="f ${hash[$rel]} $mode" ;;
+        esac
+    done < <(cd "$1" && find . ! -type d -printf '%y\037%m\037%P\037%l\0')
 }
+declare -A shipped=() present=()
+scan "$factory" shipped
+scan "$etc" present
 
 declare -A last=()
 if [ -f "$state" ]; then
@@ -72,13 +83,11 @@ install_path() {
     mv -Tf "$tmp" "$etc/$rel"
 }
 
-declare -A seen=()
 while IFS= read -r -d '' rel; do
-    rel=${rel#./}
+    [ -n "$rel" ] || continue
     owned "$rel" && continue
-    seen[$rel]=1
-    new=$(ident "$factory/$rel")
-    cur=$(ident "$etc/$rel")
+    new=${shipped[$rel]}
+    cur=${present[$rel]:--}
     printf '%s\t%s\n' "$rel" "$new" >> "$next"
     [ "$cur" = "$new" ] && continue
     if [ -z "${last[$rel]+x}" ]; then
@@ -92,13 +101,13 @@ while IFS= read -r -d '' rel; do
     else
         kept+=("$rel")
     fi
-done < <(cd "$factory" && find . ! -type d -print0 | sort -z)
+done < <(printf '%s\0' "${!shipped[@]}" | sort -z)
 
 # Paths the previous image shipped and this one doesn't.
 for rel in "${!last[@]}"; do
-    [ -n "${seen[$rel]+x}" ] && continue
+    [ -n "${shipped[$rel]+x}" ] && continue
     owned "$rel" && continue
-    if [ "$(ident "$etc/$rel")" = "${last[$rel]}" ] && [ "${last[$rel]}" != "-" ]; then
+    if [ "${present[$rel]:--}" = "${last[$rel]}" ] && [ "${last[$rel]}" != "-" ]; then
         rm -f "$etc/$rel"; removed=$((removed + 1))
     fi
 done

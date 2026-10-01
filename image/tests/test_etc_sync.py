@@ -102,6 +102,13 @@ class EtcSync(unittest.TestCase):
         self.assertEqual(os.readlink(self.etc / "systemd/system/multi-user.target.wants/b.service"),
                          "/usr/lib/systemd/system/b.service")
 
+    def test_names_with_spaces_and_empty_files_are_handled(self):
+        self.install_image({"dir with space/a file.conf": "v1\n", "empty": ""}, "1")
+        out = self.install_image({"dir with space/a file.conf": "v2\n", "empty": ""}, "2")
+        self.assertEqual((self.etc / "dir with space/a file.conf").read_text(), "v2\n")
+        self.assertEqual((self.etc / "empty").read_text(), "")
+        self.assertIn("1 updated", out)
+
     def test_a_mode_change_counts_as_a_change(self):
         self.install_image({"sudoers": "v1\n"}, "1")
         (self.etc / "sudoers").chmod(0o600)
