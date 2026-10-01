@@ -1552,6 +1552,16 @@ The body sits in a `main` function called on the last line. A piped shell execut
 
 The packaging tests run both scripts under every POSIX shell they find, with a fake `curl` that serves fixtures, and under `shellcheck -s sh` when it's installed. On a Mac, `sh` is bash pretending to be POSIX, and it forgives things dash won't, so the tests run `dash` too when it's there (it ships with macOS).
 
+### Saying what it's downloading
+
+The first installers fetched everything with `curl --silent`. That keeps a CI log tidy, and on a fast connection nobody notices. On a slow one, the 40 MB `relish` download meant several minutes of a blinking cursor, and the maintainer, who wrote the thing, sat there wondering whether it had hung. If the author can't tell, a new user certainly can't.
+
+Now every download announces itself first, with what it is, the version, the platform and the size: `Downloading relish v0.1.3 for macos-aarch64 (37.2 MiB)...`. Where does the size come from? `package.py` already reads each binary to pin its SHA-256 into the installer, so it writes the byte count next to it. No extra request, and no trusting a `Content-Length` header from a redirect. The bootstrap fetches a script of a few kilobytes, so it skips the size rather than spend a round trip on a `HEAD` request. When the download finishes there's a line with the bytes and the seconds it took, and each retry says how much had already arrived and which attempt comes next.
+
+The bar itself is curl's `--progress-bar`, but only when standard error is a terminal (`[ -t 2 ]`). The bar redraws itself with carriage returns, which a terminal turns into animation and a log file turns into one enormous line of hashes. Piped into `tee`, as `qualify-staged-install.sh` does, the installer prints the plain lines and nothing else. A test feeds the installer's output through the same `grep` and `sed` that script uses, so a chattier installer can't quietly break qualification.
+
+Both scripts now carry the same `download` helper, word for word. Keeping two copies of a shell function in step by hand is how one of them ends up with a bug the other fixed, so a test compares them.
+
 ### Getting onto `PATH` without editing your files behind your back
 
 An installer that ends with "now add this directory to PATH" has handed you homework, and the next command in the tutorial fails until you do it. But an installer that quietly appends to your `.zshrc` has edited a file you care about without asking. We wanted neither.
