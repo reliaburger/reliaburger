@@ -2017,6 +2017,7 @@ mod producer_release;
 mod restarts;
 mod runtime_inventory;
 mod scale_in_place;
+mod signal_faults;
 mod state_sweep;
 mod status_snapshot;
 use app_stop::{AppStop, PendingStops, StopPurpose};
@@ -5424,6 +5425,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 if let Some(grant) = &reservation {
                     self.node_fault_fence.active = Some((grant.sequence, rule.id));
                 }
+                // A kill, pause or resume reads its targets' pids and signals
+                // them from a task; the caller hears once they're signalled.
+                if let Some(signal) = signal_faults::Signal::of(&rule.fault_type) {
+                    self.spawn_signal_fault(&rule, signal, response);
+                    return;
+                }
                 // A pressure helper takes seconds to start; it starts in a
                 // task, and the caller hears once it runs (#351, stage 3).
                 if let crate::smoker::types::FaultType::NodePressure {
@@ -5963,44 +5970,25 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         use crate::smoker::types::FaultType;
 
         match &rule.fault_type {
-            FaultType::Kill { count } => {
-                let pids = self.target_pids(rule, *count).await;
-                if pids.is_empty() {
-                    return Err(format!("no running instances of {}", rule.target_service));
-                }
-                for pid in pids {
-                    if let Err(e) = crate::smoker::process::kill_process(pid as i32) {
-                        eprintln!("smoker: kill {pid} failed: {e}");
-                    }
-                }
-                Ok(())
-            }
-            FaultType::Pause => {
-                let pids = self.target_pids(rule, 0).await;
-                if pids.is_empty() {
-                    return Err(format!("no running instances of {}", rule.target_service));
-                }
+            // `InjectFault` signals from a task (`spawn_signal_fault`); this
+            // is the same work under the turn's runtime budget, for callers
+            // that apply a fault directly.
+            FaultType::Kill { .. } | FaultType::Pause | FaultType::Resume => {
+                let Some(signal) = signal_faults::Signal::of(&rule.fault_type) else {
+                    return Err(format!("{} is not a signal fault", rule.fault_type));
+                };
+                let ids = self.fault_targets(rule);
+                let deadline = self.turn_deadline();
+                // LOOP-INLINE: each read inside waits at most until the turn's runtime deadline
+                let pids =
+                    signal_faults::read_pids(self.supervisor.grill(), &ids, signal.count(), deadline)
+                        .await;
                 // Remember which PIDs we froze so clear/expiry can SIGCONT
                 // them. Without this a paused workload stayed frozen forever
                 // once the fault expired (CHAOS1); Resume was a separate
                 // manual fault the operator had to remember to send.
-                let mut paused = Vec::new();
-                for pid in pids {
-                    if let Err(e) = crate::smoker::process::pause_process(pid as i32) {
-                        eprintln!("smoker: pause {pid} failed: {e}");
-                    } else {
-                        paused.push(pid as i32);
-                    }
-                }
-                self.record_reversal(rule.id, crate::smoker::types::FaultReversal::Pause(paused));
-                Ok(())
-            }
-            FaultType::Resume => {
-                let pids = self.target_pids(rule, 0).await;
-                for pid in pids {
-                    if let Err(e) = crate::smoker::process::resume_process(pid as i32) {
-                        eprintln!("smoker: resume {pid} failed: {e}");
-                    }
+                if let Some(paused) = signal_faults::send(signal, &pids, &rule.target_service)? {
+                    self.record_reversal(rule.id, crate::smoker::types::FaultReversal::Pause(paused));
                 }
                 Ok(())
             }
@@ -6250,48 +6238,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 Ok(())
             }
         }
-    }
-
-    /// PIDs of running instances matching a fault's target (service, or
-    /// a specific instance). `count` limits how many (0 = all).
-    async fn target_pids(&self, rule: &crate::smoker::types::FaultRule, count: u32) -> Vec<u32> {
-        let ids: Vec<InstanceId> = self
-            .supervisor
-            .list_instances()
-            .iter()
-            .filter(|i| {
-                i.app_name == rule.target_service
-                    && rule.matches_namespace(&i.namespace)
-                    && rule.target_instance.as_ref().is_none_or(|t| &i.id.0 == t)
-                    && !i.is_being_created()
-            })
-            .map(|i| i.id.clone())
-            .collect();
-
-        // Every target's pid at once, under the turn's runtime budget: a
-        // target the runtime can't name in time is left alone, as one that
-        // has no pid always was (#351, stage 3).
-        let deadline = self.turn_deadline();
-        let grill = self.supervisor.grill();
-        let reads = ids.iter().map(|id| async move {
-            tokio::time::timeout_at(deadline, grill.pid(id))
-                .await
-                .ok()
-                .flatten()
-        });
-        // `timeout_at` polls the reads before its clock, so at the deadline
-        // the reads that finished still count.
-        let mut pids: Vec<u32> =
-            tokio::time::timeout_at(deadline, futures_util::future::join_all(reads))
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .flatten()
-                .collect();
-        if count > 0 {
-            pids.truncate(count as usize);
-        }
-        pids
     }
 
     /// Original `(instance id, cgroup path)` pairs for matching workloads.

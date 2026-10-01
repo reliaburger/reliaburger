@@ -28,6 +28,8 @@ pub(super) enum FollowUp {
         cluster_nodes: crate::firewall::rules::ClusterNodes,
         result: Result<(), crate::firewall::rules::FirewallError>,
     },
+    /// A kill, pause or resume fault's signals were sent, or weren't.
+    Signalled(super::signal_faults::Signalled),
     /// A node-pressure helper started or stopped.
     NodePressure(super::node_pressure_work::PressureDone),
     /// The egress allowlists were re-resolved.
@@ -109,6 +111,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     Err(error) => eprintln!("warning: firewall reconciliation failed: {error}"),
                 }
             }
+            Ok((_, FollowUp::Signalled(done))) => self.finish_signal_fault(done),
             Ok((_, FollowUp::NodePressure(done))) => {
                 self.finish_node_pressure(done).await;
             }

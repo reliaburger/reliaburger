@@ -3934,7 +3934,14 @@ nothing restarts it while the kill is in flight.
 #### The faults
 
 The fault code was where the five approaches met. A node-kill fault's
-container kills nobody waits on, so a task does them. Delays program a netem
+container kills nobody waits on, so a task does them. A kill, pause or resume
+reads its targets' pids and then signals them; the first version read the pids
+under the turn's budget, which kept the turn under a second but, on a slow CI
+runner, made a status queued behind it wait for the turn *and* its own pid
+reads, 1.47 s in all. So those faults became follow-ups too: the loop picks
+the targets, a task reads and signals, and the caller hears once it's done. A
+pause that lands after its fault was cleared thaws what it froze, since no
+reversal ever will. Delays program a netem
 tree inside every caller's network namespace, a handful of `tc` commands per
 caller, and doing them one caller at a time added up to most of a second on a
 busy node. They now run side by side under the turn's budget, and a caller
