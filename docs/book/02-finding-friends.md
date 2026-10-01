@@ -1875,7 +1875,46 @@ Namespaces provide resource isolation. Each namespace can have limits on CPU, me
 namespace "staging" would exceed CPU quota: 1800+500 > 2000m
 ```
 
-Notice *where* that message ends up. The quota check runs in the leader's scheduling pass, long after `relish apply` has committed the app to desired state and returned success. So in 0.1.0 the operator sees an app stuck at zero instances, and the reason is a `scheduler: quota rejects …` line in the leader's log, repeated every pass until the namespace has room. We'll meet the consequences of that in Chapter 15, where a test expected `apply` itself to fail. A durable "blocked by quota" status is still on the to-do list.
+Notice *where* that message ends up. The quota check runs in the leader's scheduling pass, long after `relish apply` has committed the app to desired state and returned success. So in 0.1.0 the operator sees an app stuck at zero instances, and the reason is a `scheduler: quota rejects …` line in the leader's log, repeated every pass until the namespace has room. We'll meet the consequences of that in Chapter 15, where a test expected `apply` itself to fail. 
+
+That was a poor place for it. Who reads the leader's log? Not the operator staring at `relish status`, and not someone connected to a follower. In 0.1.0 the app just sat at zero instances with no explanation, so in 0.1.3 (issue #326) we gave the reason a home in the council.
+
+The scheduling pass now hands back two things: the placements, and every app it refused with the `QuotaError` that refused it.
+
+```rust
+struct PassPlan {
+    decisions: Vec<SchedulingDecision>,
+    quota_blocked: BTreeMap<AppId, QuotaError>,
+}
+```
+
+`QuotaError` was already a `thiserror` enum with the numbers in it. Adding `Serialize` and `Deserialize` to its derive list is all it takes to send it through Raft. The leader stores the set in `DesiredState::quota_blocked`, and every node copies it into the desired-app evidence that `relish status`, `relish inspect`, `relish wtf` and the dashboard already read. Nothing new to query, so any node answers.
+
+The interesting part is *when* to write. The leader plans a pass every tick, and an over-quota app stays over quota until somebody changes something. Write the set every tick and a quiet cluster grows its Raft log forever, one identical entry at a time. So the leader compares first:
+
+```rust
+fn quota_blocked_update(
+    recorded: &HashMap<AppId, QuotaError>,
+    planned: &BTreeMap<AppId, QuotaError>,
+) -> Option<RaftRequest> {
+    let unchanged = recorded.len() == planned.len()
+        && planned
+            .iter()
+            .all(|(app_id, reason)| recorded.get(app_id) == Some(reason));
+    if unchanged {
+        return None;
+    }
+    Some(RaftRequest::QuotaBlocked { /* the whole planned set */ })
+}
+```
+
+`recorded.get(app_id)` returns an `Option<&QuotaError>`, a reference to the value if the key is there. Comparing it with `Some(reason)` works because `Option<T>` implements `PartialEq` whenever `T` does, and `==` on two references compares what they point at. In C, `==` on two pointers compares addresses; in Rust you have to ask for that with `std::ptr::eq`.
+
+Why does the planned set use a `BTreeMap` when the stored one is a `HashMap`? The planned set becomes a Raft entry, and a `BTreeMap` iterates in key order, so two leaders planning the same state produce byte-identical entries. The stored map is only looked up, so it keeps the same `HashMap`-serialised-as-pairs shape as its neighbours.
+
+Clearing needs no special case. The write replaces the whole set, so an app that fits again simply isn't in the next one. Deleting an app drops its reason in the same Raft entry, and the state machine ignores a reason for an app that's already gone, in case a delete commits between planning and writing. The `scheduler: quota rejects …` log line is still there, but it follows the same rule and only fires when a reason is new.
+
+The tests read like the issue: an over-quota app shows its reason, the reason clears when the quota grows or another app leaves, and a cluster that stays over quota for several passes writes once and then nothing (`a_steady_over_quota_cluster_stops_writing_after_the_first_pass`).
 
 The leader tallies each namespace's usage once per scheduling pass and adds every app it admits as it goes, so two apps admitted in the same pass can't each squeeze under a limit they exceed together. It also skips nodes cordoned by an in-progress upgrade before selecting.
 

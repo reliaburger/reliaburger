@@ -84,7 +84,7 @@ migration and no feature gate
 - [ ] **0.1.3: agent loop, observability and test quality, the next release**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/4)).
   Streamed metrics queries, so Mayo and rollup sessions no longer load every
-  Parquet file; an agent loop that's metered and never waits inline on slow
+  Parquet file ([#377](https://github.com/reliaburger/reliaburger/issues/377)); an agent loop that's metered and never waits inline on slow
   work ([#351](https://github.com/reliaburger/reliaburger/issues/351)); a
   "blocked by quota" status for apps the scheduler won't place
   ([#326](https://github.com/reliaburger/reliaburger/issues/326)); cross-node

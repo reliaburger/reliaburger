@@ -191,6 +191,11 @@ a.row-link:hover { text-decoration: underline; }
     color: #888;
 }
 .detail-meta span { margin-right: 1rem; }
+.detail-header .blocked {
+    flex-basis: 100%;
+    margin: 0.5rem 0 0;
+    color: #e74c3c;
+}
 
 /* Responsive: horizontal scroll for tables on narrow viewports */
 @media (max-width: 768px) {

@@ -50,7 +50,10 @@ details.
 `relish inspect <app>` uses the same relay to list every instance of an app on
 every node, with the node it runs on, under a `desired` vs `running` replica
 count. A node that doesn't answer, or that gossip already considers dead, gets
-a warning line naming it instead of silently shrinking the list.
+a warning line naming it instead of silently shrinking the list. An app its
+namespace quota keeps unplaced gets a `Blocked:` line with the quota it would
+break (see `deploy-an-app`), and `wtf` reports it as a `quota-blocked` warning
+rather than a generic under-replication.
 
 ## `relish path`: can A reach B?
 
