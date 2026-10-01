@@ -81,30 +81,55 @@ migration and no feature gate
   0.1.2 changes the protocol and state formats (27 and 46 in 0.1.1; 28 and 47
   now), so a 0.1.1 cluster can't roll to it: recreate the cluster
   ([upgrading from 0.1.1](releasing.md#upgrading-from-011)).
-- [ ] **0.1.3: agent loop, observability and test quality, the next release**
-  ([milestone](https://github.com/reliaburger/reliaburger/milestone/4)).
-  Streamed metrics queries, so Mayo and rollup sessions no longer load every
-  Parquet file ([#377](https://github.com/reliaburger/reliaburger/issues/377)); an agent loop that's metered and never waits inline on slow
-  work ([#351](https://github.com/reliaburger/reliaburger/issues/351)); a
-  "blocked by quota" status for apps the scheduler won't place
-  ([#326](https://github.com/reliaburger/reliaburger/issues/326)); cross-node
-  views and log streams (F07, [#365](https://github.com/reliaburger/reliaburger/issues/365));
-  large modules split once the agent-loop pull requests
-  ([#355](https://github.com/reliaburger/reliaburger/pull/355),
-  [#357](https://github.com/reliaburger/reliaburger/pull/357)) land (H05,
-  [#319](https://github.com/reliaburger/reliaburger/issues/319)); an
-  owner for every ignored test and tested CI job selection
-  ([#303](https://github.com/reliaburger/reliaburger/issues/303)); JUnit
-  evidence for every suite ([#304](https://github.com/reliaburger/reliaburger/issues/304));
-  and the rootless upgrade-walk flake ([#358](https://github.com/reliaburger/reliaburger/issues/358)).
+- [ ] **0.1.3: ready for release, qualification in progress**
+  ([milestone](https://github.com/reliaburger/reliaburger/milestone/4)). Every
+  item has landed and the crate says 0.1.3; what's left is building, staging,
+  soaking and promoting the candidate ([runbook](releasing.md)). 0.1.3 is about
+  the agent loop, observability and test quality:
+  - [x] an agent loop that's metered and never waits inline on slow work: a
+    turn meter, a starvation harness and the inline-await rule, the status
+    snapshot, parallel state reads and restarts off the loop, and the last
+    long awaits moved out, with the soak failing any turn over 1 s
+    ([#351](https://github.com/reliaburger/reliaburger/issues/351), [#352](https://github.com/reliaburger/reliaburger/pull/352), [#355](https://github.com/reliaburger/reliaburger/pull/355), [#357](https://github.com/reliaburger/reliaburger/pull/357));
+  - [x] streamed metrics queries, so Mayo and rollup sessions no longer load
+    every Parquet file ([#377](https://github.com/reliaburger/reliaburger/issues/377), [#382](https://github.com/reliaburger/reliaburger/pull/382));
+  - [x] a "blocked by quota" status for apps the scheduler won't place
+    ([#326](https://github.com/reliaburger/reliaburger/issues/326), [#383](https://github.com/reliaburger/reliaburger/pull/383));
+  - [x] cross-node views and log streams, part 1 of F07: live logs, deploy
+    history, events and jobs answer for the whole cluster, whichever node
+    serves them ([#365](https://github.com/reliaburger/reliaburger/issues/365), [#385](https://github.com/reliaburger/reliaburger/pull/385)). Part 2 is [#392](https://github.com/reliaburger/reliaburger/issues/392), in 0.1.4;
+  - [x] the agent and API modules split along their ownership boundaries
+    (H05, [#319](https://github.com/reliaburger/reliaburger/issues/319), [#394](https://github.com/reliaburger/reliaburger/pull/394), [#396](https://github.com/reliaburger/reliaburger/pull/396));
+  - [x] an owner for every ignored test, tested CI job selection and JUnit
+    evidence for every suite ([#303](https://github.com/reliaburger/reliaburger/issues/303), [#304](https://github.com/reliaburger/reliaburger/issues/304), [#380](https://github.com/reliaburger/reliaburger/pull/380));
+  - [x] a two-voter council's rolling upgrade refused before it starts,
+    instead of waiting for good ([#371](https://github.com/reliaburger/reliaburger/issues/371), [#372](https://github.com/reliaburger/reliaburger/pull/372));
+  - [x] flakes and bugs: a live instance's pid reported missing after an
+    upgrade walk ([#358](https://github.com/reliaburger/reliaburger/issues/358), [#378](https://github.com/reliaburger/reliaburger/pull/378)), the self-upgrade cluster suite run on
+    a real four-voter council ([#373](https://github.com/reliaburger/reliaburger/issues/373), [#384](https://github.com/reliaburger/reliaburger/pull/384)), `relish images` columns
+    and a single `wtf` builds row ([#375](https://github.com/reliaburger/reliaburger/issues/375), [#379](https://github.com/reliaburger/reliaburger/pull/379)), no double prepare of
+    one instance ([#386](https://github.com/reliaburger/reliaburger/issues/386), [#388](https://github.com/reliaburger/reliaburger/pull/388)), retirement waiting out a slow runtime
+    and exit codes that say when they're unknown ([#387](https://github.com/reliaburger/reliaburger/issues/387), [#389](https://github.com/reliaburger/reliaburger/issues/389),
+    [#391](https://github.com/reliaburger/reliaburger/pull/391)), and the execution fence waiting out a slow network-reference
+    read ([#393](https://github.com/reliaburger/reliaburger/issues/393), [#400](https://github.com/reliaburger/reliaburger/pull/400));
+  - [x] the installers showing what they're downloading instead of staying
+    silent for minutes ([#395](https://github.com/reliaburger/reliaburger/issues/395), [#397](https://github.com/reliaburger/reliaburger/pull/397)).
+
+  0.1.3 changes the protocol and state formats (28 and 47 in 0.1.2; 30 and 48
+  now), so a 0.1.2 cluster can't roll to it: recreate the cluster
+  ([upgrading from 0.1.2](releasing.md#upgrading-from-012)). 0.1.2's leader
+  refuses the upgrade before it records a run.
 - [ ] **0.1.4: operations security**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/8)).
   Upstream image trust: digest pinning, cosign and worker key separation (F03,
   [#361](https://github.com/reliaburger/reliaburger/issues/361)); CA recovery
   and rotation (F04, [#362](https://github.com/reliaburger/reliaburger/issues/362));
   namespace identity and the token lifecycle (F05,
-  [#363](https://github.com/reliaburger/reliaburger/issues/363)). These come
-  before real fleets in 0.3.0.
+  [#363](https://github.com/reliaburger/reliaburger/issues/363)); and part 2
+  of F07: separate stderr capture, richer log filters, a merged live event
+  stream and rollback over merged history
+  ([#392](https://github.com/reliaburger/reliaburger/issues/392)). The
+  security work comes before real fleets in 0.3.0.
 - [ ] **0.2.0: "A million jobs"**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/3),
   [#266](https://github.com/reliaburger/reliaburger/pull/266)). Task arrays
@@ -165,13 +190,13 @@ what's shipped and what's scheduled.
   V04, cold installs on Intel macOS, Linux x86_64 and Linux arm64
   ([#288](https://github.com/reliaburger/reliaburger/issues/288)). All in 0.3.0.
 - **Missing capabilities F01–F11**, one issue each, placed in
-  [0.1.3](https://github.com/reliaburger/reliaburger/milestone/4) (F07),
-  [0.1.4](https://github.com/reliaburger/reliaburger/milestone/8) (F03–F05),
+  [0.1.3](https://github.com/reliaburger/reliaburger/milestone/4) (F07 part 1, landed),
+  [0.1.4](https://github.com/reliaburger/reliaburger/milestone/8) (F03–F05,
+  F07 part 2),
   [0.3.0](https://github.com/reliaburger/reliaburger/milestone/6) (F08),
   [0.4.0](https://github.com/reliaburger/reliaburger/milestone/7) (F10) and
   [Later](https://github.com/reliaburger/reliaburger/milestone/9) (F01, F02,
   F06, F09, F11).
-- **Module splits** (H05, [#319](https://github.com/reliaburger/reliaburger/issues/319)), in 0.1.3.
 - **Flakes.** The open ones are in the [known flakes register](flakes.md)
   ([#318](https://github.com/reliaburger/reliaburger/issues/318)).
 
