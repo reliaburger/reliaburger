@@ -918,6 +918,9 @@ pub async fn run_orchestrator(
     let self_raft_id = raft_id_from_name(&self_node_id);
     let mut tick = tokio::time::interval(Duration::from_secs(3));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // The run whose quorum hold was last logged, so a hold is reported once
+    // when it begins rather than every tick.
+    let mut hold_logged: Option<String> = None;
 
     loop {
         tokio::select! {
@@ -963,9 +966,25 @@ pub async fn run_orchestrator(
                 .collect();
             (configured, live, alive)
         };
+        let quorum_ok = live_quorum_headroom_ok(configured_voters, live_voters);
+        let voter_phase = matches!(
+            upgrade.phase,
+            ClusterUpgradePhase::UpgradingCouncil | ClusterUpgradePhase::UpgradingLeader
+        );
+        if quorum_ok || !voter_phase {
+            hold_logged = None;
+        } else if hold_logged.as_deref() != Some(upgrade.upgrade_id.as_str()) {
+            eprintln!(
+                "bun: cluster upgrade {} waiting: {live_voters} of {configured_voters} voters alive, \
+                 and a voter's swap must leave {} for quorum",
+                upgrade.upgrade_id,
+                configured_voters / 2 + 1
+            );
+            hold_logged = Some(upgrade.upgrade_id.clone());
+        }
         let context = StepContext {
             self_node_id: self_node_id.clone(),
-            quorum_ok: live_quorum_headroom_ok(configured_voters, live_voters),
+            quorum_ok,
             gossip_alive_ids,
             now: SystemTime::now(),
         };

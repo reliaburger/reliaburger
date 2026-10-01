@@ -2213,6 +2213,28 @@ struct StartUpgradeNode {
     role: crate::upgrade::types::NodeRole,
 }
 
+/// Refuse a run a two-voter council would hold in the council phase for
+/// good: the orchestrator never takes a voter down without quorum to spare,
+/// and a holding run isn't paused, so it couldn't be aborted either.
+// `Response` is large but it IS the HTTP reply to send on failure.
+#[allow(clippy::result_large_err)]
+fn check_council_can_roll(council: &crate::council::CouncilNode) -> Result<(), Response> {
+    let configured_voters = council
+        .metrics()
+        .borrow()
+        .membership_config
+        .membership()
+        .voter_ids()
+        .count();
+    crate::upgrade::plan::check_council_can_roll(configured_voters).map_err(|e| {
+        (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response()
+    })
+}
+
 /// Start a cluster-wide rolling upgrade (admin, leader only).
 ///
 /// The caller (relish) has already pushed the binary blob to the leader's
@@ -2365,6 +2387,10 @@ async fn upgrade_start_handler(
             )
                 .into_response();
         }
+    }
+
+    if let Err(resp) = check_council_can_roll(council) {
+        return resp;
     }
 
     let upgrade_id = format!(
@@ -2896,6 +2922,10 @@ async fn upgrade_cluster_rollback_handler(
             Json(serde_json::json!({ "error": e.to_string() })),
         )
             .into_response();
+    }
+
+    if let Err(resp) = check_council_can_roll(council) {
+        return resp;
     }
 
     let upgrade_id = format!(

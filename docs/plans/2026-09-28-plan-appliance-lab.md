@@ -166,7 +166,7 @@ For `relish netboot` (Phase 2b):
 - `/etc` lives on the data partition, so a later image's `/etc` doesn't reach installed nodes (S1). The seed and SSH credentials land in `/etc` too.
 - A rolling bun upgrade on the appliance hasn't swapped a binary yet: no two release-signed versions share formats (see S4).
 - A seeded fleet can't grow past the addresses given to `seed-fleet.sh init`, because each seed fixes `bootstrap_peers`. The claim flow (Phase 2) has to update them, or the firewall has to admit anything the CA has enrolled.
-- A two-node cluster holds a bun upgrade in `UpgradingCouncil` indefinitely, and `relish upgrade status` gives no reason. bun should report the quorum hold, or `start` should refuse it.
+- ~~A two-node cluster holds a bun upgrade in `UpgradingCouncil` indefinitely.~~ Fixed: `start` and a cluster `rollback` now refuse a two-voter council, and the leader logs a quorum hold once when it begins.
 - The fallback takes about 16 minutes, because the boot check waits 300 s each try.
 - The lab's SSH (`openssh-server`, started only with an `ssh.authorized_keys.root` credential) exists so S4 can stage by hand. Phase 1 drops it, once bun stages OS updates itself.
 - Every spike build signs with its own throwaway key, so staging a later build needs that build's public key passed to `os-stage` explicitly.

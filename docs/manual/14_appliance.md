@@ -255,8 +255,7 @@ it also uses port 8080. `bootctl list` on the node shows both versions afterward
   `/etc/reliaburger/node.toml` on every node and restarting bun.
 - **Two machines can't roll a bun upgrade.** Both are in the council, and
   upgrading one would leave the other without a majority, so
-  `relish upgrade` waits, and `relish upgrade status` doesn't say why. Use
-  three or more.
+  `relish upgrade start` refuses. Use three or more.
 
 The design and the test results are in `docs/plans/2026-09-28-plan-appliance-lab.md`.
 The QEMU lab that exercises all of this without hardware is in `image/lab/`.

@@ -113,5 +113,5 @@ PASS for everything that can be proven without the hardware, apart from one item
 - **A rolling `relish upgrade` that swaps bun** on the appliance, once two release-signed versions share `protocol` and `state`.
 - **Found on the way, to fix outside the spike:**
   - a seeded fleet can't grow past the addresses given to `seed-fleet.sh init`, since each seed fixes `bootstrap_peers` and the firewall drops anyone else before they join;
-  - a two-node cluster holds `relish upgrade` in `UpgradingCouncil` with no reason shown, and `abort` refuses it because it isn't paused.
+  - a two-node cluster held `relish upgrade` in `UpgradingCouncil` with no reason shown, and `abort` refused it because it wasn't paused. Fixed on this branch: `start` and a cluster `rollback` refuse a two-voter council, and the leader logs a quorum hold.
 - **S6:** fold the numbers into the research note, write `<date>-wyse-3040.md`, and give the go/no-go.
