@@ -574,11 +574,12 @@ async fn status_answers_while_an_upgrade_fetches_from_a_silent_registry() {
         .await;
 }
 
-// Egress DNS re-resolution (`reresolve_egress`) and the execution fence have
-// no scenario: they run only with a loaded eBPF program, which a unit test
-// can't construct. The lookups run in a task now; `egress_resolution`'s tests
-// cover what it resolves and which bindings an answer may still change. The
-// fence kills through the same off-loop work as the job rerun scenario.
+// Egress DNS re-resolution (`reresolve_egress`) has no scenario: it runs only
+// with a loaded eBPF program, which a unit test can't construct. The lookups
+// run in a task now; `egress_resolution`'s tests cover what it resolves and
+// which bindings an answer may still change. The execution fence that follows
+// a failed egress stop needs no eBPF program, and has a scenario below the
+// retirement ones.
 
 // ---- disk, kernel and subprocesses -------------------------------------------
 
@@ -754,6 +755,63 @@ async fn a_stop_waits_out_a_network_reference_release_slower_than_the_turn() {
     assert_eq!(calls_of(&grill, "release_network_reference"), 1);
     running
         .assert_responsive("a stop released the network reference")
+        .await;
+}
+
+/// When a stop the egress fence relies on fails, the fence force-kills the
+/// app, but only once the runtime confirms each instance still holds its
+/// original address (#357). On runc that read waits for the lifecycle lock,
+/// as retirement's does (#387), and it used to fail on the turn's budget,
+/// leaving the app running until a later egress check fenced it again
+/// (#393). The read now finishes off the loop: the stop keeps its waiters
+/// until the fence holds, and the runtime is asked once.
+#[tokio::test]
+async fn a_failed_stop_fences_through_a_network_reference_read_slower_than_the_turn() {
+    let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+    grill.set_container_ip(std::net::Ipv4Addr::new(10, 0, 0, 7));
+    grill
+        .set_network_reference(original_test_network_reference())
+        .await;
+    expect_complete(&drain_deploy(&mut agent, replicated("web", 1)).await);
+    let id = InstanceId("default__web-0".into());
+    grill.set_fail_stop(true);
+    // An operator stop is pending when the egress fence comes to rely on it.
+    let (response, stopped) = oneshot::channel();
+    agent
+        .request_app_stop("web".into(), "default".into(), StopPurpose::Stop, response)
+        .await;
+    agent.stop_app_unattended("web", "default").await.unwrap();
+    let reads_before = grill.network_reference_reads();
+    grill.set_call_delay(MockCall::NetworkReference, Some(SLOW_RUNTIME));
+    let running = RunningAgent::start(agent, tx, shutdown);
+    running.measure_from_here();
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while grill.network_reference_reads() == reads_before {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the fence never read the network reference");
+    let latency = running.status_latency().await;
+    assert!(
+        latency.is_some_and(|latency| latency < TURN_BUDGET),
+        "status took {latency:?} while the fence waited on the runtime"
+    );
+    let answer = tokio::time::timeout(std::time::Duration::from_secs(10), stopped)
+        .await
+        .expect("the stop was never answered")
+        .expect("the stop's waiter was dropped");
+    assert!(answer.is_err(), "the stop must report its failure");
+    let kills = grill
+        .calls()
+        .iter()
+        .filter(|(op, i)| op == "kill" && i == &id)
+        .count();
+    assert_eq!(kills, 1, "the stop was answered before the fence held");
+    assert_eq!(grill.network_reference_reads(), reads_before + 1);
+    running
+        .assert_responsive("the execution fence read the network reference")
         .await;
 }
 

@@ -22,7 +22,8 @@
 //!
 //! Runtime calls that retirement can't do without go the same way: reading
 //! and releasing an instance's network reference wait for its lifecycle lock
-//! on runc, behind whatever state reads hold it (#387).
+//! on runc, behind whatever state reads hold it (#387). So does the read the
+//! execution fence makes before it kills anything (#393).
 //!
 //! A task belongs to one incarnation of its instance. A result that was never
 //! collected (the owner went another way) is thrown away rather than handed
@@ -54,10 +55,21 @@ pub(super) enum WorkKey {
     ClearJobRun(InstanceId),
     /// Force-killing an instance whose graceful stop failed, and confirming
     /// its exit.
-    #[cfg_attr(not(all(feature = "ebpf", target_os = "linux")), allow(dead_code))]
+    #[cfg_attr(
+        not(any(test, all(feature = "ebpf", target_os = "linux"))),
+        allow(dead_code)
+    )]
     FenceExecution(InstanceId),
     /// Asking the runtime which network reference a retiring instance holds.
     ReadNetworkReference(InstanceId),
+    /// Asking the runtime which network reference an instance holds, before
+    /// the execution fence may kill it. Its own key, so a retirement's read
+    /// and the fence's never collect each other's answer.
+    #[cfg_attr(
+        not(any(test, all(feature = "ebpf", target_os = "linux"))),
+        allow(dead_code)
+    )]
+    FenceNetworkReference(InstanceId),
     /// Handing a retiring instance's network reference back to the runtime.
     ReleaseNetworkReference(InstanceId),
 }
@@ -78,6 +90,12 @@ impl std::fmt::Display for WorkKey {
             WorkKey::FenceExecution(id) => write!(f, "force-killing {id}"),
             WorkKey::ReadNetworkReference(id) => {
                 write!(f, "reading {id}'s network reference")
+            }
+            WorkKey::FenceNetworkReference(id) => {
+                write!(
+                    f,
+                    "reading {id}'s network reference for the execution fence"
+                )
             }
             WorkKey::ReleaseNetworkReference(id) => {
                 write!(f, "releasing {id}'s network reference")

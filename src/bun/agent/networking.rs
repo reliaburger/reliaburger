@@ -260,7 +260,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let reference = match self.network_references.get(id).cloned() {
             Some(reference) => reference,
             None => {
-                let Some(held) = self.read_network_reference(id).await? else {
+                let read = off_loop_work::WorkKey::ReadNetworkReference(id.clone());
+                let Some(held) = self.read_network_reference(read, id).await? else {
                     return Ok(());
                 };
                 match self.journal_reference(&held) {
@@ -294,9 +295,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     /// Which network reference the runtime holds for `id`, read in a task
-    /// ([`off_loop_work`]). `StillRunning` means ask again.
+    /// ([`off_loop_work`]) as `key`'s work. `StillRunning` means ask again.
     pub(super) async fn read_network_reference(
         &mut self,
+        key: off_loop_work::WorkKey,
         id: &InstanceId,
     ) -> Result<Option<crate::grill::runc_intent::NetworkReference>, BunError> {
         let grill = self.supervisor.grill().clone();
@@ -307,7 +309,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 .await
                 .map_err(|error| error.to_string())
         };
-        let key = off_loop_work::WorkKey::ReadNetworkReference(id.clone());
         let incarnation = self.incarnation_of(id);
         let turn_deadline = self.turn_deadline();
         // LOOP-INLINE: `finish` waits with `timeout_at(turn_deadline)`
@@ -828,27 +829,43 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 eprintln!(
                     "sesame: failed to stop {namespace}/{app_name} after egress loss: {error}"
                 );
-                self.fence_after_failed_stop(&app_name, &namespace).await;
+                // No stop is pending to ask again, so the next egress
+                // check does, and collects whatever is still running.
+                if let Err(error) = self.fence_after_failed_stop(&app_name, &namespace).await {
+                    eprintln!("sesame: execution fence for {namespace}/{app_name}: {error}");
+                }
             }
         }
     }
 
     /// Force-kill an app whose graceful stop failed, keeping every
     /// allocation it still owns.
-    pub(super) async fn fence_after_failed_stop(&mut self, app_name: &str, namespace: &str) {
-        #[cfg(all(feature = "ebpf", target_os = "linux"))]
-        if let Err(error) = self.fence_app_execution(app_name, namespace).await {
-            eprintln!(
+    ///
+    /// `Err(StillRunning)` means part of the fence is still running off the
+    /// loop ([`off_loop_work`]): ask again, and the next attempt picks up the
+    /// same work. Any other failure is reported here; the next egress check
+    /// fences again.
+    pub(super) async fn fence_after_failed_stop(
+        &mut self,
+        app_name: &str,
+        namespace: &str,
+    ) -> Result<(), BunError> {
+        #[cfg(any(test, all(feature = "ebpf", target_os = "linux")))]
+        match self.fence_app_execution(app_name, namespace).await {
+            Err(error @ BunError::StillRunning { .. }) => return Err(error),
+            Err(error) => eprintln!(
                 "sesame: execution fencing remains unconfirmed for {namespace}/{app_name}: {error}"
-            );
+            ),
+            Ok(()) => {}
         }
         // Only the egress fence asks for this, and it exists only with eBPF.
-        #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
+        #[cfg(not(any(test, all(feature = "ebpf", target_os = "linux"))))]
         let _ = (app_name, namespace);
+        Ok(())
     }
 
     /// Stop unsafe execution while preserving refused discovery and policy cleanup.
-    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    #[cfg(any(test, all(feature = "ebpf", target_os = "linux")))]
     pub(super) async fn fence_app_execution(
         &mut self,
         app_name: &str,
@@ -873,20 +890,19 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         // LOOP-INLINE: in-memory lock, no I/O
         self.supervisor.stop_app(app_name, namespace).await?;
         let mut first_error = None;
-        let deadline = self.turn_deadline();
+        let mut still_running = None;
         for (id, publishes_address) in instances {
+            let kill = off_loop_work::WorkKey::FenceExecution(id.clone());
+            // A kill already under way passed this check when it started.
+            let checked = self.off_loop_work.started(&kill, self.incarnation_of(&id));
             let result = async {
-                if publishes_address {
-                    let reference = tokio::time::timeout_at(
-                        deadline,
-                        self.supervisor.grill().network_reference(&id),
-                    )
-                    .await
-                    .map_err(|_| BunError::RetirementState {
-                        instance_id: id.clone(),
-                        reason: "the runtime did not name the retained address within the turn"
-                            .into(),
-                    })??;
+                if publishes_address && !checked {
+                    // On runc the read waits for the instance's lifecycle
+                    // lock, which can outlast a turn (#393). It runs in a
+                    // task; `StillRunning` leaves this instance unkilled
+                    // until a later attempt collects the answer.
+                    let read = off_loop_work::WorkKey::FenceNetworkReference(id.clone());
+                    let reference = self.read_network_reference(read, &id).await?;
                     if reference.is_none()
                         || self
                             .network_references
@@ -901,10 +917,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     }
                 }
                 self.retire_initialisers(&id).await?;
-                // The kill runs off the loop; until it's confirmed the fence
-                // reports itself unconfirmed, and the next egress check
-                // fences again and collects it.
-                self.kill_off_the_loop(off_loop_work::WorkKey::FenceExecution(id.clone()), &id)
+                // The kill runs off the loop too; until it's confirmed the
+                // fence answers `StillRunning`, and asking again collects it.
+                self.kill_off_the_loop(kill.clone(), &id)
                     .await?
                     .map_err(|reason| BunError::RetirementState {
                         instance_id: id.clone(),
@@ -912,9 +927,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     })
             }
             .await;
-            if let Err(error) = result {
-                first_error.get_or_insert(error);
-                continue;
+            match result {
+                Ok(()) => {}
+                Err(error @ BunError::StillRunning { .. }) => {
+                    still_running.get_or_insert(error);
+                    continue;
+                }
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                    continue;
+                }
             }
             if let Some(instance) = self.supervisor.get_instance_mut(&id)
                 && instance.state.can_transition_to(ContainerState::Stopped)
@@ -924,7 +946,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
         // Address holds, service keys, grants and adoption records remain owned.
         // An execution stop is not an acknowledgement of their retirement.
-        first_error.map_or(Ok(()), Err)
+        // Work still running comes first: the caller asks again, and that
+        // attempt reports any failure that remains.
+        still_running.or(first_error).map_or(Ok(()), Err)
     }
 
     /// Portable builds cannot have live egress bindings.

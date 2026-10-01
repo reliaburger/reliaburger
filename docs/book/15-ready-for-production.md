@@ -4058,6 +4058,62 @@ network-reference read takes 1.5 s and one whose release does. Both used to
 answer with that error. Now both answer `Ok` after the slow call ends, with
 the runtime asked once and no turn over budget.
 
+Retirement wasn't the only thing asking runc for a network reference under
+the budget. When a stop the egress fence relied on fails, the agent fences
+the app's execution: it force-kills each instance, but only once the runtime
+confirms the instance still holds the address the agent retained for it
+(#357). Kill the wrong holder and you've freed an address something else may
+already be using. That read waited for the same lifecycle lock, and a miss
+did something quieter than a 500 (#393). The fence logged "execution fencing
+remains unconfirmed", answered the stop's callers, and left the app running
+until a later egress check tried again.
+
+The read now goes the same way, with one twist. It gets a key of its own,
+`WorkKey::FenceNetworkReference`, rather than sharing retirement's, so a
+retirement and a fence of the same instance can never collect each other's
+answer. The interesting part is who asks again. A retirement has a stop
+waiting on it, and the stop re-checks every 100 ms. The fence had nobody: it
+ran once, inside the failed stop's completion, and whatever it said went
+into a log. So the failed stop now stays pending while its fence is still
+running. It keeps the failure in a new `failure: Option<BunError>` field,
+checks back on the same 100 ms timer, and runs the fence again, which
+collects the same tasks. Only when the fence holds (or fails for good) do the
+callers hear that the stop failed:
+
+```rust
+if let Err(BunError::StillRunning { .. }) =
+    self.fence_after_failed_stop(app_name, namespace).await
+{
+    pending.failure = finished.err();
+    self.recheck_stop_later(key, pending);
+    return;
+}
+```
+
+`if let` is a `match` with one arm you care about: the block runs only if the
+value fits the pattern, and anything else falls through. Go would write
+`if errors.As(err, &stillRunning)`; Rust matches on the variant directly.
+`finished.err()` turns the `Result` into an `Option` holding just the error,
+which is exactly what the field stores.
+
+The fence keeps its order on the second pass, too. An instance whose kill has
+already started passed the address check when it started, so the fence skips
+the read for it and goes straight to collecting the kill; an instance still
+waiting on its read isn't killed. Inside the fence, `StillRunning` wins over
+any other error (`error @ BunError::StillRunning { .. }`, the binding pattern
+from Chapter 14), because the caller is about to ask again anyway, and that
+attempt reports whatever failure is left.
+
+The fence used to be compiled only with eBPF on Linux, which is why it had no
+harness scenario. Nothing in it needs a loaded eBPF program, only the mock
+runtime, so test builds compile it everywhere now, the way
+`stop_app_unattended` already was. The new scenario fails a stop the fence
+relies on, makes the fence's read take 1.5 s, and checks that status still
+answers within the budget, that the stop's caller hears about the failure
+only after the kill, and that runc was asked once. Before the fix the caller
+heard straight away and nothing was killed. A second test pins the order:
+when the runtime names a different address, the fence kills nothing.
+
 #### The faults
 
 The fault code was where the five approaches met. A node-kill fault's
@@ -4107,11 +4163,12 @@ seconds to die answers status within the second, finishes the rerun, and
 starts the job exactly once. `grep -rn 'LOOP-INLINE: stage' src/` finds
 nothing.
 
-Two things have no scenario, because they only exist with a loaded eBPF
-program: DNS re-resolution and the execution fence. Their off-loop halves
-have unit tests instead. One resolves two allowlists, one of them bad, and
-checks that the failure stays with its binding; another checks that an answer
-applies only to a binding that hasn't changed owner, cgroup or allowlist.
+One thing has no scenario, because it only exists with a loaded eBPF
+program: DNS re-resolution. (The execution fence used to keep it company,
+until #393 gave it one; see above.) Its off-loop half has unit tests instead.
+One resolves two allowlists, one of them bad, and checks that the failure
+stays with its binding; another checks that an answer applies only to a
+binding that hasn't changed owner, cgroup or allowlist.
 The off-loop work has tests of its own for the incarnation rule: the same
 incarnation finds the task it started, and a new one waits for the old work,
 then starts its own and never sees the old result.

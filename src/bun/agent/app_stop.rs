@@ -52,6 +52,9 @@ pub(super) struct PendingStop {
     /// The stop itself has finished; only what its waiters asked for after
     /// it (a retirement's disk cleanup) is still running off the loop.
     stopped: bool,
+    /// Why the stop failed, kept while the execution fence it set off is
+    /// still running off the loop, so the waiters hear it once it holds.
+    failure: Option<BunError>,
 }
 
 /// How long a stop waits before it checks again on disk work still running
@@ -143,6 +146,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 waiters,
                 fence_on_failure,
                 stopped: false,
+                failure: None,
             },
         );
     }
@@ -181,7 +185,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let (app_name, namespace) = (key.0.clone(), key.1.clone());
         let (app_name, namespace) = (app_name.as_str(), namespace.as_str());
         let finished = match waited {
-            Ok(()) if pending.stopped => Ok(()),
+            Ok(()) if pending.stopped => pending.failure.take().map_or(Ok(()), Err),
             Ok(()) => {
                 self.finish_app_stop(app_name, namespace, pending.stop.clone())
                     .await
@@ -194,12 +198,24 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             self.recheck_stop_later(key, pending);
             return;
         }
+        let first_attempt = !pending.stopped;
         pending.stopped = true;
         if let Err(error) = &finished
             && pending.fence_on_failure
         {
-            eprintln!("bun: stop of {namespace}/{app_name} failed, fencing execution: {error}");
-            self.fence_after_failed_stop(app_name, namespace).await;
+            if first_attempt {
+                eprintln!("bun: stop of {namespace}/{app_name} failed, fencing execution: {error}");
+            }
+            // The fence's runtime work runs off the loop (#393). Nobody hears
+            // about the stop until the fence holds, so a caller that sees
+            // the failure never races an app that is still running.
+            if let Err(BunError::StillRunning { .. }) =
+                self.fence_after_failed_stop(app_name, namespace).await
+            {
+                pending.failure = finished.err();
+                self.recheck_stop_later(key, pending);
+                return;
+            }
         }
         // The first waiter gets the error itself; later ones get its text.
         let reason = finished.as_ref().err().map(ToString::to_string);
@@ -566,6 +582,7 @@ mod tests {
                 waiters,
                 fence_on_failure: false,
                 stopped: false,
+                failure: None,
             },
         );
 

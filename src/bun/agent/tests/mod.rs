@@ -6059,7 +6059,6 @@ async fn an_unattended_stop_returns_before_its_grace() {
 
 /// When a stop the egress fence relied on fails, its completion fences
 /// execution at once instead of leaving it to a later tick.
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
 #[tokio::test]
 async fn a_failed_stop_the_egress_fence_relies_on_fences_at_once() {
     let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
@@ -6093,6 +6092,35 @@ async fn a_failed_stop_the_egress_fence_relies_on_fences_at_once() {
     assert_eq!(
         kills, 2,
         "the fence must force-kill again after the failed stop"
+    );
+}
+
+/// The execution fence kills only an instance whose runtime still names the
+/// address the agent retained for it (#357). Moving that read off the loop
+/// (#393) must not let the kill start before the answer is in.
+#[tokio::test]
+async fn the_execution_fence_kills_nothing_while_the_runtime_names_another_address() {
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    grill.set_container_ip(std::net::Ipv4Addr::new(10, 0, 0, 7));
+    let original = original_test_network_reference();
+    grill.set_network_reference(original.clone()).await;
+    expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+    let id = InstanceId("default__web-0".into());
+    let mut other = serde_json::to_value(&original).unwrap();
+    other["container_index"] = serde_json::json!(8);
+    agent
+        .network_references
+        .insert(id.clone(), serde_json::from_value(other).unwrap());
+
+    let fenced = agent.fence_app_execution("web", "default").await;
+
+    assert!(
+        matches!(fenced, Err(BunError::RetirementState { .. })),
+        "{fenced:?}"
+    );
+    assert!(
+        !grill.calls().iter().any(|(op, i)| op == "kill" && i == &id),
+        "the fence killed an instance whose address it couldn't confirm"
     );
 }
 
