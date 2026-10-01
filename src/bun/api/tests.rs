@@ -25,6 +25,7 @@ async fn registry_query_response_refuses_an_oversized_catalogue() {
 
 use super::faults::NODE_REQUEST_TIMEOUT;
 use super::ui::statuses_to_dashboard_apps;
+use super::upgrade::{UPGRADE_FORWARDED_HEADER, check_council_can_roll};
 use super::*;
 use axum::body::Body;
 use http_body_util::BodyExt;
