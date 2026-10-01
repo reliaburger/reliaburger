@@ -1978,6 +1978,7 @@ mod adopted_placements;
 mod discovery_ownership;
 mod discovery_recovery;
 mod egress_ownership;
+mod egress_resolution;
 mod follow_ups;
 mod identity_signing;
 mod launch_evidence;
@@ -2344,6 +2345,9 @@ pub struct BunAgent<G: Grill> {
     /// Whether the namespace-firewall maps missed a sync (a runtime that
     /// didn't name a workload's cgroup in time), so the tick retries it.
     namespace_firewall_stale: bool,
+    /// The task re-resolving egress allowlists, if one is.
+    #[cfg_attr(not(all(feature = "ebpf", target_os = "linux")), allow(dead_code))]
+    egress_resolving: Option<tokio::task::Id>,
     /// Disk cleanup and provisioning running in tasks, which a later turn
     /// collects.
     off_loop_work: off_loop_work::OffLoopWork,
@@ -2522,6 +2526,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             turn_deadline: None,
             namespace_firewall_stale: false,
             off_loop_work: off_loop_work::OffLoopWork::default(),
+            egress_resolving: None,
             adopted_apps: adopted_placements::AdoptedApps::new(),
         }
     }
@@ -2670,6 +2675,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             turn_deadline: None,
             namespace_firewall_stale: false,
             off_loop_work: off_loop_work::OffLoopWork::default(),
+            egress_resolving: None,
             adopted_apps: adopted_placements::AdoptedApps::new(),
         }
     }
@@ -4264,7 +4270,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         if self.namespace_firewall_stale {
             self.sync_firewall_ebpf().await;
         }
-        self.reresolve_egress().await;
+        self.reresolve_egress();
         self.sweep_kernel_networking().await;
         self.check_identity_rotation();
     }
@@ -8403,9 +8409,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// eBPF egress maps when an app's destination IPs change (L16). Rate-
     /// limited to roughly once every five minutes; a no-op while nothing
     /// enforces egress.
+    ///
+    /// The lookups run in a task ([`egress_resolution`]); the loop applies
+    /// what they found when the task reports back, and starts no second
+    /// re-resolution meanwhile.
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
-    async fn reresolve_egress(&mut self) {
-        if self.egress_store_uncertain {
+    fn reresolve_egress(&mut self) {
+        if self.egress_store_uncertain || self.egress_resolving.is_some() {
             return;
         }
         // ~5 minutes at the 1s event-loop tick.
@@ -8419,27 +8429,42 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         if self.onion_ebpf.is_none() {
             return;
         }
-        // Snapshot so we don't hold a borrow of self across the DNS awaits.
-        let bindings: Vec<(InstanceId, EgressBinding)> = self
-            .egress_bindings
-            .iter()
-            .filter(|(_, binding)| binding.phase == PolicyPhase::Owned)
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
+        let requests = egress_resolution::requests(self.egress_bindings.iter());
+        let task = self.follow_ups.spawn(async move {
+            follow_ups::FollowUp::EgressResolved(egress_resolution::resolve(requests).await)
+        });
+        self.egress_resolving = Some(task.id());
+    }
 
-        for (instance_id, binding) in bindings {
-            // LOOP-INLINE: stage 3 of #351: DNS lookups leave the loop
-            let new_resolved =
-                match crate::sesame::egress::re_resolve_egress_async(&binding.allow).await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        eprintln!(
-                            "sesame: egress re-resolve failed for {}: {e}",
-                            instance_id.0
-                        );
-                        continue;
-                    }
-                };
+    /// No-op without the eBPF data path.
+    #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
+    fn reresolve_egress(&mut self) {}
+
+    /// Record re-resolved allowlists, and reprogram the cgroups whose
+    /// destinations changed, for the bindings they still describe.
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    async fn apply_egress_resolutions(&mut self, resolutions: Vec<egress_resolution::Resolution>) {
+        if self.egress_store_uncertain {
+            return;
+        }
+        for resolution in resolutions {
+            let request = resolution.request;
+            let new_resolved = match resolution.resolved {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    eprintln!(
+                        "sesame: egress re-resolve failed for {}: {error}",
+                        request.instance_id.0
+                    );
+                    continue;
+                }
+            };
+            let Some(binding) = self.egress_bindings.get_mut(&request.instance_id) else {
+                continue;
+            };
+            if !egress_resolution::still_current(Some(&*binding), &request) {
+                continue;
+            }
             let (to_add, to_remove) =
                 crate::sesame::egress::egress_diff(&binding.resolved, &new_resolved);
             if to_add.is_empty() && to_remove.is_empty() {
@@ -8447,21 +8472,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
 
             // Record the new set, then rebuild the cgroup's kernel state
-            // from all bindings — CIDR values are merged per cgroup, so a
+            // from all bindings: CIDR values are merged per cgroup, so a
             // delta write can't be applied entry by entry.
-            if let Some(b) = self.egress_bindings.get_mut(&instance_id) {
-                b.resolved = new_resolved;
-            }
-            if let Err(error) = self.reprogram_cgroup_egress(binding.cgroup_id, None).await {
-                self.handle_egress_rewrite_failure(binding.cgroup_id, error)
+            binding.resolved = new_resolved;
+            if let Err(error) = self.reprogram_cgroup_egress(request.cgroup_id, None).await {
+                self.handle_egress_rewrite_failure(request.cgroup_id, error)
                     .await;
             }
         }
     }
-
-    /// No-op without the eBPF data path.
-    #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
-    async fn reresolve_egress(&mut self) {}
 
     /// Reconcile kernel truth against live instances (the sweep half of the
     /// network-policy theme): scrub egress state whose cgroup no longer maps

@@ -573,9 +573,11 @@ async fn status_answers_while_an_upgrade_fetches_from_a_silent_registry() {
         .await;
 }
 
-// Egress DNS re-resolution (`reresolve_egress`) has no scenario: it runs only
-// with a loaded eBPF program, which a unit test can't construct. Stage 3 of
-// #351 moves the lookups into a task, which makes them testable without one.
+// Egress DNS re-resolution (`reresolve_egress`) and the execution fence have
+// no scenario: they run only with a loaded eBPF program, which a unit test
+// can't construct. The lookups run in a task now; `egress_resolution`'s tests
+// cover what it resolves and which bindings an answer may still change. The
+// fence kills through the same off-loop work as the job rerun scenario.
 
 // ---- disk, kernel and subprocesses -------------------------------------------
 

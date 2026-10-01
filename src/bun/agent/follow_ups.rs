@@ -5,7 +5,9 @@
 //! must stop taking new work before it downloads the next binary, and exec it
 //! once the download is staged; the download itself can take minutes. The
 //! perimeter firewall is decided from the loop's view of membership, but the
-//! `nft` subprocess that applies it can take half a second. So the turn that
+//! `nft` subprocess that applies it can take half a second. Egress allowlists
+//! are re-resolved against DNS, which can take seconds a host, and the
+//! answers must be applied to the bindings as they are by then. So the turn that
 //! starts such work spawns its slow middle into `follow_ups`, and the task's
 //! result comes back as a [`FollowUp`] through its own `select!` branch. The
 //! loop applies it there, one turn at a time like everything else.
@@ -26,6 +28,9 @@ pub(super) enum FollowUp {
         cluster_nodes: crate::firewall::rules::ClusterNodes,
         result: Result<(), crate::firewall::rules::FirewallError>,
     },
+    /// The egress allowlists were re-resolved.
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    EgressResolved(Vec<super::egress_resolution::Resolution>),
 }
 
 /// How a follow-up task ended, as `JoinSet::join_next_with_id` yields it.
@@ -102,6 +107,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     Err(error) => eprintln!("warning: firewall reconciliation failed: {error}"),
                 }
             }
+            #[cfg(all(feature = "ebpf", target_os = "linux"))]
+            Ok((_, FollowUp::EgressResolved(resolutions))) => {
+                self.egress_resolving = None;
+                self.apply_egress_resolutions(resolutions).await;
+            }
             Err(error) => {
                 // A panicked task drops its caller's answer, which the caller
                 // sees as a closed channel; say why here.
@@ -117,6 +127,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 }
                 if self.firewall_applying == Some(error.id()) {
                     self.firewall_applying = None;
+                }
+                if self.egress_resolving == Some(error.id()) {
+                    self.egress_resolving = None;
                 }
             }
         }
