@@ -91,13 +91,16 @@ fn batch_to_parquet_bytes(batch: &RecordBatch) -> Result<Vec<u8>, MayoError> {
     Ok(buffer)
 }
 
+/// Most rows one per-app query returns from one node.
+pub const APP_QUERY_ROW_LIMIT: usize = 10_000;
+
+/// Most rows one unfiltered `/v1/metrics?name=*` query returns from one node.
+pub const ALL_QUERY_ROW_LIMIT: usize = 10_000;
+
 /// Escape a value for safe interpolation into a single-quoted SQL string
 /// literal (M1). DataFusion follows standard SQL: a `'` inside a literal is
 /// doubled. Without this, a query param like `x' OR '1'='1` breaks out of
 /// the literal and can read other namespaces' data.
-/// Most rows one per-app query returns from one node.
-pub const APP_QUERY_ROW_LIMIT: usize = 10_000;
-
 pub(crate) fn escape_sql_literal(value: &str) -> String {
     value.replace('\'', "''")
 }
@@ -749,6 +752,41 @@ impl MayoStore {
              ORDER BY timestamp"
         );
         self.query_sql_since(&sql, start).await
+    }
+
+    /// Every series' samples in `[start, end]`, oldest first, at most
+    /// [`ALL_QUERY_ROW_LIMIT`] of them: what `/v1/metrics?name=*` returns.
+    pub async fn query_all(
+        &self,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<(u64, String, String, f64)>, MayoError> {
+        let sql = format!(
+            "SELECT timestamp, metric_name, labels, value FROM metrics \
+             WHERE timestamp >= {start} AND timestamp <= {end} \
+             ORDER BY timestamp LIMIT {ALL_QUERY_ROW_LIMIT}"
+        );
+        self.query_sql_since(&sql, start).await
+    }
+
+    /// Samples of the named metrics at or after `since`, oldest first. `relish
+    /// top` reads its CPU and memory columns this way.
+    pub async fn query_names_since(
+        &self,
+        names: &[&str],
+        since: u64,
+    ) -> Result<Vec<(u64, String, String, f64)>, MayoError> {
+        let names = names
+            .iter()
+            .map(|name| format!("'{}'", escape_sql_literal(name)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT timestamp, metric_name, labels, value FROM metrics \
+             WHERE metric_name IN ({names}) \
+             AND timestamp >= {since} ORDER BY timestamp"
+        );
+        self.query_sql_since(&sql, since).await
     }
 
     /// Query the average value of a metric over a time window.
@@ -1622,6 +1660,182 @@ mod tests {
         // No data for an unknown app in the window → None.
         let none = store.query_avg("cpu", "ghost", 60).await.unwrap();
         assert_eq!(none, None);
+    }
+
+    /// Rows in a canonical order, one per line, so a snapshot compares sets
+    /// whatever order files were listed in. The caller checks the ordering
+    /// it was promised separately.
+    fn canonical(rows: &[(u64, String, String, f64)]) -> String {
+        let mut rows = rows.to_vec();
+        rows.sort_by(|left, right| {
+            (left.0, &left.1, &left.2)
+                .cmp(&(right.0, &right.1, &right.2))
+                .then(left.3.total_cmp(&right.3))
+        });
+        rows.iter()
+            .map(|(timestamp, name, labels, value)| format!("{timestamp} {name} {labels} {value}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn ascending(rows: &[(u64, String, String, f64)]) -> bool {
+        rows.windows(2).all(|pair| pair[0].0 <= pair[1].0)
+    }
+
+    /// Five flushed files that overlap in time and differ in which metrics
+    /// they hold, one corrupt file, and an unflushed buffer: the shapes the
+    /// statistics pruning has to get right. Timestamps never repeat, so
+    /// every ordered answer has exactly one right order.
+    async fn golden_store(store: &mut MayoStore, corrupt: Option<&Path>) {
+        let series = [
+            app_key("cpu", "default/web", "web-0"),
+            app_key("cpu", "default/api", "api-0"),
+            app_key("mem", "default/web", "web-0"),
+            app_key("requests_total", "other/web", "web-0"),
+        ];
+        // (first timestamp, which series) per file; the last entry stays in
+        // the buffer. Every first timestamp and step is a multiple of 50 and
+        // each file owns its own slots below 50, so no two rows collide.
+        let files: [(u64, &[usize]); 6] = [
+            (10_000, &[0, 1, 2]),
+            (10_300, &[0, 2]),
+            (10_100, &[3]),
+            (10_600, &[1, 3]),
+            (10_450, &[0, 1, 2, 3]),
+            (10_900, &[0, 3]),
+        ];
+        for (index, (first, which)) in files.iter().enumerate() {
+            for step in 0..12 {
+                for (position, series_index) in which.iter().enumerate() {
+                    let slot = (index * 5 + position) as u64;
+                    let timestamp = first + step * 50 + slot;
+                    let value = (timestamp % 13) as f64 + *series_index as f64 / 4.0;
+                    store.insert(&series[*series_index], Sample::at(timestamp, value));
+                }
+            }
+            if index + 1 < files.len() {
+                store.flush().await.unwrap();
+            }
+        }
+        if let Some(directory) = corrupt {
+            std::fs::write(directory.join("metrics_999999.parquet"), b"not parquet").unwrap();
+        }
+    }
+
+    /// Every read the store offers, over the golden data, as one report.
+    async fn golden_report(store: &MayoStore) -> String {
+        let unbounded = i64::MAX as u64;
+        let mut report = Vec::new();
+        let mut ordered = |label: &str, rows: Vec<(u64, String, String, f64)>| {
+            assert!(ascending(&rows), "{label} came back out of order");
+            report.push(format!(
+                "## {label} ({} rows)\n{}",
+                rows.len(),
+                canonical(&rows)
+            ));
+        };
+        ordered(
+            "query cpu unbounded",
+            store.query("cpu", 0, unbounded).await.unwrap(),
+        );
+        ordered(
+            "query cpu window",
+            store.query("cpu", 10_200, 10_700).await.unwrap(),
+        );
+        ordered(
+            "query mem one instant",
+            store.query("mem", 10_002, 10_002).await.unwrap(),
+        );
+        ordered(
+            "query missing",
+            store.query("missing", 0, unbounded).await.unwrap(),
+        );
+        ordered(
+            "query_all unbounded",
+            store.query_all(0, unbounded).await.unwrap(),
+        );
+        ordered(
+            "query_all window",
+            store.query_all(10_250, 10_800).await.unwrap(),
+        );
+        ordered(
+            "query_app web",
+            store
+                .query_app("default/web", None, 0, unbounded, None)
+                .await
+                .unwrap(),
+        );
+        ordered(
+            "query_app web cpu newest two",
+            store
+                .query_app("default/web", Some("cpu"), 10_000, 11_000, Some(2))
+                .await
+                .unwrap(),
+        );
+        ordered(
+            "query_names_since cpu mem",
+            store
+                .query_names_since(&["cpu", "mem"], 10_500)
+                .await
+                .unwrap(),
+        );
+        let alert = store
+            .query_sql_since(
+                "SELECT timestamp, metric_name, labels, value FROM metrics \
+                 WHERE timestamp >= 10800 ORDER BY timestamp DESC",
+                10_800,
+            )
+            .await
+            .unwrap();
+        assert!(alert.windows(2).all(|pair| pair[0].0 >= pair[1].0));
+        report.push(format!(
+            "## alert read ({} rows)\n{}",
+            alert.len(),
+            canonical(&alert)
+        ));
+        let unordered = store
+            .query_sql("SELECT timestamp, metric_name, labels, value FROM metrics")
+            .await
+            .unwrap();
+        report.push(format!(
+            "## every row ({} rows)\n{}",
+            unordered.len(),
+            canonical(&unordered)
+        ));
+
+        let aggregates = store.query_window_aggregates(10_300, 10_900).await.unwrap();
+        report.push(format!(
+            "## window aggregates\n{}",
+            aggregates
+                .iter()
+                .map(|row| format!("{row:?}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+        report.push(format!(
+            "## metric names\n{:?}",
+            store.metric_names().await.unwrap()
+        ));
+        report.join("\n\n")
+    }
+
+    /// #377: streaming must return exactly what loading every file returned.
+    /// The snapshot was recorded from the eager implementation before the
+    /// change, and both backends must still match it.
+    #[tokio::test]
+    async fn every_read_matches_the_eager_golden_answers() {
+        let (mut local, directory) = test_store();
+        golden_store(&mut local, Some(directory.path())).await;
+        let local_report = golden_report(&local).await;
+        insta::assert_snapshot!("mayo_golden_reads", local_report);
+
+        let bucket = tempfile::tempdir().unwrap();
+        let url = url::Url::from_file_path(bucket.path()).unwrap().to_string();
+        let mut remote = MayoStore::open(bucket.path().to_path_buf(), Some(&url))
+            .await
+            .unwrap();
+        golden_store(&mut remote, Some(bucket.path())).await;
+        assert_eq!(golden_report(&remote).await, local_report);
     }
 
     /// A flushed metrics file is the only copy once the buffer is cleared,

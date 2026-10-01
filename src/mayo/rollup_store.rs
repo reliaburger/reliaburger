@@ -516,6 +516,23 @@ impl RollupStore {
         self.query_sql(&sql).await
     }
 
+    /// Every series' cluster sums in `[start, end]`, oldest first, at most
+    /// 10,000 rows: what `/v1/metrics/rollup` returns without a name.
+    pub async fn query_all(
+        &self,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<(u64, String, String, f64)>, MayoError> {
+        let sql = format!(
+            "SELECT timestamp, metric_name, labels, SUM(sum_val) as total_sum \
+             FROM rollups \
+             WHERE timestamp >= {start} AND timestamp <= {end} \
+             GROUP BY timestamp, metric_name, labels \
+             ORDER BY timestamp LIMIT 10000"
+        );
+        self.query_sql(&sql).await
+    }
+
     /// Query cluster-wide aggregated metrics with full aggregate info.
     ///
     /// Returns (timestamp, metric_name, labels, min, max, sum, count)
@@ -768,6 +785,138 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = RollupStore::new(dir.path().to_path_buf());
         (store, dir)
+    }
+
+    /// Four flushed files whose windows overlap and arrive out of order (as
+    /// reassignment backfill delivers them), a corrupt file, and a buffer.
+    async fn golden_rollups(store: &mut RollupStore, directory: &std::path::Path) {
+        let files: [&[u64]; 5] = [&[0, 1, 2], &[5, 3], &[4, 1, 6], &[8, 7], &[9, 6]];
+        // Older than the idempotency horizon, so a restart forgets it.
+        store.ingest(&make_rollup("worker-a", 50_000, "cpu", 4.0));
+        for (index, windows) in files.iter().enumerate() {
+            for window in windows.iter() {
+                for (node_index, node) in ["worker-a", "worker-b", "worker-c"].iter().enumerate() {
+                    let timestamp = 60_000 + window * 60;
+                    let mut entries = Vec::new();
+                    for (metric_index, metric) in ["cpu", "mem", "disk"].iter().enumerate() {
+                        if (window + metric_index as u64 + index as u64) % 4 == 3 {
+                            continue;
+                        }
+                        let base =
+                            (window * 7 + node_index as u64 * 3 + metric_index as u64) as f64;
+                        entries.push(RollupEntry {
+                            metric_name: metric.to_string(),
+                            labels: BTreeMap::from([(
+                                "app".to_string(),
+                                format!("default/app-{}", (window + node_index as u64) % 2),
+                            )]),
+                            aggregate: RollupAggregate {
+                                min: base,
+                                max: base + 2.5,
+                                sum: base * 6.0,
+                                count: 6,
+                            },
+                        });
+                    }
+                    store.ingest(&NodeRollup {
+                        node_id: NodeId::new(*node),
+                        timestamp,
+                        entries,
+                    });
+                }
+            }
+            if index + 1 < files.len() {
+                store.flush().await.unwrap();
+            }
+        }
+        std::fs::write(directory.join("rollup_999999.parquet"), b"not parquet").unwrap();
+    }
+
+    fn canonical_rows(rows: &[(u64, String, String, f64)]) -> String {
+        assert!(rows.windows(2).all(|pair| pair[0].0 <= pair[1].0));
+        let mut lines: Vec<String> = rows.iter().map(|row| format!("{row:?}")).collect();
+        lines.sort();
+        lines.join("\n")
+    }
+
+    fn canonical_debug<T: std::fmt::Debug>(rows: &[T]) -> String {
+        let mut lines: Vec<String> = rows.iter().map(|row| format!("{row:?}")).collect();
+        lines.sort();
+        lines.join("\n")
+    }
+
+    /// #377: streaming must return exactly what loading every file returned.
+    /// The snapshot was recorded from the eager implementation before the
+    /// change.
+    #[tokio::test]
+    async fn every_rollup_read_matches_the_eager_golden_answers() {
+        let (mut store, directory) = test_store();
+        golden_rollups(&mut store, directory.path()).await;
+        let unbounded = i64::MAX as u64;
+        let mut report = Vec::new();
+        report.push(format!(
+            "## cluster cpu unbounded\n{}",
+            canonical_rows(
+                &store
+                    .query_cluster_metric("cpu", 0, unbounded)
+                    .await
+                    .unwrap()
+            )
+        ));
+        report.push(format!(
+            "## cluster mem window\n{}",
+            canonical_rows(
+                &store
+                    .query_cluster_metric("mem", 60_120, 60_300)
+                    .await
+                    .unwrap()
+            )
+        ));
+        report.push(format!(
+            "## all unbounded\n{}",
+            canonical_rows(&store.query_all(0, unbounded).await.unwrap())
+        ));
+        report.push(format!(
+            "## all window\n{}",
+            canonical_rows(&store.query_all(60_240, 60_420).await.unwrap())
+        ));
+        report.push(format!(
+            "## aggregates disk\n{}",
+            canonical_debug(
+                &store
+                    .query_cluster_aggregates("disk", 60_060, 60_480)
+                    .await
+                    .unwrap()
+            )
+        ));
+        report.push(format!(
+            "## owned cpu window\n{}",
+            canonical_debug(
+                &store
+                    .query_owned_rows(Some("cpu"), 60_180, 60_360)
+                    .await
+                    .unwrap()
+            )
+        ));
+        report.push(format!(
+            "## owned unbounded\n{}",
+            canonical_debug(&store.query_owned_rows(None, 0, unbounded).await.unwrap())
+        ));
+        report.push(format!(
+            "## names\n{:?}",
+            store.metric_names().await.unwrap()
+        ));
+
+        store.flush().await.unwrap();
+        let mut restarted = RollupStore::new(directory.path().to_path_buf());
+        restarted.hydrate_seen_windows().await.unwrap();
+        let mut seen: Vec<_> = restarted.seen_windows.iter().cloned().collect();
+        seen.sort();
+        report.push(format!(
+            "## hydrated windows (newest {})\n{seen:?}",
+            restarted.newest_window
+        ));
+        insta::assert_snapshot!("rollup_golden_reads", report.join("\n\n"));
     }
 
     fn make_rollup(node: &str, timestamp: u64, metric: &str, value: f64) -> NodeRollup {

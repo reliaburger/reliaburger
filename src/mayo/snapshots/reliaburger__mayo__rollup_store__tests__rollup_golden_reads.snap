@@ -1,0 +1,205 @@
+---
+source: src/mayo/rollup_store.rs
+expression: "report.join(\"\\n\\n\")"
+---
+## cluster cpu unbounded
+(50000, "cpu", "{}", 4.0)
+(60000, "cpu", "{\"app\":\"default/app-0\"}", 36.0)
+(60000, "cpu", "{\"app\":\"default/app-1\"}", 18.0)
+(60060, "cpu", "{\"app\":\"default/app-0\"}", 60.0)
+(60060, "cpu", "{\"app\":\"default/app-1\"}", 120.0)
+(60120, "cpu", "{\"app\":\"default/app-0\"}", 204.0)
+(60120, "cpu", "{\"app\":\"default/app-1\"}", 102.0)
+(60180, "cpu", "{\"app\":\"default/app-0\"}", 144.0)
+(60180, "cpu", "{\"app\":\"default/app-1\"}", 288.0)
+(60240, "cpu", "{\"app\":\"default/app-0\"}", 372.0)
+(60240, "cpu", "{\"app\":\"default/app-1\"}", 186.0)
+(60300, "cpu", "{\"app\":\"default/app-0\"}", 228.0)
+(60300, "cpu", "{\"app\":\"default/app-1\"}", 456.0)
+(60360, "cpu", "{\"app\":\"default/app-0\"}", 540.0)
+(60360, "cpu", "{\"app\":\"default/app-1\"}", 270.0)
+(60420, "cpu", "{\"app\":\"default/app-0\"}", 312.0)
+(60420, "cpu", "{\"app\":\"default/app-1\"}", 624.0)
+(60540, "cpu", "{\"app\":\"default/app-0\"}", 396.0)
+(60540, "cpu", "{\"app\":\"default/app-1\"}", 792.0)
+
+## cluster mem window
+(60180, "mem", "{\"app\":\"default/app-0\"}", 150.0)
+(60180, "mem", "{\"app\":\"default/app-1\"}", 300.0)
+
+## all unbounded
+(50000, "cpu", "{}", 4.0)
+(60000, "cpu", "{\"app\":\"default/app-0\"}", 36.0)
+(60000, "cpu", "{\"app\":\"default/app-1\"}", 18.0)
+(60000, "disk", "{\"app\":\"default/app-0\"}", 60.0)
+(60000, "disk", "{\"app\":\"default/app-1\"}", 30.0)
+(60000, "mem", "{\"app\":\"default/app-0\"}", 48.0)
+(60000, "mem", "{\"app\":\"default/app-1\"}", 24.0)
+(60060, "cpu", "{\"app\":\"default/app-0\"}", 60.0)
+(60060, "cpu", "{\"app\":\"default/app-1\"}", 120.0)
+(60060, "mem", "{\"app\":\"default/app-0\"}", 66.0)
+(60060, "mem", "{\"app\":\"default/app-1\"}", 132.0)
+(60120, "cpu", "{\"app\":\"default/app-0\"}", 204.0)
+(60120, "cpu", "{\"app\":\"default/app-1\"}", 102.0)
+(60120, "disk", "{\"app\":\"default/app-0\"}", 228.0)
+(60120, "disk", "{\"app\":\"default/app-1\"}", 114.0)
+(60180, "cpu", "{\"app\":\"default/app-0\"}", 144.0)
+(60180, "cpu", "{\"app\":\"default/app-1\"}", 288.0)
+(60180, "disk", "{\"app\":\"default/app-0\"}", 156.0)
+(60180, "disk", "{\"app\":\"default/app-1\"}", 312.0)
+(60180, "mem", "{\"app\":\"default/app-0\"}", 150.0)
+(60180, "mem", "{\"app\":\"default/app-1\"}", 300.0)
+(60240, "cpu", "{\"app\":\"default/app-0\"}", 372.0)
+(60240, "cpu", "{\"app\":\"default/app-1\"}", 186.0)
+(60240, "disk", "{\"app\":\"default/app-0\"}", 396.0)
+(60240, "disk", "{\"app\":\"default/app-1\"}", 198.0)
+(60300, "cpu", "{\"app\":\"default/app-0\"}", 228.0)
+(60300, "cpu", "{\"app\":\"default/app-1\"}", 456.0)
+(60300, "disk", "{\"app\":\"default/app-0\"}", 240.0)
+(60300, "disk", "{\"app\":\"default/app-1\"}", 480.0)
+(60360, "cpu", "{\"app\":\"default/app-0\"}", 540.0)
+(60360, "cpu", "{\"app\":\"default/app-1\"}", 270.0)
+(60360, "disk", "{\"app\":\"default/app-0\"}", 564.0)
+(60360, "disk", "{\"app\":\"default/app-1\"}", 282.0)
+(60360, "mem", "{\"app\":\"default/app-0\"}", 552.0)
+(60360, "mem", "{\"app\":\"default/app-1\"}", 276.0)
+(60420, "cpu", "{\"app\":\"default/app-0\"}", 312.0)
+(60420, "cpu", "{\"app\":\"default/app-1\"}", 624.0)
+(60420, "disk", "{\"app\":\"default/app-0\"}", 324.0)
+(60420, "disk", "{\"app\":\"default/app-1\"}", 648.0)
+(60480, "disk", "{\"app\":\"default/app-0\"}", 732.0)
+(60480, "disk", "{\"app\":\"default/app-1\"}", 366.0)
+(60480, "mem", "{\"app\":\"default/app-0\"}", 720.0)
+(60480, "mem", "{\"app\":\"default/app-1\"}", 360.0)
+(60540, "cpu", "{\"app\":\"default/app-0\"}", 396.0)
+(60540, "cpu", "{\"app\":\"default/app-1\"}", 792.0)
+(60540, "mem", "{\"app\":\"default/app-0\"}", 402.0)
+(60540, "mem", "{\"app\":\"default/app-1\"}", 804.0)
+
+## all window
+(60240, "cpu", "{\"app\":\"default/app-0\"}", 372.0)
+(60240, "cpu", "{\"app\":\"default/app-1\"}", 186.0)
+(60240, "disk", "{\"app\":\"default/app-0\"}", 396.0)
+(60240, "disk", "{\"app\":\"default/app-1\"}", 198.0)
+(60300, "cpu", "{\"app\":\"default/app-0\"}", 228.0)
+(60300, "cpu", "{\"app\":\"default/app-1\"}", 456.0)
+(60300, "disk", "{\"app\":\"default/app-0\"}", 240.0)
+(60300, "disk", "{\"app\":\"default/app-1\"}", 480.0)
+(60360, "cpu", "{\"app\":\"default/app-0\"}", 540.0)
+(60360, "cpu", "{\"app\":\"default/app-1\"}", 270.0)
+(60360, "disk", "{\"app\":\"default/app-0\"}", 564.0)
+(60360, "disk", "{\"app\":\"default/app-1\"}", 282.0)
+(60360, "mem", "{\"app\":\"default/app-0\"}", 552.0)
+(60360, "mem", "{\"app\":\"default/app-1\"}", 276.0)
+(60420, "cpu", "{\"app\":\"default/app-0\"}", 312.0)
+(60420, "cpu", "{\"app\":\"default/app-1\"}", 624.0)
+(60420, "disk", "{\"app\":\"default/app-0\"}", 324.0)
+(60420, "disk", "{\"app\":\"default/app-1\"}", 648.0)
+
+## aggregates disk
+ClusterAggregate { timestamp: 60120, metric_name: "disk", labels: "{\"app\":\"default/app-0\"}", min: 16.0, max: 24.5, sum: 228.0, count: 12 }
+ClusterAggregate { timestamp: 60120, metric_name: "disk", labels: "{\"app\":\"default/app-1\"}", min: 19.0, max: 21.5, sum: 114.0, count: 6 }
+ClusterAggregate { timestamp: 60180, metric_name: "disk", labels: "{\"app\":\"default/app-0\"}", min: 26.0, max: 28.5, sum: 156.0, count: 6 }
+ClusterAggregate { timestamp: 60180, metric_name: "disk", labels: "{\"app\":\"default/app-1\"}", min: 23.0, max: 31.5, sum: 312.0, count: 12 }
+ClusterAggregate { timestamp: 60240, metric_name: "disk", labels: "{\"app\":\"default/app-0\"}", min: 30.0, max: 38.5, sum: 396.0, count: 12 }
+ClusterAggregate { timestamp: 60240, metric_name: "disk", labels: "{\"app\":\"default/app-1\"}", min: 33.0, max: 35.5, sum: 198.0, count: 6 }
+ClusterAggregate { timestamp: 60300, metric_name: "disk", labels: "{\"app\":\"default/app-0\"}", min: 40.0, max: 42.5, sum: 240.0, count: 6 }
+ClusterAggregate { timestamp: 60300, metric_name: "disk", labels: "{\"app\":\"default/app-1\"}", min: 37.0, max: 45.5, sum: 480.0, count: 12 }
+ClusterAggregate { timestamp: 60360, metric_name: "disk", labels: "{\"app\":\"default/app-0\"}", min: 44.0, max: 52.5, sum: 564.0, count: 12 }
+ClusterAggregate { timestamp: 60360, metric_name: "disk", labels: "{\"app\":\"default/app-1\"}", min: 47.0, max: 49.5, sum: 282.0, count: 6 }
+ClusterAggregate { timestamp: 60420, metric_name: "disk", labels: "{\"app\":\"default/app-0\"}", min: 54.0, max: 56.5, sum: 324.0, count: 6 }
+ClusterAggregate { timestamp: 60420, metric_name: "disk", labels: "{\"app\":\"default/app-1\"}", min: 51.0, max: 59.5, sum: 648.0, count: 12 }
+ClusterAggregate { timestamp: 60480, metric_name: "disk", labels: "{\"app\":\"default/app-0\"}", min: 58.0, max: 66.5, sum: 732.0, count: 12 }
+ClusterAggregate { timestamp: 60480, metric_name: "disk", labels: "{\"app\":\"default/app-1\"}", min: 61.0, max: 63.5, sum: 366.0, count: 6 }
+
+## owned cpu window
+OwnedRollupRow { node_id: "worker-a", row: MetricsQueryRow { timestamp: 60180, metric_name: "cpu", labels: "{\"app\":\"default/app-1\"}", value: 126.0 } }
+OwnedRollupRow { node_id: "worker-a", row: MetricsQueryRow { timestamp: 60240, metric_name: "cpu", labels: "{\"app\":\"default/app-0\"}", value: 168.0 } }
+OwnedRollupRow { node_id: "worker-a", row: MetricsQueryRow { timestamp: 60300, metric_name: "cpu", labels: "{\"app\":\"default/app-1\"}", value: 210.0 } }
+OwnedRollupRow { node_id: "worker-a", row: MetricsQueryRow { timestamp: 60360, metric_name: "cpu", labels: "{\"app\":\"default/app-0\"}", value: 252.0 } }
+OwnedRollupRow { node_id: "worker-b", row: MetricsQueryRow { timestamp: 60180, metric_name: "cpu", labels: "{\"app\":\"default/app-0\"}", value: 144.0 } }
+OwnedRollupRow { node_id: "worker-b", row: MetricsQueryRow { timestamp: 60240, metric_name: "cpu", labels: "{\"app\":\"default/app-1\"}", value: 186.0 } }
+OwnedRollupRow { node_id: "worker-b", row: MetricsQueryRow { timestamp: 60300, metric_name: "cpu", labels: "{\"app\":\"default/app-0\"}", value: 228.0 } }
+OwnedRollupRow { node_id: "worker-b", row: MetricsQueryRow { timestamp: 60360, metric_name: "cpu", labels: "{\"app\":\"default/app-1\"}", value: 270.0 } }
+OwnedRollupRow { node_id: "worker-c", row: MetricsQueryRow { timestamp: 60180, metric_name: "cpu", labels: "{\"app\":\"default/app-1\"}", value: 162.0 } }
+OwnedRollupRow { node_id: "worker-c", row: MetricsQueryRow { timestamp: 60240, metric_name: "cpu", labels: "{\"app\":\"default/app-0\"}", value: 204.0 } }
+OwnedRollupRow { node_id: "worker-c", row: MetricsQueryRow { timestamp: 60300, metric_name: "cpu", labels: "{\"app\":\"default/app-1\"}", value: 246.0 } }
+OwnedRollupRow { node_id: "worker-c", row: MetricsQueryRow { timestamp: 60360, metric_name: "cpu", labels: "{\"app\":\"default/app-0\"}", value: 288.0 } }
+
+## owned unbounded
+OwnedRollupRow { node_id: "worker-a", row: MetricsQueryRow { timestamp: 50000, metric_name: "cpu", labels: "{}", value: 4.0 } }
+OwnedRollupRow { node_id: "worker-a", row: MetricsQueryRow { timestamp: 60000, metric_name: "cpu", labels: "{\"app\":\"default/app-0\"}", value: 0.0 } }
+OwnedRollupRow { node_id: "worker-a", row: MetricsQueryRow { timestamp: 60000, metric_name: "disk", labels: "{\"app\":\"default/app-0\"}", value: 12.0 } }
+OwnedRollupRow { node_id: "worker-a", row: MetricsQueryRow { timestamp: 60000, metric_name: "mem", labels: "{\"app\":\"default/app-0\"}", value: 6.0 } }
+OwnedRollupRow { node_id: "worker-a", row: MetricsQueryRow { timestamp: 60060, metric_name: "cpu", labels: "{\"app\":\"default/app-1\"}", value: 42.0 } }
+OwnedRollupRow { node_id: "worker-a", row: MetricsQueryRow { timestamp: 60060, metric_name: "mem", labels: "{\"app\":\"default/app-1\"}", value: 48.0 } }
+OwnedRollupRow { node_id: "worker-a", row: MetricsQueryRow { timestamp: 60120, metric_name: "cpu", labels: "{\"app\":\"default/app-0\"}", value: 84.0 } }
+OwnedRollupRow { node_id: "worker-a", row: MetricsQueryRow { timestamp: 60120, metric_name: "disk", labels: "{\"app\":\"default/app-0\"}", value: 96.0 } }
+OwnedRollupRow { node_id: "worker-a", row: MetricsQueryRow { timestamp: 60180, metric_name: "cpu", labels: "{\"app\":\"default/app-1\"}", value: 126.0 } }
+OwnedRollupRow { node_id: "worker-a", row: MetricsQueryRow { timestamp: 60180, metric_name: "disk", labels: "{\"app\":\"default/app-1\"}", value: 138.0 } }
+OwnedRollupRow { node_id: "worker-a", row: MetricsQueryRow { timestamp: 60180, metric_name: "mem", labels: "{\"app\":\"default/app-1\"}", value: 132.0 } }
+OwnedRollupRow { node_id: "worker-a", row: MetricsQueryRow { timestamp: 60240, metric_name: "cpu", labels: "{\"app\":\"default/app-0\"}", value: 168.0 } }
+OwnedRollupRow { node_id: "worker-a", row: MetricsQueryRow { timestamp: 60240, metric_name: "disk", labels: "{\"app\":\"default/app-0\"}", value: 180.0 } }
+OwnedRollupRow { node_id: "worker-a", row: MetricsQueryRow { timestamp: 60300, metric_name: "cpu", labels: "{\"app\":\"default/app-1\"}", value: 210.0 } }
+OwnedRollupRow { node_id: "worker-a", row: MetricsQueryRow { timestamp: 60300, metric_name: "disk", labels: "{\"app\":\"default/app-1\"}", value: 222.0 } }
+OwnedRollupRow { node_id: "worker-a", row: MetricsQueryRow { timestamp: 60360, metric_name: "cpu", labels: "{\"app\":\"default/app-0\"}", value: 252.0 } }
+OwnedRollupRow { node_id: "worker-a", row: MetricsQueryRow { timestamp: 60360, metric_name: "disk", labels: "{\"app\":\"default/app-0\"}", value: 264.0 } }
+OwnedRollupRow { node_id: "worker-a", row: MetricsQueryRow { timestamp: 60360, metric_name: "mem", labels: "{\"app\":\"default/app-0\"}", value: 258.0 } }
+OwnedRollupRow { node_id: "worker-a", row: MetricsQueryRow { timestamp: 60420, metric_name: "cpu", labels: "{\"app\":\"default/app-1\"}", value: 294.0 } }
+OwnedRollupRow { node_id: "worker-a", row: MetricsQueryRow { timestamp: 60420, metric_name: "disk", labels: "{\"app\":\"default/app-1\"}", value: 306.0 } }
+OwnedRollupRow { node_id: "worker-a", row: MetricsQueryRow { timestamp: 60480, metric_name: "disk", labels: "{\"app\":\"default/app-0\"}", value: 348.0 } }
+OwnedRollupRow { node_id: "worker-a", row: MetricsQueryRow { timestamp: 60480, metric_name: "mem", labels: "{\"app\":\"default/app-0\"}", value: 342.0 } }
+OwnedRollupRow { node_id: "worker-a", row: MetricsQueryRow { timestamp: 60540, metric_name: "cpu", labels: "{\"app\":\"default/app-1\"}", value: 378.0 } }
+OwnedRollupRow { node_id: "worker-a", row: MetricsQueryRow { timestamp: 60540, metric_name: "mem", labels: "{\"app\":\"default/app-1\"}", value: 384.0 } }
+OwnedRollupRow { node_id: "worker-b", row: MetricsQueryRow { timestamp: 60000, metric_name: "cpu", labels: "{\"app\":\"default/app-1\"}", value: 18.0 } }
+OwnedRollupRow { node_id: "worker-b", row: MetricsQueryRow { timestamp: 60000, metric_name: "disk", labels: "{\"app\":\"default/app-1\"}", value: 30.0 } }
+OwnedRollupRow { node_id: "worker-b", row: MetricsQueryRow { timestamp: 60000, metric_name: "mem", labels: "{\"app\":\"default/app-1\"}", value: 24.0 } }
+OwnedRollupRow { node_id: "worker-b", row: MetricsQueryRow { timestamp: 60060, metric_name: "cpu", labels: "{\"app\":\"default/app-0\"}", value: 60.0 } }
+OwnedRollupRow { node_id: "worker-b", row: MetricsQueryRow { timestamp: 60060, metric_name: "mem", labels: "{\"app\":\"default/app-0\"}", value: 66.0 } }
+OwnedRollupRow { node_id: "worker-b", row: MetricsQueryRow { timestamp: 60120, metric_name: "cpu", labels: "{\"app\":\"default/app-1\"}", value: 102.0 } }
+OwnedRollupRow { node_id: "worker-b", row: MetricsQueryRow { timestamp: 60120, metric_name: "disk", labels: "{\"app\":\"default/app-1\"}", value: 114.0 } }
+OwnedRollupRow { node_id: "worker-b", row: MetricsQueryRow { timestamp: 60180, metric_name: "cpu", labels: "{\"app\":\"default/app-0\"}", value: 144.0 } }
+OwnedRollupRow { node_id: "worker-b", row: MetricsQueryRow { timestamp: 60180, metric_name: "disk", labels: "{\"app\":\"default/app-0\"}", value: 156.0 } }
+OwnedRollupRow { node_id: "worker-b", row: MetricsQueryRow { timestamp: 60180, metric_name: "mem", labels: "{\"app\":\"default/app-0\"}", value: 150.0 } }
+OwnedRollupRow { node_id: "worker-b", row: MetricsQueryRow { timestamp: 60240, metric_name: "cpu", labels: "{\"app\":\"default/app-1\"}", value: 186.0 } }
+OwnedRollupRow { node_id: "worker-b", row: MetricsQueryRow { timestamp: 60240, metric_name: "disk", labels: "{\"app\":\"default/app-1\"}", value: 198.0 } }
+OwnedRollupRow { node_id: "worker-b", row: MetricsQueryRow { timestamp: 60300, metric_name: "cpu", labels: "{\"app\":\"default/app-0\"}", value: 228.0 } }
+OwnedRollupRow { node_id: "worker-b", row: MetricsQueryRow { timestamp: 60300, metric_name: "disk", labels: "{\"app\":\"default/app-0\"}", value: 240.0 } }
+OwnedRollupRow { node_id: "worker-b", row: MetricsQueryRow { timestamp: 60360, metric_name: "cpu", labels: "{\"app\":\"default/app-1\"}", value: 270.0 } }
+OwnedRollupRow { node_id: "worker-b", row: MetricsQueryRow { timestamp: 60360, metric_name: "disk", labels: "{\"app\":\"default/app-1\"}", value: 282.0 } }
+OwnedRollupRow { node_id: "worker-b", row: MetricsQueryRow { timestamp: 60360, metric_name: "mem", labels: "{\"app\":\"default/app-1\"}", value: 276.0 } }
+OwnedRollupRow { node_id: "worker-b", row: MetricsQueryRow { timestamp: 60420, metric_name: "cpu", labels: "{\"app\":\"default/app-0\"}", value: 312.0 } }
+OwnedRollupRow { node_id: "worker-b", row: MetricsQueryRow { timestamp: 60420, metric_name: "disk", labels: "{\"app\":\"default/app-0\"}", value: 324.0 } }
+OwnedRollupRow { node_id: "worker-b", row: MetricsQueryRow { timestamp: 60480, metric_name: "disk", labels: "{\"app\":\"default/app-1\"}", value: 366.0 } }
+OwnedRollupRow { node_id: "worker-b", row: MetricsQueryRow { timestamp: 60480, metric_name: "mem", labels: "{\"app\":\"default/app-1\"}", value: 360.0 } }
+OwnedRollupRow { node_id: "worker-b", row: MetricsQueryRow { timestamp: 60540, metric_name: "cpu", labels: "{\"app\":\"default/app-0\"}", value: 396.0 } }
+OwnedRollupRow { node_id: "worker-b", row: MetricsQueryRow { timestamp: 60540, metric_name: "mem", labels: "{\"app\":\"default/app-0\"}", value: 402.0 } }
+OwnedRollupRow { node_id: "worker-c", row: MetricsQueryRow { timestamp: 60000, metric_name: "cpu", labels: "{\"app\":\"default/app-0\"}", value: 36.0 } }
+OwnedRollupRow { node_id: "worker-c", row: MetricsQueryRow { timestamp: 60000, metric_name: "disk", labels: "{\"app\":\"default/app-0\"}", value: 48.0 } }
+OwnedRollupRow { node_id: "worker-c", row: MetricsQueryRow { timestamp: 60000, metric_name: "mem", labels: "{\"app\":\"default/app-0\"}", value: 42.0 } }
+OwnedRollupRow { node_id: "worker-c", row: MetricsQueryRow { timestamp: 60060, metric_name: "cpu", labels: "{\"app\":\"default/app-1\"}", value: 78.0 } }
+OwnedRollupRow { node_id: "worker-c", row: MetricsQueryRow { timestamp: 60060, metric_name: "mem", labels: "{\"app\":\"default/app-1\"}", value: 84.0 } }
+OwnedRollupRow { node_id: "worker-c", row: MetricsQueryRow { timestamp: 60120, metric_name: "cpu", labels: "{\"app\":\"default/app-0\"}", value: 120.0 } }
+OwnedRollupRow { node_id: "worker-c", row: MetricsQueryRow { timestamp: 60120, metric_name: "disk", labels: "{\"app\":\"default/app-0\"}", value: 132.0 } }
+OwnedRollupRow { node_id: "worker-c", row: MetricsQueryRow { timestamp: 60180, metric_name: "cpu", labels: "{\"app\":\"default/app-1\"}", value: 162.0 } }
+OwnedRollupRow { node_id: "worker-c", row: MetricsQueryRow { timestamp: 60180, metric_name: "disk", labels: "{\"app\":\"default/app-1\"}", value: 174.0 } }
+OwnedRollupRow { node_id: "worker-c", row: MetricsQueryRow { timestamp: 60180, metric_name: "mem", labels: "{\"app\":\"default/app-1\"}", value: 168.0 } }
+OwnedRollupRow { node_id: "worker-c", row: MetricsQueryRow { timestamp: 60240, metric_name: "cpu", labels: "{\"app\":\"default/app-0\"}", value: 204.0 } }
+OwnedRollupRow { node_id: "worker-c", row: MetricsQueryRow { timestamp: 60240, metric_name: "disk", labels: "{\"app\":\"default/app-0\"}", value: 216.0 } }
+OwnedRollupRow { node_id: "worker-c", row: MetricsQueryRow { timestamp: 60300, metric_name: "cpu", labels: "{\"app\":\"default/app-1\"}", value: 246.0 } }
+OwnedRollupRow { node_id: "worker-c", row: MetricsQueryRow { timestamp: 60300, metric_name: "disk", labels: "{\"app\":\"default/app-1\"}", value: 258.0 } }
+OwnedRollupRow { node_id: "worker-c", row: MetricsQueryRow { timestamp: 60360, metric_name: "cpu", labels: "{\"app\":\"default/app-0\"}", value: 288.0 } }
+OwnedRollupRow { node_id: "worker-c", row: MetricsQueryRow { timestamp: 60360, metric_name: "disk", labels: "{\"app\":\"default/app-0\"}", value: 300.0 } }
+OwnedRollupRow { node_id: "worker-c", row: MetricsQueryRow { timestamp: 60360, metric_name: "mem", labels: "{\"app\":\"default/app-0\"}", value: 294.0 } }
+OwnedRollupRow { node_id: "worker-c", row: MetricsQueryRow { timestamp: 60420, metric_name: "cpu", labels: "{\"app\":\"default/app-1\"}", value: 330.0 } }
+OwnedRollupRow { node_id: "worker-c", row: MetricsQueryRow { timestamp: 60420, metric_name: "disk", labels: "{\"app\":\"default/app-1\"}", value: 342.0 } }
+OwnedRollupRow { node_id: "worker-c", row: MetricsQueryRow { timestamp: 60480, metric_name: "disk", labels: "{\"app\":\"default/app-0\"}", value: 384.0 } }
+OwnedRollupRow { node_id: "worker-c", row: MetricsQueryRow { timestamp: 60480, metric_name: "mem", labels: "{\"app\":\"default/app-0\"}", value: 378.0 } }
+OwnedRollupRow { node_id: "worker-c", row: MetricsQueryRow { timestamp: 60540, metric_name: "cpu", labels: "{\"app\":\"default/app-1\"}", value: 414.0 } }
+OwnedRollupRow { node_id: "worker-c", row: MetricsQueryRow { timestamp: 60540, metric_name: "mem", labels: "{\"app\":\"default/app-1\"}", value: 420.0 } }
+
+## names
+["cpu", "disk", "mem"]
+
+## hydrated windows (newest 60540)
+[("worker-a", 60000), ("worker-a", 60060), ("worker-a", 60120), ("worker-a", 60180), ("worker-a", 60240), ("worker-a", 60300), ("worker-a", 60360), ("worker-a", 60420), ("worker-a", 60480), ("worker-a", 60540), ("worker-b", 60000), ("worker-b", 60060), ("worker-b", 60120), ("worker-b", 60180), ("worker-b", 60240), ("worker-b", 60300), ("worker-b", 60360), ("worker-b", 60420), ("worker-b", 60480), ("worker-b", 60540), ("worker-c", 60000), ("worker-c", 60060), ("worker-c", 60120), ("worker-c", 60180), ("worker-c", 60240), ("worker-c", 60300), ("worker-c", 60360), ("worker-c", 60420), ("worker-c", 60480), ("worker-c", 60540)]
