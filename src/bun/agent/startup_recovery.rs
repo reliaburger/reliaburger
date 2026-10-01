@@ -87,6 +87,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             Ok(()) => {
                 self.startup_retirements.pop_front();
             }
+            // Its disk cleanup is running off the loop; the next tick
+            // collects it. Nothing is wrong, so readiness stays as it is.
+            Err(BunError::StillRunning { .. }) => return,
             Err(error) => {
                 // Rotate ownership so one unavailable producer does not starve others.
                 if let Some(pending) = self.startup_retirements.pop_front() {
