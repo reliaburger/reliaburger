@@ -379,6 +379,12 @@ mod tests {
             ) -> UpstreamFuture<'a, UpstreamManifest> {
                 Box::pin(async { Ok(self.0.clone()) })
             }
+            fn fetch_root<'a>(
+                &'a self,
+                _: &'a crate::grill::image::ImageReference,
+            ) -> UpstreamFuture<'a, crate::pickle::upstream::UpstreamRoot> {
+                Box::pin(async { panic!("staging reads the platform manifest, not the root") })
+            }
             fn fetch_blob<'a>(
                 &'a self,
                 _: &'a crate::grill::image::ImageReference,

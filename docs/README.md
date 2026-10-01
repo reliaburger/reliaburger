@@ -40,10 +40,6 @@ what comes after it.
   [compatibility policy](releasing.md#cluster-compatibility).
 - **One Bun per writable image store.** Registry startup claims exclusive
   ownership of the image store's upload directory.
-- **The pull-through cache holds one platform per tag.** It stores the
-  platform of the node that first pulls an upstream multi-platform image, so on
-  a cluster that mixes architectures, push such images to Pickle instead; see
-  [Images and volumes](manual/11_images-and-volumes.md#multi-platform-images).
 - **Test volumes have no snapshots.** Disposable test-volume snapshots aren't
   supported.
 

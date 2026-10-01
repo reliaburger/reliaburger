@@ -161,10 +161,12 @@ destination = "pickle://api:v1.2.3"
 platform = ["linux/arm64"]
 ```
 
-Multi-platform images from an upstream registry go through the pull-through
-cache, which picks the platform of the node that fills it and stores that
-single image under the tag. On a cluster that mixes architectures, push such
-an image to Pickle instead, so every node finds its own platform.
+Multi-platform images from an upstream registry work the same way through the
+pull-through cache. The cache stores the upstream index under the tag, and
+each platform's layers the first time a node of that architecture pulls the
+image. So a cluster that mixes amd64 and arm64 nodes can run `redis:7`
+straight from Docker Hub: every node gets its own platform, and each platform
+comes from upstream only once.
 
 ## Volumes
 
