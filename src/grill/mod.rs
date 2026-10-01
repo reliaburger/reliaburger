@@ -485,14 +485,15 @@ pub trait Grill: Send + Sync {
 
     /// Get the exit code of a stopped instance.
     ///
-    /// Returns `None` if the instance hasn't exited, doesn't exist,
-    /// or the runtime doesn't track exit codes.
+    /// `Ok(None)` if the instance hasn't exited, doesn't exist, or the
+    /// runtime doesn't track exit codes. `Err` if the runtime couldn't
+    /// tell (#389), which never means "no exit code".
     fn exit_code(
         &self,
         instance: &InstanceId,
-    ) -> impl std::future::Future<Output = Option<i32>> + Send {
+    ) -> impl std::future::Future<Output = Result<Option<i32>, GrillError>> + Send {
         let _ = instance;
-        std::future::ready(None)
+        std::future::ready(Ok(None))
     }
 
     /// Get captured logs for an instance.
@@ -761,7 +762,7 @@ impl Grill for AnyGrill {
         }
     }
 
-    async fn exit_code(&self, instance: &InstanceId) -> Option<i32> {
+    async fn exit_code(&self, instance: &InstanceId) -> Result<Option<i32>, GrillError> {
         match self {
             AnyGrill::Process(g) => g.exit_code(instance).await,
             #[cfg(target_os = "linux")]

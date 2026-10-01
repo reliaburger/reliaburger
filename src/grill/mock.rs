@@ -5,7 +5,7 @@
 /// state and exit code responses for testing job completion and
 /// restart scenarios.
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::oci::OciSpec;
@@ -23,6 +23,8 @@ pub enum MockCall {
     ExitCode,
     Logs,
     RetainNetworkReference,
+    NetworkReference,
+    ReleaseNetworkReference,
 }
 
 /// Records all calls to the Grill trait for test assertions.
@@ -80,6 +82,10 @@ pub struct MockGrill {
     fail_start: Arc<AtomicBool>,
     fail_state: Arc<AtomicBool>,
     inspection_failures: Arc<Mutex<std::collections::HashSet<InstanceId>>>,
+    exit_code_failures: Arc<Mutex<std::collections::HashSet<InstanceId>>>,
+    /// How many times `network_reference` was asked. Kept apart from
+    /// `calls`, which records what a runtime handle was made to do.
+    network_reference_reads: Arc<AtomicUsize>,
     /// Per-instance captured-output stems, as a file-capturing runtime reports.
     log_stems: Arc<Mutex<HashMap<InstanceId, std::path::PathBuf>>>,
     /// How long each kind of call takes, as a loaded host makes runc do.
@@ -132,6 +138,8 @@ impl Default for MockGrill {
             fail_start: Arc::default(),
             fail_state: Arc::default(),
             inspection_failures: Arc::default(),
+            exit_code_failures: Arc::default(),
+            network_reference_reads: Arc::default(),
             log_stems: Arc::default(),
             call_delays: Arc::default(),
             captured_logs: Arc::default(),
@@ -216,6 +224,22 @@ impl MockGrill {
         } else {
             failures.remove(instance);
         }
+    }
+
+    /// Fail exit-code reads only for the named instance: the runtime
+    /// couldn't tell, which isn't "no exit code" (#389).
+    pub fn set_instance_exit_code_failure(&self, instance: &InstanceId, fail: bool) {
+        let mut failures = self.exit_code_failures.lock().unwrap();
+        if fail {
+            failures.insert(instance.clone());
+        } else {
+            failures.remove(instance);
+        }
+    }
+
+    /// How many times `network_reference` has been asked.
+    pub fn network_reference_reads(&self) -> usize {
+        self.network_reference_reads.load(Ordering::SeqCst)
     }
 
     /// Return a clone of all recorded calls.
@@ -478,6 +502,7 @@ impl super::Grill for MockGrill {
             "release_network_reference".into(),
             reference.instance_id.clone(),
         ));
+        self.delay(MockCall::ReleaseNetworkReference).await;
         if self.block_network_release.load(Ordering::SeqCst) {
             self.network_release_started.add_permits(1);
             self.network_release_resume
@@ -525,6 +550,8 @@ impl super::Grill for MockGrill {
         &self,
         instance: &InstanceId,
     ) -> Result<Option<super::runc_intent::NetworkReference>, GrillError> {
+        self.network_reference_reads.fetch_add(1, Ordering::SeqCst);
+        self.delay(MockCall::NetworkReference).await;
         Ok(self.network_references.lock().await.get(instance).cloned())
     }
 
@@ -659,10 +686,16 @@ impl super::Grill for MockGrill {
         Ok(ContainerState::Running)
     }
 
-    async fn exit_code(&self, instance: &InstanceId) -> Option<i32> {
+    async fn exit_code(&self, instance: &InstanceId) -> Result<Option<i32>, GrillError> {
         self.delay(MockCall::ExitCode).await;
+        if self.exit_code_failures.lock().unwrap().contains(instance) {
+            return Err(GrillError::StateUnavailable {
+                instance: instance.clone(),
+                reason: "injected exit code failure".into(),
+            });
+        }
         let codes = self.exit_codes.lock().unwrap();
-        codes.get(instance).copied().flatten()
+        Ok(codes.get(instance).copied().flatten())
     }
 
     async fn logs(&self, instance: &InstanceId) -> Result<String, GrillError> {

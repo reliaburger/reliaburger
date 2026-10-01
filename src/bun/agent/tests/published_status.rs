@@ -213,6 +213,21 @@ async fn a_pid_the_runtime_could_not_read_is_unknown_not_absent() {
     assert!(statuses[0].runtime_unknown, "{statuses:?}");
 }
 
+/// The same for the exit code (#389): one the runtime couldn't read is
+/// unknown, not "no exit code".
+#[tokio::test]
+async fn an_exit_code_the_runtime_could_not_read_is_unknown_not_absent() {
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    expect_complete(&drain_deploy(&mut agent, replicated("web", 1)).await);
+    grill.set_pid(4242);
+    let id = InstanceId(agent.get_status().await[0].id.clone());
+    grill.set_instance_exit_code_failure(&id, true);
+    let statuses = agent.get_status().await;
+    assert_eq!(statuses[0].pid, Some(4242));
+    assert_eq!(statuses[0].exit_code, None);
+    assert!(statuses[0].runtime_unknown, "{statuses:?}");
+}
+
 /// The runtime says the instance has exited, so it has no process left,
 /// even if the pid read still named the one it had.
 #[tokio::test]

@@ -664,6 +664,98 @@ async fn status_answers_while_a_retirement_removes_artifacts() {
         .await;
 }
 
+/// Past the turn's runtime budget, inside the stop's patience.
+const SLOW_RUNTIME: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Stop `web` through the loop, check the loop stays responsive while the
+/// stop retires the instance, and return the stop's answer. `slow_calls`
+/// counts the slow runtime call, which the stop must reach.
+async fn stop_through_a_slow_retirement(
+    running: &RunningAgent,
+    grill: &MockGrill,
+    slow_calls: impl Fn(&MockGrill) -> usize,
+) -> Result<(), BunError> {
+    let before = slow_calls(grill);
+    let (response, stopped) = oneshot::channel();
+    running
+        .tx
+        .send(AgentCommand::Stop {
+            app_name: "web".into(),
+            namespace: "default".into(),
+            response,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while slow_calls(grill) == before {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the stop never reached the slow runtime call");
+    let latency = running.status_latency().await;
+    assert!(
+        latency.is_some_and(|latency| latency < TURN_BUDGET),
+        "status took {latency:?} while retirement waited on the runtime"
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(10), stopped)
+        .await
+        .expect("the stop was never answered")
+        .expect("the stop's waiter was dropped")
+}
+
+/// Retiring a stopped instance asks the runtime for its network reference.
+/// On runc that waits for the instance's lifecycle lock, behind the health
+/// sweep's and the status reader's state reads, and the turn's budget used
+/// to run out first: the stop answered "the runtime did not answer for the
+/// network reference within the turn" (#387). The read now finishes off the
+/// loop and the stop answers once it has, having asked the runtime once.
+#[tokio::test]
+async fn a_stop_waits_out_a_network_reference_read_slower_than_the_turn() {
+    let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+    expect_complete(&drain_deploy(&mut agent, replicated("web", 1)).await);
+    let running = RunningAgent::start(agent, tx, shutdown);
+    grill.set_call_delay(MockCall::NetworkReference, Some(SLOW_RUNTIME));
+    running.measure_from_here();
+    let stopped =
+        stop_through_a_slow_retirement(&running, &grill, MockGrill::network_reference_reads).await;
+    assert!(stopped.is_ok(), "{stopped:?}");
+    assert_eq!(grill.network_reference_reads(), 1);
+    running
+        .assert_responsive("a stop read the network reference")
+        .await;
+}
+
+/// The same for the release itself, of a reference the agent holds.
+#[tokio::test]
+async fn a_stop_waits_out_a_network_reference_release_slower_than_the_turn() {
+    let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+    let root = tempfile::tempdir().unwrap();
+    agent
+        .enable_fresh_discovery_ownership(&root.path().join("discovery"))
+        .await
+        .unwrap();
+    let reference = original_test_network_reference();
+    grill.set_network_reference(reference.clone()).await;
+    expect_complete(&drain_deploy(&mut agent, replicated("web", 1)).await);
+    assert_eq!(
+        agent.network_references.get(&reference.instance_id),
+        Some(&reference)
+    );
+    let running = RunningAgent::start(agent, tx, shutdown);
+    grill.set_call_delay(MockCall::ReleaseNetworkReference, Some(SLOW_RUNTIME));
+    running.measure_from_here();
+    let stopped = stop_through_a_slow_retirement(&running, &grill, |grill| {
+        calls_of(grill, "release_network_reference")
+    })
+    .await;
+    assert!(stopped.is_ok(), "{stopped:?}");
+    assert_eq!(calls_of(&grill, "release_network_reference"), 1);
+    running
+        .assert_responsive("a stop released the network reference")
+        .await;
+}
+
 /// The tick applies the perimeter ruleset with an `nft` subprocess when
 /// membership changes (and on the first tick).
 #[tokio::test]

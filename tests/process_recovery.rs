@@ -122,7 +122,7 @@ async fn recovered_runtime_reads_short_job_outcome_without_pid_record() {
     drop(first);
     let recovered = runtime(directory.path());
     assert_eq!(recovered.state(&id).await.unwrap(), ContainerState::Stopped);
-    assert_eq!(recovered.exit_code(&id).await, Some(23));
+    assert_eq!(recovered.exit_code(&id).await.unwrap(), Some(23));
     assert_eq!(recovered.logs(&id).await.unwrap().trim(), "preserved");
 }
 
@@ -155,37 +155,82 @@ async fn a_live_instance_whose_owner_does_not_answer_has_an_unknown_pid_not_none
     grill.start(&id).await.unwrap();
     let pid = grill.pid(&id).await.unwrap().unwrap();
 
-    let record: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(
-            directory
-                .path()
-                .join("process-owners")
-                .join(&id.0)
-                .join("owner.json"),
-        )
-        .unwrap(),
-    )
-    .unwrap();
-    let socket = std::path::PathBuf::from(format!(
-        "/tmp/rbp-{}-{}",
-        nix::unistd::geteuid(),
-        record["nonce"].as_str().unwrap()
-    ))
-    .join("control.sock");
-    let aside = socket.with_extension("aside");
-    std::fs::rename(&socket, &aside).unwrap();
-    // Accepts connections into its backlog and never answers them.
-    let silent = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-
+    let silenced = SilencedOwner::new(directory.path(), &id);
     let read = grill.pid(&id).await;
-    drop(silent);
-    std::fs::remove_file(&socket).unwrap();
-    std::fs::rename(&aside, &socket).unwrap();
+    drop(silenced);
     assert!(read.is_err(), "a silent owner's pid read as {read:?}");
     assert_eq!(grill.pid(&id).await.unwrap(), Some(pid));
     grill.kill(&id).await.unwrap();
     stopped(&grill, &id).await;
     assert_eq!(grill.pid(&id).await.unwrap(), None);
+}
+
+/// The same for the exit code (#389): an owner that doesn't answer leaves
+/// the exit code unknown, which must not read as "no exit code yet". Job
+/// recovery and the state sweep used to take that `None` as an outcome.
+#[tokio::test]
+async fn an_instance_whose_owner_does_not_answer_has_an_unknown_exit_code_not_none() {
+    let directory = tempfile::tempdir().unwrap();
+    let id = InstanceId("default__silent-exit-0".into());
+    let grill = runtime(directory.path());
+    grill.create(&id, &spec("sleep 30")).await.unwrap();
+    grill.start(&id).await.unwrap();
+    assert_eq!(grill.exit_code(&id).await.unwrap(), None);
+
+    let silenced = SilencedOwner::new(directory.path(), &id);
+    let read = grill.exit_code(&id).await;
+    drop(silenced);
+    assert!(read.is_err(), "a silent owner's exit code read as {read:?}");
+    assert_eq!(grill.exit_code(&id).await.unwrap(), None);
+    grill.kill(&id).await.unwrap();
+    stopped(&grill, &id).await;
+}
+
+/// Swaps an instance's owner control socket for a listener that accepts
+/// connections into its backlog and never answers them. Dropping it puts
+/// the real socket back.
+struct SilencedOwner {
+    socket: std::path::PathBuf,
+    aside: std::path::PathBuf,
+    _listener: std::os::unix::net::UnixListener,
+}
+
+impl SilencedOwner {
+    fn new(directory: &Path, id: &InstanceId) -> Self {
+        let record: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                directory
+                    .join("process-owners")
+                    .join(&id.0)
+                    .join("owner.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let socket = std::path::PathBuf::from(format!(
+            "/tmp/rbp-{}-{}",
+            nix::unistd::geteuid(),
+            record["nonce"].as_str().unwrap()
+        ))
+        .join("control.sock");
+        let aside = socket.with_extension("aside");
+        std::fs::rename(&socket, &aside).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        Self {
+            socket,
+            aside,
+            _listener: listener,
+        }
+    }
+}
+
+impl Drop for SilencedOwner {
+    fn drop(&mut self) {
+        // The listener field drops after this body, so remove its path
+        // first; the real socket's rename then replaces nothing.
+        let _ = std::fs::remove_file(&self.socket);
+        let _ = std::fs::rename(&self.aside, &self.socket);
+    }
 }
 
 #[tokio::test]
@@ -247,7 +292,7 @@ async fn long_data_paths_and_repeated_generations_preserve_control() {
             .unwrap();
         grill.start(&id).await.unwrap();
         stopped(&grill, &id).await;
-        assert_eq!(grill.exit_code(&id).await, Some(code));
+        assert_eq!(grill.exit_code(&id).await.unwrap(), Some(code));
     }
 }
 
@@ -459,7 +504,7 @@ async fn recovery_finishes_socket_cleanup_only_after_durable_absence_proof() {
     assert!(recovered.state(&id).await.is_err());
     std::fs::set_permissions(&socket_directory, std::fs::Permissions::from_mode(0o700)).unwrap();
     assert_eq!(recovered.state(&id).await.unwrap(), ContainerState::Stopped);
-    assert_eq!(recovered.exit_code(&id).await, Some(17));
+    assert_eq!(recovered.exit_code(&id).await.unwrap(), Some(17));
     assert!(!socket_directory.exists());
 }
 
