@@ -99,34 +99,38 @@
       <section id="tour" class="section" aria-labelledby="tour-title">
         <!-- The tour's commands carry data-tour. tests/suite/website.rs parses every one
              with the real relish CLI, so the page can't drift from the product. -->
-        <details class="tour">
-          <summary>
-            <span class="section-number" aria-hidden="true">02 /</span>
-            <h2 id="tour-title">Try it in five minutes <a class="permalink" href="#tour" aria-label="Link to the tour">#</a></h2>
-          </summary>
-          <div class="tour-body">
-            <p class="tour-note">Install, then put the cluster through its paces: a real
-              Kubernetes app, a network fault, a killed replica and a lost node. Same
-              prerequisites as the install line.</p>
-            <!-- assets/tour-player.js loads the vendored asciinema
-                 player (assets/asciinema/) and the recording from this site when the tour opens. -->
-            <figure id="tour-recording" class="recording" data-cast="./assets/tour.cast" data-poster="npt:2:05">
-              <div class="recording-screen"></div>
-              <noscript><p class="recording-fallback">The recording plays with JavaScript. Without it,
-                <a href="./assets/tour.cast">download the recording</a> and play it in a terminal with
-                <code>asciinema play tour.cast</code>, or follow the steps below.</p></noscript>
-              <figcaption>
-                <span>The whole tour on a real laptop cluster, run by
-                  <a href="https://github.com/reliaburger/reliaburger/blob/main/scripts/demo/tour.sh">scripts/demo/tour.sh</a>
-                  against the published 0.1.2 install.
-                  Setup plays four times faster and idle time is cut to two seconds; every wait
-                  says how long it really took.</span>
-                <span class="recording-speed" role="group" aria-label="Playback speed" hidden>speed
-                  <button type="button" data-speed="1" aria-pressed="true">1×</button>
-                  <button type="button" data-speed="2" aria-pressed="false">2×</button>
-                  <button type="button" data-speed="4" aria-pressed="false">4×</button></span>
-              </figcaption>
-            </figure>
+        <div class="section-heading">
+          <span class="section-number" aria-hidden="true">02 /</span>
+          <h2 id="tour-title">Try it in five minutes <a class="permalink" href="#tour" aria-label="Link to the tour">#</a></h2>
+        </div>
+        <div class="tour">
+          <p class="tour-note">Install, then put the cluster through its paces: a real
+            Kubernetes app, a network fault, a killed replica and a lost node. Same
+            prerequisites as the install line.</p>
+          <!-- The recording is always on show. assets/tour-player.js loads the vendored
+               asciinema player (assets/asciinema/) and the recording from this site as the
+               figure nears the viewport. -->
+          <figure id="tour-recording" class="recording" data-cast="./assets/tour.cast" data-poster="npt:2:05">
+            <div class="recording-screen"></div>
+            <noscript><p class="recording-fallback">The recording plays with JavaScript. Without it,
+              <a href="./assets/tour.cast">download the recording</a> and play it in a terminal with
+              <code>asciinema play tour.cast</code>, or follow the steps below.</p></noscript>
+            <figcaption>
+              <span>The whole tour on a real laptop cluster, run by
+                <a href="https://github.com/reliaburger/reliaburger/blob/main/scripts/demo/tour.sh">scripts/demo/tour.sh</a>
+                against the published 0.1.2 install.
+                Setup plays four times faster and idle time is cut to two seconds; every wait
+                says how long it really took.</span>
+              <span class="recording-speed" role="group" aria-label="Playback speed" hidden>speed
+                <button type="button" data-speed="1" aria-pressed="true">1×</button>
+                <button type="button" data-speed="2" aria-pressed="false">2×</button>
+                <button type="button" data-speed="4" aria-pressed="false">4×</button></span>
+            </figcaption>
+          </figure>
+          <!-- Only the commands fold away. Find-in-page opens a closed details element
+               in Chromium and Safari, so Ctrl-F still reaches every command. -->
+          <details class="tour-commands" id="tour-commands">
+            <summary>Show the commands <span class="tour-commands-note">every step, with what to look for</span></summary>
             <ol class="tour-steps">
               <li>
                 <pre><code data-tour>curl -fsSL https://reliaburger.com/install.sh | sh</code></pre>
@@ -222,12 +226,12 @@
             <p>Finished? Remove the cluster, then Relish itself:</p>
             <pre class="tour-cleanup"><code data-tour>relish local destroy --yes</code>
 <code data-tour>relish uninstall</code></pre>
-            <p class="tour-links">Also in the CLI: <code data-tour>relish manual tour</code>
-              · <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/manual/08_five-minute-tour.md">Read it on GitHub</a>
-              · <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/quickstart.md">Prerequisites, retries and cleanup</a>
-              · <a href="install.sh">Read the bootstrap script</a></p>
-          </div>
-        </details>
+          </details>
+          <p class="tour-links">Also in the CLI: <code data-tour>relish manual tour</code>
+            · <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/manual/08_five-minute-tour.md">Read it on GitHub</a>
+            · <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/quickstart.md">Prerequisites, retries and cleanup</a>
+            · <a href="install.sh">Read the bootstrap script</a></p>
+        </div>
       </section>
 
       <section id="start" class="section start" aria-labelledby="start-title">

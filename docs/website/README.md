@@ -17,10 +17,13 @@ the text and `document.execCommand("copy")`.
 `assets/tour-player.js` (decision D2 in
 `docs/plans/archive/2026-09-23-zero-to-cluster.md`) plays the
 tour's recording, `assets/tour.cast`, with a vendored copy of the asciinema
-player in `assets/asciinema/`. It loads the player and the recording from this
-site, and only when someone opens the tour; nothing is fetched from anywhere
-else. With scripts disabled a `<noscript>` note links the `.cast` file, and the
-written tour works as before. Don't add other scripts. The footer names both,
+player in `assets/asciinema/`. The recording is always on show, with its
+poster frame, ready to play without a click. The script loads the player and
+the recording (about 1 MB) from this site when the figure comes within a screen
+or so of the viewport (an `IntersectionObserver`; browsers without one load them
+straight away), so a visitor who never scrolls down doesn't pay for them.
+Nothing is fetched from anywhere else. With scripts disabled a `<noscript>`
+note links the `.cast` file, and the written tour works as before. Don't add other scripts. The footer names both,
 so change the two together.
 
 Every `<section>` has a stable `id` (`install`, `tour`, `start`, `docs`,
@@ -79,8 +82,15 @@ tarball isn't published yet. The build step runs in a scratch directory, so
 `--install v0.1.2`.
 `asciinema play docs/website/assets/tour.cast` plays the result in a terminal.
 
-The "Try it in five minutes" tour is a `<details>` element, so it opens and
-closes without script. Each command in it carries a `data-tour` attribute.
+The "Try it in five minutes" section keeps its heading and the recording in
+plain view; people didn't notice it when the whole section sat in one collapsed
+box. Only the step-by-step command list is folded, in a `<details
+id="tour-commands">` whose summary reads "Show the commands", so it opens and
+closes without script. Chromium and Safari open a closed `<details>` when
+find-in-page matches inside it, so Ctrl-F still reaches every command, and
+`assets/copy.js` opens it for a `#tour-commands` link. `tests/suite/website.rs`
+checks that the recording isn't inside a `<details>` and that the commands are.
+Each command in the tour carries a `data-tour` attribute.
 `tests/suite/website.rs` parses every one of those with the real `relish`
 command-line definition, and does the same for the manual's copy of the tour
 (`docs/manual/08_five-minute-tour.md`), so edit both together.
