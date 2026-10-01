@@ -142,7 +142,7 @@ pub fn status_dot(state: &str) -> &'static str {
     match state.to_lowercase().as_str() {
         "running" | "alive" | "healthy" => "<span class=\"dot-green\">●</span>",
         "pending" | "preparing" => "<span class=\"dot-amber\">●</span>",
-        "failed" | "unhealthy" | "dead" => "<span class=\"dot-red\">●</span>",
+        "failed" | "unhealthy" | "dead" | "blocked" => "<span class=\"dot-red\">●</span>",
         _ => "<span class=\"dot-grey\">●</span>",
     }
 }
@@ -319,6 +319,7 @@ mod tests {
     fn status_dot_colours() {
         assert!(status_dot("running").contains("dot-green"));
         assert!(status_dot("pending").contains("dot-amber"));
+        assert!(status_dot("blocked").contains("dot-red"));
         assert!(status_dot("failed").contains("dot-red"));
         assert!(status_dot("unknown").contains("dot-grey"));
     }

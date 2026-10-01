@@ -421,9 +421,69 @@ if since.is_some_and(|since| file_max_timestamp(&path).is_some_and(|max| max < s
 }
 ```
 
-A file with no usable statistics is still read: skipping it would silently drop data. Streaming the queries that have no lower bound is later work, but the reads that run on a timer are flat now.
+A file with no usable statistics is still read: skipping it would silently drop data. That made the reads that run on a timer flat. It didn't touch the rest.
 
 The theme across all of these: the happy path was fine, and the failure paths — an attacker, a reassignment, a restart, a dead app, a crash mid-flush — were where the bugs lived. That's usually where they live.
+
+## Streaming the queries
+
+Ask for `/v1/metrics?name=*` with no start, or a window from yesterday morning, or just the list of metric names, and the store still decoded every file at or after the start into one in-memory `MemTable` before DataFusion saw a single row. The council's rollup store had no bound at all. And a node writing to a bucket fetched every object for every query, the periodic ones included. We extended the counting-allocator test to all of those, adding history an hour at a time. Every one of them needed between two and three times the heap at four hours that it needed at one.
+
+The answer isn't a smarter filter in front of the `MemTable`. It's to stop building one.
+
+**A table that's a source.** DataFusion asks a table for an execution plan through the `TableProvider` trait, and when it does, it says three things: which columns the query uses, which filters it applies, and any row limit. Our `ParquetTable` (in `src/mayo/scan.rs`) answers with a plan whose one partition reads the files lazily, one after another, then the buffer:
+
+```rust
+let files = futures_util::stream::iter(0..sources.len())
+    .then(move |index| read_source(sources[index].clone(), Arc::clone(&plan)))
+    .flat_map(|read| { /* the file's batches, or its error */ });
+```
+
+A `Stream` is the async cousin of an iterator: a sequence whose next item you `.await`. If you've written Go, it plays the part of a channel fed by a goroutine, except nothing runs until the consumer asks for the next item. `stream::iter` turns any iterator into one. `then` maps each item through an async function and waits for that future to finish before it starts the next, so at most one file's decoded batches sit in the scan at any moment. `flat_map` flattens each file's `Vec` of batches back into a stream of single batches.
+
+DataFusion's operators pull from that stream as it goes. A filter passes rows through. A hash aggregate keeps one accumulator per group, not the rows behind it, so a `GROUP BY` over a week holds a few dozen sums. An `ORDER BY timestamp LIMIT 10000` runs as a top-k that keeps ten thousand rows and drops the rest as they arrive. That's the incremental half of the fix, and we got it for free once the rows arrived one file at a time.
+
+**Pushdown from the footer.** The other half is not reading what can't match. A Parquet footer holds the minimum and maximum of every column in every row group, so before decoding anything, `read_source` checks the query's bounds against those statistics:
+
+```rust
+fn admits_times(&self, min: Option<u64>, max: Option<u64>) -> bool {
+    if let (Some(since), Some(max)) = (self.since, max)
+        && max < since
+    {
+        return false;
+    }
+    // …and the same for `until` against `min`
+    true
+}
+```
+
+A row group that fails isn't decoded, and a file with no row group left isn't read past its footer. For a bucket the footer costs two range reads (the last eight bytes hold its length and the `PAR1` magic, then the metadata itself), so an object outside the window never downloads at all. The decoder also reads only the columns the query named: `SELECT DISTINCT metric_name` decodes one column of four.
+
+Where do the bounds come from? DataFusion hands `scan` the query's filters as expression trees, and `ScanBounds::from_filters` walks them. `timestamp >= 100` raises `since`, `metric_name = 'cpu'` narrows the names, an `AND` narrows by both sides. `OR` needs more care. A row matching either side lies within the *hull* of the two sides' bounds:
+
+```rust
+fn hull(self, other: Self) -> Self {
+    Self {
+        since: self.since.zip(other.since).map(|(a, b)| a.min(b)),
+        until: self.until.zip(other.until).map(|(a, b)| a.max(b)),
+        names: self.names.zip(other.names).map(|(a, b)| a.union(&b).cloned().collect()),
+    }
+}
+```
+
+`Option::zip` pairs two options: `Some(a).zip(Some(b))` is `Some((a, b))`, and anything with a `None` in it is `None`. So if either side of the `OR` is unbounded in time, the hull is too, which is exactly right. We didn't plan to handle `OR` at first. Then the test for `metric_name IN ('cpu', 'mem')` came back with no names at all: DataFusion's optimiser rewrites short `IN` lists as a chain of `OR`s before the table ever sees them.
+
+Anything `from_filters` doesn't recognise (a `LIKE`, a function call, a cast) gives no bound, and the table reports every filter as `Inexact`, which tells DataFusion to keep applying the real filter on top of the scan. So pruning only ever has to be safe, never complete. The labels filter is a substring match on a JSON string, which a min and max can't answer, so it stays a streaming filter.
+
+**The crate chapter 2 did without.** Back in Chapter 2 we made a point of writing async trait methods as `fn … -> impl Future` instead of pulling in the `async_trait` crate. `TableProvider` is declared with `#[async_trait]`, so implementing it means adding the crate and putting the same attribute on our `impl`. Why would DataFusion choose the older style? Because it keeps tables as `Arc<dyn TableProvider>`, a *trait object*, Rust's equivalent of a Go interface value: a pointer to the data plus a table of method pointers. That table needs one concrete signature per method, and with `impl Future` every implementation returns a different future type. `#[async_trait]` rewrites `async fn scan` into a method returning `Pin<Box<dyn Future<Output = …> + Send>>`, one type for all of them, at the cost of a heap allocation per call. One allocation per query is nothing next to decoding a Parquet file.
+
+**The repartition surprise.** With streaming in, the periodic cycle's peak fell. The metric-names query and a per-series aggregate still grew, though: not by much, but steadily, hour after hour. DataFusion splits work across a partition per CPU, and for an aggregate it puts a repartition step after the scan, a task that pulls from our stream and deals batches out to the partitions. That task doesn't wait for slow consumers, so batches queued behind them. Setting `target_partitions` to one removed the step, and the peaks fell by an order of magnitude: the alert-and-rollup cycle went from about 4 MiB to about 300 KiB. Mayo's queries are per node and small, so one thread reads them comfortably.
+
+**Proving the answers didn't change.** A faster wrong answer is still wrong. Before touching the read path we recorded golden answers: every read both stores offer, over data with overlapping files, out-of-order backfill, a corrupt file and an unflushed buffer, run through the old eager code and saved as `insta` snapshots. The streamed code matches them, on the local backend and the bucket. A property test then throws random file layouts and random queries (ranges, strict bounds, `IN`, `OR`, `NOT`, an aggregate) at both the streamed scan and an eager reference.
+
+Would it catch a bug, though? We checked by planting one: make `timestamp > a` prune from `a + 2` instead of `a + 1`. The first version of the property test passed anyway. Its timestamps spread over a range of two hundred, so a bound almost never landed exactly on a file's last sample, which is the only place that off-by-one shows. Shrinking the data (sixteen distinct timestamps, files of one to four rows) made it fail on every run. A property test is only as good as the inputs it generates, so it's worth breaking the code once to find out.
+
+What still grows with history? The list of file names a query starts from, a couple of hundred bytes a file, which is a couple of MiB for a week of one-minute flushes. And a query whose *answer* grows with history, like `/v1/metrics?name=X` with no start, still needs room for that answer. Everything else is flat.
 
 ## Hardening the log path
 
@@ -1127,7 +1187,7 @@ Almost everything in this chapter is a pure data transform: a sample becomes a `
 
 The three subsystems carry their own tests at the bottom of each source file:
 
-- **Mayo (metrics):** Arrow schema validation, DataFusion SQL over the metrics table, Parquet round-trips, Prometheus text parsing, and the alert state machine. The alert tests read like the transition table itself — `inactive_to_pending_on_breach`, `pending_to_firing_after_duration`, `firing_to_inactive_on_recovery`, `pending_to_inactive_on_recovery`, `missing_metric_does_not_fire`. Each builds an evaluator, feeds it a metric value, and asserts the resulting state. The hardening work added a matching set of failure-path tests, one per edge from the previous section: `query_metric_name_injection_is_neutralised` and `app_metrics_name_injection_cannot_bypass_predicate` (the SQL escape), `resent_window_does_not_double_count` and `restart_resumes_flush_counter_without_clobbering` (idempotent, durable rollups), `stale_telemetry_does_not_resolve_a_firing_alert` (the value-not-boolean state machine), `slack_payload_matches_provider_shape` and `pagerduty_payload_matches_events_v2_shape` (the provider webhook contracts), and `query_proceeds_during_flush` plus `corrupt_parquet_file_does_not_fail_query` (the off-lock flush and corrupt-file skip). Each names the failure it prevents.
+- **Mayo (metrics):** Arrow schema validation, DataFusion SQL over the metrics table, Parquet round-trips, Prometheus text parsing, and the alert state machine. The alert tests read like the transition table itself — `inactive_to_pending_on_breach`, `pending_to_firing_after_duration`, `firing_to_inactive_on_recovery`, `pending_to_inactive_on_recovery`, `missing_metric_does_not_fire`. Each builds an evaluator, feeds it a metric value, and asserts the resulting state. The hardening work added a matching set of failure-path tests, one per edge from the previous section: `query_metric_name_injection_is_neutralised` and `app_metrics_name_injection_cannot_bypass_predicate` (the SQL escape), `resent_window_does_not_double_count` and `restart_resumes_flush_counter_without_clobbering` (idempotent, durable rollups), `stale_telemetry_does_not_resolve_a_firing_alert` (the value-not-boolean state machine), `slack_payload_matches_provider_shape` and `pagerduty_payload_matches_events_v2_shape` (the provider webhook contracts), and `query_proceeds_during_flush` plus `corrupt_parquet_file_does_not_fail_query` (the off-lock flush and corrupt-file skip). Each names the failure it prevents. The streaming work added `every_read_matches_the_eager_golden_answers` and `every_rollup_read_matches_the_eager_golden_answers` (the answers recorded before the change), `streamed_reads_match_the_eager_reader` (the property test), and `a_disjunction_narrows_to_the_hull_of_its_sides` with its neighbours in `scan.rs`, which plan real SQL and check the bounds the scan receives. The memory tests live in their own binary, `tests/mayo_memory.rs`, because they replace the global allocator, and they need a process each (nextest's default) because the counters are process-wide.
 - **Ketchup (logs):** `append_and_query`, grep/tail/time-range filters, and the SQL path (`app` filter, time range, `LIKE` grep, `LIMIT`). The log-path hardening added a matching set of failure tests, one per edge above: `bounded_sql_rejects_non_select`, `bounded_sql_rejects_other_tables` and `bounded_sql_caps_returned_rows` (the seatbelt on `/v1/logs/sql`); `unreachable_node_is_a_partial_failure` and `grep_value_with_ampersand_and_question_mark_transmitted_intact` (honest, correctly-encoded fan-out); `identical_lines_from_two_replicas_both_survive` and `repeated_identical_lines_from_one_node_both_survive` (the `(node, sequence)` dedup identity); `tail_returns_the_newest_lines_in_emission_order`, `lines_within_one_second_keep_emission_order_across_flushes` and `lines_sharing_a_second_come_back_in_sequence_order` (the V02 ordering bugs); `restart_does_not_reingest_lines_already_flushed`, `lines_lost_with_the_buffer_are_ingested_again_after_a_crash` and `refollowing_a_capture_file_replays_the_same_positions_and_the_store_keeps_one_copy` (exactly-once ingestion across restarts); `logs_from_several_instances_name_each_line_s_instance` (labelled tails); `reused_filename_with_new_contents_is_not_skipped` (durable checkpoint ids); and `flush_shared_persists_the_buffer_on_shutdown` (the final flush on stop).
 - **Brioche (dashboard):** HTML rendering, and two security-flavoured tests worth calling out — `render_app_detail_escapes_html` (no stored-XSS through an app name) and `render_app_detail_masks_encrypted_env` (a secret never reaches the page). These are unit tests because the renderer is a pure function from data to a string; you assert on the string.
 

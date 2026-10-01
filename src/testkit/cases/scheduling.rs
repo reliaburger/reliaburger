@@ -105,8 +105,8 @@ async fn schedule_respects_required_placement_label(
 /// first is untouched.
 ///
 /// Quota is enforced at *scheduling* time — the leader's placement pass
-/// skips an over-quota app and logs — not at apply time; there is no council
-/// refusal reason for quota. The old case expected the second `apply` to
+/// skips an over-quota app and records why in council state — not at apply
+/// time; there is no council refusal reason for quota. The old case expected the second `apply` to
 /// error, a rejection that doesn't exist, and then accepted *any* error
 /// (including a network blip) as proof of enforcement.
 async fn schedule_rejects_app_exceeding_namespace_quota(
@@ -181,6 +181,37 @@ async fn schedule_rejects_app_exceeding_namespace_quota(
             "quota-b was granted {granted} replica(s) after a settle window despite max_apps = 1"
         ))
         .into());
+    }
+
+    // The council says why quota-b isn't placed (#326). The leader records
+    // the reason in the same pass that skips the app, so it is normally
+    // there already; allow a few passes for the write to commit.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let evidence = ctx
+            .client
+            .desired_apps()
+            .await
+            .map_err(|error| format!("could not read the quota-b block: {error}"))?;
+        let blocked = evidence
+            .iter()
+            .find(|e| e.app == "quota-b" && e.namespace == ctx.namespace)
+            .and_then(|e| e.blocked.clone());
+        match blocked {
+            Some(crate::meat::quota::QuotaError::MaxAppsExceeded { .. }) => break,
+            Some(other) => {
+                return Err((format!(
+                    "quota-b is blocked for the wrong reason: {other} (expected max apps)"
+                ))
+                .into());
+            }
+            None if std::time::Instant::now() >= deadline => {
+                return Err("quota-b is unplaced but no blocked reason was recorded"
+                    .to_string()
+                    .into());
+            }
+            None => tokio::time::sleep(std::time::Duration::from_millis(500)).await,
+        }
     }
 
     // The first app must be untouched by the unschedulable second.

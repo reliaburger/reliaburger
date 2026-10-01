@@ -203,6 +203,10 @@ pub struct ReplicaObservation {
     pub running: BTreeMap<String, u32>,
     /// Nodes whose instances could not be read.
     pub unanswered: Vec<String>,
+    /// Why the scheduler won't place the app, when its namespace quota has
+    /// no room for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked: Option<String>,
 }
 
 /// One active Smoker fault.

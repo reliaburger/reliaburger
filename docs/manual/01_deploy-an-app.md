@@ -76,6 +76,41 @@ running replicas, so an app at zero would have nothing to scale back up on, and
 `relish apply` refuses `min = 0`. To park an app at zero by hand, use
 `relish stop`.
 
+## Namespace quotas
+
+A `[namespace]` block gives a namespace a budget:
+
+```toml
+[namespace.shop]
+cpu = "4"                 # summed requests of every replica
+memory = "8Gi"
+max_apps = 10
+max_replicas = 30
+```
+
+The scheduler checks the budget when it places an app, not when you apply it.
+`relish apply` accepts an app that doesn't fit; it just isn't placed, and
+running apps are never evicted to make room. The app says why everywhere you'd
+look:
+
+```text
+$ relish status
+no workloads running
+
+big (namespace shop) is not placed, blocked: namespace "shop" would exceed CPU quota: 3000+2000 > 4000m
+
+$ relish inspect big
+App: big (namespace shop)
+  Replicas:  2 desired, 0 running
+  Blocked:   namespace "shop" would exceed CPU quota: 3000+2000 > 4000m
+```
+
+The dashboard marks the app `blocked` with the same reason on its page, and
+`relish wtf` raises a `quota-blocked` warning. The reason lives in the
+council, so any node gives the same answer. Raise the budget, or shrink or
+delete other apps in the namespace, and the next scheduling pass (a few seconds
+later) places the app and clears the reason.
+
 ## The everyday loop
 
 ```sh

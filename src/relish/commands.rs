@@ -130,22 +130,10 @@ async fn status_with_client(output: OutputFormat, client: &BunClient) -> Result<
 
     match output {
         OutputFormat::Human => {
-            if statuses.is_empty() {
-                println!("no workloads running");
-            } else {
-                println!(
-                    "{:<24} {:<20} {:<15} {:<12} {:<10} {:<10} {:<6}",
-                    "NODE", "INSTANCE", "APP", "NAMESPACE", "STATE", "PID", "RESTARTS"
-                );
-                for row in &statuses {
-                    let s = &row.instance;
-                    let pid = pid_cell(s);
-                    println!(
-                        "{:<24} {:<20} {:<15} {:<12} {:<10} {:<10} {:<6}",
-                        row.node, s.id, s.app_name, s.namespace, s.state, pid, s.restart_count
-                    );
-                }
-            }
+            // The council knows why an app isn't placed. That is extra
+            // detail: an agent that can't say still shows its instances.
+            let desired = client.desired_apps().await.unwrap_or_default();
+            print!("{}", render_status(&statuses, &desired));
         }
         OutputFormat::Json => {
             let json =
@@ -1424,6 +1412,56 @@ pub async fn top(output: OutputFormat) -> Result<(), RelishError> {
     }
 
     Ok(())
+}
+
+/// The human `relish status` output: every instance with its node, then each
+/// app the scheduler won't place and why (#326). Without that line an
+/// over-quota app is just missing from the table.
+fn render_status(
+    statuses: &[crate::bun::agent::ClusterInstanceStatus],
+    desired: &[crate::bun::diagnostics::DesiredAppEvidence],
+) -> String {
+    use std::fmt::Write as _;
+
+    let mut output = String::new();
+    if statuses.is_empty() {
+        output.push_str("no workloads running\n");
+    } else {
+        let _ = writeln!(
+            output,
+            "{:<24} {:<20} {:<15} {:<12} {:<10} {:<10} {:<6}",
+            "NODE", "INSTANCE", "APP", "NAMESPACE", "STATE", "PID", "RESTARTS"
+        );
+        for row in statuses {
+            let s = &row.instance;
+            let _ = writeln!(
+                output,
+                "{:<24} {:<20} {:<15} {:<12} {:<10} {:<10} {:<6}",
+                row.node,
+                s.id,
+                s.app_name,
+                s.namespace,
+                s.state,
+                pid_cell(s),
+                s.restart_count
+            );
+        }
+    }
+    let blocked: Vec<_> = desired
+        .iter()
+        .filter_map(|app| app.blocked.as_ref().map(|reason| (app, reason)))
+        .collect();
+    if !blocked.is_empty() {
+        output.push('\n');
+    }
+    for (app, reason) in blocked {
+        let _ = writeln!(
+            output,
+            "{} (namespace {}) is not placed, blocked: {reason}",
+            app.app, app.namespace
+        );
+    }
+    output
 }
 
 /// An instance's PID for a table: `-` when it has none, `?` when the node's
@@ -2771,6 +2809,48 @@ spec:
         assert_eq!(
             options.json_field,
             Some(("level".to_string(), "warn".to_string()))
+        );
+    }
+
+    fn evidence(app: &str, replicas: u32) -> crate::bun::diagnostics::DesiredAppEvidence {
+        crate::bun::diagnostics::DesiredAppEvidence {
+            app: app.to_string(),
+            namespace: "prod".to_string(),
+            desired_replicas: replicas,
+            scheduled_replicas: 0,
+            placements: Default::default(),
+            service_port: None,
+            blocked: None,
+        }
+    }
+
+    /// #326: an app the namespace quota keeps off every node has no
+    /// instance row, so `relish status` names it and says why.
+    #[test]
+    fn status_names_an_over_quota_app_and_why() {
+        let blocked = crate::bun::diagnostics::DesiredAppEvidence {
+            blocked: Some(crate::meat::quota::QuotaError::CpuExceeded {
+                namespace: "prod".to_string(),
+                current: 0,
+                requested: 1600,
+                limit: 1000,
+            }),
+            ..evidence("greedy", 2)
+        };
+        let output = render_status(&[], &[evidence("fine", 1), blocked]);
+        assert_eq!(
+            output,
+            "no workloads running\n\n\
+             greedy (namespace prod) is not placed, blocked: \
+             namespace \"prod\" would exceed CPU quota: 0+1600 > 1000m\n"
+        );
+    }
+
+    #[test]
+    fn status_without_blocked_apps_is_just_the_table() {
+        assert_eq!(
+            render_status(&[], &[evidence("fine", 1)]),
+            "no workloads running\n"
         );
     }
 
