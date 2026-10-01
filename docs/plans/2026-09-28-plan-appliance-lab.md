@@ -18,7 +18,7 @@
 - [x] **S3, the x86_64 smoke run**: the virtual Wyse installs through the same path with real firmware PXE, and starts bun.
 - [x] **S4, good update**: a second CI version is staged by hand the way bun would (`os-stage`: Ed25519, SHA-256, `systemd-sysupdate` from a local directory) and rolled across the cluster. Boot counting blesses each node, and Raft, images and volumes stay intact.
 - [x] **S4, bad update**: a deliberately broken version (bun won't start) falls back to the previous slot within three boots, with no hands.
-- [ ] **S4, bun upgrade on top**: an OS update never moves bun backwards (passed, 1 Oct), and `relish upgrade` refuses 0.1.0 → 0.1.1 on the appliance as `docs/releasing.md` says it must (passed). A rolling `relish upgrade` that actually swaps bun waits for two release-signed versions with the same formats. 0.1.0 and 0.1.1 differ, and main has bumped them again.
+- [ ] **S4, bun upgrade on top**: an OS update never moves bun backwards (passed, 1 Oct), and `relish upgrade` refuses 0.1.0 → 0.1.1 on the appliance as `docs/releasing.md` says it must (passed). A rolling `relish upgrade` that actually swaps bun waits for two release-signed versions with the same formats. So far every release has bumped them: 0.1.0 is 27/44, 0.1.1 27/46, 0.1.2 (1 Oct) 28/47, and main is at 29/48.
 - [ ] **S5, ten Dell Wyse 3040s**: the last step, on the hardware (spike plan, research §9.7). The runbook, with what to record at each step, is [`2026-10-01-plan-appliance-s5-wyse.md`](2026-10-01-plan-appliance-s5-wyse.md).
 - [ ] **S6, write-up**: `docs/qualification/<date>-appliance-spike.md` and `<date>-wyse-3040.md`.
 
@@ -173,7 +173,7 @@ For `relish netboot` (Phase 2b):
 
 - `/etc` lives on the data partition, so a later image's `/etc` doesn't reach installed nodes (S1). The seed and SSH credentials land in `/etc` too.
 - A rolling bun upgrade on the appliance hasn't swapped a binary yet: no two release-signed versions share formats (see S4).
-- A seeded fleet couldn't grow past the addresses given to `seed-fleet.sh init`, because each seed fixes `bootstrap_peers`. Now `bootstrap_peers` takes CIDRs (cluster and API ports only, all mTLS), and `seed-fleet.sh init --network` writes the LAN; `join` enrols nodes appended to `fleet` later. The released buns (≤ 0.1.1) take bare addresses only, so `--network` waits for the next release.
+- A seeded fleet couldn't grow past the addresses given to `seed-fleet.sh init`, because each seed fixes `bootstrap_peers`. Now `bootstrap_peers` takes CIDRs (cluster and API ports only, all mTLS), and `seed-fleet.sh init --network` writes the LAN; `join` enrols nodes appended to `fleet` later. Released buns (up to 0.1.2) take bare addresses only, so `--network` waits for the first release with this branch.
 - ~~A two-node cluster holds a bun upgrade in `UpgradingCouncil` indefinitely.~~ Fixed: `start` and a cluster `rollback` now refuse a two-voter council, and the leader logs a quorum hold once when it begins.
 - The fallback takes about 16 minutes, because the boot check waits 300 s each try.
 - The lab's SSH (`openssh-server`, started only with an `ssh.authorized_keys.root` credential) exists so S4 can stage by hand. Phase 1 drops it, once bun stages OS updates itself.

@@ -64,7 +64,7 @@ bootstrap_peers = ["192.168.0.101", "192.168.0.102", "192.168.0.0/24"]
   host ports. Joining still needs a join token, and every cluster port is mTLS.
 - Entries follow the `operator_cidrs` rules: bare addresses or CIDRs, IPv4 or
   IPv6, no `/0` and no host bits set.
-- Releases up to 0.1.1 take bare addresses only.
+- Releases up to 0.1.2 take bare addresses only.
 
 ## API tokens
 

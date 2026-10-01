@@ -129,15 +129,16 @@ image/tools/seed-fleet.sh init ~/home-cluster --cluster home --operator 192.168.
 ```
 
 `--operator` is your laptop's address, the one relish connects from. Only
-that address can reach the nodes' API.
+that address can reach the nodes' API. The first run builds a small helper
+from the repository, which takes a few minutes.
 
 List every machine you have now. A node's firewall only lets in the listed
 addresses until they've joined, so a machine added later can't reach the
-others. With a bun newer than 0.1.1, `--network 192.168.1.0/24` lets in
-any machine on your LAN instead (only to the cluster ports, which all need
-the cluster's certificates). Then add a machine by appending `N MAC IP` to
-`~/home-cluster/fleet` and running `seed-fleet.sh join` again. The first run builds a small helper
-from the repository, which takes a few minutes.
+others. With a bun that takes networks in `bootstrap_peers` (releases up to
+0.1.2 don't), `--network 192.168.1.0/24` lets in any machine on your LAN
+instead (only to the cluster ports, which all need the cluster's
+certificates). Then add a machine by appending `N MAC IP` to
+`~/home-cluster/fleet` and running `seed-fleet.sh join` again.
 
 `~/home-cluster/init` now holds the cluster's master key and its sealed root
 CA key. Back them up: `relish council recover` needs them if the cluster ever
@@ -251,8 +252,8 @@ it also uses port 8080. `bootctl list` on the node shows both versions afterward
   enrols it.
 - **No OS updates run by bun.** Staging by hand over SSH stands in for them.
 - **Secure Boot** has to be off.
-- **Adding machines later needs `--network`**, and so a bun newer than
-  0.1.1. Without it, seeds carry only the addresses from `seed-fleet.sh
+- **Adding machines later needs `--network`**, and so a bun that takes
+  networks in `bootstrap_peers` (releases up to 0.1.2 don't). Without it, seeds carry only the addresses from `seed-fleet.sh
   init`, and adding a machine means editing `bootstrap_peers` in
   `/etc/reliaburger/node.toml` on every node and restarting bun.
 - **Two machines can't roll a bun upgrade.** Both are in the council, and

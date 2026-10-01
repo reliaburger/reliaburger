@@ -11,7 +11,7 @@
 #       1's seed. List node 1 first. Each node's firewall lets only these
 #       addresses reach the cluster ports before they've joined, unless
 #       --network names the LAN that nodes added later will join from
-#       (192.168.1.0/24, say); it needs a bun newer than 0.1.1. IP is each
+#       (192.168.1.0/24, say); releases up to 0.1.2 can't take it. IP is each
 #       node's reserved address; --operator is this laptop's address, the
 #       one relish connects from.
 #       --ssh-key puts a public key in every seed (spike only: root SSH, for
