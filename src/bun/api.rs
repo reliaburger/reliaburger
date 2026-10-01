@@ -40,94 +40,98 @@ use crate::pickle::types::ManifestCatalog;
 use crate::testkit::lease::{LeaseScope, is_node_job_lease};
 
 use super::agent::{AgentCommand, ApplyEvent, InstanceStatus};
-mod secrets;
-use secrets::{secret_public_key_handler, secret_rotate_handler};
-mod identity;
-use identity::{
-    identity_jwks_handler, identity_sign_handler, join_token_create_handler, token_create_handler,
-    token_list_handler, token_revoke_handler,
-};
-mod gitops;
-use gitops::gitops_webhook_handler;
-mod registry;
-use registry::{
-    images_handler, registry_proposal_deadline, registry_proposal_handler, registry_query_handler,
-};
+
+// One module per route group. `router_with_upgrade` wires their handlers;
+// the helpers at the bottom of this file are the ones several groups share.
+mod apply;
+mod apps;
 mod deploys;
+mod discovery;
+mod faults;
+mod gitops;
+mod identity;
+mod internal;
+mod join;
+mod logs;
+mod metrics;
+mod node_info;
+mod nodes;
+mod registry;
+mod secrets;
+mod snapshots;
+mod status;
+mod test_leases;
+mod ui;
+mod upgrade;
+
+pub(crate) use apply::leader_api_url;
+use apply::{apply_handler, cluster_apply};
+use apps::{delete_handler, exec_handler, stop_handler};
 use deploys::{
     cluster_deploy_history, deploy_cancel_handler, deploys_active_handler, deploys_history_handler,
     deploys_operations_handler, rollback_handler,
 };
-mod metrics;
-use metrics::{
-    alerts_handler, app_metric_rows, metrics_app_chart_handler, metrics_app_handler,
-    metrics_cluster_handler, metrics_keys_handler, metrics_owned_rollup_handler,
-    metrics_query_handler, metrics_rollup_handler, metrics_summary_handler,
-};
-mod ui;
-use ui::{
-    app_detail_handler, app_env_handler, dashboard_handler, fragment_alerts_handler,
-    fragment_apps_handler, fragment_instances_handler, fragment_nodes_handler, gitops_handler,
-    login_handler, node_detail_handler, ui_logout_handler, ui_session_handler,
-};
-mod logs;
-use logs::{
-    logs_cross_node_handler, logs_entries_handler, logs_export_handler, logs_handler,
-    logs_sql_handler, ws_logs_handler,
-};
-mod discovery;
 use discovery::{resolve_all_handler, resolve_handler, routes_handler};
-mod faults;
 pub use faults::ClusterFaultList;
 use faults::{
     chaos_status_handler, fault_clear_all_handler, fault_clear_handler, fault_inject_handler,
     fault_list_handler, node_fault_fence_handler, node_fault_reserve_handler,
     spawn_node_fault_reaper,
 };
-mod snapshots;
-use snapshots::{
-    snapshot_create_handler, snapshot_delete_handler, snapshot_list_handler,
-    snapshot_restore_handler,
+use gitops::gitops_webhook_handler;
+use identity::{
+    identity_jwks_handler, identity_sign_handler, join_token_create_handler, token_create_handler,
+    token_list_handler, token_revoke_handler,
 };
-mod join;
-use join::{cluster_ca_handler, join_handler, node_renewal_handler};
-mod nodes;
-use nodes::{
-    MAX_RELAY_REQUEST_BYTES, cluster_elect_handler, council_handler, node_relay_handler,
-    nodes_handler,
-};
-mod apps;
-use apps::{delete_handler, exec_handler, stop_handler};
-mod status;
-use status::{
-    cluster_statuses, collect_cluster_statuses, current_apps_handler, events_handler, jobs_handler,
-    status_app_handler, status_handler, top_handler, ws_events_handler,
-};
-mod internal;
 use internal::{
     endpoint_withdrawal_receipt_handler, node_decommission_handler, placements_handler,
     producer_retirement_handler, refuse_retired_tls_peer, workload_csr_handler,
 };
-mod apply;
-pub(crate) use apply::leader_api_url;
-use apply::{apply_handler, cluster_apply};
-mod upgrade;
-use upgrade::{
-    upgrade_abort_handler, upgrade_apply_handler, upgrade_cluster_handler,
-    upgrade_cluster_rollback_handler, upgrade_resume_handler, upgrade_rollback_handler,
-    upgrade_start_handler, upgrade_status_handler,
+use join::{cluster_ca_handler, join_handler, node_renewal_handler};
+use logs::{
+    logs_cross_node_handler, logs_entries_handler, logs_export_handler, logs_handler,
+    logs_sql_handler, ws_logs_handler,
 };
-mod test_leases;
+use metrics::{
+    alerts_handler, app_metric_rows, metrics_app_chart_handler, metrics_app_handler,
+    metrics_cluster_handler, metrics_keys_handler, metrics_owned_rollup_handler,
+    metrics_query_handler, metrics_rollup_handler, metrics_summary_handler,
+};
+use node_info::{
+    capabilities_handler, cluster_capabilities_handler, desired_apps_handler, diagnostics_handler,
+    gather_desired_apps, health_handler, path_handler, readiness_handler, version_handler,
+};
+use nodes::{
+    MAX_RELAY_REQUEST_BYTES, cluster_elect_handler, council_handler, node_relay_handler,
+    nodes_handler,
+};
+use registry::{
+    images_handler, registry_proposal_deadline, registry_proposal_handler, registry_query_handler,
+};
+use secrets::{secret_public_key_handler, secret_rotate_handler};
+use snapshots::{
+    snapshot_create_handler, snapshot_delete_handler, snapshot_list_handler,
+    snapshot_restore_handler,
+};
+use status::{
+    cluster_statuses, collect_cluster_statuses, current_apps_handler, events_handler, jobs_handler,
+    status_app_handler, status_handler, top_handler, ws_events_handler,
+};
 use test_leases::{
     authenticated_test_user, find_test_lease, forward_test_lease_request, lease_error_response,
     test_lease_create_handler, test_lease_get_handler, test_lease_release_handler,
     test_lease_renew_handler, test_lease_retired_handler, test_operation_authorisation,
     write_lease_request,
 };
-mod node_info;
-use node_info::{
-    capabilities_handler, cluster_capabilities_handler, desired_apps_handler, diagnostics_handler,
-    gather_desired_apps, health_handler, path_handler, readiness_handler, version_handler,
+use ui::{
+    app_detail_handler, app_env_handler, dashboard_handler, fragment_alerts_handler,
+    fragment_apps_handler, fragment_instances_handler, fragment_nodes_handler, gitops_handler,
+    login_handler, node_detail_handler, ui_logout_handler, ui_session_handler,
+};
+use upgrade::{
+    upgrade_abort_handler, upgrade_apply_handler, upgrade_cluster_handler,
+    upgrade_cluster_rollback_handler, upgrade_resume_handler, upgrade_rollback_handler,
+    upgrade_start_handler, upgrade_status_handler,
 };
 
 /// Lightweight node membership info for cross-node queries.
@@ -1013,14 +1017,6 @@ async fn fan_out_to_peers<T: serde::de::DeserializeOwned>(
     (answers, failures)
 }
 
-// ---------------------------------------------------------------------------
-// Chaos testing endpoints
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Volume snapshots (Phase 12 E2)
-// ---------------------------------------------------------------------------
-
 /// Resolve a live cluster member to one of its API URLs.
 // `Response` is large but it IS the HTTP reply to send on failure —
 // boxing it would tax every call site for a value that lives one frame.
@@ -1098,26 +1094,10 @@ fn copy_forwarded_auth(
     request
 }
 
-// ---------------------------------------------------------------------------
-// Metrics endpoints (Mayo)
-// ---------------------------------------------------------------------------
-
 /// Gather instance statuses from the agent.
 async fn gather_statuses(state: &ApiState) -> Vec<InstanceStatus> {
     local_statuses(state).await.unwrap_or_default()
 }
-
-// ---------------------------------------------------------------------------
-// Deploy endpoints
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Identity endpoints
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Secret rotation endpoint
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod permission_tests;
