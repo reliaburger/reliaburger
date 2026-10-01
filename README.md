@@ -18,7 +18,7 @@ it heal. Five minutes is the target.
 
 ## Five minutes, zero to cluster
 
-0.1.1 was released on 30 September 2026, and the one-line installer fetches
+0.1.2 was released on 1 October 2026, and the one-line installer fetches
 its signed binaries. You'll need macOS, or Linux with QEMU and KVM, plus about
 8 GiB of free memory and 15 GiB of disk.
 
@@ -35,6 +35,7 @@ open http://podinfo.localhost:18080  # through the built-in ingress
 # registry, signed), then run it next to podinfo
 curl -fsSL https://reliaburger.com/demo/burger.tar.gz | tar xz
 relish build burger/burger.toml
+relish images                        # burger:v1, built for amd64 and arm64
 relish apply burger/burger.toml
 curl http://burger.localhost:18080/order   # calls podinfo's backend by name
 
@@ -52,7 +53,7 @@ relish dashboard                     # live charts in the browser
 # Break things and watch the cluster recover
 relish fault kill frontend --count 1 --acknowledge
 relish local stop node-3             # lose a whole machine
-relish inspect frontend              # three frontends again, each with its node
+relish inspect frontend              # three frontends again, over the survivors
 relish wtf                           # what's wrong and what to do about it
 
 # Clean up

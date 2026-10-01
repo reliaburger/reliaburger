@@ -267,7 +267,7 @@ and the [release asset digest fields](https://docs.github.com/en/rest/releases/r
 The website and installer are separate static assets under `docs/website`,
 published by `static.yml`. GitHub Pages cannot select a different response for
 curl and a browser at `/`; the shell endpoint is `/install.sh`. The bootstrap
-installs the version in its `RELIABURGER_VERSION` default (`v0.1.1` today), so
+installs the version in its `RELIABURGER_VERSION` default (`v0.1.2` today), so
 bump that default in the same change that announces a newer release.
 
 Before tagging a release, complete the managed-cluster and clean-install
