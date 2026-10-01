@@ -249,10 +249,14 @@ async fn complete_entry<G: Grill>(
             .ok()
             .and_then(Result::ok)
     };
+    // `None` when the exit code is unknown, for the same two reasons (#389).
     let exit_code = async {
         match recorded_exit {
-            Some(code) => Ok(code),
-            None => tokio::time::timeout_at(deadline, grill.exit_code(&id)).await,
+            Some(code) => Some(code),
+            None => tokio::time::timeout_at(deadline, grill.exit_code(&id))
+                .await
+                .ok()
+                .and_then(Result::ok),
         }
     };
     let (exited, pid, exit_code) = tokio::join!(exited, pid, exit_code);
@@ -265,7 +269,7 @@ async fn complete_entry<G: Grill>(
     }
     // An exited instance has no process, whatever the pid read saw first,
     // so its pid is known even when that read failed.
-    status.runtime_unknown = liveness_unknown || (pid.is_none() && !exited) || exit_code.is_err();
+    status.runtime_unknown = liveness_unknown || (pid.is_none() && !exited) || exit_code.is_none();
     status.pid = pid.flatten().filter(|_| !exited);
     status.exit_code = exit_code.unwrap_or(recorded_exit.flatten());
     status

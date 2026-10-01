@@ -3540,6 +3540,21 @@ when there was one, such as the upgrade inventory, write `let Ok(Some(pid))
 won't let a caller confuse them, where a Go function returning `(0, nil)` for
 both would.
 
+`Grill::exit_code` had the same habit, and its `None` did more damage,
+because more callers act on it (#389). Startup recovery read a stopped job's
+`None` as "it left no exit code" and recorded the job's outcome as unknown for
+good, so it needed an explicit rerun. The state sweep reported such a job as
+exited without a code. The same silent-owner test, asking for the exit code
+this time, got `Ok(None)` back. Now `exit_code` returns
+`Result<Option<i32>, GrillError>` too, and every caller decides what "couldn't
+tell" means for it. Status sets `runtime_unknown`. The sweep reports the job
+as `Observed::Unknown`, so the next sweep asks again rather than settling it.
+Recovery, an init container's wait and a `run_before` job's wait already
+propagated a failed `state()` read with `?`, and now they do the same for the
+exit code. Changing the trait's return type was the whole fix in a sense: the
+compiler then listed every call site that had been quietly treating an error
+as an answer.
+
 There was a type problem in the middle of this. The reads need the container
 runtime, and `BunAgent<G: Grill>` is generic over it, but the API state isn't
 generic and we didn't want it to become so. The reader stores the one
@@ -3894,8 +3909,9 @@ same instance.
 #### A budget per turn
 
 Some reads the loop can't hand to anyone: the namespace firewall wants every
-instance's cgroup id, a fault wants its targets' pids, retirement wants the
-runtime's view of a network reference. Each is usually milliseconds. Each can
+instance's cgroup id, a fault wants its targets' pids, retirement wanted the
+runtime's view of a network reference (until it didn't; see below). Each is
+usually milliseconds. Each can
 take seconds behind a create holding the instance's lock. For these we
 gave every turn a budget:
 
@@ -4004,6 +4020,43 @@ the top, so the transition only happens when the instance isn't already
 `#[tokio::test]` the runtime has one thread, so a task spawned during the call
 can't have run by the time a turn with no budget left polls it, and the first
 ask is `StillRunning` every time.
+
+A day later the budget's cost came due, in exactly the place we'd said it
+could (#387). The privileged CI run's OCI interruption qualification restarts
+Bun, recovers its containers and stops them, and twice the stop came back as a
+500: "the runtime did not answer for the network reference within the turn".
+Retiring a stopped instance asks runc which network reference it holds and
+then hands it back, and on runc both wait for the instance's lifecycle lock.
+Just after recovery the health sweep's and the status reader's state reads
+queue for that lock as well, each a `runc state` subprocess. A few of those
+in front of you are the whole 500 ms. And the miss was fatal to the stop,
+because a stop only waits and retries on `StillRunning`; any other error goes
+straight back to the caller.
+
+So both calls moved to off-loop work. That needed one change to the
+mechanism: until then every task answered only "done" or "failed", and a read
+has to hand back what it read. `OffLoopWork` became generic over the answer:
+
+```rust
+pub(super) struct OffLoopWork<T = ()> {
+    in_flight: HashMap<WorkKey, InFlight<T>>,
+}
+```
+
+`T = ()` is a default type parameter. A plain `OffLoopWork` is still the
+unit-answer version every existing caller uses, so none of them changed, and
+the agent gained a second map, `OffLoopWork<Option<NetworkReference>>`, for
+the reads. C++ templates have the same idea; Go generics don't. The
+`#[derive(Default)]` it used to have had to go, too. The derive adds a
+`T: Default` bound to the impl it writes, even though an empty `HashMap` needs
+nothing from `T`, so we wrote the three-line impl by hand.
+
+Now a slow read or release fails the retirement with `StillRunning`, the stop
+checks back every 100 ms, and the retry collects the same task rather than
+asking runc again. The starvation harness has two new scenarios, a stop whose
+network-reference read takes 1.5 s and one whose release does. Both used to
+answer with that error. Now both answer `Ok` after the slow call ends, with
+the runtime asked once and no turn over budget.
 
 #### The faults
 
