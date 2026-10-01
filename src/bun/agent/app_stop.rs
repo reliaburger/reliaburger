@@ -10,6 +10,7 @@ use std::collections::HashMap;
 
 use tokio::sync::oneshot;
 
+use super::*;
 use super::{BunAgent, BunError, Grill, InstanceId};
 
 /// A stop that has withdrawn routing and marked its instances Stopping.
@@ -275,6 +276,248 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
 fn stop_incomplete(reason: String) -> BunError {
     BunError::StopIncomplete { reason }
+}
+
+impl<G: Grill + Clone + 'static> BunAgent<G> {
+    /// Stop an app's instances, waiting for their exit inline.
+    ///
+    /// Operator stops, retirements and the egress fence all await the exit
+    /// off the command loop instead (`request_app_stop`,
+    /// `stop_app_unattended`). This inline form lets tests drive a whole stop
+    /// without running the loop.
+    #[cfg(test)]
+    pub(super) async fn stop_app(
+        &mut self,
+        app_name: &str,
+        namespace: &str,
+    ) -> Result<(), BunError> {
+        let stop = self.begin_app_stop(app_name, namespace).await?;
+        self.app_exit_wait(&stop).await?;
+        self.finish_app_stop(app_name, namespace, stop).await
+    }
+
+    /// Withdraw an app's routing and move its instances to Stopping.
+    ///
+    /// Nothing is signalled yet: `app_exit_wait` sends SIGTERM, waits out
+    /// the grace and escalates, and `finish_app_stop` releases ownership only
+    /// after that wait has confirmed every exit.
+    pub(super) async fn begin_app_stop(
+        &mut self,
+        app_name: &str,
+        namespace: &str,
+    ) -> Result<AppStop, BunError> {
+        // A schedule exists before its first instance. Retire future firings
+        // even when there is no running process (or runtime cleanup fails).
+        let mut next = self.scheduled_jobs.clone();
+        let had_schedule = next
+            .remove(&(app_name.to_string(), namespace.to_string()))
+            .is_some();
+        if had_schedule {
+            self.commit_scheduled_jobs(next).await?;
+        }
+        // Get instance IDs for this app
+        let instances: Vec<InstanceId> = self
+            .supervisor
+            .list_instances()
+            .iter()
+            .filter(|i| i.app_name == app_name && i.namespace == namespace)
+            .map(|i| i.id.clone())
+            .collect();
+
+        if instances.is_empty() && !had_schedule {
+            return Err(BunError::AppNotFound {
+                app_name: app_name.to_string(),
+                namespace: namespace.to_string(),
+            });
+        }
+
+        let owns_job = instances
+            .iter()
+            .any(|id| self.recorded_jobs.contains_key(&id.0));
+        let mut jobs = self.recorded_jobs.clone();
+        for id in &instances {
+            if let Some(job) = jobs.get_mut(&id.0)
+                && job.phase != crate::bun::jobs::JobPhase::Unknown
+            {
+                job.phase = crate::bun::jobs::JobPhase::Stopping;
+            }
+        }
+        if owns_job {
+            self.commit_jobs(jobs).await?;
+        }
+
+        // Runtime retirement can release a reusable container address. Refuse
+        // before that happens if an old VIP can still route to the address.
+        let service_id = crate::onion::service_id::ServiceId::new(namespace, app_name);
+        self.withdraw_service_ebpf(&service_id).await?;
+        for id in &instances {
+            let _ = self.service_map.remove_backend(&service_id, &id.0);
+        }
+        self.rebuild_routing_table().await;
+
+        // Stop via supervisor (moves the tracked state to Stopping).
+        if !instances.is_empty() {
+            // LOOP-INLINE: in-memory lock, no I/O
+            self.supervisor.stop_app(app_name, namespace).await?;
+        }
+        // A stop wins over a restart in flight: the restart won't touch the
+        // runtime again, and the exit wait lets its current step finish.
+        let taken_restarts = instances
+            .iter()
+            .filter_map(|id| self.take_back_from_restart(id))
+            .collect();
+
+        Ok(AppStop {
+            instances,
+            owns_job,
+            taken_restarts,
+        })
+    }
+
+    /// The exit wait for a begun stop, detached from `self` so it can run on
+    /// a spawned task while the command loop keeps serving.
+    ///
+    /// DEP6: SIGTERM, wait for the runtime to confirm exit, escalate to
+    /// SIGKILL on timeout. Only then may the caller record Stopped. Recording
+    /// it before the process exits let container and supervisor state
+    /// diverge — a "stopped" app whose process was still serving traffic.
+    /// Every replica waits at once, so a stop costs one grace, not one each.
+    pub(super) fn app_exit_wait(
+        &self,
+        stop: &AppStop,
+    ) -> impl std::future::Future<Output = Result<(), BunError>> + Send + 'static {
+        let ids: Vec<InstanceId> = stop
+            .instances
+            .iter()
+            .filter(|id| {
+                !self
+                    .recorded_jobs
+                    .get(&id.0)
+                    .is_some_and(|job| job.runtime_absent)
+            })
+            .cloned()
+            .collect();
+        let grill = self.supervisor.grill().clone();
+        let drains = self.drains.clone();
+        let grace = self.stop_grace;
+        let confirmation_timeout = self.stop_confirmation_timeout;
+        let taken_restarts = stop.taken_restarts.clone();
+        async move {
+            restarts::settle_all(&taken_restarts, confirmation_timeout).await?;
+            let waits = ids.iter().map(|id| {
+                drain_and_stop_instance(&drains, &grill, id, grace, confirmation_timeout)
+            });
+            // Try every replica, but report the first failure: ownership and
+            // enforcement stay until all exits are confirmed, and a later stop
+            // can retry the incomplete cleanup.
+            futures_util::future::join_all(waits)
+                .await
+                .into_iter()
+                .find_map(Result::err)
+                .map_or(Ok(()), Err)
+        }
+    }
+
+    /// Record a stop whose exits are confirmed and release what it owned.
+    pub(super) async fn finish_app_stop(
+        &mut self,
+        app_name: &str,
+        namespace: &str,
+        stop: AppStop,
+    ) -> Result<(), BunError> {
+        let AppStop {
+            instances,
+            owns_job,
+            ..
+        } = stop;
+        let service_id = crate::onion::service_id::ServiceId::new(namespace, app_name);
+
+        // Transition Stopping → Stopped now the exit is confirmed.
+        for id in &instances {
+            if let Some(instance) = self.supervisor.get_instance_mut(id)
+                && instance.state == ContainerState::Stopping
+            {
+                let _ = instance
+                    .state
+                    .transition_to(ContainerState::Stopped)
+                    .map(|s| {
+                        instance.state = s;
+                    });
+            }
+        }
+
+        let mut jobs = self.recorded_jobs.clone();
+        for id in &instances {
+            if let Some(job) = jobs.get_mut(&id.0) {
+                if job.phase != crate::bun::jobs::JobPhase::Unknown {
+                    job.phase = crate::bun::jobs::JobPhase::Stopped;
+                }
+                job.runtime_absent = true;
+            }
+        }
+        if owns_job {
+            self.commit_jobs(jobs).await?;
+        }
+
+        // A failed artifact cleanup retains the empty service's key for retry.
+        for id in &instances {
+            self.retire_instance_artifacts(id).await?;
+        }
+
+        self.retire_discovery_service(&service_id).await?;
+        let _ = self.service_map.unregister(&service_id);
+        // NET5: prune this app's cgroup-namespace + firewall entries now it's
+        // gone, so a reused cgroup inode can't inherit its isolation identity.
+        self.sync_firewall_ebpf().await;
+        self.ingress_configs
+            .remove(&(namespace.to_string(), app_name.to_string()));
+        self.rebuild_routing_table().await;
+
+        self.record_event(
+            crate::bun::events::EventKind::Stop,
+            crate::bun::events::EventSeverity::Info,
+            Some(app_name.to_string()),
+            Some(namespace.to_string()),
+            format!("stopped app {app_name}"),
+        )
+        .await;
+
+        Ok(())
+    }
+
+    /// Restore what `finish_app_stop` released for an app whose stopped
+    /// replicas are still owned, so a redeploy can publish into it again.
+    ///
+    /// Leaves a registered service and a stored route untouched: only a
+    /// completed stop removes them while the replicas stay owned. The VIP is
+    /// derived from the app's name, so the service comes back under the
+    /// address it had before the stop, as the cluster catalogue keeps it.
+    pub(super) async fn restore_stopped_routing(
+        &mut self,
+        app_name: &str,
+        namespace: &str,
+        spec: &AppSpec,
+    ) -> Result<(), BunError> {
+        let service_id = crate::onion::service_id::ServiceId::new(namespace, app_name);
+        if let Some(port) = spec.port
+            && self.service_map.resolve(&service_id).is_none()
+        {
+            let firewall = spec
+                .firewall
+                .as_ref()
+                .filter(|firewall| !firewall.allow_from.is_empty())
+                .map(|firewall| firewall.allow_from.clone());
+            self.register_local_service(&service_id, port, firewall)?;
+            self.publish_backend_ebpf(&service_id).await?;
+            self.sync_firewall_ebpf().await;
+        }
+        if let Some(ingress) = &spec.ingress {
+            self.ingress_configs
+                .entry((namespace.to_string(), app_name.to_string()))
+                .or_insert_with(|| ingress.clone());
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
