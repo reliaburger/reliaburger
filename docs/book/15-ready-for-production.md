@@ -4834,6 +4834,76 @@ we cannot find". That's the right failure. A scan that quietly checked nothing
 would have passed. The tests now search the route modules too, from a list.
 Add a route module without listing it and the same panic tells you so.
 
+### One type, many files
+
+`src/bun/agent.rs` was the bigger one: 26,126 lines, nearly half of them tests.
+The shape was different, too. The API is a pile of free functions, so moving
+them is moving files' worth of `fn`s. The agent is one struct, `BunAgent`, and
+almost everything is a method on it.
+
+That's less of a problem than it sounds. In Rust, a type's methods don't have to
+live in one `impl` block, or in one file. Any module in the same crate can open
+another `impl BunAgent<G>` and add methods to it, and they're all methods of the
+same type: `self.drive_pending_restarts()` doesn't care which file defines it.
+(Go programmers will recognise this; a method can live in any file of the
+package. C++ programmers will recognise it as defining member functions outside
+the class, minus the header.) The agent had already started down this road during
+the loop work earlier in the chapter, where `restarts.rs`, `follow_ups.rs` and
+twenty others each took one concern. The split finished the job:
+
+```text
+agent.rs          the loop: BunAgent, its constructors, run_loop, the tick
+agent/commands.rs        AgentCommand and handle_command
+agent/deploy_ops.rs      what a deploy worker asks the loop, and the answers
+agent/deploy_worker.rs   the worker that drives a deploy off the loop
+agent/launch.rs          admission, image trust, fresh and rolling launches
+agent/networking.rs      network references and egress enforcement
+agent/routing.rs         eBPF maps, the service catalogue, the routing table
+agent/faults.rs          chaos faults on this node
+agent/trace.rs           `relish trace`
+agent/job_runs.rs        the job ledger and cron jobs
+agent/records.rs         durable instance records and adoption
+agent/health_checks.rs   probes and the exits the tick notices
+agent/retirement.rs      killing, cleaning up, shutting down
+agent/status.rs          the status types the API serves
+...and identity, volumes, plus additions to restarts, app_stop, state_sweep
+```
+
+`agent.rs` is 1,450 lines now, and the largest file under it is the deploy
+worker at about 1,770.
+
+The moved methods get `pub(super)` for the same reason the handlers did. Even
+the struct's fields stay private: a child module can read and write its
+ancestor's private fields, so `retirement.rs` reaches `self.supervisor` exactly
+as it did when it was a few thousand lines further down the same file.
+
+Two more traps showed up. The first was `#[cfg]`. Some helpers only exist on
+Linux with the `ebpf` feature, so the parent's import of one has to carry the
+same attribute, or the macOS build fails to find something that was configured
+out:
+
+```rust
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+use trace::backend_addresses;
+```
+
+The second was ours: the move script found the end of a method by looking for a
+closing brace at method indentation, and `fn reresolve_egress(&mut self) {}`
+doesn't have one. It ran on into the next method. `rustfmt` caught it with
+an unbalanced brace, which is the best kind of bug, the loud kind.
+
+And then the loop rule from earlier in the chapter. Its walker parses
+`agent.rs` and every file directly under `src/bun/agent/`, finds every
+`impl BunAgent` block wherever it lives, and follows awaited calls by method
+name, so the split didn't break it. "Didn't break it" isn't evidence, though,
+so we checked: we had the walker list every method it entered and every leaf
+await it judged, before and after the split. The two lists were identical, 162
+method bodies and the same leaf awaits. We also closed the gap that would have
+fooled it. A child module declared as `agent/x/mod.rs` is perfectly good Rust,
+but the walker doesn't look in subdirectories, so its awaits would drop out of
+the check without a word. The walker now fails if `agent.rs` declares a module
+that isn't one of the files it read.
+
 ## Lessons learned: audit the evidence too
 
 Export a log file, replace it with new contents under the same name, then export

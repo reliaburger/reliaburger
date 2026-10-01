@@ -34,6 +34,7 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use super::launch_evidence::{LaunchEvidence, retains_network};
+use super::*;
 use super::{BunAgent, BunError, ContainerState, Grill, InstanceId, kill_runtime_instance};
 use crate::grill::oci::OciSpec;
 use crate::grill::runc_intent::NetworkReference;
@@ -594,6 +595,232 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     pub(super) async fn settle_restart_steps(&mut self) {
         while let Some(outcome) = self.restart_steps.join_next_with_id().await {
             self.finish_restart_step(outcome).await;
+        }
+    }
+}
+
+/// The last instance each phase of `drive_pending_restarts` handled.
+#[derive(Debug, Default)]
+pub(super) struct RestartRotation {
+    /// Failed restarts whose partial runtime is still being cleaned up.
+    pub(super) cleanup: Option<InstanceId>,
+    /// Pending instances being started again.
+    pub(super) launch: Option<InstanceId>,
+}
+
+/// Order `items` by instance id, starting just after `last`, so a tick that
+/// runs out of budget part-way through leaves the rest for the next tick.
+pub(super) fn rotate_after<T>(
+    mut items: Vec<T>,
+    last: Option<&InstanceId>,
+    id: impl Fn(&T) -> &InstanceId,
+) -> Vec<T> {
+    items.sort_by(|a, b| id(a).0.cmp(&id(b).0));
+    if let Some(last) = last {
+        let start = items.partition_point(|item| id(item).0 <= last.0);
+        items.rotate_left(start);
+    }
+    items
+}
+
+impl<G: Grill + Clone + 'static> BunAgent<G> {
+    /// Re-drive instances that are in Pending state after a restart, and
+    /// clean up after failed attempts.
+    ///
+    /// The runtime work (kill, create, start) runs in per-restart tasks
+    /// (`restarts`); this only starts them. Each phase handles at least one
+    /// instance per tick, then stops once `PENDING_RESTART_TICK_BUDGET` is
+    /// spent or `RESTARTS_IN_FLIGHT_LIMIT` restarts are in flight.
+    /// `restart_rotation` remembers where it stopped, so every instance gets
+    /// its turn.
+    pub(super) async fn drive_pending_restarts(&mut self) {
+        self.begin_restart_cleanups().await;
+        self.begin_restart_launches().await;
+    }
+
+    /// Partial startup can have changed the runtime even when its call
+    /// failed. Keep ownership until cleanup is observed; then apply the same
+    /// budget and backoff as any other failed execution.
+    pub(super) async fn begin_restart_cleanups(&mut self) {
+        let deadline = tokio::time::Instant::now() + PENDING_RESTART_TICK_BUDGET;
+        let retrying: Vec<_> = self
+            .supervisor
+            .list_instances()
+            .iter()
+            .filter(|instance| {
+                instance.retry_pending
+                    && (!instance.is_job || !self.job_store_uncertain)
+                    && matches!(
+                        instance.state,
+                        ContainerState::Stopping | ContainerState::Stopped
+                    )
+                    && !self.restarting(&instance.id)
+                    // Deferred, not dropped: it restarts once the restore ends.
+                    && !self
+                        .volume_maintenance
+                        .restoring(&instance.namespace, &instance.app_name)
+            })
+            .map(|instance| (instance.id.clone(), instance.state))
+            .collect();
+        let retrying = rotate_after(retrying, self.restart_rotation.cleanup.as_ref(), |entry| {
+            &entry.0
+        });
+        for (index, (id, state)) in retrying.into_iter().enumerate() {
+            if index > 0 && tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            if state == ContainerState::Stopped {
+                self.restart_rotation.cleanup = Some(id.clone());
+                self.retry_restart(&id).await;
+                continue;
+            }
+            if !self.restart_capacity_left() {
+                break;
+            }
+            self.restart_rotation.cleanup = Some(id.clone());
+            match self.poll_instance_withdrawal(&id, self.stop_grace).await {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => {
+                    eprintln!("bun: failed restart of {id} awaits discovery withdrawal: {error}");
+                    continue;
+                }
+            }
+            self.begin_restart_cleanup(id).await;
+        }
+    }
+
+    /// Start every pending restart the budget allows. Each begins by killing
+    /// what's left of the old container, off the loop. Without that, the
+    /// same-id create is rejected (ProcessGrill: stale-Running entry) or
+    /// fails (runc/apple: container still exists), leaving the instance
+    /// wedged in Preparing and the old process leaked.
+    pub(super) async fn begin_restart_launches(&mut self) {
+        let deadline = tokio::time::Instant::now() + PENDING_RESTART_TICK_BUDGET;
+        let pending_restarts: Vec<(InstanceId, restarts::RestartLaunch)> = self
+            .supervisor
+            .list_instances()
+            .iter()
+            .filter(|i| {
+                i.state == ContainerState::Pending
+                    && i.restart_count > 0
+                    && (!i.is_job || !self.job_store_uncertain)
+                    && !self.restarting(&i.id)
+            })
+            .filter_map(|i| {
+                i.oci_spec.as_ref().map(|spec| {
+                    (
+                        i.id.clone(),
+                        restarts::RestartLaunch {
+                            oci_spec: spec.clone(),
+                            app_name: i.app_name.clone(),
+                            namespace: i.namespace.clone(),
+                            host_port: i.host_port,
+                        },
+                    )
+                })
+            })
+            .collect();
+        let pending_restarts = rotate_after(
+            pending_restarts,
+            self.restart_rotation.launch.as_ref(),
+            |entry| &entry.0,
+        );
+
+        for (index, (id, launch)) in pending_restarts.into_iter().enumerate() {
+            if index > 0 && tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            if !self.restart_capacity_left() {
+                break;
+            }
+            self.restart_rotation.launch = Some(id.clone());
+            match self.poll_instance_withdrawal(&id, self.stop_grace).await {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => {
+                    eprintln!("bun: restart of {id} awaits discovery withdrawal: {error}");
+                    continue;
+                }
+            }
+            self.begin_restart_launch(id, launch).await;
+        }
+    }
+
+    /// Move a Stopped instance whose execution failed back to Pending, if
+    /// its restart budget and backoff allow.
+    pub(super) async fn retry_restart(&mut self, id: &InstanceId) {
+        // LOOP-INLINE: in-memory lock, no I/O
+        match self.supervisor.maybe_restart(id, Instant::now()).await {
+            Ok(true) => {
+                if let Some(instance) = self.supervisor.get_instance(id) {
+                    self.record_event(
+                        crate::bun::events::EventKind::Restart,
+                        crate::bun::events::EventSeverity::Warning,
+                        Some(instance.app_name.clone()),
+                        Some(instance.namespace.clone()),
+                        format!(
+                            "instance {id} restarted (attempt {})",
+                            instance.restart_count
+                        ),
+                    )
+                    .await;
+                }
+            }
+            Ok(false) => {}
+            Err(BunError::RestartLimitExceeded { .. }) => {
+                if let Some(instance) = self.supervisor.get_instance_mut(id)
+                    && let Ok(failed) = instance.state.transition_to(ContainerState::Failed)
+                {
+                    instance.state = failed;
+                    instance.retry_pending = false;
+                }
+                if let Some(instance) = self.supervisor.get_instance(id) {
+                    self.record_event(
+                        crate::bun::events::EventKind::JobFailed,
+                        crate::bun::events::EventSeverity::Warning,
+                        Some(instance.app_name.clone()),
+                        Some(instance.namespace.clone()),
+                        format!(
+                            "workload {} exhausted its restart budget",
+                            instance.app_name
+                        ),
+                    )
+                    .await;
+                }
+            }
+            Err(error) => eprintln!("bun: cannot retry {id}: {error}"),
+        }
+    }
+
+    /// Run one tick's restart work to completion, runtime steps included,
+    /// the way the old inline restart did. For tests that drive the agent
+    /// without running its loop.
+    #[cfg(test)]
+    pub(super) async fn drive_pending_restarts_to_completion(&mut self) {
+        self.begin_restart_cleanups().await;
+        self.settle_restart_steps().await;
+        self.begin_restart_launches().await;
+        self.settle_restart_steps().await;
+    }
+
+    /// Retain a partially created runtime for observed cleanup and bounded retry.
+    pub(super) async fn record_failed_restart(&mut self, id: &InstanceId, reason: &str) {
+        if let Some(instance) = self.supervisor.get_instance_mut(id)
+            && let Ok(stopping) = instance.state.transition_to(ContainerState::Stopping)
+        {
+            instance.state = stopping;
+            instance.retry_pending = true;
+        }
+        if let Some(instance) = self.supervisor.get_instance(id) {
+            self.record_event(
+                crate::bun::events::EventKind::Restart,
+                crate::bun::events::EventSeverity::Warning,
+                Some(instance.app_name.clone()),
+                Some(instance.namespace.clone()),
+                format!("restart of {id} failed and awaits cleanup: {reason}"),
+            )
+            .await;
         }
     }
 }
