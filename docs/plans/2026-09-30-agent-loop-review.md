@@ -108,9 +108,9 @@ egress DNS, sweep kernel networking, check identity rotation.
 | `LOOP_RUNTIME_INVENTORY_TIMEOUT` | 1 s | `runtime_inventory.rs:14` | The inventory read inside a snapshot turn |
 | `SNAPSHOT_DEADLINE` | 2 s | `reporting/worker.rs:85` | Queue admission plus answer, per report |
 | `BUSY_LOOP_STALE_WINDOWS` | 4 × `stale_report_timeout_secs` (2 min) | `reporting/worker.rs:82` | How long the worker re-sends the last answered snapshot with fresh readiness while the loop is busy. Past it, reports stop and the node is fenced |
-| `NODE_FAULT_CLEAR_BUDGET` | `NODE_REQUEST_TIMEOUT` − 1 s = 4 s | `api.rs:7566` | The owning node's agent answer plus the reservation release wait, so a forwarded clear hears a verdict, not a timeout |
+| `NODE_FAULT_CLEAR_BUDGET` | `NODE_REQUEST_TIMEOUT` − 1 s = 4 s | `api/faults.rs:1248` | The owning node's agent answer plus the reservation release wait, so a forwarded clear hears a verdict, not a timeout |
 | `WORKLOAD_SIGNING_TIMEOUT` | 15 s | `identity_signing.rs:24` | One CSR round trip, now off the loop |
-| Status API | 5 s | `api.rs:4226` | `local_statuses`: queue plus answer |
+| Status API | 5 s | `api.rs:913` | `local_statuses`: queue plus answer |
 
 Volume maintenance leases (`volume_maintenance.rs:47`) are how snapshot work
 left the loop without losing its invariant. The loop reserves an app's volumes

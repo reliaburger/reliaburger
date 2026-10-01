@@ -4694,6 +4694,93 @@ that. The snapshot uploader still needs its own fixture: it needs Btrfs
 volumes. Its export receipts are written atomically and durably now, and an
 upload is only receipted once the destination has confirmed the archive.
 
+## Files nobody could read
+
+By 0.1.2, `src/bun/api.rs` had grown to 18,351 lines. About 10,500 of them were
+the server and the rest were tests. Every route lived in it: apply, logs,
+faults, upgrades, tokens, the dashboard. It compiled, it was tested, and nobody
+could hold it in their head. Reviewing a change to the log routes meant
+scrolling past the upgrade orchestration to find them.
+
+We didn't have to invent a structure. The router already had one: it lists its
+routes in groups, and each group's handlers sat together in the file. So each
+group became a file, and `api.rs` kept what every group shares, which is the
+`ApiState`, the router and a dozen helpers (asking the agent, fanning a read
+out to the peers, resolving a node's URL). It's 1,100 lines now. The other
+twenty files are things like `api/logs.rs`, `api/faults.rs` and
+`api/upgrade.rs`, the biggest at 1,500 lines.
+
+### How Rust finds a module
+
+In Go, a package is a directory and its files share one namespace, so a split
+like this is a matter of cutting and pasting. In Python, every file is its own
+module and you import across them explicitly. Rust sits in between. A module is
+declared by its parent, and the declaration tells the compiler where to look:
+
+```rust
+// in src/bun/api.rs
+mod logs; // loads src/bun/api/logs.rs
+```
+
+A file `api.rs` with a directory `api/` next to it is the 2018-edition layout.
+The older one, `api/mod.rs`, still works, but having a dozen files called
+`mod.rs` open in an editor gets old fast.
+
+The catch is privacy. An item without `pub` is private to the module that
+defines it, and visible to that module's *descendants*. A handler like `async
+fn logs_handler` in `api.rs` was visible to all of `api` and its test modules.
+Move it down into `api::logs` and it's private to `logs`, so the router can't
+see it any more. The fix is `pub(super)`, which means "visible in my parent",
+and visibility in a module always includes its descendants. That's exactly the
+reach the handler had before, no more. `pub(crate)` would have compiled too,
+but it would have quietly opened the whole crate to two hundred functions that
+nobody outside `api` calls.
+
+Each new file starts with `use super::*;`. A glob import brings in everything
+the parent can name, including the parent's own private `use` lines (a child is
+a descendant, so it can see them). That's why the moved handlers compile
+without a single change to their bodies: `Json`, `StatusCode`, `ApiState` and
+the shared helpers all arrive through the glob. The parent imports back what
+the router needs:
+
+```rust
+mod logs;
+use logs::{logs_handler, ws_logs_handler, /* ... */};
+pub use faults::ClusterFaultList;
+```
+
+That last line is a re-export. `ClusterFaultList` is a public type that
+`relish` names as `crate::bun::api::ClusterFaultList`. `pub use` keeps that
+path working, so no caller outside `api` changed. The tests didn't move between
+modules either: `mod tests;` now loads `api/tests.rs` instead of an inline
+block, so every test keeps its name, and the flake register and CI filters
+still find them.
+
+### Keeping it mechanical
+
+A refactor this size is only safe if nobody edits the code while moving it. We
+moved whole items by name with a small script, gave the private ones
+`pub(super)`, and let the compiler say what was missing. Each route group is
+one commit, so a reviewer can check that a commit adds to one file exactly what
+it deletes from the other.
+
+One trap is worth knowing about. Moving an inline `mod tests { ... }` into its
+own file strips one level of indentation from every line, and the obvious way
+to do that is to remove four spaces from each one. But a multi-line raw string
+like a test's TOML config is data, not code. Re-indent it and you've changed
+the string. TOML doesn't care, but an expected output compared byte for byte
+would. So we left the lines alone and let `rustfmt` re-indent the file, because
+it never touches the inside of a literal.
+
+The other trap was a test that reads source code. The route matrix (Chapters 4
+and 10) checks that every handler asks for its scope and its permission action,
+and it did that by finding each handler's body in `include_str!("api.rs")`.
+After the split the handlers weren't there, and four tests panicked, the first
+with "route /ui/app/{app}/{namespace} dispatches to app_detail_handler, which
+we cannot find". That's the right failure. A scan that quietly checked nothing
+would have passed. The tests now search the route modules too, from a list.
+Add a route module without listing it and the same panic tells you so.
+
 ## Lessons learned: audit the evidence too
 
 Export a log file, replace it with new contents under the same name, then export
