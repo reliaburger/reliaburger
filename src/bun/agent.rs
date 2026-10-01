@@ -7103,26 +7103,51 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let cuts = connections_to_cut(&landed, &callers, |virtual_ip, port| {
             backend_addresses(&services, virtual_ip, port)
         });
-        // Cutting is best effort and nothing waits on it, so it runs in a
-        // task: an `ss` per caller namespace is too slow for the loop.
-        if !cuts.is_empty() {
+        // The cuts must land before the fault is reported installed, or a
+        // pooled client's next request still goes through. Every caller's
+        // `ss` runs at once under the turn's runtime budget; one cut short
+        // is run again from a task, so it lands late rather than never.
+        let deadline = self.turn_deadline();
+        let attempts = cuts.iter().map(|cut| async move {
+            let args = crate::smoker::network::socket_destroy_args(&cut.backends);
+            tokio::time::timeout_at(
+                deadline,
+                crate::smoker::network::run_in_instance_netns(&cut.instance_id, "ss", &args),
+            )
+            .await
+        });
+        // `timeout_at` polls the cuts before its clock, so at the deadline
+        // the ones that finished still count.
+        let outcomes = tokio::time::timeout_at(deadline, futures_util::future::join_all(attempts))
+            .await
+            .unwrap_or_default();
+        let mut outcomes = outcomes.into_iter();
+        let mut late = Vec::new();
+        for cut in cuts {
+            match outcomes.next() {
+                // Process and host-network workloads have no namespace of
+                // their own; their sockets live in the host's, among every
+                // other caller's, so they are left alone.
+                Some(Ok(
+                    Ok(_) | Err(crate::smoker::network::NetnsCommandError::NoNamespace { .. }),
+                )) => {}
+                Some(Ok(Err(error))) => eprintln!("smoker: cutting open connections: {error}"),
+                Some(Err(_)) | None => late.push(cut),
+            }
+        }
+        if !late.is_empty() {
             tokio::spawn(async move {
-                for cut in cuts {
+                for cut in late {
                     let args = crate::smoker::network::socket_destroy_args(&cut.backends);
-                    match crate::smoker::network::run_in_instance_netns(
-                        &cut.instance_id,
-                        "ss",
-                        &args,
-                    )
-                    .await
+                    if let Err(error) =
+                        crate::smoker::network::run_in_instance_netns(&cut.instance_id, "ss", &args)
+                            .await
+                        && !matches!(
+                            error,
+                            crate::smoker::network::NetnsCommandError::NoNamespace { .. }
+                        )
                     {
-                        // Process and host-network workloads have no
-                        // namespace of their own; their sockets live in the
-                        // host's, among every other caller's, so they are
-                        // left alone.
-                        Ok(_)
-                        | Err(crate::smoker::network::NetnsCommandError::NoNamespace { .. }) => {}
-                        Err(error) => eprintln!("smoker: cutting open connections: {error}"),
+                        eprintln!("smoker: cutting open connections: {error}");
                     }
                 }
             });
