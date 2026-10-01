@@ -61,18 +61,25 @@ migration and no feature gate
   ([#317](https://github.com/reliaburger/reliaburger/issues/317)). 0.1.1 changes the state format
   (44 in 0.1.0), so a 0.1.0 cluster can't roll to it: recreate the cluster
   ([upgrading from 0.1.0](releasing.md#upgrading-from-010)).
-- [ ] **0.1.2: images, the next release**
-  ([milestone](https://github.com/reliaburger/reliaburger/milestone/2)).
-  Images ([#248](https://github.com/reliaburger/reliaburger/pull/248)): the Go
-  demo build in the tour, multi-arch builds and pulls (which removes the
-  multi-platform limitation), platforms in `relish images`, a build cache cap,
-  Buildah storage pruning and Buildah in the guest image. Upgrades and
-  rollbacks that can't succeed are refused before a run starts
-  ([#339](https://github.com/reliaburger/reliaburger/issues/339)), and replicas
-  spread over the survivors when a node dies, with healthy ones left in place
-  ([#346](https://github.com/reliaburger/reliaburger/issues/346)). 0.1.2 changes
-  the protocol and state formats (27 and 46 in 0.1.1), so a 0.1.1 cluster
-  can't roll to it: recreate the cluster
+- [ ] **0.1.2: ready for release, qualification in progress**
+  ([milestone](https://github.com/reliaburger/reliaburger/milestone/2)). Every
+  item has landed and the crate says 0.1.2; what's left is building, staging,
+  soaking and promoting the candidate ([runbook](releasing.md)). 0.1.2 is about
+  images:
+  - [x] images ([#248](https://github.com/reliaburger/reliaburger/pull/248)): the Go
+    demo build in the tour, multi-arch builds and pulls (which removes the
+    multi-platform limitation), platforms in `relish images`, a build cache cap,
+    Buildah storage pruning and Buildah in the guest image;
+  - [x] upgrades and rollbacks that can't succeed refused before a run starts
+    ([#339](https://github.com/reliaburger/reliaburger/issues/339), [#350](https://github.com/reliaburger/reliaburger/pull/350));
+  - [x] replicas spread over the survivors when a node dies, with healthy ones
+    left in place ([#346](https://github.com/reliaburger/reliaburger/issues/346), [#349](https://github.com/reliaburger/reliaburger/pull/349));
+  - [x] the pull-through cache holding every platform of a multi-platform
+    upstream image, not just the first puller's
+    ([#353](https://github.com/reliaburger/reliaburger/issues/353), [#354](https://github.com/reliaburger/reliaburger/pull/354)).
+
+  0.1.2 changes the protocol and state formats (27 and 46 in 0.1.1; 28 and 47
+  now), so a 0.1.1 cluster can't roll to it: recreate the cluster
   ([upgrading from 0.1.1](releasing.md#upgrading-from-011)).
 - [ ] **0.1.3: observability and test quality**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/4)).
