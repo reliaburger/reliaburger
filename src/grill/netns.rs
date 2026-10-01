@@ -1200,7 +1200,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Linux root and RELIABURGER_NETNS_TESTS=1"]
+    #[ignore = "requires Linux root and RELIABURGER_NETNS_TESTS=1; run with make test-linux"]
     async fn setup_and_teardown_container_network() {
         assert!(
             netns_tests_enabled(),
@@ -1262,7 +1262,7 @@ mod tests {
     /// container traffic crosses that hook, so the node must accept its own
     /// veths' traffic there, or every call between apps times out.
     #[tokio::test]
-    #[ignore = "requires Linux root and RELIABURGER_NETNS_TESTS=1"]
+    #[ignore = "requires Linux root and RELIABURGER_NETNS_TESTS=1; run with make test-linux"]
     async fn container_network_accepts_its_forwarded_traffic_in_iptables() {
         assert!(
             netns_tests_enabled(),
@@ -1308,7 +1308,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Linux root and RELIABURGER_NETNS_TESTS=1"]
+    #[ignore = "requires Linux root and RELIABURGER_NETNS_TESTS=1; run with make test-linux"]
     async fn port_mapping_nftables() {
         assert!(
             netns_tests_enabled(),
@@ -1406,7 +1406,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Linux root and RELIABURGER_NETNS_TESTS=1"]
+    #[ignore = "requires Linux root and RELIABURGER_NETNS_TESTS=1; run with make test-linux"]
     async fn portmap_map_handles_1000_ports() {
         assert!(
             netns_tests_enabled(),

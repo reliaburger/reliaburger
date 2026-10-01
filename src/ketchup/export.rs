@@ -684,7 +684,7 @@ mod tests {
     // Real S3/GCS export lives in a named, ignored manual suite so it never
     // silently passes without credentials (test-harness honesty rule).
     #[tokio::test]
-    #[ignore = "requires AWS credentials and RELIABURGER_TEST_S3_URL"]
+    #[ignore = "requires AWS credentials and RELIABURGER_TEST_S3_URL; run with make test-s3"]
     async fn export_to_real_s3_manual() {
         let Ok(dest) = std::env::var("RELIABURGER_TEST_S3_URL") else {
             panic!("set RELIABURGER_TEST_S3_URL=s3://bucket/prefix to run this suite");

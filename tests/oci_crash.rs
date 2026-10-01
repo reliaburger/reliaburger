@@ -560,7 +560,7 @@ fn root_suffix(root: &Path) -> String {
 }
 
 #[tokio::test]
-#[ignore = "requires isolated Linux root, real runc/ip/nft and static BusyBox"]
+#[ignore = "requires isolated Linux root, real runc/ip/nft and static BusyBox; run through scripts/release/qualify-oci-interruptions.sh"]
 async fn actual_bun_sigkill_and_cancelled_caller_preserve_oci_init_and_retry_ownership() {
     assert!(nix::unistd::geteuid().is_root());
     for phase in [
@@ -753,7 +753,7 @@ fn retire_kernel(root: &Path) {
 
 #[cfg(feature = "ebpf")]
 #[tokio::test]
-#[ignore = "requires isolated Linux root, bpffs, real runc/ip/nft and static BusyBox"]
+#[ignore = "requires isolated Linux root, bpffs, real runc/ip/nft and static BusyBox; run through scripts/release/qualify-oci-interruptions.sh"]
 async fn normal_standalone_bun_recovers_durable_kernel_and_discovery() {
     let root = tempfile::tempdir().unwrap().keep();
     let _cleanup = RootCleanup(root.clone());
@@ -812,7 +812,7 @@ async fn normal_standalone_bun_recovers_durable_kernel_and_discovery() {
 /// Containers survive because Runc gives them cgroups of their own.
 #[cfg(feature = "ebpf")]
 #[tokio::test]
-#[ignore = "requires isolated Linux root, cgroup v2, bpffs, real runc/ip/nft and static BusyBox"]
+#[ignore = "requires isolated Linux root, cgroup v2, bpffs, real runc/ip/nft and static BusyBox; run through scripts/release/qualify-oci-interruptions.sh"]
 async fn service_cgroup_kill_of_bun_and_owners_retires_the_launch_and_redeploys() {
     let root = tempfile::tempdir().unwrap().keep();
     let _cleanup = RootCleanup(root.clone());
@@ -860,7 +860,7 @@ async fn service_cgroup_kill_of_bun_and_owners_retires_the_launch_and_redeploys(
 
 #[cfg(feature = "ebpf")]
 #[tokio::test]
-#[ignore = "requires isolated Linux root, bpffs, real runc/ip/nft and static BusyBox"]
+#[ignore = "requires isolated Linux root, bpffs, real runc/ip/nft and static BusyBox; run through scripts/release/qualify-oci-interruptions.sh"]
 async fn automatic_restart_bun_death_before_adoption_retires_the_unrecorded_successor() {
     let root = tempfile::tempdir().unwrap().keep();
     let _cleanup = RootCleanup(root.clone());
@@ -994,7 +994,7 @@ fn owned_upgrade_directive(
 
 #[cfg(feature = "ebpf")]
 async fn failed_owned_upgrade_reverts(root: &Path, node: &mut Node, key: &[u8]) {
-    let original = node.client.status().await.unwrap().remove(0);
+    let original = instance_with_pid(&node.client).await;
     std::fs::write(
         root.join("upgrade-bin/bun-v0.2.0.fail-boot"),
         "broken candidate",
@@ -1018,7 +1018,7 @@ async fn failed_owned_upgrade_reverts(root: &Path, node: &mut Node, key: &[u8]) 
             .iter()
             .any(|item| item["outcome"] == "Reverted")
     );
-    let adopted = node.client.status().await.unwrap().remove(0);
+    let adopted = instance_with_pid(&node.client).await;
     assert_eq!(adopted.id, original.id);
     assert_eq!(adopted.pid, original.pid);
     assert_eq!(adopted.host_port, original.host_port);
@@ -1030,7 +1030,7 @@ async fn failed_owned_upgrade_reverts(root: &Path, node: &mut Node, key: &[u8]) 
 
 #[cfg(feature = "ebpf")]
 async fn upgrade_and_rollback(root: &Path, node: &Node, key: &[u8]) {
-    let original = node.client.status().await.unwrap().remove(0);
+    let original = instance_with_pid(&node.client).await;
     let directive = owned_upgrade_directive(root, key);
     for version in ["v0.2.0", "v0.1.0"] {
         if version == "v0.2.0" {
@@ -1051,7 +1051,7 @@ async fn upgrade_and_rollback(root: &Path, node: &Node, key: &[u8]) {
         })
         .await
         .unwrap_or_else(|_| panic!("owned runtime never settled on {version}"));
-        let adopted = node.client.status().await.unwrap().remove(0);
+        let adopted = instance_with_pid(&node.client).await;
         assert_eq!(adopted.id, original.id);
         assert_eq!(adopted.pid, original.pid);
         assert_eq!(adopted.host_port, original.host_port);
@@ -1068,7 +1068,7 @@ async fn upgrade_and_rollback(root: &Path, node: &Node, key: &[u8]) {
 
 #[cfg(feature = "ebpf")]
 #[tokio::test]
-#[ignore = "requires isolated Linux root, bpffs, real runc/ip/nft and static BusyBox"]
+#[ignore = "requires isolated Linux root, bpffs, real runc/ip/nft and static BusyBox; run through scripts/release/qualify-oci-interruptions.sh"]
 async fn normal_owned_bun_upgrade_and_rollback_preserve_runtime_and_kernel() {
     let root = tempfile::tempdir().unwrap().keep();
     let _cleanup = RootCleanup(root.clone());
@@ -1094,7 +1094,7 @@ async fn normal_owned_bun_upgrade_and_rollback_preserve_runtime_and_kernel() {
 
 #[cfg(feature = "ebpf")]
 #[tokio::test]
-#[ignore = "requires unprivileged Linux user, rootless runc/slirp and static BusyBox"]
+#[ignore = "requires unprivileged Linux user, rootless runc/slirp and static BusyBox; run with make test-rootless-runc"]
 async fn normal_rootless_bun_recovers_owned_forward_and_discovery() {
     assert!(!nix::unistd::geteuid().is_root());
     let root = tempfile::tempdir().unwrap().keep();
@@ -1125,7 +1125,7 @@ async fn normal_rootless_bun_recovers_owned_forward_and_discovery() {
     ];
     node.client.apply(&app).await.unwrap();
     wait_file(&root.join("shared/main")).await;
-    let original = node.client.status().await.unwrap().remove(0);
+    let original = instance_with_pid(&node.client).await;
     let url = format!("http://127.0.0.1:{}/", original.host_port.unwrap());
     assert_eq!(
         reqwest::get(&url).await.unwrap().text().await.unwrap(),
@@ -1133,7 +1133,7 @@ async fn normal_rootless_bun_recovers_owned_forward_and_discovery() {
     );
     node.crash().await;
     let mut recovered = Node::start(&root).await;
-    let adopted = recovered.client.status().await.unwrap().remove(0);
+    let adopted = instance_with_pid(&recovered.client).await;
     assert_eq!(adopted.pid, original.pid);
     assert_eq!(adopted.host_port, original.host_port);
     assert_eq!(
@@ -1161,7 +1161,7 @@ async fn normal_rootless_bun_recovers_owned_forward_and_discovery() {
 
 #[cfg(feature = "ebpf")]
 #[tokio::test]
-#[ignore = "requires isolated Linux root, bpffs, real runc/ip/nft and static BusyBox"]
+#[ignore = "requires isolated Linux root, bpffs, real runc/ip/nft and static BusyBox; run through scripts/release/qualify-oci-interruptions.sh"]
 async fn normal_clustered_bun_recovers_enrolled_consumer_before_adoption() {
     use reliaburger::config::node::NodeConfig;
     use sha2::{Digest, Sha256};
@@ -1208,7 +1208,7 @@ async fn normal_clustered_bun_recovers_enrolled_consumer_before_adoption() {
     // reconciler records the placement as applied leaves it pending, and
     // recovery then rightly redeploys instead of adopting the original.
     wait_placement_applied(&root, &name).await;
-    let original = node.client.status().await.unwrap().remove(0);
+    let original = instance_with_pid(&node.client).await;
     node.crash().await;
     // A failed first launch rolls to a new generation and would still pass
     // the rest of this test, hiding whatever made the first one fail.
@@ -1227,7 +1227,7 @@ async fn normal_clustered_bun_recovers_enrolled_consumer_before_adoption() {
     drop(journal);
     let mut recovered = Node::start(&root).await;
     wait_cluster_publication(&recovered.client, &name).await;
-    let adopted = recovered.client.status().await.unwrap().remove(0);
+    let adopted = instance_with_pid(&recovered.client).await;
     assert_eq!(adopted.pid, original.pid);
     assert_eq!(adopted.host_port, original.host_port);
     assert_eq!(
@@ -1312,6 +1312,34 @@ async fn wait_cluster_publication(client: &BunClient, name: &str) {
     })
     .await
     .expect("cluster never confirmed its workload publication");
+}
+
+/// The node's one running instance, once its status carries a pid.
+///
+/// `/v1/status` reads each pid under a shared 500 ms deadline and reports a
+/// miss as unknown rather than hold the answer, and rootless runc can take
+/// that long just after a bun starts or adopts its workloads (#358). A test
+/// comparing pids across a restart or an upgrade has to compare known ones;
+/// a different pid still fails the comparison, only an unknown one waits.
+#[cfg(feature = "ebpf")]
+async fn instance_with_pid(client: &BunClient) -> reliaburger::bun::agent::InstanceStatus {
+    let mut last = None;
+    let found = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if let Ok(mut statuses) = client.status().await
+                && !statuses.is_empty()
+            {
+                let instance = statuses.remove(0);
+                if instance.pid.is_some() {
+                    return instance;
+                }
+                last = Some(instance);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    found.unwrap_or_else(|_| panic!("the instance never reported a pid: {last:?}"))
 }
 
 #[cfg(feature = "ebpf")]
@@ -1410,7 +1438,7 @@ async fn enrolled_upgrade_fixture(
 
 #[cfg(feature = "ebpf")]
 #[tokio::test]
-#[ignore = "requires isolated Linux root, bpffs, real runc/ip/nft and static BusyBox"]
+#[ignore = "requires isolated Linux root, bpffs, real runc/ip/nft and static BusyBox; run through scripts/release/qualify-oci-interruptions.sh"]
 async fn three_enrolled_oci_nodes_preserve_ownership_through_upgrade_and_rollback() {
     let root = tempfile::tempdir().unwrap().keep();
     let _cleanup = RootCleanup(root.clone());
@@ -1474,7 +1502,7 @@ async fn three_enrolled_oci_nodes_preserve_ownership_through_upgrade_and_rollbac
     for node in &nodes {
         wait_cluster_publication(&node.client, &name).await;
     }
-    let original = nodes[0].client.status().await.unwrap().remove(0);
+    let original = instance_with_pid(&nodes[0].client).await;
     let manifests: Vec<_> = roots.iter().map(|root| kernel_manifest(root)).collect();
     for version in ["v0.2.0", "v0.1.0"] {
         let leader = nodes[0].client.council().await.unwrap().leader.unwrap();
@@ -1506,7 +1534,7 @@ async fn three_enrolled_oci_nodes_preserve_ownership_through_upgrade_and_rollbac
             for node in &nodes {
                 wait_cluster_publication(&node.client, &name).await;
             }
-            let current = nodes[0].client.status().await.unwrap().remove(0);
+            let current = instance_with_pid(&nodes[0].client).await;
             assert_eq!(current.id, original.id);
             assert_eq!(current.pid, original.pid);
             assert_eq!(current.host_port, original.host_port);
@@ -1554,7 +1582,7 @@ async fn three_enrolled_oci_nodes_preserve_ownership_through_upgrade_and_rollbac
 
 #[cfg(feature = "ebpf")]
 #[tokio::test]
-#[ignore = "requires Linux root and private mount namespaces"]
+#[ignore = "requires Linux root and private mount namespaces; run through scripts/release/qualify-oci-interruptions.sh"]
 async fn managed_guest_startup_establishes_bpffs_before_bun() {
     let command = reliaburger::relish::quickstart::provision::SERVICE
         .lines()

@@ -115,7 +115,8 @@ Fixes and hardening update the existing chapter for that subsystem; they don't g
 See [docs/testing.md](docs/testing.md) and [docs/design/test-harness.md](docs/design/test-harness.md).
 
 - Tests run under nextest. The portable suite is the unit tests plus the single `tests/suite/` binary: add a portable integration test there as a module. A new `tests/*.rs` binary is only for gated, heavy or process-isolated tests.
-- `make ci` runs `fmt-check`, `lint`, `test` and `test-doc`, portable only. Also run the gated target matching what you touched: `make test-cluster`, `test-linux`, `test-rootless-runc`, `test-upgrade` (or `test-upgrade-node` / `test-upgrade-cluster`), `test-slow`, `test-apple`, `bench` / `bench-large`.
+- `make ci` runs `fmt-check`, `lint`, `test`, `test-doc`, `test-ci-scripts` and `check-ignored`, portable only. Also run the gated target matching what you touched: `make test-cluster`, `test-linux`, `test-rootless-runc`, `test-upgrade` (or `test-upgrade-node` / `test-upgrade-cluster`), `test-slow`, `test-standard-clients`, `test-apple`, `bench` / `bench-large`.
+- Every `#[ignore]` reason names its owner: `run with make <gate>`, a `scripts/` path, `subprocess fixture` or `#<issue>` ([who runs an ignored test](docs/testing.md#who-runs-an-ignored-test)).
 - Retries are 0 (`.config/nextest.toml`). A failure that passes on re-run goes in the [known flakes register](docs/flakes.md) the same day, with an issue if it isn't fixed that day.
 - The `full-ci` PR label runs the heavy suites on a stacked PR.
 - The coverage floor `COVERAGE_MIN_LINES` in the `Makefile` is never lowered.
