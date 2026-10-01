@@ -6,7 +6,7 @@ own next to it, walk its network path, measure it, break it and watch it
 heal. Open it any time with `relish manual tour`.
 
 It needs macOS, or Linux with QEMU and KVM, plus about 8 GiB of free memory and
-15 GiB of disk. The one-line install fetches the signed 0.1.1 release.
+15 GiB of disk. The one-line install fetches the signed 0.1.2 release.
 
 ## Install and build the cluster
 
@@ -62,6 +62,14 @@ toolchain image, so give it a minute; after that it takes seconds.
 Builds target `linux/amd64` and `linux/arm64` by default. The Dockerfile
 cross-compiles: its Go stage runs on the builder's own architecture and tells
 the compiler which one to target, so neither platform needs an emulator.
+
+```sh
+relish images
+```
+
+What the cluster's registry holds. `burger:v1` is one row with both
+platforms: an x86 node and an Arm one each pull their own. podinfo's images
+are there too, cached on the way through.
 
 ```sh
 relish apply burger/burger.toml
