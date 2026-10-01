@@ -273,7 +273,7 @@ enum Command {
         /// Operation ID from the apply stream or deploy-operation API.
         operation_id: String,
     },
-    /// Show deploy history for an app.
+    /// Show deploy history for an app, from every node.
     History {
         /// App name.
         app: String,
