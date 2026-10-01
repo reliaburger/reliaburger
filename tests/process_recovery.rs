@@ -133,7 +133,7 @@ async fn recovered_runtime_controls_live_generation_without_adoption() {
     let first = runtime(directory.path());
     first.create(&id, &spec("sleep 30")).await.unwrap();
     first.start(&id).await.unwrap();
-    let pid = first.pid(&id).await.unwrap();
+    let pid = first.pid(&id).await.unwrap().unwrap();
     drop(first);
     let recovered = runtime(directory.path());
     let result = recovered.state(&id).await;
@@ -141,6 +141,51 @@ async fn recovered_runtime_controls_live_generation_without_adoption() {
     stopped(&recovered, &id).await;
     assert!(reliaburger::grill::records::process_start_time(pid).is_none());
     assert_eq!(result.unwrap(), ContainerState::Running);
+}
+
+/// The owner of a live instance doesn't answer (#358): the pid is unknown,
+/// which must not read as "no process". Status used to report such an
+/// instance with no pid and nothing to say the runtime hadn't answered.
+#[tokio::test]
+async fn a_live_instance_whose_owner_does_not_answer_has_an_unknown_pid_not_none() {
+    let directory = tempfile::tempdir().unwrap();
+    let id = InstanceId("default__silent-0".into());
+    let grill = runtime(directory.path());
+    grill.create(&id, &spec("sleep 30")).await.unwrap();
+    grill.start(&id).await.unwrap();
+    let pid = grill.pid(&id).await.unwrap().unwrap();
+
+    let record: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(
+            directory
+                .path()
+                .join("process-owners")
+                .join(&id.0)
+                .join("owner.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let socket = std::path::PathBuf::from(format!(
+        "/tmp/rbp-{}-{}",
+        nix::unistd::geteuid(),
+        record["nonce"].as_str().unwrap()
+    ))
+    .join("control.sock");
+    let aside = socket.with_extension("aside");
+    std::fs::rename(&socket, &aside).unwrap();
+    // Accepts connections into its backlog and never answers them.
+    let silent = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+
+    let read = grill.pid(&id).await;
+    drop(silent);
+    std::fs::remove_file(&socket).unwrap();
+    std::fs::rename(&aside, &socket).unwrap();
+    assert!(read.is_err(), "a silent owner's pid read as {read:?}");
+    assert_eq!(grill.pid(&id).await.unwrap(), Some(pid));
+    grill.kill(&id).await.unwrap();
+    stopped(&grill, &id).await;
+    assert_eq!(grill.pid(&id).await.unwrap(), None);
 }
 
 #[tokio::test]

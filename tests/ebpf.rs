@@ -3972,7 +3972,10 @@ impl reliaburger::grill::Grill for InitPolicyGrill {
     fn honours_cgroup_path(&self) -> bool {
         self.runtime.honours_cgroup_path()
     }
-    async fn pid(&self, id: &reliaburger::grill::InstanceId) -> Option<u32> {
+    async fn pid(
+        &self,
+        id: &reliaburger::grill::InstanceId,
+    ) -> Result<Option<u32>, reliaburger::grill::GrillError> {
         self.runtime.pid(id).await
     }
     async fn container_ip(&self, id: &reliaburger::grill::InstanceId) -> Option<Ipv4Addr> {

@@ -241,7 +241,14 @@ async fn complete_entry<G: Grill>(
             .await
             .map(|state| matches!(state, Ok(ContainerState::Stopped)))
     };
-    let pid = tokio::time::timeout_at(deadline, grill.pid(&id));
+    // `None` when the pid is unknown: the read missed the deadline, or the
+    // runtime failed to answer, which never means "no process".
+    let pid = async {
+        tokio::time::timeout_at(deadline, grill.pid(&id))
+            .await
+            .ok()
+            .and_then(Result::ok)
+    };
     let exit_code = async {
         match recorded_exit {
             Some(code) => Ok(code),
@@ -249,15 +256,17 @@ async fn complete_entry<G: Grill>(
         }
     };
     let (exited, pid, exit_code) = tokio::join!(exited, pid, exit_code);
-    status.runtime_unknown = exited.is_err() || pid.is_err() || exit_code.is_err();
     // A missing liveness verdict leaves the loop's view of the state.
+    let liveness_unknown = exited.is_err();
     let exited = exited.unwrap_or(false);
     if exited {
         // The loop hasn't noticed yet; its next tick will.
         status.state = ContainerState::Stopped.to_string();
     }
-    // An exited instance has no process, whatever the pid read saw first.
-    status.pid = pid.ok().flatten().filter(|_| !exited);
+    // An exited instance has no process, whatever the pid read saw first,
+    // so its pid is known even when that read failed.
+    status.runtime_unknown = liveness_unknown || (pid.is_none() && !exited) || exit_code.is_err();
+    status.pid = pid.flatten().filter(|_| !exited);
     status.exit_code = exit_code.unwrap_or(recorded_exit.flatten());
     status
 }

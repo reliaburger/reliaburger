@@ -199,6 +199,20 @@ async fn a_slow_liveness_check_does_not_hide_a_pid_that_answered() {
     assert!(statuses[0].runtime_unknown, "{statuses:?}");
 }
 
+/// The runtime failed to read the pid of a live instance (a process owner
+/// that didn't answer, #358). That is an unknown pid, not "no process".
+#[tokio::test]
+async fn a_pid_the_runtime_could_not_read_is_unknown_not_absent() {
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    expect_complete(&drain_deploy(&mut agent, replicated("web", 1)).await);
+    grill.set_pid(4242);
+    grill.set_fail_pid(true);
+    let statuses = agent.get_status().await;
+    assert_eq!(statuses[0].state, "running");
+    assert_eq!(statuses[0].pid, None);
+    assert!(statuses[0].runtime_unknown, "{statuses:?}");
+}
+
 /// The runtime says the instance has exited, so it has no process left,
 /// even if the pid read still named the one it had.
 #[tokio::test]

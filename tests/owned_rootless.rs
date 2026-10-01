@@ -170,14 +170,14 @@ async fn rootless_port_and_launcher_survive_recovery_and_helper_replacement() {
     first.create(&id, &spec).await.unwrap();
     install_fixture(&data, &id);
     first.start(&id).await.unwrap();
-    let launcher = first.pid(&id).await.unwrap();
+    let launcher = first.pid(&id).await.unwrap().unwrap();
     let network = first.rootless_network_record(&id).await.unwrap();
     let url = format!("http://127.0.0.1:{port}");
     assert_eq!(read_page(&url).await, "owned-rootless");
     drop(first);
     let recovered = runtime(&data);
     assert_eq!(recovered.state(&id).await.unwrap(), ContainerState::Running);
-    assert_eq!(recovered.pid(&id).await, Some(launcher));
+    assert_eq!(recovered.pid(&id).await.unwrap(), Some(launcher));
     // Fault injection against a just-observed helper; production recovery uses its owner.
     nix::sys::signal::kill(
         nix::unistd::Pid::from_raw(network.owner_pid as i32),
@@ -199,7 +199,7 @@ async fn rootless_port_and_launcher_survive_recovery_and_helper_replacement() {
     })
     .await
     .unwrap();
-    assert_eq!(recovered.pid(&id).await, Some(launcher));
+    assert_eq!(recovered.pid(&id).await.unwrap(), Some(launcher));
     assert_eq!(
         std::fs::read_to_string(data.join("shared/launches")).unwrap(),
         "launch"
@@ -325,7 +325,7 @@ async fn rootless_pid_answers_while_state_reads_hold_the_instance() {
     let root = tempfile::tempdir().unwrap();
     let id = InstanceId("rootless-busy".into());
     let (first, network, url) = start_published_with_wrapper(root.path(), &id).await;
-    let launcher = first.pid(&id).await.unwrap();
+    let launcher = first.pid(&id).await.unwrap().unwrap();
     drop(first);
     let runtime = runtime(root.path());
     assert_eq!(runtime.state(&id).await.unwrap(), ContainerState::Running);
@@ -345,7 +345,7 @@ async fn rootless_pid_answers_while_state_reads_hold_the_instance() {
         .collect();
     tokio::time::sleep(Duration::from_millis(50)).await;
     let asked = std::time::Instant::now();
-    assert_eq!(runtime.pid(&id).await, Some(launcher));
+    assert_eq!(runtime.pid(&id).await.unwrap(), Some(launcher));
     assert!(
         asked.elapsed() < Duration::from_millis(250),
         "the pid waited {:?} behind state reads",
@@ -360,7 +360,7 @@ async fn rootless_pid_answers_while_state_reads_hold_the_instance() {
     assert_eq!(runtime.state(&id).await.unwrap(), ContainerState::Running);
     assert_eq!(read_page(&url).await, "owned-rootless");
     runtime.kill(&id).await.unwrap();
-    assert_eq!(runtime.pid(&id).await, None);
+    assert_eq!(runtime.pid(&id).await.unwrap(), None);
 }
 
 #[tokio::test]

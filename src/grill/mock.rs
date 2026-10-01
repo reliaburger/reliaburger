@@ -74,6 +74,8 @@ pub struct MockGrill {
     pid_delay: Arc<Mutex<Option<std::time::Duration>>>,
     /// Per-instance pid delays, on top of `pid_delay`.
     instance_pid_delays: Arc<Mutex<HashMap<InstanceId, std::time::Duration>>>,
+    /// Make pid reads fail, as an owner that doesn't answer does.
+    fail_pid: Arc<AtomicBool>,
     fail_create: Arc<AtomicBool>,
     fail_start: Arc<AtomicBool>,
     fail_state: Arc<AtomicBool>,
@@ -125,6 +127,7 @@ impl Default for MockGrill {
             kill_delay: Arc::default(),
             pid_delay: Arc::default(),
             instance_pid_delays: Arc::default(),
+            fail_pid: Arc::default(),
             fail_create: Arc::default(),
             fail_start: Arc::default(),
             fail_state: Arc::default(),
@@ -403,6 +406,11 @@ impl MockGrill {
     /// Delay every pid read, as a runtime waiting on a busy lifecycle lock would.
     pub fn set_pid_delay(&self, delay: Option<std::time::Duration>) {
         *self.pid_delay.lock().unwrap() = delay;
+    }
+
+    /// Make every pid read fail, as a runtime that can't say does.
+    pub fn set_fail_pid(&self, fail: bool) {
+        self.fail_pid.store(fail, Ordering::SeqCst);
     }
 
     /// Delay pid reads for one instance only, as runc does while that
@@ -698,7 +706,7 @@ impl super::Grill for MockGrill {
             .and_then(|path| crate::sesame::egress::cgroup_id_of_path(path)))
     }
 
-    async fn pid(&self, instance: &InstanceId) -> Option<u32> {
+    async fn pid(&self, instance: &InstanceId) -> Result<Option<u32>, GrillError> {
         let delay = self
             .instance_pid_delays
             .lock()
@@ -709,7 +717,13 @@ impl super::Grill for MockGrill {
         if let Some(delay) = delay {
             tokio::time::sleep(delay).await;
         }
-        *self.pid.lock().unwrap()
+        if self.fail_pid.load(Ordering::SeqCst) {
+            return Err(GrillError::StateUnavailable {
+                instance: instance.clone(),
+                reason: "mock pid failure".into(),
+            });
+        }
+        Ok(*self.pid.lock().unwrap())
     }
 
     async fn exec(&self, instance: &InstanceId, _command: &[String]) -> Result<String, GrillError> {

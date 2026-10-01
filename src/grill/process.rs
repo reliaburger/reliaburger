@@ -642,20 +642,27 @@ impl super::Grill for ProcessGrill {
         Ok(true)
     }
 
-    async fn pid(&self, instance: &InstanceId) -> Option<u32> {
+    async fn pid(&self, instance: &InstanceId) -> Result<Option<u32>, GrillError> {
         if let Some(control) = &self.control {
-            return match control.status(instance).await.ok()?.phase {
+            // An owner that didn't answer leaves the pid unknown, never
+            // "no process" (#358).
+            let record = control
+                .status(instance)
+                .await
+                .map_err(|error| owner_error(instance, error))?;
+            return Ok(match record.phase {
                 OwnerPhase::Running { pid } => Some(pid),
                 _ => None,
-            };
+            });
         }
         let procs = self.processes.lock().await;
-        let entry = procs.get(instance)?;
-        entry
-            .child
-            .as_ref()
-            .and_then(|c| c.id())
-            .or(entry.adopted.map(|adopted| adopted.pid))
+        Ok(procs.get(instance).and_then(|entry| {
+            entry
+                .child
+                .as_ref()
+                .and_then(|c| c.id())
+                .or(entry.adopted.map(|adopted| adopted.pid))
+        }))
     }
 
     async fn log_stem(&self, instance: &InstanceId) -> Option<PathBuf> {
@@ -906,7 +913,7 @@ mod tests {
                     spec_with_args(vec!["/bin/sh".into(), "-c".into(), format!("exit {exit}")]);
                 grill.create(&id, &spec).await.unwrap();
                 grill.start(&id).await.unwrap();
-                let pid = grill.pid(&id).await.unwrap();
+                let pid = grill.pid(&id).await.unwrap().unwrap();
                 // WNOWAIT observes exit without reaping the child, preserving
                 // the exact zombie-group state that macOS refuses to signal.
                 tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -1552,7 +1559,7 @@ mod tests {
 
         assert!(adopted);
         assert_eq!(grill.state(&id).await.unwrap(), ContainerState::Running);
-        assert_eq!(grill.pid(&id).await, Some(pid));
+        assert_eq!(grill.pid(&id).await.unwrap(), Some(pid));
 
         external.kill().unwrap();
         external.wait().unwrap();
@@ -1651,7 +1658,7 @@ mod tests {
         let id = InstanceId("lost-wait-owner".into());
         grill.create(&id, &sleep_spec("0.01")).await.unwrap();
         grill.start(&id).await.unwrap();
-        let pid = grill.pid(&id).await.unwrap();
+        let pid = grill.pid(&id).await.unwrap().unwrap();
         // Consume the kernel wait result outside the Child handle. The
         // runtime can no longer obtain its own exit evidence and must refuse.
         tokio::task::spawn_blocking(move || {
