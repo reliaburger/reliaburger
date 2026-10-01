@@ -3,6 +3,7 @@
 //! cross-node routing paths without starting gossip or Raft.
 
 use super::faults::ClusterFaultList;
+use super::nodes::relay_allows;
 use super::*;
 use crate::smoker::types::{FaultRequest, FaultSummary, FaultType, ReplicaEvidence};
 use tokio_util::sync::CancellationToken;
