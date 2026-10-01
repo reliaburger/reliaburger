@@ -41,6 +41,12 @@ lists every node's build. Nodes count as the same build when their version and
 commit match, so one commit built for arm64 and x86_64 isn't skew; the SHA-256
 decides only for a build that doesn't know its commit.
 
+A node that doesn't answer (a dead one, say) leaves its build unknown, so
+there's no OK row. You get one UNKNOWN `[builds]` row instead, which says what
+the nodes that answered run and names the one that didn't. If the nodes that
+answered disagree, the `version-skew` warning carries the silent node in its
+details.
+
 `relish inspect <app>` uses the same relay to list every instance of an app on
 every node, with the node it runs on, under a `desired` vs `running` replica
 count. A node that doesn't answer, or that gossip already considers dead, gets
