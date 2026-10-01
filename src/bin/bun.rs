@@ -101,6 +101,9 @@ enum Command {
         #[arg(long)]
         instance: String,
     },
+    /// Appliance OS steps (docs/manual/14_appliance.md).
+    #[command(subcommand)]
+    Appliance(ApplianceCommand),
     /// Run the built-in test workload.
     ///
     /// The same server the library exposes, shipped inside `bun` so every
@@ -142,6 +145,21 @@ enum Command {
         /// Number of CPU-burning worker threads.
         #[arg(long)]
         cpu_workers: usize,
+    },
+}
+
+/// `bun appliance ...`: what an appliance runs before and beside the agent.
+#[derive(clap::Subcommand)]
+enum ApplianceCommand {
+    /// Prepare this node from its seed: install the bootstrap material, or
+    /// enrol and fetch the master key, then write node.toml. Run by
+    /// reliaburger-seed.service before the agent.
+    Prepare,
+    /// Show this node's status on a console, refreshed every five seconds.
+    Console {
+        /// The terminal to draw on.
+        #[arg(long, default_value = "/dev/tty1")]
+        tty: PathBuf,
     },
 }
 
@@ -706,6 +724,19 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     }) = &cli.command
     {
         return run_testapp(mode, *port, *count, *delay, *alloc_mib).await;
+    }
+    // The appliance's own steps, before (prepare) or beside (console) an agent.
+    if let Some(Command::Appliance(command)) = &cli.command {
+        let paths = reliaburger::appliance::Paths::system();
+        return match command {
+            ApplianceCommand::Prepare => reliaburger::appliance::prepare::run(&paths)
+                .await
+                .map(|_| ())
+                .map_err(|e| anyhow::anyhow!("reliaburger: {e}")),
+            ApplianceCommand::Console { tty } => reliaburger::appliance::console::run(&paths, tty)
+                .await
+                .map_err(|e| anyhow::anyhow!("console {}: {e}", tty.display())),
+        };
     }
 
     // Resolve the running version from the real executable path (not argv[0]):

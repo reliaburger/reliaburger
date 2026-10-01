@@ -729,60 +729,20 @@ pub async fn join(
     ca_fingerprint: Option<&str>,
 ) -> Result<(), RelishError> {
     let base = normalise_member_base(addr);
-    let ca_url = format!("{base}/v1/cluster/ca");
-    let member_url = format!("{base}/v1/cluster/join");
     let dir = identity_dir
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("identity"));
-
-    // Phase 1 — fetch the cluster's public CA over trust-on-first-use. This
-    // reveals no secret; a joiner has no CA yet, so it cannot verify the
-    // member's certificate on this first contact. If a fingerprint was pinned,
-    // a mismatch is refused *here*, before the one-time token is ever sent — so
-    // a man-in-the-middle cannot capture and replay a token the real cluster
-    // never consumed.
-    let tofu_client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| RelishError::JoinFailed(e.to_string()))?;
-
-    let ca = crate::sesame::join::fetch_ca(&tofu_client, &ca_url)
+    let identity = crate::sesame::join::enrol(&base, token, node_id, ca_fingerprint)
         .await
-        .map_err(|e| RelishError::JoinFailed(e.to_string()))?;
-    let offered = ca
-        .root_ca_fingerprint()
-        .map_err(|e| RelishError::JoinFailed(e.to_string()))?;
-    if let Some(expected) = ca_fingerprint
-        && offered != expected
-    {
-        return Err(RelishError::JoinFailed(format!(
-            "root CA fingerprint mismatch: member offered {offered}, expected {expected} — \
-             refusing to send the join token"
-        )));
-    }
-    let (node_ca_der, root_ca_der) = ca
-        .decode()
-        .map_err(|e| RelishError::JoinFailed(e.to_string()))?;
-
-    // Phase 2 — send the token only over a connection whose server certificate
-    // is cryptographically verified to chain to the CA we just fetched (and, if
-    // pinned, fingerprint-checked). A man-in-the-middle without the cluster's
-    // key cannot present such a chain, so the handshake fails before the token
-    // leaves this node. `request_join` re-checks the pinned fingerprint against
-    // the returned bundle as defence in depth.
-    let pinned_client = crate::sesame::mtls::build_ca_pinned_client(node_ca_der, root_ca_der)
-        .map_err(|e| RelishError::JoinFailed(e.to_string()))?;
-
-    let identity = crate::sesame::join::request_join(
-        &pinned_client,
-        &member_url,
-        token,
-        node_id,
-        ca_fingerprint,
-    )
-    .await
-    .map_err(|e| RelishError::JoinFailed(e.to_string()))?;
+        .map_err(|e| match e {
+            crate::sesame::join::JoinClientError::FingerprintMismatch { offered, expected } => {
+                RelishError::JoinFailed(format!(
+                    "root CA fingerprint mismatch: member offered {offered}, expected {expected} — \
+                     refusing to send the join token"
+                ))
+            }
+            other => RelishError::JoinFailed(other.to_string()),
+        })?;
 
     let fingerprint = crate::sesame::identity_store::root_ca_fingerprint(&identity.root_ca_der);
     crate::sesame::identity_store::save(&dir, &identity)

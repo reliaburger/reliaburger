@@ -489,6 +489,51 @@ fn mint_join_token(
     Ok((plaintext, join_token))
 }
 
+/// Enrol this machine as `node_id` through the member at `member_base`
+/// (`https://<host>:9117`), and return its new identity.
+///
+/// Phase 1 fetches the cluster's public CA over trust-on-first-use: a
+/// joiner has no CA yet, and the CA reveals nothing. A pinned
+/// `expected_fingerprint` that doesn't match stops here, before the token is
+/// sent, so a man-in-the-middle can't capture a token the real cluster
+/// never consumed. Phase 2 sends the token only over a connection whose
+/// server certificate chains to that CA. `relish join` and an appliance's
+/// `bun appliance prepare` both enrol this way.
+pub async fn enrol(
+    member_base: &str,
+    token: &str,
+    node_id: &str,
+    expected_fingerprint: Option<&str>,
+) -> Result<NodeIdentity, JoinClientError> {
+    let base = member_base.trim_end_matches('/');
+    let tofu_client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|e| JoinClientError::Transport(e.to_string()))?;
+    let ca = fetch_ca(&tofu_client, &format!("{base}/v1/cluster/ca")).await?;
+    let offered = ca.root_ca_fingerprint()?;
+    if let Some(expected) = expected_fingerprint
+        && offered != expected
+    {
+        return Err(JoinClientError::FingerprintMismatch {
+            offered,
+            expected: expected.to_string(),
+        });
+    }
+    let (node_ca_der, root_ca_der) = ca.decode()?;
+    let pinned_client = super::mtls::build_ca_pinned_client(node_ca_der, root_ca_der)
+        .map_err(|e| JoinClientError::Transport(e.to_string()))?;
+    request_join(
+        &pinned_client,
+        &format!("{base}/v1/cluster/join"),
+        token,
+        node_id,
+        expected_fingerprint,
+    )
+    .await
+}
+
 /// Fetch the cluster's master key from a member, as the node that just
 /// joined (G1): the request presents the node's new certificate, and the
 /// member's certificate must chain to the cluster CA in that identity.
