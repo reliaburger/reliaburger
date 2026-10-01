@@ -81,6 +81,19 @@ pub enum UpgradeError {
         nodes: String,
     },
 
+    /// A council too small to lose a voter for its swap without losing
+    /// quorum. The run would wait in the council phase for good.
+    #[error(
+        "a council of {voters} voters can't upgrade one voter at a time: taking one down \
+         leaves {remaining}, short of the {quorum} needed for quorum. Add a node so the \
+         council has at least three voters, then start again"
+    )]
+    CouncilTooSmallToRoll {
+        voters: usize,
+        remaining: usize,
+        quorum: usize,
+    },
+
     /// `relish upgrade abort` on an upgrade that isn't paused.
     #[error("the upgrade is {phase}, not paused; only a paused upgrade can be aborted")]
     AbortNotPaused { phase: String },

@@ -4110,6 +4110,43 @@ The tests pin each of those cases: a uniform cluster, one odd node, a
 different version with no commits at all, one commit on two architectures,
 two commit-less builds told apart by their hashes, and an unreadable node.
 
+That last case had a wrinkle, and the 0.1.2 tour recording caught it. With one
+node dead, the evidence came back *degraded*: two builds read, one node
+silent. The generic unknown sweep saw the degraded source and filed an
+UNKNOWN row. Then `check_builds` saw two matching builds and filed an OK row,
+"all 2 nodes run bun v0.1.2". The same check, twice, under two verdicts that
+contradict each other. So `check_builds` now owns its unknowns. A uniform
+build with a silent node becomes one UNKNOWN that carries both halves:
+
+```text
+UNKNOWN (1)
+  [builds] cluster: the 2 nodes that answered run bun v0.1.2 (3fcb1fd), sha256 aaaa1111bbbb; node node-3: version: timed out after 10s
+```
+
+Skew with a silent node stays one warning, with a `not read:` line in its
+details. Picking the description uses a *match guard*, an `if` after a
+pattern that must also hold for the arm to match:
+
+```rust
+let description = match builds.as_slice() {
+    [only] => format!("{} runs {}", only.node_id, describe_build(only)),
+    [first, ..] if unread.is_none() => {
+        format!("all {} nodes run {}", builds.len(), describe_build(first))
+    }
+    [first, ..] => format!(
+        "the {} nodes that answered run {}",
+        builds.len(),
+        describe_build(first)
+    ),
+    [] => return,
+};
+```
+
+When the guard fails, Rust falls through to the next arm, so the second
+`[first, ..]` catches exactly the degraded case. Go's `switch` with `case`
+expressions does something similar, but here the compiler still checks that
+the arms cover every slice length.
+
 ## Walk the path you actually care about
 
 Say `web` can't reach `redis`. Checking Bun's own DNS and TCP access might tell

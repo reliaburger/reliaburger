@@ -81,6 +81,12 @@ needs `--allow-downgrade` (note that `v0.2.0-rc.1` is older than `v0.2.0`);
 without `[upgrades] external_signing_key` would refuse the binary, so `start`
 fails there and names the node, and nothing is recorded.
 
+A cluster whose council has exactly two voters can't roll at all: taking
+either one down for its swap leaves one, short of the two a quorum needs.
+`start` and a cluster `rollback` refuse it and ask for a third node. Once a run
+has started, losing a voter makes it wait in the council phase instead, and
+the leader logs `cluster upgrade ... waiting: N of M voters alive`.
+
 Then the leader does what every node will do with the candidate: it fetches
 the binary from the registry, checks both signatures and runs
 `bun --compatibility` on it. A release with a different protocol or state

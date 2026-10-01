@@ -2227,6 +2227,28 @@ struct StartUpgradeNode {
     role: crate::upgrade::types::NodeRole,
 }
 
+/// Refuse a run a two-voter council would hold in the council phase for
+/// good: the orchestrator never takes a voter down without quorum to spare,
+/// and a holding run isn't paused, so it couldn't be aborted either.
+// `Response` is large but it IS the HTTP reply to send on failure.
+#[allow(clippy::result_large_err)]
+fn check_council_can_roll(council: &crate::council::CouncilNode) -> Result<(), Response> {
+    let configured_voters = council
+        .metrics()
+        .borrow()
+        .membership_config
+        .membership()
+        .voter_ids()
+        .count();
+    crate::upgrade::plan::check_council_can_roll(configured_voters).map_err(|e| {
+        (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response()
+    })
+}
+
 /// Start a cluster-wide rolling upgrade (admin, leader only).
 ///
 /// The caller (relish) has already pushed the binary blob to the leader's
@@ -2379,6 +2401,10 @@ async fn upgrade_start_handler(
             )
                 .into_response();
         }
+    }
+
+    if let Err(resp) = check_council_can_roll(council) {
+        return resp;
     }
 
     let upgrade_id = format!(
@@ -2910,6 +2936,10 @@ async fn upgrade_cluster_rollback_handler(
             Json(serde_json::json!({ "error": e.to_string() })),
         )
             .into_response();
+    }
+
+    if let Err(resp) = check_council_can_roll(council) {
+        return resp;
     }
 
     let upgrade_id = format!(
@@ -12022,6 +12052,78 @@ schedule = "* * * * *"
         });
         tokio::spawn(async move { axum::serve(listener, leader).await.unwrap() });
         seen
+    }
+
+    /// An in-memory council with `voters` voters, led by node 1.
+    async fn council_of(voters: u64) -> Vec<Arc<crate::council::CouncilNode>> {
+        use crate::council::CouncilNode;
+        use crate::council::log_store::MemLogStore;
+        use crate::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
+        use crate::council::state_machine::CouncilStateMachine;
+        use crate::council::types::{CouncilConfig, CouncilNodeInfo};
+
+        let network = InMemoryRaftRouter::new();
+        let mut nodes = Vec::new();
+        let mut members = std::collections::BTreeMap::new();
+        for id in 1..=voters {
+            members.insert(
+                id,
+                CouncilNodeInfo {
+                    addr: std::net::SocketAddr::from(([127, 0, 0, 1], 7000 + id as u16)),
+                    name: format!("node-{id}"),
+                },
+            );
+            let node = Arc::new(
+                CouncilNode::new(
+                    id,
+                    CouncilConfig::default(),
+                    InMemoryRaftNetworkFactory::new(id, network.clone()),
+                    MemLogStore::new(),
+                    CouncilStateMachine::new(),
+                    None,
+                )
+                .await
+                .unwrap(),
+            );
+            network.register(id, node.raft().clone()).await;
+            nodes.push(node);
+        }
+        nodes[0].initialize(members).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while nodes[0].current_leader().await.is_none() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        nodes
+    }
+
+    /// The appliance lab's two-node cluster (#259): start and a cluster
+    /// rollback read the council's configured voters from Raft, and two of
+    /// them can never roll, so both handlers refuse with a 409.
+    #[tokio::test]
+    async fn a_two_voter_council_refuses_to_roll_and_three_voters_can() {
+        let pair = council_of(2).await;
+        let refusal = check_council_can_roll(&pair[0]).expect_err("two voters must be refused");
+        assert_eq!(refusal.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(refusal.into_body(), 4096)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains("council of 2 voters") && body.contains("at least three voters"),
+            "{body}"
+        );
+        for node in pair {
+            node.shutdown().await.unwrap();
+        }
+
+        let trio = council_of(3).await;
+        assert!(check_council_can_roll(&trio[0]).is_ok());
+        for node in trio {
+            node.shutdown().await.unwrap();
+        }
     }
 
     /// A three-node council led by node 1, whose API is a fake that records
