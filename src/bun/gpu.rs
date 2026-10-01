@@ -153,9 +153,9 @@ mod tests {
 
     /// Real-hardware acceptance: on a node with an NVIDIA GPU, the detector
     /// enumerates at least one card. Gated so it only runs where the
-    /// hardware and `nvidia-smi` exist (`make test-linux`).
+    /// hardware and `nvidia-smi` exist (`make test-gpu`).
     #[test]
-    #[ignore = "requires an NVIDIA GPU and nvidia-smi (RELIABURGER_GPU_TESTS)"]
+    #[ignore = "requires an NVIDIA GPU and nvidia-smi (RELIABURGER_GPU_TESTS); run with make test-gpu"]
     fn nvidia_detector_finds_hardware() {
         let gpus = NvidiaGpuDetector.detect();
         assert!(

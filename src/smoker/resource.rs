@@ -347,7 +347,7 @@ mod tests {
     /// loudly rather than manufacturing a pass.
     #[cfg(target_os = "linux")]
     #[test]
-    #[ignore = "requires linux cgroup-v2 write access (RELIABURGER_CGROUP_TESTS=1)"]
+    #[ignore = "requires linux cgroup-v2 write access (RELIABURGER_CGROUP_TESTS=1); run with make test-linux"]
     fn cgroup_cpu_stress_applies_and_restores() {
         assert!(
             std::env::var("RELIABURGER_CGROUP_TESTS").is_ok(),
@@ -378,7 +378,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    #[ignore = "requires linux cgroup-v2 write access (RELIABURGER_CGROUP_TESTS=1)"]
+    #[ignore = "requires linux cgroup-v2 write access (RELIABURGER_CGROUP_TESTS=1); run with make test-linux"]
     fn cgroup_memory_pressure_applies_and_restores() {
         assert!(
             std::env::var("RELIABURGER_CGROUP_TESTS").is_ok(),
@@ -414,7 +414,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    #[ignore = "requires linux cgroup-v2 write access (RELIABURGER_CGROUP_TESTS=1)"]
+    #[ignore = "requires linux cgroup-v2 write access (RELIABURGER_CGROUP_TESTS=1); run with make test-linux"]
     fn cgroup_disk_io_throttle_applies_and_removes() {
         assert!(
             std::env::var("RELIABURGER_CGROUP_TESTS").is_ok(),

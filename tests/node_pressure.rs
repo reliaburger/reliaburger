@@ -26,7 +26,7 @@ fn pressure_target() -> u8 {
 }
 
 #[tokio::test]
-#[ignore = "requires rootful Linux cgroup v2 (RELIABURGER_NODE_PRESSURE_TESTS=1)"]
+#[ignore = "requires rootful Linux cgroup v2 (RELIABURGER_NODE_PRESSURE_TESTS=1); run with make test-linux"]
 async fn node_pressure_consumes_capacity_outside_bun_and_cleans_up() {
     // Selecting this ignored test is a request to run it. A host without the
     // opt-in fails loudly instead of printing "skipped" and passing, which
@@ -173,7 +173,7 @@ async fn node_pressure_consumes_capacity_outside_bun_and_cleans_up() {
 }
 
 #[tokio::test]
-#[ignore = "requires rootful Linux cgroup v2 (RELIABURGER_NODE_PRESSURE_TESTS=1)"]
+#[ignore = "requires rootful Linux cgroup v2 (RELIABURGER_NODE_PRESSURE_TESTS=1); run with make test-linux"]
 async fn disabling_pressure_still_reclaims_previous_helpers() {
     assert_eq!(
         std::env::var("RELIABURGER_NODE_PRESSURE_TESTS").as_deref(),
@@ -212,7 +212,7 @@ async fn disabling_pressure_still_reclaims_previous_helpers() {
 }
 
 #[tokio::test]
-#[ignore = "requires rootful Linux cgroup v2 (RELIABURGER_NODE_PRESSURE_TESTS=1)"]
+#[ignore = "requires rootful Linux cgroup v2 (RELIABURGER_NODE_PRESSURE_TESTS=1); run with make test-linux"]
 async fn noisy_helpers_do_not_block_readiness_or_erase_failure_diagnostics() {
     use std::os::unix::fs::PermissionsExt;
     use std::time::{Duration, Instant};
@@ -282,7 +282,7 @@ async fn noisy_helpers_do_not_block_readiness_or_erase_failure_diagnostics() {
 }
 
 #[tokio::test]
-#[ignore = "requires rootful Linux cgroup v2 (RELIABURGER_NODE_PRESSURE_TESTS=1)"]
+#[ignore = "requires rootful Linux cgroup v2 (RELIABURGER_NODE_PRESSURE_TESTS=1); run with make test-linux"]
 async fn helper_dies_with_creating_thread_or_parent_and_stale_cgroup_is_reclaimed() {
     use std::time::Duration;
 
