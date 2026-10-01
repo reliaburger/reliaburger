@@ -679,6 +679,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_step_line_appears_while_the_step_is_still_running() {
+        // A slow first step (a download on a slow link) must not leave the
+        // screen blank: its line is written when it starts, not when it ends.
+        let output = Shared::default();
+        let progress = Progress::new(output.clone(), false);
+        let step = progress.step(Stage::Download, "download relish");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !output.text().contains("... download relish") {
+            assert!(Instant::now() < deadline, "no start line within 5 s");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!output.text().contains("[ ok ]"), "{}", output.text());
+        step.done();
+        progress.finish().await;
+    }
+
+    #[tokio::test]
     async fn terminal_output_redraws_in_place() {
         let output = Shared::default();
         let progress = Progress::new(output.clone(), true);

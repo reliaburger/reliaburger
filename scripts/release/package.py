@@ -175,7 +175,10 @@ def package_release(directory, version, repository, key, trusted_keys, pins):
     template = template.replace("@VERSION@", version).replace("@REPOSITORY@", repository)
     for platform in PLATFORMS["relish"]:
         marker = "@" + platform.upper().replace("-", "_") + "@"
-        template = template.replace(marker, sha256(directory / f"relish-{platform}"))
+        binary = directory / f"relish-{platform}"
+        # The installer names the size before it downloads.
+        template = template.replace(marker[:-1] + "_SIZE@", str(binary.stat().st_size))
+        template = template.replace(marker, sha256(binary))
     (directory / "install.sh").write_text(template)
 
 

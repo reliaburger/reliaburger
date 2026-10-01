@@ -17,6 +17,11 @@ relish logs hello
 relish dashboard             # Ctrl-C stops the browser connection
 ```
 
+The installer says what it's fetching before each download (for example
+`Downloading relish v0.1.2 for macos-aarch64 (37.2 MiB)...`), draws curl's
+progress bar when you run it in a terminal, and finishes each download with
+the bytes and seconds it took. In a log or a pipe it prints only those lines.
+
 The installer keeps `relish` in `~/.reliaburger/bin`. If `~/.local/bin` is
 already on your `PATH`, it links `~/.local/bin/relish` there and you're done.
 Otherwise it prints the one line to add for your shell (`~/.zshrc`,
@@ -109,7 +114,8 @@ temporary error, setup reconnects and asks for the rest of the file, and the
 progress line says so (`resumed at 113.1 MiB (retry 2)`). It gives up only
 after ten attempts in a row that bring no new data, or after 30 minutes of
 downloads in total; the partial file stays, and the next run resumes it. The
-installer's own `curl` download does the same, up to five attempts. If setup
+installer's own `curl` download does the same, up to five attempts, and prints
+a line for each one. If setup
 fails or runs out of time, rerun the same command. It reuses verified cached
 assets, the original CA and the owned VMs. A retry won't silently
 change the version, topology or ports, or replace a previously running VM

@@ -281,6 +281,179 @@ tail -c +$((have + 1)) "$source" | head -c "$piece" >> "$output"
                 self.assertIn(b"could not download", result.stderr)
                 self.assertFalse((home / ".reliaburger/bin/relish").exists())
 
+    def recording_tools(self, name):
+        """Fake `curl` that delivers each file whole and appends its
+        arguments to $CALLS. With --progress-bar it draws a bar on stderr,
+        as the real one does, so a test can see where the bar went."""
+        tools = self.root / name
+        tools.mkdir()
+        (tools / "uname").write_text('#!/bin/sh\ncase "$1" in -s) echo Darwin;; -m) echo arm64;; esac\n')
+        (tools / "curl").write_text("""#!/bin/sh
+printf '%s\\n' "$*" >> "$CALLS"
+bar=false
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --progress-bar) bar=true ;;
+    -o) output=$2; shift ;;
+    https://*) url=$1 ;;
+  esac
+  shift
+done
+case "$url" in
+  */install.sh) cp "$INSTALLER" "$output" ;;
+  *) cp "$FIXTURE" "$output" ;;
+esac
+[ "$bar" = false ] || printf '######################################## 100.0%%\\r' >&2
+""")
+        for tool in tools.iterdir():
+            tool.chmod(0o755)
+        return tools
+
+    def download_env(self, tools, home):
+        import os
+        calls = self.root / (tools.name + "-calls")
+        calls.unlink(missing_ok=True)
+        return calls, dict(os.environ, HOME=str(home), PATH=str(tools) + os.pathsep + os.environ["PATH"],
+                           CALLS=str(calls), FIXTURE=str(self.assets / "relish-macos-aarch64"),
+                           INSTALLER=str(self.assets / "install.sh"), RELIABURGER_NO_MODIFY_PATH="1",
+                           RELIABURGER_RELEASE_BASE_URL="https://example.com/r")
+
+    def run_with_terminal_stderr(self, command, env):
+        """Run `command` with stderr on a pseudo-terminal, as `curl | sh`
+        typed at a prompt has it. Returns (exit code, terminal output)."""
+        import os
+        import pty
+        controller, terminal = pty.openpty()
+        try:
+            process = subprocess.Popen(command, env=env, stdin=subprocess.DEVNULL,
+                                       stdout=subprocess.DEVNULL, stderr=terminal)
+            os.close(terminal)
+            terminal = None
+            seen = b""
+            while True:
+                try:
+                    chunk = os.read(controller, 4096)
+                except OSError:
+                    break  # Linux reports EIO once the last writer has gone
+                if not chunk:
+                    break
+                seen += chunk
+            return process.wait(), seen.replace(b"\r\n", b"\n")
+        finally:
+            os.close(controller)
+            if terminal is not None:
+                os.close(terminal)
+
+    def test_installers_announce_each_download_in_plain_lines_without_a_terminal(self):
+        import re
+        self.package()
+        size = (self.assets / "relish-macos-aarch64").stat().st_size
+        tools = self.recording_tools("plain-tools")
+        home = self.root / "plain-home"
+        home.mkdir()
+        for shell, script in [(shell, script) for shell in POSIX_SHELLS for script in [self.assets / "install.sh", BOOTSTRAP]]:
+            with self.subTest(shell=shell, script=script):
+                calls, env = self.download_env(tools, home)
+                result = subprocess.run([shell, str(script), "--install-only"], env=env, capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                stderr = result.stderr.decode()
+                self.assertIn(f"Downloading relish v0.1.0 for macos-aarch64 ({size} B)...\n", stderr)
+                self.assertRegex(stderr, rf"Downloaded {size} bytes in \d+ s\n")
+                if script == BOOTSTRAP:
+                    version = re.search(r"RELIABURGER_VERSION:-(v[^}]+)}", BOOTSTRAP.read_text()).group(1)
+                    self.assertIn(f"Downloading the Reliaburger {version} installer from https://example.com/r...\n", stderr)
+                    self.assertEqual(len(re.findall(r"Downloaded \d+ bytes", stderr)), 2)
+                # CI logs get lines, not a bar redrawn with carriage returns.
+                self.assertNotIn("\r", stderr)
+                for call in calls.read_text().splitlines():
+                    self.assertIn("--silent", call.split())
+                    self.assertNotIn("--progress-bar", call.split())
+
+    def test_installers_show_curl_progress_bar_on_a_terminal(self):
+        self.package()
+        size = (self.assets / "relish-macos-aarch64").stat().st_size
+        tools = self.recording_tools("terminal-tools")
+        home = self.root / "terminal-home"
+        home.mkdir()
+        for shell, script in [(shell, script) for shell in POSIX_SHELLS for script in [self.assets / "install.sh", BOOTSTRAP]]:
+            with self.subTest(shell=shell, script=script):
+                calls, env = self.download_env(tools, home)
+                status, seen = self.run_with_terminal_stderr([shell, str(script), "--install-only"], env)
+                self.assertEqual(status, 0, seen)
+                seen = seen.decode()
+                self.assertIn(f"Downloading relish v0.1.0 for macos-aarch64 ({size} B)...", seen)
+                self.assertIn("100.0%", seen)
+                self.assertRegex(seen, rf"Downloaded {size} bytes in \d+ s")
+                for call in calls.read_text().splitlines():
+                    self.assertIn("--progress-bar", call.split())
+                    self.assertNotIn("--silent", call.split())
+
+    def test_installers_name_each_resume_and_report_the_whole_file(self):
+        import os
+        import re
+        self.package()
+        size = (self.assets / "relish-macos-aarch64").stat().st_size
+        tools = self.flaky_tools("resume-tools", 12)
+        home = self.root / "resume-home"
+        home.mkdir()
+        env = dict(os.environ, HOME=str(home), PATH=str(tools) + os.pathsep + os.environ["PATH"],
+                   URLS=str(self.root / "resume-urls"), FIXTURE=str(self.assets / "relish-macos-aarch64"),
+                   INSTALLER=str(self.assets / "install.sh"), RELIABURGER_NO_MODIFY_PATH="1",
+                   RELIABURGER_RELEASE_BASE_URL="https://example.com/r")
+        for shell in POSIX_SHELLS:
+            with self.subTest(shell=shell):
+                result = subprocess.run([shell, str(self.assets / "install.sh"), "--install-only"], env=env, capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                stderr = result.stderr.decode()
+                self.assertIn("reliaburger: download interrupted (curl exit 18) after 12 B; resuming, attempt 2 of 5\n", stderr)
+                self.assertIn("reliaburger: download interrupted (curl exit 18) after 24 B; resuming, attempt 3 of 5\n", stderr)
+                # The summary counts the whole file, not just the last piece.
+                self.assertEqual(re.findall(r"Downloaded (\d+) bytes in \d+ s", stderr), [str(size)])
+
+    def test_qualification_still_parses_installer_output(self):
+        """qualify-staged-install.sh tees `curl | sh` 2>&1 into install.log,
+        then greps it for the mirror notice and quotes setup's timing summary.
+        The download lines must not break either."""
+        qualify = (Path(__file__).with_name("qualify-staged-install.sh")).read_text()
+        mirror_check = "grep -q 'using an explicit release mirror' \"$evidence/install.log\""
+        summary_quote = "sed -n '/^where the time went/,$p' \"$evidence/install.log\""
+        self.assertIn(mirror_check, qualify)
+        self.assertIn(summary_quote, qualify)
+        relish_output = ("using an explicit release mirror with checksum and signature verification\n"
+                         "... check host\n"
+                         "where the time went\n"
+                         "  download 3.0 s\n")
+        binary = self.assets / "relish-macos-aarch64"
+        binary.write_text("#!/bin/sh\nprintf '%s' '" + relish_output + "'\n")
+        self.package()
+        tools = self.recording_tools("qualify-tools")
+        home = self.root / "qualify-home"
+        home.mkdir()
+        evidence = self.root / "evidence"
+        evidence.mkdir()
+        log = evidence / "install.log"
+        for shell in POSIX_SHELLS:
+            with self.subTest(shell=shell):
+                _, env = self.download_env(tools, home)
+                with log.open("wb") as output:
+                    result = subprocess.run([shell, str(BOOTSTRAP), "--timings"], env=env,
+                                            stdout=output, stderr=subprocess.STDOUT)
+                self.assertEqual(result.returncode, 0, log.read_text())
+                env = dict(env, evidence=str(evidence))
+                self.assertEqual(subprocess.run(["sh", "-c", mirror_check], env=env).returncode, 0)
+                quoted = subprocess.run(["sh", "-c", summary_quote], env=env, capture_output=True, check=True)
+                self.assertEqual(quoted.stdout.decode(), "where the time went\n  download 3.0 s\n")
+                text = log.read_text()
+                self.assertIn("Downloading relish v0.1.0 for macos-aarch64", text)
+                self.assertNotIn("\r", text)
+
+    def test_both_installers_download_with_the_same_helpers(self):
+        def helpers(text):
+            code = text[text.index("human_size() {"):text.index("\n}\n", text.index("download() {"))]
+            return [line for line in code.splitlines() if not line.lstrip().startswith("#")]
+        self.assertEqual(helpers(BOOTSTRAP.read_text()),
+                         helpers(Path(__file__).with_name("install.sh.in").read_text()))
+
     def test_installers_are_posix_sh(self):
         self.package()
         scripts = [self.assets / "install.sh", BOOTSTRAP]
