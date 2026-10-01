@@ -168,6 +168,24 @@ cluster the same way as above. A 0.1.1 cluster behaves as a 0.1.0 one does
 when you try: the first node refuses 0.1.2's `{"protocol":28,"state":47}` and
 the run pauses until `relish upgrade abort`.
 
+### Upgrading from 0.1.2
+
+A council of exactly two voters (a two-node cluster, or a bigger one whose
+council hasn't grown past two yet) can't roll an upgrade at all. Each voter
+goes down for its swap in turn, and the one left behind is short of the two a
+quorum needs. Up to 0.1.2, `start` accepted such a run anyway, and the leader
+held it in `UpgradingCouncil` for good: `relish upgrade status` gave no
+reason, and `relish upgrade abort` refused because the run wasn't paused. A
+run stuck like that carries on once a third node joins and the council
+promotes it, since three voters can spare one.
+
+From 0.1.3, `start` and a cluster `relish upgrade rollback` refuse a
+two-voter council before recording anything, with
+`a council of 2 voters can't upgrade one voter at a time: … Add a node so the council has at least three voters, then start again`.
+A run that loses a voter after it started still waits in the council phase,
+and the leader now logs `cluster upgrade ID waiting: N of M voters alive` once
+when the wait begins.
+
 ## Signing identity
 
 Configure the Actions secret `RELIABURGER_RELEASE_KEY` with the base64 encoding
