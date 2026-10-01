@@ -994,8 +994,7 @@ fn owned_upgrade_directive(
 
 #[cfg(feature = "ebpf")]
 async fn failed_owned_upgrade_reverts(root: &Path, node: &mut Node, key: &[u8]) {
-    let original = node.client.status().await.unwrap().remove(0);
-    assert!(original.pid.is_some(), "{original:?}");
+    let original = instance_with_pid(&node.client).await;
     std::fs::write(
         root.join("upgrade-bin/bun-v0.2.0.fail-boot"),
         "broken candidate",
@@ -1019,9 +1018,9 @@ async fn failed_owned_upgrade_reverts(root: &Path, node: &mut Node, key: &[u8]) 
             .iter()
             .any(|item| item["outcome"] == "Reverted")
     );
-    let adopted = node.client.status().await.unwrap().remove(0);
+    let adopted = instance_with_pid(&node.client).await;
     assert_eq!(adopted.id, original.id);
-    assert_eq!(adopted.pid, original.pid, "{adopted:?}");
+    assert_eq!(adopted.pid, original.pid);
     assert_eq!(adopted.host_port, original.host_port);
     assert_eq!(
         std::fs::read_to_string(root.join("shared/main")).unwrap(),
@@ -1031,8 +1030,7 @@ async fn failed_owned_upgrade_reverts(root: &Path, node: &mut Node, key: &[u8]) 
 
 #[cfg(feature = "ebpf")]
 async fn upgrade_and_rollback(root: &Path, node: &Node, key: &[u8]) {
-    let original = node.client.status().await.unwrap().remove(0);
-    assert!(original.pid.is_some(), "{original:?}");
+    let original = instance_with_pid(&node.client).await;
     let directive = owned_upgrade_directive(root, key);
     for version in ["v0.2.0", "v0.1.0"] {
         if version == "v0.2.0" {
@@ -1053,9 +1051,9 @@ async fn upgrade_and_rollback(root: &Path, node: &Node, key: &[u8]) {
         })
         .await
         .unwrap_or_else(|_| panic!("owned runtime never settled on {version}"));
-        let adopted = node.client.status().await.unwrap().remove(0);
+        let adopted = instance_with_pid(&node.client).await;
         assert_eq!(adopted.id, original.id);
-        assert_eq!(adopted.pid, original.pid, "{adopted:?}");
+        assert_eq!(adopted.pid, original.pid);
         assert_eq!(adopted.host_port, original.host_port);
         assert_eq!(
             std::fs::read_link(root.join("upgrade-bin/bun")).unwrap(),
@@ -1127,8 +1125,7 @@ async fn normal_rootless_bun_recovers_owned_forward_and_discovery() {
     ];
     node.client.apply(&app).await.unwrap();
     wait_file(&root.join("shared/main")).await;
-    let original = node.client.status().await.unwrap().remove(0);
-    assert!(original.pid.is_some(), "{original:?}");
+    let original = instance_with_pid(&node.client).await;
     let url = format!("http://127.0.0.1:{}/", original.host_port.unwrap());
     assert_eq!(
         reqwest::get(&url).await.unwrap().text().await.unwrap(),
@@ -1136,8 +1133,8 @@ async fn normal_rootless_bun_recovers_owned_forward_and_discovery() {
     );
     node.crash().await;
     let mut recovered = Node::start(&root).await;
-    let adopted = recovered.client.status().await.unwrap().remove(0);
-    assert_eq!(adopted.pid, original.pid, "{adopted:?}");
+    let adopted = instance_with_pid(&recovered.client).await;
+    assert_eq!(adopted.pid, original.pid);
     assert_eq!(adopted.host_port, original.host_port);
     assert_eq!(
         reqwest::get(&url).await.unwrap().text().await.unwrap(),
@@ -1211,8 +1208,7 @@ async fn normal_clustered_bun_recovers_enrolled_consumer_before_adoption() {
     // reconciler records the placement as applied leaves it pending, and
     // recovery then rightly redeploys instead of adopting the original.
     wait_placement_applied(&root, &name).await;
-    let original = node.client.status().await.unwrap().remove(0);
-    assert!(original.pid.is_some(), "{original:?}");
+    let original = instance_with_pid(&node.client).await;
     node.crash().await;
     // A failed first launch rolls to a new generation and would still pass
     // the rest of this test, hiding whatever made the first one fail.
@@ -1231,8 +1227,8 @@ async fn normal_clustered_bun_recovers_enrolled_consumer_before_adoption() {
     drop(journal);
     let mut recovered = Node::start(&root).await;
     wait_cluster_publication(&recovered.client, &name).await;
-    let adopted = recovered.client.status().await.unwrap().remove(0);
-    assert_eq!(adopted.pid, original.pid, "{adopted:?}");
+    let adopted = instance_with_pid(&recovered.client).await;
+    assert_eq!(adopted.pid, original.pid);
     assert_eq!(adopted.host_port, original.host_port);
     assert_eq!(
         std::fs::read_to_string(root.join("shared/main")).unwrap(),
@@ -1316,6 +1312,34 @@ async fn wait_cluster_publication(client: &BunClient, name: &str) {
     })
     .await
     .expect("cluster never confirmed its workload publication");
+}
+
+/// The node's one running instance, once its status carries a pid.
+///
+/// `/v1/status` reads each pid under a shared 500 ms deadline and reports a
+/// miss as unknown rather than hold the answer, and rootless runc can take
+/// that long just after a bun starts or adopts its workloads (#358). A test
+/// comparing pids across a restart or an upgrade has to compare known ones;
+/// a different pid still fails the comparison, only an unknown one waits.
+#[cfg(feature = "ebpf")]
+async fn instance_with_pid(client: &BunClient) -> reliaburger::bun::agent::InstanceStatus {
+    let mut last = None;
+    let found = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if let Ok(mut statuses) = client.status().await
+                && !statuses.is_empty()
+            {
+                let instance = statuses.remove(0);
+                if instance.pid.is_some() {
+                    return instance;
+                }
+                last = Some(instance);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    found.unwrap_or_else(|_| panic!("the instance never reported a pid: {last:?}"))
 }
 
 #[cfg(feature = "ebpf")]
@@ -1478,7 +1502,7 @@ async fn three_enrolled_oci_nodes_preserve_ownership_through_upgrade_and_rollbac
     for node in &nodes {
         wait_cluster_publication(&node.client, &name).await;
     }
-    let original = nodes[0].client.status().await.unwrap().remove(0);
+    let original = instance_with_pid(&nodes[0].client).await;
     let manifests: Vec<_> = roots.iter().map(|root| kernel_manifest(root)).collect();
     for version in ["v0.2.0", "v0.1.0"] {
         let leader = nodes[0].client.council().await.unwrap().leader.unwrap();
@@ -1510,7 +1534,7 @@ async fn three_enrolled_oci_nodes_preserve_ownership_through_upgrade_and_rollbac
             for node in &nodes {
                 wait_cluster_publication(&node.client, &name).await;
             }
-            let current = nodes[0].client.status().await.unwrap().remove(0);
+            let current = instance_with_pid(&nodes[0].client).await;
             assert_eq!(current.id, original.id);
             assert_eq!(current.pid, original.pid);
             assert_eq!(current.host_port, original.host_port);
