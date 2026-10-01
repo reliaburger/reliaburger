@@ -497,3 +497,72 @@ fn the_pdfs_come_from_the_latest_release() {
         "the page still sends people to CI artefacts for the PDFs"
     );
 }
+
+/// The byte ranges of every `<details>…</details>` element on the page. The
+/// page doesn't nest them, which the assertion below keeps true.
+fn details_ranges(page: &str) -> Vec<std::ops::Range<usize>> {
+    let opens: Vec<usize> = page.match_indices("<details").map(|(at, _)| at).collect();
+    let closes: Vec<usize> = page
+        .match_indices("</details>")
+        .map(|(at, tag)| at + tag.len())
+        .collect();
+    assert_eq!(opens.len(), closes.len(), "unbalanced <details>");
+    let ranges: Vec<_> = opens.into_iter().zip(closes).map(|(o, c)| o..c).collect();
+    for range in &ranges {
+        assert!(range.start < range.end, "<details> closes before it opens");
+    }
+    for pair in ranges.windows(2) {
+        assert!(pair[0].end <= pair[1].start, "nested <details>");
+    }
+    ranges
+}
+
+/// People didn't notice the tour while the whole section sat in one collapsed
+/// `<details>`. The heading and the recording stay in plain view, loaded
+/// without a click; only the command list folds away.
+#[test]
+fn the_tour_recording_is_always_visible_and_only_the_commands_fold() {
+    let page = read("docs/website/index.html");
+    let folded = details_ranges(&page);
+    let inside = |at: usize| folded.iter().any(|range| range.contains(&at));
+
+    for marker in [
+        "<section id=\"tour\"",
+        "id=\"tour-title\"",
+        "id=\"tour-recording\"",
+    ] {
+        let at = page.find(marker).unwrap_or_else(|| panic!("no {marker}"));
+        assert!(!inside(at), "{marker} is inside a <details>");
+    }
+
+    let commands = page
+        .find("<details class=\"tour-commands\" id=\"tour-commands\">")
+        .expect("the tour's commands aren't in their own <details>");
+    let rest = &page[commands..];
+    let summary = &rest[rest.find("<summary>").unwrap()..rest.find("</summary>").unwrap()];
+    assert!(
+        strip_tags(summary).starts_with("Show the commands"),
+        "the commands' summary reads {summary:?}"
+    );
+    let fold = folded.iter().find(|range| range.start == commands).unwrap();
+    assert!(fold.start > page.find("id=\"tour-recording\"").unwrap());
+    let steps = page.find("<ol class=\"tour-steps\">").unwrap();
+    assert!(fold.contains(&steps), "the tour's steps aren't folded");
+    // Every tour command is in the fold, bar the pointer to the CLI's own copy.
+    for (at, _) in page.match_indices("<code data-tour>") {
+        let command = &page[at..at + page[at..].find("</code>").unwrap()];
+        if strip_tags(command) == "relish manual tour" {
+            continue;
+        }
+        assert!(fold.contains(&at), "{command:?} is outside the fold");
+    }
+
+    // The recording loads by itself, not when something is opened.
+    let player = read("docs/website/assets/tour-player.js");
+    assert!(player.contains("IntersectionObserver"));
+    assert!(
+        !player.contains("\"toggle\""),
+        "the player still waits for a toggle"
+    );
+    assert!(!player.contains("closest(\"details\")"));
+}

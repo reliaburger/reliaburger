@@ -86,13 +86,12 @@
     }, function () {});
   });
 
-  // The tour is a <details>; a link to it should open it, not land on a
-  // closed box.
-  function openLinkedTour() {
-    var tour = document.getElementById("tour");
-    var details = tour && tour.querySelector("details");
-    if (details && location.hash === "#tour") details.open = true;
+  // The tour's commands sit in a <details>. A link to them (#tour-commands)
+  // should open it, not land on a closed box; #tour itself is always open.
+  function openLinkedCommands() {
+    var commands = document.getElementById("tour-commands");
+    if (commands && location.hash === "#tour-commands") commands.open = true;
   }
-  window.addEventListener("hashchange", openLinkedTour);
-  openLinkedTour();
+  window.addEventListener("hashchange", openLinkedCommands);
+  openLinkedCommands();
 })();

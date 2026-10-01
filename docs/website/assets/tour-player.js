@@ -1,13 +1,13 @@
-// The only script on this site: it plays the tour's recording with the
-// vendored asciinema player (assets/asciinema/). The player and the recording
-// load from this site, and only when someone opens the tour. Without
-// JavaScript the <noscript> link and the written tour still work.
+// One of the site's two scripts: it plays the tour's recording with the
+// vendored asciinema player (assets/asciinema/). The recording is always on
+// show; the player and the recording load from this site as the figure nears
+// the viewport, so a visitor who never scrolls that far doesn't fetch them.
+// Without JavaScript the <noscript> link and the written tour still work.
 (function () {
   "use strict";
 
   var figure = document.getElementById("tour-recording");
-  var tour = figure && figure.closest("details");
-  if (!figure || !tour) return;
+  if (!figure) return;
 
   var screen = figure.querySelector(".recording-screen");
   var speeds = figure.querySelector(".recording-speed");
@@ -60,7 +60,7 @@
   }
 
   function start() {
-    if (started || !tour.open) return;
+    if (started) return;
     started = true;
     Promise.all([
       load("link", { rel: "stylesheet", href: "./assets/asciinema/asciinema-player.css" }),
@@ -78,6 +78,15 @@
     var button = event.target.closest("button[data-speed]");
     if (button) setSpeed(button);
   });
-  tour.addEventListener("toggle", start);
-  start();
+  // Start a screen or so early, so the poster frame is ready when it's seen.
+  if (!("IntersectionObserver" in window)) {
+    start();
+    return;
+  }
+  var observer = new IntersectionObserver(function (entries) {
+    if (!entries.some(function (entry) { return entry.isIntersecting; })) return;
+    observer.disconnect();
+    start();
+  }, { rootMargin: "600px 0px" });
+  observer.observe(figure);
 })();
