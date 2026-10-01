@@ -273,7 +273,7 @@ Instances without a PID are skipped. There are no counters here, no restart/OOM/
 
 **Ingress metrics: implemented (counters), planned (durations).** The Wrapper proxy maintains a process-global `IngressMetrics` and Bun's collection loop emits `ingress_requests_total`, `ingress_responses_1xx`..`5xx`, and `ingress_requests_in_flight`. Per-route breakdowns and `ingress_request_duration_seconds` histograms remain **planned -- not yet implemented**.
 
-**Agent loop turns: implemented.** Bun times every turn of its agent loop by the `select!` branch that ran it (`snapshot`, `stop_wait`, `identity_signing`, `deploy_op`, `command`, `health_tick`) and its collection loop emits the histogram `bun_agent_loop_turn_seconds` as `_bucket{branch,le}` (bounds from 1 ms to 10 s, plus `+Inf`), `_sum{branch}` and `_count{branch}`. A branch that hasn't run yet emits nothing. The turn budget is 1 s (`src/bun/loop_meter.rs`, #351): `le="1"` against `le="+Inf"` is the share of turns within it.
+**Agent loop turns: implemented.** Bun times every turn of its agent loop by the `select!` branch that ran it (`snapshot`, `stop_wait`, `identity_signing`, `restart_step`, `state_sweep`, `follow_up`, `deploy_op`, `command`, `health_tick`) and its collection loop emits the histogram `bun_agent_loop_turn_seconds` as `_bucket{branch,le}` (bounds from 1 ms to 10 s, plus `+Inf`), `_sum{branch}` and `_count{branch}`. A branch that hasn't run yet emits nothing. The turn budget is 1 s (`src/bun/loop_meter.rs`, #351): `le="1"` against `le="+Inf"` is the share of turns within it. The V02 soak reads the histogram from `/v1/metrics` and fails a tier on any turn over the budget (`agent-loop-turn`, [releasing](../releasing.md)).
 
 ### 5.2 Prometheus Scraping
 

@@ -102,7 +102,12 @@ impl RunningAgent {
 }
 
 /// Wait until the grill has seen `count` more `operation` calls than `before`.
-async fn wait_for_calls(grill: &MockGrill, operation: &str, before: usize, count: usize) {
+pub(super) async fn wait_for_calls(
+    grill: &MockGrill,
+    operation: &str,
+    before: usize,
+    count: usize,
+) {
     let seen = |grill: &MockGrill| {
         grill
             .calls()
@@ -119,7 +124,7 @@ async fn wait_for_calls(grill: &MockGrill, operation: &str, before: usize, count
     .unwrap_or_else(|_| panic!("the slow work never called {operation}"));
 }
 
-fn calls_of(grill: &MockGrill, operation: &str) -> usize {
+pub(super) fn calls_of(grill: &MockGrill, operation: &str) -> usize {
     grill
         .calls()
         .iter()
@@ -127,7 +132,7 @@ fn calls_of(grill: &MockGrill, operation: &str) -> usize {
         .count()
 }
 
-fn replicated(app: &str, replicas: u32) -> Config {
+pub(super) fn replicated(app: &str, replicas: u32) -> Config {
     Config::parse(&format!(
         "[app.{app}]\nimage = '{app}:v1'\nport = 8080\nreplicas = {replicas}\n"
     ))
@@ -136,7 +141,7 @@ fn replicated(app: &str, replicas: u32) -> Config {
 
 /// Kill the only replica of `web` behind the runtime's back; the health tick
 /// notices and restarts it.
-fn crash(grill: &MockGrill) {
+pub(super) fn crash(grill: &MockGrill) {
     let id = InstanceId("default__web-0".to_string());
     grill.set_state(&id, ContainerState::Stopped);
     grill.set_exit_code(&id, Some(1));
@@ -147,7 +152,6 @@ fn crash(grill: &MockGrill) {
 /// `check_apps` asks the runtime for every running app's state, one at a
 /// time, on the tick. Ten replicas at 250 ms each is one 2.5 s turn.
 #[tokio::test]
-#[ignore = "stage 2 of #351"]
 async fn status_answers_while_the_tick_reads_every_app_state() {
     let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
     expect_complete(&drain_deploy(&mut agent, replicated("web", 10)).await);
@@ -163,7 +167,6 @@ async fn status_answers_while_the_tick_reads_every_app_state() {
 
 /// `check_jobs` does the same for every running job.
 #[tokio::test]
-#[ignore = "stage 2 of #351"]
 async fn status_answers_while_the_tick_reads_every_job_state() {
     let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
     let jobs: String = (0..10)
@@ -183,7 +186,6 @@ async fn status_answers_while_the_tick_reads_every_job_state() {
 /// A restart first kills what's left of the old container and waits for the
 /// runtime to confirm, inline, before the tick's restart budget is checked.
 #[tokio::test]
-#[ignore = "stage 2 of #351"]
 async fn status_answers_while_a_restart_waits_for_its_kill() {
     let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
     expect_complete(&drain_deploy(&mut agent, replicated("web", 1)).await);
@@ -200,7 +202,6 @@ async fn status_answers_while_a_restart_waits_for_its_kill() {
 
 /// Then it creates and starts the replacement, inline too.
 #[tokio::test]
-#[ignore = "stage 2 of #351"]
 async fn status_answers_while_a_restart_creates_and_starts() {
     let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
     expect_complete(&drain_deploy(&mut agent, replicated("web", 1)).await);
@@ -216,10 +217,58 @@ async fn status_answers_while_a_restart_creates_and_starts() {
         .await;
 }
 
+/// `relish apply --rerun-jobs` kills the job's previous run and waits for
+/// the runtime to confirm the exit before the rerun may start. The kill runs
+/// off the loop, and the deploy worker asks again until it's confirmed; the
+/// rerun still starts, once.
+#[tokio::test]
+async fn status_answers_while_a_job_rerun_kills_its_previous_run() {
+    let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+    let job =
+        || Config::parse("[job.batch]\nimage = 'batch:v1'\ncommand = ['sleep', '60']\n").unwrap();
+    expect_complete(&drain_deploy(&mut agent, job()).await);
+    let running = RunningAgent::start(agent, tx.clone(), shutdown);
+    // Past the turn budget, inside the test agent's 2 s kill confirmation.
+    grill.set_call_delay(MockCall::Kill, Some(std::time::Duration::from_millis(1500)));
+    let kills_before = calls_of(&grill, "kill");
+    let starts_before = calls_of(&grill, "start");
+    running.measure_from_here();
+    let (events, mut progress) = mpsc::channel(64);
+    tx.send(AgentCommand::RerunJobs {
+        config: job(),
+        events,
+    })
+    .await
+    .unwrap();
+    wait_for_calls(&grill, "kill", kills_before, 1).await;
+    let mid_kill = running.status_latency().await;
+    let last_event = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let mut last = None;
+        while let Some(event) = progress.recv().await {
+            last = Some(event);
+        }
+        last
+    })
+    .await
+    .expect("the rerun never finished");
+    expect_complete(&last_event.into_iter().collect::<Vec<_>>());
+    assert_eq!(
+        calls_of(&grill, "start"),
+        starts_before + 1,
+        "the rerun started its job once"
+    );
+    assert!(
+        mid_kill.is_some_and(|latency| latency < TURN_BUDGET),
+        "status took {mid_kill:?} while the previous run's kill was confirmed"
+    );
+    running
+        .assert_responsive("a job rerun killed its previous run")
+        .await;
+}
+
 /// A deploy's `ApplyNetworkPreStart` step retains the instance's network
 /// reference through the runtime, under its lifecycle lock.
 #[tokio::test]
-#[ignore = "stage 3 of #351"]
 async fn status_answers_while_a_deploy_step_retains_a_network_reference() {
     let (agent, tx, shutdown, grill) = test_agent_with_grill();
     let running = RunningAgent::start(agent, tx.clone(), shutdown);
@@ -241,7 +290,6 @@ async fn status_answers_while_a_deploy_step_retains_a_network_reference() {
 /// `Logs` reads every instance's whole capture into memory, on the loop. A
 /// 56 MB capture (#278) takes hundreds of milliseconds; a slow disk longer.
 #[tokio::test]
-#[ignore = "stage 3 of #351"]
 async fn status_answers_while_logs_reads_a_large_capture() {
     let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
     expect_complete(&drain_deploy(&mut agent, replicated("web", 1)).await);
@@ -359,7 +407,6 @@ fn boxed(agent: BunAgent<MockGrill>) -> Box<BunAgent<MockGrill>> {
 /// A join consumes its token through a council write. On a leader that has
 /// lost quorum the write waits until the leader steps down, or longer.
 #[tokio::test]
-#[ignore = "stage 3 of #351"]
 async fn status_answers_while_a_join_waits_on_a_council_without_quorum() {
     let council = council().await;
     let (token, join_token) = crate::sesame::join::create_join_token(
@@ -392,7 +439,6 @@ async fn status_answers_while_a_join_waits_on_a_council_without_quorum() {
 
 /// Signing an image attaches the signature through a council write too.
 #[tokio::test]
-#[ignore = "stage 3 of #351"]
 async fn status_answers_while_signing_waits_on_a_council_without_quorum() {
     let council = council().await;
     let (agent, tx, shutdown) = clustered_agent(Arc::clone(&council));
@@ -460,7 +506,6 @@ async fn silent_registry() -> (String, tokio::task::JoinHandle<()>) {
 /// registry that hangs, one attempt waits 5 s for headers and the fetch
 /// retries for up to 75 s, all of it on the loop.
 #[tokio::test]
-#[ignore = "stage 3 of #351"]
 async fn status_answers_while_an_upgrade_fetches_from_a_silent_registry() {
     use crate::upgrade::signing::{encode_public_key, generate_keypair, sha256_hex, sign};
 
@@ -528,9 +573,11 @@ async fn status_answers_while_an_upgrade_fetches_from_a_silent_registry() {
         .await;
 }
 
-// Egress DNS re-resolution (`reresolve_egress`) has no scenario: it runs only
-// with a loaded eBPF program, which a unit test can't construct. Stage 3 of
-// #351 moves the lookups into a task, which makes them testable without one.
+// Egress DNS re-resolution (`reresolve_egress`) and the execution fence have
+// no scenario: they run only with a loaded eBPF program, which a unit test
+// can't construct. The lookups run in a task now; `egress_resolution`'s tests
+// cover what it resolves and which bindings an answer may still change. The
+// fence kills through the same off-loop work as the job rerun scenario.
 
 // ---- disk, kernel and subprocesses -------------------------------------------
 
@@ -595,7 +642,6 @@ async fn status_answers_while_every_persist_waits_on_a_slow_disk() {
 
 /// Retiring an instance removes its identity directory and record inline.
 #[tokio::test]
-#[ignore = "stage 3 of #351"]
 async fn status_answers_while_a_retirement_removes_artifacts() {
     let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
     expect_complete(&drain_deploy(&mut agent, replicated("web", 1)).await);
@@ -621,7 +667,6 @@ async fn status_answers_while_a_retirement_removes_artifacts() {
 /// The tick applies the perimeter ruleset with an `nft` subprocess when
 /// membership changes (and on the first tick).
 #[tokio::test]
-#[ignore = "stage 3 of #351"]
 async fn status_answers_while_the_tick_applies_the_firewall() {
     let (mut agent, tx, shutdown) = test_agent();
     agent.set_perimeter_enabled(true);
@@ -637,7 +682,6 @@ async fn status_answers_while_the_tick_applies_the_firewall() {
 /// Injecting a workload fault reads every target's pid, one at a time, before
 /// it signals or writes a cgroup.
 #[tokio::test]
-#[ignore = "stage 3 of #351"]
 async fn status_answers_while_a_fault_reads_its_targets() {
     let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
     expect_complete(&drain_deploy(&mut agent, replicated("web", 5)).await);
@@ -719,7 +763,6 @@ async fn status_answers_while_a_large_catalogue_is_published() {
 /// channel from the loop. A client that stops reading (`| less`, a stuck
 /// proxy) holds the turn once 64 lines are queued.
 #[tokio::test]
-#[ignore = "stage 3 of #351"]
 async fn status_answers_while_a_follow_tail_waits_on_a_client_that_never_reads() {
     let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
     expect_complete(&drain_deploy(&mut agent, replicated("web", 1)).await);

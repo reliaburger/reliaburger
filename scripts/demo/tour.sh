@@ -84,6 +84,7 @@ known_command() {
         | "relish status" \
         | "${BURGER_FETCH}" \
         | "relish build burger/burger.toml" \
+        | "relish images" \
         | "relish apply burger/burger.toml" \
         | "curl ${BURGER_ORDER}" \
         | "relish path frontend --to redis" \

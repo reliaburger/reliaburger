@@ -2975,6 +2975,7 @@ mod tests {
                             exit_code: None,
                             pid: Some(1),
                             runtime_unknown: false,
+                            status_age_ms: None,
                         }]);
                     }
                     AgentCommand::SyncClusterConsumer { response, .. } => {
@@ -3585,6 +3586,7 @@ image = "busybox:latest"
             exit_code: None,
             pid: Some(42),
             runtime_unknown: false,
+            status_age_ms: None,
         };
         let mut asked = Vec::new();
         let mut deploys = 0;
@@ -3903,6 +3905,7 @@ image = "busybox:latest"
                 exit_code: None,
                 pid: Some(42),
                 runtime_unknown: false,
+                status_age_ms: None,
             },
             crate::bun::agent::InstanceStatus {
                 id: "stopped-0".into(),
@@ -3914,6 +3917,7 @@ image = "busybox:latest"
                 exit_code: Some(0),
                 pid: None,
                 runtime_unknown: false,
+                status_age_ms: None,
             },
         ];
         retain_live_assignments(&mut applied, &statuses);

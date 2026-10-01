@@ -27,7 +27,7 @@ run it.
 Each node's agent runs one loop that owns all of the node's state, one turn at
 a time. A turn that waits on something slow holds every caller, and that one
 shape caused most of the 0.1.0 and 0.1.1 soak failures
-([review](plans/2026-09-30-agent-loop-review.md), #351). Three things keep
+([review](plans/2026-09-30-agent-loop-review.md), #351). Four things keep
 turns short:
 
 | Piece | What it does | Where |
@@ -35,13 +35,18 @@ turns short:
 | Turn meter | Times every turn by branch, exports `bun_agent_loop_turn_seconds{branch}` through Mayo, logs any turn over 250 ms with the command or deploy op it ran. Tests read the worst turn, including one still running | [`src/bun/loop_meter.rs`](../src/bun/loop_meter.rs) |
 | Starvation harness | One scenario per inline await from the review: a `MockGrill` whose calls can each be slowed (`set_call_delay`), a council whose writes hang, a log client that never reads, and test-only stalls for awaits no mock stands behind (the disk, `nft`). Each scenario queues a status command during the slow work and fails unless it's answered, and the worst turn ends, within 1 s | [`src/bun/agent/tests/loop_harness.rs`](../src/bun/agent/tests/loop_harness.rs) |
 | Inline-await rule | Parses the agent's source with `syn`, walks every method a turn can reach from `run_loop`, and fails on an await with neither a `tokio::time::timeout` nor a `// LOOP-INLINE: <why>` comment | [`src/bun/agent/tests/loop_rule.rs`](../src/bun/agent/tests/loop_rule.rs) |
+| Soak gate | The V02 checker reads each node's turn histogram at every settle and heavy check and fails the tier on any turn over 1 s | [`scripts/release/sustained_check.py`](../scripts/release/sustained_check.py) (`turn_findings`) |
 
-All three run in `make test`. A harness scenario that fails today is ignored
-with the stage of #351 that fixes it (`#[ignore = "stage 2 of #351"]`); the
-fix un-ignores it in the same change. Run them all with
-`cargo nextest run --run-ignored all -E 'test(loop_harness)'`. A new inline
-await either gets a deadline, moves into a task, or gets a tag a reviewer can
-argue with.
+The first three run in `make test`; the gate's own tests run with the other
+release-script tests (`python3 -m unittest discover -s scripts/release -p
+'test_*.py'`). Every harness scenario runs; none is ignored any more. Egress
+DNS re-resolution and the execution fence have no scenario because they need
+a loaded eBPF program; their off-loop halves have unit tests
+(`bun::agent::egress_resolution`, `bun::agent::off_loop_work`). A new inline
+await either gets a deadline (`timeout_at` on the turn's shared runtime
+budget, for work a later turn can retry), moves into a task, or gets a tag a
+reviewer can argue with. A scenario for the new await belongs in the harness,
+not behind an `#[ignore]`.
 
 ## Real systems, gated
 

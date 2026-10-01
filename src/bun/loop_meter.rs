@@ -43,6 +43,13 @@ pub enum LoopBranch {
     StopWait,
     /// A spawned workload identity signing finished.
     IdentitySigning,
+    /// A spawned restart step (kill, create, start) finished.
+    RestartStep,
+    /// A spawned sweep of running instances' runtime states finished.
+    StateSweep,
+    /// Other work a turn spawned reported back: an upgrade's download, a
+    /// firewall apply, an egress re-resolution.
+    FollowUp,
     /// A deploy worker or health probe asked for an authoritative step.
     DeployOp,
     /// An `AgentCommand` from the API, `relish` or another subsystem.
@@ -52,10 +59,13 @@ pub enum LoopBranch {
 }
 
 impl LoopBranch {
-    const ALL: [LoopBranch; 6] = [
+    const ALL: [LoopBranch; 9] = [
         LoopBranch::Snapshot,
         LoopBranch::StopWait,
         LoopBranch::IdentitySigning,
+        LoopBranch::RestartStep,
+        LoopBranch::StateSweep,
+        LoopBranch::FollowUp,
         LoopBranch::DeployOp,
         LoopBranch::Command,
         LoopBranch::HealthTick,
@@ -67,6 +77,9 @@ impl LoopBranch {
             LoopBranch::Snapshot => "snapshot",
             LoopBranch::StopWait => "stop_wait",
             LoopBranch::IdentitySigning => "identity_signing",
+            LoopBranch::RestartStep => "restart_step",
+            LoopBranch::StateSweep => "state_sweep",
+            LoopBranch::FollowUp => "follow_up",
             LoopBranch::DeployOp => "deploy_op",
             LoopBranch::Command => "command",
             LoopBranch::HealthTick => "health_tick",

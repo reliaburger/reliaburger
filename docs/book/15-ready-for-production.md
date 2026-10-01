@@ -3164,11 +3164,13 @@ predicate is false, here the first id after the one we stopped at.
 An instance that disappeared since the last tick doesn't matter: the search
 finds where it *would* be, and the walk carries on from there.
 
-Two tests pin it down. One puts eight replicas into pending restart, each
-spending 400 ms and failing, and checks that a single tick finishes well short
-of the 3.2 s the old walk took, without trying all eight. The other runs six
-ticks over six slow restarts and checks that each got its turn and that no
-instance got more than one attempt more than any other.
+Two tests pinned it down. One put eight replicas into pending restart, each
+spending 400 ms and failing, and checked that a single tick finished well short
+of the 3.2 s the old walk took, without trying all eight. The other ran six
+ticks over six slow restarts and checked that each got its turn and that no
+instance got more than one attempt more than any other. (Both changed again
+when the restarts themselves left the loop; see "Three awaits leave the loop"
+below.)
 
 The second long turn was the one #270 named: signing a follower's workload
 certificate. Only the leader holds the Workload CA, so a follower sends its
@@ -3364,8 +3366,8 @@ rule (no await on a turn without a deadline or a stated reason), and every
 await that stays inline carries its reason where a reviewer will see it:
 
 ```rust
-// LOOP-INLINE: stage 2 of #351: check_apps reads bounded and in parallel
-let grill_state = match self.supervisor.grill().state(&id).await {
+// LOOP-INLINE: stage 3 of #351: reading whole captures leaves the loop
+let logs = self.supervisor.grill().logs(id).await.unwrap_or_default();
 ```
 
 The test parses `agent.rs` and its submodules with `syn`, as the router
@@ -3386,6 +3388,624 @@ now say so (`in-memory lock, no I/O`), seven are the persists we decided to
 keep, a couple of dozen have one-line reasons of their own, and fifty name the
 stage that moves them. Grep for `LOOP-INLINE: stage`
 and you have the remaining work, in the code, next to the line it's about.
+
+### Three awaits leave the loop
+
+The harness handed us a to-do list with failing tests on it. Stage two of
+#351 took the top of the list: the tick's state reads for apps and jobs, and a
+restart's kill, create and start. All of them are runtime calls the loop made
+while it held `&mut self`, so for as long as runc took, nothing else on the
+node could change. And the most frequent caller of all, status, waited in the
+queue behind them.
+
+#### Status stops asking
+
+Start with the caller. Why does `relish status` queue a command at all? The
+loop knows the answer the moment a turn ends, so now it says so, every time:
+
+```rust
+// Status readers answer from this, not by queueing for a turn.
+self.publish_status();
+self.loop_meter.finish(turn);
+```
+
+`publish_status` builds one entry per instance (id, app, state, port, restart
+count) and puts the lot in a `tokio::sync::watch` channel. We met `watch` in
+Chapter 2 holding the membership table: one slot with the latest value in it,
+which any number of receivers read without waiting for the sender.
+`send_replace` swaps the new snapshot in. The snapshot sits behind an `Arc`, so
+a reader that has started on one keeps it even after the loop publishes the
+next; cloning an `Arc` copies a pointer and bumps a counter, not the entries.
+The API holds a `StatusReader` with the receiving end, and `/v1/status` reads
+the slot without sending the loop anything.
+
+An answer from the loop came with two guarantees we got for free. An answer
+from a snapshot has to earn them.
+
+The first is freshness. A loop stuck in a 30-second turn used to make status
+time out, which is the truth: this node isn't answering. A snapshot from 30
+seconds ago would answer cheerfully and wrongly. So the reader refuses old
+snapshots:
+
+```rust
+pub async fn read(&self) -> Result<Vec<InstanceStatus>, StatusUnavailable> {
+    let deadline = tokio::time::Instant::now() + STATUS_FRESHNESS_WAIT;
+    let mut snapshots = self.snapshots.clone();
+    loop {
+        let snapshot = Arc::clone(&snapshots.borrow_and_update());
+        if snapshot.age() <= STATUS_SNAPSHOT_MAX_AGE {
+            return Ok((self.read_evidence)(snapshot).await);
+        }
+        match tokio::time::timeout_at(deadline, snapshots.changed()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => return Err(StatusUnavailable::AgentStopped),
+            Err(_) => {
+                return Err(StatusUnavailable::Stale {
+                    age: snapshot.age(),
+                });
+            }
+        }
+    }
+}
+```
+
+An idle loop still turns once a second for its health tick, so a live loop's
+snapshot is never more than about a second old, plus whatever the current turn
+takes. `STATUS_SNAPSHOT_MAX_AGE` is two seconds. Past that, the reader waits up
+to four for the next publication (`changed()` resolves when the sender writes
+again) and then gives up with the same 503 a timed-out status command used to
+get. `borrow_and_update` marks the value as seen, so `changed()` only wakes for
+a newer one. And Chapter 2's lesson about `changed()` comes back in our
+favour: it returns `Err` once the sender has been dropped, which is how a
+reader tells an agent that has stopped from one that is merely slow. Every
+answer also carries `status_age_ms`, so you can see how old it was.
+
+The second guarantee is about the dead. The loop learns that a container
+crashed from `check_apps` on its tick, and status used to report the instance
+`running` until then. A reader that trusted the snapshot would do the same, for
+up to two seconds longer. So the reader keeps the runtime reads status already
+made (pid and exit code, eight at a time, under one 500 ms deadline), now off
+the loop, and for any instance the loop last saw alive it also asks the
+runtime for its state. If the runtime says the process has exited, the answer
+says `stopped`, even though the loop hasn't noticed yet. That's an improvement
+on the old behaviour, not just parity.
+
+The privileged CI run caught two mistakes in the first version. The state read
+ran *before* the pid read, inside the same 500 ms, and rootless runc spends a
+good part of that on each call. So an adopted container came back with its
+pid marked unknown. The three reads now run side by side with `tokio::join!`,
+which polls several futures together and waits for all of them. The second
+mistake was quieter. The agent created its `watch` channel with an empty
+snapshot stamped "now", before it had adopted anything, so a request that
+arrived in that window got a fresh-looking "no instances". The placeholder
+is now explicitly unpublished, with an infinite age, and readers wait for the
+loop's first real publication.
+
+There was a type problem in the middle of this. The reads need the container
+runtime, and `BunAgent<G: Grill>` is generic over it, but the API state isn't
+generic and we didn't want it to become so. The reader stores the one
+operation it needs as a boxed closure instead:
+
+```rust
+type EvidenceReader =
+    Arc<dyn Fn(Arc<StatusSnapshot>) -> BoxFuture<'static, Vec<InstanceStatus>> + Send + Sync>;
+```
+
+`dyn Fn(...) -> ...` is a *trait object*: any closure with that signature,
+whatever its concrete type, called through a pointer and a vtable. It's the
+nearest Rust gets to a Go interface with one method, without declaring a
+trait. `BoxFuture<'static, T>` is the `futures` crate's name for
+`Pin<Box<dyn Future<Output = T> + Send + 'static>>`, a future on the heap that
+borrows nothing, so it can be awaited anywhere. The agent builds the closure
+around a clone of its grill:
+
+```rust
+let read_evidence: EvidenceReader = Arc::new(move |snapshot| {
+    let grill = grill.clone();
+    Box::pin(async move { read_status(&grill, &snapshot).await })
+});
+```
+
+The generic type `G` is inside the closure, and nobody outside needs to know
+it. The cost is one allocation per status request.
+
+The `Status` command still exists, for the metrics collector and anything else
+that only holds the command channel. The loop answers it by publishing a fresh
+snapshot and spawning the runtime reads, so it costs a turn of microseconds,
+not the old 500 ms.
+
+#### The tick reads in parallel
+
+`check_apps` and `check_jobs` asked the runtime for every running instance's
+state, one after another, inline. Ten instances behind a slow runc were a
+2.5-second turn in the harness. Now the tick only plans the reads, and spawns
+them:
+
+```rust
+pub(super) async fn sweep_states<G: Grill>(grill: G, reads: Vec<StateRead>) -> StateSweep {
+    let deadline = tokio::time::Instant::now() + STATE_SWEEP_DEADLINE;
+    let grill = &grill;
+    let observations = futures_util::stream::iter(reads)
+        .map(|read| async move {
+            let observed = tokio::time::timeout_at(deadline, observe(grill, &read))
+                .await
+                .unwrap_or(Observed::Unknown);
+            (read, observed)
+        })
+        .buffered(STATE_READ_CONCURRENCY)
+        .collect()
+        .await;
+    StateSweep { observations }
+}
+```
+
+`buffered(8)` turns a stream of futures into a pool of eight running at once
+that still yields results in the original order. All of them share one
+one-second deadline; a read that misses it comes back `Unknown` and the next
+sweep asks again. The sweep goes into a `JoinSet`, at most one at a time, and a
+new `select!` branch applies what it saw.
+
+Earlier in this chapter a `buffered` stream gave us 380 errors about `Send`
+not being general enough, and we went back to plain loops. Here it compiles,
+because each `StateRead` is *moved* into its closure: there's no borrowed
+argument for the compiler to be generic over. Where we do borrow, in the status
+reader's walk over the snapshot's entries, we build the futures into a `Vec`
+first and stream the `Vec`. Same idea, different place to put the borrow.
+
+A result that comes back a turn later can be about a container that no longer
+exists. Between the read and its result the instance may have been restarted
+under the same id, and an "exited" meant for the old container would restart
+the new one. So every read carries the instance's incarnation:
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Incarnation {
+    created_at: Instant,
+    restart_count: u32,
+}
+```
+
+A restart bumps `restart_count`; a fresh deploy under the same id gets a new
+`created_at`. The loop applies an exit only to the same incarnation, still
+`Running`. Deriving `PartialEq` is what lets `==` compare two of them field by
+field, the way a C programmer would hope `memcmp` would. The cost of all this
+is latency: a crash now restarts on the tick after the sweep reports, up to a
+second later than before. The restart backoff is longer than that anyway.
+
+#### A restart, one step at a time
+
+The restart was the longest turn of them all. It killed whatever was left of
+the old container and waited for the runtime to confirm the exit (up to twice
+the stop-confirmation timeout, twenty seconds by default), then created the
+replacement and started it. Stops (#237) and identity signings had already
+shown the way out: the loop does the bookkeeping, a task does the waiting, and
+the result comes back through a branch.
+
+A restart doesn't split into two halves, though. There's loop work *between*
+the runtime calls: the job ledger and the old artifacts after the kill, the
+replacement's egress before it starts. So each runtime call became a step of
+its own:
+
+```text
+ tick              branch              branch               branch
+ Pending ─Clear─▶ (Pending) ─Create─▶ (Preparing) ─Start─▶ (Starting) ─▶ HealthWait
+                                        └─refused─Refuse─▶ Failed
+ Stopping ─Cleanup─▶ Stopped ─▶ Pending (backoff permitting)
+```
+
+The loop spawns a step into `restart_steps`, a `JoinSet`, and records it in
+`restarts`, a map from instance to the step in flight. One entry per instance
+is the whole of the "no double restarts" rule: the tick skips any instance
+already in the map, however slow its kill. When a step finishes, the loop
+picks the next move by matching on three things at once:
+
+```rust
+match (step, result, launch) {
+    (RestartStep::Clear, StepResult::Done { .. }, Some(launch)) => {
+        self.restart_after_clear(id, launch, gate).await;
+    }
+    (RestartStep::Create | RestartStep::Start, StepResult::Failed(error), _) => {
+        self.record_failed_restart(&id, &error.to_string()).await;
+    }
+    // ...
+}
+```
+
+A tuple of enums in a `match` reads like a decision table, and the compiler
+checks it like one: leave out a combination and it won't build. At most
+`RESTARTS_IN_FLIGHT_LIMIT` (eight) restarts run at once, so a node that lost
+every container asks runc for eight kills, not eighty.
+
+The hard part was ownership. While the restart ran inline, nothing could
+happen between its kill and its start, so a stop for the same app simply went
+first or second. Now a stop can arrive while a create is running. Suppose the
+stop's kill lands before the create finishes. It kills nothing, sees no
+process, reports "stopped". Then the create finishes, the restart starts the
+container, and a process is running that its operator has just been told is
+gone. The rule we wanted: a stop wins over a restart, but it waits for the
+step already talking to the runtime. Each restart carries a gate for that:
+
+```rust
+pub(super) struct RestartGate {
+    cancelled: CancellationToken,
+    lane: Arc<tokio::sync::Mutex<()>>,
+}
+```
+
+A step task locks `lane` before it calls the runtime and checks `cancelled`
+once it has it. A stop, on the loop, cancels the token first (synchronously,
+so no new step can begin) and then hands the gate to its exit wait, which
+locks the lane before it sends SIGTERM. Locking means waiting for the step in
+flight, if any. After that, no step of the cancelled restart touches the
+runtime again, and the loop drops whatever result the last one reports.
+
+`Mutex<()>` guards no data. It guards time: holding it means "I'm talking to
+the runtime about this instance". C and Go programmers know this as a plain
+critical section. It's the tokio mutex, not `std::sync::Mutex`, because the
+step holds the guard across `.await`, and a `std` guard held across an await
+would block a runtime thread while it waits. A rolling deploy's retirement
+takes the same gate: `BeginRetire` hands it to the deploy worker, which
+settles it before it drains the old instance. So does shutdown. Settling is
+bounded by the stop-confirmation timeout, and a step that outlasts it fails
+the stop, which the caller can retry. That beats signalling a container a
+step might be creating.
+
+The step names are deliberate. They are the events a per-instance supervisor
+would report, the option (b) the review deferred to 0.4.0's migration work,
+so that work can absorb this rather than replace it.
+
+#### What the tests say now
+
+The four stage-two scenarios run without `#[ignore]` and pass: ten 250 ms
+state reads, ten job reads, a restart whose kill takes 2.5 s, and one whose
+create and start take 1.25 s each. Status answers each within the second, and
+no turn reaches it. Eight of the seventeen scenarios now pass; the other nine
+wait for stage three, and `grep -rn 'LOOP-INLINE: stage'` lists the awaits
+behind them.
+
+New tests pin the ownership rules. A stop and a retirement each arrive while a
+restart's create is blocked in the mock; neither may signal the runtime until
+the create returns, and the replacement must never be started afterwards. A
+restart whose kill hangs must not be started again by the ticks that follow.
+A retirement drops a cancelled restart's late result. A state read from
+before a restart leaves the replacement alone. And for status: it answers
+from the snapshot while the loop is in a 1.5-second turn, refuses a snapshot
+older than its bound, waits for a fresh one when one is coming, reports an
+agent that has gone, and calls an exited container `stopped` before the loop
+has noticed.
+
+The budget tests from "Shorter turns" changed too. Starting a restart now
+costs the tick microseconds, so the first test asserts that a tick returns
+before a single kill could, and stops at the in-flight limit. The second runs
+three rounds over twelve slow restarts and checks that each got its turn, and
+no instance more than one attempt more than any other.
+
+One test changed its mind rather than its timing. A job lifecycle test waited
+for status to say `running` after a retry. The mock runtime keeps reporting
+the exit the test gave it, and status now believes the runtime over the loop,
+so the started retry reads `stopped`. The test had been checking what the
+loop believed; now it checks what the runtime says.
+
+### The rest of the list
+
+Nine scenarios were still ignored after stage two, and `grep -rn 'LOOP-INLINE:
+stage'` listed forty-odd awaits behind them: log reads, two council writes,
+the upgrade download, `nft`, DNS, the retirement cleanup, a dozen fault
+operations and a handful of runtime reads scattered through deploys and
+retirements. Stage three of #351 moved every one of them. There was no single
+trick for it. There were five, and which one fits an await depends on a
+question worth asking first: once the slow thing finishes, does the loop
+still have to do something?
+
+#### Nobody needs the answer but the caller
+
+`relish logs` read every instance's capture into one `String`, inside a turn.
+The loop didn't need the logs. It needed to know which instances to read,
+which is a walk over its own map. So that's all the turn does now:
+
+```rust
+let grill = self.supervisor.grill().clone();
+tokio::spawn(async move {
+    let logs = read_captures(&grill, &instance_ids).await;
+    let _ = response.send(Ok(logs));
+});
+```
+
+The task owns everything it touches: a clone of the runtime handle (an `Arc`
+inside, so cloning is cheap), the ids, and the `oneshot` sender the caller is
+waiting on. `async move` moves those into the future, which is what lets
+`tokio::spawn` accept it: a spawned task may outlive the turn that started
+it, so it can't borrow anything from the loop. If you try, the compiler tells
+you the future "may outlive borrowed value", which is Rust's way of saying
+what a Go programmer finds out from a data race.
+
+`relish logs -f --tail 200` was the nastier one. The tail went into the API's
+64-slot channel from the loop, so a client piping into `less` that stopped
+reading held every caller on the node the moment the channel filled. Now the
+task sends the tail and then starts the per-instance follows, in that order,
+so the tail still comes first.
+
+A join and an image signature are the same shape with a council write in the
+middle. Without quorum, openraft's `client_write` waits until the leader steps
+down, or longer. The task now has a deadline the loop never had to have:
+
+```rust
+tokio::spawn(async move {
+    let result = tokio::time::timeout(COUNCIL_ANSWER_TIMEOUT, request)
+        .await
+        .unwrap_or_else(|_| Err(security_error(late)));
+    let _ = response.send(result);
+});
+```
+
+The deadline isn't for the loop any more; it's so a caller hears something.
+And it needed an honest message. A join's token is consumed by that write,
+and a write that timed out may still commit afterwards, so the error says that
+a retry might be refused and you'll want a fresh token.
+
+#### The loop has to finish the job
+
+An upgrade is the opposite case. The loop must stop taking new work before the
+download, and it's the loop that execs the new binary afterwards. Only the
+middle, fetching, checking the signature and staging (up to 75 seconds against
+a struggling registry), can go elsewhere. Restart steps and state sweeps had
+each grown their own `JoinSet` and `select!` branch for this. Rather than a
+third and a fourth, we gave the rest one between them:
+
+```rust
+pub(super) enum FollowUp {
+    UpgradePrepared(UpgradePreparation),
+    FirewallApplied {
+        cluster_nodes: crate::firewall::rules::ClusterNodes,
+        result: Result<(), crate::firewall::rules::FirewallError>,
+    },
+    NodePressure(super::node_pressure_work::PressureDone),
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    EgressResolved(Vec<super::egress_resolution::Resolution>),
+}
+```
+
+A turn spawns the slow middle into `follow_ups: JoinSet<FollowUp>`, the task
+returns a variant, and a `follow_up` branch in the loop's `select!` matches on
+it. `#[cfg(...)]` on one variant is the same conditional compilation we've
+used on functions: on a build without eBPF the variant doesn't exist, and
+neither does the match arm that handles it, so there's nothing to dead-code
+warn about.
+
+The upgrade answers its caller from that branch, sleeps the 200 ms that lets
+the HTTP response flush, and execs. That sleep is the one await in the whole
+upgrade still on the loop, and it carries a `LOOP-INLINE` tag saying it's
+there on purpose. A second `UpgradeApply` for the same upgrade id while the
+first is still downloading gets `Ok` (as a re-delivered directive always did
+once the marker was on disk), and anything else gets "already in flight".
+
+Two things bit us. First, a panicking task never returns its variant, so the
+loop can't tell from the result which piece of work just died. `JoinSet`
+helps: `join_next_with_id` yields each result with its task's id, and the
+`JoinError` of a panicked task carries the id too. The agent remembers the id
+of the upgrade it's preparing and the firewall apply it's running, so a panic
+in either clears the right flag, and an upgrade that died mid-download stops
+draining the node. Second, a result can describe a world that has moved on.
+DNS re-resolution takes a snapshot of every owned egress binding, resolves the
+lot in a task, and by the time the answers land an instance may have
+restarted into a new cgroup or been redeployed with a different allowlist.
+So the loop applies an answer only to a binding that is still the one it
+asked about: same owner, same cgroup, same allowlist. It's the incarnation
+check from the state sweep again, in a different costume.
+
+#### Whoever drove the runtime asks it
+
+The deploy worker had just created a container when it asked the loop to
+program its network, and the first thing the loop did was ask the runtime to
+retain the container's network reference, under the same lifecycle lock the
+worker had just released. Then, after the start, the loop asked for the pid,
+the log files, the rootless port forward and the address, to write the
+adoption record. Every one of those is a runtime call the worker could have
+made itself, off the loop, where waiting costs nobody anything.
+
+So now it does. The worker retains the reference and passes the result (or
+the error) in the `ApplyNetworkPreStart` op; the loop only checks that it
+belongs to this instance's generation and journals it. After the start, the
+worker reads everything the record needs into one struct:
+
+```rust
+#[derive(Debug, Clone, Default)]
+pub(super) struct LaunchEvidence {
+    pub(super) pid: Option<u32>,
+    pub(super) log_stem: Option<PathBuf>,
+    pub(super) rootless_network: Option<RootlessNetworkRecord>,
+    pub(super) container_ip: Option<Ipv4Addr>,
+}
+```
+
+and hands it over with the step that writes the record. A restart's steps do
+the same: `Create` comes back as `StepResult::Created { retained }` and
+`Start` as `StepResult::Started(Box<LaunchEvidence>)`. The `Box` is there for
+size. An enum is as big as its largest variant, so one variant carrying four
+fields would make every `Done` and `Cancelled` that big too; boxing it costs
+an allocation per start and keeps the rest one pointer wide.
+
+The refused-hold case needed a moment's thought. If the loop refuses a
+reference the runtime has already retained, nothing will ever release it,
+so it hands it back. Doing that inline would be another runtime call, so a
+detached task does it instead. That's safe because a reference names its
+generation, and releasing an old generation can't touch a later retain of the
+same instance.
+
+#### A budget per turn
+
+Some reads the loop can't hand to anyone: the namespace firewall wants every
+instance's cgroup id, a fault wants its targets' pids, retirement wants the
+runtime's view of a network reference. Each is usually milliseconds. Each can
+take seconds behind a create holding the instance's lock. For these we
+gave every turn a budget:
+
+```rust
+fn begin_turn(&mut self, branch: LoopBranch, detail: Option<&'static str>) -> Turn {
+    self.turn_deadline = Some(tokio::time::Instant::now() + TURN_RUNTIME_BUDGET);
+    self.loop_meter.begin(branch, detail)
+}
+```
+
+`TURN_RUNTIME_BUDGET` is 500 ms, measured from the start of the turn, and
+every such read in the turn waits until the same instant:
+
+```rust
+let deadline = self.turn_deadline();
+let reads = ids.iter().map(|id| async move {
+    tokio::time::timeout_at(deadline, grill.pid(id)).await.ok().flatten()
+});
+```
+
+`timeout_at` takes an absolute deadline where `timeout` takes a duration,
+and that's the point: ten reads in a row each get what's left of the same
+half-second, not half a second each. One detail makes the shared deadline
+safe to use: `timeout_at` polls the inner future before it looks at the
+clock, so a read that's ready at the deadline still counts. What misses the
+deadline fails its step the way a runtime error would, and something tries
+again: the tick, every second, for most of them. The namespace firewall
+needed a flag to make "something" true (a sync that gave up now marks the
+maps stale, and the tick re-syncs until one completes), because a missed
+mapping there means a cross-namespace connection the hook lets through.
+
+A budget is a trade, so it's worth saying what it costs. A runtime that is
+*always* slower than 500 ms for one of these reads would never get through.
+The reads that stayed under a budget are cheap on every runtime we have
+whenever nothing else holds the instance: a map lookup, or a small file read
+under the instance's lock. Anything that forks a subprocess or waits for a
+process to exit went to a task.
+
+#### Start it now, collect it later
+
+Retirement was the awkward one. A retired instance's identity directory has to
+go (on Linux that's an `umount` subprocess first, then removing the files and
+syncing the parent directory), and its adoption record with it, all *before*
+the loop forgets the instance. That "before" is the invariant: an owner must
+not disappear while its key material is still on disk. The cleanup sits in
+the middle of a sequence the loop owns, and a dozen callers run that
+sequence: stops, the tick's deferred retirements, rolling deploys, startup
+recovery.
+
+So the step starts the work in a task and waits for it, but only until the
+turn's budget runs out:
+
+```rust
+let Some((task, started_now)) = self.off_loop_work.task(&key, incarnation, work) else {
+    return Err(still_running());
+};
+let deadline = if started_now { turn_deadline } else { tokio::time::Instant::now() };
+let joined = tokio::time::timeout_at(deadline, task)
+    .await
+    .map_err(|_| still_running())?;
+```
+
+On a healthy disk the cleanup finishes in a few milliseconds and the turn
+carries on exactly as before. On a struggling one the step fails with
+`BunError::StillRunning`, and the caller asks again later: a stop checks back
+every 100 ms before it answers anyone, a deploy worker retries its op after a
+short sleep, the tick retries a deferred retirement on its next pass. The
+next attempt finds the same task in the map, so the work runs once however
+many times someone asks, and the steps before it aren't repeated.
+
+Here's the Rust detail that makes this work, and it surprises people coming
+from Go's goroutines or Python's tasks alike. `task` is a `&mut JoinHandle`,
+and awaiting a `&mut` to a future polls it without taking it. When
+`timeout_at` gives up, it drops *its* future, which is the borrow, not the
+handle. And even dropping a `JoinHandle` doesn't cancel the task it points to;
+the task keeps running and its result waits to be collected. Dropping an
+ordinary future cancels it on the spot. The two look identical at the call
+site, so this is one of those places where the type tells you what you can't
+see.
+
+Each task belongs to the instance's incarnation, its `created_at`. A result
+nobody collected (the owner went another way, say) is thrown away when a new
+incarnation with the same id asks, and a new incarnation waits until an older
+one's work has finished before it starts its own, so an old cleanup can never
+delete a new instance's directory.
+
+The same mechanism took two more awaits off the loop. Provisioning an app's
+volumes became off-loop work keyed by the spec's volume list, and a snapshot
+restore now waits while one is running. And the stage-two leftover: a job rerun
+and an execution fence used to settle any in-flight restart step and confirm a
+kill, up to twenty seconds, inside one turn. Both now kill through this path.
+A rerun also fences the old run first (Stopping, no retries, no probes), so
+nothing restarts it while the kill is in flight.
+
+#### The faults
+
+The fault code was where the five approaches met. A node-kill fault's
+container kills nobody waits on, so a task does them. A kill, pause or resume
+reads its targets' pids and then signals them; the first version read the pids
+under the turn's budget, which kept the turn under a second but, on a slow CI
+runner, made a status queued behind it wait for the turn *and* its own pid
+reads, 1.47 s in all. So those faults became follow-ups too: the loop picks
+the targets, a task reads and signals, and the caller hears once it's done. A
+pause that lands after its fault was cleared thaws what it froze, since no
+reversal ever will. Delays program a netem
+tree inside every caller's network namespace, a handful of `tc` commands per
+caller, and doing them one caller at a time added up to most of a second on a
+busy node. They now run side by side under the turn's budget, and a caller
+cut short is marked `(u32::MAX, Vec::new())`, a restart count no instance has,
+so the next pass rebuilds it.
+
+The `ss` that cuts open connections after a drop or partition lands taught us
+something. Cutting is best effort, nothing reads its result, so the first
+version sent it to a detached task. The privileged CI run disagreed: the
+Kubernetes demo injects a partition and immediately asks the frontend to talk
+to Redis, and three requests in a row went through, on pooled connections the
+cut hadn't reached yet. "Nobody reads the result" isn't the same as "nobody
+depends on it"; the caller who hears "partition installed" depends on the old
+connections being gone. So the cuts run side by side under the turn's budget,
+before the answer, like the delays, and only one that's cut short is retried
+from a task.
+
+Node pressure got the most machinery, because its helper takes up to four
+seconds to say it's ready and the controller has to stay the single owner of
+the helper. The controller moved behind a `tokio::sync::Mutex` shared with the
+tasks that drive it. The loop checks a request with `try_lock`, which returns
+straight away (an error if a task holds the lock), so the loop never waits for
+a helper; a task does the start or the stop with the lock held; and the
+`FollowUp::NodePressure` branch answers `InjectFault`, `ClearFault` or the
+leader's fence once the helper runs or is gone. Answering *after* the work is
+done is the same rule as the cleanup's: a caller who hears "cleared" may rely
+on it. The mutex also settles the race you'd worry about, a clear arriving
+while a start is still in flight: the clear's task waits for the lock, so it
+stops the helper the start just made.
+
+#### What the tests say now
+
+Every harness scenario runs. The nine stage-three scenarios are un-ignored and
+pass, and a new one joins them: a job rerun whose previous run takes 1.5
+seconds to die answers status within the second, finishes the rerun, and
+starts the job exactly once. `grep -rn 'LOOP-INLINE: stage' src/` finds
+nothing.
+
+Two things have no scenario, because they only exist with a loaded eBPF
+program: DNS re-resolution and the execution fence. Their off-loop halves
+have unit tests instead. One resolves two allowlists, one of them bad, and
+checks that the failure stays with its binding; another checks that an answer
+applies only to a binding that hasn't changed owner, cgroup or allowlist.
+The off-loop work has tests of its own for the incarnation rule: the same
+incarnation finds the task it started, and a new one waits for the old work,
+then starts its own and never sees the old result.
+
+And the meter finally has teeth. The V02 checker reads each node's
+`bun_agent_loop_turn_seconds_bucket` from `/v1/metrics` at every settle and
+heavy check. A histogram counts cumulatively, so `+Inf` minus `le="1"` is the
+number of turns over the budget since the process started, and the checker
+fails the tier on any increase since its last look. A bun that restarted
+starts its counters from zero, which the checker notices the way its resource
+trends do, by the pid and image changing. The finding says which bucket the
+worst turn landed in, `1 deploy_op turn(s) over the 1 s budget, the worst
+between 2.5 and 5 s`, and Bun's own log line from the meter says which op it
+was.
+
+Looking back over the whole arc, the lesson isn't about `select!` at all. We
+spent a dozen PRs arranging the order in which slow things waited, and three
+stages making sure nothing slow waits there. A priority order decides who
+suffers; a budget decides that nobody does. The single owner survived all of
+it, and so did every invariant that leans on it, because in every case above
+the loop still makes the decision and only the waiting moved.
 
 ### Two commands, two answers
 

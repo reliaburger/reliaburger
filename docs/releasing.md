@@ -285,7 +285,7 @@ and the [release asset digest fields](https://docs.github.com/en/rest/releases/r
 The website and installer are separate static assets under `docs/website`,
 published by `static.yml`. GitHub Pages cannot select a different response for
 curl and a browser at `/`; the shell endpoint is `/install.sh`. The bootstrap
-installs the version in its `RELIABURGER_VERSION` default (`v0.1.1` today), so
+installs the version in its `RELIABURGER_VERSION` default (`v0.1.2` today), so
 bump that default in the same change that announces a newer release.
 
 Before tagging a release, complete the managed-cluster and clean-install
@@ -408,6 +408,19 @@ the real `curl … | sh` install against it on every host we advertise.
    record](qualification/2026-09-27-v0.1.0-release-closure.md) shows what these
    runs found for 0.1.0, candidate by candidate, and the PR that fixed each
    failure.
+
+   Either tier also fails on a slow agent loop. Every settle and heavy check
+   reads each node's `bun_agent_loop_turn_seconds` histogram from
+   `/v1/metrics`, and the checker fails the tier (`agent-loop-turn`) on any
+   turn longer than 1 s since the last check, naming the node, the branch
+   (`command`, `deploy_op`, `health_tick`, …) and how long the worst one
+   took. A turn that long holds every caller on the node, the way the stalls
+   behind 0.1.0's soak failures did; the budget comes from the [agent-loop
+   review](plans/2026-09-30-agent-loop-review.md#decision) (#351). The
+   record's Data section lists the turns over budget per node. A failure
+   here is a product bug: Bun's log names the turn's command or deploy op
+   (`agent loop turn took … ms in …`), and the fix moves that work off the
+   loop.
 
    Until 1.0, a final-tier run whose only failures are known harness
    artefacts counts as passed (maintainer decision, 28 September 2026), if

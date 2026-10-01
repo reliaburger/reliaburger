@@ -739,6 +739,10 @@ collect() {
     rel --output json status > "$directory/status.json" 2>/dev/null || rm -f "$directory/status.json"
     for node in 1 2 3; do
         [ "${down[node]}" = 0 ] || continue
+        # The agent loop's turn histogram, newest samples last: the checker
+        # fails the tier on any turn over the 1 s budget (#351).
+        api_get "$node" "/v1/metrics?name=bun_agent_loop_turn_seconds_bucket&start=$(( $(date +%s) - 900 ))" \
+            > "$directory/turns-${vm[node]}.json" 2>/dev/null || rm -f "$directory/turns-${vm[node]}.json"
         if [ "$kind" = heavy ]; then
             api_get "$node" /v1/diagnostics > "$directory/diagnostics-${vm[node]}.json" 2>/dev/null || true
             guest_report | gsh_in "$node" 2>/dev/null | split_report "$directory" "${vm[node]}" || true

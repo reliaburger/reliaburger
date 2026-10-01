@@ -61,11 +61,9 @@ migration and no feature gate
   ([#317](https://github.com/reliaburger/reliaburger/issues/317)). 0.1.1 changes the state format
   (44 in 0.1.0), so a 0.1.0 cluster can't roll to it: recreate the cluster
   ([upgrading from 0.1.0](releasing.md#upgrading-from-010)).
-- [ ] **0.1.2: ready for release, qualification in progress**
-  ([milestone](https://github.com/reliaburger/reliaburger/milestone/2)). Every
-  item has landed and the crate says 0.1.2; what's left is building, staging,
-  soaking and promoting the candidate ([runbook](releasing.md)). 0.1.2 is about
-  images:
+- [x] **0.1.2: images.** [Released](https://github.com/reliaburger/reliaburger/releases/tag/v0.1.2)
+  on 1 October 2026
+  ([milestone](https://github.com/reliaburger/reliaburger/milestone/2)):
   - [x] images ([#248](https://github.com/reliaburger/reliaburger/pull/248)): the Go
     demo build in the tour, multi-arch builds and pulls (which removes the
     multi-platform limitation), platforms in `relish images`, a build cache cap,
@@ -78,10 +76,12 @@ migration and no feature gate
     upstream image, not just the first puller's
     ([#353](https://github.com/reliaburger/reliaburger/issues/353), [#354](https://github.com/reliaburger/reliaburger/pull/354)).
 
+  The homepage tour was re-recorded against the published install, with the
+  build, its platforms in `relish images` and the spread after a lost node.
   0.1.2 changes the protocol and state formats (27 and 46 in 0.1.1; 28 and 47
   now), so a 0.1.1 cluster can't roll to it: recreate the cluster
   ([upgrading from 0.1.1](releasing.md#upgrading-from-011)).
-- [ ] **0.1.3: agent loop, observability and test quality**
+- [ ] **0.1.3: agent loop, observability and test quality, the next release**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/4)).
   Streamed metrics queries, so Mayo and rollup sessions no longer load every
   Parquet file; an agent loop that's metered and never waits inline on slow
