@@ -166,6 +166,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         // Set this before awaiting the worker. An error after rename/fsync may
         // have changed durable state; no later mutation may overwrite it blindly.
         self.egress_store_uncertain = true;
+        // LOOP-INLINE: fsync'd persist (#351 decision 2); the slow-disk scenario bounds it
         tokio::task::spawn_blocking(move || crate::bun::egress_owners::persist(&directory, owners))
             .await
             .map_err(|error| BunError::AdoptionState(error.to_string()))?

@@ -11,7 +11,7 @@ run it.
 |---|---|---|---|
 | Unit tests | Pure logic, state machines, parsers, every failure branch | `#[cfg(test)]` modules across [`src/`](../src) | `make test` |
 | 10,000-member gossip | One node's membership table and dissemination at 10,000 members, in about a second | [`tests/gossip_10k.rs`](../tests/gossip_10k.rs) | `make test` |
-| Mayo memory | Periodic metrics reads need the same heap whether a node holds one hour of history or four, and leave nothing behind (a counting allocator in its own binary) | [`tests/mayo_memory.rs`](../tests/mayo_memory.rs), [record](qualification/2026-09-29-mayo-memory.md) | `make test` |
+| Mayo memory | Metrics reads (the periodic alert and rollup cycle, unbounded and old-window queries, the council rollup store and the object-store backend) need the same heap whether a node holds one hour of history or four, and the periodic ones leave nothing behind (a counting allocator in its own binary) | [`tests/mayo_memory.rs`](../tests/mayo_memory.rs), [record](qualification/2026-09-29-mayo-memory.md) | `make test` |
 | Property tests | Invariants over generated inputs: scheduling, allocation, parsing | [`proptest`](https://docs.rs/proptest) blocks in `src/` | `make test` |
 | Snapshot tests | CLI output, rendered config and TUI frames stay exactly as reviewed | [`insta`](https://insta.rs) snapshots, e.g. [`src/relish/snapshots/`](../src/relish/snapshots) | `make test` |
 | Integration suite | Real Bun and Relish processes over HTTP, TLS and the registry | [`tests/suite/`](../tests/suite) | `make test` |
@@ -19,8 +19,40 @@ run it.
 | Lint and format | Clippy with warnings as errors, all features and none | [`Makefile`](../Makefile) | `make lint`, `make fmt-check` |
 | Coverage floor | Line coverage of the portable suite never drops below 78.65% | `COVERAGE_MIN_LINES` in the [`Makefile`](../Makefile) | `make coverage` |
 | Dependency audit | No new RustSec advisory; every exception is dated | [`security.yml`](../.github/workflows/security.yml), [exceptions](qualification/2026-09-18-dependency-exceptions.md) | `make audit` |
+| CI scripts | Job selection, ignored-test owners and JUnit keeping, against fixture repositories and the real workflow | [`scripts/ci/test_*.py`](../scripts/ci) | `make test-ci-scripts` |
+| Ignored-test owners | Every `#[ignore]` reason names who runs it ([below](#who-runs-an-ignored-test)) | [`ignored_owners.py`](../scripts/ci/ignored_owners.py) | `make check-ignored` |
 
-`make ci` runs the portable set locally, the same way CI does.
+`make ci` runs the portable set locally, the same way CI does: formatting,
+lint, the portable suite, doctests, the CI scripts' tests and the ignored-test
+owner check. `make ci-bench` is `make ci` followed by `make bench`. Neither
+runs a privileged, cluster or upgrade suite; those have their own targets
+below, because they need root, a provisioned host or a lot of wall time.
+
+## The agent loop's turn budget
+
+Each node's agent runs one loop that owns all of the node's state, one turn at
+a time. A turn that waits on something slow holds every caller, and that one
+shape caused most of the 0.1.0 and 0.1.1 soak failures
+([review](plans/2026-09-30-agent-loop-review.md), #351). Four things keep
+turns short:
+
+| Piece | What it does | Where |
+|---|---|---|
+| Turn meter | Times every turn by branch, exports `bun_agent_loop_turn_seconds{branch}` through Mayo, logs any turn over 250 ms with the command or deploy op it ran. Tests read the worst turn, including one still running | [`src/bun/loop_meter.rs`](../src/bun/loop_meter.rs) |
+| Starvation harness | One scenario per inline await from the review: a `MockGrill` whose calls can each be slowed (`set_call_delay`), a council whose writes hang, a log client that never reads, and test-only stalls for awaits no mock stands behind (the disk, `nft`). Each scenario queues a status command during the slow work and fails unless it's answered, and the worst turn ends, within 1 s | [`src/bun/agent/tests/loop_harness.rs`](../src/bun/agent/tests/loop_harness.rs) |
+| Inline-await rule | Parses the agent's source with `syn`, walks every method a turn can reach from `run_loop`, and fails on an await with neither a `tokio::time::timeout` nor a `// LOOP-INLINE: <why>` comment | [`src/bun/agent/tests/loop_rule.rs`](../src/bun/agent/tests/loop_rule.rs) |
+| Soak gate | The V02 checker reads each node's turn histogram at every settle and heavy check and fails the tier on any turn over 1 s | [`scripts/release/sustained_check.py`](../scripts/release/sustained_check.py) (`turn_findings`) |
+
+The first three run in `make test`; the gate's own tests run with the other
+release-script tests (`python3 -m unittest discover -s scripts/release -p
+'test_*.py'`). Every harness scenario runs; none is ignored any more. Egress
+DNS re-resolution and the execution fence have no scenario because they need
+a loaded eBPF program; their off-loop halves have unit tests
+(`bun::agent::egress_resolution`, `bun::agent::off_loop_work`). A new inline
+await either gets a deadline (`timeout_at` on the turn's shared runtime
+budget, for work a later turn can retry), moves into a task, or gets a tag a
+reviewer can argue with. A scenario for the new await belongs in the harness,
+not behind an `#[ignore]`.
 
 ## Real systems, gated
 
@@ -35,7 +67,52 @@ ignored by default and run by their own targets and CI jobs
 | Multi-node clusters | Leader failover, council self-healing and full-loss recovery, placement, gossip | [`tests/cluster_failover.rs`](../tests/cluster_failover.rs), [`tests/council_self_healing.rs`](../tests/council_self_healing.rs), [`tests/council_disaster_recovery.rs`](../tests/council_disaster_recovery.rs), [`tests/placement.rs`](../tests/placement.rs) | `make test-cluster` |
 | Self-upgrade | Rolling binary upgrades and rollbacks with real signed binaries, workloads kept running | [`tests/self_upgrade.rs`](../tests/self_upgrade.rs), [`tests/self_upgrade_cluster.rs`](../tests/self_upgrade_cluster.rs) | `make test-upgrade` |
 | Wall-clock acceptance | Timeouts, back-offs and leases that can't be tested with a paused clock | ignored tests in [`tests/integration.rs`](../tests/integration.rs) | `make test-slow` |
+| Standard registry clients | `crane` logs in, pushes and pulls through Pickle's TLS listener | [`tests/suite/registry_standard_clients.rs`](../tests/suite/registry_standard_clients.rs) | `make test-standard-clients` (needs `crane`) |
 | Benchmarks | Gossip convergence from 5 to 1,000 nodes, plus the data plane on a live cluster (`relish bench`) | [`benches/`](../benches), [`src/testkit/bench/`](../src/testkit/bench) | `make bench`, `make bench-large` |
+
+### Who runs an ignored test
+
+Every `#[ignore = "..."]` reason names its owner, and `make check-ignored`
+(part of `make ci`, and the "CI policy" job) fails when one doesn't, or when
+the owner doesn't exist. An owner is one of:
+
+| Owner | Example reason | Checked |
+|---|---|---|
+| A Make gate: a target whose recipe runs `--run-ignored` | `"requires root and runc; run with make test-linux"` | the target exists and runs ignored tests |
+| A script | `"run through scripts/release/qualify-oci-interruptions.sh"` | the file exists |
+| A parent test | `"subprocess fixture for owned Runc caller death"` | something else in the same file names the fixture |
+| A tracking issue, for deferred work | `"stage 3 of #351"` | the reason carries `#<number>` |
+
+That proves every test *has* an owner, not that the owner still selects it:
+`--no-tests=fail` passes as long as a filter matches anything, so renaming a
+test out of `test(/runc_/)` would drop it silently. CI closes that gap. Each
+nextest suite's JUnit report is kept under its own name
+([`keep-junit.sh`](../scripts/ci/keep-junit.sh)) and uploaded as
+`junit-<job>` for 14 days, with the command, commit, run and host beside it,
+even when the suite fails. The `ignored-test evidence` job then reads every
+report, plus the OCI interruption logs, and fails when a test whose owner CI
+runs (a target or script named in `ci.yml`) is missing from all of them.
+
+Gates CI can't run are manual, so the evidence check skips them:
+
+| Gate | Needs |
+|---|---|
+| `make test-apple` | Apple silicon with Apple Container |
+| `make test-gpu` | An NVIDIA GPU and `nvidia-smi` |
+| `make test-s3` | AWS credentials and `RELIABURGER_TEST_S3_URL=s3://bucket/prefix` |
+| `qualify-oci-reboot.sh`, `qualify-discovery-reboot.sh`, `qualify-storage-power-cut.sh` | A disposable VM that can be rebooted or powered off ([below](#pulling-the-plug)) |
+
+### Which jobs a pull request runs
+
+[`select-jobs.sh`](../scripts/ci/select-jobs.sh) diffs a pull request against
+its base (with renames split into a deletion and an addition, so moving code
+into `docs/` still counts as code). Documentation-only changes skip the Rust
+jobs; pull requests stacked on another branch skip the heavy suites unless
+labelled `full-ci`. When GitHub retargets a stacked pull request to `main`,
+[`ci-retarget.yml`](../.github/workflows/ci-retarget.yml) reruns CI with the
+new base, so the heavy suites don't wait for another push. Its fixtures, in
+[`test_select_jobs.py`](../scripts/ci/test_select_jobs.py), cover each of
+those cases.
 
 ## Inside a live cluster
 

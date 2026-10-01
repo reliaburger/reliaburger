@@ -11,6 +11,22 @@ pulls anywhere in the cluster come from peers.
 relish images             # what the cluster's registry holds
 ```
 
+A multi-platform image is one row, with the platforms it offers. Images
+pulled through the cache live under `cache/<registry>/<repository>`, and the
+columns widen to fit those long names:
+
+```text
+REPOSITORY                          TAG     PLATFORMS                 LAYERS     SIZE
+burger                              v1      linux/amd64, linux/arm64       -   9.4 MB
+cache/ghcr.io/stefanprodan/podinfo  <none>  linux/amd64, linux/arm64       -  33.0 MB
+```
+
+LAYERS is `-` because each platform has its own. `relish images --output json`
+lists them under `platforms`, each with its own manifest `digest`, `layers`
+and `total_size`; a single-platform image has no `platforms` field. The
+image's `digest` is the index's, which is what a deploy of `burger:v1`
+verifies and pins.
+
 Private registries take credentials from environment variables that Bun reads
 at startup, so the password never sits in the config:
 
@@ -55,12 +71,34 @@ relish apply app.toml
 Relish uploads the context to the registry: through the quickstart's registry
 forward (`127.0.0.1:15050`) on a laptop cluster, otherwise at `localhost:5050`,
 so run it on a node or through a forward to one (`--registry-port` names the
-port on this host). A node then builds it with Buildah, which must be installed there, for
-`linux/amd64` and `linux/arm64` by default. A build has
-15 minutes (`[images] build_timeout_secs`) and a 256 MiB context. Refer to the
-result by its bare name, as `api:v1.2.3`, and nodes find it in Pickle. Built
-images are signed by the cluster, which matters when `require_signatures` is
-on (see `security`).
+port on this host). A node then builds it with Buildah, which must be installed
+there (the quickstart's VMs have it). The five-minute tour builds
+`examples/demo/burger` this way. A build has 15 minutes per stage
+(`[images] build_timeout_secs`) and a 256 MiB context. Refer to the result by
+its bare name, as `api:v1.2.3`, and nodes find it in Pickle. Built images are
+signed by the cluster, which matters when `require_signatures` is on (see
+`security`).
+
+A build targets `linux/amd64` and `linux/arm64` unless `platform` says
+otherwise (`platform = ["linux/arm64"]`). Pickle stores every platform under
+the one tag, and each node pulls the one that matches its own architecture. A
+build fails if a platform it asked for is missing from the result. Buildah
+runs a `RUN` step for a foreign platform under emulation, which is slow or
+missing, so a Dockerfile that cross-compiles (as the demo's does) builds both
+platforms quickly.
+
+A node builds one image at a time, in its own Buildah storage under
+`<storage.data>/buildah`. After every build it removes the build's containers
+and images and keeps base images for the next build, up to
+`[images] build_cache_max_bytes` (100 GiB by default, 2 GiB on a quickstart
+node; `0` keeps nothing). Past that, it removes every cached image.
+
+A `RUN` step that uses the network gets Buildah's own bridge (`podman0`,
+`10.88.0.0/16`), with Buildah's firewall rules next to Reliaburger's. The two
+don't interfere: Reliaburger's firewall only drops traffic to its own ports
+from outside the cluster, and that includes a build step trying to reach the
+node's API or registry. Add `--network=none` to `RUN` steps that don't need
+the network.
 
 ## Pushing with docker or crane
 
@@ -107,29 +145,30 @@ deleting images through the registry API.
 
 ## Multi-platform images
 
-0.1.1 can't run a multi-platform image (an OCI image index or Docker manifest
-list) stored in Pickle. A node pulling one treats the index as a single image
-and the workload fails to start. This hits `docker buildx build --platform
-linux/amd64,linux/arm64 --push` and multi-platform `relish build`, which is the
-default; a multi-platform `relish build` also stores only the builder's own
-platform. 0.1.2 is planned to fix both.
+A multi-platform image (an OCI image index or Docker manifest list) in Pickle
+runs on every node whose platform it offers. The node reads the index, picks
+`linux/amd64` or `linux/arm64` to match its own architecture, and pulls only
+that platform's layers. A node whose platform the index doesn't list refuses
+the image and names the architecture it looked for, rather than running the
+wrong one.
 
-Until then, push and build one platform that matches your nodes:
-
-```sh
-docker buildx build --platform linux/arm64 -t NODE:5050/api:v1 --push .
-```
+That covers `docker buildx build --platform linux/amd64,linux/arm64 --push`
+and `relish build`, which builds both platforms by default and stores all of
+them under one tag. To build just one, name it:
 
 ```toml
 [build.api]
 context = "./api"
 destination = "pickle://api:v1.2.3"
-platform = ["linux/arm64"]      # or ["linux/amd64"], whatever your nodes run
+platform = ["linux/arm64"]
 ```
 
-On a cluster whose nodes share one architecture, multi-platform images from
-an upstream registry work: the pull-through cache picks the node's platform
-from the index and stores that single image.
+Multi-platform images from an upstream registry work the same way through the
+pull-through cache. The cache stores the upstream index under the tag, and
+each platform's layers the first time a node of that architecture pulls the
+image. So a cluster that mixes amd64 and arm64 nodes can run `redis:7`
+straight from Docker Hub: every node gets its own platform, and each platform
+comes from upstream only once.
 
 ## Volumes
 

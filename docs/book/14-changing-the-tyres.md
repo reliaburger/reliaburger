@@ -713,7 +713,9 @@ Tests: the render functions and address/role derivation under `cargo test --lib 
 
 `tests/self_upgrade_cluster.rs` is §14.7's harness scaled up: four real bun processes, each under its own supervisor loop, forming a real gossip+Raft cluster on localhost — node 0 bootstraps, the rest join, the council reconciler promotes voters, a leader emerges. Nothing is mocked below the HTTP API; the tests drive exactly the endpoints relish drives.
 
-One honesty note up front. With four nodes and a council cap of seven, *every* node becomes a Raft voter — a genuine non-voter worker would need an eight-node harness, which is a lot of laptop for one assertion. So the test labels one voter "worker" in its start request, and the leader's server-side derivation *corrects* that to `Council` (both roles precede the leader, so it's a harmless relabel, not a rejection). The mechanics under test — batch-then-serial ordering, quorum-gated council steps, leader-last in-place upgrade — are untouched by the distinction, and the correction is exactly the behaviour a unit test pins directly.
+One honesty note up front. With four nodes and a council cap of seven, *every* node should become a Raft voter, and since #373 the harness waits until every node has before a test starts. A genuine non-voter worker would need an eight-node harness, which is a lot of laptop for one assertion. So the test labels one voter "worker" in its start request, and the leader's server-side derivation *corrects* that to `Council` (both roles precede the leader, so it's a harmless relabel, not a rejection). The mechanics under test (council members one at a time, each step gated on live quorum, the leader last and in place) are untouched by the label, and the correction is exactly the behaviour a unit test pins directly.
+
+"Should become" is doing some work in that paragraph, because for a long time it didn't. The harness picked every port at random, so each node's Raft port sat a different distance above its gossip port. Bun doesn't gossip Raft addresses: it works out a peer's Raft address from the peer's gossip port plus its *own* offset, which is right on a real fleet where every node uses the same ports. On the harness that sum pointed at the wrong port, the leader never reached a node it tried to add, and the council stayed at the one voter that bootstrapped it. The tests still passed, because a walk over learners and a lone leader looks the same from `/v1/upgrade/cluster`. Nobody noticed until #373 pointed out that one test's comment admitted to "a one-voter council" while the module header promised four voters. Now the harness gives every node the same Raft offset, and its start-up waits until the leader's `/v1/cluster/nodes` marks all four as council members. Only then does a rolling upgrade take real voters down, one at a time, against a real quorum. A real council had one side effect: two refusal tests that started two nodes now met a two-voter council, which the leader refuses to roll at all (see "Two voters, no way through" below), before the refusal they were written to check. They start three nodes now.
 
 **`rolling_upgrade_walks_workers_council_then_leader`** is the milestone test. Deploy a workload, push the signed blob to the leader's Pickle, POST the plan, and then just *watch* `/v1/upgrade/cluster` — any node can serve it, it's replicated — recording when each node first reports `Healthy`. The assertions read like the design doc: worker first; old leader last; the cluster still has a leader at the end; all four nodes report v0.2.0; and the app stays *reachable* across the whole roll. Note that last one is an **availability** assertion, not a same-pid one: unlike the single-node case (§14.7), a cluster's scheduler may legitimately reschedule an app while its host node bounces, so pid-identity is the wrong thing to demand here — "still serving, still has a running instance" is the honest cluster guarantee.
 
@@ -729,7 +731,7 @@ The fix has three interlocking parts, and the pattern is worth keeping: **make f
 
 These are the slowest tests in the repository — a couple of minutes each, serialised for the same starvation reasons as §14.7 — and the cheapest confidence per line in the whole phase. When someone asks whether the cluster can really upgrade itself, the answer is a test name.
 
-One honest operational note: they run on a *real* machine (`make test-upgrade-cluster`), not in CI. Four real `bun` processes, each with its own Raft TCP server and gossip, need enough cores to converge; on a contended 2-core shared CI runner the membership-change RPC times out under load and the council never forms. That's a property of *four real processes competing for two cores*, not of the upgrade logic — the single-node real-binary suite (§14.7) does run in CI, and the cluster mechanics are exercised deterministically by the mock-driven `step` unit tests (§14.9). The full-process cluster test is the belt-and-braces layer you point at a dev cluster, not the one that gates every push.
+One operational note. These tests used to run only on a real machine, because on a 2-core CI runner "the council never forms". That diagnosis blamed the cores. The port offsets above are the likelier culprit: a council that can't add learners never forms anywhere. CI's acceptance job now runs `make test-upgrade-cluster` on every pull request into `main` that touches code, and the cluster mechanics are also exercised deterministically by the mock-driven `step` unit tests (§14.9).
 
 What remains is bookkeeping: progress ticked, READMEs updated, and this chapter closed out with the lessons that only showed up in the doing.
 
@@ -1102,9 +1104,9 @@ The cluster suite gets
 `upgrade_start_sent_to_a_node_that_is_not_the_leader_reaches_the_leader`,
 which sends the start to a node other than the leader and waits for the run
 to finish. Before the change the node refused it with its own, leaderless
-view of the plan. Its council has a single voter, so that node is outside
-Raft and finds the leader through the directory: the Raft-follower path is the
-API test's job.
+view of the plan. Every node in that harness is a voter, so the node is a
+Raft follower and forwards to the leader Raft names. The worker outside Raft,
+which finds the leader through the directory, is the API test's job.
 
 One gap is left, and the manual says so. relish builds the `start` and
 `rollback` plans from the connected node's `/v1/cluster/nodes`, and a worker
@@ -1405,7 +1407,7 @@ IncompatibleFormats {
 },
 ```
 
-and its message leads with them, like every other compatibility refusal in §14.8: `incompatible binary: found protocol 28, state 47; this cluster (reliaburger v0.1.2 (…)) needs protocol 27, state 46`, followed by the remedy and the policy link. Keeping the pairs typed rather than baked into a string lets a test match on `found` and `expected` directly instead of grepping prose.
+and its message leads with them, like every other compatibility refusal in §14.8: `incompatible binary: found protocol 29, state 48; this cluster (reliaburger v0.1.2 (…)) needs protocol 28, state 47`, followed by the remedy and the policy link. Keeping the pairs typed rather than baked into a string lets a test match on `found` and `expected` directly instead of grepping prose.
 
 The check runs last among the start gates, after the cheap probes, because it's the expensive one: a fetch, a hash and a process spawn. It sits under a twenty-second `tokio::time::timeout`, since a follower that forwarded the call gives up after thirty.
 
@@ -1476,3 +1478,83 @@ We didn't treat an unreachable node as missing the rollback target either. The s
 ### Tests
 
 `plan::tests` covers the rollback gate: a version missing from two of three stores names both nodes, and a node already on the target or not reporting its store passes. `manager::tests` covers the candidate check through the leader's manager: a signed script that prints `{"protocol":1,"state":1}` is refused as `IncompatibleFormats` with both pairs in the message and nothing staged; a candidate with a bad external signature is refused before it runs (the script would `touch` a file, and the file must not exist); a compatible one passes and still stages nothing. `installed_versions_lists_the_binary_store` and `a_probe_reads_the_binary_store_a_node_reports` cover the new field from both ends. The quickstart tests check the version message, the `--name` form and the per-field list. The cluster suite gets two real-binary tests: `start_refuses_a_candidate_with_other_formats_before_recording_a_run` pushes a signed incompatible candidate through `relish upgrade start` and checks for the refusal with nothing recorded and no node moved, and `rollback_to_a_version_the_nodes_lack_is_refused_before_recording_a_run` asks for a rollback to a version no node holds and checks for a 409 naming every node.
+
+## Two voters, no way through
+
+The appliance work (#259) found the next late refusal on a pair of thin clients. Two machines formed a cluster, the council reconciler promoted the second one, and the council had two voters. `relish upgrade start` answered "starting", the run reached `UpgradingCouncil`, and it stayed there. `relish upgrade status` gave no reason. `relish upgrade abort` refused, because only a paused run can be aborted, and this one wasn't paused. It was waiting.
+
+Waiting for what? The quorum check from §14.9. With two voters, quorum is two, so taking either one down for its swap leaves one, short of a majority. `live_quorum_headroom_ok(2, 2)` is `false`, and its unit tests pin exactly that. The orchestrator did the right thing on every tick: it refused to break quorum. It just had no way to say that the wait would never end.
+
+Is two special? Work it through. A council of `n` voters needs `n / 2 + 1` for quorum (`/` on integers truncates in Rust, as in C and Go), and one voter down leaves `n - 1`:
+
+| Voters | Quorum | One down leaves |
+|--------|--------|-----------------|
+| 1 | 1 | nobody, but there's no quorum to keep: the leader execs in place |
+| 2 | 2 | 1 |
+| 3 | 2 | 2 |
+| 4 | 3 | 3 |
+| 5 | 3 | 4 |
+
+Two is the only size that can never take a step. So it's a fact the leader can check before recording anything, like the format and rollback checks above, and it's another pure function in `upgrade::plan`:
+
+```rust
+pub fn check_council_can_roll(configured_voters: usize) -> Result<(), UpgradeError> {
+    if configured_voters <= 1 {
+        return Ok(());
+    }
+    let quorum = configured_voters / 2 + 1;
+    let remaining = configured_voters - 1;
+    if remaining >= quorum {
+        Ok(())
+    } else {
+        Err(UpgradeError::CouncilTooSmallToRoll {
+            voters: configured_voters,
+            remaining,
+            quorum,
+        })
+    }
+}
+```
+
+The early return covers more than the table's first row. `configured_voters - 1` on a `usize` of zero would underflow, which panics in a debug build and silently wraps to an enormous number in a release one. Unsigned arithmetic makes you deal with the edge instead of handing you a count of minus one.
+
+The handlers read the configured voter set from Raft's metrics and turn the error into a 409:
+
+```rust
+let configured_voters = council
+    .metrics()
+    .borrow()
+    .membership_config
+    .membership()
+    .voter_ids()
+    .count();
+```
+
+`metrics()` is a `tokio::sync::watch::Receiver`, and `borrow()` hands back a read guard on its latest value. The guard is a temporary, so it's dropped at the end of the statement. That's what we want: a guard held across an `.await` would stop the Raft task from publishing the next value. `start` and a cluster `rollback` both run the check after their cheap gates and before anything is written. In `start` it goes before the candidate check, because counting voters costs nothing and fetching a binary doesn't. The message says what to do about it: `a council of 2 voters can't upgrade one voter at a time: taking one down leaves 1, short of the 2 needed for quorum. Add a node so the council has at least three voters, then start again`.
+
+The gate counts configured voters, not live ones, and that's deliberate. A three-voter council with one voter down can't take a step either, but that wait ends: bring the voter back and the run carries on. So the orchestrator still waits there, and now it says so, once, when the wait begins:
+
+```rust
+let mut hold_logged: Option<String> = None;
+// ... on each tick ...
+if quorum_ok || !voter_phase {
+    hold_logged = None;
+} else if hold_logged.as_deref() != Some(upgrade.upgrade_id.as_str()) {
+    eprintln!("bun: cluster upgrade {} waiting: {live_voters} of {configured_voters} voters alive, ...");
+    hold_logged = Some(upgrade.upgrade_id.clone());
+}
+```
+
+`as_deref` turns an `&Option<String>` into an `Option<&str>` without cloning, so it compares directly with `Some(upgrade.upgrade_id.as_str())`. Remembering the run's id rather than a plain `bool` gives a new run that starts waiting its own line, and clearing it when quorum returns does the same for a second wait in the same run.
+
+### What we decided not to do
+
+We didn't let `abort` end a waiting run. A run waiting on quorum may already have moved its workers, and `abort` refuses once a node has moved for a good reason: it would leave the cluster on two versions. Refusing the run up front removes the one case with no exit, without loosening the rule for the cases that have one.
+
+We didn't upgrade the leader first on a two-voter council either. The leader execs in place in under a second, so in principle the pair would survive it. In practice that's a second upgrade order with its own failure modes, written for a cluster size that can't survive losing a machine anyway. Three is the smallest council that tolerates a failure, so it's the smallest one we roll.
+
+### Tests
+
+`plan::tests` pins the arithmetic: `a_two_voter_council_is_refused_before_the_run_is_recorded` checks the variant's fields and that the message asks for three voters, and `one_voter_or_three_and_more_can_roll` walks the sizes that pass, zero included. `bun::api`'s `a_two_voter_council_refuses_to_roll_and_three_voters_can` checks the wiring: it forms an in-memory Raft council of two voters and one of three, and the handlers' check reads each one's configured voters, refusing the pair with a 409 that asks for a third node and letting the trio through.
+
+We first wrote that as a real-binary test in the cluster upgrade suite, and it timed out waiting for the second node to vote. Three minutes in, the council still had one voter. The suite's own forwarding test says why in a comment: its harness keeps a one-voter council, so it can't build a two-voter one at all. We kept the in-memory version rather than teach the harness to grow its council for one assertion.

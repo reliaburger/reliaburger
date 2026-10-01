@@ -643,6 +643,7 @@ fn collect_replicas(
                 placed: desired.placements.clone(),
                 running,
                 unanswered: unanswered.clone(),
+                blocked: desired.blocked.as_ref().map(ToString::to_string),
             }
         })
         .collect();
@@ -1054,6 +1055,7 @@ mod tests {
                 scheduled_replicas: 0,
                 placements: Default::default(),
                 service_port: Some(8080),
+                blocked: None,
             }]),
             Ok(Vec::new()),
             None,

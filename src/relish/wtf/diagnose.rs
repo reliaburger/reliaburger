@@ -73,7 +73,8 @@ fn finding_order(left: &WtfFinding, right: &WtfFinding) -> std::cmp::Ordering {
 
 fn record_cluster_unknowns(evidence: &ClusterEvidence, report: &mut WtfReport) {
     record_unknown("nodes", &evidence.nodes, "cluster", report);
-    record_unknown("builds", &evidence.builds, "cluster", report);
+    // `check_builds` reports its own unknowns, so a partly read cluster
+    // gets one builds row rather than an UNKNOWN and an OK.
     record_unknown("council", &evidence.council, "cluster", report);
     record_unknown("faults", &evidence.faults, "cluster", report);
     record_unknown("disks", &evidence.disks, "cluster", report);
@@ -181,32 +182,59 @@ fn describe_build(build: &BuildObservation) -> String {
     line
 }
 
+/// Compare the bun builds the nodes run, and report them as one row.
+///
+/// When some nodes didn't answer (the evidence is degraded), the row names
+/// them inside it: a uniform build becomes one UNKNOWN that says what the
+/// others run, and skew stays one warning with the silent nodes in its
+/// details. A missing node's build can't vouch for an OK.
 fn check_builds(inputs: &WtfInputs, report: &mut WtfReport) {
-    let Some(builds) = inputs.cluster.builds.value() else {
+    let evidence = &inputs.cluster.builds;
+    let Some(builds) = evidence.value() else {
+        record_unknown("builds", evidence, "cluster", report);
         return;
     };
+    let unread = evidence.unknown_reason();
     let mut groups: BTreeMap<(&str, Option<&str>), Vec<&BuildObservation>> = BTreeMap::new();
     for build in builds {
         groups.entry(build_identity(build)).or_default().push(build);
     }
-    let details: Vec<String> = builds
+    let mut details: Vec<String> = builds
         .iter()
         .map(|build| format!("{}: {}", build.node_id, describe_build(build)))
         .collect();
     let Some(largest) = groups.values().map(Vec::len).max() else {
+        record_unknown("builds", evidence, "cluster", report);
         return;
     };
     if groups.len() == 1 {
         let description = match builds.as_slice() {
             [only] => format!("{} runs {}", only.node_id, describe_build(only)),
-            [first, ..] => format!("all {} nodes run {}", builds.len(), describe_build(first)),
+            [first, ..] if unread.is_none() => {
+                format!("all {} nodes run {}", builds.len(), describe_build(first))
+            }
+            [first, ..] => format!(
+                "the {} nodes that answered run {}",
+                builds.len(),
+                describe_build(first)
+            ),
             [] => return,
         };
-        report.ok.push(WtfOk {
-            id: "builds".to_string(),
-            description,
-        });
+        match unread {
+            None => report.ok.push(WtfOk {
+                id: "builds".to_string(),
+                description,
+            }),
+            Some(reason) => report.unknown.push(WtfUnknown {
+                source: "builds".to_string(),
+                reason: format!("{description}; {reason}"),
+                affected_resource: "cluster".to_string(),
+            }),
+        }
         return;
+    }
+    if let Some(reason) = unread {
+        details.push(format!("not read: {reason}"));
     }
 
     let mut majorities = groups
@@ -516,6 +544,26 @@ fn check_replicas(inputs: &WtfInputs, report: &mut WtfReport) {
             continue;
         }
         found = true;
+        // The scheduler isn't failing to find room: the namespace quota
+        // forbids it, and only the operator can change that.
+        if let Some(reason) = &app.blocked {
+            report.warnings.push(WtfFinding {
+                id: "quota-blocked".to_string(),
+                title: format!(
+                    "app {}/{} is not placed: its namespace quota has no room",
+                    app.app, app.namespace
+                ),
+                details: vec![reason.clone()],
+                suggestion: format!(
+                    "raise the quota in the [namespace.{}] block and apply it, or shrink or \
+                     delete other apps in {}; the app is placed on the next scheduling pass",
+                    app.namespace, app.namespace
+                ),
+                correlated_events: Vec::new(),
+                affected_resource: app_resource(&app.app, &app.namespace),
+            });
+            continue;
+        }
         let replicas = |count: u32| {
             if count == 1 {
                 "1 replica".to_string()
@@ -1033,6 +1081,7 @@ mod tests {
                     placed: BTreeMap::from([("node-1".to_string(), 1)]),
                     running: BTreeMap::from([("node-1".to_string(), 1)]),
                     unanswered: Vec::new(),
+                    blocked: None,
                 }]),
                 alerts: available(Vec::new()),
                 cpu_throttling: available(Vec::new()),
@@ -1509,6 +1558,7 @@ mod tests {
             ]),
             running: BTreeMap::from([("node-1".to_string(), 1), ("node-2".to_string(), 1)]),
             unanswered: vec!["node-3".to_string()],
+            blocked: None,
         }]);
 
         let report = diagnose(&inputs);
@@ -1535,6 +1585,7 @@ mod tests {
             placed: BTreeMap::from([("node-1".to_string(), 2)]),
             running: BTreeMap::from([("node-1".to_string(), 1)]),
             unanswered: Vec::new(),
+            blocked: None,
         }]);
         let report = diagnose(&inputs);
         let finding = report
@@ -1559,6 +1610,7 @@ mod tests {
             placed: BTreeMap::from([("node-1".to_string(), 1), ("node-3".to_string(), 1)]),
             running: BTreeMap::from([("node-1".to_string(), 1)]),
             unanswered: Vec::new(),
+            blocked: None,
         }]);
         let report = diagnose(&inputs);
         let finding = report
@@ -1572,6 +1624,46 @@ mod tests {
         );
     }
 
+    /// #326: an app its namespace quota keeps unplaced is its own finding,
+    /// naming the quota, not a vague under-replication.
+    #[test]
+    fn an_over_quota_app_is_flagged_with_the_quota_that_blocks_it() {
+        let mut inputs = healthy_inputs();
+        let reason = "namespace \"prod\" would exceed CPU quota: 0+1600 > 1000m";
+        inputs.applications.replicas = available(vec![ReplicaObservation {
+            app: "greedy".to_string(),
+            namespace: "prod".to_string(),
+            desired_replicas: 2,
+            placed: BTreeMap::new(),
+            running: BTreeMap::new(),
+            unanswered: Vec::new(),
+            blocked: Some(reason.to_string()),
+        }]);
+
+        let report = diagnose(&inputs);
+
+        let finding = report
+            .warnings
+            .iter()
+            .find(|finding| finding.id == "quota-blocked")
+            .expect("a quota-blocked app is a warning");
+        assert_eq!(
+            finding.title,
+            "app greedy/prod is not placed: its namespace quota has no room"
+        );
+        assert_eq!(finding.details, [reason]);
+        assert_eq!(finding.affected_resource, "app.greedy/prod");
+        assert!(finding.suggestion.contains("[namespace.prod]"));
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|finding| finding.id == "under-replicated"),
+            "the quota finding replaces the generic one"
+        );
+        assert!(!report.ok.iter().any(|ok| ok.id == "replicas"));
+    }
+
     #[test]
     fn apps_at_or_above_their_desired_replicas_are_ok() {
         let mut inputs = healthy_inputs();
@@ -1583,6 +1675,7 @@ mod tests {
             placed: BTreeMap::from([("node-1".to_string(), 1)]),
             running: BTreeMap::from([("node-1".to_string(), 2)]),
             unanswered: Vec::new(),
+            blocked: None,
         }]);
         let report = diagnose(&inputs);
         assert!(report.warnings.is_empty());
@@ -1701,6 +1794,66 @@ mod tests {
 
         let skew = report.warnings.iter().find(|w| w.id == "version-skew");
         assert_eq!(skew.unwrap().title, "nodes run 2 different bun builds");
+    }
+
+    /// Every row of a report, one line each, headed by its section.
+    fn report_rows(report: &WtfReport) -> String {
+        let mut rows = Vec::new();
+        for finding in &report.critical {
+            rows.push(format!("CRITICAL [{}] {}", finding.id, finding.title));
+        }
+        for finding in &report.warnings {
+            rows.push(format!("WARNING [{}] {}", finding.id, finding.title));
+            for detail in &finding.details {
+                rows.push(format!("    {detail}"));
+            }
+        }
+        for unknown in &report.unknown {
+            rows.push(format!("UNKNOWN [{}] {}", unknown.source, unknown.reason));
+        }
+        for ok in &report.ok {
+            rows.push(format!("OK [{}] {}", ok.id, ok.description));
+        }
+        rows.join("\n")
+    }
+
+    /// Three nodes, `node-3` dead, so its build couldn't be read.
+    fn inputs_with_a_dead_node(builds: Vec<BuildObservation>) -> WtfInputs {
+        let mut inputs = healthy_inputs();
+        let node = |id: &str, state: &str, reachable| NodeObservation {
+            node_id: id.to_string(),
+            membership_state: state.to_string(),
+            agent_reachable: reachable,
+        };
+        inputs.cluster.nodes = available(vec![
+            node("node-1", "Alive", true),
+            node("node-2", "Alive", true),
+            node("node-3", "Dead", false),
+        ]);
+        inputs.cluster.builds = Evidence::Degraded {
+            observed_at: NOW,
+            value: builds,
+            reason: "node node-3: version: timed out after 10s".to_string(),
+        };
+        inputs
+    }
+
+    #[test]
+    fn a_dead_node_leaves_one_builds_row_that_names_it() {
+        let report = diagnose(&inputs_with_a_dead_node(vec![
+            build("node-1", "v0.1.2", Some(COMMIT_A), Some("aaaa1111bbbb2222")),
+            build("node-2", "v0.1.2", Some(COMMIT_A), Some("aaaa1111bbbb2222")),
+        ]));
+        insta::assert_snapshot!(report_rows(&report));
+    }
+
+    #[test]
+    fn skew_beside_a_dead_node_is_one_warning_that_names_the_dead_node() {
+        let report = diagnose(&inputs_with_a_dead_node(vec![
+            build("node-1", "v0.1.2", Some(COMMIT_A), Some("aaaa")),
+            build("node-2", "v0.1.2", Some(COMMIT_B), Some("bbbb")),
+        ]));
+        insta::assert_snapshot!(report_rows(&report));
     }
 
     #[test]

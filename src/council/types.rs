@@ -323,6 +323,13 @@ pub enum RaftRequest {
         node_id: String,
         execution: crate::grill::RuntimeExecution,
     },
+    /// Replace the set of apps the leader's scheduling pass refuses to place
+    /// because their namespace quota has no room, each with the reason. The
+    /// leader proposes it only when the set changes, so an unchanged pass
+    /// writes nothing.
+    QuotaBlocked {
+        blocked: Vec<(AppId, crate::meat::quota::QuotaError)>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -416,6 +423,15 @@ pub struct DesiredState {
         deserialize_with = "map_as_vec::deserialize"
     )]
     pub last_placed_nodes: HashMap<AppId, Vec<NodeId>>,
+    /// Apps the leader's last scheduling pass left unplaced because their
+    /// namespace quota has no room, with the reason. Any node can answer
+    /// "why isn't this running?" from it; it clears as soon as an app fits.
+    #[serde(
+        default,
+        serialize_with = "map_as_vec::serialize",
+        deserialize_with = "map_as_vec::deserialize"
+    )]
+    pub quota_blocked: HashMap<AppId, crate::meat::quota::QuotaError>,
     /// GitOps sync state.
     pub gitops_sync_state: Option<crate::lettuce::types::SyncState>,
     /// GitOps coordinator election.
@@ -589,6 +605,7 @@ mod tests {
                         ),
                         size: 1024,
                         media_type: "application/vnd.oci.image.config.v1+json".to_string(),
+                        platform: None,
                     },
                     layers: vec![],
                     repository: "myapp".to_string(),

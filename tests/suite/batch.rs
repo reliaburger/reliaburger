@@ -68,6 +68,7 @@ impl Harness {
         let volumes = tempfile::tempdir().unwrap();
         agent.set_volumes_dir(volumes.path().to_path_buf());
         let deploy_history = agent.deploy_history_handle();
+        let status_reader = agent.status_reader();
 
         let agent_task = tokio::spawn(async move {
             agent.run().await;
@@ -131,7 +132,7 @@ impl Harness {
             aggregated_rx,
             "default".to_string(),
             options.node_name,
-            900,
+            reliaburger::bun::build_runner::BuildSettings::with_timeout(900),
             reliaburger::cluster::ClusterHttp::plaintext(),
             5050,
             "http",
@@ -141,6 +142,7 @@ impl Harness {
             reliaburger::bun::readiness::ReadinessTracker::new(),
             None,
             None,
+            Some(status_reader),
         );
         let server_shutdown = shutdown.clone();
         let server_task = tokio::spawn(async move {

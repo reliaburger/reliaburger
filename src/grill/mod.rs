@@ -456,12 +456,17 @@ pub trait Grill: Send + Sync {
 
     /// Get the OS process ID for an instance, if available.
     ///
-    /// Returns `None` for runtimes where the PID isn't directly visible
-    /// (e.g. containers running inside VMs). Runc reports its owned launcher
-    /// here; use `workload_cgroup` for verified container network attribution.
-    fn pid(&self, instance: &InstanceId) -> impl std::future::Future<Output = Option<u32>> + Send {
+    /// Returns `Ok(None)` when the instance has no process, and for runtimes
+    /// where the PID isn't directly visible (e.g. containers running inside
+    /// VMs). Runc reports its owned launcher here; use `workload_cgroup` for
+    /// verified container network attribution. An error means the runtime
+    /// couldn't say, which is not the same as "no process" (#358).
+    fn pid(
+        &self,
+        instance: &InstanceId,
+    ) -> impl std::future::Future<Output = Result<Option<u32>, GrillError>> + Send {
         let _ = instance;
-        std::future::ready(None)
+        std::future::ready(Ok(None))
     }
 
     /// Get the runtime-assigned IP of a running instance's container, if any.
@@ -726,7 +731,7 @@ impl Grill for AnyGrill {
         }
     }
 
-    async fn pid(&self, instance: &InstanceId) -> Option<u32> {
+    async fn pid(&self, instance: &InstanceId) -> Result<Option<u32>, GrillError> {
         match self {
             AnyGrill::Process(g) => g.pid(instance).await,
             #[cfg(target_os = "linux")]

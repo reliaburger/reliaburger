@@ -12,7 +12,8 @@ use std::time::{Duration, SystemTime};
 
 use crate::grill::image::{ImageMirrors, ImageReference};
 use crate::grill::oci_pull::{
-    LAYER_READ, METADATA_READ, pull_verified_manifest_for_architecture, retry_registry_read,
+    LAYER_READ, METADATA_READ, VerifiedImageManifest, VerifiedRoot,
+    pull_verified_manifest_for_architecture, pull_verified_root, retry_registry_read,
 };
 
 use super::types::{Digest, LayerDescriptor, ManifestCatalog, PickleError};
@@ -105,6 +106,28 @@ pub struct UpstreamManifest {
     pub layers: Vec<LayerDescriptor>,
 }
 
+/// A multi-platform image (an OCI index or Docker manifest list) fetched
+/// from upstream: the raw index bytes, plus each runnable platform
+/// manifest's descriptor (its platform recorded) and raw bytes. The platform
+/// images' configs and layers stay upstream until a node of that platform
+/// asks for them.
+#[derive(Debug, Clone)]
+pub struct UpstreamIndex {
+    pub digest: Digest,
+    pub media_type: String,
+    pub index_bytes: Vec<u8>,
+    pub manifests: Vec<(LayerDescriptor, Vec<u8>)>,
+}
+
+/// What an upstream tag names, before any platform is chosen.
+#[derive(Debug, Clone)]
+pub enum UpstreamRoot {
+    /// A single-platform image.
+    Image(UpstreamManifest),
+    /// A multi-platform image.
+    Index(UpstreamIndex),
+}
+
 /// Boxed future for [`UpstreamRegistry`] methods (`dyn`-safe trait).
 pub type UpstreamFuture<'a, T> =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, PickleError>> + Send + 'a>>;
@@ -122,6 +145,10 @@ pub trait UpstreamRegistry: Send + Sync {
         &'a self,
         image: &'a ImageReference,
     ) -> UpstreamFuture<'a, UpstreamManifest>;
+
+    /// The manifest the reference names as it stands: an image with its
+    /// config blob, or an index with its runnable platform manifests.
+    fn fetch_root<'a>(&'a self, image: &'a ImageReference) -> UpstreamFuture<'a, UpstreamRoot>;
 
     /// One layer blob, digest-verified by the caller's blob store.
     fn fetch_blob<'a>(
@@ -268,6 +295,18 @@ impl UpstreamRegistry for OciUpstream {
         })
     }
 
+    fn fetch_root<'a>(&'a self, image: &'a ImageReference) -> UpstreamFuture<'a, UpstreamRoot> {
+        Box::pin(async move {
+            if let Some(mirror) = self.mirrors.mirror_for(image) {
+                match self.fetch_root_from(&mirror).await {
+                    Ok(root) => return Ok(root),
+                    Err(error) => report_mirror_failure(image, &mirror, &error),
+                }
+            }
+            self.fetch_root_from(image).await
+        })
+    }
+
     fn fetch_blob<'a>(
         &'a self,
         image: &'a ImageReference,
@@ -317,44 +356,103 @@ impl OciUpstream {
                 image.full_reference()
             ))
         })?;
-        let manifest = verified.manifest;
-        let digest = verified.digest;
-        let config_bytes = verified.config_bytes;
-        let manifest_bytes = verified.manifest_bytes;
-        let config = LayerDescriptor {
-            digest: Digest::new(&manifest.config.digest).map_err(|e| {
-                PickleError::ReplicationFailed(format!("upstream config digest: {e}"))
-            })?,
-            size: config_bytes.len() as u64,
-            media_type: manifest.config.media_type.clone(),
-        };
-        let layers = manifest
-            .layers
-            .iter()
-            .map(|layer| {
-                Ok(LayerDescriptor {
-                    digest: Digest::new(&layer.digest).map_err(|e| {
-                        PickleError::ReplicationFailed(format!("upstream layer digest: {e}"))
-                    })?,
-                    size: layer.size as u64,
-                    media_type: layer.media_type.clone(),
-                })
-            })
-            .collect::<Result<Vec<_>, PickleError>>()?;
-
-        let digest = Digest::new(&digest).map_err(|e| {
-            PickleError::ReplicationFailed(format!("upstream manifest digest: {e}"))
-        })?;
-
-        Ok(UpstreamManifest {
-            digest,
-            manifest_bytes,
-            config,
-            config_bytes,
-            layers,
-        })
+        upstream_manifest(verified)
     }
 
+    /// Read and verify what `image` names in its registry, index or image.
+    async fn fetch_root_from(&self, image: &ImageReference) -> Result<UpstreamRoot, PickleError> {
+        let reference = Self::oci_reference(image)?;
+        let auth = self.auth_for(&image.registry);
+        let root = retry_registry_read(METADATA_READ, || {
+            pull_verified_root(&self.client, &reference, &auth)
+        })
+        .await
+        .map_err(|e| {
+            PickleError::ReplicationFailed(format!(
+                "upstream manifest {} failed: {e}",
+                image.full_reference()
+            ))
+        })?;
+        let index = match root {
+            VerifiedRoot::Image(verified) => {
+                return Ok(UpstreamRoot::Image(upstream_manifest(*verified)?));
+            }
+            VerifiedRoot::Index(index) => index,
+        };
+        let manifests = index
+            .manifests
+            .into_iter()
+            .map(|(entry, bytes)| {
+                let descriptor = LayerDescriptor {
+                    digest: upstream_digest(&entry.digest)?,
+                    size: bytes.len() as u64,
+                    media_type: entry.media_type,
+                    // The same spelling a pushed index records.
+                    platform: entry.platform.map(|platform| match platform.variant {
+                        Some(variant) => {
+                            format!("{}/{}/{variant}", platform.os, platform.architecture)
+                        }
+                        None => format!("{}/{}", platform.os, platform.architecture),
+                    }),
+                };
+                Ok((descriptor, bytes))
+            })
+            .collect::<Result<Vec<_>, PickleError>>()?;
+        Ok(UpstreamRoot::Index(UpstreamIndex {
+            digest: upstream_digest(&index.digest)?,
+            media_type: index.media_type,
+            index_bytes: index.index_bytes,
+            manifests,
+        }))
+    }
+}
+
+fn upstream_digest(digest: &str) -> Result<Digest, PickleError> {
+    Digest::new(digest)
+        .map_err(|e| PickleError::ReplicationFailed(format!("upstream digest {digest}: {e}")))
+}
+
+/// The cache's view of a verified upstream image manifest.
+fn upstream_manifest(verified: VerifiedImageManifest) -> Result<UpstreamManifest, PickleError> {
+    let manifest = verified.manifest;
+    let digest = verified.digest;
+    let config_bytes = verified.config_bytes;
+    let manifest_bytes = verified.manifest_bytes;
+    let config = LayerDescriptor {
+        digest: Digest::new(&manifest.config.digest)
+            .map_err(|e| PickleError::ReplicationFailed(format!("upstream config digest: {e}")))?,
+        size: config_bytes.len() as u64,
+        media_type: manifest.config.media_type.clone(),
+        platform: None,
+    };
+    let layers = manifest
+        .layers
+        .iter()
+        .map(|layer| {
+            Ok(LayerDescriptor {
+                digest: Digest::new(&layer.digest).map_err(|e| {
+                    PickleError::ReplicationFailed(format!("upstream layer digest: {e}"))
+                })?,
+                size: layer.size as u64,
+                media_type: layer.media_type.clone(),
+                platform: None,
+            })
+        })
+        .collect::<Result<Vec<_>, PickleError>>()?;
+
+    let digest = Digest::new(&digest)
+        .map_err(|e| PickleError::ReplicationFailed(format!("upstream manifest digest: {e}")))?;
+
+    Ok(UpstreamManifest {
+        digest,
+        manifest_bytes,
+        config,
+        config_bytes,
+        layers,
+    })
+}
+
+impl OciUpstream {
     /// Read one layer from `image`'s registry, checking its advertised size.
     async fn fetch_blob_from(
         &self,
@@ -419,6 +517,7 @@ mod tests {
             digest: digest(i),
             size,
             media_type: "application/vnd.oci.image.layer.v1.tar+gzip".to_string(),
+            platform: None,
         }
     }
 
@@ -465,6 +564,13 @@ mod tests {
             &'a self,
             _image: &'a ImageReference,
         ) -> UpstreamFuture<'a, UpstreamManifest> {
+            unimplemented!("not used by these tests")
+        }
+
+        fn fetch_root<'a>(
+            &'a self,
+            _image: &'a ImageReference,
+        ) -> UpstreamFuture<'a, UpstreamRoot> {
             unimplemented!("not used by these tests")
         }
 

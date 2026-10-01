@@ -5,11 +5,11 @@ laptop, see the [quickstart guide](quickstart.md). For the architectural vision,
 see the [whitepaper](whitepaper.md); for status and what's next, see the
 [roadmap](roadmap.md).
 
-0.1.1 was released on 30 September 2026. Its signed binaries, guest images and
-installer are on the [GitHub release](https://github.com/reliaburger/reliaburger/releases/tag/v0.1.1),
+0.1.2 was released on 1 October 2026. Its signed binaries, guest images and
+installer are on the [GitHub release](https://github.com/reliaburger/reliaburger/releases/tag/v0.1.2),
 and `curl -fsSL https://reliaburger.com/install.sh | sh` installs it. Every
 release follows the same [build, staging and promotion procedure](releasing.md#metadata-and-publication).
-The limits below are the ones 0.1.1 ships with; the [roadmap](roadmap.md) tracks
+The limits below are the ones 0.1.2 ships with; the [roadmap](roadmap.md) tracks
 what comes after it.
 
 ## Scope and limits
@@ -40,13 +40,6 @@ what comes after it.
   [compatibility policy](releasing.md#cluster-compatibility).
 - **One Bun per writable image store.** Registry startup claims exclusive
   ownership of the image store's upload directory.
-- **Multi-platform images don't run from Pickle.** A node pulling an OCI
-  image index or Docker manifest list from the built-in registry treats it as
-  a single image and fails to run it. That covers `docker buildx build
-  --platform linux/amd64,linux/arm64 --push` and `relish build` with more than
-  one platform (the default), which also stores only the builder's platform.
-  Push or build a single platform matching your nodes; see
-  [Images and volumes](manual/11_images-and-volumes.md#multi-platform-images).
 - **Test volumes have no snapshots.** Disposable test-volume snapshots aren't
   supported.
 
@@ -231,7 +224,7 @@ xcode-select --install
 
 ## Container runtimes (optional)
 
-For 0.1.1, Bun selects Linux runc or the built-in process runtime. macOS containers run through managed Linux VMs. **ProcessGrill** (plain OS processes) is the built-in fallback that works everywhere without extra software — you don't need to install anything else to get started.
+For 0.1.2, Bun selects Linux runc or the built-in process runtime. macOS containers run through managed Linux VMs. **ProcessGrill** (plain OS processes) is the built-in fallback that works everywhere without extra software — you don't need to install anything else to get started.
 
 ### runc (Linux)
 
@@ -270,7 +263,7 @@ or operator firewall rules when diagnosing direct-host connectivity.
 
 ### macOS containers: managed Linux VMs
 
-For 0.1.1, run containers through the [managed laptop quickstart](quickstart.md):
+For 0.1.2, run containers through the [managed laptop quickstart](quickstart.md):
 
 ```sh
 relish setup --quickstart --nodes 3
@@ -281,7 +274,7 @@ foreground process workloads. Direct Apple Container selection is disabled,
 even when its CLI is installed: interrupted CLI requests can outlive Bun and
 mutate the Apple daemon, and their recovery guarantees are not yet complete.
 The adapter and its manual development tests remain in the repository for future
-work; they are outside the 0.1.1 runtime profile.
+work; they are outside the 0.1.2 runtime profile.
 
 ### ProcessGrill (built-in fallback)
 
@@ -301,7 +294,7 @@ sixteen concurrent exec requests, with a five-minute deadline, 64 KiB request
 limit and 1 MiB combined stdout/stderr response limit. Commands inherit the host
 environment and run without container isolation.
 
-**0.1.1 contract: foreground workloads only.** The main process stays under Bun's
+**0.1.2 contract: foreground workloads only.** The main process stays under Bun's
 supervision and children must remain in its supervised process group. A service
 can run unattended and spawn workers; foreground does not mean an open terminal.
 Use the application's foreground/no-daemon option. A shell wrapper should `exec`
@@ -338,7 +331,8 @@ make test-rootless-runc # non-root runc/slirp replacement proof
 make lint        # clippy with warnings as errors
 make audit       # RustSec advisory and dependency-maintenance gate
 make fmt         # format with rustfmt
-make ci          # portable format, lint and test checks
+make ci          # portable format, lint, test, doctest and CI-script checks
+make ci-bench    # make ci, then the gossip benchmarks
 make clean       # remove build artefacts
 ```
 
@@ -826,6 +820,18 @@ relish apply -f examples/kubernetes/podinfo.yaml
 curl -H 'Host: podinfo.localhost' http://127.0.0.1:18080/
 ```
 
+`examples/demo/burger` is the five-minute tour's home-built app: a small Go
+service (standard library only), its test and a cross-compiling Dockerfile.
+`relish build` has a node with Buildah build it into Pickle (the quickstart's
+VMs have Buildah), and each `/order` names the podinfo backend it reached by
+service name, so apply podinfo first:
+
+```bash
+relish build examples/demo/burger/burger.toml
+relish apply examples/demo/burger/burger.toml
+curl -H 'Host: burger.localhost' http://127.0.0.1:18080/order
+```
+
 ### Internal DNS on rootful runc
 
 The `.internal` responder is opt-in and currently supports rootful runc on
@@ -930,6 +936,7 @@ cache_recheck_secs = 3600    # how long a cached mutable tag is trusted
 p2p_concurrency = 4          # parallel layer fetches per image pull
 build_timeout_secs = 900     # ceiling per buildah stage
 max_context_bytes = 268435456 # 256 MiB cap on an extracted build context
+build_cache_max_bytes = 107374182400 # Buildah base-image cache kept between builds (100 GiB; quickstart nodes use 2 GiB)
 
 # Digest-pinned images try a mirror first and fall back to the upstream.
 # Tag references never use a mirror; loopback mirrors speak plain HTTP.
@@ -1308,7 +1315,7 @@ different name or namespace for the other kind.
 
 Release maintainers: see [the build, signing and publication procedure](releasing.md).
 
-Direct Apple Container is disabled for 0.1.1 while interrupted daemon-command
+Direct Apple Container is disabled for 0.1.2 while interrupted daemon-command
 recovery remains unfinished. Use the managed Linux/runc quickstart on macOS.
 
 Node chaos (kill, drain, pressure and council partitions) reserves one cluster-wide

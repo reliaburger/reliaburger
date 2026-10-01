@@ -44,6 +44,9 @@ struct HarnessOptions {
     registry_port: u16,
     pickle_catalog: Option<Arc<RwLock<reliaburger::pickle::types::ManifestCatalog>>>,
     require_signatures: bool,
+    /// Build settings; the gated Buildah tests give each harness its own
+    /// Buildah storage so they can inspect what a build left behind.
+    build_settings: Option<reliaburger::bun::build_runner::BuildSettings>,
 }
 
 struct Harness {
@@ -115,7 +118,9 @@ impl Harness {
             Some(aggregated_rx),
             "default".to_string(),
             options.node_name,
-            600,
+            options.build_settings.unwrap_or_else(|| {
+                reliaburger::bun::build_runner::BuildSettings::with_timeout(600)
+            }),
             reliaburger::cluster::ClusterHttp::plaintext(),
             if options.registry_port == 0 {
                 5050
@@ -127,6 +132,7 @@ impl Harness {
             options.require_signatures,
             reliaburger::bun::capabilities::StaticCapabilities::default(),
             reliaburger::bun::readiness::ReadinessTracker::new(),
+            None,
             None,
             None,
         );
@@ -287,15 +293,39 @@ async fn start_registry_with_council(
     CancellationToken,
     tempfile::TempDir,
 ) {
-    use reliaburger::pickle::api::{PickleState, router as pickle_router};
-    use reliaburger::pickle::store::BlobStore;
+    use reliaburger::pickle::api::router as pickle_router;
     use reliaburger::pickle::types::ManifestCatalog;
 
     let dir = tempfile::tempdir().unwrap();
     let catalog = Arc::new(RwLock::new(ManifestCatalog::default()));
-    let state = PickleState {
-        store: Arc::new(BlobStore::new(dir.path().join("blobs"))),
-        catalog: Arc::clone(&catalog),
+    let state = registry_state(dir.path(), Arc::clone(&catalog), council);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let app = pickle_router(state);
+    let shutdown = CancellationToken::new();
+    let serve_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move { serve_shutdown.cancelled().await })
+            .await
+            .ok();
+    });
+    (port, catalog, shutdown, dir)
+}
+
+/// Pickle state over the blobs under `dir` and `catalog`. The test registry
+/// serves one; a test that pulls as a node builds a second over the same
+/// directory, the way a node's runtime shares its registry's blob store.
+fn registry_state(
+    dir: &std::path::Path,
+    catalog: Arc<RwLock<reliaburger::pickle::types::ManifestCatalog>>,
+    council: Option<Arc<CouncilNode>>,
+) -> reliaburger::pickle::api::PickleState {
+    reliaburger::pickle::api::PickleState {
+        store: Arc::new(reliaburger::pickle::store::BlobStore::new(
+            dir.join("blobs"),
+        )),
+        catalog,
         node_raft_id: 1,
         council,
         forwarder: None,
@@ -309,19 +339,7 @@ async fn start_registry_with_council(
         sessions: reliaburger::pickle::registry_auth::UploadSessions::new(
             reliaburger::pickle::registry_auth::DEFAULT_UPLOAD_TTL,
         ),
-    };
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let app = pickle_router(state);
-    let shutdown = CancellationToken::new();
-    let serve_shutdown = shutdown.clone();
-    tokio::spawn(async move {
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async move { serve_shutdown.cancelled().await })
-            .await
-            .ok();
-    });
-    (port, catalog, shutdown, dir)
+    }
 }
 
 /// Tar a trivial context and upload it to the given registry port;
@@ -825,11 +843,39 @@ async fn cli_build_wait_times_out_with_the_last_known_state() {
     assert!(message.contains("running"), "{message}");
 }
 
+/// Build settings with Buildah storage of the test's own, so a test can check
+/// what a build left behind and parallel tests never prune each other.
+fn isolated_build_settings(dir: &std::path::Path) -> reliaburger::bun::build_runner::BuildSettings {
+    reliaburger::bun::build_runner::BuildSettings::new(600, dir, 1024 * 1024 * 1024)
+}
+
+/// Run `buildah <args>` against `settings`' storage and return stdout.
+fn buildah_output(
+    settings: &reliaburger::bun::build_runner::BuildSettings,
+    args: &[&str],
+) -> String {
+    let output = std::process::Command::new("buildah")
+        .arg("--root")
+        .arg(&settings.storage.root)
+        .arg("--runroot")
+        .arg(&settings.storage.runroot)
+        .args(["--storage-driver", "vfs"])
+        .args(args)
+        .output()
+        .expect("buildah runs");
+    assert!(
+        output.status.success(),
+        "buildah {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
 /// Roadmap (Phase 12): a real build — context blob in a real registry,
 /// buildah bud + push, manifest lands in the catalog — through the
 /// async submit/poll API. Lima only (`RELIABURGER_BUILDAH_TESTS=1`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires Buildah and RELIABURGER_BUILDAH_TESTS=1"]
+#[ignore = "requires Buildah and RELIABURGER_BUILDAH_TESTS=1; run with make test-linux"]
 async fn buildah_build_lands_in_the_catalog() {
     assert!(
         std::env::var("RELIABURGER_BUILDAH_TESTS").is_ok(),
@@ -838,12 +884,15 @@ async fn buildah_build_lands_in_the_catalog() {
 
     let (registry_port, catalog, registry_shutdown, _dir) = start_registry().await;
     let digest = upload_trivial_context(registry_port).await;
+    let storage = tempfile::tempdir().unwrap();
+    let settings = isolated_build_settings(storage.path());
 
     // Buildah is present on this host, so the submit runs locally.
     let harness = Harness::start(HarnessOptions {
         node_name: Some("builder".to_string()),
         registry_port,
         pickle_catalog: Some(Arc::clone(&catalog)),
+        build_settings: Some(settings.clone()),
         ..Default::default()
     })
     .await;
@@ -883,11 +932,29 @@ async fn buildah_build_lands_in_the_catalog() {
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 
+    // The spec names no platform, so the build targets the default two. The
+    // tag must name an index over both, and each platform manifest must be
+    // catalogued by digest, so a node of either architecture can pull it.
     let catalog = catalog.read().await;
+    let index = catalog
+        .get_manifest_by_tag("hello", "v1")
+        .expect("built image missing from the catalog");
     assert!(
-        catalog.get_manifest_by_tag("hello", "v1").is_some(),
-        "built image missing from the catalog"
+        index.is_index(),
+        "a two-platform build must land as an index"
     );
+    assert_eq!(index.layers.len(), 2, "one manifest per platform");
+    for platform in &index.layers {
+        let manifest = catalog
+            .get_repository_manifest("hello", platform.digest.as_str())
+            .unwrap_or_else(|| panic!("platform manifest {} not catalogued", platform.digest));
+        assert!(!manifest.is_index());
+    }
+
+    // Nothing the build made stays in Buildah's storage: no containers and,
+    // as a `FROM scratch` build has no base image to cache, no images.
+    assert_eq!(buildah_output(&settings, &["containers", "-q"]).trim(), "");
+    assert_eq!(buildah_output(&settings, &["images", "-q"]).trim(), "");
 
     registry_shutdown.cancel();
 }
@@ -897,7 +964,7 @@ async fn buildah_build_lands_in_the_catalog() {
 /// signature that passes the deploy-time check (build-sign → deploy-verify
 /// round-trip). Lima only (`RELIABURGER_BUILDAH_TESTS=1`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires Buildah and RELIABURGER_BUILDAH_TESTS=1"]
+#[ignore = "requires Buildah and RELIABURGER_BUILDAH_TESTS=1; run with make test-linux"]
 async fn buildah_build_signs_and_the_signature_verifies_on_deploy() {
     assert!(
         std::env::var("RELIABURGER_BUILDAH_TESTS").is_ok(),
@@ -916,12 +983,14 @@ async fn buildah_build_signs_and_the_signature_verifies_on_deploy() {
         .map(|ca| ca.certificate_der.clone())
         .expect("root CA present");
 
+    let storage = tempfile::tempdir().unwrap();
     let harness = Harness::start(HarnessOptions {
         council: Some(Arc::clone(&council)),
         node_name: Some("builder".to_string()),
         registry_port,
         pickle_catalog: Some(Arc::clone(&catalog)),
         require_signatures: true,
+        build_settings: Some(isolated_build_settings(storage.path())),
         ..Default::default()
     })
     .await;
@@ -964,28 +1033,235 @@ async fn buildah_build_signs_and_the_signature_verifies_on_deploy() {
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 
-    // The pushed manifest carries a signature that verifies under the
-    // deploy-time trust policy and the cluster root CA.
-    let manifest = council
-        .manifest_catalog()
-        .await
+    // The index the tag names, and each platform manifest, carry a
+    // signature that verifies under the deploy-time trust policy and the
+    // cluster root CA.
+    let authoritative = council.manifest_catalog().await;
+    let index = authoritative
         .get_manifest_by_tag("hello", "v1")
         .cloned()
         .expect("built image missing from the authoritative catalog");
-    let signature = manifest
-        .signature
-        .expect("signed build must carry a signature");
-    reliaburger::pickle::signing::verify_signature(
-        &signature,
-        &manifest.digest,
-        &reliaburger::config::node::TrustPolicySection {
-            require_signatures: true,
-            keys: vec![],
-        },
-        Some(&root_ca_der),
-        None,
+    let mut signed = vec![index.clone()];
+    for platform in &index.layers {
+        signed.push(
+            authoritative
+                .get_repository_manifest("hello", platform.digest.as_str())
+                .cloned()
+                .expect("platform manifest missing from the authoritative catalog"),
+        );
+    }
+    assert_eq!(signed.len(), 3, "the index and two platform manifests");
+    for manifest in signed {
+        let signature = manifest
+            .signature
+            .unwrap_or_else(|| panic!("{} must carry a signature", manifest.digest));
+        reliaburger::pickle::signing::verify_signature(
+            &signature,
+            &manifest.digest,
+            &reliaburger::config::node::TrustPolicySection {
+                require_signatures: true,
+                keys: vec![],
+            },
+            Some(&root_ca_der),
+            None,
+        )
+        .expect("the build signature must verify on deploy");
+    }
+
+    registry_shutdown.cancel();
+}
+
+/// The OCI name of this host's architecture, as a platform in an index names it.
+#[cfg(target_os = "linux")]
+fn host_oci_architecture() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        other => panic!("no OCI platform for host architecture {other}"),
+    }
+}
+
+/// Mixed architectures (#248): a real two-platform build lands in Pickle as an
+/// index over `linux/amd64` and `linux/arm64`, and a node pulls and runs its
+/// own platform's image under runc. Only the host's platform carries a
+/// runnable binary, and each platform carries a marker naming itself, so the
+/// container answering at all, and answering with the host's architecture,
+/// shows the node picked the right entry. CI's privileged Linux job runs this
+/// on x86_64, which makes it the amd64 half of a mixed cluster; an arm64 host
+/// (the Lima VM) checks the other half.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires root, runc, Buildah, static /usr/bin/busybox, RELIABURGER_BUILDAH_TESTS=1 and RELIABURGER_RUNC_TESTS=1; run with make test-linux"]
+async fn a_two_platform_build_runs_the_nodes_own_platform_under_runc() {
+    use reliaburger::grill::runc::RuncGrill;
+    use reliaburger::grill::{Grill, ImageStore, InstanceId, OciSpec};
+
+    assert!(
+        std::env::var("RELIABURGER_BUILDAH_TESTS").is_ok()
+            && std::env::var("RELIABURGER_RUNC_TESTS").is_ok(),
+        "set RELIABURGER_BUILDAH_TESTS=1 and RELIABURGER_RUNC_TESTS=1 on a host with Buildah and runc"
+    );
+    assert!(nix::unistd::geteuid().is_root(), "runc needs root");
+    let host = host_oci_architecture();
+
+    // `COPY $TARGETARCH/ /` gives each platform its own directory. The host's
+    // holds busybox; the other holds only its marker, so running it fails.
+    let (registry_port, catalog, registry_shutdown, registry_dir) = start_registry().await;
+    let context = tempfile::tempdir().unwrap();
+    for architecture in ["amd64", "arm64"] {
+        let dir = context.path().join(architecture);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("platform"), architecture).unwrap();
+    }
+    std::fs::copy(
+        "/usr/bin/busybox",
+        context.path().join(host).join("busybox"),
     )
-    .expect("the build signature must verify on deploy");
+    .unwrap();
+    std::fs::write(
+        context.path().join("Dockerfile"),
+        "FROM scratch\nARG TARGETARCH\nCOPY $TARGETARCH/ /\n",
+    )
+    .unwrap();
+    let tar_bytes = reliaburger::pickle::build::tar_context(context.path()).unwrap();
+    let context_digest = reliaburger::pickle::build::digest_of(&tar_bytes);
+    let response = reqwest::Client::new()
+        .post(reliaburger::pickle::build::context_upload_url(
+            "http",
+            registry_port,
+            &context_digest,
+        ))
+        .body(tar_bytes)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 201, "context upload failed");
+
+    let storage = tempfile::tempdir().unwrap();
+    let harness = Harness::start(HarnessOptions {
+        node_name: Some("builder".to_string()),
+        registry_port,
+        pickle_catalog: Some(Arc::clone(&catalog)),
+        build_settings: Some(isolated_build_settings(storage.path())),
+        ..Default::default()
+    })
+    .await;
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/build", harness.base_url))
+        .json(&serde_json::json!({
+            "name": "mixed",
+            "context_digest": context_digest,
+            "spec": { "context": ".", "destination": "pickle://mixed:v1" },
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 202, "submit should accept");
+    let build_id = response.json::<serde_json::Value>().await.unwrap()["build_id"]
+        .as_u64()
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
+    loop {
+        let status: serde_json::Value =
+            reqwest::get(format!("{}/v1/build/{build_id}", harness.base_url))
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        match status["status"].as_str() {
+            Some("completed") => break,
+            Some("failed") => panic!("build failed: {status}"),
+            _ => {}
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "build did not finish: {status}"
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+
+    // Both platforms are in Pickle, under one index.
+    let index = catalog
+        .read()
+        .await
+        .get_manifest_by_tag("mixed", "v1")
+        .cloned()
+        .expect("built image missing from the catalog");
+    assert!(
+        index.is_index(),
+        "a two-platform build must land as an index"
+    );
+    // Buildah may add an arm64 variant (`linux/arm64/v8`); the node matches
+    // on `os/architecture`, so that's what the test compares.
+    let mut platforms: Vec<String> = index
+        .layers
+        .iter()
+        .map(|entry| {
+            let platform = entry
+                .platform
+                .as_deref()
+                .expect("an index entry records its platform");
+            platform.split('/').take(2).collect::<Vec<_>>().join("/")
+        })
+        .collect();
+    platforms.sort();
+    assert_eq!(platforms, ["linux/amd64", "linux/arm64"]);
+
+    // The node's runtime shares the registry's blob store and catalogue, as
+    // Bun wires it, and resolves `mixed:v1` through Pickle.
+    let runtime_root = tempfile::tempdir().unwrap();
+    let images = ImageStore::new(runtime_root.path().join("images"));
+    images.set_cluster_source(Arc::new(reliaburger::pickle::p2p::ClusterSource {
+        state: registry_state(registry_dir.path(), Arc::clone(&catalog), None),
+        members: None,
+        registry_port,
+        peer_scheme: "http".to_string(),
+        concurrency: 4,
+        client: reqwest::Client::new(),
+        upstream: None,
+        pull_through: false,
+        cache_recheck_secs: 0,
+        fill_lock: tokio::sync::Mutex::new(()),
+    }));
+    let runtime = RuncGrill::new(
+        runtime_root.path().join("bundles"),
+        images,
+        false,
+        runtime_root.path().join("state"),
+        env!("CARGO_BIN_EXE_bun").into(),
+    )
+    .unwrap();
+    let id = InstanceId(format!(
+        "rbtest-mixed-arch-{}",
+        runtime_root
+            .path()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .trim_start_matches('.')
+    ));
+    let mut spec: OciSpec = serde_json::from_value(serde_json::json!({
+        "root": {"path": "mixed:v1", "readonly": true},
+        "process": {"args": ["/busybox", "sleep", "60"], "env": ["PATH=/"], "cwd": "/", "user": {"uid": 0, "gid": 0}},
+        "mounts": [], "linux": {"namespaces": []}
+    }))
+    .unwrap();
+    spec.mounts = reliaburger::grill::oci::standard_mounts();
+    spec.linux.namespaces = reliaburger::grill::oci::standard_namespaces(None);
+
+    runtime.create(&id, &spec).await.unwrap();
+    runtime.start(&id).await.unwrap();
+    let answer = runtime
+        .exec(&id, &["/busybox".into(), "cat".into(), "/platform".into()])
+        .await;
+    runtime.kill(&id).await.unwrap();
+    assert_eq!(
+        answer.expect("the node's own platform must run").trim(),
+        host,
+        "the node must run linux/{host} from the index"
+    );
 
     registry_shutdown.cancel();
 }
@@ -1122,6 +1398,7 @@ async fn commit_pushed_manifest(leader: &CouncilNode) -> reliaburger::pickle::ty
                 digest: Digest::from_sha256_hex(&"cd".repeat(32)),
                 size: 512,
                 media_type: String::new(),
+                platform: None,
             },
             layers: vec![],
             repository: "app".to_string(),

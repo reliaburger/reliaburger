@@ -14,9 +14,11 @@ on:
     - cron: "17 3 * * *"
 
 # PR updates supersede earlier checks. Main/tag runs each retain their own group.
-# Fixed prefixes also keep reusable source CI separate from its release caller.
+# Fixed prefixes also keep reusable source CI separate from its release caller,
+# and github.workflow (the caller's name when called) keeps a retarget run
+# (ci-retarget.yml) from cancelling the pull request's own run.
 concurrency:
-  group: source-ci-${{ github.event.pull_request.number || github.run_id }}
+  group: source-ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
@@ -28,6 +30,8 @@ permissions:
 # Debug builds keep line tables only: backtraces still name files and lines,
 # and each target cache is roughly half the size, so they all fit.
 # Artefacts: reports are kept 14 days; release candidates keep their 90.
+# Every nextest suite keeps its own JUnit report (scripts/ci/keep-junit.sh)
+# and each job uploads them as junit-<job>, even when a suite fails.
 
 env:
   CARGO_TERM_COLOR: always
@@ -56,6 +60,20 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           FULL_CI: ${{ contains(github.event.pull_request.labels.*.name, 'full-ci') }}
         run: scripts/ci/select-jobs.sh
+
+  ci-policy:
+    # The CI scripts' own tests (job selection, ignored-test owners, JUnit
+    # keeping) and the rule that every #[ignore] names who runs it. Cheap,
+    # so it runs on every change, documentation included.
+    name: CI policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test the CI scripts
+        run: make test-ci-scripts
+      - name: Every ignored test names its owner
+        run: make check-ignored
 
   dependency-audit:
     name: dependency advisory audit
@@ -91,6 +109,26 @@ jobs:
         run: make fmt-check
       - name: Lint every target, with all features and with none
         run: make lint
+
+  demo-app:
+    # The five-minute tour builds examples/demo/burger on a node. Its own Go
+    # tests take seconds, so they run on every code change.
+    name: demo app
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: examples/demo/burger/go.mod
+          cache: false
+      - name: Vet and test the demo app
+        working-directory: examples/demo/burger
+        run: |
+          go vet ./...
+          go test ./...
 
   minimum-rust:
     # The declared minimum compiler must build every target with and without
@@ -147,8 +185,9 @@ jobs:
           sudo apt-get install -y -qq clang libbpf-dev llvm
       - name: Portable tests with line coverage
         run: make coverage
-      - name: Verify JUnit output
-        run: test -s target/nextest/ci/junit.xml
+      - name: Keep the portable report
+        if: ${{ !cancelled() }}
+        run: scripts/ci/keep-junit.sh coverage make coverage
       - name: Doctests
         run: make test-doc
       - name: Upload JUnit
@@ -156,8 +195,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: junit-portable
-          path: target/nextest/ci/junit.xml
-          if-no-files-found: warn
+          path: target/junit
+          if-no-files-found: error
           retention-days: 14
       - name: Upload coverage
         if: always()
@@ -207,6 +246,9 @@ jobs:
         run: make test-images TEST_IMAGE_CACHE="$RUNNER_TEMP/test-images"
       - name: Prove rootless port adoption
         run: make test-rootless-runc
+      - name: Keep the rootless report
+        if: ${{ !cancelled() }}
+        run: scripts/ci/keep-junit.sh test-rootless-runc make test-rootless-runc
       - name: Qualify actual Bun OCI interruptions
         run: scripts/release/qualify-oci-interruptions.sh
       - name: Retain OCI interruption evidence
@@ -224,15 +266,20 @@ jobs:
           sudo -E env PATH="$PATH" NEXTEST_PROFILE=ci make test-linux
           TEST_IMAGE_CACHE="$RUNNER_TEMP/test-images"
           LINUX_EXCLUDE='& not binary(owned_runc) & not binary(owned_network)'
-      - name: Retain the provisioned Linux test report
-        # Names every test this job ran, so a gated test that silently stops
-        # being selected shows up as missing here.
+      - name: Keep the provisioned Linux report
         if: ${{ !cancelled() }}
+        run: >-
+          scripts/ci/keep-junit.sh test-linux make test-linux --features ebpf
+          LINUX_EXCLUDE='& not binary(owned_runc) & not binary(owned_network)'
+      - name: Upload JUnit
+        # Names every test this job ran; ignored-evidence fails if a test
+        # owned by these gates is missing.
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: junit-privileged-linux
-          path: target/nextest/ci/junit.xml
-          if-no-files-found: warn
+          name: junit-linux
+          path: target/junit
+          if-no-files-found: error
           retention-days: 14
 
   build-tests:
@@ -281,11 +328,23 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: nextest-archive
-      - run: make test-cluster NEXTEST="$ARCHIVED"
+      - name: Multi-node cluster suites
+        run: make test-cluster NEXTEST="$ARCHIVED"
+      - name: Keep the cluster report
+        if: ${{ !cancelled() }}
+        run: scripts/ci/keep-junit.sh test-cluster make test-cluster NEXTEST=archive
+      - name: Upload JUnit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-cluster
+          path: target/junit
+          if-no-files-found: error
+          retention-days: 14
 
   acceptance:
-    # Wall-clock, single-node upgrade and cluster upgrade suites: 13 tests
-    # that each used to pay for their own full test build.
+    # Wall-clock, single-node upgrade and cluster upgrade suites, plus the
+    # crane interoperability test: each used to pay for its own test build.
     name: acceptance
     needs: [changes, build-tests]
     if: needs.changes.outputs.heavy == 'true'
@@ -303,12 +362,70 @@ jobs:
           name: nextest-archive
       - name: Wall-clock acceptance
         run: make test-slow NEXTEST="$ARCHIVED"
+      - name: Keep the wall-clock report
+        if: ${{ !cancelled() }}
+        run: scripts/ci/keep-junit.sh test-slow make test-slow NEXTEST=archive
       - name: Single-node upgrade
         if: ${{ !cancelled() }}
         run: make test-upgrade-node NEXTEST="$ARCHIVED"
+      - name: Keep the single-node upgrade report
+        if: ${{ !cancelled() }}
+        run: scripts/ci/keep-junit.sh test-upgrade-node make test-upgrade-node NEXTEST=archive
       - name: Cluster upgrade
         if: ${{ !cancelled() }}
         run: make test-upgrade-cluster NEXTEST="$ARCHIVED"
+      - name: Keep the cluster upgrade report
+        if: ${{ !cancelled() }}
+        run: scripts/ci/keep-junit.sh test-upgrade-cluster make test-upgrade-cluster NEXTEST=archive
+      - name: Install crane
+        # Pinned release, checked against the digest in its checksums.txt.
+        if: ${{ !cancelled() }}
+        env:
+          CRANE_VERSION: v0.22.1
+          CRANE_SHA256: 0ab7a1d6932a213aed964ce97666c3077fe691c8606413674a8b3e0b9ec4cda0
+        run: |
+          curl -fsSLo "$RUNNER_TEMP/crane.tar.gz" "https://github.com/google/go-containerregistry/releases/download/$CRANE_VERSION/go-containerregistry_Linux_x86_64.tar.gz"
+          echo "$CRANE_SHA256  $RUNNER_TEMP/crane.tar.gz" | sha256sum --check
+          mkdir -p "$RUNNER_TEMP/crane"
+          tar -xzf "$RUNNER_TEMP/crane.tar.gz" -C "$RUNNER_TEMP/crane" crane
+          echo "$RUNNER_TEMP/crane" >> "$GITHUB_PATH"
+      - name: Standard registry clients
+        if: ${{ !cancelled() }}
+        run: make test-standard-clients NEXTEST="$ARCHIVED"
+      - name: Keep the standard clients report
+        if: ${{ !cancelled() }}
+        run: scripts/ci/keep-junit.sh test-standard-clients make test-standard-clients NEXTEST=archive
+      - name: Upload JUnit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-acceptance
+          path: target/junit
+          if-no-files-found: error
+          retention-days: 14
+
+  ignored-evidence:
+    # Every ignored test whose owner CI runs (a make gate or script named in
+    # this file) must appear in one of the reports above. --no-tests=fail only
+    # proves a filter matched something; this catches a test renamed out of
+    # its gate's filter. See scripts/ci/ignored_owners.py.
+    name: ignored-test evidence
+    needs: [changes, linux, cluster, acceptance]
+    if: ${{ always() && needs.changes.outputs.heavy == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: junit-*
+          path: evidence/junit
+      - uses: actions/download-artifact@v4
+        with:
+          name: oci-interruption-evidence
+          path: evidence/oci
+      - name: Every CI-owned ignored test ran
+        run: python3 scripts/ci/ignored_owners.py evidence evidence
 
   macos:
     name: portable macOS
@@ -330,8 +447,21 @@ jobs:
           cache-on-failure: true
       - name: Lint every target, with all features and with none
         run: make lint
-      - run: make test
-      - run: make test-doc
+      - name: Portable tests
+        run: make test
+      - name: Keep the portable report
+        if: ${{ !cancelled() }}
+        run: scripts/ci/keep-junit.sh test make test
+      - name: Doctests
+        run: make test-doc
+      - name: Upload JUnit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-macos
+          path: target/junit
+          if-no-files-found: error
+          retention-days: 14
 
   benchmarks:
     # Criterion output is uploaded, not gated, so pull requests only pay for

@@ -1074,6 +1074,9 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     };
     let event_store = Arc::new(RwLock::new(reliaburger::bun::events::EventStore::new()));
     agent.set_event_store(Arc::clone(&event_store));
+    let loop_meter = agent.loop_meter();
+    // `/v1/status` reads the loop's published snapshot through this.
+    let status_reader = agent.status_reader();
     // How this node reaches peer agent APIs: https + CA trust under mTLS,
     // plain http otherwise. Shared by the API fan-out, batch/build dispatch,
     // placement reconciler and upgrade orchestrator.
@@ -1752,6 +1755,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     let collection_shutdown = shutdown.clone();
     let collection_cmd_tx = cmd_tx.clone();
     let collection_node = node_name.clone();
+    let collection_loop_meter = Arc::clone(&loop_meter);
     feeder_handles.push(tokio::spawn(async move {
         let mut collector = SystemCollector::new();
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(collection_interval));
@@ -1794,6 +1798,10 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                             value: value as f64,
                         });
                     }
+
+                    // How long the agent loop's turns take, by branch. A long
+                    // turn holds every caller, so this is the loop's health.
+                    samples.extend(collection_loop_meter.samples());
 
                     // The leader's withdrawal ledger (zero on followers).
                     for (name, value) in
@@ -2458,7 +2466,11 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         api_aggregated_rx.clone(),
         config.cluster.name.clone(),
         Some(node_name.clone()),
-        config.images.build_timeout_secs,
+        reliaburger::bun::build_runner::BuildSettings::new(
+            config.images.build_timeout_secs,
+            &config.storage.data.join("buildah"),
+            config.images.build_cache_max_bytes,
+        ),
         cluster_http.clone(),
         config.images.registry_port,
         registry_scheme,
@@ -2470,6 +2482,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         readiness.clone(),
         Some(local_test_leases.clone()),
         jwt_verifier,
+        Some(status_reader),
     );
     let app = match &registry_forwarder {
         Some(forwarder) => app.layer(axum::Extension(

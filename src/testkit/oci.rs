@@ -379,6 +379,12 @@ mod tests {
             ) -> UpstreamFuture<'a, UpstreamManifest> {
                 Box::pin(async { Ok(self.0.clone()) })
             }
+            fn fetch_root<'a>(
+                &'a self,
+                _: &'a crate::grill::image::ImageReference,
+            ) -> UpstreamFuture<'a, crate::pickle::upstream::UpstreamRoot> {
+                Box::pin(async { panic!("staging reads the platform manifest, not the root") })
+            }
             fn fetch_blob<'a>(
                 &'a self,
                 _: &'a crate::grill::image::ImageReference,
@@ -399,12 +405,14 @@ mod tests {
                 digest: ImageDigest::new(&fixture.config_digest).unwrap(),
                 size: fixture.config.len() as u64,
                 media_type: String::new(),
+                platform: None,
             },
             config_bytes: fixture.config,
             layers: vec![LayerDescriptor {
                 digest: ImageDigest::new(&fixture.layer_digest).unwrap(),
                 size: fixture.layer.len() as u64,
                 media_type: String::new(),
+                platform: None,
             }],
         };
         let image = crate::grill::image::ImageReference::parse(&format!(

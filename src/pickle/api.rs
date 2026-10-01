@@ -1360,6 +1360,27 @@ struct OciDescriptor {
     size: u64,
     #[serde(rename = "mediaType", default)]
     media_type: Option<String>,
+    /// Present on an image index's entries.
+    #[serde(default)]
+    platform: Option<OciPlatform>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OciPlatform {
+    os: String,
+    architecture: String,
+    #[serde(default)]
+    variant: Option<String>,
+}
+
+impl OciPlatform {
+    /// `os/architecture`, plus `/variant` when there is one.
+    fn name(&self) -> String {
+        match &self.variant {
+            Some(variant) => format!("{}/{}/{variant}", self.os, self.architecture),
+            None => format!("{}/{}", self.os, self.architecture),
+        }
+    }
 }
 
 /// Media types accepted for single-platform manifests.
@@ -1435,6 +1456,7 @@ fn check_descriptor(
         digest,
         size: descriptor.size,
         media_type: descriptor.media_type.clone().unwrap_or_default(),
+        platform: None,
     })
 }
 
@@ -1576,7 +1598,12 @@ async fn manifest_put(
         let mut sub_manifests = Vec::new();
         for descriptor in &manifest_json.manifests {
             match check_descriptor(&state.store, "sub-manifest", descriptor) {
-                Ok(layer) => sub_manifests.push(layer),
+                // Record the platform the index names, so an image listing
+                // can say which platforms the image offers.
+                Ok(layer) => sub_manifests.push(LayerDescriptor {
+                    platform: descriptor.platform.as_ref().map(OciPlatform::name),
+                    ..layer
+                }),
                 Err(response) => return *response,
             }
         }
@@ -1587,6 +1614,7 @@ async fn manifest_put(
                 digest: manifest_digest.clone(),
                 size: body.len() as u64,
                 media_type: media_type.clone(),
+                platform: None,
             },
             layers: sub_manifests,
             repository: name.to_string(),
@@ -2803,6 +2831,7 @@ mod tests {
                 digest,
                 size: 7,
                 media_type: "config".into(),
+                platform: None,
             },
             layers: vec![],
             repository: "rbtest-run1/web".into(),
@@ -3144,6 +3173,7 @@ mod tests {
                 digest,
                 size: 11,
                 media_type: "config".into(),
+                platform: None,
             },
             layers: vec![],
             total_size: 11,
@@ -3339,6 +3369,7 @@ mod tests {
                         digest,
                         size: bytes.len() as u64,
                         media_type: "config".into(),
+                        platform: None,
                     },
                     layers: vec![],
                     total_size: bytes.len() as u64,
@@ -4857,6 +4888,7 @@ mod tests {
     #[tokio::test]
     async fn push_image_index_after_sub_manifests_succeeds() {
         let (state, _dir) = test_state();
+        let catalog = Arc::clone(&state.catalog);
         let app = test_router(state);
 
         let config_data = b"config";
@@ -4891,6 +4923,13 @@ mod tests {
         .unwrap();
         let resp = put_manifest(&app, "/v2/myapp/manifests/latest", index).await;
         assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // The catalogue remembers which platform each entry is for, so an
+        // image listing can show it without reading the index blob.
+        let catalog = catalog.read().await;
+        let index = catalog.get_manifest_by_tag("myapp", "latest").unwrap();
+        assert!(index.is_index());
+        assert_eq!(index.layers[0].platform.as_deref(), Some("linux/arm64"));
     }
 
     /// REG3: an index whose sub-manifest was never pushed is refused.

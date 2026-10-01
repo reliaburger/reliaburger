@@ -2456,6 +2456,8 @@ The filter logic is specific: only instances that are Pending *and* have been re
 
 This is called the "collect-then-process" pattern. We gather everything we need to act on (releasing the borrow on the supervisor), then iterate and mutate. The alternative would be indexing into the instances map by position, which is both less readable and fragile if the map changes size during iteration.
 
+Everything in this section runs on the event loop, and every `.await` in it holds every other command until it returns. On one container that's fine. On a busy node, a few slow runc calls in a row made the whole node look dead, and Chapter 15 tells that story. Today the tick only *starts* this work: the state reads in `check_jobs` (and its sibling for apps, `check_apps`) run as one parallel sweep in a spawned task, and each restart's kill, create and start run in tasks of their own, reporting back to the loop between steps.
+
 ## A local API
 
 The agent runs as a loop processing commands. Something needs to feed those commands in. That's the HTTP API: a thin axum server that translates HTTP requests into `AgentCommand` values and sends them over the channel.
@@ -2495,6 +2497,8 @@ async fn status_handler(
 ```
 
 Create a oneshot channel. Send the command with the sender half. Await the receiver half. Return the result as JSON. The handler doesn't know how the agent processes commands — it just sends and waits. This separation means we can test the API layer independently from the agent logic.
+
+Status was the first command to outgrow this. It's the one everybody polls, and each poll waited for whatever the loop was doing. Since 0.1.3 the loop publishes a snapshot of its instances after every turn on a `watch` channel, and `/v1/status` reads that instead of asking (Chapter 15, "Three awaits leave the loop").
 
 Write that dance thirty times and it stops being a pattern and starts being noise. So the API now has one helper that does it:
 

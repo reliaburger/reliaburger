@@ -146,7 +146,7 @@ paused run, because no node moved.
 From 0.1.2 the leader refuses before it records anything. It fetches the
 candidate, checks its signatures and runs `bun --compatibility` on it, and
 `start` fails with both format pairs:
-`refusing to upgrade to vX: incompatible binary: found protocol P, state S; this cluster (reliaburger v0.1.2 (…)) needs protocol 27, state 46`.
+`refusing to upgrade to vX: incompatible binary: found protocol P, state S; this cluster (reliaburger v0.1.2 (…)) needs protocol 28, state 47`.
 A cluster `relish upgrade rollback vX` is checked the same way: the leader
 asks every node which versions its binary store holds (`installed_versions`
 in `GET /v1/version`) and refuses a version any node lacks, naming those
@@ -158,6 +158,33 @@ installer finds a saved record that names the older release, so it names
 both versions and tells you to run `relish local destroy --yes` (with
 `--name` for a cluster not called `laptop`) and set it up again. Before 0.1.2
 the message only said the existing cluster's parameters differ.
+
+### Upgrading from 0.1.1
+
+0.1.2 can't roll onto a 0.1.1 cluster either. Pickle's catalogue now records
+each image index entry's platform, and image listings carry it, so the
+protocol moved from 27 to 28 and the state format from 46 to 47. Recreate the
+cluster the same way as above. A 0.1.1 cluster behaves as a 0.1.0 one does
+when you try: the first node refuses 0.1.2's `{"protocol":28,"state":47}` and
+the run pauses until `relish upgrade abort`.
+
+### Upgrading from 0.1.2
+
+A council of exactly two voters (a two-node cluster, or a bigger one whose
+council hasn't grown past two yet) can't roll an upgrade at all. Each voter
+goes down for its swap in turn, and the one left behind is short of the two a
+quorum needs. Up to 0.1.2, `start` accepted such a run anyway, and the leader
+held it in `UpgradingCouncil` for good: `relish upgrade status` gave no
+reason, and `relish upgrade abort` refused because the run wasn't paused. A
+run stuck like that carries on once a third node joins and the council
+promotes it, since three voters can spare one.
+
+From 0.1.3, `start` and a cluster `relish upgrade rollback` refuse a
+two-voter council before recording anything, with
+`a council of 2 voters can't upgrade one voter at a time: … Add a node so the council has at least three voters, then start again`.
+A run that loses a voter after it started still waits in the council phase,
+and the leader now logs `cluster upgrade ID waiting: N of M voters alive` once
+when the wait begins.
 
 ## Signing identity
 
@@ -258,7 +285,7 @@ and the [release asset digest fields](https://docs.github.com/en/rest/releases/r
 The website and installer are separate static assets under `docs/website`,
 published by `static.yml`. GitHub Pages cannot select a different response for
 curl and a browser at `/`; the shell endpoint is `/install.sh`. The bootstrap
-installs the version in its `RELIABURGER_VERSION` default (`v0.1.1` today), so
+installs the version in its `RELIABURGER_VERSION` default (`v0.1.2` today), so
 bump that default in the same change that announces a newer release.
 
 Before tagging a release, complete the managed-cluster and clean-install
@@ -381,6 +408,19 @@ the real `curl … | sh` install against it on every host we advertise.
    record](qualification/2026-09-27-v0.1.0-release-closure.md) shows what these
    runs found for 0.1.0, candidate by candidate, and the PR that fixed each
    failure.
+
+   Either tier also fails on a slow agent loop. Every settle and heavy check
+   reads each node's `bun_agent_loop_turn_seconds` histogram from
+   `/v1/metrics`, and the checker fails the tier (`agent-loop-turn`) on any
+   turn longer than 1 s since the last check, naming the node, the branch
+   (`command`, `deploy_op`, `health_tick`, …) and how long the worst one
+   took. A turn that long holds every caller on the node, the way the stalls
+   behind 0.1.0's soak failures did; the budget comes from the [agent-loop
+   review](plans/2026-09-30-agent-loop-review.md#decision) (#351). The
+   record's Data section lists the turns over budget per node. A failure
+   here is a product bug: Bun's log names the turn's command or deploy op
+   (`agent loop turn took … ms in …`), and the fix moves that work off the
+   loop.
 
    Until 1.0, a final-tier run whose only failures are known harness
    artefacts counts as passed (maintainer decision, 28 September 2026), if
@@ -535,9 +575,16 @@ need their own evidence after publication.
 Each quickstart VM boots from a guest image the release builds itself: the
 dated Ubuntu 24.04 cloud image named in `scripts/release/guest-images.json`
 with that file's `packages` (runc, uidmap, btrfs-progs, nftables, iptables,
-iproute2) already installed. Without them baked in, every VM spent 15–40 s of
+iproute2, buildah) already installed. Without them baked in, every VM spent 15–40 s of
 its first boot in `apt-get update` and `install`, against Ubuntu's live mirrors
 ([measurements](qualification/2026-09-24-guest-image.md)).
+
+Buildah is there so the five-minute tour can `relish build` on the cluster.
+With what it pulls in that the stock image lacks (`containers-common`, the CNI
+plugins and netavark, `fuse-overlayfs`), it adds about 75 MiB installed,
+going by Ubuntu 24.04's package sizes: 47 MiB of that is
+`containernetworking-plugins`. Expect the compressed image to grow by roughly
+25–40 MiB; record the real figure with the next image build.
 
 `scripts/release/build_guest_image.sh` builds one image, for the host's own
 architecture:

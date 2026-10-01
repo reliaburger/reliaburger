@@ -64,6 +64,12 @@ pub fn render_app_detail(data: &AppDetailData) -> String {
             .count(),
         data.desired_instances,
     ));
+    if let Some(reason) = &data.blocked {
+        html.push_str(&format!(
+            "<p class=\"blocked\">Not placed, blocked: {}</p>\n",
+            escape_html(reason)
+        ));
+    }
     html.push_str("</div>\n");
 
     // Charts
@@ -265,6 +271,7 @@ mod tests {
             app_name: "web".to_string(),
             namespace: "default".to_string(),
             state: "running".to_string(),
+            blocked: None,
             instances: vec![
                 InstanceStatus {
                     exit_code: None,
@@ -276,6 +283,7 @@ mod tests {
                     host_port: Some(8080),
                     pid: Some(1234),
                     runtime_unknown: false,
+                    status_age_ms: None,
                 },
                 InstanceStatus {
                     exit_code: None,
@@ -287,6 +295,7 @@ mod tests {
                     host_port: Some(8081),
                     pid: Some(1235),
                     runtime_unknown: false,
+                    status_age_ms: None,
                 },
             ],
             env: vec![
@@ -325,6 +334,25 @@ mod tests {
             "attribute break-out survived: {html}"
         );
         assert!(html.contains("&#39;"));
+    }
+
+    /// #326: the app page says why an over-quota app has no instances.
+    #[test]
+    fn render_app_detail_shows_why_an_app_is_blocked() {
+        let mut data = sample_data();
+        data.instances.clear();
+        data.state = "blocked".to_string();
+        data.blocked =
+            Some("namespace \"default\" would exceed CPU quota: 0+1600 > 1000m".to_string());
+        let html = render_app_detail(&data);
+        assert!(
+            html.contains(
+                "Not placed, blocked: namespace &quot;default&quot; would exceed CPU quota: \
+                 0+1600 &gt; 1000m"
+            ),
+            "{html}"
+        );
+        assert!(!render_app_detail(&sample_data()).contains("Not placed"));
     }
 
     #[test]

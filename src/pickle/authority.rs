@@ -694,6 +694,7 @@ mod tests {
                 digest: super::super::store::compute_sha256(b"config"),
                 size: 6,
                 media_type: "application/vnd.oci.image.config.v1+json".into(),
+                platform: None,
             },
             pushed_by: crate::cluster::identity::raft_id_from_name("writer"),
             layers: vec![],

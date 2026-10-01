@@ -50,6 +50,7 @@ impl TestHarness {
         let volumes = tempfile::tempdir().unwrap();
         agent.set_volumes_dir(volumes.path().to_path_buf());
         let deploy_history = agent.deploy_history_handle();
+        let status_reader = agent.status_reader();
         let event_store = Arc::new(RwLock::new(reliaburger::bun::events::EventStore::new()));
         agent.set_event_store(Arc::clone(&event_store));
 
@@ -92,7 +93,7 @@ impl TestHarness {
             None,
             "default".to_string(),
             None,
-            900,
+            reliaburger::bun::build_runner::BuildSettings::with_timeout(900),
             reliaburger::cluster::ClusterHttp::plaintext(),
             5050,
             "http",
@@ -102,6 +103,7 @@ impl TestHarness {
             reliaburger::bun::readiness::ReadinessTracker::new(),
             None,
             None,
+            Some(status_reader),
         );
         let server_shutdown = shutdown.clone();
 

@@ -12,6 +12,19 @@ use super::oci::OciSpec;
 use super::state::ContainerState;
 use super::{GrillError, InstanceId};
 
+/// A `Grill` call the starvation harness can slow down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MockCall {
+    Create,
+    Start,
+    Stop,
+    Kill,
+    State,
+    ExitCode,
+    Logs,
+    RetainNetworkReference,
+}
+
 /// Records all calls to the Grill trait for test assertions.
 #[derive(Debug, Clone)]
 pub struct MockGrill {
@@ -61,12 +74,18 @@ pub struct MockGrill {
     pid_delay: Arc<Mutex<Option<std::time::Duration>>>,
     /// Per-instance pid delays, on top of `pid_delay`.
     instance_pid_delays: Arc<Mutex<HashMap<InstanceId, std::time::Duration>>>,
+    /// Make pid reads fail, as an owner that doesn't answer does.
+    fail_pid: Arc<AtomicBool>,
     fail_create: Arc<AtomicBool>,
     fail_start: Arc<AtomicBool>,
     fail_state: Arc<AtomicBool>,
     inspection_failures: Arc<Mutex<std::collections::HashSet<InstanceId>>>,
     /// Per-instance captured-output stems, as a file-capturing runtime reports.
     log_stems: Arc<Mutex<HashMap<InstanceId, std::path::PathBuf>>>,
+    /// How long each kind of call takes, as a loaded host makes runc do.
+    call_delays: Arc<Mutex<HashMap<MockCall, std::time::Duration>>>,
+    /// What `logs` returns per instance; empty when unset.
+    captured_logs: Arc<Mutex<HashMap<InstanceId, String>>>,
 }
 
 impl Default for MockGrill {
@@ -108,11 +127,14 @@ impl Default for MockGrill {
             kill_delay: Arc::default(),
             pid_delay: Arc::default(),
             instance_pid_delays: Arc::default(),
+            fail_pid: Arc::default(),
             fail_create: Arc::default(),
             fail_start: Arc::default(),
             fail_state: Arc::default(),
             inspection_failures: Arc::default(),
             log_stems: Arc::default(),
+            call_delays: Arc::default(),
+            captured_logs: Arc::default(),
         }
     }
 }
@@ -121,6 +143,30 @@ impl MockGrill {
     /// Create a new MockGrill.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Make every later `call` take `delay`, or no time again with `None`.
+    pub fn set_call_delay(&self, call: MockCall, delay: Option<std::time::Duration>) {
+        let mut delays = self.call_delays.lock().unwrap();
+        match delay {
+            Some(delay) => delays.insert(call, delay),
+            None => delays.remove(&call),
+        };
+    }
+
+    /// The captured output `logs` returns for `instance`.
+    pub fn set_logs(&self, instance: &InstanceId, output: impl Into<String>) {
+        self.captured_logs
+            .lock()
+            .unwrap()
+            .insert(instance.clone(), output.into());
+    }
+
+    async fn delay(&self, call: MockCall) {
+        let delay = self.call_delays.lock().unwrap().get(&call).copied();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
     }
 
     /// Report `stem` as the instance's captured-output base path
@@ -362,6 +408,11 @@ impl MockGrill {
         *self.pid_delay.lock().unwrap() = delay;
     }
 
+    /// Make every pid read fail, as a runtime that can't say does.
+    pub fn set_fail_pid(&self, fail: bool) {
+        self.fail_pid.store(fail, Ordering::SeqCst);
+    }
+
     /// Delay pid reads for one instance only, as runc does while that
     /// instance's lifecycle lock is held.
     pub fn set_instance_pid_delay(&self, instance: &InstanceId, delay: std::time::Duration) {
@@ -466,6 +517,7 @@ impl super::Grill for MockGrill {
             .lock()
             .unwrap()
             .push(("retain_network_reference".into(), instance.clone()));
+        self.delay(MockCall::RetainNetworkReference).await;
         Ok(self.network_references.lock().await.get(instance).cloned())
     }
 
@@ -481,6 +533,7 @@ impl super::Grill for MockGrill {
             .lock()
             .unwrap()
             .push(("create".to_string(), instance.clone()));
+        self.delay(MockCall::Create).await;
         if self.block_create.load(Ordering::SeqCst) {
             self.create_started.add_permits(1);
             let permit = self
@@ -510,6 +563,7 @@ impl super::Grill for MockGrill {
             .lock()
             .unwrap()
             .push(("start".to_string(), instance.clone()));
+        self.delay(MockCall::Start).await;
         if self.block_start.load(Ordering::SeqCst) {
             self.start_started.add_permits(1);
             let permit = self
@@ -533,6 +587,7 @@ impl super::Grill for MockGrill {
             .lock()
             .unwrap()
             .push(("stop".to_string(), instance.clone()));
+        self.delay(MockCall::Stop).await;
         if self.fail_stop.load(Ordering::SeqCst) {
             return Err(GrillError::StopFailed {
                 instance: instance.clone(),
@@ -558,6 +613,7 @@ impl super::Grill for MockGrill {
             .lock()
             .unwrap()
             .push(("kill".to_string(), instance.clone()));
+        self.delay(MockCall::Kill).await;
         if self.block_kill.load(Ordering::SeqCst) {
             self.kill_started.add_permits(1);
             let permit = self.kill_release.acquire().await.unwrap();
@@ -587,6 +643,7 @@ impl super::Grill for MockGrill {
             .lock()
             .unwrap()
             .push(("state".to_string(), instance.clone()));
+        self.delay(MockCall::State).await;
         if self.fail_state.load(Ordering::SeqCst)
             || self.inspection_failures.lock().unwrap().contains(instance)
         {
@@ -603,8 +660,20 @@ impl super::Grill for MockGrill {
     }
 
     async fn exit_code(&self, instance: &InstanceId) -> Option<i32> {
+        self.delay(MockCall::ExitCode).await;
         let codes = self.exit_codes.lock().unwrap();
         codes.get(instance).copied().flatten()
+    }
+
+    async fn logs(&self, instance: &InstanceId) -> Result<String, GrillError> {
+        self.delay(MockCall::Logs).await;
+        Ok(self
+            .captured_logs
+            .lock()
+            .unwrap()
+            .get(instance)
+            .cloned()
+            .unwrap_or_default())
     }
 
     async fn log_stem(&self, instance: &InstanceId) -> Option<std::path::PathBuf> {
@@ -637,7 +706,7 @@ impl super::Grill for MockGrill {
             .and_then(|path| crate::sesame::egress::cgroup_id_of_path(path)))
     }
 
-    async fn pid(&self, instance: &InstanceId) -> Option<u32> {
+    async fn pid(&self, instance: &InstanceId) -> Result<Option<u32>, GrillError> {
         let delay = self
             .instance_pid_delays
             .lock()
@@ -648,7 +717,13 @@ impl super::Grill for MockGrill {
         if let Some(delay) = delay {
             tokio::time::sleep(delay).await;
         }
-        *self.pid.lock().unwrap()
+        if self.fail_pid.load(Ordering::SeqCst) {
+            return Err(GrillError::StateUnavailable {
+                instance: instance.clone(),
+                reason: "mock pid failure".into(),
+            });
+        }
+        Ok(*self.pid.lock().unwrap())
     }
 
     async fn exec(&self, instance: &InstanceId, _command: &[String]) -> Result<String, GrillError> {

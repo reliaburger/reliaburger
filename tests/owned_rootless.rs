@@ -8,7 +8,7 @@ use reliaburger::grill::runc::RuncGrill;
 use reliaburger::grill::{ContainerState, Grill, ImageStore, InstanceId, OciSpec};
 
 #[tokio::test]
-#[ignore = "requires an unprivileged Linux user and runc in PATH"]
+#[ignore = "requires an unprivileged Linux user and runc in PATH; run with make test-rootless-runc"]
 async fn rootless_cluster_refuses_before_ownership_recovery_for_every_selection() {
     assert!(!nix::unistd::geteuid().is_root());
     for runtime in ["runc", "auto"] {
@@ -120,7 +120,7 @@ async fn stopped(runtime: &RuncGrill, id: &InstanceId) {
 }
 
 #[tokio::test]
-#[ignore = "requires unprivileged Linux user, rootless runc, slirp4netns and static busybox"]
+#[ignore = "requires unprivileged Linux user, rootless runc, slirp4netns and static busybox; run with make test-rootless-runc"]
 async fn rootless_short_job_has_network_before_its_first_instruction() {
     assert!(!nix::unistd::geteuid().is_root());
     let root = tempfile::tempdir().unwrap();
@@ -147,7 +147,7 @@ async fn rootless_short_job_has_network_before_its_first_instruction() {
 }
 
 #[tokio::test]
-#[ignore = "requires unprivileged Linux user, rootless runc, slirp4netns and static busybox"]
+#[ignore = "requires unprivileged Linux user, rootless runc, slirp4netns and static busybox; run with make test-rootless-runc"]
 async fn rootless_port_and_launcher_survive_recovery_and_helper_replacement() {
     use reliaburger::grill::oci::PortMapping;
     let root = tempfile::tempdir().unwrap();
@@ -170,14 +170,14 @@ async fn rootless_port_and_launcher_survive_recovery_and_helper_replacement() {
     first.create(&id, &spec).await.unwrap();
     install_fixture(&data, &id);
     first.start(&id).await.unwrap();
-    let launcher = first.pid(&id).await.unwrap();
+    let launcher = first.pid(&id).await.unwrap().unwrap();
     let network = first.rootless_network_record(&id).await.unwrap();
     let url = format!("http://127.0.0.1:{port}");
     assert_eq!(read_page(&url).await, "owned-rootless");
     drop(first);
     let recovered = runtime(&data);
     assert_eq!(recovered.state(&id).await.unwrap(), ContainerState::Running);
-    assert_eq!(recovered.pid(&id).await, Some(launcher));
+    assert_eq!(recovered.pid(&id).await.unwrap(), Some(launcher));
     // Fault injection against a just-observed helper; production recovery uses its owner.
     nix::sys::signal::kill(
         nix::unistd::Pid::from_raw(network.owner_pid as i32),
@@ -199,7 +199,7 @@ async fn rootless_port_and_launcher_survive_recovery_and_helper_replacement() {
     })
     .await
     .unwrap();
-    assert_eq!(recovered.pid(&id).await, Some(launcher));
+    assert_eq!(recovered.pid(&id).await.unwrap(), Some(launcher));
     assert_eq!(
         std::fs::read_to_string(data.join("shared/launches")).unwrap(),
         "launch"
@@ -268,7 +268,7 @@ async fn start_published_with_wrapper(
 }
 
 #[tokio::test]
-#[ignore = "requires unprivileged Linux user, rootless runc, slirp4netns and static busybox"]
+#[ignore = "requires unprivileged Linux user, rootless runc, slirp4netns and static busybox; run with make test-rootless-runc"]
 async fn rootless_helper_dying_while_its_readiness_is_probed_is_replaced() {
     let root = tempfile::tempdir().unwrap();
     let id = InstanceId("rootless-probed".into());
@@ -292,7 +292,7 @@ async fn rootless_helper_dying_while_its_readiness_is_probed_is_replaced() {
 }
 
 #[tokio::test]
-#[ignore = "requires unprivileged Linux user, rootless runc, slirp4netns and static busybox"]
+#[ignore = "requires unprivileged Linux user, rootless runc, slirp4netns and static busybox; run with make test-rootless-runc"]
 async fn rootless_helper_that_keeps_dying_is_reported_then_recovers() {
     let root = tempfile::tempdir().unwrap();
     let id = InstanceId("rootless-broken".into());
@@ -314,8 +314,57 @@ async fn rootless_helper_that_keeps_dying_is_reported_then_recovers() {
     runtime.kill(&id).await.unwrap();
 }
 
+/// A status read asks for the launcher's pid while state reads hold the
+/// instance: here, each one retrying a network helper that keeps dying,
+/// with backoff (#358). Nothing they do changes the launcher, so its pid
+/// answers at once instead of queueing behind them past the status
+/// deadline. A fresh runtime stands in for the Bun that just exec'd.
 #[tokio::test]
-#[ignore = "requires unprivileged Linux user, rootless runc, slirp4netns and static busybox"]
+#[ignore = "requires unprivileged Linux user, rootless runc, slirp4netns and static busybox; run with make test-rootless-runc"]
+async fn rootless_pid_answers_while_state_reads_hold_the_instance() {
+    let root = tempfile::tempdir().unwrap();
+    let id = InstanceId("rootless-busy".into());
+    let (first, network, url) = start_published_with_wrapper(root.path(), &id).await;
+    let launcher = first.pid(&id).await.unwrap().unwrap();
+    drop(first);
+    let runtime = runtime(root.path());
+    assert_eq!(runtime.state(&id).await.unwrap(), ContainerState::Running);
+
+    std::fs::write(root.path().join("break-helper"), "").unwrap();
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(network.owner_pid as i32),
+        nix::sys::signal::Signal::SIGKILL,
+    )
+    .unwrap();
+    let busy: Vec<_> = (0..4)
+        .map(|_| {
+            let runtime = runtime.clone();
+            let id = id.clone();
+            tokio::spawn(async move { runtime.state(&id).await })
+        })
+        .collect();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let asked = std::time::Instant::now();
+    assert_eq!(runtime.pid(&id).await.unwrap(), Some(launcher));
+    assert!(
+        asked.elapsed() < Duration::from_millis(250),
+        "the pid waited {:?} behind state reads",
+        asked.elapsed()
+    );
+    for read in busy {
+        // Each fails or recovers; only the pid's latency is under test.
+        let _ = read.await.unwrap();
+    }
+
+    std::fs::remove_file(root.path().join("break-helper")).unwrap();
+    assert_eq!(runtime.state(&id).await.unwrap(), ContainerState::Running);
+    assert_eq!(read_page(&url).await, "owned-rootless");
+    runtime.kill(&id).await.unwrap();
+    assert_eq!(runtime.pid(&id).await.unwrap(), None);
+}
+
+#[tokio::test]
+#[ignore = "requires unprivileged Linux user, rootless runc, slirp4netns and static busybox; run with make test-rootless-runc"]
 async fn rootless_caller_death_recovers_without_an_adoption_record() {
     let root = tempfile::tempdir().unwrap();
     let mut caller = tokio::process::Command::new(std::env::current_exe().unwrap())
@@ -395,7 +444,7 @@ async fn owned_rootless_fixture() {
 }
 
 #[tokio::test]
-#[ignore = "requires unprivileged Linux user, rootless runc, slirp4netns and static busybox"]
+#[ignore = "requires unprivileged Linux user, rootless runc, slirp4netns and static busybox; run with make test-rootless-runc"]
 async fn caller_death_during_rootless_helper_startup_cannot_release_the_payload_later() {
     let root = tempfile::tempdir().unwrap();
     let mut caller = tokio::process::Command::new(std::env::current_exe().unwrap())
@@ -449,7 +498,7 @@ fn rootless_helper_refuses_the_host_namespace_without_starting_slirp() {
 }
 
 #[tokio::test]
-#[ignore = "requires unprivileged Linux user, rootless runc, slirp4netns and static busybox"]
+#[ignore = "requires unprivileged Linux user, rootless runc, slirp4netns and static busybox; run with make test-rootless-runc"]
 async fn helper_refuses_a_container_belonging_to_a_different_live_owner() {
     use reliaburger::grill::command::OwnedCommands;
     use std::collections::BTreeMap;

@@ -54,6 +54,10 @@ pub struct CouncilNode {
     consumer_contacts: tokio::sync::Mutex<crate::onion::lease::ConsumerContacts>,
     /// Master secret for unwrapping CA private keys (in-memory only).
     wrapping_ikm: Option<[u8; 32]>,
+    /// Test hook: writes and linearizable reads never return, as they don't
+    /// on a leader that has lost its quorum and not yet stepped down.
+    #[cfg(test)]
+    writes_hang: std::sync::atomic::AtomicBool,
 }
 
 impl CouncilNode {
@@ -101,7 +105,23 @@ impl CouncilNode {
                 std::time::Instant::now(),
             )),
             wrapping_ikm,
+            #[cfg(test)]
+            writes_hang: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Test hook: from now on every write and linearizable read hangs.
+    #[cfg(test)]
+    pub(crate) fn hang_writes(&self) {
+        self.writes_hang
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    async fn hang_if_asked(&self) {
+        if self.writes_hang.load(std::sync::atomic::Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
     }
 
     /// Initialise the cluster with an initial set of members.
@@ -123,6 +143,8 @@ impl CouncilNode {
     ///
     /// Returns `ForwardToLeader` if this node is not the leader.
     pub async fn write(&self, request: RaftRequest) -> Result<CouncilResponse, CouncilError> {
+        #[cfg(test)]
+        self.hang_if_asked().await;
         let _membership = if matches!(
             &request,
             RaftRequest::ReserveNodeFault { .. } | RaftRequest::DecommissionNode { .. }
@@ -331,6 +353,8 @@ impl CouncilNode {
     pub async fn security_state_linearizable(
         &self,
     ) -> Result<crate::sesame::types::SecurityState, CouncilError> {
+        #[cfg(test)]
+        self.hang_if_asked().await;
         self.raft
             .ensure_linearizable()
             .await

@@ -75,7 +75,7 @@ fn assert_absent(root: &Path, id: &InstanceId) {
 }
 
 #[tokio::test]
-#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft"]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux"]
 async fn runc_owned_preparation_recovers_original_intent_and_retires_without_adoption() {
     assert!(nix::unistd::geteuid().is_root());
     let root = tempfile::tempdir().unwrap();
@@ -119,7 +119,7 @@ async fn runc_owned_preparation_recovers_original_intent_and_retires_without_ado
 }
 
 #[tokio::test]
-#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft"]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux"]
 async fn runc_owned_short_job_keeps_its_actual_exit_and_logs_after_reconstruction() {
     assert!(nix::unistd::geteuid().is_root());
     let root = tempfile::tempdir().unwrap();
@@ -146,7 +146,7 @@ async fn runc_owned_short_job_keeps_its_actual_exit_and_logs_after_reconstructio
 }
 
 #[tokio::test]
-#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft"]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux"]
 async fn runc_owned_launcher_and_exec_retire_after_actual_caller_sigkill() {
     assert!(nix::unistd::geteuid().is_root());
     let root = tempfile::tempdir().unwrap();
@@ -198,7 +198,7 @@ async fn owned_runc_fixture() {
 }
 
 #[tokio::test]
-#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft"]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux"]
 async fn runc_owned_adoption_validates_generation_and_restores_live_network() {
     use reliaburger::grill::records::{InstanceRecord, RuntimeKind};
     let root = tempfile::tempdir().unwrap();
@@ -208,7 +208,7 @@ async fn runc_owned_adoption_validates_generation_and_restores_live_network() {
     first.create(&id, &specification).await.unwrap();
     install_fixture(root.path(), &id);
     first.start(&id).await.unwrap();
-    let pid = first.pid(&id).await.unwrap();
+    let pid = first.pid(&id).await.unwrap().unwrap();
     let mut record = InstanceRecord {
         schema: 2,
         instance_id: id.0.clone(),
@@ -232,7 +232,7 @@ async fn runc_owned_adoption_validates_generation_and_restores_live_network() {
     drop(first);
     let recovered = runtime(root.path());
     assert!(recovered.adopt(&id, &record).await.unwrap());
-    assert_eq!(recovered.pid(&id).await, Some(pid));
+    assert_eq!(recovered.pid(&id).await.unwrap(), Some(pid));
     assert!(recovered.container_ip(&id).await.is_some());
     assert_eq!(
         recovered
@@ -256,7 +256,7 @@ fn quote(path: &Path) -> String {
 }
 
 #[tokio::test]
-#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft"]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux"]
 async fn runc_owned_cancelled_preparation_keeps_its_worker_until_queued_cleanup() {
     use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().unwrap();
@@ -330,7 +330,7 @@ async fn runc_owned_cancelled_preparation_keeps_its_worker_until_queued_cleanup(
 }
 
 #[tokio::test]
-#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft"]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux"]
 async fn runc_owned_completed_log_reader_cannot_block_a_replacement_generation() {
     let root = tempfile::tempdir().unwrap();
     let id = instance(root.path());
@@ -379,7 +379,7 @@ async fn runc_owned_completed_log_reader_cannot_block_a_replacement_generation()
 /// bounded chunks. `#[tokio::test]` is single-threaded, so a stalled 1 ms
 /// timer is the runtime being held.
 #[tokio::test]
-#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft"]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux"]
 async fn following_a_large_capture_after_a_restart_does_not_hold_the_runtime() {
     const LINES: u64 = 200_000;
     const LINE: &str = "spam the quick brown fox jumps over";
@@ -446,7 +446,7 @@ async fn following_a_large_capture_after_a_restart_does_not_hold_the_runtime() {
 }
 
 #[tokio::test]
-#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft"]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux"]
 async fn generated_cgroup_path_matches_the_actual_container_before_its_first_instruction() {
     let root = tempfile::tempdir().unwrap();
     let id = instance(root.path());
@@ -488,7 +488,7 @@ async fn generated_cgroup_path_matches_the_actual_container_before_its_first_ins
 }
 
 #[tokio::test]
-#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft"]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux"]
 async fn recovered_source_identity_belongs_to_the_container_not_its_launcher() {
     let root = tempfile::tempdir().unwrap();
     let id = instance(root.path());
@@ -500,7 +500,7 @@ async fn recovered_source_identity_belongs_to_the_container_not_its_launcher() {
     install_fixture(root.path(), &id);
     first.start(&id).await.unwrap();
     let expected = reliaburger::sesame::egress::cgroup_id_of_path(Path::new(&path)).unwrap();
-    let launcher = first.pid(&id).await.unwrap();
+    let launcher = first.pid(&id).await.unwrap().unwrap();
     let launcher_cgroup = reliaburger::sesame::egress::cgroup_id_of_pid(launcher);
     let live = first.workload_cgroup(&id).await;
     drop(first);
@@ -516,7 +516,7 @@ async fn recovered_source_identity_belongs_to_the_container_not_its_launcher() {
 }
 
 #[tokio::test]
-#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft"]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux"]
 async fn source_identity_refuses_a_container_moved_out_of_its_original_cgroup() {
     let root = tempfile::tempdir().unwrap();
     let id = instance(root.path());
@@ -545,7 +545,7 @@ async fn source_identity_refuses_a_container_moved_out_of_its_original_cgroup() 
 }
 
 #[tokio::test]
-#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft"]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux"]
 async fn retiring_a_rollout_predecessor_preserves_its_live_successor() {
     let root = tempfile::tempdir().unwrap();
     let app_name = instance(root.path()).0;
@@ -604,7 +604,7 @@ async fn retiring_a_rollout_predecessor_preserves_its_live_successor() {
 }
 
 #[tokio::test]
-#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft"]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux"]
 async fn retained_addresses_survive_exit_and_recovery_until_the_original_reference_releases() {
     assert!(nix::unistd::geteuid().is_root());
     let root = tempfile::tempdir().unwrap();
@@ -717,7 +717,7 @@ async fn retained_addresses_survive_exit_and_recovery_until_the_original_referen
 /// intent `retiring`. Every later Bun (restart, SIGKILL, host reboot) refused
 /// to adopt it and exited, so systemd restarted it forever.
 #[tokio::test]
-#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft"]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux"]
 async fn restart_recovers_a_retiring_generation_that_still_holds_its_address() {
     use reliaburger::grill::records::{InstanceRecord, RuntimeKind};
     use reliaburger::grill::runc_intent::NetworkReferenceState;
@@ -730,7 +730,7 @@ async fn restart_recovers_a_retiring_generation_that_still_holds_its_address() {
     install_fixture(root.path(), &id);
     let original = first.retain_network_reference(&id).await.unwrap().unwrap();
     first.start(&id).await.unwrap();
-    let pid = first.pid(&id).await.unwrap();
+    let pid = first.pid(&id).await.unwrap().unwrap();
     let record = InstanceRecord {
         schema: 2,
         instance_id: id.0.clone(),
@@ -802,7 +802,7 @@ async fn restart_recovers_a_retiring_generation_that_still_holds_its_address() {
 }
 
 #[tokio::test]
-#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft"]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux"]
 async fn previous_boot_intent_cannot_start_or_remove_conflicting_live_resources() {
     let root = tempfile::tempdir().unwrap();
     let id = instance(root.path());
@@ -1067,13 +1067,13 @@ async fn restart_after_unit_cgroup_stop(retiring: bool) {
 }
 
 #[tokio::test]
-#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft"]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux"]
 async fn restart_after_unit_cgroup_stop_recovers_a_running_generation() {
     restart_after_unit_cgroup_stop(false).await;
 }
 
 #[tokio::test]
-#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft"]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux"]
 async fn restart_after_unit_cgroup_stop_recovers_a_retiring_generation() {
     restart_after_unit_cgroup_stop(true).await;
 }
@@ -1104,7 +1104,7 @@ async fn owned_runc_unit_stop_fixture() {
         .unwrap()
         .unwrap();
     runtime.start(&id).await.unwrap();
-    let pid = runtime.pid(&id).await.unwrap();
+    let pid = runtime.pid(&id).await.unwrap().unwrap();
     let record = InstanceRecord {
         schema: 2,
         instance_id: id.0.clone(),

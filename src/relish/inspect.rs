@@ -245,6 +245,10 @@ pub fn render(inspection: &Inspection) -> String {
                         .collect();
                     let _ = writeln!(out, "  Placed:    {}", placed.join(", "));
                 }
+                // An over-quota app has nothing to list below; say why.
+                if let Some(reason) = &app.blocked {
+                    let _ = writeln!(out, "  Blocked:   {reason}");
+                }
             }
             (None, Err(reason)) => {
                 let _ = writeln!(
@@ -310,6 +314,7 @@ mod tests {
             exit_code: None,
             pid: Some(100),
             runtime_unknown: false,
+            status_age_ms: None,
         }
     }
 
@@ -337,6 +342,7 @@ mod tests {
                 .map(|(node, count)| (node.to_string(), *count))
                 .collect(),
             service_port: None,
+            blocked: None,
         }
     }
 
@@ -471,6 +477,41 @@ mod tests {
             "{output}"
         );
         assert!(output.contains("Placed:    node-1 3"), "{output}");
+    }
+
+    /// #326: an app its namespace quota keeps off every node says so,
+    /// instead of just showing nothing running.
+    #[test]
+    fn an_over_quota_app_says_why_it_is_not_placed() {
+        let inspection = Inspection {
+            name: "hello".to_string(),
+            desired: Ok(vec![DesiredAppEvidence {
+                blocked: Some(crate::meat::quota::QuotaError::CpuExceeded {
+                    namespace: "default".to_string(),
+                    current: 0,
+                    requested: 1600,
+                    limit: 1000,
+                }),
+                scheduled_replicas: 0,
+                ..desired(2, &[])
+            }]),
+            nodes: vec![NodeReport {
+                node: "node-1".to_string(),
+                answer: NodeAnswer::Answered(Vec::new()),
+            }],
+        };
+
+        let output = render(&inspection);
+        assert!(
+            output.contains("Replicas:  2 desired, 0 running"),
+            "{output}"
+        );
+        assert!(
+            output.contains(
+                "  Blocked:   namespace \"default\" would exceed CPU quota: 0+1600 > 1000m\n"
+            ),
+            "{output}"
+        );
     }
 
     #[test]

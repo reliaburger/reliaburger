@@ -39,6 +39,9 @@ PAGE="${REPO_DIR}/docs/website/index.html"
 DEMO_URL="https://reliaburger.com/demo/podinfo.yaml"
 DEMO_FILE="examples/kubernetes/podinfo.yaml"
 INGRESS="http://podinfo.localhost:18080"
+BURGER_URL="https://reliaburger.com/demo/burger.tar.gz"
+BURGER_FETCH="curl -fsSL ${BURGER_URL} | tar xz"
+BURGER_ORDER="http://burger.localhost:18080/order"
 
 IDLE_LIMIT=2
 SETUP_SPEEDUP=4
@@ -79,6 +82,11 @@ known_command() {
         "curl -fsSL https://reliaburger.com/install.sh | sh" \
         | "relish apply -f ${DEMO_URL}" \
         | "relish status" \
+        | "${BURGER_FETCH}" \
+        | "relish build burger/burger.toml" \
+        | "relish images" \
+        | "relish apply burger/burger.toml" \
+        | "curl ${BURGER_ORDER}" \
         | "relish path frontend --to redis" \
         | "relish metrics frontend" \
         | "relish fault delay redis 300ms --from frontend --duration 2m --acknowledge" \
@@ -160,6 +168,13 @@ if [[ -z "${INSTALL_VERSION}" ]]; then
     command -v relish >/dev/null || { echo "relish isn't on PATH; set RELISH" >&2; exit 1; }
 fi
 
+# The build step unpacks burger/ into the current directory. It runs in a
+# scratch directory instead, so the checkout stays clean; `examples` there
+# points back at the repository for the unpublished-tarball fallback.
+BURGER_WORK=$(mktemp -d)
+ln -s "${REPO_DIR}/examples" "${BURGER_WORK}/examples"
+trap 'rm -rf "${BURGER_WORK}"' EXIT
+
 BOLD=$'\033[1m'
 DIM=$'\033[2m'
 GREEN=$'\033[32m'
@@ -189,6 +204,14 @@ type_command() {
 show() {
     type_command "$1"
     eval "$1" || true
+    printf '\n'
+    sleep 1.5
+}
+
+# The same, in the build step's scratch directory.
+show_in_work() {
+    type_command "$1"
+    (cd "${BURGER_WORK}" && eval "$1") || true
     printf '\n'
     sleep 1.5
 }
@@ -237,6 +260,14 @@ metrics_scraped() {
 frontend_restarted() {
     relish status 2>/dev/null \
         | awk '$3 == "frontend" && $5 == "running" { n++; if ($7 >= 1) r = 1 } END { exit !(n >= 3 && r) }'
+}
+
+two_burgers_running() {
+    [[ $(running burger) -ge 2 ]]
+}
+
+burger_takes_orders() {
+    curl -fsS "${BURGER_ORDER}" >/dev/null 2>&1
 }
 
 three_frontends_without_node_3() {
@@ -325,6 +356,23 @@ while IFS= read -r command <&3; do
                     show "${command}"
                     ;;
             esac
+            ;;
+        "${BURGER_FETCH}")
+            if curl -fsSI "${BURGER_URL}" >/dev/null 2>&1; then
+                show_in_work "${command}"
+            else
+                say "${BURGER_URL} is published with the site; until then,"
+                say "the same directory from the repository:"
+                show_in_work "cp -R examples/demo/burger ."
+            fi
+            ;;
+        "relish build burger/burger.toml" | "relish apply burger/burger.toml")
+            show_in_work "${command}"
+            ;;
+        "curl ${BURGER_ORDER}")
+            wait_for "both burger replicas to run" 180 two_burgers_running
+            wait_for "the ingress to route burger.localhost" 60 burger_takes_orders
+            show "${command}"
             ;;
         "relish inspect frontend")
             wait_for "three frontends on the two surviving nodes" 240 three_frontends_without_node_3

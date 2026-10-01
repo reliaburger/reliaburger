@@ -130,22 +130,10 @@ async fn status_with_client(output: OutputFormat, client: &BunClient) -> Result<
 
     match output {
         OutputFormat::Human => {
-            if statuses.is_empty() {
-                println!("no workloads running");
-            } else {
-                println!(
-                    "{:<24} {:<20} {:<15} {:<12} {:<10} {:<10} {:<6}",
-                    "NODE", "INSTANCE", "APP", "NAMESPACE", "STATE", "PID", "RESTARTS"
-                );
-                for row in &statuses {
-                    let s = &row.instance;
-                    let pid = pid_cell(s);
-                    println!(
-                        "{:<24} {:<20} {:<15} {:<12} {:<10} {:<10} {:<6}",
-                        row.node, s.id, s.app_name, s.namespace, s.state, pid, s.restart_count
-                    );
-                }
-            }
+            // The council knows why an app isn't placed. That is extra
+            // detail: an agent that can't say still shows its instances.
+            let desired = client.desired_apps().await.unwrap_or_default();
+            print!("{}", render_status(&statuses, &desired));
         }
         OutputFormat::Json => {
             let json =
@@ -1404,6 +1392,56 @@ pub async fn top(output: OutputFormat) -> Result<(), RelishError> {
     Ok(())
 }
 
+/// The human `relish status` output: every instance with its node, then each
+/// app the scheduler won't place and why (#326). Without that line an
+/// over-quota app is just missing from the table.
+fn render_status(
+    statuses: &[crate::bun::agent::ClusterInstanceStatus],
+    desired: &[crate::bun::diagnostics::DesiredAppEvidence],
+) -> String {
+    use std::fmt::Write as _;
+
+    let mut output = String::new();
+    if statuses.is_empty() {
+        output.push_str("no workloads running\n");
+    } else {
+        let _ = writeln!(
+            output,
+            "{:<24} {:<20} {:<15} {:<12} {:<10} {:<10} {:<6}",
+            "NODE", "INSTANCE", "APP", "NAMESPACE", "STATE", "PID", "RESTARTS"
+        );
+        for row in statuses {
+            let s = &row.instance;
+            let _ = writeln!(
+                output,
+                "{:<24} {:<20} {:<15} {:<12} {:<10} {:<10} {:<6}",
+                row.node,
+                s.id,
+                s.app_name,
+                s.namespace,
+                s.state,
+                pid_cell(s),
+                s.restart_count
+            );
+        }
+    }
+    let blocked: Vec<_> = desired
+        .iter()
+        .filter_map(|app| app.blocked.as_ref().map(|reason| (app, reason)))
+        .collect();
+    if !blocked.is_empty() {
+        output.push('\n');
+    }
+    for (app, reason) in blocked {
+        let _ = writeln!(
+            output,
+            "{} (namespace {}) is not placed, blocked: {reason}",
+            app.app, app.namespace
+        );
+    }
+    output
+}
+
 /// An instance's PID for a table: `-` when it has none, `?` when the node's
 /// runtime didn't answer in time.
 fn pid_cell(status: &crate::bun::agent::InstanceStatus) -> String {
@@ -1549,22 +1587,32 @@ pub fn resolve_image_digest(
     let not_found = || RelishError::ImageNotInRegistry {
         image: image.to_string(),
     };
+    // A multi-platform image lists its platform manifests under the index;
+    // a digest can name either.
+    let holds = |summary: &crate::pickle::types::ImageSummary, digest: &str| {
+        summary.digest == digest || summary.platforms.iter().any(|p| p.digest == digest)
+    };
     let found = if image.starts_with("sha256:") {
-        images.iter().find(|summary| summary.digest == image)
+        images
+            .iter()
+            .find(|summary| holds(summary, image))
+            .map(|_| image)
     } else if let Some((name, digest)) = image.split_once('@') {
         let repository = canonical_repository(name);
         images
             .iter()
-            .find(|summary| summary.repository == repository && summary.digest == digest)
+            .find(|summary| summary.repository == repository && holds(summary, digest))
+            .map(|_| digest)
     } else {
         let (name, tag) = split_repo_tag(image);
         let repository = canonical_repository(name);
         images
             .iter()
             .find(|summary| summary.repository == repository && summary.tags.contains(tag))
+            .map(|summary| summary.digest.as_str())
     };
-    let summary = found.ok_or_else(not_found)?;
-    crate::pickle::types::Digest::new(&summary.digest).map_err(|_| not_found())
+    let digest = found.ok_or_else(not_found)?;
+    crate::pickle::types::Digest::new(digest).map_err(|_| not_found())
 }
 
 pub async fn images(output: OutputFormat) -> Result<(), RelishError> {
@@ -1583,45 +1631,78 @@ pub async fn images(output: OutputFormat) -> Result<(), RelishError> {
         }
         return Ok(());
     }
-    let images = result["images"].as_array();
-    match images {
-        Some(imgs) if imgs.is_empty() => {
-            println!("no images in local registry");
-        }
-        Some(imgs) => {
-            println!(
-                "{:<30} {:<15} {:>8} {:>12}",
-                "REPOSITORY", "TAG", "LAYERS", "SIZE"
-            );
-            for img in imgs {
-                let repo = img["repository"].as_str().unwrap_or("?");
-                let tags = img["tags"]
-                    .as_array()
-                    .map(|t| {
-                        t.iter()
-                            .filter_map(|v| v.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    })
-                    .unwrap_or_default();
-                let tag_display = if tags.is_empty() { "<none>" } else { &tags };
-                let layers = img["layers"].as_u64().unwrap_or(0);
-                let size = img["total_size"].as_u64().unwrap_or(0);
-                let size_display = if size >= 1_000_000 {
-                    format!("{:.1} MB", size as f64 / 1_000_000.0)
-                } else if size >= 1_000 {
-                    format!("{:.1} KB", size as f64 / 1_000.0)
-                } else {
-                    format!("{size} B")
-                };
-                println!("{repo:<30} {tag_display:<15} {layers:>8} {size_display:>12}");
-            }
-        }
-        None => {
-            println!("no images in local registry");
+    let images: Vec<crate::pickle::types::ImageSummary> =
+        serde_json::from_value(result["images"].clone()).map_err(|e| RelishError::ApiError {
+            status: 0,
+            body: format!("failed to parse images response: {e}"),
+        })?;
+    print!("{}", format_images_table(&images));
+    Ok(())
+}
+
+/// Render `relish images` as a table: one row per image, with a
+/// multi-platform image's platforms in its PLATFORMS column and `-` for
+/// LAYERS (each platform has its own; `--output json` lists them).
+pub fn format_images_table(images: &[crate::pickle::types::ImageSummary]) -> String {
+    if images.is_empty() {
+        return "no images in local registry\n".to_string();
+    }
+    let header = ["REPOSITORY", "TAG", "PLATFORMS", "LAYERS", "SIZE"].map(str::to_string);
+    let rows: Vec<[String; 5]> = images.iter().map(image_row).collect();
+    // Each column is as wide as its widest cell, so a long pull-through
+    // name like `cache/public.ecr.aws/...` can't push its row out of line.
+    let mut widths = header.clone().map(|cell| cell.len());
+    for row in &rows {
+        for (width, cell) in widths.iter_mut().zip(row) {
+            *width = (*width).max(cell.chars().count());
         }
     }
-    Ok(())
+    let [repository, tag, platforms, layers, size] = widths;
+    let mut out = String::new();
+    for [r, t, p, l, s] in std::iter::once(&header).chain(&rows) {
+        let line =
+            format!("{r:<repository$}  {t:<tag$}  {p:<platforms$}  {l:>layers$}  {s:>size$}");
+        out.push_str(line.trim_end());
+        out.push('\n');
+    }
+    out
+}
+
+/// One `relish images` row: repository, tags, platforms, layers and size.
+fn image_row(image: &crate::pickle::types::ImageSummary) -> [String; 5] {
+    let tags = image.tags.iter().cloned().collect::<Vec<_>>().join(", ");
+    let tags = if tags.is_empty() {
+        "<none>".to_string()
+    } else {
+        tags
+    };
+    let (platforms, layers) = if image.platforms.is_empty() {
+        ("-".to_string(), image.layers.to_string())
+    } else {
+        let names: Vec<&str> = image
+            .platforms
+            .iter()
+            .map(|p| p.platform.as_str())
+            .collect();
+        (names.join(", "), "-".to_string())
+    };
+    [
+        image.repository.clone(),
+        tags,
+        platforms,
+        layers,
+        format_image_size(image.total_size),
+    ]
+}
+
+fn format_image_size(size: u64) -> String {
+    if size >= 1_000_000 {
+        format!("{:.1} MB", size as f64 / 1_000_000.0)
+    } else if size >= 1_000 {
+        format!("{:.1} KB", size as f64 / 1_000.0)
+    } else {
+        format!("{size} B")
+    }
 }
 
 /// Poll a build to a terminal state, bounded by `timeout` and Ctrl-C
@@ -1721,6 +1802,18 @@ pub async fn wait_for_batch(
     }
 }
 
+/// What `relish build` prints about a job before submitting it: where the
+/// image goes and the Buildah command the node runs.
+fn build_plan_lines(job: &crate::pickle::build::BuildahJob) -> Vec<String> {
+    vec![
+        format!(
+            "  destination: pickle://{}:{}",
+            job.destination.name, job.destination.tag
+        ),
+        format!("  build:  {}", job.build_cmd.join(" ")),
+    ]
+}
+
 /// Build OCI images and push to Pickle.
 ///
 /// Reads `[build.*]` sections from the config, tars each context,
@@ -1798,19 +1891,14 @@ pub async fn build(
 
         // Prepare the build job (for display; the agent re-derives it with
         // its own registry port, which a host forward doesn't change).
-        let job = execute_build(spec, &digest, None, client.scheme() == "https").map_err(|e| {
-            RelishError::ApiError {
-                status: 0,
-                body: format!("build preparation failed: {e}"),
-            }
+        let job = execute_build(spec, &digest, None).map_err(|e| RelishError::ApiError {
+            status: 0,
+            body: format!("build preparation failed: {e}"),
         })?;
 
-        println!(
-            "  destination: pickle://{}:{}",
-            job.destination.name, job.destination.tag
-        );
-        println!("  build:  {}", job.build_cmd.join(" "));
-        println!("  push:   {}", job.push_cmd.join(" "));
+        for line in build_plan_lines(&job) {
+            println!("{line}");
+        }
 
         // Submit and poll: builds run async on the builder node —
         // minutes-long buildah runs must not hold an HTTP request open.
@@ -2232,6 +2320,26 @@ pub async fn snapshot_delete(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn build_plan_shows_the_destination_and_build_but_no_push() {
+        let spec = crate::config::build::BuildSpec {
+            context: ".".into(),
+            dockerfile: "Dockerfile".into(),
+            destination: "pickle://burger:v1".into(),
+            args: Default::default(),
+            namespace: None,
+            platform: vec!["linux/amd64".into(), "linux/arm64".into()],
+        };
+        let job = crate::pickle::build::execute_build(&spec, "sha256:abc", None).unwrap();
+        let lines = build_plan_lines(&job);
+        assert_eq!(lines[0], "  destination: pickle://burger:v1");
+        assert!(lines[1].starts_with("  build:  buildah bud"), "{lines:?}");
+        // The node exports an OCI layout and uploads it; it never runs a
+        // `buildah push` to `docker://`, so the plan doesn't claim one.
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines.iter().all(|line| !line.contains("push")), "{lines:?}");
+    }
+
     use super::*;
     use std::io::Write as _;
 
@@ -2268,6 +2376,7 @@ mod tests {
                 exit_code: None,
                 pid,
                 runtime_unknown: false,
+                status_age_ms: None,
             },
             cpu_percent: cpu,
             memory_bytes: memory,
@@ -2654,6 +2763,48 @@ spec:
         );
     }
 
+    fn evidence(app: &str, replicas: u32) -> crate::bun::diagnostics::DesiredAppEvidence {
+        crate::bun::diagnostics::DesiredAppEvidence {
+            app: app.to_string(),
+            namespace: "prod".to_string(),
+            desired_replicas: replicas,
+            scheduled_replicas: 0,
+            placements: Default::default(),
+            service_port: None,
+            blocked: None,
+        }
+    }
+
+    /// #326: an app the namespace quota keeps off every node has no
+    /// instance row, so `relish status` names it and says why.
+    #[test]
+    fn status_names_an_over_quota_app_and_why() {
+        let blocked = crate::bun::diagnostics::DesiredAppEvidence {
+            blocked: Some(crate::meat::quota::QuotaError::CpuExceeded {
+                namespace: "prod".to_string(),
+                current: 0,
+                requested: 1600,
+                limit: 1000,
+            }),
+            ..evidence("greedy", 2)
+        };
+        let output = render_status(&[], &[evidence("fine", 1), blocked]);
+        assert_eq!(
+            output,
+            "no workloads running\n\n\
+             greedy (namespace prod) is not placed, blocked: \
+             namespace \"prod\" would exceed CPU quota: 0+1600 > 1000m\n"
+        );
+    }
+
+    #[test]
+    fn status_without_blocked_apps_is_just_the_table() {
+        assert_eq!(
+            render_status(&[], &[evidence("fine", 1)]),
+            "no workloads running\n"
+        );
+    }
+
     #[tokio::test]
     async fn status_returns_agent_unreachable() {
         let err = status_with_client(OutputFormat::Human, &bogus_client())
@@ -2906,6 +3057,7 @@ spec:
             tags: tags.iter().map(|t| t.to_string()).collect(),
             layers: 1,
             total_size: 100,
+            platforms: Vec::new(),
         }
     }
 
@@ -2915,6 +3067,77 @@ spec:
             summary("myapp", MYAPP_V2, &["v2", "latest"]),
             summary("team/app", TEAM_APP, &["v1"]),
         ]
+    }
+
+    const BURGER_INDEX: &str =
+        "sha256:4444444444444444444444444444444444444444444444444444444444444444";
+    const BURGER_AMD64: &str =
+        "sha256:5555555555555555555555555555555555555555555555555555555555555555";
+    const BURGER_ARM64: &str =
+        "sha256:6666666666666666666666666666666666666666666666666666666666666666";
+
+    fn multi_platform_summary() -> crate::pickle::types::ImageSummary {
+        let platform = |name: &str, digest: &str, size| crate::pickle::types::PlatformSummary {
+            platform: name.to_string(),
+            digest: digest.to_string(),
+            layers: 1,
+            total_size: size,
+        };
+        crate::pickle::types::ImageSummary {
+            repository: "burger".to_string(),
+            digest: BURGER_INDEX.to_string(),
+            tags: ["v1".to_string()].into(),
+            layers: 0,
+            total_size: 9_400_000,
+            platforms: vec![
+                platform("linux/amd64", BURGER_AMD64, 4_800_000),
+                platform("linux/arm64", BURGER_ARM64, 4_600_000),
+            ],
+        }
+    }
+
+    #[test]
+    fn images_table_shows_a_multi_platform_image_on_one_row_with_its_platforms() {
+        let mut images = registry_listing();
+        images.push(multi_platform_summary());
+        insta::assert_snapshot!(format_images_table(&images));
+    }
+
+    #[test]
+    fn images_table_widens_its_columns_to_fit_a_long_cached_repository() {
+        let mut images = registry_listing();
+        images.push(summary(
+            "cache/public.ecr.aws/docker/library/redis",
+            MYAPP_V1,
+            &["7.2-alpine"],
+        ));
+        images.push(multi_platform_summary());
+        insta::assert_snapshot!(format_images_table(&images));
+    }
+
+    #[test]
+    fn images_table_says_so_when_the_registry_is_empty() {
+        assert_eq!(format_images_table(&[]), "no images in local registry\n");
+    }
+
+    #[test]
+    fn sign_resolves_a_multi_platform_tag_to_the_index_and_accepts_a_platform_digest() {
+        let images = vec![multi_platform_summary()];
+        assert_eq!(
+            resolve_image_digest("burger:v1", &images).unwrap().as_str(),
+            BURGER_INDEX
+        );
+        let pinned = format!("burger@{BURGER_ARM64}");
+        assert_eq!(
+            resolve_image_digest(&pinned, &images).unwrap().as_str(),
+            BURGER_ARM64
+        );
+        assert_eq!(
+            resolve_image_digest(BURGER_AMD64, &images)
+                .unwrap()
+                .as_str(),
+            BURGER_AMD64
+        );
     }
 
     #[test]

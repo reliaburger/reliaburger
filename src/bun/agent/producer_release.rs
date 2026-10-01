@@ -30,12 +30,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             // left is the release itself and the bookkeeping after it.
             match self.retire_instance_artifacts(&id).await {
                 Ok(()) => {
+                    // LOOP-INLINE: in-memory lock, no I/O
                     self.supervisor.retire_instance(&id).await;
                     self.deferred_retirements.remove(&id);
                     self.sync_firewall_ebpf().await;
                     self.rebuild_routing_table().await;
                 }
-                Err(BunError::ProducerReleasePending { .. }) => {}
+                Err(BunError::ProducerReleasePending { .. } | BunError::StillRunning { .. }) => {}
                 Err(error) => eprintln!("bun: releasing {} awaits retry: {error}", id.0),
             }
         }

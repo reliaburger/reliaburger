@@ -179,6 +179,7 @@ mod tests {
                 host_port: Some(8080),
                 pid: Some(1234),
                 runtime_unknown: false,
+                status_age_ms: None,
             },
             InstanceStatus {
                 exit_code: None,
@@ -190,6 +191,7 @@ mod tests {
                 host_port: None,
                 pid: None,
                 runtime_unknown: false,
+                status_age_ms: None,
             },
         ];
         let html = render_instance_table_fragment(&instances);

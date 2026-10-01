@@ -209,19 +209,33 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
             let mut candidate = self.service_map.clone();
             for (id, port, has_health) in instances {
-                let ip = self.supervisor.grill().container_ip(&id).await;
-                if ip.is_none()
-                    && !self
-                        .supervisor
-                        .grill()
-                        .rootless_network_record(&id)
+                // A runtime that can't answer within the turn's budget leaves
+                // recovery for the next tick, like any other uncertainty.
+                let late = || {
+                    BunError::AdoptionState(format!(
+                        "runtime did not report {id}'s address within the turn"
+                    ))
+                };
+                let deadline = self.turn_deadline();
+                let ip =
+                    tokio::time::timeout_at(deadline, self.supervisor.grill().container_ip(&id))
                         .await
-                        .is_some_and(|network| {
-                            network.port_mapping.is_some_and(|mapping| {
-                                Some(mapping.host_port) == port
-                                    && mapping.container_port == entry.port
-                            })
+                        .map_err(|_| late())?;
+                let rootless_forward = match ip {
+                    Some(_) => None,
+                    None => tokio::time::timeout_at(
+                        deadline,
+                        self.supervisor.grill().rootless_network_record(&id),
+                    )
+                    .await
+                    .map_err(|_| late())?,
+                };
+                if ip.is_none()
+                    && !rootless_forward.is_some_and(|network| {
+                        network.port_mapping.is_some_and(|mapping| {
+                            Some(mapping.host_port) == port && mapping.container_port == entry.port
                         })
+                    })
                 {
                     return Err(BunError::AdoptionState(format!(
                         "adopted runtime {id} has no confirmed container address or rootless forward"

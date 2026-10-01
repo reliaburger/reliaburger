@@ -170,6 +170,33 @@ pub(super) fn boot_id() -> io::Result<KernelBootId> {
     Ok(KernelBootId(bytes))
 }
 
+/// An owned binding for `default__web-0`, for tests elsewhere in Bun.
+#[cfg(test)]
+pub(super) fn owned_test_binding(cgroup_id: u64, allow: Vec<String>) -> EgressBinding {
+    let original_spec = crate::grill::oci::generate_oci_spec(
+        "web",
+        "default",
+        &crate::config::Config::parse("[app.web]\nimage = 'example:v1'\n")
+            .unwrap()
+            .app["web"],
+        "default__web-0",
+        None,
+        "/sys/fs/cgroup/reliaburger/default/web/0",
+        None,
+        None,
+    );
+    EgressBinding {
+        phase: PolicyPhase::Owned,
+        cgroup_id,
+        source_namespace: None,
+        allow,
+        runtime: RuntimeKind::Runc,
+        original_spec,
+        boot_id: KernelBootId([1; 16]),
+        resolved: Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

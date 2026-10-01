@@ -74,6 +74,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             self.retire_instance_artifacts(&original.instance_id)
                 .await?;
             if let Some(port) = original.spec.port_mapping {
+                // LOOP-INLINE: in-memory lock, no I/O
                 self.supervisor
                     .port_allocator
                     .release(port.host_port)
@@ -86,12 +87,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             Ok(()) => {
                 self.startup_retirements.pop_front();
             }
+            // Its disk cleanup is running off the loop; the next tick
+            // collects it. Nothing is wrong, so readiness stays as it is.
+            Err(BunError::StillRunning { .. }) => return,
             Err(error) => {
                 // Rotate ownership so one unavailable producer does not starve others.
                 if let Some(pending) = self.startup_retirements.pop_front() {
                     self.startup_retirements.push_back(pending);
                 }
                 if let Some(readiness) = &self.readiness {
+                    // LOOP-INLINE: in-memory lock, no I/O
                     readiness
                         .degraded("discovery:startup-cleanup", error.to_string())
                         .await;
@@ -109,9 +114,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 self.startup_cleanup_pending = false;
             }
             if let Some(readiness) = &self.readiness {
+                // LOOP-INLINE: in-memory lock, no I/O
                 match result {
                     Ok(()) => readiness.ready("discovery:startup-cleanup").await,
                     Err(error) => {
+                        // LOOP-INLINE: in-memory lock, no I/O
                         readiness
                             .degraded("discovery:startup-cleanup", error.to_string())
                             .await

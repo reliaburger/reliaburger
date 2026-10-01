@@ -61,18 +61,50 @@ migration and no feature gate
   ([#317](https://github.com/reliaburger/reliaburger/issues/317)). 0.1.1 changes the state format
   (44 in 0.1.0), so a 0.1.0 cluster can't roll to it: recreate the cluster
   ([upgrading from 0.1.0](releasing.md#upgrading-from-010)).
-- [ ] **0.1.2: images, the next release**
-  ([milestone](https://github.com/reliaburger/reliaburger/milestone/2),
-  [#248](https://github.com/reliaburger/reliaburger/pull/248)). The Go demo
-  build in the tour, multi-arch builds and pulls (which removes the
-  multi-platform limitation), platforms in `relish images`, a build cache cap,
-  Buildah storage pruning and Buildah in the guest image.
-- [ ] **0.1.3: observability and test quality**
+- [x] **0.1.2: images.** [Released](https://github.com/reliaburger/reliaburger/releases/tag/v0.1.2)
+  on 1 October 2026
+  ([milestone](https://github.com/reliaburger/reliaburger/milestone/2)):
+  - [x] images ([#248](https://github.com/reliaburger/reliaburger/pull/248)): the Go
+    demo build in the tour, multi-arch builds and pulls (which removes the
+    multi-platform limitation), platforms in `relish images`, a build cache cap,
+    Buildah storage pruning and Buildah in the guest image;
+  - [x] upgrades and rollbacks that can't succeed refused before a run starts
+    ([#339](https://github.com/reliaburger/reliaburger/issues/339), [#350](https://github.com/reliaburger/reliaburger/pull/350));
+  - [x] replicas spread over the survivors when a node dies, with healthy ones
+    left in place ([#346](https://github.com/reliaburger/reliaburger/issues/346), [#349](https://github.com/reliaburger/reliaburger/pull/349));
+  - [x] the pull-through cache holding every platform of a multi-platform
+    upstream image, not just the first puller's
+    ([#353](https://github.com/reliaburger/reliaburger/issues/353), [#354](https://github.com/reliaburger/reliaburger/pull/354)).
+
+  The homepage tour was re-recorded against the published install, with the
+  build, its platforms in `relish images` and the spread after a lost node.
+  0.1.2 changes the protocol and state formats (27 and 46 in 0.1.1; 28 and 47
+  now), so a 0.1.1 cluster can't roll to it: recreate the cluster
+  ([upgrading from 0.1.1](releasing.md#upgrading-from-011)).
+- [ ] **0.1.3: agent loop, observability and test quality, the next release**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/4)).
   Streamed metrics queries, so Mayo and rollup sessions no longer load every
-  Parquet file; an owner for every ignored test and tested CI job selection
+  Parquet file ([#377](https://github.com/reliaburger/reliaburger/issues/377)); an agent loop that's metered and never waits inline on slow
+  work ([#351](https://github.com/reliaburger/reliaburger/issues/351)); a
+  "blocked by quota" status for apps the scheduler won't place
+  ([#326](https://github.com/reliaburger/reliaburger/issues/326)); cross-node
+  views and log streams (F07, [#365](https://github.com/reliaburger/reliaburger/issues/365));
+  large modules split once the agent-loop pull requests
+  ([#355](https://github.com/reliaburger/reliaburger/pull/355),
+  [#357](https://github.com/reliaburger/reliaburger/pull/357)) land (H05,
+  [#319](https://github.com/reliaburger/reliaburger/issues/319)); an
+  owner for every ignored test and tested CI job selection
   ([#303](https://github.com/reliaburger/reliaburger/issues/303)); JUnit
-  evidence for every suite ([#304](https://github.com/reliaburger/reliaburger/issues/304)).
+  evidence for every suite ([#304](https://github.com/reliaburger/reliaburger/issues/304));
+  and the rootless upgrade-walk flake ([#358](https://github.com/reliaburger/reliaburger/issues/358)).
+- [ ] **0.1.4: operations security**
+  ([milestone](https://github.com/reliaburger/reliaburger/milestone/8)).
+  Upstream image trust: digest pinning, cosign and worker key separation (F03,
+  [#361](https://github.com/reliaburger/reliaburger/issues/361)); CA recovery
+  and rotation (F04, [#362](https://github.com/reliaburger/reliaburger/issues/362));
+  namespace identity and the token lifecycle (F05,
+  [#363](https://github.com/reliaburger/reliaburger/issues/363)). These come
+  before real fleets in 0.3.0.
 - [ ] **0.2.0: "A million jobs"**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/3),
   [#266](https://github.com/reliaburger/reliaburger/pull/266)). Task arrays
@@ -85,45 +117,61 @@ migration and no feature gate
   appliance OS (our own mkosi image on Ubuntu 26.04), `relish netboot` and
   claiming machines over the LAN, weekly signed OS builds with A/B updates,
   and the quickstart guest on Ubuntu 26.04. The claim flow is designed so the
-  fleet control plane can extend it later. Exit test: ten Dell Wyse 3040s from
-  power-on to a cluster.
+  fleet control plane can extend it later. Alongside it: the acceptance gates
+  0.1.0 didn't close (V01–V04, below), WebSocket drain parity and ACME (F08,
+  [#369](https://github.com/reliaburger/reliaburger/issues/369)), and fault
+  pre-checks that read the leader's gossip view
+  ([#334](https://github.com/reliaburger/reliaburger/issues/334)). Exit test:
+  ten Dell Wyse 3040s from power-on to a cluster.
 - [ ] **0.4.0: "Full container migration"**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/7),
   [#268](https://github.com/reliaburger/reliaburger/pull/268)). Drain and
   uncordon, cold moves that carry volumes, CRIU checkpoint and restore,
-  pre-dump iterations, lazy pages and TCP handoff, for apps and jobs.
-- [ ] **After 0.4.0: the book edit and the full CLI tour.** Distil "Building
-  Reliaburger" so it reads properly from beginning to end: cut the fluff, keep
-  the design narrative, the first-use Rust explanations and the lessons, and
-  fold material that was bolted onto earlier chapters later back into place
+  pre-dump iterations, lazy pages and TCP handoff, for apps and jobs. Also
+  managed-volume retirement and the Apple runtime (F10,
+  [#367](https://github.com/reliaburger/reliaburger/issues/367)).
+- [ ] **After 0.4.0: book v2 and the full CLI tour.** Book v2: a distilled
+  rewrite alongside v1; v1 keeps collecting until then. The rewrite reads
+  properly from beginning to end: it cuts the fluff, keeps the design
+  narrative, the first-use Rust explanations and the lessons, and folds
+  material that was bolted onto earlier chapters later back into place
   ([#311](https://github.com/reliaburger/reliaburger/issues/311)). Alongside
   it, the website gets a full CLI walkthrough (a second recorded tour that
   exercises every `relish` command) and a searchable command reference on the
   landing page that ctrl-F can find, generated from the CLI
   ([#315](https://github.com/reliaburger/reliaburger/issues/315)).
-- [ ] **Later.** The fleet control plane
-  ([#265](https://github.com/reliaburger/reliaburger/pull/265)), and GPU
-  scheduling and warm starts (F01 in [#320](https://github.com/reliaburger/reliaburger/issues/320)).
-  The rest of the known gaps below aren't headline material; they land
-  alongside whichever release they fit.
+- [ ] **Later**
+  ([milestone](https://github.com/reliaburger/reliaburger/milestone/9)). The
+  fleet control plane ([#265](https://github.com/reliaburger/reliaburger/pull/265));
+  GPU capacity and cached-image placement (F01,
+  [#359](https://github.com/reliaburger/reliaburger/issues/359)); rootless
+  clusters (F02, [#360](https://github.com/reliaburger/reliaburger/issues/360));
+  PromQL and the full metrics architecture (F06,
+  [#364](https://github.com/reliaburger/reliaburger/issues/364)); bandwidth
+  faults (F09, [#366](https://github.com/reliaburger/reliaburger/issues/366));
+  and the remaining Kubernetes translations (F11,
+  [#368](https://github.com/reliaburger/reliaburger/issues/368)).
 
 ## Known gaps
 
-What 0.1.0 shipped without, each with an issue:
+What 0.1.0 shipped without, each with an issue. The
+[whitepaper](whitepaper.md) describes the full vision; this page tracks only
+what's shipped and what's scheduled.
 
 - **Acceptance gates 0.1.0 didn't close.** V01, the live catalogue on three
   independent runc nodes ([#286](https://github.com/reliaburger/reliaburger/issues/286));
   the V02 leftovers, the snapshot uploader under power cuts and the
   `v02-loops` bounds ([#287](https://github.com/reliaburger/reliaburger/issues/287));
   V04, cold installs on Intel macOS, Linux x86_64 and Linux arm64
-  ([#288](https://github.com/reliaburger/reliaburger/issues/288)).
-- **Missing capabilities F01–F12** ([#320](https://github.com/reliaburger/reliaburger/issues/320)):
-  GPU and cached-image placement evidence, rootless Runc clusters, upstream
-  image trust, CA recovery and rotation, namespace-scoped identity, the full
-  metrics and query architecture, cross-node views, WebSocket ingress parity
-  and ACME, bandwidth faults, managed-volume and Apple Container parity, and
-  lossless Kubernetes translation.
-- **Module splits** (H05, [#319](https://github.com/reliaburger/reliaburger/issues/319)).
+  ([#288](https://github.com/reliaburger/reliaburger/issues/288)). All in 0.3.0.
+- **Missing capabilities F01–F11**, one issue each, placed in
+  [0.1.3](https://github.com/reliaburger/reliaburger/milestone/4) (F07),
+  [0.1.4](https://github.com/reliaburger/reliaburger/milestone/8) (F03–F05),
+  [0.3.0](https://github.com/reliaburger/reliaburger/milestone/6) (F08),
+  [0.4.0](https://github.com/reliaburger/reliaburger/milestone/7) (F10) and
+  [Later](https://github.com/reliaburger/reliaburger/milestone/9) (F01, F02,
+  F06, F09, F11).
+- **Module splits** (H05, [#319](https://github.com/reliaburger/reliaburger/issues/319)), in 0.1.3.
 - **Flakes.** The open ones are in the [known flakes register](flakes.md)
   ([#318](https://github.com/reliaburger/reliaburger/issues/318)).
 

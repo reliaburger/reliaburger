@@ -533,7 +533,7 @@ impl super::Grill for RuncGrill {
         self.owned_exit_code(instance).await
     }
 
-    async fn pid(&self, instance: &InstanceId) -> Option<u32> {
+    async fn pid(&self, instance: &InstanceId) -> Result<Option<u32>, GrillError> {
         self.owned_pid(instance).await
     }
 
@@ -878,7 +878,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires runc and RELIABURGER_RUNC_TESTS=1"]
+    #[ignore = "requires runc and RELIABURGER_RUNC_TESTS=1; run with make test-linux"]
     async fn runc_grill_creates_bundle_dir() {
         assert!(
             runc_tests_enabled(),
@@ -939,7 +939,7 @@ mod tests {
     // Validates the run-and-capture model end-to-end: the container's exit code
     // is captured (so jobs don't get retried) and its stdout is readable.
     #[tokio::test]
-    #[ignore = "requires runc, a pinned OCI image (local test mirror or registry access), and RELIABURGER_RUNC_TESTS=1"]
+    #[ignore = "requires runc, a pinned OCI image (local test mirror or registry access), and RELIABURGER_RUNC_TESTS=1; run with make test-linux"]
     async fn runc_netns_resolves_internal_name_through_mounted_resolv_conf() {
         assert!(
             runc_tests_enabled(),
@@ -1108,7 +1108,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires rootful runc, overlayfs, a pinned OCI image (local test mirror or registry access), and RELIABURGER_RUNC_TESTS=1"]
+    #[ignore = "requires rootful runc, overlayfs, a pinned OCI image (local test mirror or registry access), and RELIABURGER_RUNC_TESTS=1; run with make test-linux"]
     async fn runc_replicas_cannot_observe_each_others_rootfs_writes() {
         assert!(
             runc_tests_enabled(),
@@ -1270,7 +1270,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires rootful runc, overlayfs, a pinned OCI image (local test mirror or registry access), and RELIABURGER_RUNC_TESTS=1"]
+    #[ignore = "requires rootful runc, overlayfs, a pinned OCI image (local test mirror or registry access), and RELIABURGER_RUNC_TESTS=1; run with make test-linux"]
     async fn runc_create_failure_rolls_back_private_rootfs_mount() {
         assert!(runc_tests_enabled());
         assert_eq!(nix::unistd::Uid::effective().as_raw(), 0);
@@ -1331,7 +1331,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires rootful runc, overlayfs, a pinned OCI image (local test mirror or registry access), and RELIABURGER_RUNC_TESTS=1"]
+    #[ignore = "requires rootful runc, overlayfs, a pinned OCI image (local test mirror or registry access), and RELIABURGER_RUNC_TESTS=1; run with make test-linux"]
     async fn runc_adoption_keeps_private_rootfs_and_releases_mount() {
         assert!(
             runc_tests_enabled(),
@@ -1397,7 +1397,7 @@ mod tests {
             "duplicate create must refuse before cleanup"
         );
         assert_eq!(original.container_ip(&id).await, Some(container_ip));
-        let pid = original.pid(&id).await.unwrap();
+        let pid = original.pid(&id).await.unwrap().unwrap();
         let started_at = crate::grill::records::process_start_time(pid).unwrap();
         let rootfs = bundle_base.join(&id.0).join("rootfs");
 
@@ -1520,7 +1520,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires runc, a pinned OCI image (local test mirror or registry access), and RELIABURGER_RUNC_TESTS=1"]
+    #[ignore = "requires runc, a pinned OCI image (local test mirror or registry access), and RELIABURGER_RUNC_TESTS=1; run with make test-linux"]
     async fn runc_runs_pinned_multiarchitecture_test_workload() {
         assert!(
             runc_tests_enabled(),
@@ -1632,7 +1632,7 @@ mod tests {
     /// entrypoint, env and working directory, as the image's user, and
     /// that user is root only inside the container's user namespace.
     #[tokio::test]
-    #[ignore = "requires rootful runc, a pinned OCI image (local test mirror or registry access), and RELIABURGER_RUNC_TESTS=1"]
+    #[ignore = "requires rootful runc, a pinned OCI image (local test mirror or registry access), and RELIABURGER_RUNC_TESTS=1; run with make test-linux"]
     async fn runc_runs_an_image_by_its_own_entrypoint_env_and_working_dir() {
         assert!(runc_tests_enabled(), "set RELIABURGER_RUNC_TESTS=1");
         assert!(nix::unistd::geteuid().is_root(), "rootful runc needs root");
@@ -1703,7 +1703,7 @@ mod tests {
     /// Z1.1/D1: image root binds port 80 and nginx's workers drop to their
     /// own user, yet no container process is root on the node.
     #[tokio::test]
-    #[ignore = "requires rootful runc, a pinned OCI image (local test mirror or registry access), and RELIABURGER_RUNC_TESTS=1"]
+    #[ignore = "requires rootful runc, a pinned OCI image (local test mirror or registry access), and RELIABURGER_RUNC_TESTS=1; run with make test-linux"]
     async fn runc_image_root_binds_port_80_without_being_host_root() {
         use std::os::unix::fs::MetadataExt;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1797,7 +1797,7 @@ mod tests {
     /// directly (no entrypoint chown to help), then as image root after a
     /// user change.
     #[tokio::test]
-    #[ignore = "requires rootful runc, a pinned OCI image (local test mirror or registry access), and RELIABURGER_RUNC_TESTS=1"]
+    #[ignore = "requires rootful runc, a pinned OCI image (local test mirror or registry access), and RELIABURGER_RUNC_TESTS=1; run with make test-linux"]
     async fn runc_redis_persists_to_a_managed_volume_across_restarts() {
         use std::os::unix::fs::MetadataExt;
 

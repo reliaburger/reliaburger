@@ -26,6 +26,7 @@ Every node must meet the following minimum specification:
 - **BPF filesystem**: `bpffs` mounted at `/sys/fs/bpf`.
 - **Resources**: At least 2 CPU cores, 2 GiB RAM, and 10 GiB available disk space per node.
 - **Required packages**: `runc`, `uidmap`, `iptables`, `iproute2`, `nftables`, `btrfs-progs`, and `curl`.
+- **Optional**: `buildah` on at least one node, for `relish build`. Nodes without it hand builds to one that has it.
 
 Install the required packages on all three nodes:
 
@@ -105,8 +106,8 @@ case "$ARCH" in
   *) echo "Unsupported architecture: $ARCH; the release has x86_64 and aarch64 builds" >&2 ;;
 esac
 
-# Release version to install (e.g. v0.1.1 or vX.Y.Z)
-VERSION="v0.1.1"
+# Release version to install (e.g. v0.1.2 or vX.Y.Z)
+VERSION="v0.1.2"
 BASE_URL="https://github.com/reliaburger/reliaburger/releases/download/${VERSION}"
 
 # Download binaries and SHA256SUMS into /tmp
@@ -133,7 +134,7 @@ relish --version
 ```
 
 Each prints its version and the commit it was built from, such as
-`bun 0.1.1 (77bace5)`. Every node should print the same commit.
+`bun 0.1.2 (e89d24d)`. Every node should print the same commit.
 
 *(Optional: If building from source instead of using pre-built releases, install
 `clang llvm libbpf-dev` and run `cargo build --locked --release --features ebpf --bin bun --bin relish`
@@ -532,8 +533,8 @@ case "$ARCH" in
   *) echo "Unsupported architecture: $ARCH; the release has x86_64 and aarch64 builds" >&2 ;;
 esac
 
-# Release version to install (e.g. v0.1.1 or vX.Y.Z)
-VERSION="v0.1.1"
+# Release version to install (e.g. v0.1.2 or vX.Y.Z)
+VERSION="v0.1.2"
 BASE_URL="https://github.com/reliaburger/reliaburger/releases/download/${VERSION}"
 
 # Download relish binary and SHA256SUMS into /tmp

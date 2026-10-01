@@ -351,7 +351,7 @@ async fn a_namespace_scoped_token_pushes_only_into_its_namespace_over_tls() {
 /// `PATH`; `--insecure` only skips crane's certificate check (Go on macOS
 /// ignores `SSL_CERT_FILE`), the connection is still TLS.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires crane on PATH; run with --run-ignored=only"]
+#[ignore = "requires crane on PATH; run with make test-standard-clients"]
 async fn crane_logs_in_pushes_and_pulls_over_tls() {
     let registry = start_registry().await;
     let work = tempfile::tempdir().unwrap();

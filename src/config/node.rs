@@ -725,6 +725,12 @@ pub struct ImagesSection {
     /// streams the context download to disk and aborts past this cap,
     /// so a giant or sparse-bomb context cannot fill the build node.
     pub max_context_bytes: u64,
+    /// Ceiling (bytes) on the Buildah image cache a build node keeps between
+    /// builds. After every build the runner removes that build's own images
+    /// and containers; base images stay cached for the next build unless the
+    /// storage is still over this cap, in which case every cached image goes.
+    /// 0 keeps nothing.
+    pub build_cache_max_bytes: u64,
     /// Image trust policy (signature requirements).
     pub trust_policy: TrustPolicySection,
     /// Registries that serve digest-pinned images on behalf of an upstream
@@ -790,6 +796,7 @@ impl Default for ImagesSection {
             external_registries: Vec::new(),
             build_timeout_secs: 900,
             max_context_bytes: 256 * 1024 * 1024,
+            build_cache_max_bytes: 100 * 1024 * 1024 * 1024,
             trust_policy: TrustPolicySection::default(),
             mirrors: crate::grill::image::ImageMirrors::default(),
         }
@@ -1396,6 +1403,14 @@ mod tests {
     fn max_context_bytes_is_configurable() {
         let nc = NodeConfig::parse("[images]\nmax_context_bytes = 1048576\n").unwrap();
         assert_eq!(nc.images.max_context_bytes, 1024 * 1024);
+    }
+
+    #[test]
+    fn build_cache_cap_defaults_to_100_gib_and_is_configurable() {
+        let nc = NodeConfig::parse("").unwrap();
+        assert_eq!(nc.images.build_cache_max_bytes, 100 * 1024 * 1024 * 1024);
+        let nc = NodeConfig::parse("[images]\nbuild_cache_max_bytes = 0\n").unwrap();
+        assert_eq!(nc.images.build_cache_max_bytes, 0);
     }
 
     #[test]

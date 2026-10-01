@@ -24,6 +24,9 @@ use crate::ketchup::types::{CapturedLine, LogStream};
 pub(super) struct Ownership {
     executable: PathBuf,
     contexts: Arc<Mutex<HashMap<InstanceId, ClaimedCommandExecutor>>>,
+    /// Launchers seen running, so a pid read needn't queue for the
+    /// instance's lifecycle lock behind slow state reads (#358).
+    launchers: Arc<Mutex<HashMap<InstanceId, BoundLauncher>>>,
     inventory_reader: crate::grill::inventory::InventoryReader,
 }
 
@@ -32,9 +35,21 @@ impl Ownership {
         Self {
             executable,
             contexts: Arc::new(Mutex::new(HashMap::new())),
+            launchers: Arc::new(Mutex::new(HashMap::new())),
             inventory_reader: Default::default(),
         }
     }
+}
+
+/// The launcher one generation bound, as last seen running. A generation
+/// binds its launcher once, so the pid never changes while that process
+/// lives; the start time tells it apart from a later process that reuses
+/// the number.
+#[derive(Debug, Clone)]
+struct BoundLauncher {
+    generation: IntentGeneration,
+    pid: u32,
+    started_at: u64,
 }
 
 fn failure(instance: &InstanceId, error: impl std::fmt::Display) -> GrillError {
@@ -399,6 +414,7 @@ impl RuncGrill {
         id: &InstanceId,
         context: &ClaimedCommandExecutor,
     ) -> io::Result<()> {
+        self.forget_launcher(id).await;
         let record = context.intent().await?;
         if matches!(record.phase, IntentPhase::Retired { .. }) {
             return Ok(());
@@ -557,6 +573,7 @@ impl RuncGrill {
         self.owned_operation(instance, |runtime, id, context| async move {
             let record = context.intent().await?;
             if matches!(record.phase, IntentPhase::Retired { .. }) {
+                runtime.forget_launcher(&id).await;
                 return Ok(ContainerState::Stopped);
             }
             if record.phase == IntentPhase::Retiring || record.from_previous_boot().await? {
@@ -565,7 +582,8 @@ impl RuncGrill {
             }
             match context.role_state(RuntimeRole::Launcher).await? {
                 None | Some(CommandState::Prepared) => Ok(ContainerState::Pending),
-                Some(CommandState::Running { .. }) => {
+                Some(CommandState::Running { pid: launcher }) => {
+                    runtime.remember_launcher(&id, &context, launcher).await?;
                     if runtime.rootless {
                         let Some(pid) = runtime.owned_running_pid(&id, &context).await? else {
                             if matches!(
@@ -607,16 +625,95 @@ impl RuncGrill {
     }
 
     /// Return informational identity from the bound launcher owner.
-    pub(super) async fn owned_pid(&self, instance: &InstanceId) -> Option<u32> {
-        self.owned_operation(instance, |_runtime, _id, context| async move {
-            Ok(match context.role_state(RuntimeRole::Launcher).await? {
-                Some(CommandState::Running { pid }) => Some(pid),
-                _ => None,
-            })
+    ///
+    /// A launcher already seen running answers without the lifecycle lock:
+    /// state reads hold that lock for a `runc state` and, rootless, a
+    /// network helper probe each, and a status read's pid used to queue
+    /// behind them past its deadline (#358). An instance with no generation
+    /// has no process; any other failure is an error, never "no process".
+    pub(super) async fn owned_pid(&self, instance: &InstanceId) -> Result<Option<u32>, GrillError> {
+        if let Some(pid) = self.remembered_launcher(instance).await {
+            return Ok(Some(pid));
+        }
+        let read = self.owned_operation(instance, |runtime, id, context| async move {
+            match context.role_state(RuntimeRole::Launcher).await? {
+                Some(CommandState::Running { pid }) => {
+                    runtime.remember_launcher(&id, &context, pid).await?;
+                    Ok(Some(pid))
+                }
+                _ => {
+                    runtime.forget_launcher(&id).await;
+                    Ok(None)
+                }
+            }
+        });
+        match read.await {
+            Err(GrillError::NotFound { .. }) => Ok(None),
+            result => result,
+        }
+    }
+
+    /// Record that `id`'s current generation has `pid` as its running
+    /// launcher.
+    async fn remember_launcher(
+        &self,
+        id: &InstanceId,
+        context: &ClaimedCommandExecutor,
+        pid: u32,
+    ) -> io::Result<()> {
+        let generation = context.intent().await?.generation;
+        let known = self.ownership()?.launchers.lock().await.get(id).cloned();
+        if known.is_some_and(|known| known.generation == generation && known.pid == pid) {
+            return Ok(());
+        }
+        let started_at =
+            tokio::task::spawn_blocking(move || crate::grill::records::process_start_time(pid))
+                .await
+                .map_err(io::Error::other)?;
+        let Some(started_at) = started_at else {
+            // Gone already: there is nothing to remember.
+            self.forget_launcher(id).await;
+            return Ok(());
+        };
+        self.ownership()?.launchers.lock().await.insert(
+            id.clone(),
+            BoundLauncher {
+                generation,
+                pid,
+                started_at,
+            },
+        );
+        Ok(())
+    }
+
+    /// Drop what [`Self::remember_launcher`] recorded for `id`.
+    async fn forget_launcher(&self, id: &InstanceId) {
+        self.ownership.launchers.lock().await.remove(id);
+    }
+
+    /// The remembered launcher's pid, if it belongs to the instance's
+    /// current generation and that process is still alive.
+    async fn remembered_launcher(&self, instance: &InstanceId) -> Option<u32> {
+        let launcher = self
+            .ownership
+            .launchers
+            .lock()
+            .await
+            .get(instance)
+            .cloned()?;
+        let generation = self.intent_journal().ok()?.observe(instance).await.ok()??;
+        if generation != launcher.generation {
+            return None;
+        }
+        let BoundLauncher {
+            pid, started_at, ..
+        } = launcher;
+        let alive = tokio::task::spawn_blocking(move || {
+            crate::grill::records::process_matches(pid, started_at)
         })
         .await
-        .ok()
-        .flatten()
+        .ok()?;
+        alive.then_some(pid)
     }
 
     /// Verify source attribution against the original launch and retained owner.
@@ -776,6 +873,9 @@ impl RuncGrill {
                     "adoption process identity conflicts with runtime owner",
                 ));
             }
+            runtime
+                .remember_launcher(&id, &context, launcher_pid)
+                .await?;
             let pid = runtime
                 .owned_running_pid(&id, &context)
                 .await?

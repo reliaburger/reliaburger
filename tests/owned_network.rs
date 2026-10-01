@@ -49,7 +49,7 @@ async fn create_executor(root: &Path, id: &InstanceId) -> ClaimedCommandExecutor
 }
 
 #[tokio::test]
-#[ignore = "requires root, ip and nft; mutates isolated owned namespaces"]
+#[ignore = "requires root, ip and nft; mutates isolated owned namespaces; run with make test-linux"]
 async fn owned_network_setup_and_forwarding_retire_through_the_generation() {
     assert!(nix::unistd::geteuid().is_root());
     let root = tempfile::tempdir().unwrap();
@@ -87,7 +87,7 @@ async fn owned_network_setup_and_forwarding_retire_through_the_generation() {
 }
 
 #[tokio::test]
-#[ignore = "requires root and ip; SIGKILL during real namespace preparation"]
+#[ignore = "requires root and ip; SIGKILL during real namespace preparation; run with make test-linux"]
 async fn killed_network_caller_cannot_publish_a_veth_after_recovered_retirement() {
     assert!(nix::unistd::geteuid().is_root());
     let root = tempfile::tempdir().unwrap();
@@ -247,7 +247,7 @@ async fn teardown_refuses_unknown_deletion_even_when_resources_currently_appear_
 }
 
 #[tokio::test]
-#[ignore = "requires root, ip and ping; creates two isolated container networks"]
+#[ignore = "requires root, ip and ping; creates two isolated container networks; run with make test-linux"]
 async fn same_node_containers_have_independent_host_and_peer_routes() {
     assert!(nix::unistd::geteuid().is_root());
     if std::env::var_os("RELIABURGER_ISOLATED_PEER_ROUTES").is_none() {
@@ -417,7 +417,7 @@ fn connects_from(source: std::net::Ipv4Addr, server: std::net::Ipv4Addr, port: u
 /// and nothing else, as the kernel actually filters it: the perimeter
 /// ruleset is applied inside a throwaway namespace, never the host's.
 #[test]
-#[ignore = "requires root, ip and nft; applies the perimeter ruleset inside isolated namespaces"]
+#[ignore = "requires root, ip and nft; applies the perimeter ruleset inside isolated namespaces; run with make test-linux"]
 fn operator_cidr_reaches_the_api_port_but_not_cluster_ports() {
     use reliaburger::firewall::rules::{ClusterNodes, PerimeterConfig, generate_ruleset};
     use std::io::Write;

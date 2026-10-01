@@ -20,12 +20,16 @@ pub struct Compatibility {
 /// binary's registry is unavailable (the orchestrator retries it), and the
 /// nodes each app last ran on (`DesiredState::last_placed_nodes`), the
 /// log store's ingest checkpoint, which records each capture file's device
-/// and inode beside its offset, and the volume snapshot layout (reversible
+/// and inode beside its offset, the volume snapshot layout (reversible
 /// volume slugs, per-destination export receipts, restore journals and
-/// volume quotas in the sidecar).
+/// volume quotas in the sidecar), and each image index entry's platform in
+/// Pickle's catalogue (`LayerDescriptor::platform`) and image listings
+/// (`ImageSummary::platforms`), and the apps a namespace quota keeps
+/// unplaced (`RaftRequest::QuotaBlocked`, `DesiredState::quota_blocked` and
+/// `DesiredAppEvidence::blocked`).
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 27,
-    state: 46,
+    protocol: 29,
+    state: 48,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.

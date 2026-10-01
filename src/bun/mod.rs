@@ -19,6 +19,7 @@ pub mod events;
 pub mod gpu;
 pub mod health;
 pub(crate) mod jobs;
+pub mod loop_meter;
 pub mod probe;
 pub mod readiness;
 pub mod restart;
@@ -130,6 +131,11 @@ pub enum BunError {
         instance_id: InstanceId,
         reason: &'static str,
     },
+
+    /// Work a step needs is still running off the agent loop; asking again
+    /// later finds it, finished or not, rather than starting it over.
+    #[error("{work} is still running; try again shortly")]
+    StillRunning { work: String },
 
     /// A stop this request joined, or was waiting on, did not complete.
     #[error("stop did not complete: {reason}")]
