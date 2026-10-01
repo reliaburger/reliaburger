@@ -22,6 +22,7 @@ pub mod meat;
 pub mod mustard;
 pub(crate) mod object_storage;
 pub mod onion;
+pub mod os;
 pub mod pickle;
 pub mod reconstruction;
 pub mod relish;

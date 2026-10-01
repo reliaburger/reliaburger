@@ -3,6 +3,3 @@ mkosi.output/
 mkosi.cache/
 mkosi.tools/
 bin-tree/
-
-# The throwaway spike key the workflow bakes into the installer.
-mkosi.images/installer/mkosi.extra/usr/lib/reliaburger/os-signing-key.pub.pem

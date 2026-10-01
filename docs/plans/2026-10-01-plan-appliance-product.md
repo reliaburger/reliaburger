@@ -28,14 +28,20 @@ Each is one stacked PR, unless it grows too big to review. Estimates are enginee
 
 ### W1. OS builds, signing and the channel (~1.5 weeks), [#401](https://github.com/reliaburger/reliaburger/issues/401)
 
-- A scheduled weekly `appliance.yml` run, plus manual dispatch. Version `YYYY.WW.N`.
-- It takes the latest released bun and relish, and publishes nothing when the package manifest and bun version match the last release.
-- A separate `sign` job (checkout, download-artifact, our signer only) signs a statement per artefact with the release key: version, architecture, asset, SHA-256, kernel and bun versions.
-- Publishes a GitHub pre-release `os-<version>`, and a signed `os-channel.json` (newest version and digests per architecture) through Pages and as a release asset. Keeps the last 8 weekly releases.
-- Installer ISO output beside the raw disk.
-- Production images drop `openssh-server`; a `lab` mkosi profile keeps it, for the QEMU lab only.
-- The firmware allow-list measured against the 1.1 GiB `/usr` slot, with its size in the step summary.
-- **Tests:** the signer and channel format (Python unit tests like `scripts/ci`), and verification of a signed statement in Rust (`src/os/` or `src/upgrade/`), including a wrong key, a wrong digest and a stale channel.
+- **Triggers:** a weekly `appliance.yml` run on main (Monday 04:00 UTC), or a dispatch with `publish`. Version `YYYY.WW.N` (ISO week; N counts that week's releases). Pull requests still build the `lab` profile with a throwaway key, for the QEMU lab.
+- **What a release is:** the latest released bun and relish. A week whose package list and build record (bun release, `image/` git tree) match the last release publishes nothing.
+- **Signing:** the `sign` job runs only first-party actions (checkout, download and upload artefact) and `scripts/release/os_release.py`. It signs every `SHA256SUMS` with the release key, in the raw Ed25519 form the installer and `os-stage` already check with `openssl`. `SHA256SUMS` lists every artefact, so one signature covers the build. The image and installer ship the release public key (`os-signing-key.pub.pem`, tested against `src/upgrade/keys.rs`).
+- **Checking it:** the netboot install test re-runs on the signed artefacts before anything is published.
+- **Publishing:**
+  - one GitHub pre-release per architecture, `os-<version>-x86_64` and `os-<version>-aarch64`, because both builds name their files the same;
+  - a signed `os-channel.json` on the fixed `os-channel` release, naming each architecture's tag and `SHA256SUMS` digest;
+  - the last 8 versions are kept.
+- **No ISO:** `relish image write` (W3) puts the raw disk or the installer on a stick, which covers USB installs without a second format to build and test.
+- **No SSH in production:** published images drop `openssh-server`. The `lab` mkosi profile (`mkosi.conf.d/30-lab.conf`) keeps it for the QEMU lab.
+- **The `/usr` budget:** the 1.1 GiB slot is a hard limit (`SizeMaxBytes=`), so a firmware allow-list that outgrows it fails the build.
+- **Tests:**
+  - `scripts/release/test_os_release.py`: signing, the channel, versions, the quiet-week check, pruning, and the shipped key;
+  - `src/os/channel.rs`: verification, including a channel signed by `os_release.py` (a fixture), a wrong key, an edited channel, mismatched tags and digests, malformed `SHA256SUMS`, and version ordering.
 
 ### W2. Seed mode in bun (~3 weeks), [#402](https://github.com/reliaburger/reliaburger/issues/402)
 

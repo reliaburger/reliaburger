@@ -155,6 +155,13 @@ pub fn countersign(
     })
 }
 
+/// True when `signature` (raw 64 bytes) is one of `keys`' Ed25519 signature
+/// over `bytes`. For detached signatures that aren't binary envelopes, such
+/// as the appliance OS channel (`crate::os`).
+pub fn verify_detached(keys: &[PublicKey], bytes: &[u8], signature: &[u8]) -> bool {
+    keys.iter().any(|key| verify_one(key, bytes, signature))
+}
+
 fn verify_one(key: &PublicKey, bytes: &[u8], signature: &[u8]) -> bool {
     UnparsedPublicKey::new(&ED25519, key)
         .verify(bytes, signature)
