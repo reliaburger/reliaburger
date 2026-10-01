@@ -1913,6 +1913,7 @@ pub struct PartitionBlocklists {
 use super::egress_owners::{EgressBinding, PolicyPhase};
 mod app_stop;
 mod consumer;
+mod council_requests;
 mod startup_recovery;
 pub use consumer::ConsumerUpdate;
 mod adopted_placements;
@@ -1920,6 +1921,7 @@ mod discovery_ownership;
 mod discovery_recovery;
 mod egress_ownership;
 mod identity_signing;
+mod logs;
 mod producer_release;
 mod restarts;
 mod runtime_inventory;
@@ -4965,12 +4967,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 tail,
                 response,
             } => {
-                let result = self.get_logs(&app_name, &namespace).await;
-                let result = result.map(|logs| match tail {
-                    Some(n) => tail_lines(&logs, n),
-                    None => logs,
-                });
-                let _ = response.send(result);
+                self.spawn_logs_read(&app_name, &namespace, tail, response);
             }
             AgentCommand::FollowLogs {
                 app_name,
@@ -4979,8 +4976,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 label,
                 lines,
             } => {
-                self.follow_app_logs(&app_name, &namespace, tail, label.as_deref(), lines)
-                    .await;
+                self.spawn_logs_follow(&app_name, &namespace, tail, label, lines);
             }
             AgentCommand::Exec {
                 app_name,
@@ -5045,8 +5041,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 csr_der,
                 response,
             } => {
-                let result = self.handle_join_issue(&token, &node_id, &csr_der).await;
-                let _ = response.send(result);
+                self.spawn_join_issue(token, node_id, csr_der, response);
             }
             AgentCommand::SnapshotCreate {
                 namespace,
@@ -5459,8 +5454,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 submission,
                 response,
             } => {
-                let result = self.handle_sign_image(submission).await;
-                let _ = response.send(result);
+                self.spawn_sign_image(submission, response);
             }
             AgentCommand::AppConfig {
                 app_name,
@@ -9967,155 +9961,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
     }
 
-    /// Issue a certificate bundle for a joining node.
-    ///
-    /// Runs on an existing cluster member. Validates the token against the
-    /// replicated security state, consumes it via Raft, and returns the
-    /// bundle (certificate, private key, CA chain) for the joiner to persist.
-    /// The joiner supplies its own `node_id`.
-    async fn handle_join_issue(
-        &self,
-        token: &str,
-        node_id: &str,
-        csr_der: &[u8],
-    ) -> Result<crate::sesame::join::JoinBundle, BunError> {
-        let cluster = self
-            .cluster
-            .as_ref()
-            .ok_or_else(|| BunError::SecurityError {
-                reason: "no cluster available for join validation".to_string(),
-            })?;
-        let council = cluster
-            .council
-            .as_ref()
-            .ok_or_else(|| BunError::SecurityError {
-                reason: "no council available for join validation".to_string(),
-            })?;
-        let ikm = cluster
-            .wrapping_ikm
-            .as_ref()
-            .ok_or_else(|| BunError::SecurityError {
-                reason: "no wrapping IKM available".to_string(),
-            })?;
-
-        // Fast-fail check against the replicated state (unknown/expired/already
-        // consumed token). The authoritative consume happens atomically below.
-        // LOOP-INLINE: reads the local council state machine; no quorum round trip
-        let security_state = council.security_state().await;
-        let token_hash = crate::sesame::join::check_join_token(token, node_id, &security_state)
-            .map_err(|e| BunError::SecurityError {
-                reason: format!("join validation failed: {e}"),
-            })?;
-
-        // Atomically consume the token and allocate a serial in one committed
-        // Raft entry (PKI5). Two racing joiners with the same token: exactly one
-        // gets a serial here; the loser is refused, so a token issues one cert.
-        // LOOP-INLINE: stage 3 of #351: an unbounded council write
-        let serial = match council
-            .write(crate::council::RaftRequest::ConsumeJoinTokenForIssue { token_hash })
-            .await
-            .map_err(|e| BunError::SecurityError {
-                reason: format!("failed to consume join token: {e}"),
-            })? {
-            crate::council::CouncilResponse::JoinTokenConsumed { serial } => {
-                crate::sesame::types::SerialNumber(serial)
-            }
-            crate::council::CouncilResponse::Refused { reason } => {
-                return Err(BunError::SecurityError {
-                    reason: format!("join refused: {reason}"),
-                });
-            }
-            other => {
-                return Err(BunError::SecurityError {
-                    reason: format!("unexpected council response to join: {other:?}"),
-                });
-            }
-        };
-
-        // Confirm the identity still has authority after consuming the token.
-        // LOOP-INLINE: stage 3 of #351: an unbounded council write
-        let security_state = council
-            .security_state_linearizable()
-            .await
-            .map_err(|error| BunError::SecurityError {
-                reason: error.to_string(),
-            })?;
-        let join_result = crate::sesame::join::sign_join_csr(
-            csr_der,
-            node_id,
-            serial,
-            self.node_leaf_lifetime,
-            &security_state,
-            ikm,
-        )
-        .map_err(|e| BunError::SecurityError {
-            reason: format!("join signing failed: {e}"),
-        })?;
-
-        Ok(crate::sesame::join::JoinBundle::from_result(&join_result))
-    }
-
-    /// Handle a SignImage command: verify an operator's detached signature
-    /// and attach it to the manifest via Raft.
-    ///
-    /// The node never holds the signing key, so it can't mint trust: it only
-    /// checks that the signature verifies under the public key it came with.
-    /// Whether that key is trusted is decided at deploy time against
-    /// `[images.trust_policy] keys`. The reply warns when this node's policy
-    /// doesn't list the key, because deploys here would still refuse it.
-    async fn handle_sign_image(
-        &self,
-        submission: crate::pickle::signing::SignatureSubmission,
-    ) -> Result<String, BunError> {
-        let council = self
-            .cluster
-            .as_ref()
-            .and_then(|cluster| cluster.council.as_ref())
-            .ok_or_else(|| BunError::SecurityError {
-                reason: "image signatures live in the cluster catalogue; this node has no council"
-                    .to_string(),
-            })?;
-
-        let public_key = submission.public_key.clone();
-        let (digest, signature) =
-            submission
-                .into_verified()
-                .map_err(|e| BunError::SecurityError {
-                    reason: format!("signature rejected: {e}"),
-                })?;
-        let fingerprint = match &signature.method {
-            crate::pickle::types::SigningMethod::ExternalKey { key_id } => key_id.clone(),
-            crate::pickle::types::SigningMethod::Keyless { identity, .. } => identity.clone(),
-        };
-
-        let attach = crate::pickle::types::AttachSignature {
-            manifest_digest: digest.clone(),
-            signature,
-        };
-        // LOOP-INLINE: stage 3 of #351: an unbounded council write
-        let response = council
-            .write(crate::council::RaftRequest::AttachSignature(attach))
-            .await
-            .map_err(|e| BunError::SecurityError {
-                reason: format!("failed to attach signature: {e}"),
-            })?;
-        // An unknown digest comes back as a refusal, not an error; reporting
-        // success there would claim a signature that attached to nothing.
-        if let crate::council::types::CouncilResponse::Refused { reason } = response {
-            return Err(BunError::SecurityError {
-                reason: format!("signature attach refused: {reason}"),
-            });
-        }
-
-        let mut message = format!("signed {} with key {fingerprint}", digest.as_str());
-        if !self.trust_policy.keys.contains(&public_key) {
-            message.push_str(
-                "\nwarning: this node's [images.trust_policy] keys does not list this key, so deploys here will refuse the image until it does",
-            );
-        }
-        Ok(message)
-    }
-
     /// Check identity rotation for all instances, and (rate-limited)
     /// provision identities for running instances that don't have one —
     /// a failed CSR at deploy time, or an adopted instance whose
@@ -10280,110 +10125,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 age_seconds: instance.created_at.elapsed().as_secs(),
             })
             .collect()
-    }
-
-    /// Get logs for all instances of an app in a namespace.
-    async fn get_logs(&self, app_name: &str, namespace: &str) -> Result<String, BunError> {
-        let instance_ids: Vec<InstanceId> = self
-            .supervisor
-            .list_instances()
-            .into_iter()
-            .filter(|i| i.app_name == app_name && i.namespace == namespace)
-            .map(|i| i.id.clone())
-            .collect();
-
-        if instance_ids.is_empty() {
-            return Err(BunError::AppNotFound {
-                app_name: app_name.to_string(),
-                namespace: namespace.to_string(),
-            });
-        }
-
-        let mut all_logs = String::new();
-        for id in &instance_ids {
-            // LOOP-INLINE: stage 3 of #351: reading whole captures leaves the loop
-            let logs = self.supervisor.grill().logs(id).await.unwrap_or_default();
-            if !logs.is_empty() {
-                if instance_ids.len() > 1 {
-                    all_logs.push_str(&format!("==> {id} <==\n"));
-                }
-                all_logs.push_str(&logs);
-                if !logs.ends_with('\n') {
-                    all_logs.push('\n');
-                }
-            }
-        }
-        Ok(all_logs)
-    }
-
-    /// Start streaming logs for all instances of an app.
-    ///
-    /// If `tail` is set, sends the last N lines of existing output first,
-    /// then starts following. Spawns a background task per instance so
-    /// the agent event loop isn't blocked.
-    async fn follow_app_logs(
-        &self,
-        app_name: &str,
-        namespace: &str,
-        tail: Option<usize>,
-        label: Option<&str>,
-        lines: mpsc::Sender<String>,
-    ) {
-        let instance_ids: Vec<InstanceId> = self
-            .supervisor
-            .list_instances()
-            .into_iter()
-            .filter(|i| i.app_name == app_name && i.namespace == namespace)
-            .map(|i| i.id.clone())
-            .collect();
-
-        if instance_ids.is_empty() {
-            return;
-        }
-
-        let prefix = |id: &InstanceId| label.map(|node| format!("[{node} {}] ", id.0));
-
-        // Send initial tail lines if requested
-        if let Some(n) = tail {
-            for id in &instance_ids {
-                // LOOP-INLINE: stage 3 of #351: the follow tail leaves the loop
-                let logs = self.supervisor.grill().logs(id).await.unwrap_or_default();
-                let tailed = tail_lines(&logs, n);
-                let prefix = prefix(id).unwrap_or_default();
-                for line in tailed.lines() {
-                    // LOOP-INLINE: stage 3 of #351: the follow tail leaves the loop
-                    if lines.send(format!("{prefix}{line}")).await.is_err() {
-                        return;
-                    }
-                }
-            }
-        }
-
-        // Spawn a follow task per instance. The grill is Arc-backed and Clone,
-        // so each task owns a handle and streams concurrently — the agent event
-        // loop is never blocked waiting for a client to disconnect.
-        for id in instance_ids {
-            let grill = self.supervisor.grill().clone();
-            // Each instance streams through its own channel; a labelled
-            // follow stamps each line with its node and instance on the way.
-            let prefix = prefix(&id).unwrap_or_default();
-            let (instance_tx, mut instance_rx) =
-                mpsc::channel::<crate::ketchup::types::CapturedLine>(64);
-            tokio::spawn(async move {
-                // A live follow shows the instance's whole capture.
-                grill
-                    .follow_logs(&id, instance_tx, &Default::default())
-                    .await;
-            });
-            let tx = lines.clone();
-            tokio::spawn(async move {
-                while let Some(captured) = instance_rx.recv().await {
-                    if tx.send(format!("{prefix}{}", captured.line)).await.is_err() {
-                        return;
-                    }
-                }
-            });
-        }
     }
 
     /// Execute a command inside a running instance of an app.

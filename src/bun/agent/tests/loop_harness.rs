@@ -242,7 +242,6 @@ async fn status_answers_while_a_deploy_step_retains_a_network_reference() {
 /// `Logs` reads every instance's whole capture into memory, on the loop. A
 /// 56 MB capture (#278) takes hundreds of milliseconds; a slow disk longer.
 #[tokio::test]
-#[ignore = "stage 3 of #351"]
 async fn status_answers_while_logs_reads_a_large_capture() {
     let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
     expect_complete(&drain_deploy(&mut agent, replicated("web", 1)).await);
@@ -360,7 +359,6 @@ fn boxed(agent: BunAgent<MockGrill>) -> Box<BunAgent<MockGrill>> {
 /// A join consumes its token through a council write. On a leader that has
 /// lost quorum the write waits until the leader steps down, or longer.
 #[tokio::test]
-#[ignore = "stage 3 of #351"]
 async fn status_answers_while_a_join_waits_on_a_council_without_quorum() {
     let council = council().await;
     let (token, join_token) = crate::sesame::join::create_join_token(
@@ -393,7 +391,6 @@ async fn status_answers_while_a_join_waits_on_a_council_without_quorum() {
 
 /// Signing an image attaches the signature through a council write too.
 #[tokio::test]
-#[ignore = "stage 3 of #351"]
 async fn status_answers_while_signing_waits_on_a_council_without_quorum() {
     let council = council().await;
     let (agent, tx, shutdown) = clustered_agent(Arc::clone(&council));
@@ -720,7 +717,6 @@ async fn status_answers_while_a_large_catalogue_is_published() {
 /// channel from the loop. A client that stops reading (`| less`, a stuck
 /// proxy) holds the turn once 64 lines are queued.
 #[tokio::test]
-#[ignore = "stage 3 of #351"]
 async fn status_answers_while_a_follow_tail_waits_on_a_client_that_never_reads() {
     let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
     expect_complete(&drain_deploy(&mut agent, replicated("web", 1)).await);
