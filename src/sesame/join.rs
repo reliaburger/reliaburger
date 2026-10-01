@@ -22,6 +22,11 @@ pub const DEFAULT_JOIN_TOKEN_TTL: Duration = Duration::from_secs(15 * 60);
 pub const MIN_JOIN_TOKEN_TTL: Duration = Duration::from_secs(1);
 /// Longest join-token lifetime accepted by the API.
 pub const MAX_JOIN_TOKEN_TTL: Duration = Duration::from_secs(60 * 60);
+/// Longest lifetime of a token minted into a seed when the cluster is
+/// created (G6). A seed can sit on a USB stick for days before the machine
+/// it's for first boots, so an hour is too short; a week bounds how long a
+/// lost stick stays useful, and each token still enrols one node id once.
+pub const MAX_SEED_JOIN_TOKEN_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// Errors from join operations.
 #[derive(Debug, thiserror::Error)]
@@ -34,7 +39,7 @@ pub enum JoinError {
     TokenExpired,
     #[error("join token has already been consumed")]
     TokenConsumed,
-    #[error("join token TTL must be between 1 second and 1 hour (got {seconds} seconds)")]
+    #[error("join token TTL out of range (got {seconds} seconds)")]
     InvalidTtl { seconds: u64 },
     #[error("join token is bound to a different node id")]
     NodeIdMismatch,
@@ -447,7 +452,25 @@ pub fn sign_join_csr(
 /// storage prevents a failed Raft write from producing a token that looks
 /// usable but no council member can validate.
 pub fn create_join_token(ttl: Duration, node_id: &str) -> Result<(String, JoinToken), JoinError> {
-    if !(MIN_JOIN_TOKEN_TTL..=MAX_JOIN_TOKEN_TTL).contains(&ttl) {
+    mint_join_token(ttl, MAX_JOIN_TOKEN_TTL, node_id)
+}
+
+/// Create a join token for a seed, pre-loaded into the cluster's initial
+/// security state rather than minted through the API (G6). Same single-use,
+/// node-bound semantics, with up to [`MAX_SEED_JOIN_TOKEN_TTL`].
+pub fn create_seed_join_token(
+    ttl: Duration,
+    node_id: &str,
+) -> Result<(String, JoinToken), JoinError> {
+    mint_join_token(ttl, MAX_SEED_JOIN_TOKEN_TTL, node_id)
+}
+
+fn mint_join_token(
+    ttl: Duration,
+    max_ttl: Duration,
+    node_id: &str,
+) -> Result<(String, JoinToken), JoinError> {
+    if !(MIN_JOIN_TOKEN_TTL..=max_ttl).contains(&ttl) {
         return Err(JoinError::InvalidTtl {
             seconds: ttl.as_secs(),
         });
@@ -464,6 +487,47 @@ pub fn create_join_token(ttl: Duration, node_id: &str) -> Result<(String, JoinTo
         node_id: node_id.to_string(),
     };
     Ok((plaintext, join_token))
+}
+
+/// What `relish join-token list` shows for one token: never the token
+/// itself, nor enough of its hash to matter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JoinTokenSummary {
+    /// The first 8 hex digits of the token's hash, to tell tokens apart.
+    pub id: String,
+    pub node_id: String,
+    /// Unix seconds.
+    pub expires_at: u64,
+    pub consumed: bool,
+}
+
+/// Summaries of the join tokens in the security state, oldest first.
+pub fn summarise_join_tokens(state: &SecurityState) -> Vec<JoinTokenSummary> {
+    state
+        .join_tokens
+        .iter()
+        .map(|token| JoinTokenSummary {
+            id: hex::encode(&token.token_hash[..4]),
+            node_id: token.node_id.clone(),
+            expires_at: token
+                .expires_at
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            consumed: token.consumed,
+        })
+        .collect()
+}
+
+/// The hashes of `node_id`'s unconsumed join tokens: revoking a node's
+/// tokens marks each consumed through Raft, so none can enrol it again.
+pub fn join_tokens_to_revoke(state: &SecurityState, node_id: &str) -> Vec<[u8; 32]> {
+    state
+        .join_tokens
+        .iter()
+        .filter(|token| token.node_id == node_id && !token.consumed)
+        .map(|token| token.token_hash)
+        .collect()
 }
 
 #[cfg(test)]
@@ -702,6 +766,65 @@ mod tests {
         assert_eq!(root_ca, result.root_ca_der);
         let expected = crate::sesame::identity_store::root_ca_fingerprint(&result.root_ca_der);
         assert_eq!(ca.root_ca_fingerprint().unwrap(), expected);
+    }
+
+    #[test]
+    fn a_seed_token_may_last_a_week_but_an_api_token_only_an_hour() {
+        let week = MAX_SEED_JOIN_TOKEN_TTL;
+        assert!(matches!(
+            create_join_token(week, "node-02"),
+            Err(JoinError::InvalidTtl { .. })
+        ));
+        let (plaintext, token) = create_seed_join_token(week, "node-02").unwrap();
+        assert!(plaintext.starts_with("rbrg_join_1_"));
+        assert_eq!(token.node_id, "node-02");
+        assert!(!token.consumed);
+        assert!(token.expires_at > SystemTime::now() + Duration::from_secs(6 * 24 * 3600));
+        assert!(matches!(
+            create_seed_join_token(week + Duration::from_secs(1), "node-02"),
+            Err(JoinError::InvalidTtl { .. })
+        ));
+        assert!(matches!(
+            create_seed_join_token(week, ""),
+            Err(JoinError::EmptyNodeId)
+        ));
+    }
+
+    #[test]
+    fn a_seed_token_enrols_its_node_once() {
+        let (mut state, _token, _master_secret) = setup_with_known_key();
+        let (plaintext, token) =
+            create_seed_join_token(MAX_SEED_JOIN_TOKEN_TTL, "node-03").unwrap();
+        state.join_tokens.push(token);
+        check_join_token(&plaintext, "node-03", &state).unwrap();
+        assert!(matches!(
+            check_join_token(&plaintext, "node-04", &state),
+            Err(JoinError::NodeIdMismatch)
+        ));
+    }
+
+    #[test]
+    fn summaries_show_a_short_id_never_the_token() {
+        let (state, _token, _master_secret) = setup_with_known_key();
+        let summaries = summarise_join_tokens(&state);
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].node_id, "node-02");
+        assert_eq!(summaries[0].id.len(), 8);
+        assert!(!summaries[0].consumed);
+        assert!(summaries[0].expires_at > 0);
+    }
+
+    #[test]
+    fn revoking_picks_only_that_node_s_unconsumed_tokens() {
+        let (mut state, _token, _master_secret) = setup_with_known_key();
+        let (_, mut used) = create_join_token(DEFAULT_JOIN_TOKEN_TTL, "node-02").unwrap();
+        used.consumed = true;
+        let (_, other) = create_join_token(DEFAULT_JOIN_TOKEN_TTL, "node-03").unwrap();
+        state.join_tokens.push(used);
+        state.join_tokens.push(other);
+        let hashes = join_tokens_to_revoke(&state, "node-02");
+        assert_eq!(hashes, vec![state.join_tokens[0].token_hash]);
+        assert!(join_tokens_to_revoke(&state, "node-09").is_empty());
     }
 
     #[test]

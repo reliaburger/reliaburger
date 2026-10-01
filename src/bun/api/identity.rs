@@ -416,6 +416,109 @@ pub(super) async fn token_create_handler(
     .into_response()
 }
 
+/// List the join tokens the council holds: their node id, expiry and
+/// whether they've been used, never the token.
+pub(super) async fn join_token_list_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+) -> Response {
+    if let Err(resp) =
+        crate::sesame::auth::authorize_user(auth.as_deref(), crate::sesame::types::ApiRole::Admin)
+    {
+        return resp;
+    }
+    if let Err(response) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
+        return response;
+    }
+    if let Err(response) = enforce_cluster_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Admin,
+    )
+    .await
+    {
+        return response;
+    }
+    let Some(ref council) = state.council else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "no council available" })),
+        )
+            .into_response();
+    };
+    let security = council.security_state().await;
+    Json(serde_json::json!({
+        "join_tokens": crate::sesame::join::summarise_join_tokens(&security),
+    }))
+    .into_response()
+}
+
+/// Revoke every unused join token for a node id: each is marked consumed
+/// through Raft, so none of them can enrol that node any more.
+pub(super) async fn join_token_revoke_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+    body: String,
+) -> Response {
+    if let Err(resp) =
+        crate::sesame::auth::authorize_user(auth.as_deref(), crate::sesame::types::ApiRole::Admin)
+    {
+        return resp;
+    }
+    if let Err(response) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
+        return response;
+    }
+    if let Err(response) = enforce_cluster_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Admin,
+    )
+    .await
+    {
+        return response;
+    }
+    #[derive(serde::Deserialize)]
+    struct RevokeRequest {
+        node_id: String,
+    }
+    let req: RevokeRequest = match serde_json::from_str(&body) {
+        Ok(request) => request,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("invalid JSON: {e}") })),
+            )
+                .into_response();
+        }
+    };
+    let Some(ref council) = state.council else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "no council available" })),
+        )
+            .into_response();
+    };
+    let security = council.security_state().await;
+    let hashes = crate::sesame::join::join_tokens_to_revoke(&security, &req.node_id);
+    for token_hash in &hashes {
+        if let Err(e) = council
+            .write(crate::council::RaftRequest::ConsumeJoinToken {
+                token_hash: *token_hash,
+            })
+            .await
+        {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": format!("failed to revoke join tokens (try the cluster leader): {e}")
+                })),
+            )
+                .into_response();
+        }
+    }
+    Json(serde_json::json!({ "node_id": req.node_id, "revoked": hashes.len() })).into_response()
+}
+
 /// Create a short-lived, single-use node join token and persist its hash.
 ///
 /// This is deliberately separate from API bearer-token management. The

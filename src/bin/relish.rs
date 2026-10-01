@@ -736,6 +736,13 @@ enum JoinTokenAction {
         #[arg(long, default_value = "15m", value_parser = parse_join_token_ttl)]
         ttl: u64,
     },
+    /// List join tokens: node id, expiry and whether each has been used.
+    List,
+    /// Revoke every unused join token for a node id.
+    Revoke {
+        /// The node id whose unused tokens to revoke.
+        node_id: String,
+    },
 }
 
 fn parse_join_token_ttl(value: &str) -> Result<u64, String> {
@@ -1616,6 +1623,8 @@ async fn main() -> ExitCode {
             TokenAction::Revoke { name } => commands::token_revoke(name).await,
         },
         Command::JoinToken { action } => match &action {
+            JoinTokenAction::List => commands::join_token_list().await,
+            JoinTokenAction::Revoke { node_id } => commands::join_token_revoke(node_id).await,
             JoinTokenAction::Create { node_id, ttl } => {
                 commands::join_token_create(node_id, *ttl).await
             }

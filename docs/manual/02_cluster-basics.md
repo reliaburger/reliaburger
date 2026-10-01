@@ -57,6 +57,10 @@ relish join --token <TOKEN> --node-id node-02 \
   --ca-fingerprint sha256:<ROOT_CA_FINGERPRINT> https://<LEADER>:9117
 ```
 
+`relish join-token list` shows the tokens the council holds (node id, and
+whether each is used, expired or still valid, never the token itself), and
+`relish join-token revoke node-02` makes node-02's unused tokens worthless.
+
 `relish init` printed the root CA fingerprint; pinning it means a member
 offering a different CA is refused. `--token-file` reads the token from a
 private file instead of the command line. `join` only enrols the identity (into

@@ -2237,6 +2237,75 @@ pub async fn join_token_create(node_id: &str, ttl_seconds: u64) -> Result<(), Re
     Ok(())
 }
 
+/// List the council's join tokens.
+pub async fn join_token_list() -> Result<(), RelishError> {
+    let tokens = BunClient::default_local().join_token_list().await?;
+    print!(
+        "{}",
+        render_join_tokens(&tokens, std::time::SystemTime::now())
+    );
+    Ok(())
+}
+
+/// Revoke a node id's unused join tokens.
+pub async fn join_token_revoke(node_id: &str) -> Result<(), RelishError> {
+    let revoked = BunClient::default_local()
+        .join_token_revoke(node_id)
+        .await?;
+    match revoked {
+        0 => println!("{node_id} had no unused join tokens"),
+        1 => println!("revoked 1 join token for {node_id}"),
+        n => println!("revoked {n} join tokens for {node_id}"),
+    }
+    Ok(())
+}
+
+/// The `relish join-token list` table: one row per token, its state
+/// relative to `now`.
+fn render_join_tokens(
+    tokens: &[crate::sesame::join::JoinTokenSummary],
+    now: std::time::SystemTime,
+) -> String {
+    if tokens.is_empty() {
+        return "no join tokens\n".to_string();
+    }
+    let now = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let width = tokens
+        .iter()
+        .map(|t| t.node_id.len())
+        .max()
+        .unwrap_or(0)
+        .max(4);
+    let mut out = format!("{:<10} {:<width$} STATE\n", "ID", "NODE");
+    for token in tokens {
+        let state = if token.consumed {
+            "used".to_string()
+        } else if token.expires_at <= now {
+            "expired".to_string()
+        } else {
+            format!("valid for {}", format_ttl_rounded(token.expires_at - now))
+        };
+        out.push_str(&format!(
+            "{:<10} {:<width$} {state}\n",
+            token.id, token.node_id
+        ));
+    }
+    out
+}
+
+/// A duration as its largest whole unit: 6d, 3h, 14m or 40s.
+fn format_ttl_rounded(seconds: u64) -> String {
+    match seconds {
+        s if s >= 86_400 => format!("{}d", s / 86_400),
+        s if s >= 3_600 => format!("{}h", s / 3_600),
+        s if s >= 60 => format!("{}m", s / 60),
+        s => format!("{s}s"),
+    }
+}
+
 fn format_ttl(seconds: u64) -> String {
     if seconds.is_multiple_of(3600) {
         format!("{}h", seconds / 3600)
@@ -2367,6 +2436,34 @@ mod tests {
         assert_eq!(rows[0], ["ID", "NODE", "IMAGE", "RESULT", "DONE", "TOTAL"]);
         assert_eq!(rows[1], ["7", "node-1", "-", "Completed", "1", "1"]);
         assert_eq!(rows[2], ["7", "node-2", "-", "Completed", "1", "1"]);
+    }
+
+    #[test]
+    fn join_token_table_shows_used_expired_and_remaining_time() {
+        use crate::sesame::join::JoinTokenSummary;
+        let now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        let token = |id: &str, node: &str, expires_at: u64, consumed: bool| JoinTokenSummary {
+            id: id.into(),
+            node_id: node.into(),
+            expires_at,
+            consumed,
+        };
+        let table = render_join_tokens(
+            &[
+                token("aaaaaaaa", "node-02", 999_000, true),
+                token("bbbbbbbb", "node-03", 999_000, false),
+                token("cccccccc", "home-10", 1_000_000 + 6 * 86_400 + 5, false),
+            ],
+            now,
+        );
+        assert_eq!(
+            table,
+            "ID         NODE    STATE\n\
+             aaaaaaaa   node-02 used\n\
+             bbbbbbbb   node-03 expired\n\
+             cccccccc   home-10 valid for 6d\n"
+        );
+        assert_eq!(render_join_tokens(&[], now), "no join tokens\n");
     }
 
     #[test]

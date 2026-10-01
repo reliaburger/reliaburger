@@ -2195,6 +2195,55 @@ impl BunClient {
             .to_string())
     }
 
+    /// The join tokens the council holds, without the tokens themselves.
+    pub async fn join_token_list(
+        &self,
+    ) -> Result<Vec<crate::sesame::join::JoinTokenSummary>, RelishError> {
+        let url = format!("{}/v1/join-token/list", self.base_url);
+        let response = self
+            .http()?
+            .get(&url)
+            .send()
+            .await
+            .map_err(classify_error)?;
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(RelishError::ApiError { status, body });
+        }
+        #[derive(serde::Deserialize)]
+        struct Listing {
+            join_tokens: Vec<crate::sesame::join::JoinTokenSummary>,
+        }
+        let listing: Listing = response.json().await.map_err(|e| RelishError::ApiError {
+            status: 0,
+            body: format!("failed to parse join-token list: {e}"),
+        })?;
+        Ok(listing.join_tokens)
+    }
+
+    /// Revoke a node id's unused join tokens; returns how many.
+    pub async fn join_token_revoke(&self, node_id: &str) -> Result<u64, RelishError> {
+        let url = format!("{}/v1/join-token/revoke", self.base_url);
+        let response = self
+            .http()?
+            .post(&url)
+            .json(&serde_json::json!({ "node_id": node_id }))
+            .send()
+            .await
+            .map_err(classify_error)?;
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(RelishError::ApiError { status, body });
+        }
+        let json: serde_json::Value = response.json().await.map_err(|e| RelishError::ApiError {
+            status: 0,
+            body: format!("failed to parse join-token revoke response: {e}"),
+        })?;
+        Ok(json["revoked"].as_u64().unwrap_or(0))
+    }
+
     /// Create a single-use node join token. The server commits only its hash
     /// to Raft and returns the plaintext once.
     pub async fn join_token_create(

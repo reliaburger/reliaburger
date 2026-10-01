@@ -79,6 +79,8 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 - `relish join --node-id <NODE_ID> <ADDR>`: Join an existing cluster
 - `relish join-token`: Manage short-lived node-enrolment tokens
   - `relish join-token create --node-id <NODE_ID>`: Create a single-use token for enrolling one node
+  - `relish join-token list`: List join tokens: node id, expiry and whether each has been used
+  - `relish join-token revoke <NODE_ID>`: Revoke every unused join token for a node id
 - `relish nodes`: List cluster nodes and their gossip state
 - `relish council`: Show council (Raft) composition and status, or recover from full loss
   - `relish council recover --data-dir <DATA_DIR>`: Recover a cluster whose entire council was lost
