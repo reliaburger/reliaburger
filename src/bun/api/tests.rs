@@ -24,6 +24,7 @@ async fn registry_query_response_refuses_an_oversized_catalogue() {
 }
 
 use super::faults::NODE_REQUEST_TIMEOUT;
+use super::node_info::{council_app_evidence, filter_desired_apps_for_scope, valid_path_label};
 use super::ui::statuses_to_dashboard_apps;
 use super::upgrade::{UPGRADE_FORWARDED_HEADER, check_council_can_roll};
 use super::*;
