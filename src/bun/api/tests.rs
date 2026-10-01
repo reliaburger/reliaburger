@@ -23,6 +23,7 @@ async fn registry_query_response_refuses_an_oversized_catalogue() {
     );
 }
 
+use super::ui::statuses_to_dashboard_apps;
 use super::*;
 use axum::body::Body;
 use http_body_util::BodyExt;
