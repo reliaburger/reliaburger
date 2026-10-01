@@ -560,7 +560,7 @@ fn root_suffix(root: &Path) -> String {
 }
 
 #[tokio::test]
-#[ignore = "requires isolated Linux root, real runc/ip/nft and static BusyBox"]
+#[ignore = "requires isolated Linux root, real runc/ip/nft and static BusyBox; run through scripts/release/qualify-oci-interruptions.sh"]
 async fn actual_bun_sigkill_and_cancelled_caller_preserve_oci_init_and_retry_ownership() {
     assert!(nix::unistd::geteuid().is_root());
     for phase in [
@@ -753,7 +753,7 @@ fn retire_kernel(root: &Path) {
 
 #[cfg(feature = "ebpf")]
 #[tokio::test]
-#[ignore = "requires isolated Linux root, bpffs, real runc/ip/nft and static BusyBox"]
+#[ignore = "requires isolated Linux root, bpffs, real runc/ip/nft and static BusyBox; run through scripts/release/qualify-oci-interruptions.sh"]
 async fn normal_standalone_bun_recovers_durable_kernel_and_discovery() {
     let root = tempfile::tempdir().unwrap().keep();
     let _cleanup = RootCleanup(root.clone());
@@ -812,7 +812,7 @@ async fn normal_standalone_bun_recovers_durable_kernel_and_discovery() {
 /// Containers survive because Runc gives them cgroups of their own.
 #[cfg(feature = "ebpf")]
 #[tokio::test]
-#[ignore = "requires isolated Linux root, cgroup v2, bpffs, real runc/ip/nft and static BusyBox"]
+#[ignore = "requires isolated Linux root, cgroup v2, bpffs, real runc/ip/nft and static BusyBox; run through scripts/release/qualify-oci-interruptions.sh"]
 async fn service_cgroup_kill_of_bun_and_owners_retires_the_launch_and_redeploys() {
     let root = tempfile::tempdir().unwrap().keep();
     let _cleanup = RootCleanup(root.clone());
@@ -860,7 +860,7 @@ async fn service_cgroup_kill_of_bun_and_owners_retires_the_launch_and_redeploys(
 
 #[cfg(feature = "ebpf")]
 #[tokio::test]
-#[ignore = "requires isolated Linux root, bpffs, real runc/ip/nft and static BusyBox"]
+#[ignore = "requires isolated Linux root, bpffs, real runc/ip/nft and static BusyBox; run through scripts/release/qualify-oci-interruptions.sh"]
 async fn automatic_restart_bun_death_before_adoption_retires_the_unrecorded_successor() {
     let root = tempfile::tempdir().unwrap().keep();
     let _cleanup = RootCleanup(root.clone());
@@ -1068,7 +1068,7 @@ async fn upgrade_and_rollback(root: &Path, node: &Node, key: &[u8]) {
 
 #[cfg(feature = "ebpf")]
 #[tokio::test]
-#[ignore = "requires isolated Linux root, bpffs, real runc/ip/nft and static BusyBox"]
+#[ignore = "requires isolated Linux root, bpffs, real runc/ip/nft and static BusyBox; run through scripts/release/qualify-oci-interruptions.sh"]
 async fn normal_owned_bun_upgrade_and_rollback_preserve_runtime_and_kernel() {
     let root = tempfile::tempdir().unwrap().keep();
     let _cleanup = RootCleanup(root.clone());
@@ -1094,7 +1094,7 @@ async fn normal_owned_bun_upgrade_and_rollback_preserve_runtime_and_kernel() {
 
 #[cfg(feature = "ebpf")]
 #[tokio::test]
-#[ignore = "requires unprivileged Linux user, rootless runc/slirp and static BusyBox"]
+#[ignore = "requires unprivileged Linux user, rootless runc/slirp and static BusyBox; run with make test-rootless-runc"]
 async fn normal_rootless_bun_recovers_owned_forward_and_discovery() {
     assert!(!nix::unistd::geteuid().is_root());
     let root = tempfile::tempdir().unwrap().keep();
@@ -1161,7 +1161,7 @@ async fn normal_rootless_bun_recovers_owned_forward_and_discovery() {
 
 #[cfg(feature = "ebpf")]
 #[tokio::test]
-#[ignore = "requires isolated Linux root, bpffs, real runc/ip/nft and static BusyBox"]
+#[ignore = "requires isolated Linux root, bpffs, real runc/ip/nft and static BusyBox; run through scripts/release/qualify-oci-interruptions.sh"]
 async fn normal_clustered_bun_recovers_enrolled_consumer_before_adoption() {
     use reliaburger::config::node::NodeConfig;
     use sha2::{Digest, Sha256};
@@ -1438,7 +1438,7 @@ async fn enrolled_upgrade_fixture(
 
 #[cfg(feature = "ebpf")]
 #[tokio::test]
-#[ignore = "requires isolated Linux root, bpffs, real runc/ip/nft and static BusyBox"]
+#[ignore = "requires isolated Linux root, bpffs, real runc/ip/nft and static BusyBox; run through scripts/release/qualify-oci-interruptions.sh"]
 async fn three_enrolled_oci_nodes_preserve_ownership_through_upgrade_and_rollback() {
     let root = tempfile::tempdir().unwrap().keep();
     let _cleanup = RootCleanup(root.clone());
@@ -1582,7 +1582,7 @@ async fn three_enrolled_oci_nodes_preserve_ownership_through_upgrade_and_rollbac
 
 #[cfg(feature = "ebpf")]
 #[tokio::test]
-#[ignore = "requires Linux root and private mount namespaces"]
+#[ignore = "requires Linux root and private mount namespaces; run through scripts/release/qualify-oci-interruptions.sh"]
 async fn managed_guest_startup_establishes_bpffs_before_bun() {
     let command = reliaburger::relish::quickstart::provision::SERVICE
         .lines()

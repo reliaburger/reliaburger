@@ -8,7 +8,11 @@
 # Pushes, schedules and manual runs get everything. Pull requests are judged
 # by the files they change against their base. Stacked PRs (base other than
 # main) skip the heavy suites unless labelled full-ci; they run in full once
-# the PR targets main.
+# the PR targets main. Retargeting a PR (GitHub does it when the branch under
+# it merges) reruns this through ci-retarget.yml, so the heavy suites don't
+# wait for the next push.
+#
+# Fixtures: scripts/ci/test_select_jobs.py.
 #
 # Inputs (environment): EVENT, BASE_REF, BASE_SHA, FULL_CI ("true"/"false"),
 # and optionally HEAD_SHA (defaults to HEAD).
@@ -26,7 +30,9 @@ if [ "${EVENT}" != "pull_request" ]; then
     exit 0
 fi
 
-changed=$(git diff --name-only "${BASE_SHA}...${HEAD_SHA:-HEAD}")
+# --no-renames lists both sides of a move: with rename detection Git names
+# only the destination, so moving src/x.rs to docs/x.md looked docs-only.
+changed=$(git diff --no-renames --name-only "${BASE_SHA}...${HEAD_SHA:-HEAD}")
 
 # Documentation that neither the build nor any test reads. The manual is
 # compiled into relish, and documentation_first_run checks snippets in the

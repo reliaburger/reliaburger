@@ -356,7 +356,7 @@ https_port = {https}
 }
 
 #[tokio::test]
-#[ignore = "requires root, runc, nftables, bpffs and the pinned images (local test mirror or internet access)"]
+#[ignore = "requires root, runc, nftables, bpffs and the pinned images (local test mirror or internet access); run with make test-linux"]
 async fn podinfo_demo_frontend_reaches_backend_and_redis_by_name() {
     let demo = start_demo("").await;
 
@@ -396,7 +396,7 @@ async fn podinfo_demo_frontend_reaches_backend_and_redis_by_name() {
 /// frontend's own connections to redis, including the ones its pool already
 /// holds open.
 #[tokio::test]
-#[ignore = "requires root, runc, nftables, bpffs and the pinned images (local test mirror or internet access)"]
+#[ignore = "requires root, runc, nftables, bpffs and the pinned images (local test mirror or internet access); run with make test-linux"]
 async fn podinfo_demo_feels_network_faults_between_frontend_and_redis() {
     use reliaburger::smoker::types::{FaultRequest, FaultType};
 

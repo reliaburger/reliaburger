@@ -56,7 +56,7 @@ async fn wait_until(timeout: Duration, cond: impl FnMut() -> bool) -> bool {
 /// move; the recovery code chooses a healthy follower to campaign instead so
 /// the resigning leader actually hands off.
 #[tokio::test]
-#[ignore = "requires RELIABURGER_CLUSTER_TESTS=1 and a multi-core host"]
+#[ignore = "requires RELIABURGER_CLUSTER_TESTS=1 and a multi-core host; run with make test-cluster"]
 async fn trigger_elect_advances_term_and_can_move_leadership() {
     assert!(
         cluster_tests_enabled(),
@@ -117,7 +117,7 @@ async fn trigger_elect_advances_term_and_can_move_leadership() {
 /// node keeps its Raft up (this is resignation, not death), so the council
 /// stays whole.
 #[tokio::test]
-#[ignore = "requires RELIABURGER_CLUSTER_TESTS=1 and a multi-core host"]
+#[ignore = "requires RELIABURGER_CLUSTER_TESTS=1 and a multi-core host; run with make test-cluster"]
 async fn pressured_leader_resigns_and_leadership_moves() {
     assert!(
         cluster_tests_enabled(),
@@ -207,7 +207,7 @@ async fn pressured_leader_resigns_and_leadership_moves() {
 /// leads. This is what closes the gap where production `start()` used to feed
 /// the reconciler a permanently empty set.
 #[tokio::test]
-#[ignore = "requires RELIABURGER_CLUSTER_TESTS=1 and a multi-core host"]
+#[ignore = "requires RELIABURGER_CLUSTER_TESTS=1 and a multi-core host; run with make test-cluster"]
 async fn disk_pressure_advertised_over_gossip_drives_resignation() {
     assert!(
         cluster_tests_enabled(),
@@ -341,7 +341,7 @@ async fn disk_pressure_advertised_over_gossip_drives_resignation() {
 /// self-healing reconciler regrows the council. The restored desired state
 /// still knows the apps that were registered before the loss.
 #[tokio::test]
-#[ignore = "requires RELIABURGER_CLUSTER_TESTS=1 and a multi-core host"]
+#[ignore = "requires RELIABURGER_CLUSTER_TESTS=1 and a multi-core host; run with make test-cluster"]
 async fn full_council_loss_recovers_from_backup() {
     assert!(
         cluster_tests_enabled(),

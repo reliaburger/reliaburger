@@ -39,7 +39,7 @@ fn checkpoint(root: &Path) -> PathBuf {
 }
 
 #[test]
-#[ignore = "requires root, loop devices and RELIABURGER_BTRFS_TESTS=1"]
+#[ignore = "requires root, loop devices and RELIABURGER_BTRFS_TESTS=1; run with make test-linux"]
 fn lease_loop_storage_keeps_busy_mount_then_retries_cleanup() {
     provisioned();
     let root = tempfile::tempdir().unwrap();
@@ -88,7 +88,7 @@ fn lease_loop_storage_keeps_busy_mount_then_retries_cleanup() {
 }
 
 #[test]
-#[ignore = "requires root, Btrfs tools and RELIABURGER_BTRFS_TESTS=1"]
+#[ignore = "requires root, Btrfs tools and RELIABURGER_BTRFS_TESTS=1; run with make test-linux"]
 fn lease_btrfs_storage_deletes_subvolume_and_preserves_other_namespace() {
     provisioned();
     let scratch = tempfile::tempdir().unwrap();
@@ -134,7 +134,7 @@ fn lease_btrfs_storage_deletes_subvolume_and_preserves_other_namespace() {
 }
 
 #[test]
-#[ignore = "requires root, mount tools and RELIABURGER_BTRFS_TESTS=1"]
+#[ignore = "requires root, mount tools and RELIABURGER_BTRFS_TESTS=1; run with make test-linux"]
 fn lease_unowned_nested_mount_keeps_storage_until_removed() {
     provisioned();
     let root = tempfile::tempdir().unwrap();
@@ -169,7 +169,7 @@ fn lease_unowned_nested_mount_keeps_storage_until_removed() {
 }
 
 #[test]
-#[ignore = "requires root, loop devices and RELIABURGER_BTRFS_TESTS=1"]
+#[ignore = "requires root, loop devices and RELIABURGER_BTRFS_TESTS=1; run with make test-linux"]
 fn lease_loop_storage_survives_owner_process_death() {
     provisioned();
     const CHILD_ROOT: &str = "RELIABURGER_STORAGE_CRASH_TEST_ROOT";
