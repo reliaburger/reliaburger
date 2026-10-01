@@ -181,9 +181,9 @@ impl StatusReader {
 
 /// The published statuses, with every instance's runtime evidence read under
 /// one shared deadline, [`STATUS_RUNTIME_READ_TIMEOUT`], at most
-/// [`STATUS_RUNTIME_READ_CONCURRENCY`] at a time. An instance whose runtime
-/// hasn't answered by then is reported with what the loop knew and
-/// `runtime_unknown` set.
+/// [`STATUS_RUNTIME_READ_CONCURRENCY`] at a time. A read that hasn't
+/// answered by then leaves its part to what the loop knew and sets
+/// `runtime_unknown`; the reads that did answer are still reported.
 pub(super) async fn read_status<G: Grill>(
     grill: &G,
     snapshot: &StatusSnapshot,
@@ -227,33 +227,37 @@ async fn complete_entry<G: Grill>(
     };
     let id = InstanceId(status.id.clone());
     // The three reads run side by side, so the liveness check doesn't eat
-    // into the deadline the pid and exit code had before it existed.
-    let read = async {
-        let exited =
-            async { alive && matches!(grill.state(&id).await, Ok(ContainerState::Stopped)) };
-        let exit_code = async {
-            match recorded_exit {
-                Some(code) => code,
-                None => grill.exit_code(&id).await,
-            }
-        };
-        tokio::join!(exited, grill.pid(&id), exit_code)
+    // into the deadline the pid and exit code had before it existed. Each
+    // has its own timeout, so one that misses the deadline doesn't take the
+    // others' answers with it: runc serialises an instance's calls, and a
+    // liveness check stuck behind the health sweep's must not hide a pid
+    // that answered (#358). `timeout_at` polls once even past the deadline,
+    // so a read that answers at once is never marked unknown.
+    let exited = async {
+        if !alive {
+            return Ok(false);
+        }
+        tokio::time::timeout_at(deadline, grill.state(&id))
+            .await
+            .map(|state| matches!(state, Ok(ContainerState::Stopped)))
     };
-    // `timeout_at` polls the read once even past the deadline, so an
-    // instance that answers at once is never marked unknown.
-    match tokio::time::timeout_at(deadline, read).await {
-        Ok((exited, pid, exit_code)) => {
-            if exited {
-                // The loop hasn't noticed yet; its next tick will.
-                status.state = ContainerState::Stopped.to_string();
-            }
-            status.pid = pid;
-            status.exit_code = exit_code;
+    let pid = tokio::time::timeout_at(deadline, grill.pid(&id));
+    let exit_code = async {
+        match recorded_exit {
+            Some(code) => Ok(code),
+            None => tokio::time::timeout_at(deadline, grill.exit_code(&id)).await,
         }
-        Err(_) => {
-            status.exit_code = recorded_exit.flatten();
-            status.runtime_unknown = true;
-        }
+    };
+    let (exited, pid, exit_code) = tokio::join!(exited, pid, exit_code);
+    status.runtime_unknown = exited.is_err() || pid.is_err() || exit_code.is_err();
+    // A missing liveness verdict leaves the loop's view of the state.
+    let exited = exited.unwrap_or(false);
+    if exited {
+        // The loop hasn't noticed yet; its next tick will.
+        status.state = ContainerState::Stopped.to_string();
     }
+    // An exited instance has no process, whatever the pid read saw first.
+    status.pid = pid.ok().flatten().filter(|_| !exited);
+    status.exit_code = exit_code.unwrap_or(recorded_exit.flatten());
     status
 }
