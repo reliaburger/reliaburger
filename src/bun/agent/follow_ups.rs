@@ -28,6 +28,8 @@ pub(super) enum FollowUp {
         cluster_nodes: crate::firewall::rules::ClusterNodes,
         result: Result<(), crate::firewall::rules::FirewallError>,
     },
+    /// A node-pressure helper started or stopped.
+    NodePressure(super::node_pressure_work::PressureDone),
     /// The egress allowlists were re-resolved.
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
     EgressResolved(Vec<super::egress_resolution::Resolution>),
@@ -106,6 +108,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     Ok(()) => self.last_firewall_nodes = Some(cluster_nodes),
                     Err(error) => eprintln!("warning: firewall reconciliation failed: {error}"),
                 }
+            }
+            Ok((_, FollowUp::NodePressure(done))) => {
+                self.finish_node_pressure(done).await;
             }
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
             Ok((_, FollowUp::EgressResolved(resolutions))) => {

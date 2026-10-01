@@ -186,6 +186,30 @@ impl NodePressureController {
         self.available
     }
 
+    /// Whether `apply` would accept this request now: within the server's
+    /// limits, on a usable controller, with no other pressure fault active.
+    /// Cheap, so the agent loop can refuse a request before it hands the
+    /// helper's start to a task.
+    pub fn check_apply(&self, cpu_percentage: u8, memory_percentage: u8) -> Result<(), String> {
+        validate_request(cpu_percentage, memory_percentage, self.limits)?;
+        if !self.available {
+            return Err(
+                "node pressure requires an enabled rootful Linux cgroup-v2 controller".to_string(),
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        return Err("node pressure requires Linux cgroup v2".to_string());
+        #[cfg(target_os = "linux")]
+        if !self.active.is_empty() {
+            return Err(
+                "a node-pressure fault is already active; clear it before starting another"
+                    .to_string(),
+            );
+        }
+        #[cfg(target_os = "linux")]
+        Ok(())
+    }
+
     /// Start one bounded helper. Concurrent pressure faults are refused so
     /// independent requests cannot add up past the configured ceiling.
     pub async fn apply(
@@ -194,12 +218,7 @@ impl NodePressureController {
         cpu_percentage: u8,
         memory_percentage: u8,
     ) -> Result<(), String> {
-        validate_request(cpu_percentage, memory_percentage, self.limits)?;
-        if !self.available {
-            return Err(
-                "node pressure requires an enabled rootful Linux cgroup-v2 controller".to_string(),
-            );
-        }
+        self.check_apply(cpu_percentage, memory_percentage)?;
 
         #[cfg(not(target_os = "linux"))]
         {
@@ -209,12 +228,6 @@ impl NodePressureController {
 
         #[cfg(target_os = "linux")]
         {
-            if !self.active.is_empty() {
-                return Err(
-                    "a node-pressure fault is already active; clear it before starting another"
-                        .to_string(),
-                );
-            }
             let executable = self
                 .executable
                 .as_ref()
@@ -377,6 +390,27 @@ impl NodePressureController {
             }
             Ok(())
         }
+    }
+
+    /// Terminate every helper this controller started, for shutdown.
+    pub async fn clear_all(&mut self) {
+        #[cfg(target_os = "linux")]
+        {
+            let ids: Vec<FaultId> = self.active.keys().copied().collect();
+            for id in ids {
+                if let Err(error) = self.clear(id).await {
+                    eprintln!("smoker: clear node pressure for {id} failed: {error}");
+                }
+            }
+        }
+    }
+
+    /// Whether a lingering cgroup directory awaits `retry_pending_cleanup`.
+    pub fn has_pending_cleanup(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        return !self.pending_cleanup.is_empty();
+        #[cfg(not(target_os = "linux"))]
+        false
     }
 
     /// Establish that no pressure process remains, including helpers inherited

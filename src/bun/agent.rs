@@ -106,6 +106,21 @@ const HEALTH_TICK_INTERVAL: std::time::Duration = std::time::Duration::from_secs
 /// Probes, restarts and retirements stall for as long as it waits.
 const HEALTH_TICK_STARVATION_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How long shutdown waits for node-pressure helpers to stop: one helper's
+/// two-second exit wait plus its cgroup removal, with room to spare.
+const SHUTDOWN_PRESSURE_CLEAR: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// What fencing a node fault left for a task to finish.
+enum NodeFaultFence {
+    /// Nothing: the grant is fenced and its slot free.
+    Done,
+    /// Stop the fenced pressure fault's helper, if there is one, and confirm
+    /// no helper is left, then free the slot.
+    Pressure {
+        fenced: Option<crate::smoker::types::FaultId>,
+    },
+}
+
 /// Grace period between SIGTERM and SIGKILL during shutdown.
 const SHUTDOWN_GRACE_SECS: u64 = 5;
 
@@ -1983,6 +1998,7 @@ mod follow_ups;
 mod identity_signing;
 mod launch_evidence;
 mod logs;
+mod node_pressure_work;
 mod off_loop_work;
 mod producer_release;
 mod restarts;
@@ -2124,7 +2140,9 @@ pub struct BunAgent<G: Grill> {
     node_fault_fence: crate::smoker::reservation::NodeFaultFence,
     node_drain_gate: crate::smoker::node_fault::NodeDrainGate,
     /// Owned helper processes and cgroups for node-scoped capacity pressure.
-    node_pressure: crate::smoker::node_pressure::NodePressureController,
+    /// The node-pressure controller, which tasks lock to start and stop its
+    /// helper off the loop.
+    node_pressure: node_pressure_work::SharedPressure,
     /// eBPF program handle for writing fault maps (Linux + ebpf feature only).
     /// `None` on macOS or when eBPF is not loaded.
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
@@ -2434,7 +2452,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 .stop_confirmation_timeout(),
             node_fault_fence: crate::smoker::reservation::NodeFaultFence::default(),
             node_drain_gate: crate::smoker::node_fault::NodeDrainGate::new(),
-            node_pressure: crate::smoker::node_pressure::NodePressureController::default(),
+            node_pressure: Default::default(),
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
             onion_ebpf: None,
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
@@ -2572,7 +2590,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 .stop_confirmation_timeout(),
             node_fault_fence: crate::smoker::reservation::NodeFaultFence::default(),
             node_drain_gate: crate::smoker::node_fault::NodeDrainGate::new(),
-            node_pressure: crate::smoker::node_pressure::NodePressureController::default(),
+            node_pressure: Default::default(),
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
             onion_ebpf: None,
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
@@ -2839,7 +2857,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         limits: crate::smoker::node_pressure::NodePressureLimits,
         executable: std::path::PathBuf,
     ) -> bool {
-        self.node_pressure.configure(limits, executable)
+        // Configuration happens before the loop starts, so no task holds it.
+        self.node_pressure
+            .try_lock()
+            .is_ok_and(|mut controller| controller.configure(limits, executable))
     }
 
     /// Record detected platform capabilities (GPUs, rootless mode) so the
@@ -5310,11 +5331,20 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 reservation,
                 response,
             } => {
-                let result = self
-                    .fence_node_fault(&reservation, only_if_finished)
+                match self
+                    .fence_node_fault_up_to_pressure(&reservation, only_if_finished)
                     .await
-                    .map_err(|reason| BunError::FaultRejected { reason });
-                let _ = response.send(result);
+                {
+                    Ok(NodeFaultFence::Done) => {
+                        let _ = response.send(Ok(()));
+                    }
+                    Ok(NodeFaultFence::Pressure { fenced }) => {
+                        self.spawn_node_pressure_fence(reservation, fenced, response);
+                    }
+                    Err(reason) => {
+                        let _ = response.send(Err(BunError::FaultRejected { reason }));
+                    }
+                }
             }
             AgentCommand::InjectFault {
                 reservation,
@@ -5381,6 +5411,27 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 if let Some(grant) = &reservation {
                     self.node_fault_fence.active = Some((grant.sequence, rule.id));
                 }
+                // A pressure helper takes seconds to start; it starts in a
+                // task, and the caller hears once it runs (#351, stage 3).
+                if let crate::smoker::types::FaultType::NodePressure {
+                    cpu_percentage,
+                    memory_percentage,
+                } = rule.fault_type
+                {
+                    match self.check_node_pressure(&rule, cpu_percentage, memory_percentage) {
+                        Ok(()) => self.spawn_node_pressure_start(
+                            rule.id,
+                            cpu_percentage,
+                            memory_percentage,
+                            response,
+                        ),
+                        Err(reason) => {
+                            self.fault_registry.remove(rule.id);
+                            let _ = response.send(Err(BunError::FaultRejected { reason }));
+                        }
+                    }
+                    return;
+                }
                 match self.apply_fault(&rule).await {
                     Ok(()) => {
                         let summary = crate::smoker::types::FaultSummary::from(&rule);
@@ -5439,14 +5490,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                             crate::smoker::types::FaultType::NodePressure { .. }
                         );
                         if node_pressure {
-                            // LOOP-INLINE: stage 3 of #351: fault apply and reversal leave the loop
-                            if let Err(reason) = self.node_pressure.clear(rule.id).await {
-                                let _ = response.send(Err(BunError::FaultRejected { reason }));
-                                return;
-                            }
-                        } else {
-                            self.reverse_fault(&rule).await;
+                            // The helper stops in a task, and the caller hears
+                            // once it's gone (#351, stage 3).
+                            self.spawn_node_pressure_clearance(rule, reservation, response);
+                            return;
                         }
+                        self.reverse_fault(&rule).await;
                         self.fault_registry.remove(fault_id);
                         // Network faults are converged from the registry, so
                         // reconciling without the rule takes its kernel state
@@ -6169,15 +6218,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 cpu_percentage,
                 memory_percentage,
             } => {
-                if rule.duration_ns == 0 {
-                    return Err("node pressure requires a non-zero duration".to_string());
-                }
-                // LOOP-INLINE: stage 3 of #351: fault apply and reversal leave the loop
-                self.node_pressure
-                    .apply(rule.id, *cpu_percentage, *memory_percentage)
-                    .await?;
-                self.record_reversal(rule.id, crate::smoker::types::FaultReversal::NodePressure);
-                Ok(())
+                // `InjectFault` starts a pressure helper itself, off the loop
+                // (`spawn_node_pressure_start`); here it can only be refused.
+                self.check_node_pressure(rule, *cpu_percentage, *memory_percentage)?;
+                Err("node pressure starts from InjectFault, which waits for its helper".to_string())
             }
             FaultType::CouncilPartition { peers } => {
                 // Block both the gossip and Raft transports to each named
@@ -6355,12 +6399,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         "8:0".to_string()
     }
 
-    /// Serialise the fence with activation and retain ownership if cleanup fails.
-    async fn fence_node_fault(
+    /// Serialise the fence with activation and retain ownership if cleanup
+    /// fails. A pressure grant's helper is stopped, and its absence
+    /// confirmed, off the loop: that's what `Pressure` hands back.
+    async fn fence_node_fault_up_to_pressure(
         &mut self,
         grant: &crate::smoker::reservation::NodeFaultReservation,
         only_if_finished: bool,
-    ) -> Result<(), String> {
+    ) -> Result<NodeFaultFence, String> {
         if only_if_finished
             && (!self.node_fault_fence.consumed(grant)
                 || (grant.boot_id == self.node_fault_fence.boot_id
@@ -6370,6 +6416,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         {
             return Err("node fault activation or reversal is still pending".into());
         }
+        let pressure = matches!(
+            grant.request.fault_type,
+            crate::smoker::types::FaultType::NodePressure { .. }
+        );
+        let mut fenced = None;
         if let Some(id) = self.node_fault_fence.fence(grant) {
             if matches!(
                 grant.request.fault_type,
@@ -6380,32 +6431,28 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 // only today's addresses cannot prove the old entries are gone.
                 self.clear_partition().await;
             }
-            if matches!(
-                grant.request.fault_type,
-                crate::smoker::types::FaultType::NodePressure { .. }
-            ) {
-                // LOOP-INLINE: stage 3 of #351: fault apply and reversal leave the loop
-                self.node_pressure.clear(id).await?;
-            }
-            if let Some(rule) = self.fault_registry.get(id).cloned() {
-                if !matches!(
-                    rule.fault_type,
-                    crate::smoker::types::FaultType::NodePressure { .. }
-                ) {
-                    self.reverse_fault(&rule).await;
-                }
+            if pressure {
+                // The registry keeps the fault until its helper is stopped.
+                fenced = Some(id);
+            } else if let Some(rule) = self.fault_registry.get(id).cloned() {
+                self.reverse_fault(&rule).await;
                 self.fault_registry.remove(id);
             }
-            // A failed apply or expiry may have removed its registry entry;
-            // inspect pressure helpers independently before acknowledging.
         }
-        if matches!(
-            grant.request.fault_type,
-            crate::smoker::types::FaultType::NodePressure { .. }
-        ) {
-            // LOOP-INLINE: stage 3 of #351: fault apply and reversal leave the loop
-            self.node_pressure.confirm_no_helpers().await?;
+        // A failed apply or expiry may have removed its registry entry, so a
+        // pressure grant inspects the helpers whether or not it fenced one.
+        if pressure {
+            return Ok(NodeFaultFence::Pressure { fenced });
         }
+        self.release_node_fault_slot(grant);
+        Ok(NodeFaultFence::Done)
+    }
+
+    /// Free the node-experiment slot a fenced grant held.
+    fn release_node_fault_slot(
+        &mut self,
+        grant: &crate::smoker::reservation::NodeFaultReservation,
+    ) {
         if self
             .node_fault_fence
             .active
@@ -6414,6 +6461,31 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         {
             self.node_fault_fence.active = None;
         }
+    }
+
+    /// The whole fence, pressure included, waiting for the helper inline.
+    /// For tests that drive the agent without its loop.
+    #[cfg(test)]
+    async fn fence_node_fault(
+        &mut self,
+        grant: &crate::smoker::reservation::NodeFaultReservation,
+        only_if_finished: bool,
+    ) -> Result<(), String> {
+        let NodeFaultFence::Pressure { fenced } = self
+            .fence_node_fault_up_to_pressure(grant, only_if_finished)
+            .await?
+        else {
+            return Ok(());
+        };
+        let pressure = Arc::clone(&self.node_pressure);
+        let mut controller = pressure.lock().await;
+        if let Some(id) = fenced {
+            controller.clear(id).await?;
+            self.fault_registry.remove(id);
+        }
+        controller.confirm_no_helpers().await?;
+        drop(controller);
+        self.release_node_fault_slot(grant);
         Ok(())
     }
 
@@ -6489,15 +6561,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     );
                 }
             }
-            FaultReversal::NodePressure => {
-                // LOOP-INLINE: stage 3 of #351: fault apply and reversal leave the loop
-                if let Err(error) = self.node_pressure.clear(rule.id).await {
-                    eprintln!(
-                        "smoker: clear node pressure for {} failed: {error}",
-                        rule.id
-                    );
-                }
-            }
+            // Nobody waits on this answer, so the helper stops in a task.
+            FaultReversal::NodePressure => self.spawn_node_pressure_clear(rule.id),
         }
     }
 
@@ -6570,8 +6635,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         // Retry any node-pressure cgroup whose directory lingered after its
         // helper was killed, so a transient removal failure doesn't leave the
         // controller permanently refusing new pressure faults.
-        // LOOP-INLINE: stage 3 of #351: fault apply and reversal leave the loop
-        self.node_pressure.retry_pending_cleanup().await;
+        self.retry_node_pressure_cleanup();
     }
 
     /// Local instances that may call a faulted service.
@@ -6660,8 +6724,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// active, so a source replica that restarts or is scheduled here picks
     /// the fault up. Failures are logged; the next tick retries.
     async fn reconcile_network_faults(&mut self) {
+        // Until it has finished, reconcile_delays programs nothing.
         #[cfg(target_os = "linux")]
-        self.sweep_stale_delays().await;
+        let _ = self.sweep_stale_delays().await;
         let active = self
             .fault_registry
             .iter()
@@ -6741,32 +6806,55 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// container's network namespace, not in Bun, so a crashed Bun would
     /// leave its callers slowed forever. Runs once, on the first reconcile.
     #[cfg(target_os = "linux")]
-    async fn sweep_stale_delays(&mut self) {
+    ///
+    /// Every instance is swept at once, under the turn's runtime budget
+    /// (#351, stage 3). Until every one has been, this returns `false` and
+    /// no delay is programmed, so a late sweep can't take a fresh delay away.
+    async fn sweep_stale_delays(&mut self) -> bool {
         if self.network_faults.delays_swept
             || self.supervisor.grill().runtime_kind() != crate::grill::records::RuntimeKind::Runc
         {
-            return;
+            return true;
         }
-        self.network_faults.delays_swept = true;
         let instances: Vec<String> = self
             .supervisor
             .list_instances()
             .into_iter()
             .map(|instance| instance.id.0.clone())
             .collect();
-        for instance in instances {
-            // LOOP-INLINE: stage 3 of #351: fault apply and reversal leave the loop
-            match remove_delay_tree(&instance).await {
-                Ok(true) => eprintln!("smoker: removed a stale delay from {instance}"),
-                Ok(false) | Err(crate::smoker::network::NetnsCommandError::NoNamespace { .. }) => {}
-                Err(error) => eprintln!("smoker: stale delay sweep: {error}"),
+        let deadline = self.turn_deadline();
+        let sweeps = instances.iter().map(|instance| async move {
+            tokio::time::timeout_at(deadline, remove_delay_tree(instance)).await
+        });
+        // `timeout_at` polls the sweeps before its clock, so at the deadline
+        // the ones that finished still count.
+        let Ok(outcomes) =
+            tokio::time::timeout_at(deadline, futures_util::future::join_all(sweeps)).await
+        else {
+            return false;
+        };
+        let mut swept = true;
+        for (instance, outcome) in instances.iter().zip(outcomes) {
+            match outcome {
+                Ok(Ok(true)) => eprintln!("smoker: removed a stale delay from {instance}"),
+                Ok(
+                    Ok(false) | Err(crate::smoker::network::NetnsCommandError::NoNamespace { .. }),
+                ) => {}
+                Ok(Err(error)) => eprintln!("smoker: stale delay sweep: {error}"),
+                Err(_) => swept = false,
             }
         }
+        self.network_faults.delays_swept = swept;
+        swept
     }
 
     /// Converge every local caller's netem delays on what the active delay
     /// faults ask for. Returns `(instance, error)` for each caller whose
     /// interface couldn't be programmed; those are retried next tick.
+    ///
+    /// The callers are programmed at once, under the turn's runtime budget
+    /// (#351, stage 3). One that doesn't finish in time is a failure, and
+    /// its interface is marked unknown so the next pass rebuilds it.
     #[cfg(target_os = "linux")]
     async fn reconcile_delays(&mut self) -> Vec<(String, String)> {
         use crate::smoker::network::{NetnsCommandError, desired_delays};
@@ -6801,23 +6889,71 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
         let mut instances: std::collections::BTreeSet<String> = desired.keys().cloned().collect();
         instances.extend(self.network_faults.delays.keys().cloned());
+        let changed: Vec<String> = instances
+            .into_iter()
+            .filter(|instance| {
+                let restart = restarts.get(instance).copied().unwrap_or_default();
+                let unchanged = match (
+                    desired.get(instance),
+                    self.network_faults.delays.get(instance),
+                ) {
+                    (Some(wanted), Some((seen_at, installed))) => {
+                        *seen_at == restart && installed == wanted
+                    }
+                    (None, None) => true,
+                    _ => false,
+                };
+                !unchanged
+            })
+            .collect();
+        if changed.is_empty() {
+            return Vec::new();
+        }
+        // A delay programmed before the stale sweep finishes could be swept
+        // away by it.
+        if !self.sweep_stale_delays().await {
+            return changed
+                .into_iter()
+                .map(|instance| {
+                    (
+                        instance,
+                        "the sweep of delays an earlier Bun left is still running".to_string(),
+                    )
+                })
+                .collect();
+        }
+        let deadline = self.turn_deadline();
+        let programs =
+            changed.iter().map(|instance| {
+                let bands = desired.get(instance).cloned().unwrap_or_default();
+                async move {
+                    tokio::time::timeout_at(deadline, program_delay_tree(instance, &bands)).await
+                }
+            });
+        // `timeout_at` polls the programs before its clock, so at the
+        // deadline the ones that finished still count.
+        let outcomes = tokio::time::timeout_at(deadline, futures_util::future::join_all(programs))
+            .await
+            .unwrap_or_default();
+        let mut outcomes = outcomes.into_iter();
         let mut failures = Vec::new();
-        for instance in instances {
+        for instance in changed {
             let wanted = desired.get(&instance);
             let restart = restarts.get(&instance).copied().unwrap_or_default();
-            let unchanged = match (wanted, self.network_faults.delays.get(&instance)) {
-                (Some(wanted), Some((seen_at, installed))) => {
-                    *seen_at == restart && installed == wanted
-                }
-                (None, None) => true,
-                _ => false,
-            };
-            if unchanged {
+            let Some(Ok(outcome)) = outcomes.next() else {
+                // Cut short half-way, the interface is in an unknown state:
+                // remember it as nothing we asked for, so it's rebuilt.
+                self.network_faults
+                    .delays
+                    .insert(instance.clone(), (u32::MAX, Vec::new()));
+                failures.push((
+                    instance,
+                    "programming the delay did not finish within the turn; the next tick retries"
+                        .to_string(),
+                ));
                 continue;
-            }
-            let bands = wanted.map(Vec::as_slice).unwrap_or_default();
-            // LOOP-INLINE: stage 3 of #351: fault apply and reversal leave the loop
-            match program_delay_tree(&instance, bands).await {
+            };
+            match outcome {
                 Ok(()) => match wanted {
                     Some(wanted) => {
                         self.network_faults
@@ -6954,17 +7090,29 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let cuts = connections_to_cut(&landed, &callers, |virtual_ip, port| {
             backend_addresses(&services, virtual_ip, port)
         });
-        for cut in cuts {
-            let args = crate::smoker::network::socket_destroy_args(&cut.backends);
-            // LOOP-INLINE: stage 3 of #351: fault apply and reversal leave the loop
-            match crate::smoker::network::run_in_instance_netns(&cut.instance_id, "ss", &args).await
-            {
-                // Process and host-network workloads have no namespace of
-                // their own; their sockets live in the host's, among every
-                // other caller's, so they are left alone.
-                Ok(_) | Err(crate::smoker::network::NetnsCommandError::NoNamespace { .. }) => {}
-                Err(error) => eprintln!("smoker: cutting open connections: {error}"),
-            }
+        // Cutting is best effort and nothing waits on it, so it runs in a
+        // task: an `ss` per caller namespace is too slow for the loop.
+        if !cuts.is_empty() {
+            tokio::spawn(async move {
+                for cut in cuts {
+                    let args = crate::smoker::network::socket_destroy_args(&cut.backends);
+                    match crate::smoker::network::run_in_instance_netns(
+                        &cut.instance_id,
+                        "ss",
+                        &args,
+                    )
+                    .await
+                    {
+                        // Process and host-network workloads have no
+                        // namespace of their own; their sockets live in the
+                        // host's, among every other caller's, so they are
+                        // left alone.
+                        Ok(_)
+                        | Err(crate::smoker::network::NetnsCommandError::NoNamespace { .. }) => {}
+                        Err(error) => eprintln!("smoker: cutting open connections: {error}"),
+                    }
+                }
+            });
         }
         if failures.is_empty() {
             Ok(())
@@ -11103,6 +11251,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         for rule in &faults {
             self.reverse_fault(rule).await;
         }
+        // A pressure helper stops in a task; this last turn waits for every
+        // one, a start still in flight included, for a few seconds at most.
+        let pressure = Arc::clone(&self.node_pressure);
+        let _ = tokio::time::timeout(SHUTDOWN_PRESSURE_CLEAR, async move {
+            pressure.lock().await.clear_all().await;
+        })
+        .await;
         self.reconcile_network_faults().await;
         self.publish_dns_faults();
 
