@@ -51,7 +51,10 @@ async fn completed_retry(explicit_stop: bool) -> InstanceStatus {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let instance = status(&tx).await;
-            if instance.state == "running" && instance.restart_count == 1 {
+            // The mock keeps reporting the exit it was given, and status
+            // believes the runtime over the loop, so the started retry reads
+            // `stopped`, not `running`.
+            if instance.state == "stopped" && instance.restart_count == 1 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;

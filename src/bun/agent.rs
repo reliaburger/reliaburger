@@ -959,10 +959,12 @@ enum DeployOp {
         old_id: InstanceId,
         reply: oneshot::Sender<Result<(), BunError>>,
     },
-    /// Fence restarts before the worker starts draining or signalling an old instance.
+    /// Fence restarts before the worker starts draining or signalling an old
+    /// instance. A restart already in flight comes back for the worker to
+    /// settle before it signals the runtime.
     BeginRetire {
         old_id: InstanceId,
-        reply: oneshot::Sender<Result<(), BunError>>,
+        reply: oneshot::Sender<Result<Option<restarts::TakenRestart>, BunError>>,
     },
     /// Hand a stopped old instance whose addresses still await remote
     /// withdrawal confirmations to the agent loop, so the rollout can finish.
@@ -1625,7 +1627,10 @@ impl DeployOps {
         .await
     }
 
-    async fn begin_retire(&self, old_id: &InstanceId) -> Result<(), BunError> {
+    async fn begin_retire(
+        &self,
+        old_id: &InstanceId,
+    ) -> Result<Option<restarts::TakenRestart>, BunError> {
         self.call(
             |reply| DeployOp::BeginRetire {
                 old_id: old_id.clone(),
@@ -1774,6 +1779,11 @@ pub struct InstanceStatus {
     /// deadline, so `pid` and `exit_code` are unknown rather than absent.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub runtime_unknown: bool,
+    /// How old the agent loop's published snapshot was when this answer was
+    /// read from it, in milliseconds. Never more than two seconds: a node
+    /// whose loop hasn't published for longer fails the request instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_age_ms: Option<u64>,
 }
 
 /// A workload status with the node that supplied it.
@@ -1911,11 +1921,15 @@ mod discovery_recovery;
 mod egress_ownership;
 mod identity_signing;
 mod producer_release;
+mod restarts;
 mod runtime_inventory;
 mod scale_in_place;
+mod state_sweep;
+mod status_snapshot;
 use app_stop::{AppStop, PendingStops, StopPurpose};
 use discovery_ownership::{DiscoveryOwnership, JournalReference};
 use runtime_inventory::{LOOP_RUNTIME_INVENTORY_TIMEOUT, RUNTIME_INVENTORY_TIMEOUT};
+pub use status_snapshot::{StatusReader, StatusUnavailable};
 
 /// An immutable, owned connectivity trace that can run outside the agent
 /// command loop. Workload probes have explicit timeouts, but even a bounded
@@ -2247,14 +2261,15 @@ pub struct BunAgent<G: Grill> {
     /// Apps adopted at startup and the spec their instances were launched
     /// from, until this agent deploys them again.
     adopted_apps: adopted_placements::AdoptedApps,
-}
-
-/// One instance's runtime view for a status answer.
-struct RuntimeEvidence {
-    pid: Option<u32>,
-    exit_code: Option<i32>,
-    /// The runtime didn't answer before the status deadline.
-    unknown: bool,
+    /// What the loop knew at the end of its last turn, for status readers
+    /// that must not queue behind it.
+    status_tx: watch::Sender<Arc<status_snapshot::StatusSnapshot>>,
+    /// The health tick's runtime state reads, at most one sweep at a time.
+    state_sweeps: tokio::task::JoinSet<state_sweep::StateSweep>,
+    /// Restarts with a runtime step in flight, by instance.
+    restarts: restarts::Restarts,
+    /// Those steps' tasks.
+    restart_steps: tokio::task::JoinSet<restarts::StepResult>,
 }
 
 /// The last instance each phase of `drive_pending_restarts` handled.
@@ -2420,6 +2435,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             restart_rotation: RestartRotation::default(),
             identity_signings: identity_signing::IdentitySignings::new(),
             identity_signing_tasks: tokio::task::JoinSet::new(),
+            status_tx: watch::Sender::new(Arc::new(status_snapshot::StatusSnapshot::new(
+                Vec::new(),
+            ))),
+            state_sweeps: tokio::task::JoinSet::new(),
+            restarts: restarts::Restarts::new(),
+            restart_steps: tokio::task::JoinSet::new(),
             adopted_apps: adopted_placements::AdoptedApps::new(),
         }
     }
@@ -2558,6 +2579,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             restart_rotation: RestartRotation::default(),
             identity_signings: identity_signing::IdentitySignings::new(),
             identity_signing_tasks: tokio::task::JoinSet::new(),
+            status_tx: watch::Sender::new(Arc::new(status_snapshot::StatusSnapshot::new(
+                Vec::new(),
+            ))),
+            state_sweeps: tokio::task::JoinSet::new(),
+            restarts: restarts::Restarts::new(),
+            restart_steps: tokio::task::JoinSet::new(),
             adopted_apps: adopted_placements::AdoptedApps::new(),
         }
     }
@@ -4010,6 +4037,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             readiness.set_capabilities(capabilities).await;
         }
 
+        self.publish_status();
         if let Some(ready) = ready {
             ready.ready();
         }
@@ -4039,7 +4067,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 // report worker asks for a snapshot once per interval. Stop
                 // completions come from stops already started, one each, and
                 // identity signings from provisions already started, at most
-                // one per instance. Every deploy op comes from a deploy task
+                // one per instance. Restart steps are one per restart in
+                // flight (`RESTARTS_IN_FLIGHT_LIMIT` at most), and the tick
+                // runs one state sweep at a time. Every deploy op comes from a deploy task
                 // that waits for its reply before sending the next, so no more
                 // of them wait than there are deploys and probes in flight. Commands come from
                 // any number of callers taking turns; during a `relish test`
@@ -4070,6 +4100,18 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         self.finish_identity_provision(outcome);
                         turn
                     }
+                    Some(outcome) = self.restart_steps.join_next_with_id(),
+                        if !self.restart_steps.is_empty() => {
+                        let turn = self.loop_meter.begin(LoopBranch::RestartStep, None);
+                        self.finish_restart_step(outcome).await;
+                        turn
+                    }
+                    Some(sweep) = self.state_sweeps.join_next(),
+                        if !self.state_sweeps.is_empty() => {
+                        let turn = self.loop_meter.begin(LoopBranch::StateSweep, None);
+                        self.apply_state_sweep(sweep).await;
+                        turn
+                    }
                     Some(op) = self.deploy_ops_rx.recv() => {
                         let turn = self.loop_meter.begin(LoopBranch::DeployOp, Some(op.name()));
                         self.handle_deploy_op(op).await;
@@ -4094,6 +4136,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             if let Err(error) = self.refresh_consumer_view().await {
                 eprintln!("bun: consumer view refresh awaits retry: {error}");
             }
+            // Status readers answer from this, not by queueing for a turn.
+            self.publish_status();
             self.loop_meter.finish(turn);
         }
     }
@@ -4109,9 +4153,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.drive_deferred_retirements().await;
         self.refresh_egress_readiness().await;
         self.run_health_checks().await;
-        self.check_jobs().await;
         self.fire_due_jobs().await;
-        self.check_apps().await;
+        self.begin_state_sweep();
         self.drive_pending_restarts().await;
         self.expire_faults().await;
         self.reconcile_firewall().await;
@@ -4794,8 +4837,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 }
             }
             AgentCommand::Status { response } => {
-                let statuses = self.get_status().await;
-                let _ = response.send(statuses);
+                // Publish now so the answer reflects every earlier command,
+                // and read the runtime's evidence off the loop.
+                let snapshot = self.publish_status();
+                let grill = self.supervisor.grill().clone();
+                tokio::spawn(async move {
+                    let statuses = status_snapshot::read_status(&grill, &snapshot).await;
+                    let _ = response.send(statuses);
+                });
             }
             AgentCommand::ScrapeTargets { response } => {
                 let targets = self
@@ -8765,194 +8814,246 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.begin_deploy(config, events_tx, false, false).await;
     }
 
-    /// Monitor running job instances for process exit.
-    ///
-    /// For each running job, polls the runtime to see if the process has
-    /// exited. On success (exit code 0), transitions to Stopped. On
-    /// failure, attempts a restart or marks as Failed if the retry limit
-    /// is exhausted.
-    async fn check_jobs(&mut self) {
-        let now = Instant::now();
-
-        // Check running job instances for process exit
-        let running_jobs: Vec<InstanceId> = self
-            .supervisor
+    /// The instances whose runtime state a sweep should read: running apps
+    /// (to catch a crash that no health check would) and running jobs that
+    /// haven't recorded an exit yet, filtered by `include`.
+    fn plan_state_reads(
+        &self,
+        include: impl Fn(&WorkloadInstance) -> bool,
+    ) -> Vec<state_sweep::StateRead> {
+        self.supervisor
             .list_instances()
-            .iter()
-            .filter(|i| {
-                i.is_job
-                    && i.state == ContainerState::Running
-                    && self
-                        .recorded_jobs
-                        .get(&i.id.0)
-                        .is_some_and(|job| job.phase == super::jobs::JobPhase::Launching)
+            .into_iter()
+            .filter(|instance| {
+                instance.state == ContainerState::Running
+                    && (!instance.is_job
+                        || self
+                            .recorded_jobs
+                            .get(&instance.id.0)
+                            .is_some_and(|job| job.phase == super::jobs::JobPhase::Launching))
+                    && include(instance)
             })
-            .map(|i| i.id.clone())
-            .collect();
+            .map(|instance| state_sweep::StateRead {
+                id: instance.id.clone(),
+                incarnation: state_sweep::Incarnation::of(instance),
+                is_job: instance.is_job,
+            })
+            .collect()
+    }
 
-        for id in running_jobs {
-            // LOOP-INLINE: stage 2 of #351: check_jobs reads bounded and in parallel
-            let grill_state = match self.supervisor.grill().state(&id).await {
-                Ok(s) => s,
-                Err(_) => continue,
+    /// Start a sweep of every running app's and job's runtime state, unless
+    /// the last one hasn't reported yet. The reads run off the loop; the
+    /// sweep's `select!` branch applies what they saw.
+    fn begin_state_sweep(&mut self) {
+        if !self.state_sweeps.is_empty() {
+            return;
+        }
+        let reads = self.plan_state_reads(|_| true);
+        if reads.is_empty() {
+            return;
+        }
+        let grill = self.supervisor.grill().clone();
+        self.state_sweeps
+            .spawn(state_sweep::sweep_states(grill, reads));
+    }
+
+    /// Apply a finished sweep: every app or job it saw exit goes through
+    /// the restart or job-outcome path, if it's still the incarnation the
+    /// sweep read and still Running.
+    async fn apply_state_sweep(
+        &mut self,
+        sweep: Result<state_sweep::StateSweep, tokio::task::JoinError>,
+    ) {
+        let sweep = match sweep {
+            Ok(sweep) => sweep,
+            Err(error) => {
+                eprintln!("bun: runtime state sweep failed: {error}");
+                return;
+            }
+        };
+        for (read, observed) in sweep.observations {
+            let state_sweep::Observed::Exited { exit_code } = observed else {
+                continue;
             };
-
-            if grill_state == ContainerState::Stopped {
-                // LOOP-INLINE: stage 2 of #351: check_jobs reads bounded and in parallel
-                let exit_code = self.supervisor.grill().exit_code(&id).await;
-                let phase = match exit_code {
-                    Some(code) => super::jobs::JobPhase::Exited { code },
-                    None => super::jobs::JobPhase::Unknown,
-                };
-                if let Err(error) = self.record_observed_job_exit(&id, phase).await {
-                    eprintln!("bun: job outcome retained as uncertain for {id}: {error}");
-                    continue;
-                }
-
-                // Transition Running → Stopping → Stopped
-                if let Some(instance) = self.supervisor.get_instance_mut(&id) {
-                    instance.retry_pending = exit_code.is_some_and(|code| code != 0);
-                    if let Ok(s) = instance.state.transition_to(ContainerState::Stopping) {
-                        instance.state = s;
-                    }
-                    if let Ok(s) = instance.state.transition_to(ContainerState::Stopped) {
-                        instance.state = s;
-                    }
-                }
-
-                if exit_code.is_none() {
-                    self.record_event(
-                        crate::bun::events::EventKind::JobFailed,
-                        crate::bun::events::EventSeverity::Warning,
-                        None,
-                        None,
-                        format!("job {id} outcome unknown; explicit rerun required"),
-                    )
-                    .await;
-                    continue;
-                }
-                if exit_code == Some(0) {
-                    // Job completed successfully — stays in Stopped
-                    if let Some(instance) = self.supervisor.get_instance(&id) {
-                        self.record_event(
-                            crate::bun::events::EventKind::JobCompleted,
-                            crate::bun::events::EventSeverity::Info,
-                            Some(instance.app_name.clone()),
-                            Some(instance.namespace.clone()),
-                            format!("job {} completed", instance.app_name),
-                        )
-                        .await;
-                    }
-                    continue;
-                }
-
-                // Job failed — attempt restart
-                // LOOP-INLINE: in-memory lock, no I/O
-                match self.supervisor.maybe_restart(&id, now).await {
-                    Ok(true) => {
-                        // Now in Pending — drive_pending_restarts will handle it
-                        if let Some(instance) = self.supervisor.get_instance(&id) {
-                            self.record_event(
-                                crate::bun::events::EventKind::Restart,
-                                crate::bun::events::EventSeverity::Warning,
-                                Some(instance.app_name.clone()),
-                                Some(instance.namespace.clone()),
-                                format!(
-                                    "instance {} restarted (attempt {})",
-                                    id.0, instance.restart_count
-                                ),
-                            )
-                            .await;
-                        }
-                    }
-                    Ok(false) => {
-                        // Backoff not elapsed — will retry on next tick
-                    }
-                    Err(_) => {
-                        // Exceeded restart limit — mark as Failed
-                        if let Some(instance) = self.supervisor.get_instance_mut(&id)
-                            && let Ok(s) = instance.state.transition_to(ContainerState::Failed)
-                        {
-                            instance.state = s;
-                            instance.retry_pending = false;
-                        }
-                        if let Some(instance) = self.supervisor.get_instance(&id) {
-                            self.record_event(
-                                crate::bun::events::EventKind::JobFailed,
-                                crate::bun::events::EventSeverity::Warning,
-                                Some(instance.app_name.clone()),
-                                Some(instance.namespace.clone()),
-                                format!("job {} failed", instance.app_name),
-                            )
-                            .await;
-                        }
-                    }
-                }
+            let current = self
+                .supervisor
+                .get_instance(&read.id)
+                .is_some_and(|instance| {
+                    instance.state == ContainerState::Running
+                        && state_sweep::Incarnation::of(instance) == read.incarnation
+                });
+            if !current {
+                continue;
+            }
+            if read.is_job {
+                self.observe_job_exit(&read.id, exit_code).await;
+            } else {
+                self.observe_app_exit(&read.id).await;
             }
         }
     }
 
-    /// Detect crashed app instances and restart them.
-    ///
-    /// Health checks catch an app that fails its probe, but an app *without* a
-    /// health check that crashes was previously reported Running forever —
-    /// nothing polled the runtime. This polls non-job Running apps and, when the
-    /// container has exited, routes them through the restart path.
-    async fn check_apps(&mut self) {
-        let now = Instant::now();
-        let running_apps: Vec<InstanceId> = self
-            .supervisor
-            .list_instances()
-            .iter()
-            .filter(|i| !i.is_job && i.state == ContainerState::Running)
-            .map(|i| i.id.clone())
-            .collect();
+    /// A running job's process has exited. Record its outcome; on failure,
+    /// attempt a restart or mark it Failed if the retry limit is exhausted.
+    async fn observe_job_exit(&mut self, id: &InstanceId, exit_code: Option<i32>) {
+        let launching = self
+            .recorded_jobs
+            .get(&id.0)
+            .is_some_and(|job| job.phase == super::jobs::JobPhase::Launching);
+        if !launching {
+            return;
+        }
+        let phase = match exit_code {
+            Some(code) => super::jobs::JobPhase::Exited { code },
+            None => super::jobs::JobPhase::Unknown,
+        };
+        if let Err(error) = self.record_observed_job_exit(id, phase).await {
+            eprintln!("bun: job outcome retained as uncertain for {id}: {error}");
+            return;
+        }
 
-        for id in running_apps {
-            // LOOP-INLINE: stage 2 of #351: check_apps reads bounded and in parallel
-            let grill_state = match self.supervisor.grill().state(&id).await {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-            if grill_state != ContainerState::Stopped {
-                continue;
+        // Transition Running → Stopping → Stopped
+        if let Some(instance) = self.supervisor.get_instance_mut(id) {
+            instance.retry_pending = exit_code.is_some_and(|code| code != 0);
+            if let Ok(s) = instance.state.transition_to(ContainerState::Stopping) {
+                instance.state = s;
             }
-
-            // The process exited unexpectedly. Mark it Stopped, then restart.
-            if let Some(instance) = self.supervisor.get_instance_mut(&id) {
-                instance.retry_pending = true;
-                if let Ok(s) = instance.state.transition_to(ContainerState::Stopping) {
-                    instance.state = s;
-                }
-                if let Ok(s) = instance.state.transition_to(ContainerState::Stopped) {
-                    instance.state = s;
-                }
-            }
-            // LOOP-INLINE: in-memory lock, no I/O
-            if let Err(BunError::RestartLimitExceeded { .. }) =
-                self.supervisor.maybe_restart(&id, now).await
-                && let Some(instance) = self.supervisor.get_instance_mut(&id)
-                && let Ok(s) = instance.state.transition_to(ContainerState::Failed)
-            {
+            if let Ok(s) = instance.state.transition_to(ContainerState::Stopped) {
                 instance.state = s;
             }
         }
+
+        if exit_code.is_none() {
+            self.record_event(
+                crate::bun::events::EventKind::JobFailed,
+                crate::bun::events::EventSeverity::Warning,
+                None,
+                None,
+                format!("job {id} outcome unknown; explicit rerun required"),
+            )
+            .await;
+            return;
+        }
+        if exit_code == Some(0) {
+            // Job completed successfully — stays in Stopped
+            if let Some(instance) = self.supervisor.get_instance(id) {
+                self.record_event(
+                    crate::bun::events::EventKind::JobCompleted,
+                    crate::bun::events::EventSeverity::Info,
+                    Some(instance.app_name.clone()),
+                    Some(instance.namespace.clone()),
+                    format!("job {} completed", instance.app_name),
+                )
+                .await;
+            }
+            return;
+        }
+
+        // Job failed — attempt restart
+        // LOOP-INLINE: in-memory lock, no I/O
+        match self.supervisor.maybe_restart(id, Instant::now()).await {
+            Ok(true) => {
+                // Now in Pending — drive_pending_restarts will handle it
+                if let Some(instance) = self.supervisor.get_instance(id) {
+                    self.record_event(
+                        crate::bun::events::EventKind::Restart,
+                        crate::bun::events::EventSeverity::Warning,
+                        Some(instance.app_name.clone()),
+                        Some(instance.namespace.clone()),
+                        format!(
+                            "instance {} restarted (attempt {})",
+                            id.0, instance.restart_count
+                        ),
+                    )
+                    .await;
+                }
+            }
+            Ok(false) => {
+                // Backoff not elapsed — will retry on next tick
+            }
+            Err(_) => {
+                // Exceeded restart limit — mark as Failed
+                if let Some(instance) = self.supervisor.get_instance_mut(id)
+                    && let Ok(s) = instance.state.transition_to(ContainerState::Failed)
+                {
+                    instance.state = s;
+                    instance.retry_pending = false;
+                }
+                if let Some(instance) = self.supervisor.get_instance(id) {
+                    self.record_event(
+                        crate::bun::events::EventKind::JobFailed,
+                        crate::bun::events::EventSeverity::Warning,
+                        Some(instance.app_name.clone()),
+                        Some(instance.namespace.clone()),
+                        format!("job {} failed", instance.app_name),
+                    )
+                    .await;
+                }
+            }
+        }
     }
 
-    /// Re-drive instances that are in Pending state after a restart.
+    /// A running app's process has exited, which a health check catches
+    /// only if the app has one. Mark it Stopped and route it through the
+    /// restart path.
+    async fn observe_app_exit(&mut self, id: &InstanceId) {
+        if let Some(instance) = self.supervisor.get_instance_mut(id) {
+            instance.retry_pending = true;
+            if let Ok(s) = instance.state.transition_to(ContainerState::Stopping) {
+                instance.state = s;
+            }
+            if let Ok(s) = instance.state.transition_to(ContainerState::Stopped) {
+                instance.state = s;
+            }
+        }
+        // LOOP-INLINE: in-memory lock, no I/O
+        if let Err(BunError::RestartLimitExceeded { .. }) =
+            self.supervisor.maybe_restart(id, Instant::now()).await
+            && let Some(instance) = self.supervisor.get_instance_mut(id)
+            && let Ok(s) = instance.state.transition_to(ContainerState::Failed)
+        {
+            instance.state = s;
+        }
+    }
+
+    /// Read every running app's state and apply what the reads saw, inline.
+    /// For tests that drive the agent without running its loop.
+    #[cfg(test)]
+    async fn check_apps(&mut self) {
+        let reads = self.plan_state_reads(|instance| !instance.is_job);
+        let grill = self.supervisor.grill().clone();
+        let sweep = state_sweep::sweep_states(grill, reads).await;
+        self.apply_state_sweep(Ok(sweep)).await;
+    }
+
+    /// The same for every running job.
+    #[cfg(test)]
+    async fn check_jobs(&mut self) {
+        let reads = self.plan_state_reads(|instance| instance.is_job);
+        let grill = self.supervisor.grill().clone();
+        let sweep = state_sweep::sweep_states(grill, reads).await;
+        self.apply_state_sweep(Ok(sweep)).await;
+    }
+
+    /// Re-drive instances that are in Pending state after a restart, and
+    /// clean up after failed attempts.
     ///
-    /// When `maybe_restart` transitions an instance back to Pending,
-    /// this method picks it up and drives it through the startup
-    /// sequence again using the stored OCI spec.
-    ///
-    /// Each phase handles at least one instance per tick, then stops once
-    /// `PENDING_RESTART_TICK_BUDGET` is spent. `restart_rotation` remembers
-    /// where it stopped, so every instance gets its turn.
+    /// The runtime work (kill, create, start) runs in per-restart tasks
+    /// (`restarts`); this only starts them. Each phase handles at least one
+    /// instance per tick, then stops once `PENDING_RESTART_TICK_BUDGET` is
+    /// spent or `RESTARTS_IN_FLIGHT_LIMIT` restarts are in flight.
+    /// `restart_rotation` remembers where it stopped, so every instance gets
+    /// its turn.
     async fn drive_pending_restarts(&mut self) {
+        self.begin_restart_cleanups().await;
+        self.begin_restart_launches().await;
+    }
+
+    /// Partial startup can have changed the runtime even when its call
+    /// failed. Keep ownership until cleanup is observed; then apply the same
+    /// budget and backoff as any other failed execution.
+    async fn begin_restart_cleanups(&mut self) {
         let deadline = tokio::time::Instant::now() + PENDING_RESTART_TICK_BUDGET;
-        // Partial startup can have changed the runtime even when its call
-        // failed. Keep ownership until cleanup is observed; then apply the
-        // same budget and backoff as any other failed execution.
         let retrying: Vec<_> = self
             .supervisor
             .list_instances()
@@ -8964,6 +9065,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         instance.state,
                         ContainerState::Stopping | ContainerState::Stopped
                     )
+                    && !self.restarting(&instance.id)
                     // Deferred, not dropped: it restarts once the restore ends.
                     && !self
                         .volume_maintenance
@@ -8978,79 +9080,35 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             if index > 0 && tokio::time::Instant::now() >= deadline {
                 break;
             }
+            if state == ContainerState::Stopped {
+                self.restart_rotation.cleanup = Some(id.clone());
+                self.retry_restart(&id).await;
+                continue;
+            }
+            if !self.restart_capacity_left() {
+                break;
+            }
             self.restart_rotation.cleanup = Some(id.clone());
-            if state == ContainerState::Stopping {
-                match self.poll_instance_withdrawal(&id, self.stop_grace).await {
-                    Ok(true) => {}
-                    Ok(false) => continue,
-                    Err(error) => {
-                        eprintln!(
-                            "bun: failed restart of {id} awaits discovery withdrawal: {error}"
-                        );
-                        continue;
-                    }
-                }
-                if let Err(error) = self.kill_and_wait_for_exit(&id).await {
-                    eprintln!("bun: failed restart of {id} awaits runtime cleanup: {error}");
+            match self.poll_instance_withdrawal(&id, self.stop_grace).await {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => {
+                    eprintln!("bun: failed restart of {id} awaits discovery withdrawal: {error}");
                     continue;
                 }
-                if let Some(instance) = self.supervisor.get_instance_mut(&id) {
-                    let Ok(stopped) = instance.state.transition_to(ContainerState::Stopped) else {
-                        continue;
-                    };
-                    instance.state = stopped;
-                }
             }
-            // LOOP-INLINE: in-memory lock, no I/O
-            match self.supervisor.maybe_restart(&id, Instant::now()).await {
-                Ok(true) => {
-                    if let Some(instance) = self.supervisor.get_instance(&id) {
-                        self.record_event(
-                            crate::bun::events::EventKind::Restart,
-                            crate::bun::events::EventSeverity::Warning,
-                            Some(instance.app_name.clone()),
-                            Some(instance.namespace.clone()),
-                            format!(
-                                "instance {id} restarted (attempt {})",
-                                instance.restart_count
-                            ),
-                        )
-                        .await;
-                    }
-                }
-                Ok(false) => {}
-                Err(BunError::RestartLimitExceeded { .. }) => {
-                    if let Some(instance) = self.supervisor.get_instance_mut(&id)
-                        && let Ok(failed) = instance.state.transition_to(ContainerState::Failed)
-                    {
-                        instance.state = failed;
-                        instance.retry_pending = false;
-                    }
-                    if let Some(instance) = self.supervisor.get_instance(&id) {
-                        self.record_event(
-                            crate::bun::events::EventKind::JobFailed,
-                            crate::bun::events::EventSeverity::Warning,
-                            Some(instance.app_name.clone()),
-                            Some(instance.namespace.clone()),
-                            format!(
-                                "workload {} exhausted its restart budget",
-                                instance.app_name
-                            ),
-                        )
-                        .await;
-                    }
-                }
-                Err(error) => eprintln!("bun: cannot retry {id}: {error}"),
-            }
+            self.begin_restart_cleanup(id).await;
         }
-        #[allow(clippy::type_complexity)]
-        let pending_restarts: Vec<(
-            InstanceId,
-            crate::grill::oci::OciSpec,
-            String,
-            String,
-            Option<u16>,
-        )> = self
+    }
+
+    /// Start every pending restart the budget allows. Each begins by killing
+    /// what's left of the old container, off the loop. Without that, the
+    /// same-id create is rejected (ProcessGrill: stale-Running entry) or
+    /// fails (runc/apple: container still exists), leaving the instance
+    /// wedged in Preparing and the old process leaked.
+    async fn begin_restart_launches(&mut self) {
+        let deadline = tokio::time::Instant::now() + PENDING_RESTART_TICK_BUDGET;
+        let pending_restarts: Vec<(InstanceId, restarts::RestartLaunch)> = self
             .supervisor
             .list_instances()
             .iter()
@@ -9058,15 +9116,18 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 i.state == ContainerState::Pending
                     && i.restart_count > 0
                     && (!i.is_job || !self.job_store_uncertain)
+                    && !self.restarting(&i.id)
             })
             .filter_map(|i| {
                 i.oci_spec.as_ref().map(|spec| {
                     (
                         i.id.clone(),
-                        spec.clone(),
-                        i.app_name.clone(),
-                        i.namespace.clone(),
-                        i.host_port,
+                        restarts::RestartLaunch {
+                            oci_spec: spec.clone(),
+                            app_name: i.app_name.clone(),
+                            namespace: i.namespace.clone(),
+                            host_port: i.host_port,
+                        },
                     )
                 })
             })
@@ -9077,10 +9138,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             |entry| &entry.0,
         );
 
-        for (index, (id, oci_spec, app_name, namespace, host_port)) in
-            pending_restarts.into_iter().enumerate()
-        {
+        for (index, (id, launch)) in pending_restarts.into_iter().enumerate() {
             if index > 0 && tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            if !self.restart_capacity_left() {
                 break;
             }
             self.restart_rotation.launch = Some(id.clone());
@@ -9092,170 +9154,65 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     continue;
                 }
             }
-            // Tear down the old container first. Without this, the same-id
-            // create is rejected (ProcessGrill: stale-Running entry) or fails
-            // (runc/apple: container still exists), leaving the instance wedged
-            // in Preparing and the old process leaked.
-            if let Err(error) = self.kill_and_wait_for_exit(&id).await {
-                eprintln!("bun: restart of {id} awaits runtime cleanup: {error}");
-                continue;
-            }
+            self.begin_restart_launch(id, launch).await;
+        }
+    }
 
-            if self
-                .supervisor
-                .get_instance(&id)
-                .is_some_and(|instance| instance.is_job)
-            {
-                if let Err(error) = self.record_job_runtime_absent(&id).await {
-                    eprintln!("bun: job retry cannot persist runtime absence for {id}: {error}");
-                    continue;
-                }
-                if let Err(error) = self.retire_instance_artifacts(&id).await {
-                    eprintln!("bun: job retry retains artifacts for {id}: {error}");
-                    continue;
-                }
-                if let Err(error) = self.claim_job_retry(&id).await {
-                    eprintln!("bun: job retry refused for {id}: {error}");
-                    continue;
-                }
-            } else if let Err(error) = self.retire_restart_artifacts(&id).await {
-                eprintln!(
-                    "bun: application restart retains predecessor artifacts for {id}: {error}"
-                );
-                continue;
-            }
-
-            // Pending → Preparing
-            if let Some(instance) = self.supervisor.get_instance_mut(&id) {
-                match instance.state.transition_to(ContainerState::Preparing) {
-                    Ok(s) => instance.state = s,
-                    Err(_) => continue,
-                }
-            }
-
-            // LOOP-INLINE: stage 2 of #351: restarts move into per-restart tasks
-            if let Err(error) = self.supervisor.grill().create(&id, &oci_spec).await {
-                self.record_failed_restart(&id, &error.to_string()).await;
-                continue;
-            }
-
-            // Close the restart window too: the recreated cgroup gets its
-            // egress programmed before start (the crash gave the instance a
-            // fresh cgroup id). The AppSpec comes from the stored deploy
-            // record, the cgroup path from the stored OCI spec. On failure
-            // the created container is removed and the restart refused —
-            // fail closed, same as a fresh deploy.
-            let restart_spec = self
-                .deployed_specs
-                .get(&(app_name.clone(), namespace.clone()))
-                .cloned();
-            let restart_egress = match oci_spec.linux.host_cgroup_path() {
-                Some(cgroup_path) => {
-                    self.apply_network_pre_start(
-                        &id,
-                        &app_name,
-                        restart_spec.as_ref(),
-                        &cgroup_path,
-                    )
-                    .await
-                }
-                None if self.supervisor.grill().honours_cgroup_path()
-                    || restart_spec
-                        .as_ref()
-                        .and_then(|spec| spec.egress.as_ref())
-                        .is_some_and(|policy| !policy.allow.is_empty()) =>
-                {
-                    Err(BunError::DeployFailed {
-                        app_name: app_name.clone(),
-                        reason: "restart has no original cgroup path for network preparation"
-                            .into(),
-                    })
-                }
-                None => Ok(()),
-            };
-            if let Err(e) = restart_egress {
-                eprintln!("bun: restart of {} refused: {e}", id.0);
-                // LOOP-INLINE: stage 2 of #351: restarts move into per-restart tasks
-                if let Err(error) = self.supervisor.grill().stop(&id).await {
-                    // The replacement is created but not stopped. Keep the
-                    // cleanup owed instead of abandoning it as Failed.
-                    self.record_failed_restart(
-                        &id,
-                        &format!("refused restart could not stop its created container: {error}"),
+    /// Move a Stopped instance whose execution failed back to Pending, if
+    /// its restart budget and backoff allow.
+    async fn retry_restart(&mut self, id: &InstanceId) {
+        // LOOP-INLINE: in-memory lock, no I/O
+        match self.supervisor.maybe_restart(id, Instant::now()).await {
+            Ok(true) => {
+                if let Some(instance) = self.supervisor.get_instance(id) {
+                    self.record_event(
+                        crate::bun::events::EventKind::Restart,
+                        crate::bun::events::EventSeverity::Warning,
+                        Some(instance.app_name.clone()),
+                        Some(instance.namespace.clone()),
+                        format!(
+                            "instance {id} restarted (attempt {})",
+                            instance.restart_count
+                        ),
                     )
                     .await;
-                    continue;
                 }
-                if let Some(instance) = self.supervisor.get_instance_mut(&id)
-                    && let Ok(state) = instance.state.transition_to(ContainerState::Failed)
+            }
+            Ok(false) => {}
+            Err(BunError::RestartLimitExceeded { .. }) => {
+                if let Some(instance) = self.supervisor.get_instance_mut(id)
+                    && let Ok(failed) = instance.state.transition_to(ContainerState::Failed)
                 {
-                    instance.state = state;
+                    instance.state = failed;
+                    instance.retry_pending = false;
                 }
-                continue;
-            }
-
-            // The durable job permit must precede every retry's start too.
-            if let Err(error) = self
-                .transition_deploy_state(&id, ContainerState::Starting)
-                .await
-            {
-                self.record_failed_restart(&id, &error.to_string()).await;
-                continue;
-            }
-
-            // LOOP-INLINE: stage 2 of #351: restarts move into per-restart tasks
-            if let Err(error) = self.supervisor.grill().start(&id).await {
-                self.record_failed_restart(&id, &error.to_string()).await;
-                continue;
-            }
-            // Re-wire the restarted instance: stream its logs and keep it routable.
-            self.spawn_log_forwarder(&id, &app_name, &namespace);
-            if let Err(error) = self.persist_instance_record(&id).await {
-                self.record_failed_restart(&id, &error.to_string()).await;
-                continue;
-            }
-            // A re-created container may get a fresh IP; refresh it before
-            // registering the backend so routing points at the live address.
-            // LOOP-INLINE: stage 2 of #351: restarts move into per-restart tasks
-            let container_ip = self.supervisor.grill().container_ip(&id).await;
-            if let Some(instance) = self.supervisor.get_instance_mut(&id) {
-                instance.container_ip = container_ip;
-            }
-            let service_id = crate::onion::service_id::ServiceId::new(&namespace, &app_name);
-            let mut candidate = self.service_map.clone();
-            if let Some(port) = host_port {
-                let healthy = self
-                    .supervisor
-                    .get_instance(&id)
-                    .is_some_and(|instance| instance.health_config.is_none());
-                let backend = self.local_backend(&id, &service_id, container_ip, port, healthy);
-                if let Err(error) = candidate.add_backend(&service_id, backend) {
-                    self.record_failed_restart(&id, &error.to_string()).await;
-                    continue;
+                if let Some(instance) = self.supervisor.get_instance(id) {
+                    self.record_event(
+                        crate::bun::events::EventKind::JobFailed,
+                        crate::bun::events::EventSeverity::Warning,
+                        Some(instance.app_name.clone()),
+                        Some(instance.namespace.clone()),
+                        format!(
+                            "workload {} exhausted its restart budget",
+                            instance.app_name
+                        ),
+                    )
+                    .await;
                 }
             }
-            // Keep every reader on the confirmed view. A runtime restart can
-            // change its address, but does not establish application health.
-            if let Err(error) = self.publish_backend_snapshot(&service_id, &candidate).await {
-                self.record_failed_restart(&id, &error.to_string()).await;
-                continue;
-            }
-            self.service_map = candidate;
-            self.sync_firewall_ebpf().await;
-            self.rebuild_routing_table().await;
-
-            // Starting → HealthWait, then Running if no health checks
-            if let Some(instance) = self.supervisor.get_instance_mut(&id) {
-                if let Ok(s) = instance.state.transition_to(ContainerState::HealthWait) {
-                    instance.state = s;
-                }
-                if instance.health_config.is_none()
-                    && let Ok(s) = instance.state.transition_to(ContainerState::Running)
-                {
-                    instance.state = s;
-                }
-            }
+            Err(error) => eprintln!("bun: cannot retry {id}: {error}"),
         }
+    }
+
+    /// Run one tick's restart work to completion, runtime steps included,
+    /// the way the old inline restart did. For tests that drive the agent
+    /// without running its loop.
+    #[cfg(test)]
+    async fn drive_pending_restarts_to_completion(&mut self) {
+        self.begin_restart_cleanups().await;
+        self.settle_restart_steps().await;
+        self.begin_restart_launches().await;
+        self.settle_restart_steps().await;
     }
 
     /// Retain a partially created runtime for observed cleanup and bounded retry.
@@ -9502,10 +9459,17 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             // LOOP-INLINE: in-memory lock, no I/O
             self.supervisor.stop_app(app_name, namespace).await?;
         }
+        // A stop wins over a restart in flight: the restart won't touch the
+        // runtime again, and the exit wait lets its current step finish.
+        let taken_restarts = instances
+            .iter()
+            .filter_map(|id| self.take_back_from_restart(id))
+            .collect();
 
         Ok(AppStop {
             instances,
             owns_job,
+            taken_restarts,
         })
     }
 
@@ -9536,7 +9500,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let drains = self.drains.clone();
         let grace = self.stop_grace;
         let confirmation_timeout = self.stop_confirmation_timeout;
+        let taken_restarts = stop.taken_restarts.clone();
         async move {
+            restarts::settle_all(&taken_restarts, confirmation_timeout).await?;
             let waits = ids.iter().map(|id| {
                 drain_and_stop_instance(&drains, &grill, id, grace, confirmation_timeout)
             });
@@ -9561,6 +9527,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let AppStop {
             instances,
             owns_job,
+            ..
         } = stop;
         let service_id = crate::onion::service_id::ServiceId::new(namespace, app_name);
 
@@ -10230,87 +10197,76 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         nodes
     }
 
-    /// Get status of all instances.
-    ///
-    /// Every instance's runtime reads share one deadline,
-    /// `STATUS_RUNTIME_READ_TIMEOUT`. An instance whose runtime hasn't
-    /// answered by then is reported with what the agent knows and
-    /// `runtime_unknown` set.
-    async fn get_status(&self) -> Vec<InstanceStatus> {
-        let deadline = tokio::time::Instant::now() + STATUS_RUNTIME_READ_TIMEOUT;
-        let instances = self.supervisor.list_instances();
-        let mut evidence = Vec::with_capacity(instances.len());
-        for batch in instances.chunks(STATUS_RUNTIME_READ_CONCURRENCY) {
-            let mut reads = Vec::with_capacity(batch.len());
-            for instance in batch {
-                reads.push(self.runtime_evidence(instance, deadline));
-            }
-            // LOOP-INLINE: every read shares the 500 ms status deadline
-            evidence.extend(futures_util::future::join_all(reads).await);
-        }
-        instances
-            .iter()
-            .zip(evidence)
-            .map(|(instance, evidence)| InstanceStatus {
-                id: instance.id.0.clone(),
-                app_name: instance.app_name.clone(),
-                namespace: instance.namespace.clone(),
-                state: self.job_state_label(instance),
-                restart_count: instance.restart_count,
-                host_port: instance.host_port,
-                exit_code: evidence.exit_code,
-                pid: evidence.pid,
-                runtime_unknown: evidence.unknown,
+    /// What the loop knows about every instance, for a status snapshot.
+    fn status_entries(&self) -> Vec<status_snapshot::StatusEntry> {
+        use status_snapshot::{EvidenceSource, StatusEntry};
+        self.supervisor
+            .list_instances()
+            .into_iter()
+            .map(|instance| {
+                let recorded_exit =
+                    match self.recorded_jobs.get(&instance.id.0).map(|job| &job.phase) {
+                        Some(super::jobs::JobPhase::Exited { code }) => Some(Some(*code)),
+                        Some(super::jobs::JobPhase::Unknown) => Some(None),
+                        _ => None,
+                    };
+                let evidence = if instance.is_being_created() {
+                    EvidenceSource::Creating {
+                        exit_code: recorded_exit.flatten(),
+                    }
+                } else {
+                    EvidenceSource::Runtime {
+                        recorded_exit,
+                        alive: matches!(
+                            instance.state,
+                            ContainerState::Running
+                                | ContainerState::HealthWait
+                                | ContainerState::Unhealthy
+                        ),
+                    }
+                };
+                StatusEntry {
+                    status: InstanceStatus {
+                        id: instance.id.0.clone(),
+                        app_name: instance.app_name.clone(),
+                        namespace: instance.namespace.clone(),
+                        state: self.job_state_label(instance),
+                        restart_count: instance.restart_count,
+                        host_port: instance.host_port,
+                        exit_code: None,
+                        pid: None,
+                        runtime_unknown: false,
+                        status_age_ms: None,
+                    },
+                    evidence,
+                }
             })
             .collect()
     }
 
-    /// Ask the runtime for one instance's pid and exit code, giving up at
-    /// `deadline`. A recorded job outcome needs no runtime read.
-    async fn runtime_evidence(
-        &self,
-        instance: &super::supervisor::WorkloadInstance,
-        deadline: tokio::time::Instant,
-    ) -> RuntimeEvidence {
-        // An instance still being created has neither, and asking would
-        // hold the agent loop until its image pull finishes (Z6.7).
-        let creating = instance.is_being_created();
-        let recorded_exit = match self.recorded_jobs.get(&instance.id.0).map(|job| &job.phase) {
-            Some(super::jobs::JobPhase::Exited { code }) => Some(Some(*code)),
-            Some(super::jobs::JobPhase::Unknown) => Some(None),
-            _ if creating => Some(None),
-            _ => None,
-        };
-        if creating {
-            return RuntimeEvidence {
-                pid: None,
-                exit_code: recorded_exit.flatten(),
-                unknown: false,
-            };
-        }
-        let grill = self.supervisor.grill();
-        let read = async {
-            let pid = grill.pid(&instance.id).await;
-            let exit_code = match recorded_exit {
-                Some(code) => code,
-                None => grill.exit_code(&instance.id).await,
-            };
-            (pid, exit_code)
-        };
-        // `timeout_at` polls the read once even past the deadline, so an
-        // instance that answers at once is never marked unknown.
-        match tokio::time::timeout_at(deadline, read).await {
-            Ok((pid, exit_code)) => RuntimeEvidence {
-                pid,
-                exit_code,
-                unknown: false,
-            },
-            Err(_) => RuntimeEvidence {
-                pid: None,
-                exit_code: recorded_exit.flatten(),
-                unknown: true,
-            },
-        }
+    /// Publish what the loop knows now, for status readers, and return it.
+    fn publish_status(&self) -> Arc<status_snapshot::StatusSnapshot> {
+        let snapshot = Arc::new(status_snapshot::StatusSnapshot::new(self.status_entries()));
+        self.status_tx.send_replace(Arc::clone(&snapshot));
+        snapshot
+    }
+
+    /// A reader that answers status requests from the snapshot this agent's
+    /// loop publishes, without queueing anything for the loop.
+    pub fn status_reader(&self) -> status_snapshot::StatusReader {
+        status_snapshot::StatusReader::new(
+            self.status_tx.subscribe(),
+            self.supervisor.grill().clone(),
+        )
+    }
+
+    /// Every instance's status, read the way a status request reads it:
+    /// published now, then completed with the runtime's evidence under the
+    /// shared `STATUS_RUNTIME_READ_TIMEOUT`.
+    #[cfg(test)]
+    async fn get_status(&self) -> Vec<InstanceStatus> {
+        let snapshot = self.publish_status();
+        status_snapshot::read_status(self.supervisor.grill(), &snapshot).await
     }
 
     fn get_job_status(&self) -> Vec<JobStatus> {
@@ -10996,8 +10952,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .await)
     }
 
-    /// Preserve ownership until both force-kill and observed runtime exit succeed.
-    async fn kill_and_wait_for_exit(&self, id: &InstanceId) -> Result<(), BunError> {
+    /// Preserve ownership until both force-kill and observed runtime exit
+    /// succeed. A restart in flight gives the instance up first.
+    async fn kill_and_wait_for_exit(&mut self, id: &InstanceId) -> Result<(), BunError> {
+        if let Some(restart) = self.take_back_from_restart(id) {
+            // LOOP-INLINE: stage 3 of #351: settle carries its own deadline, but holds the turn
+            restart.settle(self.stop_confirmation_timeout).await?;
+        }
         if self
             .recorded_jobs
             .get(&id.0)
@@ -11005,7 +10966,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         {
             return Ok(());
         }
-        // LOOP-INLINE: stage 2 of #351: restarts move into per-restart tasks
+        // LOOP-INLINE: stage 3 of #351: an execution fence or job rerun kills inline
         kill_runtime_instance(self.supervisor.grill(), id, self.stop_confirmation_timeout).await
     }
 
@@ -11108,7 +11069,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     /// Withdraw traffic before fencing supervision and permitting an off-loop stop.
-    async fn begin_instance_retirement(&mut self, id: &InstanceId) -> Result<(), BunError> {
+    async fn begin_instance_retirement(
+        &mut self,
+        id: &InstanceId,
+    ) -> Result<Option<restarts::TakenRestart>, BunError> {
         if self.supervisor.get_instance(id).is_none() {
             return Err(BunError::InstanceNotFound {
                 instance_id: id.clone(),
@@ -11122,7 +11086,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
         }
         self.supervisor.health_checker_mut().unregister(id);
-        Ok(())
+        Ok(self.take_back_from_restart(id))
     }
 
     /// Drain, stop and forget one old instance (M7).
@@ -11179,6 +11143,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 .values()
                 .flat_map(|children| children.iter().cloned()),
         );
+
+        // A restart step still creating or starting a container would race
+        // the signals below. Take every instance back and let those finish.
+        for restart in self.take_back_all_restarts() {
+            // LOOP-INLINE: shutdown's last turn; settle carries its own deadline
+            if let Err(error) = restart.settle(self.stop_confirmation_timeout).await {
+                eprintln!("bun: shutting down despite a restart in flight: {error}");
+            }
+        }
 
         // Ask everything to stop (SIGTERM), wait (up to a grace period, but no
         // longer than needed) for it to exit, then force-kill (SIGKILL) whatever
@@ -13005,7 +12978,9 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 continue;
             }
             let cleanup = async {
-                self.ops.begin_retire(id).await?;
+                if let Some(restart) = self.ops.begin_retire(id).await? {
+                    restart.settle(self.stop_confirmation_timeout).await?;
+                }
                 // A failed create may already own runtime resources. Only a
                 // reservation that never attempted create proves their absence.
                 if runtime_attempted.contains(id) {
@@ -13067,7 +13042,9 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         id: &InstanceId,
         drain_timeout: std::time::Duration,
     ) -> Result<(), BunError> {
-        self.ops.begin_retire(id).await?;
+        if let Some(restart) = self.ops.begin_retire(id).await? {
+            restart.settle(self.stop_confirmation_timeout).await?;
+        }
         drain_and_stop_instance(
             &self.drains,
             &self.grill,
@@ -13778,6 +13755,8 @@ mod tests {
 
     mod loop_harness;
     mod loop_rule;
+    mod published_status;
+    mod restart_ownership;
 
     #[test]
     fn trace_targets_are_positional_arguments_not_shell_source() {
@@ -15491,7 +15470,7 @@ mod tests {
             .unwrap();
         tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            agent.drive_pending_restarts(),
+            agent.drive_pending_restarts_to_completion(),
         )
         .await
         .expect("waiting for ingress blocked the agent loop");
@@ -15510,7 +15489,7 @@ mod tests {
         assert!(view.borrow().resolve(&service).unwrap().backends.is_empty());
         assert!(drains.is_draining(&id.0).await);
         drains.decrement_connections(&id.0).await;
-        agent.drive_pending_restarts().await;
+        agent.drive_pending_restarts_to_completion().await;
         assert_eq!(
             agent.supervisor.get_instance(&id).unwrap().state,
             ContainerState::Running
@@ -15538,7 +15517,7 @@ mod tests {
         grill.set_state(&id, ContainerState::Stopped);
         agent.check_apps().await;
         grill.set_fail_stop(true);
-        agent.drive_pending_restarts().await;
+        agent.drive_pending_restarts_to_completion().await;
         let instance = agent.supervisor.get_instance(&id).unwrap();
         assert_ne!(
             instance.state,
@@ -15562,7 +15541,7 @@ mod tests {
         expect_complete(&drain_deploy(&mut agent, basic_config()).await);
         grill.set_state(&original.instance_id, ContainerState::Stopped);
         agent.check_apps().await;
-        agent.drive_pending_restarts().await;
+        agent.drive_pending_restarts_to_completion().await;
         let calls = grill.calls();
         let release = calls.iter().position(|(operation, id)| {
             operation == "release_network_reference" && id == &original.instance_id
@@ -15601,7 +15580,7 @@ mod tests {
         let checkpoint = path.join("discovery.json");
         std::fs::remove_file(&checkpoint).unwrap();
         std::fs::create_dir(&checkpoint).unwrap();
-        agent.drive_pending_restarts().await;
+        agent.drive_pending_restarts_to_completion().await;
         assert_eq!(
             grill
                 .calls()
@@ -15641,7 +15620,7 @@ mod tests {
         grill.set_state(&id, ContainerState::Stopped);
         agent.check_apps().await;
         grill.set_container_ip(new_ip);
-        agent.drive_pending_restarts().await;
+        agent.drive_pending_restarts_to_completion().await;
         assert_eq!(
             agent.supervisor.get_instance(&id).unwrap().state,
             ContainerState::Running
@@ -15677,7 +15656,7 @@ mod tests {
                 Ok(super::super::health::HealthStatus::Unhealthy),
             )
             .await;
-        agent.drive_pending_restarts().await;
+        agent.drive_pending_restarts_to_completion().await;
         assert_eq!(
             agent.supervisor.get_instance(&id).unwrap().state,
             ContainerState::HealthWait
@@ -17819,39 +17798,40 @@ interval = 1
     /// PR #260's journal: every pending restart spends ~400 ms on cleanup it
     /// can't finish yet, and one tick walked all of them. Eight of them made
     /// one tick 3.2 s long, and every command queued behind it waited that
-    /// long. A tick now stops starting new restarts once its budget is spent.
+    /// long. A tick now only starts restarts: their kills run in tasks, and
+    /// no more than `RESTARTS_IN_FLIGHT_LIMIT` run at once.
     #[tokio::test]
-    async fn one_tick_of_pending_restarts_stays_within_its_budget() {
+    async fn one_tick_starts_restarts_without_waiting_for_their_runtime() {
         const PER_RESTART: std::time::Duration = std::time::Duration::from_millis(400);
-        let (mut agent, grill, ids) = slow_pending_restarts(8, PER_RESTART).await;
+        let count = restarts::RESTARTS_IN_FLIGHT_LIMIT as u32 + 4;
+        let (mut agent, _grill, ids) = slow_pending_restarts(count, PER_RESTART).await;
         let started = std::time::Instant::now();
         agent.drive_pending_restarts().await;
         let took = started.elapsed();
-        // The budget plus the one restart that was already running when it
-        // ran out; the old tick took 8 x 400 ms.
         assert!(
-            took < PENDING_RESTART_TICK_BUDGET + 3 * PER_RESTART,
-            "one tick spent {took:?} on {} pending restarts",
+            took < PER_RESTART,
+            "one tick spent {took:?} starting {} pending restarts",
             ids.len()
         );
-        let attempted: usize = kills_per_instance(&grill).values().sum();
-        assert!(
-            attempted < ids.len(),
-            "the tick attempted all {attempted} restarts"
+        assert_eq!(
+            agent.restarts.len(),
+            restarts::RESTARTS_IN_FLIGHT_LIMIT,
+            "the tick didn't stop at the in-flight limit"
         );
+        agent.settle_restart_steps().await;
     }
 
-    /// A bounded tick must not keep retrying the same few restarts: the
-    /// next tick carries on where the last one stopped, so every pending
-    /// restart gets its turn.
+    /// A tick that stops at the limit must not keep retrying the same few
+    /// restarts: the next tick carries on where the last one stopped, so
+    /// every pending restart gets its turn.
     #[tokio::test]
     async fn bounded_ticks_rotate_through_every_pending_restart() {
-        const PER_RESTART: std::time::Duration = std::time::Duration::from_millis(300);
-        let (mut agent, grill, ids) = slow_pending_restarts(6, PER_RESTART).await;
-        // At least one restart per tick, so six ticks reach all six even on
-        // a slow machine.
-        for _ in 0..ids.len() {
+        const PER_RESTART: std::time::Duration = std::time::Duration::from_millis(100);
+        let count = restarts::RESTARTS_IN_FLIGHT_LIMIT as u32 + 4;
+        let (mut agent, grill, ids) = slow_pending_restarts(count, PER_RESTART).await;
+        for _ in 0..3 {
             agent.drive_pending_restarts().await;
+            agent.settle_restart_steps().await;
         }
         let kills = kills_per_instance(&grill);
         for id in &ids {
@@ -18644,7 +18624,7 @@ interval = 1
         inject(&grill);
         tokio::time::timeout(
             std::time::Duration::from_secs(6),
-            agent.drive_pending_restarts(),
+            agent.drive_pending_restarts_to_completion(),
         )
         .await
         .expect("restart cleanup stalled the agent");
@@ -18667,7 +18647,7 @@ interval = 1
         grill.set_ignore_kill(false);
         grill.set_fail_state(false);
         grill.release_kills(1);
-        agent.drive_pending_restarts().await;
+        agent.drive_pending_restarts_to_completion().await;
         assert_eq!(
             agent.supervisor.get_instance(&id).unwrap().state,
             ContainerState::Running
@@ -18719,7 +18699,7 @@ interval = 1
         let (mut agent, grill, id, _directory) = failed_restart_fixture().await;
         let port = agent.supervisor.get_instance(&id).unwrap().host_port;
         inject(&grill);
-        agent.drive_pending_restarts().await;
+        agent.drive_pending_restarts_to_completion().await;
         assert_eq!(
             agent.supervisor.get_instance(&id).unwrap().state,
             ContainerState::Stopping
@@ -18731,7 +18711,7 @@ interval = 1
             .filter(|(op, _)| op == "create")
             .count();
         grill.set_fail_kill(true);
-        agent.drive_pending_restarts().await;
+        agent.drive_pending_restarts_to_completion().await;
         assert_eq!(
             agent.supervisor.get_instance(&id).unwrap().state,
             ContainerState::Stopping
@@ -18745,7 +18725,7 @@ interval = 1
             creates
         );
         grill.set_fail_kill(false);
-        agent.drive_pending_restarts().await;
+        agent.drive_pending_restarts_to_completion().await;
         assert_eq!(
             agent.supervisor.get_instance(&id).unwrap().state,
             ContainerState::Stopped
@@ -18763,7 +18743,7 @@ interval = 1
         grill.set_fail_start(false);
         agent.supervisor.get_instance_mut(&id).unwrap().last_restart =
             Some(Instant::now() - std::time::Duration::from_secs(600));
-        agent.drive_pending_restarts().await;
+        agent.drive_pending_restarts_to_completion().await;
         assert_eq!(
             agent.supervisor.get_instance(&id).unwrap().state,
             ContainerState::Running
@@ -18803,7 +18783,7 @@ interval = 1
         for _ in 0..4 {
             agent.supervisor.get_instance_mut(&id).unwrap().last_restart =
                 Some(Instant::now() - std::time::Duration::from_secs(600));
-            agent.drive_pending_restarts().await;
+            agent.drive_pending_restarts_to_completion().await;
         }
         let instance = agent.supervisor.get_instance(&id).unwrap();
         assert_eq!(instance.state, ContainerState::Failed);
@@ -18818,14 +18798,14 @@ interval = 1
     async fn explicit_stop_cancels_failed_restart_recovery() {
         let (mut agent, grill, id, _directory) = failed_restart_fixture().await;
         grill.set_fail_start(true);
-        agent.drive_pending_restarts().await;
+        agent.drive_pending_restarts_to_completion().await;
         agent.stop_app("retry", "default").await.unwrap();
         assert_eq!(
             agent.supervisor.get_instance(&id).unwrap().state,
             ContainerState::Stopped
         );
         let calls = grill.calls().len();
-        agent.drive_pending_restarts().await;
+        agent.drive_pending_restarts_to_completion().await;
         assert_eq!(grill.calls().len(), calls);
     }
 
@@ -18838,7 +18818,7 @@ interval = 1
             ContainerState::Stopped
         );
         let calls = grill.calls().len();
-        agent.drive_pending_restarts().await;
+        agent.drive_pending_restarts_to_completion().await;
         assert_eq!(grill.calls().len(), calls);
     }
 
@@ -18872,12 +18852,12 @@ interval = 1
         grill.kill(&id).await.unwrap();
         std::fs::remove_file(&program).unwrap();
         agent.check_apps().await;
-        agent.drive_pending_restarts().await;
+        agent.drive_pending_restarts_to_completion().await;
         assert_eq!(
             agent.supervisor.get_instance(&id).unwrap().state,
             ContainerState::Stopping
         );
-        agent.drive_pending_restarts().await;
+        agent.drive_pending_restarts_to_completion().await;
         assert_eq!(
             agent.supervisor.get_instance(&id).unwrap().state,
             ContainerState::Stopped
@@ -18885,7 +18865,7 @@ interval = 1
         install();
         agent.supervisor.get_instance_mut(&id).unwrap().last_restart =
             Some(Instant::now() - std::time::Duration::from_secs(600));
-        agent.drive_pending_restarts().await;
+        agent.drive_pending_restarts_to_completion().await;
         assert_eq!(grill.state(&id).await.unwrap(), ContainerState::Running);
         assert_eq!(agent.supervisor.get_instance(&id).unwrap().restart_count, 2);
         // A second crash during backoff must stay eligible for a later tick.
@@ -18897,7 +18877,7 @@ interval = 1
         );
         agent.supervisor.get_instance_mut(&id).unwrap().last_restart =
             Some(Instant::now() - std::time::Duration::from_secs(600));
-        agent.drive_pending_restarts().await;
+        agent.drive_pending_restarts_to_completion().await;
         assert_eq!(grill.state(&id).await.unwrap(), ContainerState::Running);
         assert_eq!(agent.supervisor.get_instance(&id).unwrap().restart_count, 3);
         agent.stop_app("retry", "default").await.unwrap();
@@ -18952,7 +18932,7 @@ interval = 1
         agent.supervisor.get_instance_mut(&id).unwrap().state =
             crate::grill::state::ContainerState::Stopped;
         let _ = agent.supervisor.maybe_restart(&id, now).await;
-        agent.drive_pending_restarts().await;
+        agent.drive_pending_restarts_to_completion().await;
 
         let state = agent.supervisor.get_instance(&id).unwrap().state;
         assert_ne!(
@@ -21465,7 +21445,7 @@ host = "remote.local"
             replacement.set_records_dir(crashed.path().to_path_buf());
             replacement.adopt_recorded_instances().await.unwrap();
             assert_eq!(replacement.get_job_status()[0].state, "unknown");
-            replacement.drive_pending_restarts().await;
+            replacement.drive_pending_restarts_to_completion().await;
             assert!(runtime.calls().is_empty());
         }
         grill.release_creates(1);
@@ -21734,7 +21714,7 @@ host = "remote.local"
             .get_instance_mut(&id)
             .unwrap()
             .restart_count = 3;
-        agent.drive_pending_restarts().await;
+        agent.drive_pending_restarts_to_completion().await;
         assert_eq!(
             agent.supervisor.get_instance(&id).unwrap().state,
             ContainerState::Running
@@ -21749,7 +21729,7 @@ host = "remote.local"
         runtime.set_state(&id, ContainerState::Stopped);
         runtime.set_exit_code(&id, Some(1));
         replacement.check_jobs().await;
-        replacement.drive_pending_restarts().await;
+        replacement.drive_pending_restarts_to_completion().await;
         assert!(!runtime.calls().iter().any(|(op, _)| op == "start"));
     }
 
@@ -24372,7 +24352,7 @@ host = "remote.local"
         instance.restart_count = 1;
         grill.block_creates();
         let task = tokio::spawn(async move {
-            agent.drive_pending_restarts().await;
+            agent.drive_pending_restarts_to_completion().await;
         });
         tokio::time::timeout(std::time::Duration::from_secs(5), grill.wait_for_creates(1))
             .await
@@ -24415,7 +24395,7 @@ host = "remote.local"
         let instance = agent.supervisor.get_instance_mut(&id).unwrap();
         instance.state = ContainerState::Pending;
         instance.restart_count = 1;
-        agent.drive_pending_restarts().await;
+        agent.drive_pending_restarts_to_completion().await;
         let creates = grill
             .calls()
             .iter()
@@ -24433,7 +24413,7 @@ host = "remote.local"
             predecessor_retained && pending,
             "restart lost the predecessor cleanup obligation"
         );
-        agent.drive_pending_restarts().await;
+        agent.drive_pending_restarts_to_completion().await;
         assert_eq!(
             agent.supervisor.get_instance(&id).unwrap().state,
             ContainerState::Running
@@ -25758,6 +25738,7 @@ host = "remote.local"
             exit_code: None,
             pid: Some(7),
             runtime_unknown: false,
+            status_age_ms: None,
         };
         let plain = serde_json::to_value(&status).unwrap();
         assert!(plain.get("runtime_unknown").is_none(), "{plain}");

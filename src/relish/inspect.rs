@@ -310,6 +310,7 @@ mod tests {
             exit_code: None,
             pid: Some(100),
             runtime_unknown: false,
+            status_age_ms: None,
         }
     }
 

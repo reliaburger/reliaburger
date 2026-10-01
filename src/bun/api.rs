@@ -209,6 +209,11 @@ pub struct LeaderDirectory(
 #[derive(Clone)]
 pub struct ApiState {
     pub cmd_tx: mpsc::Sender<AgentCommand>,
+    /// Answers status requests from the snapshot the agent loop publishes,
+    /// without queueing for it. Production Bun always supplies one; routers
+    /// built without an agent loop (small embedded and test routers) ask
+    /// the loop through `cmd_tx` instead.
+    pub status: Option<super::agent::StatusReader>,
     /// Live long-lived-task and placement-capability evidence.
     pub readiness: super::readiness::ReadinessTracker,
     /// Durable standalone resource leases. Cluster leases live in Raft.
@@ -364,6 +369,7 @@ pub fn router(
         super::readiness::ReadinessTracker::new(),
         None,
         None,
+        None,
     )
 }
 
@@ -403,9 +409,11 @@ pub fn router_with_upgrade(
     readiness: super::readiness::ReadinessTracker,
     local_test_leases: Option<crate::testkit::lease::LocalLeaseStore>,
     jwt_verifier: Option<crate::sesame::auth::WorkloadJwtVerifier>,
+    status: Option<super::agent::StatusReader>,
 ) -> Router {
     let state = ApiState {
         cmd_tx,
+        status,
         readiness,
         local_test_leases: local_test_leases.unwrap_or_default(),
         mayo,
@@ -4324,6 +4332,9 @@ struct StatusQuery {
 }
 
 async fn local_statuses(state: &ApiState) -> Result<Vec<InstanceStatus>, String> {
+    if let Some(reader) = &state.status {
+        return reader.read().await.map_err(|error| error.to_string());
+    }
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         let (response, receiver) = oneshot::channel();
         state
@@ -4696,7 +4707,7 @@ async fn status_app_handler(
     if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
         return resp;
     }
-    match ask_agent(&state.cmd_tx, |response| AgentCommand::Status { response }).await {
+    match local_statuses(&state).await.map_err(unavailable_response) {
         Ok(statuses) => {
             let filtered: Vec<&InstanceStatus> = statuses
                 .iter()
@@ -8127,9 +8138,7 @@ async fn metrics_summary_handler(
 
 /// Gather instance statuses from the agent.
 async fn gather_statuses(state: &ApiState) -> Vec<InstanceStatus> {
-    ask_agent(&state.cmd_tx, |response| AgentCommand::Status { response })
-        .await
-        .unwrap_or_default()
+    local_statuses(state).await.unwrap_or_default()
 }
 
 /// Build dashboard app rows from instance statuses.
@@ -10800,6 +10809,7 @@ mod tests {
             readiness,
             local_test_leases,
             None,
+            None,
         );
         (app, shutdown)
     }
@@ -11443,6 +11453,7 @@ mod tests {
             false,
             workload_fault_static_capabilities(),
             crate::bun::readiness::ReadinessTracker::new(),
+            None,
             None,
             None,
         );
@@ -12346,6 +12357,7 @@ schedule = "* * * * *"
                 false,
                 lease_static_capabilities(),
                 crate::bun::readiness::ReadinessTracker::new(),
+                None,
                 None,
                 None,
             );
@@ -14495,6 +14507,7 @@ schedule = "* * * * *"
             crate::bun::readiness::ReadinessTracker::new(),
             None,
             None,
+            None,
         );
         (app, shutdown, mayo_dir)
     }
@@ -16504,6 +16517,7 @@ schedule = "* * * * *"
             crate::bun::readiness::ReadinessTracker::new(),
             None,
             None,
+            None,
         );
         (app, webhook_rx, shutdown)
     }
@@ -16816,6 +16830,7 @@ schedule = "* * * * *"
             false,
             crate::bun::capabilities::StaticCapabilities::default(),
             crate::bun::readiness::ReadinessTracker::new(),
+            None,
             None,
             None,
         );
@@ -17131,6 +17146,7 @@ mod cluster_routing_tests {
             exit_code: None,
             pid: Some(4242),
             runtime_unknown: false,
+            status_age_ms: None,
         }
     }
 
@@ -17310,6 +17326,7 @@ mod cluster_routing_tests {
                 false,
                 static_capabilities,
                 super::super::readiness::ReadinessTracker::new(),
+                None,
                 None,
                 None,
             )
