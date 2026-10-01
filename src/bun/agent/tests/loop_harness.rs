@@ -458,7 +458,6 @@ async fn silent_registry() -> (String, tokio::task::JoinHandle<()>) {
 /// registry that hangs, one attempt waits 5 s for headers and the fetch
 /// retries for up to 75 s, all of it on the loop.
 #[tokio::test]
-#[ignore = "stage 3 of #351"]
 async fn status_answers_while_an_upgrade_fetches_from_a_silent_registry() {
     use crate::upgrade::signing::{encode_public_key, generate_keypair, sha256_hex, sign};
 
@@ -619,7 +618,6 @@ async fn status_answers_while_a_retirement_removes_artifacts() {
 /// The tick applies the perimeter ruleset with an `nft` subprocess when
 /// membership changes (and on the first tick).
 #[tokio::test]
-#[ignore = "stage 3 of #351"]
 async fn status_answers_while_the_tick_applies_the_firewall() {
     let (mut agent, tx, shutdown) = test_agent();
     agent.set_perimeter_enabled(true);

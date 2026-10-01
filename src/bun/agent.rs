@@ -119,6 +119,14 @@ const STOP_GRACE_SECS: u64 = 10;
 /// the rest `runtime_unknown`, rather than holding the agent loop.
 const STATUS_RUNTIME_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// How long one turn may wait, all told, on runtime reads and other work
+/// it can retry on a later turn (#351, stage 3). Every such await in a turn
+/// shares this one deadline, measured from the turn's start, so a turn that
+/// meets a slow runtime many times still ends well inside the 1 s turn
+/// budget. What doesn't finish in time fails the step, and the tick, the
+/// deploy worker or the caller tries again.
+const TURN_RUNTIME_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// At most this many instances' runtime reads run at once for one status.
 const STATUS_RUNTIME_READ_CONCURRENCY: usize = 8;
 
@@ -1920,6 +1928,7 @@ mod adopted_placements;
 mod discovery_ownership;
 mod discovery_recovery;
 mod egress_ownership;
+mod follow_ups;
 mod identity_signing;
 mod logs;
 mod producer_release;
@@ -2272,6 +2281,14 @@ pub struct BunAgent<G: Grill> {
     restarts: restarts::Restarts,
     /// Those steps' tasks.
     restart_steps: tokio::task::JoinSet<restarts::StepResult>,
+    /// Work a turn spawned and finishes when it reports back.
+    follow_ups: tokio::task::JoinSet<follow_ups::FollowUp>,
+    /// The upgrade or rollback preparing its binary, if one is.
+    upgrade_preparing: Option<follow_ups::UpgradeKind>,
+    /// Whether an `nft` apply of the perimeter ruleset is in flight.
+    firewall_applying: bool,
+    /// When the turn in progress must stop waiting on work it can retry.
+    turn_deadline: Option<tokio::time::Instant>,
 }
 
 /// The last instance each phase of `drive_pending_restarts` handled.
@@ -2441,6 +2458,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             state_sweeps: tokio::task::JoinSet::new(),
             restarts: restarts::Restarts::new(),
             restart_steps: tokio::task::JoinSet::new(),
+            follow_ups: tokio::task::JoinSet::new(),
+            upgrade_preparing: None,
+            firewall_applying: false,
+            turn_deadline: None,
             adopted_apps: adopted_placements::AdoptedApps::new(),
         }
     }
@@ -2583,6 +2604,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             state_sweeps: tokio::task::JoinSet::new(),
             restarts: restarts::Restarts::new(),
             restart_steps: tokio::task::JoinSet::new(),
+            follow_ups: tokio::task::JoinSet::new(),
+            upgrade_preparing: None,
+            firewall_applying: false,
+            turn_deadline: None,
             adopted_apps: adopted_placements::AdoptedApps::new(),
         }
     }
@@ -3048,32 +3073,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Attach the self-upgrade manager (enables the upgrade commands).
     pub fn set_upgrade_manager(&mut self, manager: crate::upgrade::manager::UpgradeManager) {
         self.upgrade = Some(manager);
-    }
-
-    /// Snapshot of running (non-job) workloads for the upgrade marker:
-    /// these must all still be alive after the swap for it to commit.
-    async fn upgrade_inventory(&self) -> Vec<crate::upgrade::marker::InstanceInventory> {
-        let mut inventory = Vec::new();
-        for instance in self.supervisor.list_instances() {
-            if instance.is_job || instance.state != ContainerState::Running {
-                continue;
-            }
-            // LOOP-INLINE: stage 3 of #351: the upgrade path reads pids off the loop
-            let Some(pid) = self.supervisor.grill().pid(&instance.id).await else {
-                continue;
-            };
-            let replica_index = crate::grill::InstanceIdentity::parse(&instance.id.0)
-                .map(|ident| ident.ordinal)
-                .unwrap_or(0);
-            inventory.push(crate::upgrade::marker::InstanceInventory {
-                namespace: instance.namespace.clone(),
-                app_name: instance.app_name.clone(),
-                instance_id: replica_index,
-                pid,
-                full_id: instance.id.0.clone(),
-            });
-        }
-        inventory
     }
 
     /// Check that every pre-upgrade workload survived the swap.
@@ -4045,7 +4044,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             // steady stream of them must not hold the tick off for good:
             // health probes, restarts and retirements all run from it.
             let turn = if last_health_tick.elapsed() >= HEALTH_TICK_STARVATION_BOUND {
-                let turn = self.loop_meter.begin(LoopBranch::HealthTick, None);
+                let turn = self.begin_turn(LoopBranch::HealthTick, None);
                 self.run_health_tick().await;
                 last_health_tick = tokio::time::Instant::now();
                 health_interval.reset();
@@ -4078,50 +4077,59 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     _ = self.shutdown.cancelled() => {
                         self.abandon_pending_stops();
                         self.abandon_identity_signings();
+                        // An upgrade still preparing leaves its caller a
+                        // closed channel, and the node on its current binary.
+                        self.follow_ups.abort_all();
                         self.shutdown_all().await;
                         break;
                     }
                     Some(req) = Self::recv_snapshot(&mut self.cluster) => {
-                        let turn = self.loop_meter.begin(LoopBranch::Snapshot, None);
+                        let turn = self.begin_turn(LoopBranch::Snapshot, None);
                         self.handle_snapshot_request(req).await;
                         turn
                     }
                     Some(outcome) = self.stop_waits.join_next_with_id(),
                         if !self.stop_waits.is_empty() => {
-                        let turn = self.loop_meter.begin(LoopBranch::StopWait, None);
+                        let turn = self.begin_turn(LoopBranch::StopWait, None);
                         self.complete_app_stop(outcome).await;
                         turn
                     }
                     Some(outcome) = self.identity_signing_tasks.join_next_with_id(),
                         if !self.identity_signing_tasks.is_empty() => {
-                        let turn = self.loop_meter.begin(LoopBranch::IdentitySigning, None);
+                        let turn = self.begin_turn(LoopBranch::IdentitySigning, None);
                         self.finish_identity_provision(outcome);
                         turn
                     }
                     Some(outcome) = self.restart_steps.join_next_with_id(),
                         if !self.restart_steps.is_empty() => {
-                        let turn = self.loop_meter.begin(LoopBranch::RestartStep, None);
+                        let turn = self.begin_turn(LoopBranch::RestartStep, None);
                         self.finish_restart_step(outcome).await;
                         turn
                     }
                     Some(sweep) = self.state_sweeps.join_next(),
                         if !self.state_sweeps.is_empty() => {
-                        let turn = self.loop_meter.begin(LoopBranch::StateSweep, None);
+                        let turn = self.begin_turn(LoopBranch::StateSweep, None);
                         self.apply_state_sweep(sweep).await;
                         turn
                     }
+                    Some(done) = self.follow_ups.join_next(),
+                        if !self.follow_ups.is_empty() => {
+                        let turn = self.begin_turn(LoopBranch::FollowUp, None);
+                        self.apply_follow_up(done).await;
+                        turn
+                    }
                     Some(op) = self.deploy_ops_rx.recv() => {
-                        let turn = self.loop_meter.begin(LoopBranch::DeployOp, Some(op.name()));
+                        let turn = self.begin_turn(LoopBranch::DeployOp, Some(op.name()));
                         self.handle_deploy_op(op).await;
                         turn
                     }
                     Some(cmd) = self.command_rx.recv() => {
-                        let turn = self.loop_meter.begin(LoopBranch::Command, Some(cmd.name()));
+                        let turn = self.begin_turn(LoopBranch::Command, Some(cmd.name()));
                         self.handle_command(cmd).await;
                         turn
                     }
                     _ = health_interval.tick() => {
-                        let turn = self.loop_meter.begin(LoopBranch::HealthTick, None);
+                        let turn = self.begin_turn(LoopBranch::HealthTick, None);
                         self.run_health_tick().await;
                         last_health_tick = tokio::time::Instant::now();
                         turn
@@ -4136,8 +4144,28 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
             // Status readers answer from this, not by queueing for a turn.
             self.publish_status();
+            self.turn_deadline = None;
             self.loop_meter.finish(turn);
         }
+    }
+
+    /// Start timing a turn, and start the clock on what it may spend
+    /// waiting for work it can retry ([`TURN_RUNTIME_BUDGET`]).
+    fn begin_turn(
+        &mut self,
+        branch: LoopBranch,
+        detail: Option<&'static str>,
+    ) -> super::loop_meter::Turn {
+        self.turn_deadline = Some(tokio::time::Instant::now() + TURN_RUNTIME_BUDGET);
+        self.loop_meter.begin(branch, detail)
+    }
+
+    /// When the turn in progress must give up on a runtime read or other
+    /// work it can retry later. Outside a turn (startup, or a test driving a
+    /// handler directly) every wait gets a fresh budget.
+    fn turn_deadline(&self) -> tokio::time::Instant {
+        self.turn_deadline
+            .unwrap_or_else(|| tokio::time::Instant::now() + TURN_RUNTIME_BUDGET)
     }
 
     /// The loop's periodic work: health probes, restarts, retirements, jobs,
@@ -4155,7 +4183,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.begin_state_sweep();
         self.drive_pending_restarts().await;
         self.expire_faults().await;
-        self.reconcile_firewall().await;
+        self.reconcile_firewall();
         self.reresolve_egress().await;
         self.sweep_kernel_networking().await;
         self.check_identity_rotation();
@@ -5468,7 +5496,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 directive,
                 response,
             } => {
-                self.handle_upgrade_apply(directive, response).await;
+                self.begin_upgrade_apply(directive, response);
             }
             AgentCommand::UpgradeStatus { response } => {
                 let result = match &self.upgrade {
@@ -5478,7 +5506,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 let _ = response.send(result);
             }
             AgentCommand::UpgradeRollback { version, response } => {
-                self.handle_upgrade_rollback(version, response).await;
+                self.begin_upgrade_rollback(version, response);
             }
             AgentCommand::UpgradeVerify {
                 marker,
@@ -5488,100 +5516,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 self.handle_upgrade_verify(marker, rejoin, response).await;
             }
         }
-    }
-
-    /// Node-level upgrade: verify + stage, respond, then exec. On any
-    /// failure the node keeps running the current version, undrained.
-    async fn handle_upgrade_apply(
-        &mut self,
-        directive: crate::upgrade::types::UpgradeDirective,
-        response: oneshot::Sender<Result<(), BunError>>,
-    ) {
-        let Some(manager) = self.upgrade.clone() else {
-            let _ = response.send(Err(BunError::UpgradesUnavailable));
-            return;
-        };
-
-        // Stop taking new work while the swap is in progress. Running
-        // workloads are untouched (and survive the exec — see grill).
-        self.draining
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-
-        let inventory = self.upgrade_inventory().await;
-        // LOOP-INLINE: stage 3 of #351: the upgrade fetch leaves the loop (decision 4)
-        let prepared = match manager.prepare(&directive, inventory).await {
-            Ok(Some(prepared)) => prepared,
-            Ok(None) => {
-                // Same upgrade already in flight: idempotent OK.
-                let _ = response.send(Ok(()));
-                return;
-            }
-            Err(e) => {
-                self.draining
-                    .store(false, std::sync::atomic::Ordering::Relaxed);
-                let _ = response.send(Err(BunError::Upgrade(e)));
-                return;
-            }
-        };
-
-        println!(
-            "bun: upgrading to {} (upgrade {})",
-            prepared.target_version(),
-            directive.upgrade_id
-        );
-        // Respond before the point of no return, and give the HTTP layer a
-        // moment to flush the response — exec closes every socket.
-        let _ = response.send(Ok(()));
-        // LOOP-INLINE: 200 ms on purpose, so the answer flushes before exec replaces the process
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-        // Only returns on failure (the symlink is already reverted then).
-        let error = manager.execute(prepared);
-        self.draining
-            .store(false, std::sync::atomic::Ordering::Relaxed);
-        eprintln!(
-            "bun: upgrade exec failed, still on {}: {error}",
-            manager.running_version()
-        );
-    }
-
-    /// Node-level rollback: same swap machinery, no download or re-verify.
-    async fn handle_upgrade_rollback(
-        &mut self,
-        version: Option<crate::upgrade::BinaryVersion>,
-        response: oneshot::Sender<Result<(), BunError>>,
-    ) {
-        let Some(manager) = self.upgrade.clone() else {
-            let _ = response.send(Err(BunError::UpgradesUnavailable));
-            return;
-        };
-
-        self.draining
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        let inventory = self.upgrade_inventory().await;
-        // LOOP-INLINE: stages a binary already on disk and persists the marker, like a persist
-        let prepared = match manager.prepare_rollback(version, inventory).await {
-            Ok(prepared) => prepared,
-            Err(e) => {
-                self.draining
-                    .store(false, std::sync::atomic::Ordering::Relaxed);
-                let _ = response.send(Err(BunError::Upgrade(e)));
-                return;
-            }
-        };
-
-        println!("bun: rolling back to {}", prepared.target_version());
-        let _ = response.send(Ok(()));
-        // LOOP-INLINE: 200 ms on purpose, so the answer flushes before exec replaces the process
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-        let error = manager.execute(prepared);
-        self.draining
-            .store(false, std::sync::atomic::Ordering::Relaxed);
-        eprintln!(
-            "bun: rollback exec failed, still on {}: {error}",
-            manager.running_version()
-        );
     }
 
     /// Post-boot verification of a freshly swapped-in version: all
@@ -9741,23 +9675,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.service_map_tx.send_replace(merged);
     }
 
-    /// Apply `ruleset` with `nft`. A test that stalls the firewall stands in
-    /// for `nft` entirely, so the harness never rewrites the host's firewall.
-    async fn apply_perimeter_ruleset(
-        &self,
-        ruleset: &str,
-    ) -> Result<(), crate::firewall::rules::FirewallError> {
-        #[cfg(test)]
-        if self.loop_stalls.hold(LoopStall::Firewall).await {
-            return Ok(());
-        }
-        // LOOP-INLINE: stage 3 of #351: the nft subprocess leaves the loop
-        crate::firewall::rules::apply_ruleset(ruleset).await
-    }
-
-    /// Reconcile the perimeter firewall if cluster membership changed.
-    async fn reconcile_firewall(&mut self) {
-        if !self.perimeter_config.enabled {
+    /// Reconcile the perimeter firewall if cluster membership changed. The
+    /// `nft` subprocess runs off the loop; until it reports back, the tick
+    /// leaves the firewall alone.
+    fn reconcile_firewall(&mut self) {
+        if !self.perimeter_config.enabled || self.firewall_applying {
             return;
         }
 
@@ -9783,11 +9705,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
         };
 
-        if let Err(e) = self.apply_perimeter_ruleset(&ruleset).await {
-            eprintln!("warning: firewall reconciliation failed: {e}");
-        } else {
-            self.last_firewall_nodes = Some(cluster_nodes);
-        }
+        self.spawn_perimeter_apply(ruleset, cluster_nodes);
     }
 
     /// The per-instance identity directory (PKI7): keyed by instance id so
