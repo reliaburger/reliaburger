@@ -713,7 +713,9 @@ Tests: the render functions and address/role derivation under `cargo test --lib 
 
 `tests/self_upgrade_cluster.rs` is §14.7's harness scaled up: four real bun processes, each under its own supervisor loop, forming a real gossip+Raft cluster on localhost — node 0 bootstraps, the rest join, the council reconciler promotes voters, a leader emerges. Nothing is mocked below the HTTP API; the tests drive exactly the endpoints relish drives.
 
-One honesty note up front. With four nodes and a council cap of seven, *every* node becomes a Raft voter — a genuine non-voter worker would need an eight-node harness, which is a lot of laptop for one assertion. So the test labels one voter "worker" in its start request, and the leader's server-side derivation *corrects* that to `Council` (both roles precede the leader, so it's a harmless relabel, not a rejection). The mechanics under test — batch-then-serial ordering, quorum-gated council steps, leader-last in-place upgrade — are untouched by the distinction, and the correction is exactly the behaviour a unit test pins directly.
+One honesty note up front. With four nodes and a council cap of seven, *every* node should become a Raft voter, and since #373 the harness waits until every node has before a test starts. A genuine non-voter worker would need an eight-node harness, which is a lot of laptop for one assertion. So the test labels one voter "worker" in its start request, and the leader's server-side derivation *corrects* that to `Council` (both roles precede the leader, so it's a harmless relabel, not a rejection). The mechanics under test (council members one at a time, each step gated on live quorum, the leader last and in place) are untouched by the label, and the correction is exactly the behaviour a unit test pins directly.
+
+"Should become" is doing some work in that paragraph, because for a long time it didn't. The harness picked every port at random, so each node's Raft port sat a different distance above its gossip port. Bun doesn't gossip Raft addresses: it works out a peer's Raft address from the peer's gossip port plus its *own* offset, which is right on a real fleet where every node uses the same ports. On the harness that sum pointed at the wrong port, the leader never reached a node it tried to add, and the council stayed at the one voter that bootstrapped it. The tests still passed, because a walk over learners and a lone leader looks the same from `/v1/upgrade/cluster`. Nobody noticed until #373 pointed out that one test's comment admitted to "a one-voter council" while the module header promised four voters. Now the harness gives every node the same Raft offset, and its start-up waits until the leader's `/v1/cluster/nodes` marks all four as council members. Only then does a rolling upgrade take real voters down, one at a time, against a real quorum.
 
 **`rolling_upgrade_walks_workers_council_then_leader`** is the milestone test. Deploy a workload, push the signed blob to the leader's Pickle, POST the plan, and then just *watch* `/v1/upgrade/cluster` — any node can serve it, it's replicated — recording when each node first reports `Healthy`. The assertions read like the design doc: worker first; old leader last; the cluster still has a leader at the end; all four nodes report v0.2.0; and the app stays *reachable* across the whole roll. Note that last one is an **availability** assertion, not a same-pid one: unlike the single-node case (§14.7), a cluster's scheduler may legitimately reschedule an app while its host node bounces, so pid-identity is the wrong thing to demand here — "still serving, still has a running instance" is the honest cluster guarantee.
 
@@ -729,7 +731,7 @@ The fix has three interlocking parts, and the pattern is worth keeping: **make f
 
 These are the slowest tests in the repository — a couple of minutes each, serialised for the same starvation reasons as §14.7 — and the cheapest confidence per line in the whole phase. When someone asks whether the cluster can really upgrade itself, the answer is a test name.
 
-One honest operational note: they run on a *real* machine (`make test-upgrade-cluster`), not in CI. Four real `bun` processes, each with its own Raft TCP server and gossip, need enough cores to converge; on a contended 2-core shared CI runner the membership-change RPC times out under load and the council never forms. That's a property of *four real processes competing for two cores*, not of the upgrade logic — the single-node real-binary suite (§14.7) does run in CI, and the cluster mechanics are exercised deterministically by the mock-driven `step` unit tests (§14.9). The full-process cluster test is the belt-and-braces layer you point at a dev cluster, not the one that gates every push.
+One operational note. These tests used to run only on a real machine, because on a 2-core CI runner "the council never forms". That diagnosis blamed the cores. The port offsets above are the likelier culprit: a council that can't add learners never forms anywhere. CI's acceptance job now runs `make test-upgrade-cluster` on every pull request into `main` that touches code, and the cluster mechanics are also exercised deterministically by the mock-driven `step` unit tests (§14.9).
 
 What remains is bookkeeping: progress ticked, READMEs updated, and this chapter closed out with the lessons that only showed up in the doing.
 
@@ -1102,9 +1104,9 @@ The cluster suite gets
 `upgrade_start_sent_to_a_node_that_is_not_the_leader_reaches_the_leader`,
 which sends the start to a node other than the leader and waits for the run
 to finish. Before the change the node refused it with its own, leaderless
-view of the plan. Its council has a single voter, so that node is outside
-Raft and finds the leader through the directory: the Raft-follower path is the
-API test's job.
+view of the plan. Every node in that harness is a voter, so the node is a
+Raft follower and forwards to the leader Raft names. The worker outside Raft,
+which finds the leader through the directory, is the API test's job.
 
 One gap is left, and the manual says so. relish builds the `start` and
 `rollback` plans from the connected node's `/v1/cluster/nodes`, and a worker
