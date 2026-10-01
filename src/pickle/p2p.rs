@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::replication::Peer;
-use super::types::{Digest, ManifestCatalog, PickleError};
+use super::types::{Digest, LayerDescriptor, ManifestCatalog, PickleError};
 use crate::grill::image::LocalImageBlobs;
 
 /// One planned fetch: this digest, from this peer.
@@ -288,10 +288,31 @@ impl ClusterSource {
                 .cloned(),
             Err(_) => catalog.get_manifest_by_tag(repository, tag).cloned(),
         };
-        let Some(mut manifest) = manifest else {
+        let Some(manifest) = manifest else {
             return Ok(None);
         };
+        self.materialise_for_architecture(repository, manifest, catalog, peers, architecture, None)
+            .await
+            .map(Some)
+    }
 
+    /// Make `root` runnable here: the image itself, or, for an index, the
+    /// `linux/<architecture>` image it names. `fill` is the pull-through
+    /// cache's upstream: a platform the catalogue doesn't hold yet is fetched
+    /// from it, so each architecture fills its own part of a cached index.
+    async fn materialise_for_architecture(
+        &self,
+        repository: &str,
+        root: super::types::ImageManifest,
+        mut catalog: ManifestCatalog,
+        peers: &[Peer],
+        architecture: &str,
+        fill: Option<(
+            &dyn super::upstream::UpstreamRegistry,
+            &crate::grill::image::ImageReference,
+        )>,
+    ) -> Result<LocalImageBlobs, PickleError> {
+        let mut manifest = root;
         // A multi-platform image: materialise the index (and the platform
         // manifests it pins), then pick this node's platform. The index bytes
         // name the platform manifest by digest and every blob is
@@ -310,6 +331,15 @@ impl ClusterSource {
                     ))
                 })??;
             let platform_digest = select_platform_manifest(&index_bytes, architecture)?;
+            if let Some((upstream, image)) = fill
+                && catalog
+                    .get_repository_manifest(repository, platform_digest.as_str())
+                    .is_none()
+            {
+                self.fill_platform(upstream, image, repository, &platform_digest)
+                    .await?;
+                catalog = self.state.catalog_snapshot(repository).await?;
+            }
             manifest = catalog
                 .get_repository_manifest(repository, platform_digest.as_str())
                 .cloned()
@@ -327,7 +357,7 @@ impl ClusterSource {
 
         self.materialise(repository, &manifest, &catalog, peers)
             .await?;
-        Ok(Some(local_blobs(&self.state.store, &manifest)))
+        Ok(local_blobs(&self.state.store, &manifest))
     }
 
     /// Make every blob a catalogue entry pins local (its own manifest blob
@@ -469,12 +499,29 @@ impl ClusterSource {
         image: &crate::grill::image::ImageReference,
         peers: &[Peer],
     ) -> Result<Option<LocalImageBlobs>, PickleError> {
+        self.ensure_external_image_for_architecture(image, peers, std::env::consts::ARCH)
+            .await
+    }
+
+    /// [`Self::ensure_external_image_with_peers`] for a given container
+    /// architecture (`amd64`/`x86_64` or `arm64`/`aarch64`).
+    ///
+    /// A multi-platform upstream image is cached as its index, under the
+    /// tag. Each platform's image is fetched from upstream the first time a
+    /// node of that architecture asks for it, then served from the cluster
+    /// like any other cached image.
+    pub async fn ensure_external_image_for_architecture(
+        &self,
+        image: &crate::grill::image::ImageReference,
+        peers: &[Peer],
+        architecture: &str,
+    ) -> Result<Option<LocalImageBlobs>, PickleError> {
         use super::upstream::{CacheDecision, CacheState, decide, refresh_or_refetch};
 
         if !self.pull_through {
             return Ok(None);
         }
-        let Some(upstream) = &self.upstream else {
+        let Some(upstream) = self.upstream.as_deref() else {
             return Ok(None);
         };
 
@@ -482,55 +529,131 @@ impl ClusterSource {
         let recheck = std::time::Duration::from_secs(self.cache_recheck_secs);
 
         let catalog = self.state.catalog_snapshot(&cached_repo).await?;
-        match decide(
+        let cached = match decide(
             &catalog,
             &cached_repo,
             &image.tag,
             std::time::SystemTime::now(),
             recheck,
         ) {
-            CacheState::Fresh => {
-                return self
-                    .ensure_image_local_with_peers(&cached_repo, &image.tag, peers)
-                    .await;
-            }
-            CacheState::Stale(cached_digest) => {
-                match refresh_or_refetch(upstream.as_ref(), image, &cached_digest).await {
-                    Ok(CacheDecision::Hit) | Err(_) => {
-                        // Same digest — or upstream unreachable, in
-                        // which case a stale cache beats no image:
-                        // availability over freshness, stated plainly.
-                        return self
-                            .ensure_image_local_with_peers(&cached_repo, &image.tag, peers)
-                            .await;
-                    }
-                    Ok(CacheDecision::Refetch) => {}
-                }
-            }
-            CacheState::Miss => {}
+            CacheState::Fresh => true,
+            // Same digest, or upstream unreachable, in which case a stale
+            // cache beats no image: availability over freshness, stated
+            // plainly.
+            CacheState::Stale(cached_digest) => matches!(
+                refresh_or_refetch(upstream, image, &cached_digest).await,
+                Ok(CacheDecision::Hit) | Err(_)
+            ),
+            CacheState::Miss => false,
+        };
+        if !cached {
+            self.fill_root(upstream, image, &cached_repo, recheck)
+                .await?;
         }
 
-        // Fill from upstream, serialised so concurrent misses don't
-        // double-download. Re-check after acquiring: another task may
-        // have filled while we waited.
-        let _guard = self.fill_lock.lock().await;
         let catalog = self.state.catalog_snapshot(&cached_repo).await?;
+        let Some(root) = catalog
+            .get_manifest_by_tag(&cached_repo, &image.tag)
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        self.materialise_for_architecture(
+            &cached_repo,
+            root,
+            catalog,
+            peers,
+            architecture,
+            Some((upstream, image)),
+        )
+        .await
+        .map(Some)
+    }
+
+    /// Cache what `image` names upstream under its tag: a single-platform
+    /// image whole, or an index with its platform manifests but none of
+    /// their configs or layers yet.
+    async fn fill_root(
+        &self,
+        upstream: &dyn super::upstream::UpstreamRegistry,
+        image: &crate::grill::image::ImageReference,
+        cached_repo: &str,
+        recheck: Duration,
+    ) -> Result<(), PickleError> {
+        use super::upstream::{CacheState, UpstreamRoot, decide};
+
+        // Serialised so concurrent misses don't double-download. Re-check
+        // after acquiring: another task may have filled while we waited.
+        let _guard = self.fill_lock.lock().await;
+        let catalog = self.state.catalog_snapshot(cached_repo).await?;
         if matches!(
             decide(
                 &catalog,
-                &cached_repo,
+                cached_repo,
                 &image.tag,
                 std::time::SystemTime::now(),
                 recheck,
             ),
             CacheState::Fresh
         ) {
-            return self
-                .ensure_image_local_with_peers(&cached_repo, &image.tag, peers)
-                .await;
+            return Ok(());
         }
 
-        let manifest = upstream.fetch_manifest(image).await?;
+        match upstream.fetch_root(image).await? {
+            UpstreamRoot::Image(manifest) => {
+                self.store_upstream_image(upstream, image, manifest, cached_repo, &image.tag)
+                    .await
+            }
+            UpstreamRoot::Index(index) => {
+                self.store_upstream_index(index, cached_repo, &image.tag)
+                    .await
+            }
+        }
+    }
+
+    /// Cache one platform image of a cached index, named by its digest.
+    async fn fill_platform(
+        &self,
+        upstream: &dyn super::upstream::UpstreamRegistry,
+        image: &crate::grill::image::ImageReference,
+        cached_repo: &str,
+        platform: &Digest,
+    ) -> Result<(), PickleError> {
+        let _guard = self.fill_lock.lock().await;
+        let catalog = self.state.catalog_snapshot(cached_repo).await?;
+        if catalog
+            .get_repository_manifest(cached_repo, platform.as_str())
+            .is_some()
+        {
+            return Ok(());
+        }
+        let pinned = crate::grill::image::ImageReference {
+            registry: image.registry.clone(),
+            repository: image.repository.clone(),
+            tag: platform.as_str().to_string(),
+        };
+        let manifest = upstream.fetch_manifest(&pinned).await?;
+        if manifest.digest != *platform {
+            return Err(PickleError::ReplicationFailed(format!(
+                "upstream answered {} with manifest {}",
+                platform, manifest.digest
+            )));
+        }
+        // Tagged by its digest, as a pushed index's platform manifests are.
+        self.store_upstream_image(upstream, &pinned, manifest, cached_repo, platform.as_str())
+            .await
+    }
+
+    /// Store an upstream image's manifest, config and layers, then commit
+    /// it to the catalogue under `tag`.
+    async fn store_upstream_image(
+        &self,
+        upstream: &dyn super::upstream::UpstreamRegistry,
+        image: &crate::grill::image::ImageReference,
+        manifest: super::upstream::UpstreamManifest,
+        cached_repo: &str,
+        tag: &str,
+    ) -> Result<(), PickleError> {
         // The raw manifest bytes are a pinned blob like any layer
         // (REG1): the cache serves the manifest GET and peers pull it.
         self.state
@@ -553,8 +676,8 @@ impl ClusterSource {
             digest: manifest.digest,
             config: manifest.config,
             layers: manifest.layers,
-            repository: cached_repo,
-            tags: std::iter::once(image.tag.clone()).collect(),
+            repository: cached_repo.to_string(),
+            tags: std::iter::once(tag.to_string()).collect(),
             total_size,
             pushed_at: std::time::SystemTime::now(),
             pushed_by: self.state.node_raft_id,
@@ -562,10 +685,48 @@ impl ClusterSource {
             // repositories are exempt from require_signatures.
             signature: None,
         };
-        let blobs = local_blobs(&self.state.store, &image_manifest);
-        super::api::record_commit(&self.state, image_manifest, image.tag.clone()).await?;
+        super::api::record_commit(&self.state, image_manifest, tag.to_string()).await
+    }
 
-        Ok(Some(blobs))
+    /// Store an upstream index and its platform manifests, then commit it
+    /// under `tag` the way the registry records a pushed index: its own blob
+    /// as the config descriptor, its platform manifests as the "layers".
+    async fn store_upstream_index(
+        &self,
+        index: super::upstream::UpstreamIndex,
+        cached_repo: &str,
+        tag: &str,
+    ) -> Result<(), PickleError> {
+        for (descriptor, bytes) in &index.manifests {
+            self.state.store.write_blob(bytes, &descriptor.digest)?;
+        }
+        self.state
+            .store
+            .write_blob(&index.index_bytes, &index.digest)?;
+
+        let size = index.index_bytes.len() as u64;
+        let layers: Vec<LayerDescriptor> = index
+            .manifests
+            .into_iter()
+            .map(|(descriptor, _)| descriptor)
+            .collect();
+        let entry = super::types::ImageManifest {
+            digest: index.digest.clone(),
+            config: LayerDescriptor {
+                digest: index.digest,
+                size,
+                media_type: index.media_type,
+                platform: None,
+            },
+            total_size: size + layers.iter().map(|l| l.size).sum::<u64>(),
+            layers,
+            repository: cached_repo.to_string(),
+            tags: std::iter::once(tag.to_string()).collect(),
+            pushed_at: std::time::SystemTime::now(),
+            pushed_by: self.state.node_raft_id,
+            signature: None,
+        };
+        super::api::record_commit(&self.state, entry, tag.to_string()).await
     }
 }
 

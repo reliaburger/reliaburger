@@ -2,8 +2,8 @@
 
 use oci_distribution::errors::OciDistributionError;
 use oci_distribution::manifest::{
-    IMAGE_MANIFEST_LIST_MEDIA_TYPE, IMAGE_MANIFEST_MEDIA_TYPE, OCI_IMAGE_INDEX_MEDIA_TYPE,
-    OCI_IMAGE_MEDIA_TYPE, OciImageManifest, OciManifest, Versioned,
+    IMAGE_MANIFEST_LIST_MEDIA_TYPE, IMAGE_MANIFEST_MEDIA_TYPE, ImageIndexEntry,
+    OCI_IMAGE_INDEX_MEDIA_TYPE, OCI_IMAGE_MEDIA_TYPE, OciImageManifest, OciManifest, Versioned,
 };
 use oci_distribution::secrets::RegistryAuth;
 use oci_distribution::{Client, Reference};
@@ -136,6 +136,17 @@ pub(crate) async fn pull_verified_manifest_for_architecture(
             }
         }
     };
+    verified_image(client, reference, manifest_bytes, manifest).await
+}
+
+/// Check an image manifest's layer sizes, then fetch and verify its config.
+/// `manifest_bytes` must already be verified against the digest that names them.
+async fn verified_image(
+    client: &Client,
+    reference: &Reference,
+    manifest_bytes: Vec<u8>,
+    manifest: OciImageManifest,
+) -> Result<VerifiedImageManifest, OciDistributionError> {
     // Cache accounting sums layer lengths as u64. Validate before any cast,
     // allocation or publication, even when the raw manifest digest is valid.
     manifest.layers.iter().try_fold(0_u64, |total, layer| {
@@ -162,6 +173,86 @@ pub(crate) async fn pull_verified_manifest_for_architecture(
         manifest_bytes,
         config_bytes,
     })
+}
+
+/// The most platform manifests an upstream index may name. Real indexes list
+/// a dozen or so (platforms plus attestations); the cap stops a hostile index
+/// from turning one pull into thousands of requests.
+const MAX_INDEX_ENTRIES: usize = 256;
+
+/// An image index and the platform manifests it names that Reliaburger can
+/// run, every byte verified against the digest that names it.
+pub(crate) struct VerifiedImageIndex {
+    pub(crate) digest: String,
+    pub(crate) media_type: String,
+    pub(crate) index_bytes: Vec<u8>,
+    /// Each `linux/amd64` or `linux/arm64` entry and its manifest's raw bytes.
+    /// Other platforms and attestations stay upstream: no node can run them.
+    pub(crate) manifests: Vec<(ImageIndexEntry, Vec<u8>)>,
+}
+
+/// What a reference names upstream, before any platform is chosen.
+pub(crate) enum VerifiedRoot {
+    Image(Box<VerifiedImageManifest>),
+    Index(VerifiedImageIndex),
+}
+
+/// Fetch and verify the manifest a reference names as it stands: one image,
+/// or an index with the runnable platform manifests it pins. Unlike
+/// [`pull_verified_manifest_for_architecture`], nothing picks a platform, so
+/// a cache can keep the index and let each node choose its own.
+pub(crate) async fn pull_verified_root(
+    client: &Client,
+    reference: &Reference,
+    auth: &RegistryAuth,
+) -> Result<VerifiedRoot, OciDistributionError> {
+    let (index_bytes, _) = client
+        .pull_manifest_raw(reference, auth, MEDIA_TYPES)
+        .await?;
+    if let Some(expected) = reference.digest() {
+        verify(&index_bytes, expected, None)?;
+    }
+    let index = match parse_manifest(&index_bytes)? {
+        OciManifest::Image(manifest) => {
+            return Ok(VerifiedRoot::Image(Box::new(
+                verified_image(client, reference, index_bytes, manifest).await?,
+            )));
+        }
+        OciManifest::ImageIndex(index) => index,
+    };
+    if index.manifests.len() > MAX_INDEX_ENTRIES {
+        return Err(invalid(format!(
+            "upstream index names {} manifests, more than {MAX_INDEX_ENTRIES}",
+            index.manifests.len()
+        )));
+    }
+    let mut manifests = Vec::new();
+    for entry in index.manifests {
+        let runnable = entry.platform.as_ref().is_some_and(|platform| {
+            platform.os == "linux" && linux_architecture(&platform.architecture).is_ok()
+        });
+        if !runnable {
+            continue;
+        }
+        let child_reference = Reference::with_digest(
+            reference.registry().to_owned(),
+            reference.repository().to_owned(),
+            entry.digest.clone(),
+        );
+        let (bytes, _) = client
+            .pull_manifest_raw(&child_reference, auth, MEDIA_TYPES)
+            .await?;
+        verify(&bytes, &entry.digest, Some(entry.size))?;
+        manifests.push((entry, bytes));
+    }
+    Ok(VerifiedRoot::Index(VerifiedImageIndex {
+        digest: format!("sha256:{:x}", Sha256::digest(&index_bytes)),
+        media_type: index
+            .media_type
+            .unwrap_or_else(|| OCI_IMAGE_INDEX_MEDIA_TYPE.to_string()),
+        index_bytes,
+        manifests,
+    }))
 }
 
 /// How long one registry read may take, and how long all its attempts may take together.
