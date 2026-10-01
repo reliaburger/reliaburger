@@ -4624,14 +4624,14 @@ async fn local_top_rows(state: &ApiState) -> Result<Vec<crate::bun::top::TopRow>
                 .unwrap_or_default()
                 .as_secs()
                 .saturating_sub(USAGE_WINDOW_SECS);
-            let sql = format!(
-                "SELECT timestamp, metric_name, labels, value FROM metrics \
-                 WHERE metric_name IN ('{CPU_METRIC}', '{MEMORY_METRIC}') \
-                 AND timestamp >= {since} ORDER BY timestamp"
-            );
             // Missing samples leave the columns empty; they don't hide the
             // workloads themselves.
-            match mayo.read().await.query_sql_since(&sql, since).await {
+            match mayo
+                .read()
+                .await
+                .query_names_since(&[CPU_METRIC, MEMORY_METRIC], since)
+                .await
+            {
                 Ok(samples) => crate::bun::top::latest_usage(&samples),
                 Err(_) => std::collections::HashMap::new(),
             }
@@ -8090,12 +8090,7 @@ async fn metrics_query_handler(
     }
 
     if name == "*" {
-        let sql = format!(
-            "SELECT timestamp, metric_name, labels, value FROM metrics \
-             WHERE timestamp >= {start} AND timestamp <= {end} \
-             ORDER BY timestamp LIMIT 10000"
-        );
-        match store.query_sql_since(&sql, start).await {
+        match store.query_all(start, end).await {
             Ok(results) => {
                 let data: Vec<serde_json::Value> = results
                     .iter()
@@ -8820,16 +8815,7 @@ async fn metrics_rollup_handler(
 
     let result = match &params.name {
         Some(name) => store.query_cluster_metric(name, start, end).await,
-        None => {
-            let sql = format!(
-                "SELECT timestamp, metric_name, labels, SUM(sum_val) as total_sum \
-                 FROM rollups \
-                 WHERE timestamp >= {start} AND timestamp <= {end} \
-                 GROUP BY timestamp, metric_name, labels \
-                 ORDER BY timestamp LIMIT 10000"
-            );
-            store.query_sql(&sql).await
-        }
+        None => store.query_all(start, end).await,
     };
 
     match result {
