@@ -559,6 +559,10 @@ pub(super) async fn join_token_create_handler(
         /// exactly one node id so it cannot be replayed to impersonate another.
         #[serde(default)]
         node_id: String,
+        /// A token for a seed (`relish image seed`): it may wait on a USB
+        /// stick for days, so it may last up to a week (G6).
+        #[serde(default)]
+        seed: bool,
     }
 
     let req: CreateRequest = match serde_json::from_str(&body) {
@@ -581,7 +585,12 @@ pub(super) async fn join_token_create_handler(
     };
 
     let ttl = std::time::Duration::from_secs(req.ttl_seconds);
-    let (plaintext, join_token) = match crate::sesame::join::create_join_token(ttl, &req.node_id) {
+    let created = if req.seed {
+        crate::sesame::join::create_seed_join_token(ttl, &req.node_id)
+    } else {
+        crate::sesame::join::create_join_token(ttl, &req.node_id)
+    };
+    let (plaintext, join_token) = match created {
         Ok(created) => created,
         Err(crate::sesame::join::JoinError::EmptyNodeId) => {
             return (
@@ -597,7 +606,12 @@ pub(super) async fn join_token_create_handler(
                     "error": format!(
                         "ttl_seconds must be between {} and {}",
                         crate::sesame::join::MIN_JOIN_TOKEN_TTL.as_secs(),
-                        crate::sesame::join::MAX_JOIN_TOKEN_TTL.as_secs(),
+                        if req.seed {
+                            crate::sesame::join::MAX_SEED_JOIN_TOKEN_TTL
+                        } else {
+                            crate::sesame::join::MAX_JOIN_TOKEN_TTL
+                        }
+                        .as_secs(),
                     )
                 })),
             )

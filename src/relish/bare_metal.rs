@@ -288,6 +288,119 @@ pub fn create(options: &CreateOptions) -> Result<Created, RelishError> {
     })
 }
 
+/// The machines `relish image seed` adds: each named after the cluster
+/// and the next free number, refusing a MAC or address the fleet has.
+pub fn plan_additions(
+    fleet: &Fleet,
+    machines: &[(String, IpAddr)],
+) -> Result<Vec<FleetNode>, RelishError> {
+    let prefix = format!("{}-", fleet.cluster);
+    let first = fleet
+        .nodes
+        .iter()
+        .filter_map(|n| n.name.strip_prefix(&prefix)?.parse::<usize>().ok())
+        .max()
+        .unwrap_or(0)
+        + 1;
+    let mut added: Vec<FleetNode> = Vec::new();
+    for (index, (mac, address)) in (first..).zip(machines) {
+        let known = fleet.nodes.iter().chain(added.iter());
+        if let Some(clash) = known
+            .clone()
+            .find(|n| &n.mac == mac || &n.address == address)
+        {
+            return Err(failed(&format!(
+                "{mac}@{address} clashes with {} ({}@{})",
+                clash.name, clash.mac, clash.address
+            )));
+        }
+        added.push(FleetNode {
+            name: node_name(&fleet.cluster, index),
+            mac: mac.clone(),
+            address: *address,
+        });
+    }
+    Ok(added)
+}
+
+/// Whether the fleet's existing nodes let `address` through their firewall
+/// before it has joined: only if it's inside the `--network` they were
+/// created with.
+pub fn admitted(fleet: &Fleet, address: IpAddr) -> bool {
+    let Some(network) = &fleet.network else {
+        return false;
+    };
+    let Ok((base, prefix)) = crate::firewall::rules::parse_cidr(network) else {
+        return false;
+    };
+    match (base, address) {
+        (IpAddr::V4(base), IpAddr::V4(address)) => {
+            let mask = u32::MAX.checked_shl(32 - u32::from(prefix)).unwrap_or(0);
+            u32::from(base) & mask == u32::from(address) & mask
+        }
+        (IpAddr::V6(base), IpAddr::V6(address)) => {
+            let mask = u128::MAX.checked_shl(128 - u32::from(prefix)).unwrap_or(0);
+            u128::from(base) & mask == u128::from(address) & mask
+        }
+        _ => false,
+    }
+}
+
+/// `relish image seed <dir> MAC@IP...`: add machines to a running cluster.
+/// Their join tokens come from the cluster (relish's context must point at
+/// it), and their seeds land beside the others in `<dir>/stick/seeds`.
+pub async fn run_add(
+    directory: &Path,
+    machines: &[(String, IpAddr)],
+    token_ttl: Duration,
+    ssh_key: Option<Vec<u8>>,
+) -> Result<(), RelishError> {
+    let fleet_path = directory.join("fleet.json");
+    let mut fleet: Fleet = serde_json::from_slice(&std::fs::read(&fleet_path)?)
+        .map_err(|e| failed(&format!("{}: {e}", fleet_path.display())))?;
+    let added = plan_additions(&fleet, machines)?;
+    let client = super::client::BunClient::default_local();
+    let mut written = Vec::new();
+    for node in &added {
+        let token = client
+            .join_token_create_for_seed(&node.name, token_ttl.as_secs())
+            .await?;
+        let mut files = BTreeMap::new();
+        if let Some(key) = &ssh_key {
+            files.insert("authorized_keys".to_string(), key.clone());
+        }
+        let mut with_node = fleet.clone();
+        with_node.nodes.push(node.clone());
+        let config = with_node.seed_config(node, SeedRole::Join, Some(token), &None);
+        let path = directory.join("stick").join(stick_file(&node.mac));
+        write_private(&path, &seed_tarball(&config, &files)?)?;
+        written.push(path);
+    }
+    fleet.nodes.extend(added.iter().cloned());
+    write_private(
+        &fleet_path,
+        &serde_json::to_vec_pretty(&fleet).map_err(RelishError::SerialiseJson)?,
+    )?;
+    for (node, seed) in added.iter().zip(&written) {
+        println!(
+            "  {} ({} at {}): {}",
+            node.name,
+            node.mac,
+            node.address,
+            seed.display()
+        );
+        if !admitted(&fleet, node.address) {
+            println!(
+                "    {} isn't in a network the cluster admits (cluster create --network); add it to \
+                 [security] bootstrap_peers on the existing nodes, or it can't reach them to join",
+                node.address
+            );
+        }
+    }
+    println!("Copy the new seeds onto the RBSEED stick (seeds/ keeps one per MAC).");
+    Ok(())
+}
+
 /// The relish context for a bare-metal cluster: node 1's API with the admin
 /// token, trusting the cluster's root CA.
 pub fn context(
@@ -524,6 +637,74 @@ mod tests {
             create(&options(dir.path(), &["d8:9e:f3:00:00:01@192.168.1.51"])).is_err(),
             "an existing cluster"
         );
+    }
+
+    #[test]
+    fn added_machines_take_the_next_names_and_refuse_clashes() {
+        let fleet = Fleet {
+            schema: 1,
+            cluster: "home".into(),
+            ca_fingerprint: "sha256:x".into(),
+            operators: vec![],
+            network: Some("192.168.1.0/24".into()),
+            faults: false,
+            nodes: vec![
+                FleetNode {
+                    name: "home-1".into(),
+                    mac: "aa:aa:aa:aa:aa:01".into(),
+                    address: "192.168.1.51".parse().unwrap(),
+                },
+                FleetNode {
+                    name: "home-3".into(),
+                    mac: "aa:aa:aa:aa:aa:03".into(),
+                    address: "192.168.1.53".parse().unwrap(),
+                },
+            ],
+        };
+        let added = plan_additions(
+            &fleet,
+            &[
+                parse_machine("aa:aa:aa:aa:aa:04@192.168.1.54").unwrap(),
+                parse_machine("aa:aa:aa:aa:aa:05@10.0.0.5").unwrap(),
+            ],
+        )
+        .unwrap();
+        let names: Vec<&str> = added.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names, ["home-4", "home-5"]);
+        assert!(
+            plan_additions(
+                &fleet,
+                &[parse_machine("aa:aa:aa:aa:aa:01@192.168.1.99").unwrap()]
+            )
+            .is_err()
+        );
+        assert!(
+            plan_additions(
+                &fleet,
+                &[parse_machine("bb:bb:bb:bb:bb:bb@192.168.1.53").unwrap()]
+            )
+            .is_err()
+        );
+        assert!(
+            plan_additions(
+                &fleet,
+                &[
+                    parse_machine("cc:cc:cc:cc:cc:01@192.168.1.60").unwrap(),
+                    parse_machine("cc:cc:cc:cc:cc:01@192.168.1.61").unwrap()
+                ]
+            )
+            .is_err(),
+            "the same MAC twice"
+        );
+        assert!(admitted(&fleet, "192.168.1.54".parse().unwrap()));
+        assert!(!admitted(&fleet, "10.0.0.5".parse().unwrap()));
+        assert!(!admitted(
+            &Fleet {
+                network: None,
+                ..fleet
+            },
+            "192.168.1.54".parse().unwrap()
+        ));
     }
 
     #[test]

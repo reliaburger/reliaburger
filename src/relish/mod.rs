@@ -14,6 +14,7 @@ pub mod dev;
 pub mod diff;
 pub mod fault;
 pub mod fmt;
+pub mod image;
 pub mod inspect;
 pub mod install;
 #[cfg(feature = "kubernetes")]

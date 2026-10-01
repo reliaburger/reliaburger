@@ -78,6 +78,10 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 - `relish init [DIR]`: Initialise a new cluster (generates CAs, age keypair, node identity)
 - `relish cluster`: Create a cluster of bare-metal appliances (docs/manual/14_appliance.md)
   - `relish cluster create --bare-metal --name <NAME> --operator <OPERATORS>... <DIRECTORY> <MACHINES>...`: Create a cluster for appliance machines: its PKI and admin token on this machine, and a seed per machine for an RBSEED stick
+- `relish image`: Appliance OS images: download, write to a disk, and seed machines
+  - `relish image download`: Download the newest OS build and check it against the release key
+  - `relish image write <IMAGE> <DEVICE>`: Write a disk image (.raw or .raw.zst) onto a device, erasing it
+  - `relish image seed <DIRECTORY> <MACHINES>...`: Write seeds for machines joining a running bare-metal cluster
 - `relish join --node-id <NODE_ID> <ADDR>`: Join an existing cluster
 - `relish join-token`: Manage short-lived node-enrolment tokens
   - `relish join-token create --node-id <NODE_ID>`: Create a single-use token for enrolling one node

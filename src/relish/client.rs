@@ -2251,11 +2251,32 @@ impl BunClient {
         node_id: &str,
         ttl_seconds: u64,
     ) -> Result<String, RelishError> {
+        self.join_token_create_with(node_id, ttl_seconds, false)
+            .await
+    }
+
+    /// A join token for a seed: like [`Self::join_token_create`], but it
+    /// may last up to a week.
+    pub async fn join_token_create_for_seed(
+        &self,
+        node_id: &str,
+        ttl_seconds: u64,
+    ) -> Result<String, RelishError> {
+        self.join_token_create_with(node_id, ttl_seconds, true)
+            .await
+    }
+
+    async fn join_token_create_with(
+        &self,
+        node_id: &str,
+        ttl_seconds: u64,
+        seed: bool,
+    ) -> Result<String, RelishError> {
         let url = format!("{}/v1/join-token/create", self.base_url);
         let response = self
             .http()?
             .post(&url)
-            .json(&serde_json::json!({ "ttl_seconds": ttl_seconds, "node_id": node_id }))
+            .json(&serde_json::json!({ "ttl_seconds": ttl_seconds, "node_id": node_id, "seed": seed }))
             .send()
             .await
             .map_err(classify_error)?;

@@ -385,6 +385,11 @@ enum Command {
         #[command(subcommand)]
         action: ClusterAction,
     },
+    /// Appliance OS images: download, write to a disk, and seed machines.
+    Image {
+        #[command(subcommand)]
+        action: ImageAction,
+    },
     /// Manage short-lived node-enrolment tokens.
     JoinToken {
         #[command(subcommand)]
@@ -761,6 +766,47 @@ enum ClusterAction {
         #[arg(long)]
         external_signing_key: Option<String>,
         /// Each machine as MAC@IP, node 1 first.
+        #[arg(required = true, value_parser = parse_machine)]
+        machines: Vec<(String, std::net::IpAddr)>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ImageAction {
+    /// Download the newest OS build and check it against the release key.
+    Download {
+        /// x86_64 or aarch64.
+        #[arg(long, default_value = std::env::consts::ARCH)]
+        arch: String,
+        /// Where to save it (as <dir>/<arch>/, the layout a netboot server serves).
+        #[arg(long, default_value = "os")]
+        dir: PathBuf,
+        /// Also fetch the pieces only OS updates use (the UKI and /usr images).
+        #[arg(long)]
+        all: bool,
+        /// Channel to read instead of the published one.
+        #[arg(long, default_value = reliaburger::relish::image::CHANNEL_URL)]
+        channel: String,
+    },
+    /// Write a disk image (.raw or .raw.zst) onto a device, erasing it.
+    Write {
+        image: PathBuf,
+        device: PathBuf,
+        /// Confirm that everything on the device may be erased.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Write seeds for machines joining a running bare-metal cluster.
+    Seed {
+        /// The directory `relish cluster create --bare-metal` made.
+        directory: PathBuf,
+        /// How long the join tokens stay valid (s, m, h or d; at most 7d).
+        #[arg(long, default_value = "7d", value_parser = parse_seed_ttl)]
+        ttl: u64,
+        /// Public key for root SSH on lab images.
+        #[arg(long)]
+        ssh_key: Option<PathBuf>,
+        /// Each machine as MAC@IP.
         #[arg(required = true, value_parser = parse_machine)]
         machines: Vec<(String, std::net::IpAddr)>,
     },
@@ -1718,6 +1764,36 @@ async fn main() -> ExitCode {
                     external_signing_key,
                 },
             ),
+        },
+        Command::Image { action } => match action {
+            ImageAction::Download {
+                arch,
+                dir,
+                all,
+                channel,
+            } => reliaburger::relish::image::download(&channel, &arch, &dir, all).await,
+            ImageAction::Write { image, device, yes } => {
+                reliaburger::relish::image::write(&image, &device, yes).map(|bytes| {
+                    println!("wrote {} MB to {}", bytes / 1_000_000, device.display());
+                })
+            }
+            ImageAction::Seed {
+                directory,
+                ttl,
+                ssh_key,
+                machines,
+            } => match ssh_key.as_deref().map(std::fs::read).transpose() {
+                Err(error) => Err(error.into()),
+                Ok(ssh_key) => {
+                    reliaburger::relish::bare_metal::run_add(
+                        &directory,
+                        &machines,
+                        std::time::Duration::from_secs(ttl),
+                        ssh_key,
+                    )
+                    .await
+                }
+            },
         },
         Command::JoinToken { action } => match &action {
             JoinTokenAction::List => commands::join_token_list().await,
