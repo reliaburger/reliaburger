@@ -6,15 +6,15 @@ async fn registry_query_response_refuses_an_oversized_catalogue() {
         .repository_owners
         .insert("repository".into(), "x".repeat(MAX_REGISTRY_PROPOSAL_BYTES));
     assert_eq!(
-        super::bounded_registry_query_response(RegistryQueryResponse::Repository(Box::new(
-            catalog
-        )))
+        super::registry::bounded_registry_query_response(RegistryQueryResponse::Repository(
+            Box::new(catalog)
+        ))
         .await
         .status(),
         axum::http::StatusCode::SERVICE_UNAVAILABLE
     );
     assert_eq!(
-        super::bounded_registry_query_response(RegistryQueryResponse::Repository(
+        super::registry::bounded_registry_query_response(RegistryQueryResponse::Repository(
             Default::default()
         ))
         .await
