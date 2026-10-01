@@ -342,7 +342,7 @@ and any missing member shows as a yellow `incomplete: node node-3 timed out`
 line above the rows. The dashboard's node page asks that node for its status
 directly, says "node-3 did not answer" when it can't, and only draws CPU and
 memory charts on a node's own page. The tests live in
-`src/bun/api_cluster_view_tests.rs`: each view gets a fake peer on an
+`src/bun/api/cluster_view_tests.rs`: each view gets a fake peer on an
 ephemeral port, and the tests check the merge, the warning for a member that
 doesn't answer, that a `local=true` request never fans out, and that a scoped
 token's rows stay inside its namespace.

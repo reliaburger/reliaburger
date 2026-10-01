@@ -910,7 +910,7 @@ route, because no API route returns decrypted secret material: the agent
 decrypts `ENC[...]` values straight into the instance environment. Two tests
 keep the matrix honest: `every_gated_route_checks_its_permission_action`
 statically finds each gated handler's check, and the table test in
-`src/bun/api_permission_tests.rs` drives a real request per gated route and per
+`src/bun/api/permission_tests.rs` drives a real request per gated route and per
 principal (every role, grant shape, session, scope, system and bootstrap),
 asserting 403 exactly where the spec doesn't grant the action.
 

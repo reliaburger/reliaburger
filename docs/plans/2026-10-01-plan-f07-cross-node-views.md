@@ -52,7 +52,7 @@ member that didn't answer as a warning rather than failing or going quiet.
    fan-out, says when that node didn't answer, and charts CPU and memory only
    on the node's own dashboard instead of misattributing this node's.
 
-Tests first: unit tests in `src/bun/api.rs` against a fake peer router for
+Tests first: unit tests in `src/bun/api/cluster_view_tests.rs` against a fake peer router for
 each fan-out (merge, node tags, partial failure, namespace scope), reducer and
 renderer tests for the TUI, and one cluster test in `tests/placement.rs`
 (`make test-cluster`) that reads the WebSocket stream, deploy history and
