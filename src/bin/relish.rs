@@ -380,6 +380,11 @@ enum Command {
         #[command(subcommand)]
         action: TokenAction,
     },
+    /// Create a cluster of bare-metal appliances (docs/manual/14_appliance.md).
+    Cluster {
+        #[command(subcommand)]
+        action: ClusterAction,
+    },
     /// Manage short-lived node-enrolment tokens.
     JoinToken {
         #[command(subcommand)]
@@ -721,6 +726,68 @@ enum SignAction {
         #[arg(long)]
         out: PathBuf,
     },
+}
+
+#[derive(Subcommand)]
+enum ClusterAction {
+    /// Create a cluster for appliance machines: its PKI and admin token on
+    /// this machine, and a seed per machine for an RBSEED stick.
+    Create {
+        /// The only kind of cluster this creates (laptop clusters are
+        /// `relish local`).
+        #[arg(long, required = true)]
+        bare_metal: bool,
+        /// Directory for the cluster's secrets, seeds and fleet list.
+        directory: PathBuf,
+        /// The cluster's name; machines become <name>-1, <name>-2, ...
+        #[arg(long)]
+        name: String,
+        /// Address or network relish runs from (repeatable).
+        #[arg(long = "operator", required = true)]
+        operators: Vec<String>,
+        /// The LAN machines added later join from (for example 192.168.1.0/24).
+        #[arg(long)]
+        network: Option<String>,
+        /// Admit workload and node faults, as the laptop quickstart does.
+        #[arg(long)]
+        faults: bool,
+        /// Public key for root SSH on lab images (which have sshd).
+        #[arg(long)]
+        ssh_key: Option<PathBuf>,
+        /// How long the seeds' join tokens stay valid (s, m, h or d; at most 7d).
+        #[arg(long, default_value = "7d", value_parser = parse_seed_ttl)]
+        ttl: u64,
+        /// Operator countersignature key for cluster bun upgrades.
+        #[arg(long)]
+        external_signing_key: Option<String>,
+        /// Each machine as MAC@IP, node 1 first.
+        #[arg(required = true, value_parser = parse_machine)]
+        machines: Vec<(String, std::net::IpAddr)>,
+    },
+}
+
+fn parse_machine(value: &str) -> Result<(String, std::net::IpAddr), String> {
+    reliaburger::relish::bare_metal::parse_machine(value)
+}
+
+fn parse_seed_ttl(value: &str) -> Result<u64, String> {
+    let (digits, multiplier) = match value.as_bytes().last().copied() {
+        Some(b's') => (&value[..value.len() - 1], 1_u64),
+        Some(b'm') => (&value[..value.len() - 1], 60_u64),
+        Some(b'h') => (&value[..value.len() - 1], 3_600_u64),
+        Some(b'd') => (&value[..value.len() - 1], 86_400_u64),
+        _ => return Err("TTL must end in s, m, h or d (for example 7d)".to_string()),
+    };
+    let seconds = digits
+        .parse::<u64>()
+        .map_err(|_| "TTL must start with a whole number".to_string())?
+        .checked_mul(multiplier)
+        .ok_or_else(|| "TTL is too large".to_string())?;
+    let max = reliaburger::sesame::join::MAX_SEED_JOIN_TOKEN_TTL.as_secs();
+    if !(1..=max).contains(&seconds) {
+        return Err("TTL must be between 1s and 7d".to_string());
+    }
+    Ok(seconds)
 }
 
 #[derive(Subcommand)]
@@ -1621,6 +1688,36 @@ async fn main() -> ExitCode {
             }
             TokenAction::List => commands::token_list().await,
             TokenAction::Revoke { name } => commands::token_revoke(name).await,
+        },
+        Command::Cluster {
+            action:
+                ClusterAction::Create {
+                    bare_metal: _,
+                    directory,
+                    name,
+                    operators,
+                    network,
+                    faults,
+                    ssh_key,
+                    ttl,
+                    external_signing_key,
+                    machines,
+                },
+        } => match ssh_key.as_deref().map(std::fs::read).transpose() {
+            Err(error) => Err(error.into()),
+            Ok(ssh_key) => reliaburger::relish::bare_metal::run_create(
+                &reliaburger::relish::bare_metal::CreateOptions {
+                    directory,
+                    cluster: name,
+                    machines,
+                    operators,
+                    network,
+                    faults,
+                    ssh_key,
+                    token_ttl: std::time::Duration::from_secs(ttl),
+                    external_signing_key,
+                },
+            ),
         },
         Command::JoinToken { action } => match &action {
             JoinTokenAction::List => commands::join_token_list().await,

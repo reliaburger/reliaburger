@@ -1,3 +1,4 @@
+pub mod bare_metal;
 pub mod bench_cmd;
 /// Relish CLI library.
 ///
