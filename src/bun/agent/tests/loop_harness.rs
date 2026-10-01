@@ -102,7 +102,12 @@ impl RunningAgent {
 }
 
 /// Wait until the grill has seen `count` more `operation` calls than `before`.
-async fn wait_for_calls(grill: &MockGrill, operation: &str, before: usize, count: usize) {
+pub(super) async fn wait_for_calls(
+    grill: &MockGrill,
+    operation: &str,
+    before: usize,
+    count: usize,
+) {
     let seen = |grill: &MockGrill| {
         grill
             .calls()
@@ -119,7 +124,7 @@ async fn wait_for_calls(grill: &MockGrill, operation: &str, before: usize, count
     .unwrap_or_else(|_| panic!("the slow work never called {operation}"));
 }
 
-fn calls_of(grill: &MockGrill, operation: &str) -> usize {
+pub(super) fn calls_of(grill: &MockGrill, operation: &str) -> usize {
     grill
         .calls()
         .iter()
@@ -127,7 +132,7 @@ fn calls_of(grill: &MockGrill, operation: &str) -> usize {
         .count()
 }
 
-fn replicated(app: &str, replicas: u32) -> Config {
+pub(super) fn replicated(app: &str, replicas: u32) -> Config {
     Config::parse(&format!(
         "[app.{app}]\nimage = '{app}:v1'\nport = 8080\nreplicas = {replicas}\n"
     ))
@@ -136,7 +141,7 @@ fn replicated(app: &str, replicas: u32) -> Config {
 
 /// Kill the only replica of `web` behind the runtime's back; the health tick
 /// notices and restarts it.
-fn crash(grill: &MockGrill) {
+pub(super) fn crash(grill: &MockGrill) {
     let id = InstanceId("default__web-0".to_string());
     grill.set_state(&id, ContainerState::Stopped);
     grill.set_exit_code(&id, Some(1));
@@ -147,7 +152,6 @@ fn crash(grill: &MockGrill) {
 /// `check_apps` asks the runtime for every running app's state, one at a
 /// time, on the tick. Ten replicas at 250 ms each is one 2.5 s turn.
 #[tokio::test]
-#[ignore = "stage 2 of #351"]
 async fn status_answers_while_the_tick_reads_every_app_state() {
     let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
     expect_complete(&drain_deploy(&mut agent, replicated("web", 10)).await);
@@ -163,7 +167,6 @@ async fn status_answers_while_the_tick_reads_every_app_state() {
 
 /// `check_jobs` does the same for every running job.
 #[tokio::test]
-#[ignore = "stage 2 of #351"]
 async fn status_answers_while_the_tick_reads_every_job_state() {
     let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
     let jobs: String = (0..10)
@@ -183,7 +186,6 @@ async fn status_answers_while_the_tick_reads_every_job_state() {
 /// A restart first kills what's left of the old container and waits for the
 /// runtime to confirm, inline, before the tick's restart budget is checked.
 #[tokio::test]
-#[ignore = "stage 2 of #351"]
 async fn status_answers_while_a_restart_waits_for_its_kill() {
     let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
     expect_complete(&drain_deploy(&mut agent, replicated("web", 1)).await);
@@ -200,7 +202,6 @@ async fn status_answers_while_a_restart_waits_for_its_kill() {
 
 /// Then it creates and starts the replacement, inline too.
 #[tokio::test]
-#[ignore = "stage 2 of #351"]
 async fn status_answers_while_a_restart_creates_and_starts() {
     let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
     expect_complete(&drain_deploy(&mut agent, replicated("web", 1)).await);

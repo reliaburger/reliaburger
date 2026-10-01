@@ -2320,6 +2320,7 @@ mod tests {
                 exit_code: None,
                 pid,
                 runtime_unknown: false,
+                status_age_ms: None,
             },
             cpu_percent: cpu,
             memory_bytes: memory,

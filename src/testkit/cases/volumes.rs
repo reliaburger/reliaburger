@@ -248,6 +248,7 @@ mod tests {
             exit_code: None,
             pid: None,
             runtime_unknown: false,
+            status_age_ms: None,
         }
     }
 

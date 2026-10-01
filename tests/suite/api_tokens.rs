@@ -85,6 +85,7 @@ async fn api() -> (Arc<CouncilNode>, Router) {
         reliaburger::bun::readiness::ReadinessTracker::new(),
         None,
         None,
+        None,
     );
     (council, router)
 }

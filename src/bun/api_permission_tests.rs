@@ -459,6 +459,7 @@ fn instance(app: &str) -> InstanceStatus {
         exit_code: None,
         pid: Some(4242),
         runtime_unknown: false,
+        status_age_ms: None,
     }
 }
 

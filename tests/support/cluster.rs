@@ -392,6 +392,8 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
     // Several agents share this host; don't spawn nft against the real
     // host firewall (`with_cluster` enables it by default on Linux).
     agent.set_perimeter_enabled(false);
+    // The API answers status from the loop's published snapshot, as Bun does.
+    let status_reader = agent.status_reader();
     let agent_task = reliaburger::bun::readiness::spawn_owned(
         "agent",
         true,
@@ -517,9 +519,10 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
             readiness,
             None,
             None,
+            Some(status_reader.clone()),
         )
     } else {
-        api::router(
+        api::router_with_upgrade(
             cmd_tx.clone(),
             None,
             None,
@@ -532,8 +535,24 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
             None,
             Some(Arc::clone(&membership_table)),
             None,
+            None,
             api_port,
             None,
+            None,
+            None,
+            "default".to_string(),
+            None,
+            reliaburger::bun::build_runner::BuildSettings::with_timeout(900),
+            reliaburger::cluster::ClusterHttp::plaintext(),
+            5050,
+            "http",
+            256 * 1024 * 1024,
+            false,
+            reliaburger::bun::capabilities::StaticCapabilities::default(),
+            reliaburger::bun::readiness::ReadinessTracker::new(),
+            None,
+            None,
+            Some(status_reader),
         )
     };
     let app = match capacity_admission {

@@ -17,6 +17,9 @@ pub(super) struct AppStop {
     pub(super) instances: Vec<InstanceId>,
     /// Whether any instance is a recorded job whose phase must be committed.
     pub(super) owns_job: bool,
+    /// Restarts this stop took its instances back from. The exit wait lets
+    /// their in-flight runtime steps finish before it signals anything.
+    pub(super) taken_restarts: Vec<super::restarts::TakenRestart>,
 }
 
 /// What a caller wants done once a stop has confirmed every exit.
@@ -273,6 +276,7 @@ mod tests {
                 stop: AppStop {
                     instances: Vec::new(),
                     owns_job: false,
+                    taken_restarts: Vec::new(),
                 },
                 task,
                 waiters,

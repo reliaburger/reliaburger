@@ -53,6 +53,7 @@ impl TestScenario {
                         exit_code: None,
                         pid: Some(1000 + app_index as u32 * 2 + replica),
                         runtime_unknown: false,
+                        status_age_ms: None,
                     },
                 });
             }

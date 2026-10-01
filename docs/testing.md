@@ -37,7 +37,7 @@ turns short:
 | Inline-await rule | Parses the agent's source with `syn`, walks every method a turn can reach from `run_loop`, and fails on an await with neither a `tokio::time::timeout` nor a `// LOOP-INLINE: <why>` comment | [`src/bun/agent/tests/loop_rule.rs`](../src/bun/agent/tests/loop_rule.rs) |
 
 All three run in `make test`. A harness scenario that fails today is ignored
-with the stage of #351 that fixes it (`#[ignore = "stage 2 of #351"]`); the
+with the stage of #351 that fixes it (`#[ignore = "stage 3 of #351"]`); the
 fix un-ignores it in the same change. Run them all with
 `cargo nextest run --run-ignored all -E 'test(loop_harness)'`. A new inline
 await either gets a deadline, moves into a task, or gets a tag a reviewer can

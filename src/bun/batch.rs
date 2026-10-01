@@ -648,6 +648,9 @@ async fn watch_batch(state: &ApiState, batch_id: u64) {
 }
 
 async fn fetch_local_statuses(state: &ApiState) -> Option<Vec<InstanceStatus>> {
+    if let Some(reader) = &state.status {
+        return reader.read().await.ok();
+    }
     let (status_tx, status_rx) = oneshot::channel();
     state
         .cmd_tx
@@ -1324,6 +1327,7 @@ mod tests {
             exit_code: exit,
             pid: None,
             runtime_unknown: false,
+            status_age_ms: None,
         };
         assert_eq!(
             job_outcome(&[status("stopped", Some(0))], "j", "default"),

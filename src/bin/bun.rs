@@ -1075,6 +1075,8 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     let event_store = Arc::new(RwLock::new(reliaburger::bun::events::EventStore::new()));
     agent.set_event_store(Arc::clone(&event_store));
     let loop_meter = agent.loop_meter();
+    // `/v1/status` reads the loop's published snapshot through this.
+    let status_reader = agent.status_reader();
     // How this node reaches peer agent APIs: https + CA trust under mTLS,
     // plain http otherwise. Shared by the API fan-out, batch/build dispatch,
     // placement reconciler and upgrade orchestrator.
@@ -2480,6 +2482,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         readiness.clone(),
         Some(local_test_leases.clone()),
         jwt_verifier,
+        Some(status_reader),
     );
     let app = match &registry_forwarder {
         Some(forwarder) => app.layer(axum::Extension(
