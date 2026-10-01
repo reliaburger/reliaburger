@@ -3934,14 +3934,23 @@ nothing restarts it while the kill is in flight.
 #### The faults
 
 The fault code was where the five approaches met. A node-kill fault's
-container kills nobody waits on, so a task does them. The `ss` that cuts open
-connections after a drop or partition lands is best effort, so a task does
-that too. Delays program a netem tree inside every caller's network
-namespace, a handful of `tc` commands per caller, and doing them one caller
-at a time added up to most of a second on a busy node. They now run side by
-side under the turn's budget, and a caller cut short is marked
-`(u32::MAX, Vec::new())`, a restart count no instance has, so the next pass
-rebuilds it.
+container kills nobody waits on, so a task does them. Delays program a netem
+tree inside every caller's network namespace, a handful of `tc` commands per
+caller, and doing them one caller at a time added up to most of a second on a
+busy node. They now run side by side under the turn's budget, and a caller
+cut short is marked `(u32::MAX, Vec::new())`, a restart count no instance has,
+so the next pass rebuilds it.
+
+The `ss` that cuts open connections after a drop or partition lands taught us
+something. Cutting is best effort, nothing reads its result, so the first
+version sent it to a detached task. The privileged CI run disagreed: the
+Kubernetes demo injects a partition and immediately asks the frontend to talk
+to Redis, and three requests in a row went through, on pooled connections the
+cut hadn't reached yet. "Nobody reads the result" isn't the same as "nobody
+depends on it"; the caller who hears "partition installed" depends on the old
+connections being gone. So the cuts run side by side under the turn's budget,
+before the answer, like the delays, and only one that's cut short is retried
+from a task.
 
 Node pressure got the most machinery, because its helper takes up to four
 seconds to say it's ready and the controller has to stay the single owner of
