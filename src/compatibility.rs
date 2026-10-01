@@ -24,10 +24,12 @@ pub struct Compatibility {
 /// volume slugs, per-destination export receipts, restore journals and
 /// volume quotas in the sidecar), and each image index entry's platform in
 /// Pickle's catalogue (`LayerDescriptor::platform`) and image listings
-/// (`ImageSummary::platforms`).
+/// (`ImageSummary::platforms`), and the apps a namespace quota keeps
+/// unplaced (`RaftRequest::QuotaBlocked`, `DesiredState::quota_blocked` and
+/// `DesiredAppEvidence::blocked`).
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 28,
-    state: 47,
+    protocol: 29,
+    state: 48,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.

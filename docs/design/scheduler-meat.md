@@ -928,7 +928,7 @@ fn reconcile_daemon_apps(&self, membership_event: MembershipEvent) {
 
 ### 5.6 Namespace Quota Enforcement
 
-Quotas are enforced at scheduling time, not at apply time and not retroactively. `relish apply` commits an over-quota app to desired state like any other; the leader's scheduling pass (`plan_scheduling_pass` in `src/cluster/orchestrate.rs`) seeds a `QuotaLedger` with every converged app's footprint, then runs this check before placing each unconverged app. An app that fails it gets no placement that pass and the leader logs `scheduler: quota rejects <app>: <reason>`; the check runs again every pass, so the app places once the namespace has room. `over_quota_apply_is_accepted_but_never_placed` pins this contract. The check, in outline:
+Quotas are enforced at scheduling time, not at apply time and not retroactively. `relish apply` commits an over-quota app to desired state like any other; the leader's scheduling pass (`plan_scheduling_pass` in `src/cluster/orchestrate.rs`) seeds a `QuotaLedger` with every converged app's footprint, then runs this check before placing each unconverged app. An app that fails it gets no placement that pass, and the pass returns the `QuotaError` beside its placements (`PassPlan::quota_blocked`). The leader keeps those reasons in council state, `DesiredState::quota_blocked`, so any node can say why an app isn't running (see §7.3). The check runs again every pass, so the app places once the namespace has room, and its reason clears in the same pass. `over_quota_app_is_not_placed_and_the_pass_says_why` pins this contract. The check, in outline:
 
 ```rust
 fn check_namespace_quota(
@@ -1094,12 +1094,16 @@ All scheduler-related configuration is set in the cluster-level configuration (a
 
 **Response:**
 
-- **New deploys (0.1.0):** `relish apply` succeeds and the app is committed, but Meat leaves it unplaced, so it shows zero instances. The only record of why is a line in the leader's log, repeated each scheduling pass:
+- **New deploys:** `relish apply` succeeds and the app is committed, but Meat leaves it unplaced. The pass records why: the leader proposes a `RaftRequest::QuotaBlocked` carrying every blocked app and its `QuotaError`, which replaces `DesiredState::quota_blocked`. Every node serves that reason in its desired-app evidence (`GET /v1/diagnostics/apps`, field `blocked`), so it shows wherever an operator looks:
   ```
-  scheduler: quota rejects prod/new-service: <QuotaError>
+  $ relish status
+  new-service (namespace prod) is not placed, blocked: namespace "prod" would exceed CPU quota: 3000+2000 > 4000m
   ```
-- **Autoscale and replica changes:** a scale-up that would bust the budget is skipped the same way, and the app keeps the placements it already has. Running workloads are never terminated to satisfy a quota.
-- **Planned, not yet scheduled on the roadmap:** a durable "blocked by quota" reason on the app that `relish status` and Brioche can show, and an apply-time error for an app that can't fit its namespace's budget. There's no `QuotaBlocked` event or quota alert today.
+  `relish inspect` adds a `Blocked:` line, Brioche marks the app `blocked` and prints the reason on its page, and `relish wtf` raises a `quota-blocked` warning in place of the generic under-replication.
+- **Clearing:** the reason belongs to the pass that found it. Raise the budget, or shrink or delete other apps in the namespace, and the next pass admits the app, places it and drops it from the set. Deleting the blocked app removes its reason in the same Raft entry.
+- **No write churn:** an over-quota app stays blocked pass after pass, and the leader plans a pass every tick. It compares the pass's set with the recorded one (`quota_blocked_update`) and writes only when an app joins or leaves the set or its numbers change, so a steady over-quota cluster adds nothing to the Raft log. The `scheduler: quota rejects …` log line follows the same rule and appears only when the reason is new.
+- **Autoscale and replica changes:** a scale-up that would bust the budget is skipped the same way, records the same reason, and the app keeps the placements it already has. Running workloads are never terminated to satisfy a quota.
+- **Planned, not yet scheduled on the roadmap:** an apply-time error for an app that can't fit its namespace's budget, and a quota alert. The reason is a status, not an event: there's no history of when an app was blocked.
 
 ### 7.4 Leader Failure Mid-Deploy
 
