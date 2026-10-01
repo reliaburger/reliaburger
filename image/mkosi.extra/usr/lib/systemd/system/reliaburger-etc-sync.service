@@ -13,7 +13,10 @@ Description=Reliaburger /etc update
 DefaultDependencies=no
 RequiresMountsFor=/var/lib/reliaburger
 After=local-fs.target
-Before=sysinit.target systemd-update-done.service ldconfig.service systemd-sysusers.service systemd-tmpfiles-setup.service
+# Not before systemd-sysusers.service: that runs before local-fs-pre.target,
+# so it would close an ordering cycle with After=local-fs.target. It only
+# writes passwd and group, which etc-sync never touches.
+Before=sysinit.target systemd-update-done.service ldconfig.service systemd-tmpfiles-setup.service
 Conflicts=shutdown.target
 Before=shutdown.target
 
