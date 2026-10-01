@@ -331,7 +331,8 @@ make test-rootless-runc # non-root runc/slirp replacement proof
 make lint        # clippy with warnings as errors
 make audit       # RustSec advisory and dependency-maintenance gate
 make fmt         # format with rustfmt
-make ci          # portable format, lint and test checks
+make ci          # portable format, lint, test, doctest and CI-script checks
+make ci-bench    # make ci, then the gossip benchmarks
 make clean       # remove build artefacts
 ```
 

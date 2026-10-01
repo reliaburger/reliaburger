@@ -1,0 +1,21 @@
+---
+source: src/relish/wtf/diagnose.rs
+expression: report_rows(&report)
+---
+CRITICAL [node-dead] node node-3 is Dead
+CRITICAL [unreachable-nodes] node node-3 did not answer its Bun API
+WARNING [version-skew] nodes run 2 different bun builds
+    node-1: bun v0.1.2 (3fcb1fd), sha256 aaaa
+    node-2: bun v0.1.2 (9e1d2c3), sha256 bbbb
+    not read: node node-3: version: timed out after 10s
+OK [alerts] no relevant alerts are firing
+OK [certificates] all observed certificates are currently valid with healthy automatic rotation
+OK [council] council quorum healthy (1/1)
+OK [cpu-throttling] no application accumulated throttled CPU time
+OK [crashloops] no applications have three timestamped restarts in 15 minutes
+OK [deploys] no deploy has been active for more than 15 minutes
+OK [disks] all observed storage domains are below 85% usage
+OK [faults] no active Smoker faults
+OK [registry] Pickle is reachable and its known layers meet the redundancy target
+OK [replicas] every app runs its desired replicas
+OK [services] all deployed services have a healthy backend

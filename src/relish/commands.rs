@@ -1647,34 +1647,52 @@ pub fn format_images_table(images: &[crate::pickle::types::ImageSummary]) -> Str
     if images.is_empty() {
         return "no images in local registry\n".to_string();
     }
-    let mut out = format!(
-        "{:<30} {:<15} {:<28} {:>8} {:>12}\n",
-        "REPOSITORY", "TAG", "PLATFORMS", "LAYERS", "SIZE"
-    );
-    for image in images {
-        let tags = image.tags.iter().cloned().collect::<Vec<_>>().join(", ");
-        let tags = if tags.is_empty() {
-            "<none>".to_string()
-        } else {
-            tags
-        };
-        let (platforms, layers) = if image.platforms.is_empty() {
-            ("-".to_string(), image.layers.to_string())
-        } else {
-            let names: Vec<&str> = image
-                .platforms
-                .iter()
-                .map(|p| p.platform.as_str())
-                .collect();
-            (names.join(", "), "-".to_string())
-        };
-        let size = format_image_size(image.total_size);
-        out.push_str(&format!(
-            "{:<30} {tags:<15} {platforms:<28} {layers:>8} {size:>12}\n",
-            image.repository
-        ));
+    let header = ["REPOSITORY", "TAG", "PLATFORMS", "LAYERS", "SIZE"].map(str::to_string);
+    let rows: Vec<[String; 5]> = images.iter().map(image_row).collect();
+    // Each column is as wide as its widest cell, so a long pull-through
+    // name like `cache/public.ecr.aws/...` can't push its row out of line.
+    let mut widths = header.clone().map(|cell| cell.len());
+    for row in &rows {
+        for (width, cell) in widths.iter_mut().zip(row) {
+            *width = (*width).max(cell.chars().count());
+        }
+    }
+    let [repository, tag, platforms, layers, size] = widths;
+    let mut out = String::new();
+    for [r, t, p, l, s] in std::iter::once(&header).chain(&rows) {
+        let line =
+            format!("{r:<repository$}  {t:<tag$}  {p:<platforms$}  {l:>layers$}  {s:>size$}");
+        out.push_str(line.trim_end());
+        out.push('\n');
     }
     out
+}
+
+/// One `relish images` row: repository, tags, platforms, layers and size.
+fn image_row(image: &crate::pickle::types::ImageSummary) -> [String; 5] {
+    let tags = image.tags.iter().cloned().collect::<Vec<_>>().join(", ");
+    let tags = if tags.is_empty() {
+        "<none>".to_string()
+    } else {
+        tags
+    };
+    let (platforms, layers) = if image.platforms.is_empty() {
+        ("-".to_string(), image.layers.to_string())
+    } else {
+        let names: Vec<&str> = image
+            .platforms
+            .iter()
+            .map(|p| p.platform.as_str())
+            .collect();
+        (names.join(", "), "-".to_string())
+    };
+    [
+        image.repository.clone(),
+        tags,
+        platforms,
+        layers,
+        format_image_size(image.total_size),
+    ]
 }
 
 fn format_image_size(size: u64) -> String {
@@ -3081,6 +3099,18 @@ spec:
     #[test]
     fn images_table_shows_a_multi_platform_image_on_one_row_with_its_platforms() {
         let mut images = registry_listing();
+        images.push(multi_platform_summary());
+        insta::assert_snapshot!(format_images_table(&images));
+    }
+
+    #[test]
+    fn images_table_widens_its_columns_to_fit_a_long_cached_repository() {
+        let mut images = registry_listing();
+        images.push(summary(
+            "cache/public.ecr.aws/docker/library/redis",
+            MYAPP_V1,
+            &["7.2-alpine"],
+        ));
         images.push(multi_platform_summary());
         insta::assert_snapshot!(format_images_table(&images));
     }
