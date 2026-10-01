@@ -452,7 +452,7 @@ static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore = "requires RELIABURGER_UPGRADE_TESTS=1 and real bun processes"]
+#[ignore = "requires RELIABURGER_UPGRADE_TESTS=1 and real bun processes; run with make test-upgrade-node"]
 async fn single_node_upgrade_preserves_running_containers() {
     assert!(
         upgrade_tests_enabled(),
@@ -515,7 +515,7 @@ async fn single_node_upgrade_preserves_running_containers() {
 }
 
 #[tokio::test]
-#[ignore = "requires RELIABURGER_UPGRADE_TESTS=1 and real bun processes"]
+#[ignore = "requires RELIABURGER_UPGRADE_TESTS=1 and real bun processes; run with make test-upgrade-node"]
 async fn single_node_rollback_reverts_to_previous_version() {
     assert!(
         upgrade_tests_enabled(),
@@ -546,7 +546,7 @@ async fn single_node_rollback_reverts_to_previous_version() {
 }
 
 #[tokio::test]
-#[ignore = "requires RELIABURGER_UPGRADE_TESTS=1 and real bun processes"]
+#[ignore = "requires RELIABURGER_UPGRADE_TESTS=1 and real bun processes; run with make test-upgrade-node"]
 async fn failed_upgrade_triggers_automatic_rollback() {
     assert!(
         upgrade_tests_enabled(),
@@ -603,7 +603,7 @@ async fn failed_upgrade_triggers_automatic_rollback() {
 }
 
 #[tokio::test]
-#[ignore = "requires RELIABURGER_UPGRADE_TESTS=1 and real bun processes"]
+#[ignore = "requires RELIABURGER_UPGRADE_TESTS=1 and real bun processes; run with make test-upgrade-node"]
 async fn version_retention_gc_keeps_last_three() {
     assert!(
         upgrade_tests_enabled(),
@@ -636,7 +636,7 @@ async fn version_retention_gc_keeps_last_three() {
 }
 
 #[tokio::test]
-#[ignore = "requires RELIABURGER_UPGRADE_TESTS=1 and real bun processes"]
+#[ignore = "requires RELIABURGER_UPGRADE_TESTS=1 and real bun processes; run with make test-upgrade-node"]
 async fn upgrade_rejects_bad_external_signature() {
     assert!(
         upgrade_tests_enabled(),
@@ -663,7 +663,7 @@ async fn upgrade_rejects_bad_external_signature() {
 }
 
 #[tokio::test]
-#[ignore = "requires RELIABURGER_UPGRADE_TESTS=1 and real bun processes"]
+#[ignore = "requires RELIABURGER_UPGRADE_TESTS=1 and real bun processes; run with make test-upgrade-node"]
 async fn same_version_upgrade_never_swaps_silently() {
     assert!(
         upgrade_tests_enabled(),
@@ -709,7 +709,7 @@ async fn same_version_upgrade_never_swaps_silently() {
 }
 
 #[tokio::test]
-#[ignore = "requires RELIABURGER_UPGRADE_TESTS=1 and real bun processes"]
+#[ignore = "requires RELIABURGER_UPGRADE_TESTS=1 and real bun processes; run with make test-upgrade-node"]
 async fn isolated_replacement_reverts_without_restarting_its_workload() {
     assert!(upgrade_tests_enabled());
     let _serial = SERIAL.lock().await;

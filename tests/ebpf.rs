@@ -89,7 +89,7 @@ const CGROUP_PATH: &str = "/sys/fs/cgroup";
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 fn embedded_program_loads_without_an_object_directory() {
     assert!(ebpf_tests_enabled(), "set RELIABURGER_EBPF_TESTS=1");
     let loader = OnionEbpf::load_embedded(std::path::Path::new(CGROUP_PATH)).unwrap();
@@ -100,7 +100,7 @@ fn embedded_program_loads_without_an_object_directory() {
 }
 
 #[tokio::test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn ebpf_load_and_attach() {
     let mut ebpf = load_ebpf();
 
@@ -112,7 +112,7 @@ async fn ebpf_load_and_attach() {
 }
 
 #[tokio::test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn ebpf_backend_map_write_and_read() {
     let mut ebpf = load_ebpf();
 
@@ -160,7 +160,7 @@ async fn ebpf_backend_map_write_and_read() {
 }
 
 #[tokio::test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn ebpf_backend_map_remove() {
     let mut ebpf = load_ebpf();
 
@@ -198,7 +198,7 @@ async fn ebpf_backend_map_remove() {
 }
 
 #[tokio::test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn ebpf_service_map_sync_multiple() {
     let mut ebpf = load_ebpf();
 
@@ -255,7 +255,7 @@ async fn ebpf_service_map_sync_multiple() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn ebpf_connect_to_vip_rewrites_destination() {
     let mut ebpf = load_ebpf();
 
@@ -317,7 +317,7 @@ async fn ebpf_connect_to_vip_rewrites_destination() {
 /// on the kernel keeps routing to local backends and refuses the rest, with
 /// or without Bun running.
 #[tokio::test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn a_lapsed_view_lease_routes_only_to_local_backends() {
     use reliaburger::onion::lease::{ViewLease, boot_clock_ns};
     use reliaburger::onion::types::ViewLeaseValue;
@@ -407,7 +407,7 @@ async fn a_lapsed_view_lease_routes_only_to_local_backends() {
 }
 
 #[tokio::test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn ebpf_connect_to_vip_no_backends_refused() {
     let mut ebpf = load_ebpf();
 
@@ -444,7 +444,7 @@ async fn ebpf_connect_to_vip_no_backends_refused() {
 }
 
 #[tokio::test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn ebpf_connect_non_vip_passes_through() {
     let mut ebpf = load_ebpf();
 
@@ -473,7 +473,7 @@ async fn ebpf_connect_non_vip_passes_through() {
 /// not a manual `BpfServiceMap` write. Deploy through the agent command
 /// channel and read the map back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn agent_deploy_populates_backend_map() {
     use reliaburger::bun::agent::AgentCommand;
     use reliaburger::config::Config;
@@ -556,7 +556,7 @@ async fn agent_deploy_populates_backend_map() {
 /// absent listener with ECONNREFUSED, not EPERM); after the fault it is
 /// dropped (EPERM) regardless of backends.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn agent_drop_fault_refuses_vip_with_eperm() {
     use reliaburger::bun::agent::AgentCommand;
     use reliaburger::config::Config;
@@ -687,7 +687,7 @@ async fn agent_drop_fault_refuses_vip_with_eperm() {
 /// the connect hook refuses the VIP, then delete the exact key and prove the
 /// refusal disappears.
 #[tokio::test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn partition_fault_blocks_its_source_cgroup_and_clears() {
     use reliaburger::sesame::egress::cgroup_id_of_pid;
     use reliaburger::smoker::bpf_maps;
@@ -790,7 +790,7 @@ async fn partition_fault_blocks_its_source_cgroup_and_clears() {
 /// on the *test's own* cgroup — the process doing the connects — so the
 /// eBPF `bpf_get_current_cgroup_id()` matches what we program.
 #[tokio::test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn egress_denied_by_default_allowed_when_listed() {
     use reliaburger::sesame::egress::{self, EGRESS_ALLOW, EgressKey, EgressValue};
 
@@ -892,7 +892,7 @@ async fn egress_denied_by_default_allowed_when_listed() {
 /// performs (a `delete_egress_entry` per destination, then
 /// `clear_egress_enforced`) and asserts nothing survives.
 #[tokio::test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn egress_cleanup_deletes_destinations_not_just_the_flag() {
     use reliaburger::sesame::egress::{self, EGRESS_ALLOW, EgressKey, EgressValue};
 
@@ -969,7 +969,7 @@ async fn egress_cleanup_deletes_destinations_not_just_the_flag() {
 /// check. We enforce against the *test's own* cgroup so
 /// `bpf_get_current_cgroup_id()` matches what we program.
 #[tokio::test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn namespace_isolation_denies_cross_namespace_by_default() {
     use reliaburger::onion::ebpf::maps::BpfServiceMap;
     use reliaburger::sesame::firewall::{
@@ -1049,7 +1049,7 @@ async fn namespace_isolation_denies_cross_namespace_by_default() {
 
 /// An explicit grant must identify the destination service, not its bare name.
 #[tokio::test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn namespace_grant_cannot_authorise_a_same_named_destination() {
     use reliaburger::sesame::{egress, firewall};
     use std::collections::HashMap;
@@ -1132,7 +1132,7 @@ async fn namespace_grant_cannot_authorise_a_same_named_destination() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn dns_responder_resolves_internal_name() {
     assert!(
         ebpf_tests_enabled(),
@@ -1197,7 +1197,7 @@ async fn dns_responder_resolves_internal_name() {
 }
 
 #[tokio::test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn dns_responder_non_internal_times_out() {
     assert!(
         ebpf_tests_enabled(),
@@ -1259,7 +1259,7 @@ async fn dns_responder_non_internal_times_out() {
 /// and an unlisted one is denied with EPERM — the connect6 hook, driven
 /// against the test's own cgroup.
 #[tokio::test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn connect6_denies_unlisted_and_allows_listed_ipv6() {
     use reliaburger::sesame::egress::{self, EGRESS_ALLOW, EgressValue, exact_v6_key};
     use std::net::Ipv6Addr;
@@ -1345,7 +1345,7 @@ async fn connect6_denies_unlisted_and_allows_listed_ipv6() {
 /// destination stays reachable both natively and as a v4-mapped
 /// (::ffff:a.b.c.d) connect through the connect6 hook.
 #[tokio::test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn v4_only_allowlist_no_longer_bypassed_over_ipv6() {
     use reliaburger::sesame::egress::{self, EGRESS_ALLOW, EgressValue, exact_v4_key};
     use std::net::{Ipv6Addr, SocketAddrV6};
@@ -1424,7 +1424,7 @@ async fn v4_only_allowlist_no_longer_bypassed_over_ipv6() {
 /// an allowed prefix connects on the listed port and is denied on any
 /// other port.
 #[tokio::test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn cidr_egress_allowed_via_lpm_trie() {
     use reliaburger::sesame::egress::{self, EgressDestination, merge_cidr_ports};
     use std::net::IpAddr;
@@ -1479,7 +1479,7 @@ async fn cidr_egress_allowed_via_lpm_trie() {
 /// NET8 sweep: kernel egress state for a cgroup with no live instance is
 /// planned stale and scrubbed across all four allow maps plus the flag.
 #[tokio::test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn sweep_scrubs_orphaned_cgroup_state() {
     use reliaburger::sesame::egress::{
         self, EgressDestination, merge_cidr_ports, plan_egress_sweep,
@@ -1548,7 +1548,7 @@ async fn sweep_scrubs_orphaned_cgroup_state() {
 /// enforcement being active for the cgroup path proves the pre-start
 /// ordering — there is no window in which the workload runs unpoliced.
 #[tokio::test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn egress_programmed_before_start_via_cgroup_path() {
     use reliaburger::bun::agent::AgentCommand;
     use reliaburger::config::Config;
@@ -1645,7 +1645,7 @@ async fn egress_programmed_before_start_via_cgroup_path() {
 /// an unclean exit. Pre-start programming must scrub that whole cgroup policy
 /// before opening the destinations requested by the new workload.
 #[tokio::test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn pre_start_programming_scrubs_recycled_cgroup_allows() {
     use reliaburger::bun::agent::AgentCommand;
     use reliaburger::config::Config;
@@ -1732,7 +1732,7 @@ async fn pre_start_programming_scrubs_recycled_cgroup_allows() {
 /// deploy, the agent must stop the protected workload rather than leave it
 /// running with a decorative allowlist.
 #[tokio::test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn live_egress_hook_loss_stops_protected_workload() {
     use reliaburger::bun::agent::AgentCommand;
     use reliaburger::config::Config;
@@ -1817,7 +1817,7 @@ async fn live_egress_hook_loss_stops_protected_workload() {
 /// leaves no running process — the mock grill records a create and a
 /// stop, but never a start.
 #[tokio::test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn pre_start_programming_error_fails_deploy_with_no_running_process() {
     use reliaburger::bun::agent::AgentCommand;
     use reliaburger::config::Config;
@@ -2092,7 +2092,7 @@ fn freeze_egress_map(ebpf: &OnionEbpf, name: &str) {
 }
 
 #[test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 fn egress_cleanup_refuses_a_frozen_destination_map_and_keeps_enforcement() {
     use reliaburger::sesame::egress::{self, EGRESS_ALLOW, EgressKey, EgressValue};
     let mut ebpf = load_ebpf();
@@ -2125,7 +2125,7 @@ fn egress_cleanup_refuses_a_frozen_destination_map_and_keeps_enforcement() {
 }
 
 #[test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 fn egress_cleanup_refuses_a_frozen_enforcement_flag() {
     use reliaburger::sesame::egress;
     let mut ebpf = load_ebpf();
@@ -2143,7 +2143,7 @@ fn egress_cleanup_refuses_a_frozen_enforcement_flag() {
 }
 
 #[tokio::test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn agent_retirement_keeps_its_record_when_kernel_egress_cleanup_fails() {
     use reliaburger::bun::agent::{AgentCommand, ApplyEvent};
     use reliaburger::config::Config;
@@ -2319,7 +2319,7 @@ impl Drop for OwnedPolicyFixture {
 }
 
 #[test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 fn egress_policy_survives_actual_loader_process_death() {
     use std::process::Command;
     assert!(ebpf_tests_enabled());
@@ -2433,7 +2433,7 @@ fn egress_owner_process_fixture() {
 }
 
 #[test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 fn persistent_policy_refuses_conflicting_owners_and_retired_state() {
     assert!(ebpf_tests_enabled());
     let owned = OwnedPolicyFixture::new();
@@ -2487,7 +2487,7 @@ fn persistent_policy_refuses_conflicting_owners_and_retired_state() {
 }
 
 #[test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 fn persistent_policy_refuses_obsolete_destination_identity() {
     assert!(ebpf_tests_enabled());
     let owned = OwnedPolicyFixture::new();
@@ -2509,7 +2509,7 @@ fn persistent_policy_refuses_obsolete_destination_identity() {
 }
 
 #[test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 fn persistent_policy_rebuilds_only_proven_prior_boot_empty_inventory() {
     assert!(ebpf_tests_enabled());
     let owned = OwnedPolicyFixture::new();
@@ -2561,7 +2561,7 @@ fn persistent_policy_rebuilds_only_proven_prior_boot_empty_inventory() {
 }
 
 #[test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 fn persistent_policy_refuses_missing_or_malformed_boot_identity() {
     assert!(ebpf_tests_enabled());
     let owned = OwnedPolicyFixture::new();
@@ -2578,7 +2578,7 @@ fn persistent_policy_refuses_missing_or_malformed_boot_identity() {
 }
 
 #[test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 fn persistent_policy_never_recreates_a_missing_live_claim() {
     assert!(ebpf_tests_enabled());
     let owned = OwnedPolicyFixture::new();
@@ -2602,7 +2602,7 @@ fn persistent_policy_never_recreates_a_missing_live_claim() {
 }
 
 #[test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 fn persistent_policy_never_recreates_a_missing_manifest() {
     assert!(ebpf_tests_enabled());
     let owned = OwnedPolicyFixture::new();
@@ -2629,7 +2629,7 @@ fn persistent_policy_never_recreates_a_missing_manifest() {
 }
 
 #[test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 fn persistent_policy_recovers_partial_startup_and_interrupted_retirement() {
     assert!(ebpf_tests_enabled());
     let owned = OwnedPolicyFixture::new();
@@ -2670,7 +2670,7 @@ fn persistent_policy_recovers_partial_startup_and_interrupted_retirement() {
 }
 
 #[test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 fn persistent_policy_refuses_wrong_map_layout_and_foreign_map_identity() {
     assert!(ebpf_tests_enabled());
     for foreign_name in ["backend_map", "egress_map"] {
@@ -2710,7 +2710,7 @@ fn persistent_policy_refuses_wrong_map_layout_and_foreign_map_identity() {
 }
 
 #[tokio::test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn agent_adoption_restores_durable_egress_ownership_before_live_checks() {
     use reliaburger::bun::agent::{AgentCommand, ApplyEvent};
     use reliaburger::config::Config;
@@ -2950,7 +2950,7 @@ impl Drop for EgressRecoveryFixture {
 }
 
 #[tokio::test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn confirmed_egress_retirement_survives_interrupted_adoption_record_cleanup() {
     assert!(ebpf_tests_enabled());
     let mut fixture = EgressRecoveryFixture::deploy("egress-tombstone").await;
@@ -2987,7 +2987,7 @@ async fn confirmed_egress_retirement_survives_interrupted_adoption_record_cleanu
 }
 
 #[tokio::test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn missing_policy_owner_refuses_even_a_stopped_recorded_runtime() {
     assert!(ebpf_tests_enabled());
     let mut fixture = EgressRecoveryFixture::deploy("egress-missing-owner").await;
@@ -3012,7 +3012,7 @@ async fn missing_policy_owner_refuses_even_a_stopped_recorded_runtime() {
 }
 
 #[tokio::test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn failed_policy_checkpoint_prevents_kernel_programming_and_workload_start() {
     assert!(ebpf_tests_enabled());
     let mut fixture = EgressRecoveryFixture::prepare("egress-checkpoint-failure", true).await;
@@ -3041,7 +3041,7 @@ async fn failed_policy_checkpoint_prevents_kernel_programming_and_workload_start
 }
 
 #[tokio::test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn agent_recovery_keeps_policy_ownership_when_kernel_retirement_is_refused() {
     assert!(ebpf_tests_enabled());
     let mut fixture = EgressRecoveryFixture::deploy("egress-recovery-cleanup").await;
@@ -3071,7 +3071,7 @@ async fn agent_recovery_keeps_policy_ownership_when_kernel_retirement_is_refused
 }
 
 #[tokio::test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn adoption_fences_missing_enforcement_before_publishing_the_workload() {
     use reliaburger::sesame::egress;
     assert!(ebpf_tests_enabled());
@@ -3103,7 +3103,7 @@ async fn adoption_fences_missing_enforcement_before_publishing_the_workload() {
 }
 
 #[tokio::test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn agent_namespace_binding_uses_the_workload_cgroup_instead_of_its_launcher() {
     use reliaburger::sesame::{egress, firewall};
     assert!(ebpf_tests_enabled());
@@ -3138,7 +3138,7 @@ async fn agent_namespace_binding_uses_the_workload_cgroup_instead_of_its_launche
 }
 
 #[test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 fn firewall_cleanup_refuses_frozen_maps_and_preserves_their_entries() {
     use reliaburger::onion::types::{FirewallKey, FirewallValue};
     use reliaburger::sesame::firewall;
@@ -3174,7 +3174,7 @@ fn firewall_cleanup_refuses_frozen_maps_and_preserves_their_entries() {
 }
 
 #[test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 fn firewall_cleanup_confirms_removal_and_accepts_already_absent_entries() {
     use reliaburger::onion::types::{FirewallKey, FirewallValue};
     use reliaburger::sesame::firewall;
@@ -3210,7 +3210,7 @@ fn firewall_cleanup_confirms_removal_and_accepts_already_absent_entries() {
 }
 
 #[test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 fn firewall_reconciliation_retains_refused_cleanup_for_repeated_attempts() {
     use reliaburger::onion::types::{FirewallKey, FirewallValue};
     use reliaburger::sesame::firewall::{self, CgroupNamespaceEntry};
@@ -3268,7 +3268,7 @@ fn firewall_reconciliation_retains_refused_cleanup_for_repeated_attempts() {
 }
 
 #[test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 fn firewall_reconciliation_retains_partial_publication_and_unrelated_entries() {
     use reliaburger::onion::types::{FirewallKey, FirewallValue};
     use reliaburger::sesame::firewall::{self, CgroupNamespaceEntry};
@@ -3312,7 +3312,7 @@ fn firewall_reconciliation_retains_partial_publication_and_unrelated_entries() {
 }
 
 #[test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 fn firewall_reconciliation_forgets_confirmed_removals_only() {
     use reliaburger::onion::types::{FirewallKey, FirewallValue};
     use reliaburger::sesame::firewall::{self, CgroupNamespaceEntry};
@@ -3353,7 +3353,7 @@ fn firewall_reconciliation_forgets_confirmed_removals_only() {
 }
 
 #[tokio::test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn agent_namespace_binding_includes_outbound_only_workloads() {
     use reliaburger::sesame::{egress, firewall};
     assert!(ebpf_tests_enabled());
@@ -3388,7 +3388,7 @@ async fn agent_namespace_binding_includes_outbound_only_workloads() {
 }
 
 #[tokio::test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn agent_retirement_preserves_ownership_when_backend_removal_is_refused() {
     assert!(ebpf_tests_enabled());
     let mut fixture =
@@ -3429,7 +3429,7 @@ async fn agent_retirement_preserves_ownership_when_backend_removal_is_refused() 
 }
 
 #[tokio::test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn agent_retirement_confirms_backend_absence_before_forgetting_ownership() {
     assert!(ebpf_tests_enabled());
     let mut fixture =
@@ -3612,19 +3612,19 @@ async fn assert_source_policy_precedes_start(job: bool) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn source_policy_precedes_portless_application_start() {
     assert_source_policy_precedes_start(false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn source_policy_precedes_job_start() {
     assert_source_policy_precedes_start(true).await;
 }
 
 #[tokio::test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn namespace_retirement_keeps_original_ownership_through_recovery() {
     assert!(ebpf_tests_enabled());
     let mut fixture = EgressRecoveryFixture::deploy("namespace-retirement").await;
@@ -3657,7 +3657,7 @@ async fn namespace_retirement_keeps_original_ownership_through_recovery() {
 }
 
 #[tokio::test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn namespace_adoption_refuses_missing_original_enforcement() {
     use reliaburger::sesame::{egress, firewall};
     assert!(ebpf_tests_enabled());
@@ -3685,7 +3685,7 @@ async fn namespace_adoption_refuses_missing_original_enforcement() {
 }
 
 #[tokio::test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn source_namespace_loss_fences_a_live_workload() {
     use reliaburger::sesame::{egress, firewall};
     assert!(ebpf_tests_enabled());
@@ -3723,7 +3723,7 @@ async fn source_namespace_loss_fences_a_live_workload() {
 }
 
 #[tokio::test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn source_namespace_recovery_refuses_an_owner_with_erased_identity() {
     use reliaburger::sesame::{egress, firewall};
     assert!(ebpf_tests_enabled());
@@ -3756,7 +3756,7 @@ async fn source_namespace_recovery_refuses_an_owner_with_erased_identity() {
 }
 
 #[tokio::test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn source_only_checkpoint_failure_prevents_execution() {
     use reliaburger::sesame::{egress, firewall};
     assert!(ebpf_tests_enabled());
@@ -3782,7 +3782,7 @@ async fn source_only_checkpoint_failure_prevents_execution() {
 }
 
 #[tokio::test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn source_only_adoption_preserves_namespace_without_an_egress_allowlist() {
     use reliaburger::bun::agent::AgentCommand;
     use reliaburger::sesame::{egress, firewall};
@@ -3990,7 +3990,7 @@ impl reliaburger::grill::Grill for InitPolicyGrill {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires Linux root, runc, static BusyBox and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root, runc, static BusyBox and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn init_exit_preserves_policy_before_the_next_container_starts() {
     use reliaburger::bun::agent::{AgentCommand, ApplyEvent};
     use reliaburger::grill::{Grill, ImageStore, port::PortAllocator, runc::RuncGrill};
@@ -4095,7 +4095,7 @@ async fn init_exit_preserves_policy_before_the_next_container_starts() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires Linux root, runc, static BusyBox and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root, runc, static BusyBox and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn uncertain_initialiser_preserves_parent_policy_until_confirmed_retirement() {
     use reliaburger::bun::agent::{AgentCommand, ApplyEvent};
     use reliaburger::grill::{Grill, ImageStore, port::PortAllocator, runc::RuncGrill};
@@ -4256,7 +4256,7 @@ async fn read_runtime_fixture_page(address: SocketAddr) -> anyhow::Result<String
 }
 
 #[test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 fn kernel_lookup_denial_is_not_reported_as_backend_absence() {
     assert!(ebpf_tests_enabled());
     const CHILD: &str = "RELIABURGER_LOOKUP_DENIAL_CHILD";
@@ -4334,43 +4334,43 @@ fn kernel_lookup_denial_is_not_reported_as_backend_absence() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires Linux root, runc, static BusyBox and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root, runc, static BusyBox and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn refused_backend_withdrawal_cannot_redirect_a_vip_to_a_new_workload() {
     check_backend_retirement(None, true, DiscoveryExercise::Disabled).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires Linux root, runc, static BusyBox and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root, runc, static BusyBox and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn refused_rollout_withdrawal_cannot_retire_the_original_destination() {
     check_backend_retirement(Some("rolling"), true, DiscoveryExercise::Disabled).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires Linux root, runc, static BusyBox and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root, runc, static BusyBox and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn refused_blue_green_withdrawal_cannot_retire_the_original_destination() {
     check_backend_retirement(Some("blue-green"), true, DiscoveryExercise::Disabled).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires Linux root, runc, static BusyBox and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root, runc, static BusyBox and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn confirmed_rollout_withdrawal_keeps_the_replacement_reachable() {
     check_backend_retirement(Some("rolling"), false, DiscoveryExercise::Disabled).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires Linux root, runc, static BusyBox and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root, runc, static BusyBox and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn standalone_discovery_release_allows_confirmed_address_reuse() {
     check_backend_retirement(None, false, DiscoveryExercise::Release).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires Linux root, runc, static BusyBox and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root, runc, static BusyBox and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn standalone_automatic_restart_replaces_the_original_address_owner() {
     check_backend_retirement(None, false, DiscoveryExercise::Restart).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires Linux root, runc, static BusyBox and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root, runc, static BusyBox and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn standalone_discovery_recovery_preserves_original_routing_and_cleanup() {
     check_backend_retirement(None, false, DiscoveryExercise::Recover).await;
 }
@@ -4627,7 +4627,7 @@ async fn check_backend_retirement(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn refused_backend_publication_cannot_report_a_completed_deployment() {
     use reliaburger::bun::agent::{AgentCommand, ApplyEvent};
     use reliaburger::grill::{
@@ -4818,31 +4818,31 @@ async fn check_destination_grant_retirement(frozen: bool) {
 }
 
 #[tokio::test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn refused_destination_grant_removal_retains_the_original_service() {
     check_destination_grant_retirement(true).await;
 }
 
 #[tokio::test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn confirmed_destination_retirement_removes_only_its_own_grants() {
     check_destination_grant_retirement(false).await;
 }
 
 #[tokio::test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn natural_exit_keeps_its_address_while_a_retained_backend_can_reach_it() {
     check_stopped_address_retention(false, false).await;
 }
 
 #[tokio::test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn lost_enforcement_stops_execution_even_when_backend_withdrawal_refuses() {
     check_stopped_address_retention(true, false).await;
 }
 
 #[tokio::test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn durable_discovery_retains_original_reference_after_controller_loss() {
     check_stopped_address_retention(false, true).await;
 }
@@ -5025,7 +5025,7 @@ async fn check_stopped_address_retention(lose_enforcement: bool, durable_discove
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn refused_health_publication_prevents_restart_and_preserves_ownership() {
     use reliaburger::bun::agent::{AgentCommand, ApplyEvent};
     use reliaburger::grill::{Grill, InstanceId, port::PortAllocator, process::ProcessGrill};
@@ -5308,13 +5308,13 @@ async fn exercise_consumer_kernel_withdrawal(freeze: bool) {
 }
 
 #[tokio::test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn consumer_kernel_withdrawal_recovers_ready_receipt_without_republishing() {
     exercise_consumer_kernel_withdrawal(false).await;
 }
 
 #[tokio::test]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn consumer_kernel_delete_refusal_retains_pending_receipt_across_restart() {
     exercise_consumer_kernel_withdrawal(true).await;
 }

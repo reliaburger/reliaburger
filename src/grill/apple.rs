@@ -741,7 +741,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Apple Container and RELIABURGER_APPLE_CONTAINER_TESTS=1"]
+    #[ignore = "requires Apple Container and RELIABURGER_APPLE_CONTAINER_TESTS=1; run with make test-apple"]
     async fn apple_serves_a_readonly_bind_mount_with_requested_identity_and_port() {
         assert!(apple_tests_enabled());
         let directory = tempfile::tempdir().unwrap();
@@ -905,7 +905,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Apple Container and RELIABURGER_APPLE_CONTAINER_TESTS=1"]
+    #[ignore = "requires Apple Container and RELIABURGER_APPLE_CONTAINER_TESTS=1; run with make test-apple"]
     async fn pinned_test_workload_runs_under_apple_container() {
         assert!(
             apple_tests_enabled(),
@@ -979,7 +979,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Apple Container and RELIABURGER_APPLE_CONTAINER_TESTS=1"]
+    #[ignore = "requires Apple Container and RELIABURGER_APPLE_CONTAINER_TESTS=1; run with make test-apple"]
     async fn adopt_re_tracks_a_running_apple_container() {
         assert!(
             apple_tests_enabled(),

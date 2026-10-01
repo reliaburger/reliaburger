@@ -40,7 +40,7 @@ make fmt-check            # formatting check
 make lint                 # Clippy, all features and none, warnings as errors
 ```
 
-`make ci` runs the standard portable CI checks together. Use the specialised targets for ignored acceptance suites when your environment supports them: `make test-linux`, `make test-cluster`, `make test-upgrade`, and `make test-apple`.
+`make ci` runs the standard portable CI checks together, including `make check-ignored`, which fails when an `#[ignore]` reason doesn't name the target or script that runs it (see [who runs an ignored test](docs/testing.md#who-runs-an-ignored-test)). Use the specialised targets for ignored acceptance suites when your environment supports them: `make test-linux`, `make test-cluster`, `make test-upgrade`, `make test-standard-clients` and `make test-apple`.
 
 Tests should describe behaviour in their names, cover failure and boundary cases, and avoid relying on timing or external services unless the test is an explicit integration or acceptance test. Unit tests belong beside the code; cross-subsystem tests belong in `tests/suite/` as a module of the single portable integration binary. Add a separate `tests/*.rs` binary only for gated, heavy or process-isolated suites (see `docs/design/test-harness.md`).
 

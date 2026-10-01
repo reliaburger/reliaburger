@@ -1751,7 +1751,7 @@ mod tests {
     /// restore from snapshot, verify data intact.
     #[cfg(target_os = "linux")]
     #[test]
-    #[ignore = "requires Linux root, Btrfs tools, and RELIABURGER_BTRFS_TESTS=1"]
+    #[ignore = "requires Linux root, Btrfs tools, and RELIABURGER_BTRFS_TESTS=1; run with make test-linux"]
     fn btrfs_snapshot_restore_recovers_corrupted_data() {
         assert!(
             std::env::var("RELIABURGER_BTRFS_TESTS").is_ok(),
@@ -1815,7 +1815,7 @@ mod tests {
     /// deletes exactly that volume's copy.
     #[cfg(target_os = "linux")]
     #[test]
-    #[ignore = "requires Linux root, Btrfs tools, and RELIABURGER_BTRFS_TESTS=1"]
+    #[ignore = "requires Linux root, Btrfs tools, and RELIABURGER_BTRFS_TESTS=1; run with make test-linux"]
     fn btrfs_multi_volume_snapshots_are_addressed_by_volume() {
         assert!(
             std::env::var("RELIABURGER_BTRFS_TESTS").is_ok(),
@@ -1931,7 +1931,7 @@ mod tests {
     /// copies or journal, and a fresh restore must then succeed.
     #[cfg(target_os = "linux")]
     #[test]
-    #[ignore = "requires Linux root, Btrfs tools, and RELIABURGER_BTRFS_TESTS=1"]
+    #[ignore = "requires Linux root, Btrfs tools, and RELIABURGER_BTRFS_TESTS=1; run with make test-linux"]
     fn btrfs_restore_recovers_from_a_crash_at_every_step() {
         let fs = ScratchBtrfs::new();
         let crashes = [
@@ -1986,7 +1986,7 @@ mod tests {
     /// limit (the review's open quota question).
     #[cfg(target_os = "linux")]
     #[test]
-    #[ignore = "requires Linux root, Btrfs tools, and RELIABURGER_BTRFS_TESTS=1"]
+    #[ignore = "requires Linux root, Btrfs tools, and RELIABURGER_BTRFS_TESTS=1; run with make test-linux"]
     fn btrfs_restore_keeps_the_volume_quota() {
         let fs = ScratchBtrfs::new();
         let volumes = crate::grill::volume::VolumeManager::new(&fs.mount);
@@ -2017,7 +2017,7 @@ mod tests {
     /// restore and delete independently.
     #[cfg(target_os = "linux")]
     #[test]
-    #[ignore = "requires Linux root, Btrfs tools, and RELIABURGER_BTRFS_TESTS=1"]
+    #[ignore = "requires Linux root, Btrfs tools, and RELIABURGER_BTRFS_TESTS=1; run with make test-linux"]
     fn btrfs_volumes_with_formerly_colliding_slugs_stay_separate() {
         let fs = ScratchBtrfs::new();
         let volumes = crate::grill::volume::VolumeManager::new(&fs.mount);

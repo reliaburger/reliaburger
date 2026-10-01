@@ -1420,7 +1420,7 @@ mod tests {
     /// D1: image ownership survives into the node's container id range, so
     /// `redis` in the image owns `/data` inside the user namespace too.
     #[test]
-    #[ignore = "requires root to chown into the container id range"]
+    #[ignore = "requires root to chown into the container id range; run with make test-linux"]
     fn owner_shift_maps_layer_owners_into_the_container_range() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         assert!(nix::unistd::geteuid().is_root(), "run as root");

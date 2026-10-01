@@ -119,7 +119,7 @@ async fn wait_until(timeout: Duration, cond: impl FnMut() -> bool) -> bool {
 /// healthy voters (the older spare promoted, the dead voter evicted), the
 /// cluster commits writes throughout, and the leader is never removed.
 #[tokio::test]
-#[ignore = "requires RELIABURGER_CLUSTER_TESTS=1 and a multi-core host"]
+#[ignore = "requires RELIABURGER_CLUSTER_TESTS=1 and a multi-core host; run with make test-cluster"]
 async fn killed_voter_is_replaced_by_healthy_spare() {
     assert!(
         cluster_tests_enabled(),
@@ -218,7 +218,7 @@ async fn killed_voter_is_replaced_by_healthy_spare() {
 /// Kill a learner mid-catch-up: no voter-set change lands until a healthy
 /// learner catches up, then the healthy spare completes the replacement.
 #[tokio::test]
-#[ignore = "requires RELIABURGER_CLUSTER_TESTS=1 and a multi-core host"]
+#[ignore = "requires RELIABURGER_CLUSTER_TESTS=1 and a multi-core host; run with make test-cluster"]
 async fn dead_learner_mid_catch_up_does_not_block_replacement() {
     assert!(
         cluster_tests_enabled(),
@@ -293,7 +293,7 @@ async fn dead_learner_mid_catch_up_does_not_block_replacement() {
 /// A node flapping inside the hysteresis window causes no membership churn:
 /// no eviction, no learner added, voter set untouched.
 #[tokio::test]
-#[ignore = "requires RELIABURGER_CLUSTER_TESTS=1 and a multi-core host"]
+#[ignore = "requires RELIABURGER_CLUSTER_TESTS=1 and a multi-core host; run with make test-cluster"]
 async fn flapping_node_inside_window_causes_no_churn() {
     assert!(
         cluster_tests_enabled(),
