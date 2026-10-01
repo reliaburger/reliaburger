@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 
 use crate::bun::agent::InstanceStatus;
+use crate::bun::cluster_view::NodeTagged;
 use crate::config::EnvValue;
 use crate::meat::deploy_types::DeployHistoryEntry;
 
@@ -78,7 +79,10 @@ pub struct AppDetailData {
     pub blocked: Option<String>,
     pub instances: Vec<InstanceStatus>,
     pub env: Vec<SafeEnvValue>,
-    pub deploy_history: Vec<DeployHistoryEntry>,
+    /// Every node's record of the app's deploys, oldest first.
+    pub deploy_history: Vec<NodeTagged<DeployHistoryEntry>>,
+    /// Members whose history is missing from `deploy_history`.
+    pub history_warnings: Vec<String>,
     pub charts: Vec<ChartConfig>,
 }
 
@@ -88,6 +92,8 @@ pub struct NodeDetailData {
     pub state: String,
     pub app_count: usize,
     pub apps: Vec<InstanceStatus>,
+    /// Why the node's workloads couldn't be listed, when it didn't answer.
+    pub warning: Option<String>,
     pub charts: Vec<ChartConfig>,
 }
 

@@ -673,16 +673,21 @@ impl super::Grill for ProcessGrill {
         procs.get(instance).and_then(|e| e.log_stem.clone())
     }
 
-    async fn exit_code(&self, instance: &InstanceId) -> Option<i32> {
+    async fn exit_code(&self, instance: &InstanceId) -> Result<Option<i32>, GrillError> {
         if let Some(control) = &self.control {
-            return match control.status(instance).await.ok()?.phase {
+            // An owner that didn't answer leaves the exit code unknown,
+            // never "hasn't exited" (#389).
+            let record = control
+                .status(instance)
+                .await
+                .map_err(|error| owner_error(instance, error))?;
+            return Ok(match record.phase {
                 OwnerPhase::Retired { exit_code } => exit_code,
                 _ => None,
-            };
+            });
         }
         let procs = self.processes.lock().await;
-        let entry = procs.get(instance)?;
-        entry.exit_code
+        Ok(procs.get(instance).and_then(|entry| entry.exit_code))
     }
 
     async fn logs(&self, instance: &InstanceId) -> Result<String, GrillError> {
@@ -957,7 +962,7 @@ mod tests {
                     "{operation} on exited child failed: {result:?}"
                 );
                 assert_eq!(grill.state(&id).await.unwrap(), ContainerState::Stopped);
-                assert_eq!(grill.exit_code(&id).await, Some(exit));
+                assert_eq!(grill.exit_code(&id).await.unwrap(), Some(exit));
             }
         }
     }
@@ -1716,7 +1721,7 @@ mod tests {
         assert_eq!(grill.state(&id).await.unwrap(), ContainerState::Running);
 
         wait_for_state(&grill, &id, ContainerState::Stopped).await;
-        assert_eq!(grill.exit_code(&id).await, Some(0));
+        assert_eq!(grill.exit_code(&id).await.unwrap(), Some(0));
         std::mem::forget(external); // already reaped via waitpid
     }
 

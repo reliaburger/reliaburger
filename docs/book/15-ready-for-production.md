@@ -3540,6 +3540,21 @@ when there was one, such as the upgrade inventory, write `let Ok(Some(pid))
 won't let a caller confuse them, where a Go function returning `(0, nil)` for
 both would.
 
+`Grill::exit_code` had the same habit, and its `None` did more damage,
+because more callers act on it (#389). Startup recovery read a stopped job's
+`None` as "it left no exit code" and recorded the job's outcome as unknown for
+good, so it needed an explicit rerun. The state sweep reported such a job as
+exited without a code. The same silent-owner test, asking for the exit code
+this time, got `Ok(None)` back. Now `exit_code` returns
+`Result<Option<i32>, GrillError>` too, and every caller decides what "couldn't
+tell" means for it. Status sets `runtime_unknown`. The sweep reports the job
+as `Observed::Unknown`, so the next sweep asks again rather than settling it.
+Recovery, an init container's wait and a `run_before` job's wait already
+propagated a failed `state()` read with `?`, and now they do the same for the
+exit code. Changing the trait's return type was the whole fix in a sense: the
+compiler then listed every call site that had been quietly treating an error
+as an answer.
+
 There was a type problem in the middle of this. The reads need the container
 runtime, and `BunAgent<G: Grill>` is generic over it, but the API state isn't
 generic and we didn't want it to become so. The reader stores the one
@@ -3894,8 +3909,9 @@ same instance.
 #### A budget per turn
 
 Some reads the loop can't hand to anyone: the namespace firewall wants every
-instance's cgroup id, a fault wants its targets' pids, retirement wants the
-runtime's view of a network reference. Each is usually milliseconds. Each can
+instance's cgroup id, a fault wants its targets' pids, retirement wanted the
+runtime's view of a network reference (until it didn't; see below). Each is
+usually milliseconds. Each can
 take seconds behind a create holding the instance's lock. For these we
 gave every turn a budget:
 
@@ -3989,6 +4005,58 @@ and an execution fence used to settle any in-flight restart step and confirm a
 kill, up to twenty seconds, inside one turn. Both now kill through this path.
 A rerun also fences the old run first (Stopping, no retries, no probes), so
 nothing restarts it while the kill is in flight.
+
+"The steps before it aren't repeated" held for retirement, because its caller
+re-enters past the steps it already took. Provisioning broke that promise, and
+we found out from a flake. The loop's half of a fresh launch moved the
+instance from `Pending` to `Preparing` and *then* provisioned its volumes. On a
+loaded machine provisioning outlasted the turn, the deploy worker asked again,
+and the second ask tried to move a `Preparing` instance to `Preparing`. The
+state machine refused, as it should, and the deploy failed. Two lease tests
+caught it about one run in four under CPU load and never alone. The fix is one
+guard: a step that can answer `StillRunning` has to be safe to run again from
+the top, so the transition only happens when the instance isn't already
+`Preparing`. The test that pins it doesn't need any load at all. Under
+`#[tokio::test]` the runtime has one thread, so a task spawned during the call
+can't have run by the time a turn with no budget left polls it, and the first
+ask is `StillRunning` every time.
+
+A day later the budget's cost came due, in exactly the place we'd said it
+could (#387). The privileged CI run's OCI interruption qualification restarts
+Bun, recovers its containers and stops them, and twice the stop came back as a
+500: "the runtime did not answer for the network reference within the turn".
+Retiring a stopped instance asks runc which network reference it holds and
+then hands it back, and on runc both wait for the instance's lifecycle lock.
+Just after recovery the health sweep's and the status reader's state reads
+queue for that lock as well, each a `runc state` subprocess. A few of those
+in front of you are the whole 500 ms. And the miss was fatal to the stop,
+because a stop only waits and retries on `StillRunning`; any other error goes
+straight back to the caller.
+
+So both calls moved to off-loop work. That needed one change to the
+mechanism: until then every task answered only "done" or "failed", and a read
+has to hand back what it read. `OffLoopWork` became generic over the answer:
+
+```rust
+pub(super) struct OffLoopWork<T = ()> {
+    in_flight: HashMap<WorkKey, InFlight<T>>,
+}
+```
+
+`T = ()` is a default type parameter. A plain `OffLoopWork` is still the
+unit-answer version every existing caller uses, so none of them changed, and
+the agent gained a second map, `OffLoopWork<Option<NetworkReference>>`, for
+the reads. C++ templates have the same idea; Go generics don't. The
+`#[derive(Default)]` it used to have had to go, too. The derive adds a
+`T: Default` bound to the impl it writes, even though an empty `HashMap` needs
+nothing from `T`, so we wrote the three-line impl by hand.
+
+Now a slow read or release fails the retirement with `StillRunning`, the stop
+checks back every 100 ms, and the retry collects the same task rather than
+asking runc again. The starvation harness has two new scenarios, a stop whose
+network-reference read takes 1.5 s and one whose release does. Both used to
+answer with that error. Now both answer `Ok` after the slow call ends, with
+the runtime asked once and no turn over budget.
 
 #### The faults
 
@@ -4678,6 +4746,163 @@ until the kernel went away, and no amount of killing processes reproduces
 that. The snapshot uploader still needs its own fixture: it needs Btrfs
 volumes. Its export receipts are written atomically and durably now, and an
 upload is only receipted once the destination has confirmed the archive.
+
+## Files nobody could read
+
+By 0.1.2, `src/bun/api.rs` had grown to 18,351 lines. About 10,500 of them were
+the server and the rest were tests. Every route lived in it: apply, logs,
+faults, upgrades, tokens, the dashboard. It compiled, it was tested, and nobody
+could hold it in their head. Reviewing a change to the log routes meant
+scrolling past the upgrade orchestration to find them.
+
+We didn't have to invent a structure. The router already had one: it lists its
+routes in groups, and each group's handlers sat together in the file. So each
+group became a file, and `api.rs` kept what every group shares, which is the
+`ApiState`, the router and a dozen helpers (asking the agent, fanning a read
+out to the peers, resolving a node's URL). It's 1,100 lines now. The other
+twenty files are things like `api/logs.rs`, `api/faults.rs` and
+`api/upgrade.rs`, the biggest at 1,500 lines.
+
+### How Rust finds a module
+
+In Go, a package is a directory and its files share one namespace, so a split
+like this is a matter of cutting and pasting. In Python, every file is its own
+module and you import across them explicitly. Rust sits in between. A module is
+declared by its parent, and the declaration tells the compiler where to look:
+
+```rust
+// in src/bun/api.rs
+mod logs; // loads src/bun/api/logs.rs
+```
+
+A file `api.rs` with a directory `api/` next to it is the 2018-edition layout.
+The older one, `api/mod.rs`, still works, but having a dozen files called
+`mod.rs` open in an editor gets old fast.
+
+The catch is privacy. An item without `pub` is private to the module that
+defines it, and visible to that module's *descendants*. A handler like `async
+fn logs_handler` in `api.rs` was visible to all of `api` and its test modules.
+Move it down into `api::logs` and it's private to `logs`, so the router can't
+see it any more. The fix is `pub(super)`, which means "visible in my parent",
+and visibility in a module always includes its descendants. That's exactly the
+reach the handler had before, no more. `pub(crate)` would have compiled too,
+but it would have quietly opened the whole crate to two hundred functions that
+nobody outside `api` calls.
+
+Each new file starts with `use super::*;`. A glob import brings in everything
+the parent can name, including the parent's own private `use` lines (a child is
+a descendant, so it can see them). That's why the moved handlers compile
+without a single change to their bodies: `Json`, `StatusCode`, `ApiState` and
+the shared helpers all arrive through the glob. The parent imports back what
+the router needs:
+
+```rust
+mod logs;
+use logs::{logs_handler, ws_logs_handler, /* ... */};
+pub use faults::ClusterFaultList;
+```
+
+That last line is a re-export. `ClusterFaultList` is a public type that
+`relish` names as `crate::bun::api::ClusterFaultList`. `pub use` keeps that
+path working, so no caller outside `api` changed. The tests didn't move between
+modules either: `mod tests;` now loads `api/tests.rs` instead of an inline
+block, so every test keeps its name, and the flake register and CI filters
+still find them.
+
+### Keeping it mechanical
+
+A refactor this size is only safe if nobody edits the code while moving it. We
+moved whole items by name with a small script, gave the private ones
+`pub(super)`, and let the compiler say what was missing. Each route group is
+one commit, so a reviewer can check that a commit adds to one file exactly what
+it deletes from the other.
+
+One trap is worth knowing about. Moving an inline `mod tests { ... }` into its
+own file strips one level of indentation from every line, and the obvious way
+to do that is to remove four spaces from each one. But a multi-line raw string
+like a test's TOML config is data, not code. Re-indent it and you've changed
+the string. TOML doesn't care, but an expected output compared byte for byte
+would. So we left the lines alone and let `rustfmt` re-indent the file, because
+it never touches the inside of a literal.
+
+The other trap was a test that reads source code. The route matrix (Chapters 4
+and 10) checks that every handler asks for its scope and its permission action,
+and it did that by finding each handler's body in `include_str!("api.rs")`.
+After the split the handlers weren't there, and four tests panicked, the first
+with "route /ui/app/{app}/{namespace} dispatches to app_detail_handler, which
+we cannot find". That's the right failure. A scan that quietly checked nothing
+would have passed. The tests now search the route modules too, from a list.
+Add a route module without listing it and the same panic tells you so.
+
+### One type, many files
+
+`src/bun/agent.rs` was the bigger one: 26,126 lines, nearly half of them tests.
+The shape was different, too. The API is a pile of free functions, so moving
+them is moving files' worth of `fn`s. The agent is one struct, `BunAgent`, and
+almost everything is a method on it.
+
+That's less of a problem than it sounds. In Rust, a type's methods don't have to
+live in one `impl` block, or in one file. Any module in the same crate can open
+another `impl BunAgent<G>` and add methods to it, and they're all methods of the
+same type: `self.drive_pending_restarts()` doesn't care which file defines it.
+(Go programmers will recognise this; a method can live in any file of the
+package. C++ programmers will recognise it as defining member functions outside
+the class, minus the header.) The agent had already started down this road during
+the loop work earlier in the chapter, where `restarts.rs`, `follow_ups.rs` and
+twenty others each took one concern. The split finished the job:
+
+```text
+agent.rs          the loop: BunAgent, its constructors, run_loop, the tick
+agent/commands.rs        AgentCommand and handle_command
+agent/deploy_ops.rs      what a deploy worker asks the loop, and the answers
+agent/deploy_worker.rs   the worker that drives a deploy off the loop
+agent/launch.rs          admission, image trust, fresh and rolling launches
+agent/networking.rs      network references and egress enforcement
+agent/routing.rs         eBPF maps, the service catalogue, the routing table
+agent/faults.rs          chaos faults on this node
+agent/trace.rs           `relish trace`
+agent/job_runs.rs        the job ledger and cron jobs
+agent/records.rs         durable instance records and adoption
+agent/health_checks.rs   probes and the exits the tick notices
+agent/retirement.rs      killing, cleaning up, shutting down
+agent/status.rs          the status types the API serves
+...and identity, volumes, plus additions to restarts, app_stop, state_sweep
+```
+
+`agent.rs` is 1,450 lines now, and the largest file under it is the deploy
+worker at about 1,770.
+
+The moved methods get `pub(super)` for the same reason the handlers did. Even
+the struct's fields stay private: a child module can read and write its
+ancestor's private fields, so `retirement.rs` reaches `self.supervisor` exactly
+as it did when it was a few thousand lines further down the same file.
+
+Two more traps showed up. The first was `#[cfg]`. Some helpers only exist on
+Linux with the `ebpf` feature, so the parent's import of one has to carry the
+same attribute, or the macOS build fails to find something that was configured
+out:
+
+```rust
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+use trace::backend_addresses;
+```
+
+The second was ours: the move script found the end of a method by looking for a
+closing brace at method indentation, and `fn reresolve_egress(&mut self) {}`
+doesn't have one. It ran on into the next method. `rustfmt` caught it with
+an unbalanced brace, which is the best kind of bug, the loud kind.
+
+And then the loop rule from earlier in the chapter. Its walker parses
+`agent.rs` and every file directly under `src/bun/agent/`, finds every
+`impl BunAgent` block wherever it lives, and follows awaited calls by method
+name, so the split didn't break it. "Didn't break it" isn't evidence, though,
+so we checked: we had the walker list every method it entered and every leaf
+await it judged, before and after the split. The two lists were identical, 162
+method bodies and the same leaf awaits. We also closed the gap that would have
+fooled it. A child module declared as `agent/x/mod.rs` is perfectly good Rust,
+but the walker doesn't look in subdirectories, so its awaits would drop out of
+the check without a word. The walker now fails if `agent.rs` declares a module
+that isn't one of the files it read.
 
 ## Lessons learned: audit the evidence too
 

@@ -93,7 +93,7 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 - `relish exec <APP> [COMMAND]...`: Execute a command inside a running container
 - `relish deploy <PATH>`: Trigger a rolling deploy for an app
 - `relish cancel-deploy <OPERATION_ID>`: Cancel a node-local deploy and wait for its current work to finish
-- `relish history <APP>`: Show deploy history for an app
+- `relish history <APP>`: Show deploy history for an app, from every node
 - `relish rollback <APP>`: Rollback an app to the previous version
 - `relish stop <APP>`: Scale an app to zero, keeping its configuration; `relish apply` starts it again
 - `relish delete <APP>`: Remove an app from the cluster and stop all its instances

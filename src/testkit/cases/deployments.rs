@@ -103,19 +103,22 @@ async fn wait_for_recorded_versions(
     ctx.deadline
         .run("completed history for every deployed version", async {
             loop {
-                let mut history = Vec::new();
-                for (node, client) in ctx.node_clients().await? {
-                    history.extend(
-                        client
-                            .deploy_history(app, &ctx.namespace)
-                            .await
-                            .map_err(|error| format!("deploy history on {node}: {error}"))?,
-                    );
-                }
+                // The entry node merges every node's records; a node that
+                // didn't answer just means another round.
+                let history = ctx
+                    .client
+                    .deploy_history(app, &ctx.namespace)
+                    .await
+                    .map_err(|error| format!("deploy history: {error}"))?
+                    .history;
                 let complete = commands.iter().all(|command| {
                     history.iter().any(|entry| {
-                        entry["result"] == "Completed"
-                            && entry["spec"]["command"] == serde_json::json!(command)
+                        entry.row.result == crate::meat::deploy_types::DeployResult::Completed
+                            && entry
+                                .row
+                                .spec
+                                .as_ref()
+                                .is_some_and(|spec| &spec.command == command)
                     })
                 });
                 if complete {
@@ -162,7 +165,9 @@ mod tests {
     use tokio::sync::Mutex;
 
     async fn run_history_case(record_every_version: bool) -> Result<(), String> {
-        let recorded = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let recorded = Arc::new(Mutex::new(Vec::<
+            crate::bun::cluster_view::NodeTagged<crate::meat::deploy_types::DeployHistoryEntry>,
+        >::new()));
         let writes = Arc::clone(&recorded);
         let reads = Arc::clone(&recorded);
         let router = axum::Router::new()
@@ -172,9 +177,22 @@ mod tests {
                     let config = crate::config::Config::parse(&body).unwrap();
                     let mut history = writes.lock().await;
                     if history.is_empty() || record_every_version {
-                        history.push(serde_json::json!({
-                            "result": "Completed", "spec": config.app["history"]
-                        }));
+                        let now = std::time::SystemTime::now();
+                        let id = history.len() as u64;
+                        history.push(crate::bun::cluster_view::NodeTagged {
+                            node: "node-1".into(),
+                            row: crate::meat::deploy_types::DeployHistoryEntry {
+                                id: crate::meat::deploy_types::DeployId(id),
+                                app_id: crate::meat::types::AppId::new("history", "rbtest-history-00"),
+                                image: String::new(),
+                                result: crate::meat::deploy_types::DeployResult::Completed,
+                                created_at: now,
+                                completed_at: now,
+                                steps_completed: 1,
+                                steps_total: 1,
+                                spec: Some(Box::new(config.app["history"].clone())),
+                            },
+                        });
                     }
                     format!("data: {}\n\n", serde_json::to_string(
                         &crate::bun::agent::ApplyEvent::Complete { created: 1, instances: vec![] }
@@ -187,7 +205,14 @@ mod tests {
             ])) }))
             .route("/v1/deploys/history/history", axum::routing::get(move || {
                 let reads = Arc::clone(&reads);
-                async move { axum::Json(serde_json::json!({"history": reads.lock().await.clone()})) }
+                async move {
+                    axum::Json(crate::bun::cluster_view::ClusterDeployHistory {
+                        app: "history".into(),
+                        namespace: "rbtest-history-00".into(),
+                        history: reads.lock().await.clone(),
+                        warnings: Vec::new(),
+                    })
+                }
             }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();

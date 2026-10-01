@@ -497,6 +497,40 @@ mod tests {
         Some(&rest[..end])
     }
 
+    /// api.rs mounts handlers that live in its route modules, one per
+    /// route group. A handler the router names that none of these files
+    /// defines fails the scans below, so a new route module must be listed.
+    const API_ROUTE_MODULES: &[&str] = &[
+        include_str!("api/apply.rs"),
+        include_str!("api/apps.rs"),
+        include_str!("api/deploys.rs"),
+        include_str!("api/discovery.rs"),
+        include_str!("api/faults.rs"),
+        include_str!("api/gitops.rs"),
+        include_str!("api/identity.rs"),
+        include_str!("api/internal.rs"),
+        include_str!("api/join.rs"),
+        include_str!("api/logs.rs"),
+        include_str!("api/metrics.rs"),
+        include_str!("api/node_info.rs"),
+        include_str!("api/nodes.rs"),
+        include_str!("api/registry.rs"),
+        include_str!("api/secrets.rs"),
+        include_str!("api/snapshots.rs"),
+        include_str!("api/status.rs"),
+        include_str!("api/test_leases.rs"),
+        include_str!("api/ui.rs"),
+        include_str!("api/upgrade.rs"),
+    ];
+
+    /// A mounted handler's body, from the file that mounts it or from one
+    /// of api.rs's route modules.
+    fn mounted_handler_body<'a>(source: &'a str, ident: &str) -> Option<&'a str> {
+        std::iter::once(source)
+            .chain(API_ROUTE_MODULES.iter().copied())
+            .find_map(|candidate| handler_body(candidate, ident))
+    }
+
     /// Any route whose path names an app must check the caller's *scope*,
     /// not just its role.
     ///
@@ -520,7 +554,7 @@ mod tests {
                     continue;
                 }
                 for handler in handlers {
-                    let Some(body) = handler_body(source, &handler) else {
+                    let Some(body) = mounted_handler_body(source, &handler) else {
                         panic!("route {path} dispatches to {handler}, which we cannot find");
                     };
                     checked += 1;
@@ -546,7 +580,7 @@ mod tests {
     ///
     /// This is the cheap static half of the guard: it catches a new gated row
     /// whose handler forgot the check. The behavioural half, a request per
-    /// route × principal, lives in `api_permission_tests`.
+    /// route × principal, lives in `api::permission_tests`.
     #[test]
     fn every_gated_route_checks_its_permission_action() {
         let sources = [
@@ -579,7 +613,7 @@ mod tests {
                 .collect();
             assert!(!handlers.is_empty(), "no handler found for {}", row.path);
             for (source, handler) in handlers {
-                let body = handler_body(source, &handler)
+                let body = mounted_handler_body(source, &handler)
                     .unwrap_or_else(|| panic!("{} dispatches to missing {handler}", row.path));
                 checked += 1;
                 let cluster_admin =
@@ -601,7 +635,7 @@ mod tests {
     #[test]
     fn cluster_wide_log_sql_refuses_scoped_tokens() {
         let source = include_str!("api.rs");
-        let body = handler_body(source, "logs_sql_handler").expect("logs_sql_handler");
+        let body = mounted_handler_body(source, "logs_sql_handler").expect("logs_sql_handler");
         assert!(
             body.contains("require_unscoped"),
             "/v1/logs/sql must refuse scoped tokens — it cannot filter arbitrary SQL by tenant"
@@ -622,7 +656,7 @@ mod tests {
             "upgrade_cluster_rollback_handler",
             "cluster_elect_handler",
         ] {
-            let body = handler_body(source, handler).expect(handler);
+            let body = mounted_handler_body(source, handler).expect(handler);
             assert!(
                 body.contains("authorize_cluster_admin"),
                 "{handler} must require an unscoped Admin"

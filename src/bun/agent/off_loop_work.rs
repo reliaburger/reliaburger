@@ -20,6 +20,10 @@
 //! The next attempt finds the same task, so the work runs once however many
 //! times it is asked about, and a step only goes past it once it is done.
 //!
+//! Runtime calls that retirement can't do without go the same way: reading
+//! and releasing an instance's network reference wait for its lifecycle lock
+//! on runc, behind whatever state reads hold it (#387).
+//!
 //! A task belongs to one incarnation of its instance. A result that was never
 //! collected (the owner went another way) is thrown away rather than handed
 //! to the next incarnation that happens to reuse the id.
@@ -52,6 +56,10 @@ pub(super) enum WorkKey {
     /// its exit.
     #[cfg_attr(not(all(feature = "ebpf", target_os = "linux")), allow(dead_code))]
     FenceExecution(InstanceId),
+    /// Asking the runtime which network reference a retiring instance holds.
+    ReadNetworkReference(InstanceId),
+    /// Handing a retiring instance's network reference back to the runtime.
+    ReleaseNetworkReference(InstanceId),
 }
 
 impl std::fmt::Display for WorkKey {
@@ -68,24 +76,40 @@ impl std::fmt::Display for WorkKey {
             }
             WorkKey::ClearJobRun(id) => write!(f, "killing {id}'s previous run"),
             WorkKey::FenceExecution(id) => write!(f, "force-killing {id}"),
+            WorkKey::ReadNetworkReference(id) => {
+                write!(f, "reading {id}'s network reference")
+            }
+            WorkKey::ReleaseNetworkReference(id) => {
+                write!(f, "releasing {id}'s network reference")
+            }
         }
     }
 }
 
 /// One piece of work in flight, or finished and not yet collected.
-struct InFlight {
+struct InFlight<T> {
     /// The instance's `created_at` when the work started, if it had one.
     incarnation: Option<Instant>,
-    task: JoinHandle<Result<(), String>>,
+    task: JoinHandle<Result<T, String>>,
 }
 
-/// Work in flight, by what it's doing.
-#[derive(Default)]
-pub(super) struct OffLoopWork {
-    in_flight: HashMap<WorkKey, InFlight>,
+/// Work in flight, by what it's doing. Each task answers `Ok(T)` or the
+/// reason it failed; most work has nothing to answer but that it's done.
+pub(super) struct OffLoopWork<T = ()> {
+    in_flight: HashMap<WorkKey, InFlight<T>>,
 }
 
-impl OffLoopWork {
+// A derived `Default` would demand `T: Default`, which an empty map doesn't
+// need.
+impl<T> Default for OffLoopWork<T> {
+    fn default() -> Self {
+        Self {
+            in_flight: HashMap::new(),
+        }
+    }
+}
+
+impl<T: Send + 'static> OffLoopWork<T> {
     /// Whether work for `key` is still running.
     #[cfg(test)]
     pub(super) fn is_running(&self, key: &WorkKey) -> bool {
@@ -121,9 +145,9 @@ impl OffLoopWork {
         key: &WorkKey,
         incarnation: Option<Instant>,
         work: F,
-    ) -> Option<(&mut JoinHandle<Result<(), String>>, bool)>
+    ) -> Option<(&mut JoinHandle<Result<T, String>>, bool)>
     where
-        F: std::future::Future<Output = Result<(), String>> + Send + 'static,
+        F: std::future::Future<Output = Result<T, String>> + Send + 'static,
     {
         if let Some(stale) = self.in_flight.get(key)
             && stale.incarnation != incarnation
@@ -149,28 +173,26 @@ impl OffLoopWork {
     pub(super) fn abandon_all(&mut self) {
         self.in_flight.clear();
     }
-}
 
-impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Run `key`'s work, starting it with `work` if this incarnation hasn't
-    /// yet. A turn that starts the work waits for it until the turn's
-    /// runtime budget runs out, so with a healthy disk and runtime the step
-    /// finishes in the same turn; a later turn only collects a result that
-    /// is already there. `Err(BunError::StillRunning)` means ask again later.
-    pub(super) async fn finish_off_loop_work<F>(
+    /// yet. A turn that starts the work waits for it until `turn_deadline`,
+    /// so with a healthy disk and runtime the step finishes in the same
+    /// turn; a later turn only collects a result that is already there.
+    /// `Err(BunError::StillRunning)` means ask again later.
+    pub(super) async fn finish<F>(
         &mut self,
         key: WorkKey,
         incarnation: Option<Instant>,
         work: F,
-    ) -> Result<Result<(), String>, BunError>
+        turn_deadline: tokio::time::Instant,
+    ) -> Result<Result<T, String>, BunError>
     where
-        F: std::future::Future<Output = Result<(), String>> + Send + 'static,
+        F: std::future::Future<Output = Result<T, String>> + Send + 'static,
     {
-        let turn_deadline = self.turn_deadline();
         let still_running = || BunError::StillRunning {
             work: key.to_string(),
         };
-        let Some((task, started_now)) = self.off_loop_work.task(&key, incarnation, work) else {
+        let Some((task, started_now)) = self.task(&key, incarnation, work) else {
             return Err(still_running());
         };
         // `timeout_at` polls the task once even with the deadline passed, so
@@ -183,8 +205,28 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let joined = tokio::time::timeout_at(deadline, task)
             .await
             .map_err(|_| still_running())?;
-        self.off_loop_work.in_flight.remove(&key);
+        self.in_flight.remove(&key);
         Ok(joined.unwrap_or_else(|error| Err(format!("off-loop task failed: {error}"))))
+    }
+}
+
+impl<G: Grill + Clone + 'static> BunAgent<G> {
+    /// [`OffLoopWork::finish`] for the agent's work that answers only
+    /// whether it's done, against the current turn's deadline.
+    pub(super) async fn finish_off_loop_work<F>(
+        &mut self,
+        key: WorkKey,
+        incarnation: Option<Instant>,
+        work: F,
+    ) -> Result<Result<(), String>, BunError>
+    where
+        F: std::future::Future<Output = Result<(), String>> + Send + 'static,
+    {
+        let turn_deadline = self.turn_deadline();
+        // LOOP-INLINE: `finish` waits with `timeout_at(turn_deadline)`
+        self.off_loop_work
+            .finish(key, incarnation, work, turn_deadline)
+            .await
     }
 
     /// The incarnation of `id` that work started now belongs to.
@@ -205,7 +247,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_same_incarnation_finds_the_task_it_started() {
-        let mut work = OffLoopWork::default();
+        let mut work = OffLoopWork::<()>::default();
         let incarnation = Some(Instant::now());
         let (release, wait) = tokio::sync::oneshot::channel::<()>();
         assert!(
@@ -232,7 +274,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_new_incarnation_waits_for_the_old_work_then_starts_its_own() {
-        let mut work = OffLoopWork::default();
+        let mut work = OffLoopWork::<()>::default();
         let old = Some(Instant::now());
         let new = Some(Instant::now() + std::time::Duration::from_secs(1));
         let (release, wait) = tokio::sync::oneshot::channel::<()>();

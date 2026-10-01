@@ -529,7 +529,7 @@ impl super::Grill for RuncGrill {
         self.owned_state(instance).await
     }
 
-    async fn exit_code(&self, instance: &InstanceId) -> Option<i32> {
+    async fn exit_code(&self, instance: &InstanceId) -> Result<Option<i32>, GrillError> {
         self.owned_exit_code(instance).await
     }
 
@@ -1071,7 +1071,11 @@ mod tests {
                 logs.contains(&format!("qualified={}", vip.0)),
                 "{id} did not resolve redis.default to {vip:?}: {logs}"
             );
-            assert_eq!(grill.exit_code(id).await, Some(0), "{id} logs: {logs}");
+            assert_eq!(
+                grill.exit_code(id).await.unwrap(),
+                Some(0),
+                "{id} logs: {logs}"
+            );
         }
 
         let config: crate::grill::oci::OciSpec = serde_json::from_slice(
@@ -1219,7 +1223,7 @@ mod tests {
 
         for id in &ids {
             assert_eq!(
-                grill.exit_code(id).await,
+                grill.exit_code(id).await.unwrap(),
                 Some(0),
                 "{id} observed another replica's write: {}",
                 grill.logs(id).await.unwrap()
@@ -1264,7 +1268,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         for (id, rootfs) in ids.iter().zip(&rootfs_paths) {
-            assert_eq!(grill.exit_code(id).await, Some(0));
+            assert_eq!(grill.exit_code(id).await.unwrap(), Some(0));
             assert!(!crate::grill::rootfs::is_mountpoint(rootfs));
         }
     }
@@ -1514,7 +1518,7 @@ mod tests {
             })
             .await
             .unwrap();
-            assert_eq!(adopter.exit_code(&job_id).await, Some(code));
+            assert_eq!(adopter.exit_code(&job_id).await.unwrap(), Some(code));
             adopter.kill(&job_id).await.unwrap();
         }
     }

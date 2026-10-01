@@ -4,6 +4,7 @@
 //! how old its answer is, refuse one that is too old, and never report an
 //! exited container as running just because the loop hasn't noticed yet.
 
+use super::commands::AgentCommand;
 use super::loop_harness::{crash, replicated};
 use super::*;
 use crate::grill::mock::MockCall;
@@ -210,6 +211,21 @@ async fn a_pid_the_runtime_could_not_read_is_unknown_not_absent() {
     let statuses = agent.get_status().await;
     assert_eq!(statuses[0].state, "running");
     assert_eq!(statuses[0].pid, None);
+    assert!(statuses[0].runtime_unknown, "{statuses:?}");
+}
+
+/// The same for the exit code (#389): one the runtime couldn't read is
+/// unknown, not "no exit code".
+#[tokio::test]
+async fn an_exit_code_the_runtime_could_not_read_is_unknown_not_absent() {
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    expect_complete(&drain_deploy(&mut agent, replicated("web", 1)).await);
+    grill.set_pid(4242);
+    let id = InstanceId(agent.get_status().await[0].id.clone());
+    grill.set_instance_exit_code_failure(&id, true);
+    let statuses = agent.get_status().await;
+    assert_eq!(statuses[0].pid, Some(4242));
+    assert_eq!(statuses[0].exit_code, None);
     assert!(statuses[0].runtime_unknown, "{statuses:?}");
 }
 

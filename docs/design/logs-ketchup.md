@@ -10,7 +10,7 @@
 
 Ketchup is Reliaburger's built-in log collection subsystem. It captures the output of every managed container and process workload on a node, stores it as flat Parquet files, and provides querying, export, and retention management without any external dependencies.
 
-Ketchup runs as a module within the Bun agent on every node. There is no separate log collection daemon, no sidecar container, and no central log aggregation server. Each node captures and serves the logs produced by workloads running on it. Non-follow cross-node queries are coordinated by the leader using the same fan-out pattern Mayo uses for metrics -- dispatched to the nodes running the target app, then merge-sorted -- **but log *follow* (`-f`) is local-node only** (see §3.7). Transport is HTTP throughout; there is no gRPC.
+Ketchup runs as a module within the Bun agent on every node. There is no separate log collection daemon, no sidecar container, and no central log aggregation server. Each node captures and serves the logs produced by workloads running on it. Non-follow cross-node queries are coordinated by the leader using the same fan-out pattern Mayo uses for metrics -- dispatched to the nodes running the target app, then merge-sorted. Log *follow* (`-f`) is cluster-wide too: the node you ask streams every placed node's lines into one follow (see §3.7). Transport is HTTP throughout; there is no gRPC.
 
 The storage engine is **Parquet + DataFusion SQL**, mirroring `MayoStore` exactly. This document has been reconciled against the code: the per-app binary log-record format, the sparse memory-mapped `.idx` index, per-day file rotation, the `.log`/`.log.zst` compression lifecycle, regex grep, RFC3339 time ranges, the `--instance` and dot-path `--json-field` filters, and the log-permission model are all **planned -- not yet implemented** and flagged as such below.
 
@@ -121,7 +121,9 @@ relish logs web --since 1h --grep "ERROR"          (one-shot, no -f)
 
 Non-follow queries fan out over HTTP (`fan_out_query` in `src/ketchup/query.rs`) to the nodes running the app and merge-sort the results by timestamp.
 
-**Follow (`-f`) is local-node only.** `relish logs web -f` opens `GET /v1/logs/{app}/{namespace}?follow=true`, which streams (SSE, or WebSocket via `ws_logs_handler`) new lines from **that node's** agent only, via the `FollowLogs` agent command. There is no cross-node merge of live streams -- the "leader opens a stream to all nodes and merge-sorts" behaviour is **planned -- not yet implemented**. Cross-node aggregation exists only for the non-follow query path.
+**Follow (`-f`) covers every node that runs the app.** `relish logs web -f` and the dashboard open `GET /v1/logs/{app}/{namespace}?follow=true` (SSE); the TUI opens `GET /v1/ws/logs/{app}/{namespace}` (WebSocket). On a cluster member both read the same merge task, `follow_cluster_logs` in `src/bun/api/logs.rs`: every 2 s it re-reads the app's placements and the live membership, opens a stream to each placed node it isn't following yet (`?follow=true&local=true&label=true`, so the peer answers for itself and prefixes each line `[node instance]`), and drops nodes that left. Its own replicas come through the `FollowLogs` agent command. Lines arrive in the order they reach the merging node; there is no clock-skew reordering window.
+
+The task emits `ketchup::follow::LogFrame` values, `Line(String)` or `Warning(String)`. A node that leaves or whose stream breaks produces one `Warning` and the follow carries on with the rest. SSE writes a warning as an `event: warning` block (the CLI prints it to stderr); the WebSocket sends each frame as externally tagged JSON, `{"line":"..."}` or `{"warning":"..."}`, and the TUI shows warnings in line. A standalone node follows itself only.
 
 ---
 
@@ -216,7 +218,7 @@ Without `-f`, this is a **one-shot fetch**, not a tail/follow. It returns the (o
 ```bash
 relish logs web -f
 ```
-`-f` streams new lines from the **local node only** (§3.7). It is not a cluster-wide merged tail.
+`-f` streams new lines from every node that runs the app, each prefixed `[node instance]`, with a warning on stderr when a node leaves (§3.7).
 
 **Time range:**
 ```bash
@@ -278,7 +280,7 @@ Retention is the same Parquet-file model as Mayo (`src/bun/disk_pressure.rs`, `c
 
 For **non-follow** queries, `/v1/logs/query/{app}/{namespace}` looks up which nodes run the app (council placement state), fans the query out over **HTTP** to each node's `/v1/logs/entries/...`, and merge-sorts the returned `LogEntry` lists by `timestamp` (`fan_out_query` in `src/ketchup/query.rs`). Transport is HTTP; there is no gRPC and no newline-delimited streaming protocol.
 
-**Follow across all nodes is planned -- not yet implemented.** `-f` streams from the local node only (§3.7). The k-way live merge with a 100ms clock-skew window belongs to the planned design.
+Follow merges live streams from every placed node (§3.7) in arrival order. The k-way merge with a 100 ms clock-skew window from earlier drafts is **planned -- not yet implemented**.
 
 ---
 
@@ -552,7 +554,7 @@ Some applications (e.g., HTTP access logs for high-traffic APIs) produce million
 
 ### 13.3 Real-Time Log Streaming Protocol
 
-**Reconciliation note:** today `--follow` is local-node only (§3.7) -- there is no cross-node live merge. What ships for non-follow queries is an HTTP fan-out that runs each node's SQL query and merge-sorts the returned lists. The paragraph below describes the planned cross-node streaming design, not current behaviour.
+**Reconciliation note:** `--follow` merges every placed node's SSE stream on the node you ask, in arrival order (§3.7); non-follow queries fan out each node's SQL query and merge-sort the lists. The paragraph below describes an earlier binary-protocol design, not current behaviour.
 
 The planned design uses streaming for cross-node log fan-out (the leader opens a stream to each node and merge-sorts the results). This targets the `relish logs --follow` use case but has limitations:
 

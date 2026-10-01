@@ -20,27 +20,64 @@ checksum() {
   fi
 }
 
+# A byte count as people read it: 812 B, 6.9 KiB, 37.2 MiB.
+human_size() {
+  awk -v bytes="$1" 'BEGIN {
+    if (bytes >= 1048576) printf "%.1f MiB", bytes / 1048576
+    else if (bytes >= 1024) printf "%.1f KiB", bytes / 1024
+    else printf "%d B", bytes
+  }'
+}
+
+file_size() {
+  if [ -f "$1" ]; then wc -c <"$1" | tr -d ' '; else printf '0\n'; fi
+}
+
+now() { date +%s 2>/dev/null || printf '0\n'; }
+
 # Fetch $1 into $2, resuming rather than restarting when the connection
-# drops. Our own loop instead of curl's --retry: --retry-all-errors needs curl
+# drops; $3 says what it is and $4 its size in bytes, when known. Each step
+# gets a line, so a slow link never looks like a hung installer. Our own loop instead of curl's --retry: --retry-all-errors needs curl
 # 7.71 (Ubuntu 20.04 ships 7.68), and a fresh curl per attempt picks up where
 # the file ends with --continue-at on every version. Each attempt also goes
 # back to the original URL, so a release asset's short-lived signed redirect
 # is issued anew. No --max-time: a slow link is fine as long as bytes keep
 # coming, and --speed-time drops one that has stalled for 30 seconds.
 download() {
+  if [ -n "${4:-}" ]; then
+    printf 'Downloading %s (%s)...\n' "$3" "$(human_size "$4")" >&2
+  else
+    printf 'Downloading %s...\n' "$3" >&2
+  fi
+  # A bar on a terminal. A log gets the lines around it instead, because the
+  # bar redraws itself with carriage returns.
+  meter=--silent
+  [ ! -t 2 ] || meter=--progress-bar
+  started=$(now)
   attempt=1
   while :; do
     status=0
-    curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+    curl --fail "$meter" --show-error --location --proto '=https' --proto-redir '=https' \
       --tlsv1.2 --connect-timeout 15 --speed-limit 1 --speed-time 30 \
       --continue-at - "$1" -o "$2" || status=$?
-    [ "$status" -ne 0 ] || return 0
+    if [ "$status" -eq 0 ]; then
+      fetched=$(file_size "$2")
+      readable=
+      [ "$fetched" -lt 1024 ] || readable=" ($(human_size "$fetched"))"
+      printf 'Downloaded %s bytes%s in %s s\n' "$fetched" "$readable" "$(($(now) - started))" >&2
+      return 0
+    fi
+    have=$(file_size "$2")
+    next=resuming
     # 33: the server can't resume, so the next attempt starts from scratch.
-    [ "$status" -ne 33 ] || rm -f "$2"
+    if [ "$status" -eq 33 ]; then
+      rm -f "$2"
+      next='starting again'
+    fi
     [ "$attempt" -lt 5 ] || return "$status"
     attempt=$((attempt + 1))
-    printf 'reliaburger: download interrupted (curl exit %s); resuming, attempt %s of 5\n' \
-      "$status" "$attempt" >&2
+    printf 'reliaburger: download interrupted (curl exit %s) after %s; %s, attempt %s of 5\n' \
+      "$status" "$(human_size "$have")" "$next" "$attempt" >&2
     sleep 2
   done
 }
@@ -134,10 +171,10 @@ main() {
   system=$(uname -s) || fail 'could not detect the operating system'
   machine=$(uname -m) || fail 'could not detect the CPU architecture'
   case "$system-$machine" in
-    Darwin-arm64) platform=macos-aarch64; expected=@MACOS_AARCH64@ ;;
-    Darwin-x86_64) platform=macos-x86_64; expected=@MACOS_X86_64@ ;;
-    Linux-aarch64|Linux-arm64) platform=linux-aarch64; expected=@LINUX_AARCH64@ ;;
-    Linux-x86_64) platform=linux-x86_64; expected=@LINUX_X86_64@ ;;
+    Darwin-arm64) platform=macos-aarch64; expected=@MACOS_AARCH64@; size=@MACOS_AARCH64_SIZE@ ;;
+    Darwin-x86_64) platform=macos-x86_64; expected=@MACOS_X86_64@; size=@MACOS_X86_64_SIZE@ ;;
+    Linux-aarch64|Linux-arm64) platform=linux-aarch64; expected=@LINUX_AARCH64@; size=@LINUX_AARCH64_SIZE@ ;;
+    Linux-x86_64) platform=linux-x86_64; expected=@LINUX_X86_64@; size=@LINUX_X86_64_SIZE@ ;;
     *) fail 'supported CLI platforms are macOS and Linux on arm64 or x86_64' ;;
   esac
   if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
@@ -172,7 +209,7 @@ main() {
   trap 'exit 143' TERM HUP
   url="$release_base/relish-$platform"
   downloaded=true
-  download "$url" "$staging/relish" || downloaded=false
+  download "$url" "$staging/relish" "relish @VERSION@ for $platform" "$size" || downloaded=false
   actual=$(checksum "$staging/relish" 2>/dev/null) || actual=
   # A last attempt can fail with 416 on a file that is already complete, so
   # the checksum, not curl's exit status, decides.

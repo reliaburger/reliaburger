@@ -5,6 +5,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::bun::events::ClusterEvent;
+use crate::ketchup::follow::LogFrame;
 use crate::relish::client::BunClient;
 
 use super::app::LogLine;
@@ -44,12 +45,8 @@ pub(super) async fn reconnect_logs(
                     tokio::select! {
                         _ = cancel.cancelled() => return,
                         frame = socket.next() => match frame {
-                            Some(Ok(tokio_tungstenite::tungstenite::Message::Text(line))) => {
-                                let item = StreamItem::LogLine(LogLine {
-                                    instance: app.clone(),
-                                    line: line.to_string(),
-                                });
-                                if tx.send(item).await.is_err() {
+                            Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
+                                if tx.send(log_stream_item(&app, &text)).await.is_err() {
                                     return;
                                 }
                             }
@@ -88,6 +85,24 @@ pub(super) async fn reconnect_logs(
         if !retry_delay(&cancel).await {
             return;
         }
+    }
+}
+
+/// Turn one WebSocket text frame into what the reducer shows.
+///
+/// A frame that isn't a [`LogFrame`] is kept as a raw line rather than
+/// dropped: a log line is better shown oddly than lost.
+fn log_stream_item(app: &str, text: &str) -> StreamItem {
+    match serde_json::from_str::<LogFrame>(text) {
+        Ok(LogFrame::Warning(warning)) => StreamItem::LogWarning(warning),
+        Ok(LogFrame::Line(line)) => StreamItem::LogLine(LogLine {
+            instance: app.to_string(),
+            line,
+        }),
+        Err(_) => StreamItem::LogLine(LogLine {
+            instance: app.to_string(),
+            line: text.to_string(),
+        }),
     }
 }
 
@@ -165,5 +180,30 @@ pub(super) async fn reconnect_events(
         if !retry_delay(&cancel).await {
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_warning_frame_becomes_a_log_warning() {
+        let item = log_stream_item("web", r#"{"warning":"node n2 left the cluster"}"#);
+        assert!(
+            matches!(item, StreamItem::LogWarning(warning) if warning == "node n2 left the cluster")
+        );
+    }
+
+    #[test]
+    fn a_line_frame_keeps_its_node_label() {
+        let item = log_stream_item("web", r#"{"line":"[n1 web-0] ready"}"#);
+        assert!(matches!(item, StreamItem::LogLine(line) if line.line == "[n1 web-0] ready"));
+    }
+
+    #[test]
+    fn an_unframed_text_message_is_shown_rather_than_dropped() {
+        let item = log_stream_item("web", "plain text");
+        assert!(matches!(item, StreamItem::LogLine(line) if line.line == "plain text"));
     }
 }

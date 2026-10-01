@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 
+use super::*;
 use super::{ContainerState, Grill, InstanceId, WorkloadInstance};
 
 /// At most this many runtime state reads run at once in one sweep.
@@ -93,11 +94,95 @@ pub(super) async fn sweep_states<G: Grill>(grill: G, reads: Vec<StateRead>) -> S
 
 async fn observe<G: Grill>(grill: &G, read: &StateRead) -> Observed {
     match grill.state(&read.id).await {
-        Ok(ContainerState::Stopped) if read.is_job => Observed::Exited {
-            exit_code: grill.exit_code(&read.id).await,
+        // A job's exit code the runtime couldn't read is unknown, not "none":
+        // the next sweep asks again rather than settling the outcome (#389).
+        Ok(ContainerState::Stopped) if read.is_job => match grill.exit_code(&read.id).await {
+            Ok(exit_code) => Observed::Exited { exit_code },
+            Err(_) => Observed::Unknown,
         },
         Ok(ContainerState::Stopped) => Observed::Exited { exit_code: None },
         Ok(_) => Observed::Alive,
         Err(_) => Observed::Unknown,
+    }
+}
+
+impl<G: Grill + Clone + 'static> BunAgent<G> {
+    /// The instances whose runtime state a sweep should read: running apps
+    /// (to catch a crash that no health check would) and running jobs that
+    /// haven't recorded an exit yet, filtered by `include`.
+    pub(super) fn plan_state_reads(
+        &self,
+        include: impl Fn(&WorkloadInstance) -> bool,
+    ) -> Vec<state_sweep::StateRead> {
+        self.supervisor
+            .list_instances()
+            .into_iter()
+            .filter(|instance| {
+                instance.state == ContainerState::Running
+                    && (!instance.is_job
+                        || self
+                            .recorded_jobs
+                            .get(&instance.id.0)
+                            .is_some_and(|job| job.phase == crate::bun::jobs::JobPhase::Launching))
+                    && include(instance)
+            })
+            .map(|instance| state_sweep::StateRead {
+                id: instance.id.clone(),
+                incarnation: state_sweep::Incarnation::of(instance),
+                is_job: instance.is_job,
+            })
+            .collect()
+    }
+
+    /// Start a sweep of every running app's and job's runtime state, unless
+    /// the last one hasn't reported yet. The reads run off the loop; the
+    /// sweep's `select!` branch applies what they saw.
+    pub(super) fn begin_state_sweep(&mut self) {
+        if !self.state_sweeps.is_empty() {
+            return;
+        }
+        let reads = self.plan_state_reads(|_| true);
+        if reads.is_empty() {
+            return;
+        }
+        let grill = self.supervisor.grill().clone();
+        self.state_sweeps
+            .spawn(state_sweep::sweep_states(grill, reads));
+    }
+
+    /// Apply a finished sweep: every app or job it saw exit goes through
+    /// the restart or job-outcome path, if it's still the incarnation the
+    /// sweep read and still Running.
+    pub(super) async fn apply_state_sweep(
+        &mut self,
+        sweep: Result<state_sweep::StateSweep, tokio::task::JoinError>,
+    ) {
+        let sweep = match sweep {
+            Ok(sweep) => sweep,
+            Err(error) => {
+                eprintln!("bun: runtime state sweep failed: {error}");
+                return;
+            }
+        };
+        for (read, observed) in sweep.observations {
+            let state_sweep::Observed::Exited { exit_code } = observed else {
+                continue;
+            };
+            let current = self
+                .supervisor
+                .get_instance(&read.id)
+                .is_some_and(|instance| {
+                    instance.state == ContainerState::Running
+                        && state_sweep::Incarnation::of(instance) == read.incarnation
+                });
+            if !current {
+                continue;
+            }
+            if read.is_job {
+                self.observe_job_exit(&read.id, exit_code).await;
+            } else {
+                self.observe_app_exit(&read.id).await;
+            }
+        }
     }
 }

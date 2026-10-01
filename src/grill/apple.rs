@@ -523,25 +523,30 @@ impl super::Grill for AppleContainerGrill {
         Self::parse_state(&inspect_json, instance)
     }
 
-    async fn exit_code(&self, instance: &InstanceId) -> Option<i32> {
+    async fn exit_code(&self, instance: &InstanceId) -> Result<Option<i32>, GrillError> {
         let output = self
             .container_command(&["inspect", &instance.0], instance)
-            .await
-            .ok()?;
+            .await?;
         if !output.status.success() {
-            return None;
+            return Ok(None);
         }
-        let inspect: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+        let inspect: serde_json::Value =
+            serde_json::from_slice(&output.stdout).map_err(|error| {
+                GrillError::StateUnavailable {
+                    instance: instance.clone(),
+                    reason: format!("unreadable inspect output: {error}"),
+                }
+            })?;
         // Apple's `container inspect` does not currently surface the process
         // exit code, so this normally yields None; we still probe the shapes we
         // might see if a future CLI adds it.
         let root = Self::inspect_root(&inspect);
-        root["State"]["ExitCode"]
+        Ok(root["State"]["ExitCode"]
             .as_i64()
             .or_else(|| root["state"]["exitCode"].as_i64())
             .or_else(|| root["exitCode"].as_i64())
             .or_else(|| root["ExitCode"].as_i64())
-            .map(|code| code as i32)
+            .map(|code| code as i32))
     }
 
     /// The container IP discovered during `start()` (see `discover_container_ip`).

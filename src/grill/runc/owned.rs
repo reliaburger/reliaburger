@@ -609,8 +609,14 @@ impl RuncGrill {
     }
 
     /// Read the actual workload outcome without inventing a cleanup result.
-    pub(super) async fn owned_exit_code(&self, instance: &InstanceId) -> Option<i32> {
-        self.owned_operation(instance, |_runtime, _id, context| async move {
+    ///
+    /// An instance with no generation has no exit code; any other failure
+    /// is an error, never "no exit code" (#389).
+    pub(super) async fn owned_exit_code(
+        &self,
+        instance: &InstanceId,
+    ) -> Result<Option<i32>, GrillError> {
+        let read = self.owned_operation(instance, |_runtime, _id, context| async move {
             if let IntentPhase::Retired { exit_code } = context.intent().await?.phase {
                 return Ok(exit_code);
             }
@@ -618,10 +624,11 @@ impl RuncGrill {
                 Some(CommandState::Retired { exit_code }) => exit_code,
                 _ => None,
             })
-        })
-        .await
-        .ok()
-        .flatten()
+        });
+        match read.await {
+            Err(GrillError::NotFound { .. }) => Ok(None),
+            result => result,
+        }
     }
 
     /// Return informational identity from the bound launcher owner.

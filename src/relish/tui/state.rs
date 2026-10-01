@@ -3,6 +3,7 @@
 use std::collections::{HashMap, VecDeque};
 
 use crate::bun::agent::{ClusterInstanceStatus, CouncilStatus, JobStatus, NodeStatus};
+use crate::bun::cluster_view::{ClusterDeployHistory, NodeTagged};
 use crate::bun::events::ClusterEvent;
 use crate::mayo::rollup::MetricsQueryResult;
 use crate::wrapper::types::RouteInfo;
@@ -75,11 +76,16 @@ pub struct ClusterData {
     pub council: Option<CouncilStatus>,
     pub alerts: Vec<crate::mayo::alert::AlertStatus>,
     pub routes: Vec<RouteInfo>,
-    pub jobs: Vec<JobStatus>,
+    /// Every node's jobs, each with its node.
+    pub jobs: Vec<NodeTagged<JobStatus>>,
+    /// Nodes whose jobs are missing from `jobs`.
+    pub job_warnings: Vec<String>,
     pub events: VecDeque<ClusterEvent>,
+    /// Nodes whose events are missing from the last refresh.
+    pub event_warnings: Vec<String>,
     /// Deploy history keyed by [`deploy_history_key`] — two apps of the same
     /// name in different namespaces have separate histories (C3).
-    pub deploy_history: HashMap<String, Vec<serde_json::Value>>,
+    pub deploy_history: HashMap<String, ClusterDeployHistory>,
     pub app_metrics: Option<MetricsQueryResult>,
     pub last_updated: Option<u64>,
 }

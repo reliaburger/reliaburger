@@ -6,8 +6,9 @@ use super::widgets;
 
 pub fn lines(app: &TuiApp) -> Vec<Line<'static>> {
     let mut lines = vec![widgets::heading(
-        "TIME      SEV       KIND            APP              MESSAGE",
+        "TIME      SEV       KIND            NODE         APP              MESSAGE",
     )];
+    lines.extend(widgets::partial_warnings(&app.data.event_warnings));
     if let Some(error) = &app.event_stream_down {
         lines.push(Line::raw(format!(
             "stream disconnected — reconnecting: {error}"
@@ -40,10 +41,11 @@ pub fn lines(app: &TuiApp) -> Vec<Line<'static>> {
         .rev()
     {
         lines.push(Line::raw(format!(
-            "{}  {:<9?} {:<15?} {:<16} {}",
+            "{}  {:<9?} {:<15?} {:<12} {:<16} {}",
             widgets::format_time(event.timestamp),
             event.severity,
             event.kind,
+            event.node.as_deref().unwrap_or("-"),
             event.app.as_deref().unwrap_or("-"),
             event.message
         )));

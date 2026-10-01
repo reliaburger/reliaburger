@@ -5,8 +5,8 @@ expression: "render_to_string(&app, 120, 40)"
  RELISH  3 nodes · 3 apps · leader node-1 · CONNECTED                                                                   
                                                                                                                         
 ┌jobs──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│NAME                 NS           STATE        RESTARTS  AGE      IMAGE                                               │
-│migrate              default      stopped             0      60s  proc-grill:image-ignored                            │
+│NAME                 NODE         NS           STATE        RESTARTS  AGE      IMAGE                                  │
+│migrate              node-1       default      stopped             0      60s  proc-grill:image-ignored               │
 │                                                                                                                      │
 │                                                                                                                      │
 │                                                                                                                      │

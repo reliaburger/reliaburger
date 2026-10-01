@@ -51,10 +51,18 @@ impl TuiApp {
             },
             DataUpdate::Alerts(result) => set_data!(result, alerts),
             DataUpdate::Routes(result) => set_data!(result, routes),
-            DataUpdate::Jobs(result) => set_data!(result, jobs),
+            DataUpdate::Jobs(result) => match result {
+                Ok(value) => {
+                    self.data.jobs = value.jobs;
+                    self.data.job_warnings = value.warnings;
+                    self.mark_connected();
+                }
+                Err(error) => self.mark_disconnected(error.to_string()),
+            },
             DataUpdate::EventsSeed(result) => match result {
                 Ok(value) => {
-                    self.data.events = value.into();
+                    self.data.events = value.events.into();
+                    self.data.event_warnings = value.warnings;
                     self.mark_connected();
                 }
                 Err(error) => self.mark_disconnected(error.to_string()),
@@ -82,6 +90,16 @@ impl TuiApp {
         }
     }
 
+    fn push_log_line(&mut self, line: LogLine) {
+        if self.log_lines.len() == 10_000 {
+            self.log_lines.pop_front();
+        }
+        self.log_lines.push_back(line);
+        if self.log_follow {
+            self.log_scroll = 0;
+        }
+    }
+
     fn mark_connected(&mut self) {
         self.connection = Connection::Connected;
         self.data.last_updated = Some(self.now_epoch);
@@ -100,15 +118,13 @@ impl TuiApp {
 
     fn handle_stream(&mut self, item: StreamItem) {
         match item {
-            StreamItem::LogLine(line) => {
-                if self.log_lines.len() == 10_000 {
-                    self.log_lines.pop_front();
-                }
-                self.log_lines.push_back(line);
-                if self.log_follow {
-                    self.log_scroll = 0;
-                }
-            }
+            StreamItem::LogLine(line) => self.push_log_line(line),
+            // Shown in line, where it happened, so the gap in that node's
+            // lines has its explanation right beside it.
+            StreamItem::LogWarning(warning) => self.push_log_line(LogLine {
+                instance: "warning".into(),
+                line: warning,
+            }),
             StreamItem::Event(event) => {
                 if self.data.events.len() == 1024 {
                     self.data.events.pop_front();

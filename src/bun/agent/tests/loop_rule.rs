@@ -330,13 +330,29 @@ fn agent_sources() -> Vec<Source> {
         .collect();
     submodules.sort();
     paths.extend(submodules);
-    paths
+    let sources: Vec<Source> = paths
         .into_iter()
         .map(|path| {
             let text = std::fs::read_to_string(root.join(&path)).unwrap();
             parse(path, &text)
         })
-        .collect()
+        .collect();
+    // The agent's methods live in its child modules. One the walk can't
+    // read (a nested `agent/x/mod.rs`, say) would drop its awaits silently.
+    for item in &sources[0].file.items {
+        if let syn::Item::Mod(module) = item
+            && module.content.is_none()
+            && !is_cfg_test(&module.attrs)
+        {
+            let file = format!("src/bun/agent/{}.rs", module.ident);
+            assert!(
+                sources.iter().any(|source| source.path == Path::new(&file)),
+                "agent module `{}` isn't in {file}, so the loop rule can't check it",
+                module.ident
+            );
+        }
+    }
+    sources
 }
 
 #[test]

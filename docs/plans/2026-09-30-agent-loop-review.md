@@ -4,6 +4,10 @@
 with the answers in [Decision](#decision). The work ships in 0.1.3 and is
 tracked in #351.
 Code references are against `9ba64f6c` (main, 30 September 2026).
+Since #319 (October 2026) those files are split by concern: a method cited as
+`agent.rs:N` now lives in `src/bun/agent.rs` (the loop, `BunAgent` and its
+constructors) or one of the files under `src/bun/agent/`, and an API handler in
+`src/bun/api/<route group>.rs`. Search by name.
 
 Bun's agent loop (`run_loop`, `src/bun/agent.rs:3748`) caused most of the soak
 failures in 0.1.0 and 0.1.1. We fixed each one where it hurt: a reorder here,

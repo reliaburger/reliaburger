@@ -3981,7 +3981,10 @@ impl reliaburger::grill::Grill for InitPolicyGrill {
     async fn container_ip(&self, id: &reliaburger::grill::InstanceId) -> Option<Ipv4Addr> {
         self.runtime.container_ip(id).await
     }
-    async fn exit_code(&self, id: &reliaburger::grill::InstanceId) -> Option<i32> {
+    async fn exit_code(
+        &self,
+        id: &reliaburger::grill::InstanceId,
+    ) -> Result<Option<i32>, reliaburger::grill::GrillError> {
         self.runtime.exit_code(id).await
     }
     async fn workload_cgroup(
@@ -4975,7 +4978,7 @@ async fn check_stopped_address_retention(lose_enforcement: bool, durable_discove
             actor.abort();
             let _ = actor.await;
         } else {
-            anyhow::ensure!(runtime.exit_code(&old).await == Some(0), "original did not exit naturally");
+            anyhow::ensure!(runtime.exit_code(&old).await? == Some(0), "original did not exit naturally");
         }
         let successor: reliaburger::config::app::AppSpec = toml::from_str("image = '/empty-fixture'\ncommand = ['/bin/busybox', 'httpd', '-f', '-p', '8080', '-h', '/']\n")?;
         let cgroup = reliaburger::grill::cgroup::instance_cgroup_path("default", &successor_name, &new)?;

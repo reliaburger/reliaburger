@@ -7,6 +7,7 @@
 //! runtime), and a state read from before a restart never touches the
 //! replacement.
 
+use super::commands::AgentCommand;
 use super::loop_harness::{calls_of, crash, replicated};
 use super::*;
 use crate::grill::mock::MockCall;
@@ -216,6 +217,32 @@ async fn a_state_read_from_before_a_restart_leaves_the_replacement_alone() {
     assert_eq!(instance.state, ContainerState::Running);
     assert_eq!(instance.restart_count, restarts_before);
     assert!(!instance.retry_pending);
+}
+
+/// A job has exited but the runtime couldn't read its exit code (#389).
+/// The sweep says it doesn't know, so the loop asks again next tick rather
+/// than settling the job as exited without a code.
+#[tokio::test]
+async fn a_job_exit_code_the_runtime_could_not_read_sweeps_as_unknown() {
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    let job = Config::parse("[job.batch]\nimage = 'batch:v1'\ncommand = ['true']\n").unwrap();
+    expect_complete(&drain_deploy(&mut agent, job).await);
+    let reads = agent.plan_state_reads(|_| true);
+    assert_eq!(reads.len(), 1);
+    assert!(reads[0].is_job);
+    let id = reads[0].id.clone();
+    grill.set_state(&id, ContainerState::Stopped);
+    grill.set_exit_code(&id, Some(0));
+    grill.set_instance_exit_code_failure(&id, true);
+    let sweep = state_sweep::sweep_states(grill.clone(), reads.clone()).await;
+    assert_eq!(sweep.observations[0].1, state_sweep::Observed::Unknown);
+
+    grill.set_instance_exit_code_failure(&id, false);
+    let sweep = state_sweep::sweep_states(grill.clone(), reads).await;
+    assert_eq!(
+        sweep.observations[0].1,
+        state_sweep::Observed::Exited { exit_code: Some(0) }
+    );
 }
 
 /// The sweep reads in parallel, under one deadline: ten slow reads take

@@ -141,7 +141,7 @@ async fn rootless_short_job_has_network_before_its_first_instruction() {
     drop(first);
     let recovered = runtime(root.path());
     stopped(&recovered, &id).await;
-    assert_eq!(recovered.exit_code(&id).await, Some(7));
+    assert_eq!(recovered.exit_code(&id).await.unwrap(), Some(7));
     assert!(recovered.logs(&id).await.unwrap().contains("network-ready"));
     assert!(!root.path().join("state").join(&id.0).exists());
 }
