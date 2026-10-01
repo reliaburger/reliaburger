@@ -208,7 +208,7 @@ async fn runc_owned_adoption_validates_generation_and_restores_live_network() {
     first.create(&id, &specification).await.unwrap();
     install_fixture(root.path(), &id);
     first.start(&id).await.unwrap();
-    let pid = first.pid(&id).await.unwrap();
+    let pid = first.pid(&id).await.unwrap().unwrap();
     let mut record = InstanceRecord {
         schema: 2,
         instance_id: id.0.clone(),
@@ -232,7 +232,7 @@ async fn runc_owned_adoption_validates_generation_and_restores_live_network() {
     drop(first);
     let recovered = runtime(root.path());
     assert!(recovered.adopt(&id, &record).await.unwrap());
-    assert_eq!(recovered.pid(&id).await, Some(pid));
+    assert_eq!(recovered.pid(&id).await.unwrap(), Some(pid));
     assert!(recovered.container_ip(&id).await.is_some());
     assert_eq!(
         recovered
@@ -500,7 +500,7 @@ async fn recovered_source_identity_belongs_to_the_container_not_its_launcher() {
     install_fixture(root.path(), &id);
     first.start(&id).await.unwrap();
     let expected = reliaburger::sesame::egress::cgroup_id_of_path(Path::new(&path)).unwrap();
-    let launcher = first.pid(&id).await.unwrap();
+    let launcher = first.pid(&id).await.unwrap().unwrap();
     let launcher_cgroup = reliaburger::sesame::egress::cgroup_id_of_pid(launcher);
     let live = first.workload_cgroup(&id).await;
     drop(first);
@@ -730,7 +730,7 @@ async fn restart_recovers_a_retiring_generation_that_still_holds_its_address() {
     install_fixture(root.path(), &id);
     let original = first.retain_network_reference(&id).await.unwrap().unwrap();
     first.start(&id).await.unwrap();
-    let pid = first.pid(&id).await.unwrap();
+    let pid = first.pid(&id).await.unwrap().unwrap();
     let record = InstanceRecord {
         schema: 2,
         instance_id: id.0.clone(),
@@ -1104,7 +1104,7 @@ async fn owned_runc_unit_stop_fixture() {
         .unwrap()
         .unwrap();
     runtime.start(&id).await.unwrap();
-    let pid = runtime.pid(&id).await.unwrap();
+    let pid = runtime.pid(&id).await.unwrap().unwrap();
     let record = InstanceRecord {
         schema: 2,
         instance_id: id.0.clone(),

@@ -288,6 +288,29 @@ pub fn check_network_prerequisites(
     }
 }
 
+/// Refuse a run the council can never finish. Voters upgrade one at a
+/// time, so the rest must still make a quorum of the configured set. With a
+/// single voter there is no quorum to keep (the leader just restarts); with
+/// three or more there always is. Only two voters fail: the orchestrator
+/// would hold the run in the council phase indefinitely, and a holding run
+/// isn't paused, so it can't be aborted either.
+pub fn check_council_can_roll(configured_voters: usize) -> Result<(), UpgradeError> {
+    if configured_voters <= 1 {
+        return Ok(());
+    }
+    let quorum = configured_voters / 2 + 1;
+    let remaining = configured_voters - 1;
+    if remaining >= quorum {
+        Ok(())
+    } else {
+        Err(UpgradeError::CouncilTooSmallToRoll {
+            voters: configured_voters,
+            remaining,
+            quorum,
+        })
+    }
+}
+
 /// What one node holds in its binary store, as input to
 /// [`check_rollback_target`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -629,6 +652,30 @@ mod tests {
             "{err}"
         );
         assert!(err.to_string().contains("upgrades.external_signing_key"));
+    }
+
+    #[test]
+    fn a_two_voter_council_is_refused_before_the_run_is_recorded() {
+        let err = check_council_can_roll(2).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                UpgradeError::CouncilTooSmallToRoll {
+                    voters: 2,
+                    remaining: 1,
+                    quorum: 2
+                }
+            ),
+            "{err}"
+        );
+        assert!(err.to_string().contains("at least three voters"));
+    }
+
+    #[test]
+    fn one_voter_or_three_and_more_can_roll() {
+        for voters in [0, 1, 3, 4, 5, 7] {
+            check_council_can_roll(voters).unwrap();
+        }
     }
 
     #[test]

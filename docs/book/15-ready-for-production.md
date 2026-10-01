@@ -3515,6 +3515,29 @@ if the instance hasn't exited, since a dead container has no process however
 quickly its pid was read. `runtime_unknown` now means "some of the runtime's
 evidence is missing", and a pid that arrived is reported beside it.
 
+There was a quieter way to lose a pid, too. `Grill::pid` returned
+`Option<u32>`, and both owned runtimes turned any failure into `None` with
+`.ok()`: a process owner that didn't answer, a runc owner operation that
+failed. `None` was supposed to mean "this instance has no process", so status
+reported a live instance as process-less and didn't even mark it unknown. A
+test now replaces a live owner's socket with a listener that never answers,
+and the pid used to come back `None`. The trait now says what it means:
+
+```rust
+fn pid(
+    &self,
+    instance: &InstanceId,
+) -> impl std::future::Future<Output = Result<Option<u32>, GrillError>> + Send
+```
+
+`Ok(None)` is "no process", `Err` is "couldn't tell", and the status reader
+turns an `Err` into `runtime_unknown`. Callers that only ever wanted a pid
+when there was one, such as the upgrade inventory, write `let Ok(Some(pid))
+= ... else { continue };` and behave as before. This is what `Option` and
+`Result` are for: once both outcomes have their own variant, the compiler
+won't let a caller confuse them, where a Go function returning `(0, nil)` for
+both would.
+
 There was a type problem in the middle of this. The reads need the container
 runtime, and `BunAgent<G: Grill>` is generic over it, but the API state isn't
 generic and we didn't want it to become so. The reader stores the one

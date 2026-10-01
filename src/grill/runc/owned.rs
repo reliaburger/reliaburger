@@ -629,12 +629,13 @@ impl RuncGrill {
     /// A launcher already seen running answers without the lifecycle lock:
     /// state reads hold that lock for a `runc state` and, rootless, a
     /// network helper probe each, and a status read's pid used to queue
-    /// behind them past its deadline (#358).
-    pub(super) async fn owned_pid(&self, instance: &InstanceId) -> Option<u32> {
+    /// behind them past its deadline (#358). An instance with no generation
+    /// has no process; any other failure is an error, never "no process".
+    pub(super) async fn owned_pid(&self, instance: &InstanceId) -> Result<Option<u32>, GrillError> {
         if let Some(pid) = self.remembered_launcher(instance).await {
-            return Some(pid);
+            return Ok(Some(pid));
         }
-        self.owned_operation(instance, |runtime, id, context| async move {
+        let read = self.owned_operation(instance, |runtime, id, context| async move {
             match context.role_state(RuntimeRole::Launcher).await? {
                 Some(CommandState::Running { pid }) => {
                     runtime.remember_launcher(&id, &context, pid).await?;
@@ -645,10 +646,11 @@ impl RuncGrill {
                     Ok(None)
                 }
             }
-        })
-        .await
-        .ok()
-        .flatten()
+        });
+        match read.await {
+            Err(GrillError::NotFound { .. }) => Ok(None),
+            result => result,
+        }
     }
 
     /// Record that `id`'s current generation has `pid` as its running
