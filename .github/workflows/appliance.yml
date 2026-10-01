@@ -384,6 +384,17 @@ jobs:
         timeout-minutes: 20
         run: image/tests/netboot-install.sh image/mkosi.output "$IMAGE_VERSION"
 
+      - name: Seeded pair (x86-64, KVM)
+        # Two appliances form a cluster from their seeds alone, with the
+        # bun and relish of the commit under test (lab builds only).
+        if: matrix.arch == 'x86_64' && env.BROKEN_BUN != '1' && hashFiles('source-bin/relish-linux-x86_64') != ''
+        timeout-minutes: 25
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y -qq dnsmasq-base
+          chmod +x source-bin/relish-linux-x86_64
+          image/tests/seeded-pair.sh image/mkosi.output "$IMAGE_VERSION" source-bin/relish-linux-x86_64
+
       - name: Upload the image
         uses: actions/upload-artifact@v4
         with:
