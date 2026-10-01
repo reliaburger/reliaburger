@@ -2435,9 +2435,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             restart_rotation: RestartRotation::default(),
             identity_signings: identity_signing::IdentitySignings::new(),
             identity_signing_tasks: tokio::task::JoinSet::new(),
-            status_tx: watch::Sender::new(Arc::new(status_snapshot::StatusSnapshot::new(
-                Vec::new(),
-            ))),
+            status_tx: watch::Sender::new(Arc::new(status_snapshot::StatusSnapshot::unpublished())),
             state_sweeps: tokio::task::JoinSet::new(),
             restarts: restarts::Restarts::new(),
             restart_steps: tokio::task::JoinSet::new(),
@@ -2579,9 +2577,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             restart_rotation: RestartRotation::default(),
             identity_signings: identity_signing::IdentitySignings::new(),
             identity_signing_tasks: tokio::task::JoinSet::new(),
-            status_tx: watch::Sender::new(Arc::new(status_snapshot::StatusSnapshot::new(
-                Vec::new(),
-            ))),
+            status_tx: watch::Sender::new(Arc::new(status_snapshot::StatusSnapshot::unpublished())),
             state_sweeps: tokio::task::JoinSet::new(),
             restarts: restarts::Restarts::new(),
             restart_steps: tokio::task::JoinSet::new(),

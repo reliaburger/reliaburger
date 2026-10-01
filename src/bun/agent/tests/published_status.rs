@@ -147,3 +147,38 @@ async fn the_status_command_reads_the_runtime_off_the_loop() {
     let statuses = answer.await.unwrap();
     assert!(statuses[0].runtime_unknown);
 }
+
+/// Before its loop first publishes, the agent is still adopting what it
+/// found on disk. Status must wait for that, not answer "nothing here".
+#[tokio::test(start_paused = true)]
+async fn status_waits_for_the_loop_to_publish_for_the_first_time() {
+    let (mut agent, _tx, _shutdown, _grill) = test_agent_with_grill();
+    expect_complete(&drain_deploy(&mut agent, replicated("web", 1)).await);
+    let reader = agent.status_reader();
+
+    let read = reader.read();
+    tokio::pin!(read);
+    assert!(futures_util::poll!(read.as_mut()).is_pending());
+    agent.publish_status();
+    assert_eq!(read.await.unwrap().len(), 1);
+
+    let (fresh, _fresh_tx, _fresh_shutdown, _fresh_grill) = test_agent_with_grill();
+    assert!(matches!(
+        fresh.status_reader().read().await,
+        Err(StatusUnavailable::Stale { .. })
+    ));
+}
+
+/// The liveness check runs beside the pid and exit-code reads, so it
+/// doesn't use up their share of the status deadline.
+#[tokio::test]
+async fn the_liveness_check_does_not_delay_the_pid_read() {
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    expect_complete(&drain_deploy(&mut agent, replicated("web", 1)).await);
+    grill.set_pid(4242);
+    grill.set_call_delay(MockCall::State, Some(std::time::Duration::from_millis(300)));
+    grill.set_pid_delay(Some(std::time::Duration::from_millis(300)));
+    let statuses = agent.get_status().await;
+    assert!(!statuses[0].runtime_unknown, "{statuses:?}");
+    assert_eq!(statuses[0].pid, Some(4242));
+}

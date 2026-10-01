@@ -3470,6 +3470,17 @@ runtime for its state. If the runtime says the process has exited, the answer
 says `stopped`, even though the loop hasn't noticed yet. That's an improvement
 on the old behaviour, not just parity.
 
+The privileged CI run caught two mistakes in the first version. The state read
+ran *before* the pid read, inside the same 500 ms, and rootless runc spends a
+good part of that on each call. So an adopted container came back with its
+pid marked unknown. The three reads now run side by side with `tokio::join!`,
+which polls several futures together and waits for all of them. The second
+mistake was quieter. The agent created its `watch` channel with an empty
+snapshot stamped "now", before it had adopted anything, so a request that
+arrived in that window got a fresh-looking "no instances". The placeholder
+is now explicitly unpublished, with an infinite age, and readers wait for the
+loop's first real publication.
+
 There was a type problem in the middle of this. The reads need the container
 runtime, and `BunAgent<G: Grill>` is generic over it, but the API state isn't
 generic and we didn't want it to become so. The reader stores the one

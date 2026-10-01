@@ -48,7 +48,9 @@ pub(crate) const STATUS_FRESHNESS_WAIT: Duration = Duration::from_secs(4);
 /// What the loop knew about every instance at the end of one turn.
 #[derive(Debug)]
 pub(crate) struct StatusSnapshot {
-    published_at: tokio::time::Instant,
+    /// `None` until the loop has run: the agent is still adopting what it
+    /// finds on disk, so it has nothing true to say yet.
+    published_at: Option<tokio::time::Instant>,
     entries: Vec<StatusEntry>,
 }
 
@@ -81,14 +83,24 @@ impl StatusSnapshot {
     /// A snapshot of `entries`, published now.
     pub(super) fn new(entries: Vec<StatusEntry>) -> Self {
         Self {
-            published_at: tokio::time::Instant::now(),
+            published_at: Some(tokio::time::Instant::now()),
             entries,
         }
     }
 
-    /// How long ago the loop published this.
+    /// The placeholder an agent holds before its loop first publishes. It
+    /// is never fresh, so readers wait for the real thing.
+    pub(super) fn unpublished() -> Self {
+        Self {
+            published_at: None,
+            entries: Vec::new(),
+        }
+    }
+
+    /// How long ago the loop published this; `Duration::MAX` if it hasn't.
     pub(crate) fn age(&self) -> Duration {
-        self.published_at.elapsed()
+        self.published_at
+            .map_or(Duration::MAX, |published| published.elapsed())
     }
 }
 
@@ -214,14 +226,18 @@ async fn complete_entry<G: Grill>(
         } => (recorded_exit, alive),
     };
     let id = InstanceId(status.id.clone());
+    // The three reads run side by side, so the liveness check doesn't eat
+    // into the deadline the pid and exit code had before it existed.
     let read = async {
-        let exited = alive && matches!(grill.state(&id).await, Ok(ContainerState::Stopped));
-        let pid = grill.pid(&id).await;
-        let exit_code = match recorded_exit {
-            Some(code) => code,
-            None => grill.exit_code(&id).await,
+        let exited =
+            async { alive && matches!(grill.state(&id).await, Ok(ContainerState::Stopped)) };
+        let exit_code = async {
+            match recorded_exit {
+                Some(code) => code,
+                None => grill.exit_code(&id).await,
+            }
         };
-        (exited, pid, exit_code)
+        tokio::join!(exited, grill.pid(&id), exit_code)
     };
     // `timeout_at` polls the read once even past the deadline, so an
     // instance that answers at once is never marked unknown.
