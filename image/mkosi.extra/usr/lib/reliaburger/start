@@ -26,6 +26,17 @@ if [ -z "$active_version" ] \
     ln -sfn "bun-v$image_version" "$bin/.bun.tmp"
     mv -Tf "$bin/.bun.tmp" "$bin/bun"
     echo "reliaburger: bun $image_version from the image is now active (was ${active_version:-none})"
+    # Keep the bun just replaced, for a rollback, and drop older ones: each
+    # is about 100 MB, and an 8 GB eMMC can't hold one per OS update. bun's
+    # own upgrades prune the same way ([upgrades] retain_versions).
+    for old in "$bin"/bun-v*; do
+        case ${old##*/} in
+            "bun-v$image_version" | "bun-v$active_version" | *.sig) continue ;;
+        esac
+        [ -f "$old" ] || continue
+        rm -f "$old" "$old.sig"
+        echo "reliaburger: removed ${old##*/}"
+    done
 fi
 
 if [ -f /etc/reliaburger/node.toml ]; then

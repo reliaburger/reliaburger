@@ -9,8 +9,10 @@ the others join it. --network lets any machine on that network through the
 firewall to the cluster ports before it has joined, so nodes can be added
 later; without it only the listed addresses get through. Mirrors src/relish/quickstart/provision.rs::node_config
 (mTLS, eBPF, DNS, ingress, the laptop fault policy), plus operator_cidrs so
-relish on the operator's machine can reach the API, and optionally the
-operator key cluster bun upgrades need (docs/manual/12_operations.md).
+relish on the operator's machine can reach the API, optionally the operator
+key cluster bun upgrades need (docs/manual/12_operations.md), and retention
+sized for an 8 GB disk: one old bun (about 100 MB each) and two days of
+unreferenced images.
 """
 import argparse
 import ipaddress
@@ -68,12 +70,15 @@ listen = "{me}:53"
 [ingress]
 enabled = true
 
+[images]
+gc_retain_days = 2
+
 [testing]
 safety_class = "development"
 allowed_operations = ["inject_workload_faults", "alter_node_state"]
+
+[upgrades]
+retain_versions = 1
 ''', end="")
 if args.operator_key:
-    print(f'''
-[upgrades]
-external_signing_key = "{args.operator_key}"
-''', end="")
+    print(f'external_signing_key = "{args.operator_key}"\n', end="")
