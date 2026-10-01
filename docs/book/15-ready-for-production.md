@@ -3242,8 +3242,9 @@ Not "no pid" either, because that means something (the process has gone).
 So the answer carries what's known and says which part isn't:
 
 ```rust
-/// The runtime didn't answer for this instance before the status
-/// deadline, so `pid` and `exit_code` are unknown rather than absent.
+/// Some of the runtime's evidence for this instance (its liveness, pid
+/// or exit code) didn't arrive before the status deadline, so a `None`
+/// `pid` or `exit_code` is unknown rather than absent.
 #[serde(default, skip_serializing_if = "std::ops::Not::not")]
 pub runtime_unknown: bool,
 ```
@@ -3482,6 +3483,62 @@ snapshot stamped "now", before it had adopted anything, so a request that
 arrived in that window got a fresh-looking "no instances". The placeholder
 is now explicitly unpublished, with an infinite age, and readers wait for the
 loop's first real publication.
+
+Side by side wasn't the end of it. A week later the same rootless test came
+back with `pid: None` after an upgrade walk, about one run in ten (#358). The
+`join!` let three futures run together, but the runc grill doesn't. Every
+call it makes for one instance takes that instance's lifecycle lock, so the
+pid read still queued behind our own state read, and behind the health
+sweep's, and each rootless state read is a `runc state` through the durable
+command owner plus a probe of the network helper. On a busy runner two of
+those in front of you are the whole 500 ms. Then `timeout_at` dropped the
+joined future, and with it the pid that was only waiting its turn.
+
+Two changes, one at each end. The runc grill remembers the launcher it last
+saw running, with its intent generation and the process's start time. A
+generation binds its launcher once, so that pid can't change while the
+process lives, and `pid()` answers from memory, checking only that the
+generation is still current and the process is the same one, without the
+lock. Cleanup and a retired intent forget it. And the reader now gives each
+read its own `timeout_at`, so a liveness check that misses the deadline
+costs only the liveness verdict:
+
+```rust
+let (exited, pid, exit_code) = tokio::join!(exited, pid, exit_code);
+status.runtime_unknown = exited.is_err() || pid.is_err() || exit_code.is_err();
+let exited = exited.unwrap_or(false);
+status.pid = pid.ok().flatten().filter(|_| !exited);
+```
+
+Each value is a `Result`: `Ok` with the answer, or `Err(Elapsed)` if the
+deadline beat it. `pid.ok()` turns that into an `Option<Option<u32>>`,
+`flatten` collapses the two layers into one, and `filter` keeps the pid only
+if the instance hasn't exited, since a dead container has no process however
+quickly its pid was read. `runtime_unknown` now means "some of the runtime's
+evidence is missing", and a pid that arrived is reported beside it.
+
+There was a quieter way to lose a pid, too. `Grill::pid` returned
+`Option<u32>`, and both owned runtimes turned any failure into `None` with
+`.ok()`: a process owner that didn't answer, a runc owner operation that
+failed. `None` was supposed to mean "this instance has no process", so status
+reported a live instance as process-less and didn't even mark it unknown. A
+test now replaces a live owner's socket with a listener that never answers,
+and the pid used to come back `None`. The trait now says what it means:
+
+```rust
+fn pid(
+    &self,
+    instance: &InstanceId,
+) -> impl std::future::Future<Output = Result<Option<u32>, GrillError>> + Send
+```
+
+`Ok(None)` is "no process", `Err` is "couldn't tell", and the status reader
+turns an `Err` into `runtime_unknown`. Callers that only ever wanted a pid
+when there was one, such as the upgrade inventory, write `let Ok(Some(pid))
+= ... else { continue };` and behave as before. This is what `Option` and
+`Result` are for: once both outcomes have their own variant, the compiler
+won't let a caller confuse them, where a Go function returning `(0, nil)` for
+both would.
 
 There was a type problem in the middle of this. The reads need the container
 runtime, and `BunAgent<G: Grill>` is generic over it, but the API state isn't

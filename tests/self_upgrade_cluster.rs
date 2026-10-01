@@ -8,10 +8,12 @@
 //! against real processes exec'ing themselves.
 //!
 //! Note on roles: with four nodes the council reconciler makes ALL of
-//! them Raft voters (the cap is seven), so "worker" here is a role in
-//! the upgrade plan, not a Raft status. The ordering mechanics the tests
-//! assert — workers first, council one at a time, leader last (in place)
-//! — are exactly the mechanics under test.
+//! them Raft voters (the cap is seven), and the harness waits until it
+//! has before any test starts, so every upgrade walk takes real voters
+//! down one at a time against a four-voter quorum. "Worker" here is a
+//! label in the upgrade plan, not a Raft status: the leader corrects it
+//! to `Council`. The ordering mechanics the tests assert (council one at
+//! a time, leader last, in place) are exactly the mechanics under test.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -70,6 +72,28 @@ fn free_udp_port(allocated: &mut HashSet<u16>) -> u16 {
         let port = socket.local_addr().unwrap().port();
         if allocated.insert(port) {
             return port;
+        }
+    }
+}
+
+/// How far above its gossip port each node's Raft port sits. Bun derives a
+/// peer's Raft address from the peer's gossip port plus its OWN offset, so
+/// every node in a cluster must use the same one. With unrelated random
+/// ports the reconciler aimed every learner add at the wrong port and the
+/// council never grew past the bootstrap voter (#373).
+const RAFT_PORT_OFFSET: u16 = 1000;
+
+/// A free gossip (UDP) port whose Raft (TCP) port, [`RAFT_PORT_OFFSET`]
+/// above it, is free too.
+fn free_gossip_and_raft_ports(allocated: &mut HashSet<u16>) -> (u16, u16) {
+    loop {
+        let gossip = free_udp_port(allocated);
+        let Some(raft) = gossip.checked_add(RAFT_PORT_OFFSET) else {
+            continue;
+        };
+        if !allocated.contains(&raft) && std::net::TcpListener::bind(("127.0.0.1", raft)).is_ok() {
+            allocated.insert(raft);
+            return (gossip, raft);
         }
     }
 }
@@ -164,8 +188,7 @@ impl ClusterHarness {
             std::os::unix::fs::symlink("bun-v0.1.0", bin_dir.join("bun")).unwrap();
 
             let api_port = free_tcp_port(&mut allocated_ports);
-            let gossip_port = free_udp_port(&mut allocated_ports);
-            let raft_port = free_tcp_port(&mut allocated_ports);
+            let (gossip_port, raft_port) = free_gossip_and_raft_ports(&mut allocated_ports);
             let reporting_port = free_tcp_port(&mut allocated_ports);
             let registry_port = free_tcp_port(&mut allocated_ports);
             let join = match seed_gossip {
@@ -309,7 +332,45 @@ retain_versions = 3
             harness.leader().await.is_some()
         })
         .await;
+        // The reconciler promotes one node per tick after a few seconds of
+        // stable gossip, so a leader alone proves nothing about the council.
+        // Wait for every node to hold a vote: the rolling walk must take real
+        // voters down one at a time, not learners that Raft can do without.
+        wait_for("every node a council voter", WAIT, || async {
+            harness.voters().await.len() == harness.nodes.len()
+        })
+        .await;
         harness
+    }
+
+    /// The nodes the leader's gossip view marks as council voters. The
+    /// mark comes from the Raft voter set, so learners never count.
+    async fn voters(&self) -> HashSet<String> {
+        let Some(leader) = self.leader().await else {
+            return HashSet::new();
+        };
+        let members = async {
+            self.client
+                .get(format!(
+                    "http://{}/v1/cluster/nodes",
+                    self.node(&leader).api
+                ))
+                .send()
+                .await
+                .ok()?
+                .error_for_status()
+                .ok()?
+                .json::<Vec<reliaburger::bun::agent::NodeStatus>>()
+                .await
+                .ok()
+        }
+        .await;
+        members
+            .into_iter()
+            .flatten()
+            .filter(|member| member.is_council)
+            .map(|member| member.node_id)
+            .collect()
     }
 
     async fn leader_from(&self, node: &ClusterNode) -> Option<String> {
@@ -512,6 +573,10 @@ retain_versions = 3
                 "http://{}/v1/upgrade/start",
                 self.node(through.unwrap_or(&leader)).api
             ))
+            // The leader probes every node (5 s) and checks the candidate
+            // (up to 20 s) before it records the run, so a start can take
+            // far longer than a status read.
+            .timeout(Duration::from_secs(60))
             .json(&request)
             .send()
             .await
@@ -741,6 +806,35 @@ async fn rolling_upgrade_walks_workers_council_then_leader() {
     // bouncing node is inherently at risk for its ~1s window, so it's the
     // wrong thing to pin here.
     let (upgrade_id, old_leader, worker) = harness.start_upgrade().await;
+
+    // The leader derives each node's role from the Raft voter set. Every
+    // node but the leader must be walked as a council member, or this run
+    // never took a voter down (#373).
+    let recorded = harness
+        .cluster_state_from(harness.node(&old_leader))
+        .await
+        .expect("cluster upgrade state");
+    let roles: Vec<(String, String)> = recorded["active"]["nodes"]
+        .as_array()
+        .expect("the started run is active")
+        .iter()
+        .map(|node| {
+            (
+                node["node_id"].as_str().unwrap().to_string(),
+                node["role"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    for (node, role) in &roles {
+        let expected = if *node == old_leader {
+            "Leader"
+        } else {
+            "Council"
+        };
+        assert_eq!(role, expected, "{node} walked as {role}: {roles:?}");
+    }
+    assert_eq!(roles.len(), harness.nodes.len(), "{roles:?}");
+
     let (healthy_order, phase) = harness.watch_upgrade(&upgrade_id, false).await;
     assert_eq!(phase, "Completed");
 
@@ -755,7 +849,8 @@ async fn rolling_upgrade_walks_workers_council_then_leader() {
         );
     }
 
-    // Rolling order: the worker first, the (old) leader last. The leader
+    // Rolling order: the node labelled worker (first in the plan, so first
+    // of the council members) goes first, the (old) leader last. The leader
     // upgrades itself in place (openraft 0.9 can't gracefully hand off
     // against a live leader), so it may still be leader afterwards — what
     // matters is that it went last and the cluster still has a leader.
@@ -845,10 +940,11 @@ async fn relish_pushes_through_a_forward_while_nodes_fetch_from_the_cluster_addr
 /// (are we the leader?)". A node that isn't the leader now forwards the call,
 /// with the caller's credential, and the run it starts completes.
 ///
-/// This harness keeps a one-voter council, so the node here is outside Raft
-/// altogether and finds the leader through the gossip directory. The Raft
-/// follower case is `bun::api`'s
-/// `a_follower_forwards_upgrade_control_calls_to_the_leader_with_the_callers_token`.
+/// Every node in this harness is a voter, so the node here is a Raft
+/// follower and forwards to the leader Raft names. A worker outside Raft
+/// finds the leader through the gossip directory instead; that case is
+/// `bun::api`'s
+/// `a_worker_outside_raft_forwards_upgrade_calls_to_the_leader_gossip_names`.
 #[tokio::test]
 #[ignore = "requires RELIABURGER_UPGRADE_TESTS=1 and a multi-core host; run with make test-upgrade-cluster"]
 async fn upgrade_start_sent_to_a_node_that_is_not_the_leader_reaches_the_leader() {
@@ -1103,7 +1199,9 @@ async fn start_refuses_a_candidate_with_other_formats_before_recording_a_run() {
         "set RELIABURGER_UPGRADE_TESTS=1 on a provisioned multi-core host"
     );
     let _serial = SERIAL.lock().await;
-    let harness = ClusterHarness::start(2).await;
+    // Three nodes, not two: two would be a two-voter council, which the
+    // leader refuses to roll (#372) before this test's own refusal.
+    let harness = ClusterHarness::start(3).await;
     let leader = harness.wait_for_idle_leader().await;
     let client = harness.relish_client(harness.node(&leader));
     let staging = tempfile::tempdir().unwrap();
@@ -1144,7 +1242,9 @@ async fn rollback_to_a_version_the_nodes_lack_is_refused_before_recording_a_run(
         "set RELIABURGER_UPGRADE_TESTS=1 on a provisioned multi-core host"
     );
     let _serial = SERIAL.lock().await;
-    let harness = ClusterHarness::start(2).await;
+    // Three nodes, not two: two would be a two-voter council, which the
+    // leader refuses to roll (#372) before this test's own refusal.
+    let harness = ClusterHarness::start(3).await;
     let leader = harness.wait_for_idle_leader().await;
     let (nodes, _) = harness.plan_nodes_for(&leader);
     let request = serde_json::json!({ "target_version": "v0.0.5", "nodes": nodes });

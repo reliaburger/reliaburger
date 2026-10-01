@@ -34,7 +34,9 @@ impl LaunchEvidence {
     pub(super) async fn read<G: Grill>(grill: &G, id: &InstanceId) -> Self {
         let pid = match grill.runtime_kind() {
             RuntimeKind::Apple => None,
-            _ => grill.pid(id).await,
+            // A pid the runtime couldn't read is left out of the record, as
+            // one it doesn't report is: adoption then relies on the runtime.
+            _ => grill.pid(id).await.ok().flatten(),
         };
         Self {
             pid,

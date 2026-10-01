@@ -1861,8 +1861,9 @@ pub struct InstanceStatus {
     pub exit_code: Option<i32>,
     /// OS process ID, if available.
     pub pid: Option<u32>,
-    /// The runtime didn't answer for this instance before the status
-    /// deadline, so `pid` and `exit_code` are unknown rather than absent.
+    /// Some of the runtime's evidence for this instance (its liveness, pid
+    /// or exit code) didn't arrive before the status deadline, so a `None`
+    /// `pid` or `exit_code` is unknown rather than absent.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub runtime_unknown: bool,
     /// How old the agent loop's published snapshot was when this answer was

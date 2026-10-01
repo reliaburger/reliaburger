@@ -121,29 +121,31 @@ async fn wait_job(client: &BunClient, expected_state: &str, restarts: u32) {
     }
 }
 
-/// The job's pid, once status reports one.
+/// The job's pid, from the first status whose runtime evidence is complete.
 ///
-/// Status reads each pid from the process owner when it answers, and
-/// reports one it couldn't read in time as unknown rather than hold the
-/// answer; a busy runner right after a Bun starts or adopts can miss that
-/// (#358). Comparing pids across a crash has to compare known ones: a
-/// different pid still fails, only a missing one waits.
+/// Status reads each pid from the process owner and marks an answer it
+/// couldn't complete in time `runtime_unknown` rather than hold the reply,
+/// so only that answer (or a failed request) is worth asking again. A
+/// complete answer with no pid is a running job reported without a process,
+/// the product bug #358 fixed, and fails at once.
 async fn job_pid(client: &BunClient) -> u32 {
     let deadline = tokio::time::Instant::now() + STATE_DEADLINE;
     loop {
         let last_observed = match client.status().await {
             Ok(statuses) => match statuses.first() {
-                Some(status) => match status.pid {
-                    Some(pid) => return pid,
-                    None => format!("{status:?}"),
-                },
+                Some(status) if !status.runtime_unknown => {
+                    return status
+                        .pid
+                        .unwrap_or_else(|| panic!("a running job had no pid: {status:?}"));
+                }
+                Some(status) => format!("{status:?}"),
                 None => "no instances".to_string(),
             },
             Err(error) => format!("status request failed: {error}"),
         };
         assert!(
             tokio::time::Instant::now() < deadline,
-            "job never reported a pid within {STATE_DEADLINE:?}; last observed {last_observed}"
+            "the runtime never answered for the job within {STATE_DEADLINE:?}; last observed {last_observed}"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }

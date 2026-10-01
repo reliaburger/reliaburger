@@ -74,7 +74,7 @@ async fn read_inventory<G: Grill>(
 ) -> Vec<crate::upgrade::marker::InstanceInventory> {
     let mut inventory = Vec::new();
     for entry in entries {
-        let Some(pid) = grill.pid(&entry.id).await else {
+        let Ok(Some(pid)) = grill.pid(&entry.id).await else {
             continue;
         };
         let replica_index = crate::grill::InstanceIdentity::parse(&entry.id.0)

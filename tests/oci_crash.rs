@@ -1314,13 +1314,14 @@ async fn wait_cluster_publication(client: &BunClient, name: &str) {
     .expect("cluster never confirmed its workload publication");
 }
 
-/// The node's one running instance, once its status carries a pid.
+/// The node's one running instance, from the first status whose runtime
+/// evidence is complete.
 ///
-/// `/v1/status` reads each pid under a shared 500 ms deadline and reports a
-/// miss as unknown rather than hold the answer, and rootless runc can take
-/// that long just after a bun starts or adopts its workloads (#358). A test
-/// comparing pids across a restart or an upgrade has to compare known ones;
-/// a different pid still fails the comparison, only an unknown one waits.
+/// `/v1/status` reads each pid under a shared 500 ms deadline and marks an
+/// answer that missed it `runtime_unknown` rather than hold the reply, so
+/// only that answer (or a failed request) is worth asking again. A complete
+/// answer with no pid is a live instance reported without a process, the
+/// product bug #358 fixed, and fails at once.
 #[cfg(feature = "ebpf")]
 async fn instance_with_pid(client: &BunClient) -> reliaburger::bun::agent::InstanceStatus {
     let mut last = None;
@@ -1330,7 +1331,11 @@ async fn instance_with_pid(client: &BunClient) -> reliaburger::bun::agent::Insta
                 && !statuses.is_empty()
             {
                 let instance = statuses.remove(0);
-                if instance.pid.is_some() {
+                if !instance.runtime_unknown {
+                    assert!(
+                        instance.pid.is_some(),
+                        "a live instance had no pid: {instance:?}"
+                    );
                     return instance;
                 }
                 last = Some(instance);
@@ -1339,7 +1344,7 @@ async fn instance_with_pid(client: &BunClient) -> reliaburger::bun::agent::Insta
         }
     })
     .await;
-    found.unwrap_or_else(|_| panic!("the instance never reported a pid: {last:?}"))
+    found.unwrap_or_else(|_| panic!("the runtime never answered for the instance: {last:?}"))
 }
 
 #[cfg(feature = "ebpf")]

@@ -72,6 +72,7 @@ pub(super) async fn read_pids<G: Grill>(
         tokio::time::timeout_at(deadline, grill.pid(id))
             .await
             .ok()
+            .and_then(Result::ok)
             .flatten()
     });
     // `timeout_at` polls the reads before its clock, so at the deadline the
