@@ -100,14 +100,18 @@ PASS for everything that can be proven without the hardware, apart from one item
 - **Nodes were configured with systemd credentials over SMBIOS** (`reliaburger.seed`, `ssh.authorized_keys.root`). There's no claim flow yet, and nodes have no login.
 - **`openssh-server` is in the spike image**, started only by a credential, so S4 could stage by hand.
 
+## Ready for S5
+
+The appliance profile from research §9.2–9.3 is in the image since 2026.40.46: zram swap, the data partition mounted `noatime,compress=zstd:1`, journald capped at 32 MB, and the launcher and seeds keeping one old bun. Details are in the plan's log.
+
 ## Still to do
 
 - **S5:** the ten Dell Wyse 3040s (research §9.7). It covers:
   - the BIOS setup;
   - PXE on the real Realtek NIC (the `snp` iPXE build is now the default);
   - whether firmware keeps the boot entry the installer creates;
-  - `MemAvailable` under the tour;
-  - eMMC writes per day;
+  - `MemAvailable` under the tour, and whether zram gets used;
+  - eMMC writes per day (`image/tools/fleet-measure.sh` samples both, and more, into CSVs);
   - the `dw_dmac` reboot hang;
   - one OS update across the fleet.
 - **A rolling `relish upgrade` that swaps bun** on the appliance, once two release-signed versions share `protocol` and `state`.

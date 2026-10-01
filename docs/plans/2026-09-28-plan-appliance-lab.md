@@ -100,6 +100,14 @@
   - the boot check passed: `bun healthy (bun 0.1.1 (77bace5)) on OS 2026.40.42`.
 - **Still open:** a rolling upgrade that actually swaps bun. It needs two consecutive release-signed versions with the same `protocol` and `state`. main is already at 28/47 against 0.1.1's 27/46, so 0.1.1 → 0.1.2 won't roll either.
 
+**The appliance profile, ahead of S5 (1 Oct).** Research §9.2–9.3 asks for it on a 2 GB, 8 GB eMMC machine. Build 2026.40.46 (run 36808394596) has it, checked on a lab VM:
+- **zram swap:** `systemd-zram-generator`, half of RAM with zstd (973 MB on a 2 GiB VM, priority 100).
+- **The data partition** mounts `noatime,compress=zstd:1` (`rootflags=` on the command line; Btrfs adds `discard=async` itself).
+- **journald** is capped at 32 MB on disk and 16 MB in RAM.
+- **Old buns are pruned.** The launcher keeps the active bun and the one it replaced, and deletes the rest with their `.sig`, so a 100 MB binary per OS update can't fill the eMMC. Tested with stand-in binaries through seven image versions and a bun that upgraded itself: it never downgraded, and it never touched a bun newer than the image's.
+- **The seeds' `node.toml`** keeps one old bun (`[upgrades] retain_versions = 1`) and two days of unreferenced images (`[images] gc_retain_days = 2`). `[metrics]` and `[logs] max_storage_mb` were left alone, because they only prune files already exported; the V02 soak's 7–11 MB per 12 h means a week of each fits.
+- **`image/tools/fleet-measure.sh`** samples every node over SSH into one CSV per node, for S5's 24-hour run: `MemAvailable`, swap and zram, bun's RSS, bytes written to the system disk (`/sys/block/<disk>/stat`), data partition use, load, the hottest thermal zone, and the OS and bun versions. Checked against the lab VM.
+
 **The bare-metal preview (29–30 Sep).** It covers the manual chapter `docs/manual/14_appliance.md`, the book chapter `docs/book/15a-becoming-the-os.md`, and the tools in `image/tools/`.
 - **Seeds for real machines:** real hardware has no SMBIOS channel for the lab's seed credential. So `reliaburger-seed` now also reads a USB stick labelled `RBSEED`, with `seeds/<mac>.seed` for one of the machine's NICs, so one stick serves a whole fleet. Without it, a physical node could install but never join a cluster, and S5 would have been blocked.
 - **The guide, followed end to end in the lab:**
