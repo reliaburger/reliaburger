@@ -217,6 +217,55 @@ async fn status_answers_while_a_restart_creates_and_starts() {
         .await;
 }
 
+/// `relish apply --rerun-jobs` kills the job's previous run and waits for
+/// the runtime to confirm the exit before the rerun may start. The kill runs
+/// off the loop, and the deploy worker asks again until it's confirmed; the
+/// rerun still starts, once.
+#[tokio::test]
+async fn status_answers_while_a_job_rerun_kills_its_previous_run() {
+    let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+    let job =
+        || Config::parse("[job.batch]\nimage = 'batch:v1'\ncommand = ['sleep', '60']\n").unwrap();
+    expect_complete(&drain_deploy(&mut agent, job()).await);
+    let running = RunningAgent::start(agent, tx.clone(), shutdown);
+    // Past the turn budget, inside the test agent's 2 s kill confirmation.
+    grill.set_call_delay(MockCall::Kill, Some(std::time::Duration::from_millis(1500)));
+    let kills_before = calls_of(&grill, "kill");
+    let starts_before = calls_of(&grill, "start");
+    running.measure_from_here();
+    let (events, mut progress) = mpsc::channel(64);
+    tx.send(AgentCommand::RerunJobs {
+        config: job(),
+        events,
+    })
+    .await
+    .unwrap();
+    wait_for_calls(&grill, "kill", kills_before, 1).await;
+    let mid_kill = running.status_latency().await;
+    let last_event = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let mut last = None;
+        while let Some(event) = progress.recv().await {
+            last = Some(event);
+        }
+        last
+    })
+    .await
+    .expect("the rerun never finished");
+    expect_complete(&last_event.into_iter().collect::<Vec<_>>());
+    assert_eq!(
+        calls_of(&grill, "start"),
+        starts_before + 1,
+        "the rerun started its job once"
+    );
+    assert!(
+        mid_kill.is_some_and(|latency| latency < TURN_BUDGET),
+        "status took {mid_kill:?} while the previous run's kill was confirmed"
+    );
+    running
+        .assert_responsive("a job rerun killed its previous run")
+        .await;
+}
+
 /// A deploy's `ApplyNetworkPreStart` step retains the instance's network
 /// reference through the runtime, under its lifecycle lock.
 #[tokio::test]

@@ -1,12 +1,16 @@
-//! Disk work a turn starts and a later turn finishes (#351, stage 3).
+//! Disk and runtime work a turn starts and a later turn finishes (#351,
+//! stage 3).
 //!
 //! Retiring an instance removes its identity directory (unmounting its tmpfs
 //! first) and its adoption record; deploying an app with managed volumes
-//! creates them; retiring a test lease removes its storage. Each is a few
-//! milliseconds on a healthy disk and seconds on a struggling one, and each
-//! sits in the middle of a sequence the loop owns: retirement must not forget
-//! an owner whose key material is still on disk, and a launch must not start
-//! before its volumes exist.
+//! creates them; retiring a test lease removes its storage. Rerunning a job
+//! kills its previous run first, and fencing an app whose stop failed kills
+//! its instances. Each is milliseconds when the disk and the runtime are
+//! healthy and seconds when they aren't (a kill waits for the runtime to
+//! confirm the exit), and each sits in the middle of a sequence the loop
+//! owns: retirement must not forget an owner whose key material is still on
+//! disk, a launch must not start before its volumes exist, and a rerun must
+//! not start before the run it replaces is gone.
 //!
 //! So the turn that reaches the work starts it in a task and waits for it
 //! only until the turn's runtime budget runs out. If it finished, the turn
@@ -27,9 +31,9 @@ use tokio::task::JoinHandle;
 
 use super::{BunAgent, BunError, Grill, InstanceId};
 
-/// Which disk work a task is doing.
+/// Which work a task is doing.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(super) enum DiskWorkKey {
+pub(super) enum WorkKey {
     /// Removing a retired instance's identity directory and adoption record.
     RetireArtifacts(InstanceId),
     /// Creating an app's managed volumes, or claiming its test storage, for
@@ -41,41 +45,50 @@ pub(super) enum DiskWorkKey {
     },
     /// Removing a retired test lease's disposable storage.
     RetireTestStorage { namespace: String, app: String },
+    /// Killing a job's previous run, and confirming its exit, before a
+    /// rerun replaces it.
+    ClearJobRun(InstanceId),
+    /// Force-killing an instance whose graceful stop failed, and confirming
+    /// its exit.
+    #[cfg_attr(not(all(feature = "ebpf", target_os = "linux")), allow(dead_code))]
+    FenceExecution(InstanceId),
 }
 
-impl std::fmt::Display for DiskWorkKey {
+impl std::fmt::Display for WorkKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            DiskWorkKey::RetireArtifacts(id) => {
+            WorkKey::RetireArtifacts(id) => {
                 write!(f, "removing {id}'s identity directory and record")
             }
-            DiskWorkKey::ProvisionStorage { namespace, app, .. } => {
+            WorkKey::ProvisionStorage { namespace, app, .. } => {
                 write!(f, "provisioning {namespace}/{app}'s volumes")
             }
-            DiskWorkKey::RetireTestStorage { namespace, app } => {
+            WorkKey::RetireTestStorage { namespace, app } => {
                 write!(f, "removing {namespace}/{app}'s test storage")
             }
+            WorkKey::ClearJobRun(id) => write!(f, "killing {id}'s previous run"),
+            WorkKey::FenceExecution(id) => write!(f, "force-killing {id}"),
         }
     }
 }
 
-/// One piece of disk work in flight, or finished and not yet collected.
+/// One piece of work in flight, or finished and not yet collected.
 struct InFlight {
     /// The instance's `created_at` when the work started, if it had one.
     incarnation: Option<Instant>,
     task: JoinHandle<Result<(), String>>,
 }
 
-/// Disk work in flight, by what it's doing.
+/// Work in flight, by what it's doing.
 #[derive(Default)]
-pub(super) struct DiskWork {
-    in_flight: HashMap<DiskWorkKey, InFlight>,
+pub(super) struct OffLoopWork {
+    in_flight: HashMap<WorkKey, InFlight>,
 }
 
-impl DiskWork {
+impl OffLoopWork {
     /// Whether work for `key` is still running.
     #[cfg(test)]
-    pub(super) fn is_running(&self, key: &DiskWorkKey) -> bool {
+    pub(super) fn is_running(&self, key: &WorkKey) -> bool {
         self.in_flight
             .get(key)
             .is_some_and(|work| !work.task.is_finished())
@@ -85,7 +98,7 @@ impl DiskWork {
     /// must not swap them meanwhile.
     pub(super) fn provisioning(&self, namespace: &str, app: &str) -> bool {
         self.in_flight.iter().any(|(key, work)| {
-            matches!(key, DiskWorkKey::ProvisionStorage { namespace: n, app: a, .. }
+            matches!(key, WorkKey::ProvisionStorage { namespace: n, app: a, .. }
                 if n == namespace && a == app)
                 && !work.task.is_finished()
         })
@@ -93,7 +106,7 @@ impl DiskWork {
 
     /// Whether work for `key` was started for this incarnation, so the
     /// steps before it have already run.
-    pub(super) fn started(&self, key: &DiskWorkKey, incarnation: Option<Instant>) -> bool {
+    pub(super) fn started(&self, key: &WorkKey, incarnation: Option<Instant>) -> bool {
         self.in_flight
             .get(key)
             .is_some_and(|work| work.incarnation == incarnation)
@@ -105,7 +118,7 @@ impl DiskWork {
     /// starts once that has finished.
     fn task<F>(
         &mut self,
-        key: &DiskWorkKey,
+        key: &WorkKey,
         incarnation: Option<Instant>,
         work: F,
     ) -> Option<(&mut JoinHandle<Result<(), String>>, bool)>
@@ -139,14 +152,14 @@ impl DiskWork {
 }
 
 impl<G: Grill + Clone + 'static> BunAgent<G> {
-    /// Run `key`'s disk work, starting it with `work` if this incarnation
-    /// hasn't yet. A turn that starts the work waits for it until the turn's
-    /// runtime budget runs out, so on a healthy disk the step finishes in
-    /// the same turn; a later turn only collects a result that is already
-    /// there. `Err(BunError::StillRunning)` means ask again later.
-    pub(super) async fn finish_disk_work<F>(
+    /// Run `key`'s work, starting it with `work` if this incarnation hasn't
+    /// yet. A turn that starts the work waits for it until the turn's
+    /// runtime budget runs out, so with a healthy disk and runtime the step
+    /// finishes in the same turn; a later turn only collects a result that
+    /// is already there. `Err(BunError::StillRunning)` means ask again later.
+    pub(super) async fn finish_off_loop_work<F>(
         &mut self,
-        key: DiskWorkKey,
+        key: WorkKey,
         incarnation: Option<Instant>,
         work: F,
     ) -> Result<Result<(), String>, BunError>
@@ -157,7 +170,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let still_running = || BunError::StillRunning {
             work: key.to_string(),
         };
-        let Some((task, started_now)) = self.disk_work.task(&key, incarnation, work) else {
+        let Some((task, started_now)) = self.off_loop_work.task(&key, incarnation, work) else {
             return Err(still_running());
         };
         // `timeout_at` polls the task once even with the deadline passed, so
@@ -170,8 +183,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let joined = tokio::time::timeout_at(deadline, task)
             .await
             .map_err(|_| still_running())?;
-        self.disk_work.in_flight.remove(&key);
-        Ok(joined.unwrap_or_else(|error| Err(format!("disk work task failed: {error}"))))
+        self.off_loop_work.in_flight.remove(&key);
+        Ok(joined.unwrap_or_else(|error| Err(format!("off-loop task failed: {error}"))))
     }
 
     /// The incarnation of `id` that work started now belongs to.
@@ -186,13 +199,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 mod tests {
     use super::*;
 
-    fn key() -> DiskWorkKey {
-        DiskWorkKey::RetireArtifacts(InstanceId("default__web-0".into()))
+    fn key() -> WorkKey {
+        WorkKey::RetireArtifacts(InstanceId("default__web-0".into()))
     }
 
     #[tokio::test]
     async fn the_same_incarnation_finds_the_task_it_started() {
-        let mut work = DiskWork::default();
+        let mut work = OffLoopWork::default();
         let incarnation = Some(Instant::now());
         let (release, wait) = tokio::sync::oneshot::channel::<()>();
         assert!(
@@ -219,7 +232,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_new_incarnation_waits_for_the_old_work_then_starts_its_own() {
-        let mut work = DiskWork::default();
+        let mut work = OffLoopWork::default();
         let old = Some(Instant::now());
         let new = Some(Instant::now() + std::time::Duration::from_secs(1));
         let (release, wait) = tokio::sync::oneshot::channel::<()>();

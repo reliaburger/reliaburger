@@ -1977,12 +1977,12 @@ pub use consumer::ConsumerUpdate;
 mod adopted_placements;
 mod discovery_ownership;
 mod discovery_recovery;
-mod disk_work;
 mod egress_ownership;
 mod follow_ups;
 mod identity_signing;
 mod launch_evidence;
 mod logs;
+mod off_loop_work;
 mod producer_release;
 mod restarts;
 mod runtime_inventory;
@@ -2346,7 +2346,7 @@ pub struct BunAgent<G: Grill> {
     namespace_firewall_stale: bool,
     /// Disk cleanup and provisioning running in tasks, which a later turn
     /// collects.
-    disk_work: disk_work::DiskWork,
+    off_loop_work: off_loop_work::OffLoopWork,
 }
 
 /// The last instance each phase of `drive_pending_restarts` handled.
@@ -2521,7 +2521,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             firewall_applying: None,
             turn_deadline: None,
             namespace_firewall_stale: false,
-            disk_work: disk_work::DiskWork::default(),
+            off_loop_work: off_loop_work::OffLoopWork::default(),
             adopted_apps: adopted_placements::AdoptedApps::new(),
         }
     }
@@ -2669,7 +2669,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             firewall_applying: None,
             turn_deadline: None,
             namespace_firewall_stale: false,
-            disk_work: disk_work::DiskWork::default(),
+            off_loop_work: off_loop_work::OffLoopWork::default(),
             adopted_apps: adopted_placements::AdoptedApps::new(),
         }
     }
@@ -3249,11 +3249,18 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         if self.job_store_uncertain {
             return Err(refuse("checkpoint is uncertain; restart Bun"));
         }
+        // An earlier attempt of this apply may already be clearing the
+        // previous run off the loop, and marked it Stopping to do so.
+        let clearing = self.off_loop_work.started(
+            &off_loop_work::WorkKey::ClearJobRun(id.clone()),
+            self.incarnation_of(&id),
+        );
         if let Some(instance) = self.supervisor.get_instance(&id) {
             if !instance.is_job || instance.app_name != name || instance.namespace != namespace {
                 return Err(refuse("instance id belongs to another workload"));
             }
             if !rerun_unknown
+                && !clearing
                 && !matches!(
                     instance.state,
                     ContainerState::Stopped | ContainerState::Failed
@@ -3290,7 +3297,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         };
         if let Some(job) = &previous {
             if !job.runtime_absent {
-                self.kill_and_wait_for_exit(&id).await?;
+                self.clear_previous_job_run(&id).await?;
             }
             self.record_job_runtime_absent(&id).await?;
             self.retire_instance_artifacts(&id).await?;
@@ -4148,7 +4155,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         // An upgrade still preparing leaves its caller a
                         // closed channel, and the node on its current binary.
                         self.follow_ups.abort_all();
-                        self.disk_work.abandon_all();
+                        self.off_loop_work.abandon_all();
                         self.shutdown_all().await;
                         break;
                     }
@@ -5216,7 +5223,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 }
                 // A deploy still creating the volumes off the loop would
                 // race the restore's swap.
-                if self.disk_work.provisioning(&namespace, &app_name) {
+                if self.off_loop_work.provisioning(&namespace, &app_name) {
                     let _ = response.send(Err(Self::volumes_busy(&namespace, &app_name)));
                     return;
                 }
@@ -8327,11 +8334,20 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         // LOOP-INLINE: in-memory lock, no I/O
         self.supervisor.stop_app(app_name, namespace).await?;
         let mut first_error = None;
+        let deadline = self.turn_deadline();
         for (id, publishes_address) in instances {
             let result = async {
                 if publishes_address {
-                    // LOOP-INLINE: stage 3 of #351: an unbounded runtime call
-                    let reference = self.supervisor.grill().network_reference(&id).await?;
+                    let reference = tokio::time::timeout_at(
+                        deadline,
+                        self.supervisor.grill().network_reference(&id),
+                    )
+                    .await
+                    .map_err(|_| BunError::RetirementState {
+                        instance_id: id.clone(),
+                        reason: "the runtime did not name the retained address within the turn"
+                            .into(),
+                    })??;
                     if reference.is_none()
                         || self
                             .network_references
@@ -8346,7 +8362,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     }
                 }
                 self.retire_initialisers(&id).await?;
-                self.kill_and_wait_for_exit(&id).await
+                // The kill runs off the loop; until it's confirmed the fence
+                // reports itself unconfirmed, and the next egress check
+                // fences again and collects it.
+                self.kill_off_the_loop(off_loop_work::WorkKey::FenceExecution(id.clone()), &id)
+                    .await?
+                    .map_err(|reason| BunError::RetirementState {
+                        instance_id: id.clone(),
+                        reason: format!("execution fence kill unconfirmed: {reason}"),
+                    })
             }
             .await;
             if let Err(error) = result {
@@ -9394,7 +9418,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     /// Remove a retired lease's disposable managed storage.
-    /// The removal runs in a task ([`disk_work`]); `StillRunning` means ask
+    /// The removal runs in a task ([`off_loop_work`]); `StillRunning` means ask
     /// again.
     async fn retire_test_storage(
         &mut self,
@@ -9402,7 +9426,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         namespace: &str,
     ) -> Result<(), BunError> {
         let manager = crate::grill::volume::VolumeManager::new(self.volumes_dir.clone());
-        let key = disk_work::DiskWorkKey::RetireTestStorage {
+        let key = off_loop_work::WorkKey::RetireTestStorage {
             namespace: namespace.to_string(),
             app: app_name.to_string(),
         };
@@ -9413,7 +9437,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 .map_err(|error| error.to_string())?
                 .map_err(|error| error.to_string())
         };
-        self.finish_disk_work(key, None, removal)
+        self.finish_off_loop_work(key, None, removal)
             .await?
             .map_err(|reason| BunError::DeployFailed {
                 app_name: app_name.into(),
@@ -9422,7 +9446,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     /// Claim test storage and create managed volumes before launch. The disk
-    /// work runs in a task ([`disk_work`]); `StillRunning` means ask again,
+    /// work runs in a task ([`off_loop_work`]); `StillRunning` means ask again,
     /// and a snapshot restore of the app waits until it has finished.
     async fn prepare_storage(
         &mut self,
@@ -9441,7 +9465,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             });
         }
         let manager = crate::grill::volume::VolumeManager::new(self.volumes_dir.clone());
-        let key = disk_work::DiskWorkKey::ProvisionStorage {
+        let key = off_loop_work::WorkKey::ProvisionStorage {
             namespace: namespace.to_string(),
             app: app_name.to_string(),
             volumes: format!("{:?}", spec.volumes),
@@ -9468,7 +9492,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .map_err(|error| error.to_string())?
             .map_err(|error| error.to_string())
         };
-        self.finish_disk_work(key, None, provisioning)
+        self.finish_off_loop_work(key, None, provisioning)
             .await?
             .map_err(|reason| BunError::DeployFailed {
                 app_name: app_name.into(),
@@ -9976,16 +10000,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Retire durable artifacts before allowing the caller to forget an owner.
     ///
     /// The identity directory and adoption record go last, from a task
-    /// ([`disk_work`]): `Err(BunError::StillRunning)` means that removal
+    /// ([`off_loop_work`]): `Err(BunError::StillRunning)` means that removal
     /// hasn't finished within the turn, and asking again picks it up where
     /// it is without repeating the steps before it.
     async fn retire_instance_artifacts(
         &mut self,
         instance_id: &InstanceId,
     ) -> Result<(), BunError> {
-        let key = disk_work::DiskWorkKey::RetireArtifacts(instance_id.clone());
+        let key = off_loop_work::WorkKey::RetireArtifacts(instance_id.clone());
         let incarnation = self.incarnation_of(instance_id);
-        if !self.disk_work.started(&key, incarnation) {
+        if !self.off_loop_work.started(&key, incarnation) {
             self.retire_instance_artifacts_up_to_disk(instance_id)
                 .await?;
         }
@@ -10008,7 +10032,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .map_err(|error| error.to_string())?
             .map_err(|error| error.to_string())
         };
-        self.finish_disk_work(key, incarnation, cleanup)
+        self.finish_off_loop_work(key, incarnation, cleanup)
             .await?
             .map_err(|reason| BunError::RetirementState {
                 instance_id: instance_id.clone(),
@@ -10824,22 +10848,82 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .await)
     }
 
-    /// Preserve ownership until both force-kill and observed runtime exit
-    /// succeed. A restart in flight gives the instance up first.
-    async fn kill_and_wait_for_exit(&mut self, id: &InstanceId) -> Result<(), BunError> {
-        if let Some(restart) = self.take_back_from_restart(id) {
-            // LOOP-INLINE: stage 3 of #351: settle carries its own deadline, but holds the turn
-            restart.settle(self.stop_confirmation_timeout).await?;
-        }
-        if self
+    /// Force-kill `id` and confirm its exit from a task, as `key`'s work
+    /// (#351, stage 3). A restart in flight gives the instance up first, and
+    /// the task lets its runtime step finish before it signals anything.
+    /// Ownership stays put until the kill is confirmed: the outer `Err` is
+    /// `StillRunning` while it isn't yet, and the inner one says why the
+    /// runtime didn't confirm it.
+    async fn kill_off_the_loop(
+        &mut self,
+        key: off_loop_work::WorkKey,
+        id: &InstanceId,
+    ) -> Result<Result<(), String>, BunError> {
+        let incarnation = self.incarnation_of(id);
+        let taken = if self.off_loop_work.started(&key, incarnation) {
+            None
+        } else {
+            self.take_back_from_restart(id)
+        };
+        let runtime_absent = self
             .recorded_jobs
             .get(&id.0)
-            .is_some_and(|job| job.runtime_absent)
-        {
-            return Ok(());
+            .is_some_and(|job| job.runtime_absent);
+        let grill = self.supervisor.grill().clone();
+        let confirmation = self.stop_confirmation_timeout;
+        let target = id.clone();
+        let kill = async move {
+            if let Some(restart) = taken {
+                restart
+                    .settle(confirmation)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            if runtime_absent {
+                return Ok(());
+            }
+            kill_runtime_instance(&grill, &target, confirmation)
+                .await
+                .map_err(|error| error.to_string())
+        };
+        self.finish_off_loop_work(key, incarnation, kill).await
+    }
+
+    /// Kill `id` off the loop and wait until it's confirmed, the way a
+    /// caller that keeps asking would. For tests that drive the agent
+    /// without its loop.
+    #[cfg(test)]
+    async fn kill_and_wait_for_exit(&mut self, id: &InstanceId) -> Result<(), BunError> {
+        loop {
+            match self
+                .kill_off_the_loop(off_loop_work::WorkKey::ClearJobRun(id.clone()), id)
+                .await
+            {
+                Err(BunError::StillRunning { .. }) => tokio::task::yield_now().await,
+                Err(error) => return Err(error),
+                Ok(result) => return result.map_err(|reason| BunError::StopIncomplete { reason }),
+            }
         }
-        // LOOP-INLINE: stage 3 of #351: an execution fence or job rerun kills inline
-        kill_runtime_instance(self.supervisor.grill(), id, self.stop_confirmation_timeout).await
+    }
+
+    /// Kill a job's previous run before a rerun replaces it. The first
+    /// attempt fences the instance (Stopping, no retries, no probes), so
+    /// neither the health tick nor a restart touches it while the kill runs
+    /// off the loop; the deploy worker asks again until it's confirmed.
+    async fn clear_previous_job_run(&mut self, id: &InstanceId) -> Result<(), BunError> {
+        let key = off_loop_work::WorkKey::ClearJobRun(id.clone());
+        if !self.off_loop_work.started(&key, self.incarnation_of(id)) {
+            if let Some(instance) = self.supervisor.get_instance_mut(id) {
+                instance.retry_pending = false;
+                if instance.state.can_transition_to(ContainerState::Stopping) {
+                    instance.state = ContainerState::Stopping;
+                }
+            }
+            self.supervisor.health_checker_mut().unregister(id);
+        }
+        self.kill_off_the_loop(key, id).await?.map_err(|reason| {
+            BunError::JobState(format!("{id}: previous run not cleared: {reason}"))
+        })
     }
 
     /// Add one freshly-healthy replacement to the service map and rebuild the
