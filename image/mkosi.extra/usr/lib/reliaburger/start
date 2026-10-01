@@ -5,9 +5,11 @@
 # installs the image's own bun there only when it's newer than the active
 # one: neither an OS update nor a bun upgrade can move bun backwards.
 #
-# With a seed's /etc/reliaburger/node.toml (spike S3) bun runs as a cluster
-# node; without one it runs standalone on loopback, which is what the CI boot
-# tests check.
+# With /etc/reliaburger/node.toml (written by `bun appliance prepare` from
+# the node's seed) bun runs as a cluster node; without one it runs standalone
+# on loopback, which is what the CI boot tests check. `start prepare` and
+# `start console` run bun's appliance steps (reliaburger-seed and
+# reliaburger-console).
 set -eu
 bin=/var/lib/reliaburger/bin
 image=/usr/lib/reliaburger/bin/bun
@@ -38,6 +40,12 @@ if [ -z "$active_version" ] \
         echo "reliaburger: removed ${old##*/}"
     done
 fi
+
+# The appliance's own steps run the same bun the agent would.
+case ${1:-} in
+    prepare) exec "$bin/bun" appliance prepare ;;
+    console) exec "$bin/bun" appliance console ;;
+esac
 
 if [ -f /etc/reliaburger/node.toml ]; then
     exec "$bin/bun" --cluster --runtime runc \

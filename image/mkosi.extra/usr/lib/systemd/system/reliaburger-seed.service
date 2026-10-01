@@ -1,11 +1,13 @@
-# Install /etc/reliaburger from a seed: a tarball of node.toml, master.key,
-# identity/ and, on the first node, security-bootstrap.json. It comes from
-# the reliaburger.seed credential (the lab passes it with QEMU's
-# -smbios type=11) or from a USB stick labelled RBSEED (real machines,
-# research §4.2's seed mode). It runs while node.toml is absent; without a
-# seed, bun runs standalone. The claim flow replaces this in Phase 2.
+# Prepare this node from its seed before the agent starts: install the
+# bootstrap material of the node that creates the cluster, or enrol with a
+# join token and fetch the master key (`bun appliance prepare`). The seed is
+# the reliaburger.seed credential or seeds/<mac>.seed on a USB stick labelled
+# RBSEED. Without one, bun runs standalone. Claiming over the LAN (W5)
+# replaces seeds for most fleets.
 [Unit]
 Description=Reliaburger seed
+After=network-online.target
+Wants=network-online.target
 Before=reliaburger.service
 ConditionPathExists=!/etc/reliaburger/node.toml
 
@@ -13,8 +15,11 @@ ConditionPathExists=!/etc/reliaburger/node.toml
 Type=oneshot
 RemainAfterExit=yes
 ImportCredential=reliaburger.seed
+# A joiner waits for its first member to come up, which can take a while
+# when a whole fleet powers on together.
+TimeoutStartSec=infinity
 StandardOutput=journal+console
-ExecStart=/usr/lib/reliaburger/apply-seed
+ExecStart=/usr/lib/reliaburger/start prepare
 
 [Install]
 WantedBy=multi-user.target
