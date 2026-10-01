@@ -205,18 +205,6 @@ jobs:
             du -sh ../mkosi.tools 2>/dev/null | sed 's/^/Tools tree: /' || true
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Sign (throwaway key)
-        if: env.PUBLISH != 'true'
-        run: |
-          set -euo pipefail
-          cd image/mkosi.output
-          cp "$RUNNER_TEMP/spike.pub.pem" spike-signing-key.pub.pem
-          for sums in *.SHA256SUMS; do
-            openssl pkeyutl -sign -inkey "$RUNNER_TEMP/spike.key" -rawin -in "$sums" -out "$sums.sig"
-            openssl pkeyutl -verify -pubin -inkey spike-signing-key.pub.pem -rawin -in "$sums" -sigfile "$sums.sig"
-          done
-          rm -f "$RUNNER_TEMP/spike.key"
-
       - name: Build iPXE
         # Pinned and built here rather than downloaded (research §4.7), with
         # image/netboot/embed.ipxe built in.
@@ -244,6 +232,30 @@ jobs:
           cp "$RUNNER_TEMP/ipxe/src/$dir/ipxe.efi" "image/mkosi.output/netboot/ipxe-$name.efi"
           cp image/netboot/boot.ipxe image/mkosi.output/netboot/
           ls -l image/mkosi.output/netboot
+
+      - name: List the netboot files in SHA256SUMS
+        # One signature then covers everything a release publishes: the image,
+        # the installer and iPXE (relish image download checks them all).
+        run: |
+          set -euo pipefail
+          cd image/mkosi.output
+          sums="reliaburger-os_$IMAGE_VERSION.SHA256SUMS"
+          for f in "reliaburger-os-installer_$IMAGE_VERSION.efi" netboot/*; do
+            printf '%s  %s\n' "$(sha256sum "$f" | cut -d' ' -f1)" "$(basename "$f")" >> "$sums"
+          done
+          cat "$sums"
+
+      - name: Sign (throwaway key)
+        if: env.PUBLISH != 'true'
+        run: |
+          set -euo pipefail
+          cd image/mkosi.output
+          cp "$RUNNER_TEMP/spike.pub.pem" spike-signing-key.pub.pem
+          for sums in *.SHA256SUMS; do
+            openssl pkeyutl -sign -inkey "$RUNNER_TEMP/spike.key" -rawin -in "$sums" -out "$sums.sig"
+            openssl pkeyutl -verify -pubin -inkey spike-signing-key.pub.pem -rawin -in "$sums" -sigfile "$sums.sig"
+          done
+          rm -f "$RUNNER_TEMP/spike.key"
 
       - name: Boot test
         if: env.BROKEN_BUN != '1'
