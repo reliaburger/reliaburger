@@ -585,7 +585,7 @@ A refusal is only as good as its first line. The 0.1.0 version said `invalid or 
 So every refusal now leads with the pair, then the remedy, then a link to the policy:
 
 ```text
-incompatible state format: found 43; this binary (reliaburger v0.1.1 (3fcb1fd)) needs 44. Pre-1.0 builds don't migrate state: run the reliaburger release that wrote /var/lib/reliaburger/data/state-format.json, or move the data aside and recreate the cluster. See https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#compatibility-before-100
+incompatible state format: found 47; this binary (reliaburger v0.1.3 (465fdeb)) needs 48. Pre-1.0 builds don't migrate state: run the reliaburger release that wrote /var/lib/reliaburger/data/state-format.json, or move the data aside and recreate the cluster. See https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#compatibility-before-100
 ```
 
 A stamp from another generation used to share a variant with a corrupt one. They're different problems (one has an answer, the other doesn't), so the number now travels in its own variant:
@@ -603,9 +603,9 @@ StateMismatch { stamp: PathBuf, found: u32, expected: u32 },
 
 Two bits of `thiserror` syntax are new here. `{found}` names a field of the variant, as before. The arguments after the string are extra format arguments, like trailing arguments to C's `printf`. They can be any expression, and a leading dot (`.stamp`) means "this variant's field", so `.stamp.display()` calls a method on it. `{POLICY_URL}` isn't a field at all: Rust's format strings capture a name from the surrounding scope, and a module-level `const` counts. The backslash at the end of a line continues the string literal and swallows the next line's leading whitespace, so the message stays one line on screen and readable in the source.
 
-`this_binary()` names the release and, when the build knew it, the commit, reusing the same `describe` that `relish version` prints (`v0.1.1 (3fcb1fd)`). Two dev builds can share a version number and still hold different code, so the commit is what tells a user which one refused.
+`this_binary()` names the release and, when the build knew it, the commit, reusing the same `describe` that `relish version` prints (`v0.1.3 (465fdeb)`). Two dev builds can share a version number and still hold different code, so the commit is what tells a user which one refused.
 
-The join refusal gets the same treatment. It used to wrap the mismatch as `cluster member rejected the join: ...`, which blamed a member that never rejected anything: the joiner itself refused the member's formats after asking `/v1/version`. `JoinClientError::Incompatible` now carries the `CompatibilityError` through `#[from]`, so `?` converts it and the message starts `cannot join: incompatible cluster formats: found protocol 26, state 43; this binary (...) needs protocol 27, state 44`.
+The join refusal gets the same treatment. It used to wrap the mismatch as `cluster member rejected the join: ...`, which blamed a member that never rejected anything: the joiner itself refused the member's formats after asking `/v1/version`. `JoinClientError::Incompatible` now carries the `CompatibilityError` through `#[from]`, so `?` converts it and the message starts `cannot join: incompatible cluster formats: found protocol 28, state 47; this binary (...) needs protocol 30, state 48`.
 
 The tests pin the order, not just the content. A helper takes everything before the first `". "` and checks that it holds both numbers and the version, so a future edit can't push the key facts past the point where the journal cuts the line.
 
@@ -1407,7 +1407,7 @@ IncompatibleFormats {
 },
 ```
 
-and its message leads with them, like every other compatibility refusal in §14.8: `incompatible binary: found protocol 29, state 48; this cluster (reliaburger v0.1.2 (…)) needs protocol 28, state 47`, followed by the remedy and the policy link. Keeping the pairs typed rather than baked into a string lets a test match on `found` and `expected` directly instead of grepping prose.
+and its message leads with them, like every other compatibility refusal in §14.8: `incompatible binary: found protocol 30, state 48; this cluster (reliaburger v0.1.2 (…)) needs protocol 28, state 47` (a 0.1.2 cluster offered 0.1.3), followed by the remedy and the policy link. Keeping the pairs typed rather than baked into a string lets a test match on `found` and `expected` directly instead of grepping prose.
 
 The check runs last among the start gates, after the cheap probes, because it's the expensive one: a fetch, a hash and a process spawn. It sits under a twenty-second `tokio::time::timeout`, since a follower that forwarded the call gives up after thirty.
 
