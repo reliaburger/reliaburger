@@ -320,7 +320,7 @@ async fn rootless_helper_that_keeps_dying_is_reported_then_recovers() {
 /// answers at once instead of queueing behind them past the status
 /// deadline. A fresh runtime stands in for the Bun that just exec'd.
 #[tokio::test]
-#[ignore = "requires unprivileged Linux user, rootless runc, slirp4netns and static busybox"]
+#[ignore = "requires unprivileged Linux user, rootless runc, slirp4netns and static busybox; run with make test-rootless-runc"]
 async fn rootless_pid_answers_while_state_reads_hold_the_instance() {
     let root = tempfile::tempdir().unwrap();
     let id = InstanceId("rootless-busy".into());
