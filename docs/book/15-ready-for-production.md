@@ -463,8 +463,10 @@ So on a healthy cluster the case's expected rejection never happens, and the onl
 ever passed was the same `Err(_)` sponge soaking up unrelated failures. The rewrite asserts
 the enforcement that actually exists: both applies succeed, and the scheduling evidence shows
 the second app pinned at zero scheduled replicas — re-checked after a settle window, because
-a *late* grant is precisely the bug. When a test can't say what mechanism it's testing, check
-whether the mechanism exists.
+a *late* grant is precisely the bug. Since 0.1.3 it also waits for the council to record why
+(`max_apps`), because an unplaced app with no stated reason was the other half of the problem
+(Chapter 2). When a test can't say what mechanism it's testing, check whether the mechanism
+exists.
 
 The placement case rounds out the set: it swept per-node status errors into "not hosting"
 (`unwrap_or(false)`) and only ever asserted the *negative* — no wrong node hosts the replica.

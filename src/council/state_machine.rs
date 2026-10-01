@@ -316,6 +316,7 @@ impl StateMachineInner {
                 self.state.stopped_apps.remove(app_id);
                 self.state.scheduling.remove(app_id);
                 self.state.last_placed_nodes.remove(app_id);
+                self.state.quota_blocked.remove(app_id);
                 // A deleted app leaves no baseline for an override to sit
                 // above; drop it so a re-created app of the same name starts
                 // from its own spec, not a ghost override (DEP8).
@@ -814,6 +815,15 @@ impl StateMachineInner {
                 self.state.security_state.crl.updated_at = logical_now;
             }
             RaftRequest::Noop => {}
+            RaftRequest::QuotaBlocked { blocked } => {
+                // Only apps still in desired state: a delete committed after
+                // the leader planned must not leave a ghost reason behind.
+                self.state.quota_blocked = blocked
+                    .iter()
+                    .filter(|(app_id, _)| self.state.apps.contains_key(app_id))
+                    .cloned()
+                    .collect();
+            }
             RaftRequest::UpgradeUpdate { state } => {
                 // Reject starting a *different* upgrade while one is actively in
                 // progress (M13). The start/rollback handlers check
@@ -4914,6 +4924,74 @@ mod tests {
             app_id: crate::meat::types::AppId::new("web", "default"),
         });
         assert!(inner.state.security_state.secret_seals.is_empty());
+    }
+
+    fn cpu_block(namespace: &str) -> crate::meat::quota::QuotaError {
+        crate::meat::quota::QuotaError::CpuExceeded {
+            namespace: namespace.to_string(),
+            current: 0,
+            requested: 1600,
+            limit: 1000,
+        }
+    }
+
+    /// The leader replaces the whole set: an app that fits again drops out,
+    /// and a reason for an app no longer in desired state is never kept.
+    #[test]
+    fn quota_blocked_replaces_the_set_and_ignores_unknown_apps() {
+        let mut inner = StateMachineInner::default();
+        apply_app(&mut inner, "web", "prod");
+        apply_app(&mut inner, "api", "prod");
+        let web = crate::meat::types::AppId::new("web", "prod");
+        let api = crate::meat::types::AppId::new("api", "prod");
+        let ghost = crate::meat::types::AppId::new("ghost", "prod");
+
+        inner.apply_request(&RaftRequest::QuotaBlocked {
+            blocked: vec![
+                (web.clone(), cpu_block("prod")),
+                (ghost.clone(), cpu_block("prod")),
+            ],
+        });
+        assert_eq!(
+            inner.state.quota_blocked.get(&web),
+            Some(&cpu_block("prod"))
+        );
+        assert!(!inner.state.quota_blocked.contains_key(&ghost));
+
+        inner.apply_request(&RaftRequest::QuotaBlocked {
+            blocked: vec![(api.clone(), cpu_block("prod"))],
+        });
+        assert!(!inner.state.quota_blocked.contains_key(&web));
+        assert!(inner.state.quota_blocked.contains_key(&api));
+    }
+
+    /// Deleting a blocked app takes its reason with it.
+    #[test]
+    fn app_delete_clears_its_quota_block() {
+        let mut inner = StateMachineInner::default();
+        apply_app(&mut inner, "web", "prod");
+        let web = crate::meat::types::AppId::new("web", "prod");
+        inner.apply_request(&RaftRequest::QuotaBlocked {
+            blocked: vec![(web.clone(), cpu_block("prod"))],
+        });
+
+        inner.apply_request(&RaftRequest::AppDelete { app_id: web });
+        assert!(inner.state.quota_blocked.is_empty());
+    }
+
+    /// The reason survives a snapshot, so a follower that catches up from
+    /// one answers the same as the leader.
+    #[test]
+    fn quota_blocked_survives_a_snapshot_round_trip() {
+        let mut inner = StateMachineInner::default();
+        apply_app(&mut inner, "web", "prod");
+        let web = crate::meat::types::AppId::new("web", "prod");
+        inner.apply_request(&RaftRequest::QuotaBlocked {
+            blocked: vec![(web.clone(), cpu_block("prod"))],
+        });
+        let json = serde_json::to_vec(&inner.state).unwrap();
+        let restored: DesiredState = serde_json::from_slice(&json).unwrap();
+        assert_eq!(restored.quota_blocked.get(&web), Some(&cpu_block("prod")));
     }
 
     #[test]

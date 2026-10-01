@@ -5054,6 +5054,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                                 .unwrap_or(u32::MAX),
                             placements: Default::default(),
                             service_port: spec.port,
+                            blocked: None,
                         },
                     )
                     .collect::<Vec<_>>();
