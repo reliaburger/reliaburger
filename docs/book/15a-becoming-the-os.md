@@ -418,7 +418,38 @@ fi
 
 `sort -V` sorts version numbers numerically, so the condition reads "the image's bun is strictly newer than the active one". The copy uses the same two-step as Chapter 14's `BinaryStore`: write a hidden temporary file, rename it into place, then build a new symlink and rename that over the old one. `mv -T` makes `mv` replace `bun` itself rather than treat it as a directory to move into, so the swap is a single atomic rename. The upshot: an OS update can't downgrade a bun that upgraded itself, and a bun upgrade can't be undone by the next OS image. We tested five cases on Linux with stand-in binaries (first boot, same version, newer image, older image, and a bun that upgraded itself past the image), and the second rolling update, to 2026.40.30, moved bun onto `/var` on every node.
 
-The end-to-end `relish upgrade` on the appliance still hasn't run. Every staging candidate is v0.1.0, the launcher correctly refuses the same version with different bytes, and so the test waits for the next release-signed bun.
+We later ran both directions with real releases. An image carrying bun 0.1.1, updated to a newer image carrying 0.1.0, kept running 0.1.1, exactly as the launcher promises. And `relish upgrade` from 0.1.0 to 0.1.1 was refused, as Chapter 14's compatibility rules say it must be: the state format moved from 44 to 46 between them, so the run paused on the first node and no node moved. A rolling bun upgrade that actually swaps a binary on the appliance waits for two releases that share their formats, and so far every release has changed them.
+
+### Keeping /etc in step
+
+Remember the cost we put off at the start, when `/etc` went onto the data partition? An OS update writes a new `/usr` and a new UKI, and that's all it writes. So a node installed from one image keeps that image's `/etc` forever: new CA certificates, a changed linker path or a unit some later image enables never arrive. That's fine for a spike and wrong for a product.
+
+Debian solved this decades ago for packages, and its rule is worth stealing. dpkg calls the files in `/etc` *conffiles*, and on an upgrade it asks one question per file: did the administrator change it? If not, the new version replaces it. If so, the administrator's version stays. To answer that question you need a record of what you shipped last time, so dpkg keeps a hash of every conffile it installed.
+
+We do the same, with two pieces. The build copies the finished `/etc` into `/usr/share/factory/etc`, so every image carries a pristine copy of its own `/etc` inside the read-only, verity-checked `/usr`. That's a four-line `mkosi.finalize` script: finalize scripts run after every other step has written to `/etc`, presets included, so the copy is the real thing. Then, on the first boot of each new version, `reliaburger-etc-sync.service` compares three things for every path: what the new image ships, what's on the node now, and what the last sync installed (kept in `/var/lib/reliaburger/etc-factory`). A file that still matches what we installed follows the new image. A file the node changed stays, and the boot log names it. A file the new image dropped goes, unless the node changed it. And the node's own files (its identity under `/etc/reliaburger`, `passwd` and `shadow`, SSH host keys, `machine-id`) are never compared at all.
+
+There's a small trap in enabling the service. A preset would put its `WantedBy=` symlink in `/etc`, and `/etc` is exactly the thing an old node never gets from a new image. So the symlink ships in `/usr/lib/systemd/system/sysinit.target.wants/` instead, where systemd looks too, and where an OS update does write.
+
+The first version hashed each file with its own `sha256sum` and read its mode with its own `stat`: two processes per file, for about 480 files. On the aarch64 boot test, which runs under emulation in CI, that held up boot by 90 seconds. The fix hashes the whole tree in one go:
+
+```bash
+scan() {
+    local -n into=$2
+    local -A hash=()
+    local line type mode target rel
+    while IFS= read -r -d '' line; do
+        hash[${line#*  }]=${line%% *}
+    done < <(cd "$1" && find . -type f -printf '%P\0' | xargs -0 -r sha256sum -z --)
+    while IFS=$'\037' read -r -d '' type mode rel target; do
+        case $type in
+            l) into[$rel]="l $target" ;;
+            f) into[$rel]="f ${hash[$rel]} $mode" ;;
+        esac
+    done < <(cd "$1" && find . ! -type d -printf '%y\037%m\037%P\037%l\0')
+}
+```
+
+If you mostly write Python, read `local -A hash` as `hash = {}` (a bash associative array), and `local -n into=$2` as "`into` is another name for the caller's variable whose name is in `$2`", which is how bash passes a dictionary by reference. `< <(...)` feeds the loop from a command, and every name travels between NUL bytes (`-print0`, `-z`, `read -d ''`), the only byte a path can't contain. That's the same reason Rust's `std::ffi::OsStr` exists: a file name isn't text until you check. The `\037` is the old ASCII unit separator, and it isn't decoration. Our first try split fields on tabs, and `read` treats a tab as whitespace, collapsing the empty link target of every regular file and shifting the name into the wrong field. Nine tests in `image/tests/test_etc_sync.py` run the real script against temporary directories, and they caught it before any machine did. A full `/etc` of 1,439 files now syncs in 0.2 s, and the emulated boot reaches it at 10 s.
 
 ## A LAN on a laptop
 
@@ -533,12 +564,11 @@ We read Sidero Labs' Omni bare-metal provider (`siderolabs/omni-infra-provider-b
 
 ## What's next
 
-The spike's interim record is a pass for everything that can be proven without hardware, with one item open (bun's own upgrade on the appliance). The rest of the road:
+The spike's interim record is a pass for everything that can be proven without hardware. Turning it into part of Reliaburger is the [product plan](../plans/2026-10-01-plan-appliance-product.md) for 0.3.0, and these are the big pieces:
 
 - **S5, ten Dell Wyse 3040s.** BIOS setup, PXE on the real Realtek NIC, whether the firmware keeps the boot entry the installer makes, `MemAvailable` under the tour, eMMC writes per day, one OS update across the fleet, and whether Linux 7.0 still hangs on reboot without our `dw_dmac` blacklist. A node that can't reboot can't finish an A/B update, so that last one matters more than it sounds.
 - **`relish netboot` in Rust.** A ProxyDHCP on UDP 67 and 4011 that reads the client's architecture from option 93, TFTP for iPXE, and HTTP for the rest. It should remember installed machines by MAC and SMBIOS UUID, and serve them a `boot.ipxe` that just says `exit`.
 - **Claims.** Seeds over SMBIOS and USB sticks were a spike shortcut. The product plan is a claim over the LAN: the machine boots `unclaimed`, and an operator with the admin token adopts it. Netboot never serves secrets.
-- **The `/etc` gap.** Because `/etc` lives on the data partition, a later image's `/etc` never reaches installed nodes, and the seed and SSH credentials land there too. It has to close before OS updates ship for real.
-- **Smaller things with known answers:** a shorter health timeout on counted boots, to bring the fallback well under 16 minutes; dropping the lab's credential-gated SSH once bun stages OS updates itself; the real OS signing key; and a way for the installer to find its server under Secure Boot, which drops the command line iPXE passes.
+- **Smaller things with known answers:** a shorter health timeout on counted boots, to bring the fallback well under 16 minutes; dropping the lab's credential-gated SSH once bun stages OS updates itself; signing OS images with the release key; and a way for the installer to find its server under Secure Boot, which drops the command line iPXE passes.
 
 The shape is clear, though. The operating system is now one more artefact that Reliaburger builds, signs, rolls out and rolls back, like bun. It just happens to be the one bun stands on.

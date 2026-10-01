@@ -243,6 +243,22 @@ same way as before, into `new/x86_64`, and run `python3 -m http.server 8080`
 in `new/`, so the URLs above find them. Stop `netboot-server.sh` first, since
 it also uses port 8080. `bootctl list` on the node shows both versions afterwards.
 
+### What happens to `/etc`
+
+An update replaces `/usr`, but `/etc` lives on the node's data partition. So
+each image also carries its own `/etc`, and on the first boot of a new
+version the node brings its `/etc` up to that image:
+- a file you never changed follows the new image, and new files appear;
+- a file the new image no longer has is removed, unless you changed it;
+- a file you changed or deleted stays as you left it, and the boot log says
+  so: `journalctl -u reliaburger-etc-sync` lists each one as `kept`.
+
+The node's own files are never touched: its identity and keys under
+`/etc/reliaburger`, users and passwords, SSH host keys and `machine-id`.
+Nodes installed from an image older than 2026.40.51 have no record of what
+their image shipped, so their first update keeps every file that differs
+from the new image; reinstall them to start clean.
+
 ## What's missing
 
 - **No `relish netboot` yet.** Serving from your laptop (macOS included) is

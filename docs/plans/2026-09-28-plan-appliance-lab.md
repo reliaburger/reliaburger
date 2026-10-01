@@ -171,7 +171,7 @@ For `relish netboot` (Phase 2b):
 
 ## Known gaps
 
-- `/etc` lives on the data partition, so a later image's `/etc` doesn't reach installed nodes (S1). The seed and SSH credentials land in `/etc` too.
+- ~~`/etc` lives on the data partition, so a later image's `/etc` doesn't reach installed nodes (S1).~~ Closed 1 Oct: each image ships its `/etc` in `/usr/share/factory/etc`, and `reliaburger-etc-sync.service` applies dpkg's conffile rule on the first boot of each version (see the log).
 - A rolling bun upgrade on the appliance hasn't swapped a binary yet: no two release-signed versions share formats (see S4).
 - A seeded fleet couldn't grow past the addresses given to `seed-fleet.sh init`, because each seed fixes `bootstrap_peers`. Now `bootstrap_peers` takes CIDRs (cluster and API ports only, all mTLS), and `seed-fleet.sh init --network` writes the LAN; `join` enrols nodes appended to `fleet` later. Released buns (up to 0.1.2) take bare addresses only, so `--network` waits for the first release with this branch.
 - ~~A two-node cluster holds a bun upgrade in `UpgradingCouncil` indefinitely.~~ Fixed: `start` and a cluster `rollback` now refuse a two-voter council, and the leader logs a quorum hold once when it begins.
