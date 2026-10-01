@@ -1046,7 +1046,7 @@ mod tests {
     /// owned, and a symlink the container planted is never followed.
     #[cfg(target_os = "linux")]
     #[test]
-    #[ignore = "requires Linux root"]
+    #[ignore = "requires Linux root; run with make test-linux"]
     fn rehoming_moves_only_the_previous_users_files_and_never_follows_symlinks() {
         assert!(is_root(), "chowning into the container range needs root");
         let dir = tempfile::tempdir().unwrap();
@@ -1112,7 +1112,7 @@ mod tests {
     /// survives a restore, so a restored volume needs no second hand-over.
     #[cfg(target_os = "linux")]
     #[test]
-    #[ignore = "requires Linux root, Btrfs tools, and RELIABURGER_BTRFS_TESTS=1"]
+    #[ignore = "requires Linux root, Btrfs tools, and RELIABURGER_BTRFS_TESTS=1; run with make test-linux"]
     fn a_restored_btrfs_volume_keeps_its_container_ownership() {
         assert!(
             std::env::var("RELIABURGER_BTRFS_TESTS").is_ok(),
@@ -1171,7 +1171,7 @@ mod tests {
     /// assumptions about the host's disks.
     #[cfg(target_os = "linux")]
     #[test]
-    #[ignore = "requires Linux root with mkfs.ext4 and loop devices"]
+    #[ignore = "requires Linux root with mkfs.ext4 and loop devices; run with make test-linux"]
     fn loop_volume_is_mounted_again_after_a_reboot() {
         assert!(nix::unistd::geteuid().is_root());
         let scratch = tempfile::tempdir().unwrap();
@@ -1200,7 +1200,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    #[ignore = "requires Linux root, Btrfs tools, and RELIABURGER_BTRFS_TESTS=1"]
+    #[ignore = "requires Linux root, Btrfs tools, and RELIABURGER_BTRFS_TESTS=1; run with make test-linux"]
     fn btrfs_quota_blocks_writes_beyond_limit() {
         assert!(
             std::env::var("RELIABURGER_BTRFS_TESTS").is_ok(),

@@ -217,7 +217,7 @@ fn node_running_app(state: &AggregatedState, app: &str) -> Option<String> {
 /// service map, so cross-node resolution works even though the backend runs
 /// elsewhere. Also proves the catalogue survives a leader change.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore = "requires RELIABURGER_CLUSTER_TESTS=1 and a multi-core host"]
+#[ignore = "requires RELIABURGER_CLUSTER_TESTS=1 and a multi-core host; run with make test-cluster"]
 async fn service_on_one_node_resolves_and_survives_leader_change_from_another() {
     assert!(
         cluster_tests_enabled(),
@@ -339,7 +339,7 @@ async fn service_on_one_node_resolves_and_survives_leader_change_from_another() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore = "requires RELIABURGER_CLUSTER_TESTS=1 and a multi-core host"]
+#[ignore = "requires RELIABURGER_CLUSTER_TESTS=1 and a multi-core host; run with make test-cluster"]
 async fn eight_plus_node_cluster_reconciles_and_reports_through_leader_failover() {
     assert!(
         cluster_tests_enabled(),
@@ -479,7 +479,7 @@ async fn eight_plus_node_cluster_reconciles_and_reports_through_leader_failover(
 /// Ownership survives a real leader change even when the worker's local
 /// placement journal is missing and it has missed the deletion entirely.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore = "requires RELIABURGER_CLUSTER_TESTS=1 and a multi-core host"]
+#[ignore = "requires RELIABURGER_CLUSTER_TESTS=1 and a multi-core host; run with make test-cluster"]
 async fn lease_retirement_waits_for_paused_worker_across_leader_change() {
     use reliaburger::meat::{Placement, Resources, SchedulingDecision};
     use reliaburger::testkit::lease::{
@@ -643,7 +643,7 @@ async fn lease_retirement_waits_for_paused_worker_across_leader_change() {
 /// An unreachable worker's duties can be resolved by the operator without
 /// admitting its old identity when gossip or membership catches up later.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore = "requires RELIABURGER_CLUSTER_TESTS=1 and a multi-core host"]
+#[ignore = "requires RELIABURGER_CLUSTER_TESTS=1 and a multi-core host; run with make test-cluster"]
 async fn decommissioned_worker_releases_cleanup_and_stays_retired_after_leader_change() {
     use reliaburger::cluster::retirement::DecommissionRequest;
     use reliaburger::meat::{Placement, Resources, SchedulingDecision};

@@ -190,21 +190,21 @@ fn qualify_process_catalogue(group: &str) {
 
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "requires rootful runc, networking tools and registry access"]
+#[ignore = "requires rootful runc, networking tools and registry access; run with make test-linux"]
 fn runc_catalogue_decrypts_secrets_using_only_the_public_key_api() {
     qualify_runc_catalogue("secrets-config");
 }
 
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "requires rootful runc, networking tools and registry access"]
+#[ignore = "requires rootful runc, networking tools and registry access; run with make test-linux"]
 fn runc_catalogue_verifies_workload_spiffe_certificates() {
     qualify_runc_catalogue("workload-identity");
 }
 
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "requires rootful runc, networking tools and registry access"]
+#[ignore = "requires rootful runc, networking tools and registry access; run with make test-linux"]
 fn runc_catalogue_deploys_the_exact_image_pushed_to_pickle() {
     qualify_runc_catalogue("image-registry");
 }
